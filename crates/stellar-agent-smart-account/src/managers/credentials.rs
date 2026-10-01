@@ -50,7 +50,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::managers::signers::SignersManager;
+use crate::managers::auth_entry::{PreSubmitBudget, bound_pre_submit_stage};
+use crate::managers::signers::{RuleLockGuard, SignersManager, V1Handling};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::{OsRng, RngCore};
@@ -463,14 +464,17 @@ pub enum CredentialsError {
         reason: &'static str,
     },
 
-    /// The per-signing divergence check refused the WebAuthn ceremony.
+    /// The per-signing signer-set check refused the WebAuthn ceremony.
     ///
-    /// Wraps [`crate::SaError`] variants from
-    /// `SignersManager::verify_signer_set_against_chain`:
+    /// Wraps the [`crate::SaError`] of the rule locks, the baseline reads and
+    /// the signer-set comparisons:
     /// - `SaError::SignerSetDiverged` — on-chain state mismatches audit-log baseline.
     /// - `SaError::SignerSetMissingBaseline` — no audit-log baseline exists for the rule.
     /// - `SaError::NetworkRpcDivergence` — primary and secondary RPC disagree.
     /// - `SaError::AuditLog` — audit-log integrity violation.
+    /// - `SaError::AuthEntryConstructionFailed` at stage `rule_lock`,
+    ///   `baseline_read` or `signer_set_compare`: a lock was not acquired, or
+    ///   the deadline elapsed, within the manager's timeout.
     ///
     /// The WebAuthn ceremony is aborted BEFORE any `bridge_local_addr` I/O,
     /// so no browser window is opened and no passkey tap is requested.
@@ -1512,9 +1516,10 @@ impl CredentialsManager {
     /// - `auth_digest`: 32-byte Soroban auth digest that the WebAuthn
     ///   ceremony must sign (the `challenge` the bridge encodes for the
     ///   browser).
-    /// - `signers_manager`: the `SignersManager` that runs the per-signing
-    ///   divergence check and the pinned-hash drift check of every non-zero
-    ///   rule in `rule_ids`. It also provides the shared
+    /// - `signers_manager`: the `SignersManager` through which the per-signing
+    ///   rule checks of every non-zero rule in `rule_ids` run: the rule locks,
+    ///   the signer-set baseline reads, the pinned-hash drift check and the
+    ///   signer-set comparison. It also provides the shared
     ///   `Arc<Mutex<AuditWriter>>` (via `SignersManager::audit_writer()`) that
     ///   carries both the `SaSignerSetDiverged` row and the `PasskeyAssertion`
     ///   row through the same writer instance. It is an `Arc` so a caller can
@@ -1539,10 +1544,11 @@ impl CredentialsManager {
     /// - [`CredentialsError::ApprovalStore`] — store insert failed.
     /// - [`CredentialsError::Signing`] — `sign_webauthn_assertion` returned an
     ///   error; the inner error message is redacted to prevent sensitive data leaking into logs.
-    /// - [`CredentialsError::SignerSetDivergence`] — the per-signing divergence
-    ///   check fired (on-chain signer-set mismatch, missing baseline, RPC
-    ///   disagreement, or audit-log integrity failure); the browser window is
-    ///   never opened.
+    /// - [`CredentialsError::SignerSetDivergence`]: the per-signing signer-set
+    ///   check fired (a rule lock not acquired, a missing baseline, an
+    ///   audit-log integrity failure, an on-chain signer-set mismatch, RPC
+    ///   disagreement, or the deadline elapsing); the browser window is never
+    ///   opened.
     /// - [`CredentialsError::DiversificationRequired`] — the diversification
     ///   enforce-default trigger fired: the rule references a single verifier
     ///   wasm hash and the policy criteria is high-value or `Undetermined`.
@@ -1560,7 +1566,7 @@ impl CredentialsManager {
     ///
     /// Implements the manager-side WebAuthn signing arm.
     /// The `signers_manager` parameter wires up the per-signing
-    /// divergence check before the WebAuthn ceremony.
+    /// rule checks before the WebAuthn ceremony.
     /// The `accept_single_verifier` parameter controls the
     /// diversification enforce-default trigger.
     #[allow(
@@ -1615,8 +1621,8 @@ impl CredentialsManager {
         // The inner fn returns a 4-tuple; the 4th element is the
         // divergence_request_id when the failure is SignerSetDivergence, so
         // emit_signing_audit can share that ID with the SaSignerSetDiverged
-        // audit row emitted by verify_signer_set_against_chain (forensic
-        // correlation invariant).
+        // audit row the signer-set comparison writes (forensic correlation
+        // invariant).
         //
         // accept_single_verifier is threaded into the inner fn so
         // the diversification check can emit SaVerifierDiversificationOverride
@@ -1701,7 +1707,7 @@ impl CredentialsManager {
         //
         // On the divergence-fail branch, divergence_request_id is Some and
         // is passed as the request_id_override so this row shares the same UUID as
-        // the SaSignerSetDiverged row emitted by verify_signer_set_against_chain.
+        // the SaSignerSetDiverged row the signer-set comparison writes.
         self.emit_signing_audit(
             &audit_writer_arc,
             &signers_manager,
@@ -1760,9 +1766,9 @@ impl CredentialsManager {
             );
         }
 
-        // Per-signing divergence check BEFORE any bridge I/O.
-        // Run for EACH rule_id in rule_ids. This fires before show()
-        // so that the audit fields are "" on this early-exit path.
+        // The per-signing rule checks run before any bridge I/O, for every
+        // rule in rule_ids, and before show(), so the audit fields are "" on
+        // their early-exit paths.
         //
         let sm = &signers_manager;
         // Parse smart_account strkey → ScAddress through the shared
@@ -1786,8 +1792,8 @@ impl CredentialsManager {
 
         // Generate a per-invocation request_id for divergence audit correlation.
         //
-        // This ID is threaded into verify_signer_set_against_chain (so
-        // SaSignerSetDiverged audit rows carry it) AND returned as the 4th tuple
+        // This ID is threaded into the rule checks (so SaSignerSetDiverged and
+        // drift audit rows carry it) AND returned as the 4th tuple
         // element so the outer fn can pass it as request_id_override to
         // emit_signing_audit.  Both audit rows thus share the same ID, enabling
         // forensic correlation across the two-row emission set.
@@ -1799,9 +1805,9 @@ impl CredentialsManager {
 
         // Verifier diversification enforce-default trigger.
         //
-        // Runs BEFORE the signer-set divergence check and wasm-hash drift checks
-        // because it reads only the local audit log (no network I/O) and is the
-        // cheapest gate, so it runs first.  For each non-bootstrap rule_id,
+        // Runs before the rule checks because it reads only the local audit
+        // log (no network I/O) and takes no lock; it is the cheapest gate, so
+        // it runs first.  For each non-bootstrap rule_id,
         // reads the audit-log-derived pinned-hash record and applies
         // `check_diversification_required`.
         //
@@ -1839,7 +1845,9 @@ impl CredentialsManager {
 
             for &rule_id in &rule_ids {
                 if rule_id == 0 {
-                    // Bootstrap rule has no verifier by definition.
+                    // Rule 0, the bootstrap rule, is exempt from the rule
+                    // lock, the signer-set check and the pin check; it has no
+                    // pins, and the submit path never reads a baseline for it.
                     continue;
                 }
 
@@ -1965,168 +1973,42 @@ impl CredentialsManager {
             }
         }
 
-        for &rule_id in &rule_ids {
-            // Rule 0, the bootstrap rule, is exempt from the check, as in
-            // rules.rs::check_divergence_for_auth_rule_ids.
-            if rule_id == 0 {
-                warn!(
-                    rule_id,
-                    "sign_with_passkey_rule: auth_rule_id == 0 (bootstrap rule); \
-                     divergence check skipped: the bootstrap rule is exempt"
-                );
-                continue;
-            }
-
-            match sm
-                .verify_signer_set_against_chain(
-                    sc_addr.clone(),
-                    rule_id,
-                    None,
-                    divergence_request_id.clone(),
-                )
-                .await
-            {
-                Ok(_frozen) => {
-                    // Divergence check passed for this rule_id; continue.
-                }
-                Err(sa_err) => {
-                    // Return divergence_request_id as the 4th tuple
-                    // element so the outer fn threads it into emit_signing_audit.
-                    return (
-                        Err(CredentialsError::SignerSetDivergence {
-                            source: Box::new(sa_err),
-                        }),
-                        String::new(),
-                        String::new(),
-                        Some(divergence_request_id),
-                    );
-                }
-            }
+        // The rule checks run in the submit path's order, under one deadline:
+        // the rule locks, the baseline reads, the pinned-hash drift checks,
+        // then the signer-set comparisons. The locks are released before the
+        // WebAuthn ceremony. Rule 0, the bootstrap rule, is exempt from the
+        // rule lock, the signer-set check and the pin check; it has no pins,
+        // and the submit path never reads a baseline for it.
+        if rule_ids.contains(&0) {
+            debug!("sign_with_passkey_rule: rule 0 is exempt from the rule checks");
         }
-
-        // After the signer-set divergence check passes, run per-rule verifier
-        // and policy wasm-hash drift detection BEFORE any bridge I/O.
-        //
-        // Per-call `HashMap<ScAddress-XDR-bytes, ObservedExecutable>` cache
-        // prevents redundant two-RPC fetches when multiple rules reference
-        // the same verifier/policy contract.
-        //
-        // Each verifier/policy call uses `divergence_request_id` so that the
-        // `SaVerifierHashDrift` / `SaPolicyHashDrift` audit rows share the same
-        // request_id as the eventual `PasskeyAssertion(failure:verifier_hash_drift)`
-        // row, for forensic correlation.
-        let mut wasm_hash_cache: HashMap<Vec<u8>, crate::managers::signers::ObservedExecutable> =
-            HashMap::new();
-
-        for &rule_id in &rule_ids {
-            if rule_id == 0 {
-                // Bootstrap rule: no verifier/policy contracts to check.
-                continue;
-            }
-
-            // Fetch the on-chain rule to learn which verifier/policy addresses
-            // are registered.  Read-only `get_context_rule` view call; no auth required.
-            let (verifier_addrs, policy_addrs) = match sm
-                .fetch_verifier_and_policy_addresses(sc_addr.clone(), rule_id, None)
-                .await
-            {
-                Ok(pair) => pair,
-                Err(sa_err) => {
-                    // The rule is not on chain or the RPC failed: abort
-                    // signing (fail closed) with DriftCheckUnavailable, not
-                    // WasmHashDrift.  No hash mismatch was detected; the
-                    // drift check infrastructure itself could not run.
-                    // No SaVerifierHashDrift / SaPolicyHashDrift
-                    // audit row is emitted here: a rule-fetch failure is not
-                    // a detected drift event.
-                    warn!(
-                        rule_id,
-                        error = %sa_err,
-                        "sign_with_passkey_rule: failed to fetch on-chain rule for \
-                         drift-detection; aborting signing (fail closed)"
-                    );
-                    return (
-                        Err(CredentialsError::DriftCheckUnavailable {
-                            source: Box::new(sa_err),
-                        }),
-                        String::new(),
-                        String::new(),
-                        Some(divergence_request_id),
-                    );
-                }
-            };
-
-            // Verifier drift-detection: one call per distinct External verifier.
-            //
-            // Discriminant-route the inner SaError so that only
-            // *actual* drift events (SaVerifierHashDrift, SaPolicyHashDrift)
-            // produce CredentialsError::WasmHashDrift, which must be paired
-            // with a SaVerifier/PolicyHashDrift audit row.  Infrastructure failures
-            // (NetworkRpcDivergence, DeploymentFailed, MultiplePinnedHashesUnsupported,
-            // AuditLog) and PinnedPolicyAbsent route to DriftCheckUnavailable: no
-            // drift audit row is emitted for those (none was written by
-            // verify_pinned_* or verify_policy_pins_present).
-            for verifier_addr in verifier_addrs {
-                if let Err(sa_err) =
-                    crate::managers::verifiers::verify_pinned_verifier_against_chain(
-                        sm,
-                        verifier_addr,
-                        rule_id,
-                        &smart_account_redacted,
-                        &divergence_request_id,
-                        &mut wasm_hash_cache,
-                    )
-                    .await
-                {
-                    let credentials_err = drift_err_route(sa_err);
-                    return (
-                        Err(credentials_err),
-                        String::new(),
-                        String::new(),
-                        Some(divergence_request_id),
-                    );
-                }
-            }
-
-            // Policy drift-detection: one call per policy address.
-            for policy_addr in &policy_addrs {
-                if let Err(sa_err) = crate::managers::verifiers::verify_pinned_policy_against_chain(
-                    sm,
-                    policy_addr.clone(),
-                    rule_id,
-                    &smart_account_redacted,
-                    &divergence_request_id,
-                    &mut wasm_hash_cache,
-                )
-                .await
-                {
-                    let credentials_err = drift_err_route(sa_err);
-                    return (
-                        Err(credentials_err),
-                        String::new(),
-                        String::new(),
-                        Some(divergence_request_id),
-                    );
-                }
-            }
-
-            // A rule with no policy on chain whose record pins policies is
-            // refused; `drift_err_route` routes the refusal to
-            // DriftCheckUnavailable because no drift row is written for it.
-            if let Err(sa_err) = crate::managers::verifiers::verify_policy_pins_present(
-                sm,
-                rule_id,
-                &smart_account_redacted,
-                &divergence_request_id,
-                &policy_addrs,
-            ) {
-                return (
-                    Err(drift_err_route(sa_err)),
-                    String::new(),
-                    String::new(),
-                    Some(divergence_request_id),
-                );
-            }
+        let mut checked_rule_ids: Vec<u32> = rule_ids
+            .iter()
+            .copied()
+            .filter(|rule_id| *rule_id != 0)
+            .collect();
+        checked_rule_ids.sort_unstable();
+        checked_rule_ids.dedup();
+        let budget = PreSubmitBudget {
+            deadline: tokio::time::Instant::now() + sm.timeout_ref(),
+            total: sm.timeout_ref(),
+        };
+        let checked = check_passkey_rules(
+            sm,
+            &sc_addr,
+            &checked_rule_ids,
+            &smart_account_redacted,
+            &divergence_request_id,
+            budget,
+        )
+        .await;
+        if let Err(credentials_err) = checked {
+            return (
+                Err(credentials_err),
+                String::new(),
+                String::new(),
+                Some(divergence_request_id),
+            );
         }
 
         // Require approval store — read-only managers cannot drive signing.
@@ -2417,7 +2299,7 @@ impl CredentialsManager {
     /// When `request_id_override` is `Some(id)`, that ID is used verbatim for the
     /// `PasskeyAssertion` row.  This is set to the `divergence_request_id` on the
     /// `failure:signer_set_diverged` path so both the `SaSignerSetDiverged` row
-    /// (emitted by `verify_signer_set_against_chain`) and this `PasskeyAssertion`
+    /// (written by the signer-set comparison) and this `PasskeyAssertion`
     /// row carry the same UUID, enabling forensic correlation.  On all other paths
     /// `request_id_override` is `None` and a fresh UUID is minted here.
     #[allow(
@@ -2441,7 +2323,7 @@ impl CredentialsManager {
         // Lock the shared Arc<std::sync::Mutex<AuditWriter>>
         // instead of borrowing a caller-owned &mut AuditWriter.  Both the
         // PasskeyAssertion row (emitted here) and the SaSignerSetDiverged row
-        // (emitted inside verify_signer_set_against_chain) transit the same
+        // (written by the signer-set comparison) transit the same
         // Arc, so they land in the same JSONL file — satisfying the cross-row
         // request_id pairing invariant.
         //
@@ -2450,9 +2332,9 @@ impl CredentialsManager {
         //
         // Lock discipline: the lock is acquired for the minimum time needed to
         // write the single entry; it is released before the function returns.
-        // No caller holds the lock on entry; SaSignerSetDiverged emission
-        // inside verify_signer_set_against_chain acquires and releases the same
-        // lock separately, so there is no deadlock risk.
+        // No caller holds the lock on entry; the signer-set comparison's
+        // SaSignerSetDiverged emission acquires and releases the same lock
+        // separately, so there is no deadlock risk.
         let mut writer = match audit_writer.lock() {
             Ok(g) => g,
             Err(e) => {
@@ -2503,6 +2385,156 @@ impl CredentialsManager {
 
 fn encode_auth_digest_hex(auth_digest: &[u8; 32]) -> String {
     hex::encode(auth_digest)
+}
+
+/// The rule checks of a passkey signature, for the distinct non-zero rules
+/// `rule_ids` in ascending order, under `budget`:
+///
+/// 1. one acquisition of the rules' locks;
+/// 2. the newest signer-set state row of each rule, with a deadline check
+///    after each audit-log scan;
+/// 3. the pinned-hash drift check of each rule: its verifier and policy
+///    addresses, each live executable against the pin record and the
+///    policy-pin presence check, each read bounded by the deadline and each
+///    record scan followed by a deadline check;
+/// 4. the signer-set comparison of each rule through both endpoints.
+///
+/// The locks are released when this function returns. One `wasm_hash_cache`
+/// serves every rule, so a contract several rules reference is fetched once.
+///
+/// # Errors
+///
+/// - [`CredentialsError::SignerSetDivergence`] wrapping the refusal of steps
+///   1, 2 and 4, a deadline elapse included.
+/// - [`CredentialsError::WasmHashDrift`] for a drifted verifier or policy,
+///   and [`CredentialsError::DriftCheckUnavailable`] for every other
+///   refusal of step 3 (see [`drift_err_route`]).
+async fn check_passkey_rules(
+    sm: &SignersManager,
+    sc_addr: &stellar_xdr::ScAddress,
+    rule_ids: &[u32],
+    smart_account_redacted: &str,
+    request_id: &str,
+    budget: PreSubmitBudget,
+) -> Result<(), CredentialsError> {
+    let divergence = |sa_err: crate::SaError| CredentialsError::SignerSetDivergence {
+        source: Box::new(sa_err),
+    };
+    let smart_account_strkey =
+        crate::managers::rules::scaddress_to_strkey(sc_addr).map_err(divergence)?;
+
+    // Step 1: the locks, one guard per rule in ascending order; each later
+    // step takes its rule from the guard.
+    let guards = sm
+        .acquire_rule_locks(&smart_account_strkey, rule_ids.iter().copied(), budget)
+        .await
+        .map_err(divergence)?;
+
+    // Step 2: the baseline reads, before any RPC.
+    let mut baselines = Vec::with_capacity(guards.len());
+    for guard in &guards {
+        let baseline = bound_pre_submit_stage(
+            budget,
+            "baseline_read",
+            "baseline_read",
+            sm.read_baseline_locked(guard, V1Handling::Compare, request_id),
+        )
+        .await
+        .and_then(|read| read)
+        .map_err(divergence)?;
+        budget.check("baseline_read").map_err(divergence)?;
+        baselines.push((guard, baseline));
+    }
+
+    // Step 3: the pinned-hash drift checks.
+    let mut wasm_hash_cache: HashMap<Vec<u8>, crate::managers::signers::ObservedExecutable> =
+        HashMap::new();
+    for rule_id in guards.iter().map(RuleLockGuard::rule_id) {
+        let (verifier_addrs, policy_addrs) = bound_pre_submit_stage(
+            budget,
+            "pin_check",
+            "auth_payload",
+            sm.fetch_verifier_and_policy_addresses(sc_addr.clone(), rule_id, None),
+        )
+        .await
+        .and_then(|addresses| addresses)
+        .map_err(|sa_err| {
+            warn!(
+                rule_id,
+                error = %sa_err,
+                "sign_with_passkey_rule: the drift check could not read the rule; aborting \
+                 signing (fail closed)"
+            );
+            drift_err_route(sa_err)
+        })?;
+
+        // Only a drifted verifier or policy routes to WasmHashDrift, which is
+        // paired with the drift row the check wrote; every other refusal
+        // routes to DriftCheckUnavailable (see `drift_err_route`).
+        for verifier_addr in verifier_addrs {
+            bound_pre_submit_stage(
+                budget,
+                "pin_check",
+                "auth_payload",
+                crate::managers::verifiers::verify_pinned_verifier_against_chain(
+                    sm,
+                    verifier_addr,
+                    rule_id,
+                    smart_account_redacted,
+                    request_id,
+                    &mut wasm_hash_cache,
+                ),
+            )
+            .await
+            .and_then(|checked| checked)
+            .map_err(drift_err_route)?;
+            budget.check("auth_payload").map_err(drift_err_route)?;
+        }
+        for policy_addr in &policy_addrs {
+            bound_pre_submit_stage(
+                budget,
+                "pin_check",
+                "auth_payload",
+                crate::managers::verifiers::verify_pinned_policy_against_chain(
+                    sm,
+                    policy_addr.clone(),
+                    rule_id,
+                    smart_account_redacted,
+                    request_id,
+                    &mut wasm_hash_cache,
+                ),
+            )
+            .await
+            .and_then(|checked| checked)
+            .map_err(drift_err_route)?;
+            budget.check("auth_payload").map_err(drift_err_route)?;
+        }
+        // A rule with no policy on chain whose record pins policies is
+        // refused; no drift row is written for it.
+        crate::managers::verifiers::verify_policy_pins_present(
+            sm,
+            rule_id,
+            smart_account_redacted,
+            request_id,
+            &policy_addrs,
+        )
+        .map_err(drift_err_route)?;
+        budget.check("auth_payload").map_err(drift_err_route)?;
+    }
+
+    // Step 4: the signer-set comparisons.
+    for (guard, baseline) in baselines {
+        bound_pre_submit_stage(
+            budget,
+            "signer_set_compare",
+            "signer_set_compare",
+            sm.compare_locked(guard, baseline, None, request_id),
+        )
+        .await
+        .and_then(|compared| compared)
+        .map_err(divergence)?;
+    }
+    Ok(())
 }
 
 /// Routes a `SaError` from a drift-detection call into the correct
@@ -3244,8 +3276,8 @@ registered_at_unix_ms = 1700000000000
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19900);
         let auth_digest = [0u8; 32];
         // Supply a SignersManager that provides the shared AuditWriter.
-        // Use rule_id=0 (bootstrap skip) so verify_signer_set_against_chain is
-        // never invoked (no testnet needed).  The approval-store check fires
+        // Use rule_id=0 (bootstrap skip) so no rule check runs (no testnet
+        // needed).  The approval-store check fires
         // immediately after the skip and returns ApprovalStoreUnavailable.
         let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
 

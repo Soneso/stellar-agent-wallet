@@ -17,8 +17,10 @@ use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 use tempfile::TempDir;
 
+use crate::SaError;
+use crate::managers::auth_entry::PreSubmitBudget;
 use crate::managers::rules::{ContextRuleManager, ContextRuleManagerConfig};
-use crate::managers::signers::{SignersManager, SignersManagerConfig};
+use crate::managers::signers::{RuleLockGuard, SignersManager, SignersManagerConfig};
 
 /// The chain id the builders configure.
 const TEST_CHAIN_ID: &str = "stellar:testnet";
@@ -159,4 +161,46 @@ pub fn rule_manager_for_tests(
         timeout,
     ))
     .expect("ContextRuleManager::new accepts the test URLs")
+}
+
+/// A held lock on one rule of one smart account, from [`hold_rule_lock`].
+///
+/// The lock is held until the value is dropped, so a test can hold a rule's
+/// lock without a verb in flight.
+pub struct HeldRuleLock(RuleLockGuard);
+
+impl std::fmt::Debug for HeldRuleLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldRuleLock")
+            .field("rule_id", &self.0.rule_id())
+            .field("smart_account", &self.0.smart_account_redacted())
+            .finish()
+    }
+}
+
+/// Acquires the lock `manager` takes for rule `rule_id` of the smart account
+/// `smart_account_strkey`, waiting at most `budget`, and holds it in the
+/// returned value.
+///
+/// # Errors
+///
+/// [`SaError::AuthEntryConstructionFailed`] at stage `rule_lock` when the
+/// lock is not acquired within `budget`.
+pub async fn hold_rule_lock(
+    manager: &SignersManager,
+    smart_account_strkey: &str,
+    rule_id: u32,
+    budget: Duration,
+) -> Result<HeldRuleLock, SaError> {
+    manager
+        .acquire_rule_lock(
+            smart_account_strkey,
+            rule_id,
+            PreSubmitBudget {
+                deadline: tokio::time::Instant::now() + budget,
+                total: budget,
+            },
+        )
+        .await
+        .map(HeldRuleLock)
 }

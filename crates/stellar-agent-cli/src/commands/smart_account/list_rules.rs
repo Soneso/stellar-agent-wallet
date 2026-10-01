@@ -241,6 +241,12 @@ pub struct ListRulesEntry {
     /// `null` means the rule is permanent (no expiry).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_until: Option<u32>,
+
+    /// The rule's signer-set baseline in the profile's audit log: `none`
+    /// (no state row; a signature under the rule refuses until one
+    /// `signers list --rule-id N` records it), `v1`, `v2`, `unreadable` (an
+    /// audit-log integrity error), or `unknown` (the log was not read).
+    pub baseline: String,
 }
 
 /// Scanned rule-ID range reported in the envelope.
@@ -470,6 +476,7 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
             signer_count: r.signer_count,
             policy_count: r.policy_count,
             valid_until: r.valid_until,
+            baseline: r.baseline.as_str().to_owned(),
         })
         .collect();
 
@@ -635,6 +642,7 @@ mod tests {
                 signer_count: 1,
                 policy_count: 0,
                 valid_until: None,
+                baseline: "v2".to_owned(),
             }],
             active_count: 1,
             scanned_id_range: ScannedIdRange { start: 0, end: 1 },
@@ -683,6 +691,7 @@ mod tests {
             signer_count: 1,
             policy_count: 0,
             valid_until: None,
+            baseline: "none".to_owned(),
         };
         let json = serde_json::to_string(&entry).expect("serialise");
         assert!(
@@ -700,11 +709,30 @@ mod tests {
             signer_count: 1,
             policy_count: 0,
             valid_until: Some(999_999),
+            baseline: "none".to_owned(),
         };
         let json = serde_json::to_string(&entry).expect("serialise");
         assert!(
             json.contains("\"valid_until\":999999"),
             "valid_until must be present when Some; got: {json}"
+        );
+    }
+
+    #[test]
+    fn list_rules_entry_carries_the_baseline_key() {
+        let entry = ListRulesEntry {
+            rule_id: 3,
+            name: "r".to_owned(),
+            context_type_label: "call_contract".to_owned(),
+            signer_count: 1,
+            policy_count: 0,
+            valid_until: None,
+            baseline: "none".to_owned(),
+        };
+        let json = serde_json::to_string(&entry).expect("serialise");
+        assert!(
+            json.contains("\"baseline\":\"none\""),
+            "baseline must be present; got: {json}"
         );
     }
 

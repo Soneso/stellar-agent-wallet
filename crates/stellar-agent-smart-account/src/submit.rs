@@ -19,13 +19,14 @@
 //!
 //! # Step ordering
 //!
-//! 1. Pre-flight: argument guards, then the pinned-hash drift check, then the
-//!    source-account fetch. For every distinct non-zero rule in
-//!    `auth_rule_ids` the drift check compares the rule's live verifier and
-//!    policy contracts against the rule's pin record (see [`PinCheck`]) and
-//!    refuses before anything is simulated or signed. Rule 0, the bootstrap
-//!    rule, has no pins and is never checked; a submission under rule 0 only
-//!    may omit the check.
+//! 1. Pre-flight: argument guards, then, for every distinct non-zero rule in
+//!    `auth_rule_ids` in ascending order, the rule locks, the signer-set
+//!    baseline read, the pinned-hash drift check and the signer-set
+//!    comparison (see [`PinCheck`]), then the source-account fetch. Each
+//!    check refuses before anything is simulated or signed. Rule 0, the
+//!    bootstrap rule, is exempt from the rule lock, the signer-set check and
+//!    the pin check; it has no pins, and the submit path never reads a
+//!    baseline for it. A submission under rule 0 only may omit the check.
 //! 2. Simulate: primary RPC; harvest `latestLedger`.
 //! 3. Required-check enforcement + `Option<*Check>` dispatch.
 //! 4. Cross-RPC simulate check (passthrough when `secondary_rpc_url` is `None`
@@ -67,7 +68,10 @@ use crate::managers::rules::{
     parse_c_strkey_to_smart_account, parse_min_resource_fee, passphrase_fingerprint,
     resimulate_with_signed_auth, scaddress_to_strkey, validate_latest_ledger,
 };
-use crate::managers::signers::SignersManager;
+use crate::managers::signers::{
+    BorrowedRuleLocks, RuleLockGuard, SignersManager, V1Handling, find_rule_guard,
+    rule_lock_missing,
+};
 use crate::managers::verifiers::{
     verify_pinned_policy_against_chain, verify_pinned_verifier_against_chain,
     verify_policy_pins_present,
@@ -179,21 +183,39 @@ pub struct Ed25519RuleSigner<'a> {
 // PinCheck
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Inputs of the pre-signing drift check [`submit_signed_invoke`] runs for
-/// every distinct non-zero rule in [`SubmitInvokeArgs::auth_rule_ids`].
+/// Inputs of the pre-signing checks [`submit_signed_invoke`] runs for every
+/// distinct non-zero rule in [`SubmitInvokeArgs::auth_rule_ids`].
 ///
-/// For each such rule the check fetches the rule's verifier and policy
-/// addresses from chain through [`SignersManager`], then compares each live
-/// executable against the rule's pin record: the newest
-/// `SaContextRuleCreated` or `SaContextRulePinsUpdated` row in the audit log
-/// of `signers_manager`. One per-call cache of observed executables is shared
-/// across the rules, so a contract referenced by several rules is fetched
-/// once. The smart account and its redaction are derived inside
-/// [`submit_signed_invoke`] from `auth_address` (or `target_contract`), never
-/// from the caller.
+/// For each such rule, in ascending order and under one pre-submit
+/// deadline, the submit path:
 ///
-/// Outcomes, all before any simulation or signature:
+/// 1. holds the rule's lock: it acquires it through `signers_manager`, or
+///    finds it in the caller's held-lock context;
+/// 2. reads the rule's newest signer-set state row from the audit log of
+///    `signers_manager`, with no RPC;
+/// 3. runs the pinned-hash drift check: it fetches the rule's verifier and
+///    policy addresses from chain through [`SignersManager`], then compares
+///    each live executable against the rule's pin record, the newest
+///    `SaContextRuleCreated` or `SaContextRulePinsUpdated` row. One per-call
+///    cache of observed executables is shared across the rules, so a
+///    contract referenced by several rules is fetched once;
+/// 4. compares the rule's signer set, observed through both endpoints of
+///    `signers_manager`, with the state row.
 ///
+/// Each step runs for every rule before the next step starts. The smart
+/// account and its redaction are derived inside [`submit_signed_invoke`]
+/// from `auth_address` (or `target_contract`), never from the caller.
+///
+/// Outcomes, all before any simulation or signature, in the order the steps
+/// reach them:
+///
+/// - a lock not acquired within the deadline refuses with
+///   [`SaError::AuthEntryConstructionFailed`] at stage `rule_lock`, and a
+///   held-lock context without a guard for a named rule at stage
+///   `rule_lock_missing`;
+/// - a rule without a state row refuses with
+///   [`SaError::SignerSetMissingBaseline`], and an audit-log integrity
+///   error with [`SaError::AuditLog`];
 /// - drift refuses with [`SaError::VerifierHashDrift`] or
 ///   [`SaError::PolicyHashDrift`], and the check writes a
 ///   `SaVerifierHashDrift` / `SaPolicyHashDrift` row carrying `request_id`;
@@ -205,7 +227,18 @@ pub struct Ed25519RuleSigner<'a> {
 ///   elapsing) refuses with [`SaError::PinCheckUnavailable`] carrying the
 ///   inner error's wire code;
 /// - a rule without a pin record, or without pins of a kind, passes that
-///   part of the check (the check skips it with a debug line).
+///   part of the check (the check skips it with a debug line);
+/// - a signer set that differs from the state row refuses with
+///   [`SaError::SignerSetDiverged`] and writes a `SaSignerSetDiverged` row
+///   carrying `request_id`; endpoints that disagree refuse with
+///   [`SaError::NetworkRpcDivergence`]; a version-1 row the observation
+///   cannot be projected onto refuses with the projection's error.
+///
+/// The signer-set refusals propagate as themselves and are never folded
+/// into [`SaError::PinCheckUnavailable`]. An elapse of the deadline during
+/// the baseline read or the comparison refuses with
+/// [`SaError::AuthEntryConstructionFailed`] at stage `baseline_read` or
+/// `signer_set_compare`.
 ///
 /// The execute path does not run the verifier diversification gate: a rule
 /// with two pinned verifiers already refuses here through
@@ -219,19 +252,59 @@ pub struct PinCheck<'a> {
     pub signers_manager: &'a SignersManager,
     /// Correlation id carried by drift rows and refusals.
     pub request_id: &'a str,
-    /// The rule a verifier migration is rewriting, whose verifier check is
-    /// skipped; its policy check still runs.
+    /// The rule a verifier migration is rewriting; see [`MigratingRule`].
     ///
-    /// The migration's own preflight identifies, allowlists and probes the
-    /// destination verifier, and its remove step signs while the source
-    /// verifier, which may be the drifted contract the migration moves away
-    /// from, is still live. `Some(id)` is accepted only when `auth_rule_ids`
-    /// is exactly `[id]`; any other combination is refused with
+    /// `Some` is accepted only when `auth_rule_ids` is exactly the migrating
+    /// rule; any other combination is refused with
     /// [`SaError::AuthEntryConstructionFailed`] at stage
     /// `"migrating_rule_mismatch"`, so only a submission signed under the
-    /// migrating rule alone carries the exemption. Every other caller passes
+    /// migrating rule alone carries the exemptions. Every other caller passes
     /// `None`.
-    pub migrating_rule: Option<u32>,
+    pub migrating_rule: Option<MigratingRule>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MigratingRule
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The rule a verifier migration rewrites, exempt from two checks of a
+/// submission signed under it alone.
+///
+/// - The verifier check of the pinned-hash drift check is skipped; the
+///   policy check still runs. The migration's own preflight identifies,
+///   allowlists and probes the destination verifier, and its remove step
+///   signs while the source verifier, which may be the drifted contract the
+///   migration moves away from, is still live.
+/// - The signer-set baseline read and comparison are skipped; the rule is
+///   still locked. The remove step changes the signer set the add step
+///   signs under, and the migration writes no signer-set state row between
+///   them.
+///
+/// Only the migration step constructs one. A caller outside this crate
+/// cannot, except through the test constructor the `test-helpers` feature
+/// compiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MigratingRule(u32);
+
+impl MigratingRule {
+    /// The migrating rule `rule_id`.
+    pub(crate) fn new(rule_id: u32) -> Self {
+        Self(rule_id)
+    }
+
+    /// The migrating rule `rule_id`, for tests that sign under a migrating
+    /// rule or exercise the exemption's argument guard.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn for_tests(rule_id: u32) -> Self {
+        Self(rule_id)
+    }
+
+    /// The migrating rule's id.
+    #[must_use]
+    pub fn rule_id(&self) -> u32 {
+        self.0
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -336,7 +409,7 @@ pub struct SubmitInvokeResult {
 ///   - `ed25519_rule_signer: Some(Ed25519RuleSigner { signer, verifier })`
 ///   - `authorization: None` (mutually exclusive; see [`Ed25519RuleSigner`])
 /// - `pin_check` ([`PinCheck`]): `signers.rs` callers pass the manager
-///   itself, with `migrating_rule: Some(rule_id)` only on the migration step;
+///   itself, with `migrating_rule: Some(_)` only on the migration step;
 ///   `rules.rs` callers pass their configured manager and refuse a non-zero
 ///   rule without one; `smart-account execute` and the multicall submit pass
 ///   a manager built from the profile; the DeFi adapters sign under rule 0
@@ -549,6 +622,24 @@ pub struct SubmitInvokeArgs<'a> {
     /// [`SaError::AuthEntryConstructionFailed`] at stage
     /// `"pin_check_required"`.
     pub pin_check: Option<PinCheck<'a>>,
+
+    /// The caller's held-lock context, when it holds the locks of the rules
+    /// it signs under.
+    ///
+    /// With `None`, the submit path acquires the lock of every checked rule
+    /// itself, holds the locks through the checks, the simulation and the
+    /// signing, and releases them immediately before the transaction is sent.
+    /// With `Some`, it acquires nothing: it refuses a checked rule the
+    /// context holds no guard for on this account and in the log of the
+    /// `pin_check` manager at stage `"rule_lock_missing"`, skips the
+    /// signer-set steps of a rule the context already compared, and leaves
+    /// the locks to the caller. A context without a `pin_check` is refused at
+    /// stage `"rule_locks_without_pin_check"`.
+    ///
+    /// Field and setter are `pub(crate)`: a context is built only by the
+    /// signers manager, from the guards of one lock acquisition.
+    #[builder(setters(vis = "pub(crate)"))]
+    pub(crate) rule_locks: Option<&'a BorrowedRuleLocks<'a>>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -564,11 +655,21 @@ pub struct SubmitInvokeArgs<'a> {
 ///
 /// # Step ordering
 ///
-/// 1. **Pre-flight**: argument guards, then the pinned-hash drift check of
-///    every distinct non-zero rule in `auth_rule_ids` (see [`PinCheck`]),
-///    then the source-account fetch. Rule 0 is never checked, and a
-///    submission under rule 0 only may pass `pin_check: None`; any other
-///    submission without a check is refused before network I/O.
+/// 1. **Pre-flight**: argument guards, then, for every distinct non-zero rule
+///    in `auth_rule_ids` in ascending order and under one pre-submit
+///    deadline (see [`PinCheck`]):
+///    1. the rule locks: acquired here when the caller holds none, or found
+///       in the held-lock context a signers-manager verb supplies;
+///    2. the signer-set baseline read, with no RPC;
+///    3. the pinned-hash drift check;
+///    4. the signer-set comparison through both endpoints;
+///
+///    then the source-account fetch. Rule 0, the bootstrap rule, is exempt
+///    from the rule lock, the signer-set check and the pin check; it has no
+///    pins, and the submit path never reads a baseline for it. A submission
+///    under rule 0 only may pass `pin_check: None`; any other submission
+///    without a check is refused before network I/O. The locks acquired here
+///    are released immediately before the send.
 /// 2. **Simulate**: primary RPC; harvest `latestLedger`.
 /// 3. **Required-check enforcement + `Option<*Check>` dispatch**: for each
 ///    name in `args.required_checks`, the corresponding `Option<*Check>` MUST
@@ -592,6 +693,13 @@ pub struct SubmitInvokeArgs<'a> {
 ///
 /// # Errors
 ///
+/// - [`SaError::SignerSetMissingBaseline`]: a checked rule has no signer-set
+///   state row.
+/// - [`SaError::SignerSetDiverged`] / [`SaError::NetworkRpcDivergence`]: a
+///   checked rule's signer set differs from its state row, or the two
+///   endpoints disagree on it.
+/// - [`SaError::AuditLog`]: the baseline read met an audit-log integrity
+///   error.
 /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`]: a live
 ///   verifier or policy of a checked rule differs from the rule's pin record.
 /// - [`SaError::PinnedPolicyAbsent`]: a checked rule's pin record holds
@@ -605,10 +713,14 @@ pub struct SubmitInvokeArgs<'a> {
 ///   check rule_id.
 /// - [`SaError::AuthEntryConstructionFailed`]: an argument guard refused
 ///   (stages `"pin_check_required"`, `"migrating_rule_mismatch"`,
-///   `"multicall_check_undeclared"`, `"ed25519_rule_signer_quorum_guard"`),
-///   or a pubkey fetch, XDR encoding, simulate, or auth-entry construction
-///   failure, or a pre-submit RPC stage exceeding the collective pre-submit
-///   deadline (`args.timeout`).
+///   `"rule_locks_without_pin_check"`, `"multicall_check_undeclared"`,
+///   `"ed25519_rule_signer_quorum_guard"`), a held-lock context lacks a
+///   checked rule (`"rule_lock_missing"`), a rule lock was not acquired
+///   within the deadline (`"rule_lock"`), the deadline elapsed during a
+///   baseline read or a comparison (`"baseline_read"`,
+///   `"signer_set_compare"`), or a pubkey fetch, XDR encoding, simulate, or
+///   auth-entry construction failure, or another pre-submit stage exceeding
+///   the collective pre-submit deadline (`args.timeout`).
 /// - [`SaError::DeploymentFailed`] — simulate error, envelope build, or
 ///   submission failure.
 /// - [`SaError::RuleIdMismatch`] / [`SaError::SimulationDivergence`] — from
@@ -714,11 +826,13 @@ pub async fn submit_signed_invoke(
         .map_err(|e| auth_payload_err(format!("StellarRpcClient construction failed: {e}")))?;
 
     // Pre-submit deadline: a single absolute instant, armed once here, binds
-    // the collective wall-clock budget of the pre-submit RPC stages: the
-    // pinned-hash drift check of each checked rule (stage "pin_check"), then
-    // the FOUR unconditional stages this path always runs: the initial
-    // account fetch, the initial simulate, and the re-fetch + re-simulate
-    // inside `resimulate_with_signed_auth` (see `PreSubmitBudget` /
+    // the collective wall-clock budget of the pre-submit stages: for the
+    // checked rules, the rule-lock wait (stage "rule_lock"), each baseline
+    // read ("baseline_read"), each pinned-hash drift check ("pin_check") and
+    // each signer-set comparison ("signer_set_compare"); then the FOUR
+    // unconditional stages this path always runs: the initial account fetch,
+    // the initial simulate, and the re-fetch + re-simulate inside
+    // `resimulate_with_signed_auth` (see `PreSubmitBudget` /
     // `bound_pre_submit_stage`). They share this SAME deadline rather than
     // each re-arming a fresh `args.timeout` window. The optional intervening
     // checks (the rule-expiry check and the multicall cross-RPC verification,
@@ -731,22 +845,31 @@ pub async fn submit_signed_invoke(
         total: args.timeout,
     };
 
-    // ── Step 1: pinned-hash drift check, before anything is simulated ──────
+    // ── Step 1: rule locks and rule checks, before anything is simulated ──
     // `validate_submit_invoke_args` refused a submission naming a non-zero
-    // rule without a check, so `None` here means rule 0 only.
-    if let Some(pin_check) = &args.pin_check {
-        run_pin_check(
-            pin_check,
-            args.auth_rule_ids,
-            &auth_scaddr,
-            pre_submit_budget,
-        )
-        .await?;
-    }
+    // rule without a check, so `None` here means rule 0 only. The locks
+    // acquired here are held through the simulation and the signing and
+    // released immediately before the send; a held-lock context's locks
+    // belong to its holder.
+    let owned_rule_locks = match &args.pin_check {
+        Some(pin_check) => {
+            run_rule_checks(
+                pin_check,
+                args.rule_locks,
+                args.auth_rule_ids,
+                &auth_scaddr,
+                &source_pubkey_strkey,
+                pre_submit_budget,
+            )
+            .await?
+        }
+        None => Vec::new(),
+    };
 
     let source_view = bound_pre_submit_stage(
         pre_submit_budget,
         "fetch_account_initial",
+        "auth_payload",
         stellar_agent_network::sequence_floor::fetch_account_with_sequence_catchup(
             args.sequence_floor,
             &primary_rpc_client,
@@ -779,6 +902,7 @@ pub async fn submit_signed_invoke(
     let sim_response = bound_pre_submit_stage(
         pre_submit_budget,
         "simulate_initial",
+        "auth_payload",
         server.simulate_transaction_envelope(&sim_envelope, None),
     )
     .await?
@@ -1417,6 +1541,11 @@ pub async fn submit_signed_invoke(
         );
     }
 
+    // The send and the confirmation poll run without the rule locks this
+    // call acquired: every check they guard has run, and the signed
+    // envelope is final.
+    drop(owned_rule_locks);
+
     let sa_submit_timing_t_submit = std::time::Instant::now();
     let submission = submit_transaction_and_wait(
         &primary_rpc_client,
@@ -1537,11 +1666,14 @@ pub(crate) fn map_submit_error(
 /// - `multicall_check: Some(_)` requires `"multicall"` in `required_checks`,
 ///   so the required-check enforcement always covers a multicall submission
 ///   (stage `"multicall_check_undeclared"`).
+/// - `rule_locks: Some(_)` requires a `pin_check`, whatever the auth rules
+///   are (stage `"rule_locks_without_pin_check"`).
 /// - `pin_check: None` is accepted only when every entry of `auth_rule_ids`
 ///   is rule 0, the bootstrap rule with no pins (stage
 ///   `"pin_check_required"`).
-/// - `pin_check.migrating_rule: Some(id)` is accepted only when
-///   `auth_rule_ids` is exactly `[id]` (stage `"migrating_rule_mismatch"`).
+/// - `pin_check.migrating_rule: Some(rule)` is accepted only when
+///   `auth_rule_ids` is exactly that rule (stage
+///   `"migrating_rule_mismatch"`).
 ///
 /// # Errors
 ///
@@ -1552,6 +1684,15 @@ fn validate_submit_invoke_args(args: &SubmitInvokeArgs<'_>) -> Result<(), SaErro
             stage: "multicall_check_undeclared",
             redacted_reason: format!(
                 "{}: multicall_check requires \"multicall\" in required_checks",
+                args.op_label
+            ),
+        });
+    }
+    if args.rule_locks.is_some() && args.pin_check.is_none() {
+        return Err(SaError::AuthEntryConstructionFailed {
+            stage: "rule_locks_without_pin_check",
+            redacted_reason: format!(
+                "{}: a held rule-lock context is accepted only with a pinned-hash drift check",
                 args.op_label
             ),
         });
@@ -1578,12 +1719,13 @@ fn validate_submit_invoke_args(args: &SubmitInvokeArgs<'_>) -> Result<(), SaErro
             migrating_rule: Some(migrating_rule),
             ..
         }) => {
-            if args.auth_rule_ids != [ContextRuleId::new(*migrating_rule)] {
+            let migrating_rule = migrating_rule.rule_id();
+            if args.auth_rule_ids != [ContextRuleId::new(migrating_rule)] {
                 return Err(SaError::AuthEntryConstructionFailed {
                     stage: "migrating_rule_mismatch",
                     redacted_reason: format!(
-                        "{}: the verifier-check exemption for migrating rule {migrating_rule} \
-                         requires auth_rule_ids to be exactly [{migrating_rule}]",
+                        "{}: the exemptions of migrating rule {migrating_rule} \
+                         require auth_rule_ids to be exactly [{migrating_rule}]",
                         args.op_label
                     ),
                 });
@@ -1597,8 +1739,124 @@ fn validate_submit_invoke_args(args: &SubmitInvokeArgs<'_>) -> Result<(), SaErro
     Ok(())
 }
 
-/// Runs the pinned-hash drift check of every distinct non-zero rule in
-/// `auth_rule_ids`, in order, each bounded by `budget` as stage
+/// Runs the pre-submission checks of the distinct non-zero rules in
+/// `auth_rule_ids`, ascending, under `budget`; see [`PinCheck`] for the
+/// steps and the outcomes.
+///
+/// 1. Locks: with no `rule_locks`, one acquisition of every checked rule's
+///    lock on the account of `smart_account`; with a held-lock context,
+///    none, and a checked rule the context holds no guard for, on that
+///    account and in the log of the `pin_check` manager, refuses.
+/// 2. Baseline reads, each followed by a deadline check, skipping the
+///    migrating rule and the rules the context compared.
+/// 3. The pinned-hash drift check ([`run_pin_check`]).
+/// 4. The signer-set comparison of each rule read in step 2.
+///
+/// Returns the locks step 1 acquired, empty for a held-lock context.
+///
+/// # Errors
+///
+/// - [`SaError::AuthEntryConstructionFailed`] at stage `rule_lock`,
+///   `rule_lock_missing`, `baseline_read` or `signer_set_compare`.
+/// - The baseline-read refusals ([`SaError::SignerSetMissingBaseline`],
+///   [`SaError::AuditLog`]), the pin-check refusals of [`run_pin_check`],
+///   and the comparison refusals ([`SaError::SignerSetDiverged`],
+///   [`SaError::NetworkRpcDivergence`] and the observation errors), each as
+///   itself.
+async fn run_rule_checks(
+    pin_check: &PinCheck<'_>,
+    rule_locks: Option<&BorrowedRuleLocks<'_>>,
+    auth_rule_ids: &[ContextRuleId],
+    smart_account: &ScAddress,
+    source_account_strkey: &str,
+    budget: PreSubmitBudget,
+) -> Result<Vec<RuleLockGuard>, SaError> {
+    let manager = pin_check.signers_manager;
+    let smart_account_strkey = scaddress_to_strkey(smart_account)?;
+    let mut rule_ids: Vec<u32> = auth_rule_ids
+        .iter()
+        .map(ContextRuleId::as_u32)
+        .filter(|rule_id| *rule_id != 0)
+        .collect();
+    rule_ids.sort_unstable();
+    rule_ids.dedup();
+
+    // Step 1: the locks.
+    let owned = match rule_locks {
+        None => {
+            manager
+                .acquire_rule_locks(&smart_account_strkey, rule_ids.iter().copied(), budget)
+                .await?
+        }
+        Some(borrowed) => {
+            // A guard counts only when it locks the rule on this account in
+            // the log of the manager that checks it.
+            if let Some(rule_id) = rule_ids.iter().copied().find(|rule_id| {
+                borrowed
+                    .guard_for(&smart_account_strkey, *rule_id)
+                    .is_none_or(|guard| guard.audit_log_path() != manager.audit_log_path())
+            }) {
+                return Err(rule_lock_missing(rule_id));
+            }
+            Vec::new()
+        }
+    };
+    let guard_of = |rule_id: u32| {
+        match rule_locks {
+            Some(borrowed) => borrowed.guard_for(&smart_account_strkey, rule_id),
+            None => find_rule_guard(&owned, &smart_account_strkey, rule_id),
+        }
+        .ok_or_else(|| rule_lock_missing(rule_id))
+    };
+
+    // Step 2: the baseline reads, before any RPC.
+    let migrating_rule = pin_check.migrating_rule.map(|rule| rule.rule_id());
+    let mut baselines = Vec::with_capacity(rule_ids.len());
+    for &rule_id in &rule_ids {
+        let compared_by_holder =
+            rule_locks.is_some_and(|borrowed| borrowed.compared_for(rule_id).is_some());
+        if compared_by_holder || migrating_rule == Some(rule_id) {
+            continue;
+        }
+        let baseline = bound_pre_submit_stage(
+            budget,
+            "baseline_read",
+            "baseline_read",
+            manager.read_baseline_locked(
+                guard_of(rule_id)?,
+                V1Handling::Compare,
+                pin_check.request_id,
+            ),
+        )
+        .await??;
+        budget.check("baseline_read")?;
+        baselines.push((rule_id, baseline));
+    }
+
+    // Step 3: the pinned-hash drift check.
+    run_pin_check(pin_check, &rule_ids, smart_account, budget).await?;
+
+    // Step 4: the signer-set comparisons.
+    for (rule_id, baseline) in baselines {
+        bound_pre_submit_stage(
+            budget,
+            "signer_set_compare",
+            "signer_set_compare",
+            manager.compare_locked(
+                guard_of(rule_id)?,
+                baseline,
+                Some(source_account_strkey),
+                pin_check.request_id,
+            ),
+        )
+        .await??;
+    }
+
+    Ok(owned)
+}
+
+/// Runs the pinned-hash drift check of each rule in `rule_ids`, the distinct
+/// non-zero auth rules in ascending order, each bounded by `budget` as stage
 /// `"pin_check"`; see [`PinCheck`] for the outcomes.
 ///
 /// # Errors
@@ -1611,29 +1869,24 @@ fn validate_submit_invoke_args(args: &SubmitInvokeArgs<'_>) -> Result<(), SaErro
 ///   strkey form.
 async fn run_pin_check(
     pin_check: &PinCheck<'_>,
-    auth_rule_ids: &[ContextRuleId],
+    rule_ids: &[u32],
     smart_account: &ScAddress,
     budget: PreSubmitBudget,
 ) -> Result<(), SaError> {
     let smart_account_redacted = redact_strkey_first5_last5(&scaddress_to_strkey(smart_account)?);
-    let mut rule_ids: Vec<u32> = Vec::with_capacity(auth_rule_ids.len());
-    for rule_id in auth_rule_ids.iter().map(ContextRuleId::as_u32) {
-        if rule_id != 0 && !rule_ids.contains(&rule_id) {
-            rule_ids.push(rule_id);
-        }
-    }
-
     let mut cache = HashMap::new();
-    for rule_id in rule_ids {
+    for &rule_id in rule_ids {
         let outcome = bound_pre_submit_stage(
             budget,
             "pin_check",
+            "auth_payload",
             check_rule_pins(
                 pin_check,
                 smart_account,
                 rule_id,
                 &smart_account_redacted,
                 &mut cache,
+                budget,
             ),
         )
         .await;
@@ -1671,18 +1924,23 @@ async fn run_pin_check(
 /// against the rule's pin record, sharing `cache` across calls, then
 /// refuses a rule with no policy on chain whose record pins policies. The
 /// migrating-rule exemption covers the verifiers only.
+///
+/// Each comparison and the presence check scan the audit log
+/// synchronously; `budget` is checked after each, with the elapse identity
+/// of the pin stage (`"auth_payload"`).
 async fn check_rule_pins(
     pin_check: &PinCheck<'_>,
     smart_account: &ScAddress,
     rule_id: u32,
     smart_account_redacted: &str,
     cache: &mut HashMap<Vec<u8>, crate::managers::signers::ObservedExecutable>,
+    budget: PreSubmitBudget,
 ) -> Result<(), SaError> {
     let manager = pin_check.signers_manager;
     let (verifier_addrs, policy_addrs) = manager
         .fetch_verifier_and_policy_addresses(smart_account.clone(), rule_id, None)
         .await?;
-    if pin_check.migrating_rule == Some(rule_id) {
+    if pin_check.migrating_rule.map(|rule| rule.rule_id()) == Some(rule_id) {
         tracing::debug!(
             rule_id,
             "pinned-hash drift check: verifier check skipped for the migrating rule"
@@ -1698,6 +1956,7 @@ async fn check_rule_pins(
                 cache,
             )
             .await?;
+            budget.check("auth_payload")?;
         }
     }
     for policy_addr in &policy_addrs {
@@ -1710,6 +1969,7 @@ async fn check_rule_pins(
             cache,
         )
         .await?;
+        budget.check("auth_payload")?;
     }
     verify_policy_pins_present(
         manager,
@@ -1717,7 +1977,8 @@ async fn check_rule_pins(
         smart_account_redacted,
         pin_check.request_id,
         &policy_addrs,
-    )
+    )?;
+    budget.check("auth_payload")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

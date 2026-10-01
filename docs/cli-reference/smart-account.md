@@ -20,15 +20,28 @@ The write verbs use the shared signer-source group: exactly one of `--signer-sec
 export WALLET_SK="S..."   # source-account secret key; pass the var name, never the secret
 ```
 
-## Pinned-hash drift check
+## Pre-submission checks
 
-`smart-account rules create` pins every verifier and policy contract a rule references: the audit log records each contract's hash (and, for a CAP-85 external reference, its owner, its tag and the hash the tag resolves to) in the rule's `SaContextRuleCreated` row. Every verb that signs a transaction authorized by a rule checks that rule against its pin record before anything is simulated or signed: `smart-account execute`, `smart-account multicall`, the `smart-account rules` and `smart-account signers` write verbs, and `smart-account migrate-verifier`, which checks the migrating rule's policies and skips its verifiers (see that verb). For each authorizing rule other than `0`, the wallet fetches the rule's verifier and policy addresses from chain and compares each live contract with its pin:
+Every verb that signs a transaction authorized by a rule other than rule `0` checks each such rule before anything is simulated or signed: `smart-account execute`, `smart-account multicall`, the `smart-account rules` and `smart-account signers` write verbs, and `smart-account migrate-verifier` (see that verb). For each authorizing rule other than `0`, in ascending order, the wallet:
+
+1. Holds the rule's lock. A verb holds the lock of each rule it signs under while it signs, and a concurrent verb on the same rule waits for it. A lock not acquired before the pre-submit budget (`--timeout-seconds`) ends refuses with `sa.auth_entry_construction_failed` at stage `rule_lock`.
+2. Reads the rule's [signer-set baseline](#smart-account-signers--signer-set-lifecycle) from the audit log, with no RPC. A rule without one refuses with `sa.signer_set_missing_baseline`; run `signers list --rule-id N` once to record it. [`rules list`](#smart-account-rules-list) shows which rules have one. An audit-log integrity error refuses with `sa.audit_log`.
+3. Runs the [pinned-hash drift check](#pinned-hash-drift-check).
+4. Compares the rule's signer set, read through both RPC endpoints, with the baseline in the baseline's version; a version 1 baseline is compared through its version 1 projection. A changed set writes a `SaSignerSetDiverged` row and refuses with `sa.signer_set_diverged`. Endpoints that disagree refuse with `network.rpc_divergence`.
+
+Each step runs for every rule before the next step starts, so when several faults coexist the refusal is the earliest step's. The steps share one deadline: an elapse during a baseline read or a comparison refuses with `sa.auth_entry_construction_failed` at stage `baseline_read` or `signer_set_compare`. Rule 0, the bootstrap rule, is exempt from the rule lock, the signer-set check and the pin check; it has no pins, and the submit path never reads a baseline for it. The migrating rule of `migrate-verifier` is locked and pin-checked, and its baseline read and comparison are skipped (see that verb). A verb that locks a rule itself, such as a signer verb, compares that rule before it submits and the submit path does not compare it again.
+
+Nothing is sent when a check refuses. `smart-account multicall` reports the refusal as `sa.multicall_failed` at phase `policy_gate`, naming the inner code. A verb holds a rule's lock through its signing, which can wait on a hardware signer or a passkey, and through its confirmation; a concurrent verb on the same rule then refuses at stage `rule_lock` when its own pre-submit budget ends.
+
+### Pinned-hash drift check
+
+`smart-account rules create` pins every verifier and policy contract a rule references: the audit log records each contract's hash (and, for a CAP-85 external reference, its owner, its tag, and the hash the tag resolves to) in the rule's `SaContextRuleCreated` row. Every verb that signs a transaction authorized by a rule checks that rule against its pin record before anything is simulated or signed, as step 3 of the [pre-submission checks](#pre-submission-checks). `smart-account migrate-verifier` checks the migrating rule's policies and skips its verifiers (see that verb). For each authorizing rule other than `0`, the wallet fetches the rule's verifier and policy addresses from chain and compares each live contract with its pin:
 
 - A changed hash, a repointed or different external reference, or a changed executable kind refuses with `sa.verifier_hash_drift` / `sa.policy_hash_drift` and writes a `SaVerifierHashDrift` / `SaPolicyHashDrift` audit row carrying the command's request id. A rule whose pin record holds policy pins while the rule has no policy on chain refuses with `sa.pinned_policy_absent` and writes no drift row. Repair it with `rules add-policy` authorized under rule `0`, which pins the added policy and replaces the stale pins, or reinstall the rule.
-- A check that cannot run refuses with `sa.pin_check_unavailable`; its message leads with the inner wire code: an RPC failure or divergence, an audit-log integrity error, an instance the wallet cannot read, or a record with more than one verifier or policy pin (`sa.multiple_pinned_hashes_unsupported`).
-- A rule without a pin record, such as one installed outside the wallet, is not checked. Rule `0`, the bootstrap rule, has no pins and is never checked.
+- A check that cannot run refuses with `sa.pin_check_unavailable`; its message leads with the inner wire code: an RPC failure or divergence, an instance the wallet cannot read, or a record with more than one verifier or policy pin (`sa.multiple_pinned_hashes_unsupported`). The baseline read, which runs first, reports an audit-log integrity error as `sa.audit_log`; under the migrating rule of `migrate-verifier`, which has no baseline read, this check reports it.
+- A rule without a pin record, such as one installed outside the wallet, is not checked for drift. Rule 0, the bootstrap rule, is exempt from the rule lock, the signer-set check and the pin check; it has no pins, and the submit path never reads a baseline for it.
 
-Nothing is sent when the check refuses. `smart-account multicall` reports the refusal as `sa.multicall_failed` at phase `policy_gate`, naming the inner code. A write verb whose `--auth-rule-id` names a rule other than `0` needs the rule's pin record to match, so a rule whose verifier or policy changed outside the wallet (an upgraded contract, a repointed reference, a signer or policy changed through another client) is refused for its own administration too; authorize the repair through rule `0`, or reinstall the rule.
+A write verb whose `--auth-rule-id` names a rule other than `0` needs the rule's pin record and signer-set baseline to match the chain, so a rule whose verifier, policy, or signers changed outside the wallet (an upgraded contract, a repointed reference, or a signer or policy changed through another client) is refused for its own administration too; authorize the repair through rule `0`, or reinstall the rule.
 
 The pin record is the newest `SaContextRuleCreated` or `SaContextRulePinsUpdated` row for the rule. `smart-account migrate-verifier`, `smart-account signers add` / `signers batch-add` and `smart-account rules add-policy` / `rules remove-policy` write a `SaContextRulePinsUpdated` row when they change the verifier or policy set of a pinned rule (see those verbs), so the check follows the wallet's own changes. `smart-account rules verify-pins` runs the same comparison on demand without signing.
 
@@ -106,7 +119,7 @@ Flags:
 - `--account <C_STRKEY>` (required).
 - `--rule-id <U32>` (required) — rule to rename.
 - `--name <STRING>` (required) — new name; same 20-byte cap as `create`.
-- `--auth-rule-id <U32>` (optional) — authorizing rule id; defaults to `--rule-id`.
+- `--auth-rule-id <U32>` (optional): authorizing rule id; defaults to `--rule-id`. The authorizing rule passes the [pre-submission checks](#pre-submission-checks), its signer-set baseline included.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
 ```bash
@@ -126,7 +139,7 @@ Flags:
 - `--account <C_STRKEY>` (required).
 - `--rule-id <U32>` (required) — rule to update.
 - `--valid-until <LEDGER|none>` (required) — a ledger sequence sets explicit expiry; `none` clears it (permanent rule).
-- `--auth-rule-id <U32>` (optional) — defaults to `--rule-id`.
+- `--auth-rule-id <U32>` (optional): defaults to `--rule-id`. The authorizing rule passes the [pre-submission checks](#pre-submission-checks), its signer-set baseline included.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
 ```bash
@@ -145,7 +158,7 @@ Flags:
 
 - `--account <C_STRKEY>` (required).
 - `--rule-id <U32>` (required) — rule to delete.
-- `--auth-rule-id <U32>` (optional) — defaults to `--rule-id`.
+- `--auth-rule-id <U32>` (optional): defaults to `--rule-id`. The authorizing rule passes the [pre-submission checks](#pre-submission-checks), its signer-set baseline included.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
 ```bash
@@ -205,7 +218,7 @@ Flags:
 - `--accept-unknown-verifier`: pin a policy whose hash is outside the policy allowlist (the simple-threshold, weighted-threshold and spending-limit Wasms the wallet vendors). Same scope; the audit log then records `SaUnknownContractOverride`, carrying the rule id, after the add confirms.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
-The add signs under `--auth-rule-id`, so that rule passes the [pinned-hash drift check](#pinned-hash-drift-check) first. Before submission the wallet then reads the policy's executable through both RPC endpoints, to tell whether it is the simple-threshold policy.
+The add signs under `--auth-rule-id`, so that rule passes the [pre-submission checks](#pre-submission-checks) first, its signer-set baseline included. Before submission the wallet then reads the policy's executable through both RPC endpoints, to tell whether it is the simple-threshold policy.
 
 **Simple-threshold policy.** When the policy's executable is the simple-threshold policy (`--kind simple-threshold`, or a `--kind raw` address that runs it), the add records the threshold in the rule's [signer-set state](#smart-account-signers--signer-set-lifecycle):
 
@@ -259,7 +272,7 @@ Flags:
 - `--auth-rule-id <U32>` (optional) — authorizing rule id(s). Repeatable. Defaults to `--rule-id`.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
-The removal signs under `--auth-rule-id`, so that rule passes the [pinned-hash drift check](#pinned-hash-drift-check) first. Before submission the wallet then reads the rule to resolve `--policy-id` to the policy's address, and reads the policy's executable through both RPC endpoints. The removal refuses a rule that is not on chain and a `--policy-id` the rule does not hold with `sa.deployment_failed`. It refuses a policy whose executable cannot be read with `sa.deployment_failed` when the read fails. An undecodable instance or an external reference with no live tag entry gives `sa.contract_instance_unsupported`, and endpoints that disagree give `network.rpc_divergence`. The wallet sends nothing. Remove a rule whose policy stays unreadable with `rules delete --rule-id N --auth-rule-id 0`.
+The removal signs under `--auth-rule-id`, so that rule passes the [pre-submission checks](#pre-submission-checks) first, its signer-set baseline included. Before submission the wallet then reads the rule to resolve `--policy-id` to the policy's address, and reads the policy's executable through both RPC endpoints. The removal refuses a rule that is not on chain and a `--policy-id` the rule does not hold with `sa.deployment_failed`. It refuses a policy whose executable cannot be read with `sa.deployment_failed` when the read fails. An undecodable instance or an external reference with no live tag entry gives `sa.contract_instance_unsupported`, and endpoints that disagree give `network.rpc_divergence`. The wallet sends nothing. Remove a rule whose policy stays unreadable with `rules delete --rule-id N --auth-rule-id 0`.
 
 **Simple-threshold policy.** When the removed policy is the simple-threshold policy, the removal records the cleared threshold. The rule's version 2 signer-set state must match the chain, and the refusals of [`rules add-policy`](#smart-account-rules-add-policy) apply. Its observed simple-threshold policy must be the removed one; otherwise the removal refuses with `sa.threshold_policy_identification_failed`. After the removal confirms, the signers must be unchanged and the threshold gone; a `SaThresholdChangedV2` row records it before the `SaPolicyRemoved` row. A different result refuses with `sa.signer_set_diverged` naming the transaction hash, and the `SaPolicyRemoved` and pin rows are still written.
 
@@ -277,7 +290,7 @@ stellar-agent smart-account rules remove-policy \
 
 ### `smart-account rules list`
 
-Enumerates the active context rules on a smart-account via on-chain scan. Read-only; no signing. `mainnet` is accepted. This is the canonical name for the enumeration; it produces the same JSON envelope as `smart-account list-rules` and takes the same flags (see [`smart-account list-rules`](#smart-account-list-rules)).
+Enumerates the active context rules on a smart-account through an on-chain scan. Read-only; no signing. `mainnet` is accepted. This is the canonical name for the enumeration; it produces the same JSON envelope as `smart-account list-rules` and takes the same flags (see [`smart-account list-rules`](#smart-account-list-rules)). Each rule's `baseline` reports its signer-set baseline in the profile's audit log; a rule reporting `none` needs one `signers list --rule-id N` before any signature under it.
 
 ```bash
 stellar-agent smart-account rules list --account CABC...WXYZ
@@ -319,7 +332,7 @@ Flags:
 
 - `--account <C_STRKEY>` (required).
 - `--rule-id <U32>` (required) — rule whose spending-limit policy to retune. This rule keys the policy's storage; it does NOT authorize the call.
-- `--auth-rule-id <U32>` — rule that AUTHORIZES the retune. Default `0` (the bootstrap rule installed at deploy time), NOT `--rule-id`: the retune executes on the smart account itself, an auth context the CallContract-scoped rule named by `--rule-id` always refuses on-chain (`UnvalidatedContext`) — the target rule can never authorize its own retune. Supply a different admin-capable rule id if the bootstrap rule has been replaced.
+- `--auth-rule-id <U32>`: rule that AUTHORIZES the retune. Default `0` (the bootstrap rule installed at deploy time), NOT `--rule-id`: the retune executes on the smart account itself, an auth context the CallContract-scoped rule named by `--rule-id` always refuses on-chain (`UnvalidatedContext`), so the target rule can never authorize its own retune. Supply a different admin-capable rule id if the bootstrap rule has been replaced. An authorizing rule other than `0` has its signer-set baseline checked before signing (see [pre-submission checks](#pre-submission-checks)).
 - `--limit <STROOPS>` (required) — new spending limit, in stroops. Must be positive.
 - `--profile <NAME>` — profile name for audit-log path resolution.
 - Signer-source group (see [Signer source](#signer-source)); the signer must satisfy the `--auth-rule-id` rule.
@@ -341,9 +354,11 @@ Manages the signer set and threshold of a context rule. All verbs take `--accoun
 
 `list` and `refresh` also require a signer source: the manager needs a source account to assemble the read envelope.
 
+Every verb waits for the rule's lock at most `--timeout-seconds`, then refuses with `sa.auth_entry_construction_failed` at stage `rule_lock`; another verb on the same rule holds the lock while it signs and records.
+
 **Signer-set baseline.** The audit log keeps each rule's signer-set state: a baseline row, then one state row per signer change the wallet makes. A version 2 state records every signer's full identity, an `External` signer by the SHA-256 and the length of its whole key data. It also records the rule's simple-threshold policy and threshold, or no threshold when the rule has no simple-threshold policy. A version 1 state keeps the first 16 bytes of an `External` signer's key data. Both RPC endpoints (`--rpc-url` and `--secondary-rpc-url`) read the rule, the executable of each attached policy and the threshold, and must agree; otherwise the verb refuses with `network.rpc_divergence`.
 
-- `add`, `remove`, `set-threshold` and `batch-add` compare the chain with the rule's state before they submit. A rule without a state refuses with `sa.signer_set_missing_baseline`; run `signers list --rule-id N` to record one. A version 1 state refuses before any RPC with `sa.signer_set_baseline_legacy`; run `signers refresh --rule-id N` once to record a version 2 state. A chain that differs from the state writes a `SaSignerSetDiverged` row and refuses with `sa.signer_set_diverged`; nothing is sent.
+- Every signature under a rule other than `0` compares the chain with the rule's state before it is signed, as part of the [pre-submission checks](#pre-submission-checks): the signer verbs, `execute`, `multicall`, the authorizing rules of the `rules` write verbs and the passkey signing path. A rule without a state refuses with `sa.signer_set_missing_baseline`; run `signers list --rule-id N` to record one. `add`, `remove`, `set-threshold` and `batch-add` require a version 2 state: a version 1 state refuses before any RPC with `sa.signer_set_baseline_legacy`; run `signers refresh --rule-id N` once to record a version 2 state. Every other signature compares a version 1 state through its version 1 projection. A chain that differs from the state writes a `SaSignerSetDiverged` row and refuses with `sa.signer_set_diverged`; nothing is sent.
 - After the transaction confirms, both endpoints are read again at or past the confirmation ledger, and the result must be exactly the intended change. It is recorded as a `SaSignerAddedV2`, `SaSignerRemovedV2` or `SaThresholdChangedV2` row. A different result writes a `SaSignerSetDiverged` row and refuses with `sa.signer_set_diverged` naming the transaction hash.
 - When the confirmed result cannot be observed within `--timeout-seconds` (stage `observe`) or its row cannot be written (stage `write`), the verb returns `sa.baseline_write_failed` with the transaction hash. The transaction stands; `signers refresh --rule-id N --accept-divergence` records the chain state. On a pinned rule, a confirmed `add` or `batch-add` writes its pin rows once. They follow the state row when the change is recorded, and precede the refusal when the result is not observed or not the intended change; the pin record then holds every verifier the transaction added. When the state row is not written, the pin rows are attempted and are usually refused too. A pin row the audit log refuses is logged as a warning, and the rule keeps its previous pin record.
 
@@ -452,7 +467,7 @@ Changes a rule's weighted-threshold policy's `threshold` (OZ `set_threshold` on 
 Extra flags:
 
 - `--new-threshold <U32>` (required).
-- `--auth-rule-id <U32>` (optional) — rule that AUTHORIZES the change. Defaults to `--rule-id`: a weighted policy commonly sits on a Default-scoped rule that self-authorizes. Pass an explicit admin-capable rule id when `--rule-id` names a CallContract- or CreateContract-scoped rule — a scoped rule cannot validate the `execute` auth context and can never authorize its own retune (the same constraint documented for `rules set-spending-limit`).
+- `--auth-rule-id <U32>` (optional): rule that AUTHORIZES the change. Defaults to `--rule-id`: a weighted policy commonly sits on a Default-scoped rule that self-authorizes. Pass an explicit admin-capable rule id when `--rule-id` names a CallContract- or CreateContract-scoped rule: a scoped rule cannot validate the `execute` auth context and can never authorize its own retune (the same constraint documented for `rules set-spending-limit`). An authorizing rule other than `0` has its signer-set baseline checked before signing (see [pre-submission checks](#pre-submission-checks)).
 
 ```bash
 stellar-agent smart-account signers set-weighted-threshold \
@@ -476,7 +491,7 @@ Exactly one of the following identifies the TARGET signer (mutually exclusive gr
 Plus:
 
 - `--new-weight <U32>` (required) — the target signer's new weight.
-- `--auth-rule-id <U32>` (optional) — same default-to-`--rule-id` / scoped-rule override rule as `set-weighted-threshold`.
+- `--auth-rule-id <U32>` (optional): same default-to-`--rule-id` / scoped-rule override rule as `set-weighted-threshold`. An authorizing rule other than `0` has its signer-set baseline checked before signing (see [pre-submission checks](#pre-submission-checks)).
 
 ```bash
 stellar-agent smart-account signers set-signer-weight \
@@ -535,7 +550,7 @@ Flags:
 
 On success the envelope carries `status: "submitted"`, `contract`, `function`, `arg_count`, `auth_rule_ids`, `rule_signer_pubkey_first8` (never the full key or seed), `verifier_address`, and `tx_hash`. On-chain refusals (spending-limit cap, scope mismatch, expired rule) surface through the same typed `SaError` wire codes and message annotations (e.g. `[OZ:SpendingLimitExceeded]`, `[OZ:UnvalidatedContext]`) every other smart-account write verb renders.
 
-Before anything is simulated or signed, every `--auth-rule-id` other than `0` goes through the [pinned-hash drift check](#pinned-hash-drift-check) against the pin record in the profile's audit log: a verifier or policy that differs from its pin refuses with `sa.verifier_hash_drift` / `sa.policy_hash_drift`, a rule whose record holds policy pins while the rule has no policy on chain refuses with `sa.pinned_policy_absent`, and a check that cannot run refuses with `sa.pin_check_unavailable`. The check reads and fetches through the same `--rpc-url` / `--secondary-rpc-url` endpoints as the submission.
+Before anything is simulated or signed, every `--auth-rule-id` other than `0` goes through the [pre-submission checks](#pre-submission-checks) against the profile's audit log. A rule without a signer-set baseline refuses with `sa.signer_set_missing_baseline`, and an audit-log integrity error with `sa.audit_log`. A verifier or policy that differs from its pin refuses with `sa.verifier_hash_drift` / `sa.policy_hash_drift`, a rule whose record holds policy pins while the rule has no policy on chain with `sa.pinned_policy_absent`, and a drift check that cannot run with `sa.pin_check_unavailable`. A signer set that differs from the baseline refuses with `sa.signer_set_diverged`. The checks read and fetch through the same `--rpc-url` / `--secondary-rpc-url` endpoints as the submission.
 
 ```bash
 stellar-agent smart-account execute \
@@ -570,7 +585,7 @@ Flags:
 - Signer-source flags are required (one of `--signer-secret-env` or `--sign-with-ledger`); `--account-index <INDEX>` defaults to `0`.
 - Shared: `--network`, `--rpc-url`, `--timeout-seconds`, `--profile`.
 
-A `--rule-id` other than `0` goes through the [pinned-hash drift check](#pinned-hash-drift-check) before the bundle is simulated; a refusal surfaces as `sa.multicall_failed` at phase `policy_gate`, naming the inner code.
+A `--rule-id` other than `0` goes through the [pre-submission checks](#pre-submission-checks) before the bundle is simulated; a refusal surfaces as `sa.multicall_failed` at phase `policy_gate`, naming the inner code.
 
 ```bash
 stellar-agent smart-account multicall \
@@ -650,9 +665,9 @@ Pre-flight gates (fail-closed): the destination verifier hash must be in the all
 
 The plan reads every active rule's signer set in full. A rule holding a signer the wallet cannot decode refuses the whole plan, dry-run included, with `sa.verifier_migration_failed` at phase `plan_build`; the reason names the rule, the signer's index and why it does not decode. Delete that rule (see [pinned-hash drift check](#pinned-hash-drift-check)), then migrate.
 
-Both transactions of each pair sign under the migrating rule. The [pinned-hash drift check](#pinned-hash-drift-check) runs on that rule's policies, refusing with `sa.policy_hash_drift`, `sa.pinned_policy_absent` or `sa.pin_check_unavailable`, and skips its verifiers: the gates above already vetted the destination, and the source verifier may be the drifted contract being replaced. After each pair confirms on a rule with a pin record, a `SaContextRulePinsUpdated` row (reason `verifier_migrated`) names the destination verifier's hash as the rule's verifier pin, with the policy pins unchanged, so later signing under the rule checks against the destination. A rule without a pin record stays unpinned and no row is written.
+Both transactions of each pair sign under the migrating rule. The [pinned-hash drift check](#pinned-hash-drift-check) runs on that rule's policies, refusing with `sa.policy_hash_drift`, `sa.pinned_policy_absent` or `sa.pin_check_unavailable`, and skips its verifiers: the migration's gates already vetted the destination, and the source verifier may be the drifted contract being replaced. The [pre-submission checks](#pre-submission-checks) lock the migrating rule and skip its signer-set baseline read and comparison: the remove step changes the signer set the add step signs under. After each pair confirms on a rule with a pin record, a `SaContextRulePinsUpdated` row (reason `verifier_migrated`) names the destination verifier's hash as the rule's verifier pin, with the policy pins unchanged, so later signing under the rule checks against the destination. A rule without a pin record stays unpinned and no row is written.
 
-A migration writes no signer-set state row, so the next `signers add`, `remove`, `set-threshold` or `batch-add` on a migrated rule refuses with `sa.signer_set_diverged`. Run `signers refresh --rule-id N --accept-divergence` once to record the migrated set.
+A migration writes no signer-set state row, so a signer verb, an `execute`, or any other signature under a migrated rule refuses with `sa.signer_set_diverged`. Run `signers refresh --rule-id N --accept-divergence` once to record the migrated set.
 
 Flags:
 
@@ -691,8 +706,10 @@ Flags:
 - `--network <NETWORK>` — default `testnet`.
 - `--profile <NAME>`.
 - `--max-scan-id <N>` — override the scan upper bound. Must be in `1..=10000`; values outside that range are rejected at parse time. When unset, the profile value is used, else `50`.
-- `--timeout-seconds <SECONDS>` — default `60`; covers the full enumeration.
+- `--timeout-seconds <SECONDS>`: default `60`; covers the full enumeration, the baseline reads included.
 - `--output <FORMAT>` — `json` default; `table` mode is deferred (the flag is accepted but renders the JSON envelope).
+
+Each entry of `rules` carries `rule_id`, `name`, `context_type_label`, `signer_count`, `policy_count`, `valid_until` (omitted for a permanent rule) and `baseline`. `baseline` is the rule's signer-set baseline in the profile's audit log: `none` (no state row), `v1`, `v2`, `unreadable` (an audit-log integrity error for that rule) or `unknown` (the log was not read). Every signature under a rule other than `0` needs the baseline: a rule reporting `none` refuses with `sa.signer_set_missing_baseline` until one `signers list --rule-id N` records it. Rule `0` reports its own state like any rule.
 
 ```bash
 stellar-agent smart-account list-rules --account CABC...WXYZ

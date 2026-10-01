@@ -13,6 +13,8 @@
 //! | [`t7_non_context_rule_not_found_error_is_skipped_defensively`] | wiremock | Unrecognised simulate error → defensive skip (rules_skipped += 1) |
 //! | [`t2b_valid_until_some_decoded_correctly`] | wiremock | `valid_until = Some(N)` → `ScVal::U32(N)` decoded to `Some(N)`; `Some(valid_until)` decoder regression-lock |
 //! | [`t8_collective_scan_budget_fires_before_max_scan_id_exhaustion`] | wiremock (delayed response) | `active_count=5`, per-rule probes delayed past a short `timeout` → collective scan budget refuses before `max_scan_id` would exhaust (#33) |
+//! | [`t9_baseline_column_reports_each_rules_state_row`] | wiremock + audit log | each rule's signer-set baseline: `none`, `v2`, `v1` with a writer; `unknown` without one |
+//! | [`t10_a_malformed_state_row_reports_unreadable_and_the_listing_answers`] | wiremock + audit log | a chained state row whose snapshot breaks its rules: every rule `unreadable`, the listing answers |
 //!
 //! The empty-account and dense-scan tests are regression-locks for the early-exit logic.
 //! The `Some(valid_until)` decoder path requires the canonical
@@ -46,8 +48,13 @@
     reason = "test-only; adversarial fixtures assert invariants via panic-on-failure"
 )]
 
+use stellar_agent_core::audit_log::entry::AuditEntry;
+use stellar_agent_core::audit_log::signer_set::{
+    BaselineReason, SignerEntryV2, SignerIdentityV2, SignerSetSnapshotV2, account_digest,
+};
+use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleManager, ContextRuleManagerConfig, DEFAULT_MAX_SCAN_ID,
+    BaselineState, ContextRuleManager, ContextRuleManagerConfig, DEFAULT_MAX_SCAN_ID,
 };
 use stellar_xdr::{ContractId, Hash, Limits, ScAddress, ScVal, WriteXdr};
 use wiremock::{
@@ -61,7 +68,7 @@ mod rpc_mock_helpers;
 use rpc_mock_helpers::{
     SorobanRpcDispatcher, build_context_rule_scval_xdr,
     build_context_rule_scval_xdr_with_valid_until, build_ledger_entries_account,
-    build_simulate_response, signer_set_n_of_n,
+    build_simulate_response, signer_set_n_of_n, tmp_audit_writer, write_baseline,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -827,4 +834,210 @@ async fn t8_collective_scan_budget_fires_before_max_scan_id_exhaustion() {
         "error must be the collective-budget timeout, not scan-bound exhaustion \
          or a hard-propagated per-rule error; got: {msg}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// baseline column: each rule's signer-set state row in the audit log
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Each summarized rule reports its signer-set baseline: with an audit
+/// writer, rule 0 served and unrecorded reports `none`, rule 1 with a
+/// version-2 row `v2` and rule 2 with a version-1 row `v1`; the same chain
+/// through a manager without a writer reports `unknown` for every rule.
+#[tokio::test]
+async fn t9_baseline_column_reports_each_rules_state_row() {
+    let server = MockServer::start().await;
+    let smart_account = addr(0x09);
+    let strkey = stellar_strkey::Contract([0x09; 32]).to_string();
+    let redacted = redact_strkey_first5_last5(strkey.as_str());
+    let signers = signer_set_n_of_n(1);
+
+    // Two enumerations of the same three rules: the count, then rules 0..3.
+    let mut sim_responses = vec![];
+    for _ in 0..2 {
+        sim_responses.push(build_simulate_response(&u32_xdr(3)));
+        for rule_id in 0..3u32 {
+            let rule_xdr = build_context_rule_scval_xdr(rule_id, &signers, &[]);
+            sim_responses.push(build_simulate_response(&rule_xdr));
+        }
+    }
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(SorobanRpcDispatcher::new_multi_simulate(
+            build_ledger_entries_account(SOURCE_G),
+            sim_responses,
+        ))
+        .mount(&server)
+        .await;
+
+    let (writer, _log_path, _dir) = tmp_audit_writer();
+    let snapshot = SignerSetSnapshotV2 {
+        signers: vec![SignerEntryV2 {
+            id: 0,
+            identity: SignerIdentityV2::Ed25519 { pubkey: [0x01; 32] },
+        }],
+        threshold: None,
+    };
+    {
+        let mut writer = writer.lock().unwrap();
+        let tip = writer.current_chain_tip();
+        writer
+            .write_entry(AuditEntry::new_sa_signer_set_baselined_v2(
+                1,
+                &snapshot,
+                1000,
+                1_700_000_000_000,
+                BaselineReason::first_observation(),
+                tip,
+                account_digest(NETWORK_PASSPHRASE, strkey.as_str()),
+                RedactedStrkey::from_already_redacted(redacted.as_str()),
+                CHAIN_ID,
+                "req-baseline-v2",
+            ))
+            .unwrap();
+    }
+    write_baseline(&writer, 2, &redacted, &signers);
+
+    let with_writer = ContextRuleManager::new(
+        ContextRuleManagerConfig::new(
+            server.uri(),
+            NETWORK_PASSPHRASE.to_owned(),
+            std::time::Duration::from_secs(5),
+            CHAIN_ID.to_owned(),
+        )
+        .with_audit_writer(writer),
+    )
+    .expect("ContextRuleManager::new must succeed");
+    let listed = with_writer
+        .list_active_context_rules(smart_account.clone(), SOURCE_G, DEFAULT_MAX_SCAN_ID)
+        .await
+        .expect("list_active_context_rules must succeed");
+    let baselines: Vec<(u32, BaselineState)> = listed
+        .rules
+        .iter()
+        .map(|rule| (rule.rule_id, rule.baseline))
+        .collect();
+    assert_eq!(
+        baselines,
+        vec![
+            (0, BaselineState::None),
+            (1, BaselineState::V2),
+            (2, BaselineState::V1),
+        ]
+    );
+    assert_eq!(
+        listed
+            .rules
+            .iter()
+            .map(|rule| rule.baseline.as_str())
+            .collect::<Vec<_>>(),
+        vec!["none", "v2", "v1"]
+    );
+
+    let listed = manager_for_server(&server)
+        .list_active_context_rules(smart_account, SOURCE_G, DEFAULT_MAX_SCAN_ID)
+        .await
+        .expect("list_active_context_rules must succeed");
+    assert_eq!(listed.rules.len(), 3);
+    assert!(
+        listed
+            .rules
+            .iter()
+            .all(|rule| rule.baseline == BaselineState::Unknown),
+        "a manager without a writer reads no log"
+    );
+}
+
+/// A version-2 state row whose snapshot breaks its structural rules (two
+/// signers under one id) is an integrity error for the signer-set reader,
+/// which refuses the whole file, while the row is chained like any other.
+/// Every summarized rule then reports `unreadable`, and the listing still
+/// answers: the audit-log cross-check verifies the chain and does not
+/// validate state-row snapshots.
+#[tokio::test]
+async fn t10_a_malformed_state_row_reports_unreadable_and_the_listing_answers() {
+    let server = MockServer::start().await;
+    let smart_account = addr(0x0a);
+    let strkey = stellar_strkey::Contract([0x0a; 32]).to_string();
+    let redacted = redact_strkey_first5_last5(strkey.as_str());
+    let signers = signer_set_n_of_n(1);
+
+    let mut sim_responses = vec![build_simulate_response(&u32_xdr(2))];
+    for rule_id in 0..2u32 {
+        let rule_xdr = build_context_rule_scval_xdr(rule_id, &signers, &[]);
+        sim_responses.push(build_simulate_response(&rule_xdr));
+    }
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(SorobanRpcDispatcher::new_multi_simulate(
+            build_ledger_entries_account(SOURCE_G),
+            sim_responses,
+        ))
+        .mount(&server)
+        .await;
+
+    let (writer, _log_path, _dir) = tmp_audit_writer();
+    let duplicate_ids = SignerSetSnapshotV2 {
+        signers: vec![
+            SignerEntryV2 {
+                id: 0,
+                identity: SignerIdentityV2::Ed25519 { pubkey: [0x01; 32] },
+            },
+            SignerEntryV2 {
+                id: 0,
+                identity: SignerIdentityV2::Ed25519 { pubkey: [0x02; 32] },
+            },
+        ],
+        threshold: None,
+    };
+    assert!(
+        duplicate_ids.validate().is_err(),
+        "the snapshot is malformed"
+    );
+    {
+        let mut writer = writer.lock().unwrap();
+        let tip = writer.current_chain_tip();
+        writer
+            .write_entry(AuditEntry::new_sa_signer_set_baselined_v2(
+                1,
+                &duplicate_ids,
+                1000,
+                1_700_000_000_000,
+                BaselineReason::first_observation(),
+                tip,
+                account_digest(NETWORK_PASSPHRASE, strkey.as_str()),
+                RedactedStrkey::from_already_redacted(redacted.as_str()),
+                CHAIN_ID,
+                "req-malformed-baseline",
+            ))
+            .unwrap();
+    }
+
+    let manager = ContextRuleManager::new(
+        ContextRuleManagerConfig::new(
+            server.uri(),
+            NETWORK_PASSPHRASE.to_owned(),
+            std::time::Duration::from_secs(5),
+            CHAIN_ID.to_owned(),
+        )
+        .with_audit_writer(writer),
+    )
+    .expect("ContextRuleManager::new must succeed");
+    let listed = manager
+        .list_active_context_rules(smart_account, SOURCE_G, DEFAULT_MAX_SCAN_ID)
+        .await
+        .expect("the listing answers beside an unreadable state row");
+    let baselines: Vec<(u32, BaselineState)> = listed
+        .rules
+        .iter()
+        .map(|rule| (rule.rule_id, rule.baseline))
+        .collect();
+    assert_eq!(
+        baselines,
+        vec![
+            (0, BaselineState::Unreadable),
+            (1, BaselineState::Unreadable)
+        ]
+    );
+    assert_eq!(listed.rules[1].baseline.as_str(), "unreadable");
 }

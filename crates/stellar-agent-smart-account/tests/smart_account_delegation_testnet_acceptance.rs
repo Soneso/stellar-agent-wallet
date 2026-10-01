@@ -66,10 +66,9 @@
 )]
 
 mod common;
-#[path = "common/pin_check_manager.rs"]
-mod pin_check_manager;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
@@ -93,6 +92,7 @@ use stellar_agent_smart_account::managers::rules::{
     decode_context_type_from_scval, parse_c_strkey_to_smart_account,
     parse_g_strkey_to_signer_address,
 };
+use stellar_agent_smart_account::managers::signers::SignersManager;
 use stellar_agent_smart_account::spending_limit_policy::build_spending_limit_install_param;
 use stellar_agent_smart_account::submit::{
     Ed25519RuleSigner, PinCheck, SubmitInvokeArgs, submit_signed_invoke,
@@ -168,17 +168,18 @@ fn fresh_deployer_keypair() -> (String, DeployerKeypair) {
     (g_strkey, deployer)
 }
 
-/// Constructs a `ContextRuleManager` against testnet with a signers manager,
+/// Constructs a `ContextRuleManager` against testnet and its signers manager,
 /// both writing to one audit log under the returned `TempDir`, which the
-/// caller holds while it uses the manager. Rule install and the policy verbs
-/// require the signers manager.
-fn fresh_rule_manager() -> (ContextRuleManager, TempDir) {
-    let (manager, _signers_manager, _audit_log_path, dir) = managers_for_tests(
+/// caller holds while it uses the managers. Rule install and the policy verbs
+/// require the signers manager, and a submission signed under the installed
+/// rule reads the baseline the install recorded through it.
+fn fresh_rule_manager() -> (ContextRuleManager, Arc<SignersManager>, TempDir) {
+    let (manager, signers_manager, _audit_log_path, dir) = managers_for_tests(
         TESTNET_RPC_URL,
         TESTNET_RPC_URL,
         Duration::from_secs(TIMEOUT_SECS),
     );
-    (manager, dir)
+    (manager, signers_manager, dir)
 }
 
 /// Deploys a fresh smart account whose constructor-rule signer is
@@ -295,7 +296,7 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
     let agent_signer_box: Box<dyn Signer + Send + Sync> =
         Box::new(SoftwareSigningKey::new_from_zeroizing(agent_seed));
 
-    let (manager, _manager_audit_dir) = fresh_rule_manager();
+    let (manager, signers_manager, _manager_audit_dir) = fresh_rule_manager();
 
     // ── Step 3 (part 3): install the CallContract(token) rule ───────────────
     let call_contract_definition = ContextRuleDefinition::new(
@@ -394,18 +395,13 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
     let recipient_scaddr =
         parse_g_strkey_to_signer_address(&recipient_g).expect("recipient G-strkey must parse");
 
-    // The rule manager records its rows in its own audit log, so this log
-    // holds no pin record of the rule and the check fetches the rule and
-    // passes it.
-    let pin_manager = pin_check_manager::pin_check_manager(
-        TESTNET_RPC_URL,
-        TESTNET_RPC_URL,
-        "delegation-acceptance",
-        tmp.path(),
-    );
+    // The installing manager's log holds the rule's install baseline and its
+    // pin record: one verifier pin and the spending-limit policy's pin. Each
+    // submission below locks the rule, reads that baseline, checks the pins
+    // and compares the rule's signer set with it before signing.
     let pin_request_id = rid();
     let pin_check = || PinCheck {
-        signers_manager: &pin_manager,
+        signers_manager: &signers_manager,
         request_id: &pin_request_id,
         migrating_rule: None,
     };

@@ -26,12 +26,18 @@
 //!    BINARY: attaches the spending-limit policy to that rule.
 //! 5. Fund the smart account's SAC balance (test-support library helper
 //!    `fund_sac_balance`).
-//! 6. `smart-account execute` a transfer UNDER the limit through the BINARY
+//! 6. `smart-account execute` a transfer through the BINARY with
+//!    `STELLAR_AGENT_HOME` pointing at a fresh directory, whose synthesized
+//!    profile opens an empty audit log -> assert
+//!    `sa.signer_set_missing_baseline`, no transaction hash and an unchanged
+//!    recipient balance. Every other step keeps the default home, whose
+//!    audit log holds the install baseline `rules create` recorded.
+//! 7. `smart-account execute` a transfer UNDER the limit through the BINARY
 //!    -> assert submitted + on-chain recipient balance delta.
-//! 7. `smart-account execute` a transfer OVER the limit through the BINARY ->
+//! 8. `smart-account execute` a transfer OVER the limit through the BINARY ->
 //!    assert the CLI's error envelope carries `SpendingLimitExceeded` (3221),
 //!    not `NotAllowed` (3223).
-//! 8. `smart-account execute` against a different contract (the smart account
+//! 9. `smart-account execute` against a different contract (the smart account
 //!    itself) through the BINARY -> assert `UnvalidatedContext` (3002).
 //!
 //! Every step's failure fails the whole test — there is no early return that
@@ -502,9 +508,74 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
     let recipient_sc =
         parse_g_strkey_to_signer_address(&recipient_g).expect("recipient G-strkey parses");
 
-    // ── Step 6: execute UNDER the limit — MUST succeed ──────────────────────
-    let balance_before = xlm_stroops_balance(&recipient_g).await;
+    // ── Step 6: execute with an audit log that holds no baseline: refused ───
+    // A fresh home synthesizes the testnet profile with an empty audit log,
+    // so the rule has no signer-set state row there and the submission
+    // refuses before anything is signed or sent.
     let first_amount_scval = ScVal::I128(i128_parts(FIRST_TRANSFER_STROOPS));
+    let empty_home = tempfile::tempdir().expect("tempdir must be created");
+    let empty_home_path = empty_home
+        .path()
+        .to_str()
+        .expect("temporary directory path is UTF-8")
+        .to_owned();
+    let balance_before_refusal = xlm_stroops_balance(&recipient_g).await;
+    let (ok, envelope, stdout, stderr) = run_cli(
+        &[
+            "smart-account",
+            "execute",
+            "--account",
+            &smart_account,
+            "--contract",
+            XLM_SAC_TESTNET,
+            "--function",
+            "transfer",
+            "--arg",
+            &scval_b64(&ScVal::Address(smart_account_sc.clone())),
+            "--arg",
+            &scval_b64(&ScVal::Address(recipient_sc.clone())),
+            "--arg",
+            &scval_b64(&first_amount_scval),
+            "--auth-rule-id",
+            &rule_id.to_string(),
+            "--rule-signer-ed25519-secret-env",
+            RULE_SIGNER_ENV_VAR,
+            "--verifier",
+            &verifier_address,
+            "--signer-secret-env",
+            FEE_PAYER_ENV_VAR,
+            "--network",
+            "testnet",
+            "--rpc-url",
+            TESTNET_RPC_URL,
+        ],
+        &[
+            (RULE_SIGNER_ENV_VAR, &rule_signer_s_strkey),
+            (FEE_PAYER_ENV_VAR, &bootstrap_s_strkey),
+            ("STELLAR_AGENT_HOME", &empty_home_path),
+        ],
+    );
+    assert!(
+        !ok,
+        "execute without a baseline must be refused; stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(
+        envelope["error"]["code"].as_str(),
+        Some("sa.signer_set_missing_baseline"),
+        "the refusal names the missing baseline; envelope={envelope}"
+    );
+    assert!(
+        envelope["data"]["tx_hash"].is_null(),
+        "nothing is submitted; envelope={envelope}"
+    );
+    assert_eq!(
+        xlm_stroops_balance(&recipient_g).await,
+        balance_before_refusal,
+        "the refused transfer moves nothing"
+    );
+
+    // ── Step 7: execute UNDER the limit: MUST succeed ──────────────────────
+    let balance_before = xlm_stroops_balance(&recipient_g).await;
     let (ok, envelope, stdout, stderr) = run_cli(
         &[
             "smart-account",
@@ -565,7 +636,7 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
         "recipient balance delta must equal the transferred amount exactly"
     );
 
-    // ── Step 7: execute OVER the limit — MUST fail with SpendingLimitExceeded ──
+    // ── Step 8: execute OVER the limit: MUST fail with SpendingLimitExceeded ──
     let second_amount_scval = ScVal::I128(i128_parts(SECOND_TRANSFER_STROOPS));
     let (ok, envelope, stdout, stderr) = run_cli(
         &[
@@ -617,7 +688,7 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
         "must not be misclassified as NotAllowed (3223): {error_message}"
     );
 
-    // ── Step 8: execute against a DIFFERENT contract — MUST fail (scope) ────
+    // ── Step 9: execute against a DIFFERENT contract: MUST fail (scope) ────
     //
     // The "different contract" is the smart account itself: a self-call
     // (`update_context_rule_name`) has `context.contract == smart_account`,

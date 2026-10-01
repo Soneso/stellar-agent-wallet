@@ -1128,15 +1128,15 @@ pub(crate) async fn build_and_sign_delegated_g_key_entry(
     })
 }
 
-/// The collective pre-submit deadline shared across every pre-submit RPC
-/// stage of a single `submit_signed_invoke` call.
+/// The collective pre-submit deadline shared across every pre-submit stage
+/// of a single `submit_signed_invoke` call.
 ///
 /// `deadline` is the absolute instant (`Instant::now() + args.timeout`)
 /// computed once at the top of `submit_signed_invoke`; `total` is the
 /// `args.timeout` value it was derived from, carried only for the budget
 /// figure in the timeout error message. `Copy`, so it threads through the
-/// pre-submit call sites — including [`resimulate_with_signed_auth`] — as one
-/// argument.
+/// pre-submit call sites, [`resimulate_with_signed_auth`] and the rule-lock
+/// acquisition included, as one argument.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PreSubmitBudget {
     /// Absolute instant past which a pre-submit stage is refused.
@@ -1145,38 +1145,70 @@ pub(crate) struct PreSubmitBudget {
     pub total: std::time::Duration,
 }
 
-/// Bounds one pre-submit RPC stage against the collective [`PreSubmitBudget`]
+impl PreSubmitBudget {
+    /// Refuses once the deadline has passed, with the elapse identity of
+    /// [`bound_pre_submit_stage`] for `stage`.
+    ///
+    /// An audit-log scan is synchronous and never yields, so a deadline that
+    /// passes during a scan is not observed by the `timeout_at` around it.
+    /// Each scan on the pre-submit path is followed by this check.
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::AuthEntryConstructionFailed`] with `stage` as its stage
+    /// when `Instant::now()` is at or past the deadline.
+    pub(crate) fn check(self, stage: &'static str) -> Result<(), SaError> {
+        if tokio::time::Instant::now() >= self.deadline {
+            return Err(self.elapsed(stage, stage));
+        }
+        Ok(())
+    }
+
+    /// The refusal of a pre-submit stage `stage` that met the deadline,
+    /// reported at `elapse_stage`.
+    fn elapsed(self, stage: &'static str, elapse_stage: &'static str) -> SaError {
+        SaError::AuthEntryConstructionFailed {
+            stage: elapse_stage,
+            redacted_reason: format!(
+                "{stage} exceeded collective pre-submit budget of {}s",
+                self.total.as_secs()
+            ),
+        }
+    }
+}
+
+/// Bounds one pre-submit stage against the collective [`PreSubmitBudget`]
 /// and records its wall-clock duration on the `sa_submit_timing` debug span.
 ///
-/// Every pre-submit stage on the submit path — the initial fetch, the initial
-/// simulate, the re-fetch, and the re-simulate — shares ONE `budget.deadline`
-/// rather than each re-arming a fresh `args.timeout` window, so time spent in
-/// an earlier stage (including the off-chain auth-entry signing step between
-/// simulate and re-simulate) shrinks the budget left for a later one. A stage
-/// can therefore elapse because earlier stages consumed the collective budget,
-/// not because that stage itself ran long — the timeout message says
+/// Every pre-submit stage on the submit path shares ONE `budget.deadline`
+/// rather than each re-arming a fresh `args.timeout` window. The stages are
+/// the rule-lock acquisition, the signer-set baseline read of each checked
+/// rule, the pinned-hash drift check of each checked rule, the signer-set
+/// comparison of each checked rule, the initial fetch, the initial simulate,
+/// the re-fetch and the re-simulate. Time spent in an earlier stage
+/// (including the off-chain auth-entry signing step between simulate and
+/// re-simulate) shrinks the budget left for a later one. A stage can
+/// therefore elapse because earlier stages consumed the collective budget,
+/// not because that stage itself ran long; the timeout message says
 /// "collective" for that reason.
 ///
 /// On elapse, returns [`SaError::AuthEntryConstructionFailed`] with
-/// `stage: "auth_payload"` — the same stage tag the non-timeout
-/// transport-error mapping at each call site already uses, so a timed-out
-/// pre-submit stage and a transport failure at that stage surface through the
-/// identical error variant.
+/// `elapse_stage` as its stage and `stage` named in the reason. The RPC
+/// stages pass `"auth_payload"`, the stage tag their transport-error mapping
+/// already uses, so a timed-out stage and a transport failure at that stage
+/// surface through the identical error. The signer-set stages pass their own
+/// stage (`"baseline_read"`, `"signer_set_compare"`), so their elapses are
+/// distinguishable.
 pub(crate) async fn bound_pre_submit_stage<T>(
     budget: PreSubmitBudget,
     stage: &'static str,
+    elapse_stage: &'static str,
     fut: impl std::future::Future<Output = T>,
 ) -> Result<T, SaError> {
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout_at(budget.deadline, fut)
         .await
-        .map_err(|_elapsed| SaError::AuthEntryConstructionFailed {
-            stage: "auth_payload",
-            redacted_reason: format!(
-                "{stage} exceeded collective pre-submit budget of {}s",
-                budget.total.as_secs()
-            ),
-        });
+        .map_err(|_elapsed| budget.elapsed(stage, elapse_stage));
     tracing::debug!(
         target: "sa_submit_timing",
         stage,
@@ -1253,6 +1285,7 @@ pub(crate) async fn resimulate_with_signed_auth(
     let source_view = bound_pre_submit_stage(
         budget,
         "fetch_account_resimulate",
+        "auth_payload",
         fetch_account(rpc_client, source_account_strkey, &[]),
     )
     .await?
@@ -1274,6 +1307,7 @@ pub(crate) async fn resimulate_with_signed_auth(
     let resim_response = bound_pre_submit_stage(
         budget,
         "simulate_resimulate",
+        "auth_payload",
         server.simulate_transaction_envelope(&resim_envelope, None),
     )
     .await?
@@ -2533,7 +2567,10 @@ mod tests {
             total: std::time::Duration::from_secs(30),
         };
         let outcome: Result<Result<u32, &str>, SaError> =
-            bound_pre_submit_stage(budget, "unit_test_stage", async { Ok::<u32, &str>(7) }).await;
+            bound_pre_submit_stage(budget, "unit_test_stage", "auth_payload", async {
+                Ok::<u32, &str>(7)
+            })
+            .await;
 
         let inner = outcome.expect("the outer timeout must not fire before the deadline");
         assert_eq!(inner, Ok(7));
@@ -2548,7 +2585,7 @@ mod tests {
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             total: std::time::Duration::from_secs(30),
         };
-        let outcome = bound_pre_submit_stage(budget, "unit_test_stage", async {
+        let outcome = bound_pre_submit_stage(budget, "unit_test_stage", "auth_payload", async {
             Err::<u32, &str>("inner transport failure")
         })
         .await
@@ -2573,7 +2610,7 @@ mod tests {
         // The inner future sleeps past any reasonable poll granularity so a
         // same-poll fast-path resolution cannot mask the timeout.
         let result: Result<Result<u32, &str>, SaError> =
-            bound_pre_submit_stage(budget, "unit_test_elapsed_stage", async {
+            bound_pre_submit_stage(budget, "unit_test_elapsed_stage", "auth_payload", async {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 Ok::<u32, &str>(1)
             })
@@ -2595,5 +2632,66 @@ mod tests {
             }
             other => panic!("expected AuthEntryConstructionFailed; got {other:?}"),
         }
+    }
+    /// The elapse of a stage reports the caller's elapse stage and names the
+    /// stage in the reason.
+    #[tokio::test]
+    async fn bound_pre_submit_stage_reports_the_elapse_stage_it_is_given() {
+        let budget = PreSubmitBudget {
+            deadline: tokio::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .expect("test host clock must be well past 1 second of monotonic time"),
+            total: std::time::Duration::from_secs(9),
+        };
+        let err =
+            bound_pre_submit_stage(budget, "signer_set_compare", "signer_set_compare", async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            })
+            .await
+            .expect_err("an already-elapsed deadline must surface a timeout error");
+        let SaError::AuthEntryConstructionFailed {
+            stage,
+            redacted_reason,
+        } = err
+        else {
+            panic!("expected AuthEntryConstructionFailed; got {err:?}");
+        };
+        assert_eq!(stage, "signer_set_compare");
+        assert_eq!(
+            redacted_reason,
+            "signer_set_compare exceeded collective pre-submit budget of 9s"
+        );
+    }
+
+    /// `check` passes before the deadline and refuses once it has passed,
+    /// with the checked stage as both the stage and the reason's subject.
+    #[test]
+    fn pre_submit_budget_check_refuses_once_the_deadline_has_passed() {
+        let open = PreSubmitBudget {
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            total: std::time::Duration::from_secs(30),
+        };
+        open.check("baseline_read")
+            .expect("the deadline has not passed");
+
+        let passed = PreSubmitBudget {
+            deadline: tokio::time::Instant::now(),
+            total: std::time::Duration::from_secs(5),
+        };
+        let err = passed
+            .check("baseline_read")
+            .expect_err("the deadline has been reached");
+        let SaError::AuthEntryConstructionFailed {
+            stage,
+            redacted_reason,
+        } = err
+        else {
+            panic!("expected AuthEntryConstructionFailed; got {err:?}");
+        };
+        assert_eq!(stage, "baseline_read");
+        assert_eq!(
+            redacted_reason,
+            "baseline_read exceeded collective pre-submit budget of 5s"
+        );
     }
 }

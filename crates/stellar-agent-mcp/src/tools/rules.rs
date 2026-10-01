@@ -80,7 +80,8 @@ const RULES_OBSERVABILITY_PROFILE: &str = "mcp-rules-observability";
 // Manager construction helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Builds a read-only [`ContextRuleManager`] for the given RPC URL / network.
+/// Builds a read-only [`ContextRuleManager`] for the given RPC URL / network,
+/// reading `audit_writer`'s log when one is given.
 #[allow(
     clippy::result_large_err,
     reason = "SaError::SignerSetDiverged carries full diagnostic state by design \
@@ -91,13 +92,18 @@ fn build_context_rule_manager(
     rpc_url: &str,
     network_passphrase: &str,
     chain_id: &str,
+    audit_writer: Option<Arc<Mutex<AuditWriter>>>,
 ) -> Result<ContextRuleManager, SaError> {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
+    let config = ContextRuleManagerConfig::new(
         rpc_url.to_owned(),
         network_passphrase.to_owned(),
         Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
         chain_id.to_owned(),
-    ))
+    );
+    ContextRuleManager::new(match audit_writer {
+        Some(writer) => config.with_audit_writer(writer),
+        None => config,
+    })
 }
 
 /// Builds a [`SignersManager`] for the given RPC URL / network.
@@ -145,6 +151,29 @@ fn build_signers_manager(
     SignersManager::new(config)
 }
 
+/// The profile's audit writer, for the `baseline` the rule tools report, or
+/// `None` with a warning when the log cannot be opened (no chain-root key,
+/// the log cannot open, a tip-anchor mismatch). Without a writer every rule
+/// reports `unknown`, and the tool still answers.
+fn profile_audit_writer(
+    server: &WalletServer,
+    tool: &'static str,
+) -> Option<Arc<Mutex<AuditWriter>>> {
+    let profile_name = server.profile_name_for_approval();
+    match super::value_audit::require_value_audit_writer(&server.profile, &profile_name) {
+        Ok(writer) => Some(writer),
+        Err(err) => {
+            tracing::warn!(
+                tool,
+                profile = %profile_name,
+                error = %err,
+                "the profile's audit log is not readable; every rule's baseline reports unknown"
+            );
+            None
+        }
+    }
+}
+
 /// Maps an [`SaError`] to an MCP tool-level error result (`is_error = true`),
 /// mirroring the `redacted_wallet_error_envelope` pattern used by the other
 /// read-only tools in this crate.
@@ -185,6 +214,11 @@ pub struct RuleListEntry {
     pub signer_count: u32,
     /// Number of policies attached to the rule.
     pub policy_count: u32,
+    /// The rule's signer-set baseline in the profile's audit log: `none`
+    /// (no state row; a signature under the rule refuses until one
+    /// `signers list --rule-id N` records it), `v1`, `v2`, `unreadable` (an
+    /// audit-log integrity error), or `unknown` (the log was not read).
+    pub baseline: String,
 }
 
 impl From<stellar_agent_smart_account::managers::rules::ContextRuleSummary> for RuleListEntry {
@@ -196,6 +230,7 @@ impl From<stellar_agent_smart_account::managers::rules::ContextRuleSummary> for 
             valid_until: s.valid_until,
             signer_count: s.signer_count,
             policy_count: s.policy_count,
+            baseline: s.baseline.as_str().to_owned(),
         }
     }
 }
@@ -227,11 +262,14 @@ impl WalletServer {
     #[tool(
         name = "stellar_rules_list",
         description = "Enumerate active context rules on a smart account (read-only). Returns \
-                       each rule's id, name, context_type_label, valid_until, signer_count, and \
-                       policy_count, plus the as_of_ledger the scan was read at. Scans up to \
-                       max_scan_id rule IDs (same default as the CLI `rules list`). Data comes \
-                       from a single RPC endpoint (no two-RPC cross-check; advisory read, not a \
-                       signing input). read_only_hint=true; destructive_hint=false.",
+                       each rule's id, name, context_type_label, valid_until, signer_count, \
+                       policy_count and baseline (the rule's signer-set baseline in the \
+                       profile's audit log: none, v1, v2, unreadable or unknown; a rule \
+                       reporting none refuses signing until its baseline is recorded), plus \
+                       the as_of_ledger the scan was read at. Scans up to max_scan_id rule IDs \
+                       (same default as the CLI `rules list`). Data comes from a single RPC \
+                       endpoint (no two-RPC cross-check; advisory read, not a signing input). \
+                       read_only_hint=true; destructive_hint=false.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn stellar_rules_list(
@@ -264,6 +302,7 @@ impl WalletServer {
             rpc_url,
             &self.profile.network_passphrase,
             self.profile.chain_id.caip2_str(),
+            profile_audit_writer(self, "stellar_rules_list"),
         ) {
             Ok(m) => m,
             Err(err) => {
@@ -402,6 +441,11 @@ pub struct StellarRulesGetResult {
     pub spending_limit: Option<SpendingLimitBudget>,
     /// Ledger sequence this read was performed as of.
     pub as_of_ledger: u32,
+    /// The rule's signer-set baseline in the profile's audit log: `none`
+    /// (no state row; a signature under the rule refuses until one
+    /// `signers list --rule-id N` records it), `v1`, `v2`, `unreadable` (an
+    /// audit-log integrity error), or `unknown` (the log was not read).
+    pub baseline: String,
 }
 
 #[mcp_tool_router]
@@ -424,10 +468,12 @@ impl WalletServer {
     #[tool(
         name = "stellar_rules_get",
         description = "Read a single context rule's metadata (name, context_type_label, \
-                       valid_until, expires_in_ledgers, signer_count, policy_count), its \
+                       valid_until, expires_in_ledgers, signer_count, policy_count, and \
+                       baseline: the rule's signer-set baseline in the profile's audit log, \
+                       none, v1, v2, unreadable or unknown), its \
                        policies with best-effort identified_kind classification \
-                       (threshold/spending-limit/unknown), and — when exactly one attached \
-                       policy identifies as spending-limit — the budget snapshot (spending_limit, \
+                       (threshold/spending-limit/unknown), and, when exactly one attached \
+                       policy identifies as spending-limit, the budget snapshot (spending_limit, \
                        period_ledgers, in_window_spent, remaining_budget, as_of_ledger). \
                        in_window_spent/remaining_budget are exact only as of as_of_ledger: an \
                        intervening spend can still cause SpendingLimitExceeded on a later \
@@ -467,6 +513,7 @@ impl WalletServer {
             rpc_url,
             &self.profile.network_passphrase,
             self.profile.chain_id.caip2_str(),
+            profile_audit_writer(self, "stellar_rules_get"),
         ) {
             Ok(m) => m,
             Err(err) => {
@@ -615,6 +662,7 @@ impl WalletServer {
             policies,
             spending_limit,
             as_of_ledger,
+            baseline: summary.baseline.as_str().to_owned(),
         };
         let envelope = stellar_agent_core::envelope::Envelope::ok(result);
         let json = envelope
@@ -767,6 +815,7 @@ mod tests {
                 valid_until: None,
                 signer_count: 1,
                 policy_count: 0,
+                baseline: "v2".to_owned(),
             }],
             as_of_ledger: 12_345,
         };
@@ -777,6 +826,7 @@ mod tests {
             "rule_id",
             "name",
             "context_type_label",
+            "baseline",
         ] {
             assert!(
                 json.contains(&format!("\"{key}\"")),
@@ -801,6 +851,7 @@ mod tests {
             }],
             spending_limit: None,
             as_of_ledger: 1_500,
+            baseline: "v2".to_owned(),
         };
         let json = serde_json::to_string(&result).expect("serialise");
         for key in [
@@ -812,6 +863,7 @@ mod tests {
             "address",
             "identified_kind",
             "as_of_ledger",
+            "baseline",
         ] {
             assert!(
                 json.contains(&format!("\"{key}\"")),
@@ -847,6 +899,7 @@ mod tests {
                 as_of_ledger: 1_500,
             }),
             as_of_ledger: 1_500,
+            baseline: "none".to_owned(),
         };
         let json = serde_json::to_string(&result).expect("serialise");
         for key in [

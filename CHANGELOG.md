@@ -168,8 +168,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sa.simple_threshold_install_refused`. An `External` signer with empty key
   data refuses with `sa.auth_entry_construction_failed`.
 - A rule created before this version has no baseline until one `signers list
-  --rule-id N`, which a signer verb and an attach or detach of the
-  simple-threshold policy on it need first.
+  --rule-id N`, which every signing authorized by the rule needs first:
+  `execute`, `multicall`, `rules update-name`, `update-valid-until` and
+  `delete`, `set-spending-limit`, `set-weighted-threshold` and
+  `set-signer-weight`, the signer verbs, the policy verbs' target and auth
+  rules, and the passkey path's rules. The migrating rule of
+  `migrate-verifier` is exempt.
 - `SaError::SignersManagerNotConfigured.rule_id` is optional. An install's
   refusal omits it on the wire; a refusal scoped to a rule keeps the bare
   number.
@@ -187,9 +191,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   again when its read reports a ledger behind the confirmation, whether the
   read succeeded or failed. A lagging endpoint that does not hold a new rule
   or threshold yet is read again until the recording budget ends.
-- `smart-account migrate-verifier` records no signer-set state row, so the
-  next signer verb on a migrated rule refuses with `sa.signer_set_diverged`
-  until `signers refresh --rule-id N --accept-divergence`.
+- `smart-account migrate-verifier` records no signer-set state row, so a
+  signer verb, an `execute`, or any other signature under a migrated rule
+  refuses with `sa.signer_set_diverged` until `signers refresh --rule-id N
+  --accept-divergence`.
 - A confirmed `signers add` or `signers batch-add` on a pinned rule writes
   its pin rows before it refuses when its resulting state is not observed or
   not the intended change. When the audit log refuses the state row, the pin
@@ -203,6 +208,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `stellar_agent_sep43::signing::sign_soroban_auth_entry` takes the expected
   signer's public key after the signer. The key must be the signer's own; the
   function checks a type 10 preimage's address against it.
+- Every submission signed under a rule other than rule 0 runs four checks
+  for each such rule before anything is simulated or signed, under one
+  pre-submit deadline: the rule's lock, its signer-set baseline read with no
+  RPC, the pinned-hash drift check, and the comparison of the rule's signer
+  set through both endpoints with the baseline. A version-1 baseline is
+  compared through its version-1 projection. This covers `execute`,
+  `multicall`, `rules create`, `update-name`, `update-valid-until`,
+  `delete`, `add-policy`, `remove-policy`, `set-spending-limit`,
+  `set-weighted-threshold`, `set-signer-weight`, the signer verbs and the
+  passkey signing path.
+- When the checks find several faults, the refusal follows their order:
+  `sa.auth_entry_construction_failed` at stage `rule_lock`, then
+  `sa.audit_log` or `sa.signer_set_missing_baseline`, then the pin
+  refusals, then `sa.signer_set_diverged` or `network.rpc_divergence`. An
+  audit-log integrity error under a rule other than rule 0 is reported as
+  `sa.audit_log` by the baseline read; under the migrating rule of
+  `migrate-verifier` it stays `sa.pin_check_unavailable`.
+- A lock not acquired within the pre-submit budget refuses with
+  `sa.auth_entry_construction_failed` at stage `rule_lock`, and a deadline
+  elapse during a baseline read or a comparison at stage `baseline_read` or
+  `signer_set_compare`. A verb holds the lock of each rule it signs under
+  while it signs and confirms, so a concurrent verb on the same rule
+  refuses at stage `rule_lock` when its own budget ends. A submission that
+  acquired the locks itself releases them before it sends.
+- `set-spending-limit`, `set-weighted-threshold` and `set-signer-weight`
+  lock their `--auth-rule-id` rules beside the target rule, and the
+  submission compares those rules with their baselines.
+- The passkey signing path runs its checks in the same order under one
+  deadline, the signers manager's timeout: the rule locks, the baseline
+  reads, the pinned-hash drift check and the signer-set comparison. Every
+  refusal of the locks, the baseline reads, and the comparisons is
+  `CredentialsError::SignerSetDivergence`, a deadline elapse included.
+- `signers list`, `signers refresh` and the other signer verbs wait for the
+  rule's lock at most the manager's timeout (`--timeout-seconds`), then
+  refuse with `sa.auth_entry_construction_failed` at stage `rule_lock`.
+- `PinCheck::migrating_rule` is `Option<MigratingRule>`. Only the migration
+  step constructs a `MigratingRule`; its rule is exempt from the verifier
+  check and from the signer-set baseline read and comparison.
+- `rules list`, `list-rules`, `stellar_rules_list` and `stellar_rules_get`
+  report each rule's signer-set baseline in the audit log as `baseline`:
+  `none`, `v1`, `v2`, `unreadable` or `unknown`. `ContextRuleSummary`
+  carries it as `BaselineState`. The two MCP tools read the profile's audit
+  log and report `unknown` for every rule when they cannot open it.
+- `multicall` reports a refusal of its rule's signer-set checks at phase
+  `policy_gate`: `sa.signer_set_missing_baseline`,
+  `sa.signer_set_baseline_legacy`, `sa.signer_set_diverged`,
+  `sa.audit_log`, `network.rpc_divergence`, the threshold identification
+  and read refusals, and `sa.auth_entry_construction_failed` at the lock
+  and signer-set stages.
 
 ### Removed
 
@@ -210,6 +264,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identifies the simple-threshold policy through both endpoints.
 - The install-time pin-check skip of a rule manager without a signers
   manager: install and its simulation refuse instead.
+- The rule verbs' own signer-set check before submission, with its separate
+  budget; the submission's checks cover their authorizing rules.
 
 ### Fixed
 
