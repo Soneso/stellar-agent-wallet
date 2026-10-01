@@ -42,15 +42,17 @@ const RULE_ID_A: u32 = 1;
 const RULE_ID_B: u32 = 2;
 
 /// Every RPC round-trip (simulate or getLedgerEntries) is delayed by this much.
-/// One `verify_signer_set_against_chain` call needs 4 sequential hops on its
-/// critical path (identify_threshold_policy: cr-fetch + wasm-pin-check;
-/// then fetch_signer_set primary/secondary in parallel: cr-fetch + threshold-fetch
-/// each) — roughly `4 * PER_HOP_DELAY` wall time per rule_id.
+/// One `verify_signer_set_against_chain` call needs 5 sequential hops on its
+/// critical path: on both endpoints in parallel, the source-account fetch and
+/// the `get_context_rule` simulation; the policy's two-endpoint instance
+/// read; then, on both endpoints in parallel, the source-account fetch and
+/// the `get_threshold` simulation: roughly `5 * PER_HOP_DELAY` wall time per
+/// rule_id.
 const PER_HOP_DELAY: Duration = Duration::from_millis(200);
 
 /// The manager's configured RPC timeout — the SHARED collective-budget total.
-/// Comfortably covers one rule_id's ~800ms critical path (with margin) but
-/// leaves too little remaining for a second full ~800ms check.
+/// Covers one rule_id's ~1000ms critical path but leaves too little remaining
+/// for a second full ~1000ms check.
 const MANAGER_TIMEOUT: Duration = Duration::from_millis(1200);
 
 /// Wraps any `Respond` implementation and adds a fixed delay to every response,
@@ -95,8 +97,8 @@ async fn build_manager() -> (
     let sim_cr = build_simulate_response(&cr_xdr);
     let sim_th = build_simulate_response(&th_xdr);
 
-    // Primary sees, per rule_id: identify's cr-fetch, fetch_signer_set's
-    // cr-fetch, fetch_signer_set's threshold-fetch — [cr, cr, th] x 2 rule_ids.
+    // Each endpoint sees, per rule_id, the observation's rule read and
+    // threshold read: [cr, th] x 2 rule_ids.
     let primary_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
@@ -107,9 +109,7 @@ async fn build_manager() -> (
                 KNOWN_WASM_HASH,
                 SequencedSimulate::new(vec![
                     sim_cr.clone(),
-                    sim_cr.clone(),
                     sim_th.clone(),
-                    sim_cr.clone(),
                     sim_cr.clone(),
                     sim_th.clone(),
                 ]),
@@ -119,7 +119,6 @@ async fn build_manager() -> (
         .mount(&primary_server)
         .await;
 
-    // Secondary only runs fetch_signer_set: [cr, th] x 2 rule_ids.
     let secondary_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))

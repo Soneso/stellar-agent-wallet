@@ -152,16 +152,14 @@ fn responses_2_of_2(policy: &stellar_xdr::ScAddress) -> (serde_json::Value, serd
 /// Constructs a **primary** mock server for a single sequential
 /// `verify_signer_set_against_chain` call on a 1-of-1 signer set.
 ///
-/// Per-call primary-server sequence:
-///   1. `simulateTransaction` — `get_context_rule` (`identify_threshold_policy`)
-///   2. `simulateTransaction` — `get_context_rule` (`fetch_signer_set` primary)
-///   3. `simulateTransaction` — `get_threshold`    (`fetch_signer_set` primary)
+/// Per-call primary-server sequence of the signer-set observation:
+///   1. `simulateTransaction`: `get_context_rule`
+///   2. `simulateTransaction`: `get_threshold` (after the policy's instance read)
 async fn build_primary_server_1_of_1(policy: &stellar_xdr::ScAddress) -> MockServer {
     let (sim_cr, sim_th) = responses_1_of_1(policy);
     let responses = vec![
-        sim_cr.clone(), // identify_threshold_policy
-        sim_cr.clone(), // fetch_signer_set get_context_rule
-        sim_th.clone(), // fetch_signer_set get_threshold
+        sim_cr.clone(), // get_context_rule
+        sim_th.clone(), // get_threshold
     ];
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -180,14 +178,14 @@ async fn build_primary_server_1_of_1(policy: &stellar_xdr::ScAddress) -> MockSer
 /// Constructs a **secondary** mock server for a single sequential
 /// `verify_signer_set_against_chain` call on a 1-of-1 signer set.
 ///
-/// Per-call secondary-server sequence:
-///   1. `simulateTransaction` — `get_context_rule` (`fetch_signer_set` secondary)
-///   2. `simulateTransaction` — `get_threshold`    (`fetch_signer_set` secondary)
+/// Per-call secondary-server sequence of the signer-set observation:
+///   1. `simulateTransaction`: `get_context_rule`
+///   2. `simulateTransaction`: `get_threshold` (after the policy's instance read)
 async fn build_secondary_server_1_of_1(policy: &stellar_xdr::ScAddress) -> MockServer {
     let (sim_cr, sim_th) = responses_1_of_1(policy);
     let responses = vec![
-        sim_cr.clone(), // fetch_signer_set get_context_rule
-        sim_th.clone(), // fetch_signer_set get_threshold
+        sim_cr.clone(), // get_context_rule
+        sim_th.clone(), // get_threshold
     ];
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -208,9 +206,8 @@ async fn build_secondary_server_1_of_1(policy: &stellar_xdr::ScAddress) -> MockS
 async fn build_primary_server_2_of_2(policy: &stellar_xdr::ScAddress) -> MockServer {
     let (sim_cr, sim_th) = responses_2_of_2(policy);
     let responses = vec![
-        sim_cr.clone(), // identify_threshold_policy
-        sim_cr.clone(), // fetch_signer_set get_context_rule
-        sim_th.clone(), // fetch_signer_set get_threshold
+        sim_cr.clone(), // get_context_rule
+        sim_th.clone(), // get_threshold
     ];
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -231,8 +228,8 @@ async fn build_primary_server_2_of_2(policy: &stellar_xdr::ScAddress) -> MockSer
 async fn build_secondary_server_2_of_2(policy: &stellar_xdr::ScAddress) -> MockServer {
     let (sim_cr, sim_th) = responses_2_of_2(policy);
     let responses = vec![
-        sim_cr.clone(), // fetch_signer_set get_context_rule
-        sim_th.clone(), // fetch_signer_set get_threshold
+        sim_cr.clone(), // get_context_rule
+        sim_th.clone(), // get_threshold
     ];
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -262,9 +259,8 @@ async fn build_traced_primary_server_1_of_1(
 ) -> MockServer {
     let (sim_cr, sim_th) = responses_1_of_1(policy);
     let responses = vec![
-        sim_cr.clone(), // identify_threshold_policy
-        sim_cr.clone(), // fetch_signer_set get_context_rule
-        sim_th.clone(), // fetch_signer_set get_threshold
+        sim_cr.clone(), // get_context_rule
+        sim_th.clone(), // get_threshold
     ];
     let responder = TracedCombinedRpcResponder::new(
         SOURCE_G,
@@ -291,8 +287,8 @@ async fn build_traced_secondary_server_1_of_1(
 ) -> MockServer {
     let (sim_cr, sim_th) = responses_1_of_1(policy);
     let responses = vec![
-        sim_cr.clone(), // fetch_signer_set get_context_rule
-        sim_th.clone(), // fetch_signer_set get_threshold
+        sim_cr.clone(), // get_context_rule
+        sim_th.clone(), // get_threshold
     ];
     let responder = TracedCombinedRpcResponder::new(
         SOURCE_G,
@@ -466,15 +462,15 @@ async fn a1_a2_callers_serialise_behind_per_rule_mutex() {
     );
 
     // Inspect the trace for non-interleaving.
-    // Each caller issues 5 simulate calls total (3 primary + 2 secondary).
-    // Under serialisation: all 5 ticks for one caller are strictly less than
-    // all 5 ticks for the other caller.  Interleaving would mix the two caller_ids
+    // Each caller issues 4 simulate calls total (2 primary + 2 secondary).
+    // Under serialisation: all 4 ticks for one caller are strictly less than
+    // all 4 ticks for the other caller.  Interleaving would mix the two caller_ids
     // within the sorted-by-tick prefix.
     let trace_snapshot = trace.lock().expect("trace lock must not be poisoned");
     assert_eq!(
         trace_snapshot.len(),
-        10,
-        "expected 10 simulate calls total (5 per caller); got {}",
+        8,
+        "expected 8 simulate calls total (4 per caller); got {}",
         trace_snapshot.len()
     );
 
@@ -482,23 +478,23 @@ async fn a1_a2_callers_serialise_behind_per_rule_mutex() {
     let mut by_tick = trace_snapshot.clone();
     by_tick.sort_unstable_by_key(|&(_, tick)| tick);
 
-    // The first 5 entries in tick order must all belong to one caller;
-    // the last 5 must all belong to the other caller.
+    // The first 4 entries in tick order must all belong to one caller;
+    // the last 4 must all belong to the other caller.
     let first_half_ids: std::collections::HashSet<u8> =
-        by_tick[..5].iter().map(|&(id, _)| id).collect();
+        by_tick[..4].iter().map(|&(id, _)| id).collect();
     let second_half_ids: std::collections::HashSet<u8> =
-        by_tick[5..].iter().map(|&(id, _)| id).collect();
+        by_tick[4..].iter().map(|&(id, _)| id).collect();
 
     assert_eq!(
         first_half_ids.len(),
         1,
-        "first 5 simulate calls (by tick) must all belong to one caller; \
+        "first 4 simulate calls (by tick) must all belong to one caller; \
          got caller_ids: {first_half_ids:?} — callers interleaved inside the mutex"
     );
     assert_eq!(
         second_half_ids.len(),
         1,
-        "last 5 simulate calls (by tick) must all belong to one caller; \
+        "last 4 simulate calls (by tick) must all belong to one caller; \
          got caller_ids: {second_half_ids:?} — callers interleaved inside the mutex"
     );
 
@@ -811,8 +807,8 @@ async fn a1_multi_threaded_both_callers_serialise_and_succeed() {
     let trace_snapshot = trace.lock().expect("trace lock must not be poisoned");
     assert_eq!(
         trace_snapshot.len(),
-        10,
-        "expected 10 simulate calls total (5 per caller); got {}",
+        8,
+        "expected 8 simulate calls total (4 per caller); got {}",
         trace_snapshot.len()
     );
 
@@ -820,20 +816,20 @@ async fn a1_multi_threaded_both_callers_serialise_and_succeed() {
     by_tick.sort_unstable_by_key(|&(_, tick)| tick);
 
     let first_half_ids: std::collections::HashSet<u8> =
-        by_tick[..5].iter().map(|&(id, _)| id).collect();
+        by_tick[..4].iter().map(|&(id, _)| id).collect();
     let second_half_ids: std::collections::HashSet<u8> =
-        by_tick[5..].iter().map(|&(id, _)| id).collect();
+        by_tick[4..].iter().map(|&(id, _)| id).collect();
 
     assert_eq!(
         first_half_ids.len(),
         1,
-        "multi-thread: first 5 simulate calls must all belong to one caller; \
+        "multi-thread: first 4 simulate calls must all belong to one caller; \
          got: {first_half_ids:?}"
     );
     assert_eq!(
         second_half_ids.len(),
         1,
-        "multi-thread: last 5 simulate calls must all belong to one caller; \
+        "multi-thread: last 4 simulate calls must all belong to one caller; \
          got: {second_half_ids:?}"
     );
     assert_ne!(

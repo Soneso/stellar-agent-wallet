@@ -1,13 +1,14 @@
 //! Adversarial fixture: threshold policy identification — RPC hash disagreement.
 //!
 //! Scenario: primary and secondary RPCs return different wasm hashes for the same
-//! policy contract during `identify_threshold_policy`. Both hashes are individually
-//! in the allowlist, but the two RPCs disagree on which hash is current →
+//! policy contract during the signer-set observation's executable read of the
+//! policy. The two RPCs disagree on which hash is current →
 //! `NetworkRpcDivergence`.
 //!
-//! This validates that the two-RPC agreement check in `identify_threshold_policy`
-//! fires even within the policy-identification step — before the signer-set
-//! comparison — when the policy contract's wasm hash is inconsistent.
+//! This validates that the two-RPC agreement check of the policy's executable
+//! fires within the policy-identification step, before any threshold read and
+//! before the signer-set comparison, when the policy contract's wasm hash is
+//! inconsistent.
 
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ use super::rpc_mock_helpers::{
 
 /// Primary returns `KNOWN_WASM_HASH` for the policy; secondary returns `UNKNOWN_WASM_HASH`.
 ///
-/// The two-RPC agreement check in `identify_threshold_policy` detects the hash
+/// The two-RPC agreement check of the policy's executable detects the hash
 /// disagreement and returns `NetworkRpcDivergence` before performing any signer-set
 /// comparison.
 #[tokio::test]
@@ -51,9 +52,9 @@ async fn policy_hash_rpc_disagreement_returns_rpc_divergence() {
     let primary_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
-        // Primary only handles: getLedgerEntries (account), simulateTransaction (get_context_rule),
+        // Primary handles: getLedgerEntries (account), simulateTransaction (get_context_rule),
         // getLedgerEntries (contract instance → KNOWN_WASM_HASH).
-        // No simulateTransaction calls after the wasm-hash divergence fires.
+        // No threshold read follows the wasm-hash divergence.
         .respond_with(CombinedRpcResponder::new(
             SOURCE_G,
             &policy,
@@ -71,8 +72,8 @@ async fn policy_hash_rpc_disagreement_returns_rpc_divergence() {
             SOURCE_G,
             &policy,
             UNKNOWN_WASM_HASH,
-            // Secondary's simulateTransaction is NOT called (divergence fires in getLedgerEntries).
-            // We still need at least one response in the sequence.
+            // The secondary reads the rule once (get_context_rule), then the
+            // policy's instance; no threshold read follows the divergence.
             SequencedSimulate::new(vec![sim_cr.clone()]),
         ))
         .mount(&secondary_server)

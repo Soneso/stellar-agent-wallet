@@ -86,6 +86,7 @@ use stellar_agent_smart_account::managers::rules::{
     parse_g_strkey_to_signer_address,
 };
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
+use stellar_agent_smart_account::signers::SignerSetView;
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_agent_smart_account::submit::{PinCheck, SubmitInvokeArgs, submit_signed_invoke};
 use stellar_agent_smart_account::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
@@ -156,6 +157,14 @@ fn first8_hex(hash: &[u8; 32]) -> String {
 }
 
 /// Reads every audit entry `log_path` holds.
+/// The simple-threshold value a signer-set view records, if any.
+fn view_threshold(view: &SignerSetView) -> Option<u32> {
+    match view {
+        SignerSetView::V1(state) => Some(state.threshold),
+        SignerSetView::V2(snapshot) => snapshot.threshold.as_ref().map(|t| t.threshold),
+    }
+}
+
 fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
     use std::io::BufRead as _;
     let file = std::fs::File::open(log_path).expect("audit log must be readable");
@@ -760,6 +769,9 @@ async fn fetch_rule_decoded(smart_account_addr: &ScAddress, rule_id: u32) -> Dec
                 external_ids.push(signer_id);
                 external.push(decoded_signer);
             }
+            _ => panic!(
+                "rule {rule_id} signer id {signer_id} is neither an account delegate nor External"
+            ),
         }
     }
 
@@ -1002,7 +1014,7 @@ async fn d1_migrate_verifier_dry_run_constructs_plan_without_submitting() {
 ///
 /// Deploys a fresh smart account, then installs a new context rule (rule_id=1)
 /// with one `External` signer pointing to a freshly-deployed OZ WebAuthn verifier
-/// contract and a threshold-policy (required for `refresh_signer_baseline`).
+/// contract and a threshold-policy, so the baseline records a threshold.
 /// Calls `MigrationPlanner::build` with
 /// `from_hash = OZ_WEBAUTHN_VERIFIER_HASH` and asserts that the planner detects
 /// the new rule as having one affected External signer.
@@ -1014,8 +1026,8 @@ async fn d1_migrate_verifier_dry_run_constructs_plan_without_submitting() {
 ///
 /// 1. Deploy fresh smart account with bootstrap signer S1.
 /// 2. Fund and deploy OZ WebAuthn verifier (this becomes the External verifier address).
-/// 3. Deploy threshold-policy WASM (required so `refresh_signer_baseline` can route
-///    through `identify_threshold_policy`).
+/// 3. Deploy threshold-policy WASM, so the rule's baseline records a
+///    threshold.
 /// 4. Install a new context rule via `ContextRuleManager::install_rule` with:
 ///    - One `ContextRuleSignerInput::External { verifier: verifier_addr, pubkey_data }`.
 ///    - One `ContextRulePolicy` with the threshold-policy contract.
@@ -1110,10 +1122,10 @@ async fn d2_migrate_verifier_dry_run_identifies_one_external_signer() {
 
     // ── 3. Deploy threshold-policy WASM ──────────────────────────────────────
     //
-    // Required so `refresh_signer_baseline` and `verify_signer_set_against_chain`
-    // can route threshold reading through `identify_threshold_policy`.
-    // The bootstrap rule (rule_id=0) has no threshold-policy;
-    // the new rule installed in step 4 uses the threshold-policy explicitly.
+    // The signer-set observation reads the threshold from this policy, so the
+    // baseline records it. The bootstrap rule (rule_id=0) has no
+    // threshold-policy; the new rule installed in step 4 uses the
+    // threshold-policy explicitly.
 
     let (tp_deployer_g, tp_deployer_signer) = fresh_signer();
     fund_via_friendbot(&tp_deployer_g).await;
@@ -1184,10 +1196,9 @@ async fn d2_migrate_verifier_dry_run_identifies_one_external_signer() {
 
     // ── 5. Build SignersManager + establish baseline for new rule ────────────
     //
-    // `refresh_signer_baseline` requires a threshold-policy in the rule's
-    // `policies` list.  The new rule has the threshold-policy installed, so
-    // this call succeeds.  The bootstrap rule (rule_id=0) is NOT used here
-    // because it has no threshold-policy.
+    // The new rule has the threshold-policy installed, so the baseline records
+    // its threshold. The bootstrap rule (rule_id=0) is NOT used here because
+    // it has no threshold-policy.
 
     let tmp_dir = tempfile::tempdir().expect("tempdir");
     let audit_log_path = tmp_dir.path().join("audit.jsonl");
@@ -1212,25 +1223,28 @@ async fn d2_migrate_verifier_dry_run_identifies_one_external_signer() {
             smart_account_addr.clone(),
             new_rule_id,
             Some(&signer_g),
+            false,
             baseline_rid,
         )
         .await
         .expect("refresh_signer_baseline must succeed on newly installed rule");
 
     eprintln!(
-        "baseline established — signer_count={}, threshold={}",
-        baseline.signer_count, baseline.threshold
+        "baseline established: {}, previous {:?}",
+        baseline.view, baseline.previous_baseline
     );
 
     assert_eq!(
-        baseline.signer_count, 2,
+        baseline.view.signer_count(),
+        2,
         "new rule must have signer_count=2 (Delegated co-signer + External); got {}",
-        baseline.signer_count
+        baseline.view
     );
     assert_eq!(
-        baseline.threshold, 1,
+        view_threshold(&baseline.view),
+        Some(1),
         "new rule must have threshold=1 (1-of-2); got {}",
-        baseline.threshold
+        baseline.view
     );
 
     // ── 6. Execute the dry-run plan ───────────────────────────────────────────
@@ -1351,8 +1365,8 @@ async fn d2_migrate_verifier_dry_run_identifies_one_external_signer() {
 /// 1. Deploy fresh smart account with bootstrap signer S1.
 /// 2. Deploy verifier-A (OZ WebAuthn v0.7.2, first deployer).
 /// 3. Deploy verifier-B (OZ WebAuthn v0.7.2, second deployer — different address).
-/// 4. Deploy threshold-policy WASM (required so `refresh_signer_baseline` routes
-///    through `identify_threshold_policy`).
+/// 4. Deploy threshold-policy WASM, so the rule's baseline records a
+///    threshold.
 /// 5. Install a context rule with one External signer pointing to verifier-A.
 /// 6. Establish baseline via `SignersManager::refresh_signer_baseline`.
 /// 7. Build migration plan via `MigrationPlanner::build`.
@@ -1633,25 +1647,28 @@ async fn d3_migrate_verifier_on_chain_submit() {
             smart_account_addr.clone(),
             new_rule_id,
             Some(&signer_g),
+            false,
             baseline_rid,
         )
         .await
         .expect("refresh_signer_baseline must succeed");
 
     eprintln!(
-        "baseline established — signer_count={}, threshold={}",
-        baseline.signer_count, baseline.threshold
+        "baseline established: {}, previous {:?}",
+        baseline.view, baseline.previous_baseline
     );
 
     assert_eq!(
-        baseline.signer_count, 2,
+        baseline.view.signer_count(),
+        2,
         "new rule must have signer_count=2 (Delegated co-signer + External); got {}",
-        baseline.signer_count
+        baseline.view
     );
     assert_eq!(
-        baseline.threshold, 1,
+        view_threshold(&baseline.view),
+        Some(1),
         "new rule must have threshold=1 (1-of-2); got {}",
-        baseline.threshold
+        baseline.view
     );
 
     // ── 7. Build migration plan ───────────────────────────────────────────────
@@ -1791,30 +1808,36 @@ async fn d3_migrate_verifier_on_chain_submit() {
     // the wrong signer; real tx hashes only prove confirmation, not signer-set
     // correctness.
     let post_baseline_rid = uuid::Uuid::new_v4().to_string();
+    // The migration replaced the External signer on chain; this refresh
+    // exists to accept and inspect that intended change, so it passes
+    // `accept_divergence`.
     let post_baseline = manager
         .refresh_signer_baseline(
             smart_account_addr.clone(),
             new_rule_id,
             Some(&signer_g),
+            true,
             post_baseline_rid,
         )
         .await
         .expect("post-submit refresh_signer_baseline must succeed");
 
     assert_eq!(
-        post_baseline.signer_count, 2,
+        post_baseline.view.signer_count(),
+        2,
         "post-migration signer_count must remain 2 (Delegated invariant + new External); got {}",
-        post_baseline.signer_count
+        post_baseline.view
     );
     assert_eq!(
-        post_baseline.threshold, 1,
+        view_threshold(&post_baseline.view),
+        Some(1),
         "post-migration threshold must remain 1; got {}",
-        post_baseline.threshold
+        post_baseline.view
     );
 
     eprintln!(
-        "post-migration baseline — signer_count={}, threshold={}",
-        post_baseline.signer_count, post_baseline.threshold,
+        "post-migration baseline: {}, previous {:?}",
+        post_baseline.view, post_baseline.previous_baseline,
     );
 
     // Assertion 4: audit log contains exactly 1 SaVerifierMigrated row.
@@ -1837,7 +1860,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
             .collect();
 
         // Count SaVerifierMigrated rows.
-        // `refresh_signer_baseline` emits SaSignerSetBaselined, not SaVerifierMigrated.
+        // `refresh_signer_baseline` emits SaSignerSetBaselinedV2, not SaVerifierMigrated.
         // Only the submit step (one per successful signer-step pair) emits SaVerifierMigrated.
         let migrated_rows: Vec<&serde_json::Value> = entries
             .iter()
@@ -1927,9 +1950,9 @@ async fn d3_migrate_verifier_on_chain_submit() {
             key_data,
             ..
         } => (verifier_strkey.as_str(), key_data.as_slice()),
-        DecodedOnChainSigner::Delegated { .. } => panic!(
+        _ => panic!(
             "external_signers[0] must be External variant; \
-             got Delegated — signer-set decode routing bug"
+             got another variant: signer-set decode routing bug"
         ),
     };
 

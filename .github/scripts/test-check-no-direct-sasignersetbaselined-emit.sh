@@ -102,10 +102,16 @@ echo "repository tree: $(cat "$TMP/tree.out")"
 reset_ws
 expect_pass "unmodified copy"
 
-# (a) A second constructor call in another production function.
+# (a) A version-1 constructor call in a production function.
 inject "$SIGNERS" '^    async fn fetch_context_rule_primary[(]' \
   '        let _row = AuditEntry::new_sa_signer_set_baselined(rule_id);'
 expect_fail "extra constructor call" "FAIL (a):" "(in fn fetch_context_rule_primary)"
+
+# (a) A second version-2 constructor call inside fn emit_baseline.
+reset_ws
+inject "$SIGNERS" '^    fn emit_baseline[(]' \
+  '        let _row = AuditEntry::new_sa_signer_set_baselined_v2(rule_id);'
+expect_fail "second version-2 constructor call" "FAIL (a):" "found 2"
 
 # (a) A version-2 constructor call outside fn emit_baseline.
 reset_ws
@@ -115,9 +121,9 @@ expect_fail "version-2 constructor call" "FAIL (a):" "(in fn fetch_context_rule_
 
 # (b) An emit_baseline call in another function.
 reset_ws
-inject "$SIGNERS" '^    async fn fetch_signer_set[(]' \
+inject "$SIGNERS" '^    async fn fetch_context_rule_primary[(]' \
   '        self.emit_baseline(&observed, rule_id, &redacted, reason, &request_id);'
-expect_fail "extra emit_baseline call" "FAIL (b):" "(in fn fetch_signer_set)"
+expect_fail "extra emit_baseline call" "FAIL (b):" "(in fn fetch_context_rule_primary)"
 
 # (c) A struct-literal construction in another module.
 reset_ws
@@ -234,15 +240,15 @@ expect_fail "import through EventKind" "FAIL (e):" \
 
 # (d) A BaselineReason constructor call in another function.
 reset_ws
-inject "$SIGNERS" '^    async fn fetch_signer_set[(]' \
+inject "$SIGNERS" '^    async fn fetch_context_rule_primary[(]' \
   '        let _reason = BaselineReason::first_observation();'
-expect_fail "BaselineReason call" "FAIL (d):" "(in fn fetch_signer_set)"
+expect_fail "BaselineReason call" "FAIL (d):" "(in fn fetch_context_rule_primary)"
 
 # (d) The confirmed-install constructor in another function.
 reset_ws
-inject "$SIGNERS" '^    async fn fetch_signer_set[(]' \
+inject "$SIGNERS" '^    async fn fetch_context_rule_primary[(]' \
   '        let _reason = BaselineReason::confirmed_install();'
-expect_fail "confirmed_install call" "FAIL (d):" "(in fn fetch_signer_set)"
+expect_fail "confirmed_install call" "FAIL (d):" "(in fn fetch_context_rule_primary)"
 
 # (d) A `const fn` and an `extern "C" fn` are functions of their own: a call
 # inside one placed within `list_signers` is not attributed to it.

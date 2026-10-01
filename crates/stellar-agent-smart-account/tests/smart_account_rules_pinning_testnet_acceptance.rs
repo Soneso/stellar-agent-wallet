@@ -888,7 +888,7 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
     // `verify_signer_set_against_chain` in the signing pre-flight requires a
     // baselined row in the audit log.  Call `refresh_signer_baseline` so the
     // signer-set check passes before the drift check fires.
-    sm.refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), rid())
+    sm.refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
         .await
         .expect("refresh_signer_baseline must succeed");
 
@@ -1188,7 +1188,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
 
     // ── Baseline the signer set ───────────────────────────────────────────────
 
-    sm.refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), rid())
+    sm.refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
         .await
         .expect("refresh_signer_baseline must succeed");
 
@@ -1460,7 +1460,7 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
     // baselined row in the audit log.  Establishing the baseline ensures that
     // the signer-set check passes, leaving the drift-detection path as the
     // first point of failure.
-    sm.refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), rid())
+    sm.refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
         .await
         .expect("refresh_signer_baseline must succeed");
 

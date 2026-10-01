@@ -5,9 +5,11 @@
 # A signer-set baseline is the anchor of divergence detection, so only
 # `SignersManager::list_signers` (first observation) and
 # `SignersManager::refresh_signer_baseline` (explicit re-anchor) may write one,
-# both through `SignersManager::emit_baseline`. The constructors involved are
-# `pub` across crates, and `AuditEntry::event_kind` is a `pub` field, so Rust
-# visibility cannot enforce this; this gate does.
+# both through `SignersManager::emit_baseline`, the only builder of a
+# `SaSignerSetBaselinedV2` row. No production code builds a version-1
+# `SaSignerSetBaselined` row. The constructors involved are `pub` across
+# crates, and `AuditEntry::event_kind` is a `pub` field, so Rust visibility
+# cannot enforce this; this gate does.
 #
 # Scope: every `*.rs` file under a `src/` directory of `crates/`, run from the
 # repository root. The production text of a file is the text before its test
@@ -23,10 +25,9 @@
 #
 # Assertions (each failure prints one line naming the offending file:line and
 # exits 1):
-#   (a) exactly one call `new_sa_signer_set_baselined(`, inside `fn
-#       emit_baseline` of the signers manager, and every call
-#       `new_sa_signer_set_baselined_v2(` inside that same function (none is
-#       also accepted);
+#   (a) no call `new_sa_signer_set_baselined(` (the version-1 constructor),
+#       and exactly one call `new_sa_signer_set_baselined_v2(`, inside
+#       `fn emit_baseline` of the signers manager;
 #   (b) exactly two calls `emit_baseline(`, one inside `fn list_signers` and
 #       one inside `fn refresh_signer_baseline` of the signers manager;
 #   (c) no construction `SaSignerSetBaselined { .. }` or
@@ -158,9 +159,9 @@ function verdict(text, rest) {
 
 BEGIN {
   files = 0
-  na = 0; nb = 0
+  na = 0; na2 = 0; nb = 0
   a_bad = ""; a2_bad = ""; b_bad = ""; c_bad = ""; c_variant = ""; d_bad = ""; e_bad = ""
-  a_locs = ""; b_locs = ""
+  a_locs = ""; a2_locs = ""; b_locs = ""
   b_list = 0; b_refresh = 0
   while ((getline f < list) > 0) {
     files++
@@ -184,12 +185,13 @@ BEGIN {
 
       if (def == "" && line ~ /new_sa_signer_set_baselined[(]/) {
         na++
-        a_locs = a_locs (a_locs == "" ? "" : ", ") f ":" i
-        if (a_bad == "" && !(f == signers && cur == "emit_baseline")) a_bad = loc(f, i, cur)
+        if (a_bad == "") a_bad = loc(f, i, cur)
       }
 
-      if (def == "" && a2_bad == "" && line ~ /new_sa_signer_set_baselined_v2[(]/) {
-        if (!(f == signers && cur == "emit_baseline")) a2_bad = loc(f, i, cur)
+      if (def == "" && line ~ /new_sa_signer_set_baselined_v2[(]/) {
+        na2++
+        a2_locs = a2_locs (a2_locs == "" ? "" : ", ") f ":" i
+        if (a2_bad == "" && !(f == signers && cur == "emit_baseline")) a2_bad = loc(f, i, cur)
       }
 
       if (def == "" && line ~ /emit_baseline[(]/) {
@@ -257,15 +259,15 @@ BEGIN {
   close(list)
 
   if (a_bad != "") {
-    print "FAIL (a): new_sa_signer_set_baselined( is called outside fn emit_baseline of " signers " at " a_bad
+    print "FAIL (a): the version-1 constructor new_sa_signer_set_baselined( is called at " a_bad
     exit 1
   }
   if (a2_bad != "") {
     print "FAIL (a): new_sa_signer_set_baselined_v2( is called outside fn emit_baseline of " signers " at " a2_bad
     exit 1
   }
-  if (na != 1) {
-    print "FAIL (a): expected exactly one new_sa_signer_set_baselined( call, found " na (na ? " at " a_locs : "")
+  if (na2 != 1) {
+    print "FAIL (a): expected exactly one new_sa_signer_set_baselined_v2( call, found " na2 (na2 ? " at " a2_locs : "")
     exit 1
   }
   if (b_bad != "") {
@@ -288,6 +290,6 @@ BEGIN {
     print "FAIL (e): a use statement imports through EventKind:: or renames EventKind outside " entry " and " schema " at " e_bad
     exit 1
   }
-  print name ": ok (" files " files; SaSignerSetBaselined and SaSignerSetBaselinedV2 are written only through emit_baseline from list_signers and refresh_signer_baseline)"
+  print name ": ok (" files " files; SaSignerSetBaselinedV2 is built only in emit_baseline, reached from list_signers and refresh_signer_baseline; no version-1 baseline constructor call exists in production code)"
 }
 '

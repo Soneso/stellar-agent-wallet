@@ -24,18 +24,19 @@
 //!   [`SaError::SignerSetMissingBaseline`].  After `refresh_signer_baseline`,
 //!   the subsequent `verify` returns `Ok`.
 //!
-//! - **Threshold-read fail-closed**.  `list_signers` and
-//!   `refresh_signer_baseline` return [`SaError::ThresholdPolicyNotInstalled`]
-//!   when the rule has no threshold-policy installed (empty `policies` list),
-//!   asserting that threshold reading routes through
-//!   `identify_threshold_policy`, not a silent `signers.len()` proxy.
+//! - **Policyless rule**.  `list_signers` and `refresh_signer_baseline`
+//!   record a version-2 baseline with no threshold for a rule with no
+//!   threshold-policy installed (empty `policies` list); no threshold is
+//!   inferred from the signer count.
 //!
 //! - **External signer add**. A
 //!   `Signer::External(verifier, key_data)` is added to an existing 1-of-1
 //!   rule via `add_signer`. Verifies that:
 //!   (a) the returned `new_signer_id` is valid (not-zero or consistently assigned),
-//!   (b) `list_signers` shows `signer_count = 2` after the add,
-//!   (c) a `SaSignerAdded` audit row is emitted.
+//!   (b) `list_signers` shows `signer_count = 2` after the add and matches the
+//!   recorded state,
+//!   (c) a `SaSignerAddedV2` audit row carries the full identity of the added
+//!   signer.
 //!
 //! - **WebAuthn signer add**. A
 //!   `Signer::External(webauthn_verifier, pubkey_65 || credential_id)` is added to
@@ -68,7 +69,9 @@ use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::signer_set::{BaselineReason, ObservedSignerSet, SignerPubkey};
+use stellar_agent_core::audit_log::signer_set::{
+    BaselineReason, ObservedSignerSet, SignerIdentityV2, SignerPubkey, SignerSetView,
+};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
@@ -88,7 +91,7 @@ use stellar_agent_smart_account::managers::rules::{
     ContextRuleSignerInput, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
 use stellar_agent_smart_account::managers::signers::{
-    SignersManager, SignersManagerConfig, build_external_signer_scval,
+    PreviousBaseline, SignersManager, SignersManagerConfig, build_external_signer_scval,
 };
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
@@ -121,6 +124,22 @@ const TIMEOUT_SECS: u64 = 120;
 /// Generates a fresh request-id for audit-log forensic correlation.
 fn rid() -> String {
     Uuid::new_v4().to_string()
+}
+
+/// The simple-threshold value a signer-set view records, if any.
+fn view_threshold(view: &SignerSetView) -> Option<u32> {
+    match view {
+        SignerSetView::V1(state) => Some(state.threshold),
+        SignerSetView::V2(snapshot) => snapshot.threshold.as_ref().map(|t| t.threshold),
+    }
+}
+
+/// The signer ids a signer-set view records.
+fn view_signer_ids(view: &SignerSetView) -> Vec<u32> {
+    match view {
+        SignerSetView::V1(state) => state.signer_ids.clone(),
+        SignerSetView::V2(snapshot) => snapshot.signers.iter().map(|e| e.id).collect(),
+    }
 }
 
 /// Generates a fresh ed25519 keypair and returns `(g_strkey, boxed_signer)`.
@@ -493,11 +512,9 @@ fn encode_simple_threshold_params(threshold: u32) -> ScVal {
 /// Installs a 1-of-1 threshold-policy rule on a freshly-deployed smart account.
 ///
 /// `deploy_fresh_smart_account` creates the bootstrap rule (rule_id=0) with no
-/// threshold-policy in `policies`.  That bootstrap rule cannot be used by tests
-/// that call `list_signers`, `refresh_signer_baseline`, or
-/// `verify_signer_set_against_chain`, because those entry-points route through
-/// `identify_threshold_policy` and fail closed with `ThresholdPolicyNotInstalled`
-/// when `policies` is empty.
+/// threshold-policy in `policies`, so its baseline records no threshold. Tests
+/// that exercise the threshold (the threshold invariant, `set_threshold`, a
+/// threshold divergence) need a rule with a simple-threshold policy.
 ///
 /// This helper:
 /// 1. Deploys the vendored OZ threshold-policy WASM to testnet.
@@ -509,9 +526,8 @@ fn encode_simple_threshold_params(threshold: u32) -> ScVal {
 ///
 /// # Bootstrap rule (rule_id=0)
 ///
-/// Rule_id=0 retains its empty `policies` list and is intentionally tested only
-/// by `b5_threshold_read_routes_through_identify_threshold_policy`, which
-/// verifies the fail-closed `ThresholdPolicyNotInstalled` behaviour.
+/// Rule_id=0 retains its empty `policies` list and is exercised by
+/// `b5_a_policyless_rule_baselines_without_a_threshold`.
 async fn install_threshold_policy_on_fresh_sa(
     sa_addr: stellar_xdr::ScAddress,
     signer_g: &str,
@@ -565,9 +581,8 @@ async fn install_threshold_policy_on_fresh_sa(
 /// Missing-baseline path returns `sa.signer_set_missing_baseline`
 /// (NOT `sa.signer_set_diverged`).
 ///
-/// Setup: installs a 1-of-1 rule with the threshold-policy in `policies` so that
-/// `verify_signer_set_against_chain` / `refresh_signer_baseline` can route through
-/// `identify_threshold_policy` (bootstrap rule_id=0 has no policy).
+/// Setup: installs a 1-of-1 rule with the threshold-policy in `policies`, so the
+/// baseline records a threshold (bootstrap rule_id=0 has no policy).
 #[tokio::test]
 async fn b4_fresh_wallet_missing_baseline_then_refresh_then_verify_ok() {
     let (signer_g, signer_box) = fresh_signer();
@@ -594,20 +609,23 @@ async fn b4_fresh_wallet_missing_baseline_then_refresh_then_verify_ok() {
         "empty audit log must return SignerSetMissingBaseline; got: {missing:?}"
     );
 
-    // refresh_signer_baseline writes the SaSignerSetBaselined row.
+    // refresh_signer_baseline writes the SaSignerSetBaselinedV2 row.
     let observed = mgr
-        .refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), rid())
+        .refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
         .await
         .expect("refresh_signer_baseline must succeed");
+    assert_eq!(observed.previous_baseline, PreviousBaseline::None);
     assert_eq!(
-        observed.signer_count, 1,
+        observed.view.signer_count(),
+        1,
         "installed rule must have signer_count=1; got {}",
-        observed.signer_count
+        observed.view
     );
     assert_eq!(
-        observed.threshold, 1,
+        view_threshold(&observed.view),
+        Some(1),
         "installed rule must have threshold=1; got {}",
-        observed.threshold
+        observed.view
     );
 
     // Verify after refresh → Ok (on-chain matches baseline).
@@ -617,16 +635,20 @@ async fn b4_fresh_wallet_missing_baseline_then_refresh_then_verify_ok() {
         .expect("verify after refresh must succeed");
 
     assert_eq!(
-        frozen.observed_chain_state().signer_count,
+        frozen.observed_chain_state().signer_count(),
         1,
         "frozen tuple must report signer_count=1; got {}",
-        frozen.observed_chain_state().signer_count
+        frozen.observed_chain_state()
     );
     assert_eq!(
-        frozen.observed_chain_state().threshold,
-        1,
+        view_threshold(frozen.observed_chain_state()),
+        Some(1),
         "frozen tuple must report threshold=1; got {}",
-        frozen.observed_chain_state().threshold
+        frozen.observed_chain_state()
+    );
+    assert!(
+        frozen.simulation_ledger().0 > 0,
+        "the frozen tuple carries the observation's ledger"
     );
 }
 
@@ -640,8 +662,8 @@ async fn b4_fresh_wallet_missing_baseline_then_refresh_then_verify_ok() {
 /// signer_count < threshold.
 ///
 /// Setup: installs a 1-of-1 rule with threshold-policy (bootstrap rule_id=0 has
-/// no policies; `remove_signer` reads threshold via `identify_threshold_policy`
-/// before the pre-flight invariant check).
+/// no policies; `remove_signer` checks the invariant against the threshold the
+/// signer-set observation reads).
 /// The post-op state after removing the sole signer would be (0, 1) which
 /// violates the invariant `threshold <= signer_count`.
 ///
@@ -657,8 +679,8 @@ async fn b1_threshold_brick_refusal() {
         parse_c_strkey_to_smart_account(&sa_strkey).expect("deployed C-strkey must parse");
 
     // Install a 1-of-1 rule with the threshold-policy (bootstrap rule_id=0 has no
-    // policies; `remove_signer` reads threshold via `identify_threshold_policy`
-    // before the invariant check).
+    // policies; `remove_signer` checks the invariant against the observed
+    // threshold).
     let (rule_id, _policy_strkey) =
         install_threshold_policy_on_fresh_sa(sa_addr.clone(), &signer_g, signer_box.as_ref()).await;
 
@@ -670,7 +692,7 @@ async fn b1_threshold_brick_refusal() {
     let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path);
 
     // Establish baseline so the pre-flight invariant check can read signer_count + threshold.
-    mgr.refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), rid())
+    mgr.refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
         .await
         .expect("refresh_signer_baseline must succeed");
 
@@ -786,8 +808,8 @@ async fn b1_threshold_brick_refusal() {
 /// bootstrap rule has `(signer_count=1, threshold=1)`.
 ///
 /// Setup: installs a 1-of-1 rule with the threshold-policy (bootstrap rule_id=0
-/// has no policies; `verify_signer_set_against_chain` routes threshold reading
-/// through `identify_threshold_policy`).
+/// has no policies). The injected row is version 1, so the check compares the
+/// observation's version-1 projection with it.
 #[tokio::test]
 async fn b3_divergence_detection_via_injected_baseline() {
     let (signer_g, signer_box) = fresh_signer();
@@ -910,14 +932,16 @@ async fn b3_divergence_detection_via_injected_baseline() {
 
                 // d. Divergence semantics: injected baseline had threshold=2, on-chain=1.
                 assert_eq!(
-                    *expected_threshold, 2,
+                    *expected_threshold,
+                    Some(2),
                     "expected_threshold must be 2 (from injected baseline); \
-                     got: {expected_threshold}"
+                     got: {expected_threshold:?}"
                 );
                 assert_eq!(
-                    *observed_threshold, 1,
+                    *observed_threshold,
+                    Some(1),
                     "observed_threshold must be 1 (on-chain bootstrap rule); \
-                     got: {observed_threshold}"
+                     got: {observed_threshold:?}"
                 );
 
                 found_diverged_row = true;
@@ -1031,10 +1055,14 @@ async fn b7_add_external_signer_to_existing_rule() {
 
     // Establish audit-log baseline.
     let baseline = mgr
-        .refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), rid())
+        .refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
         .await
         .expect("refresh_signer_baseline must succeed");
-    assert_eq!(baseline.signer_count, 1, "initial signer_count must be 1");
+    assert_eq!(
+        baseline.view.signer_count(),
+        1,
+        "initial signer_count must be 1"
+    );
 
     // Build an External signer ScVal using the deployed WebAuthn verifier address.
     //
@@ -1065,18 +1093,12 @@ async fn b7_add_external_signer_to_existing_rule() {
     let external_scval = build_external_signer_scval(verifier_sc_addr, &key_data)
         .expect("build_external_signer_scval must succeed");
 
-    let external_pubkey = SignerPubkey::External {
-        verifier_contract: verifier_strkey.clone(),
-        key_data_first16: key_data[..16].try_into().expect("16 bytes"),
-    };
-
     // add_signer with External ScVal.
     let new_signer_id = mgr
         .add_signer(
             sa_addr.clone(),
             rule_id,
             external_scval,
-            external_pubkey,
             signer_box.as_ref(),
             rid(),
             false, // accept_mutable_verifier
@@ -1092,27 +1114,35 @@ async fn b7_add_external_signer_to_existing_rule() {
         .expect("list_signers post-add must succeed");
 
     assert_eq!(
-        post_add.signer_count, 2,
-        "signer_count must be 2 after adding External signer; got {}",
-        post_add.signer_count
+        post_add.baseline,
+        PreviousBaseline::Matched,
+        "the add recorded the confirmed set, which the chain matches"
     );
+    let post_add_ids = view_signer_ids(&post_add.view);
     assert_eq!(
-        post_add.signer_ids.len(),
+        post_add_ids.len(),
         2,
-        "signer_ids length must be 2; got {}",
-        post_add.signer_ids.len()
+        "signer_count must be 2 after adding External signer; got {}",
+        post_add.view
     );
     assert!(
-        post_add.signer_ids.contains(&new_signer_id),
+        post_add_ids.contains(&new_signer_id),
         "new_signer_id={new_signer_id} must appear in signer_ids"
     );
 
-    // SaSignerAdded audit row must be emitted.
+    // SaSignerAddedV2 audit row must be emitted.
     //
-    // SaSignerAdded carries `signer_id` (the assigned on-chain ID) and
-    // `resulting_signer_pubkeys`. We verify `signer_id == new_signer_id` and
-    // that at least one pubkey in `resulting_signer_pubkeys` is an External variant
-    // (the added signer).
+    // SaSignerAddedV2 carries `signer_id` (the assigned on-chain ID) and the
+    // resulting `snapshot`. We verify `signer_id == new_signer_id` and that the
+    // snapshot holds the added signer's full identity under that id.
+    let verifier_id = stellar_strkey::Contract::from_string(&verifier_strkey)
+        .expect("verifier C-strkey must parse")
+        .0;
+    let expected_identity = SignerIdentityV2::External {
+        verifier: verifier_id,
+        key_data_sha256: Sha256::digest(&key_data).into(),
+        key_data_len: u32::try_from(key_data.len()).expect("key data length fits u32"),
+    };
     {
         let writer_guard = audit_writer.lock().expect("audit writer lock");
         let log_path = writer_guard.path().to_path_buf();
@@ -1128,22 +1158,23 @@ async fn b7_add_external_signer_to_existing_rule() {
                 continue;
             }
             if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line)
-                && let EventKind::SaSignerAdded {
+                && let EventKind::SaSignerAddedV2 {
                     rule_id: row_rule_id,
                     signer_id: row_id,
-                    resulting_signer_pubkeys,
+                    snapshot,
                     ..
                 } = &entry.event_kind
                 && *row_rule_id == rule_id
                 && *row_id == new_signer_id
             {
-                // Verify the new signer appears as an External pubkey in the result.
-                let has_external = resulting_signer_pubkeys
-                    .iter()
-                    .any(|pk| matches!(pk, SignerPubkey::External { .. }));
+                // The snapshot holds the added signer's full identity under
+                // the new id.
                 assert!(
-                    has_external,
-                    "resulting_signer_pubkeys must include at least one External variant"
+                    snapshot
+                        .signers
+                        .iter()
+                        .any(|e| e.id == new_signer_id && e.identity == expected_identity),
+                    "the snapshot must hold the added External signer under id {new_signer_id}"
                 );
                 found = true;
                 break;
@@ -1151,7 +1182,7 @@ async fn b7_add_external_signer_to_existing_rule() {
         }
         assert!(
             found,
-            "SaSignerAdded audit row for rule_id={rule_id}, \
+            "SaSignerAddedV2 audit row for rule_id={rule_id}, \
              signer_id={new_signer_id} must be emitted"
         );
     }
@@ -1165,7 +1196,7 @@ async fn b7_add_external_signer_to_existing_rule() {
 ///
 /// Acceptance criteria (WebAuthn path):
 /// - `signer_count` increases from 1 to 2 after `add_signer`.
-/// - A `SaSignerAdded` audit row is emitted.
+/// - A `SaSignerAddedV2` audit row is emitted.
 ///
 /// The test uses a synthetic P-256-style uncompressed public key (65 bytes with
 /// leading `0x04` tag) and a 16-byte credential_id.  No browser ceremony is required
@@ -1178,15 +1209,12 @@ async fn b7_add_external_signer_to_existing_rule() {
 ///
 /// On-chain, OZ `Signer` has only `Delegated` and `External` variants; there is no
 /// `WebAuthn` variant in the contract storage layer.  A WebAuthn signer is stored as
-/// `External(webauthn_verifier_address, pubkey_65 || credential_id)`.  When the wallet
-/// reads back the signer set, the decoder always projects to `SignerPubkey::External`;
-/// the assertion therefore checks for an `External` entry whose `verifier_contract`
-/// matches the deployed WebAuthn verifier, not a `WebAuthn` entry.
-///
-/// The `webauthn_pubkey = SignerPubkey::WebAuthn { .. }` argument supplied to
-/// `add_signer` is the wallet's local label for the in-flight call; this is correct
-/// as input and is not changed.  Only the READ-BACK assertion in the `SaSignerAdded`
-/// audit row changes.
+/// `External(webauthn_verifier_address, pubkey_65 || credential_id)`.  The
+/// wallet reads the signer back as an `External` identity; the assertion
+/// therefore checks for an `External` entry whose verifier is the deployed
+/// WebAuthn verifier and whose key data is the whole `pubkey_65 ||
+/// credential_id`. The rule is installed without a pin record, so the add
+/// writes no pin row.
 ///
 /// # Byte-layout
 ///
@@ -1299,20 +1327,19 @@ async fn b8_add_webauthn_signer_to_existing_rule() {
     let external_scval = build_external_signer_scval(verifier_sc_addr, &key_data)
         .expect("build_external_signer_scval must succeed");
 
-    let cred_id_first16: [u8; 16] = credential_id.as_slice().try_into().expect("16 bytes");
-    let webauthn_pubkey = SignerPubkey::WebAuthn {
-        credential_id_first16: cred_id_first16,
-    };
-
     // Establish audit-log baseline.
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path.clone());
 
     let baseline = mgr
-        .refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), rid())
+        .refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
         .await
         .expect("refresh_signer_baseline must succeed");
-    assert_eq!(baseline.signer_count, 1, "initial signer_count must be 1");
+    assert_eq!(
+        baseline.view.signer_count(),
+        1,
+        "initial signer_count must be 1"
+    );
 
     // add_signer with WebAuthn External ScVal.
     let new_signer_id = mgr
@@ -1320,7 +1347,6 @@ async fn b8_add_webauthn_signer_to_existing_rule() {
             sa_addr.clone(),
             rule_id,
             external_scval,
-            webauthn_pubkey,
             signer_box.as_ref(),
             rid(),
             false, // accept_mutable_verifier
@@ -1335,25 +1361,34 @@ async fn b8_add_webauthn_signer_to_existing_rule() {
         .await
         .expect("list_signers post-add must succeed");
 
+    assert_eq!(post_add.baseline, PreviousBaseline::Matched);
+    let post_add_ids = view_signer_ids(&post_add.view);
     assert_eq!(
-        post_add.signer_count, 2,
+        post_add_ids.len(),
+        2,
         "signer_count must be 2 after adding WebAuthn signer; got {}",
-        post_add.signer_count
+        post_add.view
     );
     assert!(
-        post_add.signer_ids.contains(&new_signer_id),
+        post_add_ids.contains(&new_signer_id),
         "new_signer_id={new_signer_id} must appear in signer_ids"
     );
 
-    // SaSignerAdded audit row for the WebAuthn signer must be emitted.
+    // SaSignerAddedV2 audit row for the WebAuthn signer must be emitted.
     //
-    // Verified by: `signer_id == new_signer_id` AND `resulting_signer_pubkeys`
-    // includes at least one `SignerPubkey::External` entry whose `verifier_contract`
-    // equals the deployed WebAuthn verifier strkey.
-    //
-    // A WebAuthn signer reads back as `External(webauthn_verifier_address, ...)` because
-    // the on-chain OZ `Signer` type has no `WebAuthn` variant; the decoder always
-    // projects to `SignerPubkey::External`.
+    // Verified by: `signer_id == new_signer_id` AND the snapshot holds, under
+    // that id, an `External` identity whose verifier is the deployed WebAuthn
+    // verifier and whose key data is the whole `pubkey_65 || credential_id`.
+    // A WebAuthn signer reads back as `External` because the on-chain OZ
+    // `Signer` type has no `WebAuthn` variant.
+    let verifier_id = stellar_strkey::Contract::from_string(&verifier_strkey)
+        .expect("verifier C-strkey must parse")
+        .0;
+    let expected_identity = SignerIdentityV2::External {
+        verifier: verifier_id,
+        key_data_sha256: Sha256::digest(&key_data).into(),
+        key_data_len: u32::try_from(key_data.len()).expect("key data length fits u32"),
+    };
     {
         let writer_guard = audit_writer.lock().expect("audit writer lock");
         let log_path = writer_guard.path().to_path_buf();
@@ -1369,29 +1404,22 @@ async fn b8_add_webauthn_signer_to_existing_rule() {
                 continue;
             }
             if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line)
-                && let EventKind::SaSignerAdded {
+                && let EventKind::SaSignerAddedV2 {
                     rule_id: row_rule_id,
                     signer_id: row_id,
-                    resulting_signer_pubkeys,
+                    snapshot,
                     ..
                 } = &entry.event_kind
                 && *row_rule_id == rule_id
                 && *row_id == new_signer_id
             {
-                // The added WebAuthn signer reads back as External(webauthn_verifier, ...)
-                // because the on-chain OZ Signer enum has no WebAuthn variant.
-                let has_external_webauthn = resulting_signer_pubkeys.iter().any(|pk| {
-                    matches!(
-                        pk,
-                        SignerPubkey::External { verifier_contract, .. }
-                            if verifier_contract == &verifier_strkey
-                    )
-                });
                 assert!(
-                    has_external_webauthn,
-                    "resulting_signer_pubkeys must include an External entry with \
-                     verifier_contract={verifier_strkey} (WebAuthn signer reads back \
-                     as External on-chain)"
+                    snapshot
+                        .signers
+                        .iter()
+                        .any(|e| e.id == new_signer_id && e.identity == expected_identity),
+                    "the snapshot must hold the added WebAuthn signer as an External \
+                     identity on verifier {verifier_strkey} under id {new_signer_id}"
                 );
                 found = true;
                 break;
@@ -1399,7 +1427,7 @@ async fn b8_add_webauthn_signer_to_existing_rule() {
         }
         assert!(
             found,
-            "SaSignerAdded audit row for rule_id={rule_id}, \
+            "SaSignerAddedV2 audit row for rule_id={rule_id}, \
              signer_id={new_signer_id} must be emitted"
         );
     }
@@ -1512,19 +1540,21 @@ async fn b2_set_threshold_single_op() {
     let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path);
 
     let baseline = mgr
-        .refresh_signer_baseline(sa_addr.clone(), new_rule_id, Some(&signer_g), rid())
+        .refresh_signer_baseline(sa_addr.clone(), new_rule_id, Some(&signer_g), false, rid())
         .await
         .expect("refresh_signer_baseline must succeed");
 
     assert_eq!(
-        baseline.signer_count, 2,
+        baseline.view.signer_count(),
+        2,
         "installed rule must have signer_count=2; got {}",
-        baseline.signer_count
+        baseline.view
     );
     assert_eq!(
-        baseline.threshold, 1,
+        view_threshold(&baseline.view),
+        Some(1),
         "installed rule must have threshold=1; got {}",
-        baseline.threshold
+        baseline.view
     );
 
     // ── Step 4: Raise threshold from 1 to 2 (single-op set_threshold) ────────
@@ -1546,37 +1576,37 @@ async fn b2_set_threshold_single_op() {
         .expect("list_signers post-set_threshold must succeed");
 
     assert_eq!(
-        post_op.signer_count, 2,
-        "signer_count must remain 2 after set_threshold; got {}",
-        post_op.signer_count
+        post_op.baseline,
+        PreviousBaseline::Matched,
+        "set_threshold recorded the confirmed threshold, which the chain matches"
     );
     assert_eq!(
-        post_op.threshold, 2,
+        post_op.view.signer_count(),
+        2,
+        "signer_count must remain 2 after set_threshold; got {}",
+        post_op.view
+    );
+    assert_eq!(
+        view_threshold(&post_op.view),
+        Some(2),
         "threshold must be 2 after set_threshold; got {}",
-        post_op.threshold
+        post_op.view
     );
 }
 
-// ── Threshold-read routes through identify_threshold_policy ──────────────────
+// ── Policyless rule ───────────────────────────────────────────────────────────
 
-/// `list_signers` and `refresh_signer_baseline` fail closed with
-/// `SaError::ThresholdPolicyNotInstalled` when the rule's `policies` list is
-/// empty, asserting that threshold reading is routed through
-/// `identify_threshold_policy`.
+/// `list_signers` and `refresh_signer_baseline` on a rule whose `policies`
+/// list is empty record a version-2 baseline with no threshold: the rule has
+/// no simple-threshold policy, and no threshold is inferred from the signer
+/// count.
 ///
-/// The wallet must not silently use `signers.len()` as a proxy for the threshold
-/// value when `policies.is_empty()`.  This test asserts the correct fail-closed
-/// behaviour: both entry-points that call `identify_threshold_policy` return
-/// `ThresholdPolicyNotInstalled` instead of proceeding with a silently incorrect
-/// threshold value.
-///
-/// The bootstrap smart-account bootstrap rule (rule_id = 0) is deployed with
-/// zero policies (see `deploy_fresh_smart_account`), making it a convenient
+/// The bootstrap smart-account rule (rule_id = 0) is deployed with zero
+/// policies (see `deploy_fresh_smart_account`), making it a convenient
 /// in-protocol way to reproduce the no-policy condition on testnet without
 /// patching on-chain state.
-///
 #[tokio::test(flavor = "multi_thread")]
-async fn b5_threshold_read_routes_through_identify_threshold_policy() {
+async fn b5_a_policyless_rule_baselines_without_a_threshold() {
     let (signer_g, _signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
@@ -1590,33 +1620,27 @@ async fn b5_threshold_read_routes_through_identify_threshold_policy() {
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path);
 
-    // `list_signers` on the no-policy bootstrap rule must fail closed.
-    let result_list = mgr
+    // `list_signers` on the no-policy bootstrap rule records the first baseline.
+    let listed = mgr
         .list_signers(sa_addr.clone(), 0, Some(&signer_g), rid())
-        .await;
-
+        .await
+        .expect("list_signers on a policyless rule must succeed");
+    assert_eq!(listed.baseline, PreviousBaseline::None);
+    assert_eq!(listed.view.signer_count(), 1);
     assert!(
-        matches!(
-            result_list,
-            Err(SaError::ThresholdPolicyNotInstalled { rule_id: 0, .. })
-        ),
-        "list_signers on a rule with no threshold policy must return \
-         ThresholdPolicyNotInstalled (fail-closed); got: {result_list:?}"
+        matches!(&listed.view, SignerSetView::V2(snapshot) if snapshot.threshold.is_none()),
+        "a policyless rule observes no threshold; got {}",
+        listed.view
     );
 
-    // `refresh_signer_baseline` must also fail closed on the same rule.
-    let result_refresh = mgr
-        .refresh_signer_baseline(sa_addr.clone(), 0, Some(&signer_g), rid())
-        .await;
-
-    assert!(
-        matches!(
-            result_refresh,
-            Err(SaError::ThresholdPolicyNotInstalled { rule_id: 0, .. })
-        ),
-        "refresh_signer_baseline on a rule with no threshold policy must return \
-         ThresholdPolicyNotInstalled (fail-closed); got: {result_refresh:?}"
-    );
+    // `refresh_signer_baseline` compares with that baseline and records it
+    // again.
+    let refreshed = mgr
+        .refresh_signer_baseline(sa_addr.clone(), 0, Some(&signer_g), false, rid())
+        .await
+        .expect("refresh_signer_baseline on a policyless rule must succeed");
+    assert_eq!(refreshed.previous_baseline, PreviousBaseline::Matched);
+    assert_eq!(view_threshold(&refreshed.view), None);
 }
 
 // ── Cross-row request_id pairing across divergence emit ──────────────────────

@@ -88,7 +88,10 @@ use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
     ContextRuleSignerInput, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
-use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
+use stellar_agent_smart_account::managers::signers::{
+    PreviousBaseline, SignersManager, SignersManagerConfig,
+};
+use stellar_agent_smart_account::signers::SignerSetView;
 use stellar_agent_smart_account::simple_threshold_policy::build_simple_threshold_install_param;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -971,7 +974,16 @@ async fn e3_self_authorized_rename_through_the_production_manager_shape() {
         .await
         .expect("list_signers must baseline the rule");
     assert_eq!(
-        baseline.threshold, 1,
+        baseline.baseline,
+        PreviousBaseline::None,
+        "a fresh rule's first list records the baseline"
+    );
+    let SignerSetView::V2(snapshot) = &baseline.view else {
+        panic!("list records a version-2 baseline; got {}", baseline.view)
+    };
+    assert_eq!(
+        snapshot.threshold.as_ref().map(|t| t.threshold),
+        Some(1),
         "the baseline must read the policy's threshold"
     );
 

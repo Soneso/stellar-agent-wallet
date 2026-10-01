@@ -1,12 +1,13 @@
 //! Adversarial fixture: `threshold_policy_not_installed`.
 //!
-//! Scenario: the on-chain `ContextRule` has an empty `policies` list. The
-//! `identify_threshold_policy` step returns `ThresholdPolicyNotInstalled`
-//! fail-closed.
+//! Scenario: the on-chain `ContextRule` has an empty `policies` list and the
+//! audit log holds a version-1 baseline. The version-2 observation records no
+//! threshold, and the version-1 comparison needs one, so the projection
+//! refuses with `ThresholdPolicyNotInstalled`, failing closed.
 //!
-//! A valid baseline exists so the test confirms that Step 2a (policy
-//! identification) fires AFTER Step 1 (audit-log read) passes, and that the
-//! error is `ThresholdPolicyNotInstalled`, NOT `SignerSetMissingBaseline`.
+//! A valid baseline exists so the test confirms that the comparison fires
+//! AFTER the audit-log read passes, and that the error is
+//! `ThresholdPolicyNotInstalled`, NOT `SignerSetMissingBaseline`.
 
 use std::sync::Arc;
 
@@ -30,8 +31,9 @@ use super::rpc_mock_helpers::{
 /// `ContextRule.policies` is empty → `ThresholdPolicyNotInstalled` fail-closed.
 ///
 /// The RPC returns a valid ContextRule ScVal but with no policy addresses in
-/// the `policies` field. `identify_threshold_policy` must detect this and
-/// return `ThresholdPolicyNotInstalled` without falling through to the wasm-hash check.
+/// the `policies` field. The version-1 comparison must detect the missing
+/// threshold and return `ThresholdPolicyNotInstalled`; with no policy there is
+/// no executable or threshold read.
 #[tokio::test]
 async fn empty_policies_returns_threshold_policy_not_installed() {
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
@@ -47,10 +49,10 @@ async fn empty_policies_returns_threshold_policy_not_installed() {
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
-        // No policy → no contract-instance fetch will be attempted after the first simulate.
-        // Only one simulateTransaction call happens (identify_threshold_policy's
-        // fetch_context_rule_primary), which returns a ContextRule with empty policies.
-        // The function returns ThresholdPolicyNotInstalled before issuing any getLedgerEntries.
+        // No policy → no contract-instance fetch and no threshold read follow the
+        // rule reads. Both clients point at this one server, so it serves the
+        // primary's and the secondary's get_context_rule; the comparison then
+        // returns ThresholdPolicyNotInstalled without any getLedgerEntries.
         .respond_with(CombinedRpcResponder::new(
             SOURCE_G,
             &policy_sc_address(), // policy_addr not used since policies=[]; kept for account dispatch

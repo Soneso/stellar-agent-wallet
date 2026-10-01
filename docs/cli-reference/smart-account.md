@@ -32,7 +32,7 @@ Nothing is sent when the check refuses. `smart-account multicall` reports the re
 
 The pin record is the newest `SaContextRuleCreated` or `SaContextRulePinsUpdated` row for the rule. `smart-account migrate-verifier`, `smart-account signers add` / `signers batch-add` and `smart-account rules add-policy` / `rules remove-policy` write a `SaContextRulePinsUpdated` row when they change the verifier or policy set of a pinned rule (see those verbs), so the check follows the wallet's own changes. `smart-account rules verify-pins` runs the same comparison on demand without signing.
 
-Every read of a rule's signer set decodes the whole set. A rule holding a signer the wallet cannot decode (an unknown signer kind, a malformed signer, or a delegated signer with a contract address) is refused for every operation that reads it, including this check and the signer-set baseline, with `sa.deployment_failed` and the signer's index in the reason. Remove such a rule with `smart-account rules delete --rule-id N --auth-rule-id M`, where rule `M` is one the wallet can read; `--auth-rule-id` defaults to the deleted rule.
+Every read of a rule's signer set decodes the whole set. The wallet cannot decode an unknown signer kind, a malformed signer, or an `External` signer with empty key data. A rule holding such a signer is refused for every operation that reads it, including this check and the signer-set baseline, with `sa.deployment_failed` and the signer's index in the reason. A signer delegated to a contract address is readable; only a comparison with a version 1 signer-set baseline cannot represent it (see [`signers refresh`](#smart-account-signers-refresh)). Remove such a rule with `smart-account rules delete --rule-id N --auth-rule-id M`, where rule `M` is one the wallet can read; `--auth-rule-id` defaults to the deleted rule.
 
 ---
 
@@ -322,11 +322,17 @@ Manages the signer set and threshold of a context rule. All verbs take `--accoun
 
 `list` and `refresh` also require a signer source: the manager needs a source account to assemble the read envelope.
 
+**Signer-set baseline.** The audit log keeps each rule's signer-set state: a baseline row, then one state row per signer change the wallet makes. A version 2 state records every signer's full identity, an `External` signer by the SHA-256 and the length of its whole key data. It also records the rule's simple-threshold policy and threshold, or no threshold when the rule has no simple-threshold policy. A version 1 state keeps the first 16 bytes of an `External` signer's key data. Both RPC endpoints (`--rpc-url` and `--secondary-rpc-url`) read the rule, the executable of each attached policy and the threshold, and must agree; otherwise the verb refuses with `network.rpc_divergence`.
+
+- `add`, `remove`, `set-threshold` and `batch-add` compare the chain with the rule's state before they submit. A rule without a state refuses with `sa.signer_set_missing_baseline`; run `signers list --rule-id N` to record one. A version 1 state refuses before any RPC with `sa.signer_set_baseline_legacy`; run `signers refresh --rule-id N` once to record a version 2 state. A chain that differs from the state writes a `SaSignerSetDiverged` row and refuses with `sa.signer_set_diverged`; nothing is sent.
+- After the transaction confirms, both endpoints are read again at or past the confirmation ledger, and the result must be exactly the intended change. It is recorded as a `SaSignerAddedV2`, `SaSignerRemovedV2` or `SaThresholdChangedV2` row. A different result writes a `SaSignerSetDiverged` row and refuses with `sa.signer_set_diverged` naming the transaction hash.
+- When the confirmed result cannot be observed within `--timeout-seconds` (stage `observe`) or its row cannot be written (stage `write`), the verb returns `sa.baseline_write_failed` with the transaction hash. The transaction stands; `signers refresh --rule-id N --accept-divergence` records the chain state. On a pinned rule, a confirmed `add` or `batch-add` writes its pin rows once. They follow the state row when the change is recorded, and precede the refusal when the result is not observed or not the intended change; the pin record then holds every verifier the transaction added. When the state row is not written, the pin rows are attempted and are usually refused too. A pin row the audit log refuses is logged as a warning, and the rule keeps its previous pin record.
+
 ### `smart-account signers list`
 
-Reads the on-chain signer set for a rule and, if no prior baseline exists for the `(rule_id, account)` pair, writes a `SaSignerSetBaselined` audit row to anchor future divergence detection. Submits no on-chain transaction, but is state-changing on the audit log. Testnet only. A rule holding a signer the wallet cannot decode is refused with `sa.deployment_failed` naming the signer's index, and no baseline is written; delete it with `smart-account rules delete --rule-id N` authorized by a rule the wallet can read (see [pinned-hash drift check](#pinned-hash-drift-check)).
+Reads the rule's signer set through both RPC endpoints and compares it with the rule's audit-log state. When the `(rule_id, account)` pair has no state, it writes a `SaSignerSetBaselinedV2` audit row to anchor future divergence detection; otherwise it writes nothing. A rule without a simple-threshold policy is baselined with no threshold. Submits no on-chain transaction, but is state-changing on the audit log. Testnet only. A rule holding a signer the wallet cannot decode is refused with `sa.deployment_failed` naming the signer's index, and no baseline is written. Delete such a rule with `smart-account rules delete --rule-id N` authorized by a rule the wallet can read (see [pinned-hash drift check](#pinned-hash-drift-check)).
 
-The envelope reports `signer_count`, `threshold`, the `signer_ids`, and a parallel `signer_kinds` list.
+The envelope reports `signer_count`, `threshold` (`null` when the rule has no simple-threshold policy), `snapshot_version` (`2`), the `signer_ids` with parallel `signer_kinds` and `signer_summaries` lists, and `baseline`. A `signer_kinds` entry is `delegated_ed25519`, `external` (a passkey signer included) or `delegated_contract`; a `signer_summaries` entry renders the signer's identity as first-8 hex projections. `baseline` is `none` when this call wrote the first baseline, otherwise `matched`, `diverged` or `not_comparable`. `not_comparable` reports a version 1 state the wallet cannot compare the chain with, because the rule holds a signer delegated to a contract address or has no simple-threshold policy.
 
 ```bash
 stellar-agent smart-account signers list \
@@ -337,7 +343,11 @@ stellar-agent smart-account signers list \
 
 ### `smart-account signers refresh`
 
-Unconditionally writes a fresh `SaSignerSetBaselined` audit row (re-anchor after an intentional out-of-band signer change). State-changing on the audit log only. Testnet only. Same flags as `list`. A rule holding a signer the wallet cannot decode cannot be re-anchored: `refresh` refuses it like `list`, with the signer's index in the reason.
+Compares the chain with the rule's audit-log state and writes a fresh `SaSignerSetBaselinedV2` audit row. Use it to re-anchor after an intentional out-of-band signer change, and once to upgrade a version 1 state, which the wallet compares with the version 1 form of the chain's signer set. State-changing on the audit log only. Testnet only. Same flags as `list`, plus:
+
+- `--accept-divergence`: record the chain state even when it differs from the rule's state, or when a version 1 state cannot be compared with it. Without the flag, a differing set writes a `SaSignerSetDiverged` row and refuses with `sa.signer_set_diverged`, and an incomparable version 1 state refuses the same way without writing a row. With the flag, a differing set writes the `SaSignerSetDiverged` row and then the baseline, and the command prints one warning line on stderr.
+
+The envelope reports `signer_count`, `threshold` (`null` without a simple-threshold policy), `snapshot_version` and `previous_baseline` (`none`, `matched`, `diverged` or `not_comparable`). A rule holding a signer the wallet cannot decode cannot be re-anchored: `refresh` refuses it like `list`, with the signer's index in the reason.
 
 ```bash
 stellar-agent smart-account signers refresh \
@@ -366,7 +376,7 @@ Plus:
 
 The add signs under `--rule-id`, so the rule passes the [pinned-hash drift check](#pinned-hash-drift-check) first.
 
-**Pin record.** When the new signer is `External` (`--signer-ed25519`, `--signer-external`, `--signer-webauthn`) and the rule has a pin record, the add keeps the record in step with the rule's verifiers. Before submission, a verifier address the rule does not already use is identified and probed as `rules create` probes one: a hash outside the allowlist fails with `sa.verifier_wasm_not_in_allowlist` and a mutable contract with `sa.verifier_mutable` unless the matching flag above is set, and an unpinnable instance fails with `sa.contract_instance_unsupported` regardless. After the add confirms, a `SaContextRulePinsUpdated` row (reason `signer_added`) records the verifier pins, one per distinct verifier address: a signer on a verifier the rule already uses leaves them unchanged, a signer on a new verifier appends its pin. A record with two verifier pins is refused by every checked signing verb with `sa.pin_check_unavailable` (inner code `sa.multiple_pinned_hashes_unsupported`), the same outcome as a rule installed with two verifiers. A rule without a pin record stays unpinned: nothing is probed and no row is written.
+**Pin record.** When the new signer is `External` (`--signer-ed25519`, `--signer-external`, `--signer-webauthn`) and the rule has a pin record, the add keeps the record in step with the rule's verifiers. Before submission, a verifier address the rule does not already use is identified and probed as `rules create` probes one. A hash outside the allowlist fails with `sa.verifier_wasm_not_in_allowlist` and a mutable contract with `sa.verifier_mutable` unless the matching flag above is set. An unpinnable instance fails with `sa.contract_instance_unsupported` regardless. After the add confirms, a `SaContextRulePinsUpdated` row (reason `signer_added`) records the verifier pins, one per distinct verifier address, whether or not the resulting state is then recorded. A signer on a verifier the rule already uses leaves them unchanged, and a signer on a new verifier appends its pin. A record with two verifier pins is refused by every checked signing verb with `sa.pin_check_unavailable` (inner code `sa.multiple_pinned_hashes_unsupported`), the same outcome as a rule installed with two verifiers. A rule without a pin record stays unpinned: nothing is probed and no row is written.
 
 ```bash
 stellar-agent smart-account signers add \
@@ -386,7 +396,7 @@ stellar-agent smart-account signers add \
 
 ### `smart-account signers remove`
 
-Removes a signer by its on-chain id (OZ `remove_signer`). Signs and submits. Testnet only. Refused (with a safe-ordering hint) if removing the signer would drop `signer_count` below `threshold`: lower the threshold first, then remove.
+Removes a signer by its on-chain id (OZ `remove_signer`). Signs and submits. Testnet only. Refused (with a safe-ordering hint) if removing the signer would drop `signer_count` below `threshold`: lower the threshold first, then remove. A rule whose policies include no simple-threshold policy, such as a weighted-threshold rule, refuses with `sa.threshold_policy_identification_failed` before submission. Another policy decides which signers suffice there. A rule without any policy has no threshold to check.
 
 Extra flag:
 
@@ -402,7 +412,7 @@ stellar-agent smart-account signers remove \
 
 ### `smart-account signers set-threshold`
 
-Changes the rule's signing threshold via the threshold-policy contract's `set_threshold`. Signs and submits. Testnet only. The threshold-policy contract is identified by WASM-hash allowlist lookup; zero or multiple matches refuse with `sa.threshold_policy_identification_failed`.
+Changes the rule's signing threshold via the threshold-policy contract's `set_threshold`. Signs and submits. Testnet only. The threshold-policy contract is the attached policy whose executable hash is in the simple-threshold allowlist. A rule with none refuses with `sa.threshold_policy_not_installed`, and a rule with more than one with `sa.threshold_policy_identification_failed`.
 
 Extra flag:
 
@@ -460,9 +470,7 @@ stellar-agent smart-account signers set-signer-weight \
 
 ### `smart-account signers batch-add`
 
-Adds MULTIPLE signers to a rule in ONE transaction (OZ `batch_add_signer`). Signs and submits. Testnet only. Refused client-side if the batch is empty, or if `current_signer_count + batch_len` would exceed the per-rule signer cap (15). Emits one `SaSignerAdded` audit row per signer, plus the raw-invocation row. Returns `new_signer_ids` in the order supplied.
-
-The rule's post-op result-fetch identifies a SIMPLE-threshold policy (`identify_threshold_policy`); on a rule whose only threshold policy is weighted-threshold, this call fails closed with a typed pre-submission error and no on-chain side effect. Attach a simple-threshold policy to the target rule first (`rules add-policy --kind simple-threshold`) if it does not already have one.
+Adds MULTIPLE signers to a rule in ONE transaction (OZ `batch_add_signer`). Signs and submits. Testnet only. Refused client-side if the batch is empty, or if `current_signer_count + batch_len` would exceed the per-rule signer cap (15). Emits one `SaSignerAddedV2` audit row per signer. Returns `new_signer_ids` in the order supplied: each entry is the id the chain assigned to that signer. A rule without a simple-threshold policy accepts a batch.
 
 Flags (each repeatable, any combination, at least one signer required across all three):
 
@@ -624,6 +632,8 @@ Pre-flight gates (fail-closed): the destination verifier hash must be in the all
 The plan reads every active rule's signer set in full. A rule holding a signer the wallet cannot decode refuses the whole plan, dry-run included, with `sa.verifier_migration_failed` at phase `plan_build`; the reason names the rule, the signer's index and why it does not decode. Delete that rule (see [pinned-hash drift check](#pinned-hash-drift-check)), then migrate.
 
 Both transactions of each pair sign under the migrating rule. The [pinned-hash drift check](#pinned-hash-drift-check) runs on that rule's policies, refusing with `sa.policy_hash_drift`, `sa.pinned_policy_absent` or `sa.pin_check_unavailable`, and skips its verifiers: the gates above already vetted the destination, and the source verifier may be the drifted contract being replaced. After each pair confirms on a rule with a pin record, a `SaContextRulePinsUpdated` row (reason `verifier_migrated`) names the destination verifier's hash as the rule's verifier pin, with the policy pins unchanged, so later signing under the rule checks against the destination. A rule without a pin record stays unpinned and no row is written.
+
+A migration writes no signer-set state row, so the next `signers add`, `remove`, `set-threshold` or `batch-add` on a migrated rule refuses with `sa.signer_set_diverged`. Run `signers refresh --rule-id N --accept-divergence` once to record the migrated set.
 
 Flags:
 

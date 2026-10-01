@@ -19,14 +19,22 @@
 //!
 //! # Coverage relationship to existing per-consumer fixtures
 //!
-//! The per-consumer divergent-secondary-RPC fixtures already in
-//! `tests/smart-account-fixtures/adversarial/` cover the individual
+//! The per-consumer divergent-secondary-RPC fixtures cover the individual
 //! consumers in isolation:
-//! - `signer_set_divergence_rpc_suppression.rs` — signer-set consumer.
+//! - `signer_set_divergence_rpc_suppression.rs` and
+//!   `rpc_divergence_before.rs`: the signer-set observation's rule
+//!   disagreement (`signer_set_rpc_divergence`). Mock tests in
+//!   `tests/execute_path_drift_check_mock.rs` pin its other disagreements:
+//!   the policy list
+//!   (`the_endpoints_disagreeing_on_the_policy_list_refuse_with_rpc_divergence`),
+//!   the simple-threshold value
+//!   (`the_endpoints_disagreeing_on_the_threshold_refuse_with_rpc_divergence`)
+//!   and the rule after a repeated observation
+//!   (`endpoints_that_disagree_after_a_repeated_observation_refuse_at_stage_observe`).
 //! - `verifier_drift_rpc_suppression.rs` — wasm-hash drift consumer.
 //! - `verifier_identification_rpc_divergence.rs` +
-//!   `threshold_policy_identification_rpc_divergence.rs` — identification
-//!   path consumers.
+//!   `threshold_policy_identification_rpc_divergence.rs`: the executable
+//!   read of a verifier or a policy (`fetch_observed_executable`).
 //!
 //! This audit fixture adds a source-grep regression-lock that catches
 //! a future cross-RPC consumer added without a corresponding
@@ -50,33 +58,23 @@ use std::path::{Path, PathBuf};
 /// consumer REQUIRES adding an entry here AND adding a per-consumer
 /// divergent-secondary-RPC adversarial fixture.
 const CROSS_RPC_CONSUMER_SITES: &[(&str, &str)] = &[
-    // Signer-set divergence detection — 4 consumers in signers.rs
+    // Signer-set observation: 1 consumer in signers.rs. Every disagreement of
+    // the observation (the two endpoints' rules, including their policy
+    // lists, and their thresholds) is built by this one helper, which
+    // `list_signers`, `refresh_signer_baseline`,
+    // `verify_signer_set_against_chain` and the signer verbs reach through
+    // `observe_signer_set_v2`.
     (
         "crates/stellar-agent-smart-account/src/managers/signers.rs",
-        "list_signers",
+        "signer_set_rpc_divergence",
     ),
-    (
-        "crates/stellar-agent-smart-account/src/managers/signers.rs",
-        "refresh_signer_baseline",
-    ),
-    (
-        "crates/stellar-agent-smart-account/src/managers/signers.rs",
-        "verify_signer_set_against_chain",
-    ),
-    (
-        "crates/stellar-agent-smart-account/src/managers/signers.rs",
-        "identify_threshold_policy",
-    ),
-    // Spending-limit-policy identification — 1 consumer in signers.rs.
-    // identify_spending_limit_policy is the 10th cross-RPC consumer; mirrors
-    // identify_threshold_policy's two-RPC wasm-hash agreement check against a
-    // single-entry allowlist.
+    // Spending-limit-policy identification: 1 consumer in signers.rs;
+    // a two-RPC wasm-hash agreement check against a single-entry allowlist.
     (
         "crates/stellar-agent-smart-account/src/managers/signers.rs",
         "identify_spending_limit_policy",
     ),
-    // Weighted-threshold-policy identification — 1 consumer in signers.rs.
-    // identify_weighted_threshold_policy is the 11th cross-RPC consumer;
+    // Weighted-threshold-policy identification: 1 consumer in signers.rs;
     // mirrors identify_spending_limit_policy's two-RPC wasm-hash agreement
     // check against a single-entry allowlist.
     (
@@ -94,14 +92,14 @@ const CROSS_RPC_CONSUMER_SITES: &[(&str, &str)] = &[
         "detect_contract_mutability",
     ),
     // Timelock ready-window race guard.
-    // query_operation_state_cross_rpc is the 7th cross-RPC consumer; it is called
+    // query_operation_state_cross_rpc is called
     // from both `execute()` (pre-submit guard) and `list_pending()` (state validation).
     (
         "crates/stellar-agent-smart-account/src/timelock.rs",
         "query_operation_state_cross_rpc",
     ),
     // Dual-RPC defence-in-depth for event confirmation.
-    // cross_confirm_event is the 8th cross-RPC consumer; requires the expected OZ
+    // cross_confirm_event requires the expected OZ
     // ContractEvent (OperationScheduled / OperationCancelled / OperationExecuted) be
     // present in BOTH RPC getTransaction meta responses. Mismatch → NetworkRpcDivergence.
     (
@@ -109,7 +107,7 @@ const CROSS_RPC_CONSUMER_SITES: &[(&str, &str)] = &[
         "cross_confirm_event",
     ),
     // Dual-RPC defence-in-depth for hash_operation simulate.
-    // simulate_hash_operation is the 9th cross-RPC consumer; simulates hash_operation on
+    // simulate_hash_operation simulates hash_operation on
     // both RPCs and asserts byte-identical hashes. Mismatch → NetworkRpcDivergence.
     (
         "crates/stellar-agent-smart-account/src/timelock.rs",
@@ -186,10 +184,12 @@ fn count_emit_sites(workspace: &Path, file_path: &str) -> usize {
 /// Asserts every cross-RPC consumer call site enumerated in
 /// `CROSS_RPC_CONSUMER_SITES` matches the actual source-grep count.
 ///
-/// There are 7 `SaError::NetworkRpcDivergence` emit sites in `signers.rs`,
-/// 1 in `verifiers.rs`, and 3 in `timelock.rs`
+/// There are 4 `SaError::NetworkRpcDivergence` emit sites in `signers.rs`
+/// (`signer_set_rpc_divergence`, `identify_spending_limit_policy`,
+/// `identify_weighted_threshold_policy`, `fetch_observed_executable`), 1 in
+/// `verifiers.rs`, and 3 in `timelock.rs`
 /// (`query_operation_state_cross_rpc`, `cross_confirm_event`, `simulate_hash_operation`)
-/// = 11 total. The `CROSS_RPC_CONSUMER_SITES` list above MUST account for all 11.
+/// = 8 total. The `CROSS_RPC_CONSUMER_SITES` list above MUST account for all 8.
 ///
 /// A new cross-RPC consumer MUST add an entry here, OR this test fails.
 #[test]
@@ -280,11 +280,11 @@ fn cross_rpc_consumer_audit_covers_both_threat_surfaces() {
         .count();
 
     assert!(
-        signers_count >= 5,
-        "signer-set divergence detection must have ≥5 cross-RPC consumers \
-         (list_signers + refresh_signer_baseline + verify_signer_set_against_chain + \
-         identify_threshold_policy + identify_spending_limit_policy + \
-         identify_weighted_threshold_policy); got {signers_count}",
+        signers_count >= 4,
+        "signers.rs must have ≥4 cross-RPC consumers \
+         (signer_set_rpc_divergence + identify_spending_limit_policy + \
+         identify_weighted_threshold_policy + fetch_observed_executable); \
+         got {signers_count}",
     );
     assert!(
         verifiers_count >= 1,
@@ -306,6 +306,17 @@ fn cross_rpc_consumer_audit_covers_both_threat_surfaces() {
     assert!(
         has_wasm_hash_consumer,
         "executable drift detection must have its `fetch_observed_executable` \
+         consumer enumerated",
+    );
+
+    // The signer-set observation's consumer must be enumerated explicitly,
+    // not merely covered by the >= bound above.
+    let has_signer_set_consumer = CROSS_RPC_CONSUMER_SITES
+        .iter()
+        .any(|(_, fn_name)| *fn_name == "signer_set_rpc_divergence");
+    assert!(
+        has_signer_set_consumer,
+        "the signer-set observation must have its `signer_set_rpc_divergence` \
          consumer enumerated",
     );
 

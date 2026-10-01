@@ -39,19 +39,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `stellar-agent-soroban-auth` crate maps a `SorobanCredentials` arm to its
   authorization preimage version, builds the envelope type 9 or type 10
   preimage, and hashes it into the signature payload.
+- The signers manager observes a rule's signer set in version 2 through both
+  RPC endpoints: each endpoint reads the rule, then each attached policy's
+  executable, then the simple-threshold value, and the endpoints must agree.
+  A rule without a simple-threshold policy observes no threshold. `signers
+  list` and `signers refresh` record `SaSignerSetBaselinedV2` rows, and the
+  signer verbs record `SaSignerAddedV2`, `SaSignerRemovedV2` and
+  `SaThresholdChangedV2` rows.
+- `signers list` over an existing baseline compares the chain with it and
+  reports `baseline` (`matched`, `diverged` or `not_comparable`, or `none`
+  for a first observation). `signers refresh` compares before it re-anchors
+  and reports `previous_baseline`; `--accept-divergence` records a changed
+  set or a version-1 baseline the chain cannot be compared with.
+- `sa.signer_set_baseline_legacy` (`SaError::SignerSetBaselineLegacy`)
+  refuses a signer mutation on a rule whose baseline is version 1.
+  `sa.baseline_write_failed` (`SaError::BaselineWriteFailed`, stages in
+  `BASELINE_WRITE_STAGES`, reason capped at
+  `BASELINE_WRITE_REASON_MAX_BYTES`) reports a signer-set state row that was
+  not recorded, with the transaction hash when a signer mutation confirmed.
+- `ListOutcome`, `RefreshOutcome` and `PreviousBaseline` in
+  `stellar_agent_smart_account::managers::signers`, and `Display` for
+  `SignerSetView` (`v{version} count={n} threshold={t|none}`).
 
 ### Changed
 
+- `DecodedOnChainSigner` gains `DelegatedContract` for a `Delegated` signer
+  with a contract address and is `#[non_exhaustive]`, its `External` variant
+  included. `to_identity_v2` and `to_signer_pubkey_v1` project a decoded
+  signer; the second refuses a contract delegate with
+  `SignerDecodeError::DelegatedAddressNotAnAccount`. A rule holding a
+  contract delegate is readable.
+- `SignerDecodeError::ExternalKeyDataEmpty` refuses an `External` signer with
+  empty key data, so a rule holding one is unreadable for every signer-set
+  read and for the executable pin check of every rule-authorized signing
+  verb.
+- `SignersManager::get_rule_signers` returns `Vec<SignerEntryV2>`.
+  `list_signers` returns `ListOutcome`. `refresh_signer_baseline` takes
+  `accept_divergence` and returns `RefreshOutcome`. `add_signer` and
+  `batch_add_signers` take the signer `ScVal`s only and decode each identity
+  from it; `batch_add_signers` returns the id the chain assigned to each
+  signer, in input order.
+- `SaError::SignerSetDiverged` carries a `SignerSetView` on both sides (on the
+  wire, `expected` and `observed` gain a `version` tag) and an optional
+  `tx_hash`. Its message names `signers list` to inspect and `signers refresh
+  --accept-divergence` to accept. `SignerSetMissingBaseline` names `signers
+  list --rule-id N`.
+- `FrozenChainStateTuple::observed_chain_state` returns a `SignerSetView`, and
+  `simulation_ledger` carries the ledger of the observation.
+- The `SaSignerSetDiverged` audit row's `expected_threshold` and
+  `observed_threshold` are optional and omitted when absent, and a new
+  `snapshot_version` is `2` for a version-2 comparison and omitted for version
+  1, so existing rows re-serialize unchanged.
+  `AuditEntry::new_sa_signer_set_diverged` takes the two views.
+- `signers add`, `remove`, `set-threshold` and `batch-add` compare the chain
+  with the rule's baseline before they submit and refuse a changed set with
+  `sa.signer_set_diverged`. After the transaction confirms they read both
+  endpoints at or past the confirmation ledger, require exactly the intended
+  change and record it; any other result is `sa.signer_set_diverged` with the
+  transaction hash.
+- A rule whose baseline is version 1 refuses signer mutations until one
+  `signers refresh --rule-id N`, which compares the chain with the version-1
+  baseline and records a version-2 baseline.
+- The `signers list` and `signers refresh` envelopes carry `threshold` as
+  optional (`null` without a simple-threshold policy) and
+  `snapshot_version`; `list` adds `signer_summaries` and `baseline`, and
+  `signer_kinds` gains `delegated_contract`.
+- `signers list` and `signers refresh` accept a rule without a
+  simple-threshold policy. `signers remove` on a rule whose policies include
+  none refuses with `sa.threshold_policy_identification_failed`, and `signers
+  set-threshold` on a rule without one with `sa.threshold_policy_not_installed`.
+  `signers batch-add` accepts a rule without a simple-threshold policy.
+- The passkey signing path works on a rule without a simple-threshold policy
+  once the rule has a version-2 baseline.
+- A passkey signer added to a pinned rule pins its WebAuthn verifier like any
+  other `External` verifier, and a passkey add reports signer type
+  `external`.
+- A rule whose policy instance is an external reference with no live tag
+  entry refuses signer-set reads with `sa.contract_instance_unsupported`.
+- Attaching or detaching the simple-threshold policy with `rules add-policy`
+  or `rules remove-policy` records no threshold row, so the next signer verb
+  on that rule refuses with `sa.signer_set_diverged` until `signers refresh
+  --rule-id N --accept-divergence`.
+- `smart-account migrate-verifier` records no signer-set state row, so the
+  next signer verb on a migrated rule refuses with `sa.signer_set_diverged`
+  until `signers refresh --rule-id N --accept-divergence`.
+- A confirmed `signers add` or `signers batch-add` on a pinned rule writes
+  its pin rows before it refuses when its resulting state is not observed or
+  not the intended change. When the audit log refuses the state row, the pin
+  rows are attempted and are usually refused too.
 - `AuditReader::find_latest_signer_set_view` replaces
   `find_latest_signer_set_state`. It takes the account digest beside the
   redacted account and returns the newest state row of either version as a
   versioned `SignerSetView`, with the file and line of the row. A version-2
   row with a malformed snapshot is an audit parse error. The signer-set
-  checks of the signing verbs compare version-1 rows, and a rule whose newest
-  state row is version 2 refuses with `sa.audit_log`.
+  checks compare a rule's newest state row in that row's version.
 - `stellar_agent_sep43::signing::sign_soroban_auth_entry` takes the expected
   signer's public key after the signer. The key must be the signer's own; the
   function checks a type 10 preimage's address against it.
+
+### Removed
+
+- `SignersManager::identify_threshold_policy`; the signer-set observation
+  identifies the simple-threshold policy through both endpoints.
 
 ### Fixed
 

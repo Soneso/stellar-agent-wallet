@@ -59,11 +59,9 @@ async fn primary_secondary_disagree_returns_rpc_divergence() {
     let sim_cr_2 = build_simulate_response(&cr_2of2);
     let sim_th_2 = build_simulate_response(&th_2);
 
-    // Primary mock server: simulate sequence for primary.
-    // Primary receives:
-    //   1. identify_threshold_policy: get_context_rule (primary)
-    //   2. fetch_signer_set(primary): get_context_rule
-    //   3. fetch_signer_set(primary): get_threshold
+    // Each mock server serves its own simulate sequence of the signer-set
+    // observation: get_context_rule, then (after the policy's instance read)
+    // get_threshold.
     let primary_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
@@ -71,16 +69,11 @@ async fn primary_secondary_disagree_returns_rpc_divergence() {
             SOURCE_G,
             &policy,
             KNOWN_WASM_HASH,
-            SequencedSimulate::new(vec![sim_cr_1.clone(), sim_cr_1.clone(), sim_th_1.clone()]),
+            SequencedSimulate::new(vec![sim_cr_1.clone(), sim_th_1.clone()]),
         ))
         .mount(&primary_server)
         .await;
 
-    // Secondary mock server: simulate sequence for secondary.
-    // Secondary receives:
-    //   1. fetch_contract_wasm_hashes secondary: getLedgerEntries (contract instance)
-    //   2. fetch_signer_set(secondary): get_context_rule
-    //   3. fetch_signer_set(secondary): get_threshold
     let secondary_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))

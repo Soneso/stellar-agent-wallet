@@ -477,9 +477,8 @@ fn validate_rule_proposal_signer(signer: &RuleProposalSigner) -> Result<(), Stri
             let Some(address) = &signer.address else {
                 return Err("Delegated signer must carry `address`".to_owned());
             };
-            // A `Delegated` signer is an ed25519 account. The wallet reads a
-            // rule's signer set in full and has no representation for a
-            // contract-address delegated signer, so a C-strkey is refused.
+            // A proposed `Delegated` signer is an ed25519 account; a C-strkey
+            // is refused.
             validate_strkey_shape(address, 'G', "address")?;
             if signer.verifier.is_some() || signer.pubkey_data.is_some() {
                 return Err(

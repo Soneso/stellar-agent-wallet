@@ -1228,6 +1228,30 @@ impl SignerSetView {
     }
 }
 
+impl std::fmt::Display for SignerSetView {
+    /// Formats the view as `v{version} count={n} threshold={t}`, with
+    /// `threshold=none` for a version-2 snapshot that observed no
+    /// simple-threshold policy.
+    ///
+    /// Omits signer ids and identities so no key material reaches log
+    /// output or error messages.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "v{} count={} threshold=",
+            self.version(),
+            self.signer_count()
+        )?;
+        match self {
+            Self::V1(state) => write!(f, "{}", state.threshold),
+            Self::V2(snapshot) => match &snapshot.threshold {
+                Some(observation) => write!(f, "{}", observation.threshold),
+                None => f.write_str("none"),
+            },
+        }
+    }
+}
+
 /// Return value of [`super::reader::AuditReader::find_latest_signer_set_view`].
 ///
 /// Carries the versioned state, the SHA-256 of the canonical JSON body of
@@ -2277,5 +2301,40 @@ mod tests {
         let payload =
             SignerSetViewPayload::new(SignerSetView::V2(vector_a()), [0xee; 32], 2, "x".to_owned());
         assert!(payload.into_v1().is_none());
+    }
+
+    #[test]
+    fn signer_set_view_display_v1_names_version_count_and_threshold() {
+        let view = SignerSetView::V1(ObservedSignerSet {
+            signer_count: 2,
+            threshold: 1,
+            signer_ids: vec![0, 1],
+            signer_pubkeys: vec![
+                SignerPubkey::Ed25519 { pubkey: [1u8; 32] },
+                SignerPubkey::Ed25519 { pubkey: [2u8; 32] },
+            ],
+        });
+        assert_eq!(view.to_string(), "v1 count=2 threshold=1");
+    }
+
+    #[test]
+    fn signer_set_view_display_v2_renders_an_absent_threshold_as_none() {
+        let mut snapshot = vector_a();
+        snapshot.threshold = None;
+        let count = snapshot.signer_count();
+        assert_eq!(
+            SignerSetView::V2(snapshot.clone()).to_string(),
+            format!("v2 count={count} threshold=none")
+        );
+        snapshot.threshold = Some(ThresholdObservation {
+            policy: [0x44; 32],
+            threshold: 3,
+        });
+        let rendered = SignerSetView::V2(snapshot).to_string();
+        assert_eq!(rendered, format!("v2 count={count} threshold=3"));
+        assert!(
+            !rendered.contains("4444"),
+            "the policy id stays out of the display: {rendered}"
+        );
     }
 }

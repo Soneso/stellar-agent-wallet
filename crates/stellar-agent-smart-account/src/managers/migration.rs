@@ -1626,7 +1626,12 @@ fn decode_external_signers_from_context_rule(
                 verifier_addr: verifier_address,
                 key_data_full: key_data,
             }),
-            Ok(DecodedOnChainSigner::Delegated { .. }) => {}
+            // Migration moves `External` signers between verifiers; a
+            // delegated signer, to an account or a contract, has no verifier.
+            Ok(
+                DecodedOnChainSigner::Delegated { .. }
+                | DecodedOnChainSigner::DelegatedContract { .. },
+            ) => {}
             Err(e) => {
                 return Err(refuse(format!(
                     "get_context_rule({rule_id}): signer at index {i} (id {signer_id}) is not a \

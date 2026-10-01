@@ -26,10 +26,11 @@
 //!
 //! # Policy identification
 //!
-//! `SignersManager::identify_threshold_policy` fetches the wasm-hash
-//! of each `Address` in the rule's `policies: Vec<Address>` via batched
-//! `getLedgerEntries` and matches against this allowlist.  Single-match is
-//! required; zero or multi-match returns a typed error (fail-closed).
+//! The signers manager's signer-set observation observes the executable of
+//! each `Address` in the rule's `policies: Vec<Address>` through both RPC
+//! endpoints and matches its effective hash against this allowlist. One match
+//! is the rule's simple-threshold policy; no match observes no threshold; more
+//! than one match refuses with a typed error (fail closed).
 //!
 //! # Per-rule wasm-hash drift
 //!
@@ -170,7 +171,7 @@ mod tests {
     ///
     /// Guards the index-reorder: index 0 is the current v0.7.2 deploy hash and
     /// index 1 must remain the v0.7.1 hash so already-deployed policy contracts
-    /// keep passing `identify_threshold_policy`. A silent loss of the legacy
+    /// keep identifying as the simple-threshold policy. A silent loss of the legacy
     /// entry (e.g. an accidental single-entry allowlist) fails here.
     #[test]
     fn allowlist_retains_legacy_v0_7_1_hash_at_index_1() {
@@ -196,9 +197,8 @@ mod tests {
 
     /// Asserts that the allowlist has at least one entry.
     ///
-    /// An empty allowlist would cause `identify_threshold_policy`
-    /// to always fail with `ThresholdPolicyIdentificationFailed`, silently
-    /// disabling the threshold-policy enforcement path.
+    /// An empty allowlist would make every rule observe no simple-threshold
+    /// policy, silently disabling the threshold-policy enforcement path.
     #[test]
     fn allowlist_is_non_empty() {
         assert!(

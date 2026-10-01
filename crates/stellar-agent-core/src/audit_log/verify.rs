@@ -1685,10 +1685,11 @@ mod tests {
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...12345"),
                 expected_signer_count: 2,
                 observed_signer_count: 1,
-                expected_threshold: 2,
-                observed_threshold: 2,
+                expected_threshold: Some(2),
+                observed_threshold: Some(2),
                 expected_signer_set_digest: "abcdef12...34567890".to_owned(),
                 observed_signer_set_digest: "12345678...abcdef90".to_owned(),
+                snapshot_version: None,
             },
             EventKind::SaSignerSetBaselined {
                 rule_id: 1,

@@ -82,8 +82,9 @@ pub const WEIGHTED_THRESHOLD_POLICY_WASM: &[u8] = include_bytes!(
 ///
 /// Single-entry allowlist (unlike [`crate::signers::policy_identification::THRESHOLD_POLICY_WASM_HASHES`]'s
 /// two entries — this policy has no legacy version to grandfather). Separate
-/// from the simple-threshold allowlist: `identify_threshold_policy` matches
-/// ONLY simple-threshold hashes and `identify_weighted_threshold_policy`
+/// from the simple-threshold allowlist: the signer-set observation's
+/// threshold-policy identification matches ONLY simple-threshold hashes and
+/// `identify_weighted_threshold_policy`
 /// matches ONLY this array, so the two policy kinds cannot cross-identify.
 ///
 /// Each entry is a 32-byte raw SHA-256 digest — the same value pinned in
