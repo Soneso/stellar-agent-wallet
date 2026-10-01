@@ -1,12 +1,15 @@
 //! Adversarial fixture: threshold policy identification — zero-match rejection.
 //!
 //! Scenario: the `ContextRule` lists one policy address, but the policy contract's
-//! wasm hash does NOT match any entry in `THRESHOLD_POLICY_WASM_HASHES`. The
-//! match count is zero → `ThresholdPolicyIdentificationFailed` (fail-closed).
+//! wasm hash does NOT match any entry in `THRESHOLD_POLICY_WASM_HASHES`, and the
+//! audit log holds a version-1 baseline. The version-2 observation records no
+//! threshold; the version-1 comparison needs one, and the rule's policies
+//! include none that is a simple-threshold policy →
+//! `ThresholdPolicyIdentificationFailed` (fail closed).
 //!
 //! This validates that a policy contract with an unrecognised wasm hash (e.g. an
 //! attacker-controlled contract that mimics the threshold-policy interface) is
-//! rejected before any threshold read.
+//! never read as the threshold policy: no threshold read happens.
 
 use std::sync::Arc;
 
@@ -46,9 +49,9 @@ async fn unknown_wasm_hash_returns_identification_failed_zero_match() {
     let cr_xdr = build_context_rule_scval_xdr(1, &baseline, std::slice::from_ref(&policy));
     let sim_cr = build_simulate_response(&cr_xdr);
 
-    // The mock serves UNKNOWN_WASM_HASH for the policy contract instance.
-    // `identify_threshold_policy` will see this hash, find no allowlist match,
-    // and return ThresholdPolicyIdentificationFailed with match_count = 0.
+    // The mock serves UNKNOWN_WASM_HASH for the policy contract instance. The
+    // observation finds no allowlist match and records no threshold; the
+    // version-1 comparison returns ThresholdPolicyIdentificationFailed.
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
@@ -56,9 +59,9 @@ async fn unknown_wasm_hash_returns_identification_failed_zero_match() {
             SOURCE_G,
             &policy,
             UNKNOWN_WASM_HASH,
-            // Only one simulateTransaction call: fetch_context_rule_primary.
-            // After that, getLedgerEntries fetches happen for wasm-hash check.
-            // No further simulateTransaction needed (hash mismatch fires before simulate).
+            // Only get_context_rule simulations (one per endpoint, both on this
+            // server); the policy's instance read follows, and no threshold
+            // read is made for a policy that is not allowlisted.
             SequencedSimulate::new(vec![sim_cr]),
         ))
         .mount(&mock_server)

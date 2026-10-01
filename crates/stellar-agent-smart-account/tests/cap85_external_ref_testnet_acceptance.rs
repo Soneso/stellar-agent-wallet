@@ -866,7 +866,13 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     assert!(created.2, "the created row must carry mutable_override");
 
     signers_manager
-        .refresh_signer_baseline(smart_account_sc.clone(), rule_id, Some(&bootstrap_g), rid())
+        .refresh_signer_baseline(
+            smart_account_sc.clone(),
+            rule_id,
+            Some(&bootstrap_g),
+            false,
+            rid(),
+        )
         .await
         .expect("refresh_signer_baseline must succeed");
 

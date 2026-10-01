@@ -88,7 +88,7 @@ async fn build_fixture() -> DivergenceFixture {
             &signer_g,
             &policy,
             KNOWN_WASM_HASH,
-            SequencedSimulate::new(vec![sim_cr.clone(), sim_cr.clone(), sim_th.clone()]),
+            SequencedSimulate::new(vec![sim_cr.clone(), sim_th.clone()]),
         ))
         .mount(&primary_server)
         .await;

@@ -17,7 +17,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use stellar_agent_core::audit_log::signer_set::ObservedSignerSet;
+use stellar_agent_core::audit_log::signer_set::SignerSetView;
 
 // ── FrozenChainStateTuple ─────────────────────────────────────────────────────
 
@@ -51,8 +51,9 @@ use stellar_agent_core::audit_log::signer_set::ObservedSignerSet;
 #[must_use = "FrozenChainStateTuple binds the divergence-check result to the signing call; \
               dropping it without consuming defeats the TOCTOU mitigation"]
 pub struct FrozenChainStateTuple {
-    /// The signer-set state observed at divergence-check time.
-    pub(crate) observed_chain_state: ObservedSignerSet,
+    /// The signer-set state observed at divergence-check time, in the
+    /// snapshot version of the baseline it matched.
+    pub(crate) observed_chain_state: SignerSetView,
 
     /// Simulation ledger at divergence-check time: `(latest_ledger_seq, observed_at_unix_ms)`.
     ///
@@ -85,16 +86,13 @@ impl FrozenChainStateTuple {
     ///
     /// # Arguments
     ///
-    /// - `observed_chain_state` — the on-chain signer-set state observed at check time.
+    /// - `observed_chain_state`: the on-chain signer-set state observed at
+    ///   check time, in the baseline's snapshot version.
     /// - `simulation_ledger` — `(latest_ledger_seq, observed_at_unix_ms)`.
     /// - `expected_audit_row_hash` — SHA-256 of the baseline audit-log row body.
     /// - `rule_id` — the context-rule identifier.
-    #[allow(
-        dead_code,
-        reason = "production call site wired in managers/signers.rs"
-    )]
     pub(crate) fn new(
-        observed_chain_state: ObservedSignerSet,
+        observed_chain_state: SignerSetView,
         simulation_ledger: (u32, i64),
         expected_audit_row_hash: [u8; 32],
         rule_id: u32,
@@ -135,26 +133,33 @@ impl FrozenChainStateTuple {
         &self.expected_audit_row_hash
     }
 
-    /// Returns a reference to the observed on-chain signer-set state.
+    /// Returns a reference to the observed on-chain signer-set state, in the
+    /// snapshot version of the baseline it matched.
     ///
     /// The signing call uses this as the starting point for signing-entry
     /// construction, after confirming the tuple's `rule_id` and staleness bound.
     #[must_use]
-    pub fn observed_chain_state(&self) -> &ObservedSignerSet {
+    pub fn observed_chain_state(&self) -> &SignerSetView {
         &self.observed_chain_state
     }
 }
 
-// Manual Debug impl — avoids leaking full signer-set pubkey data at info level.
-// Redaction discipline: only counts and the rule_id are printed; the full
-// pubkey data is available at debug level via `observed_chain_state` directly.
+// Manual Debug impl: avoids leaking signer identities at info level.
+// Redaction discipline: only the snapshot version, the signer count, the
+// threshold and the rule_id are printed; the full identities are available
+// through `observed_chain_state` directly.
 impl fmt::Debug for FrozenChainStateTuple {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let threshold = match &self.observed_chain_state {
+            SignerSetView::V1(state) => Some(state.threshold),
+            SignerSetView::V2(snapshot) => snapshot.threshold.as_ref().map(|t| t.threshold),
+        };
         f.debug_struct("FrozenChainStateTuple")
             .field("rule_id", &self.rule_id)
             .field("simulation_ledger", &self.simulation_ledger)
-            .field("signer_count", &self.observed_chain_state.signer_count)
-            .field("threshold", &self.observed_chain_state.threshold)
+            .field("snapshot_version", &self.observed_chain_state.version())
+            .field("signer_count", &self.observed_chain_state.signer_count())
+            .field("threshold", &threshold)
             .field(
                 "expected_audit_row_hash_first8",
                 &format_args!(
@@ -354,8 +359,10 @@ pub enum ThresholdAffectingOp {
 
     /// Add a signer to the context rule.
     ///
-    /// `signer_type` is a discriminant string (`"ed25519"`, `"webauthn"`,
-    /// `"external"`) identifying the signer arm being added.  `signer_id` is
+    /// `signer_type` is a discriminant string (`"ed25519"`, `"external"`,
+    /// `"delegated_contract"`) identifying the kind of the signer being
+    /// added, decoded from the signer itself; a passkey signer is
+    /// `"external"`.  `signer_id` is
     /// present when the add operation targets a known-ID signer (currently
     /// `None` for new-signer adds; the on-chain ID is assigned by the contract
     /// and only known post-submit).
@@ -366,7 +373,8 @@ pub enum ThresholdAffectingOp {
     AddSigner {
         /// Discriminant string for the signer arm being added.
         ///
-        /// Known values: `"ed25519"`, `"webauthn"`, `"external"`.
+        /// Known values: `"ed25519"`, `"external"`, `"delegated_contract"`,
+        /// and `"unknown"` for a kind this build does not name.
         /// `String` rather than `&'static str` to support serde round-trips
         /// (deserialization cannot produce `&'static str` from heap-allocated JSON).
         signer_type: String,
@@ -391,9 +399,10 @@ pub enum ThresholdAffectingOp {
 /// Closed-set per-policy classification returned by
 /// `SignersManager::classify_rule_policies`.
 ///
-/// Unlike `identify_threshold_policy` / `identify_spending_limit_policy`
-/// (which fail-closed when a rule's policies do not resolve to exactly one
-/// allowlisted contract of the requested kind), this classification is for
+/// Unlike the signer-set observation's threshold-policy identification and
+/// `identify_spending_limit_policy` (which fail closed when a rule's policies
+/// do not resolve to the allowlisted contracts they require), this
+/// classification is for
 /// read-only observability: each policy address attached to a rule is
 /// independently classified by its own on-chain wasm-hash, and an
 /// unrecognised or unreachable hash degrades to `Unknown` rather than
@@ -428,7 +437,9 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
 
     use static_assertions::assert_not_impl_any;
-    use stellar_agent_core::audit_log::signer_set::{ObservedSignerSet, SignerPubkey};
+    use stellar_agent_core::audit_log::signer_set::{
+        ObservedSignerSet, SignerEntryV2, SignerIdentityV2, SignerPubkey, SignerSetSnapshotV2,
+    };
 
     use super::*;
 
@@ -459,13 +470,51 @@ mod tests {
     #[test]
     fn frozen_chain_state_tuple_expected_audit_row_hash_accessor_borrows() {
         let hash: [u8; 32] = [0xde; 32];
-        let frozen =
-            FrozenChainStateTuple::new(observed_signer_set(), (42u32, 999_000i64), hash, 7u32);
+        let frozen = FrozenChainStateTuple::new(
+            SignerSetView::V1(observed_signer_set()),
+            (42u32, 999_000i64),
+            hash,
+            7u32,
+        );
         // Call the accessor twice — only valid if it borrows (not moves).
         let r1: &[u8; 32] = frozen.expected_audit_row_hash();
         let r2: &[u8; 32] = frozen.expected_audit_row_hash();
         assert_eq!(r1, r2);
         assert_eq!(r1, &hash);
+    }
+
+    /// `Debug` prints the snapshot version, the signer count and the
+    /// threshold of each version and never a signer identity.
+    #[test]
+    fn frozen_chain_state_tuple_debug_prints_version_count_and_threshold() {
+        let v1 = FrozenChainStateTuple::new(
+            SignerSetView::V1(observed_signer_set()),
+            (42, 1),
+            [0xde; 32],
+            7,
+        );
+        let rendered = format!("{v1:?}");
+        assert!(rendered.contains("snapshot_version: 1"), "{rendered}");
+        assert!(rendered.contains("signer_count: 2"), "{rendered}");
+        assert!(rendered.contains("threshold: Some(2)"), "{rendered}");
+
+        let v2 = FrozenChainStateTuple::new(
+            SignerSetView::V2(SignerSetSnapshotV2 {
+                signers: vec![SignerEntryV2 {
+                    id: 3,
+                    identity: SignerIdentityV2::Ed25519 { pubkey: [0x5a; 32] },
+                }],
+                threshold: None,
+            }),
+            (43, 2),
+            [0xde; 32],
+            8,
+        );
+        let rendered = format!("{v2:?}");
+        assert!(rendered.contains("snapshot_version: 2"), "{rendered}");
+        assert!(rendered.contains("signer_count: 1"), "{rendered}");
+        assert!(rendered.contains("threshold: None"), "{rendered}");
+        assert!(!rendered.contains("5a5a"), "no identity bytes: {rendered}");
     }
 
     // ── WasmHashSummary ───────────────────────────────────────────────────────

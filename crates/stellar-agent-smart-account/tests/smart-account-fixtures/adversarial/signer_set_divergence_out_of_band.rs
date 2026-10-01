@@ -34,8 +34,8 @@ use super::rpc_mock_helpers::{
 /// Uses separate primary and secondary mock servers so that the interleaved
 /// `tokio::join!` calls within `verify_signer_set_against_chain` do not race on
 /// a shared `SequencedSimulate` counter.  Each server sees its own ordered
-/// sequence: get_context_rule (Step 2a) then get_context_rule + get_threshold
-/// (Step 2b).
+/// sequence of the signer-set observation: get_context_rule, the policy's
+/// instance read, then get_threshold.
 #[tokio::test]
 async fn out_of_band_rotation_returns_signer_set_diverged() {
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
@@ -52,10 +52,10 @@ async fn out_of_band_rotation_returns_signer_set_diverged() {
     let sim_cr = build_simulate_response(&cr_xdr);
     let sim_th = build_simulate_response(&th_xdr);
 
-    // Primary server: sees 3 simulate calls in sequence:
-    //   1. identify_threshold_policy: get_context_rule (primary only)
-    //   2. fetch_signer_set(primary): get_context_rule
-    //   3. fetch_signer_set(primary): get_threshold
+    // Each server sees 2 simulate calls in sequence, with the policy's
+    // instance read (getLedgerEntries) between them:
+    //   1. get_context_rule
+    //   2. get_threshold
     let primary_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
@@ -63,15 +63,11 @@ async fn out_of_band_rotation_returns_signer_set_diverged() {
             SOURCE_G,
             &policy,
             KNOWN_WASM_HASH,
-            SequencedSimulate::new(vec![sim_cr.clone(), sim_cr.clone(), sim_th.clone()]),
+            SequencedSimulate::new(vec![sim_cr.clone(), sim_th.clone()]),
         ))
         .mount(&primary_server)
         .await;
 
-    // Secondary server: sees 2 simulate calls:
-    //   1. fetch_signer_set(secondary): get_context_rule
-    //   2. fetch_signer_set(secondary): get_threshold
-    // Also serves the two-RPC getLedgerEntries for identify_threshold_policy.
     let secondary_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))

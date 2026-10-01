@@ -49,6 +49,8 @@ async fn two_allowlisted_policies_returns_identification_failed_multi_match() {
     let sim_cr = build_simulate_response(&cr_xdr);
 
     // Mock: both policy_a and policy_b return KNOWN_WASM_HASH (both in allowlist).
+    // Each policy's executable is read on its own; the response carries both
+    // instances and the fetcher takes the entry whose key it requested.
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))

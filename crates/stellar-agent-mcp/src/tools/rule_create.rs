@@ -112,8 +112,7 @@ fn default_auth_rule_ids() -> Vec<u32> {
 /// One signer entry in `stellar_rule_create`'s `signers` array.
 ///
 /// - `delegated`: a G-strkey (ed25519-keyed delegate). A contract-address
-///   delegated signer is refused: the wallet reads a rule's signer set in
-///   full, and a C-strkey delegated signer has no representation in it.
+///   (C-strkey) delegated signer is refused.
 /// - `external`: raw escape hatch — an explicit verifier C-strkey and
 ///   hex-encoded `pubkey_data`, passed through unresolved (mirrors the
 ///   `raw` policy-kind precedent: a typed convenience path plus a raw

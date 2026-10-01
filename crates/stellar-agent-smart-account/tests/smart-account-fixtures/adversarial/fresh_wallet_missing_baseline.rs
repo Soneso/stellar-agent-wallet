@@ -9,11 +9,10 @@
 //! - Fail-closed: first signing attempt with no baseline returns
 //!   `sa.signer_set_missing_baseline` (NOT `sa.signer_set_diverged`).
 //! - Wire code `"sa.signer_set_missing_baseline"` is present.
-//! - Error message mentions the baseline-write commands.
-//! - After `refresh_signer_baseline`, the baseline is established and
-//!   subsequent `verify_signer_set_against_chain` calls can proceed past
-//!   Step 1. The "proceed past step 1" assertion with real on-chain state
-//!   is covered by the testnet acceptance tests.
+//! - The error message names `smart-account signers list --rule-id <N>`, the
+//!   command that records the baseline.
+//! - A baseline of another rule of the same account does not satisfy the
+//!   check.
 //!
 //! # Invariant
 //!
@@ -26,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use stellar_agent_core::audit_log::writer::AuditWriter;
+use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
 use stellar_xdr::{ContractId, Hash, ScAddress};
@@ -34,10 +34,11 @@ use uuid::Uuid;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Minimal valid C-strkey for a 32-byte zero contract hash.
-///
-/// `stellar_strkey::Contract([0u8; 32]).to_string()` → this value.
-const ZERO_CONTRACT_STRKEY: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+/// The C-strkey of the all-zero contract id, the account of
+/// [`zero_sc_address`].
+fn zero_contract_strkey() -> String {
+    format!("{}", stellar_strkey::Contract([0u8; 32]))
+}
 
 fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
     let dir = tempfile::tempdir().expect("tempdir must succeed");
@@ -134,6 +135,11 @@ async fn missing_baseline_wire_code_is_correct() {
         "wire_code must be 'sa.signer_set_missing_baseline'; got: '{}'",
         err.wire_code()
     );
+    let message = err.to_string();
+    assert!(
+        message.contains("'smart-account signers list --rule-id 2'"),
+        "the message must name the command that records the baseline: {message}"
+    );
 }
 
 /// Rule 0 (bootstrap rule) and rule 1 are independent in the audit log.
@@ -164,7 +170,9 @@ async fn missing_baseline_is_per_rule() {
             0,
             BaselineReason::first_observation(),
             [0u8; 32],
-            RedactedStrkey::from_already_redacted(format!("{}...", &ZERO_CONTRACT_STRKEY[..5])),
+            RedactedStrkey::from_already_redacted(redact_strkey_first5_last5(
+                &zero_contract_strkey(),
+            )),
             "stellar:testnet",
             Uuid::new_v4().to_string(),
         );
@@ -197,5 +205,20 @@ async fn missing_baseline_is_per_rule() {
             Err(SaError::SignerSetMissingBaseline { rule_id: 1, .. })
         ),
         "rule 1 must return SignerSetMissingBaseline even if rule 0 has a baseline; got: {result:?}"
+    );
+
+    // Rule 0's row is this account's: its check passes the baseline read and
+    // fails later, at the unreachable RPC.
+    let rule_0 = manager
+        .verify_signer_set_against_chain(
+            zero_sc_address(),
+            0,
+            Some(stellar_agent_core::constants::SIMULATE_SENTINEL_G),
+            Uuid::new_v4().to_string(),
+        )
+        .await;
+    assert!(
+        matches!(&rule_0, Err(err) if err.wire_code() != "sa.signer_set_missing_baseline"),
+        "rule 0 has a baseline, so its check reaches the RPC; got: {rule_0:?}"
     );
 }

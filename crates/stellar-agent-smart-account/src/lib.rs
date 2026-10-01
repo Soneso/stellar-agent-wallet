@@ -17,15 +17,15 @@
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
-// `SaError::SignerSetDiverged` carries two `ObservedSignerSet` structs + two
-// forensic-symmetry `String` fields.
-// The combined variant size of 164 bytes exceeds the 128-byte default threshold.
-// The variant is intentionally rich: operators need the full signer-set state to
-// diagnose divergence without a separate audit-log query.  The error is always
-// converted to `Box<dyn Error>` or serialised before crossing ABI boundaries.
+// `SaError::SignerSetDiverged` carries two `SignerSetView` values, the optional
+// transaction hash and forensic `String` fields, which exceeds the 128-byte
+// default threshold. The variant is intentionally rich: operators need the full
+// signer-set state to diagnose divergence without a separate audit-log query.
+// The error is always converted to `Box<dyn Error>` or serialised before
+// crossing ABI boundaries.
 #![allow(
     clippy::result_large_err,
-    reason = "SaError::SignerSetDiverged carries full ObservedSignerSet diagnostic state by design"
+    reason = "SaError::SignerSetDiverged carries full SignerSetView diagnostic state by design"
 )]
 
 pub mod bindings;

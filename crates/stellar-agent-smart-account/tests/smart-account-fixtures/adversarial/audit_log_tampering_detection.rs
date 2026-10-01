@@ -3,8 +3,8 @@
 //! Synthesises an audit log with the most-recent `SaSignerSetBaselined` row's
 //! payload tampered (e.g. `resulting_threshold` flipped) WITHOUT regenerating the
 //! hash chain. Asserts that `verify_signer_set_against_chain` returns
-//! `AuditLogIntegrityError` BEFORE `read_audit_log_baseline` can return a
-//! poisoned `ObservedSignerSet`.
+//! `AuditLogIntegrityError` BEFORE the audit-log state read can return a
+//! poisoned signer-set view.
 //!
 //! The audit log is a load-bearing substrate: the path MUST NOT swallow the
 //! integrity error and fall through to the on-chain comparison step.

@@ -436,10 +436,10 @@ async fn h_1_revocation_audit_log_timeline() {
 /// # Design
 ///
 /// `ContextRuleManager::add_policy` is used instead of `SignersManager::add_signer`
-/// because `add_signer` requires a threshold policy to be installed on the rule
-/// (`identify_threshold_policy` fires before the expiry check, fail-closed).
-/// `add_policy` is one of the signing paths wired with the pre-submission expiry
-/// check; it does not require a threshold policy.
+/// because `add_signer` requires a signer-set baseline for the rule and compares
+/// the chain with it before the expiry check. `add_policy` is one of the
+/// signing paths wired with the pre-submission expiry check; it needs no
+/// baseline.
 ///
 /// After revocation (`valid_until = revocation_ledger`), we wait for the chain
 /// to advance so `latest_ledger > revocation_ledger`. The expiry check fires

@@ -161,13 +161,15 @@ async fn policy_rpc_divergence_routes_to_drift_check_unavailable() {
     let context_rule_response = build_simulate_response(&context_rule_xdr);
     let threshold_response = build_simulate_response(&threshold_xdr);
 
+    // Primary simulations: the signer-set observation's rule read and
+    // threshold read, then the drift check's rule read. Each endpoint's first
+    // policy instance read is the observation's, its second the drift check's.
     let primary = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
         .respond_with(SequencedLedgerResponder::new(
             vec![KNOWN_WASM_HASH, KNOWN_WASM_HASH],
             vec![
-                context_rule_response.clone(),
                 context_rule_response.clone(),
                 threshold_response.clone(),
                 context_rule_response.clone(),

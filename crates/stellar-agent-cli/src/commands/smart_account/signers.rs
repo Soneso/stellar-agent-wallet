@@ -5,13 +5,16 @@
 //!
 //! # Subcommands
 //!
-//! - [`ListArgs`] — `smart-account signers list` — reads on-chain signer set; writes
-//!   a `SaSignerSetBaselined` audit row if no prior baseline exists.
-//! - [`RefreshArgs`] — `smart-account signers refresh` — unconditionally writes a new
-//!   `SaSignerSetBaselined` row (programmatic re-anchor after intentional
-//!   out-of-band mutation).
+//! - [`ListArgs`], `smart-account signers list`: reads the on-chain signer set;
+//!   writes a `SaSignerSetBaselinedV2` audit row if no prior baseline exists,
+//!   and otherwise reports how the chain compares with it.
+//! - [`RefreshArgs`], `smart-account signers refresh`: compares the chain with
+//!   the baseline and writes a new `SaSignerSetBaselinedV2` row (programmatic
+//!   re-anchor after intentional out-of-band mutation, and the one-time upgrade
+//!   of a version 1 baseline); a changed or incomparable set needs
+//!   `--accept-divergence`.
 //! - [`AddArgs`] — `smart-account signers add` — adds one signer to a context rule via
-//!   OZ `add_signer`; emits `SaSignerAdded`. Accepts three mutually-exclusive
+//!   OZ `add_signer`; emits `SaSignerAddedV2`. Accepts three mutually-exclusive
 //!   signer-source flags:
 //!   - `--signer-delegated <G-strkey>` — ed25519 delegated signer.
 //!   - `--signer-external <verifier-C-strkey> --signer-key-data <hex>` — custom
@@ -19,11 +22,11 @@
 //!   - `--signer-webauthn <credential-name>` — WebAuthn passkey signer resolved
 //!     from the credential store and `VerifierRegistry`.
 //! - [`RemoveArgs`] — `smart-account signers remove` — removes one signer by `signer_id`
-//!   via OZ `remove_signer`; emits `SaSignerRemoved`. Refuses operations that
+//!   via OZ `remove_signer`; emits `SaSignerRemovedV2`. Refuses operations that
 //!   would violate `signer_count >= threshold` with `safe_ordering_hint`.
 //! - [`SetThresholdArgs`] — `smart-account signers set-threshold` — changes the
 //!   signing threshold via OZ `ThresholdPolicyContract::set_threshold`; emits
-//!   `SaThresholdChanged`.
+//!   `SaThresholdChangedV2`.
 //!
 //! # Signer-source modes (mirror of `smart-account rules`)
 //!
@@ -48,15 +51,18 @@
 //!
 //! - `sa.threshold_unreachable` — `SaError::ThresholdUnreachable`
 //! - `sa.signer_set_missing_baseline` — `SaError::SignerSetMissingBaseline`
+//! - `sa.signer_set_baseline_legacy`: `SaError::SignerSetBaselineLegacy`
 //! - `sa.signer_set_diverged` — `SaError::SignerSetDiverged`
+//! - `sa.baseline_write_failed`: `SaError::BaselineWriteFailed`
 //! - `network.rpc_divergence` — `SaError::NetworkRpcDivergence`
 //! - `sa.threshold_policy_not_installed` — `SaError::ThresholdPolicyNotInstalled`
 //! - `sa.threshold_policy_identification_failed` — `SaError::ThresholdPolicyIdentificationFailed`
+//! - `sa.threshold_read_failed`: `SaError::ThresholdReadFailed`
 
 use base64::Engine as _;
 use clap::{ArgGroup, Args, Subcommand};
 use serde::{Deserialize, Serialize};
-use stellar_agent_core::audit_log::signer_set::SignerPubkey;
+use stellar_agent_core::audit_log::signer_set::{SignerIdentityV2, SignerPubkey, SignerSetView};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{CapKind, NetworkError, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
@@ -66,7 +72,8 @@ use stellar_agent_smart_account::managers::rules::{
     OZ_MAX_SIGNERS, decode_signer_count_from_scval, parse_c_strkey_to_smart_account,
 };
 use stellar_agent_smart_account::managers::signers::{
-    build_delegated_signer_scval, build_external_signer_scval,
+    PreviousBaseline, RefreshOutcome, SignersManager, build_delegated_signer_scval,
+    build_external_signer_scval,
 };
 use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use tracing::info;
@@ -247,8 +254,9 @@ pub async fn run(args: &SignersArgs) -> i32 {
 
 /// Arguments for `smart-account signers list`.
 ///
-/// Reads on-chain signer set; writes `SaSignerSetBaselined` if no prior
-/// baseline exists. Mainnet is structurally refused.
+/// Reads the on-chain signer set; writes `SaSignerSetBaselinedV2` if no prior
+/// baseline exists, and otherwise compares the chain with it and writes
+/// nothing. Mainnet is structurally refused.
 #[non_exhaustive]
 #[derive(Debug, Args)]
 #[command(
@@ -290,10 +298,10 @@ pub struct ListArgs {
 
 /// Result envelope for `smart-account signers list`.
 ///
-/// This envelope intentionally omits a `baselined` field: `list_signers` does
-/// not yet expose a first-observation signal from the manager, so any such
-/// field would be hard-coded and would misreport in the JSON output. The field
-/// will be re-introduced when the manager exposes the signal.
+/// Carries the observed signer set and `baseline`, how it compared with the
+/// rule's audit-log state row before the call: `none` when this call recorded
+/// the first baseline, otherwise `matched`, `diverged` or `not_comparable` (a
+/// version 1 baseline the chain state has no version 1 form for).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListResult {
     /// Smart-account C-strkey (caller-supplied; not fetched from chain).
@@ -302,12 +310,90 @@ pub struct ListResult {
     pub rule_id: u32,
     /// Number of signers in the rule.
     pub signer_count: u32,
-    /// Threshold required for rule invocation.
-    pub threshold: u32,
-    /// Signer IDs (parallel to `signer_kinds`).
+    /// Threshold of the rule's simple-threshold policy; `null` when the rule
+    /// has none.
+    pub threshold: Option<u32>,
+    /// Snapshot version of the observed set.
+    pub snapshot_version: u8,
+    /// Signer IDs (parallel to `signer_kinds` and `signer_summaries`).
     pub signer_ids: Vec<u32>,
-    /// Human-readable signer-kind labels (parallel to `signer_ids`).
+    /// Signer-kind labels (parallel to `signer_ids`): `delegated_ed25519`,
+    /// `external` (a passkey signer included) or `delegated_contract`.
     pub signer_kinds: Vec<String>,
+    /// Signer identity summaries of first-8 hex projections (parallel to
+    /// `signer_ids`).
+    pub signer_summaries: Vec<String>,
+    /// How the observation compared with the prior state row.
+    pub baseline: PreviousBaseline,
+}
+
+/// The fields every signer-set envelope reports for a view.
+struct ViewFields {
+    signer_count: u32,
+    threshold: Option<u32>,
+    snapshot_version: u8,
+    signer_ids: Vec<u32>,
+    signer_kinds: Vec<String>,
+    signer_summaries: Vec<String>,
+}
+
+/// Projects a signer-set view to its envelope fields, signers in the view's
+/// order.
+fn view_fields(view: &SignerSetView) -> ViewFields {
+    match view {
+        SignerSetView::V2(snapshot) => ViewFields {
+            signer_count: snapshot.signer_count(),
+            threshold: snapshot.threshold.as_ref().map(|t| t.threshold),
+            snapshot_version: view.version(),
+            signer_ids: snapshot.signers.iter().map(|entry| entry.id).collect(),
+            signer_kinds: snapshot
+                .signers
+                .iter()
+                .map(|entry| identity_kind_label(&entry.identity).to_owned())
+                .collect(),
+            signer_summaries: snapshot
+                .signers
+                .iter()
+                .map(|entry| entry.identity.summary())
+                .collect(),
+        },
+        // The manager's outcomes carry version 2 views; a version 1 view
+        // summarizes each signer by its kind label.
+        SignerSetView::V1(state) => {
+            let signer_kinds: Vec<String> =
+                state.signer_pubkeys.iter().map(signer_kind_label).collect();
+            ViewFields {
+                signer_count: state.signer_count,
+                threshold: Some(state.threshold),
+                snapshot_version: view.version(),
+                signer_ids: state.signer_ids.clone(),
+                signer_summaries: signer_kinds.clone(),
+                signer_kinds,
+            }
+        }
+    }
+}
+
+/// Builds the `signers list` envelope from the observed view and its
+/// comparison with the prior state row.
+fn list_result(
+    smart_account: &str,
+    rule_id: u32,
+    view: &SignerSetView,
+    baseline: PreviousBaseline,
+) -> ListResult {
+    let fields = view_fields(view);
+    ListResult {
+        smart_account: smart_account.to_owned(),
+        rule_id,
+        signer_count: fields.signer_count,
+        threshold: fields.threshold,
+        snapshot_version: fields.snapshot_version,
+        signer_ids: fields.signer_ids,
+        signer_kinds: fields.signer_kinds,
+        signer_summaries: fields.signer_summaries,
+        baseline,
+    }
 }
 
 async fn list_run(args: &ListArgs) -> i32 {
@@ -358,22 +444,10 @@ async fn list_run(args: &ListArgs) -> i32 {
         )
         .await
     {
-        Ok(observed) => {
-            let signer_kinds = observed
-                .signer_pubkeys
-                .iter()
-                .map(signer_kind_label)
-                .collect::<Vec<_>>();
-            let result = ListResult {
-                smart_account: args.account.clone(),
-                rule_id: args.rule_id,
-                signer_count: observed.signer_count,
-                threshold: observed.threshold,
-                signer_ids: observed.signer_ids,
-                signer_kinds,
-            };
-            emit_success(&result, &request_id)
-        }
+        Ok(outcome) => emit_success(
+            &list_result(&args.account, args.rule_id, &outcome.view, outcome.baseline),
+            &request_id,
+        ),
         Err(e) => emit_error_sa(&e, &request_id),
     }
 }
@@ -384,7 +458,10 @@ async fn list_run(args: &ListArgs) -> i32 {
 
 /// Arguments for `smart-account signers refresh`.
 ///
-/// Unconditionally fetches signer set and writes `SaSignerSetBaselined`.
+/// Observes the signer set, compares it with the rule's audit-log baseline
+/// and writes a new `SaSignerSetBaselinedV2` row. A set that differs from the
+/// baseline, or a version 1 baseline the chain state cannot be compared with,
+/// is recorded only with `--accept-divergence`.
 #[non_exhaustive]
 #[derive(Debug, Args)]
 pub struct RefreshArgs {
@@ -395,6 +472,13 @@ pub struct RefreshArgs {
     /// Context rule ID to baseline.
     #[arg(long, value_name = "U32", required = true)]
     pub rule_id: u32,
+
+    /// Record the chain state even when it differs from the rule's audit-log
+    /// baseline, or when a version 1 baseline cannot be compared with it.
+    /// Without this flag such a refresh writes the divergence row (for a
+    /// differing set) and refuses with `sa.signer_set_diverged`.
+    #[arg(long)]
+    pub accept_divergence: bool,
 
     /// Profile name for audit-log path resolution.
     #[arg(long, value_name = "NAME")]
@@ -429,8 +513,73 @@ pub struct RefreshResult {
     pub rule_id: u32,
     /// Number of signers in the rule at refresh time.
     pub signer_count: u32,
-    /// Threshold at refresh time.
-    pub threshold: u32,
+    /// Threshold of the rule's simple-threshold policy at refresh time;
+    /// `null` when the rule has none.
+    pub threshold: Option<u32>,
+    /// Snapshot version of the recorded baseline.
+    pub snapshot_version: u8,
+    /// How the chain compared with the baseline the refresh replaced:
+    /// `none`, `matched`, `diverged` or `not_comparable`.
+    pub previous_baseline: PreviousBaseline,
+}
+
+/// Builds the `signers refresh` envelope from the recorded view and its
+/// comparison with the state row it replaced.
+fn refresh_result(
+    smart_account: &str,
+    rule_id: u32,
+    view: &SignerSetView,
+    previous_baseline: PreviousBaseline,
+) -> RefreshResult {
+    let fields = view_fields(view);
+    RefreshResult {
+        smart_account: smart_account.to_owned(),
+        rule_id,
+        signer_count: fields.signer_count,
+        threshold: fields.threshold,
+        snapshot_version: fields.snapshot_version,
+        previous_baseline,
+    }
+}
+
+/// The one warning line a refresh that accepted a changed or incomparable
+/// set prints; `None` when the chain matched the baseline or there was none.
+fn refresh_warning(rule_id: u32, previous_baseline: PreviousBaseline) -> Option<String> {
+    match previous_baseline {
+        PreviousBaseline::Diverged => Some(format!(
+            "warning: rule {rule_id}'s on-chain signer set differed from its audit-log \
+             baseline; the refresh recorded the current chain state"
+        )),
+        PreviousBaseline::NotComparable => Some(format!(
+            "warning: rule {rule_id}'s version 1 baseline could not be compared with the \
+             chain; the refresh recorded the current chain state"
+        )),
+        _ => None,
+    }
+}
+
+/// Runs the manager's refresh for `args`, passing `--accept-divergence`
+/// through.
+#[allow(
+    clippy::result_large_err,
+    reason = "returns the manager's own error type unchanged"
+)]
+async fn refresh_outcome(
+    manager: &SignersManager,
+    smart_account: stellar_xdr::ScAddress,
+    args: &RefreshArgs,
+    source_account_strkey: Option<&str>,
+    request_id: String,
+) -> Result<RefreshOutcome, SaError> {
+    manager
+        .refresh_signer_baseline(
+            smart_account,
+            args.rule_id,
+            source_account_strkey,
+            args.accept_divergence,
+            request_id,
+        )
+        .await
 }
 
 async fn refresh_run(args: &RefreshArgs) -> i32 {
@@ -471,23 +620,34 @@ async fn refresh_run(args: &RefreshArgs) -> i32 {
         "smart-account signers refresh: writing fresh baseline"
     );
 
-    match manager
-        .refresh_signer_baseline(
-            ctx.smart_account,
-            args.rule_id,
-            Some(&source_account_strkey),
-            request_id.clone(),
-        )
-        .await
+    match refresh_outcome(
+        &manager,
+        ctx.smart_account,
+        args,
+        Some(&source_account_strkey),
+        request_id.clone(),
+    )
+    .await
     {
-        Ok(observed) => {
-            let result = RefreshResult {
-                smart_account: args.account.clone(),
-                rule_id: args.rule_id,
-                signer_count: observed.signer_count,
-                threshold: observed.threshold,
-            };
-            emit_success(&result, &request_id)
+        Ok(outcome) => {
+            if let Some(warning) = refresh_warning(args.rule_id, outcome.previous_baseline) {
+                #[allow(
+                    clippy::print_stderr,
+                    reason = "one warning line beside the JSON envelope on stdout"
+                )]
+                {
+                    eprintln!("{warning}");
+                }
+            }
+            emit_success(
+                &refresh_result(
+                    &args.account,
+                    args.rule_id,
+                    &outcome.view,
+                    outcome.previous_baseline,
+                ),
+                &request_id,
+            )
         }
         Err(e) => emit_error_sa(&e, &request_id),
     }
@@ -698,104 +858,299 @@ async fn add_run(args: &AddArgs) -> i32 {
         );
     }
 
-    // ── Resolve signer-source: build ScVal + SignerPubkey for each path ───────
+    // ── Resolve signer-source: build the signer ScVal for each path ───────────
     //
     // Exactly one of `signer_delegated` / `signer_external` / `signer_webauthn`
-    // is non-None, enforced by the `new_signer_source` ArgGroup at parse time.
+    // / `signer_ed25519` is non-None, enforced by the `new_signer_source`
+    // ArgGroup at parse time. The manager decodes the signer's identity from
+    // the ScVal itself.
 
-    let (new_signer_scval, new_signer_pubkey, signer_source_label, new_signer_display) =
-        if let Some(g_strkey) = &args.signer_delegated {
-            // ── Delegated (ed25519) ───────────────────────────────────────────
-            // Encoded as OZ `Signer::Delegated(Address)`.
-            let scval = match build_delegated_signer_scval(g_strkey) {
-                Ok(v) => v,
-                Err(e) => {
-                    return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("--signer-delegated: {e}"),
-                        }),
-                        &request_id,
-                    );
-                }
-            };
-            let pubkey = match build_ed25519_signer_pubkey(g_strkey) {
-                Ok(pk) => pk,
-                Err(e) => return emit_error(&e, &request_id),
-            };
-            (scval, pubkey, "delegated".to_owned(), g_strkey.clone())
-        } else if let Some(verifier_c_strkey) = &args.signer_external {
-            // ── External (custom verifier) ────────────────────────────────────
-            // Encoded as OZ `Signer::External(Address, Bytes)`.
-            // key_data is operator-supplied raw hex; no canonicalisation applied here
-            // (operator takes responsibility for correct layout matching the verifier).
-            let key_data_hex = args.signer_key_data.as_deref().unwrap_or("");
-            let key_data = match hex::decode(key_data_hex) {
-                Ok(b) => b,
-                Err(e) => {
-                    return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("--signer-key-data is not valid hex: {e}"),
-                        }),
-                        &request_id,
-                    );
-                }
-            };
-            if key_data.is_empty() {
+    let (new_signer_scval, signer_source_label, new_signer_display) = if let Some(g_strkey) =
+        &args.signer_delegated
+    {
+        // ── Delegated (ed25519) ───────────────────────────────────────────
+        // Encoded as OZ `Signer::Delegated(Address)`.
+        let scval = match build_delegated_signer_scval(g_strkey) {
+            Ok(v) => v,
+            Err(e) => {
                 return emit_error(
                     &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: "--signer-key-data must be non-empty".to_owned(),
+                        input: format!("--signer-delegated: {e}"),
                     }),
                     &request_id,
                 );
             }
-            let verifier_sc_addr = match parse_c_strkey_to_smart_account(verifier_c_strkey) {
-                Ok(addr) => addr,
-                Err(e) => {
-                    return emit_error(
-                        &WalletError::SmartAccount {
-                            wire_code: e.wire_code(),
-                            message: format!("--signer-external: {e}"),
-                        },
-                        &request_id,
-                    );
-                }
-            };
-            let scval = match build_external_signer_scval(verifier_sc_addr, &key_data) {
-                Ok(v) => v,
-                Err(e) => {
-                    return emit_error(
-                        &WalletError::SmartAccount {
-                            wire_code: e.wire_code(),
-                            message: format!("--signer-external ScVal encode: {e}"),
-                        },
-                        &request_id,
-                    );
-                }
-            };
-            // key_data_first16 for audit-log display.
-            let key_data_first16: [u8; 16] = {
-                let mut arr = [0u8; 16];
-                let len = key_data.len().min(16);
-                arr[..len].copy_from_slice(&key_data[..len]);
-                arr
-            };
-            let pubkey = SignerPubkey::External {
-                verifier_contract: verifier_c_strkey.clone(),
-                key_data_first16,
-            };
-            (
-                scval,
-                pubkey,
-                "external".to_owned(),
-                verifier_c_strkey.clone(),
-            )
-        } else if let Some(credential_name) = &args.signer_webauthn {
-            // ── WebAuthn passkey ──────────────────────────────────────────────
-            // key_data = pubkey_65_bytes || credential_id_bytes, matching the OZ
-            // WebAuthn verifier (`canonicalize_key` strips the credential-ID
-            // suffix at verify time; the full concat is stored on-chain).
-            // Verifier address is read from `VerifierRegistry` for the target network.
+        };
+        (scval, "delegated".to_owned(), g_strkey.clone())
+    } else if let Some(verifier_c_strkey) = &args.signer_external {
+        // ── External (custom verifier) ────────────────────────────────────
+        // Encoded as OZ `Signer::External(Address, Bytes)`.
+        // key_data is operator-supplied raw hex; no canonicalisation applied here
+        // (operator takes responsibility for correct layout matching the verifier).
+        let key_data_hex = args.signer_key_data.as_deref().unwrap_or("");
+        let key_data = match hex::decode(key_data_hex) {
+            Ok(b) => b,
+            Err(e) => {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: format!("--signer-key-data is not valid hex: {e}"),
+                    }),
+                    &request_id,
+                );
+            }
+        };
+        if key_data.is_empty() {
+            return emit_error(
+                &WalletError::Validation(ValidationError::AddressInvalid {
+                    input: "--signer-key-data must be non-empty".to_owned(),
+                }),
+                &request_id,
+            );
+        }
+        let verifier_sc_addr = match parse_c_strkey_to_smart_account(verifier_c_strkey) {
+            Ok(addr) => addr,
+            Err(e) => {
+                return emit_error(
+                    &WalletError::SmartAccount {
+                        wire_code: e.wire_code(),
+                        message: format!("--signer-external: {e}"),
+                    },
+                    &request_id,
+                );
+            }
+        };
+        let scval = match build_external_signer_scval(verifier_sc_addr, &key_data) {
+            Ok(v) => v,
+            Err(e) => {
+                return emit_error(
+                    &WalletError::SmartAccount {
+                        wire_code: e.wire_code(),
+                        message: format!("--signer-external ScVal encode: {e}"),
+                    },
+                    &request_id,
+                );
+            }
+        };
+        (scval, "external".to_owned(), verifier_c_strkey.clone())
+    } else if let Some(credential_name) = &args.signer_webauthn {
+        // ── WebAuthn passkey ──────────────────────────────────────────────
+        // key_data = pubkey_65_bytes || credential_id_bytes, matching the OZ
+        // WebAuthn verifier (`canonicalize_key` strips the credential-ID
+        // suffix at verify time; the full concat is stored on-chain).
+        // Verifier address is read from `VerifierRegistry` for the target network.
 
+        let verifier_registry = match VerifierRegistry::open() {
+            Ok(r) => r,
+            Err(e) => {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: format!("could not open verifier registry: {e}"),
+                    }),
+                    &request_id,
+                );
+            }
+        };
+
+        let network_passphrase = args.network.passphrase();
+        let verifier_entry = match verifier_registry.webauthn_verifier_for(network_passphrase) {
+            Some(e) => e,
+            None => {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: format!(
+                            "no WebAuthn verifier deployed for network '{network_passphrase}'; \
+                                 run: smart-account deploy-webauthn-verifier"
+                        ),
+                    }),
+                    &request_id,
+                );
+            }
+        };
+
+        let verifier_sc_addr = match parse_c_strkey_to_smart_account(&verifier_entry.address) {
+            Ok(addr) => addr,
+            Err(e) => {
+                return emit_error(
+                    &WalletError::SmartAccount {
+                        wire_code: e.wire_code(),
+                        message: format!(
+                            "verifier registry address '{}' is not a valid C-strkey: {e}",
+                            verifier_entry.address
+                        ),
+                    },
+                    &request_id,
+                );
+            }
+        };
+
+        let profile = resolve_profile_name(args.profile.as_deref()).name;
+        if let Err(reason) = validate_path_component_ascii_safe(&profile) {
+            return emit_error(
+                &WalletError::Validation(ValidationError::AddressInvalid {
+                    input: format!("invalid profile name '{profile}': {reason}"),
+                }),
+                &request_id,
+            );
+        }
+
+        let creds_mgr = match CredentialsManager::from_defaults_readonly(&profile, "localhost") {
+            Ok(m) => m,
+            Err(e) => {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: format!("could not open passkeys registry: {e}"),
+                    }),
+                    &request_id,
+                );
+            }
+        };
+
+        let metadata = match creds_mgr.show(credential_name) {
+            Ok(m) => m,
+            Err(e) => {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: format!("--signer-webauthn '{credential_name}': {e}"),
+                    }),
+                    &request_id,
+                );
+            }
+        };
+
+        if metadata.public_key_sec1_b64.is_empty() {
+            return emit_error(
+                &WalletError::Validation(ValidationError::AddressInvalid {
+                    input: format!(
+                        "--signer-webauthn '{credential_name}': credential is missing \
+                             public_key_sec1_b64 (delete and re-register)"
+                    ),
+                }),
+                &request_id,
+            );
+        }
+
+        // Decode public key (65-byte uncompressed SEC1 P-256 point).
+        let pubkey_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&metadata.public_key_sec1_b64)
+        {
+            Ok(b) => b,
+            Err(_) => {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: format!(
+                            "--signer-webauthn '{credential_name}': \
+                                 public_key_sec1_b64 is not valid base64url"
+                        ),
+                    }),
+                    &request_id,
+                );
+            }
+        };
+        if pubkey_bytes.len() != 65 {
+            return emit_error(
+                &WalletError::Validation(ValidationError::AddressInvalid {
+                    input: format!(
+                        "--signer-webauthn '{credential_name}': public_key_sec1_b64 \
+                             decodes to {} bytes, expected 65",
+                        pubkey_bytes.len()
+                    ),
+                }),
+                &request_id,
+            );
+        }
+
+        // Decode credential_id bytes.
+        let credential_id_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&metadata.credential_id_b64url)
+        {
+            Ok(b) => b,
+            Err(_) => {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: format!(
+                            "--signer-webauthn '{credential_name}': \
+                                 credential_id_b64url is not valid base64url"
+                        ),
+                    }),
+                    &request_id,
+                );
+            }
+        };
+        if credential_id_bytes.is_empty() {
+            return emit_error(
+                &WalletError::Validation(ValidationError::AddressInvalid {
+                    input: format!(
+                        "--signer-webauthn '{credential_name}': credential_id_b64url is empty \
+                             (corrupted credential store entry; delete and re-register)"
+                    ),
+                }),
+                &request_id,
+            );
+        }
+
+        // key_data = pubkey_65_bytes || credential_id_bytes.
+        // Canonical layout expected by the OZ WebAuthn verifier:
+        //   `canonicalize_key` reads bytes 0..65 as the public key; the credential-ID
+        //   suffix at bytes 65+ is metadata used for credential lookup on the off-chain
+        //   side and ignored by the on-chain verifier.
+        let mut key_data = Vec::with_capacity(65 + credential_id_bytes.len());
+        key_data.extend_from_slice(&pubkey_bytes);
+        key_data.extend_from_slice(&credential_id_bytes);
+
+        let scval = match build_external_signer_scval(verifier_sc_addr, &key_data) {
+            Ok(v) => v,
+            Err(e) => {
+                return emit_error(
+                    &WalletError::SmartAccount {
+                        wire_code: e.wire_code(),
+                        message: format!("--signer-webauthn ScVal encode: {e}"),
+                    },
+                    &request_id,
+                );
+            }
+        };
+
+        (scval, "webauthn".to_owned(), credential_name.clone())
+    } else if let Some(hex_pubkey) = &args.signer_ed25519 {
+        // ── First-class Ed25519 external signer ───────────────────────────
+        // key_data is the raw 32-byte Ed25519 public key; encoded as OZ
+        // `Signer::External(verifier, key_data)`: the same on-chain shape as
+        // `--signer-external`, resolved through the same
+        // `build_external_signer_scval`. The OZ Ed25519 verifier's
+        // `canonicalize_key` returns the 32-byte key verbatim
+        // (`packages/accounts/src/verifiers/ed25519.rs`, SHA `a9c4216`).
+
+        // Decode exactly 32 bytes; fail closed on invalid hex or wrong length.
+        let key_data = match hex::decode(hex_pubkey) {
+            Ok(b) => b,
+            Err(e) => {
+                return emit_error(
+                    &WalletError::Validation(ValidationError::AddressInvalid {
+                        input: format!("--signer-ed25519 is not valid hex: {e}"),
+                    }),
+                    &request_id,
+                );
+            }
+        };
+        if key_data.len() != 32 {
+            return emit_error(
+                &WalletError::Validation(ValidationError::AddressInvalid {
+                    input: format!(
+                        "--signer-ed25519 must decode to exactly 32 bytes (a raw Ed25519 \
+                             public key), got {} bytes",
+                        key_data.len()
+                    ),
+                }),
+                &request_id,
+            );
+        }
+
+        // Resolve the verifier address: explicit `--verifier` override, else
+        // the network's registered Ed25519 verifier. Fail closed if neither
+        // is available.
+        let verifier_c_strkey = if let Some(explicit) = &args.verifier {
+            explicit.clone()
+        } else {
             let verifier_registry = match VerifierRegistry::open() {
                 Ok(r) => r,
                 Err(e) => {
@@ -807,296 +1162,56 @@ async fn add_run(args: &AddArgs) -> i32 {
                     );
                 }
             };
-
             let network_passphrase = args.network.passphrase();
-            let verifier_entry = match verifier_registry.webauthn_verifier_for(network_passphrase) {
-                Some(e) => e,
+            match verifier_registry.ed25519_verifier_for(network_passphrase) {
+                Some(entry) => entry.address.clone(),
                 None => {
                     return emit_error(
                         &WalletError::Validation(ValidationError::AddressInvalid {
                             input: format!(
-                                "no WebAuthn verifier deployed for network '{network_passphrase}'; \
-                                 run: smart-account deploy-webauthn-verifier"
-                            ),
-                        }),
-                        &request_id,
-                    );
-                }
-            };
-
-            let verifier_sc_addr = match parse_c_strkey_to_smart_account(&verifier_entry.address) {
-                Ok(addr) => addr,
-                Err(e) => {
-                    return emit_error(
-                        &WalletError::SmartAccount {
-                            wire_code: e.wire_code(),
-                            message: format!(
-                                "verifier registry address '{}' is not a valid C-strkey: {e}",
-                                verifier_entry.address
-                            ),
-                        },
-                        &request_id,
-                    );
-                }
-            };
-
-            let profile = resolve_profile_name(args.profile.as_deref()).name;
-            if let Err(reason) = validate_path_component_ascii_safe(&profile) {
-                return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!("invalid profile name '{profile}': {reason}"),
-                    }),
-                    &request_id,
-                );
-            }
-
-            let creds_mgr = match CredentialsManager::from_defaults_readonly(&profile, "localhost")
-            {
-                Ok(m) => m,
-                Err(e) => {
-                    return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("could not open passkeys registry: {e}"),
-                        }),
-                        &request_id,
-                    );
-                }
-            };
-
-            let metadata = match creds_mgr.show(credential_name) {
-                Ok(m) => m,
-                Err(e) => {
-                    return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("--signer-webauthn '{credential_name}': {e}"),
-                        }),
-                        &request_id,
-                    );
-                }
-            };
-
-            if metadata.public_key_sec1_b64.is_empty() {
-                return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!(
-                            "--signer-webauthn '{credential_name}': credential is missing \
-                             public_key_sec1_b64 (delete and re-register)"
-                        ),
-                    }),
-                    &request_id,
-                );
-            }
-
-            // Decode public key (65-byte uncompressed SEC1 P-256 point).
-            let pubkey_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(&metadata.public_key_sec1_b64)
-            {
-                Ok(b) => b,
-                Err(_) => {
-                    return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!(
-                                "--signer-webauthn '{credential_name}': \
-                                 public_key_sec1_b64 is not valid base64url"
-                            ),
-                        }),
-                        &request_id,
-                    );
-                }
-            };
-            if pubkey_bytes.len() != 65 {
-                return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!(
-                            "--signer-webauthn '{credential_name}': public_key_sec1_b64 \
-                             decodes to {} bytes, expected 65",
-                            pubkey_bytes.len()
-                        ),
-                    }),
-                    &request_id,
-                );
-            }
-
-            // Decode credential_id bytes.
-            let credential_id_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(&metadata.credential_id_b64url)
-            {
-                Ok(b) => b,
-                Err(_) => {
-                    return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!(
-                                "--signer-webauthn '{credential_name}': \
-                                 credential_id_b64url is not valid base64url"
-                            ),
-                        }),
-                        &request_id,
-                    );
-                }
-            };
-            if credential_id_bytes.is_empty() {
-                return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!(
-                            "--signer-webauthn '{credential_name}': credential_id_b64url is empty \
-                             (corrupted credential store entry; delete and re-register)"
-                        ),
-                    }),
-                    &request_id,
-                );
-            }
-
-            // key_data = pubkey_65_bytes || credential_id_bytes.
-            // Canonical layout expected by the OZ WebAuthn verifier:
-            //   `canonicalize_key` reads bytes 0..65 as the public key; the credential-ID
-            //   suffix at bytes 65+ is metadata used for credential lookup on the off-chain
-            //   side and ignored by the on-chain verifier.
-            let mut key_data = Vec::with_capacity(65 + credential_id_bytes.len());
-            key_data.extend_from_slice(&pubkey_bytes);
-            key_data.extend_from_slice(&credential_id_bytes);
-
-            let scval = match build_external_signer_scval(verifier_sc_addr, &key_data) {
-                Ok(v) => v,
-                Err(e) => {
-                    return emit_error(
-                        &WalletError::SmartAccount {
-                            wire_code: e.wire_code(),
-                            message: format!("--signer-webauthn ScVal encode: {e}"),
-                        },
-                        &request_id,
-                    );
-                }
-            };
-
-            let credential_id_first16: [u8; 16] = {
-                let mut arr = [0u8; 16];
-                let len = credential_id_bytes.len().min(16);
-                arr[..len].copy_from_slice(&credential_id_bytes[..len]);
-                arr
-            };
-            let pubkey = SignerPubkey::WebAuthn {
-                credential_id_first16,
-            };
-            (
-                scval,
-                pubkey,
-                "webauthn".to_owned(),
-                credential_name.clone(),
-            )
-        } else if let Some(hex_pubkey) = &args.signer_ed25519 {
-            // ── First-class Ed25519 external signer ───────────────────────────
-            // key_data is the raw 32-byte Ed25519 public key; encoded as OZ
-            // `Signer::External(verifier, key_data)` — the same on-chain shape as
-            // `--signer-external`, resolved through the same
-            // `build_external_signer_scval`. The OZ Ed25519 verifier's
-            // `canonicalize_key` returns the 32-byte key verbatim
-            // (`packages/accounts/src/verifiers/ed25519.rs`, SHA `a9c4216`).
-
-            // Decode exactly 32 bytes; fail closed on invalid hex or wrong length.
-            let key_data = match hex::decode(hex_pubkey) {
-                Ok(b) => b,
-                Err(e) => {
-                    return emit_error(
-                        &WalletError::Validation(ValidationError::AddressInvalid {
-                            input: format!("--signer-ed25519 is not valid hex: {e}"),
-                        }),
-                        &request_id,
-                    );
-                }
-            };
-            if key_data.len() != 32 {
-                return emit_error(
-                    &WalletError::Validation(ValidationError::AddressInvalid {
-                        input: format!(
-                            "--signer-ed25519 must decode to exactly 32 bytes (a raw Ed25519 \
-                             public key), got {} bytes",
-                            key_data.len()
-                        ),
-                    }),
-                    &request_id,
-                );
-            }
-
-            // Resolve the verifier address: explicit `--verifier` override, else
-            // the network's registered Ed25519 verifier. Fail closed if neither
-            // is available.
-            let verifier_c_strkey = if let Some(explicit) = &args.verifier {
-                explicit.clone()
-            } else {
-                let verifier_registry = match VerifierRegistry::open() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return emit_error(
-                            &WalletError::Validation(ValidationError::AddressInvalid {
-                                input: format!("could not open verifier registry: {e}"),
-                            }),
-                            &request_id,
-                        );
-                    }
-                };
-                let network_passphrase = args.network.passphrase();
-                match verifier_registry.ed25519_verifier_for(network_passphrase) {
-                    Some(entry) => entry.address.clone(),
-                    None => {
-                        return emit_error(
-                            &WalletError::Validation(ValidationError::AddressInvalid {
-                                input: format!(
-                                    "no Ed25519 verifier registered for network \
+                                "no Ed25519 verifier registered for network \
                                      '{network_passphrase}'; run: \
                                      smart-account deploy-ed25519-verifier (or pass --verifier)"
-                                ),
-                            }),
-                            &request_id,
-                        );
-                    }
-                }
-            };
-
-            let verifier_sc_addr = match parse_c_strkey_to_smart_account(&verifier_c_strkey) {
-                Ok(addr) => addr,
-                Err(e) => {
-                    return emit_error(
-                        &WalletError::SmartAccount {
-                            wire_code: e.wire_code(),
-                            message: format!(
-                                "--signer-ed25519 verifier '{verifier_c_strkey}': {e}"
                             ),
-                        },
+                        }),
                         &request_id,
                     );
                 }
-            };
-
-            let scval = match build_external_signer_scval(verifier_sc_addr, &key_data) {
-                Ok(v) => v,
-                Err(e) => {
-                    return emit_error(
-                        &WalletError::SmartAccount {
-                            wire_code: e.wire_code(),
-                            message: format!("--signer-ed25519 ScVal encode: {e}"),
-                        },
-                        &request_id,
-                    );
-                }
-            };
-
-            // key_data_first16 for audit-log display (an Ed25519 external signer
-            // IS an OZ `Signer::External`; reuse the External audit representation).
-            let key_data_first16: [u8; 16] = {
-                let mut arr = [0u8; 16];
-                arr.copy_from_slice(&key_data[..16]);
-                arr
-            };
-            let pubkey = SignerPubkey::External {
-                verifier_contract: verifier_c_strkey.clone(),
-                key_data_first16,
-            };
-            (scval, pubkey, "ed25519".to_owned(), verifier_c_strkey)
-        } else {
-            // ArgGroup enforces that one of the four is always set; this branch
-            // is unreachable at runtime but required for exhaustive match.
-            unreachable!("ArgGroup `new_signer_source` guarantees one signer-source flag is set")
+            }
         };
+
+        let verifier_sc_addr = match parse_c_strkey_to_smart_account(&verifier_c_strkey) {
+            Ok(addr) => addr,
+            Err(e) => {
+                return emit_error(
+                    &WalletError::SmartAccount {
+                        wire_code: e.wire_code(),
+                        message: format!("--signer-ed25519 verifier '{verifier_c_strkey}': {e}"),
+                    },
+                    &request_id,
+                );
+            }
+        };
+
+        let scval = match build_external_signer_scval(verifier_sc_addr, &key_data) {
+            Ok(v) => v,
+            Err(e) => {
+                return emit_error(
+                    &WalletError::SmartAccount {
+                        wire_code: e.wire_code(),
+                        message: format!("--signer-ed25519 ScVal encode: {e}"),
+                    },
+                    &request_id,
+                );
+            }
+        };
+
+        (scval, "ed25519".to_owned(), verifier_c_strkey)
+    } else {
+        // ArgGroup enforces that one of the four is always set; this branch
+        // is unreachable at runtime but required for exhaustive match.
+        unreachable!("ArgGroup `new_signer_source` guarantees one signer-source flag is set")
+    };
 
     let ctx = match CommonHandlerContext::new(args).await {
         Ok(ctx) => ctx,
@@ -1190,7 +1305,6 @@ async fn add_run(args: &AddArgs) -> i32 {
             ctx.smart_account,
             args.rule_id,
             new_signer_scval,
-            new_signer_pubkey,
             ctx.signer.as_ref(),
             request_id.clone(),
             args.accept_mutable_verifier,
@@ -1903,7 +2017,7 @@ async fn batch_add_run(args: &BatchAddArgs) -> i32 {
         );
     }
 
-    let mut new_signers: Vec<(stellar_xdr::ScVal, SignerPubkey)> = Vec::with_capacity(
+    let mut new_signers: Vec<stellar_xdr::ScVal> = Vec::with_capacity(
         args.signer_delegated.len() + args.signer_webauthn.len() + args.signer_ed25519.len(),
     );
 
@@ -1916,10 +2030,8 @@ async fn batch_add_run(args: &BatchAddArgs) -> i32 {
             ed25519_hex_pubkey: None,
             ed25519_verifier_override: None,
         };
-        match resolve_batch_signer_scval_and_pubkey(spec, args.network, args.profile.as_deref())
-            .await
-        {
-            Ok(pair) => new_signers.push(pair),
+        match resolve_batch_signer_scval(spec, args.network, args.profile.as_deref()).await {
+            Ok(scval) => new_signers.push(scval),
             Err(e) => return emit_error(&e, &request_id),
         }
     }
@@ -1932,10 +2044,8 @@ async fn batch_add_run(args: &BatchAddArgs) -> i32 {
             ed25519_hex_pubkey: None,
             ed25519_verifier_override: None,
         };
-        match resolve_batch_signer_scval_and_pubkey(spec, args.network, args.profile.as_deref())
-            .await
-        {
-            Ok(pair) => new_signers.push(pair),
+        match resolve_batch_signer_scval(spec, args.network, args.profile.as_deref()).await {
+            Ok(scval) => new_signers.push(scval),
             Err(e) => return emit_error(&e, &request_id),
         }
     }
@@ -1948,10 +2058,8 @@ async fn batch_add_run(args: &BatchAddArgs) -> i32 {
             ed25519_hex_pubkey: Some(hex_pubkey.as_str()),
             ed25519_verifier_override: args.verifier.as_deref(),
         };
-        match resolve_batch_signer_scval_and_pubkey(spec, args.network, args.profile.as_deref())
-            .await
-        {
-            Ok(pair) => new_signers.push(pair),
+        match resolve_batch_signer_scval(spec, args.network, args.profile.as_deref()).await {
+            Ok(scval) => new_signers.push(scval),
             Err(e) => return emit_error(&e, &request_id),
         }
     }
@@ -2221,66 +2329,39 @@ async fn resolve_weighted_signer_input(
     }))
 }
 
-/// Resolves a [`WeightedSignerSourceSpec`] to a `(ScVal, SignerPubkey)` pair
-/// for `batch-add`'s per-flag signer resolution.
-async fn resolve_batch_signer_scval_and_pubkey(
+/// Resolves a [`WeightedSignerSourceSpec`] to the signer `ScVal` for
+/// `batch-add`'s per-flag signer resolution; the manager decodes each
+/// signer's identity and verifier from it.
+async fn resolve_batch_signer_scval(
     spec: WeightedSignerSourceSpec<'_>,
     network: TargetNetwork,
     profile: Option<&str>,
-) -> Result<(stellar_xdr::ScVal, SignerPubkey), WalletError> {
+) -> Result<stellar_xdr::ScVal, WalletError> {
     if let Some(g_strkey) = spec.delegated {
-        let scval =
-            build_delegated_signer_scval(g_strkey).map_err(|e| WalletError::SmartAccount {
-                wire_code: e.wire_code(),
-                message: format!("--signer-delegated: {e}"),
-            })?;
-        let pubkey = build_ed25519_signer_pubkey(g_strkey)?;
-        return Ok((scval, pubkey));
+        return build_delegated_signer_scval(g_strkey).map_err(|e| WalletError::SmartAccount {
+            wire_code: e.wire_code(),
+            message: format!("--signer-delegated: {e}"),
+        });
     }
     if let Some(credential_name) = spec.webauthn_credential {
         let (verifier, key_data) =
             resolve_webauthn_source(credential_name, network, profile).await?;
-        let scval = build_external_signer_scval(verifier, &key_data).map_err(|e| {
+        return build_external_signer_scval(verifier, &key_data).map_err(|e| {
             WalletError::SmartAccount {
                 wire_code: e.wire_code(),
                 message: format!("--signer-webauthn ScVal encode: {e}"),
             }
-        })?;
-        let credential_id_first16: [u8; 16] = {
-            let mut arr = [0u8; 16];
-            let len = key_data.len().min(16);
-            let tail = &key_data[key_data.len().saturating_sub(len)..];
-            arr[..tail.len()].copy_from_slice(tail);
-            arr
-        };
-        return Ok((
-            scval,
-            SignerPubkey::WebAuthn {
-                credential_id_first16,
-            },
-        ));
+        });
     }
     if let Some(hex_pubkey) = spec.ed25519_hex_pubkey {
         let (verifier, key_data) =
             resolve_ed25519_source(hex_pubkey, spec.ed25519_verifier_override, network)?;
-        let scval = build_external_signer_scval(verifier, &key_data).map_err(|e| {
+        return build_external_signer_scval(verifier, &key_data).map_err(|e| {
             WalletError::SmartAccount {
                 wire_code: e.wire_code(),
                 message: format!("--signer-ed25519 ScVal encode: {e}"),
             }
-        })?;
-        let key_data_first16: [u8; 16] = {
-            let mut arr = [0u8; 16];
-            arr.copy_from_slice(&key_data[..16]);
-            arr
-        };
-        return Ok((
-            scval,
-            SignerPubkey::External {
-                verifier_contract: hex_pubkey.to_owned(),
-                key_data_first16,
-            },
-        ));
+        });
     }
 
     Err(WalletError::Validation(ValidationError::AddressInvalid {
@@ -2297,7 +2378,20 @@ fn new_request_id() -> String {
     Uuid::new_v4().to_string()
 }
 
-/// Returns a human-readable label for a [`SignerPubkey`] variant.
+/// Returns the `signer_kinds` label of a version 2 signer identity. An
+/// on-chain passkey signer is an `External` identity and reads `external`.
+/// The manager's threshold refusals use their own labels (`ed25519`).
+fn identity_kind_label(identity: &SignerIdentityV2) -> &'static str {
+    match identity {
+        SignerIdentityV2::Ed25519 { .. } => "delegated_ed25519",
+        SignerIdentityV2::External { .. } => "external",
+        SignerIdentityV2::DelegatedContract { .. } => "delegated_contract",
+        // SignerIdentityV2 is #[non_exhaustive]; future variants are rendered as "unknown".
+        _ => "unknown",
+    }
+}
+
+/// Returns the `signer_kinds` label of a version 1 signer.
 fn signer_kind_label(pk: &SignerPubkey) -> String {
     match pk {
         SignerPubkey::Ed25519 { .. } => "delegated_ed25519".to_owned(),
@@ -2306,16 +2400,6 @@ fn signer_kind_label(pk: &SignerPubkey) -> String {
         // SignerPubkey is #[non_exhaustive]; future variants are rendered as "unknown".
         _ => "unknown".to_owned(),
     }
-}
-
-/// Builds an ed25519 `SignerPubkey` from a G-strkey.
-fn build_ed25519_signer_pubkey(g_strkey: &str) -> Result<SignerPubkey, WalletError> {
-    let pk = stellar_strkey::ed25519::PublicKey::from_string(g_strkey).map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("--signer-delegated G-strkey decode: {e}"),
-        })
-    })?;
-    Ok(SignerPubkey::Ed25519 { pubkey: pk.0 })
 }
 
 /// Renders an envelope around an `Ok` result.
@@ -3102,43 +3186,311 @@ mod tests {
         assert_eq!(signer_kind_label(&pk), "webauthn");
     }
 
-    // ── list_result round-trip ────────────────────────────────────────────────
+    // ── list and refresh envelopes ────────────────────────────────────────────
 
-    #[test]
-    fn list_result_json_round_trip() {
-        let result = ListResult {
-            smart_account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-            rule_id: 1,
-            signer_count: 2,
-            threshold: 1,
-            signer_ids: vec![0, 1],
-            signer_kinds: vec!["delegated_ed25519".to_owned(), "webauthn".to_owned()],
+    /// A version-2 view of three signers, one of each identity kind, with
+    /// `threshold`.
+    fn v2_view(threshold: Option<u32>) -> SignerSetView {
+        use stellar_agent_core::audit_log::signer_set::{
+            SignerEntryV2, SignerSetSnapshotV2, ThresholdObservation,
         };
-        let json = serde_json::to_string(&result).unwrap();
-        let rt: ListResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(rt.signer_count, 2);
-        assert_eq!(rt.threshold, 1);
+        SignerSetView::V2(SignerSetSnapshotV2 {
+            signers: vec![
+                SignerEntryV2 {
+                    id: 0,
+                    identity: SignerIdentityV2::Ed25519 { pubkey: [0x11; 32] },
+                },
+                SignerEntryV2 {
+                    id: 3,
+                    identity: SignerIdentityV2::External {
+                        verifier: [0x22; 32],
+                        key_data_sha256: [0x33; 32],
+                        key_data_len: 81,
+                    },
+                },
+                SignerEntryV2 {
+                    id: 5,
+                    identity: SignerIdentityV2::DelegatedContract {
+                        contract: [0x44; 32],
+                    },
+                },
+            ],
+            threshold: threshold.map(|threshold| ThresholdObservation {
+                policy: [0x55; 32],
+                threshold,
+            }),
+        })
     }
 
+    const ACCOUNT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+    /// The `signers list` envelope of a policyless version-2 set reports a
+    /// `null` threshold, snapshot version 2, and the kind and summary of
+    /// every signer, a contract delegate included.
     #[test]
-    fn list_result_does_not_contain_baselined_field() {
-        // `baselined` is intentionally absent because it would have to be
-        // hard-coded to false. Verify that the serialised JSON does not contain
-        // the field so callers that expect it get a clear schema signal
-        // (missing field rather than a misleading false).
-        let result = ListResult {
-            smart_account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-            rule_id: 1,
-            signer_count: 1,
-            threshold: 1,
-            signer_ids: vec![0],
-            signer_kinds: vec!["delegated_ed25519".to_owned()],
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(
-            !json.contains("baselined"),
-            "ListResult JSON must not contain the removed baselined field"
+    fn list_result_reports_a_version_2_set_as_json() {
+        let json = serde_json::to_value(list_result(
+            ACCOUNT,
+            4,
+            &v2_view(None),
+            PreviousBaseline::None,
+        ))
+        .unwrap();
+        assert_eq!(json["rule_id"], 4);
+        assert_eq!(json["signer_count"], 3);
+        assert!(json["threshold"].is_null(), "{json}");
+        assert!(json.as_object().unwrap().contains_key("threshold"));
+        assert_eq!(json["snapshot_version"], 2);
+        assert_eq!(json["signer_ids"], serde_json::json!([0, 3, 5]));
+        assert_eq!(
+            json["signer_kinds"],
+            serde_json::json!(["delegated_ed25519", "external", "delegated_contract"])
         );
+        assert_eq!(
+            json["signer_summaries"],
+            serde_json::json!([
+                "ed25519:1111111111111111",
+                "external:2222222222222222:3333333333333333",
+                "delegated_contract:4444444444444444"
+            ])
+        );
+        assert_eq!(json["baseline"], "none");
+    }
+
+    /// `baseline` renders each comparison outcome.
+    #[test]
+    fn list_result_renders_each_baseline_value() {
+        for (baseline, expected) in [
+            (PreviousBaseline::None, "none"),
+            (PreviousBaseline::Matched, "matched"),
+            (PreviousBaseline::Diverged, "diverged"),
+            (PreviousBaseline::NotComparable, "not_comparable"),
+        ] {
+            let json =
+                serde_json::to_value(list_result(ACCOUNT, 1, &v2_view(Some(2)), baseline)).unwrap();
+            assert_eq!(json["baseline"], expected);
+            assert_eq!(json["threshold"], 2);
+        }
+    }
+
+    /// The `signers refresh` envelope reports the recorded set's threshold,
+    /// its snapshot version and the comparison with the replaced row.
+    #[test]
+    fn refresh_result_reports_the_comparison_as_json() {
+        let json = serde_json::to_value(refresh_result(
+            ACCOUNT,
+            2,
+            &v2_view(Some(2)),
+            PreviousBaseline::NotComparable,
+        ))
+        .unwrap();
+        assert_eq!(json["signer_count"], 3);
+        assert_eq!(json["threshold"], 2);
+        assert_eq!(json["snapshot_version"], 2);
+        assert_eq!(json["previous_baseline"], "not_comparable");
+
+        let json = serde_json::to_value(refresh_result(
+            ACCOUNT,
+            2,
+            &v2_view(None),
+            PreviousBaseline::Matched,
+        ))
+        .unwrap();
+        assert!(json["threshold"].is_null(), "{json}");
+        assert_eq!(json["previous_baseline"], "matched");
+    }
+
+    /// A refresh that recorded a changed or incomparable set prints one
+    /// warning line; a matching or first refresh prints none.
+    #[test]
+    fn refresh_warning_names_an_accepted_change() {
+        assert_eq!(refresh_warning(3, PreviousBaseline::None), None);
+        assert_eq!(refresh_warning(3, PreviousBaseline::Matched), None);
+        let diverged = refresh_warning(3, PreviousBaseline::Diverged).unwrap();
+        assert!(diverged.starts_with("warning: rule 3's"), "{diverged}");
+        assert!(!diverged.contains('\n'));
+        let not_comparable = refresh_warning(3, PreviousBaseline::NotComparable).unwrap();
+        assert!(
+            not_comparable.contains("version 1 baseline"),
+            "{not_comparable}"
+        );
+    }
+
+    /// `--accept-divergence` defaults to off.
+    #[test]
+    fn refresh_args_accept_divergence_defaults_off() {
+        let base = [
+            "test",
+            "--account",
+            ACCOUNT,
+            "--rule-id",
+            "2",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
+        ];
+        assert!(!RefreshArgsHarness::parse_from(base).args.accept_divergence);
+        let with_flag: Vec<&str> = base
+            .iter()
+            .copied()
+            .chain(std::iter::once("--accept-divergence"))
+            .collect();
+        assert!(
+            RefreshArgsHarness::parse_from(with_flag)
+                .args
+                .accept_divergence
+        );
+    }
+
+    /// A mock endpoint answering every `get_context_rule` simulation with
+    /// `rule`.
+    struct RuleResponder(ScVal);
+
+    impl wiremock::Respond for RuleResponder {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use stellar_xdr::{Limits, WriteXdr};
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["method"], "simulateTransaction", "{body}");
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {
+                    "results": [{"auth": [], "xdr": self.0.to_xdr_base64(Limits::none()).unwrap()}],
+                    "latestLedger": 1000
+                }
+            }))
+        }
+    }
+
+    /// `--accept-divergence` reaches the manager: over a baseline the chain
+    /// differs from, the refresh refuses without the flag and records the
+    /// chain state with it.
+    #[tokio::test]
+    async fn refresh_passes_accept_divergence_to_the_manager() {
+        use std::sync::{Arc, Mutex};
+        use stellar_agent_core::audit_log::entry::AuditEntry;
+        use stellar_agent_core::audit_log::signer_set::{
+            BaselineReason, SignerEntryV2, SignerSetSnapshotV2, account_digest,
+        };
+        use stellar_agent_core::audit_log::writer::AuditWriter;
+        use stellar_agent_core::observability::RedactedStrkey;
+        use stellar_agent_smart_account::managers::signers::SignersManagerConfig;
+        use stellar_xdr::{AccountId, PublicKey, ScAddress, Uint256};
+
+        const PASSPHRASE: &str = "Test SDF Network ; September 2015";
+        let delegated = |byte: u8| {
+            ScVal::Vec(Some(ScVec(
+                vec![
+                    ScVal::Symbol(ScSymbol("Delegated".try_into().unwrap())),
+                    ScVal::Address(ScAddress::Account(AccountId(
+                        PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32])),
+                    ))),
+                ]
+                .try_into()
+                .unwrap(),
+            )))
+        };
+        let entry = |key: &str, val: ScVal| ScMapEntry {
+            key: ScVal::Symbol(ScSymbol(key.try_into().unwrap())),
+            val,
+        };
+        let vec_of = |items: Vec<ScVal>| ScVal::Vec(Some(ScVec(items.try_into().unwrap())));
+        let rule = ScVal::Map(Some(ScMap(
+            vec![
+                entry("id", ScVal::U32(1)),
+                entry("policies", vec_of(vec![])),
+                entry("signer_ids", vec_of(vec![ScVal::U32(0)])),
+                entry("signers", vec_of(vec![delegated(0x11)])),
+            ]
+            .try_into()
+            .unwrap(),
+        )));
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(RuleResponder(rule))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(Mutex::new(
+            AuditWriter::open(log_path.clone(), None).unwrap(),
+        ));
+        {
+            // A baseline recording another signer than the one on chain.
+            let snapshot = SignerSetSnapshotV2 {
+                signers: vec![SignerEntryV2 {
+                    id: 0,
+                    identity: SignerIdentityV2::Ed25519 { pubkey: [0x22; 32] },
+                }],
+                threshold: None,
+            };
+            let mut writer = audit.lock().unwrap();
+            let tip = writer.current_chain_tip();
+            writer
+                .write_entry(AuditEntry::new_sa_signer_set_baselined_v2(
+                    1,
+                    &snapshot,
+                    1000,
+                    1_700_000_000_000,
+                    BaselineReason::first_observation(),
+                    tip,
+                    account_digest(PASSPHRASE, ACCOUNT),
+                    RedactedStrkey::from_already_redacted(redact_strkey_first5_last5(ACCOUNT)),
+                    "stellar:testnet",
+                    "req-baseline",
+                ))
+                .unwrap();
+        }
+        let manager = SignersManager::new(SignersManagerConfig::new(
+            server.uri(),
+            server.uri(),
+            Arc::clone(&audit),
+            log_path,
+            PASSPHRASE.to_owned(),
+            "refresh-pass-through".to_owned(),
+            std::time::Duration::from_secs(10),
+            "stellar:testnet".to_owned(),
+        ))
+        .unwrap();
+        let smart_account = parse_c_strkey_to_smart_account(ACCOUNT).unwrap();
+        let args_with = |flag: bool| {
+            let mut argv = vec![
+                "test",
+                "--account",
+                ACCOUNT,
+                "--rule-id",
+                "1",
+                "--signer-secret-env",
+                "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
+            ];
+            if flag {
+                argv.push("--accept-divergence");
+            }
+            RefreshArgsHarness::parse_from(argv).args
+        };
+
+        let refused = refresh_outcome(
+            &manager,
+            smart_account.clone(),
+            &args_with(false),
+            None,
+            "req-refresh-no".to_owned(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.wire_code(), "sa.signer_set_diverged");
+
+        let accepted = refresh_outcome(
+            &manager,
+            smart_account,
+            &args_with(true),
+            None,
+            "req-refresh-yes".to_owned(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted.previous_baseline, PreviousBaseline::Diverged);
     }
 
     // ── signers add --signer-ed25519 tests ───────────────────────────────────

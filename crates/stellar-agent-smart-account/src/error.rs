@@ -22,7 +22,7 @@ use thiserror::Error;
 
 use crate::signers::types::{ThresholdAffectingOp, WasmHashSummary};
 use stellar_agent_core::audit_log::schema::ContractKind;
-use stellar_agent_core::audit_log::signer_set::ObservedSignerSet;
+use stellar_agent_core::audit_log::signer_set::SignerSetView;
 pub use stellar_agent_core::error::AuthMismatchReason;
 use stellar_agent_core::observability::RedactedStrkey;
 
@@ -114,6 +114,14 @@ fn rule_suffix(rule_id: &Option<u32>) -> String {
     rule_id.map_or_else(String::new, |rule_id| format!(" for rule {rule_id}"))
 }
 
+/// Renders an optional transaction hash as an ` after transaction <hash>`
+/// Display suffix, or nothing when absent.
+fn after_transaction_suffix(tx_hash: &Option<String>) -> String {
+    tx_hash
+        .as_deref()
+        .map_or_else(String::new, |hash| format!(" after transaction {hash}"))
+}
+
 /// Renders an optional bounded detail as a parenthesised Display suffix, or
 /// nothing when absent.
 fn paren_suffix(detail: &Option<String>) -> String {
@@ -145,6 +153,37 @@ pub(crate) fn truncate_to_byte_cap(msg: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}{ELLIPSIS}", &msg[..end])
+}
+
+/// Stage of [`SaError::BaselineWriteFailed`] for a post-confirmation
+/// observation that did not produce a validated state.
+pub(crate) const BASELINE_WRITE_STAGE_OBSERVE: &str = "observe";
+
+/// Stage of [`SaError::BaselineWriteFailed`] for a state row the audit log
+/// refused.
+pub(crate) const BASELINE_WRITE_STAGE_WRITE: &str = "write";
+
+/// The closed set of [`SaError::BaselineWriteFailed`] stages.
+pub const BASELINE_WRITE_STAGES: [&str; 2] =
+    [BASELINE_WRITE_STAGE_OBSERVE, BASELINE_WRITE_STAGE_WRITE];
+
+/// Byte cap of [`SaError::BaselineWriteFailed`]'s `reason`.
+pub const BASELINE_WRITE_REASON_MAX_BYTES: usize = 256;
+
+/// Builds the `reason` of a [`SaError::BaselineWriteFailed`] at stage
+/// `observe` from the error that stopped the observation: its wire code, a
+/// colon and its Display, capped at [`BASELINE_WRITE_REASON_MAX_BYTES`] bytes.
+pub(crate) fn baseline_observe_reason(inner: &SaError) -> String {
+    truncate_to_byte_cap(
+        &format!("{}: {inner}", inner.wire_code()),
+        BASELINE_WRITE_REASON_MAX_BYTES,
+    )
+}
+
+/// Caps a writer error's Display for [`SaError::BaselineWriteFailed`] at
+/// stage `write` to [`BASELINE_WRITE_REASON_MAX_BYTES`] bytes.
+pub(crate) fn baseline_write_reason(detail: &str) -> String {
+    truncate_to_byte_cap(detail, BASELINE_WRITE_REASON_MAX_BYTES)
 }
 
 /// Builds the `reason` of [`SaError::PinCheckUnavailable`] from the error
@@ -218,17 +257,16 @@ pub enum PostSubmitVerificationKind {
 #[derive(Debug, Error, serde::Serialize)]
 #[serde(tag = "wire_code", content = "context")]
 #[non_exhaustive]
-// `SignerSetDiverged` carries two `ObservedSignerSet` structs (each containing
-// a `Vec`) plus two forensic-symmetry `String` fields.
-// The combined size exceeds the 128-byte default threshold.  Boxing the
-// `ObservedSignerSet` fields would degrade call-site ergonomics for a type
-// that is always heap-allocated as a `Box<dyn Error>` at log time anyway.
-// The `SaError` enum is explicitly large by design: it carries the full
-// signer-set diagnostic state so operators can reconstruct divergence context
-// without querying the audit log separately.
+// `SignerSetDiverged` carries two `SignerSetView` values (each holding a
+// `Vec` of signers) plus the optional transaction hash and forensic `String`
+// fields, which exceeds the 128-byte default threshold. Boxing the views would
+// degrade call-site ergonomics for a type that is always heap-allocated as a
+// `Box<dyn Error>` at log time anyway. The `SaError` enum is explicitly large
+// by design: it carries the full signer-set diagnostic state so operators can
+// reconstruct divergence context without querying the audit log separately.
 #[allow(
     clippy::result_large_err,
-    reason = "SignerSetDiverged carries two ObservedSignerSet + forensic strings by design; \
+    reason = "SignerSetDiverged carries two SignerSetView values + forensic strings by design; \
               variant size is intentional diagnostic richness"
 )]
 pub enum SaError {
@@ -763,33 +801,53 @@ pub enum SaError {
         redacted_reason: String,
     },
 
-    /// On-chain signer-set diverged from the audit-log baseline; pre-signing gate.
+    /// The on-chain signer set differs from the state the wallet expected.
     ///
-    /// Fired when `verify_signer_set_against_chain` finds that the audit-log
-    /// baseline view and the on-chain view disagree after the two-RPC consultation
-    /// confirms both RPCs agree.  The `expected` and `observed` fields carry full
-    /// `ObservedSignerSet` structs (signer IDs + pubkeys + threshold) for forensic
-    /// correlation.
+    /// Raised in three places, each after both RPC endpoints agreed on the
+    /// on-chain set:
+    ///
+    /// - the comparison with the audit-log baseline that precedes a signer
+    ///   mutation, a rule write verb or a passkey signature (`tx_hash`
+    ///   absent; nothing was submitted);
+    /// - `signers refresh` without `--accept-divergence` on a rule whose
+    ///   chain state differs from its baseline, or whose version-1 baseline
+    ///   cannot be compared with the chain (`tx_hash` absent);
+    /// - after a signer mutation confirmed, when the confirmed set is not the
+    ///   intended change (`tx_hash` names the confirmed transaction).
+    ///
+    /// `expected` and `observed` carry the full [`SignerSetView`] of each
+    /// side, tagged with its snapshot version. Both sides have the same
+    /// version, except for the `signers refresh` refusal of a version-1
+    /// baseline that cannot be compared, which carries the version-1 baseline
+    /// and the version-2 observation.
     ///
     /// # Display
     ///
-    /// `ObservedSignerSet::fmt` emits `count=N threshold=M` — a compact summary
-    /// that does not include signer pubkeys or IDs.  This avoids leaking Ed25519
-    /// key material into logs while preserving actionable count/threshold context.
+    /// Each side renders as `v{version} count={n} threshold={t|none}`, which
+    /// includes no signer identity. The message names the inspection command
+    /// and the command that accepts the current chain state.
     #[error(
         "signer-set diverged on rule {rule_id} \
          (sa={smart_account_redacted}, req={request_id}): \
-         expected {expected}, observed {observed} \
-         [use 'smart-account signers list --rule-id {rule_id}' and check the audit log for details]"
+         expected {expected}, observed {observed}{}; \
+         inspect with 'smart-account signers list --rule-id {rule_id}'; \
+         accept the current chain state with \
+         'smart-account signers refresh --rule-id {rule_id} --accept-divergence'",
+        after_transaction_suffix(.tx_hash)
     )]
     #[serde(rename = "sa.signer_set_diverged")]
     SignerSetDiverged {
         /// Context-rule identifier for which divergence was detected.
         rule_id: u32,
-        /// Expected signer-set state per the audit-log baseline.
-        expected: ObservedSignerSet,
-        /// Observed signer-set state from the two-RPC consultation.
-        observed: ObservedSignerSet,
+        /// The expected signer-set state: the audit-log baseline, or the
+        /// intended result of a confirmed signer mutation.
+        expected: SignerSetView,
+        /// The signer-set state both RPC endpoints observed.
+        observed: SignerSetView,
+        /// Hash of the confirmed transaction after which the set was
+        /// observed; absent when nothing was submitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tx_hash: Option<String>,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         ///
         /// MUST be passed through
@@ -1565,11 +1623,13 @@ pub enum SaError {
 
     /// The rule's `policies` list is empty; no threshold policy is installed.
     ///
-    /// Fired by `SignersManager::identify_threshold_policy` when the rule has
-    /// `policies.len() == 0`.  The operator must deploy and attach a
+    /// Fired by the signers manager's signer-set observation when a
+    /// comparison with a version-1 baseline needs a threshold and the rule
+    /// has no policy, and by `set_threshold` on a rule whose observation has
+    /// no simple-threshold policy. The operator deploys and attaches a
     /// simple-threshold policy via `smart-account deploy-policy --kind
     /// simple-threshold` followed by `smart-account rules add-policy --kind
-    /// simple-threshold` before signer-threshold atomic updates can proceed.
+    /// simple-threshold` before the threshold can be changed.
     ///
     /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
     /// at the call site.
@@ -1591,12 +1651,11 @@ pub enum SaError {
 
     /// No audit-log baseline exists for the `(rule_id, smart_account)` pair.
     ///
-    /// Fired when a signing attempt against a context rule finds no
-    /// `SaSignerSetBaselined`, `SaSignerAdded`, `SaSignerRemoved`, or
-    /// `SaThresholdChanged` audit row for this `(rule_id, smart_account)` pair.
-    /// The operator must run `smart-account signers list --rule-id <N>` or
-    /// `smart-account signers refresh --rule-id <N>` to create the baseline before
-    /// signing can proceed.
+    /// Fired when a signing attempt against a context rule finds no signer-set
+    /// state row (a baseline, signer add, signer removal or threshold change
+    /// row of either snapshot version) for this `(rule_id, smart_account)`
+    /// pair. `smart-account signers list --rule-id <N>` records the baseline
+    /// on first sight of the rule.
     ///
     /// Wire code: `sa.signer_set_missing_baseline`.
     ///
@@ -1604,7 +1663,7 @@ pub enum SaError {
     /// at the call site.
     #[error(
         "signer-set missing baseline: rule {rule_id} has no audit-log baseline; \
-         run the signers-refresh command for rule {rule_id}"
+         run 'smart-account signers list --rule-id {rule_id}' to record one"
     )]
     #[serde(rename = "sa.signer_set_missing_baseline")]
     SignerSetMissingBaseline {
@@ -1612,6 +1671,83 @@ pub enum SaError {
         rule_id: u32,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         smart_account_redacted: RedactedStrkey,
+        /// Per-request correlation identifier (UUIDv4).
+        request_id: String,
+    },
+
+    /// The rule's newest signer-set state row is version 1, and a signer
+    /// mutation compares only against a version-2 state.
+    ///
+    /// Fired by `add_signer`, `remove_signer`, `set_threshold` and
+    /// `batch_add_signers` before any RPC. `smart-account signers refresh
+    /// --rule-id <N>` compares the chain with the version-1 baseline and, when
+    /// they match, records a version-2 baseline; a changed or incomparable set
+    /// needs `--accept-divergence` on that command.
+    ///
+    /// Wire code: `sa.signer_set_baseline_legacy`.
+    ///
+    /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
+    /// at the call site.
+    #[error(
+        "signer-set baseline of rule {rule_id} (sa={smart_account_redacted}, \
+         req={request_id}) is version 1; \
+         run 'smart-account signers refresh --rule-id {rule_id}' to compare the chain with it \
+         and record a version 2 baseline"
+    )]
+    #[serde(rename = "sa.signer_set_baseline_legacy")]
+    SignerSetBaselineLegacy {
+        /// Context-rule identifier whose baseline is version 1.
+        rule_id: u32,
+        /// Redacted smart-account contract address (first-5-last-5 C-strkey).
+        smart_account_redacted: RedactedStrkey,
+        /// Per-request correlation identifier (UUIDv4).
+        request_id: String,
+    },
+
+    /// A signer-set state row was not written.
+    ///
+    /// `stage` is one of [`BASELINE_WRITE_STAGES`]:
+    ///
+    /// - `observe`: after a signer mutation confirmed, the resulting set could
+    ///   not be observed and validated, for example because an endpoint stayed
+    ///   behind the confirmation ledger for the whole recording budget, the
+    ///   endpoints disagreed or a read failed;
+    /// - `write`: the audit log refused the row (a write error or a poisoned
+    ///   writer) after the observation was validated.
+    ///
+    /// `tx_hash` names the confirmed transaction for a signer mutation and is
+    /// absent for the baseline writes of `signers list` and `signers refresh`,
+    /// which submit nothing. The audit log keeps the state it held before;
+    /// `smart-account signers refresh --rule-id <N> --accept-divergence`
+    /// records the current chain state. `reason` is the cause's wire code, a
+    /// colon and its Display, or the writer's error, capped at
+    /// [`BASELINE_WRITE_REASON_MAX_BYTES`] bytes.
+    ///
+    /// Wire code: `sa.baseline_write_failed`.
+    ///
+    /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
+    /// at the call site.
+    #[error(
+        "signer-set state of rule {rule_id} (sa={smart_account_redacted}, req={request_id}) \
+         was not recorded{}: {stage} failed: {reason}; \
+         record the current chain state with \
+         'smart-account signers refresh --rule-id {rule_id} --accept-divergence'",
+        after_transaction_suffix(.tx_hash)
+    )]
+    #[serde(rename = "sa.baseline_write_failed")]
+    BaselineWriteFailed {
+        /// Context-rule identifier whose state row was not written.
+        rule_id: u32,
+        /// Redacted smart-account contract address (first-5-last-5 C-strkey).
+        smart_account_redacted: RedactedStrkey,
+        /// Hash of the confirmed transaction; absent when nothing was
+        /// submitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tx_hash: Option<String>,
+        /// The step that failed; one of [`BASELINE_WRITE_STAGES`].
+        stage: &'static str,
+        /// The bounded wire code and Display of the cause.
+        reason: String,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
     },
@@ -1637,10 +1773,17 @@ pub enum SaError {
 
     /// Threshold-policy identification failed: no or multiple allowlist matches.
     ///
-    /// Fired by `SignersManager::identify_threshold_policy` when the `policies`
-    /// list has entries but zero or multiple wasm-hash matches against
-    /// `THRESHOLD_POLICY_WASM_HASHES`.  Fail-closed; the operator must ensure
-    /// exactly one recognized policy hash is attached to the rule.
+    /// Fired by the signers manager's signer-set observation in three cases:
+    ///
+    /// - more than one attached policy matches `THRESHOLD_POLICY_WASM_HASHES`;
+    /// - a comparison with a version-1 baseline needs a threshold, and the
+    ///   rule's policies include none that matches;
+    /// - `remove_signer` finds a rule whose policies include none that
+    ///   matches. Another policy decides which signers suffice there, so the
+    ///   removal cannot be checked.
+    ///
+    /// The refusal fails closed; the operator must ensure exactly one
+    /// recognized policy hash is attached to the rule.
     ///
     /// `observed_wasm_hashes_summary` carries `count` (number of policies
     /// observed) and `first_first8` (first 8 bytes of the first observed hash,
@@ -1668,13 +1811,13 @@ pub enum SaError {
     /// `get_threshold` RPC call failed after the threshold-policy address was
     /// identified.
     ///
-    /// Fired by `fetch_signer_set` when the `get_threshold(rule_id, smart_account)`
-    /// simulation call returns an error or an unexpected `ScVal` type. Replaces
-    /// the previous `warn!`-and-continue fallback that silently proxied
-    /// `signers.len()` as the threshold value (fail-closed).
+    /// Fired by the signers manager's signer-set observation when the
+    /// `get_threshold(rule_id, smart_account)` simulation call returns an
+    /// error or an unexpected `ScVal` type (fail closed: no threshold is
+    /// inferred from the signer count).
     ///
-    /// `source_kind` is a `&'static str` tag indicating which RPC or decode step
-    /// produced the failure (`"primary"`, `"secondary"`, or `"decode"`).
+    /// `source_kind` is a `&'static str` tag indicating which RPC endpoint
+    /// produced the failure (`"primary"` or `"secondary"`).
     ///
     /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
     /// at the call site.
@@ -2783,6 +2926,8 @@ impl SaError {
             },
             Self::ThresholdPolicyNotInstalled { .. } => "sa.threshold_policy_not_installed",
             Self::SignerSetMissingBaseline { .. } => "sa.signer_set_missing_baseline",
+            Self::SignerSetBaselineLegacy { .. } => "sa.signer_set_baseline_legacy",
+            Self::BaselineWriteFailed { .. } => "sa.baseline_write_failed",
             Self::SignersManagerNotConfigured { .. } => "sa.signers_manager_not_configured",
             Self::ThresholdPolicyIdentificationFailed { .. } => {
                 "sa.threshold_policy_identification_failed"
@@ -2827,7 +2972,10 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use stellar_agent_core::audit_log::signer_set::{ObservedSignerSet, SignerPubkey};
+    use stellar_agent_core::audit_log::signer_set::{
+        ObservedSignerSet, SignerEntryV2, SignerIdentityV2, SignerPubkey, SignerSetSnapshotV2,
+        SignerSetView, ThresholdObservation,
+    };
     use stellar_agent_core::audit_log::verify::VerifyError;
 
     use crate::signers::types::{ThresholdAffectingOp, WasmHashSummary};
@@ -3009,7 +3157,7 @@ mod tests {
                 "sa.signer_set_diverged",
                 SaError::SignerSetDiverged {
                     rule_id: 1,
-                    expected: ObservedSignerSet {
+                    expected: SignerSetView::V1(ObservedSignerSet {
                         signer_count: 3,
                         threshold: 3,
                         signer_ids: vec![0, 1, 2],
@@ -3018,8 +3166,8 @@ mod tests {
                             SignerPubkey::Ed25519 { pubkey: [2u8; 32] },
                             SignerPubkey::Ed25519 { pubkey: [3u8; 32] },
                         ],
-                    },
-                    observed: ObservedSignerSet {
+                    }),
+                    observed: SignerSetView::V1(ObservedSignerSet {
                         signer_count: 2,
                         threshold: 3,
                         signer_ids: vec![0, 1],
@@ -3027,9 +3175,29 @@ mod tests {
                             SignerPubkey::Ed25519 { pubkey: [1u8; 32] },
                             SignerPubkey::Ed25519 { pubkey: [2u8; 32] },
                         ],
-                    },
+                    }),
+                    tx_hash: None,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     request_id: "test-req-div-001".to_owned(),
+                },
+            ),
+            (
+                "sa.signer_set_baseline_legacy",
+                SaError::SignerSetBaselineLegacy {
+                    rule_id: 4,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-legacy-001".to_owned(),
+                },
+            ),
+            (
+                "sa.baseline_write_failed",
+                SaError::BaselineWriteFailed {
+                    rule_id: 4,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    tx_hash: None,
+                    stage: BASELINE_WRITE_STAGE_WRITE,
+                    reason: "audit writer poisoned".to_owned(),
+                    request_id: "test-req-bwf-001".to_owned(),
                 },
             ),
             (
@@ -3755,7 +3923,7 @@ mod tests {
                 "sa.signer_set_diverged",
                 SaError::SignerSetDiverged {
                     rule_id: 1,
-                    expected: ObservedSignerSet {
+                    expected: SignerSetView::V1(ObservedSignerSet {
                         signer_count: 3,
                         threshold: 3,
                         signer_ids: vec![0, 1, 2],
@@ -3764,8 +3932,8 @@ mod tests {
                             SignerPubkey::Ed25519 { pubkey: [2u8; 32] },
                             SignerPubkey::Ed25519 { pubkey: [3u8; 32] },
                         ],
-                    },
-                    observed: ObservedSignerSet {
+                    }),
+                    observed: SignerSetView::V1(ObservedSignerSet {
                         signer_count: 2,
                         threshold: 3,
                         signer_ids: vec![0, 1],
@@ -3773,7 +3941,8 @@ mod tests {
                             SignerPubkey::Ed25519 { pubkey: [1u8; 32] },
                             SignerPubkey::Ed25519 { pubkey: [2u8; 32] },
                         ],
-                    },
+                    }),
+                    tx_hash: None,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     request_id: "test-req-div-001".to_owned(),
                 },
@@ -3782,6 +3951,34 @@ mod tests {
                     "expected",
                     "observed",
                     "smart_account_redacted",
+                    "request_id",
+                ],
+            ),
+            (
+                "sa.signer_set_baseline_legacy",
+                SaError::SignerSetBaselineLegacy {
+                    rule_id: 4,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-legacy-001".to_owned(),
+                },
+                &["rule_id", "smart_account_redacted", "request_id"],
+            ),
+            (
+                "sa.baseline_write_failed",
+                SaError::BaselineWriteFailed {
+                    rule_id: 4,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    tx_hash: Some("ab".repeat(32)),
+                    stage: BASELINE_WRITE_STAGE_OBSERVE,
+                    reason: "network.rpc_divergence: views differ".to_owned(),
+                    request_id: "test-req-bwf-001".to_owned(),
+                },
+                &[
+                    "rule_id",
+                    "smart_account_redacted",
+                    "tx_hash",
+                    "stage",
+                    "reason",
                     "request_id",
                 ],
             ),
@@ -4433,8 +4630,11 @@ mod tests {
     #[test]
     fn wire_code_set_has_no_duplicates_and_correct_count() {
         // Construct one instance of each variant and collect its wire_code.
-        // The match is exhaustive: adding a new variant without extending this
-        // list is a compile error, ensuring every variant is represented.
+        // The list is a slice literal, so the compiler does not check it
+        // against the enum: the literal count below and the order check
+        // against `expected_codes` are what enforce that every variant is
+        // represented. A new variant updates the list, the codes and the
+        // count together.
         let variants: &[SaError] = &[
             SaError::ThresholdUnreachable {
                 rule_id: 1,
@@ -4544,7 +4744,7 @@ mod tests {
             },
             SaError::SignerSetDiverged {
                 rule_id: 1,
-                expected: ObservedSignerSet {
+                expected: SignerSetView::V1(ObservedSignerSet {
                     signer_count: 3,
                     threshold: 3,
                     signer_ids: vec![0, 1, 2],
@@ -4553,8 +4753,8 @@ mod tests {
                         SignerPubkey::Ed25519 { pubkey: [2u8; 32] },
                         SignerPubkey::Ed25519 { pubkey: [3u8; 32] },
                     ],
-                },
-                observed: ObservedSignerSet {
+                }),
+                observed: SignerSetView::V1(ObservedSignerSet {
                     signer_count: 2,
                     threshold: 3,
                     signer_ids: vec![0, 1],
@@ -4562,7 +4762,8 @@ mod tests {
                         SignerPubkey::Ed25519 { pubkey: [1u8; 32] },
                         SignerPubkey::Ed25519 { pubkey: [2u8; 32] },
                     ],
-                },
+                }),
+                tx_hash: None,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 request_id: "test-req-div-001".to_owned(),
             },
@@ -4720,6 +4921,19 @@ mod tests {
                 rule_id: 2,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 request_id: "test-req-003".to_owned(),
+            },
+            SaError::SignerSetBaselineLegacy {
+                rule_id: 2,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                request_id: "test-req-legacy-002".to_owned(),
+            },
+            SaError::BaselineWriteFailed {
+                rule_id: 2,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                tx_hash: Some("ef".repeat(32)),
+                stage: BASELINE_WRITE_STAGE_OBSERVE,
+                reason: "network.rpc_divergence: views differ".to_owned(),
+                request_id: "test-req-bwf-002".to_owned(),
             },
             SaError::SignersManagerNotConfigured {
                 rule_id: 7,
@@ -4893,6 +5107,8 @@ mod tests {
             "sa.networks_toml_parse",
             "sa.threshold_policy_not_installed",
             "sa.signer_set_missing_baseline",
+            "sa.signer_set_baseline_legacy",
+            "sa.baseline_write_failed",
             "sa.signers_manager_not_configured",
             "sa.threshold_policy_identification_failed",
             "network.rpc_divergence",
@@ -4941,7 +5157,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 75, "closed set must have exactly 75 wire codes");
+        assert_eq!(seen.len(), 77, "closed set must have exactly 77 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.
@@ -5271,8 +5487,9 @@ mod tests {
         };
         let err = SaError::SignerSetDiverged {
             rule_id: 7,
-            expected: expected.clone(),
-            observed: observed.clone(),
+            expected: SignerSetView::V1(expected.clone()),
+            observed: SignerSetView::V1(observed.clone()),
+            tx_hash: None,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
             request_id: "req-test-ssd".to_owned(),
         };
@@ -5286,9 +5503,189 @@ mod tests {
         );
         let ctx = value.get("context").unwrap();
         assert_eq!(ctx.get("rule_id").and_then(|v| v.as_u64()), Some(7));
-        // Verify expected.signer_count is preserved in the context.
-        assert!(ctx.get("expected").is_some());
-        assert!(ctx.get("observed").is_some());
+        assert_eq!(ctx["expected"]["version"], "v1", "{json}");
+        assert_eq!(ctx["expected"]["signer_count"], 3, "{json}");
+        assert_eq!(ctx["observed"]["version"], "v1", "{json}");
+        assert_eq!(ctx["observed"]["signer_count"], 2, "{json}");
+        assert!(
+            ctx.get("tx_hash").is_none(),
+            "an absent transaction hash is omitted: {json}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("expected v1 count=3 threshold=2, observed v1 count=2 threshold=2;"),
+            "{message}"
+        );
+        assert!(!message.contains("after transaction"), "{message}");
+        assert!(
+            message.contains("'smart-account signers list --rule-id 7'"),
+            "{message}"
+        );
+        assert!(
+            message.contains("'smart-account signers refresh --rule-id 7 --accept-divergence'"),
+            "{message}"
+        );
+    }
+
+    /// A version-2 `SignerSetDiverged` after a confirmed transaction carries
+    /// the hash on the wire and in its Display, and renders an absent
+    /// threshold as `none`.
+    #[test]
+    fn signer_set_diverged_after_a_transaction_names_the_hash() {
+        let snapshot = |threshold: Option<u32>| SignerSetSnapshotV2 {
+            signers: vec![SignerEntryV2 {
+                id: 0,
+                identity: SignerIdentityV2::Ed25519 { pubkey: [0x11; 32] },
+            }],
+            threshold: threshold.map(|threshold| ThresholdObservation {
+                policy: [0x22; 32],
+                threshold,
+            }),
+        };
+        let hash = "ab".repeat(32);
+        let err = SaError::SignerSetDiverged {
+            rule_id: 2,
+            expected: SignerSetView::V2(snapshot(Some(1))),
+            observed: SignerSetView::V2(snapshot(None)),
+            tx_hash: Some(hash.clone()),
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            request_id: "req-test-ssd-v2".to_owned(),
+        };
+        let value = serde_json::to_value(&err).unwrap();
+        assert_eq!(value["context"]["tx_hash"], hash.as_str());
+        assert_eq!(value["context"]["expected"]["version"], "v2");
+        assert_eq!(
+            value["context"]["observed"]["threshold"],
+            serde_json::Value::Null
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!(
+                "expected v2 count=1 threshold=1, observed v2 count=1 threshold=none \
+                 after transaction {hash};"
+            )),
+            "{message}"
+        );
+    }
+
+    /// The legacy-baseline refusal names the refresh command for its rule.
+    #[test]
+    fn signer_set_baseline_legacy_names_the_refresh_command() {
+        let err = SaError::SignerSetBaselineLegacy {
+            rule_id: 9,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            request_id: "req-legacy".to_owned(),
+        };
+        assert_eq!(err.wire_code(), "sa.signer_set_baseline_legacy");
+        let message = err.to_string();
+        assert!(message.contains("is version 1"), "{message}");
+        assert!(
+            message.contains("'smart-account signers refresh --rule-id 9'"),
+            "{message}"
+        );
+    }
+
+    /// `BaselineWriteFailed` names its stage, the transaction when present
+    /// and the refresh command that records the chain state; the hash is
+    /// omitted from the wire when absent.
+    #[test]
+    fn baseline_write_failed_names_stage_transaction_and_recovery() {
+        let failed = |tx_hash: Option<String>| SaError::BaselineWriteFailed {
+            rule_id: 5,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            tx_hash,
+            stage: BASELINE_WRITE_STAGE_WRITE,
+            reason: "audit writer poisoned".to_owned(),
+            request_id: "req-bwf".to_owned(),
+        };
+        let hash = "cd".repeat(32);
+        let with_hash = failed(Some(hash.clone()));
+        let message = with_hash.to_string();
+        assert!(
+            message.contains(&format!(
+                "was not recorded after transaction {hash}: write failed"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("'smart-account signers refresh --rule-id 5 --accept-divergence'"),
+            "{message}"
+        );
+        assert_eq!(
+            serde_json::to_value(&with_hash).unwrap()["context"]["tx_hash"],
+            hash.as_str()
+        );
+        let without_hash = failed(None);
+        assert!(!without_hash.to_string().contains("after transaction"));
+        assert!(
+            serde_json::to_value(&without_hash).unwrap()["context"]
+                .get("tx_hash")
+                .is_none()
+        );
+    }
+
+    /// The observe-stage reason leads with the inner wire code and is capped.
+    #[test]
+    fn baseline_observe_reason_carries_the_inner_code_and_is_capped() {
+        let inner = SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: "x".repeat(4 * BASELINE_WRITE_REASON_MAX_BYTES),
+        };
+        let reason = baseline_observe_reason(&inner);
+        assert!(reason.starts_with("sa.deployment_failed: "), "{reason}");
+        assert!(reason.len() <= BASELINE_WRITE_REASON_MAX_BYTES);
+        assert!(reason.ends_with("..."));
+    }
+
+    /// The `BaselineWriteFailed` stage set is closed: exactly `observe` and
+    /// `write`, and every production construction of the variant in this
+    /// crate takes its stage from a named stage constant, never a string
+    /// literal outside that set.
+    #[test]
+    fn baseline_write_stage_set_is_closed() {
+        assert_eq!(BASELINE_WRITE_STAGES, ["observe", "write"]);
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut constructions = 0usize;
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap().replace('\r', "");
+                let production: Vec<&str> = text
+                    .lines()
+                    .take_while(|line| line.trim() != "#[cfg(test)]")
+                    .collect();
+                for (i, line) in production.iter().enumerate() {
+                    if !line.contains("SaError::BaselineWriteFailed {") || line.contains("..") {
+                        continue;
+                    }
+                    constructions += 1;
+                    let stage_line = production[i..]
+                        .iter()
+                        .find(|l| l.trim_start().starts_with("stage"))
+                        .unwrap_or_else(|| panic!("{}:{}: no stage field", path.display(), i + 1));
+                    assert!(
+                        stage_line.contains("BASELINE_WRITE_STAGE_OBSERVE")
+                            || stage_line.contains("BASELINE_WRITE_STAGE_WRITE"),
+                        "{}:{}: stage must come from a stage constant: {stage_line}",
+                        path.display(),
+                        i + 1
+                    );
+                }
+            }
+        }
+        assert!(
+            constructions >= 2,
+            "the production sources construct BaselineWriteFailed at both stages"
+        );
     }
 
     /// Verifies that a `ThresholdPolicyNotInstalled` error round-trips via serde

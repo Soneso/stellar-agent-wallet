@@ -5,11 +5,11 @@
 //! RPCs would agree on it, and the audit log holds no baseline for the rule.
 //!
 //! Expected: `list_signers` refuses with `sa.deployment_failed` naming the
-//! undecodable signer's index. The refusal comes out of
-//! `identify_threshold_policy`, the first read of the rule, so the only
-//! simulation is one `get_context_rule` on the primary. No
-//! `SaSignerSetBaselined` row is written for the two signers the wallet can
-//! read, and no `SaSignerSetDiverged` row either.
+//! undecodable signer's index. The refusal comes out of the signer-set
+//! observation's rule reads, which run on both endpoints before any other
+//! read, so each endpoint sees one `get_context_rule` simulation and nothing
+//! more. No `SaSignerSetBaselinedV2` (or version 1) row is written for the two
+//! signers the wallet can read, and no `SaSignerSetDiverged` row either.
 //!
 //! # Invariant
 //!
@@ -62,9 +62,8 @@ async fn simulate_count(server: &MockServer) -> usize {
 /// `list_signers` on a fresh log refuses a rule with an undecodable third
 /// signer and writes neither a baseline nor a divergence row.
 ///
-/// Both servers serve the full `list_signers` sequence (the rule, then the
-/// rule and the threshold for each signer-set fetch), so the refusal is the
-/// decoder's and not a missing response.
+/// Both servers serve the full observation sequence (the rule, then the
+/// threshold), so the refusal is the decoder's and not a missing response.
 #[tokio::test]
 async fn list_signers_refuses_a_rule_with_an_undecodable_signer() {
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
@@ -80,7 +79,7 @@ async fn list_signers_refuses_a_rule_with_an_undecodable_signer() {
             SOURCE_G,
             &policy,
             KNOWN_WASM_HASH,
-            SequencedSimulate::new(vec![sim_cr.clone(), sim_cr.clone(), sim_th.clone()]),
+            SequencedSimulate::new(vec![sim_cr.clone(), sim_th.clone()]),
         ))
         .mount(&primary_server)
         .await;
@@ -118,7 +117,9 @@ async fn list_signers_refuses_a_rule_with_an_undecodable_signer() {
         .lines()
         .filter(|line| {
             serde_json::from_str::<serde_json::Value>(line).is_ok_and(|row| {
-                row["kind"] == "sa_signer_set_baselined" || row["kind"] == "sa_signer_set_diverged"
+                row["kind"] == "sa_signer_set_baselined"
+                    || row["kind"] == "sa_signer_set_baselined_v2"
+                    || row["kind"] == "sa_signer_set_diverged"
             })
         })
         .collect();
@@ -150,11 +151,12 @@ async fn list_signers_refuses_a_rule_with_an_undecodable_signer() {
     assert_eq!(
         simulate_count(&primary_server).await,
         1,
-        "the refusal comes from the first get_context_rule on the primary"
+        "the refusal comes from the primary's rule read; no threshold read follows"
     );
     assert_eq!(
         simulate_count(&secondary_server).await,
-        0,
-        "the secondary is never simulated against"
+        1,
+        "the secondary reads the rule once, concurrently with the primary, and \
+         nothing more"
     );
 }

@@ -1002,27 +1002,36 @@ impl AuditEntry {
         }
     }
 
-    /// Constructs a `SaSignerSetDiverged` audit entry.
+    /// Constructs a `SaSignerSetDiverged` audit entry from the expected and
+    /// the observed signer-set views.
     ///
-    /// Emitted by `SignersManager::verify_signer_set_against_chain` when the
-    /// on-chain signer set does not match the audit-log baseline.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "irreducible per-entry constructor surface"
-    )]
+    /// Both views must have the same snapshot version: a comparison runs only
+    /// between states of one version, and the row records one
+    /// `snapshot_version`. The counts come from
+    /// [`SignerSetView::signer_count`], the thresholds from each view (absent
+    /// for a version-2 snapshot without a threshold observation), and the
+    /// digests from the version's digest function rendered first-8-last-8. A
+    /// digest that cannot be computed is recorded as `compute_error`.
+    ///
+    /// [`SignerSetView::signer_count`]: super::signer_set::SignerSetView::signer_count
     #[must_use]
     pub fn new_sa_signer_set_diverged(
         rule_id: u32,
         smart_account_redacted: impl Into<RedactedStrkey>,
-        expected_signer_count: u32,
-        observed_signer_count: u32,
-        expected_threshold: u32,
-        observed_threshold: u32,
-        expected_signer_set_digest: impl Into<String>,
-        observed_signer_set_digest: impl Into<String>,
+        expected: &super::signer_set::SignerSetView,
+        observed: &super::signer_set::SignerSetView,
         chain_id: impl IntoOptionalChainId,
         request_id: impl Into<String>,
     ) -> Self {
+        debug_assert_eq!(
+            expected.version(),
+            observed.version(),
+            "a diverged row compares two views of one snapshot version"
+        );
+        let snapshot_version = match expected {
+            super::signer_set::SignerSetView::V1(_) => None,
+            super::signer_set::SignerSetView::V2(_) => Some(expected.version()),
+        };
         Self {
             ts: current_iso8601_utc(),
             tool: "sa.signer_set_diverged".to_owned(),
@@ -1038,12 +1047,13 @@ impl AuditEntry {
             event_kind: EventKind::SaSignerSetDiverged {
                 rule_id,
                 smart_account_redacted: smart_account_redacted.into(),
-                expected_signer_count,
-                observed_signer_count,
-                expected_threshold,
-                observed_threshold,
-                expected_signer_set_digest: expected_signer_set_digest.into(),
-                observed_signer_set_digest: observed_signer_set_digest.into(),
+                expected_signer_count: expected.signer_count(),
+                observed_signer_count: observed.signer_count(),
+                expected_threshold: view_threshold(expected),
+                observed_threshold: view_threshold(observed),
+                expected_signer_set_digest: view_digest_first8_last8(expected),
+                observed_signer_set_digest: view_digest_first8_last8(observed),
+                snapshot_version,
             },
             previous_entry_hash: String::new(),
         }
@@ -3678,6 +3688,36 @@ impl AuditEntry {
     }
 }
 
+/// The threshold a `SaSignerSetDiverged` row records for one view: the
+/// version-1 threshold, or a version-2 threshold observation's value, absent
+/// when the snapshot observed no simple-threshold policy.
+fn view_threshold(view: &super::signer_set::SignerSetView) -> Option<u32> {
+    match view {
+        super::signer_set::SignerSetView::V1(state) => Some(state.threshold),
+        super::signer_set::SignerSetView::V2(snapshot) => {
+            snapshot.threshold.as_ref().map(|t| t.threshold)
+        }
+    }
+}
+
+/// The first-8-last-8 digest a `SaSignerSetDiverged` row records for one
+/// view, computed with the view's version, or `compute_error` when the
+/// digest cannot be computed.
+fn view_digest_first8_last8(view: &super::signer_set::SignerSetView) -> String {
+    use super::signer_set::{
+        SignerSetView, compute_signer_set_digest, compute_signer_set_digest_v2,
+        format_digest_first8_last8,
+    };
+    let digest = match view {
+        SignerSetView::V1(state) => compute_signer_set_digest(state),
+        SignerSetView::V2(snapshot) => compute_signer_set_digest_v2(snapshot),
+    };
+    digest.map_or_else(
+        |_| "compute_error".to_owned(),
+        |d| format_digest_first8_last8(&d),
+    )
+}
+
 fn validate_plugin_name(plugin_name: &str) -> Result<(), ValidationError> {
     let reason = if plugin_name.is_empty() {
         Some("empty")
@@ -5958,15 +5998,26 @@ mod tests {
 
     #[test]
     fn sa_signer_set_diverged_constructor_shape() {
+        use crate::audit_log::signer_set::{
+            ObservedSignerSet, SignerPubkey, SignerSetView, compute_signer_set_digest,
+            format_digest_first8_last8,
+        };
+        let expected_state = make_observed_signer_set();
+        let observed_state = ObservedSignerSet {
+            signer_count: 3,
+            threshold: 2,
+            signer_ids: vec![0, 1, 2],
+            signer_pubkeys: vec![
+                SignerPubkey::Ed25519 { pubkey: [1u8; 32] },
+                SignerPubkey::Ed25519 { pubkey: [2u8; 32] },
+                SignerPubkey::Ed25519 { pubkey: [3u8; 32] },
+            ],
+        };
         let entry = AuditEntry::new_sa_signer_set_diverged(
             6u32,
             RedactedStrkey::from_already_redacted("CDABC...12345"),
-            2u32,
-            3u32,
-            1u32,
-            2u32,
-            "aabb1122...ccdd3344",
-            "eeff5566...aabb7788",
+            &SignerSetView::V1(expected_state.clone()),
+            &SignerSetView::V1(observed_state.clone()),
             "stellar:testnet",
             "req-diverge-001",
         );
@@ -5979,6 +6030,7 @@ mod tests {
             observed_threshold,
             expected_signer_set_digest,
             observed_signer_set_digest,
+            snapshot_version,
             ..
         } = &entry.event_kind
         else {
@@ -5987,10 +6039,109 @@ mod tests {
         assert_eq!(*rule_id, 6u32);
         assert_eq!(*expected_signer_count, 2u32);
         assert_eq!(*observed_signer_count, 3u32);
-        assert_eq!(*expected_threshold, 1u32);
-        assert_eq!(*observed_threshold, 2u32);
-        assert_eq!(expected_signer_set_digest, "aabb1122...ccdd3344");
-        assert_eq!(observed_signer_set_digest, "eeff5566...aabb7788");
+        assert_eq!(*expected_threshold, Some(1));
+        assert_eq!(*observed_threshold, Some(2));
+        assert_eq!(
+            expected_signer_set_digest,
+            &format_digest_first8_last8(&compute_signer_set_digest(&expected_state).unwrap())
+        );
+        assert_eq!(
+            observed_signer_set_digest,
+            &format_digest_first8_last8(&compute_signer_set_digest(&observed_state).unwrap())
+        );
+        assert_eq!(*snapshot_version, None);
+        let json = serde_json::to_string(&entry).expect("must serialise");
+        assert!(
+            json.contains(r#""expected_threshold":1,"observed_threshold":2"#),
+            "a version-1 row carries both thresholds as bare numbers: {json}"
+        );
+        assert!(
+            !json.contains("snapshot_version"),
+            "a version-1 row carries no snapshot_version key: {json}"
+        );
+    }
+
+    #[test]
+    fn sa_signer_set_diverged_v2_row_omits_absent_thresholds() {
+        use crate::audit_log::signer_set::{
+            SignerEntryV2, SignerIdentityV2, SignerSetSnapshotV2, SignerSetView,
+            compute_signer_set_digest_v2, format_digest_first8_last8,
+        };
+        let expected = SignerSetSnapshotV2 {
+            signers: vec![SignerEntryV2 {
+                id: 0,
+                identity: SignerIdentityV2::Ed25519 { pubkey: [1u8; 32] },
+            }],
+            threshold: None,
+        };
+        let observed = SignerSetSnapshotV2 {
+            signers: vec![SignerEntryV2 {
+                id: 0,
+                identity: SignerIdentityV2::DelegatedContract {
+                    contract: [2u8; 32],
+                },
+            }],
+            threshold: None,
+        };
+        let entry = AuditEntry::new_sa_signer_set_diverged(
+            1u32,
+            RedactedStrkey::from_already_redacted("CDABC...12345"),
+            &SignerSetView::V2(expected.clone()),
+            &SignerSetView::V2(observed.clone()),
+            "stellar:testnet",
+            "req-diverge-002",
+        );
+        let json = serde_json::to_string(&entry).expect("must serialise");
+        let row: serde_json::Value = serde_json::from_str(&json).expect("row is JSON");
+        let kind = row.as_object().expect("row is an object");
+        assert!(
+            !kind.contains_key("expected_threshold") && !kind.contains_key("observed_threshold"),
+            "absent thresholds are omitted from the row: {json}"
+        );
+        assert_eq!(row["snapshot_version"], 2, "{json}");
+        assert_eq!(row["expected_signer_count"], 1, "{json}");
+        assert_eq!(row["observed_signer_count"], 1, "{json}");
+        assert_eq!(
+            row["expected_signer_set_digest"],
+            format_digest_first8_last8(&compute_signer_set_digest_v2(&expected).unwrap()),
+            "{json}"
+        );
+        assert_eq!(
+            row["observed_signer_set_digest"],
+            format_digest_first8_last8(&compute_signer_set_digest_v2(&observed).unwrap()),
+            "{json}"
+        );
+        let back: AuditEntry = serde_json::from_str(&json).expect("row deserializes");
+        assert_eq!(back.event_kind, entry.event_kind);
+    }
+
+    #[test]
+    fn sa_signer_set_diverged_renders_an_uncomputable_digest_as_compute_error() {
+        use crate::audit_log::signer_set::{ObservedSignerSet, SignerSetView};
+        let malformed = ObservedSignerSet {
+            signer_count: 2,
+            threshold: 1,
+            signer_ids: vec![0],
+            signer_pubkeys: vec![],
+        };
+        let entry = AuditEntry::new_sa_signer_set_diverged(
+            1u32,
+            RedactedStrkey::from_already_redacted("CDABC...12345"),
+            &SignerSetView::V1(malformed),
+            &SignerSetView::V1(make_observed_signer_set()),
+            "stellar:testnet",
+            "req-diverge-003",
+        );
+        let EventKind::SaSignerSetDiverged {
+            expected_signer_set_digest,
+            observed_signer_set_digest,
+            ..
+        } = &entry.event_kind
+        else {
+            panic!("expected SaSignerSetDiverged; got: {:?}", entry.event_kind);
+        };
+        assert_eq!(expected_signer_set_digest, "compute_error");
+        assert_ne!(observed_signer_set_digest, "compute_error");
     }
 
     #[test]

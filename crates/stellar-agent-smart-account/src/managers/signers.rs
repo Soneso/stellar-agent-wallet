@@ -5,41 +5,52 @@
 //! context-rule signer sets.  Every mutating method enforces:
 //!
 //! 1. **Threshold invariant pre-flight**: refuses operations that would produce
-//!    `signer_count' < threshold'` or `threshold' < 1` before submitting.
-//! 2. **Two-RPC signer-set consultation**: primary + secondary RPC must agree on
-//!    `(signer_count, threshold)` before any divergence check fires.
+//!    `signer_count' < threshold'` or `threshold' < 1` before submitting, when
+//!    the rule has a simple-threshold policy.
+//! 2. **Two-RPC signer-set observation**: the primary and secondary RPC
+//!    endpoints each read the rule, its policies' executables and its
+//!    simple-threshold value, and must agree on all of them.
 //! 3. **Audit-log-derived divergence detection**: the expected signer-set view
-//!    comes from the most-recent `SaSignerSetBaselined` / `SaSignerAdded` /
-//!    `SaSignerRemoved` / `SaThresholdChanged` row, not a separate cache.
+//!    comes from the newest signer-set state row of either snapshot version,
+//!    not a separate cache, and is compared with the chain in that row's
+//!    version before every signer mutation.
 //! 4. **Refusal path**: signer mutations that would cross the threshold-vs-count
 //!    invariant are refused with [`crate::SaError::ThresholdUnreachable`] carrying
 //!    a `safe_ordering_hint` guiding the safe two-command sequence (atomic bundle
 //!    dropped; CAP-46 prohibits two `InvokeHostFunctionOp` per Soroban transaction).
+//! 5. **Recorded confirmed state**: after a signer mutation confirms, both
+//!    endpoints are read again at or past the confirmation ledger, the
+//!    resulting set must be exactly the intended change, and it is recorded as
+//!    a version-2 state row; a failure to observe or record it is returned as
+//!    [`crate::SaError::BaselineWriteFailed`] with the transaction hash.
 //!
 //! # Architecture
 //!
 //! Each public `async` method is a thin outer function that:
 //! 1. Acquires the per-rule mutex (non-reentrant; fails on double-lock attempt).
-//! 2. Delegates to `*_locked_inner` which does the actual work.
-//! 3. Emits the audit-log row (success or failure) inside the write critical
-//!    section, sourcing `prev_chain_tip_hash` from `AuditWriter::current_chain_tip()`
-//!    inside that section (prev_chain_tip_hash sourced inside the write lock).
+//! 2. Delegates to `*_locked_inner` which compares, submits, observes and
+//!    validates.
+//! 3. Writes the audit-log state row inside the write critical section
+//!    (`write_state_row`). A signer add also writes its pin rows once its
+//!    transaction confirms: after the state row, or before a refusal that
+//!    follows the confirmation.
 //!
-//! # Single-caller invariant for `SaSignerSetBaselined`
+//! # Single-caller invariant for the signer-set baseline
 //!
-//! Only `SignersManager::list_signers` (first-observation) and
-//! `SignersManager::refresh_signer_baseline` (always) may construct
-//! `EventKind::SaSignerSetBaselined`.  The CI gate
+//! Only `SignersManager::list_signers` (first observation) and
+//! `SignersManager::refresh_signer_baseline` (explicit re-anchor) may write a
+//! baseline, a `EventKind::SaSignerSetBaselinedV2` row. The CI gate
 //! `.github/scripts/check-no-direct-sasignersetbaselined-emit.sh` enforces
 //! this over the production code of every crate:
 //!
-//! 1. `AuditEntry::new_sa_signer_set_baselined` is called exactly once, inside
-//!    `SignersManager::emit_baseline`;
+//! 1. `AuditEntry::new_sa_signer_set_baselined_v2` is called exactly once,
+//!    inside `SignersManager::emit_baseline`, and the version-1 constructor
+//!    `AuditEntry::new_sa_signer_set_baselined` is not called;
 //! 2. `emit_baseline` is called exactly twice, once from `list_signers` and
 //!    once from `refresh_signer_baseline`;
 //! 3. no code outside `stellar-agent-core`'s `audit_log/entry.rs` constructs
-//!    `SaSignerSetBaselined`, with any path prefix (pattern matches are
-//!    allowed);
+//!    `SaSignerSetBaselined` or `SaSignerSetBaselinedV2`, with any path prefix
+//!    (pattern matches are allowed);
 //! 4. `BaselineReason::first_observation`, `explicit_refresh`,
 //!    `FirstObservation` and `ExplicitRefresh` are used only from
 //!    `list_signers` and `refresh_signer_baseline` (pattern matches are
@@ -61,16 +72,18 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::AuditLogIntegrityError;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::{AuditWriterHealth, AuditWriterHealthHandle};
 use stellar_agent_core::audit_log::schema::{ContractKind, PinsUpdateReason};
 use stellar_agent_core::audit_log::signer_set::{
-    BaselineReason, ObservedSignerSet, SignerPubkey, compute_signer_set_digest,
-    format_digest_first8_last8,
+    BaselineReason, ObservedSignerSet, SignerEntryV2, SignerIdentityV2, SignerPubkey,
+    SignerSetSnapshotV2, SignerSetView, SignerSetViewPayload, ThresholdObservation, account_digest,
+    compute_signer_set_digest, compute_signer_set_digest_v2,
 };
-use stellar_agent_core::audit_log::writer::AuditWriter;
+use stellar_agent_core::audit_log::writer::{AuditWriter, WriterError};
 use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 use stellar_agent_core::observability::{
     RedactedStrkey, redact_strkey_first5_last5, untrusted_display_bounded,
@@ -93,10 +106,13 @@ use stellar_xdr::{
 use tracing::{debug, info, warn};
 
 use crate::SaError;
-use crate::error::AdminOrOwnerKey;
+use crate::error::{
+    AdminOrOwnerKey, BASELINE_WRITE_STAGE_OBSERVE, BASELINE_WRITE_STAGE_WRITE,
+    baseline_observe_reason, baseline_write_reason,
+};
 use crate::managers::rules::{
     BASE_FEE_STROOPS, ExpiryCheck, augment_with_oz_error_name, contract_instance_key,
-    parse_c_strkey_to_smart_account, scaddress_to_strkey,
+    scaddress_to_strkey,
 };
 use crate::managers::verifiers::PlannedPinUpdate;
 use crate::signers::policy_identification::THRESHOLD_POLICY_WASM_HASHES;
@@ -358,21 +374,20 @@ impl SignersManagerConfig {
 ///
 /// | Method | Effect | Mutex | Audit row |
 /// |--------|--------|-------|-----------|
-/// | `list_signers` | Reads on-chain signer set (two-RPC); baselines if no prior row | yes | `SaSignerSetBaselined` (first-obs) |
-/// | `refresh_signer_baseline` | Two-RPC fetch; always writes fresh baseline | yes | `SaSignerSetBaselined` |
-/// | `add_signer` | Adds a signer; per-rule mutex held | yes | `SaSignerAdded` |
-/// | `remove_signer` | Removes a signer; per-rule mutex held | yes | `SaSignerRemoved` |
-/// | `set_threshold` | Changes threshold only; per-rule mutex held | yes | `SaThresholdChanged` |
-/// | `verify_signer_set_against_chain` | Checks on-chain vs audit-log baseline | yes | `SaSignerSetDiverged` (on mismatch) |
-/// | `identify_threshold_policy` | Wasm-hash two-RPC lookup | no | (internal; no audit row) |
+/// | `list_signers` | Observes the signer set (two-RPC); baselines if no prior row, otherwise compares | yes | `SaSignerSetBaselinedV2` (first observation) |
+/// | `refresh_signer_baseline` | Observes and compares; writes a fresh baseline (a changed set needs `accept_divergence`) | yes | `SaSignerSetDiverged` (changed set), `SaSignerSetBaselinedV2` |
+/// | `add_signer` | Compares, adds a signer, validates the confirmed set | yes | `SaSignerAddedV2` |
+/// | `batch_add_signers` | Compares, adds signers, validates the confirmed set | yes | `SaSignerAddedV2` per signer |
+/// | `remove_signer` | Compares, removes a signer, validates the confirmed set | yes | `SaSignerRemovedV2` |
+/// | `set_threshold` | Compares, changes the threshold, validates the confirmed set | yes | `SaThresholdChangedV2` |
+/// | `verify_signer_set_against_chain` | Compares the chain with the audit-log baseline | yes | `SaSignerSetDiverged` (on mismatch) |
 /// | `identify_verifier` | Verifier wasm-hash two-RPC lookup | no | (internal; no audit row) |
 ///
 /// # Non-reentrant rule mutex
 ///
-/// All six public `async` methods acquire a per-rule `tokio::sync::Mutex`
-/// before any network I/O, preventing TOCTOU races between the divergence
-/// check and the transaction submission.
-/// A CI gate enforces exactly six authorised acquire sites.
+/// Every method that reads or writes a rule's signer-set state acquires a
+/// per-rule `tokio::sync::Mutex` before any network I/O, preventing TOCTOU
+/// races between the divergence check and the transaction submission.
 ///
 /// # Implements
 ///
@@ -703,7 +718,8 @@ impl SignersManager {
     /// # Errors
     ///
     /// - [`SaError::DeploymentFailed`] — simulation or decode error.
-    /// - [`SaError::AuthEntryConstructionFailed`] — strkey parse error.
+    /// - [`SaError::AuthEntryConstructionFailed`]: RPC or XDR construction
+    ///   failure.
     ///
     /// # Implements
     ///
@@ -719,43 +735,30 @@ impl SignersManager {
             .fetch_context_rule_primary(smart_account, rule_id, source_account_strkey)
             .await?;
 
-        // Extract unique verifier addresses from External signers.
-        let mut verifier_addrs: Vec<ScAddress> = Vec::new();
-        let mut seen_verifiers: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        for (_sid, pk) in &rule.signers {
-            if let SignerPubkey::External {
-                verifier_contract, ..
-            } = pk
-                && seen_verifiers.insert(verifier_contract.clone())
-            {
-                let addr =
-                    crate::managers::rules::parse_c_strkey_to_smart_account(verifier_contract)
-                        .map_err(|e| SaError::AuthEntryConstructionFailed {
-                            stage: "strkey_parse",
-                            redacted_reason: format!(
-                                "External signer verifier_contract is not a valid C-strkey \
-                                 (rule_id={rule_id}): {e}"
-                            ),
-                        })?;
-                verifier_addrs.push(addr);
-            }
-        }
-
+        let verifier_addrs = external_verifiers(rule.signers.iter().map(|(_, signer)| signer));
         Ok((verifier_addrs, rule.policies))
     }
 
     // ── list_signers ──────────────────────────────────────────────────────────
 
-    /// Lists the current signer set for a context rule.
+    /// Lists the current signer set of a context rule and compares it with
+    /// the rule's audit-log state.
     ///
-    /// Fetches the signer set from the primary RPC (view call, no auth), then
-    /// emits a `SaSignerSetBaselined` audit row if and only if no prior
-    /// baseline / state-change row exists for this `(rule_id, smart_account)`.
+    /// Reads the rule's newest signer-set state row, then observes the signer
+    /// set in version 2 through both RPC endpoints (the signers, the policy
+    /// list, each policy's executable and the simple-threshold value; see
+    /// [`ListOutcome`]). With no prior row it writes a `SaSignerSetBaselinedV2`
+    /// row (`first_observation`) and reports [`PreviousBaseline::None`]. With a
+    /// prior row it writes nothing and reports how the chain compares with
+    /// that row in the row's version: [`PreviousBaseline::Matched`],
+    /// [`PreviousBaseline::Diverged`] or [`PreviousBaseline::NotComparable`].
     ///
-    /// This is the human-path bootstrap: calling `smart-account signers list` for the
-    /// first time establishes the audit-log baseline so subsequent signing
-    /// attempts can use it.
+    /// A rule without a simple-threshold policy is observed with no threshold
+    /// and can be baselined.
+    ///
+    /// This is the human-path bootstrap: calling `smart-account signers list`
+    /// for the first time establishes the audit-log baseline so subsequent
+    /// signing attempts can use it.
     ///
     /// # Arguments
     ///
@@ -767,8 +770,19 @@ impl SignersManager {
     ///
     /// # Errors
     ///
-    /// - [`SaError::DeploymentFailed`] (phase `"simulate"`) — on-chain view call failed.
-    /// - [`SaError::AuditLog`] — audit-log integrity violation on baseline read.
+    /// - [`SaError::AuditLog`]: audit-log integrity violation on the state
+    ///   read.
+    /// - [`SaError::NetworkRpcDivergence`]: the two endpoints disagree on the
+    ///   rule, a policy's executable or the threshold.
+    /// - [`SaError::ThresholdPolicyIdentificationFailed`]: more than one
+    ///   attached policy is a simple-threshold policy.
+    /// - [`SaError::ThresholdReadFailed`]: the threshold read failed.
+    /// - [`SaError::ContractInstanceUnsupported`]: a policy's instance is
+    ///   malformed or an external reference with no live tag entry.
+    /// - [`SaError::DeploymentFailed`] (phase `"simulate"`): a read failed or
+    ///   the rule holds a signer the wallet cannot decode.
+    /// - [`SaError::BaselineWriteFailed`] (stage `write`): the first
+    ///   observation's baseline row was not written.
     /// - [`SaError::AuthEntryConstructionFailed`] — RPC or XDR construction failure.
     ///
     /// # Implements
@@ -776,17 +790,13 @@ impl SignersManager {
     /// Atomic signer-threshold update: ensures baseline is written before any
     /// signer mutation can be issued against a rule, so the audit trail always
     /// has a starting point for divergence detection.
-    #[allow(
-        clippy::expect_used,
-        reason = "std::sync::Mutex poison is unrecoverable here"
-    )]
     pub async fn list_signers(
         &self,
         smart_account: ScAddress,
         rule_id: u32,
         source_account_strkey: Option<&str>,
         request_id: String,
-    ) -> Result<ObservedSignerSet, SaError> {
+    ) -> Result<ListOutcome, SaError> {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
@@ -795,100 +805,97 @@ impl SignersManager {
         let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
         let _guard = mutex.lock().await;
 
-        // Identify threshold policy via wasm-hash allowlist (fail-closed).
-        // Must precede the two-RPC signer-set fetch so fetch_signer_set_* receive a
-        // validated policy address (not an unvalidated policies.first() pick).
-        let policy_addr = self
-            .identify_threshold_policy(
-                smart_account.clone(),
+        // The state row is read before the observation: an audit-log integrity
+        // failure refuses without any RPC.
+        let prior =
+            self.read_signer_set_view(rule_id, &smart_account_strkey, &smart_account_redacted)?;
+
+        let observation = self
+            .observe_signer_set_v2(
+                &smart_account,
                 rule_id,
                 source_account_strkey,
-                request_id.clone(),
+                None,
+                &request_id,
             )
             .await?;
 
-        // Two-RPC consultation — baseline writes must agree across RPCs.
-        let (primary_result, secondary_result) = tokio::join!(
-            self.fetch_signer_set(
-                &self.primary_rpc_client,
-                smart_account.clone(),
-                rule_id,
-                source_account_strkey,
-                &policy_addr,
-                &request_id,
-            ),
-            self.fetch_signer_set(
-                &self.secondary_rpc_client,
-                smart_account.clone(),
-                rule_id,
-                source_account_strkey,
-                &policy_addr,
-                &request_id,
-            ),
-        );
-        let primary_observed = primary_result?;
-        let secondary_observed = secondary_result?;
-
-        let primary_digest = compute_signer_set_digest(&primary_observed)?;
-        let secondary_digest = compute_signer_set_digest(&secondary_observed)?;
-
-        if primary_digest != secondary_digest {
-            let primary_first8 = primary_digest[..8]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            let secondary_first8 = secondary_digest[..8]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            return Err(SaError::NetworkRpcDivergence {
-                rule_id: Some(rule_id),
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted.clone(),
-                ),
-                primary_view_digest_first8: primary_first8,
-                secondary_view_digest_first8: secondary_first8,
-                request_id: request_id.clone(),
-            });
-        }
-
-        let observed = primary_observed;
-
-        // Check whether a prior baseline exists. If not, emit SaSignerSetBaselined.
-        // AuditLogIntegrityError must propagate — never silently reinterpreted as Ok(None).
-        let prior =
-            self.read_audit_log_baseline(rule_id, &smart_account_strkey, &smart_account_redacted)?;
-
-        if prior.is_none() {
-            // First observation: emit SaSignerSetBaselined.
+        let Some(prior) = prior else {
             self.emit_baseline(
-                &observed,
+                &observation,
                 rule_id,
+                &smart_account_strkey,
                 &smart_account_redacted,
                 BaselineReason::first_observation(),
                 &request_id,
+            )?;
+            info!(
+                profile = %self.profile_name,
+                rule_id,
+                smart_account = %smart_account_redacted,
+                signer_count = observation.snapshot.signer_count(),
+                threshold = ?observation.snapshot.threshold.as_ref().map(|t| t.threshold),
+                "list_signers: first observation baselined"
             );
-        }
+            return Ok(ListOutcome {
+                view: SignerSetView::V2(observation.snapshot),
+                baseline: PreviousBaseline::None,
+            });
+        };
+
+        let baseline = match classify_against(prior.view(), &observation)? {
+            Classified::Matched { .. } => PreviousBaseline::Matched,
+            Classified::Diverged { .. } => PreviousBaseline::Diverged,
+            Classified::NotComparable { cause } => {
+                debug!(
+                    rule_id,
+                    cause = cause.wire_code(),
+                    "list_signers: the version-1 baseline has no comparable projection"
+                );
+                PreviousBaseline::NotComparable
+            }
+        };
 
         info!(
             profile = %self.profile_name,
             rule_id,
             smart_account = %smart_account_redacted,
-            signer_count = observed.signer_count,
-            threshold = observed.threshold,
+            signer_count = observation.snapshot.signer_count(),
+            threshold = ?observation.snapshot.threshold.as_ref().map(|t| t.threshold),
+            baseline = ?baseline,
             "list_signers: on-chain signer set"
         );
 
-        Ok(observed)
+        Ok(ListOutcome {
+            view: SignerSetView::V2(observation.snapshot),
+            baseline,
+        })
     }
 
     // ── refresh_signer_baseline ───────────────────────────────────────────────
 
-    /// Fetches the on-chain signer set and unconditionally writes a new
-    /// `SaSignerSetBaselined` audit row.
+    /// Observes the on-chain signer set, compares it with the rule's
+    /// audit-log state and records it as a new `SaSignerSetBaselinedV2` row.
     ///
-    /// This is the programmatic baseline-write primitive.  Call this after an
-    /// intentional out-of-band signer change to re-anchor the wallet's
+    /// The signer set is observed once in version 2 through both RPC
+    /// endpoints. With a prior state row it is compared in that row's
+    /// version, a version-1 row through the version-1 projection of the same
+    /// reads (see [`RefreshOutcome`]):
+    ///
+    /// - no prior row, or a matching one: the baseline is written;
+    /// - a changed set ([`PreviousBaseline::Diverged`]): a
+    ///   `SaSignerSetDiverged` row records the two states, then the baseline
+    ///   is written only when `accept_divergence` is `true`; otherwise the
+    ///   call refuses with [`SaError::SignerSetDiverged`];
+    /// - a version-1 row with no comparable projection
+    ///   ([`PreviousBaseline::NotComparable`]: a signer delegated to a
+    ///   contract address, or no simple-threshold policy): nothing is written
+    ///   and the call refuses with [`SaError::SignerSetDiverged`] carrying
+    ///   the version-1 row and the version-2 observation, unless
+    ///   `accept_divergence` is `true`, which writes the baseline.
+    ///
+    /// Call this after an intentional out-of-band signer change, or once on
+    /// a rule whose baseline is version 1, to re-anchor the wallet's
     /// divergence-detection view.
     ///
     /// # Arguments
@@ -896,29 +903,33 @@ impl SignersManager {
     /// - `smart_account` — the smart-account contract's [`ScAddress`].
     /// - `rule_id` — the context rule to baseline.
     /// - `source_account_strkey` — G-strkey of the fee-paying account.
+    /// - `accept_divergence`: record the chain state even when it differs
+    ///   from, or cannot be compared with, the prior state row.
     /// - `request_id` — caller-supplied UUID for audit-log correlation.
     ///
     /// # Errors
     ///
-    /// - [`SaError::DeploymentFailed`] (phase `"simulate"`) — view call failed.
-    /// - [`SaError::AuthEntryConstructionFailed`] — RPC or XDR construction failure.
+    /// - [`SaError::SignerSetDiverged`] (no transaction hash): the chain
+    ///   differs from the prior row, or a version-1 row cannot be compared,
+    ///   and `accept_divergence` is `false`.
+    /// - [`SaError::BaselineWriteFailed`] (stage `write`): the baseline row
+    ///   was not written.
+    /// - [`SaError::AuditLog`]: audit-log integrity violation.
+    /// - The observation errors of [`Self::list_signers`].
     ///
     /// # Implements
     ///
     /// Atomic signer-threshold update: ensures baseline is re-established
     /// after an out-of-band signer change so divergence detection remains
     /// accurate.
-    #[allow(
-        clippy::expect_used,
-        reason = "std::sync::Mutex poison is unrecoverable here"
-    )]
     pub async fn refresh_signer_baseline(
         &self,
         smart_account: ScAddress,
         rule_id: u32,
         source_account_strkey: Option<&str>,
+        accept_divergence: bool,
         request_id: String,
-    ) -> Result<ObservedSignerSet, SaError> {
+    ) -> Result<RefreshOutcome, SaError> {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
@@ -926,102 +937,125 @@ impl SignersManager {
         let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
         let _guard = mutex.lock().await;
 
-        // Identify threshold policy via wasm-hash allowlist (fail-closed).
-        let policy_addr = self
-            .identify_threshold_policy(
-                smart_account.clone(),
+        let prior =
+            self.read_signer_set_view(rule_id, &smart_account_strkey, &smart_account_redacted)?;
+
+        let observation = self
+            .observe_signer_set_v2(
+                &smart_account,
                 rule_id,
                 source_account_strkey,
-                request_id.clone(),
+                None,
+                &request_id,
             )
             .await?;
 
-        // Two-RPC consultation — baseline writes must agree across RPCs.
-        let (primary_result, secondary_result) = tokio::join!(
-            self.fetch_signer_set(
-                &self.primary_rpc_client,
-                smart_account.clone(),
-                rule_id,
-                source_account_strkey,
-                &policy_addr,
-                &request_id,
-            ),
-            self.fetch_signer_set(
-                &self.secondary_rpc_client,
-                smart_account.clone(),
-                rule_id,
-                source_account_strkey,
-                &policy_addr,
-                &request_id,
-            ),
-        );
-        let primary_observed = primary_result?;
-        let secondary_observed = secondary_result?;
+        let previous_baseline = match prior {
+            None => PreviousBaseline::None,
+            Some(prior) => {
+                let expected = prior.view().clone();
+                match classify_against(&expected, &observation)? {
+                    Classified::Matched { .. } => PreviousBaseline::Matched,
+                    Classified::Diverged { observed } => {
+                        // The log records what the refresh met, whether or
+                        // not it accepts it.
+                        self.emit_signer_set_diverged(
+                            rule_id,
+                            &smart_account_redacted,
+                            &expected,
+                            &observed,
+                            &request_id,
+                        );
+                        if !accept_divergence {
+                            return Err(SaError::SignerSetDiverged {
+                                rule_id,
+                                expected,
+                                observed,
+                                tx_hash: None,
+                                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                                    smart_account_redacted,
+                                ),
+                                request_id,
+                            });
+                        }
+                        PreviousBaseline::Diverged
+                    }
+                    Classified::NotComparable { cause } => {
+                        warn!(
+                            rule_id,
+                            smart_account = %smart_account_redacted,
+                            cause = cause.wire_code(),
+                            accept_divergence,
+                            "refresh_signer_baseline: the version-1 baseline cannot be compared \
+                             with the chain"
+                        );
+                        if !accept_divergence {
+                            return Err(SaError::SignerSetDiverged {
+                                rule_id,
+                                expected,
+                                observed: SignerSetView::V2(observation.snapshot),
+                                tx_hash: None,
+                                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                                    smart_account_redacted,
+                                ),
+                                request_id,
+                            });
+                        }
+                        PreviousBaseline::NotComparable
+                    }
+                }
+            }
+        };
 
-        let primary_digest = compute_signer_set_digest(&primary_observed)?;
-        let secondary_digest = compute_signer_set_digest(&secondary_observed)?;
-
-        if primary_digest != secondary_digest {
-            let primary_first8 = primary_digest[..8]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            let secondary_first8 = secondary_digest[..8]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            return Err(SaError::NetworkRpcDivergence {
-                rule_id: Some(rule_id),
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted.clone(),
-                ),
-                primary_view_digest_first8: primary_first8,
-                secondary_view_digest_first8: secondary_first8,
-                request_id: request_id.clone(),
-            });
-        }
-
-        let observed = primary_observed;
-
-        // Always emit SaSignerSetBaselined on explicit refresh.
         self.emit_baseline(
-            &observed,
+            &observation,
             rule_id,
+            &smart_account_strkey,
             &smart_account_redacted,
             BaselineReason::explicit_refresh(),
             &request_id,
-        );
+        )?;
 
         info!(
             profile = %self.profile_name,
             rule_id,
             smart_account = %smart_account_redacted,
-            signer_count = observed.signer_count,
-            threshold = observed.threshold,
+            signer_count = observation.snapshot.signer_count(),
+            threshold = ?observation.snapshot.threshold.as_ref().map(|t| t.threshold),
+            previous_baseline = ?previous_baseline,
             "refresh_signer_baseline: baseline written"
         );
 
-        Ok(observed)
+        Ok(RefreshOutcome {
+            view: SignerSetView::V2(observation.snapshot),
+            previous_baseline,
+        })
     }
 
     // ── verify_signer_set_against_chain ───────────────────────────────────────
 
     /// Checks the on-chain signer set against the audit-log baseline.
     ///
-    /// Executes in three ordered steps:
+    /// Acquires the rule's lock, then compares (see
+    /// `compare_signer_set_locked`):
     ///
-    /// 1. **Audit-log read** — loads the most-recent signer-set state row.
-    ///    Returns [`SaError::SignerSetMissingBaseline`] if no baseline exists
-    ///    (before any RPC call), or [`SaError::AuditLog`] on integrity failure.
-    /// 2. **Two-RPC consultation** — fetches `(signer_count, threshold)` from
-    ///    primary + secondary RPC in parallel.  Returns
+    /// 1. **Audit-log read**: loads the newest signer-set state row of either
+    ///    snapshot version. Returns [`SaError::SignerSetMissingBaseline`] if no
+    ///    baseline exists (before any RPC call), or [`SaError::AuditLog`] on
+    ///    integrity failure.
+    /// 2. **Two-RPC observation**: observes the signer set in version 2
+    ///    through the primary and secondary endpoints. Returns
     ///    [`SaError::NetworkRpcDivergence`] if they disagree.
-    /// 3. **Audit-vs-chain comparison** — compares the audit-log-derived
-    ///    expected view against the agreed on-chain state.  Returns
-    ///    [`SaError::SignerSetDiverged`] (and emits `SaSignerSetDiverged` audit
-    ///    row) if they disagree.
+    /// 3. **Audit-vs-chain comparison**: compares the row with the
+    ///    observation in the row's version: a version-2 row with the full
+    ///    snapshot, a version-1 row with the observation's version-1
+    ///    projection, whose 16-byte `External` key-data prefix is all a
+    ///    version-1 row records. Returns [`SaError::SignerSetDiverged`] (and
+    ///    writes a `SaSignerSetDiverged` audit row) if they disagree.
     ///
-    /// On success, returns a move-only [`FrozenChainStateTuple`].
+    /// On success, returns a move-only [`FrozenChainStateTuple`] carrying the
+    /// observed view in the row's version, the smallest `latestLedger` the
+    /// observation's reads reported and the matched row's hash.
     ///
     /// **TOCTOU semantics.** The `FrozenChainStateTuple` is a data-only
     /// tamper-evidence anchor — it captures the audit-log expectation hash at
@@ -1046,8 +1080,8 @@ impl SignersManager {
     /// - `source_account_strkey` — `Some(G...)` for a real fee-paying account,
     ///   or `None` when no fee-payer is available (e.g. read-only divergence
     ///   checks called from `sign_with_passkey_rule_inner`).  When `None`, the
-    ///   underlying `simulate_read_only` calls use [`SIMULATE_SENTINEL_G`] with
-    ///   sequence number `"0"`.
+    ///   underlying simulations use [`SIMULATE_SENTINEL_G`] with sequence
+    ///   number `"0"`.
     /// - `request_id` — caller-supplied UUID for audit-log correlation.
     ///
     /// # Errors
@@ -1056,8 +1090,13 @@ impl SignersManager {
     /// - [`SaError::AuditLog`] — audit-log integrity violation.
     /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPC disagree.
     /// - [`SaError::SignerSetDiverged`] — on-chain state differs from baseline.
-    /// - [`SaError::DeploymentFailed`] / [`SaError::AuthEntryConstructionFailed`]
-    ///   — RPC errors during signer-set fetch.
+    /// - [`SaError::ThresholdPolicyNotInstalled`] /
+    ///   [`SaError::ThresholdPolicyIdentificationFailed`]: a version-1
+    ///   baseline needs a threshold and the rule observes none.
+    /// - [`SaError::DeploymentFailed`]: a read failed, or a version-1
+    ///   baseline meets a signer it has no representation for.
+    /// - [`SaError::AuthEntryConstructionFailed`]: RPC or XDR construction
+    ///   failure.
     ///
     /// # Implements
     ///
@@ -1079,124 +1118,33 @@ impl SignersManager {
         let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, &smart_account_strkey);
         let _guard = mutex.lock().await;
 
-        // Step 1: audit-log read (before any RPC call).
-        let baseline =
-            self.read_audit_log_baseline(rule_id, &smart_account_strkey, &smart_account_redacted)?;
-
-        let state_payload = baseline.ok_or_else(|| SaError::SignerSetMissingBaseline {
-            rule_id,
-            smart_account_redacted: RedactedStrkey::from_already_redacted(
-                smart_account_redacted.clone(),
-            ),
-            request_id: request_id.clone(),
-        })?;
-
-        let expected = state_payload.state().clone();
-        let row_hash = *state_payload.row_hash();
-
-        // Step 2a: identify threshold policy (fail-closed).
-        let policy_addr = self
-            .identify_threshold_policy(
-                smart_account.clone(),
+        let compared = self
+            .compare_signer_set_locked(
+                &smart_account,
+                &smart_account_strkey,
+                &smart_account_redacted,
                 rule_id,
                 source_account_strkey,
-                request_id.clone(),
+                V1Handling::Compare,
+                &request_id,
             )
             .await?;
 
-        // Step 2b: two-RPC consultation in parallel.
-        let (primary_result, secondary_result) = tokio::join!(
-            self.fetch_signer_set(
-                &self.primary_rpc_client,
-                smart_account.clone(),
-                rule_id,
-                source_account_strkey,
-                &policy_addr,
-                &request_id,
-            ),
-            self.fetch_signer_set(
-                &self.secondary_rpc_client,
-                smart_account.clone(),
-                rule_id,
-                source_account_strkey,
-                &policy_addr,
-                &request_id,
-            ),
-        );
-
-        let primary_observed = primary_result?;
-        let secondary_observed = secondary_result?;
-
-        // Compute digests for both RPC views and check agreement.
-        let primary_digest = compute_signer_set_digest(&primary_observed)?;
-        let secondary_digest = compute_signer_set_digest(&secondary_observed)?;
-
-        if primary_digest != secondary_digest {
-            let primary_first8 = primary_digest[..8]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            let secondary_first8 = secondary_digest[..8]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            return Err(SaError::NetworkRpcDivergence {
-                rule_id: Some(rule_id),
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted.clone(),
-                ),
-                primary_view_digest_first8: primary_first8,
-                secondary_view_digest_first8: secondary_first8,
-                request_id: request_id.clone(),
-            });
-        }
-
-        // Both RPCs agreed; use the primary observation as the authoritative view.
-        let observed = primary_observed;
-
-        // Step 3: audit-log expected vs on-chain comparison.
-        let expected_digest = compute_signer_set_digest(&expected)?;
-        let observed_digest = compute_signer_set_digest(&observed)?;
-
-        if expected_digest != observed_digest {
-            // Divergence detected — emit SaSignerSetDiverged audit row.
-            self.emit_signer_set_diverged(
-                rule_id,
-                &smart_account_redacted,
-                &expected,
-                &observed,
-                &request_id,
-            );
-
-            return Err(SaError::SignerSetDiverged {
-                rule_id,
-                expected,
-                observed,
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted.clone(),
-                ),
-                request_id: request_id.clone(),
-            });
-        }
-
-        // Use the ledger sequence from the primary simulation (not available
-        // from the view-call result directly; use timestamp instead).
         let now_ms = i64::try_from(now_unix_ms().unwrap_or(0)).unwrap_or(i64::MAX);
-        let simulation_ledger = (0u32, now_ms);
 
         debug!(
             profile = %self.profile_name,
             rule_id,
             smart_account = %smart_account_redacted,
-            signer_count = observed.signer_count,
-            threshold = observed.threshold,
+            observed = %compared.view,
+            ledger = compared.observation.ledger,
             "verify_signer_set_against_chain: on-chain matches baseline"
         );
 
         Ok(FrozenChainStateTuple::new(
-            observed,
-            simulation_ledger,
-            row_hash,
+            compared.view,
+            (compared.observation.ledger, now_ms),
+            compared.row_hash,
             rule_id,
         ))
     }
@@ -1207,20 +1155,31 @@ impl SignersManager {
     ///
     /// Acquires the per-rule mutex, then:
     ///
-    /// 1. Checks `signer_count' <= MAX_SIGNERS`.
-    /// 2. Validates the threshold invariant; refuses with
+    /// 1. Compares the chain with the rule's version-2 audit-log state through
+    ///    both RPC endpoints; a version-1 state refuses before any RPC with
+    ///    [`SaError::SignerSetBaselineLegacy`], a changed set refuses with
+    ///    [`SaError::SignerSetDiverged`] and submits nothing.
+    /// 2. Checks `signer_count' <= MAX_SIGNERS` and, when the rule has a
+    ///    simple-threshold policy, the threshold invariant; refuses with
     ///    [`SaError::ThresholdUnreachable`] if the add would create an
     ///    unreachable threshold state.
     /// 3. Constructs and submits a single `InvokeHostFunctionOp` transaction.
-    /// 4. Emits `SaSignerAdded` audit row, then the override rows and the
-    ///    `SaContextRulePinsUpdated` row described under "Pin record".
+    /// 4. After it confirms, observes the rule through both endpoints at or
+    ///    past the confirmation ledger and requires exactly the intended
+    ///    change. The new signer must hold a new id equal to the id the
+    ///    simulation returned; every other signer and the threshold must be
+    ///    unchanged.
+    /// 5. Writes a `SaSignerAddedV2` audit row carrying the resulting set,
+    ///    then the override rows and the `SaContextRulePinsUpdated` row
+    ///    described under "Pin record".
     ///
     /// # Pin record
     ///
-    /// When a new signer is `External` and the rule has a pin record (the
-    /// newest `SaContextRuleCreated` or `SaContextRulePinsUpdated` row), the
-    /// add keeps the record in step with the rule's live verifier set, so
-    /// the signing-time drift check does not refuse the rule the wallet
+    /// A rule's pin record is its newest `SaContextRuleCreated` or
+    /// `SaContextRulePinsUpdated` row. When the new signer is `External` (a
+    /// passkey signer included) and the rule has a pin record, the add keeps
+    /// the record in step with the rule's live verifier set. The
+    /// signing-time drift check then does not refuse the rule the wallet
     /// itself changed:
     ///
     /// - before submission, each new verifier address not already live on
@@ -1228,13 +1187,20 @@ impl SignersManager {
     ///   applies: an allowlist miss refuses unless `accept_unknown_verifier`
     ///   is set, and a mutable contract refuses unless
     ///   `accept_mutable_verifier` is set;
-    /// - after the add confirms, each applied override writes its override
-    ///   row carrying the rule id, after the `SaSignerAdded` row; a refused
-    ///   add writes none;
+    /// - once the add confirms, each applied override writes its override
+    ///   row carrying the rule id; a refused add writes none;
     /// - then a `SaContextRulePinsUpdated` row (reason
     ///   `signer_added`) records the verifier pins deduplicated by address:
     ///   a signer on a verifier already live leaves the list unchanged, a
     ///   signer on a new verifier appends its pin.
+    ///
+    /// The pin rows are written exactly once after the add confirms. They
+    /// follow the `SaSignerAddedV2` row when the change is recorded. When the
+    /// confirmed state is not observed or not the intended change, they are
+    /// written before the refusal returns. When the state row is not written,
+    /// they are attempted, and the audit log usually refuses them as well.
+    /// The confirmed add put the new verifier on the rule in every case, and
+    /// a pin only restricts which executable may run under it.
     ///
     /// A record with more than one verifier pin is refused by every checked
     /// signing verb with `sa.pin_check_unavailable`
@@ -1246,8 +1212,9 @@ impl SignersManager {
     ///
     /// - `smart_account` — the smart-account contract's [`ScAddress`].
     /// - `rule_id` — the context rule to update.
-    /// - `new_signer` — the signer to add (encoded as an OZ `Signer` ScVal).
-    /// - `new_signer_pubkey` — pubkey envelope for the audit-log row.
+    /// - `new_signer`: the signer to add (encoded as an OZ `Signer` ScVal);
+    ///   its identity for the comparison, the audit row and pin planning is
+    ///   decoded from this value.
     /// - `signer` — the ed25519 signer for auth-entry signing + fee envelope.
     /// - `request_id` — caller-supplied UUID for audit-log correlation.
     /// - `accept_mutable_verifier` / `accept_unknown_verifier`: the overrides
@@ -1265,11 +1232,19 @@ impl SignersManager {
     /// - [`SaError::ContextRuleCapsExceeded`] — signer count would exceed `MAX_SIGNERS`.
     /// - [`SaError::ThresholdUnreachable`] — threshold invariant violated.
     /// - [`SaError::SignerSetMissingBaseline`] — no audit-log baseline.
+    /// - [`SaError::SignerSetBaselineLegacy`]: the baseline is version 1.
     /// - [`SaError::AuditLog`] — audit-log integrity violation.
-    /// - [`SaError::NetworkRpcDivergence`] — two-RPC disagreement.
-    /// - [`SaError::SignerSetDiverged`] — on-chain state diverged from baseline.
+    /// - [`SaError::NetworkRpcDivergence`]: two-RPC disagreement before
+    ///   submission.
+    /// - [`SaError::SignerSetDiverged`]: the chain differs from the baseline
+    ///   before submission (no transaction hash), or the confirmed set is not
+    ///   the intended change (with the transaction hash).
+    /// - [`SaError::BaselineWriteFailed`]: the transaction confirmed and its
+    ///   resulting state was not observed (stage `observe`) or not recorded
+    ///   (stage `write`).
     /// - [`SaError::DeploymentFailed`] — submission or on-chain rejection.
-    /// - [`SaError::AuthEntryConstructionFailed`] — XDR or RPC construction failure.
+    /// - [`SaError::AuthEntryConstructionFailed`]: XDR or RPC construction
+    ///   failure, or `new_signer` is not a signer the wallet can decode.
     ///
     /// # Implements
     ///
@@ -1285,7 +1260,6 @@ impl SignersManager {
         smart_account: ScAddress,
         rule_id: u32,
         new_signer: ScVal,
-        new_signer_pubkey: SignerPubkey,
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
         accept_mutable_verifier: bool,
@@ -1300,12 +1274,11 @@ impl SignersManager {
 
         let outcome = self
             .add_signer_locked_inner(
-                smart_account.clone(),
+                smart_account,
                 rule_id,
                 &smart_account_strkey,
                 &smart_account_redacted,
                 new_signer,
-                new_signer_pubkey.clone(),
                 signer,
                 &request_id,
                 PinOverrides {
@@ -1314,71 +1287,18 @@ impl SignersManager {
                 },
             )
             .await;
+        let confirmed = outcome
+            .inspect_err(|err| warn_failed("add_signer", rule_id, &smart_account_redacted, err))?;
 
-        match &outcome {
-            Ok((signer_id, resulting, pin_update)) => {
-                let pubkeys_first8 = pubkeys_first8(&resulting.signer_pubkeys);
-                match self.audit_writer.lock() {
-                    Ok(mut writer) => {
-                        let entry = AuditEntry::new_sa_signer_added(
-                            rule_id,
-                            *signer_id,
-                            resulting,
-                            pubkeys_first8,
-                            RedactedStrkey::from_already_redacted(smart_account_redacted.clone()),
-                            self.chain_id.as_str(),
-                            request_id.clone(),
-                        );
-                        if let Err(e) = writer.write_entry(entry) {
-                            warn!(error = %e, "add_signer: SaSignerAdded audit write failed");
-                        }
-                    }
-                    Err(_poison) => {
-                        self.mark_audit_writer_degraded();
-                        warn!(
-                            target: "stellar_agent::audit",
-                            rule_id,
-                            signer_id = *signer_id,
-                            resulting_signer_count = resulting.signer_count,
-                            resulting_threshold = resulting.threshold,
-                            resulting_signer_ids = ?resulting.signer_ids,
-                            resulting_signer_pubkeys_first8 = ?pubkeys_first8,
-                            smart_account_redacted = %smart_account_redacted,
-                            chain_id = %self.chain_id,
-                            request_id = %request_id,
-                            "audit-writer mutex poisoned; SaSignerAdded row dropped"
-                        );
-                    }
-                }
-                if let Some(update) = pin_update {
-                    crate::managers::verifiers::write_pending_override_rows(
-                        self,
-                        &smart_account_redacted,
-                        rule_id,
-                        &request_id,
-                        &update.pending_overrides,
-                    );
-                    crate::managers::verifiers::write_pins_updated_row(
-                        self,
-                        &smart_account_redacted,
-                        rule_id,
-                        PinsUpdateReason::SignerAdded,
-                        &update.record,
-                        &request_id,
-                    );
-                }
-            }
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    rule_id,
-                    smart_account = %smart_account_redacted,
-                    "add_signer: operation failed"
-                );
-            }
-        }
-
-        outcome.map(|(signer_id, _, _)| signer_id)
+        let [signer_id] = self.record_confirmed_add(
+            "add_signer",
+            rule_id,
+            &smart_account_strkey,
+            &smart_account_redacted,
+            confirmed,
+            &request_id,
+        )?;
+        Ok(signer_id)
     }
 
     // ── remove_signer ─────────────────────────────────────────────────────────
@@ -1387,12 +1307,23 @@ impl SignersManager {
     ///
     /// Acquires the per-rule mutex, then:
     ///
-    /// 1. Validates `threshold' >= 1 && signer_count' >= threshold'`.
-    ///    Returns [`SaError::ThresholdUnreachable`] with a `safe_ordering_hint`
-    ///    if the invariant would be violated.  To lower the threshold first, run
+    /// 1. Compares the chain with the rule's version-2 audit-log state, as
+    ///    [`Self::add_signer`] does.
+    /// 2. When the rule has a simple-threshold policy, validates
+    ///    `threshold' >= 1 && signer_count' >= threshold'`; returns
+    ///    [`SaError::ThresholdUnreachable`] with a `safe_ordering_hint` if the
+    ///    invariant would be violated. To lower the threshold first, run
     ///    `smart-account signers set-threshold` and then retry the removal.
-    /// 2. Constructs and submits a single `InvokeHostFunctionOp` transaction.
-    /// 3. Emits `SaSignerRemoved` audit row.
+    ///    A rule with no policy has no threshold to check. A rule whose
+    ///    policies include no simple-threshold policy refuses with
+    ///    [`SaError::ThresholdPolicyIdentificationFailed`]: another policy
+    ///    decides which signers suffice, and a removal could make its
+    ///    threshold unreachable.
+    /// 3. Constructs and submits a single `InvokeHostFunctionOp` transaction.
+    /// 4. After it confirms, requires exactly the intended change (the signer
+    ///    absent, every other signer and the threshold unchanged) through both
+    ///    endpoints at or past the confirmation ledger.
+    /// 5. Writes a `SaSignerRemovedV2` audit row carrying the resulting set.
     ///
     /// # Arguments
     ///
@@ -1404,7 +1335,9 @@ impl SignersManager {
     ///
     /// # Errors
     ///
-    /// See [`Self::add_signer`] for the error taxonomy; same variants apply.
+    /// See [`Self::add_signer`] for the error taxonomy; the same variants
+    /// apply, plus [`SaError::ThresholdPolicyIdentificationFailed`] for a rule
+    /// whose policies include no simple-threshold policy.
     ///
     /// # Implements
     ///
@@ -1432,7 +1365,7 @@ impl SignersManager {
 
         let outcome = self
             .remove_signer_locked_inner(
-                smart_account.clone(),
+                smart_account,
                 rule_id,
                 &smart_account_strkey,
                 &smart_account_redacted,
@@ -1441,54 +1374,28 @@ impl SignersManager {
                 &request_id,
             )
             .await;
+        let confirmed = outcome.inspect_err(|err| {
+            warn_failed("remove_signer", rule_id, &smart_account_redacted, err)
+        })?;
 
-        match &outcome {
-            Ok(resulting) => {
-                let pubkeys_first8 = pubkeys_first8(&resulting.signer_pubkeys);
-                match self.audit_writer.lock() {
-                    Ok(mut writer) => {
-                        let entry = AuditEntry::new_sa_signer_removed(
-                            rule_id,
-                            signer_id,
-                            resulting,
-                            pubkeys_first8,
-                            RedactedStrkey::from_already_redacted(smart_account_redacted.clone()),
-                            self.chain_id.as_str(),
-                            request_id.clone(),
-                        );
-                        if let Err(e) = writer.write_entry(entry) {
-                            warn!(error = %e, "remove_signer: SaSignerRemoved audit write failed");
-                        }
-                    }
-                    Err(_poison) => {
-                        self.mark_audit_writer_degraded();
-                        warn!(
-                            target: "stellar_agent::audit",
-                            rule_id,
-                            signer_id,
-                            resulting_signer_count = resulting.signer_count,
-                            resulting_threshold = resulting.threshold,
-                            resulting_signer_ids = ?resulting.signer_ids,
-                            resulting_signer_pubkeys_first8 = ?pubkeys_first8,
-                            smart_account_redacted = %smart_account_redacted,
-                            chain_id = %self.chain_id,
-                            request_id = %request_id,
-                            "audit-writer mutex poisoned; SaSignerRemoved row dropped"
-                        );
-                    }
-                }
-            }
-            Err(err) => {
-                warn!(
-                    error = %err,
+        let account = account_digest(&self.network_passphrase, &smart_account_strkey);
+        self.write_confirmed_state_row(
+            rule_id,
+            &smart_account_redacted,
+            &confirmed.tx_hash,
+            &request_id,
+            |_| {
+                AuditEntry::new_sa_signer_removed_v2(
                     rule_id,
-                    smart_account = %smart_account_redacted,
-                    "remove_signer: operation failed"
-                );
-            }
-        }
-
-        outcome.map(|_| ())
+                    signer_id,
+                    &confirmed.resulting,
+                    account,
+                    RedactedStrkey::from_already_redacted(smart_account_redacted.as_str()),
+                    self.chain_id.as_str(),
+                    request_id.as_str(),
+                )
+            },
+        )
     }
 
     // ── set_threshold ─────────────────────────────────────────────────────────
@@ -1497,12 +1404,20 @@ impl SignersManager {
     ///
     /// Acquires the per-rule mutex, then:
     ///
-    /// 1. Reads the current signer count from the audit-log baseline.
-    /// 2. Validates `1 <= new_threshold <= signer_count`.
-    /// 3. Identifies the threshold-policy address via wasm-hash lookup.
+    /// 1. Compares the chain with the rule's version-2 audit-log state, as
+    ///    [`Self::add_signer`] does. The comparison's observation supplies the
+    ///    signer count, the simple-threshold policy, the current threshold
+    ///    and the rule value passed to the policy.
+    /// 2. Refuses a rule with no simple-threshold policy with
+    ///    [`SaError::ThresholdPolicyNotInstalled`].
+    /// 3. Validates `1 <= new_threshold <= signer_count`.
     /// 4. Constructs and submits a single `InvokeHostFunctionOp` targeting
     ///    the threshold-policy `set_threshold` entrypoint.
-    /// 5. Emits `SaThresholdChanged` audit row.
+    /// 5. After it confirms, requires exactly the intended change (the new
+    ///    threshold on the same policy, the signers unchanged) through both
+    ///    endpoints at or past the confirmation ledger.
+    /// 6. Writes a `SaThresholdChangedV2` audit row carrying the previous
+    ///    threshold observation and the resulting set.
     ///
     /// # Arguments
     ///
@@ -1515,11 +1430,10 @@ impl SignersManager {
     /// # Errors
     ///
     /// - [`SaError::ThresholdUnreachable`] — new threshold would violate invariants.
-    /// - [`SaError::SignerSetMissingBaseline`] — no audit-log baseline.
-    /// - [`SaError::ThresholdPolicyNotInstalled`] — empty `policies` list.
-    /// - [`SaError::ThresholdPolicyIdentificationFailed`] — wasm-hash mismatch.
-    /// - [`SaError::NetworkRpcDivergence`] — two-RPC disagreement on policy hash.
-    /// - [`SaError::DeploymentFailed`] — submission or on-chain rejection.
+    /// - [`SaError::ThresholdPolicyNotInstalled`]: the rule has no
+    ///   simple-threshold policy.
+    /// - The comparison, submission and recording errors of
+    ///   [`Self::add_signer`].
     ///
     /// # Implements
     ///
@@ -1543,7 +1457,7 @@ impl SignersManager {
 
         let outcome = self
             .set_threshold_locked_inner(
-                smart_account.clone(),
+                smart_account,
                 rule_id,
                 &smart_account_strkey,
                 &smart_account_redacted,
@@ -1552,59 +1466,28 @@ impl SignersManager {
                 &request_id,
             )
             .await;
+        let (previous, confirmed) = outcome.inspect_err(|err| {
+            warn_failed("set_threshold", rule_id, &smart_account_redacted, err)
+        })?;
 
-        match &outcome {
-            Ok((old_threshold, resulting)) => {
-                let pubkeys_first8 = pubkeys_first8(&resulting.signer_pubkeys);
-                match self.audit_writer.lock() {
-                    Ok(mut writer) => {
-                        let entry = AuditEntry::new_sa_threshold_changed(
-                            rule_id,
-                            *old_threshold,
-                            new_threshold,
-                            resulting,
-                            pubkeys_first8,
-                            RedactedStrkey::from_already_redacted(smart_account_redacted.clone()),
-                            self.chain_id.as_str(),
-                            request_id.clone(),
-                        );
-                        if let Err(e) = writer.write_entry(entry) {
-                            warn!(
-                                error = %e,
-                                "set_threshold: SaThresholdChanged audit write failed"
-                            );
-                        }
-                    }
-                    Err(_poison) => {
-                        self.mark_audit_writer_degraded();
-                        warn!(
-                            target: "stellar_agent::audit",
-                            rule_id,
-                            old_threshold = *old_threshold,
-                            new_threshold,
-                            resulting_threshold = resulting.threshold,
-                            resulting_signer_count = resulting.signer_count,
-                            resulting_signer_ids = ?resulting.signer_ids,
-                            resulting_signer_pubkeys_first8 = ?pubkeys_first8,
-                            smart_account_redacted = %smart_account_redacted,
-                            chain_id = %self.chain_id,
-                            request_id = %request_id,
-                            "audit-writer mutex poisoned; SaThresholdChanged row dropped"
-                        );
-                    }
-                }
-            }
-            Err(err) => {
-                warn!(
-                    error = %err,
+        let account = account_digest(&self.network_passphrase, &smart_account_strkey);
+        self.write_confirmed_state_row(
+            rule_id,
+            &smart_account_redacted,
+            &confirmed.tx_hash,
+            &request_id,
+            |_| {
+                AuditEntry::new_sa_threshold_changed_v2(
                     rule_id,
-                    smart_account = %smart_account_redacted,
-                    "set_threshold: operation failed"
-                );
-            }
-        }
-
-        outcome.map(|_| ())
+                    Some(previous),
+                    &confirmed.resulting,
+                    account,
+                    RedactedStrkey::from_already_redacted(smart_account_redacted.as_str()),
+                    self.chain_id.as_str(),
+                    request_id.as_str(),
+                )
+            },
+        )
     }
 
     // ── set_spending_limit ─────────────────────────────────────────────────────
@@ -1914,198 +1797,17 @@ impl SignersManager {
         ))
     }
 
-    // ── identify_threshold_policy ─────────────────────────────────────────────
-
-    /// Identifies the threshold-policy contract for a context rule.
-    ///
-    /// Fetches the wasm-hash of each `Address` in the rule's `policies` list
-    /// via batched `getLedgerEntries` on BOTH RPCs in parallel (two-RPC
-    /// consultation).  Single-match against `THRESHOLD_POLICY_WASM_HASHES` is
-    /// required; zero or multi-match returns a typed error (fail-closed).
-    ///
-    /// # Arguments
-    ///
-    /// - `smart_account` — the smart-account contract's [`ScAddress`].
-    /// - `rule_id` — the context rule whose policies are examined.
-    /// - `source_account_strkey` — G-strkey of the fee-paying account.
-    /// - `request_id` — caller-supplied UUID for error reporting.
-    ///
-    /// # Errors
-    ///
-    /// - [`SaError::ThresholdPolicyNotInstalled`] — `policies` list is empty.
-    /// - [`SaError::NetworkRpcDivergence`] — primary + secondary disagree on wasm-hash.
-    /// - [`SaError::ThresholdPolicyIdentificationFailed`] — zero or multi-match.
-    /// - [`SaError::DeploymentFailed`] — RPC `getLedgerEntries` failure.
-    ///
-    /// # Panics
-    ///
-    /// Does not panic in practice: the infallible `expect` on a SHA-256 slice
-    /// and on the `Option<ScAddress>` guarded by `match_count == 1` are
-    /// provably safe. See inline comments.
-    ///
-    /// # Implements
-    ///
-    /// Threshold-policy identification: locates the single installed threshold
-    /// policy by matching its wasm-hash against the allowlist, ensuring the
-    /// correct contract is targeted for threshold mutations.
-    #[allow(
-        clippy::expect_used,
-        reason = "infallible: sha256 is 32 bytes; match_count == 1"
-    )]
-    pub async fn identify_threshold_policy(
-        &self,
-        smart_account: ScAddress,
-        rule_id: u32,
-        source_account_strkey: Option<&str>,
-        request_id: String,
-    ) -> Result<ScAddress, SaError> {
-        let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
-        let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
-
-        // Fetch the on-chain context rule to get the policies list.
-        let context_rule = self
-            .fetch_context_rule_primary(smart_account.clone(), rule_id, source_account_strkey)
-            .await?;
-
-        // Policy list empty check (fail-closed).
-        if context_rule.policies.is_empty() {
-            return Err(SaError::ThresholdPolicyNotInstalled {
-                rule_id,
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted.clone(),
-                ),
-                request_id,
-            });
-        }
-
-        // Build LedgerKey::ContractData(ContractInstance) keys for each policy address.
-        // `contract_instance_key` is infallible: no silent skip.
-        let policy_keys: Vec<LedgerKey> = context_rule
-            .policies
-            .iter()
-            .map(contract_instance_key)
-            .collect();
-
-        if policy_keys.is_empty() {
-            return Err(SaError::ThresholdPolicyIdentificationFailed {
-                rule_id,
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted.clone(),
-                ),
-                observed_wasm_hashes_summary: WasmHashSummary {
-                    count: 0,
-                    first_first8: None,
-                },
-                request_id,
-            });
-        }
-
-        // Two-RPC parallel wasm-hash fetch.
-        let (primary_hashes_result, secondary_hashes_result) = tokio::join!(
-            fetch_contract_wasm_hashes(&self.primary_rpc_client, &policy_keys),
-            fetch_contract_wasm_hashes(&self.secondary_rpc_client, &policy_keys),
-        );
-
-        // Returns Vec<Option<[u8; 32]>> aligned with policy_keys.
-        let primary_hashes = primary_hashes_result.map_err(|e| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("primary RPC policy wasm-hash fetch failed: {e}"),
-        })?;
-        let secondary_hashes = secondary_hashes_result.map_err(|e| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("secondary RPC policy wasm-hash fetch failed: {e}"),
-        })?;
-
-        // Two-RPC agreement check.
-        if primary_hashes.len() != secondary_hashes.len() || primary_hashes != secondary_hashes {
-            let primary_digest: [u8; 32] = Sha256::digest(
-                primary_hashes
-                    .iter()
-                    .flat_map(|h| h.iter().flat_map(|b| b.iter()).copied())
-                    .collect::<Vec<u8>>(),
-            )
-            .into();
-            let secondary_digest: [u8; 32] = Sha256::digest(
-                secondary_hashes
-                    .iter()
-                    .flat_map(|h| h.iter().flat_map(|b| b.iter()).copied())
-                    .collect::<Vec<u8>>(),
-            )
-            .into();
-            let primary_first8 = primary_digest[..8]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            let secondary_first8 = secondary_digest[..8]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            return Err(SaError::NetworkRpcDivergence {
-                rule_id: Some(rule_id),
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted.clone(),
-                ),
-                primary_view_digest_first8: primary_first8,
-                secondary_view_digest_first8: secondary_first8,
-                request_id,
-            });
-        }
-
-        // Allowlist match: single-match required, fail-closed.
-        // Zip aligned with policy addresses: position i in primary_hashes corresponds
-        // to position i in context_rule.policies.
-        let mut matched_policy_addr: Option<ScAddress> = None;
-        let mut match_count = 0usize;
-        let first_first8: Option<[u8; 8]> = primary_hashes
-            .iter()
-            .find_map(|opt_h| opt_h.as_ref())
-            .map(|h| <[u8; 8]>::try_from(&h[..8]).expect("sha256 is 32 bytes"));
-
-        for (opt_hash, policy_addr) in primary_hashes.iter().zip(context_rule.policies.iter()) {
-            let Some(hash) = opt_hash else { continue };
-            debug!(
-                policy_wasm_hash_first8 = %hash_first8_hex(hash),
-                "identify_threshold_policy: observed policy wasm hash"
-            );
-            if THRESHOLD_POLICY_WASM_HASHES
-                .iter()
-                .any(|allowed| allowed == hash)
-            {
-                match_count += 1;
-                matched_policy_addr = Some(policy_addr.clone());
-            }
-        }
-
-        if match_count != 1 {
-            let count = u32::try_from(primary_hashes.len()).unwrap_or(u32::MAX);
-            return Err(SaError::ThresholdPolicyIdentificationFailed {
-                rule_id,
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted,
-                ),
-                observed_wasm_hashes_summary: WasmHashSummary {
-                    count,
-                    first_first8,
-                },
-                request_id,
-            });
-        }
-
-        Ok(matched_policy_addr.expect("match_count == 1 guarantees Some"))
-    }
-
     // ── identify_spending_limit_policy ────────────────────────────────────────
 
     /// Identifies the spending-limit-policy contract for a context rule.
     ///
-    /// Mirrors [`SignersManager::identify_threshold_policy`]: fetches the
-    /// wasm-hash of each `Address` in the rule's `policies` list via batched
-    /// `getLedgerEntries` on BOTH RPCs in parallel (two-RPC consultation),
-    /// then matches against the spending-limit-policy wasm-hash allowlist.
-    /// Exactly one match is required (fail-closed).
+    /// Fetches the wasm-hash of each `Address` in the rule's `policies` list
+    /// via batched `getLedgerEntries` on BOTH RPCs in parallel (two-RPC
+    /// consultation), then matches against the spending-limit-policy
+    /// wasm-hash allowlist. Exactly one match is required (fail closed).
     ///
-    /// Unlike `identify_threshold_policy`'s two-entry allowlist (current
-    /// deploy hash plus one grandfathered legacy version), the spending-limit
+    /// Unlike the two-entry simple-threshold allowlist (current deploy hash
+    /// plus one grandfathered legacy version), the spending-limit
     /// allowlist has exactly one entry — decoded at call time from
     /// [`crate::spending_limit_policy::SPENDING_LIMIT_POLICY_WASM_SHA256`],
     /// the same hex string the deploy-time
@@ -3229,63 +2931,48 @@ impl SignersManager {
     ///
     /// Acquires the per-rule mutex, then:
     ///
-    /// 1. Refuses client-side if `existing_signer_count + batch.len() >
+    /// 1. Compares the chain with the rule's version-2 audit-log state, as
+    ///    [`Self::add_signer`] does.
+    /// 2. Refuses client-side if `existing_signer_count + batch.len() >
     ///    MAX_SIGNERS` (OZ `MAX_SIGNERS = 15`,
     ///    `packages/accounts/src/smart_account/mod.rs:526`, SHA `a9c4216`;
     ///    enforced on-chain via a raw panic, `storage.rs:1072` → `:379`).
-    /// 2. Submits `batch_add_signer(rule_id, signers)` as a single
+    /// 3. Submits `batch_add_signer(rule_id, signers)` as a single
     ///    `InvokeHostFunctionOp`.
-    /// 3. Emits one `SaSignerAdded` row per signer (reusing the existing
-    ///    audit kind), then the override rows and the
+    /// 4. After it confirms, requires exactly the intended change through both
+    ///    endpoints at or past the confirmation ledger: each new signer
+    ///    present under a new id, every other signer and the threshold
+    ///    unchanged.
+    /// 5. Writes one `SaSignerAddedV2` row per signer, each carrying the
+    ///    resulting set, then the override rows and the
     ///    `SaContextRulePinsUpdated` row described under "Pin record".
+    ///
+    /// Returns the id the chain assigned to each new signer, in input order.
+    /// A rule without a simple-threshold policy accepts a batch; adding
+    /// signers cannot make a threshold unreachable.
     ///
     /// The single-signer `add_signer` verb and its arg contract are
     /// unchanged; this is an additive verb for the batch case.
-    ///
-    /// The post-op result-fetch identifies the rule's threshold policy via
-    /// [`Self::identify_threshold_policy`], which recognizes only
-    /// simple-threshold policies. On a rule whose only attached threshold
-    /// policy is weighted-threshold, batch-adding signers requires first
-    /// attaching a simple-threshold policy to that rule. In practice this
-    /// call refuses BEFORE identification is ever reached:
-    /// `batch_add_signers_locked_inner` reads the audit-log baseline first,
-    /// and a baseline can only exist once `identify_threshold_policy` has
-    /// ALREADY succeeded for that rule (every path that writes one —
-    /// `refresh_signer_baseline`, `add_signer`, this function itself — calls
-    /// it first), so a weighted-only rule has no baseline to read and this
-    /// call fails closed with [`SaError::SignerSetMissingBaseline`] instead.
-    /// [`SaError::ThresholdPolicyNotInstalled`] /
-    /// [`SaError::ThresholdPolicyIdentificationFailed`] from THIS call are
-    /// effectively unreachable for a weighted-only rule for that reason —
-    /// they remain listed below because the closed-set `# Errors` contract
-    /// covers every code path this function's own `identify_threshold_policy`
-    /// call can return, not just the practically-reachable ones. Either way,
-    /// identification (when it does run) precedes any `batch_add_signer`
-    /// submission, so refusal leaves no partial on-chain state.
     ///
     /// # Pin record
     ///
     /// The batch keeps a pinned rule's pin record in step as
     /// [`Self::add_signer`] does (see "Pin record" there), for every distinct
-    /// new verifier address among the batch's `External` signers. After the
-    /// batch confirms it writes the override rows of every new verifier, then
-    /// one `SaContextRulePinsUpdated` row; a refusal of any new verifier
+    /// new verifier address among the batch's `External` signers. Once the
+    /// batch confirms it writes the override rows of every new verifier,
+    /// then one `SaContextRulePinsUpdated` row, at the points
+    /// [`Self::add_signer`] writes them. A refusal of any new verifier
     /// refuses the batch and writes no override row.
     ///
     /// # Errors
     ///
     /// - [`SaError::BatchSignerAddRefused`] — the batch is empty (nothing to
-    ///   add); refused before acquiring the per-rule mutex.
+    ///   add), refused before acquiring the per-rule mutex, or one of its
+    ///   signers is not a signer the wallet can decode.
     /// - [`SaError::ContextRuleCapsExceeded`] — the batch would exceed
     ///   `MAX_SIGNERS`.
-    /// - [`SaError::SignerSetMissingBaseline`] — no audit-log baseline; the
-    ///   practical refusal for a weighted-only rule (see above).
-    /// - [`SaError::ThresholdPolicyNotInstalled`] /
-    ///   [`SaError::ThresholdPolicyIdentificationFailed`] — the rule has no
-    ///   uniquely-identifiable simple-threshold policy for the post-op
-    ///   result-fetch; reachable only when a baseline already exists but the
-    ///   rule's policy set changed since (see above).
-    /// - [`SaError::DeploymentFailed`] — submission or on-chain rejection.
+    /// - The comparison, submission and recording errors of
+    ///   [`Self::add_signer`].
     /// - [`SaError::VerifierWasmNotInAllowlist`] / [`SaError::VerifierMutable`] /
     ///   [`SaError::ContractInstanceUnsupported`]: a new verifier of a pinned
     ///   rule was refused under "Pin record".
@@ -3300,7 +2987,7 @@ impl SignersManager {
         &self,
         smart_account: ScAddress,
         rule_id: u32,
-        new_signers: Vec<(ScVal, SignerPubkey)>,
+        new_signers: Vec<ScVal>,
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
         accept_mutable_verifier: bool,
@@ -3320,7 +3007,7 @@ impl SignersManager {
 
         let outcome = self
             .batch_add_signers_locked_inner(
-                smart_account.clone(),
+                smart_account,
                 rule_id,
                 &smart_account_strkey,
                 &smart_account_redacted,
@@ -3333,79 +3020,27 @@ impl SignersManager {
                 },
             )
             .await;
+        let confirmed = outcome.inspect_err(|err| {
+            warn_failed("batch_add_signers", rule_id, &smart_account_redacted, err);
+        })?;
 
-        match &outcome {
-            Ok((signer_ids, resulting, pin_update)) => {
-                let pubkeys_first8 = pubkeys_first8(&resulting.signer_pubkeys);
-                match self.audit_writer.lock() {
-                    Ok(mut writer) => {
-                        for signer_id in signer_ids {
-                            let entry = AuditEntry::new_sa_signer_added(
-                                rule_id,
-                                *signer_id,
-                                resulting,
-                                pubkeys_first8.clone(),
-                                RedactedStrkey::from_already_redacted(
-                                    smart_account_redacted.clone(),
-                                ),
-                                self.chain_id.as_str(),
-                                request_id.clone(),
-                            );
-                            if let Err(e) = writer.write_entry(entry) {
-                                warn!(
-                                    error = %e,
-                                    signer_id,
-                                    "batch_add_signers: SaSignerAdded audit write failed"
-                                );
-                            }
-                        }
-                    }
-                    Err(_poison) => {
-                        self.mark_audit_writer_degraded();
-                        warn!(
-                            target: "stellar_agent::audit",
-                            rule_id,
-                            signer_ids = ?signer_ids,
-                            resulting_signer_count = resulting.signer_count,
-                            resulting_threshold = resulting.threshold,
-                            smart_account_redacted = %smart_account_redacted,
-                            chain_id = %self.chain_id,
-                            request_id = %request_id,
-                            "audit-writer mutex poisoned; SaSignerAdded rows dropped"
-                        );
-                    }
-                }
-                if let Some(update) = pin_update {
-                    crate::managers::verifiers::write_pending_override_rows(
-                        self,
-                        &smart_account_redacted,
-                        rule_id,
-                        &request_id,
-                        &update.pending_overrides,
-                    );
-                    crate::managers::verifiers::write_pins_updated_row(
-                        self,
-                        &smart_account_redacted,
-                        rule_id,
-                        PinsUpdateReason::SignerAdded,
-                        &update.record,
-                        &request_id,
-                    );
-                }
-            }
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    rule_id,
-                    smart_account = %smart_account_redacted,
-                    "batch_add_signers: operation failed"
-                );
-            }
-        }
-
-        outcome.map(|(signer_ids, _, _)| signer_ids)
+        self.record_confirmed_add(
+            "batch_add_signers",
+            rule_id,
+            &smart_account_strkey,
+            &smart_account_redacted,
+            confirmed,
+            &request_id,
+        )
     }
 
+    /// Core logic for `batch_add_signers` (called inside the per-rule
+    /// mutex).
+    ///
+    /// Returns an error when the batch is refused or fails before it
+    /// confirms. Once it confirms, returns the outcome of the steps after
+    /// confirmation ([`Self::validate_confirmed_batch`]) with the pin update
+    /// planned before submission.
     #[allow(clippy::too_many_arguments, reason = "irreducible inner arg set")]
     async fn batch_add_signers_locked_inner(
         &self,
@@ -3413,32 +3048,41 @@ impl SignersManager {
         rule_id: u32,
         smart_account_strkey: &str,
         smart_account_redacted: &str,
-        new_signers: Vec<(ScVal, SignerPubkey)>,
+        new_signers: Vec<ScVal>,
         signer: &(dyn Signer + Send + Sync),
         request_id: &str,
         overrides: PinOverrides,
-    ) -> Result<(Vec<u32>, ObservedSignerSet, Option<PlannedPinUpdate>), SaError> {
-        let source_pubkey =
-            signer
-                .public_key()
-                .await
-                .map_err(|e| SaError::AuthEntryConstructionFailed {
-                    stage: "auth_payload",
-                    redacted_reason: format!("signer public_key fetch failed: {e}"),
-                })?;
-        let source_pubkey_strkey = stellar_strkey::ed25519::PublicKey(source_pubkey.0).to_string();
+    ) -> Result<ConfirmedSignerAdd<Vec<u32>>, SaError> {
+        let source_pubkey_strkey = signer_source_strkey(signer).await?;
 
-        let baseline = self
-            .read_audit_log_baseline(rule_id, smart_account_strkey, smart_account_redacted)?
-            .ok_or_else(|| SaError::SignerSetMissingBaseline {
+        let added = new_signers
+            .iter()
+            .enumerate()
+            .map(|(index, scval)| {
+                decode_signer_scval_full(scval).map_err(|e| SaError::BatchSignerAddRefused {
+                    reason: format!("signer at index {index} is not a recognised Signer: {e}"),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let identities: Vec<SignerIdentityV2> = added
+            .iter()
+            .map(DecodedOnChainSigner::to_identity_v2)
+            .collect();
+
+        let compared = self
+            .compare_signer_set_locked(
+                &smart_account,
+                smart_account_strkey,
+                smart_account_redacted,
                 rule_id,
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted,
-                ),
-                request_id: request_id.to_owned(),
-            })?;
+                Some(&source_pubkey_strkey),
+                V1Handling::RefuseLegacy,
+                request_id,
+            )
+            .await?;
+        let before = compared.observation.snapshot;
 
-        let current_signer_count = baseline.state().signer_count;
+        let current_signer_count = before.signer_count();
         let batch_len = u32::try_from(new_signers.len()).unwrap_or(u32::MAX);
         let post_op_signer_count = current_signer_count.saturating_add(batch_len);
 
@@ -3454,81 +3098,119 @@ impl SignersManager {
             });
         }
 
-        let signers_vec: VecM<ScVal> = new_signers
-            .iter()
-            .map(|(scval, _)| scval.clone())
-            .collect::<Vec<_>>()
-            .try_into()
-            .map_err(|e| SaError::AuthEntryConstructionFailed {
-                stage: "auth_contexts_args",
-                redacted_reason: format!("encode batch_add_signer signers VecM: {e:?}"),
-            })?;
+        let signers_vec: VecM<ScVal> =
+            new_signers
+                .try_into()
+                .map_err(|e| SaError::AuthEntryConstructionFailed {
+                    stage: "auth_contexts_args",
+                    redacted_reason: format!("encode batch_add_signer signers VecM: {e:?}"),
+                })?;
         let batch_add_signer_args = vec![ScVal::U32(rule_id), ScVal::Vec(Some(ScVec(signers_vec)))];
-
-        // Identify the threshold policy BEFORE submission so the post-op
-        // result-fetch (which needs a policy address to read the resulting
-        // threshold) receives a validated address, mirroring
-        // `add_signer_locked_inner`.
-        let policy_addr = self
-            .identify_threshold_policy(
-                smart_account.clone(),
-                rule_id,
-                Some(&source_pubkey_strkey),
-                request_id.to_owned(),
-            )
-            .await?;
 
         let pin_update = self
             .plan_signer_add_pin_update(
-                &smart_account,
                 rule_id,
                 smart_account_redacted,
-                new_signers.iter().map(|(_, pubkey)| pubkey),
+                &before,
+                &external_verifiers(added.iter()),
                 overrides,
                 request_id,
             )
             .await?;
 
         let auth_rule_ids = vec![ContextRuleId::from(rule_id)];
-        self.submit_single_op(
-            smart_account.clone(),
-            &smart_account,
-            rule_id,
-            "batch_add_signer",
-            batch_add_signer_args,
-            &auth_rule_ids,
-            signer,
-            &source_pubkey_strkey,
-            Some(ExpiryCheck { rule_id }),
-            request_id,
-        )
-        .await?;
-
-        let resulting = self
-            .fetch_signer_set(
-                &self.primary_rpc_client,
-                smart_account,
+        let submitted = self
+            .submit_single_op(
+                smart_account.clone(),
+                &smart_account,
                 rule_id,
-                Some(&source_pubkey_strkey),
-                &policy_addr,
+                "batch_add_signer",
+                batch_add_signer_args,
+                &auth_rule_ids,
+                signer,
+                &source_pubkey_strkey,
+                Some(ExpiryCheck { rule_id }),
                 request_id,
             )
             .await?;
 
-        // The newly-added signer IDs are the LAST `batch_len` entries of the
-        // resulting `signer_ids` (on-chain `register_signer` appends
-        // monotonically; `batch_add_signer` iterates `signers` in order and
-        // pushes each new ID in turn, storage.rs:1064-1067, SHA `a9c4216`).
-        let new_signer_ids: Vec<u32> = resulting
-            .signer_ids
-            .iter()
-            .rev()
-            .take(new_signers.len())
-            .rev()
-            .copied()
-            .collect();
+        let outcome = self
+            .validate_confirmed_batch(
+                &smart_account,
+                rule_id,
+                smart_account_redacted,
+                &source_pubkey_strkey,
+                &before,
+                identities,
+                submitted,
+                request_id,
+            )
+            .await;
+        Ok(ConfirmedSignerAdd {
+            outcome,
+            pin_update,
+        })
+    }
 
-        Ok((new_signer_ids, resulting, pin_update))
+    /// Observes the rule after a confirmed `batch_add_signer` and requires
+    /// exactly the intended change: `before` with each of `identities` added,
+    /// every other signer and the threshold unchanged. Returns the id the
+    /// chain assigned to each added identity, in input order.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::BaselineWriteFailed`] at stage `observe`: the confirmed
+    ///   state was not observed.
+    /// - [`SaError::SignerSetDiverged`] with the transaction hash: the
+    ///   confirmed state is not the intended change.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "rule identity, the pre-submission state, the added identities and the \
+                  confirmed transaction"
+    )]
+    async fn validate_confirmed_batch(
+        &self,
+        smart_account: &ScAddress,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        source_pubkey_strkey: &str,
+        before: &SignerSetSnapshotV2,
+        identities: Vec<SignerIdentityV2>,
+        submitted: crate::submit::SubmitInvokeResult,
+        request_id: &str,
+    ) -> Result<(Vec<u32>, ConfirmedMutation), SaError> {
+        let observation = self
+            .observe_confirmed(
+                smart_account,
+                rule_id,
+                Some(source_pubkey_strkey),
+                &submitted,
+                smart_account_redacted,
+                request_id,
+            )
+            .await?;
+
+        // The chain assigns the ids; each added identity takes the id it
+        // holds in the observed set, so the returned ids follow the input
+        // order whatever order the chain assigned them in.
+        let added_ids = assign_added_ids(before, &observation.snapshot, &identities);
+        let intended = with_added_signers(before, added_ids.iter().copied().zip(identities));
+        let resulting = self.require_intended_state(
+            rule_id,
+            smart_account_redacted,
+            intended,
+            observation,
+            &submitted.tx_hash,
+            request_id,
+        )?;
+
+        Ok((
+            added_ids,
+            ConfirmedMutation {
+                resulting,
+                tx_hash: submitted.tx_hash,
+            },
+        ))
     }
 
     // ── classify_rule_policies ─────────────────────────────────────────────────
@@ -3536,9 +3218,10 @@ impl SignersManager {
     /// Classifies every policy attached to a context rule by its own on-chain
     /// wasm-hash, for read-only observability (`stellar_rules_get`).
     ///
-    /// Unlike [`Self::identify_threshold_policy`] / [`Self::identify_spending_limit_policy`]
-    /// (which fail-closed unless the rule's policies resolve to exactly one
-    /// allowlisted contract of the requested kind), this is a per-address,
+    /// Unlike [`Self::identify_spending_limit_policy`] and the signer-set
+    /// observation's threshold-policy identification (which fail closed
+    /// when the rule's policies do not resolve to the allowlisted contracts
+    /// they require), this is a per-address,
     /// best-effort classification for display purposes: each attached policy
     /// is independently checked against both allowlists, and an unrecognised
     /// or unobservable hash degrades to [`PolicyIdentifiedKind::Unknown`]
@@ -3706,8 +3389,9 @@ impl SignersManager {
     ) -> Result<[u8; 32], SaError> {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
-        // source_account_strkey is accepted for API symmetry with identify_threshold_policy
-        // but not used directly — smart_account_redacted populates forensic fields.
+        // source_account_strkey is accepted for API symmetry with the other
+        // identify_* helpers but not used directly; smart_account_redacted
+        // populates forensic fields.
         let _ = source_account_strkey;
 
         let observation = self
@@ -3825,170 +3509,989 @@ impl SignersManager {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /// Reads the version-1 audit-log baseline of rule `rule_id` of the smart
-    /// account `smart_account_strkey`.
+    /// Reads the newest signer-set state row of rule `rule_id` of the smart
+    /// account `smart_account_strkey`, of either snapshot version.
     ///
     /// The reader matches a version-1 state row on `smart_account_redacted`
     /// and a version-2 state row on the account digest of this manager's
-    /// network passphrase and `smart_account_strkey`. This manager compares
-    /// version-1 state only: when the newest matching state row is version 2
-    /// the read refuses with `AuditLogIntegrityError::ParseError` naming the
-    /// row, which callers propagate as `sa.audit_log`; a version-2 row is
-    /// never read as a missing baseline.
+    /// network passphrase and `smart_account_strkey`. Each caller branches on
+    /// the returned view's version.
     ///
     /// `AuditLogIntegrityError` MUST propagate; it is never reinterpreted as
     /// `Ok(None)`.
-    fn read_audit_log_baseline(
+    fn read_signer_set_view(
         &self,
         rule_id: u32,
         smart_account_strkey: &str,
         smart_account_redacted: &str,
-    ) -> Result<
-        Option<stellar_agent_core::audit_log::signer_set::SignerSetStatePayload>,
-        AuditLogIntegrityError,
-    > {
-        use stellar_agent_core::audit_log::signer_set::{SignerSetView, account_digest};
-
+    ) -> Result<Option<SignerSetViewPayload>, AuditLogIntegrityError> {
         let reader = stellar_agent_core::audit_log::reader::AuditReader::new(
             Arc::clone(&self.audit_writer),
             None,
         );
         let digest = account_digest(&self.network_passphrase, smart_account_strkey);
-        let Some(payload) =
-            reader.find_latest_signer_set_view(rule_id, smart_account_redacted, &digest)?
-        else {
-            return Ok(None);
-        };
-        match payload.view() {
-            SignerSetView::V1(_) => Ok(payload.into_v1()),
-            SignerSetView::V2(_) => Err(AuditLogIntegrityError::ParseError {
-                line: payload.line(),
-                detail: format!(
-                    "signer-set state row {}:{} is version 2; this build compares version 1 rows only",
-                    payload.file(),
-                    payload.line()
+        reader.find_latest_signer_set_view(rule_id, smart_account_redacted, &digest)
+    }
+
+    /// Compares the chain with the rule's audit-log state. The caller holds
+    /// the rule's lock; this function acquires none.
+    ///
+    /// Reads the newest state row once, before any RPC: no row refuses with
+    /// [`SaError::SignerSetMissingBaseline`], and a version-1 row refuses
+    /// with [`SaError::SignerSetBaselineLegacy`] when `on_v1` is
+    /// [`V1Handling::RefuseLegacy`]. It then observes the signer set in
+    /// version 2 and classifies it against the row in the row's version
+    /// ([`classify_against`]). A changed set writes the `SaSignerSetDiverged`
+    /// row and refuses with [`SaError::SignerSetDiverged`] without a
+    /// transaction hash; a version-1 row without a comparable projection
+    /// refuses with the projection's error.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "account identity, rule, source, version handling and correlation id"
+    )]
+    async fn compare_signer_set_locked(
+        &self,
+        smart_account: &ScAddress,
+        smart_account_strkey: &str,
+        smart_account_redacted: &str,
+        rule_id: u32,
+        source_account_strkey: Option<&str>,
+        on_v1: V1Handling,
+        request_id: &str,
+    ) -> Result<ComparedState, SaError> {
+        let payload = self
+            .read_signer_set_view(rule_id, smart_account_strkey, smart_account_redacted)?
+            .ok_or_else(|| SaError::SignerSetMissingBaseline {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
                 ),
+                request_id: request_id.to_owned(),
+            })?;
+        let expected = payload.view().clone();
+        let row_hash = *payload.row_hash();
+
+        if on_v1 == V1Handling::RefuseLegacy && matches!(expected, SignerSetView::V1(_)) {
+            return Err(SaError::SignerSetBaselineLegacy {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                request_id: request_id.to_owned(),
+            });
+        }
+
+        let observation = self
+            .observe_signer_set_v2(
+                smart_account,
+                rule_id,
+                source_account_strkey,
+                None,
+                request_id,
+            )
+            .await?;
+
+        match classify_against(&expected, &observation)? {
+            Classified::Matched { observed } => Ok(ComparedState {
+                view: observed,
+                row_hash,
+                observation,
             }),
+            Classified::Diverged { observed } => {
+                self.emit_signer_set_diverged(
+                    rule_id,
+                    smart_account_redacted,
+                    &expected,
+                    &observed,
+                    request_id,
+                );
+                Err(SaError::SignerSetDiverged {
+                    rule_id,
+                    expected,
+                    observed,
+                    tx_hash: None,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted(
+                        smart_account_redacted,
+                    ),
+                    request_id: request_id.to_owned(),
+                })
+            }
+            Classified::NotComparable { cause } => Err(cause),
         }
     }
 
-    /// Emits a `SaSignerSetBaselined` audit row.
+    /// Observes rule `rule_id`'s signer set in version 2 through both RPC
+    /// endpoints.
     ///
-    /// Called exclusively from `list_signers` (first-observation) and
-    /// `refresh_signer_baseline` (always).  A CI gate enforces this
-    /// single-caller invariant.
+    /// Per endpoint, in order: the rule read (`get_context_rule`), then, once
+    /// both endpoints agree on the rule, one executable read per distinct
+    /// attached policy (two-endpoint, see
+    /// `identify_simple_threshold_policy`), then the `get_threshold` read of
+    /// the simple-threshold policy when there is one. The two endpoints must
+    /// agree on the rule (id, signers as version-2 identities, policy list)
+    /// and on the threshold; a difference refuses with
+    /// [`SaError::NetworkRpcDivergence`]. A threshold read failure refuses
+    /// with [`SaError::ThresholdReadFailed`]. The snapshot is built in
+    /// ascending id order and validated; a malformed set is a chain fact and
+    /// refuses with [`SaError::DeploymentFailed`] (phase `simulate`) naming
+    /// the broken rule.
     ///
-    /// `prev_chain_tip_hash` is sourced from `AuditWriter::current_chain_tip()`
-    /// inside the write critical section, ensuring the tip hash captured is
-    /// consistent with the write being committed.
+    /// `catch_up` is `Some` for the observation after a confirmed
+    /// transaction. A read reporting a `latestLedger` below its floor comes
+    /// from an endpoint that is behind: a behind rule read is repeated after
+    /// a pause, and a behind threshold read repeats that endpoint's whole
+    /// observation, rule and threshold. Reads repeat until they reach the
+    /// floor or the budget ends, which refuses with
+    /// [`SaError::DeploymentFailed`]. The observation's ledger is the
+    /// smallest `latestLedger` across the reads it keeps.
+    async fn observe_signer_set_v2(
+        &self,
+        smart_account: &ScAddress,
+        rule_id: u32,
+        source_account_strkey: Option<&str>,
+        catch_up: Option<CatchUp<'_>>,
+        request_id: &str,
+    ) -> Result<ObservationV2, SaError> {
+        let smart_account_redacted =
+            redact_strkey_first5_last5(&scaddress_to_strkey(smart_account)?);
+
+        let (primary, secondary) = tokio::join!(
+            self.read_rule(
+                &self.primary_rpc_client,
+                smart_account,
+                rule_id,
+                source_account_strkey,
+                catch_up,
+            ),
+            self.read_rule(
+                &self.secondary_rpc_client,
+                smart_account,
+                rule_id,
+                source_account_strkey,
+                catch_up,
+            ),
+        );
+        let (primary, secondary) = (primary?, secondary?);
+        Self::require_same_rule(
+            &primary.rule,
+            &secondary.rule,
+            rule_id,
+            &smart_account_redacted,
+            request_id,
+        )?;
+
+        let policies = primary.rule.policies.clone();
+        let (threshold_policy, policy_hashes) = self
+            .identify_simple_threshold_policy(
+                &policies,
+                rule_id,
+                &smart_account_redacted,
+                request_id,
+            )
+            .await?;
+        let threshold_policy_address = threshold_policy.as_ref().map(|(address, _)| address);
+
+        let (primary, secondary) = tokio::join!(
+            self.complete_endpoint(
+                &self.primary_rpc_client,
+                smart_account,
+                rule_id,
+                source_account_strkey,
+                primary,
+                threshold_policy_address,
+                catch_up,
+                &smart_account_redacted,
+                request_id,
+            ),
+            self.complete_endpoint(
+                &self.secondary_rpc_client,
+                smart_account,
+                rule_id,
+                source_account_strkey,
+                secondary,
+                threshold_policy_address,
+                catch_up,
+                &smart_account_redacted,
+                request_id,
+            ),
+        );
+        let (primary, secondary) = (primary?, secondary?);
+
+        // A repeated endpoint observation replaced that endpoint's rule read,
+        // so the endpoints are compared again, and the rule's policy list must
+        // still be the one the threshold policy was identified from.
+        Self::require_same_rule(
+            &primary.rule,
+            &secondary.rule,
+            rule_id,
+            &smart_account_redacted,
+            request_id,
+        )?;
+        if primary.rule.policies != policies {
+            return Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: "get_context_rule: the rule's policy list changed during the \
+                                  signer-set observation"
+                    .to_owned(),
+            });
+        }
+        if let (Some(primary_threshold), Some(secondary_threshold)) =
+            (primary.threshold, secondary.threshold)
+            && primary_threshold != secondary_threshold
+        {
+            return Err(Self::signer_set_rpc_divergence(
+                rule_id,
+                &smart_account_redacted,
+                &ScVal::U32(primary_threshold),
+                &ScVal::U32(secondary_threshold),
+                request_id,
+            ));
+        }
+        let threshold = threshold_policy
+            .zip(primary.threshold)
+            .map(|((_, policy), threshold)| ThresholdObservation { policy, threshold });
+
+        let mut signers: Vec<SignerEntryV2> = primary
+            .rule
+            .signers
+            .iter()
+            .map(|(id, signer)| SignerEntryV2 {
+                id: *id,
+                identity: signer.to_identity_v2(),
+            })
+            .collect();
+        signers.sort_by_key(|entry| entry.id);
+        let snapshot = SignerSetSnapshotV2 { signers, threshold };
+        snapshot.validate().map_err(|e| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("get_context_rule: the observed signer set is malformed: {e}"),
+        })?;
+
+        let v1_signers = primary
+            .rule
+            .signers
+            .iter()
+            .enumerate()
+            .map(|(index, (id, signer))| {
+                signer
+                    .to_signer_pubkey_v1()
+                    .map(|pubkey| (*id, pubkey))
+                    .map_err(|e| (index, *id, e))
+            })
+            .collect();
+
+        Ok(ObservationV2 {
+            rule_id,
+            smart_account_redacted,
+            request_id: request_id.to_owned(),
+            snapshot,
+            policies,
+            policy_hashes,
+            ledger: primary.ledger.min(secondary.ledger),
+            primary_rule: primary.rule.raw_scval,
+            v1_signers,
+        })
+    }
+
+    /// Reads rule `rule_id` from one endpoint with the read's `latestLedger`.
     ///
+    /// With `catch_up`, a read reporting a ledger below the floor is repeated
+    /// after [`CONFIRMATION_CATCH_UP_PAUSE`] until it reaches the floor or the
+    /// budget ends.
+    async fn read_rule(
+        &self,
+        rpc_client: &StellarRpcClient,
+        smart_account: &ScAddress,
+        rule_id: u32,
+        source_account_strkey: Option<&str>,
+        catch_up: Option<CatchUp<'_>>,
+    ) -> Result<EndpointRead, SaError> {
+        loop {
+            let (scval, ledger) = simulate_read_only_with_ledger(
+                rpc_client.url(),
+                smart_account.clone(),
+                "get_context_rule",
+                vec![ScVal::U32(rule_id)],
+                source_account_strkey,
+                &self.network_passphrase,
+                self.timeout,
+            )
+            .await?;
+            if let Some(catch_up) = catch_up
+                && ledger < catch_up.floor
+            {
+                self.catch_up_pause(rpc_client, "get_context_rule", ledger, catch_up)
+                    .await?;
+                continue;
+            }
+            return Ok(EndpointRead {
+                rule: decode_context_rule_scval(scval)?,
+                ledger,
+                threshold: None,
+            });
+        }
+    }
+
+    /// Completes one endpoint's observation with the `get_threshold` read of
+    /// `threshold_policy`; returns `read` unchanged when the rule has no
+    /// simple-threshold policy.
+    ///
+    /// With `catch_up`, a threshold read reporting a ledger below the floor
+    /// repeats the endpoint's whole observation, the rule read and the
+    /// threshold read, after [`CONFIRMATION_CATCH_UP_PAUSE`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "endpoint, rule identity, the endpoint's rule read, the policy, the \
+                  catch-up floor and correlation fields"
+    )]
+    async fn complete_endpoint(
+        &self,
+        rpc_client: &StellarRpcClient,
+        smart_account: &ScAddress,
+        rule_id: u32,
+        source_account_strkey: Option<&str>,
+        mut read: EndpointRead,
+        threshold_policy: Option<&ScAddress>,
+        catch_up: Option<CatchUp<'_>>,
+        smart_account_redacted: &str,
+        request_id: &str,
+    ) -> Result<EndpointRead, SaError> {
+        let Some(policy) = threshold_policy else {
+            return Ok(read);
+        };
+        loop {
+            let (threshold, ledger) = self
+                .read_threshold(
+                    rpc_client,
+                    policy,
+                    smart_account,
+                    rule_id,
+                    source_account_strkey,
+                    smart_account_redacted,
+                    request_id,
+                )
+                .await?;
+            if let Some(catch_up) = catch_up
+                && ledger < catch_up.floor
+            {
+                self.catch_up_pause(rpc_client, "get_threshold", ledger, catch_up)
+                    .await?;
+                read = self
+                    .read_rule(
+                        rpc_client,
+                        smart_account,
+                        rule_id,
+                        source_account_strkey,
+                        Some(catch_up),
+                    )
+                    .await?;
+                continue;
+            }
+            read.threshold = Some(threshold);
+            read.ledger = read.ledger.min(ledger);
+            return Ok(read);
+        }
+    }
+
+    /// Reads `get_threshold(rule_id, smart_account)` of the simple-threshold
+    /// policy `policy` from one endpoint, with the read's `latestLedger`.
+    ///
+    /// The threshold policy exposes
+    /// `get_threshold(e, context_rule_id: u32, smart_account: Address) -> u32`
+    /// per the OpenZeppelin stellar-accounts v0.7.2 contract. Any failure,
+    /// including a return that is not a `u32`, refuses with
+    /// [`SaError::ThresholdReadFailed`] naming the endpoint; no threshold is
+    /// inferred from the signer count.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "endpoint, policy, rule identity and correlation fields"
+    )]
+    async fn read_threshold(
+        &self,
+        rpc_client: &StellarRpcClient,
+        policy: &ScAddress,
+        smart_account: &ScAddress,
+        rule_id: u32,
+        source_account_strkey: Option<&str>,
+        smart_account_redacted: &str,
+        request_id: &str,
+    ) -> Result<(u32, u32), SaError> {
+        let source_kind = self.rpc_source_kind(rpc_client);
+        let read = simulate_read_only_with_ledger(
+            rpc_client.url(),
+            policy.clone(),
+            "get_threshold",
+            vec![ScVal::U32(rule_id), ScVal::Address(smart_account.clone())],
+            source_account_strkey,
+            &self.network_passphrase,
+            self.timeout,
+        )
+        .await;
+        let detail = match read {
+            Ok((ScVal::U32(threshold), ledger)) => return Ok((threshold, ledger)),
+            Ok((other, _)) => format!("expected ScVal::U32, got {}", scval_variant_name(&other)),
+            Err(e) => e.to_string(),
+        };
+        debug!(
+            rule_id,
+            source_kind,
+            detail = %detail,
+            "get_threshold failed (fail closed)"
+        );
+        Err(SaError::ThresholdReadFailed {
+            rule_id,
+            smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
+            source_kind,
+            request_id: request_id.to_owned(),
+        })
+    }
+
+    /// Waits [`CONFIRMATION_CATCH_UP_PAUSE`] before an endpoint behind the
+    /// confirmation ledger is read again. The read is first recorded as
+    /// `catch_up`'s last behind read.
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::DeploymentFailed`] (phase `simulate`) naming the read, the
+    /// endpoint and both ledgers when the pause would end past `catch_up`'s
+    /// deadline.
+    async fn catch_up_pause(
+        &self,
+        rpc_client: &StellarRpcClient,
+        read: &'static str,
+        latest_ledger: u32,
+        catch_up: CatchUp<'_>,
+    ) -> Result<(), SaError> {
+        let source_kind = self.rpc_source_kind(rpc_client);
+        let behind = BehindRead {
+            read,
+            source_kind,
+            latest_ledger,
+            floor: catch_up.floor,
+        };
+        if let Ok(mut last_behind) = catch_up.last_behind.lock() {
+            *last_behind = Some(behind);
+        }
+        if tokio::time::Instant::now() + CONFIRMATION_CATCH_UP_PAUSE > catch_up.deadline {
+            return Err(behind.refusal(&format!(
+                "the confirmation_recording budget of {} ms leaves no time for another read",
+                self.timeout.as_millis()
+            )));
+        }
+        debug!(
+            read,
+            source_kind,
+            latest_ledger,
+            floor = catch_up.floor,
+            "endpoint behind the confirmation ledger; reading again after a pause"
+        );
+        tokio::time::sleep(CONFIRMATION_CATCH_UP_PAUSE).await;
+        Ok(())
+    }
+
+    /// Identifies the rule's simple-threshold policy among `policies`.
+    ///
+    /// Observes each distinct policy's executable through both endpoints
+    /// ([`Self::observe_contract`], which refuses a divergence, a malformed
+    /// instance or an external reference with no live tag entry). A policy is
+    /// the simple-threshold policy when its effective hash is in
+    /// [`THRESHOLD_POLICY_WASM_HASHES`]; a policy with no code (an absent
+    /// instance or a Stellar asset) is readable and never matches. Returns
+    /// the one match with its contract id, or `None` when no policy matches,
+    /// together with the summary a refusal carries: the number of attached
+    /// policies and the first 8 bytes of the first observed effective hash.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::ThresholdPolicyIdentificationFailed`]: more than one
+    ///   policy matches.
+    /// - The errors of [`Self::observe_contract`].
+    async fn identify_simple_threshold_policy(
+        &self,
+        policies: &[ScAddress],
+        rule_id: u32,
+        smart_account_redacted: &str,
+        request_id: &str,
+    ) -> Result<(Option<(ScAddress, [u8; 32])>, WasmHashSummary), SaError> {
+        let mut distinct: Vec<&ScAddress> = Vec::with_capacity(policies.len());
+        for policy in policies {
+            if !distinct.contains(&policy) {
+                distinct.push(policy);
+            }
+        }
+
+        let mut first_first8: Option<[u8; 8]> = None;
+        let mut matches: Vec<ScAddress> = Vec::new();
+        for policy in distinct {
+            let observation = self
+                .observe_contract(
+                    policy,
+                    ContractKind::Policy,
+                    |hash| THRESHOLD_POLICY_WASM_HASHES.contains(hash),
+                    Some(rule_id),
+                    smart_account_redacted,
+                    request_id,
+                )
+                .await?;
+            if first_first8.is_none()
+                && let Some(hash) = observation.observed.effective_hash()
+            {
+                let mut first8 = [0u8; 8];
+                first8.copy_from_slice(&hash[..8]);
+                first_first8 = Some(first8);
+            }
+            if observation.allowlisted {
+                matches.push(policy.clone());
+            }
+        }
+
+        let summary = WasmHashSummary {
+            count: u32::try_from(policies.len()).unwrap_or(u32::MAX),
+            first_first8,
+        };
+        if matches.len() > 1 {
+            return Err(SaError::ThresholdPolicyIdentificationFailed {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                observed_wasm_hashes_summary: summary,
+                request_id: request_id.to_owned(),
+            });
+        }
+        let Some(policy) = matches.pop() else {
+            return Ok((None, summary));
+        };
+        let ScAddress::Contract(ContractId(Hash(policy_id))) = &policy else {
+            return Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: "get_context_rule: the simple-threshold policy address is not \
+                                  a contract address"
+                    .to_owned(),
+            });
+        };
+        let policy_id = *policy_id;
+        Ok((Some((policy, policy_id)), summary))
+    }
+
+    /// Refuses with [`SaError::NetworkRpcDivergence`] unless the two
+    /// endpoints' rules agree on the id, the signers as version-2 identities
+    /// and the policy list.
+    fn require_same_rule(
+        primary: &OnChainContextRule,
+        secondary: &OnChainContextRule,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        request_id: &str,
+    ) -> Result<(), SaError> {
+        if primary.id == secondary.id
+            && primary.identities() == secondary.identities()
+            && primary.policies == secondary.policies
+        {
+            return Ok(());
+        }
+        Err(Self::signer_set_rpc_divergence(
+            rule_id,
+            smart_account_redacted,
+            &primary.raw_scval,
+            &secondary.raw_scval,
+            request_id,
+        ))
+    }
+
+    /// Builds the [`SaError::NetworkRpcDivergence`] of a signer-set
+    /// observation whose endpoints disagree on the rule or the threshold.
+    ///
+    /// Each view digest is the first 8 bytes, as hex, of the SHA-256 of that
+    /// endpoint's returned value's XDR: the `get_context_rule` value for a
+    /// rule disagreement, the `get_threshold` value for a threshold
+    /// disagreement.
+    fn signer_set_rpc_divergence(
+        rule_id: u32,
+        smart_account_redacted: &str,
+        primary: &ScVal,
+        secondary: &ScVal,
+        request_id: &str,
+    ) -> SaError {
+        SaError::NetworkRpcDivergence {
+            rule_id: Some(rule_id),
+            smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
+            primary_view_digest_first8: scval_digest_first8(primary),
+            secondary_view_digest_first8: scval_digest_first8(secondary),
+            request_id: request_id.to_owned(),
+        }
+    }
+
+    /// Observes the rule after a signer mutation confirmed, under the
+    /// `confirmation_recording` budget: the manager's timeout, measured from
+    /// the confirmation.
+    ///
+    /// Every read must reach the confirmation ledger; see
+    /// `observe_signer_set_v2`. Every failure, including the budget ending,
+    /// returns [`SaError::BaselineWriteFailed`] at stage `observe` with the
+    /// transaction hash. A budget that ends while a read is outstanding names
+    /// the last read found behind the confirmation ledger, with its endpoint
+    /// and ledger ([`BehindRead`]).
+    async fn observe_confirmed(
+        &self,
+        smart_account: &ScAddress,
+        rule_id: u32,
+        source_account_strkey: Option<&str>,
+        submitted: &crate::submit::SubmitInvokeResult,
+        smart_account_redacted: &str,
+        request_id: &str,
+    ) -> Result<ObservationV2, SaError> {
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let last_behind = std::sync::Mutex::new(None);
+        let catch_up = CatchUp {
+            floor: submitted.ledger,
+            deadline,
+            last_behind: &last_behind,
+        };
+        let observed = tokio::time::timeout_at(
+            deadline,
+            self.observe_signer_set_v2(
+                smart_account,
+                rule_id,
+                source_account_strkey,
+                Some(catch_up),
+                request_id,
+            ),
+        )
+        .await;
+        let cause = match observed {
+            Ok(Ok(observation)) => return Ok(observation),
+            Ok(Err(cause)) => cause,
+            Err(_elapsed) => {
+                let budget_ms = self.timeout.as_millis();
+                match last_behind.lock().ok().and_then(|last| *last) {
+                    Some(behind) => behind.refusal(&format!(
+                        "the confirmation_recording budget of {budget_ms} ms ended"
+                    )),
+                    None => SaError::DeploymentFailed {
+                        phase: "simulate",
+                        redacted_reason: format!(
+                            "the confirmation_recording budget of {budget_ms} ms ended before \
+                             the signer-set observation completed"
+                        ),
+                    },
+                }
+            }
+        };
+        Err(observe_failed_after(
+            rule_id,
+            smart_account_redacted,
+            &submitted.tx_hash,
+            &cause,
+            request_id,
+        ))
+    }
+
+    /// Requires the state observed after a confirmed signer mutation to be
+    /// `intended`, compared by their version-2 digests, and returns the
+    /// observed snapshot.
+    ///
+    /// Otherwise refuses through [`Self::unintended_state`]. An intended
+    /// state that is not a valid snapshot never matches.
+    fn require_intended_state(
+        &self,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        intended: SignerSetSnapshotV2,
+        observation: ObservationV2,
+        tx_hash: &str,
+        request_id: &str,
+    ) -> Result<SignerSetSnapshotV2, SaError> {
+        let intended_digest = compute_signer_set_digest_v2(&intended).ok();
+        let observed_digest = compute_signer_set_digest_v2(&observation.snapshot).ok();
+        if intended_digest.is_some() && intended_digest == observed_digest {
+            return Ok(observation.snapshot);
+        }
+        Err(self.unintended_state(
+            rule_id,
+            smart_account_redacted,
+            intended,
+            observation.snapshot,
+            tx_hash,
+            request_id,
+        ))
+    }
+
+    /// Writes the `SaSignerSetDiverged` row of a confirmed signer mutation
+    /// whose observed state is not the intended one, and returns the
+    /// [`SaError::SignerSetDiverged`] carrying the transaction hash.
+    fn unintended_state(
+        &self,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        intended: SignerSetSnapshotV2,
+        observed: SignerSetSnapshotV2,
+        tx_hash: &str,
+        request_id: &str,
+    ) -> SaError {
+        let expected = SignerSetView::V2(intended);
+        let observed = SignerSetView::V2(observed);
+        self.emit_signer_set_diverged(
+            rule_id,
+            smart_account_redacted,
+            &expected,
+            &observed,
+            request_id,
+        );
+        SaError::SignerSetDiverged {
+            rule_id,
+            expected,
+            observed,
+            tx_hash: Some(tx_hash.to_owned()),
+            smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
+            request_id: request_id.to_owned(),
+        }
+    }
+
+    /// Writes a `SaSignerSetBaselinedV2` row recording `observation` as the
+    /// rule's baseline.
+    ///
+    /// Called exclusively from `list_signers` (first observation) and
+    /// `refresh_signer_baseline` (explicit re-anchor); a CI gate enforces the
+    /// single-caller invariant and that this function is the only builder of
+    /// the row. The row carries the observation's ledger and the account
+    /// digest of this manager's network and `smart_account_strkey`.
+    /// `prev_chain_tip_hash` is read from `AuditWriter::current_chain_tip()`
+    /// inside the write critical section, so it names the row's predecessor.
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::BaselineWriteFailed`] at stage `write`, without a
+    /// transaction hash, when the row is not written.
     fn emit_baseline(
         &self,
-        observed: &ObservedSignerSet,
+        observation: &ObservationV2,
         rule_id: u32,
+        smart_account_strkey: &str,
         smart_account_redacted: &str,
         baseline_reason: BaselineReason,
         request_id: &str,
-    ) {
-        let pubkeys_first8 = pubkeys_first8(&observed.signer_pubkeys);
+    ) -> Result<(), SaError> {
+        let account = account_digest(&self.network_passphrase, smart_account_strkey);
         let now_ms = now_unix_ms().unwrap_or(0);
-
-        match self.audit_writer.lock() {
-            Ok(mut writer) => {
-                // prev_chain_tip_hash MUST be sourced inside the write critical
-                // section so it is consistent with the write being committed.
-                let prev_chain_tip_hash = writer.current_chain_tip();
-
-                let entry = AuditEntry::new_sa_signer_set_baselined(
-                    rule_id,
-                    observed,
-                    pubkeys_first8,
-                    now_ms,
-                    baseline_reason,
-                    prev_chain_tip_hash,
-                    RedactedStrkey::from_already_redacted(smart_account_redacted),
-                    self.chain_id.as_str(),
-                    request_id,
-                );
-
-                if let Err(e) = writer.write_entry(entry) {
-                    warn!(error = %e, rule_id, "emit_baseline: SaSignerSetBaselined audit write failed");
-                }
+        self.write_state_row(|writer| {
+            AuditEntry::new_sa_signer_set_baselined_v2(
+                rule_id,
+                &observation.snapshot,
+                observation.ledger,
+                now_ms,
+                baseline_reason,
+                writer.current_chain_tip(),
+                account,
+                RedactedStrkey::from_already_redacted(smart_account_redacted),
+                self.chain_id.as_str(),
+                request_id,
+            )
+        })
+        .map_err(|e| {
+            warn!(
+                target: "stellar_agent::audit",
+                rule_id,
+                smart_account_redacted = %smart_account_redacted,
+                error = %e,
+                request_id = %request_id,
+                "SaSignerSetBaselinedV2 row not written"
+            );
+            SaError::BaselineWriteFailed {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                tx_hash: None,
+                stage: BASELINE_WRITE_STAGE_WRITE,
+                reason: baseline_write_reason(&e.to_string()),
+                request_id: request_id.to_owned(),
             }
-            Err(_poison) => {
-                self.mark_audit_writer_degraded();
-                warn!(
-                    target: "stellar_agent::audit",
-                    rule_id,
-                    observed_signer_count = observed.signer_count,
-                    observed_threshold = observed.threshold,
-                    observed_signer_ids = ?observed.signer_ids,
-                    observed_signer_pubkeys_first8 = ?pubkeys_first8,
-                    observed_at_unix_ms = now_ms,
-                    baseline_reason = ?baseline_reason,
-                    prev_chain_tip_hash = "[unavailable-poisoned]",
-                    smart_account_redacted = %smart_account_redacted,
-                    chain_id = %self.chain_id,
-                    request_id = %request_id,
-                    "audit-writer mutex poisoned; SaSignerSetBaselined row dropped"
-                );
-            }
-        }
+        })
     }
 
-    /// Emits a `SaSignerSetDiverged` audit row.
+    /// Writes a `SaSignerSetDiverged` row comparing `expected` with
+    /// `observed`, two views of one snapshot version.
     ///
+    /// A row that is not written is a warning: the refusal that follows
+    /// carries the same two views.
     fn emit_signer_set_diverged(
         &self,
         rule_id: u32,
         smart_account_redacted: &str,
-        expected: &ObservedSignerSet,
-        observed: &ObservedSignerSet,
+        expected: &SignerSetView,
+        observed: &SignerSetView,
         request_id: &str,
     ) {
-        let expected_digest = compute_signer_set_digest(expected)
-            .map(|d| format_digest_first8_last8(&d))
-            .unwrap_or_else(|_| "compute_error".to_owned());
-        let observed_digest = compute_signer_set_digest(observed)
-            .map(|d| format_digest_first8_last8(&d))
-            .unwrap_or_else(|_| "compute_error".to_owned());
-
-        match self.audit_writer.lock() {
-            Ok(mut writer) => {
-                let entry = AuditEntry::new_sa_signer_set_diverged(
-                    rule_id,
-                    RedactedStrkey::from_already_redacted(smart_account_redacted),
-                    expected.signer_count,
-                    observed.signer_count,
-                    expected.threshold,
-                    observed.threshold,
-                    expected_digest.as_str(),
-                    observed_digest.as_str(),
-                    self.chain_id.as_str(),
-                    request_id,
-                );
-                if let Err(e) = writer.write_entry(entry) {
-                    warn!(error = %e, rule_id, "emit_signer_set_diverged: SaSignerSetDiverged audit write failed");
-                }
-            }
-            Err(_poison) => {
-                self.mark_audit_writer_degraded();
-                warn!(
-                    target: "stellar_agent::audit",
-                    rule_id,
-                    smart_account_redacted = %smart_account_redacted,
-                    expected_signer_count = expected.signer_count,
-                    observed_signer_count = observed.signer_count,
-                    expected_threshold = expected.threshold,
-                    observed_threshold = observed.threshold,
-                    expected_signer_set_digest = %expected_digest,
-                    observed_signer_set_digest = %observed_digest,
-                    chain_id = %self.chain_id,
-                    request_id = %request_id,
-                    "audit-writer mutex poisoned; SaSignerSetDiverged row dropped"
-                );
-            }
+        let written = self.write_state_row(|_| {
+            AuditEntry::new_sa_signer_set_diverged(
+                rule_id,
+                RedactedStrkey::from_already_redacted(smart_account_redacted),
+                expected,
+                observed,
+                self.chain_id.as_str(),
+                request_id,
+            )
+        });
+        if let Err(e) = written {
+            warn!(
+                target: "stellar_agent::audit",
+                rule_id,
+                smart_account_redacted = %smart_account_redacted,
+                expected = %expected,
+                observed = %observed,
+                chain_id = %self.chain_id,
+                request_id = %request_id,
+                error = %e,
+                "SaSignerSetDiverged row not written"
+            );
         }
+    }
+
+    /// Writes one audit row built by `build` inside the writer's critical
+    /// section.
+    ///
+    /// `build` receives the locked writer, so a row that anchors the chain
+    /// tip reads it inside the same critical section as the write. A
+    /// poisoned writer lock marks the manager's audit writer degraded and
+    /// returns [`BaselineWriteError::Poisoned`]; a failed write returns
+    /// [`BaselineWriteError::Write`]. Nothing is written in either case.
+    fn write_state_row(
+        &self,
+        build: impl FnOnce(&AuditWriter) -> AuditEntry,
+    ) -> Result<(), BaselineWriteError> {
+        let Ok(mut writer) = self.audit_writer.lock() else {
+            self.mark_audit_writer_degraded();
+            return Err(BaselineWriteError::Poisoned);
+        };
+        let entry = build(&writer);
+        writer.write_entry(entry).map_err(BaselineWriteError::Write)
+    }
+
+    /// Writes the state row recording a confirmed signer mutation.
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::BaselineWriteFailed`] at stage `write` with the transaction
+    /// hash when the row is not written.
+    fn write_confirmed_state_row(
+        &self,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        tx_hash: &str,
+        request_id: &str,
+        build: impl FnOnce(&AuditWriter) -> AuditEntry,
+    ) -> Result<(), SaError> {
+        self.write_state_row(build).map_err(|e| {
+            warn!(
+                target: "stellar_agent::audit",
+                rule_id,
+                smart_account_redacted = %smart_account_redacted,
+                tx_hash,
+                error = %e,
+                request_id = %request_id,
+                "signer-set state row of a confirmed transaction not written"
+            );
+            SaError::BaselineWriteFailed {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                tx_hash: Some(tx_hash.to_owned()),
+                stage: BASELINE_WRITE_STAGE_WRITE,
+                reason: baseline_write_reason(&e.to_string()),
+                request_id: request_id.to_owned(),
+            }
+        })
+    }
+
+    /// Records a confirmed signer add, then writes its pin rows.
+    ///
+    /// A validated outcome writes one `SaSignerAddedV2` row per added id, in
+    /// order, each carrying the resulting set. The planned pin rows are then
+    /// written exactly once whatever the outcome, because the confirmed add
+    /// put its verifiers on the rule:
+    ///
+    /// - on success they follow the state rows;
+    /// - when the confirmed state is not observed or not the intended
+    ///   change, they are written before the refusal returns;
+    /// - when a state row is not written, they are attempted, and the audit
+    ///   log usually refuses them as well.
+    ///
+    /// Returns the added ids, or the refusal of the outcome or of a state
+    /// row write.
+    fn record_confirmed_add<Ids: AsRef<[u32]>>(
+        &self,
+        verb: &str,
+        rule_id: u32,
+        smart_account_strkey: &str,
+        smart_account_redacted: &str,
+        confirmed: ConfirmedSignerAdd<Ids>,
+        request_id: &str,
+    ) -> Result<Ids, SaError> {
+        let account = account_digest(&self.network_passphrase, smart_account_strkey);
+        let recorded = confirmed
+            .outcome
+            .inspect_err(|err| warn_failed(verb, rule_id, smart_account_redacted, err))
+            .and_then(|(added_ids, mutation)| {
+                for signer_id in added_ids.as_ref() {
+                    self.write_confirmed_state_row(
+                        rule_id,
+                        smart_account_redacted,
+                        &mutation.tx_hash,
+                        request_id,
+                        |_| {
+                            AuditEntry::new_sa_signer_added_v2(
+                                rule_id,
+                                *signer_id,
+                                &mutation.resulting,
+                                account,
+                                RedactedStrkey::from_already_redacted(smart_account_redacted),
+                                self.chain_id.as_str(),
+                                request_id,
+                            )
+                        },
+                    )?;
+                }
+                Ok(added_ids)
+            });
+        self.write_signer_add_pin_rows(
+            rule_id,
+            smart_account_redacted,
+            confirmed.pin_update,
+            request_id,
+        );
+        recorded
+    }
+
+    /// Writes a confirmed signer add's pin rows: the pending override rows,
+    /// then the `SaContextRulePinsUpdated` row. Writes nothing when the add
+    /// planned no pin update.
+    fn write_signer_add_pin_rows(
+        &self,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        pin_update: Option<PlannedPinUpdate>,
+        request_id: &str,
+    ) {
+        let Some(update) = pin_update else {
+            return;
+        };
+        crate::managers::verifiers::write_pending_override_rows(
+            self,
+            smart_account_redacted,
+            rule_id,
+            request_id,
+            &update.pending_overrides,
+        );
+        crate::managers::verifiers::write_pins_updated_row(
+            self,
+            smart_account_redacted,
+            rule_id,
+            PinsUpdateReason::SignerAdded,
+            &update.record,
+            request_id,
+        );
     }
 
     /// Fetches the on-chain `ContextRule` via the primary RPC (simulate read-only).
@@ -4007,30 +4510,38 @@ impl SignersManager {
         .await
     }
 
-    /// Reads a context rule's raw `(signer_id, pubkey)` set directly from the
-    /// on-chain `ContextRule` — policy-independent (no threshold-policy
-    /// identification is performed, unlike [`Self::identify_threshold_policy`]
-    /// + the internal `fetch_signer_set`).
+    /// Reads a context rule's signers directly from the on-chain
+    /// `ContextRule` through the primary RPC, as version-2 entries in the
+    /// rule's order: each signer id with its full identity.
     ///
-    /// Use this to inspect a rule's signer set when the rule may carry no
-    /// policy at all (e.g. immediately after `deploy_smart_account`, before
-    /// any policy is attached), or a weighted-threshold policy instead of a
-    /// simple-threshold one.
+    /// Policy-independent: no policy is identified and no threshold is read,
+    /// so this works on a rule with no policy at all (for example right after
+    /// `deploy_smart_account`) or with a weighted-threshold policy. A signer
+    /// delegated to a contract address reads as
+    /// [`SignerIdentityV2::DelegatedContract`].
     ///
     /// # Errors
     ///
-    /// - [`SaError::DeploymentFailed`] — simulation or decode failure (the
-    ///   rule does not exist, or the `ContextRule` ScVal is malformed).
+    /// - [`SaError::DeploymentFailed`]: simulation or decode failure (the
+    ///   rule does not exist, the `ContextRule` ScVal is malformed, or a
+    ///   signer does not decode).
     pub async fn get_rule_signers(
         &self,
         smart_account: ScAddress,
         rule_id: u32,
         source_account_strkey: Option<&str>,
-    ) -> Result<Vec<(u32, SignerPubkey)>, SaError> {
+    ) -> Result<Vec<SignerEntryV2>, SaError> {
         let rule = self
             .fetch_context_rule_primary(smart_account, rule_id, source_account_strkey)
             .await?;
-        Ok(rule.signers)
+        Ok(rule
+            .signers
+            .iter()
+            .map(|(id, signer)| SignerEntryV2 {
+                id: *id,
+                identity: signer.to_identity_v2(),
+            })
+            .collect())
     }
 
     async fn fetch_context_rule(
@@ -4054,111 +4565,6 @@ impl SignersManager {
         decode_context_rule_scval(scval)
     }
 
-    /// Fetches the real threshold for `(rule_id, smart_account)` from the threshold
-    /// policy contract through the supplied RPC client.
-    ///
-    /// Calls `policy.get_threshold(rule_id, smart_account)` via read-only simulation.
-    ///
-    /// The threshold policy exposes
-    /// `get_threshold(e, context_rule_id: u32, smart_account: Address) -> u32`
-    /// per the OpenZeppelin stellar-accounts v0.7.2 contract.
-    async fn fetch_threshold(
-        &self,
-        rpc_client: &StellarRpcClient,
-        policy_addr: &ScAddress,
-        smart_account: &ScAddress,
-        rule_id: u32,
-        source_account_strkey: Option<&str>,
-    ) -> Result<u32, SaError> {
-        let get_threshold_args = vec![ScVal::U32(rule_id), ScVal::Address(smart_account.clone())];
-        let result = simulate_read_only(
-            rpc_client.url(),
-            policy_addr.clone(),
-            "get_threshold",
-            get_threshold_args,
-            source_account_strkey,
-            &self.network_passphrase,
-            self.timeout,
-        )
-        .await?;
-        match result {
-            ScVal::U32(t) => Ok(t),
-            other => Err(SaError::DeploymentFailed {
-                phase: "simulate",
-                redacted_reason: format!(
-                    "get_threshold ({}): expected ScVal::U32, got {}",
-                    self.rpc_source_kind(rpc_client),
-                    scval_variant_name(&other)
-                ),
-            }),
-        }
-    }
-
-    /// Fetches the on-chain signer set for a rule via the supplied RPC client.
-    ///
-    /// `policy_addr` MUST be the result of a prior `identify_threshold_policy` call —
-    /// it is the wasm-hash-allowlist-matched threshold-policy contract address.
-    /// Callers are responsible for calling `identify_threshold_policy` first and
-    /// passing the result here (fail-closed: no silent `signers.len()` proxy).
-    ///
-    /// Calls `get_context_rule` to obtain the signer list, then calls
-    /// `get_threshold(rule_id, smart_account)` on `policy_addr` to populate
-    /// `ObservedSignerSet.threshold` from actual on-chain storage.
-    ///
-    /// Returns `SaError::ThresholdReadFailed` if the `get_threshold` call fails
-    /// or returns an unexpected `ScVal` type.
-    async fn fetch_signer_set(
-        &self,
-        rpc_client: &StellarRpcClient,
-        smart_account: ScAddress,
-        rule_id: u32,
-        source_account_strkey: Option<&str>,
-        policy_addr: &ScAddress,
-        request_id: &str,
-    ) -> Result<ObservedSignerSet, SaError> {
-        let smart_account_redacted = scaddress_to_strkey(&smart_account)
-            .map(|s| redact_strkey_first5_last5(&s))
-            .unwrap_or_else(|_| "<redact-err>".to_owned());
-
-        let source_kind = self.rpc_source_kind(rpc_client);
-        let mut rule = self
-            .fetch_context_rule(
-                rpc_client,
-                smart_account.clone(),
-                rule_id,
-                source_account_strkey,
-            )
-            .await?;
-
-        rule.threshold = self
-            .fetch_threshold(
-                rpc_client,
-                policy_addr,
-                &smart_account,
-                rule_id,
-                source_account_strkey,
-            )
-            .await
-            .map_err(|e| {
-                debug!(
-                    rule_id,
-                    error = %e,
-                    source_kind,
-                    "fetch_signer_set: get_threshold failed (fail-closed)"
-                );
-                SaError::ThresholdReadFailed {
-                    rule_id,
-                    smart_account_redacted: RedactedStrkey::from_already_redacted(
-                        smart_account_redacted.clone(),
-                    ),
-                    source_kind,
-                    request_id: request_id.to_owned(),
-                }
-            })?;
-
-        Ok(rule.into_observed_signer_set())
-    }
-
     fn rpc_source_kind(&self, rpc_client: &StellarRpcClient) -> &'static str {
         if std::ptr::eq(rpc_client, &self.primary_rpc_client) {
             "primary"
@@ -4171,8 +4577,10 @@ impl SignersManager {
 
     /// Core logic for `add_signer` (called inside the per-rule mutex).
     ///
-    /// Returns `(assigned_signer_id, resulting_ObservedSignerSet,
-    /// pin_record_to_write)`.
+    /// Returns an error when the add is refused or fails before it confirms.
+    /// Once it confirms, returns the outcome of the steps after confirmation
+    /// ([`Self::validate_confirmed_add`]) with the pin update planned before
+    /// submission.
     #[allow(clippy::too_many_arguments, reason = "irreducible inner arg set")]
     async fn add_signer_locked_inner(
         &self,
@@ -4181,34 +4589,36 @@ impl SignersManager {
         smart_account_strkey: &str,
         smart_account_redacted: &str,
         new_signer: ScVal,
-        new_signer_pubkey: SignerPubkey,
         signer: &(dyn Signer + Send + Sync),
         request_id: &str,
         overrides: PinOverrides,
-    ) -> Result<(u32, ObservedSignerSet, Option<PlannedPinUpdate>), SaError> {
-        let source_pubkey =
-            signer
-                .public_key()
-                .await
-                .map_err(|e| SaError::AuthEntryConstructionFailed {
-                    stage: "auth_payload",
-                    redacted_reason: format!("signer public_key fetch failed: {e}"),
-                })?;
-        let source_pubkey_strkey = stellar_strkey::ed25519::PublicKey(source_pubkey.0).to_string();
+    ) -> Result<ConfirmedSignerAdd<[u32; 1]>, SaError> {
+        let source_pubkey_strkey = signer_source_strkey(signer).await?;
 
-        // Read baseline signer set for pre-flight invariant check.
-        let baseline = self
-            .read_audit_log_baseline(rule_id, smart_account_strkey, smart_account_redacted)?
-            .ok_or_else(|| SaError::SignerSetMissingBaseline {
-                rule_id,
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted,
+        let added = decode_signer_scval_full(&new_signer).map_err(|e| {
+            SaError::AuthEntryConstructionFailed {
+                stage: "auth_contexts_args",
+                redacted_reason: format!(
+                    "add_signer: the new signer is not a recognised Signer: {e}"
                 ),
-                request_id: request_id.to_owned(),
-            })?;
+            }
+        })?;
+        let identity = added.to_identity_v2();
 
-        let current_signer_count = baseline.state().signer_count;
-        let current_threshold = baseline.state().threshold;
+        let compared = self
+            .compare_signer_set_locked(
+                &smart_account,
+                smart_account_strkey,
+                smart_account_redacted,
+                rule_id,
+                Some(&source_pubkey_strkey),
+                V1Handling::RefuseLegacy,
+                request_id,
+            )
+            .await?;
+        let before = compared.observation.snapshot;
+
+        let current_signer_count = before.signer_count();
         let post_op_signer_count = current_signer_count.saturating_add(1);
 
         // Cap check (MAX_SIGNERS = 15 per OZ `mod.rs:526`).
@@ -4220,40 +4630,30 @@ impl SignersManager {
             });
         }
 
-        // Threshold invariant check: adding a signer is always safe (count goes
-        // up) unless the threshold is somehow > signer_count already (which
-        // would be a corrupted on-chain state).  Check for the degenerate case.
-        compute_post_op_invariant(
-            rule_id,
-            post_op_signer_count,
-            current_threshold,
-            current_threshold, // effective threshold unchanged
-            ThresholdAffectingOp::AddSigner {
-                signer_type: signer_pubkey_type_label(&new_signer_pubkey).to_owned(),
-                signer_id: None,
-            },
-            smart_account_redacted,
-            request_id,
-        )?;
-
-        // Identify threshold policy (fail-closed).
-        // Must be called before the op submission so that the result-fetch
-        // receives a validated policy address.
-        let policy_addr = self
-            .identify_threshold_policy(
-                smart_account.clone(),
+        // Adding a signer raises the count, so the invariant only fails for
+        // a threshold already above the count (a corrupted on-chain state). A
+        // rule without a simple-threshold policy has no threshold to check.
+        if let Some(threshold) = &before.threshold {
+            compute_post_op_invariant(
                 rule_id,
-                Some(&source_pubkey_strkey),
-                request_id.to_owned(),
-            )
-            .await?;
+                post_op_signer_count,
+                threshold.threshold,
+                threshold.threshold,
+                ThresholdAffectingOp::AddSigner {
+                    signer_type: identity_kind_label(&identity).to_owned(),
+                    signer_id: None,
+                },
+                smart_account_redacted,
+                request_id,
+            )?;
+        }
 
         let pin_update = self
             .plan_signer_add_pin_update(
-                &smart_account,
                 rule_id,
                 smart_account_redacted,
-                std::iter::once(&new_signer_pubkey),
+                &before,
+                &external_verifiers(std::iter::once(&added)),
                 overrides,
                 request_id,
             )
@@ -4263,9 +4663,9 @@ impl SignersManager {
         // `add_signer` calls `e.current_contract_address().require_auth()`;
         // auth entry is credentialed for the smart account (= contract).
         let auth_rule_ids = vec![ContextRuleId::from(rule_id)];
-        let add_signer_args = vec![ScVal::U32(rule_id), new_signer.clone()];
+        let add_signer_args = vec![ScVal::U32(rule_id), new_signer];
 
-        let return_val = self
+        let submitted = self
             .submit_single_op(
                 smart_account.clone(),
                 &smart_account,
@@ -4283,56 +4683,139 @@ impl SignersManager {
             )
             .await?;
 
-        let assigned_id = extract_u32_return(&return_val, "add_signer")?;
-        let resulting = self
-            .fetch_signer_set(
-                &self.primary_rpc_client,
+        let outcome = self
+            .validate_confirmed_add(
+                &smart_account,
+                rule_id,
+                smart_account_redacted,
+                &source_pubkey_strkey,
+                &before,
+                identity,
+                submitted,
+                request_id,
+            )
+            .await
+            .map(|(signer_id, mutation)| ([signer_id], mutation));
+        Ok(ConfirmedSignerAdd {
+            outcome,
+            pin_update,
+        })
+    }
+
+    /// Observes the rule after a confirmed `add_signer` and requires exactly
+    /// the intended change: `before` with `identity` added under the id the
+    /// simulation returned, every other signer and the threshold unchanged.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::BaselineWriteFailed`] at stage `observe`: the simulated
+    ///   id or the confirmed state was not observed.
+    /// - [`SaError::SignerSetDiverged`] with the transaction hash: the
+    ///   confirmed state is not the intended change, or the chain assigned
+    ///   the new signer another id.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "rule identity, the pre-submission state, the added identity and the \
+                  confirmed transaction"
+    )]
+    async fn validate_confirmed_add(
+        &self,
+        smart_account: &ScAddress,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        source_pubkey_strkey: &str,
+        before: &SignerSetSnapshotV2,
+        identity: SignerIdentityV2,
+        submitted: crate::submit::SubmitInvokeResult,
+        request_id: &str,
+    ) -> Result<(u32, ConfirmedMutation), SaError> {
+        let simulated_id =
+            extract_u32_return(&submitted.return_val, "add_signer").map_err(|e| {
+                observe_failed_after(
+                    rule_id,
+                    smart_account_redacted,
+                    &submitted.tx_hash,
+                    &e,
+                    request_id,
+                )
+            })?;
+        let observation = self
+            .observe_confirmed(
                 smart_account,
                 rule_id,
-                Some(&source_pubkey_strkey),
-                &policy_addr,
+                Some(source_pubkey_strkey),
+                &submitted,
+                smart_account_redacted,
                 request_id,
             )
             .await?;
 
-        Ok((assigned_id, resulting, pin_update))
+        // The observed set is authoritative: the new signer takes the id it
+        // holds on chain, and every other signer and the threshold must be
+        // unchanged.
+        let observed_id = new_entry_id(before, &observation.snapshot, &identity, &[]);
+        let intended = with_added_signers(
+            before,
+            [(observed_id.unwrap_or(simulated_id), identity.clone())],
+        );
+        let resulting = self.require_intended_state(
+            rule_id,
+            smart_account_redacted,
+            intended,
+            observation,
+            &submitted.tx_hash,
+            request_id,
+        )?;
+
+        // The id the simulation returned, which the caller reports, must be
+        // the id the chain assigned.
+        if observed_id != Some(simulated_id) {
+            return Err(self.unintended_state(
+                rule_id,
+                smart_account_redacted,
+                with_added_signers(before, [(simulated_id, identity)]),
+                resulting,
+                &submitted.tx_hash,
+                request_id,
+            ));
+        }
+
+        Ok((
+            simulated_id,
+            ConfirmedMutation {
+                resulting,
+                tx_hash: submitted.tx_hash,
+            },
+        ))
     }
 
     /// Computes the pin record a signer add writes for rule `rule_id` once
     /// the add confirms; see "Pin record" on [`Self::add_signer`].
     ///
-    /// Returns `None` when no new signer is `External` or the rule has no pin
-    /// record. Otherwise the returned record is the current one with a pin
-    /// appended for each distinct new verifier address that is not already
-    /// live on the rule, each identified and probed here, before submission,
-    /// and the overrides applied to them pending. A refusal of any new
-    /// verifier refuses the add, and no override row is written for it.
+    /// `new_verifiers` holds the distinct verifier addresses of the added
+    /// `External` signers, decoded from the signers being added. `live` is
+    /// the rule's signer set as the pre-submission comparison observed it
+    /// through both endpoints. Returns `None` when `new_verifiers` is empty
+    /// or the rule has no pin record. Otherwise the returned record is the
+    /// current one with a pin appended for each new verifier address that no
+    /// `External` signer of `live` uses. Each such verifier is identified and
+    /// probed here, before submission, with the overrides applied to it
+    /// pending. A refusal of any new verifier refuses the add, and no
+    /// override row is written for it.
     ///
     /// # Errors
     ///
     /// - [`SaError::AuditLog`]: the pin record could not be read.
-    /// - [`SaError::DeploymentFailed`] / [`SaError::AuthEntryConstructionFailed`]:
-    ///   the rule's live verifier addresses could not be fetched.
     /// - The refusals of `pin_added_contract` for a new verifier.
-    async fn plan_signer_add_pin_update<'p>(
+    async fn plan_signer_add_pin_update(
         &self,
-        smart_account: &ScAddress,
         rule_id: u32,
         smart_account_redacted: &str,
-        new_signer_pubkeys: impl Iterator<Item = &'p SignerPubkey>,
+        live: &SignerSetSnapshotV2,
+        new_verifiers: &[ScAddress],
         overrides: PinOverrides,
         request_id: &str,
     ) -> Result<Option<PlannedPinUpdate>, SaError> {
-        let mut new_verifiers: Vec<&str> = Vec::new();
-        for pubkey in new_signer_pubkeys {
-            if let SignerPubkey::External {
-                verifier_contract, ..
-            } = pubkey
-                && !new_verifiers.contains(&verifier_contract.as_str())
-            {
-                new_verifiers.push(verifier_contract);
-            }
-        }
         if new_verifiers.is_empty() {
             return Ok(None);
         }
@@ -4349,26 +4832,24 @@ impl SignersManager {
             return Ok(None);
         };
 
-        let (live_verifiers, _) = self
-            .fetch_verifier_and_policy_addresses(smart_account.clone(), rule_id, None)
-            .await?;
-        let live_verifier_strkeys: Vec<String> = live_verifiers
+        let live_verifiers: Vec<[u8; 32]> = live
+            .signers
             .iter()
-            .map(scaddress_to_strkey)
-            .collect::<Result<_, _>>()?;
+            .filter_map(|entry| match &entry.identity {
+                SignerIdentityV2::External { verifier, .. } => Some(*verifier),
+                _ => None,
+            })
+            .collect();
 
         let mut update = PlannedPinUpdate::unchanged(record);
-        for verifier_strkey in new_verifiers {
-            if live_verifier_strkeys
-                .iter()
-                .any(|live| live == verifier_strkey)
-            {
+        for verifier in new_verifiers {
+            // A decoded `External` verifier is always a contract address.
+            if live_verifiers.contains(&contract_address_bytes(verifier)) {
                 continue;
             }
-            let verifier = parse_c_strkey_to_smart_account(verifier_strkey)?;
             let pin = crate::managers::verifiers::pin_added_contract(
                 self,
-                &verifier,
+                verifier,
                 crate::managers::verifiers::PinnedKind::Verifier,
                 rule_id,
                 smart_account_redacted,
@@ -4393,88 +4874,103 @@ impl SignersManager {
         signer_id: u32,
         signer: &(dyn Signer + Send + Sync),
         request_id: &str,
-    ) -> Result<ObservedSignerSet, SaError> {
-        let source_pubkey =
-            signer
-                .public_key()
-                .await
-                .map_err(|e| SaError::AuthEntryConstructionFailed {
-                    stage: "auth_payload",
-                    redacted_reason: format!("signer public_key fetch failed: {e}"),
-                })?;
-        let source_pubkey_strkey = stellar_strkey::ed25519::PublicKey(source_pubkey.0).to_string();
+    ) -> Result<ConfirmedMutation, SaError> {
+        let source_pubkey_strkey = signer_source_strkey(signer).await?;
 
-        // Read baseline.
-        let baseline = self
-            .read_audit_log_baseline(rule_id, smart_account_strkey, smart_account_redacted)?
-            .ok_or_else(|| SaError::SignerSetMissingBaseline {
+        let compared = self
+            .compare_signer_set_locked(
+                &smart_account,
+                smart_account_strkey,
+                smart_account_redacted,
+                rule_id,
+                Some(&source_pubkey_strkey),
+                V1Handling::RefuseLegacy,
+                request_id,
+            )
+            .await?;
+        let observation = compared.observation;
+
+        // A rule whose policies include no simple-threshold policy lets
+        // another policy decide which signers suffice (OZ
+        // `weighted_threshold.rs:16-22`); a removal can make that policy's
+        // threshold unreachable, and the wallet cannot check it.
+        if observation.snapshot.threshold.is_none() && !observation.policies.is_empty() {
+            return Err(SaError::ThresholdPolicyIdentificationFailed {
                 rule_id,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
+                observed_wasm_hashes_summary: observation.policy_hashes,
                 request_id: request_id.to_owned(),
-            })?;
+            });
+        }
+        let before = observation.snapshot;
 
-        let current_signer_count = baseline.state().signer_count;
-        let current_threshold = baseline.state().threshold;
-        let post_op_signer_count = current_signer_count.saturating_sub(1);
-
-        // Threshold invariant check.  current_threshold is unchanged (no bundle);
-        // if post_op_signer_count < current_threshold, the op would brick the rule.
-        compute_post_op_invariant(
-            rule_id,
-            post_op_signer_count,
-            current_threshold,
-            current_threshold, // effective threshold unchanged
-            ThresholdAffectingOp::RemoveSigner { signer_id },
-            smart_account_redacted,
-            request_id,
-        )?;
-
-        // Identify threshold policy (fail-closed).
-        let policy_addr = self
-            .identify_threshold_policy(
-                smart_account.clone(),
+        // Threshold invariant check. The threshold is unchanged (no bundle);
+        // if the post-op count falls below it, the op would brick the rule.
+        if let Some(threshold) = &before.threshold {
+            compute_post_op_invariant(
                 rule_id,
-                Some(&source_pubkey_strkey),
-                request_id.to_owned(),
-            )
-            .await?;
+                before.signer_count().saturating_sub(1),
+                threshold.threshold,
+                threshold.threshold,
+                ThresholdAffectingOp::RemoveSigner { signer_id },
+                smart_account_redacted,
+                request_id,
+            )?;
+        }
 
         // Single-op: remove_signer.
         // `remove_signer` calls `e.current_contract_address().require_auth()`.
         let auth_rule_ids = vec![ContextRuleId::from(rule_id)];
         let remove_signer_args = vec![ScVal::U32(rule_id), ScVal::U32(signer_id)];
 
-        self.submit_single_op(
-            smart_account.clone(),
-            &smart_account,
-            rule_id,
-            "remove_signer",
-            remove_signer_args,
-            &auth_rule_ids,
-            signer,
-            &source_pubkey_strkey,
-            // Expiry check at signing-path entry.
-            Some(ExpiryCheck { rule_id }),
-            request_id,
-        )
-        .await?;
-
-        let resulting = self
-            .fetch_signer_set(
-                &self.primary_rpc_client,
-                smart_account,
+        let submitted = self
+            .submit_single_op(
+                smart_account.clone(),
+                &smart_account,
                 rule_id,
-                Some(&source_pubkey_strkey),
-                &policy_addr,
+                "remove_signer",
+                remove_signer_args,
+                &auth_rule_ids,
+                signer,
+                &source_pubkey_strkey,
+                // Expiry check at signing-path entry.
+                Some(ExpiryCheck { rule_id }),
                 request_id,
             )
             .await?;
-        Ok(resulting)
+
+        let observation = self
+            .observe_confirmed(
+                &smart_account,
+                rule_id,
+                Some(&source_pubkey_strkey),
+                &submitted,
+                smart_account_redacted,
+                request_id,
+            )
+            .await?;
+        let intended = without_signer(&before, signer_id);
+        let resulting = self.require_intended_state(
+            rule_id,
+            smart_account_redacted,
+            intended,
+            observation,
+            &submitted.tx_hash,
+            request_id,
+        )?;
+
+        Ok(ConfirmedMutation {
+            resulting,
+            tx_hash: submitted.tx_hash,
+        })
     }
 
     /// Core logic for `set_threshold` (called inside the per-rule mutex).
+    ///
+    /// Returns the threshold observation before the change and the confirmed,
+    /// validated mutation.
     #[allow(clippy::too_many_arguments, reason = "irreducible inner arg set")]
     async fn set_threshold_locked_inner(
         &self,
@@ -4485,56 +4981,42 @@ impl SignersManager {
         new_threshold: u32,
         signer: &(dyn Signer + Send + Sync),
         request_id: &str,
-    ) -> Result<(u32, ObservedSignerSet), SaError> {
-        let source_pubkey =
-            signer
-                .public_key()
-                .await
-                .map_err(|e| SaError::AuthEntryConstructionFailed {
-                    stage: "auth_payload",
-                    redacted_reason: format!("signer public_key fetch failed: {e}"),
-                })?;
-        let source_pubkey_strkey = stellar_strkey::ed25519::PublicKey(source_pubkey.0).to_string();
+    ) -> Result<(ThresholdObservation, ConfirmedMutation), SaError> {
+        let source_pubkey_strkey = signer_source_strkey(signer).await?;
 
-        // Read baseline for old_threshold.
-        let baseline = self
-            .read_audit_log_baseline(rule_id, smart_account_strkey, smart_account_redacted)?
-            .ok_or_else(|| SaError::SignerSetMissingBaseline {
+        let compared = self
+            .compare_signer_set_locked(
+                &smart_account,
+                smart_account_strkey,
+                smart_account_redacted,
+                rule_id,
+                Some(&source_pubkey_strkey),
+                V1Handling::RefuseLegacy,
+                request_id,
+            )
+            .await?;
+        let before = compared.observation.snapshot;
+
+        let Some(previous) = before.threshold.clone() else {
+            return Err(SaError::ThresholdPolicyNotInstalled {
                 rule_id,
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
                 request_id: request_id.to_owned(),
-            })?;
-
-        let current_signer_count = baseline.state().signer_count;
-        let old_threshold = baseline.state().threshold;
+            });
+        };
 
         // Threshold invariant: 1 <= new_threshold <= signer_count.
         compute_post_op_invariant(
             rule_id,
-            current_signer_count,
-            old_threshold,
+            before.signer_count(),
+            previous.threshold,
             new_threshold,
             ThresholdAffectingOp::SetThreshold { new: new_threshold },
             smart_account_redacted,
             request_id,
         )?;
-
-        // Identify threshold policy.
-        let policy_addr = self
-            .identify_threshold_policy(
-                smart_account.clone(),
-                rule_id,
-                Some(&source_pubkey_strkey),
-                request_id.to_owned(),
-            )
-            .await?;
-
-        // Fetch context rule for set_threshold args.
-        let context_rule = self
-            .fetch_context_rule_primary(smart_account.clone(), rule_id, Some(&source_pubkey_strkey))
-            .await?;
 
         // Route `set_threshold` through the smart account's `execute()` entrypoint
         // to avoid Soroban re-entry.  Direct call: `set_threshold(policy)` →
@@ -4552,12 +5034,14 @@ impl SignersManager {
                 redacted_reason: format!("encode set_threshold symbol: {e:?}"),
             }
         })?;
-        let context_rule_scval = context_rule.as_scval()?;
         // `target_args` = [threshold: u32, context_rule: ContextRule, smart_account: Address]
         // (Env is implicit in Soroban contractimpl; not encoded in the Vec<Val>).
+        // The context rule is the verbatim value of the primary read the
+        // comparison covered, so the policy receives the rule the wallet
+        // checked.
         let target_args_vec: VecM<ScVal> = vec![
             ScVal::U32(new_threshold),
-            context_rule_scval,
+            compared.observation.primary_rule,
             ScVal::Address(smart_account.clone()),
         ]
         .try_into()
@@ -4565,10 +5049,8 @@ impl SignersManager {
             stage: "auth_contexts_args",
             redacted_reason: format!("encode set_threshold target_args VecM: {e:?}"),
         })?;
-        // Clone policy_addr before move into ScVal (needed for result-fetch below).
-        let policy_addr_for_result_fetch = policy_addr.clone();
         let execute_args = vec![
-            ScVal::Address(policy_addr),
+            ScVal::Address(ScAddress::Contract(ContractId(Hash(previous.policy)))),
             ScVal::Symbol(set_threshold_sym),
             ScVal::Vec(Some(ScVec(target_args_vec))),
         ];
@@ -4576,35 +5058,60 @@ impl SignersManager {
         // Both contract and auth_address are the smart account; `execute()` calls
         // `e.current_contract_address().require_auth()`.
         let policy_auth_rule_ids = vec![ContextRuleId::from(rule_id)];
-        self.submit_single_op(
-            smart_account.clone(),
-            &smart_account,
-            rule_id,
-            "execute",
-            execute_args,
-            &policy_auth_rule_ids,
-            signer,
-            &source_pubkey_strkey,
-            // Expiry check at signing-path entry.
-            Some(ExpiryCheck { rule_id }),
-            request_id,
-        )
-        .await?;
-
-        let resulting = self
-            .fetch_signer_set(
-                &self.primary_rpc_client,
-                smart_account,
+        let submitted = self
+            .submit_single_op(
+                smart_account.clone(),
+                &smart_account,
                 rule_id,
-                Some(&source_pubkey_strkey),
-                &policy_addr_for_result_fetch,
+                "execute",
+                execute_args,
+                &policy_auth_rule_ids,
+                signer,
+                &source_pubkey_strkey,
+                // Expiry check at signing-path entry.
+                Some(ExpiryCheck { rule_id }),
                 request_id,
             )
             .await?;
-        Ok((old_threshold, resulting))
+
+        let observation = self
+            .observe_confirmed(
+                &smart_account,
+                rule_id,
+                Some(&source_pubkey_strkey),
+                &submitted,
+                smart_account_redacted,
+                request_id,
+            )
+            .await?;
+        let intended = SignerSetSnapshotV2 {
+            signers: before.signers.clone(),
+            threshold: Some(ThresholdObservation {
+                policy: previous.policy,
+                threshold: new_threshold,
+            }),
+        };
+        let resulting = self.require_intended_state(
+            rule_id,
+            smart_account_redacted,
+            intended,
+            observation,
+            &submitted.tx_hash,
+            request_id,
+        )?;
+
+        Ok((
+            previous,
+            ConfirmedMutation {
+                resulting,
+                tx_hash: submitted.tx_hash,
+            },
+        ))
     }
 
-    /// Submits a single `InvokeHostFunction` op transaction.
+    /// Submits a single `InvokeHostFunction` op transaction and returns the
+    /// confirmed result: the simulated return value, the transaction hash
+    /// and the confirmation ledger.
     ///
     /// Uses the six-stage flow (build → simulate → build_auth →
     /// sign_auth → delegated_entry → resimulate → envelope-sign → submit).
@@ -4631,7 +5138,7 @@ impl SignersManager {
         source_pubkey_strkey: &str,
         expiry_check: Option<ExpiryCheck>,
         request_id: &str,
-    ) -> Result<ScVal, SaError> {
+    ) -> Result<crate::submit::SubmitInvokeResult, SaError> {
         self.submit_signed_invoke(
             contract,
             auth_address,
@@ -4646,7 +5153,6 @@ impl SignersManager {
             None,
         )
         .await
-        .map(|result| result.return_val)
     }
 
     /// Thin delegating wrapper that forwards to
@@ -4754,6 +5260,488 @@ struct PinOverrides {
     accept_unknown_verifier: bool,
 }
 
+// ── Signer-set observation and comparison ─────────────────────────────────────
+
+/// The pause before an endpoint behind the confirmation ledger is read again.
+const CONFIRMATION_CATCH_UP_PAUSE: Duration = Duration::from_secs(1);
+
+/// The ledger floor of an observation after a confirmed transaction, and the
+/// end of its `confirmation_recording` budget.
+#[derive(Clone, Copy, Debug)]
+struct CatchUp<'a> {
+    /// The confirmation ledger every read must reach.
+    floor: u32,
+    /// When the budget ends.
+    deadline: tokio::time::Instant,
+    /// The last read found behind `floor`, which the refusal at the end of
+    /// the budget names.
+    last_behind: &'a std::sync::Mutex<Option<BehindRead>>,
+}
+
+/// A read that reported a `latestLedger` below the confirmation ledger.
+///
+/// `Display` renders it as history: `{read} ({endpoint}) was last seen at
+/// latestLedger {N}, below the confirmation ledger {F}`. The endpoint may
+/// have caught up since.
+#[derive(Clone, Copy, Debug)]
+struct BehindRead {
+    /// The simulated function.
+    read: &'static str,
+    /// The endpoint, `primary` or `secondary`.
+    source_kind: &'static str,
+    /// The `latestLedger` the read reported.
+    latest_ledger: u32,
+    /// The confirmation ledger the read had to reach.
+    floor: u32,
+}
+
+impl BehindRead {
+    /// The refusal of an observation stopped by its budget with this read the
+    /// last one behind; `budget` states how the budget stopped it. The read
+    /// comes first so the reason cap never removes it.
+    fn refusal(self, budget: &str) -> SaError {
+        SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("{self}; {budget}"),
+        }
+    }
+}
+
+impl std::fmt::Display for BehindRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({}) was last seen at latestLedger {}, below the confirmation ledger {}",
+            self.read, self.source_kind, self.latest_ledger, self.floor
+        )
+    }
+}
+
+/// One endpoint's reads of a rule.
+struct EndpointRead {
+    /// The decoded rule, with its verbatim value.
+    rule: OnChainContextRule,
+    /// The smallest `latestLedger` the endpoint's reads reported.
+    ledger: u32,
+    /// The simple-threshold value, when the rule has a simple-threshold
+    /// policy.
+    threshold: Option<u32>,
+}
+
+/// A rule's signer set observed in version 2 through both RPC endpoints,
+/// with the reads a version-1 comparison and the signer verbs need.
+struct ObservationV2 {
+    /// The observed rule's id, as requested.
+    rule_id: u32,
+    /// The smart account, redacted first-5-last-5.
+    smart_account_redacted: String,
+    /// The correlation id of the call that observed.
+    request_id: String,
+    /// The validated snapshot, signers in ascending id order.
+    snapshot: SignerSetSnapshotV2,
+    /// The rule's attached policies, in the rule's order.
+    policies: Vec<ScAddress>,
+    /// The number of attached policies and the first 8 bytes of the first
+    /// observed effective hash, for a threshold-policy refusal.
+    policy_hashes: WasmHashSummary,
+    /// The smallest `latestLedger` across the reads the observation kept.
+    ledger: u32,
+    /// The primary's verbatim `get_context_rule` value.
+    primary_rule: ScVal,
+    /// The version-1 projection of the primary's signers in the rule's
+    /// order, or the index, id and reason of the first signer without one.
+    v1_signers: Result<Vec<(u32, SignerPubkey)>, (usize, u32, SignerDecodeError)>,
+}
+
+/// How a comparison treats a version-1 state row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum V1Handling {
+    /// Compare through the observation's version-1 projection.
+    Compare,
+    /// Refuse with [`SaError::SignerSetBaselineLegacy`] before any RPC.
+    RefuseLegacy,
+}
+
+/// The result of a comparison that matched: the observed view in the row's
+/// version, the matched row's hash and the observation.
+struct ComparedState {
+    view: SignerSetView,
+    row_hash: [u8; 32],
+    observation: ObservationV2,
+}
+
+/// How an observation compares with a state row, in the row's version.
+enum Classified {
+    /// The observation matches the row.
+    Matched {
+        /// The observation in the row's version.
+        observed: SignerSetView,
+    },
+    /// The observation differs from the row.
+    Diverged {
+        /// The observation in the row's version.
+        observed: SignerSetView,
+    },
+    /// The row is version 1 and the observation has no version-1
+    /// projection.
+    NotComparable {
+        /// Why the projection failed.
+        cause: SaError,
+    },
+}
+
+/// A signer mutation that confirmed and whose resulting state was observed
+/// and validated.
+struct ConfirmedMutation {
+    /// The validated resulting snapshot.
+    resulting: SignerSetSnapshotV2,
+    /// The confirmed transaction's hash.
+    tx_hash: String,
+}
+
+/// A signer add whose transaction confirmed: the outcome of the steps after
+/// confirmation, and the pin update planned before submission.
+///
+/// The confirmed add put its verifiers on the rule whatever `outcome` is, so
+/// `SignersManager::record_confirmed_add` writes `pin_update` in either case.
+struct ConfirmedSignerAdd<Ids> {
+    /// The ids the chain assigned and the validated mutation, or the
+    /// refusal of an observation or validation after confirmation.
+    outcome: Result<(Ids, ConfirmedMutation), SaError>,
+    /// The pin rows to write for the confirmed add.
+    pin_update: Option<PlannedPinUpdate>,
+}
+
+/// Why an audit row was not written.
+#[derive(Debug, thiserror::Error)]
+enum BaselineWriteError {
+    /// The audit-log writer lock is poisoned.
+    #[error("the audit-log writer lock is poisoned")]
+    Poisoned,
+    /// The audit-log writer refused the row.
+    #[error("audit-log write failed: {0}")]
+    Write(WriterError),
+}
+
+/// How the observed signer set compared with the rule's audit-log state row
+/// that existed before the call.
+///
+/// A version-1 row is compared through the version-1 projection of the
+/// observation, which keeps the first 16 bytes of an `External` signer's key
+/// data; a version-2 row with the full snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PreviousBaseline {
+    /// No state row existed.
+    None,
+    /// The row's state matches the chain.
+    Matched,
+    /// The row's state differs from the chain.
+    Diverged,
+    /// The row is version 1 and the chain state has no version-1 projection:
+    /// the rule holds a signer delegated to a contract address, or has no
+    /// simple-threshold policy.
+    NotComparable,
+}
+
+/// The result of [`SignersManager::list_signers`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ListOutcome {
+    /// The observed signer set, always version 2.
+    pub view: SignerSetView,
+    /// How the observation compared with the prior state row; `None` when
+    /// this call wrote the first baseline.
+    pub baseline: PreviousBaseline,
+}
+
+/// The result of [`SignersManager::refresh_signer_baseline`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RefreshOutcome {
+    /// The observed signer set the new baseline records, always version 2.
+    pub view: SignerSetView,
+    /// How the observation compared with the state row the refresh
+    /// replaced.
+    pub previous_baseline: PreviousBaseline,
+}
+
+/// Projects an observation to the version-1 view a version-1 row compares
+/// with: the signers truncated as version 1 records them, in the rule's
+/// order, and the simple-threshold value.
+///
+/// # Errors
+///
+/// - [`SaError::DeploymentFailed`] (phase `simulate`) naming the index and id
+///   of the first signer without a version-1 form (a signer delegated to a
+///   contract address).
+/// - [`SaError::ThresholdPolicyNotInstalled`]: no threshold and no attached
+///   policy.
+/// - [`SaError::ThresholdPolicyIdentificationFailed`]: no threshold, with
+///   attached policies none of which is a simple-threshold policy.
+fn project_v1(obs: &ObservationV2) -> Result<ObservedSignerSet, SaError> {
+    let signers = match &obs.v1_signers {
+        Ok(signers) => signers,
+        Err((index, id, reason)) => {
+            return Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: unrecognised_signer_reason(*index, *id, reason),
+            });
+        }
+    };
+    let Some(threshold) = &obs.snapshot.threshold else {
+        let smart_account_redacted =
+            RedactedStrkey::from_already_redacted(obs.smart_account_redacted.as_str());
+        return Err(if obs.policies.is_empty() {
+            SaError::ThresholdPolicyNotInstalled {
+                rule_id: obs.rule_id,
+                smart_account_redacted,
+                request_id: obs.request_id.clone(),
+            }
+        } else {
+            SaError::ThresholdPolicyIdentificationFailed {
+                rule_id: obs.rule_id,
+                smart_account_redacted,
+                observed_wasm_hashes_summary: obs.policy_hashes.clone(),
+                request_id: obs.request_id.clone(),
+            }
+        });
+    };
+    Ok(ObservedSignerSet {
+        signer_count: u32::try_from(signers.len()).unwrap_or(u32::MAX),
+        threshold: threshold.threshold,
+        signer_ids: signers.iter().map(|(id, _)| *id).collect(),
+        signer_pubkeys: signers.iter().map(|(_, pubkey)| pubkey.clone()).collect(),
+    })
+}
+
+/// Classifies `obs` against the state row `view` in the row's version; the
+/// one comparison body behind the signer verbs, `verify_signer_set_against_chain`,
+/// `list_signers` and `refresh_signer_baseline`.
+///
+/// A version-2 row compares its snapshot's digest with the observation's.
+/// A version-1 row compares with the observation's version-1 projection
+/// ([`project_v1`]); a projection that fails is
+/// [`Classified::NotComparable`] with the projection's error.
+///
+/// # Errors
+///
+/// [`SaError::AuditLog`] when the row's own digest cannot be computed.
+fn classify_against(view: &SignerSetView, obs: &ObservationV2) -> Result<Classified, SaError> {
+    let (expected_digest, observed_digest, observed) = match view {
+        SignerSetView::V1(expected) => {
+            let observed = match project_v1(obs) {
+                Ok(observed) => observed,
+                Err(cause) => return Ok(Classified::NotComparable { cause }),
+            };
+            (
+                compute_signer_set_digest(expected)?,
+                compute_signer_set_digest(&observed)?,
+                SignerSetView::V1(observed),
+            )
+        }
+        SignerSetView::V2(expected) => (
+            compute_signer_set_digest_v2(expected)?,
+            compute_signer_set_digest_v2(&obs.snapshot)?,
+            SignerSetView::V2(obs.snapshot.clone()),
+        ),
+    };
+    if expected_digest != observed_digest {
+        return Ok(Classified::Diverged { observed });
+    }
+    Ok(Classified::Matched { observed })
+}
+
+/// The reason a rule read refuses a signer at `index` (id `id`) the wallet
+/// cannot represent.
+fn unrecognised_signer_reason(index: usize, id: u32, reason: &SignerDecodeError) -> String {
+    format!(
+        "get_context_rule: signer at index {index} (id {id}) is not a recognised Signer: {reason}"
+    )
+}
+
+/// The first 8 bytes, as hex, of the SHA-256 of `value`'s XDR encoding, or
+/// `encode_error` when the value does not encode.
+fn scval_digest_first8(value: &ScVal) -> String {
+    use stellar_xdr::{Limits, WriteXdr};
+    value.to_xdr(Limits::none()).map_or_else(
+        |_| "encode_error".to_owned(),
+        |bytes| hex::encode(&Sha256::digest(bytes)[..8]),
+    )
+}
+
+/// The [`SaError::BaselineWriteFailed`] at stage `observe` of a confirmed
+/// transaction whose resulting state could not be observed because of
+/// `cause`.
+fn observe_failed_after(
+    rule_id: u32,
+    smart_account_redacted: &str,
+    tx_hash: &str,
+    cause: &SaError,
+    request_id: &str,
+) -> SaError {
+    warn!(
+        rule_id,
+        smart_account_redacted = %smart_account_redacted,
+        tx_hash,
+        cause = cause.wire_code(),
+        "the confirmed signer-set state could not be observed"
+    );
+    SaError::BaselineWriteFailed {
+        rule_id,
+        smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
+        tx_hash: Some(tx_hash.to_owned()),
+        stage: BASELINE_WRITE_STAGE_OBSERVE,
+        reason: baseline_observe_reason(cause),
+        request_id: request_id.to_owned(),
+    }
+}
+
+/// `before` with `added` signers inserted, in ascending id order, and the
+/// threshold unchanged.
+fn with_added_signers(
+    before: &SignerSetSnapshotV2,
+    added: impl IntoIterator<Item = (u32, SignerIdentityV2)>,
+) -> SignerSetSnapshotV2 {
+    let mut signers = before.signers.clone();
+    signers.extend(
+        added
+            .into_iter()
+            .map(|(id, identity)| SignerEntryV2 { id, identity }),
+    );
+    signers.sort_by_key(|entry| entry.id);
+    SignerSetSnapshotV2 {
+        signers,
+        threshold: before.threshold.clone(),
+    }
+}
+
+/// `before` without the signer `signer_id`, the threshold unchanged.
+fn without_signer(before: &SignerSetSnapshotV2, signer_id: u32) -> SignerSetSnapshotV2 {
+    SignerSetSnapshotV2 {
+        signers: before
+            .signers
+            .iter()
+            .filter(|entry| entry.id != signer_id)
+            .cloned()
+            .collect(),
+        threshold: before.threshold.clone(),
+    }
+}
+
+/// The lowest id of an entry of `observed` that holds `identity`, whose id
+/// `before` does not hold and that `taken` does not list; `None` when there
+/// is none.
+fn new_entry_id(
+    before: &SignerSetSnapshotV2,
+    observed: &SignerSetSnapshotV2,
+    identity: &SignerIdentityV2,
+    taken: &[u32],
+) -> Option<u32> {
+    observed
+        .signers
+        .iter()
+        .filter(|entry| {
+            &entry.identity == identity
+                && !taken.contains(&entry.id)
+                && !before
+                    .signers
+                    .iter()
+                    .any(|existing| existing.id == entry.id)
+        })
+        .map(|entry| entry.id)
+        .min()
+}
+
+/// The ids of the `added` identities, in input order.
+///
+/// Each identity takes the id of a new entry of `observed` that holds it
+/// ([`new_entry_id`]). An identity without one takes an id above every id of
+/// `before` and `observed`, so the intended state built from these ids
+/// differs from the observed one.
+fn assign_added_ids(
+    before: &SignerSetSnapshotV2,
+    observed: &SignerSetSnapshotV2,
+    added: &[SignerIdentityV2],
+) -> Vec<u32> {
+    let mut next_unobserved = before
+        .signers
+        .iter()
+        .chain(&observed.signers)
+        .map(|entry| entry.id)
+        .max()
+        .map_or(0, |id| id.saturating_add(1));
+    let mut ids: Vec<u32> = Vec::with_capacity(added.len());
+    for identity in added {
+        let id = new_entry_id(before, observed, identity, &ids).unwrap_or_else(|| {
+            let id = next_unobserved;
+            next_unobserved = next_unobserved.saturating_add(1);
+            id
+        });
+        ids.push(id);
+    }
+    ids
+}
+
+/// The distinct verifier addresses of the `External` signers among
+/// `signers`, in first-seen order.
+fn external_verifiers<'a>(
+    signers: impl IntoIterator<Item = &'a DecodedOnChainSigner>,
+) -> Vec<ScAddress> {
+    let mut verifiers: Vec<ScAddress> = Vec::new();
+    for signer in signers {
+        if let DecodedOnChainSigner::External {
+            verifier_address, ..
+        } = signer
+            && !verifiers.contains(verifier_address)
+        {
+            verifiers.push(verifier_address.clone());
+        }
+    }
+    verifiers
+}
+
+/// The kind label a threshold refusal names for a signer being added. The
+/// CLI's `signer_kinds` envelope uses its own labels (`delegated_ed25519`).
+fn identity_kind_label(identity: &SignerIdentityV2) -> &'static str {
+    match identity {
+        SignerIdentityV2::Ed25519 { .. } => "ed25519",
+        SignerIdentityV2::External { .. } => "external",
+        SignerIdentityV2::DelegatedContract { .. } => "delegated_contract",
+        // `SignerIdentityV2` is `#[non_exhaustive]`.
+        _ => "unknown",
+    }
+}
+
+/// The G-strkey of `signer`'s public key, the source account of a signer
+/// verb's transaction.
+async fn signer_source_strkey(signer: &(dyn Signer + Send + Sync)) -> Result<String, SaError> {
+    let source_pubkey =
+        signer
+            .public_key()
+            .await
+            .map_err(|e| SaError::AuthEntryConstructionFailed {
+                stage: "auth_payload",
+                redacted_reason: format!("signer public_key fetch failed: {e}"),
+            })?;
+    Ok(format!(
+        "{}",
+        stellar_strkey::ed25519::PublicKey(source_pubkey.0)
+    ))
+}
+
+/// Logs a signer verb's refusal or failure.
+fn warn_failed(verb: &str, rule_id: u32, smart_account_redacted: &str, err: &SaError) {
+    warn!(
+        error = %err,
+        verb,
+        rule_id,
+        smart_account = %smart_account_redacted,
+        "signer verb failed"
+    );
+}
+
 /// Pre-flight threshold + count invariant check.
 ///
 /// Returns `Ok(())` when both:
@@ -4829,11 +5817,10 @@ fn compute_post_op_invariant(
 /// endpoint.
 ///
 /// Generic over any contract address slice; its consumers are the on-chain
-/// policy identification helpers `identify_threshold_policy`,
-/// `identify_spending_limit_policy`, `identify_weighted_threshold_policy` and
-/// `classify_rule_policies`. The three identify helpers compare aligned
-/// results from both endpoints. The display-only `classify_rule_policies`
-/// uses the primary endpoint.
+/// policy identification helpers `identify_spending_limit_policy`,
+/// `identify_weighted_threshold_policy` and `classify_rule_policies`. The two
+/// identify helpers compare aligned results from both endpoints. The
+/// display-only `classify_rule_policies` uses the primary endpoint.
 ///
 /// Returns `Vec<Option<[u8; 32]>>` **aligned with `keys`**:
 /// - `Some(hash)` when the key resolved to a Wasm contract instance, or to a
@@ -5285,24 +6272,6 @@ fn extract_u32_return(val: &ScVal, context: &str) -> Result<u32, SaError> {
     }
 }
 
-/// Returns the info-level redacted first-8-hex summary for a signer pubkey.
-fn pubkey_first8(pk: &SignerPubkey) -> String {
-    use stellar_agent_core::audit_log::signer_set::signer_pubkey_canonical_body;
-    signer_pubkey_canonical_body(pk)
-        .map(|body| {
-            body[..body.len().min(8)]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        })
-        .unwrap_or_else(|_| "encode_error".to_owned())
-}
-
-/// Returns the info-level first-8-hex summaries for a pubkey slice.
-fn pubkeys_first8(pks: &[SignerPubkey]) -> Vec<String> {
-    pks.iter().map(pubkey_first8).collect()
-}
-
 /// Builds an OZ `Signer::Delegated(Address)` ScVal from a delegated signer
 /// G-strkey.
 ///
@@ -5373,17 +6342,6 @@ pub fn build_external_signer_scval(
         redacted_reason: format!("encode External ScVec: {e:?}"),
     })?;
     Ok(ScVal::Vec(Some(ScVec(scvec))))
-}
-
-/// Returns a stable type-discriminant label for a `SignerPubkey` (for error messages).
-fn signer_pubkey_type_label(pk: &SignerPubkey) -> &'static str {
-    match pk {
-        SignerPubkey::Ed25519 { .. } => "ed25519",
-        SignerPubkey::External { .. } => "external",
-        SignerPubkey::WebAuthn { .. } => "webauthn",
-        // `SignerPubkey` is `#[non_exhaustive]`; forward-compatibility arm.
-        &_ => "unknown",
-    }
 }
 
 /// Standalone read-only simulate helper (no auth, no signing).
@@ -5543,10 +6501,12 @@ pub(crate) async fn simulate_read_only_with_ledger(
 
 /// Decoded on-chain context rule (off-chain mirror of the OZ `ContextRule` struct).
 ///
-/// Produced by decoding the `ScVal` returned from `get_context_rule`.
-/// The `raw_scval` field preserves the verbatim simulation return value so it
-/// can be round-tripped back to the chain as the `context_rule` argument for
-/// `set_threshold` without re-encoding risk.
+/// Produced by decoding the `ScVal` returned from `get_context_rule`. Every
+/// signer is kept in full ([`DecodedOnChainSigner`]); the version-2 identity
+/// and the version-1 projection are derived from it. The `raw_scval` field
+/// preserves the verbatim simulation return value so it can be round-tripped
+/// back to the chain as the `context_rule` argument for `set_threshold`
+/// without re-encoding risk.
 ///
 /// # Round-trip strategy
 ///
@@ -5561,33 +6521,28 @@ pub(crate) async fn simulate_read_only_with_ledger(
 /// The simulation uses the OZ soroban-sdk contracttype derive — the SAME encoder
 /// the host runs on-chain — guaranteeing byte-identity.
 struct OnChainContextRule {
-    #[allow(
-        dead_code,
-        reason = "kept for struct completeness; not accessed after decode"
-    )]
-    pub id: u32,
-    pub signers: Vec<(u32, SignerPubkey)>, // (signer_id, pubkey)
-    pub threshold: u32,
-    pub policies: Vec<ScAddress>,
+    /// The rule id the contract returned.
+    id: u32,
+    /// `(signer_id, signer)` pairs in the rule's order.
+    signers: Vec<(u32, DecodedOnChainSigner)>,
+    /// The attached policies in the rule's order.
+    policies: Vec<ScAddress>,
     /// Verbatim `ScVal::Map` from `get_context_rule` simulation — passed through
     /// as the `context_rule` argument to `set_threshold`.
     ///
     /// Stores the full on-chain `#[contracttype]` ScVal encoding so the wallet
     /// never re-encodes the 8-field struct off-chain.
-    pub raw_scval: ScVal,
+    raw_scval: ScVal,
 }
 
 impl OnChainContextRule {
-    fn into_observed_signer_set(self) -> ObservedSignerSet {
-        let signer_count = u32::try_from(self.signers.len()).unwrap_or(u32::MAX);
-        let signer_ids = self.signers.iter().map(|(id, _)| *id).collect();
-        let signer_pubkeys = self.signers.into_iter().map(|(_, pk)| pk).collect();
-        ObservedSignerSet {
-            signer_count,
-            threshold: self.threshold,
-            signer_ids,
-            signer_pubkeys,
-        }
+    /// The signers as `(signer_id, version-2 identity)` pairs, in the rule's
+    /// order.
+    fn identities(&self) -> Vec<(u32, SignerIdentityV2)> {
+        self.signers
+            .iter()
+            .map(|(id, signer)| (*id, signer.to_identity_v2()))
+            .collect()
     }
 
     /// Returns the verbatim `ScVal::Map` encoding of the ContextRule for use as
@@ -5614,17 +6569,9 @@ impl OnChainContextRule {
 /// The `get_context_rule` entrypoint returns a `ContextRule` contracttype.
 /// In Soroban simulation, contracttype structs are returned as `ScVal::Map`
 /// with sorted keys. We decode the relevant fields: `id`, `signers`,
-/// `signer_ids`, and `policies`.
-///
-/// # Threshold placeholder
-///
-/// `ContextRule` does not carry a `threshold` field directly; the threshold is
-/// stored in the threshold-policy contract's own storage keyed by
-/// `(context_rule_id, smart_account)`.  This function stores a **placeholder**
-/// value of `signers.len()` in `OnChainContextRule.threshold`.  All callers
-/// that care about the real threshold MUST call `fetch_threshold` with an
-/// explicit RPC client on the first policy address and overwrite `threshold`
-/// before returning the value to the user.
+/// `signer_ids`, and `policies`. `ContextRule` carries no threshold: a
+/// simple-threshold policy stores it keyed by `(context_rule_id,
+/// smart_account)`, and the signer-set observation reads it there.
 ///
 /// # Complete signer set
 ///
@@ -5632,8 +6579,9 @@ impl OnChainContextRule {
 /// must carry both `signer_ids` and `signers` as `Vec`s; the two lists are
 /// parallel, so they must have the same length, every id must be a `u32` and
 /// every signer must decode through [`decode_signer_scval_full`]. A signer the
-/// wallet cannot represent (an unknown `Signer` variant, a malformed encoding,
-/// or a `Delegated` signer whose address is a contract) refuses the
+/// wallet cannot represent (an unknown `Signer` variant, a malformed
+/// encoding, a `Delegated` address that is neither an account nor a
+/// contract, or an `External` signer with empty key data) refuses the
 /// observation, so every read of the rule's signer set fails closed: the
 /// baseline comparison, `signers list` and `signers refresh`, the signer verbs
 /// and their post-submit reads, policy identification for threshold,
@@ -5750,32 +6698,20 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
         )));
     }
 
-    let signers: Vec<(u32, SignerPubkey)> = signer_ids
+    let signers: Vec<(u32, DecodedOnChainSigner)> = signer_ids
         .iter()
         .zip(signers_scvals.iter())
         .enumerate()
         .map(|(i, (sid, sv))| {
-            decode_signer_scval(sv).map(|pk| (*sid, pk)).map_err(|e| {
-                refuse(format!(
-                    "get_context_rule: signer at index {i} (id {sid}) is not a recognised \
-                         Signer: {e}"
-                ))
-            })
+            decode_signer_scval_full(sv)
+                .map(|signer| (*sid, signer))
+                .map_err(|e| refuse(unrecognised_signer_reason(i, *sid, &e)))
         })
         .collect::<Result<_, _>>()?;
-
-    // Threshold placeholder: callers that need the real threshold MUST override
-    // this value by calling `fetch_threshold` with an explicit RPC client on
-    // the first policy address. `signers.len()` is NOT the threshold; the
-    // threshold is stored in the policy contract's own storage keyed by
-    // `(context_rule_id, smart_account)`. `fetch_signer_set` replaces this
-    // value with the real on-chain threshold before returning.
-    let threshold = u32::try_from(signers.len()).unwrap_or(1).max(1);
 
     Ok(OnChainContextRule {
         id: rule_id,
         signers,
-        threshold,
         policies,
         raw_scval,
     })
@@ -5805,49 +6741,132 @@ pub(crate) fn context_rule_list_items<'a>(
 /// Full-fidelity decoded representation of an OZ on-chain `Signer` variant.
 ///
 /// Produced by [`decode_signer_scval_full`] from a `Signer` `#[contracttype]`
-/// ScVal.  Carries all fields without truncation so callers can either project
-/// to [`SignerPubkey`] (truncating `key_data` to 16 bytes for audit-log
-/// display) or assert byte-exact equality against the original key blob.
+/// ScVal. Carries all fields without truncation. [`Self::to_identity_v2`]
+/// derives the full version-2 identity every signer has;
+/// [`Self::to_signer_pubkey_v1`] derives the truncated version-1 form, which
+/// a signer delegated to a contract address does not have.
 ///
 /// Decoded from the OZ stellar-accounts v0.7.2 `Signer` contracttype.
 ///
-/// Production callers within this crate reach it through
-/// `decode_signer_scval`, which projects the result to [`SignerPubkey`], and
-/// through the verifier-migration planner, which keeps the full `key_data` to
-/// rebuild the signer.
+/// Production callers within this crate reach it through the rule decoder,
+/// which keeps every signer of a rule, and through the verifier-migration
+/// planner, which keeps the full `key_data` to rebuild the signer.
+///
+/// The enum is `#[non_exhaustive]`: a match outside this crate needs a
+/// wildcard arm.
+#[non_exhaustive]
 pub enum DecodedOnChainSigner {
-    /// `Signer::Delegated(Address)` — a G-strkey ed25519 keypair.
-    ///
-    /// The `Address` payload is always `ScAddress::Account(...)` wrapping an
-    /// ed25519 public key.
+    /// `Signer::Delegated(Address)` with an account (G) address: an ed25519
+    /// keypair.
     ///
     /// Note: in the OZ contracttype, the `Address` is the **signer** account
     /// address (a G-strkey public key), not a verifier contract address.
     Delegated {
         /// The 32-byte ed25519 public key extracted from the Account address.
         pubkey: [u8; 32],
-        /// The verbatim `ScAddress` for callers that need the typed value
-        /// (e.g. for ScMap key construction or equality assertions).
+        /// The verbatim `ScAddress` (always `ScAddress::Account`) for callers
+        /// that need the typed value (for example for ScMap key construction or
+        /// equality assertions).
         signer_address: ScAddress,
     },
-    /// `Signer::External(Address, Bytes)` — a custom verifier contract with an
-    /// opaque public-key blob.
+    /// `Signer::Delegated(Address)` with a contract (C) address: the
+    /// contract's own authorization decides for this signer.
+    DelegatedContract {
+        /// The 32-byte contract id extracted from the Contract address.
+        contract: [u8; 32],
+        /// The verbatim `ScAddress` (always `ScAddress::Contract`).
+        signer_address: ScAddress,
+    },
+    /// `Signer::External(Address, Bytes)`: a custom verifier contract with an
+    /// opaque public-key blob, a passkey signer included.
     ///
-    /// The `Address` payload is always `ScAddress::Contract(...)`.
+    /// The `Address` payload is always `ScAddress::Contract(...)`: the
+    /// variant is `#[non_exhaustive]`, so only [`decode_signer_scval_full`]
+    /// constructs it, and it refuses any other verifier address.
+    #[non_exhaustive]
     External {
         /// Verifier contract C-strkey (e.g. `"CABC..."` prefix).
         verifier_strkey: String,
         /// The verbatim verifier `ScAddress` (always `ScAddress::Contract`),
         /// for callers that rebuild the signer ScVal.
         verifier_address: ScAddress,
-        /// Full public-key byte blob.  NOT truncated — production callers
-        /// derive `key_data_first16: [u8; 16]` at the call site; test callers
-        /// use the full blob for byte-exact equality assertions.
+        /// Full public-key byte blob, never empty. NOT truncated: the
+        /// version-2 identity hashes it whole, and test callers use it for
+        /// byte-exact equality assertions.
         key_data: Vec<u8>,
     },
 }
 
-/// Reason an OZ `Signer` ScVal does not decode to a [`DecodedOnChainSigner`].
+impl DecodedOnChainSigner {
+    /// The signer's full version-2 identity.
+    ///
+    /// `Delegated` maps to [`SignerIdentityV2::Ed25519`],
+    /// `DelegatedContract` to [`SignerIdentityV2::DelegatedContract`], and
+    /// `External` to [`SignerIdentityV2::External`] with the SHA-256 and the
+    /// length of the whole key data.
+    #[must_use]
+    pub fn to_identity_v2(&self) -> SignerIdentityV2 {
+        match self {
+            Self::Delegated { pubkey, .. } => SignerIdentityV2::Ed25519 { pubkey: *pubkey },
+            Self::DelegatedContract { contract, .. } => SignerIdentityV2::DelegatedContract {
+                contract: *contract,
+            },
+            Self::External {
+                verifier_address,
+                key_data,
+                ..
+            } => SignerIdentityV2::External {
+                verifier: contract_address_bytes(verifier_address),
+                key_data_sha256: Sha256::digest(key_data).into(),
+                key_data_len: u32::try_from(key_data.len()).unwrap_or(u32::MAX),
+            },
+        }
+    }
+
+    /// The signer's version-1 form, as version-1 state rows record it:
+    /// `Delegated` as [`SignerPubkey::Ed25519`], `External` as
+    /// [`SignerPubkey::External`] keeping the first 16 bytes of the key data
+    /// (zero-padded when shorter).
+    ///
+    /// # Errors
+    ///
+    /// [`SignerDecodeError::DelegatedAddressNotAnAccount`] for a
+    /// `DelegatedContract` signer, which version 1 cannot represent.
+    pub fn to_signer_pubkey_v1(&self) -> Result<SignerPubkey, SignerDecodeError> {
+        match self {
+            Self::Delegated { pubkey, .. } => Ok(SignerPubkey::Ed25519 { pubkey: *pubkey }),
+            Self::DelegatedContract { .. } => Err(SignerDecodeError::DelegatedAddressNotAnAccount),
+            Self::External {
+                verifier_strkey,
+                key_data,
+                ..
+            } => {
+                let mut key_data_first16 = [0u8; 16];
+                let len = key_data.len().min(16);
+                key_data_first16[..len].copy_from_slice(&key_data[..len]);
+                Ok(SignerPubkey::External {
+                    verifier_contract: verifier_strkey.clone(),
+                    key_data_first16,
+                })
+            }
+        }
+    }
+}
+
+/// The 32-byte id of an `External` signer's verifier address.
+///
+/// Only [`decode_signer_scval_full`] constructs an `External` signer, and
+/// only with a contract address, so the zero id of the other arm is never
+/// produced for a decoded signer.
+fn contract_address_bytes(address: &ScAddress) -> [u8; 32] {
+    match address {
+        ScAddress::Contract(ContractId(Hash(bytes))) => *bytes,
+        _ => [0u8; 32],
+    }
+}
+
+/// Reason an OZ `Signer` ScVal does not decode to a [`DecodedOnChainSigner`],
+/// or has no version-1 form.
 ///
 /// One variant per refusal. The `Display` text names the offending shape
 /// (an `ScVal` variant name, an item count or the tag bounded to
@@ -5882,6 +6901,11 @@ pub enum SignerDecodeError {
         tag: String,
     },
     /// A `Delegated` signer's address is not an account (G) address.
+    ///
+    /// Raised by [`decode_signer_scval_full`] for an address that is neither
+    /// an account nor a contract, and by
+    /// [`DecodedOnChainSigner::to_signer_pubkey_v1`] for a contract address,
+    /// which the version-1 form cannot represent.
     #[error("Delegated signer address is not an account address")]
     DelegatedAddressNotAnAccount,
     /// An `External` signer has fewer than three items (tag, verifier, key data).
@@ -5905,19 +6929,23 @@ pub enum SignerDecodeError {
         /// Variant name of the key data item, from `scval_variant_name`.
         variant: &'static str,
     },
+    /// An `External` signer's key data is empty; no verifier can check a
+    /// signature against no key.
+    #[error("External signer key data is empty")]
+    ExternalKeyDataEmpty,
 }
 
 /// Full-fidelity decode of an OZ `Signer` ScVal — the single decode site for
 /// all OZ `Signer` variant routing and field extraction.
 ///
-/// Production callers (`decode_signer_scval`, which projects to
-/// [`SignerPubkey`], and the verifier-migration planner) and test-helper
-/// callers (which need the full `key_data` for byte-exact equality
-/// assertions) route through this function, so a change to the OZ `Signer`
-/// encoding is made here once.
+/// Production callers (the rule decoder and the verifier-migration planner)
+/// and test-helper callers (which need the full `key_data` for byte-exact
+/// equality assertions) route through this function, so a change to the OZ
+/// `Signer` encoding is made here once.
 ///
 /// The OZ stellar-accounts v0.7.2 `Signer` contracttype encodes as:
-/// - `Delegated(Address)` → `ScVal::Vec([Symbol("Delegated"), Address(pubkey_addr)])`
+/// - `Delegated(Address)` → `ScVal::Vec([Symbol("Delegated"), Address(signer)])`,
+///   where the address is an account or a contract
 /// - `External(Address, Bytes)` → `ScVal::Vec([Symbol("External"), Address(verifier), Bytes(key_data)])`
 ///
 /// A signer the wallet cannot represent refuses the observation: every rule
@@ -5929,8 +6957,9 @@ pub enum SignerDecodeError {
 /// Returns the [`SignerDecodeError`] variant naming the first malformed part:
 /// a value that is not a `Vec`, a `Vec` shorter than its variant requires, a
 /// tag that is not a `Symbol` or names an unknown variant, a `Delegated`
-/// address that is not an account, or an `External` verifier that is not a
-/// contract address or key data that is not `Bytes`.
+/// address that is neither an account nor a contract, or an `External`
+/// verifier that is not a contract address or key data that is not `Bytes`
+/// or is empty.
 pub fn decode_signer_scval_full(val: &ScVal) -> Result<DecodedOnChainSigner, SignerDecodeError> {
     let ScVal::Vec(vec) = val else {
         return Err(SignerDecodeError::NotAVec {
@@ -5951,8 +6980,8 @@ pub fn decode_signer_scval_full(val: &ScVal) -> Result<DecodedOnChainSigner, Sig
 
     match tag.as_slice() {
         b"Delegated" => {
-            // OZ `Signer::Delegated(Address)`; the address is a G-strkey
-            // ed25519 account.
+            // OZ `Signer::Delegated(Address)`: an account (G) or a contract
+            // (C) address.
             match items[1] {
                 ScVal::Address(addr @ ScAddress::Account(acc)) => {
                     let pubkey = match &acc.0 {
@@ -5960,6 +6989,12 @@ pub fn decode_signer_scval_full(val: &ScVal) -> Result<DecodedOnChainSigner, Sig
                     };
                     Ok(DecodedOnChainSigner::Delegated {
                         pubkey,
+                        signer_address: addr.clone(),
+                    })
+                }
+                ScVal::Address(addr @ ScAddress::Contract(ContractId(Hash(contract)))) => {
+                    Ok(DecodedOnChainSigner::DelegatedContract {
+                        contract: *contract,
                         signer_address: addr.clone(),
                     })
                 }
@@ -5985,6 +7020,9 @@ pub fn decode_signer_scval_full(val: &ScVal) -> Result<DecodedOnChainSigner, Sig
                     variant: scval_variant_name(items[2]),
                 });
             };
+            if key_data.is_empty() {
+                return Err(SignerDecodeError::ExternalKeyDataEmpty);
+            }
             Ok(DecodedOnChainSigner::External {
                 verifier_strkey,
                 verifier_address: verifier_address.clone(),
@@ -5994,39 +7032,6 @@ pub fn decode_signer_scval_full(val: &ScVal) -> Result<DecodedOnChainSigner, Sig
         other => Err(SignerDecodeError::UnknownTag {
             tag: untrusted_display_bounded(other),
         }),
-    }
-}
-
-/// Decodes an OZ `Signer` ScVal into a [`SignerPubkey`].
-///
-/// Projects the full-fidelity [`DecodedOnChainSigner`] returned by
-/// [`decode_signer_scval_full`] to the production-facing [`SignerPubkey`],
-/// truncating `key_data` to 16 bytes for audit-log display efficiency.
-/// Test-helper consumers that need the full `key_data` call
-/// [`decode_signer_scval_full`] directly (enabled via `features = ["test-helpers"]`).
-///
-/// # Errors
-///
-/// Returns the [`SignerDecodeError`] from [`decode_signer_scval_full`].
-fn decode_signer_scval(val: &ScVal) -> Result<SignerPubkey, SignerDecodeError> {
-    match decode_signer_scval_full(val)? {
-        DecodedOnChainSigner::Delegated { pubkey, .. } => Ok(SignerPubkey::Ed25519 { pubkey }),
-        DecodedOnChainSigner::External {
-            verifier_strkey,
-            key_data,
-            ..
-        } => {
-            let key_data_first16: [u8; 16] = {
-                let mut arr = [0u8; 16];
-                let len = key_data.len().min(16);
-                arr[..len].copy_from_slice(&key_data[..len]);
-                arr
-            };
-            Ok(SignerPubkey::External {
-                verifier_contract: verifier_strkey,
-                key_data_first16,
-            })
-        }
     }
 }
 
@@ -6181,23 +7186,35 @@ pub(crate) mod tests {
             "manager starts with non-degraded audit writer state"
         );
 
-        let observed = ObservedSignerSet {
-            signer_count: 1,
-            threshold: 1,
-            signer_ids: vec![0],
-            signer_pubkeys: vec![SignerPubkey::Ed25519 { pubkey: [0x11; 32] }],
-        };
+        let observation = test_observation(SignerSetSnapshotV2 {
+            signers: vec![SignerEntryV2 {
+                id: 0,
+                identity: SignerIdentityV2::Ed25519 { pubkey: [0x11; 32] },
+            }],
+            threshold: None,
+        });
+        let mut outcome = None;
         let logs = stellar_agent_test_support::with_captured_logs(|| {
-            manager.emit_baseline(
-                &observed,
+            outcome = Some(manager.emit_baseline(
+                &observation,
                 7,
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
                 "CDABC...12345",
                 BaselineReason::FirstObservation,
                 "req-poison",
-            );
+            ));
         });
+        match outcome.expect("emit_baseline ran") {
+            Err(SaError::BaselineWriteFailed {
+                rule_id: 7,
+                tx_hash: None,
+                stage,
+                ..
+            }) => assert_eq!(stage, BASELINE_WRITE_STAGE_WRITE),
+            other => panic!("a poisoned writer must fail the baseline write: {other:?}"),
+        }
         assert!(
-            logs.contains("audit-writer mutex poisoned; SaSignerSetBaselined row dropped"),
+            logs.contains("SaSignerSetBaselinedV2 row not written"),
             "missing poison warning: {logs}"
         );
         // The session-degraded warning TEXT is pinned next to its emitter
@@ -6214,6 +7231,234 @@ pub(crate) mod tests {
         assert!(
             manager.audit_writer_degraded(),
             "poisoned audit-writer branch must mark manager degraded"
+        );
+    }
+
+    /// An observation of `snapshot` with no policies, for tests that write
+    /// rows from an observation.
+    fn test_observation(snapshot: SignerSetSnapshotV2) -> ObservationV2 {
+        ObservationV2 {
+            rule_id: 7,
+            smart_account_redacted: "CDABC...12345".to_owned(),
+            request_id: "req-test".to_owned(),
+            snapshot,
+            policies: vec![],
+            policy_hashes: WasmHashSummary {
+                count: 0,
+                first_first8: None,
+            },
+            ledger: 1000,
+            primary_rule: ScVal::Void,
+            v1_signers: Ok(vec![]),
+        }
+    }
+
+    fn ed25519_entry(id: u32, byte: u8) -> SignerEntryV2 {
+        SignerEntryV2 {
+            id,
+            identity: SignerIdentityV2::Ed25519 { pubkey: [byte; 32] },
+        }
+    }
+
+    /// An observation of two Ed25519 signers (ids 0 and 1) whose version-1
+    /// projection is available, with `threshold` and `policies`.
+    fn two_signer_observation(
+        threshold: Option<ThresholdObservation>,
+        policies: Vec<ScAddress>,
+    ) -> ObservationV2 {
+        let mut observation = test_observation(SignerSetSnapshotV2 {
+            signers: vec![ed25519_entry(0, 0x10), ed25519_entry(1, 0x11)],
+            threshold,
+        });
+        observation.v1_signers = Ok(vec![
+            (0, SignerPubkey::Ed25519 { pubkey: [0x10; 32] }),
+            (1, SignerPubkey::Ed25519 { pubkey: [0x11; 32] }),
+        ]);
+        observation.policy_hashes = WasmHashSummary {
+            count: u32::try_from(policies.len()).unwrap(),
+            first_first8: (!policies.is_empty()).then_some([0xab; 8]),
+        };
+        observation.policies = policies;
+        observation
+    }
+
+    fn v1_state(threshold: u32, second: u8) -> ObservedSignerSet {
+        ObservedSignerSet {
+            signer_count: 2,
+            threshold,
+            signer_ids: vec![0, 1],
+            signer_pubkeys: vec![
+                SignerPubkey::Ed25519 { pubkey: [0x10; 32] },
+                SignerPubkey::Ed25519 {
+                    pubkey: [second; 32],
+                },
+            ],
+        }
+    }
+
+    fn policy_address(byte: u8) -> ScAddress {
+        ScAddress::Contract(ContractId(Hash([byte; 32])))
+    }
+
+    /// A version-1 row compares through the projection: a matching state is
+    /// `Matched` with the version-1 view, one changed field is `Diverged`.
+    #[test]
+    fn classify_against_compares_a_version_1_row_through_the_projection() {
+        let observation = two_signer_observation(
+            Some(ThresholdObservation {
+                policy: [0x66; 32],
+                threshold: 2,
+            }),
+            vec![policy_address(0x66)],
+        );
+        match classify_against(&SignerSetView::V1(v1_state(2, 0x11)), &observation).unwrap() {
+            Classified::Matched { observed } => {
+                assert_eq!(observed, SignerSetView::V1(v1_state(2, 0x11)));
+            }
+            _ => panic!("an equal version-1 state must match"),
+        }
+        assert!(matches!(
+            classify_against(&SignerSetView::V1(v1_state(1, 0x11)), &observation).unwrap(),
+            Classified::Diverged { .. }
+        ));
+        assert!(matches!(
+            classify_against(&SignerSetView::V1(v1_state(2, 0x12)), &observation).unwrap(),
+            Classified::Diverged { .. }
+        ));
+    }
+
+    /// A version-1 row meets an observation without a threshold: not
+    /// comparable, and the cause names the rule's policy state: no policy,
+    /// or policies without a simple-threshold policy.
+    #[test]
+    fn classify_against_a_version_1_row_without_a_threshold_is_not_comparable() {
+        let policyless = two_signer_observation(None, vec![]);
+        match classify_against(&SignerSetView::V1(v1_state(2, 0x11)), &policyless).unwrap() {
+            Classified::NotComparable { cause } => {
+                assert_eq!(cause.wire_code(), "sa.threshold_policy_not_installed");
+            }
+            _ => panic!("a policyless rule has no version-1 projection"),
+        }
+        let weighted_only = two_signer_observation(None, vec![policy_address(0x77)]);
+        match classify_against(&SignerSetView::V1(v1_state(2, 0x11)), &weighted_only).unwrap() {
+            Classified::NotComparable { cause } => {
+                assert_eq!(
+                    cause.wire_code(),
+                    "sa.threshold_policy_identification_failed"
+                );
+            }
+            _ => panic!("a rule without a simple-threshold policy has no projection"),
+        }
+    }
+
+    /// A version-2 row compares the full snapshot, the threshold's policy
+    /// included.
+    #[test]
+    fn classify_against_compares_a_version_2_row_with_the_full_snapshot() {
+        let threshold = |policy: u8| {
+            Some(ThresholdObservation {
+                policy: [policy; 32],
+                threshold: 2,
+            })
+        };
+        let observation = two_signer_observation(threshold(0x66), vec![policy_address(0x66)]);
+        let row = |policy: u8| {
+            SignerSetView::V2(SignerSetSnapshotV2 {
+                signers: vec![ed25519_entry(0, 0x10), ed25519_entry(1, 0x11)],
+                threshold: threshold(policy),
+            })
+        };
+        assert!(matches!(
+            classify_against(&row(0x66), &observation).unwrap(),
+            Classified::Matched {
+                observed: SignerSetView::V2(_)
+            }
+        ));
+        assert!(matches!(
+            classify_against(&row(0x67), &observation).unwrap(),
+            Classified::Diverged { .. }
+        ));
+    }
+
+    /// Each added identity takes the id it holds on chain, in input order,
+    /// whatever order the chain assigned the ids in; an identity the chain
+    /// does not hold takes an id no observed entry has.
+    #[test]
+    fn assign_added_ids_follows_the_input_order() {
+        let before = SignerSetSnapshotV2 {
+            signers: vec![ed25519_entry(0, 0x10)],
+            threshold: None,
+        };
+        let observed = SignerSetSnapshotV2 {
+            signers: vec![
+                ed25519_entry(0, 0x10),
+                ed25519_entry(7, 0x22),
+                ed25519_entry(8, 0x21),
+            ],
+            threshold: None,
+        };
+        let added = [
+            SignerIdentityV2::Ed25519 { pubkey: [0x21; 32] },
+            SignerIdentityV2::Ed25519 { pubkey: [0x22; 32] },
+        ];
+        assert_eq!(assign_added_ids(&before, &observed, &added), vec![8, 7]);
+
+        let missing = [SignerIdentityV2::Ed25519 { pubkey: [0x23; 32] }];
+        assert_eq!(assign_added_ids(&before, &observed, &missing), vec![9]);
+    }
+
+    /// An entry whose id the prior set already held is not a new entry, even
+    /// when it holds the added identity.
+    #[test]
+    fn new_entry_id_ignores_an_id_the_prior_set_held() {
+        let before = SignerSetSnapshotV2 {
+            signers: vec![ed25519_entry(0, 0x10)],
+            threshold: None,
+        };
+        let replaced = SignerSetSnapshotV2 {
+            signers: vec![ed25519_entry(0, 0x22)],
+            threshold: None,
+        };
+        assert_eq!(
+            new_entry_id(
+                &before,
+                &replaced,
+                &SignerIdentityV2::Ed25519 { pubkey: [0x22; 32] },
+                &[]
+            ),
+            None
+        );
+    }
+
+    /// A budget refusal renders the behind read as history, and the capped
+    /// `sa.baseline_write_failed` reason keeps that read whole at the largest
+    /// ledgers, the budget clause after it.
+    #[test]
+    fn a_budget_refusal_keeps_the_behind_read_within_the_reason_cap() {
+        let behind = BehindRead {
+            read: "get_context_rule",
+            source_kind: "secondary",
+            latest_ledger: u32::MAX - 1,
+            floor: u32::MAX,
+        };
+        assert_eq!(
+            behind.to_string(),
+            "get_context_rule (secondary) was last seen at latestLedger 4294967294, below \
+             the confirmation ledger 4294967295"
+        );
+        let reason = baseline_observe_reason(&behind.refusal(
+            "the confirmation_recording budget of 600000 ms leaves no time for another read",
+        ));
+        // The premise: the full reason exceeds the cap, so the cap cuts it.
+        assert_eq!(
+            reason.len(),
+            crate::error::BASELINE_WRITE_REASON_MAX_BYTES,
+            "{reason}"
+        );
+        assert!(reason.ends_with("..."), "{reason}");
+        assert!(
+            reason.starts_with("sa.deployment_failed: ") && reason.contains(&behind.to_string()),
+            "{reason}"
         );
     }
 
@@ -6275,12 +7520,13 @@ pub(crate) mod tests {
     fn emit_signer_set_diverged_marks_degraded_and_warns_when_audit_writer_poisoned() {
         let (manager, _dir) = make_manager_with_poisoned_writer();
 
-        let signer_set = ObservedSignerSet {
-            signer_count: 1,
-            threshold: 1,
-            signer_ids: vec![0],
-            signer_pubkeys: vec![SignerPubkey::Ed25519 { pubkey: [0x22; 32] }],
-        };
+        let signer_set = SignerSetView::V2(SignerSetSnapshotV2 {
+            signers: vec![SignerEntryV2 {
+                id: 0,
+                identity: SignerIdentityV2::Ed25519 { pubkey: [0x22; 32] },
+            }],
+            threshold: None,
+        });
 
         let logs = stellar_agent_test_support::with_captured_logs(|| {
             manager.emit_signer_set_diverged(
@@ -6292,7 +7538,7 @@ pub(crate) mod tests {
             );
         });
         assert!(
-            logs.contains("audit-writer mutex poisoned; SaSignerSetDiverged row dropped"),
+            logs.contains("SaSignerSetDiverged row not written"),
             "missing poison warning: {logs}"
         );
         // Session-degraded warning text: pinned in core audit_log::health
@@ -6458,10 +7704,15 @@ pub(crate) mod tests {
         );
     }
 
-    // ── decode_signer_scval ───────────────────────────────────────────────────
+    // ── the version-1 projection ─────────────────────────────────────────────
+
+    /// Decodes `val` and projects it to its version-1 form.
+    fn decode_v1(val: &ScVal) -> Result<SignerPubkey, SignerDecodeError> {
+        decode_signer_scval_full(val).and_then(|signer| signer.to_signer_pubkey_v1())
+    }
 
     #[test]
-    fn decode_signer_scval_delegated_ed25519() {
+    fn to_signer_pubkey_v1_projects_a_delegated_ed25519_signer() {
         // Build a ScVal::Vec([Symbol("Delegated"), Address(Account(pubkey))]).
         use stellar_xdr::{AccountId, ScAddress, ScSymbol, ScVec, Uint256};
         let pubkey = [0x42u8; 32];
@@ -6472,7 +7723,7 @@ pub(crate) mod tests {
         let vec_val = ScVal::Vec(Some(ScVec(VecM::try_from(vec![sym, addr]).unwrap())));
 
         assert_eq!(
-            decode_signer_scval(&vec_val),
+            decode_v1(&vec_val),
             Ok(SignerPubkey::Ed25519 { pubkey }),
             "should decode Delegated signer"
         );
@@ -6491,45 +7742,109 @@ pub(crate) mod tests {
 
         assert_eq!(xdr, expected);
         assert_eq!(
-            decode_signer_scval(&val),
+            decode_v1(&val),
             Ok(SignerPubkey::Ed25519 { pubkey: [0; 32] })
         );
     }
 
     #[test]
-    fn decode_signer_scval_refuses_an_unknown_tag() {
+    fn to_signer_pubkey_v1_keeps_the_first_16_key_data_bytes_of_an_external_signer() {
+        let verifier = ScAddress::Contract(ContractId(Hash([0x31; 32])));
+        let long = build_external_signer_scval(verifier.clone(), &[0x7e; 40]).unwrap();
+        assert_eq!(
+            decode_v1(&long),
+            Ok(SignerPubkey::External {
+                verifier_contract: format!("{}", stellar_strkey::Contract([0x31; 32])),
+                key_data_first16: [0x7e; 16],
+            })
+        );
+        let short = build_external_signer_scval(verifier, &[0x5a; 3]).unwrap();
+        let mut padded = [0u8; 16];
+        padded[..3].copy_from_slice(&[0x5a; 3]);
+        assert_eq!(
+            decode_v1(&short),
+            Ok(SignerPubkey::External {
+                verifier_contract: format!("{}", stellar_strkey::Contract([0x31; 32])),
+                key_data_first16: padded,
+            })
+        );
+    }
+
+    #[test]
+    fn to_signer_pubkey_v1_refuses_a_delegated_contract_signer() {
+        use stellar_xdr::{ScSymbol, ScVec};
+        let val = ScVal::Vec(Some(ScVec(
+            VecM::try_from(vec![
+                ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap()),
+                ScVal::Address(ScAddress::Contract(ContractId(Hash([0x11; 32])))),
+            ])
+            .unwrap(),
+        )));
+        assert_eq!(
+            decode_v1(&val),
+            Err(SignerDecodeError::DelegatedAddressNotAnAccount)
+        );
+    }
+
+    #[test]
+    fn to_identity_v2_keeps_every_signer_in_full() {
+        use stellar_xdr::{AccountId, ScSymbol, ScVec};
+        let delegated = ScVal::Vec(Some(ScVec(
+            VecM::try_from(vec![
+                ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap()),
+                ScVal::Address(ScAddress::Account(AccountId(
+                    PublicKey::PublicKeyTypeEd25519(Uint256([0x42; 32])),
+                ))),
+            ])
+            .unwrap(),
+        )));
+        let contract = ScVal::Vec(Some(ScVec(
+            VecM::try_from(vec![
+                ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap()),
+                ScVal::Address(ScAddress::Contract(ContractId(Hash([0x11; 32])))),
+            ])
+            .unwrap(),
+        )));
+        let key_data = [0x7e; 40];
+        let external = build_external_signer_scval(
+            ScAddress::Contract(ContractId(Hash([0x31; 32]))),
+            &key_data,
+        )
+        .unwrap();
+
+        let identity = |val: &ScVal| decode_signer_scval_full(val).unwrap().to_identity_v2();
+        assert_eq!(
+            identity(&delegated),
+            SignerIdentityV2::Ed25519 { pubkey: [0x42; 32] }
+        );
+        assert_eq!(
+            identity(&contract),
+            SignerIdentityV2::DelegatedContract {
+                contract: [0x11; 32]
+            }
+        );
+        assert_eq!(
+            identity(&external),
+            SignerIdentityV2::External {
+                verifier: [0x31; 32],
+                key_data_sha256: Sha256::digest(key_data).into(),
+                key_data_len: 40,
+            }
+        );
+    }
+
+    #[test]
+    fn decode_signer_scval_full_refuses_an_unknown_tag() {
         use stellar_xdr::{AccountId, ScAddress, ScSymbol, ScVec, Uint256};
         let sym = ScVal::Symbol(ScSymbol::try_from("UnknownTag").unwrap());
         let addr = ScVal::Address(ScAddress::Account(AccountId(
             PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])),
         )));
         let vec_val = ScVal::Vec(Some(ScVec(VecM::try_from(vec![sym, addr]).unwrap())));
-        assert_eq!(
-            decode_signer_scval(&vec_val),
-            Err(SignerDecodeError::UnknownTag {
-                tag: "UnknownTag".to_owned()
-            })
-        );
-    }
-
-    // ── pubkeys_first8 ────────────────────────────────────────────────────────
-
-    #[test]
-    fn pubkeys_first8_returns_one_per_pubkey() {
-        let pks = vec![
-            SignerPubkey::Ed25519 {
-                pubkey: [0xabu8; 32],
-            },
-            SignerPubkey::WebAuthn {
-                credential_id_first16: [0xccu8; 16],
-            },
-        ];
-        let first8 = pubkeys_first8(&pks);
-        assert_eq!(first8.len(), 2, "must produce one entry per pubkey");
-        // Each is a non-empty hex string.
-        for s in &first8 {
-            assert!(!s.is_empty(), "first8 entry must not be empty");
-        }
+        assert!(matches!(
+            decode_signer_scval_full(&vec_val),
+            Err(SignerDecodeError::UnknownTag { tag }) if tag == "UnknownTag"
+        ));
     }
 
     // ── rule_mutex_acquire ────────────────────────────────────────────────────
@@ -6758,7 +8073,7 @@ pub(crate) mod tests {
     /// Asserts that `fetch_contract_wasm_hash` (the shared network primitive, also
     /// used by `fetch_observed_executable`) and
     /// `fetch_contract_wasm_hashes` (the multi-key batch primitive used by
-    /// `identify_threshold_policy`) extract an IDENTICAL 32-byte WASM hash from
+    /// `identify_spending_limit_policy`) extract an IDENTICAL 32-byte WASM hash from
     /// the SAME shared fixture bytes.
     ///
     /// Both parsers decode the same `LedgerEntryData` XDR blob produced by
@@ -7515,33 +8830,46 @@ pub(crate) mod tests {
                 // The key_data must be byte-exact (not truncated at this level).
                 assert_eq!(decoded_key, key_data, "decoded key_data must be byte-exact");
             }
-            DecodedOnChainSigner::Delegated { .. } => {
-                panic!("expected External variant, got Delegated")
+            DecodedOnChainSigner::Delegated { .. }
+            | DecodedOnChainSigner::DelegatedContract { .. } => {
+                panic!("expected External variant, got a delegated signer")
             }
         }
     }
 
-    /// `build_external_signer_scval` with empty `key_data` must succeed.
-    /// The OZ contract does not forbid zero-length key_data at encoding time.
+    /// `build_external_signer_scval` encodes empty `key_data` (the OZ contract
+    /// does not forbid it at encoding time), and the decoder refuses such a
+    /// signer, naming the empty key data: no verifier checks a signature
+    /// against no key, and a version-2 identity is never empty.
     #[test]
-    fn build_external_signer_scval_empty_key_data_succeeds() {
+    fn build_external_signer_scval_empty_key_data_encodes_and_the_decoder_refuses_it() {
         use stellar_xdr::{ContractId, Hash, ScAddress};
 
         let verifier_sc_addr = ScAddress::Contract(ContractId(Hash([0x33u8; 32])));
-        let result = build_external_signer_scval(verifier_sc_addr, &[]);
-        assert!(
-            result.is_ok(),
-            "build_external_signer_scval with empty key_data must succeed"
+        let encoded = build_external_signer_scval(verifier_sc_addr, &[])
+            .expect("build_external_signer_scval with empty key_data must succeed");
+        assert!(matches!(
+            decode_signer_scval_full(&encoded),
+            Err(SignerDecodeError::ExternalKeyDataEmpty)
+        ));
+    }
+
+    /// A rule holding an `External` signer with empty key data refuses the
+    /// whole rule with the per-index reason.
+    #[test]
+    fn decode_context_rule_scval_refuses_an_external_signer_with_empty_key_data() {
+        let empty =
+            build_external_signer_scval(ScAddress::Contract(ContractId(Hash([0x33u8; 32]))), &[])
+                .unwrap();
+        let val = rule_with_signer_lists(
+            vec![ScVal::U32(0), ScVal::U32(5)],
+            vec![delegated_signer(0xaa), empty],
         );
-        // Verify the decoded form has an empty key blob.
-        let Ok(decoded) = decode_signer_scval_full(&result.unwrap()) else {
-            panic!("an empty-key External ScVal must decode");
-        };
-        if let DecodedOnChainSigner::External { key_data, .. } = decoded {
-            assert!(key_data.is_empty(), "decoded key_data must be empty");
-        } else {
-            panic!("expected External variant");
-        }
+        assert_eq!(
+            refused_rule_reason(val),
+            "get_context_rule: signer at index 1 (id 5) is not a recognised Signer: \
+             External signer key data is empty"
+        );
     }
 
     // ── decode_signer_scval_full ──────────────────────────────────────────────
@@ -7620,20 +8948,28 @@ pub(crate) mod tests {
         );
     }
 
-    /// `decode_signer_scval_full` refuses a `Delegated` signer whose address is
-    /// a contract: `SignerPubkey` has no contract-address delegated form, so
-    /// the wallet cannot represent it.
+    /// `decode_signer_scval_full` decodes a `Delegated` signer whose address
+    /// is a contract as `DelegatedContract`, keeping the contract id and the
+    /// verbatim address.
     #[test]
-    fn decode_signer_scval_full_refuses_a_delegated_contract_address() {
+    fn decode_signer_scval_full_accepts_a_delegated_contract_address() {
         use stellar_xdr::{ContractId, Hash, ScAddress, ScSymbol, ScVec};
 
         let sym = ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap());
-        let addr = ScVal::Address(ScAddress::Contract(ContractId(Hash([0x11u8; 32]))));
+        let address = ScAddress::Contract(ContractId(Hash([0x11u8; 32])));
+        let addr = ScVal::Address(address.clone());
         let vec_val = ScVal::Vec(Some(ScVec(VecM::try_from(vec![sym, addr]).unwrap())));
-        assert_eq!(
-            decode_signer_scval_full(&vec_val).err(),
-            Some(SignerDecodeError::DelegatedAddressNotAnAccount)
-        );
+        match decode_signer_scval_full(&vec_val) {
+            Ok(DecodedOnChainSigner::DelegatedContract {
+                contract,
+                signer_address,
+            }) => {
+                assert_eq!(contract, [0x11u8; 32]);
+                assert_eq!(signer_address, address);
+            }
+            Ok(_) => panic!("a contract delegate must decode as DelegatedContract"),
+            Err(e) => panic!("a contract delegate must decode: {e}"),
+        }
     }
 
     /// `decode_signer_scval_full` refuses an `External` signer whose third
@@ -7733,6 +9069,10 @@ pub(crate) mod tests {
             (
                 SignerDecodeError::ExternalKeyDataNotBytes { variant: "Void" },
                 "External key data is not Bytes: Void",
+            ),
+            (
+                SignerDecodeError::ExternalKeyDataEmpty,
+                "External signer key data is empty",
             ),
         ];
         for (err, expected) in cases {
@@ -7942,10 +9282,10 @@ pub(crate) mod tests {
         ))
         .expect("equal lists of decodable signers must decode");
         assert_eq!(
-            rule.signers,
+            rule.identities(),
             vec![
-                (4, SignerPubkey::Ed25519 { pubkey: [0xaa; 32] }),
-                (9, SignerPubkey::Ed25519 { pubkey: [0xbb; 32] }),
+                (4, SignerIdentityV2::Ed25519 { pubkey: [0xaa; 32] }),
+                (9, SignerIdentityV2::Ed25519 { pubkey: [0xbb; 32] }),
             ]
         );
 
@@ -8039,10 +9379,11 @@ pub(crate) mod tests {
         assert!(rule.signers.is_empty());
     }
 
-    /// A `Delegated` signer whose address is a contract refuses the rule:
-    /// `SignerPubkey` has no form for it.
+    /// A `Delegated` signer whose address is a contract decodes in version 2,
+    /// and its version-1 projection, which a version-1 comparison needs,
+    /// refuses with the per-index reason.
     #[test]
-    fn decode_context_rule_scval_refuses_a_delegated_contract_address() {
+    fn decode_context_rule_scval_reads_a_delegated_contract_address_in_version_2_only() {
         use stellar_xdr::{ContractId, Hash, ScAddress, ScVec};
 
         let delegated_contract = ScVal::Vec(Some(ScVec(
@@ -8057,11 +9398,56 @@ pub(crate) mod tests {
             vec![ScVal::U32(3), ScVal::U32(8)],
             vec![delegated_signer(0xaa), delegated_contract],
         );
+        let rule = decode_context_rule_scval(val).expect("a contract delegate decodes");
         assert_eq!(
-            refused_rule_reason(val),
-            "get_context_rule: signer at index 1 (id 8) is not a recognised Signer: \
-             Delegated signer address is not an account address"
+            rule.identities(),
+            vec![
+                (3, SignerIdentityV2::Ed25519 { pubkey: [0xaa; 32] }),
+                (
+                    8,
+                    SignerIdentityV2::DelegatedContract {
+                        contract: [0x55; 32]
+                    }
+                ),
+            ]
         );
+
+        let mut observation = test_observation(SignerSetSnapshotV2 {
+            signers: rule
+                .identities()
+                .into_iter()
+                .map(|(id, identity)| SignerEntryV2 { id, identity })
+                .collect(),
+            threshold: Some(ThresholdObservation {
+                policy: [0x66; 32],
+                threshold: 1,
+            }),
+        });
+        observation.v1_signers = rule
+            .signers
+            .iter()
+            .enumerate()
+            .map(|(index, (id, signer))| {
+                signer
+                    .to_signer_pubkey_v1()
+                    .map(|pubkey| (*id, pubkey))
+                    .map_err(|e| (index, *id, e))
+            })
+            .collect();
+        match project_v1(&observation) {
+            Err(SaError::DeploymentFailed {
+                phase,
+                redacted_reason,
+            }) => {
+                assert_eq!(phase, "simulate");
+                assert_eq!(
+                    redacted_reason,
+                    "get_context_rule: signer at index 1 (id 8) is not a recognised Signer: \
+                     Delegated signer address is not an account address"
+                );
+            }
+            other => panic!("the version-1 projection must refuse: {other:?}"),
+        }
     }
 
     /// An unknown tag renders through `untrusted_display_bounded`: a 32-byte
@@ -8096,29 +9482,33 @@ pub(crate) mod tests {
         );
     }
 
-    // ── signer_pubkey_type_label ──────────────────────────────────────────────
+    // ── identity_kind_label ───────────────────────────────────────────────────
 
-    /// `signer_pubkey_type_label` must return distinct discriminant strings for
-    /// each `SignerPubkey` variant used in production.
+    /// `identity_kind_label` returns a distinct label for each version-2
+    /// identity kind; a passkey signer is an `External` identity.
     ///
     /// The labels are embedded in `ThresholdUnreachable::requested_op::AddSigner::signer_type`
     /// error messages visible to operators; they must be stable.
     #[test]
-    fn signer_pubkey_type_label_returns_correct_labels() {
-        let ed25519 = SignerPubkey::Ed25519 { pubkey: [0u8; 32] };
-        assert_eq!(signer_pubkey_type_label(&ed25519), "ed25519");
-
-        let external = SignerPubkey::External {
-            verifier_contract: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                .to_owned(),
-            key_data_first16: [0u8; 16],
-        };
-        assert_eq!(signer_pubkey_type_label(&external), "external");
-
-        let webauthn = SignerPubkey::WebAuthn {
-            credential_id_first16: [0u8; 16],
-        };
-        assert_eq!(signer_pubkey_type_label(&webauthn), "webauthn");
+    fn identity_kind_label_returns_correct_labels() {
+        assert_eq!(
+            identity_kind_label(&SignerIdentityV2::Ed25519 { pubkey: [0u8; 32] }),
+            "ed25519"
+        );
+        assert_eq!(
+            identity_kind_label(&SignerIdentityV2::External {
+                verifier: [0u8; 32],
+                key_data_sha256: [0u8; 32],
+                key_data_len: 97,
+            }),
+            "external"
+        );
+        assert_eq!(
+            identity_kind_label(&SignerIdentityV2::DelegatedContract {
+                contract: [0u8; 32]
+            }),
+            "delegated_contract"
+        );
     }
 
     // ── SignersManagerConfig::new ─────────────────────────────────────────────
@@ -8275,43 +9665,6 @@ pub(crate) mod tests {
         let third_client = stellar_agent_network::StellarRpcClient::new("http://127.0.0.1:3")
             .expect("third client must construct");
         assert_eq!(manager.rpc_source_kind(&third_client), "rpc");
-    }
-
-    // ── pubkey_first8 ─────────────────────────────────────────────────────────
-
-    /// `pubkey_first8` must return a non-empty hex string for a `WebAuthn`
-    /// pubkey.  The WebAuthn canonical body is `0x03 ‖ credential_id_first16`
-    /// (17 bytes); the first 8 bytes rendered as hex must be 16 hex characters.
-    #[test]
-    fn pubkey_first8_webauthn_produces_16_hex_chars() {
-        let pk = SignerPubkey::WebAuthn {
-            credential_id_first16: [0xddu8; 16],
-        };
-        let result = pubkey_first8(&pk);
-        // The tag byte is 0x03 and the first 7 bytes of credential_id are 0xdd.
-        // Expected first 8 hex chars: "03dddddddddddddd".
-        assert_eq!(
-            result, "03dddddddddddddd",
-            "WebAuthn pubkey_first8 must be tag+7_bytes: got {result}"
-        );
-    }
-
-    /// `pubkey_first8` for an `Ed25519` key must be exactly the first 8 bytes
-    /// rendered as hex (16 hex characters), preceded by the 0x01 type tag.
-    ///
-    /// The canonical body for `Ed25519` is `0x01 ‖ pubkey[32]` (33 bytes);
-    /// the first 8 bytes rendered as hex: `"01" + first_7_pubkey_bytes`.
-    #[test]
-    fn pubkey_first8_ed25519_produces_correct_prefix() {
-        let pk = SignerPubkey::Ed25519 {
-            pubkey: [0xabu8; 32],
-        };
-        let result = pubkey_first8(&pk);
-        // Tag=0x01, then 7 bytes of 0xab.
-        assert_eq!(
-            result, "01ababababababab",
-            "Ed25519 pubkey_first8 must be tag+7_pubkey_bytes: got {result}"
-        );
     }
 
     // ── fetch_contract_wasm_hashes: empty keys path ───────────────────────────

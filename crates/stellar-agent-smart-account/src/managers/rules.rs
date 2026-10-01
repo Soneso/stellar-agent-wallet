@@ -596,10 +596,11 @@ impl ContextRuleManager {
         };
 
         // `auth_rule_ids` is capped at 50 by the caller, but each entry costs
-        // ~2 RPC round-trips (`identify_threshold_policy` + the parallel
-        // primary/secondary `fetch_signer_set`), each individually bounded at
-        // 60s by the transport — with no shared deadline the whole loop could
-        // cost up to 50 x 2 x 60s. Reuses `self.timeout` (the manager's
+        // several RPC round-trips (the two-endpoint rule reads, one executable
+        // read per policy and the two-endpoint threshold read of the signer-set
+        // observation), each individually bounded at 60s by the transport;
+        // with no shared deadline the whole loop could cost a multiple of
+        // 50 x 60s. Reuses `self.timeout` (the manager's
         // configured RPC timeout — the flow's existing caller-facing budget),
         // mirroring `list_active_context_rules`'s `scan_budget` above.
         let divergence_budget =
@@ -3131,9 +3132,8 @@ pub enum ContextRuleSignerInput {
     /// from the signer's G-strkey.
     Delegated {
         /// Signer address: a G-strkey account, `ScAddress::Account(...)`
-        /// derived from the signer's G-strkey. The wallet has no
-        /// representation for a contract-address delegated signer and
-        /// refuses to read a rule holding one.
+        /// derived from the signer's G-strkey. Rule creation through the
+        /// wallet accepts an account address only.
         address: ScAddress,
     },
     /// An external signer with custom verification (e.g. WebAuthn-via-verifier).
@@ -3763,9 +3763,8 @@ pub fn compute_context_rule_proposal_sha256(
 /// the digest for [`stellar_agent_core::approval::PendingApprovalStore::verify_rule_proposal_gate`]
 /// and so [`ContextRuleManager::install_rule`] can be called with it.
 ///
-/// A `Delegated` signer's `address` must be a G-strkey: the wallet reads a
-/// rule's signer set in full and has no representation for a
-/// contract-address delegated signer, so a C-strkey is refused.
+/// A `Delegated` signer's `address` must be a G-strkey; a C-strkey is
+/// refused.
 ///
 /// # Errors
 ///
@@ -5127,7 +5126,6 @@ pub(crate) fn sa_error_to_invocation_result(
         | SaError::RuleIdMismatch { .. }
         | SaError::SimulationDivergence { .. }
         | SaError::ThresholdUnreachable { .. }
-        | SaError::SignerSetDiverged { .. }
         | SaError::ContextRuleCapsExceeded { .. }
         | SaError::RuleExpired { .. }
         | SaError::ScAddressEncodingFailed { .. }
@@ -5156,6 +5154,7 @@ pub(crate) fn sa_error_to_invocation_result(
         // All fire before any chain submission attempt.
         | SaError::ThresholdPolicyNotInstalled { .. }
         | SaError::SignerSetMissingBaseline { .. }
+        | SaError::SignerSetBaselineLegacy { .. }
         | SaError::SignersManagerNotConfigured { .. }
         | SaError::ThresholdPolicyIdentificationFailed { .. }
         | SaError::ThresholdReadFailed { .. }
@@ -5223,6 +5222,20 @@ pub(crate) fn sa_error_to_invocation_result(
                 SaInvocationResult::PostSubmitVerificationFailed
             }
             _ => SaInvocationResult::PreSubmissionRefused,
+        },
+        // SignerSetDiverged: without a transaction hash the comparison refused
+        // before anything was sent; with one, the set observed after a
+        // confirmed signer mutation is not the intended change.
+        SaError::SignerSetDiverged { tx_hash, .. } => match tx_hash {
+            None => SaInvocationResult::PreSubmissionRefused,
+            Some(_) => SaInvocationResult::PostSubmitVerificationFailed,
+        },
+        // BaselineWriteFailed: with a transaction hash a signer mutation
+        // confirmed and its resulting state was not recorded; without one a
+        // read-only verb sent nothing.
+        SaError::BaselineWriteFailed { tx_hash, .. } => match tx_hash {
+            None => SaInvocationResult::PreSubmissionRefused,
+            Some(_) => SaInvocationResult::PostSubmitVerificationFailed,
         },
         // PolicyDenied: the wallet's own refusal, decided before the send.
         SaError::PolicyDenied { .. } => SaInvocationResult::PreSubmissionRefused,
@@ -6300,6 +6313,84 @@ mod tests {
                 SaInvocationResult::PreSubmissionRefused
             ));
         }
+    }
+
+    #[test]
+    fn sa_error_to_invocation_result_classifies_signer_set_diverged_by_its_transaction() {
+        use stellar_agent_core::audit_log::schema::SaInvocationResult;
+        use stellar_agent_core::audit_log::signer_set::{SignerSetSnapshotV2, SignerSetView};
+
+        let diverged = |tx_hash: Option<String>| SaError::SignerSetDiverged {
+            rule_id: 1,
+            expected: SignerSetView::V2(SignerSetSnapshotV2 {
+                signers: vec![],
+                threshold: None,
+            }),
+            observed: SignerSetView::V2(SignerSetSnapshotV2 {
+                signers: vec![],
+                threshold: None,
+            }),
+            tx_hash,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            request_id: "req".to_owned(),
+        };
+        assert!(
+            matches!(
+                sa_error_to_invocation_result(&diverged(None)),
+                SaInvocationResult::PreSubmissionRefused
+            ),
+            "a comparison refusal sent nothing"
+        );
+        assert!(
+            matches!(
+                sa_error_to_invocation_result(&diverged(Some("ab".repeat(32)))),
+                SaInvocationResult::PostSubmitVerificationFailed
+            ),
+            "a confirmed transaction whose result is not the intended change"
+        );
+    }
+
+    #[test]
+    fn sa_error_to_invocation_result_classifies_a_legacy_baseline_as_refused() {
+        use stellar_agent_core::audit_log::schema::SaInvocationResult;
+
+        let legacy = SaError::SignerSetBaselineLegacy {
+            rule_id: 1,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            request_id: "req".to_owned(),
+        };
+        assert!(matches!(
+            sa_error_to_invocation_result(&legacy),
+            SaInvocationResult::PreSubmissionRefused
+        ));
+    }
+
+    #[test]
+    fn sa_error_to_invocation_result_classifies_baseline_write_failed_by_its_transaction() {
+        use stellar_agent_core::audit_log::schema::SaInvocationResult;
+
+        let write_failed = |tx_hash: Option<String>| SaError::BaselineWriteFailed {
+            rule_id: 1,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            tx_hash,
+            stage: crate::error::BASELINE_WRITE_STAGE_WRITE,
+            reason: "audit writer poisoned".to_owned(),
+            request_id: "req".to_owned(),
+        };
+        assert!(
+            matches!(
+                sa_error_to_invocation_result(&write_failed(None)),
+                SaInvocationResult::PreSubmissionRefused
+            ),
+            "a list or refresh whose baseline row was not written sent nothing"
+        );
+        assert!(
+            matches!(
+                sa_error_to_invocation_result(&write_failed(Some("cd".repeat(32)))),
+                SaInvocationResult::PostSubmitVerificationFailed
+            ),
+            "a confirmed signer mutation whose state row was not written"
+        );
     }
 
     // ── Timelock failure_reason classifier ───────────────────────────────────

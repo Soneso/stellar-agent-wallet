@@ -332,10 +332,10 @@ Every verb's exact flags, the mainnet-refusal matrix, signer-kind discriminators
 | `rules list` / `list-rules` | Enumerate active rules by on-chain scan (read-only, mainnet OK) |
 | `rules get-spending-limit` | Read an installed spending-limit policy's rolling-window budget (read-only; amounts are decimal strings) |
 | `rules set-spending-limit` | Retune a spending-limit cap without resetting history. `--auth-rule-id` default 0: the retuned CallContract rule cannot authorize its own retune — name an admin-capable rule. Period is immutable |
-| `signers list` | Read the on-chain signer set; baselines if none |
-| `signers refresh` | Re-anchor the signer-set baseline |
+| `signers list` | Read the on-chain signer set; baselines if none, otherwise reports `baseline` (`matched`, `diverged`, `not_comparable`) |
+| `signers refresh` | Compare with the signer-set baseline and re-anchor it; a changed set needs `--accept-divergence` |
 | `signers add` | Add one signer (cap 15). `--signer-ed25519` is the recommended agent-key shape. On a pinned rule, writes `SaContextRulePinsUpdated` for an External signer; `--accept-mutable-verifier` / `--accept-unknown-verifier` apply to a new verifier |
-| `signers remove` | Remove a signer; refuses if it would drop below threshold |
+| `signers remove` | Remove a signer; refuses if it would drop below threshold, and on a rule whose policies include no simple-threshold policy (`sa.threshold_policy_identification_failed`) |
 | `signers set-threshold` | Change a simple-threshold policy's threshold (authorizer is `--rule-id`) |
 | `signers set-weighted-threshold` | Change a weighted-threshold policy's threshold (use an admin `--auth-rule-id` when `--rule-id` is scoped) |
 | `signers set-signer-weight` | Change one signer's weight in a weighted-threshold policy |

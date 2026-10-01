@@ -56,11 +56,10 @@ async fn stale_primary_current_secondary_returns_rpc_divergence() {
     let sim_cr_2 = build_simulate_response(&cr_2of2);
     let sim_th_2 = build_simulate_response(&th_2);
 
-    // Primary server: serves stale 1-of-1.
-    // Primary receives:
-    //   1. identify_threshold_policy: get_context_rule (primary only)
-    //   2. fetch_signer_set(primary): get_context_rule
-    //   3. fetch_signer_set(primary): get_threshold
+    // Primary server: serves stale 1-of-1; secondary serves current 2-of-2.
+    // Each receives the signer-set observation's simulate sequence:
+    //   1. get_context_rule
+    //   2. get_threshold (after the policy's instance read)
     let primary_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
@@ -68,16 +67,11 @@ async fn stale_primary_current_secondary_returns_rpc_divergence() {
             SOURCE_G,
             &policy,
             KNOWN_WASM_HASH,
-            SequencedSimulate::new(vec![sim_cr_1.clone(), sim_cr_1.clone(), sim_th_1.clone()]),
+            SequencedSimulate::new(vec![sim_cr_1.clone(), sim_th_1.clone()]),
         ))
         .mount(&primary_server)
         .await;
 
-    // Secondary server: serves current 2-of-2.
-    // Secondary receives:
-    //   1. fetch_contract_wasm_hashes secondary: getLedgerEntries (contract instance)
-    //   2. fetch_signer_set(secondary): get_context_rule
-    //   3. fetch_signer_set(secondary): get_threshold
     let secondary_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))

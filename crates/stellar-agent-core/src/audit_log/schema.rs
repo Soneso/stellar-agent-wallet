@@ -1187,16 +1187,30 @@ pub enum EventKind {
 
     /// A signer-set divergence was detected.
     ///
-    /// Emitted by `SignersManager::verify_signer_set_against_chain` when the
-    /// on-chain signer set does not match the audit-log baseline.
+    /// Written by the signers manager when the on-chain signer set does not
+    /// match the audit-log state it was compared with. The comparison runs
+    /// before a signer mutation, a rule write verb or a passkey signature,
+    /// and in `signers refresh`. A row is also written when the state
+    /// confirmed after a signer mutation is not the intended change.
+    ///
+    /// # Versions
+    ///
+    /// Both sides of one row are in the same snapshot version.
+    /// `snapshot_version` is absent for a version-1 comparison and `2` for a
+    /// version-2 comparison. A threshold is absent when that side observed
+    /// no simple-threshold policy, which only a version-2 snapshot records.
+    /// A row with both thresholds present and no `snapshot_version`
+    /// re-serializes byte-identically to the version-1 row shape.
     ///
     /// # Digest fields
     ///
     /// `expected_signer_set_digest` and `observed_signer_set_digest` carry
     /// first-8-last-8 hex representations of the domain-tagged SHA-256 of the
-    /// respective signer sets (computed by
-    /// `signer_set::compute_signer_set_digest`). The 19-char format matches the
-    /// `wasm_hash_prefix` / `tx_hash_redacted` discipline.
+    /// respective signer sets, computed by
+    /// `signer_set::compute_signer_set_digest` for version 1 and
+    /// `signer_set::compute_signer_set_digest_v2` for version 2, or
+    /// `compute_error` for a set whose digest cannot be computed. The 19-char
+    /// format matches the `wasm_hash_prefix` / `tx_hash_redacted` discipline.
     ///
     /// # Redaction
     ///
@@ -1216,16 +1230,24 @@ pub enum EventKind {
         expected_signer_count: u32,
         /// Signer count observed on-chain.
         observed_signer_count: u32,
-        /// Threshold from the audit-log baseline.
-        expected_threshold: u32,
-        /// Threshold observed on-chain.
-        observed_threshold: u32,
+        /// Threshold of the expected set; absent when that set records no
+        /// simple-threshold policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_threshold: Option<u32>,
+        /// Threshold observed on-chain; absent when no simple-threshold
+        /// policy was observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_threshold: Option<u32>,
         /// First-8-last-8 hex of the domain-tagged SHA-256 of the expected
-        /// signer set (`(signer_ids, signer_pubkeys, threshold)`).
+        /// signer set.
         expected_signer_set_digest: String,
         /// First-8-last-8 hex of the domain-tagged SHA-256 of the observed
         /// signer set.
         observed_signer_set_digest: String,
+        /// Snapshot version of both sides: absent for version 1, `2` for
+        /// version 2.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot_version: Option<u8>,
     },
 
     /// The signer-set baseline was recorded for a context rule.
@@ -3755,10 +3777,11 @@ mod tests {
             smart_account_redacted: RedactedStrkey::from_already_redacted("CDABC...22222"),
             expected_signer_count: 3,
             observed_signer_count: 2,
-            expected_threshold: 3,
-            observed_threshold: 3,
+            expected_threshold: Some(3),
+            observed_threshold: Some(3),
             expected_signer_set_digest: "abcdef12...90abcdef".to_owned(),
             observed_signer_set_digest: "12345678...fedcba90".to_owned(),
+            snapshot_version: None,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();

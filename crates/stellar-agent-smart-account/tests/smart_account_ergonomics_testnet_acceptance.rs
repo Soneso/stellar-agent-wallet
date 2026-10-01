@@ -155,6 +155,7 @@ use stellar_agent_smart_account::managers::signers::{SignersManager, SignersMana
 use stellar_agent_smart_account::managers::signers::{
     build_delegated_signer_scval, build_external_signer_scval,
 };
+use stellar_agent_smart_account::signers::SignerSetView;
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_agent_smart_account::submit::{PinCheck, SubmitInvokeArgs, submit_signed_invoke};
 use stellar_agent_smart_account::verifiers::VerifierRegistry;
@@ -1293,14 +1294,17 @@ async fn deploy_c_external_ed25519_genesis_testnet_acceptance() {
         1,
         "bootstrap rule must carry exactly the External genesis signer at deploy time"
     );
-    match &genesis_signers[0].1 {
-        stellar_agent_core::audit_log::signer_set::SignerPubkey::External {
-            verifier_contract,
-            ..
+    let deployed_verifier =
+        stellar_strkey::Contract::from_string(&verifier_result.verifier_address)
+            .expect("deployed ed25519 verifier C-strkey must parse")
+            .0;
+    match &genesis_signers[0].identity {
+        stellar_agent_core::audit_log::signer_set::SignerIdentityV2::External {
+            verifier, ..
         } => {
             assert_eq!(
-                verifier_contract, &verifier_result.verifier_address,
-                "genesis signer's verifier_contract must match the deployed ed25519 verifier"
+                verifier, &deployed_verifier,
+                "genesis signer's verifier must match the deployed ed25519 verifier"
             );
         }
         other => panic!("expected an External genesis signer; got {other:?}"),
@@ -1356,12 +1360,13 @@ async fn deploy_c_external_ed25519_genesis_testnet_acceptance() {
     // `add_signer` requires an established audit-log baseline
     // (`SaError::SignerSetMissingBaseline` otherwise); a freshly-installed
     // rule has none until `refresh_signer_baseline` writes the first
-    // `SaSignerSetBaselined` row.
+    // `SaSignerSetBaselinedV2` row.
     signers_mgr
         .refresh_signer_baseline(
             fallback_smart_account_sc.clone(),
             rule_id,
             Some(&admin_g),
+            false,
             rid(),
         )
         .await
@@ -1370,16 +1375,11 @@ async fn deploy_c_external_ed25519_genesis_testnet_acceptance() {
     let (fallback_g, _fallback_signer) = fresh_signer();
     let fallback_scval =
         build_delegated_signer_scval(&fallback_g).expect("fallback signer ScVal must encode");
-    let fallback_pubkey = stellar_strkey::ed25519::PublicKey::from_string(&fallback_g)
-        .expect("fallback G-strkey must parse");
     let new_signer_id = signers_mgr
         .add_signer(
             fallback_smart_account_sc.clone(),
             rule_id,
             fallback_scval,
-            stellar_agent_core::audit_log::signer_set::SignerPubkey::Ed25519 {
-                pubkey: fallback_pubkey.0,
-            },
             admin_signer.as_ref(),
             rid(),
             false, // accept_mutable_verifier
@@ -1474,26 +1474,33 @@ async fn batch_add_delegated_signers_testnet_acceptance() {
     // signer is observed is checked. The actual id is read back and used
     // below for the post-batch ground-truth cross-check.
     let baseline = signers_mgr
-        .refresh_signer_baseline(smart_account_sc.clone(), rule_id, Some(&admin_g), rid())
+        .refresh_signer_baseline(
+            smart_account_sc.clone(),
+            rule_id,
+            Some(&admin_g),
+            false,
+            rid(),
+        )
         .await
         .expect("refresh_signer_baseline must succeed");
+    let SignerSetView::V2(baseline_snapshot) = &baseline.view else {
+        panic!(
+            "refresh records a version-2 baseline; got {}",
+            baseline.view
+        )
+    };
     assert_eq!(
-        baseline.signer_ids.len(),
+        baseline_snapshot.signers.len(),
         1,
         "exactly one signer (the genesis participant) must be observed pre-batch"
     );
-    let pre_batch_signer_id = baseline.signer_ids[0];
+    let pre_batch_signer_id = baseline_snapshot.signers[0].id;
 
     let mut batch_signers = Vec::with_capacity(3);
     for _ in 0..3 {
         let (g, _signer) = fresh_signer();
-        let scval = build_delegated_signer_scval(&g).expect("delegated signer ScVal must encode");
-        let pubkey =
-            stellar_strkey::ed25519::PublicKey::from_string(&g).expect("G-strkey must parse");
-        batch_signers.push((
-            scval,
-            stellar_agent_core::audit_log::signer_set::SignerPubkey::Ed25519 { pubkey: pubkey.0 },
-        ));
+        batch_signers
+            .push(build_delegated_signer_scval(&g).expect("delegated signer ScVal must encode"));
     }
 
     let new_signer_ids = signers_mgr
@@ -1514,14 +1521,14 @@ async fn batch_add_delegated_signers_testnet_acceptance() {
         "three new signer ids must be assigned"
     );
 
-    // Cross-check the `rev().take(n).rev()` extraction against ground truth:
-    // the returned IDs, plus the pre-batch signer's id, must equal the
-    // COMPLETE post-batch on-chain signer-id set from a separate read.
+    // Cross-check the returned ids against ground truth: the returned IDs,
+    // plus the pre-batch signer's id, must equal the COMPLETE post-batch
+    // on-chain signer-id set from a separate read.
     let post_batch_signers = signers_mgr
         .get_rule_signers(smart_account_sc, rule_id, None)
         .await
         .expect("get_rule_signers after the batch-add must succeed");
-    let mut observed_ids: Vec<u32> = post_batch_signers.iter().map(|(id, _)| *id).collect();
+    let mut observed_ids: Vec<u32> = post_batch_signers.iter().map(|entry| entry.id).collect();
     observed_ids.sort_unstable();
     let mut expected_ids = new_signer_ids.clone();
     expected_ids.push(pre_batch_signer_id);
@@ -1532,13 +1539,13 @@ async fn batch_add_delegated_signers_testnet_acceptance() {
          signer-id set"
     );
 
-    // One SaSignerAdded audit row per new signer, each naming one of the
+    // One SaSignerAddedV2 audit row per new signer, each naming one of the
     // returned IDs.
     let entries = read_audit_entries(&audit_log_path);
     let signer_added_ids: Vec<u32> = entries
         .iter()
         .filter_map(|e| match &e.event_kind {
-            EventKind::SaSignerAdded {
+            EventKind::SaSignerAddedV2 {
                 rule_id: entry_rule_id,
                 signer_id,
                 ..
@@ -1552,7 +1559,7 @@ async fn batch_add_delegated_signers_testnet_acceptance() {
     sorted_new_signer_ids.sort_unstable();
     assert_eq!(
         sorted_signer_added_ids, sorted_new_signer_ids,
-        "exactly one SaSignerAdded row per new signer, naming the returned IDs; \
+        "exactly one SaSignerAddedV2 row per new signer, naming the returned IDs; \
          entries: {entries:?}"
     );
 }
@@ -1563,10 +1570,11 @@ async fn batch_add_delegated_signers_testnet_acceptance() {
 
 /// `set_signer_weight` / `set_weighted_threshold` against a rule with NO
 /// weighted-threshold policy fail with `WeightedThresholdNotInstalled`.
-/// `batch_add_signers` against a rule whose ONLY threshold policy is
-/// weighted-threshold fails closed with a typed pre-submission refusal and NO
-/// on-chain side effect — the exact hardening item (b) constraint this Block
-/// documents on `SignersManager::batch_add_signers`.
+/// On a rule whose ONLY threshold policy is weighted-threshold, `signers
+/// refresh` records a baseline with no threshold, and `remove_signer` fails
+/// closed with `ThresholdPolicyIdentificationFailed` before submission and
+/// with NO on-chain side effect: the weighted policy decides which signers
+/// suffice, so the wallet cannot check a removal.
 #[tokio::test]
 async fn weighted_threshold_negatives_testnet_acceptance() {
     let tmp = tempfile::tempdir().expect("tempdir must be created");
@@ -1624,7 +1632,7 @@ async fn weighted_threshold_negatives_testnet_acceptance() {
         "expected WeightedThresholdNotInstalled; got {set_weight_err:?}"
     );
 
-    // ── batch_add_signers against a rule whose ONLY policy is weighted ───────
+    // ── a rule whose ONLY policy is weighted ─────────────────────────────────
     use stellar_agent_smart_account::deployment::{PolicyDeployArgs, PolicyDeployKind};
     let (policy_deployer_g, policy_deployer) = fresh_deployer_keypair();
     fund_via_friendbot(&policy_deployer_g).await;
@@ -1690,81 +1698,64 @@ async fn weighted_threshold_negatives_testnet_acceptance() {
         .expect("weighted-only rule install must succeed");
     let weighted_only_rule_id = install_out.rule_id;
 
-    // `refresh_signer_baseline` is the FIRST call that would establish an
-    // audit-log baseline for this freshly-installed rule; it identifies the
-    // threshold policy via `identify_threshold_policy` (simple-threshold
-    // only) internally. On a rule whose ONLY threshold policy is
-    // weighted-threshold, this is where hardening item (b)'s constraint
-    // surfaces directly: a clear typed error, before any on-chain call.
-    let baseline_err = signers_mgr
+    // The weighted policy is not a simple-threshold policy, so the rule
+    // observes no threshold and the baseline records none.
+    let baseline = signers_mgr
         .refresh_signer_baseline(
             smart_account_sc.clone(),
             weighted_only_rule_id,
             Some(&bootstrap_g),
+            false,
             rid(),
         )
         .await
-        .expect_err(
-            "refresh_signer_baseline against a rule whose ONLY threshold policy is weighted \
-             must fail closed",
-        );
-    assert!(
-        matches!(
-            baseline_err,
-            SaError::ThresholdPolicyNotInstalled { .. }
-                | SaError::ThresholdPolicyIdentificationFailed { .. }
-        ),
-        "expected ThresholdPolicyNotInstalled or ThresholdPolicyIdentificationFailed; \
-         got {baseline_err:?}"
+        .expect("refresh_signer_baseline on a weighted-only rule must succeed");
+    let SignerSetView::V2(baseline_snapshot) = &baseline.view else {
+        panic!(
+            "refresh records a version-2 baseline; got {}",
+            baseline.view
+        )
+    };
+    assert_eq!(
+        baseline_snapshot.threshold, None,
+        "a weighted-only rule observes no simple threshold"
     );
+    let genesis_signer_id = baseline_snapshot.signers[0].id;
 
-    let (new_signer_g, _new_signer) = fresh_signer();
-    let new_signer_scval =
-        build_delegated_signer_scval(&new_signer_g).expect("new signer ScVal must encode");
-    let new_signer_pubkey = stellar_strkey::ed25519::PublicKey::from_string(&new_signer_g)
-        .expect("new signer G-strkey must parse");
-
-    // With no baseline ever established (the call above failed before writing
-    // one), `batch_add_signers` itself refuses at its OWN first pre-flight
-    // check — `SignerSetMissingBaseline` — before it ever reaches
-    // `identify_threshold_policy`. Either refusal leaves no on-chain side
-    // effect; both are exercised here because a caller could reach either one
-    // depending on whether a baseline happens to already exist.
-    let batch_add_err = signers_mgr
-        .batch_add_signers(
+    // A removal on a rule whose policies include no simple-threshold policy
+    // refuses before submission: the weighted policy decides which signers
+    // suffice, and the wallet cannot check that the removal leaves its
+    // threshold reachable.
+    let remove_err = signers_mgr
+        .remove_signer(
             smart_account_sc.clone(),
             weighted_only_rule_id,
-            vec![(
-                new_signer_scval,
-                stellar_agent_core::audit_log::signer_set::SignerPubkey::Ed25519 {
-                    pubkey: new_signer_pubkey.0,
-                },
-            )],
+            genesis_signer_id,
             bootstrap_signer.as_ref(),
             rid(),
-            false, // accept_mutable_verifier
-            false, // accept_unknown_verifier
         )
         .await
         .expect_err(
-            "batch_add_signers against a rule whose ONLY threshold policy is weighted \
+            "remove_signer against a rule whose ONLY threshold policy is weighted \
              must fail closed before any on-chain submission",
         );
     assert!(
-        matches!(batch_add_err, SaError::SignerSetMissingBaseline { .. }),
-        "expected SignerSetMissingBaseline (no baseline was ever established above); \
-         got {batch_add_err:?}"
+        matches!(
+            remove_err,
+            SaError::ThresholdPolicyIdentificationFailed { .. }
+        ),
+        "expected ThresholdPolicyIdentificationFailed; got {remove_err:?}"
     );
 
     // Confirm no on-chain side effect: the rule's signer set is unchanged.
-    let signers_after_failed_batch = signers_mgr
+    let signers_after_refused_removal = signers_mgr
         .get_rule_signers(smart_account_sc, weighted_only_rule_id, None)
         .await
-        .expect("get_rule_signers must succeed after the failed batch-add");
+        .expect("get_rule_signers must succeed after the refused removal");
     assert_eq!(
-        signers_after_failed_batch.len(),
+        signers_after_refused_removal.len(),
         1,
-        "the weighted-only rule's signer set must be unchanged after the refused batch-add"
+        "the weighted-only rule's signer set must be unchanged after the refused removal"
     );
 }
 
@@ -2105,14 +2096,17 @@ async fn deploy_c_webauthn_genesis_and_batch_add_testnet_acceptance() {
         1,
         "WebAuthn-genesis bootstrap rule must carry exactly the sole WebAuthn signer"
     );
-    match &genesis_signers[0].1 {
-        stellar_agent_core::audit_log::signer_set::SignerPubkey::External {
-            verifier_contract,
-            ..
+    let deployed_webauthn_verifier =
+        stellar_strkey::Contract::from_string(&verifier_result.verifier_address)
+            .expect("deployed WebAuthn verifier C-strkey must parse")
+            .0;
+    match &genesis_signers[0].identity {
+        stellar_agent_core::audit_log::signer_set::SignerIdentityV2::External {
+            verifier, ..
         } => {
             assert_eq!(
-                verifier_contract, &verifier_result.verifier_address,
-                "genesis signer's verifier_contract must match the deployed WebAuthn verifier"
+                verifier, &deployed_webauthn_verifier,
+                "genesis signer's verifier must match the deployed WebAuthn verifier"
             );
         }
         other => panic!("expected an External (WebAuthn) genesis signer; got {other:?}"),
@@ -2181,12 +2175,13 @@ async fn deploy_c_webauthn_genesis_and_batch_add_testnet_acceptance() {
     // `batch_add_signers` requires an established audit-log baseline
     // (`SaError::SignerSetMissingBaseline` otherwise); a freshly-installed
     // rule has none until `refresh_signer_baseline` writes the first
-    // `SaSignerSetBaselined` row.
+    // `SaSignerSetBaselinedV2` row.
     signers_mgr
         .refresh_signer_baseline(
             batch_smart_account_sc.clone(),
             rule_id,
             Some(&admin_g),
+            false,
             rid(),
         )
         .await
@@ -2195,8 +2190,6 @@ async fn deploy_c_webauthn_genesis_and_batch_add_testnet_acceptance() {
     let (delegated_g, _delegated_signer) = fresh_signer();
     let delegated_scval =
         build_delegated_signer_scval(&delegated_g).expect("delegated signer ScVal must encode");
-    let delegated_pubkey = stellar_strkey::ed25519::PublicKey::from_string(&delegated_g)
-        .expect("delegated G-strkey must parse");
 
     let ed25519_agent_signing_key = SigningKey::generate(&mut OsRng);
     let ed25519_agent_pubkey_bytes: [u8; 32] = ed25519_agent_signing_key.verifying_key().to_bytes();
@@ -2227,35 +2220,7 @@ async fn deploy_c_webauthn_genesis_and_batch_add_testnet_acceptance() {
         build_external_signer_scval(ed25519_verifier_sc, &ed25519_agent_pubkey_bytes)
             .expect("ed25519 agent signer ScVal must encode");
 
-    fn first16(bytes: &[u8]) -> [u8; 16] {
-        let mut buf = [0u8; 16];
-        let n = bytes.len().min(16);
-        buf[..n].copy_from_slice(&bytes[..n]);
-        buf
-    }
-
-    let batch_signers = vec![
-        (
-            delegated_scval,
-            stellar_agent_core::audit_log::signer_set::SignerPubkey::Ed25519 {
-                pubkey: delegated_pubkey.0,
-            },
-        ),
-        (
-            ed25519_agent_scval,
-            stellar_agent_core::audit_log::signer_set::SignerPubkey::External {
-                verifier_contract: ed25519_verifier_result.verifier_address.clone(),
-                key_data_first16: first16(&ed25519_agent_pubkey_bytes),
-            },
-        ),
-        (
-            batch_webauthn_scval,
-            stellar_agent_core::audit_log::signer_set::SignerPubkey::External {
-                verifier_contract: verifier_result.verifier_address.clone(),
-                key_data_first16: first16(&batch_webauthn_key_data),
-            },
-        ),
-    ];
+    let batch_signers = vec![delegated_scval, ed25519_agent_scval, batch_webauthn_scval];
 
     let new_signer_ids = signers_mgr
         .batch_add_signers(
