@@ -81,14 +81,16 @@ use stellar_agent_smart_account::deployment::{
 use stellar_agent_smart_account::managers::migration::MigrationPlanner;
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
-    ContextRuleSignerInput, PinStatus, parse_c_strkey_to_smart_account,
-    parse_g_strkey_to_signer_address,
+    ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
+    PinStatus, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
-use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
+use stellar_agent_smart_account::managers::signers::{PreviousBaseline, SignersManager};
 use stellar_agent_smart_account::signers::SignerSetView;
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_agent_smart_account::submit::{PinCheck, SubmitInvokeArgs, submit_signed_invoke};
+use stellar_agent_smart_account::test_helpers::{
+    rule_manager_for_tests, signers_manager_for_tests,
+};
 use stellar_agent_smart_account::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
 use stellar_agent_smart_account::{DecodedOnChainSigner, decode_signer_scval_full};
 use stellar_agent_test_support::testnet_helpers::fund_sac_balance;
@@ -231,15 +233,45 @@ async fn fund_via_friendbot(g_strkey: &str) {
     tokio::time::sleep(Duration::from_secs(3)).await;
 }
 
-/// Constructs a `ContextRuleManager` for testnet.
-fn fresh_rule_manager() -> ContextRuleManager {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_PASSPHRASE.to_owned(),
+/// Opens an `AuditWriter` on `audit.jsonl` inside `dir`, returning the
+/// shared writer and the log's path.
+fn audit_writer_in(dir: &tempfile::TempDir) -> (Arc<Mutex<AuditWriter>>, std::path::PathBuf) {
+    let audit_log_path = dir.path().join("audit.jsonl");
+    let audit_writer = Arc::new(Mutex::new(
+        AuditWriter::open(audit_log_path.clone(), None).expect("AuditWriter::open"),
+    ));
+    (audit_writer, audit_log_path)
+}
+
+/// Constructs a `SignersManager` for testnet over `audit_writer`, with both
+/// RPC endpoints on `TESTNET_RPC_URL`.
+fn fresh_signers_manager(
+    audit_writer: Arc<Mutex<AuditWriter>>,
+    audit_log_path: std::path::PathBuf,
+) -> Arc<SignersManager> {
+    signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
+        audit_writer,
+        audit_log_path,
         Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("ContextRuleManager::new must succeed")
+    )
+}
+
+/// Constructs a `ContextRuleManager` for testnet whose installs pin their
+/// contracts and record their baselines through `signers_manager`, which
+/// writes to `audit_writer`.
+fn fresh_rule_manager(
+    signers_manager: &Arc<SignersManager>,
+    audit_writer: &Arc<Mutex<AuditWriter>>,
+) -> ContextRuleManager {
+    rule_manager_for_tests(
+        TESTNET_RPC_URL,
+        None,
+        Arc::clone(signers_manager),
+        Arc::clone(audit_writer),
+        Duration::from_secs(TIMEOUT_SECS),
+    )
 }
 
 /// Encodes `SimpleThresholdAccountParams { threshold: N }` as a Soroban ScVal.
@@ -912,21 +944,8 @@ async fn d1_migrate_verifier_dry_run_constructs_plan_without_submitting() {
     // ── 3. Build SignersManager ───────────────────────────────────────────────
 
     let tmp_dir = tempfile::tempdir().expect("tempdir");
-    let audit_log_path = tmp_dir.path().join("audit.jsonl");
-    let audit_writer = Arc::new(Mutex::new(
-        AuditWriter::open(audit_log_path.clone(), None).expect("AuditWriter::open"),
-    ));
-    let manager = SignersManager::new(SignersManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_RPC_URL.to_owned(),
-        audit_writer,
-        audit_log_path,
-        TESTNET_PASSPHRASE.to_owned(),
-        "d1-test".to_owned(),
-        Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("SignersManager::new must succeed");
+    let (audit_writer, audit_log_path) = audit_writer_in(&tmp_dir);
+    let manager = fresh_signers_manager(audit_writer, audit_log_path);
 
     // ── 4. Execute the dry-run plan ───────────────────────────────────────────
 
@@ -1031,7 +1050,8 @@ async fn d1_migrate_verifier_dry_run_constructs_plan_without_submitting() {
 /// 4. Install a new context rule via `ContextRuleManager::install_rule` with:
 ///    - One `ContextRuleSignerInput::External { verifier: verifier_addr, pubkey_data }`.
 ///    - One `ContextRulePolicy` with the threshold-policy contract.
-/// 5. Establish baseline for the new rule via `SignersManager::refresh_signer_baseline`.
+/// 5. The install records the new rule's baseline; `SignersManager::list_signers`
+///    confirms the chain matches it.
 /// 6. Run `MigrationPlanner::build` — planner scans all rules, fetches each rule via
 ///    `get_context_rule`, reads each External signer's verifier wasm hash, and
 ///    adds matching signers to `affected_rules`.
@@ -1176,7 +1196,12 @@ async fn d2_migrate_verifier_dry_run_identifies_one_external_signer() {
         vec![ContextRulePolicy::new(policy_addr, threshold_params)],
     );
 
-    let rule_manager = fresh_rule_manager();
+    // The rule manager shares the SignersManager and the audit log the plan
+    // uses, so the install records the new rule's baseline there.
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let (audit_writer, audit_log_path) = audit_writer_in(&tmp_dir);
+    let manager = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path);
+    let rule_manager = fresh_rule_manager(&manager, &audit_writer);
     let install_out = rule_manager
         .install_rule(
             smart_account_addr.clone(),
@@ -1194,44 +1219,31 @@ async fn d2_migrate_verifier_dry_run_identifies_one_external_signer() {
 
     eprintln!("External signer rule installed as rule_id={new_rule_id}");
 
-    // ── 5. Build SignersManager + establish baseline for new rule ────────────
+    // ── 5. The new rule's baseline ────────────────────────────────────────────
     //
-    // The new rule has the threshold-policy installed, so the baseline records
-    // its threshold. The bootstrap rule (rule_id=0) is NOT used here because
-    // it has no threshold-policy.
-
-    let tmp_dir = tempfile::tempdir().expect("tempdir");
-    let audit_log_path = tmp_dir.path().join("audit.jsonl");
-    let audit_writer = Arc::new(Mutex::new(
-        AuditWriter::open(audit_log_path.clone(), None).expect("AuditWriter::open"),
-    ));
-    let manager = SignersManager::new(SignersManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_RPC_URL.to_owned(),
-        audit_writer,
-        audit_log_path,
-        TESTNET_PASSPHRASE.to_owned(),
-        "d2-test".to_owned(),
-        Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("SignersManager::new must succeed");
+    // The new rule has the threshold-policy installed, so the baseline the
+    // install recorded holds its threshold. The bootstrap rule (rule_id=0) is
+    // NOT used here because it has no threshold-policy.
 
     let baseline_rid = uuid::Uuid::new_v4().to_string();
     let baseline = manager
-        .refresh_signer_baseline(
+        .list_signers(
             smart_account_addr.clone(),
             new_rule_id,
             Some(&signer_g),
-            false,
             baseline_rid,
         )
         .await
-        .expect("refresh_signer_baseline must succeed on newly installed rule");
+        .expect("list_signers must succeed on the newly installed rule");
 
     eprintln!(
-        "baseline established: {}, previous {:?}",
-        baseline.view, baseline.previous_baseline
+        "installed baseline: {}, comparison {:?}",
+        baseline.view, baseline.baseline
+    );
+    assert_eq!(
+        baseline.baseline,
+        PreviousBaseline::Matched,
+        "the install recorded the baseline, which the chain matches"
     );
 
     assert_eq!(
@@ -1368,7 +1380,8 @@ async fn d2_migrate_verifier_dry_run_identifies_one_external_signer() {
 /// 4. Deploy threshold-policy WASM, so the rule's baseline records a
 ///    threshold.
 /// 5. Install a context rule with one External signer pointing to verifier-A.
-/// 6. Establish baseline via `SignersManager::refresh_signer_baseline`.
+/// 6. The install records the rule's baseline; `SignersManager::list_signers`
+///    confirms the chain matches it.
 /// 7. Build migration plan via `MigrationPlanner::build`.
 /// 8. Submit migration via `MigrationPlan::submit`.
 ///
@@ -1583,36 +1596,12 @@ async fn d3_migrate_verifier_on_chain_submit() {
     );
 
     // The rule manager pins: it shares the SignersManager and the audit log
-    // the migration uses, so the install writes the rule's pin record there.
+    // the migration uses, so the install writes the rule's pin record and
+    // its baseline there.
     let tmp_dir = tempfile::tempdir().expect("tempdir");
-    let audit_log_path = tmp_dir.path().join("audit.jsonl");
-    let audit_writer = Arc::new(Mutex::new(
-        AuditWriter::open(audit_log_path.clone(), None).expect("AuditWriter::open"),
-    ));
-    let manager = Arc::new(
-        SignersManager::new(SignersManagerConfig::new(
-            TESTNET_RPC_URL.to_owned(),
-            TESTNET_RPC_URL.to_owned(),
-            Arc::clone(&audit_writer),
-            audit_log_path.clone(),
-            TESTNET_PASSPHRASE.to_owned(),
-            "d3-test".to_owned(),
-            Duration::from_secs(TIMEOUT_SECS),
-            CHAIN_ID.to_owned(),
-        ))
-        .expect("SignersManager::new must succeed"),
-    );
-    let rule_manager = ContextRuleManager::new(
-        ContextRuleManagerConfig::new(
-            TESTNET_RPC_URL.to_owned(),
-            TESTNET_PASSPHRASE.to_owned(),
-            Duration::from_secs(TIMEOUT_SECS),
-            CHAIN_ID.to_owned(),
-        )
-        .with_audit_writer(Arc::clone(&audit_writer))
-        .with_signers_manager(Arc::clone(&manager)),
-    )
-    .expect("ContextRuleManager::new must succeed");
+    let (audit_writer, audit_log_path) = audit_writer_in(&tmp_dir);
+    let manager = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
+    let rule_manager = fresh_rule_manager(&manager, &audit_writer);
 
     let install_out = rule_manager
         .install_rule(
@@ -1639,23 +1628,27 @@ async fn d3_migrate_verifier_on_chain_submit() {
 
     eprintln!("External signer rule installed as rule_id={new_rule_id}");
 
-    // ── 6. Establish baseline for new rule ───────────────────────────────────
+    // ── 6. The new rule's baseline ────────────────────────────────────────────
 
     let baseline_rid = uuid::Uuid::new_v4().to_string();
     let baseline = manager
-        .refresh_signer_baseline(
+        .list_signers(
             smart_account_addr.clone(),
             new_rule_id,
             Some(&signer_g),
-            false,
             baseline_rid,
         )
         .await
-        .expect("refresh_signer_baseline must succeed");
+        .expect("list_signers must succeed on the newly installed rule");
 
     eprintln!(
-        "baseline established: {}, previous {:?}",
-        baseline.view, baseline.previous_baseline
+        "installed baseline: {}, comparison {:?}",
+        baseline.view, baseline.baseline
+    );
+    assert_eq!(
+        baseline.baseline,
+        PreviousBaseline::Matched,
+        "the install recorded the baseline, which the chain matches"
     );
 
     assert_eq!(
@@ -1860,7 +1853,8 @@ async fn d3_migrate_verifier_on_chain_submit() {
             .collect();
 
         // Count SaVerifierMigrated rows.
-        // `refresh_signer_baseline` emits SaSignerSetBaselinedV2, not SaVerifierMigrated.
+        // The install and `refresh_signer_baseline` emit SaSignerSetBaselinedV2, not
+        // SaVerifierMigrated.
         // Only the submit step (one per successful signer-step pair) emits SaVerifierMigrated.
         let migrated_rows: Vec<&serde_json::Value> = entries
             .iter()

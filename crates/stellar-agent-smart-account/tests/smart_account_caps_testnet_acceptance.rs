@@ -5,7 +5,7 @@
 //! | Fixture | Description |
 //! |---------|-------------|
 //! | [`h1_16th_signer_refused`] | Deploy SA; install rule with `OZ_MAX_SIGNERS = 15` signers; attempt to add 16th via the release binary — must exit non-zero with `validation.context_rule_caps_exceeded` in the JSON envelope BEFORE the `add_signer` submit |
-//! | [`h2_6th_policy_refused`] | Deploy SA; install rule with 5 policies; attempt to add 6th via the release binary — must exit non-zero with `validation.context_rule_caps_exceeded { kind: "policy", attempted: 6, max: 5 }` BEFORE simulate |
+//! | [`h2_6th_policy_refused`] | Deploy SA; install rule with 5 policies (one simple-threshold, four weighted-threshold); attempt to add 6th via the release binary, which must exit non-zero with `validation.context_rule_caps_exceeded { kind: "policy", attempted: 6, max: 5 }` BEFORE simulate |
 //!
 //! # Gating
 //!
@@ -16,7 +16,8 @@
 //! cargo test --features "testnet-integration,deploy-cli" --test smart_account_caps_testnet_acceptance
 //! ```
 //!
-//! `deploy-cli` is required for `THRESHOLD_POLICY_WASM` (used by `h2_6th_policy_refused` setup).
+//! `deploy-cli` is required for `THRESHOLD_POLICY_WASM` (used by `h2_6th_policy_refused` setup,
+//! beside `WEIGHTED_THRESHOLD_POLICY_WASM`).
 //! Tests require live testnet access and Friendbot funding. They are excluded
 //! from default `cargo test` runs.
 //!
@@ -62,12 +63,16 @@ use stellar_agent_smart_account::deployment::{
 };
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
-    ContextRuleSignerInput, OZ_MAX_POLICIES, decode_policy_count_from_scval,
-    decode_signer_count_from_scval, parse_c_strkey_to_smart_account,
-    parse_g_strkey_to_signer_address,
+    ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
+    OZ_MAX_POLICIES, decode_policy_count_from_scval, decode_signer_count_from_scval,
+    parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
+use stellar_agent_smart_account::test_helpers::managers_for_tests;
+use stellar_agent_smart_account::weighted_threshold_policy::{
+    WEIGHTED_THRESHOLD_POLICY_WASM, WeightedThresholdSignerInput,
+    build_weighted_threshold_install_param,
+};
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::{Transaction, TransactionBehavior};
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
@@ -78,6 +83,7 @@ use stellar_xdr::{
     LedgerKeyContractCode, Limits, Operation, OperationBody, PublicKey as XdrPublicKey, ScAddress,
     ScMap, ScMapEntry, ScSymbol, ScVal, SorobanAuthorizationEntry, Uint256, VecM, WriteXdr,
 };
+use tempfile::TempDir;
 use zeroize::Zeroizing;
 
 // ── Network constants ─────────────────────────────────────────────────────────
@@ -85,7 +91,6 @@ use zeroize::Zeroizing;
 const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 const TESTNET_FRIENDBOT_URL: &str = "https://friendbot.stellar.org";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
-const CHAIN_ID: &str = "stellar:testnet";
 const FEE_STROOPS: u32 = 1_000_000;
 const TIMEOUT_SECS: u64 = 120;
 
@@ -147,14 +152,16 @@ async fn fund_via_friendbot(g_strkey: &str) {
     );
 }
 
-fn fresh_rule_manager() -> ContextRuleManager {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_PASSPHRASE.to_owned(),
+/// A testnet rule manager with a signers manager, both writing to one audit
+/// log under the returned `TempDir`, which the caller holds for the test's
+/// duration. Rule install requires the signers manager.
+fn fresh_rule_manager() -> (ContextRuleManager, TempDir) {
+    let (manager, _signers_manager, _audit_log_path, dir) = managers_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
         Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("ContextRuleManager::new must succeed")
+    );
+    (manager, dir)
 }
 
 async fn deploy_fresh_smart_account(signer_g: &str) -> String {
@@ -293,9 +300,10 @@ async fn h1_16th_signer_refused() {
     assert_eq!(signers.len(), 15, "must have exactly 15 signers");
 
     // ── Step 4: Install the 15-signer context rule ───────────────────────────
-    // install_rule is invoked with `None` for the audit writer; the cap-check
-    // failure path never reaches audit-log emission, so no writer is needed.
-    let rule_manager = fresh_rule_manager();
+    // install_rule is invoked with `None` for the per-call audit writer: the
+    // manager's own writer, shared with its signers manager, records the
+    // install and its baseline.
+    let (rule_manager, _audit_dir) = fresh_rule_manager();
 
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
@@ -455,14 +463,14 @@ fn encode_threshold_params_h2(threshold: u32) -> ScVal {
     ScVal::Map(Some(ScMap(map)))
 }
 
-/// Deploys the OZ v0.7.2 threshold-policy WASM to testnet and returns the
-/// resulting contract C-strkey.
+/// Deploys an OZ v0.7.2 policy WASM to testnet and returns the resulting
+/// contract C-strkey.
 ///
 /// The deployed contract address is deterministic: it is derived from
-/// `sha256("oz-threshold-policy-v0.7.2-{salt_suffix}")` and the deployer's
-/// G-strkey. Distinct `salt_suffix` values produce distinct contract addresses
-/// even when the same deployer and the same WASM are used, which is required
-/// for the 5-policy rule (5 distinct policy contracts) where the on-chain
+/// `sha256("{salt_label}-{salt_suffix}")` and the deployer's G-strkey.
+/// Distinct `salt_suffix` values produce distinct contract addresses even
+/// when the same deployer and the same WASM are used, which is required for
+/// the 5-policy rule (5 distinct policy contracts) where the on-chain
 /// `ScMap<Address, Val>` key uniqueness constraint (enforced by the Soroban
 /// host through the stellar-xdr `ScMap` validation) would
 /// reject a map with duplicate `Address` keys.
@@ -486,18 +494,20 @@ fn encode_threshold_params_h2(threshold: u32) -> ScVal {
 /// - OZ `storage.rs:1119-1121` SHA `a9c4216`: `add_policy` also rejects
 ///   duplicate addresses via `DuplicatePolicy` panic, making a second
 ///   `add_policy(same_addr)` call on any rule impossible.
-async fn deploy_threshold_policy_with_salt(
+async fn deploy_policy_with_salt(
     deployer_g: &str,
     signer: &(dyn stellar_agent_network::Signer + Send + Sync),
+    wasm: &[u8],
+    salt_label: &str,
     salt_suffix: &str,
 ) -> String {
-    let wasm_hash_bytes: [u8; 32] = Sha256::digest(THRESHOLD_POLICY_WASM).into();
+    let wasm_hash_bytes: [u8; 32] = Sha256::digest(wasm).into();
 
-    let salt_input = format!("oz-threshold-policy-v0.7.2-{salt_suffix}");
+    let salt_input = format!("{salt_label}-{salt_suffix}");
     let salt: [u8; 32] = Sha256::digest(salt_input.as_bytes()).into();
 
     let policy_strkey = derive_smart_account_address(deployer_g, &salt, TESTNET_PASSPHRASE)
-        .expect("threshold-policy address derivation must succeed");
+        .expect("policy address derivation must succeed");
 
     let rpc_server = Client::new(TESTNET_RPC_URL).expect("Server::new must succeed");
 
@@ -522,10 +532,10 @@ async fn deploy_threshold_policy_with_salt(
     let wasm_already_on_chain = wasm_query.entries.as_ref().is_some_and(|e| !e.is_empty());
 
     if !wasm_already_on_chain {
-        let wasm_bytes: BytesM = THRESHOLD_POLICY_WASM
+        let wasm_bytes: BytesM = wasm
             .to_vec()
             .try_into()
-            .expect("THRESHOLD_POLICY_WASM must fit in BytesM");
+            .expect("the policy WASM must fit in BytesM");
 
         let upload_op = Operation {
             source_account: None,
@@ -675,7 +685,7 @@ async fn deploy_threshold_policy_with_salt(
         Err(e) => {
             let msg = format!("{e}");
             if !msg.contains("AlreadyExists") && !msg.contains("ContractAlreadyExists") {
-                panic!("deploy threshold-policy tx failed: {e}");
+                panic!("deploy policy tx failed: {e}");
             }
         }
     }
@@ -685,27 +695,48 @@ async fn deploy_threshold_policy_with_salt(
 
 // ── Policy-cap helpers (continued) ───────────────────────────────────────────
 
-/// Deploys 5 distinct threshold-policy contracts for the policy-cap test setup.
+/// Deploys 5 distinct policy contracts for the policy-cap test setup: the
+/// simple-threshold policy first, then four weighted-threshold policies.
 ///
-/// Each contract is deployed with salt suffix `"h2-salt-N"` (N = 1..=5), producing
-/// 5 distinct contract addresses from the same WASM.  This is required because
-/// the `policies` argument to OZ `add_context_rule` is typed
-/// `Map<Address, Val>` (OZ `storage.rs:632-638` SHA `a9c4216`), whose keys
-/// must be unique. The wallet's off-chain encoding as `ScVal::Map` is validated
-/// by the Soroban host for strict ascending key order with no duplicates
-/// (the stellar-xdr `ScMap` validation); passing 5 entries with the same `Address`
-/// key would fail at the simulate phase with `Error::Invalid`.
+/// The wallet installs a rule with at most one simple-threshold policy,
+/// because it records that policy's threshold in the rule's signer-set
+/// baseline; the other four policies are weighted-threshold contracts.
+/// Each contract is deployed with salt suffix `"h2-salt-N"` (N = 1..=5),
+/// producing 5 distinct contract addresses. This is required because the
+/// `policies` argument to OZ `add_context_rule` is typed `Map<Address, Val>`
+/// (OZ `storage.rs:632-638` SHA `a9c4216`), whose keys must be unique. The
+/// wallet's off-chain encoding as `ScVal::Map` is validated by the Soroban
+/// host for strict ascending key order with no duplicates (the stellar-xdr
+/// `ScMap` validation); passing 5 entries with the same `Address` key would
+/// fail at the simulate phase with `Error::Invalid`.
 ///
-/// The 5 deployments share the same WASM bytes (upload is idempotent) but
-/// produce distinct on-chain contract addresses.
-async fn deploy_five_distinct_threshold_policies_h2(
+/// The four weighted deployments share the same WASM bytes (upload is
+/// idempotent) but produce distinct on-chain contract addresses.
+async fn deploy_five_distinct_policies_h2(
     deployer_g: &str,
     signer: &(dyn stellar_agent_network::Signer + Send + Sync),
 ) -> Vec<String> {
     let mut addrs = Vec::with_capacity(5);
-    for n in 1_u32..=5 {
+    addrs.push(
+        deploy_policy_with_salt(
+            deployer_g,
+            signer,
+            THRESHOLD_POLICY_WASM,
+            "oz-threshold-policy-v0.7.2",
+            "h2-salt-1",
+        )
+        .await,
+    );
+    for n in 2_u32..=5 {
         let suffix = format!("h2-salt-{n}");
-        let addr = deploy_threshold_policy_with_salt(deployer_g, signer, &suffix).await;
+        let addr = deploy_policy_with_salt(
+            deployer_g,
+            signer,
+            WEIGHTED_THRESHOLD_POLICY_WASM,
+            "oz-weighted-threshold-policy-v0.7.2",
+            &suffix,
+        )
+        .await;
         addrs.push(addr);
     }
     addrs
@@ -747,7 +778,8 @@ async fn deploy_five_distinct_threshold_policies_h2(
 ///
 /// 1. Generate and fund the operator signer.
 /// 2. Deploy a fresh smart account.
-/// 3. Deploy 5 DISTINCT threshold-policy contracts (salts `h2-salt-1..h2-salt-5`).
+/// 3. Deploy 5 DISTINCT policy contracts (salts `h2-salt-1..h2-salt-5`): the
+///    simple-threshold policy and four weighted-threshold policies.
 /// 4. Install a 5-policy rule with the 5 distinct addresses.
 /// 5. Fetch the installed rule; assert `decode_policy_count_from_scval == 5`.
 /// 6. Spawn the binary with `smart-account rules add-policy` for the 6th policy.
@@ -794,8 +826,10 @@ async fn h2_6th_policy_refused() {
 
     eprintln!("h2: smart_account = {smart_account_strkey}");
 
-    // ── Step 3: Deploy 5 distinct threshold-policy contracts ─────────────────
-    // Each contract is deployed with a unique salt suffix (h2-salt-1..h2-salt-5)
+    // ── Step 3: Deploy 5 distinct policy contracts ───────────────────────────
+    // The simple-threshold policy and four weighted-threshold policies: the
+    // wallet installs a rule with at most one simple-threshold policy. Each
+    // contract is deployed with a unique salt suffix (h2-salt-1..h2-salt-5)
     // so the resulting addresses are distinct. This is required because the
     // `policies` arg to OZ `add_context_rule` is `Map<Address, Val>`; the
     // wallet's ScVal::Map encoding is validated by the Soroban host for strict
@@ -803,7 +837,7 @@ async fn h2_6th_policy_refused() {
     // validation).
     // Using 5 entries with the same Address key would fail at simulate.
     let policy_strkeys =
-        deploy_five_distinct_threshold_policies_h2(&operator_g, operator_signer.as_ref()).await;
+        deploy_five_distinct_policies_h2(&operator_g, operator_signer.as_ref()).await;
     assert_eq!(
         policy_strkeys.len(),
         5,
@@ -818,7 +852,7 @@ async fn h2_6th_policy_refused() {
         5,
         "h2: all 5 deployed policy addresses must be distinct"
     );
-    eprintln!("h2: deployed 5 distinct threshold-policy contracts");
+    eprintln!("h2: deployed 5 distinct policy contracts");
 
     // The first policy is used as the "6th add-policy" attempt target later.
     let sixth_policy_strkey = policy_strkeys[0].clone();
@@ -828,19 +862,38 @@ async fn h2_6th_policy_refused() {
     // constraint (the stellar-xdr `ScMap` validation) and the on-chain Map<Address, Val>
     // semantics of the `policies` argument to `add_context_rule`
     // (OZ storage.rs:632-638 SHA `a9c4216`).
+    // The simple-threshold policy takes its threshold map; each
+    // weighted-threshold policy weighs the rule's one signer at 1 with
+    // threshold 1.
     let threshold_params = encode_threshold_params_h2(1);
+    let weighted_params = build_weighted_threshold_install_param(
+        &[(
+            WeightedThresholdSignerInput::Delegated {
+                g_strkey: operator_g.clone(),
+            },
+            1,
+        )],
+        1,
+    )
+    .expect("h2: weighted-threshold install param must build");
     let policies: Vec<ContextRulePolicy> = policy_strkeys
         .iter()
-        .map(|strkey| {
+        .enumerate()
+        .map(|(index, strkey)| {
             let addr = parse_c_strkey_to_smart_account(strkey).expect("policy C-strkey must parse");
-            ContextRulePolicy::new(addr, threshold_params.clone())
+            let params = if index == 0 {
+                threshold_params.clone()
+            } else {
+                weighted_params.clone()
+            };
+            ContextRulePolicy::new(addr, params)
         })
         .collect();
 
     let signer_addr = parse_g_strkey_to_signer_address(&operator_g)
         .expect("operator G-strkey must parse to ScAddress");
 
-    let rule_manager = fresh_rule_manager();
+    let (rule_manager, _audit_dir) = fresh_rule_manager();
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
         "h2-cap-test-rule".to_owned(),

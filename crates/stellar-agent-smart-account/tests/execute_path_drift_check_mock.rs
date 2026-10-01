@@ -56,7 +56,8 @@ use stellar_agent_smart_account::managers::migration::{
     MigrationPlan, RuleMigration, SignerMigrationStep,
 };
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleManager, ContextRuleManagerConfig, PinStatus,
+    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
+    ContextRuleSignerInput, PinStatus, RuleContext,
 };
 use stellar_agent_smart_account::managers::signers::{
     PreviousBaseline, SignersManager, SignersManagerConfig,
@@ -343,9 +344,16 @@ struct Chain {
     /// A state change that lands while an endpoint is behind, applied once a
     /// read behind the confirmation is served, and where it lands.
     after_behind_read: Option<(AfterSend, Landing)>,
-    /// What a simulated `add_signer` or `add_policy` returns; `U32(7)` when
-    /// unset.
-    add_return: Option<ScVal>,
+    /// What a simulated function returns, by function name. Unset, a
+    /// simulated `add_signer` or `add_policy` returns `U32(7)`, an
+    /// `add_context_rule` the map `{ id: U32(next rule id) }`, and any other
+    /// invocation `Void`.
+    returns: HashMap<&'static str, ScVal>,
+    /// An entry that replaces the one under its key once the key has been
+    /// read the given number of times, by key.
+    entries_after_reads: HashMap<String, (usize, Value)>,
+    /// How many times each ledger-entry key has been read.
+    entry_reads: HashMap<String, usize>,
 }
 
 /// Where a [`Chain::after_behind_read`] change lands.
@@ -380,6 +388,25 @@ impl Chain {
     fn with_threshold(mut self, policy: &ScAddress, rule_id: u32, threshold: u32) -> Self {
         self.thresholds.insert((strkey(policy), rule_id), threshold);
         self
+    }
+
+    /// Serves `entry` under `key` once `n` reads of `key` have been answered,
+    /// so a contract's executable can change between two observations. Both
+    /// endpoints of a [`Harness::new`] harness share the count.
+    fn entry_after_reads(mut self, key: String, n: usize, entry: Value) -> Self {
+        self.entries_after_reads.insert(key, (n, entry));
+        self
+    }
+
+    /// The entry a read of `key` serves, counting the read.
+    fn read_entry(&mut self, key: &str) -> Option<Value> {
+        let reads = self.entry_reads.entry(key.to_owned()).or_insert(0);
+        let served_before = *reads;
+        *reads += 1;
+        match self.entries_after_reads.get(key) {
+            Some((n, entry)) if served_before >= *n => Some(entry.clone()),
+            _ => self.entries.get(key).cloned(),
+        }
     }
 
     /// Applies a send: keeps the current rules and thresholds for reads
@@ -521,6 +548,19 @@ impl Rpc {
     }
 }
 
+/// The `ContextRule` return value of a simulated `add_context_rule`, reduced
+/// to the `id` field the wallet reads.
+fn context_rule_return(rule_id: u32) -> ScVal {
+    ScVal::Map(Some(ScMap(
+        vec![ScMapEntry {
+            key: symbol("id"),
+            val: ScVal::U32(rule_id),
+        }]
+        .try_into()
+        .unwrap(),
+    )))
+}
+
 fn simulate_result(value: &ScVal, auth: &[SorobanAuthorizationEntry], ledger: u32) -> Value {
     let mut result =
         rpc_mock_helpers::build_simulate_response(&value.to_xdr_base64(Limits::none()).unwrap());
@@ -574,7 +614,7 @@ impl Respond for Rpc {
                     .lock()
                     .unwrap()
                     .extend(keys.iter().cloned());
-                let chain = self.chain.lock().unwrap();
+                let mut chain = self.chain.lock().unwrap();
                 if keys.iter().any(|k| chain.failing_keys.contains(k)) {
                     return ResponseTemplate::new(200).set_body_json(json!({
                         "jsonrpc": "2.0",
@@ -596,7 +636,7 @@ impl Respond for Rpc {
                                 "lastModifiedLedgerSeq": 100
                             }));
                         }
-                        chain.entries.get(key).cloned()
+                        chain.read_entry(key)
                     })
                     .collect();
                 reply(json!({"entries": entries, "latestLedger": PRE_SEND_LEDGER}))
@@ -642,10 +682,14 @@ impl Respond for Rpc {
                         let ScVal::U32(rule_id) = invoke.args[0] else {
                             panic!("get_context_rule takes a u32")
                         };
-                        let value = rules
-                            .get(&rule_id)
-                            .unwrap_or_else(|| panic!("rule {rule_id} is not on the mock chain"));
-                        reply(simulate_result(value, &[], ledger))
+                        match rules.get(&rule_id) {
+                            Some(value) => reply(simulate_result(value, &[], ledger)),
+                            // The contract's `ContextRuleNotFound` panic.
+                            None => reply(json!({
+                                "error": "HostError: Error(Contract, #3000)",
+                                "latestLedger": ledger,
+                            })),
+                        }
                     }
                     "get_threshold" => {
                         let ScVal::U32(rule_id) = invoke.args[0] else {
@@ -657,12 +701,17 @@ impl Respond for Rpc {
                         reply(simulate_result(&value, &[], ledger))
                     }
                     _ => {
-                        let value = match function.as_str() {
-                            "add_signer" | "add_policy" => {
-                                chain.add_return.clone().unwrap_or(ScVal::U32(7))
-                            }
-                            _ => ScVal::Void,
-                        };
+                        let value = chain
+                            .returns
+                            .get(function.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| match function.as_str() {
+                                "add_signer" | "add_policy" => ScVal::U32(7),
+                                "add_context_rule" => context_rule_return(
+                                    rules.keys().max().map_or(0, |rule_id| rule_id + 1),
+                                ),
+                                _ => ScVal::Void,
+                            });
                         let auth = if op.auth.is_empty() {
                             vec![SorobanAuthorizationEntry {
                                 credentials: SorobanCredentials::Address(
@@ -915,10 +964,9 @@ impl Harness {
         }
     }
 
-    /// Makes the primary's simulated `add_signer` and `add_policy` return
-    /// `value`.
-    fn set_simulated_add_return(&self, value: ScVal) {
-        self.chain.lock().unwrap().add_return = Some(value);
+    /// Makes the primary's simulated `function` return `value`.
+    fn set_simulated_return(&self, function: &'static str, value: ScVal) {
+        self.chain.lock().unwrap().returns.insert(function, value);
     }
 
     /// Poisons the audit writer when the primary endpoint receives `at`.
@@ -2215,7 +2263,7 @@ async fn a_rule_manager_without_a_signers_manager_refuses_a_non_zero_rule() {
             smart_account_redacted: ref redacted,
             ref request_id,
         } => {
-            assert_eq!(rule_id, 5);
+            assert_eq!(rule_id, Some(5));
             assert_eq!(redacted.as_str(), smart_account_redacted());
             assert_eq!(request_id, "req-no-manager");
         }
@@ -2253,20 +2301,61 @@ fn rule_one_with_policies(policies: Vec<ScAddress>) -> ScVal {
 }
 
 /// A chain serving rule 1 with `policies`, verifier V, and the policies P
-/// (threshold), Q (spending-limit) and R (unknown hash).
+/// (simple-threshold), Q (spending-limit) and R (unknown hash). P is served
+/// with [`Chain::with_wasm`], so a baseline written from the chain records
+/// its threshold once a test sets one.
 async fn policy_harness(policies: Vec<ScAddress>) -> Harness {
     let chain = Chain::default()
         .with_rule(1, rule_one_with_policies(policies))
         .with_entry(wasm_instance(&verifier_v(), webauthn_hash()))
-        .with_entry(wasm_instance(&policy_p(), KNOWN_WASM_HASH))
+        .with_wasm(&policy_p(), KNOWN_WASM_HASH)
         .with_entry(wasm_instance(&policy_q(), spending_limit_hash()))
         .with_entry(wasm_instance(&policy_r(), [0xdd; 32]));
     Harness::new(chain).await
 }
 
+/// The install parameter of the simple-threshold policy with `threshold`.
+fn threshold_param(threshold: u32) -> ScVal {
+    stellar_agent_smart_account::simple_threshold_policy::build_simple_threshold_install_param(
+        threshold,
+    )
+    .unwrap()
+}
+
+/// The install parameter the policy-pin tests attach `policy` with: the
+/// simple-threshold parameter with threshold 1 for P, the policy that takes
+/// the threshold path, and `Void` for the others.
+fn pin_test_param(policy: &ScAddress) -> ScVal {
+    if *policy == policy_p() {
+        threshold_param(1)
+    } else {
+        ScVal::Void
+    }
+}
+
+/// Attaches `policy` to rule 1 with [`pin_test_param`], authorized under
+/// rule 0.
 async fn add_policy(
     h: &Harness,
     policy: &ScAddress,
+    request_id: &str,
+    accept_unknown_verifier: bool,
+) -> Result<u32, SaError> {
+    add_policy_with(
+        h,
+        policy,
+        pin_test_param(policy),
+        request_id,
+        accept_unknown_verifier,
+    )
+    .await
+}
+
+/// Attaches `policy` to rule 1 with `install_param`, authorized under rule 0.
+async fn add_policy_with(
+    h: &Harness,
+    policy: &ScAddress,
+    install_param: ScVal,
     request_id: &str,
     accept_unknown_verifier: bool,
 ) -> Result<u32, SaError> {
@@ -2276,7 +2365,7 @@ async fn add_policy(
             smart_account(),
             1,
             policy.clone(),
-            ScVal::Void,
+            install_param,
             vec![ContextRuleId::new(0)],
             &signer,
             None,
@@ -2321,14 +2410,24 @@ fn policy_pins_of(entry: &AuditEntry) -> (Vec<String>, bool, PinsUpdateReason) {
     }
 }
 
+/// The post-send state of attaching the simple-threshold policy P to rule 1
+/// with threshold 1: the rule holds `policies`, and P's threshold is 1.
+fn after_threshold_attach(policies: Vec<ScAddress>) -> AfterSend {
+    AfterSend {
+        rules: vec![(1, rule_one_with_policies(policies))],
+        thresholds: vec![(strkey(&policy_p()), 1, 1)],
+    }
+}
+
 /// A policy attached to a pinned rule with no policy pin is pinned: the
 /// record gains its pin, and the next checked verb compares the live policy
 /// with it.
 #[tokio::test]
 async fn a_policy_added_to_a_pinned_rule_is_pinned_and_checked() {
     let h = policy_harness(vec![]).await;
+    h.baseline_v2(1);
     h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
-    h.after_send(1, rule_one_with_policies(vec![policy_p()]));
+    h.after_send_state(&after_threshold_attach(vec![policy_p()]));
     add_policy(&h, &policy_p(), "req-policy-add", false)
         .await
         .unwrap();
@@ -2478,6 +2577,8 @@ async fn a_policy_add_writes_the_override_row_after_the_raw_invocation() {
 #[tokio::test]
 async fn removing_the_pinned_policy_clears_its_pin() {
     let h = policy_harness(vec![policy_p()]).await;
+    h.set_threshold(&policy_p(), 1, 1);
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -2546,10 +2647,12 @@ async fn removing_a_drifted_only_policy_drops_its_pin() {
         .unwrap();
 }
 
-/// A rule's only policy that cannot be read is still removed, and its
-/// single pin is dropped with it.
+/// A rule's only policy whose executable cannot be read refuses the removal
+/// before submission: the removal cannot tell whether the policy is the
+/// simple-threshold policy whose threshold change it must record. The pin
+/// record and the chain are unchanged.
 #[tokio::test]
-async fn removing_an_unreadable_only_policy_confirms_and_drops_its_pin() {
+async fn removing_an_unreadable_only_policy_refuses_before_submission() {
     let h = policy_harness(vec![policy_p()]).await;
     h.pin_created(
         1,
@@ -2560,15 +2663,17 @@ async fn removing_an_unreadable_only_policy_confirms_and_drops_its_pin() {
     );
     h.fail_reads_of(&policy_p());
     h.after_send(1, rule_one_with_policies(vec![]));
-    remove_policy(&h, 0, "req-unreadable-remove").await.unwrap();
-    assert_eq!(h.sends(), 1);
-
-    let rows = h.pins_updated_rows();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].request_id, "req-unreadable-remove");
-    let (policies, _, reason) = policy_pins_of(&rows[0]);
-    assert!(policies.is_empty(), "{policies:?}");
-    assert_eq!(reason, PinsUpdateReason::PolicyRemoved);
+    let err = remove_policy(&h, 0, "req-unreadable-remove")
+        .await
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "sa.deployment_failed", "{err:?}");
+    assert_eq!(h.sends(), 0);
+    assert!(!h.simulated("remove_policy"));
+    assert!(h.pins_updated_rows().is_empty());
+    assert_eq!(
+        row_kinds(&h.rows(), "req-unreadable-remove"),
+        vec!["sa_raw_invocation"]
+    );
 }
 
 /// With two policy pins, the removal drops the pin equal to the removed
@@ -2745,6 +2850,7 @@ async fn a_policy_added_with_no_live_policy_replaces_a_stale_pin() {
 #[tokio::test]
 async fn a_policy_added_after_the_last_of_two_pinned_policies_replaces_both_pins() {
     let h = policy_harness(vec![]).await;
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -2752,7 +2858,7 @@ async fn a_policy_added_after_the_last_of_two_pinned_policies_replaces_both_pins
         vec![],
         vec![],
     );
-    h.after_send(1, rule_one_with_policies(vec![policy_p()]));
+    h.after_send_state(&after_threshold_attach(vec![policy_p()]));
     add_policy(&h, &policy_p(), "req-repin-two", false)
         .await
         .unwrap();
@@ -3587,7 +3693,7 @@ fn verifierless_rule_with_the_passkey() -> ScVal {
 #[tokio::test]
 async fn an_add_whose_simulated_return_is_not_a_u32_fails_at_stage_observe_and_pins() {
     let h = verifierless_pinned_rule().await;
-    h.set_simulated_add_return(ScVal::Void);
+    h.set_simulated_return("add_signer", ScVal::Void);
     h.after_send(1, verifierless_rule_with_the_passkey());
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
 
@@ -4261,4 +4367,1468 @@ async fn the_endpoints_disagreeing_on_the_policy_list_refuse_with_rpc_divergence
             .all(|f| f == "get_context_rule")
     );
     assert!(h.rows().is_empty());
+}
+
+// ── Rule install: the confirmed-install baseline ──────────────────────────────
+
+/// A second simple-threshold policy, served with the same executable as P.
+fn policy_p2() -> ScAddress {
+    contract(0x38)
+}
+
+/// A third simple-threshold policy, served with the other allowlisted
+/// simple-threshold executable.
+fn policy_p3() -> ScAddress {
+    contract(0x39)
+}
+
+/// An `External` signer input on verifier V with `key`.
+fn passkey_input(key: &[u8]) -> ContextRuleSignerInput {
+    ContextRuleSignerInput::External {
+        verifier: verifier_v(),
+        pubkey_data: key.to_vec(),
+    }
+}
+
+/// A `Delegated` signer input for the ed25519 account `[byte; 32]`.
+fn account_input(byte: u8) -> ContextRuleSignerInput {
+    ContextRuleSignerInput::Delegated {
+        address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+            [byte; 32],
+        )))),
+    }
+}
+
+fn install_definition(
+    signers: Vec<ContextRuleSignerInput>,
+    policies: Vec<ContextRulePolicy>,
+) -> ContextRuleDefinition {
+    ContextRuleDefinition::new(
+        RuleContext::Default,
+        "installed".to_owned(),
+        None,
+        signers,
+        policies,
+    )
+}
+
+/// A chain serving rule 0, which authorizes the installs, and the contracts
+/// the install tests reference: verifier V, the simple-threshold policies P
+/// and P2, and policy R with an unknown hash. The installed rule takes id 1,
+/// the next free id.
+fn install_chain() -> Chain {
+    Chain::default()
+        .with_rule(0, rule(0, vec![delegated_signer()], vec![]))
+        .with_entry(wasm_instance(&verifier_v(), webauthn_hash()))
+        .with_wasm(&policy_p(), KNOWN_WASM_HASH)
+        .with_wasm(&policy_p2(), KNOWN_WASM_HASH)
+        .with_entry(wasm_instance(&policy_r(), [0xdd; 32]))
+}
+
+/// The state an install of rule 1 with `signers` and `policies` leaves, with
+/// `thresholds` as `(policy, threshold)` pairs for rule 1.
+fn installed(
+    signers: Vec<ScVal>,
+    policies: Vec<ScAddress>,
+    thresholds: &[(ScAddress, u32)],
+) -> AfterSend {
+    AfterSend {
+        rules: vec![(1, rule(1, signers, policies))],
+        thresholds: thresholds
+            .iter()
+            .map(|(policy, threshold)| (strkey(policy), 1, *threshold))
+            .collect(),
+    }
+}
+
+/// Installs `definition` authorized under rule 0.
+async fn install(
+    h: &Harness,
+    definition: ContextRuleDefinition,
+    request_id: &str,
+    accept_unknown_verifier: bool,
+) -> Result<u32, SaError> {
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    h.rule_manager()
+        .install_rule(
+            smart_account(),
+            definition,
+            vec![ContextRuleId::new(0)],
+            &signer,
+            None,
+            request_id.to_owned(),
+            false,
+            accept_unknown_verifier,
+        )
+        .await
+        .map(|output| output.rule_id)
+}
+
+/// Simulates the install of `definition`.
+async fn simulate_install(
+    h: &Harness,
+    definition: ContextRuleDefinition,
+    request_id: &str,
+) -> Result<u32, SaError> {
+    h.rule_manager()
+        .simulate_install_rule(
+            smart_account(),
+            definition,
+            &account_id_for_seed(SEED),
+            false,
+            false,
+            request_id.to_owned(),
+        )
+        .await
+        .map(|output| output.latest_ledger)
+}
+
+/// A rule manager over the harness's endpoints with no signers manager.
+fn rule_manager_without_signers_manager(h: &Harness) -> ContextRuleManager {
+    ContextRuleManager::new(ContextRuleManagerConfig::new(
+        h.primary.uri(),
+        PASSPHRASE.to_owned(),
+        Duration::from_secs(10),
+        CHAIN_ID.to_owned(),
+    ))
+    .unwrap()
+}
+
+/// The wire code of the `SaRawInvocation` row written under `request_id`.
+fn raw_wire_code(h: &Harness, request_id: &str) -> String {
+    let codes: Vec<String> = rows_of(h, request_id)
+        .into_iter()
+        .filter_map(|entry| match entry.event_kind {
+            EventKind::SaRawInvocation { wire_code, .. } => Some(wire_code),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(codes.len(), 1, "one raw invocation row: {codes:?}");
+    codes[0].clone()
+}
+
+/// The `SaSignerSetBaselinedV2` row written under `request_id`.
+fn baselined_row(h: &Harness, request_id: &str) -> (SignerSetSnapshotV2, BaselineReason, u32) {
+    let rows: Vec<(SignerSetSnapshotV2, BaselineReason, u32)> = rows_of(h, request_id)
+        .into_iter()
+        .filter_map(|entry| match entry.event_kind {
+            EventKind::SaSignerSetBaselinedV2 {
+                rule_id: 1,
+                snapshot,
+                baseline_reason,
+                observed_at_ledger_seq,
+                ..
+            } => Some((snapshot, baseline_reason, observed_at_ledger_seq)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "one baseline row for rule 1");
+    rows.into_iter().next().unwrap()
+}
+
+/// The `InstallStateMismatch` fields of `err`, or a panic naming it.
+fn install_state_mismatch(err: &SaError) -> (Option<u32>, &str) {
+    match err {
+        SaError::InstallStateMismatch {
+            rule_id, tx_hash, ..
+        } => (*rule_id, tx_hash.as_str()),
+        other => panic!("expected InstallStateMismatch; got {other:?}"),
+    }
+}
+
+/// A confirmed install writes the override row, the `SaContextRuleCreated`
+/// row, the baseline with reason `confirmed_install` recording the served
+/// rule at the confirmation ledger, then `sa.ok`; the next `signers list`
+/// matches the baseline.
+#[tokio::test]
+async fn a_confirmed_install_records_its_baseline_after_the_created_row() {
+    let h = Harness::new(install_chain()).await;
+    h.after_send_state(&installed(
+        vec![
+            external_signer(&verifier_v(), &[0x11; 65]),
+            delegated_account(0x13),
+        ],
+        vec![policy_r()],
+        &[],
+    ));
+    let rule_id = install(
+        &h,
+        install_definition(
+            vec![passkey_input(&[0x11; 65]), account_input(0x13)],
+            vec![ContextRulePolicy::new(policy_r(), ScVal::Void)],
+        ),
+        "req-install",
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rule_id, 1);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-install"),
+        vec![
+            "unknown_override(rule Some(1))",
+            "sa_context_rule_created",
+            "sa_signer_set_baselined_v2",
+            "sa_raw_invocation",
+        ]
+    );
+    assert_eq!(raw_wire_code(&h, "req-install"), "sa.ok");
+    let (snapshot, reason, ledger) = baselined_row(&h, "req-install");
+    assert_eq!(snapshot, h.snapshot_of(1));
+    assert_eq!(snapshot.signers.len(), 2);
+    assert_eq!(snapshot.threshold, None);
+    assert_eq!(reason, BaselineReason::ConfirmedInstall);
+    assert_eq!(ledger, CONFIRMATION_LEDGER);
+    assert_eq!(h.sends(), 1);
+
+    let listed = h
+        .manager
+        .list_signers(smart_account(), 1, None, "req-install-list".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(listed.baseline, PreviousBaseline::Matched);
+}
+
+/// An install that attaches the simple-threshold policy baselines the
+/// policy with the threshold of its install parameter.
+#[tokio::test]
+async fn an_install_with_the_simple_threshold_policy_baselines_its_threshold() {
+    let h = Harness::new(install_chain()).await;
+    h.after_send_state(&installed(
+        vec![delegated_account(0x13)],
+        vec![policy_p()],
+        &[(policy_p(), 2)],
+    ));
+    install(
+        &h,
+        install_definition(
+            vec![account_input(0x13)],
+            vec![ContextRulePolicy::new(policy_p(), threshold_param(2))],
+        ),
+        "req-install-threshold",
+        false,
+    )
+    .await
+    .unwrap();
+    let (snapshot, reason, _) = baselined_row(&h, "req-install-threshold");
+    assert_eq!(
+        snapshot.threshold,
+        Some(ThresholdObservation {
+            policy: contract_id(&policy_p()),
+            threshold: 2
+        })
+    );
+    assert_eq!(reason, BaselineReason::ConfirmedInstall);
+}
+
+/// Asserts the outcome of a confirmed install whose served rule is not the
+/// definition: `sa.install_state_mismatch` naming rule 1 and the
+/// transaction, the created row and the refusal's raw row, no baseline.
+fn assert_mismatch_without_baseline(h: &Harness, err: &SaError, request_id: &str) {
+    let (rule_id, tx_hash) = install_state_mismatch(err);
+    assert_eq!(rule_id, Some(1));
+    assert_eq!(tx_hash.len(), 64);
+    assert_eq!(err.wire_code(), "sa.install_state_mismatch");
+    assert_eq!(
+        row_kinds(&h.rows(), request_id),
+        vec!["sa_context_rule_created", "sa_raw_invocation"]
+    );
+    assert_eq!(raw_wire_code(h, request_id), "sa.install_state_mismatch");
+    assert_eq!(h.sends(), 1);
+}
+
+/// A served threshold value other than the install parameter's refuses with
+/// `sa.install_state_mismatch` and writes no baseline.
+#[tokio::test]
+async fn an_install_whose_served_threshold_differs_refuses_with_the_rule_id() {
+    let h = Harness::new(install_chain()).await;
+    h.after_send_state(&installed(
+        vec![delegated_account(0x13)],
+        vec![policy_p()],
+        &[(policy_p(), 3)],
+    ));
+    let err = install(
+        &h,
+        install_definition(
+            vec![account_input(0x13)],
+            vec![ContextRulePolicy::new(policy_p(), threshold_param(2))],
+        ),
+        "req-install-value",
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_mismatch_without_baseline(&h, &err, "req-install-value");
+}
+
+/// A served simple-threshold policy other than the definition's, at the
+/// same threshold value, refuses: the comparison covers the policy, not the
+/// value alone.
+#[tokio::test]
+async fn an_install_whose_served_threshold_policy_differs_refuses() {
+    let h = Harness::new(install_chain()).await;
+    h.after_send_state(&installed(
+        vec![delegated_account(0x13)],
+        vec![policy_p2()],
+        &[(policy_p2(), 2)],
+    ));
+    let err = install(
+        &h,
+        install_definition(
+            vec![account_input(0x13)],
+            vec![ContextRulePolicy::new(policy_p(), threshold_param(2))],
+        ),
+        "req-install-policy",
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_mismatch_without_baseline(&h, &err, "req-install-policy");
+}
+
+/// Served signers that differ from the definition in one identity, at an
+/// equal count, refuse: the comparison covers every identity, not the
+/// count alone.
+#[tokio::test]
+async fn an_install_whose_served_signers_differ_in_one_identity_refuses() {
+    let h = Harness::new(install_chain()).await;
+    h.after_send_state(&installed(
+        vec![
+            external_signer(&verifier_v(), &[0x11; 65]),
+            delegated_account(0x14),
+        ],
+        vec![],
+        &[],
+    ));
+    let err = install(
+        &h,
+        install_definition(
+            vec![passkey_input(&[0x11; 65]), account_input(0x13)],
+            vec![],
+        ),
+        "req-install-signers",
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_mismatch_without_baseline(&h, &err, "req-install-signers");
+}
+
+/// A confirmed install whose return value carries no rule id refuses with
+/// `sa.install_state_mismatch` without a rule id, and writes neither the
+/// override row nor the created row, since neither has a rule to name.
+#[tokio::test]
+async fn an_install_whose_return_carries_no_rule_id_refuses_without_one() {
+    let h = Harness::new(install_chain()).await;
+    h.set_simulated_return("add_context_rule", ScVal::Void);
+    h.after_send_state(&installed(
+        vec![delegated_account(0x13)],
+        vec![policy_r()],
+        &[],
+    ));
+    let err = install(
+        &h,
+        install_definition(
+            vec![account_input(0x13)],
+            vec![ContextRulePolicy::new(policy_r(), ScVal::Void)],
+        ),
+        "req-install-void",
+        true,
+    )
+    .await
+    .unwrap_err();
+    let (rule_id, tx_hash) = install_state_mismatch(&err);
+    assert_eq!(rule_id, None);
+    assert_eq!(tx_hash.len(), 64);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-install-void"),
+        vec!["sa_raw_invocation"]
+    );
+    assert_eq!(
+        raw_wire_code(&h, "req-install-void"),
+        "sa.install_state_mismatch"
+    );
+    assert_eq!(h.sends(), 1);
+}
+
+/// A confirmed install whose baseline row the audit log refuses (the
+/// writer poisoned after the created row) fails at stage `write` with the
+/// transaction hash; the created row stays and no baseline is written.
+#[tokio::test]
+async fn an_install_whose_baseline_row_is_refused_fails_at_stage_write() {
+    let h = Harness::new(install_chain()).await;
+    h.after_send_state(&installed(vec![delegated_account(0x13)], vec![], &[]));
+    h.poison_audit_writer_at("get_context_rule");
+    let err = install(
+        &h,
+        install_definition(vec![account_input(0x13)], vec![]),
+        "req-install-poisoned",
+        false,
+    )
+    .await
+    .unwrap_err();
+    match &err {
+        SaError::BaselineWriteFailed {
+            rule_id: 1,
+            tx_hash: Some(hash),
+            stage,
+            ..
+        } => {
+            assert_eq!(*stage, "write");
+            assert_eq!(hash.len(), 64);
+        }
+        other => panic!("expected BaselineWriteFailed at stage write; got {other:?}"),
+    }
+    assert!(h.manager.audit_writer_degraded());
+    assert_eq!(
+        row_kinds(&h.rows(), "req-install-poisoned"),
+        vec!["sa_context_rule_created"]
+    );
+    assert_eq!(h.sends(), 1);
+}
+
+/// A secondary that stays behind the confirmation ledger for the whole
+/// recording budget fails the install's baseline at stage `observe` with the
+/// transaction hash; the created row and the refusal's raw row are written.
+#[tokio::test]
+async fn an_install_whose_secondary_stays_behind_fails_at_stage_observe() {
+    let h = Harness::with_timeout(install_chain(), Duration::from_secs(2)).await;
+    h.after_send_state(&installed(vec![delegated_account(0x13)], vec![], &[]));
+    *h.secondary_ledgers.after_send.lock().unwrap() = Some(PRE_SEND_LEDGER);
+    let err = install(
+        &h,
+        install_definition(vec![account_input(0x13)], vec![]),
+        "req-install-behind",
+        false,
+    )
+    .await
+    .unwrap_err();
+    match &err {
+        SaError::BaselineWriteFailed {
+            rule_id: 1,
+            tx_hash: Some(hash),
+            stage,
+            reason,
+            ..
+        } => {
+            assert_eq!(*stage, "observe");
+            assert_eq!(hash.len(), 64);
+            assert!(reason.contains("(secondary)"), "{reason}");
+        }
+        other => panic!("expected BaselineWriteFailed at stage observe; got {other:?}"),
+    }
+    assert_eq!(
+        row_kinds(&h.rows(), "req-install-behind"),
+        vec!["sa_context_rule_created", "sa_raw_invocation"]
+    );
+    assert_eq!(
+        raw_wire_code(&h, "req-install-behind"),
+        "sa.baseline_write_failed"
+    );
+}
+
+/// Without a signers manager an install and its simulation refuse with
+/// `sa.signers_manager_not_configured` and no rule id, before any RPC.
+#[tokio::test]
+async fn an_install_and_its_simulation_without_a_signers_manager_refuse_before_any_rpc() {
+    let h = Harness::new(install_chain()).await;
+    let manager = rule_manager_without_signers_manager(&h);
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    let installed = manager
+        .install_rule(
+            smart_account(),
+            install_definition(vec![account_input(0x13)], vec![]),
+            vec![ContextRuleId::new(0)],
+            &signer,
+            None,
+            "req-install-no-manager".to_owned(),
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+    let simulated = manager
+        .simulate_install_rule(
+            smart_account(),
+            install_definition(vec![account_input(0x13)], vec![]),
+            &account_id_for_seed(SEED),
+            false,
+            false,
+            "req-simulate-no-manager".to_owned(),
+        )
+        .await
+        .unwrap_err();
+    for (err, request) in [
+        (&installed, "req-install-no-manager"),
+        (&simulated, "req-simulate-no-manager"),
+    ] {
+        match err {
+            SaError::SignersManagerNotConfigured {
+                rule_id,
+                request_id,
+                ..
+            } => {
+                assert_eq!(*rule_id, None);
+                assert_eq!(request_id, request);
+            }
+            other => panic!("expected SignersManagerNotConfigured; got {other:?}"),
+        }
+        assert_eq!(err.wire_code(), "sa.signers_manager_not_configured");
+    }
+    assert!(h.primary_log.is_untouched());
+    assert!(h.secondary_log.is_untouched());
+}
+
+/// Asserts that `err` is the build-phase refusal with `reason`, and that
+/// nothing was simulated as an install or sent.
+fn assert_build_refusal(h: &Harness, err: &SaError, reason: &str) {
+    match err {
+        SaError::DeploymentFailed {
+            phase,
+            redacted_reason,
+        } => {
+            assert_eq!(*phase, "build");
+            assert_eq!(redacted_reason, reason);
+        }
+        other => panic!("expected DeploymentFailed at phase build; got {other:?}"),
+    }
+    assert!(!h.simulated("add_context_rule"));
+    assert_eq!(h.sends(), 0);
+}
+
+/// A definition that attaches two policies whose executables are the
+/// simple-threshold policy refuses an install and its simulation before
+/// either is simulated.
+#[tokio::test]
+async fn two_simple_threshold_policies_refuse_an_install_and_its_simulation() {
+    let h = Harness::new(install_chain()).await;
+    let definition = || {
+        install_definition(
+            vec![account_input(0x13)],
+            vec![
+                ContextRulePolicy::new(policy_p(), threshold_param(1)),
+                ContextRulePolicy::new(policy_p2(), threshold_param(1)),
+            ],
+        )
+    };
+    let reason = "install: 2 policies identify as the simple-threshold policy; at most one is \
+                  allowed";
+    let err = install(&h, definition(), "req-install-two", false)
+        .await
+        .unwrap_err();
+    assert_build_refusal(&h, &err, reason);
+    assert_eq!(raw_wire_code(&h, "req-install-two"), "sa.deployment_failed");
+    let err = simulate_install(&h, definition(), "req-simulate-two")
+        .await
+        .unwrap_err();
+    assert_build_refusal(&h, &err, reason);
+}
+
+/// A simple-threshold install parameter that is not the threshold map
+/// refuses an install and its simulation before either is simulated.
+#[tokio::test]
+async fn a_malformed_threshold_parameter_refuses_an_install_and_its_simulation() {
+    let h = Harness::new(install_chain()).await;
+    let definition = || {
+        install_definition(
+            vec![account_input(0x13)],
+            vec![ContextRulePolicy::new(policy_p(), ScVal::Void)],
+        )
+    };
+    for err in [
+        install(&h, definition(), "req-install-malformed", false)
+            .await
+            .unwrap_err(),
+        simulate_install(&h, definition(), "req-simulate-malformed")
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(
+            matches!(err, SaError::SimpleThresholdInstallRefused { .. }),
+            "{err:?}"
+        );
+    }
+    assert!(!h.simulated("add_context_rule"));
+    assert_eq!(h.sends(), 0);
+}
+
+/// A definition that lists a policy address twice refuses an install and its
+/// simulation before either is simulated.
+#[tokio::test]
+async fn a_policy_address_listed_twice_refuses_an_install_before_submission() {
+    let h = Harness::new(install_chain()).await;
+    let definition = || {
+        install_definition(
+            vec![account_input(0x13)],
+            vec![
+                ContextRulePolicy::new(policy_p(), threshold_param(1)),
+                ContextRulePolicy::new(policy_p(), threshold_param(1)),
+            ],
+        )
+    };
+    let err = install(&h, definition(), "req-install-twice", false)
+        .await
+        .unwrap_err();
+    assert_build_refusal(&h, &err, "install: policy address listed twice");
+    let err = simulate_install(&h, definition(), "req-simulate-twice")
+        .await
+        .unwrap_err();
+    assert_build_refusal(&h, &err, "install: policy address listed twice");
+}
+
+/// An `External` signer with empty key data refuses before submission.
+#[tokio::test]
+async fn an_external_signer_with_empty_key_data_refuses_an_install_before_submission() {
+    let h = Harness::new(install_chain()).await;
+    let err = install(
+        &h,
+        install_definition(vec![passkey_input(&[])], vec![]),
+        "req-install-empty-key",
+        false,
+    )
+    .await
+    .unwrap_err();
+    match &err {
+        SaError::AuthEntryConstructionFailed {
+            stage,
+            redacted_reason,
+        } => {
+            assert_eq!(*stage, "auth_payload");
+            assert_eq!(redacted_reason, "External signer pubkey is empty");
+        }
+        other => panic!("expected AuthEntryConstructionFailed; got {other:?}"),
+    }
+    assert!(!h.simulated("add_context_rule"));
+    assert_eq!(h.sends(), 0);
+}
+
+/// A signer delegated to a contract installs, and the baseline records its
+/// full contract identity.
+#[tokio::test]
+async fn a_contract_delegate_installs_and_its_baseline_carries_it() {
+    let delegate = contract(0x77);
+    let h = Harness::new(install_chain()).await;
+    h.after_send_state(&installed(vec![contract_delegate(&delegate)], vec![], &[]));
+    install(
+        &h,
+        install_definition(
+            vec![ContextRuleSignerInput::Delegated {
+                address: delegate.clone(),
+            }],
+            vec![],
+        ),
+        "req-install-contract",
+        false,
+    )
+    .await
+    .unwrap();
+    let (snapshot, _, _) = baselined_row(&h, "req-install-contract");
+    assert_eq!(
+        snapshot.signers,
+        vec![SignerEntryV2 {
+            id: 0,
+            identity: SignerIdentityV2::DelegatedContract {
+                contract: contract_id(&delegate)
+            }
+        }]
+    );
+}
+
+// ── The simple-threshold policy entries ───────────────────────────────────────
+
+/// A chain serving rule 1 with an External signer on verifier V and
+/// `policies`, the simple-threshold policies P, P2 and P3, the
+/// spending-limit policy Q, and `thresholds` for rule 1.
+async fn threshold_policy_harness(
+    policies: Vec<ScAddress>,
+    thresholds: &[(ScAddress, u32)],
+) -> Harness {
+    let mut chain = Chain::default()
+        .with_rule(1, rule_one_with_policies(policies))
+        .with_entry(wasm_instance(&verifier_v(), webauthn_hash()))
+        .with_wasm(&policy_p(), KNOWN_WASM_HASH)
+        .with_wasm(&policy_p2(), KNOWN_WASM_HASH)
+        .with_wasm(&policy_p3(), THRESHOLD_POLICY_WASM_HASHES[1])
+        .with_entry(wasm_instance(&policy_q(), spending_limit_hash()));
+    for (policy, threshold) in thresholds {
+        chain = chain.with_threshold(policy, 1, *threshold);
+    }
+    Harness::new(chain).await
+}
+
+/// The state a policy change leaves on rule 1: the rule holds `policies` and
+/// `thresholds` are rule 1's threshold values.
+fn rule_one_after(policies: Vec<ScAddress>, thresholds: &[(ScAddress, u32)]) -> AfterSend {
+    AfterSend {
+        rules: vec![(1, rule_one_with_policies(policies))],
+        thresholds: thresholds
+            .iter()
+            .map(|(policy, threshold)| (strkey(policy), 1, *threshold))
+            .collect(),
+    }
+}
+
+/// The `SaThresholdChangedV2` row written under `request_id`: its previous
+/// threshold and resulting snapshot.
+fn threshold_row(
+    h: &Harness,
+    request_id: &str,
+) -> (Option<ThresholdObservation>, SignerSetSnapshotV2) {
+    let rows: Vec<(Option<ThresholdObservation>, SignerSetSnapshotV2)> = rows_of(h, request_id)
+        .into_iter()
+        .filter_map(|entry| match entry.event_kind {
+            EventKind::SaThresholdChangedV2 {
+                rule_id: 1,
+                previous_threshold,
+                snapshot,
+                ..
+            } => Some((previous_threshold, snapshot)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "one threshold row for rule 1");
+    rows.into_iter().next().unwrap()
+}
+
+fn observation(policy: &ScAddress, threshold: u32) -> Option<ThresholdObservation> {
+    Some(ThresholdObservation {
+        policy: contract_id(policy),
+        threshold,
+    })
+}
+
+/// Attaching the simple-threshold policy to a baselined rule records the
+/// threshold row (no previous threshold, the resulting set with the
+/// parameter's threshold on the policy) before the policy row, then the raw
+/// row and the pins row; the next `signers list` matches.
+#[tokio::test]
+async fn a_threshold_attach_records_the_threshold_before_the_policy_row() {
+    let h = threshold_policy_harness(vec![], &[]).await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.after_send_state(&rule_one_after(vec![policy_p()], &[(policy_p(), 2)]));
+    let policy_id = add_policy_with(&h, &policy_p(), threshold_param(2), "req-attach", false)
+        .await
+        .unwrap();
+    assert_eq!(policy_id, 7);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-attach"),
+        vec![
+            "sa_threshold_changed_v2",
+            "sa_policy_added",
+            "sa_raw_invocation",
+            "sa_context_rule_pins_updated",
+        ]
+    );
+    assert_eq!(raw_wire_code(&h, "req-attach"), "sa.ok");
+    let (previous, resulting) = threshold_row(&h, "req-attach");
+    assert_eq!(previous, None);
+    assert_eq!(resulting.threshold, observation(&policy_p(), 2));
+    assert_eq!(resulting, h.snapshot_of(1));
+
+    let listed = h
+        .manager
+        .list_signers(smart_account(), 1, None, "req-attach-list".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(listed.baseline, PreviousBaseline::Matched);
+}
+
+/// Asserts a refusal before submission: nothing simulated as `function`,
+/// nothing sent, and one raw row under `request_id` carrying the refusal.
+fn assert_refused_before_submission(h: &Harness, err: &SaError, function: &str, request_id: &str) {
+    assert!(!h.simulated(function), "{function} was simulated");
+    assert_eq!(h.sends(), 0);
+    assert_eq!(raw_wire_code(h, request_id), err.wire_code());
+}
+
+/// Attaching the simple-threshold policy to a rule that already has one
+/// refuses before submission.
+#[tokio::test]
+async fn a_threshold_attach_on_a_rule_with_a_threshold_policy_refuses() {
+    let h = threshold_policy_harness(vec![policy_p2()], &[(policy_p2(), 1)]).await;
+    h.baseline_v2(1);
+    let err = add_policy_with(
+        &h,
+        &policy_p(),
+        threshold_param(2),
+        "req-attach-second",
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaError::ThresholdPolicyIdentificationFailed { rule_id: 1, .. }
+        ),
+        "{err:?}"
+    );
+    assert_refused_before_submission(&h, &err, "add_policy", "req-attach-second");
+}
+
+/// An attach of the simple-threshold policy on a rule whose signers changed
+/// since its state row refuses before submission: the comparison writes the
+/// diverged row and returns `sa.signer_set_diverged` without a transaction
+/// hash.
+#[tokio::test]
+async fn a_threshold_attach_on_a_rule_whose_signers_changed_refuses() {
+    let h = threshold_policy_harness(vec![], &[]).await;
+    h.baseline_v2(1);
+    h.set_rule(
+        1,
+        &rule(
+            1,
+            vec![
+                external_signer(&verifier_v(), &[0x11; 32]),
+                delegated_account(0x13),
+            ],
+            vec![],
+        ),
+    );
+    let err = add_policy_with(
+        &h,
+        &policy_p(),
+        threshold_param(2),
+        "req-attach-changed",
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaError::SignerSetDiverged {
+                rule_id: 1,
+                tx_hash: None,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        row_kinds(&h.rows(), "req-attach-changed"),
+        vec!["sa_signer_set_diverged", "sa_raw_invocation"]
+    );
+    assert_refused_before_submission(&h, &err, "add_policy", "req-attach-changed");
+}
+
+/// An attach of the simple-threshold policy whose install parameter is not
+/// the threshold map refuses before submission.
+#[tokio::test]
+async fn a_threshold_attach_with_a_malformed_parameter_refuses() {
+    let h = threshold_policy_harness(vec![], &[]).await;
+    h.baseline_v2(1);
+    let err = add_policy_with(&h, &policy_p(), ScVal::Void, "req-attach-malformed", false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SaError::SimpleThresholdInstallRefused { .. }),
+        "{err:?}"
+    );
+    assert_refused_before_submission(&h, &err, "add_policy", "req-attach-malformed");
+}
+
+/// A confirmed attach whose served threshold is not the parameter's refuses
+/// with `sa.signer_set_diverged` carrying the hash; the policy row and the
+/// pins row are still written, and no threshold row.
+#[tokio::test]
+async fn a_confirmed_threshold_attach_whose_threshold_differs_refuses_with_the_hash() {
+    let h = threshold_policy_harness(vec![], &[]).await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.after_send_state(&rule_one_after(vec![policy_p()], &[(policy_p(), 3)]));
+    let err = add_policy_with(
+        &h,
+        &policy_p(),
+        threshold_param(2),
+        "req-attach-differs",
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaError::SignerSetDiverged {
+                rule_id: 1,
+                tx_hash: Some(_),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        row_kinds(&h.rows(), "req-attach-differs"),
+        vec![
+            "sa_signer_set_diverged",
+            "sa_policy_added",
+            "sa_raw_invocation",
+            "sa_context_rule_pins_updated",
+        ]
+    );
+    assert_eq!(
+        raw_wire_code(&h, "req-attach-differs"),
+        "sa.signer_set_diverged"
+    );
+    assert_eq!(h.sends(), 1);
+}
+
+/// A confirmed attach whose simulated return is not a `u32` fails at stage
+/// `observe` with the hash: no policy row and no threshold row, and the pins
+/// row of the confirmed attach is written.
+#[tokio::test]
+async fn a_confirmed_threshold_attach_whose_return_is_not_a_u32_fails_at_stage_observe() {
+    let h = threshold_policy_harness(vec![], &[]).await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.set_simulated_return("add_policy", ScVal::Void);
+    h.after_send_state(&rule_one_after(vec![policy_p()], &[(policy_p(), 2)]));
+    let err = add_policy_with(
+        &h,
+        &policy_p(),
+        threshold_param(2),
+        "req-attach-void",
+        false,
+    )
+    .await
+    .unwrap_err();
+    match &err {
+        SaError::BaselineWriteFailed {
+            rule_id: 1,
+            tx_hash: Some(hash),
+            stage,
+            reason,
+            ..
+        } => {
+            assert_eq!(*stage, "observe");
+            assert_eq!(hash.len(), 64);
+            assert!(
+                reason.contains("add_policy: expected ScVal::U32 return, got Void"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected BaselineWriteFailed at stage observe; got {other:?}"),
+    }
+    assert_eq!(
+        row_kinds(&h.rows(), "req-attach-void"),
+        vec!["sa_raw_invocation", "sa_context_rule_pins_updated"]
+    );
+    assert_eq!(h.sends(), 1);
+}
+
+/// An attach of the simple-threshold policy refuses a rule with no state
+/// row and a rule whose state row is version 1, before submission.
+#[tokio::test]
+async fn a_threshold_attach_without_a_version_2_baseline_refuses() {
+    let h = threshold_policy_harness(vec![], &[]).await;
+    let err = add_policy_with(
+        &h,
+        &policy_p(),
+        threshold_param(2),
+        "req-attach-missing",
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.wire_code(), "sa.signer_set_missing_baseline", "{err:?}");
+    assert_refused_before_submission(&h, &err, "add_policy", "req-attach-missing");
+
+    let h = threshold_policy_harness(vec![policy_p2()], &[(policy_p2(), 1)]).await;
+    h.baseline_v1(1);
+    let err = add_policy_with(
+        &h,
+        &policy_p(),
+        threshold_param(2),
+        "req-attach-legacy",
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.wire_code(), "sa.signer_set_baseline_legacy", "{err:?}");
+    assert_refused_before_submission(&h, &err, "add_policy", "req-attach-legacy");
+}
+
+/// A confirmed attach of a policy other than the simple-threshold policy
+/// whose simulated return is not a `u32` fails at stage `observe` with the
+/// hash: no policy row, a raw row that records the confirmed transaction,
+/// and the pins row of the confirmed attach.
+#[tokio::test]
+async fn a_confirmed_direct_attach_whose_return_is_not_a_u32_fails_at_stage_observe_and_pins() {
+    let h = threshold_policy_harness(vec![], &[]).await;
+    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.set_simulated_return("add_policy", ScVal::Void);
+    h.after_send(1, rule_one_with_policies(vec![policy_q()]));
+    let err = add_policy_with(&h, &policy_q(), ScVal::Void, "req-direct-void", false)
+        .await
+        .unwrap_err();
+    match &err {
+        SaError::BaselineWriteFailed {
+            rule_id: 1,
+            tx_hash: Some(hash),
+            stage,
+            reason,
+            ..
+        } => {
+            assert_eq!(*stage, "observe");
+            assert_eq!(hash.len(), 64);
+            assert!(
+                reason.contains("add_policy return value is not ScVal::U32 (got Void)"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected BaselineWriteFailed at stage observe; got {other:?}"),
+    }
+    assert_eq!(
+        row_kinds(&h.rows(), "req-direct-void"),
+        vec!["sa_raw_invocation", "sa_context_rule_pins_updated"]
+    );
+    assert_eq!(
+        raw_wire_code(&h, "req-direct-void"),
+        "sa.baseline_write_failed"
+    );
+    let pins = h.pins_updated_rows();
+    assert_eq!(pins.len(), 1);
+    let (policies, _, reason) = policy_pins_of(&pins[0]);
+    assert_eq!(policies, vec![first8(&spending_limit_hash())]);
+    assert_eq!(reason, PinsUpdateReason::PolicyAdded);
+    assert_eq!(h.sends(), 1);
+}
+
+/// A spending-limit attach records no signer-set state row and keeps its
+/// pin rows.
+#[tokio::test]
+async fn a_spending_limit_attach_writes_no_state_row_and_keeps_its_pin_rows() {
+    let h = threshold_policy_harness(vec![], &[]).await;
+    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.after_send(1, rule_one_with_policies(vec![policy_q()]));
+    add_policy_with(&h, &policy_q(), ScVal::Void, "req-attach-limit", false)
+        .await
+        .unwrap();
+    assert_eq!(
+        row_kinds(&h.rows(), "req-attach-limit"),
+        vec![
+            "sa_policy_added",
+            "sa_raw_invocation",
+            "sa_context_rule_pins_updated",
+        ]
+    );
+    assert_eq!(h.sends(), 1);
+}
+
+/// Without a signers manager the policy verbs refuse with
+/// `sa.signers_manager_not_configured` naming the target rule, before any
+/// RPC.
+#[tokio::test]
+async fn the_policy_verbs_without_a_signers_manager_refuse_before_any_rpc() {
+    let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 1)]).await;
+    let manager = rule_manager_without_signers_manager(&h);
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    let added = manager
+        .add_policy(
+            smart_account(),
+            1,
+            policy_q(),
+            ScVal::Void,
+            vec![ContextRuleId::new(0)],
+            &signer,
+            None,
+            "req-add-no-manager".to_owned(),
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+    let removed = manager
+        .remove_policy(
+            smart_account(),
+            1,
+            0,
+            vec![ContextRuleId::new(0)],
+            &signer,
+            None,
+            "req-remove-no-manager".to_owned(),
+        )
+        .await
+        .unwrap_err();
+    for err in [&added, &removed] {
+        assert!(
+            matches!(
+                err,
+                SaError::SignersManagerNotConfigured {
+                    rule_id: Some(1),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+    assert!(h.primary_log.is_untouched());
+    assert!(h.secondary_log.is_untouched());
+}
+
+/// Detaching the observed simple-threshold policy records the threshold row
+/// (the observed threshold as previous, none as resulting) before the policy
+/// row, then the raw row and the pins row; the next `signers list` matches.
+#[tokio::test]
+async fn a_threshold_detach_records_the_cleared_threshold_before_the_policy_row() {
+    let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 2)]).await;
+    h.baseline_v2(1);
+    h.pin_created(
+        1,
+        vec![first8(&webauthn_hash())],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    h.after_send(1, rule_one_with_policies(vec![]));
+    remove_policy(&h, 0, "req-detach").await.unwrap();
+    assert_eq!(
+        row_kinds(&h.rows(), "req-detach"),
+        vec![
+            "sa_threshold_changed_v2",
+            "sa_policy_removed",
+            "sa_raw_invocation",
+            "sa_context_rule_pins_updated",
+        ]
+    );
+    assert_eq!(raw_wire_code(&h, "req-detach"), "sa.ok");
+    let (previous, resulting) = threshold_row(&h, "req-detach");
+    assert_eq!(previous, observation(&policy_p(), 2));
+    assert_eq!(resulting.threshold, None);
+    assert_eq!(resulting, h.snapshot_of(1));
+
+    let listed = h
+        .manager
+        .list_signers(smart_account(), 1, None, "req-detach-list".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(listed.baseline, PreviousBaseline::Matched);
+}
+
+/// A confirmed detach whose served state keeps the threshold refuses with
+/// `sa.signer_set_diverged` carrying the hash; the policy row and the pins
+/// row are written, and no threshold row.
+#[tokio::test]
+async fn a_confirmed_threshold_detach_whose_threshold_stays_refuses_with_the_hash() {
+    let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 2)]).await;
+    h.baseline_v2(1);
+    h.pin_created(
+        1,
+        vec![first8(&webauthn_hash())],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    h.after_send(1, rule_one_with_policies(vec![policy_p()]));
+    let err = remove_policy(&h, 0, "req-detach-stays").await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaError::SignerSetDiverged {
+                rule_id: 1,
+                tx_hash: Some(_),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        row_kinds(&h.rows(), "req-detach-stays"),
+        vec![
+            "sa_signer_set_diverged",
+            "sa_policy_removed",
+            "sa_raw_invocation",
+            "sa_context_rule_pins_updated",
+        ]
+    );
+    assert_eq!(h.sends(), 1);
+}
+
+/// A detach whose policy identified as the simple-threshold policy at the
+/// verb's read and not at the rule's observation refuses before submission:
+/// the observed rule has no simple-threshold policy to detach. The policy's
+/// executable changes after the verb's two reads, one per endpoint of the
+/// shared chain.
+#[tokio::test]
+async fn a_detach_whose_policy_stops_identifying_after_the_verb_read_refuses() {
+    let chain = Chain::default()
+        .with_rule(1, rule_one_with_policies(vec![policy_p()]))
+        .with_entry(wasm_instance(&verifier_v(), webauthn_hash()))
+        .with_entry(wasm_instance(&policy_p(), KNOWN_WASM_HASH))
+        .entry_after_reads(
+            rpc_mock_helpers::contract_instance_key_xdr(&policy_p()),
+            2,
+            wasm_instance(&policy_p(), [0xab; 32]),
+        );
+    let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    let err = remove_policy(&h, 0, "req-detach-identity")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaError::ThresholdPolicyIdentificationFailed { rule_id: 1, .. }
+        ),
+        "{err:?}"
+    );
+    assert_refused_before_submission(&h, &err, "remove_policy", "req-detach-identity");
+    assert_eq!(h.primary_instance_reads(&policy_p()), 2);
+}
+
+/// A rule with two simple-threshold policies cannot be observed, and the
+/// detach of one of them is accepted: the row records no previous threshold
+/// and the remaining policy's threshold; the next `signers list` matches.
+#[tokio::test]
+async fn a_rule_with_two_threshold_policies_detaches_one_of_them() {
+    let h = threshold_policy_harness(
+        vec![policy_p(), policy_p2()],
+        &[(policy_p(), 1), (policy_p2(), 2)],
+    )
+    .await;
+    h.baseline_v2(1);
+    let err = h
+        .manager
+        .list_signers(smart_account(), 1, None, "req-two-list".to_owned())
+        .await
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "sa.threshold_policy_identification_failed");
+
+    h.after_send(1, rule_one_with_policies(vec![policy_p2()]));
+    remove_policy(&h, 0, "req-repair").await.unwrap();
+    assert_eq!(
+        row_kinds(&h.rows(), "req-repair"),
+        vec![
+            "sa_threshold_changed_v2",
+            "sa_policy_removed",
+            "sa_raw_invocation",
+        ]
+    );
+    let (previous, resulting) = threshold_row(&h, "req-repair");
+    assert_eq!(previous, None);
+    assert_eq!(resulting.threshold, observation(&policy_p2(), 2));
+    assert_eq!(resulting, h.snapshot_of(1));
+    assert_eq!(h.sends(), 1);
+
+    let listed = h
+        .manager
+        .list_signers(smart_account(), 1, None, "req-repair-list".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(listed.baseline, PreviousBaseline::Matched);
+}
+
+/// The detach of one of two simple-threshold policies from a rule whose
+/// signers changed since its state row refuses before submission with
+/// `sa.signer_set_diverged` without a hash, and writes one diverged row.
+#[tokio::test]
+async fn a_repair_detach_on_a_rule_whose_signers_changed_refuses_before_submission() {
+    let h = threshold_policy_harness(
+        vec![policy_p(), policy_p2()],
+        &[(policy_p(), 1), (policy_p2(), 2)],
+    )
+    .await;
+    h.baseline_v2(1);
+    h.set_rule(
+        1,
+        &rule(
+            1,
+            vec![
+                external_signer(&verifier_v(), &[0x11; 32]),
+                delegated_account(0x13),
+            ],
+            vec![policy_p(), policy_p2()],
+        ),
+    );
+    let err = remove_policy(&h, 0, "req-repair-signers")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaError::SignerSetDiverged {
+                rule_id: 1,
+                tx_hash: None,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        row_kinds(&h.rows(), "req-repair-signers"),
+        vec!["sa_signer_set_diverged", "sa_raw_invocation"]
+    );
+    assert_refused_before_submission(&h, &err, "remove_policy", "req-repair-signers");
+}
+
+/// The detach of one of two simple-threshold policies whose confirmed state
+/// is not the remaining policy's threshold refuses with
+/// `sa.signer_set_diverged` carrying the hash, and writes no threshold row.
+#[tokio::test]
+async fn a_repair_detach_whose_confirmed_state_is_not_the_remaining_policy_refuses() {
+    let h = threshold_policy_harness(
+        vec![policy_p(), policy_p2()],
+        &[(policy_p(), 1), (policy_p2(), 2)],
+    )
+    .await;
+    h.baseline_v2(1);
+    h.after_send(1, rule_one_with_policies(vec![]));
+    let err = remove_policy(&h, 0, "req-repair-wrong").await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaError::SignerSetDiverged {
+                rule_id: 1,
+                tx_hash: Some(_),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        row_kinds(&h.rows(), "req-repair-wrong"),
+        vec![
+            "sa_signer_set_diverged",
+            "sa_policy_removed",
+            "sa_raw_invocation",
+        ]
+    );
+    assert_eq!(h.sends(), 1);
+}
+
+/// A rule with three simple-threshold policies refuses the detach of one of
+/// them before submission: one detach cannot leave it observable.
+#[tokio::test]
+async fn three_threshold_policies_refuse_the_detach() {
+    let h = threshold_policy_harness(
+        vec![policy_p(), policy_p2(), policy_p3()],
+        &[(policy_p(), 1), (policy_p2(), 2), (policy_p3(), 3)],
+    )
+    .await;
+    h.baseline_v2(1);
+    let err = remove_policy(&h, 0, "req-three").await.unwrap_err();
+    match &err {
+        SaError::ThresholdPolicyIdentificationFailed {
+            rule_id: 1,
+            observed_wasm_hashes_summary,
+            ..
+        } => assert_eq!(observed_wasm_hashes_summary.count, 3),
+        other => panic!("expected ThresholdPolicyIdentificationFailed; got {other:?}"),
+    }
+    assert_refused_before_submission(&h, &err, "remove_policy", "req-three");
+}
+
+/// A removal from a rule that is not on chain and a removal of a policy id
+/// the rule does not hold each refuse before submission with their own
+/// reason.
+#[tokio::test]
+async fn a_missing_rule_and_an_unattached_policy_id_refuse_the_removal() {
+    let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 1)]).await;
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    let missing_rule = h
+        .rule_manager()
+        .remove_policy(
+            smart_account(),
+            9,
+            0,
+            vec![ContextRuleId::new(0)],
+            &signer,
+            None,
+            "req-remove-missing-rule".to_owned(),
+        )
+        .await
+        .unwrap_err();
+    let missing_policy = remove_policy(&h, 5, "req-remove-missing-policy")
+        .await
+        .unwrap_err();
+    for (err, expected, request_id) in [
+        (
+            &missing_rule,
+            "remove_policy: rule 9 not found",
+            "req-remove-missing-rule",
+        ),
+        (
+            &missing_policy,
+            "remove_policy: policy 5 is not attached to rule 1",
+            "req-remove-missing-policy",
+        ),
+    ] {
+        match err {
+            SaError::DeploymentFailed {
+                phase,
+                redacted_reason,
+            } => {
+                assert_eq!(*phase, "simulate");
+                assert_eq!(redacted_reason, expected);
+            }
+            other => panic!("expected DeploymentFailed; got {other:?}"),
+        }
+        assert_refused_before_submission(&h, err, "remove_policy", request_id);
+    }
+}
+
+/// A secondary one ledger behind for its first read after the install
+/// confirms does not hold the new rule yet: the failed read is behind the
+/// confirmation, so it is read again after a pause, and the baseline is
+/// written from the caught-up reads.
+#[tokio::test]
+async fn an_install_whose_secondary_lags_one_read_is_baselined() {
+    let h = Harness::new(install_chain()).await;
+    h.after_send_state(&installed(vec![delegated_account(0x13)], vec![], &[]));
+    h.secondary_ledgers
+        .queued
+        .lock()
+        .unwrap()
+        .push_back(PRE_SEND_LEDGER);
+    install(
+        &h,
+        install_definition(vec![account_input(0x13)], vec![]),
+        "req-install-lag",
+        false,
+    )
+    .await
+    .unwrap();
+    let (snapshot, reason, ledger) = baselined_row(&h, "req-install-lag");
+    assert_eq!(snapshot, h.snapshot_of(1));
+    assert_eq!(reason, BaselineReason::ConfirmedInstall);
+    assert_eq!(ledger, CONFIRMATION_LEDGER);
+    assert_eq!(
+        h.secondary_log.simulated(),
+        vec!["get_context_rule", "get_context_rule"],
+        "the behind read is repeated"
+    );
+}
+
+/// A secondary whose threshold read after a confirmed attach is one ledger
+/// behind does not hold the new threshold yet: the read is behind the
+/// confirmation, so the endpoint's observation is repeated after a pause,
+/// and the threshold row is written from the caught-up reads.
+#[tokio::test]
+async fn a_threshold_attach_whose_secondary_threshold_read_lags_is_recorded() {
+    let h = threshold_policy_harness(vec![], &[]).await;
+    h.baseline_v2(1);
+    h.after_send_state(&rule_one_after(vec![policy_p()], &[(policy_p(), 2)]));
+    h.secondary_ledgers
+        .queued
+        .lock()
+        .unwrap()
+        .extend([CONFIRMATION_LEDGER, PRE_SEND_LEDGER]);
+    add_policy_with(&h, &policy_p(), threshold_param(2), "req-attach-lag", false)
+        .await
+        .unwrap();
+    let (previous, resulting) = threshold_row(&h, "req-attach-lag");
+    assert_eq!(previous, None);
+    assert_eq!(resulting.threshold, observation(&policy_p(), 2));
+    let secondary = h.secondary_log.simulated();
+    assert_eq!(
+        secondary[secondary.len() - 4..],
+        [
+            "get_context_rule",
+            "get_threshold",
+            "get_context_rule",
+            "get_threshold"
+        ],
+        "the behind threshold read repeats the endpoint's observation: {secondary:?}"
+    );
 }

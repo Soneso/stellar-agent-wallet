@@ -68,10 +68,11 @@ use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::credentials::CredentialsManager;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
-    InstallRuleOutput, OZ_MAX_NAME_SIZE, OZ_MAX_POLICIES, OZ_MAX_SIGNERS, PinStatus, RuleContext,
-    SmartAccountAddress, VerifyPinsResult as SaVerifyPinsResult, decode_context_type_from_scval,
+    DELEGATED_SIGNER_ADDRESS_REASON, InstallRuleOutput, OZ_MAX_NAME_SIZE, OZ_MAX_POLICIES,
+    OZ_MAX_SIGNERS, PinStatus, RuleContext, SmartAccountAddress,
+    VerifyPinsResult as SaVerifyPinsResult, decode_context_type_from_scval,
     decode_policy_count_from_scval, parse_c_strkey_to_smart_account,
-    parse_g_strkey_to_signer_address,
+    parse_delegated_signer_address, parse_g_strkey_to_signer_address,
 };
 use stellar_agent_smart_account::simple_threshold_policy::build_simple_threshold_install_param;
 use stellar_agent_smart_account::spending_limit_policy::{
@@ -426,14 +427,16 @@ async fn list_rules_run(args: &ListArgs) -> i32 {
 ///
 /// # Passkey-only refusal
 ///
-/// When only `--signer-webauthn` entries are present and no `--signer-delegated`
-/// entries are specified, the CLI prints a warning banner to stderr and refuses
-/// with `validation.passkey_only_rule_no_delegated_fallback` unless
+/// When `--signer-webauthn` or `--signer-ed25519` entries are present and no
+/// `--signer-delegated` entry is an account (G-strkey), the CLI prints a
+/// warning banner to stderr and refuses with
+/// `validation.passkey_only_rule_no_delegated_fallback` unless
 /// `--accept-no-delegated-fallback` is also passed.
 ///
-/// Rationale: a passkey-only rule has no delegated G-key fallback. If the
-/// authenticator device is lost the rule cannot be used. The flag makes the
-/// operator explicitly acknowledge this risk.
+/// Rationale: such a rule has no delegated G-key fallback. If the
+/// authenticator device is lost the rule cannot be used. A contract delegate
+/// (C-strkey) is not a fallback signer: it is not a key the operator holds.
+/// The flag makes the operator explicitly acknowledge this risk.
 #[non_exhaustive]
 #[derive(Debug, Args)]
 pub struct CreateArgs {
@@ -446,12 +449,14 @@ pub struct CreateArgs {
     #[arg(long, value_name = "STRING", required = true)]
     pub name: String,
 
-    /// One or more delegated-signer G-strkeys (one G-strkey per
-    /// `--signer-delegated`; flag is repeatable).
+    /// One or more delegated signers (one strkey per `--signer-delegated`;
+    /// flag is repeatable): a G-strkey for an ed25519 account, or a C-strkey
+    /// for a contract whose own authorization decides for the signer.
     ///
-    /// Each G-strkey is encoded as the OZ `Signer::Delegated(Address)`
-    /// variant.
-    #[arg(long = "signer-delegated", value_name = "G_STRKEY",
+    /// Each address is encoded as the OZ `Signer::Delegated(Address)`
+    /// variant. Only an account delegate counts as the delegated fallback
+    /// signer of a passkey or Ed25519 rule.
+    #[arg(long = "signer-delegated", value_name = "STRKEY",
           num_args = 1.., action = clap::ArgAction::Append)]
     pub signer_delegated: Vec<String>,
 
@@ -503,7 +508,8 @@ pub struct CreateArgs {
     /// is the sole signing authority.
     ///
     /// Required when `--signer-webauthn` and/or `--signer-ed25519` entries
-    /// are provided and no `--signer-delegated` entries are present
+    /// are provided and no `--signer-delegated` entry is an account
+    /// (G-strkey); a contract delegate is not a fallback signer
     /// (External-only refusal). If omitted, the command is refused with
     /// `validation.passkey_only_rule_no_delegated_fallback`.
     #[arg(long)]
@@ -671,16 +677,29 @@ async fn create_run(args: &CreateArgs) -> i32 {
         );
     }
 
-    // Refuse an External-only rule without explicit acknowledgement: if ALL
-    // signers are WebAuthn and/or first-class Ed25519 (no delegated
-    // fallback), the operator must pass --accept-no-delegated-fallback to
-    // acknowledge that a lost authenticator device or rule seed leaves the
-    // rule permanently inaccessible.
+    // The delegated signers are parsed before the fallback check, which
+    // counts the account delegates among them: an invalid strkey refuses
+    // first.
+    let mut delegated_addresses: Vec<SmartAccountAddress> =
+        Vec::with_capacity(args.signer_delegated.len());
+    for s in &args.signer_delegated {
+        match parse_delegated_signer_for_rule(s) {
+            Ok(address) => delegated_addresses.push(address),
+            Err(e) => return emit_error(&e, args.common.output, &request_id),
+        }
+    }
+
+    // Refuse an External-only rule without explicit acknowledgement. When
+    // the signers are WebAuthn or first-class Ed25519 with no account
+    // delegate as fallback, the operator must pass
+    // --accept-no-delegated-fallback: a lost authenticator device or rule
+    // seed leaves such a rule permanently inaccessible.
     let external_signer_count = args.signer_webauthn.len() + args.signer_ed25519.len();
-    if args.signer_delegated.is_empty()
-        && external_signer_count > 0
-        && !args.accept_no_delegated_fallback
-    {
+    if let Some(refusal) = no_delegated_fallback_refusal(
+        &delegated_addresses,
+        external_signer_count,
+        args.accept_no_delegated_fallback,
+    ) {
         // Print a stderr warning banner before the JSON refusal.
         #[allow(
             clippy::print_stderr,
@@ -702,9 +721,7 @@ async fn create_run(args: &CreateArgs) -> i32 {
             eprintln!();
         }
         return emit_error(
-            &WalletError::Validation(ValidationError::PasskeyOnlyRuleNoDelegatedFallback {
-                credential_count: external_signer_count,
-            }),
+            &WalletError::Validation(refusal),
             args.common.output,
             &request_id,
         );
@@ -746,12 +763,11 @@ async fn create_run(args: &CreateArgs) -> i32 {
     let mut signers: Vec<ContextRuleSignerInput> =
         Vec::with_capacity(args.signer_delegated.len() + args.signer_webauthn.len());
 
-    for s in &args.signer_delegated {
-        match parse_g_strkey_for_signer(s) {
-            Ok(addr) => signers.push(ContextRuleSignerInput::Delegated { address: addr }),
-            Err(e) => return emit_error(&e, args.common.output, &request_id),
-        }
-    }
+    signers.extend(
+        delegated_addresses
+            .into_iter()
+            .map(|address| ContextRuleSignerInput::Delegated { address }),
+    );
 
     // Resolve WebAuthn passkey signers → External entries.
     let webauthn_count = args.signer_webauthn.len() as u32;
@@ -3169,13 +3185,46 @@ fn contract_scaddress_to_strkey(addr: &stellar_xdr::ScAddress) -> Result<String,
 }
 
 /// Parses a G-strkey via the smart_account-crate helper, used for
-/// `--signer-delegated` args.
+/// `--weighted-signer-delegated` args, which take an account only.
 fn parse_g_strkey_for_signer(s: &str) -> Result<SmartAccountAddress, WalletError> {
     parse_g_strkey_to_signer_address(s).map_err(|e| {
         WalletError::Validation(ValidationError::AddressInvalid {
             input: format!("--signer-delegated: {e}"),
         })
     })
+}
+
+/// Parses a `rules create --signer-delegated` value: a G-strkey (an ed25519
+/// account) or a C-strkey (a contract). A refusal names the flag and the
+/// parser's reason, since the value is typed by the operator.
+fn parse_delegated_signer_for_rule(s: &str) -> Result<SmartAccountAddress, WalletError> {
+    parse_delegated_signer_address(s).map_err(|_| {
+        WalletError::Validation(ValidationError::AddressInvalid {
+            input: format!("--signer-delegated: {DELEGATED_SIGNER_ADDRESS_REASON}"),
+        })
+    })
+}
+
+/// The `validation.passkey_only_rule_no_delegated_fallback` refusal of a rule
+/// with `external_signer_count` External signers and no account among the
+/// `delegated` signers, unless `accept_no_delegated_fallback` acknowledges it.
+///
+/// Only an account delegate is a fallback signer: its key keeps the rule
+/// usable when the External signers are lost. A contract delegate is not a
+/// key the operator holds.
+fn no_delegated_fallback_refusal(
+    delegated: &[SmartAccountAddress],
+    external_signer_count: usize,
+    accept_no_delegated_fallback: bool,
+) -> Option<ValidationError> {
+    let account_delegates = delegated
+        .iter()
+        .filter(|address| matches!(address, SmartAccountAddress::Account(_)))
+        .count();
+    (account_delegates == 0 && external_signer_count > 0 && !accept_no_delegated_fallback)
+        .then_some(ValidationError::PasskeyOnlyRuleNoDelegatedFallback {
+            credential_count: external_signer_count,
+        })
 }
 
 /// Resolves a policy contract address for `add-policy`: an explicit
@@ -5800,5 +5849,94 @@ mod tests {
         args.network = TargetNetwork::Mainnet;
         let code = set_spending_limit_run(&args).await;
         assert_eq!(code, 1, "mainnet must be refused");
+    }
+
+    // ── rules create --signer-delegated ──────────────────────────────────────
+
+    fn contract_strkey(byte: u8) -> String {
+        format!("{}", stellar_strkey::Contract([byte; 32]))
+    }
+
+    fn muxed_strkey() -> String {
+        format!(
+            "{}",
+            stellar_strkey::ed25519::MuxedAccount {
+                ed25519: [0u8; 32],
+                id: 7,
+            }
+        )
+    }
+
+    /// `rules create --signer-delegated` takes a G-strkey as an account and
+    /// a C-strkey as a contract, and refuses a muxed M-strkey.
+    #[test]
+    fn parse_delegated_signer_for_rule_takes_an_account_or_a_contract() {
+        assert!(matches!(
+            parse_delegated_signer_for_rule(SIMULATE_SENTINEL_G),
+            Ok(SmartAccountAddress::Account(_))
+        ));
+        assert!(matches!(
+            parse_delegated_signer_for_rule(&contract_strkey(0x11)),
+            Ok(SmartAccountAddress::Contract(_))
+        ));
+        match parse_delegated_signer_for_rule(&muxed_strkey()) {
+            Err(WalletError::Validation(ValidationError::AddressInvalid { input })) => {
+                assert_eq!(
+                    input,
+                    "--signer-delegated: invalid delegated signer address: expected a G-strkey \
+                     or a C-strkey"
+                );
+            }
+            other => panic!("expected AddressInvalid, got {other:?}"),
+        }
+    }
+
+    /// The weighted-threshold signer flag stays account-only: the parser of
+    /// `--weighted-signer-delegated` refuses a C-strkey.
+    #[test]
+    fn weighted_signer_delegated_refuses_a_c_strkey() {
+        assert!(parse_g_strkey_for_signer(SIMULATE_SENTINEL_G).is_ok());
+        assert!(matches!(
+            parse_g_strkey_for_signer(&contract_strkey(0x11)),
+            Err(WalletError::Validation(
+                ValidationError::AddressInvalid { .. }
+            ))
+        ));
+    }
+
+    /// A contract delegate is not the fallback signer of a passkey rule: a
+    /// `[C-delegate, passkey]` rule refuses without the acknowledgement and
+    /// proceeds with it, and a `[G-delegate, passkey]` rule proceeds without
+    /// it.
+    #[test]
+    fn only_an_account_delegate_is_the_passkey_fallback_signer() {
+        let contract = parse_delegated_signer_for_rule(&contract_strkey(0x22)).unwrap();
+        let account = parse_delegated_signer_for_rule(SIMULATE_SENTINEL_G).unwrap();
+
+        let refusal = no_delegated_fallback_refusal(std::slice::from_ref(&contract), 1, false)
+            .expect("a contract delegate is not a fallback signer");
+        assert_eq!(
+            refusal.code(),
+            "validation.passkey_only_rule_no_delegated_fallback"
+        );
+        assert!(matches!(
+            refusal,
+            ValidationError::PasskeyOnlyRuleNoDelegatedFallback {
+                credential_count: 1
+            }
+        ));
+
+        assert!(
+            no_delegated_fallback_refusal(std::slice::from_ref(&contract), 1, true).is_none(),
+            "the acknowledgement admits a contract-delegate rule"
+        );
+        assert!(
+            no_delegated_fallback_refusal(&[account, contract], 1, false).is_none(),
+            "an account delegate is the fallback signer"
+        );
+        assert!(
+            no_delegated_fallback_refusal(&[], 0, false).is_none(),
+            "a rule without External signers needs no fallback"
+        );
     }
 }

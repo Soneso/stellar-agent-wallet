@@ -62,8 +62,11 @@ use stellar_agent_smart_account::deployment::{
 };
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
+    ContextRuleDefinition, ContextRuleManager, ContextRuleSignerInput,
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
+};
+use stellar_agent_smart_account::test_helpers::{
+    rule_manager_config_for_tests, signers_manager_for_tests,
 };
 use stellar_rpc_client::Client;
 use zeroize::Zeroizing;
@@ -73,7 +76,6 @@ use zeroize::Zeroizing;
 const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 const TESTNET_FRIENDBOT_URL: &str = "https://friendbot.stellar.org";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
-const CHAIN_ID: &str = "stellar:testnet";
 const FEE_STROOPS: u32 = 1_000_000;
 const TIMEOUT_SECS: u64 = 120;
 
@@ -243,20 +245,34 @@ fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
     entries
 }
 
-fn fresh_rule_manager_uncapped(audit_writer: Arc<Mutex<AuditWriter>>) -> ContextRuleManager {
+/// A testnet rule manager writing to `audit_writer`, with a signers manager
+/// over the same writer, whose log is `audit_log_path`. Rule install and the
+/// policy verbs require the signers manager.
+fn fresh_rule_manager_uncapped(
+    audit_writer: Arc<Mutex<AuditWriter>>,
+    audit_log_path: std::path::PathBuf,
+) -> ContextRuleManager {
     // Use a very large cap so the substrate install with `current + 5`
     // does not trigger the horizon enforcement.  The horizon test is in
     // `smart_account_session_rule_horizon_testnet_acceptance.rs`; here we focus
     // on the expiry detection.
+    let timeout = Duration::from_secs(TIMEOUT_SECS);
+    let signers_manager = signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
+        Arc::clone(&audit_writer),
+        audit_log_path,
+        timeout,
+    );
     ContextRuleManager::new(
-        ContextRuleManagerConfig::new(
-            TESTNET_RPC_URL.to_owned(),
-            TESTNET_PASSPHRASE.to_owned(),
-            Duration::from_secs(TIMEOUT_SECS),
-            CHAIN_ID.to_owned(),
+        rule_manager_config_for_tests(
+            TESTNET_RPC_URL,
+            None,
+            signers_manager,
+            audit_writer,
+            timeout,
         )
-        .with_session_rule_max_horizon_ledgers(u32::MAX)
-        .with_audit_writer(audit_writer),
+        .with_session_rule_max_horizon_ledgers(u32::MAX),
     )
     .expect("ContextRuleManager::new must succeed")
 }
@@ -307,7 +323,7 @@ async fn h_1_revocation_audit_log_timeline() {
     );
 
     let (audit_writer, audit_log_path, _tmpdir) = tmp_audit_writer();
-    let manager = fresh_rule_manager_uncapped(Arc::clone(&audit_writer));
+    let manager = fresh_rule_manager_uncapped(Arc::clone(&audit_writer), audit_log_path.clone());
 
     let sa_addr = parse_c_strkey_to_smart_account(&sa_strkey).expect("C-strkey must parse");
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g).expect("G-strkey must parse");
@@ -357,8 +373,8 @@ async fn h_1_revocation_audit_log_timeline() {
             sa_addr.clone(),
             rule_id,
             Some(revocation_ledger),
-            // Rule 0 authorizes: this manager has no signers manager, so an
-            // authorizing rule other than 0 is refused before signing.
+            // Rule 0, the bootstrap rule whose signer is this test's signer,
+            // authorizes the revocation.
             vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None,
@@ -436,10 +452,10 @@ async fn h_1_revocation_audit_log_timeline() {
 /// # Design
 ///
 /// `ContextRuleManager::add_policy` is used instead of `SignersManager::add_signer`
-/// because `add_signer` requires a signer-set baseline for the rule and compares
-/// the chain with it before the expiry check. `add_policy` is one of the
-/// signing paths wired with the pre-submission expiry check; it needs no
-/// baseline.
+/// because `add_signer` compares the chain with the rule's signer-set
+/// baseline before the expiry check. `add_policy` is one of the signing paths
+/// wired with the pre-submission expiry check; an attach of a policy that is
+/// not the simple-threshold policy compares nothing with the baseline.
 ///
 /// After revocation (`valid_until = revocation_ledger`), we wait for the chain
 /// to advance so `latest_ledger > revocation_ledger`. The expiry check fires
@@ -447,8 +463,12 @@ async fn h_1_revocation_audit_log_timeline() {
 /// `valid_until < latestLedger`. The refusal fires before any auth-entry signing
 /// byte is generated.
 ///
-/// The dummy `policy_address` (set to the smart-account address itself) is
-/// never inspected by wallet-side code before the expiry check fires.
+/// The dummy `policy_address` is the smart-account address itself: its
+/// executable is observed before submission and is not the simple-threshold
+/// policy, so the attach takes the direct path. The attach runs through a
+/// second manager over a fresh audit log, which holds no pin record of the
+/// rule, so the dummy policy is not probed for one and the attach reaches the
+/// expiry check.
 ///
 #[tokio::test]
 async fn h_2_post_revocation_new_sign_refused() {
@@ -469,8 +489,8 @@ async fn h_2_post_revocation_new_sign_refused() {
          valid_until = {session_valid_until}"
     );
 
-    let (audit_writer, _audit_log_path, _tmpdir) = tmp_audit_writer();
-    let rule_manager = fresh_rule_manager_uncapped(Arc::clone(&audit_writer));
+    let (audit_writer, audit_log_path, _tmpdir) = tmp_audit_writer();
+    let rule_manager = fresh_rule_manager_uncapped(Arc::clone(&audit_writer), audit_log_path);
 
     let sa_addr = parse_c_strkey_to_smart_account(&sa_strkey).expect("C-strkey must parse");
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g).expect("G-strkey must parse");
@@ -514,8 +534,8 @@ async fn h_2_post_revocation_new_sign_refused() {
             sa_addr.clone(),
             rule_id,
             Some(revocation_ledger),
-            // Rule 0 authorizes: this manager has no signers manager, so an
-            // authorizing rule other than 0 is refused before signing.
+            // Rule 0, the bootstrap rule whose signer is this test's signer,
+            // authorizes the revocation.
             vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None,
@@ -538,9 +558,11 @@ async fn h_2_post_revocation_new_sign_refused() {
 
     // ── Step 6: Attempt add_policy against the revoked rule ──────────────────
     // `ContextRuleManager::add_policy` is one of the signing paths wired with
-    // the pre-submission expiry check.  It does NOT require a threshold policy
-    // (unlike `SignersManager::add_signer`) — the divergence check is a no-op
-    // when `signers_manager` is `None` (as in the test-uncapped manager).
+    // the pre-submission expiry check. Authorized by rule 0, the divergence
+    // check covers no rule. The dummy policy's executable is observed first;
+    // it is not the simple-threshold policy, so the attach takes the direct
+    // path, and the second manager's fresh audit log holds no pin record of
+    // the rule to plan an update for.
     //
     // The call reaches `submit_signed_invoke` which:
     //   1. Calls `simulateTransaction` — succeeds (sim doesn't validate auth
@@ -549,18 +571,20 @@ async fn h_2_post_revocation_new_sign_refused() {
     //      < latest_ledger (= post_revocation_ledger)` → `RuleExpired`.
     //   3. Never reaches auth-entry signing — no signature material is produced.
     //
-    // The dummy policy address is a C-strkey of the smart account itself; its
-    // on-chain validity is never verified by the wallet-side code before the
-    // expiry check fires.
+    // The dummy policy address is a C-strkey of the smart account itself; the
+    // wallet reads its executable and verifies nothing else about it before
+    // the expiry check fires.
     let dummy_policy_addr = sa_addr.clone();
-    let result = rule_manager
+    let (attach_audit_writer, attach_audit_log_path, _attach_tmpdir) = tmp_audit_writer();
+    let attach_manager = fresh_rule_manager_uncapped(attach_audit_writer, attach_audit_log_path);
+    let result = attach_manager
         .add_policy(
             sa_addr.clone(),
             rule_id,
             dummy_policy_addr,
             stellar_xdr::ScVal::Void, // install_param
-            // Rule 0 authorizes: this manager has no signers manager, so an
-            // authorizing rule other than 0 is refused before signing.
+            // Rule 0, the bootstrap rule whose signer is this test's signer,
+            // authorizes the attach.
             vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None, // audit_writer (per-call override)

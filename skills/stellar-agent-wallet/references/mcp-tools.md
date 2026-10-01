@@ -412,12 +412,12 @@ is why this catalog does not expose one.
 | `context` | string | no | `"default"` (default), `"call-contract:<C-strkey>"`, or `"create-contract:<64-hex-wasm-hash>"`. |
 | `name` | string | yes | 1–20 bytes (OZ cap). |
 | `valid_until` | integer (u32) | no | Ledger sequence at which the rule expires; omit for permanent. |
-| `signers` | array | yes | At least one entry (OZ cap 15). Each is `{"kind": "delegated", "address": <G-strkey>}` (a C-strkey is refused: a contract-address delegated signer is not supported), `{"kind": "external", "verifier": <C-strkey>, "pubkey_data_hex": <hex>}`, or `{"kind": "webauthn", "credential_name": <name>}` (resolved from the passkey store at propose time). |
+| `signers` | array | yes | At least one entry (OZ cap 15). A delegated entry is `{"kind": "delegated", "address": <G-strkey or C-strkey>}`: an account, or a contract whose own authorization decides for the signer. An external entry is `{"kind": "external", "verifier": <C-strkey>, "pubkey_data_hex": <hex>}`, and a passkey entry is `{"kind": "webauthn", "credential_name": <name>}`, resolved from the passkey store at propose time. |
 | `policies` | array | no | Up to 5. Each is `{"kind": "raw", "policy_address": <C-strkey>, "install_param_xdr_b64": <base64>}` or `{"kind": "spending_limit", "limit_stroops": <decimal string>, "period_ledgers": <u32>, "policy_address": <C-strkey, optional>}`. |
 | `auth_rule_ids` | array of integer | no | Defaults to `[0]` (the bootstrap rule). |
 | `accept_mutable_verifier` | bool | no | Opt in to a mutable verifier/policy contract: an admin/owner key, or an owner-managed external-reference executable. Rendered as a warning on every approval surface when set. An external reference is pinned by owner, tag and resolved hash (listed in `pinned_verifier_executable_refs` / `pinned_policy_executable_refs`), and signing refuses when any of them or the executable kind changes; `accept_unknown_verifier` is also required when the resolved hash is outside the allowlist. Does not admit an external reference with no live tag entry, an undecodable instance, a non-Wasm executable, or an executable that changed during install (`sa.contract_instance_unsupported`). |
 | `accept_unknown_verifier` | bool | no | Opt in to a verifier/policy wasm hash outside the compile-time allowlist. Rendered as a warning when set. |
-| `accept_no_delegated_fallback` | bool | no | Required `true` when every signer is `webauthn` and no `delegated` entry is present — otherwise the rule has no ed25519 fallback if the passkey device is lost. |
+| `accept_no_delegated_fallback` | bool | no | Required `true` when the signers include no `delegated` account (G-strkey): such a rule has no ed25519 fallback if the passkey device is lost. A contract delegate is not a fallback signer. |
 
 Returns `{ approval_nonce, expires_at_unix_ms, requires_operator_approval,
 proposal_sha256_hex, summary: { context_type_label, name, signer_count,

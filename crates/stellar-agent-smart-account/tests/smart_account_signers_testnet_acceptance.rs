@@ -19,10 +19,12 @@
 //!   The mismatch is injected via a direct `AuditEntry::new_sa_signer_set_baselined`
 //!   write — no out-of-band on-chain mutation is required.
 //!
-//! - **Fresh-wallet missing-baseline path**.  An empty audit log causes
-//!   `verify_signer_set_against_chain` to return
-//!   [`SaError::SignerSetMissingBaseline`].  After `refresh_signer_baseline`,
-//!   the subsequent `verify` returns `Ok`.
+//! - **Install baseline and fresh-wallet missing-baseline path**.  A rule
+//!   installed through the wallet is baselined by the install, so the next
+//!   `list_signers` matches.  A wallet whose audit log never saw the install
+//!   gets [`SaError::SignerSetMissingBaseline`] from
+//!   `verify_signer_set_against_chain`; after `refresh_signer_baseline`, the
+//!   subsequent `verify` returns `Ok`.
 //!
 //! - **Policyless rule**.  `list_signers` and `refresh_signer_baseline`
 //!   record a version-2 baseline with no threshold for a rule with no
@@ -87,13 +89,16 @@ use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
-    ContextRuleSignerInput, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
+    ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
+    parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
 use stellar_agent_smart_account::managers::signers::{
-    PreviousBaseline, SignersManager, SignersManagerConfig, build_external_signer_scval,
+    PreviousBaseline, SignersManager, build_external_signer_scval,
 };
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
+use stellar_agent_smart_account::test_helpers::{
+    rule_manager_for_tests, signers_manager_for_tests,
+};
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::{Transaction, TransactionBehavior};
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
@@ -197,15 +202,21 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
     (Arc::new(Mutex::new(writer)), path, dir)
 }
 
-/// Constructs a `ContextRuleManager` for testnet.
-fn fresh_rule_manager() -> ContextRuleManager {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_PASSPHRASE.to_owned(),
+/// Constructs a `ContextRuleManager` for testnet whose installs record their
+/// baselines through `signers_manager`. `audit_writer` is the writer
+/// `signers_manager` writes to, so the install rows and the state rows of a
+/// rule land in one log.
+fn fresh_rule_manager(
+    signers_manager: &Arc<SignersManager>,
+    audit_writer: &Arc<Mutex<AuditWriter>>,
+) -> ContextRuleManager {
+    rule_manager_for_tests(
+        TESTNET_RPC_URL,
+        None,
+        Arc::clone(signers_manager),
+        Arc::clone(audit_writer),
         Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("ContextRuleManager::new must succeed")
+    )
 }
 
 /// Constructs a `SignersManager` for testnet using the given audit writer.
@@ -216,18 +227,14 @@ fn fresh_rule_manager() -> ContextRuleManager {
 fn fresh_signers_manager(
     audit_writer: Arc<Mutex<AuditWriter>>,
     audit_log_path: PathBuf,
-) -> SignersManager {
-    SignersManager::new(SignersManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_RPC_URL.to_owned(),
+) -> Arc<SignersManager> {
+    signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
         audit_writer,
         audit_log_path,
-        TESTNET_PASSPHRASE.to_owned(),
-        "testnet-acceptance".to_owned(),
         Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("SignersManager::new must succeed")
+    )
 }
 
 /// Deploys a fresh smart-account whose bootstrap rule (rule_id 0) uses
@@ -519,7 +526,9 @@ fn encode_simple_threshold_params(threshold: u32) -> ScVal {
 /// This helper:
 /// 1. Deploys the vendored OZ threshold-policy WASM to testnet.
 /// 2. Installs a new `ContextRule` on `sa_addr` with `signer_g` as its sole
-///    `Delegated` signer, `threshold=1`, and the deployed policy in `policies`.
+///    `Delegated` signer, `threshold=1`, and the deployed policy in `policies`,
+///    through a rule manager carrying `signers_manager`, so the install
+///    records the rule's baseline in the log `audit_writer` writes to.
 /// 3. Returns `(new_rule_id, policy_strkey)`.
 ///
 /// Tests that require threshold-aware operations must use this new rule, not rule_id=0.
@@ -532,8 +541,10 @@ async fn install_threshold_policy_on_fresh_sa(
     sa_addr: stellar_xdr::ScAddress,
     signer_g: &str,
     signer_box: &(dyn Signer + Send + Sync),
+    signers_manager: &Arc<SignersManager>,
+    audit_writer: &Arc<Mutex<AuditWriter>>,
 ) -> (u32, String) {
-    let rule_manager = fresh_rule_manager();
+    let rule_manager = fresh_rule_manager(signers_manager, audit_writer);
 
     let policy_strkey = deploy_threshold_policy_wasm(signer_g, signer_box).await;
     let policy_addr = parse_c_strkey_to_smart_account(&policy_strkey)
@@ -574,7 +585,8 @@ async fn install_threshold_policy_on_fresh_sa(
 
 // ── Fresh-wallet missing-baseline ────────────────────────────────────────────
 
-/// A wallet with an empty audit log returns
+/// The install records the rule's baseline, which the next `list_signers`
+/// matches. A wallet whose audit log never saw the install returns
 /// [`SaError::SignerSetMissingBaseline`] on `verify_signer_set_against_chain`;
 /// after `refresh_signer_baseline` the subsequent `verify` returns `Ok`.
 ///
@@ -592,13 +604,37 @@ async fn b4_fresh_wallet_missing_baseline_then_refresh_then_verify_ok() {
     let sa_addr =
         parse_c_strkey_to_smart_account(&sa_strkey).expect("deployed C-strkey must parse");
 
+    let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
+    let installer = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path);
+
     // Install a 1-of-1 rule with the threshold-policy (bootstrap rule_id=0 has no
     // policies; new rule is required for threshold-reading tests).
-    let (rule_id, _policy_strkey) =
-        install_threshold_policy_on_fresh_sa(sa_addr.clone(), &signer_g, signer_box.as_ref()).await;
+    let (rule_id, _policy_strkey) = install_threshold_policy_on_fresh_sa(
+        sa_addr.clone(),
+        &signer_g,
+        signer_box.as_ref(),
+        &installer,
+        &audit_writer,
+    )
+    .await;
 
-    let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path);
+    // The install recorded the confirmed rule as its baseline.
+    let listed = installer
+        .list_signers(sa_addr.clone(), rule_id, Some(&signer_g), rid())
+        .await
+        .expect("list_signers after the install must succeed");
+    assert_eq!(
+        listed.baseline,
+        PreviousBaseline::Matched,
+        "the install recorded the baseline, which the chain matches"
+    );
+    assert_eq!(listed.view.signer_count(), 1);
+    assert_eq!(view_threshold(&listed.view), Some(1));
+
+    // A wallet whose audit log never saw the install has no baseline for
+    // the rule.
+    let (fresh_writer, fresh_log_path, _fresh_dir) = tmp_audit_writer();
+    let mgr = fresh_signers_manager(fresh_writer, fresh_log_path);
 
     // Verify with empty audit log → SignerSetMissingBaseline.
     let missing = mgr
@@ -678,23 +714,31 @@ async fn b1_threshold_brick_refusal() {
     let sa_addr =
         parse_c_strkey_to_smart_account(&sa_strkey).expect("deployed C-strkey must parse");
 
+    let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
+    let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path);
+
     // Install a 1-of-1 rule with the threshold-policy (bootstrap rule_id=0 has no
     // policies; `remove_signer` checks the invariant against the observed
     // threshold).
-    let (rule_id, _policy_strkey) =
-        install_threshold_policy_on_fresh_sa(sa_addr.clone(), &signer_g, signer_box.as_ref()).await;
+    let (rule_id, _policy_strkey) = install_threshold_policy_on_fresh_sa(
+        sa_addr.clone(),
+        &signer_g,
+        signer_box.as_ref(),
+        &mgr,
+        &audit_writer,
+    )
+    .await;
 
     // Signer_id of the sole signer in the newly installed rule.
     // The install places signer_g at index 0 within the new rule's signer list.
     let signer_id_in_rule: u32 = 0;
 
-    let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path);
-
-    // Establish baseline so the pre-flight invariant check can read signer_count + threshold.
-    mgr.refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
+    // The install recorded the baseline the pre-flight comparison reads.
+    let listed = mgr
+        .list_signers(sa_addr.clone(), rule_id, Some(&signer_g), rid())
         .await
-        .expect("refresh_signer_baseline must succeed");
+        .expect("list_signers after the install must succeed");
+    assert_eq!(listed.baseline, PreviousBaseline::Matched);
 
     // Remove the sole signer from the installed rule.
     // Post-op: signer_count=0 < threshold=1 → ThresholdUnreachable.
@@ -819,17 +863,25 @@ async fn b3_divergence_detection_via_injected_baseline() {
     let sa_addr =
         parse_c_strkey_to_smart_account(&sa_strkey).expect("deployed C-strkey must parse");
 
-    // Install a 1-of-1 rule with the threshold-policy (bootstrap rule_id=0 has no
-    // policies; new rule is required for threshold-reading tests).
-    let (rule_id, _policy_strkey) =
-        install_threshold_policy_on_fresh_sa(sa_addr.clone(), &signer_g, signer_box.as_ref()).await;
-
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path.clone());
 
+    // Install a 1-of-1 rule with the threshold-policy (bootstrap rule_id=0 has no
+    // policies; new rule is required for threshold-reading tests).
+    let (rule_id, _policy_strkey) = install_threshold_policy_on_fresh_sa(
+        sa_addr.clone(),
+        &signer_g,
+        signer_box.as_ref(),
+        &mgr,
+        &audit_writer,
+    )
+    .await;
+
     // Inject a baseline claiming (signer_count=1, threshold=2) — same signer count
     // as on-chain but a higher threshold.  The installed rule's actual threshold=1
-    // diverges from the injected threshold=2 (threshold-only divergence).
+    // diverges from the injected threshold=2 (threshold-only divergence). The
+    // injected row is newer than the baseline the install recorded, so it is
+    // the row the check compares with.
     let smart_account_redacted = redact_strkey_first5_last5(&sa_strkey);
     let fabricated_state = ObservedSignerSet {
         signer_count: 1,
@@ -993,10 +1045,19 @@ async fn b7_add_external_signer_to_existing_rule() {
     let sa_addr =
         parse_c_strkey_to_smart_account(&sa_strkey).expect("deployed C-strkey must parse");
 
+    let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
+    let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path.clone());
+
     // Install a 1-of-1 rule with the threshold-policy (bootstrap rule_id=0 has no policies).
     // `_policy_strkey` is bound with underscore prefix: only the rule_id is used below.
-    let (rule_id, _policy_strkey) =
-        install_threshold_policy_on_fresh_sa(sa_addr.clone(), &signer_g, signer_box.as_ref()).await;
+    let (rule_id, _policy_strkey) = install_threshold_policy_on_fresh_sa(
+        sa_addr.clone(),
+        &signer_g,
+        signer_box.as_ref(),
+        &mgr,
+        &audit_writer,
+    )
+    .await;
 
     // Deploy the OZ WebAuthn verifier WASM to obtain a valid verifier C-strkey.
     //
@@ -1050,14 +1111,12 @@ async fn b7_add_external_signer_to_existing_rule() {
         );
     }
 
-    let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path.clone());
-
-    // Establish audit-log baseline.
+    // The install recorded the rule's baseline, which the chain matches.
     let baseline = mgr
-        .refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
+        .list_signers(sa_addr.clone(), rule_id, Some(&signer_g), rid())
         .await
-        .expect("refresh_signer_baseline must succeed");
+        .expect("list_signers after the install must succeed");
+    assert_eq!(baseline.baseline, PreviousBaseline::Matched);
     assert_eq!(
         baseline.view.signer_count(),
         1,
@@ -1238,9 +1297,18 @@ async fn b8_add_webauthn_signer_to_existing_rule() {
     let sa_addr =
         parse_c_strkey_to_smart_account(&sa_strkey).expect("deployed C-strkey must parse");
 
+    let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
+    let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path.clone());
+
     // Install a 1-of-1 rule with the threshold-policy (bootstrap rule_id=0 has no policies).
-    let (rule_id, _policy_strkey) =
-        install_threshold_policy_on_fresh_sa(sa_addr.clone(), &signer_g, signer_box.as_ref()).await;
+    let (rule_id, _policy_strkey) = install_threshold_policy_on_fresh_sa(
+        sa_addr.clone(),
+        &signer_g,
+        signer_box.as_ref(),
+        &mgr,
+        &audit_writer,
+    )
+    .await;
 
     // Deploy the OZ WebAuthn verifier WASM to get a valid verifier C-strkey.
     //
@@ -1327,14 +1395,12 @@ async fn b8_add_webauthn_signer_to_existing_rule() {
     let external_scval = build_external_signer_scval(verifier_sc_addr, &key_data)
         .expect("build_external_signer_scval must succeed");
 
-    // Establish audit-log baseline.
-    let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path.clone());
-
+    // The install recorded the rule's baseline, which the chain matches.
     let baseline = mgr
-        .refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
+        .list_signers(sa_addr.clone(), rule_id, Some(&signer_g), rid())
         .await
-        .expect("refresh_signer_baseline must succeed");
+        .expect("list_signers after the install must succeed");
+    assert_eq!(baseline.baseline, PreviousBaseline::Matched);
     assert_eq!(
         baseline.view.signer_count(),
         1,
@@ -1468,8 +1534,9 @@ fn digest_matches_first8_last8_pattern(s: &str) -> bool {
 /// Setup:
 /// 1. Deploy a smart account with bootstrap signer S1.
 /// 2. Deploy the threshold-policy WASM to testnet.
-/// 3. Install a 1-of-2 rule with signers `[S1, S2]` and threshold=1.
-/// 4. Establish audit-log baseline (signer_count=2, threshold=1).
+/// 3. Install a 1-of-2 rule with signers `[S1, S2]` and threshold=1; the
+///    install records the baseline (signer_count=2, threshold=1).
+/// 4. Refresh the baseline, which compares the chain with the recorded one.
 /// 5. `set_threshold(new_threshold=2)` → upgrades rule to 2-of-2.
 /// 6. Verify post-op: signer_count=2, threshold=2.
 ///
@@ -1487,7 +1554,9 @@ async fn b2_set_threshold_single_op() {
     let sa_addr =
         parse_c_strkey_to_smart_account(&sa_strkey).expect("deployed C-strkey must parse");
 
-    let rule_manager = fresh_rule_manager();
+    let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
+    let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path);
+    let rule_manager = fresh_rule_manager(&mgr, &audit_writer);
 
     // ── Step 1: Deploy threshold-policy WASM to testnet ──────────────────────
     let policy_strkey = deploy_threshold_policy_wasm(&signer_g, signer_box.as_ref()).await;
@@ -1535,14 +1604,16 @@ async fn b2_set_threshold_single_op() {
         .expect("install_rule must succeed");
     let new_rule_id = b2_install_out.rule_id;
 
-    // ── Step 3: Establish audit-log baseline ─────────────────────────────────
-    let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path);
-
+    // ── Step 3: Refresh the baseline the install recorded ────────────────────
     let baseline = mgr
         .refresh_signer_baseline(sa_addr.clone(), new_rule_id, Some(&signer_g), false, rid())
         .await
         .expect("refresh_signer_baseline must succeed");
+    assert_eq!(
+        baseline.previous_baseline,
+        PreviousBaseline::Matched,
+        "the refresh compares the chain with the baseline the install recorded"
+    );
 
     assert_eq!(
         baseline.view.signer_count(),
@@ -1664,8 +1735,9 @@ async fn b5_a_policyless_rule_baselines_without_a_threshold() {
 ///
 /// 1. Deploy a fresh smart account + install a 1-of-1 rule with threshold-policy.
 /// 2. Inject a divergent `SaSignerSetBaselined` row (threshold=2 vs on-chain=1).
-/// 3. Call `sign_with_passkey_rule` with `signers_manager = Some(sm)` where `sm`
-///    wraps the shared `Arc<Mutex<AuditWriter>>`.
+/// 3. Call `sign_with_passkey_rule` with the signers manager `sm`, which
+///    wraps the shared `Arc<Mutex<AuditWriter>>` and recorded the install's
+///    baseline before the injected row.
 /// 4. The divergence check fires before the WebAuthn ceremony (no browser needed).
 /// 5. Both `SaSignerSetDiverged` and `PasskeyAssertion` rows are emitted to the
 ///    SAME writer instance; verify that their `request_id` fields match.
@@ -1687,11 +1759,6 @@ async fn b6_audit_log_request_id_pairing_across_divergence_emit() {
     let sa_addr =
         parse_c_strkey_to_smart_account(&sa_strkey).expect("deployed C-strkey must parse");
 
-    // Install a 1-of-1 rule with the threshold-policy (required by
-    // verify_signer_set_against_chain; bootstrap rule_id=0 has no policies).
-    let (rule_id, _policy_strkey) =
-        install_threshold_policy_on_fresh_sa(sa_addr.clone(), &signer_g, signer_box.as_ref()).await;
-
     // ── Shared AuditWriter + SignersManager ───────────────────────────────────
 
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
@@ -1699,12 +1766,23 @@ async fn b6_audit_log_request_id_pairing_across_divergence_emit() {
     //   - SignersManager (emits SaSignerSetDiverged inside verify_signer_set_against_chain)
     //   - sign_with_passkey_rule outer wrapper (emits PasskeyAssertion via sm.audit_writer())
     // Both managers share the same Arc so there is no second open on the same path.
-    let sm = Arc::new(fresh_signers_manager(
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    ));
+    let sm = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
+
+    // Install a 1-of-1 rule with the threshold-policy (required by
+    // verify_signer_set_against_chain; bootstrap rule_id=0 has no policies).
+    let (rule_id, _policy_strkey) = install_threshold_policy_on_fresh_sa(
+        sa_addr.clone(),
+        &signer_g,
+        signer_box.as_ref(),
+        &sm,
+        &audit_writer,
+    )
+    .await;
 
     // ── Inject divergent baseline ─────────────────────────────────────────────
+    //
+    // The injected row is newer than the baseline the install recorded, so
+    // the passkey path's check compares the chain with it.
 
     let smart_account_redacted = redact_strkey_first5_last5(&sa_strkey);
     let fabricated_state = ObservedSignerSet {
@@ -1760,7 +1838,7 @@ async fn b6_audit_log_request_id_pairing_across_divergence_emit() {
             &sa_strkey,
             &auth_digest,
             vec![rule_id],
-            Some(Arc::clone(&sm)),
+            Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),
             |_| {}, // url callback: never invoked (divergence fires first)

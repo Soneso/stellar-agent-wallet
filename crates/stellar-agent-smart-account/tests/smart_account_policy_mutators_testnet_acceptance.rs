@@ -4,9 +4,14 @@
 //!
 //! | Fixture | Description |
 //! |---------|-------------|
-//! | [`h3_add_policy_increments_count_and_emits_audit_row`] | Deploy SA + rule with 1 policy, call `manager.add_policy`, assert `policy_count == 2`, assert `SaPolicyAdded` audit row |
-//! | [`h4_remove_policy_decrements_count_and_emits_audit_row`] | Deploy SA + rule with 2 policies (installed + added), call `manager.remove_policy`, assert `policy_count == 1`, assert `SaPolicyRemoved` audit row |
-//! | [`h5_add_policy_type_mismatched_install_param_no_success_audit`] | Deploy SA + rule, call `manager.add_policy` with a `ScVal::Bool(true)` install-param (base64-decodable but type-mismatches `SimpleThresholdAccountParams`), assert simulate-phase failure, no `SaPolicyAdded` row, exactly one `SaRawInvocation(PreSubmissionRefused)` row |
+//! | [`h3_add_policy_increments_count_and_emits_audit_row`] | Deploy SA + policyless rule, attach the simple-threshold policy with `manager.add_policy`, assert `policy_count == 1`, the `SaThresholdChangedV2` row before the `SaPolicyAdded` row, then a refused second simple-threshold attach |
+//! | [`h4_remove_policy_decrements_count_and_emits_audit_row`] | Deploy SA + policyless rule, attach the simple-threshold policy, call `manager.remove_policy`, assert `policy_count == 0`, the `SaThresholdChangedV2` row before the `SaPolicyRemoved` row |
+//! | [`h5_add_policy_type_mismatched_install_param_no_success_audit`] | Deploy SA + rule, call `manager.add_policy` for a simple-threshold policy with a `ScVal::Bool(true)` install-param (base64-decodable but type-mismatches `SimpleThresholdAccountParams`), assert the `sa.simple_threshold_install_refused` refusal before submission, no `SaPolicyAdded` row, exactly one `SaRawInvocation(PreSubmissionRefused)` row |
+//!
+//! Every rule is installed through a rule manager and a signers manager over
+//! one audit log, as production wires them: the install records the rule's
+//! signer-set baseline, which the simple-threshold attach and detach compare
+//! with the chain before submission.
 //!
 //! # Gating
 //!
@@ -38,14 +43,12 @@
     clippy::panic,
     clippy::use_debug,
     clippy::print_stderr,
-    clippy::await_holding_lock,
-    reason = "test-only; panics and MutexGuard-across-await are acceptable in testnet \
-              acceptance tests where async-aware Mutex would add test-only dependency complexity"
+    reason = "test-only; panics and diagnostic output are acceptable in testnet acceptance tests"
 )]
 
 use std::io::{BufRead as _, BufReader};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -53,7 +56,7 @@ use rand_core::OsRng;
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::EventKind;
-use stellar_agent_core::audit_log::writer::AuditWriter;
+use stellar_agent_core::audit_log::signer_set::ThresholdObservation;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::{
@@ -66,20 +69,23 @@ use stellar_agent_smart_account::deployment::{
 };
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
-    ContextRuleSignerInput, decode_policy_count_from_scval, parse_c_strkey_to_smart_account,
+    ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
+    decode_policy_count_from_scval, parse_c_strkey_to_smart_account,
     parse_g_strkey_to_signer_address,
 };
+use stellar_agent_smart_account::managers::signers::{PreviousBaseline, SignersManager};
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
+use stellar_agent_smart_account::test_helpers::managers_for_tests;
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::{Transaction, TransactionBehavior};
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
 use stellar_rpc_client::Client;
 use stellar_xdr::{
-    AccountId, BytesM, ContractExecutable, ContractIdPreimage, ContractIdPreimageFromAddress,
-    CreateContractArgsV2, Hash, HostFunction, InvokeHostFunctionOp, LedgerKey,
-    LedgerKeyContractCode, Limits, Operation, OperationBody, PublicKey as XdrPublicKey, ScAddress,
-    ScMap, ScMapEntry, ScSymbol, ScVal, SorobanAuthorizationEntry, Uint256, VecM, WriteXdr,
+    AccountId, BytesM, ContractExecutable, ContractId, ContractIdPreimage,
+    ContractIdPreimageFromAddress, CreateContractArgsV2, Hash, HostFunction, InvokeHostFunctionOp,
+    LedgerKey, LedgerKeyContractCode, Limits, Operation, OperationBody, PublicKey as XdrPublicKey,
+    ScAddress, ScMap, ScMapEntry, ScSymbol, ScVal, SorobanAuthorizationEntry, Uint256, VecM,
+    WriteXdr,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -144,13 +150,6 @@ async fn fund_via_friendbot(g_strkey: &str) {
     );
 }
 
-fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
-    let dir = tempfile::tempdir().expect("tempdir must succeed");
-    let path = dir.path().join("audit.jsonl");
-    let writer = AuditWriter::open(path.clone(), None).expect("AuditWriter::open must succeed");
-    (Arc::new(Mutex::new(writer)), path, dir)
-}
-
 fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
     let file = std::fs::File::open(log_path).expect("audit log file must be readable");
     let reader = BufReader::new(file);
@@ -167,14 +166,31 @@ fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
     entries
 }
 
-fn fresh_rule_manager() -> ContextRuleManager {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_PASSPHRASE.to_owned(),
+/// The audit rows written under `request_id`, in log order.
+fn rows_for_request(log_path: &std::path::Path, request_id: &str) -> Vec<AuditEntry> {
+    read_audit_entries(log_path)
+        .into_iter()
+        .filter(|entry| entry.request_id == request_id)
+        .collect()
+}
+
+/// The 32-byte id of a contract address.
+fn contract_id(address: &ScAddress) -> [u8; 32] {
+    match address {
+        ScAddress::Contract(ContractId(Hash(id))) => *id,
+        other => panic!("not a contract address: {other:?}"),
+    }
+}
+
+/// A testnet rule manager and its signers manager over one temporary audit
+/// log, as production wires them, with the log's path and the `TempDir`
+/// that holds it. The caller holds the `TempDir` for the test's duration.
+fn fresh_managers() -> (ContextRuleManager, Arc<SignersManager>, PathBuf, TempDir) {
+    managers_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
         Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("ContextRuleManager::new must succeed")
+    )
 }
 
 async fn deploy_fresh_smart_account(signer_g: &str) -> String {
@@ -443,35 +459,39 @@ async fn deploy_threshold_policy_with_salt(
 
 // ── h3_add_policy_increments_count_and_emits_audit_row ───────────────────────
 
-/// Deploy a fresh smart account, install a rule with 1 policy (policy_addr_A),
-/// call `manager.add_policy` with a SECOND distinct address (policy_addr_B),
-/// assert `policy_count == 2`, and assert a `SaPolicyAdded` audit row was emitted.
+/// Deploy a fresh smart account, install a rule with no policy, call
+/// `manager.add_policy` with the simple-threshold policy `policy_addr_A`,
+/// assert `policy_count == 1` and the audit rows of the attach, then attach a
+/// second simple-threshold policy `policy_addr_B` and assert the refusal.
 ///
-/// # Why two distinct policy contracts are required
+/// # Why the rule holds one simple-threshold policy
 ///
-/// The OpenZeppelin `add_policy` calls `register_policy`,
-/// which returns the same `policy_id` for the same `Address`, and then checks
-/// `entry.policy_ids.contains(policy_id)` — panicking with `DuplicatePolicy` if
-/// the id is already present.  Calling `add_policy(policy_addr_A)` on a rule
-/// that was installed with `policy_addr_A` unconditionally fails on-chain.
-///
-/// Two distinct contracts are deployed with salt suffixes `"h3-policy-a"` and
-/// `"h3-policy-b"`, guaranteeing distinct on-chain addresses and distinct
-/// `policy_id` values.
+/// The wallet records a rule's simple-threshold value in its signer-set
+/// state, so an attach of the simple-threshold policy runs through the
+/// signers manager: the rule's version-2 baseline (which the install recorded)
+/// must match the chain, and the rule must have no simple-threshold policy
+/// yet. The attach of `policy_addr_A` records a `SaThresholdChangedV2` row
+/// (no previous threshold, the resulting threshold 1 on `policy_addr_A`)
+/// before the `SaPolicyAdded` row. The attach of the distinct
+/// `policy_addr_B` then refuses before submission with
+/// `ThresholdPolicyIdentificationFailed`, and the policy count stays 1.
 ///
 /// # Steps
 ///
 /// 1. Generate and fund the operator signer.
 /// 2. Deploy a fresh smart account.
 /// 3. Deploy two DISTINCT threshold-policy contracts (salts `h3-policy-a`, `h3-policy-b`).
-/// 4. Install a rule with 1 policy (policy_addr_A).
-/// 5. Fetch the installed rule; assert `decode_policy_count_from_scval == 1`
+/// 4. Install a rule with no policy through a rule manager and signers
+///    manager over one audit log.
+/// 5. Fetch the installed rule; assert `decode_policy_count_from_scval == 0`
 ///    (precondition guard).
-/// 6. Open an `AuditWriter` and call `manager.add_policy` with `policy_addr_B`.
-/// 7. Fetch the rule again; assert `decode_policy_count_from_scval == 2`.
-/// 8. Assert the audit log contains a `SaPolicyAdded` row with the correct
-///    `rule_id` and `chain_id`.
-/// 9. Assert the audit log also contains a `SaRawInvocation(Success)` row.
+/// 6. Call `manager.add_policy` with `policy_addr_A` and threshold 1.
+/// 7. Fetch the rule again; assert `decode_policy_count_from_scval == 1`.
+/// 8. Assert the attach's rows: `SaThresholdChangedV2`, then `SaPolicyAdded`
+///    with the correct `rule_id` and `chain_id`, then one
+///    `SaRawInvocation(Success)`.
+/// 9. Call `manager.add_policy` with `policy_addr_B`; assert the refusal, no
+///    `SaPolicyAdded` row for it, and `policy_count == 1`.
 ///
 /// # Reference cross-check
 ///
@@ -494,10 +514,8 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
     eprintln!("[h3] smart_account = {sa_strkey}");
 
     // ── Step 3: Deploy two DISTINCT threshold-policy contracts ───────────────
-    // policy_addr_a is installed in the initial rule.
-    // policy_addr_b is added via add_policy — a DISTINCT address is required
-    // because the OpenZeppelin add_policy panics with DuplicatePolicy
-    // when add_policy is called with an address already present in the rule.
+    // policy_addr_a is attached to the policyless rule; policy_addr_b is the
+    // second simple-threshold policy whose attach the wallet refuses.
     let policy_a_strkey =
         deploy_threshold_policy_with_salt(&signer_g, signer_box.as_ref(), "h3-policy-a").await;
     let policy_addr_a = parse_c_strkey_to_smart_account(&policy_a_strkey)
@@ -515,12 +533,11 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
         "[h3] the two deployed policy addresses must be distinct"
     );
 
-    // ── Step 4: Install a 1-policy rule with policy_addr_a ───────────────────
-    let threshold_params = encode_threshold_params(1);
+    // ── Step 4: Install a rule with no policy ────────────────────────────────
     let signer_addr =
         parse_g_strkey_to_signer_address(&signer_g).expect("[h3] signer G-strkey must parse");
 
-    let rule_manager = fresh_rule_manager();
+    let (rule_manager, signers_manager, audit_log_path, _audit_dir) = fresh_managers();
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
         "h3-add-policy-test".to_owned(),
@@ -528,10 +545,7 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
         vec![ContextRuleSignerInput::Delegated {
             address: signer_addr,
         }],
-        vec![ContextRulePolicy::new(
-            policy_addr_a.clone(),
-            threshold_params.clone(),
-        )],
+        vec![],
     );
 
     let install_output = rule_manager
@@ -549,9 +563,9 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
         .expect("[h3] install_rule must succeed on testnet");
 
     let rule_id = install_output.rule_id;
-    eprintln!("[h3] installed 1-policy rule: rule_id = {rule_id}");
+    eprintln!("[h3] installed policyless rule: rule_id = {rule_id}");
 
-    // ── Step 5: Precondition guard — assert policy_count == 1 ────────────────
+    // ── Step 5: Precondition guard: assert policy_count == 0 ────────────────
     let scval_before = rule_manager
         .get_rule(sa_addr.clone(), rule_id, &signer_g)
         .await
@@ -561,44 +575,34 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
     let count_before = decode_policy_count_from_scval(&scval_before)
         .expect("[h3] decode_policy_count_from_scval must succeed");
     assert_eq!(
-        count_before, 1,
-        "[h3] precondition guard: installed rule must have exactly 1 policy; \
-         got {count_before}"
+        count_before, 0,
+        "[h3] precondition guard: installed rule must have no policy; got {count_before}"
     );
     eprintln!("[h3] precondition guard passed: policy_count = {count_before}");
 
-    // ── Step 6: Open AuditWriter + call add_policy with policy_addr_b ─────────
-    // Using policy_addr_b (distinct from policy_addr_a already installed in the
-    // rule) avoids the DuplicatePolicy on-chain panic in the OpenZeppelin
-    // add_policy.
-    let (audit_writer_arc, audit_log_path, _tmp_dir) = tmp_audit_writer();
-    let mut audit_writer = audit_writer_arc.lock().expect("audit writer lock");
+    // ── Step 6: attach policy_addr_a with threshold 1 ─────────────────────────
     let request_id = rid();
-
-    // Rule 0 authorizes: this manager has no signers manager, so an
-    // authorizing rule other than 0 is refused before signing.
-    let auth_rule_ids = vec![ContextRuleId::new(0)];
-
     let add_policy_result = rule_manager
         .add_policy(
             sa_addr.clone(),
             rule_id,
-            policy_addr_b.clone(),
-            threshold_params,
-            auth_rule_ids,
+            policy_addr_a.clone(),
+            encode_threshold_params(1),
+            // Rule 0, the bootstrap rule whose signer is this test's signer,
+            // authorizes the attach.
+            vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
-            Some(&mut *audit_writer),
+            None,
             request_id.clone(),
             false, // accept_mutable_verifier
             false, // accept_unknown_verifier
         )
         .await;
-    drop(audit_writer); // release the lock before reading the log
 
     let policy_id = add_policy_result.expect("[h3] add_policy must succeed on testnet");
     eprintln!("[h3] add_policy succeeded: policy_id = {policy_id}");
 
-    // ── Step 7: Fetch the rule and assert policy_count == 2 ──────────────────
+    // ── Step 7: Fetch the rule and assert policy_count == 1 ──────────────────
     let scval_after = rule_manager
         .get_rule(sa_addr.clone(), rule_id, &signer_g)
         .await
@@ -608,21 +612,45 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
     let count_after = decode_policy_count_from_scval(&scval_after)
         .expect("[h3] decode_policy_count_from_scval (after) must succeed");
     assert_eq!(
-        count_after, 2,
-        "[h3] policy_count must be 2 after add_policy; got {count_after}"
+        count_after, 1,
+        "[h3] policy_count must be 1 after add_policy; got {count_after}"
     );
     eprintln!("[h3] post-add_policy policy_count = {count_after}");
 
-    // ── Step 8: Assert SaPolicyAdded audit row ────────────────────────────────
-    let entries = read_audit_entries(&audit_log_path);
+    // ── Step 8: Assert the attach's audit rows ────────────────────────────────
+    let entries = rows_for_request(&audit_log_path, &request_id);
     assert!(
         !entries.is_empty(),
-        "[h3] audit log must contain at least one entry after add_policy"
+        "[h3] audit log must contain the attach's rows"
     );
 
-    let policy_added_count = entries
+    let threshold_position = entries
         .iter()
-        .filter(|e| {
+        .position(|e| {
+            matches!(
+                &e.event_kind,
+                EventKind::SaThresholdChangedV2 {
+                    rule_id: rid,
+                    previous_threshold: None,
+                    snapshot,
+                    ..
+                } if *rid == rule_id
+                    && snapshot.threshold
+                        == Some(ThresholdObservation {
+                            policy: contract_id(&policy_addr_a),
+                            threshold: 1,
+                        })
+            )
+        })
+        .expect(
+            "[h3] the attach must record SaThresholdChangedV2 with no previous threshold and \
+             threshold 1 on policy A",
+        );
+
+    let policy_added_positions: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
             matches!(
                 &e.event_kind,
                 EventKind::SaPolicyAdded {
@@ -632,32 +660,26 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
                 } if *rid == rule_id && *pid == policy_id
             )
         })
-        .count();
+        .map(|(position, _)| position)
+        .collect();
     assert_eq!(
-        policy_added_count, 1,
+        policy_added_positions.len(),
+        1,
         "[h3] exactly one SaPolicyAdded row with rule_id={rule_id} and \
-         policy_id={policy_id} must be present; found {policy_added_count}"
+         policy_id={policy_id} must be present; found {}",
+        policy_added_positions.len()
+    );
+    assert!(
+        threshold_position < policy_added_positions[0],
+        "[h3] SaThresholdChangedV2 must precede SaPolicyAdded"
     );
 
-    let policy_added_entry = entries
-        .iter()
-        .find(|e| {
-            matches!(
-                &e.event_kind,
-                EventKind::SaPolicyAdded { rule_id: rid, .. } if *rid == rule_id
-            )
-        })
-        .expect("[h3] add_policy must emit SaPolicyAdded");
-
+    let policy_added_entry = &entries[policy_added_positions[0]];
     assert_eq!(
         policy_added_entry.chain_id.as_deref(),
         Some(CHAIN_ID),
         "[h3] SaPolicyAdded row must carry chain_id={CHAIN_ID}; got {:?}",
         policy_added_entry.chain_id
-    );
-    assert_eq!(
-        policy_added_entry.request_id, request_id,
-        "[h3] SaPolicyAdded row must carry the request_id used in the call"
     );
     let EventKind::SaPolicyAdded {
         transaction_hash_redacted,
@@ -672,7 +694,6 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
         "[h3] SaPolicyAdded row must carry first-8-last-8 redacted tx hash"
     );
 
-    // ── Step 9: Assert SaRawInvocation(Success) audit row ────────────────────
     let raw_ok_count = entries
         .iter()
         .filter(|e| {
@@ -691,49 +712,94 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
         "[h3] exactly one SaRawInvocation(Success) row with wire_code=sa.ok \
          must be present; found {raw_ok_count}"
     );
+
+    // The recorded threshold change keeps the rule's state row in step with
+    // the chain.
+    let listed = signers_manager
+        .list_signers(sa_addr.clone(), rule_id, Some(&signer_g), rid())
+        .await
+        .expect("[h3] list_signers after the attach must succeed");
+    assert_eq!(
+        listed.baseline,
+        PreviousBaseline::Matched,
+        "[h3] the recorded state must match the chain after the attach"
+    );
+
+    // ── Step 9: a second simple-threshold policy refuses ─────────────────────
+    let second_request_id = rid();
+    let second = rule_manager
+        .add_policy(
+            sa_addr.clone(),
+            rule_id,
+            policy_addr_b,
+            encode_threshold_params(1),
+            vec![ContextRuleId::new(0)],
+            signer_box.as_ref(),
+            None,
+            second_request_id.clone(),
+            false, // accept_mutable_verifier
+            false, // accept_unknown_verifier
+        )
+        .await
+        .expect_err("[h3] a second simple-threshold policy must be refused");
+    assert!(
+        matches!(second, SaError::ThresholdPolicyIdentificationFailed { .. }),
+        "[h3] expected ThresholdPolicyIdentificationFailed; got {second:?}"
+    );
+    let second_entries = rows_for_request(&audit_log_path, &second_request_id);
+    assert!(
+        !second_entries
+            .iter()
+            .any(|e| matches!(&e.event_kind, EventKind::SaPolicyAdded { .. })),
+        "[h3] the refused attach must write no SaPolicyAdded row"
+    );
+    let scval_refused = rule_manager
+        .get_rule(sa_addr, rule_id, &signer_g)
+        .await
+        .expect("[h3] get_rule (after the refused attach) must succeed")
+        .expect("[h3] rule must still be present");
+    assert_eq!(
+        decode_policy_count_from_scval(&scval_refused)
+            .expect("[h3] decode_policy_count_from_scval (refused) must succeed"),
+        1,
+        "[h3] the refused attach must leave policy_count at 1"
+    );
 }
 
 // ── h4_remove_policy_decrements_count_and_emits_audit_row ────────────────────
 
-/// Deploy a fresh smart account, install a rule with 1 policy (policy_addr_a),
-/// call `add_policy(policy_addr_b)` to reach `policy_count = 2`, then call
-/// `manager.remove_policy` with the `policy_id` returned by `add_policy`,
-/// assert `policy_count == 1`, and assert a `SaPolicyRemoved` audit row is
-/// emitted.
+/// Deploy a fresh smart account, install a rule with no policy, attach the
+/// simple-threshold policy `policy_addr_a` to reach `policy_count = 1`, then
+/// call `manager.remove_policy` with the `policy_id` returned by `add_policy`,
+/// assert `policy_count == 0`, and assert the detach's audit rows.
 ///
-/// # Why two distinct policy contracts are required
+/// # Why the rule holds one simple-threshold policy
 ///
-/// The `add_policy` step that builds the 2-policy state MUST use a DISTINCT
-/// address from the one installed in the initial rule: the OpenZeppelin
-/// `add_policy` panics with `DuplicatePolicy` when `add_policy` is called with
-/// an address already present in the rule.
-///
-/// Two distinct contracts are deployed with salt suffixes `"h4-policy-a"` and
-/// `"h4-policy-b"`.  The rule is installed with `policy_addr_a`; then
-/// `add_policy(policy_addr_b)` yields `policy_id_b`.  `remove_policy(policy_id_b)`
-/// is then called, returning the rule to `policy_count = 1`.
+/// The wallet records a rule's simple-threshold value in its signer-set
+/// state and attaches at most one simple-threshold policy to a rule. The
+/// detach of the observed simple-threshold policy records a
+/// `SaThresholdChangedV2` row (the observed threshold as previous, none as
+/// resulting) before the `SaPolicyRemoved` row.
 ///
 /// # Steps
 ///
 /// 1. Generate + fund operator signer; deploy SA.
-/// 2. Deploy two DISTINCT threshold-policy contracts (salts `h4-policy-a`, `h4-policy-b`).
-/// 3. Install a 1-policy rule with policy_addr_a.
-/// 4. Call `add_policy(policy_addr_b)` to reach `policy_count = 2`; store `policy_id_b`.
-/// 5. Precondition guard: assert `policy_count == 2`.
-/// 6. Open a fresh `AuditWriter` and call `manager.remove_policy(policy_id_b)`.
-/// 7. Fetch the rule; assert `policy_count == 1`.
-/// 8. Assert the audit log contains a `SaPolicyRemoved` row with the correct
-///    `rule_id`, `policy_id_b`, and `chain_id`.
-/// 9. Assert the audit log also contains a `SaRawInvocation(Success)` row.
+/// 2. Deploy a threshold-policy contract (salt `h4-policy-a`).
+/// 3. Install a policyless rule through a rule manager and signers manager
+///    over one audit log.
+/// 4. Call `add_policy(policy_addr_a)` to reach `policy_count = 1`; store its
+///    `policy_id`.
+/// 5. Precondition guard: assert `policy_count == 1`.
+/// 6. Call `manager.remove_policy(policy_id)`.
+/// 7. Fetch the rule; assert `policy_count == 0`.
+/// 8. Assert the audit log contains `SaThresholdChangedV2` before a
+///    `SaPolicyRemoved` row with the correct `rule_id`, `policy_id`, and
+///    `chain_id`, and one `SaRawInvocation(Success)` row for the removal.
 ///
 /// # Reference cross-check
 ///
 /// - The OpenZeppelin `remove_policy(context_rule_id, policy_id)`.
 /// - The OpenZeppelin `remove_policy` implementation.
-/// - The OpenZeppelin `add_policy` `DuplicatePolicy` panic — reason
-///   distinct contracts are required for the `add_policy` setup step.
-/// - The OpenZeppelin `add_context_rule` accepts
-///   `Map<Address, Val>` — unique address keys.
 #[tokio::test]
 async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
     // ── Step 1: Generate and fund the operator signer ────────────────────────
@@ -745,34 +811,18 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
 
     eprintln!("[h4] smart_account = {sa_strkey}");
 
-    // ── Step 2: Deploy two DISTINCT threshold-policy contracts ────────────────
-    // policy_addr_a is installed in the initial rule.
-    // policy_addr_b is added via add_policy (distinct address required — the
-    // OpenZeppelin add_policy panics with DuplicatePolicy if the
-    // same address is passed to add_policy for a rule that already contains it).
+    // ── Step 2: Deploy the threshold-policy contract ─────────────────────────
     let policy_a_strkey =
         deploy_threshold_policy_with_salt(&signer_g, signer_box.as_ref(), "h4-policy-a").await;
     let policy_addr_a = parse_c_strkey_to_smart_account(&policy_a_strkey)
         .expect("[h4] policy_a C-strkey must parse");
     eprintln!("[h4] threshold-policy A = {policy_a_strkey}");
 
-    let policy_b_strkey =
-        deploy_threshold_policy_with_salt(&signer_g, signer_box.as_ref(), "h4-policy-b").await;
-    let policy_addr_b = parse_c_strkey_to_smart_account(&policy_b_strkey)
-        .expect("[h4] policy_b C-strkey must parse");
-    eprintln!("[h4] threshold-policy B = {policy_b_strkey}");
-
-    assert_ne!(
-        policy_a_strkey, policy_b_strkey,
-        "[h4] the two deployed policy addresses must be distinct"
-    );
-
-    // ── Step 3: Install 1-policy rule with policy_addr_a ─────────────────────
-    let threshold_params = encode_threshold_params(1);
+    // ── Step 3: Install a policyless rule ─────────────────────────────────────
     let signer_addr =
         parse_g_strkey_to_signer_address(&signer_g).expect("[h4] signer G-strkey must parse");
 
-    let rule_manager = fresh_rule_manager();
+    let (rule_manager, signers_manager, audit_log_path, _audit_dir) = fresh_managers();
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
         "h4-rm-policy-test".to_owned(),
@@ -780,10 +830,7 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
         vec![ContextRuleSignerInput::Delegated {
             address: signer_addr,
         }],
-        vec![ContextRulePolicy::new(
-            policy_addr_a.clone(),
-            threshold_params.clone(),
-        )],
+        vec![],
     );
 
     let install_output = rule_manager
@@ -801,20 +848,18 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
         .expect("[h4] install_rule must succeed on testnet");
 
     let rule_id = install_output.rule_id;
-    eprintln!("[h4] installed 1-policy rule: rule_id = {rule_id}");
+    eprintln!("[h4] installed policyless rule: rule_id = {rule_id}");
 
-    // ── Step 4: Call add_policy(policy_addr_b) to reach policy_count = 2 ─────
-    // policy_addr_b is DISTINCT from policy_addr_a, so the DuplicatePolicy
-    // guard in the OpenZeppelin add_policy does not fire.
+    // ── Step 4: Call add_policy(policy_addr_a) to reach policy_count = 1 ─────
     // The policy_id returned here is the id that remove_policy will target.
     let policy_id_to_remove = rule_manager
         .add_policy(
             sa_addr.clone(),
             rule_id,
-            policy_addr_b.clone(),
-            threshold_params.clone(),
-            // Rule 0 authorizes: this manager has no signers manager, so an
-            // authorizing rule other than 0 is refused before signing.
+            policy_addr_a.clone(),
+            encode_threshold_params(1),
+            // Rule 0, the bootstrap rule whose signer is this test's signer,
+            // authorizes the attach.
             vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None,
@@ -823,11 +868,11 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
             false, // accept_unknown_verifier
         )
         .await
-        .expect("[h4] add_policy(policy_addr_b) must succeed (establishing policy_count=2)");
+        .expect("[h4] add_policy(policy_addr_a) must succeed (establishing policy_count=1)");
 
     eprintln!("[h4] add_policy succeeded: policy_id_to_remove = {policy_id_to_remove}");
 
-    // ── Step 5: Precondition guard — assert policy_count == 2 ────────────────
+    // ── Step 5: Precondition guard: assert policy_count == 1 ────────────────
     let scval_before = rule_manager
         .get_rule(sa_addr.clone(), rule_id, &signer_g)
         .await
@@ -837,15 +882,13 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
     let count_before = decode_policy_count_from_scval(&scval_before)
         .expect("[h4] decode_policy_count_from_scval must succeed");
     assert_eq!(
-        count_before, 2,
-        "[h4] precondition guard: must have 2 policies before remove_policy; \
+        count_before, 1,
+        "[h4] precondition guard: must have 1 policy before remove_policy; \
          got {count_before}"
     );
     eprintln!("[h4] precondition guard passed: policy_count = {count_before}");
 
-    // ── Step 6: Open AuditWriter + call remove_policy ─────────────────────────
-    let (audit_writer_arc, audit_log_path, _tmp_dir) = tmp_audit_writer();
-    let mut audit_writer = audit_writer_arc.lock().expect("audit writer lock");
+    // ── Step 6: call remove_policy ───────────────────────────────────────────
     let request_id = rid();
 
     let remove_result = rule_manager
@@ -853,20 +896,19 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
             sa_addr.clone(),
             rule_id,
             policy_id_to_remove,
-            // Rule 0 authorizes: this manager has no signers manager, so an
-            // authorizing rule other than 0 is refused before signing.
+            // Rule 0, the bootstrap rule whose signer is this test's signer,
+            // authorizes the removal.
             vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
-            Some(&mut *audit_writer),
+            None,
             request_id.clone(),
         )
         .await;
-    drop(audit_writer);
 
     remove_result.expect("[h4] remove_policy must succeed on testnet");
     eprintln!("[h4] remove_policy succeeded");
 
-    // ── Step 7: Fetch the rule and assert policy_count == 1 ──────────────────
+    // ── Step 7: Fetch the rule and assert policy_count == 0 ──────────────────
     let scval_after = rule_manager
         .get_rule(sa_addr.clone(), rule_id, &signer_g)
         .await
@@ -876,21 +918,46 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
     let count_after = decode_policy_count_from_scval(&scval_after)
         .expect("[h4] decode_policy_count_from_scval (after) must succeed");
     assert_eq!(
-        count_after, 1,
-        "[h4] policy_count must be 1 after remove_policy; got {count_after}"
+        count_after, 0,
+        "[h4] policy_count must be 0 after remove_policy; got {count_after}"
     );
     eprintln!("[h4] post-remove_policy policy_count = {count_after}");
 
-    // ── Step 8: Assert SaPolicyRemoved audit row ──────────────────────────────
-    let entries = read_audit_entries(&audit_log_path);
+    // ── Step 8: Assert the detach's audit rows ────────────────────────────────
+    let entries = rows_for_request(&audit_log_path, &request_id);
     assert!(
         !entries.is_empty(),
-        "[h4] audit log must contain at least one entry after remove_policy"
+        "[h4] audit log must contain the removal's rows"
     );
 
-    let policy_removed_count = entries
+    let threshold_position = entries
         .iter()
-        .filter(|e| {
+        .position(|e| {
+            matches!(
+                &e.event_kind,
+                EventKind::SaThresholdChangedV2 {
+                    rule_id: rid,
+                    previous_threshold: Some(previous),
+                    snapshot,
+                    ..
+                } if *rid == rule_id
+                    && *previous
+                        == ThresholdObservation {
+                            policy: contract_id(&policy_addr_a),
+                            threshold: 1,
+                        }
+                    && snapshot.threshold.is_none()
+            )
+        })
+        .expect(
+            "[h4] the detach must record SaThresholdChangedV2 from threshold 1 on policy A \
+             to no threshold",
+        );
+
+    let policy_removed_positions: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
             matches!(
                 &e.event_kind,
                 EventKind::SaPolicyRemoved {
@@ -900,32 +967,26 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
                 } if *rid == rule_id && *pid == policy_id_to_remove
             )
         })
-        .count();
+        .map(|(position, _)| position)
+        .collect();
     assert_eq!(
-        policy_removed_count, 1,
+        policy_removed_positions.len(),
+        1,
         "[h4] exactly one SaPolicyRemoved row with rule_id={rule_id} and \
-         policy_id={policy_id_to_remove} must be present; found {policy_removed_count}"
+         policy_id={policy_id_to_remove} must be present; found {}",
+        policy_removed_positions.len()
+    );
+    assert!(
+        threshold_position < policy_removed_positions[0],
+        "[h4] SaThresholdChangedV2 must precede SaPolicyRemoved"
     );
 
-    let policy_removed_entry = entries
-        .iter()
-        .find(|e| {
-            matches!(
-                &e.event_kind,
-                EventKind::SaPolicyRemoved { rule_id: rid, .. } if *rid == rule_id
-            )
-        })
-        .expect("[h4] remove_policy must emit SaPolicyRemoved");
-
+    let policy_removed_entry = &entries[policy_removed_positions[0]];
     assert_eq!(
         policy_removed_entry.chain_id.as_deref(),
         Some(CHAIN_ID),
         "[h4] SaPolicyRemoved row must carry chain_id={CHAIN_ID}; got {:?}",
         policy_removed_entry.chain_id
-    );
-    assert_eq!(
-        policy_removed_entry.request_id, request_id,
-        "[h4] SaPolicyRemoved row must carry the request_id used in the call"
     );
     let EventKind::SaPolicyRemoved {
         transaction_hash_redacted,
@@ -940,7 +1001,6 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
         "[h4] SaPolicyRemoved row must carry first-8-last-8 redacted tx hash"
     );
 
-    // ── Step 9: Assert SaRawInvocation(Success) audit row ────────────────────
     let raw_ok_count = entries
         .iter()
         .filter(|e| {
@@ -959,46 +1019,47 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
         "[h4] exactly one SaRawInvocation(Success) row must be present; \
          found {raw_ok_count}"
     );
+
+    // The recorded threshold change keeps the rule's state row in step with
+    // the chain.
+    let listed = signers_manager
+        .list_signers(sa_addr, rule_id, Some(&signer_g), rid())
+        .await
+        .expect("[h4] list_signers after the detach must succeed");
+    assert_eq!(
+        listed.baseline,
+        PreviousBaseline::Matched,
+        "[h4] the recorded state must match the chain after the detach"
+    );
 }
 
 // ── h5_add_policy_type_mismatched_install_param_no_success_audit ─────────────
 
-/// Supply a `--install-param` that base64-decodes correctly but type-mismatches
-/// the threshold-policy contract's expected `SimpleThresholdAccountParams`.
+/// Supply an install parameter that base64-decodes correctly but is not the
+/// simple-threshold policy's `SimpleThresholdAccountParams`.
 ///
 /// `ScVal::Bool(true)` is valid XDR and decodes without error; it does NOT
 /// match `SimpleThresholdAccountParams { threshold: u32 }` (which the on-chain
 /// contract expects as `ScVal::Map([("threshold", ScVal::U32(N))])`).
-/// The mismatch is detected at the Soroban simulate phase.
 ///
-/// # Why a DISTINCT second policy address is required
+/// # Why the refusal comes before submission
 ///
-/// The OpenZeppelin `add_policy` executes in this order:
-///
-/// 1. `register_policy(e, policy)` → `policy_id`.
-/// 2. `if entry.policy_ids.contains(policy_id) { panic_with_error!(DuplicatePolicy) }`.
-/// 3. `PolicyClient::new(e, policy).install(&install_param, ...)`.
-///
-/// The `DuplicatePolicy` panic fires at step 2, BEFORE the `install` call at
-/// step 3 where the type-mismatch would be caught.  If `policy_addr_a`
-/// (installed in the rule at install-time) were reused here, the test would
-/// receive `DuplicatePolicy` — not the `DeploymentFailed { phase: "simulate" }`
-/// error that this test is designed to assert.
-///
-/// Therefore `policy_addr_b` (salt `"h5-policy-b"`) is deployed as a second
-/// distinct address.  `policy_addr_b` is NOT in the rule's `policy_ids` list,
-/// so step 2 passes and the `install(&ScVal::Bool(true), ...)` call at step 3
-/// triggers the type-mismatch host trap at the simulate phase.
+/// The wallet observes the policy's executable before submission. The
+/// simple-threshold policy's attach records the threshold the parameter sets,
+/// so the wallet reads the parameter first and refuses one that is not the
+/// threshold map with `SimpleThresholdInstallRefused`, before anything is
+/// simulated or signed. `policy_addr_b` is not attached to the rule, so the
+/// refusal concerns the parameter alone.
 ///
 /// # Assertions
 ///
 /// 1. `manager.add_policy(...)` returns
-///    `Err(SaError::DeploymentFailed { phase: "simulate", .. })`.
+///    `Err(SaError::SimpleThresholdInstallRefused { .. })`.
 /// 2. No `SaPolicyAdded` row is present in the audit log (no audit-row
 ///    claiming success after a failed operation).
-/// 3. Exactly one `SaRawInvocation` row is present with
-///    `result: SaInvocationResult::PreSubmissionRefused` (simulate is
-///    classified as pre-submission by `sa_error_to_invocation_result`).
+/// 3. Exactly one `SaRawInvocation` row is present for the call, with
+///    `result: SaInvocationResult::PreSubmissionRefused`.
+/// 4. The rule still holds its one policy.
 ///
 /// # Steps
 ///
@@ -1007,32 +1068,22 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
 /// 3. Deploy TWO distinct threshold-policy contracts (salts `h5-policy-a`,
 ///    `h5-policy-b`).
 /// 4. Install a rule with 1 policy (`policy_addr_a`).
-/// 5. Open a fresh `AuditWriter`; call `manager.add_policy` with
-///    `policy_addr_b` and `install_param = ScVal::Bool(true)`.
-/// 6. Assert the call returns `Err` with `DeploymentFailed { phase: "simulate" }`.
-/// 7. Assert the audit log has NO `SaPolicyAdded` row.
-/// 8. Assert the audit log has exactly one `SaRawInvocation(PreSubmissionRefused)` row.
+/// 5. Call `manager.add_policy` with `policy_addr_b` and
+///    `install_param = ScVal::Bool(true)`.
+/// 6. Assert the call returns `Err` with `SimpleThresholdInstallRefused`.
+/// 7. Assert the audit log has NO `SaPolicyAdded` row for the call.
+/// 8. Assert the audit log has exactly one `SaRawInvocation(PreSubmissionRefused)`
+///    row for the call.
+/// 9. Assert the rule's policy count is unchanged.
 ///
 /// # Reference cross-check
 ///
-/// - The OpenZeppelin `add_policy` implementation fires `DuplicatePolicy`
-///   before the `install` call. Using a distinct `policy_addr_b` bypasses
-///   `DuplicatePolicy` and reaches the `install` call where the type-mismatch
-///   is caught.
 /// - The OpenZeppelin threshold policy defines
 ///   `SimpleThresholdAccountParams { threshold: u32 }` with
 ///   `#[contracttype]` — on-chain contract initialiser expects
 ///   `ScVal::Map([("threshold", ScVal::U32(N))])`.
-/// - The OpenZeppelin `add_policy` invokes the policy installer
-///   at simulate time; a type-mismatch surfaces as a Soroban host trap.
-/// - `sa_error_to_invocation_result`: `DeploymentFailed { phase: "simulate" }`
-///   maps to `SaInvocationResult::PreSubmissionRefused` (simulate is not in
-///   the `["submit", "deploy", "upload", "post_deploy_verification"]` set).
-/// - The OpenZeppelin `add_context_rule` takes
-///   `policies: &Map<Address, Val>` — Soroban Map, unique Address keys.
-/// - The Soroban host rejects `ScVal::Map` with
-///   duplicate keys (reinforces why duplicate addresses at install-time also
-///   fail).
+/// - `sa_error_to_invocation_result`: `SimpleThresholdInstallRefused` maps to
+///   `SaInvocationResult::PreSubmissionRefused`.
 #[tokio::test]
 async fn h5_add_policy_type_mismatched_install_param_no_success_audit() {
     // ── Step 1: Generate and fund the operator signer ────────────────────────
@@ -1047,12 +1098,8 @@ async fn h5_add_policy_type_mismatched_install_param_no_success_audit() {
     eprintln!("[h5] smart_account = {sa_strkey}");
 
     // ── Step 3: Deploy TWO DISTINCT threshold-policy contracts ───────────────
-    // policy_addr_a is installed in the initial rule.
-    // policy_addr_b is used for the adversarial add_policy call (distinct address
-    // required — the OpenZeppelin add_policy panics with DuplicatePolicy
-    // BEFORE the install call where the type-mismatch would
-    // be detected; reusing policy_addr_a would produce DuplicatePolicy, not the
-    // DeploymentFailed { phase: "simulate" } error this test asserts).
+    // policy_addr_a is installed in the initial rule; policy_addr_b, not
+    // attached to the rule, carries the malformed parameter.
     let policy_a_strkey =
         deploy_threshold_policy_with_salt(&signer_g, signer_box.as_ref(), "h5-policy-a").await;
     let policy_addr_a = parse_c_strkey_to_smart_account(&policy_a_strkey)
@@ -1075,7 +1122,7 @@ async fn h5_add_policy_type_mismatched_install_param_no_success_audit() {
     let signer_addr =
         parse_g_strkey_to_signer_address(&signer_g).expect("[h5] signer G-strkey must parse");
 
-    let rule_manager = fresh_rule_manager();
+    let (rule_manager, _signers_manager, audit_log_path, _audit_dir) = fresh_managers();
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
         "h5-type-mismatch".to_owned(),
@@ -1105,18 +1152,10 @@ async fn h5_add_policy_type_mismatched_install_param_no_success_audit() {
 
     // ── Step 5: Build a type-mismatched install_param ─────────────────────────
     // `ScVal::Bool(true)` is valid XDR and decodes without error.  It does NOT
-    // match `SimpleThresholdAccountParams { threshold: u32 }` expected by the
-    // OpenZeppelin threshold-policy contract.
-    // The mismatch surfaces as a Soroban host trap at the simulate phase.
-    //
-    // policy_addr_b (distinct from policy_addr_a) is used so that the DuplicatePolicy
-    // guard in the OpenZeppelin add_policy does NOT fire; the test reaches the
-    // install call where the type-mismatch is caught at simulate time.
+    // match `SimpleThresholdAccountParams { threshold: u32 }`.
     let mismatched_param = ScVal::Bool(true);
 
-    // ── Step 6: Open AuditWriter + call add_policy with policy_addr_b + mismatched param ──
-    let (audit_writer_arc, audit_log_path, _tmp_dir) = tmp_audit_writer();
-    let mut audit_writer = audit_writer_arc.lock().expect("[h5] audit writer lock");
+    // ── Step 6: call add_policy with policy_addr_b + mismatched param ─────────
     let request_id = rid();
 
     let result = rule_manager
@@ -1125,27 +1164,26 @@ async fn h5_add_policy_type_mismatched_install_param_no_success_audit() {
             rule_id,
             policy_addr_b,
             mismatched_param,
-            // Rule 0 authorizes: this manager has no signers manager, so an
-            // authorizing rule other than 0 is refused before signing.
+            // Rule 0, the bootstrap rule whose signer is this test's signer,
+            // authorizes the attach.
             vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
-            Some(&mut *audit_writer),
+            None,
             request_id.clone(),
             false, // accept_mutable_verifier
             false, // accept_unknown_verifier
         )
         .await;
-    drop(audit_writer); // release lock before reading
 
-    // ── Step 7: Assert simulate-phase failure ─────────────────────────────────
-    // The on-chain contract rejects the malformed install_param at simulate time.
+    // ── Step 7: Assert the refusal before submission ──────────────────────────
     match &result {
-        Err(SaError::DeploymentFailed { phase, .. }) => {
+        Err(err @ SaError::SimpleThresholdInstallRefused { .. }) => {
             assert_eq!(
-                *phase, "simulate",
-                "[h5] failure must occur at the simulate phase; got phase = {phase:?}"
+                err.wire_code(),
+                "sa.simple_threshold_install_refused",
+                "[h5] the refusal's wire code must be sa.simple_threshold_install_refused"
             );
-            eprintln!("[h5] simulate-phase failure confirmed: phase = {phase}");
+            eprintln!("[h5] pre-submission refusal confirmed: {err}");
         }
         Ok(policy_id) => {
             panic!(
@@ -1154,15 +1192,12 @@ async fn h5_add_policy_type_mismatched_install_param_no_success_audit() {
             );
         }
         Err(other) => {
-            panic!(
-                "[h5] expected DeploymentFailed {{ phase: \"simulate\" }}; \
-                 got {other:?}"
-            );
+            panic!("[h5] expected SimpleThresholdInstallRefused; got {other:?}");
         }
     }
 
     // ── Step 8: Assert NO SaPolicyAdded audit row ─────────────────────────────
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = rows_for_request(&audit_log_path, &request_id);
 
     let policy_added_count = entries
         .iter()
@@ -1170,14 +1205,12 @@ async fn h5_add_policy_type_mismatched_install_param_no_success_audit() {
         .count();
     assert_eq!(
         policy_added_count, 0,
-        "[h5] no SaPolicyAdded row must be present after a simulate-phase \
-         failure; found {policy_added_count}"
+        "[h5] no SaPolicyAdded row must be present after the refusal; \
+         found {policy_added_count}"
     );
     eprintln!("[h5] confirmed: no SaPolicyAdded row in audit log");
 
     // ── Step 9: Assert exactly one SaRawInvocation(PreSubmissionRefused) ──────
-    // `sa_error_to_invocation_result` maps `DeploymentFailed { phase: "simulate" }`
-    // to `PreSubmissionRefused` (simulate is not in the on-chain-rejection phase set).
     let pre_sub_refused_count = entries
         .iter()
         .filter(|e| {
@@ -1193,7 +1226,20 @@ async fn h5_add_policy_type_mismatched_install_param_no_success_audit() {
     assert_eq!(
         pre_sub_refused_count, 1,
         "[h5] exactly one SaRawInvocation(PreSubmissionRefused) row must be \
-         present after simulate-phase failure; found {pre_sub_refused_count}"
+         present after the refusal; found {pre_sub_refused_count}"
     );
     eprintln!("[h5] confirmed: 1 SaRawInvocation(PreSubmissionRefused) row in audit log");
+
+    // ── Step 10: Assert the rule still holds its one policy ───────────────────
+    let scval_after = rule_manager
+        .get_rule(sa_addr, rule_id, &signer_g)
+        .await
+        .expect("[h5] get_rule (after the refusal) must succeed")
+        .expect("[h5] rule must still be present");
+    assert_eq!(
+        decode_policy_count_from_scval(&scval_after)
+            .expect("[h5] decode_policy_count_from_scval must succeed"),
+        1,
+        "[h5] the refused attach must leave the rule's policy count at 1"
+    );
 }

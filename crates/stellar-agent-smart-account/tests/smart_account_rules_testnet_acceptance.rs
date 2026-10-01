@@ -45,14 +45,15 @@
 //! End-to-end testnet acceptance for the metadata-only lifecycle.
 //!
 //! - `install_rule` invoked with `audit_writer: None` and
-//!   `self.audit_writer = Some(arc)` (the production CLI pattern) emits both
-//!   a `SaContextRuleCreated` row AND a `SaRawInvocation(Success)` row on the
-//!   audit log via the `self.audit_writer` fallback path.
+//!   `self.audit_writer = Some(arc)` (the production CLI pattern) emits a
+//!   `SaContextRuleCreated` row, the rule's `SaSignerSetBaselinedV2` row and a
+//!   `SaRawInvocation(Success)` row on the audit log via the
+//!   `self.audit_writer` fallback path.
 //! - A rule mutation authorized by the rule itself runs in the production
 //!   shape: a manager built `with_signers_manager` over the shared audit log,
-//!   a rule with a simple-threshold policy baselined through `list_signers`,
-//!   and `update_name` under that rule passing the signer-set divergence
-//!   check and the pinned-hash drift check.
+//!   a rule with a simple-threshold policy baselined by its install, and
+//!   `update_name` under that rule passing the signer-set divergence check
+//!   and the pinned-hash drift check.
 
 #![cfg(feature = "testnet-integration")]
 #![allow(
@@ -75,6 +76,7 @@ use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EventKind, PinsUpdateReason, SaInvocationResult};
+use stellar_agent_core::audit_log::signer_set::BaselineReason;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::{Signer, SoftwareSigningKey};
@@ -85,14 +87,15 @@ use stellar_agent_smart_account::deployment::{
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
-    ContextRuleSignerInput, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
+    ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
+    parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
-use stellar_agent_smart_account::managers::signers::{
-    PreviousBaseline, SignersManager, SignersManagerConfig,
-};
+use stellar_agent_smart_account::managers::signers::{PreviousBaseline, SignersManager};
 use stellar_agent_smart_account::signers::SignerSetView;
 use stellar_agent_smart_account::simple_threshold_policy::build_simple_threshold_install_param;
+use stellar_agent_smart_account::test_helpers::{
+    rule_manager_config_for_tests, rule_manager_for_tests, signers_manager_for_tests,
+};
 use tempfile::TempDir;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -159,52 +162,61 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
     (Arc::new(Mutex::new(writer)), path, dir)
 }
 
-/// Constructs a fresh `ContextRuleManager` configured against testnet.
-fn fresh_manager() -> ContextRuleManager {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_PASSPHRASE.to_owned(),
+/// Constructs a `SignersManager` for testnet over `audit_writer`, with both
+/// RPC endpoints on `TESTNET_RPC_URL`.
+fn fresh_signers_manager(
+    audit_writer: Arc<Mutex<AuditWriter>>,
+    audit_log_path: PathBuf,
+) -> Arc<SignersManager> {
+    signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
+        audit_writer,
+        audit_log_path,
         Duration::from_secs(120),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("manager construction must succeed")
+    )
 }
 
-/// Constructs a `ContextRuleManager` with no horizon cap, for lifecycle tests
-/// that intentionally use far-future `valid_until` values (e.g. set/clear
-/// expiry with `FAR_FUTURE_LEDGER`).
+/// Constructs a `ContextRuleManager` configured against testnet with
+/// `signers_manager` and the shared `audit_writer` it writes to (the
+/// production CLI pattern: one writer for the install rows and the
+/// signer-set state rows).
+fn fresh_manager(
+    signers_manager: &Arc<SignersManager>,
+    audit_writer: &Arc<Mutex<AuditWriter>>,
+) -> ContextRuleManager {
+    rule_manager_for_tests(
+        TESTNET_RPC_URL,
+        None,
+        Arc::clone(signers_manager),
+        Arc::clone(audit_writer),
+        Duration::from_secs(120),
+    )
+}
+
+/// Constructs a `ContextRuleManager` like [`fresh_manager`] with no horizon
+/// cap, for lifecycle tests that intentionally use far-future `valid_until`
+/// values (e.g. set/clear expiry with `FAR_FUTURE_LEDGER`).
 ///
 /// The cap enforcement is tested separately in
 /// `smart_account_session_rule_horizon_testnet_acceptance.rs`.  Tests that need to
 /// set a `valid_until` beyond the default 1000-ledger horizon without
 /// triggering the cap must use this manager.
-fn fresh_manager_uncapped() -> ContextRuleManager {
+fn fresh_manager_uncapped(
+    signers_manager: &Arc<SignersManager>,
+    audit_writer: &Arc<Mutex<AuditWriter>>,
+) -> ContextRuleManager {
     ContextRuleManager::new(
-        ContextRuleManagerConfig::new(
-            TESTNET_RPC_URL.to_owned(),
-            TESTNET_PASSPHRASE.to_owned(),
+        rule_manager_config_for_tests(
+            TESTNET_RPC_URL,
+            None,
+            Arc::clone(signers_manager),
+            Arc::clone(audit_writer),
             Duration::from_secs(120),
-            CHAIN_ID.to_owned(),
         )
         .with_session_rule_max_horizon_ledgers(u32::MAX),
     )
     .expect("manager construction must succeed")
-}
-
-/// Constructs a `ContextRuleManager` configured against testnet and wired with
-/// the supplied shared audit writer (the production CLI pattern — calls
-/// `.with_audit_writer(Arc::clone(&ctx.audit_writer))`).
-fn fresh_manager_with_audit_writer(audit_writer: Arc<Mutex<AuditWriter>>) -> ContextRuleManager {
-    ContextRuleManager::new(
-        ContextRuleManagerConfig::new(
-            TESTNET_RPC_URL.to_owned(),
-            TESTNET_PASSPHRASE.to_owned(),
-            Duration::from_secs(120),
-            CHAIN_ID.to_owned(),
-        )
-        .with_audit_writer(audit_writer),
-    )
-    .expect("manager construction with audit writer must succeed")
 }
 
 /// Reads every non-empty JSONL line from `log_path` into a `Vec<AuditEntry>`.
@@ -276,7 +288,9 @@ async fn full_metadata_only_lifecycle_on_testnet() {
     let smart_account = parse_c_strkey_to_smart_account(&smart_account_strkey)
         .expect("deployed C-strkey must parse");
 
-    let manager = fresh_manager();
+    let (audit_arc, log_path, _temp_dir) = tmp_audit_writer();
+    let signers_manager = fresh_signers_manager(Arc::clone(&audit_arc), log_path);
+    let manager = fresh_manager(&signers_manager, &audit_arc);
 
     // ── get_rules_count post-deploy = 1 ──────────────────────────────────
     let count_after_deploy = manager
@@ -347,8 +361,7 @@ async fn full_metadata_only_lifecycle_on_testnet() {
     );
 
     // ── rename ────────────────────────────────────────────────────────
-    // Rule 0 authorizes: this manager has no signers manager, so an
-    // authorizing rule other than 0 is refused before signing.
+    // The bootstrap rule authorizes, as it authorized the install.
     let auth_rule_ids = vec![ContextRuleId::new(0)];
     manager
         .update_name(
@@ -381,9 +394,8 @@ async fn full_metadata_only_lifecycle_on_testnet() {
     // end-to-end.  The horizon-cap enforcement is tested separately in
     // `smart_account_session_rule_horizon_testnet_acceptance.rs`; here we use an
     // uncapped manager to avoid the cap interfering with the lifecycle test.
-    let uncapped_manager = fresh_manager_uncapped();
-    // Rule 0 authorizes: this manager has no signers manager, so an
-    // authorizing rule other than 0 is refused before signing.
+    let uncapped_manager = fresh_manager_uncapped(&signers_manager, &audit_arc);
+    // The bootstrap rule authorizes, as it authorized the install.
     let auth_rule_ids = vec![ContextRuleId::new(0)];
     uncapped_manager
         .update_valid_until(
@@ -407,8 +419,7 @@ async fn full_metadata_only_lifecycle_on_testnet() {
     );
 
     // ── clear expiry (the clear-expiry carve-out) ───────────────────────────────
-    // Rule 0 authorizes: this manager has no signers manager, so an
-    // authorizing rule other than 0 is refused before signing.
+    // The bootstrap rule authorizes, as it authorized the install.
     let auth_rule_ids = vec![ContextRuleId::new(0)];
     uncapped_manager
         .update_valid_until(
@@ -432,8 +443,7 @@ async fn full_metadata_only_lifecycle_on_testnet() {
     );
 
     // ── delete the rule ───────────────────────────────────────────────
-    // Rule 0 authorizes: this manager has no signers manager, so an
-    // authorizing rule other than 0 is refused before signing.
+    // The bootstrap rule authorizes, as it authorized the install.
     let auth_rule_ids = vec![ContextRuleId::new(0)];
     manager
         .delete_rule(
@@ -522,6 +532,9 @@ async fn full_metadata_only_lifecycle_on_testnet() {
 /// 5. Assert that the audit log contains a `SaRawInvocation` row with
 ///    `wire_code = "sa.ok"` and `result = SaInvocationResult::Success`.
 /// 6. Assert that the `chain_id` field on both rows matches `CHAIN_ID`.
+/// 7. Assert that the install's rows, in order, are `SaContextRuleCreated`,
+///    the rule's `SaSignerSetBaselinedV2` with reason `confirmed_install`,
+///    and the `sa.ok` `SaRawInvocation`.
 #[tokio::test(flavor = "multi_thread")]
 async fn e1_install_rule_emits_audit_rows_via_self_audit_writer() {
     // ── Setup ──────────────────────────────────────────────────────────────────
@@ -538,7 +551,8 @@ async fn e1_install_rule_emits_audit_rows_via_self_audit_writer() {
 
     // Construct the manager with self.audit_writer wired (production CLI pattern).
     // No per-operation audit_writer will be passed to install_rule below.
-    let manager = fresh_manager_with_audit_writer(Arc::clone(&audit_arc));
+    let signers_manager = fresh_signers_manager(Arc::clone(&audit_arc), log_path.clone());
+    let manager = fresh_manager(&signers_manager, &audit_arc);
 
     // ── install_rule with audit_writer: None ──────────────────────────────
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g)
@@ -673,6 +687,29 @@ async fn e1_install_rule_emits_audit_rows_via_self_audit_writer() {
         entry.request_id, request_id,
         "SaRawInvocation Success row must carry the request_id used in the call"
     );
+
+    // ── The install's rows in order ────────────────────────────────────────────
+    let install_rows: Vec<&EventKind> = entries
+        .iter()
+        .filter(|e| e.request_id == request_id)
+        .map(|e| &e.event_kind)
+        .collect();
+    assert!(
+        matches!(
+            install_rows.as_slice(),
+            [
+                EventKind::SaContextRuleCreated { rule_id: created, .. },
+                EventKind::SaSignerSetBaselinedV2 {
+                    rule_id: baselined,
+                    baseline_reason: BaselineReason::ConfirmedInstall,
+                    ..
+                },
+                EventKind::SaRawInvocation { wire_code, .. },
+            ] if *created == rule_id && *baselined == rule_id && wire_code == "sa.ok"
+        ),
+        "the install writes the created row, the confirmed-install baseline, then sa.ok: \
+         {install_rows:?}"
+    );
 }
 
 /// `update_name` and `update_valid_until` each emit their typed forensic row
@@ -693,7 +730,8 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
         .expect("deployed C-strkey must parse");
 
     let (audit_arc, log_path, _temp_dir) = tmp_audit_writer();
-    let manager = fresh_manager_with_audit_writer(Arc::clone(&audit_arc));
+    let signers_manager = fresh_signers_manager(Arc::clone(&audit_arc), log_path.clone());
+    let manager = fresh_manager(&signers_manager, &audit_arc);
 
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g)
         .expect("signer G-strkey must parse to ScAddress");
@@ -728,8 +766,7 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
             smart_account.clone(),
             rule_id,
             "e2-renamed".to_owned(), // 10 bytes, within OZ MAX_NAME_SIZE = 20
-            // Rule 0 authorizes: this manager has no signers manager, so an
-            // authorizing rule other than 0 is refused before signing.
+            // The bootstrap rule authorizes, as it authorized the install.
             vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None,
@@ -746,8 +783,7 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
             smart_account.clone(),
             rule_id,
             None,
-            // Rule 0 authorizes: this manager has no signers manager, so an
-            // authorizing rule other than 0 is refused before signing.
+            // The bootstrap rule authorizes, as it authorized the install.
             vec![ContextRuleId::new(0)],
             signer_box.as_ref(),
             None,
@@ -860,7 +896,8 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
 /// 2. Install a Default rule whose sole signer is the bootstrap signer, with
 ///    the policy at threshold 1, authorized by rule 0. The install pins the
 ///    policy's Wasm hash in `SaContextRuleCreated`.
-/// 3. Baseline the rule's signer set with `list_signers`.
+/// 3. Assert the install recorded one `SaSignerSetBaselinedV2` row with reason
+///    `confirmed_install`, which the next `list_signers` matches.
 /// 4. Rename the rule with `auth_rule_ids = [rule_id]`: the divergence check
 ///    compares the live signer set against the baseline, and the drift check
 ///    compares the live policy hash against the pin, before signing.
@@ -904,30 +941,8 @@ async fn e3_self_authorized_rename_through_the_production_manager_shape() {
         parse_c_strkey_to_smart_account(&policy.policy_address).expect("policy C-strkey parses");
 
     let (audit_arc, log_path, _temp_dir) = tmp_audit_writer();
-    let signers_manager = Arc::new(
-        SignersManager::new(SignersManagerConfig::new(
-            TESTNET_RPC_URL.to_owned(),
-            TESTNET_RPC_URL.to_owned(),
-            Arc::clone(&audit_arc),
-            log_path.clone(),
-            TESTNET_PASSPHRASE.to_owned(),
-            "rules-acceptance".to_owned(),
-            Duration::from_secs(120),
-            CHAIN_ID.to_owned(),
-        ))
-        .expect("SignersManager::new must succeed"),
-    );
-    let manager = ContextRuleManager::new(
-        ContextRuleManagerConfig::new(
-            TESTNET_RPC_URL.to_owned(),
-            TESTNET_PASSPHRASE.to_owned(),
-            Duration::from_secs(120),
-            CHAIN_ID.to_owned(),
-        )
-        .with_audit_writer(Arc::clone(&audit_arc))
-        .with_signers_manager(Arc::clone(&signers_manager)),
-    )
-    .expect("manager construction with a signers manager must succeed");
+    let signers_manager = fresh_signers_manager(Arc::clone(&audit_arc), log_path.clone());
+    let manager = fresh_manager(&signers_manager, &audit_arc);
 
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g)
         .expect("signer G-strkey must parse to ScAddress");
@@ -969,14 +984,33 @@ async fn e3_self_authorized_rename_through_the_production_manager_shape() {
         installed.tx_hash
     );
 
+    // The install recorded exactly one baseline for the rule, from the
+    // confirmed chain state.
+    let install_baselines: Vec<BaselineReason> = read_audit_entries(&log_path)
+        .into_iter()
+        .filter_map(|e| match e.event_kind {
+            EventKind::SaSignerSetBaselinedV2 {
+                rule_id: rid,
+                baseline_reason,
+                ..
+            } if rid == rule_id => Some(baseline_reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        install_baselines,
+        vec![BaselineReason::ConfirmedInstall],
+        "the install records one confirmed-install baseline for the rule"
+    );
+
     let baseline = signers_manager
         .list_signers(smart_account.clone(), rule_id, Some(&signer_g), rid())
         .await
-        .expect("list_signers must baseline the rule");
+        .expect("list_signers must read the rule");
     assert_eq!(
         baseline.baseline,
-        PreviousBaseline::None,
-        "a fresh rule's first list records the baseline"
+        PreviousBaseline::Matched,
+        "the install recorded the baseline, which the chain matches"
     );
     let SignerSetView::V2(snapshot) = &baseline.view else {
         panic!("list records a version-2 baseline; got {}", baseline.view)

@@ -114,6 +114,37 @@ fn rule_suffix(rule_id: &Option<u32>) -> String {
     rule_id.map_or_else(String::new, |rule_id| format!(" for rule {rule_id}"))
 }
 
+/// Renders an optional rule id as its number, or `none` when absent.
+fn rule_id_or_none(rule_id: &Option<u32>) -> String {
+    rule_id.map_or_else(|| "none".to_owned(), |rule_id| rule_id.to_string())
+}
+
+/// Renders [`SaError::InstallStateMismatch`]: the confirmed transaction, the
+/// failed check and the two ways to settle the unbaselined rule. A rule whose
+/// id could not be read is found with `rules list` first.
+fn install_state_mismatch_message(
+    rule_id: &Option<u32>,
+    smart_account_redacted: &RedactedStrkey,
+    tx_hash: &str,
+) -> String {
+    match rule_id {
+        Some(rule_id) => format!(
+            "install on {smart_account_redacted} confirmed in transaction {tx_hash} but the \
+             observed rule {rule_id} does not match the authorized definition; the rule is not \
+             baselined; inspect it with 'smart-account rules get --rule-id {rule_id}' and either \
+             delete it with 'smart-account rules delete --rule-id {rule_id} --auth-rule-id 0' or \
+             accept it with 'smart-account signers refresh --rule-id {rule_id}'"
+        ),
+        None => format!(
+            "install on {smart_account_redacted} confirmed in transaction {tx_hash} but the new \
+             rule's id could not be read; the rule is not baselined; find it with \
+             'smart-account rules list', then either delete it with \
+             'smart-account rules delete --rule-id N --auth-rule-id 0' or accept it with \
+             'smart-account signers refresh --rule-id N'"
+        ),
+    }
+}
+
 /// Renders an optional transaction hash as an ` after transaction <hash>`
 /// Display suffix, or nothing when absent.
 fn after_transaction_suffix(tx_hash: &Option<String>) -> String {
@@ -1259,8 +1290,11 @@ pub enum SaError {
 
     /// A typed simple-threshold policy install was refused client-side before
     /// any simulate/submit.  Fires when `threshold == 0` (OZ `install` panics
-    /// `InvalidThreshold`, `simple_threshold.rs:97-101`, SHA `a9c4216`) or when
-    /// the wallet cannot build the install parameter.
+    /// `InvalidThreshold`, `simple_threshold.rs:97-101`, SHA `a9c4216`) or
+    /// when the wallet cannot build the install parameter. It also fires when
+    /// the install parameter of an install or an attach of the
+    /// simple-threshold policy is not the one-entry `{ threshold: u32 }` map
+    /// with a non-zero threshold.
     ///
     /// `reason` is a human-readable description with no secret material.
     #[error("simple-threshold policy install refused: {reason}")]
@@ -1752,19 +1786,56 @@ pub enum SaError {
         request_id: String,
     },
 
+    /// A rule install confirmed, and the installed rule was not recorded as
+    /// its signer-set baseline.
+    ///
+    /// Either the observed rule does not match the authorized definition
+    /// (`rule_id` names it), or the transaction's return value did not
+    /// carry the new rule's id (`rule_id` is absent). The rule exists on
+    /// chain without a baseline, so every verb that compares it refuses with
+    /// `sa.signer_set_missing_baseline`. The Display names the transaction
+    /// and the two ways to settle the rule: delete it under rule 0, or
+    /// accept its observed state with `signers refresh`.
+    ///
+    /// Wire code: `sa.install_state_mismatch`.
+    ///
+    /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
+    /// at the call site.
+    #[error("{}", install_state_mismatch_message(.rule_id, .smart_account_redacted, .tx_hash))]
+    #[serde(rename = "sa.install_state_mismatch")]
+    InstallStateMismatch {
+        /// The installed rule's id; absent when the transaction's return
+        /// value did not carry it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<u32>,
+        /// Redacted smart-account contract address (first-5-last-5 C-strkey).
+        smart_account_redacted: RedactedStrkey,
+        /// Hash of the confirmed install transaction.
+        tx_hash: String,
+        /// Per-request correlation identifier (UUIDv4).
+        request_id: String,
+    },
+
     /// Smart-account manager operation requires a configured signers manager.
     ///
-    /// Fired by manager paths that need two-RPC signer/verifier consultation but
-    /// were constructed without `with_signers_manager`.
+    /// Fired before any RPC when the manager was constructed without
+    /// `with_signers_manager`, by the operations that need two-RPC signer and
+    /// contract consultation. These are rule install and its simulation, the
+    /// policy verbs, the pin verification, and a submission authorized by a
+    /// rule other than rule 0. `rule_id` is the rule the operation is scoped
+    /// to, and is absent for an install, whose rule has no id yet.
     ///
     /// Wire code: `sa.signers_manager_not_configured`.
     #[error(
-        "signers manager not configured for smart-account manager operation on rule_id={rule_id} (smart_account={smart_account_redacted})"
+        "signers manager not configured for smart-account manager operation on rule_id={} (smart_account={smart_account_redacted})",
+        rule_id_or_none(.rule_id)
     )]
     #[serde(rename = "sa.signers_manager_not_configured")]
     SignersManagerNotConfigured {
-        /// Context-rule identifier the manager operation was scoped to.
-        rule_id: u32,
+        /// Context-rule identifier the manager operation was scoped to;
+        /// absent for an install.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<u32>,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         smart_account_redacted: RedactedStrkey,
         /// Per-request correlation identifier (UUIDv4).
@@ -1780,7 +1851,15 @@ pub enum SaError {
     ///   rule's policies include none that matches;
     /// - `remove_signer` finds a rule whose policies include none that
     ///   matches. Another policy decides which signers suffice there, so the
-    ///   removal cannot be checked.
+    ///   removal cannot be checked;
+    /// - attaching the simple-threshold policy to a rule that already has
+    ///   one: the only change an attach records is from no threshold to one;
+    /// - detaching a policy whose executable identified as the
+    ///   simple-threshold policy before the rule's observation, when the
+    ///   observation names another policy or none;
+    /// - detaching from a rule with two or more matching policies, unless
+    ///   exactly two match and the detached policy is one of them, which
+    ///   leaves the rule with one.
     ///
     /// The refusal fails closed; the operator must ensure exactly one
     /// recognized policy hash is attached to the rule.
@@ -2928,6 +3007,7 @@ impl SaError {
             Self::SignerSetMissingBaseline { .. } => "sa.signer_set_missing_baseline",
             Self::SignerSetBaselineLegacy { .. } => "sa.signer_set_baseline_legacy",
             Self::BaselineWriteFailed { .. } => "sa.baseline_write_failed",
+            Self::InstallStateMismatch { .. } => "sa.install_state_mismatch",
             Self::SignersManagerNotConfigured { .. } => "sa.signers_manager_not_configured",
             Self::ThresholdPolicyIdentificationFailed { .. } => {
                 "sa.threshold_policy_identification_failed"
@@ -3451,9 +3531,18 @@ mod tests {
                 },
             ),
             (
+                "sa.install_state_mismatch",
+                SaError::InstallStateMismatch {
+                    rule_id: Some(4),
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    tx_hash: "ab".repeat(32),
+                    request_id: "test-req-ism-001".to_owned(),
+                },
+            ),
+            (
                 "sa.signers_manager_not_configured",
                 SaError::SignersManagerNotConfigured {
-                    rule_id: 7,
+                    rule_id: Some(7),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     request_id: "test-req-manager-001".to_owned(),
                 },
@@ -3981,6 +4070,44 @@ mod tests {
                     "reason",
                     "request_id",
                 ],
+            ),
+            (
+                "sa.install_state_mismatch",
+                SaError::InstallStateMismatch {
+                    rule_id: Some(4),
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    tx_hash: "ab".repeat(32),
+                    request_id: "test-req-ism-001".to_owned(),
+                },
+                &["rule_id", "smart_account_redacted", "tx_hash", "request_id"],
+            ),
+            (
+                "sa.install_state_mismatch",
+                SaError::InstallStateMismatch {
+                    rule_id: None,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    tx_hash: "ab".repeat(32),
+                    request_id: "test-req-ism-002".to_owned(),
+                },
+                &["smart_account_redacted", "tx_hash", "request_id"],
+            ),
+            (
+                "sa.signers_manager_not_configured",
+                SaError::SignersManagerNotConfigured {
+                    rule_id: Some(7),
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-manager-001".to_owned(),
+                },
+                &["rule_id", "smart_account_redacted", "request_id"],
+            ),
+            (
+                "sa.signers_manager_not_configured",
+                SaError::SignersManagerNotConfigured {
+                    rule_id: None,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-manager-002".to_owned(),
+                },
+                &["smart_account_redacted", "request_id"],
             ),
             (
                 "sa.context_rule_caps_exceeded",
@@ -4623,10 +4750,10 @@ mod tests {
 
     /// Verifies the wire-code closed set has no duplicates and covers every variant.
     ///
-    /// The `match` arms below are exhaustive — adding a variant without updating
-    /// this test produces a compile error, which enforces "every variant has a
-    /// unique wire code" at compile time. The duplicate check and count assertion
-    /// enforce uniqueness and completeness at test time.
+    /// The variant list is a slice literal the compiler does not check
+    /// against the enum. The literal count is the completeness check: a new
+    /// variant updates the list, the expected codes and the count together.
+    /// The duplicate check enforces that every wire code is unique.
     #[test]
     fn wire_code_set_has_no_duplicates_and_correct_count() {
         // Construct one instance of each variant and collect its wire_code.
@@ -4935,8 +5062,14 @@ mod tests {
                 reason: "network.rpc_divergence: views differ".to_owned(),
                 request_id: "test-req-bwf-002".to_owned(),
             },
+            SaError::InstallStateMismatch {
+                rule_id: None,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                tx_hash: "cd".repeat(32),
+                request_id: "test-req-ism-003".to_owned(),
+            },
             SaError::SignersManagerNotConfigured {
-                rule_id: 7,
+                rule_id: Some(7),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 request_id: "test-req-manager-001".to_owned(),
             },
@@ -5109,6 +5242,7 @@ mod tests {
             "sa.signer_set_missing_baseline",
             "sa.signer_set_baseline_legacy",
             "sa.baseline_write_failed",
+            "sa.install_state_mismatch",
             "sa.signers_manager_not_configured",
             "sa.threshold_policy_identification_failed",
             "network.rpc_divergence",
@@ -5157,7 +5291,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 77, "closed set must have exactly 77 wire codes");
+        assert_eq!(seen.len(), 78, "closed set must have exactly 78 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.
@@ -5749,7 +5883,7 @@ mod tests {
     #[test]
     fn signers_manager_not_configured_round_trip() {
         let err = SaError::SignersManagerNotConfigured {
-            rule_id: 11,
+            rule_id: Some(11),
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
             request_id: "req-manager".to_owned(),
         };
@@ -5759,6 +5893,103 @@ mod tests {
         assert_eq!(
             value.get("wire_code").and_then(|v| v.as_str()),
             Some("sa.signers_manager_not_configured")
+        );
+    }
+
+    /// `SignersManagerNotConfigured` keeps the bare rule number on the wire
+    /// for a scoped rule and omits the key for an install; the Display
+    /// renders the absent rule as `none`.
+    #[test]
+    fn signers_manager_not_configured_rule_id_is_optional() {
+        let err = |rule_id: Option<u32>| SaError::SignersManagerNotConfigured {
+            rule_id,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            request_id: "req-manager".to_owned(),
+        };
+
+        let scoped = serde_json::to_value(err(Some(7))).unwrap();
+        assert_eq!(
+            scoped["context"]["rule_id"],
+            serde_json::json!(7),
+            "{scoped}"
+        );
+        let install = serde_json::to_value(err(None)).unwrap();
+        assert!(install["context"].get("rule_id").is_none(), "{install}");
+        assert_eq!(install["context"]["request_id"], "req-manager", "{install}");
+
+        assert_eq!(
+            err(Some(7)).to_string(),
+            "signers manager not configured for smart-account manager operation on \
+             rule_id=7 (smart_account=CAAAA...ZZZZZ)"
+        );
+        assert_eq!(
+            err(None).to_string(),
+            "signers manager not configured for smart-account manager operation on \
+             rule_id=none (smart_account=CAAAA...ZZZZZ)"
+        );
+    }
+
+    /// `InstallStateMismatch` names the confirmed transaction in both forms.
+    /// With the rule id it names the rule in the inspect, delete and refresh
+    /// commands; without it, it sends the operator to `rules list` first.
+    /// The delete command authorizes under rule 0, because an unbaselined
+    /// rule cannot authorize its own removal.
+    #[test]
+    fn install_state_mismatch_display_and_wire_shape_per_rule_id_form() {
+        let hash = "ab".repeat(32);
+        let err = |rule_id: Option<u32>| SaError::InstallStateMismatch {
+            rule_id,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            tx_hash: hash.clone(),
+            request_id: "req-ism".to_owned(),
+        };
+
+        let observed = err(Some(4)).to_string();
+        assert_eq!(
+            observed,
+            format!(
+                "install on CAAAA...ZZZZZ confirmed in transaction {hash} but the observed rule 4 \
+                 does not match the authorized definition; the rule is not baselined; inspect it \
+                 with 'smart-account rules get --rule-id 4' and either delete it with \
+                 'smart-account rules delete --rule-id 4 --auth-rule-id 0' or accept it with \
+                 'smart-account signers refresh --rule-id 4'"
+            )
+        );
+        assert!(
+            observed.contains("--rule-id 4 --auth-rule-id 0"),
+            "{observed}"
+        );
+
+        let unread = err(None).to_string();
+        assert_eq!(
+            unread,
+            format!(
+                "install on CAAAA...ZZZZZ confirmed in transaction {hash} but the new rule's id \
+                 could not be read; the rule is not baselined; find it with \
+                 'smart-account rules list', then either delete it with \
+                 'smart-account rules delete --rule-id N --auth-rule-id 0' or accept it with \
+                 'smart-account signers refresh --rule-id N'"
+            )
+        );
+        assert!(unread.contains("--rule-id N --auth-rule-id 0"), "{unread}");
+
+        let with_id = serde_json::to_value(err(Some(4))).unwrap();
+        assert_eq!(with_id["wire_code"], "sa.install_state_mismatch");
+        assert_eq!(
+            with_id["context"]["rule_id"],
+            serde_json::json!(4),
+            "{with_id}"
+        );
+        assert_eq!(with_id["context"]["tx_hash"], hash.as_str(), "{with_id}");
+        let without_id = serde_json::to_value(err(None)).unwrap();
+        assert!(
+            without_id["context"].get("rule_id").is_none(),
+            "{without_id}"
+        );
+        assert_eq!(
+            without_id["context"]["tx_hash"],
+            hash.as_str(),
+            "{without_id}"
         );
     }
 

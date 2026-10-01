@@ -84,6 +84,7 @@ use sha2::{Digest as _, Sha256};
 use soroban_spec_tools::Spec;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{ContractKind, EventKind, ExecutableRefPin};
+use stellar_agent_core::audit_log::signer_set::BaselineReason;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::sc_address::executable_tag_ledger_key;
@@ -105,14 +106,16 @@ use stellar_agent_smart_account::ed25519_verifier::ED25519_VERIFIER_WASM;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
-    ContextRuleSignerInput, PinStatus, RuleContext, parse_c_strkey_to_smart_account,
-    parse_g_strkey_to_signer_address,
+    ContextRuleDefinition, ContextRulePolicy, ContextRuleSignerInput, PinStatus, RuleContext,
+    parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
-use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
+use stellar_agent_smart_account::managers::signers::PreviousBaseline;
 use stellar_agent_smart_account::simple_threshold_policy::build_simple_threshold_install_param;
 use stellar_agent_smart_account::submit::{
     Ed25519RuleSigner, PinCheck, SubmitInvokeArgs, submit_signed_invoke,
+};
+use stellar_agent_smart_account::test_helpers::{
+    rule_manager_for_tests, signers_manager_for_tests,
 };
 use stellar_agent_smart_account::webauthn_verifier::WEBAUTHN_VERIFIER_WASM;
 use stellar_agent_test_support::testnet_helpers::{
@@ -654,30 +657,20 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         parse_c_strkey_to_smart_account(&policy.policy_address).expect("policy C-strkey parses");
 
     let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
-    let signers_manager = Arc::new(
-        SignersManager::new(SignersManagerConfig::new(
-            TESTNET_RPC_URL.to_owned(),
-            TESTNET_RPC_URL.to_owned(),
-            Arc::clone(&audit_writer),
-            audit_log_path.clone(),
-            TESTNET_PASSPHRASE.to_owned(),
-            "cap85-acceptance".to_owned(),
-            TIMEOUT,
-            CHAIN_ID.to_owned(),
-        ))
-        .expect("SignersManager::new"),
+    let signers_manager = signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
+        Arc::clone(&audit_writer),
+        audit_log_path.clone(),
+        TIMEOUT,
     );
-    let manager = ContextRuleManager::new(
-        ContextRuleManagerConfig::new(
-            TESTNET_RPC_URL.to_owned(),
-            TESTNET_PASSPHRASE.to_owned(),
-            TIMEOUT,
-            CHAIN_ID.to_owned(),
-        )
-        .with_audit_writer(Arc::clone(&audit_writer))
-        .with_signers_manager(Arc::clone(&signers_manager)),
-    )
-    .expect("ContextRuleManager::new");
+    let manager = rule_manager_for_tests(
+        TESTNET_RPC_URL,
+        None,
+        Arc::clone(&signers_manager),
+        Arc::clone(&audit_writer),
+        TIMEOUT,
+    );
 
     let (_agent_g, agent_seed) = fresh_keypair();
     let agent_pubkey = SigningKey::from_bytes(&agent_seed)
@@ -783,7 +776,8 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let entries = read_audit_entries(&audit_log_path);
     // The override row is written after the install confirms, carrying the
     // installed rule's id: the install's rows are the override row, then
-    // SaContextRuleCreated, then the `sa.ok` raw-invocation row.
+    // SaContextRuleCreated, then the baseline the confirmed rule records,
+    // then the `sa.ok` raw-invocation row.
     let install_rows: Vec<&EventKind> = entries
         .iter()
         .filter(|entry| entry.request_id == install_request_id)
@@ -795,10 +789,16 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
             [
                 EventKind::SaMutableContractOverride { .. },
                 EventKind::SaContextRuleCreated { .. },
+                EventKind::SaSignerSetBaselinedV2 {
+                    rule_id: baselined_rule_id,
+                    baseline_reason: BaselineReason::ConfirmedInstall,
+                    ..
+                },
                 EventKind::SaRawInvocation { wire_code, .. },
-            ] if wire_code == "sa.ok"
+            ] if wire_code == "sa.ok" && *baselined_rule_id == rule_id
         ),
-        "the install writes the override row, the created row, then sa.ok: {install_rows:?}"
+        "the install writes the override row, the created row, the baseline, then sa.ok: \
+         {install_rows:?}"
     );
     let overrides: Vec<&AuditEntry> = entries
         .iter()
@@ -865,16 +865,13 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     assert_eq!(created.1, vec![Some(expected_pin)]);
     assert!(created.2, "the created row must carry mutable_override");
 
-    signers_manager
-        .refresh_signer_baseline(
-            smart_account_sc.clone(),
-            rule_id,
-            Some(&bootstrap_g),
-            false,
-            rid(),
-        )
+    // The install recorded the rule's baseline; the list confirms the chain
+    // matches it before the rule signs.
+    let listed = signers_manager
+        .list_signers(smart_account_sc.clone(), rule_id, Some(&bootstrap_g), rid())
         .await
-        .expect("refresh_signer_baseline must succeed");
+        .expect("list_signers after the install must succeed");
+    assert_eq!(listed.baseline, PreviousBaseline::Matched);
 
     // ── Proof 3: a transfer signed through the proxy-verified rule ──────────
     let funded = fund_sac_balance(
@@ -1042,7 +1039,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
             &smart_account,
             &[0u8; 32],
             vec![rule_id],
-            Some(Arc::clone(&signers_manager)),
+            Arc::clone(&signers_manager),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19907),
             Duration::from_millis(500),
             |_| {},

@@ -89,14 +89,15 @@ use stellar_agent_smart_account::deployment::{
 use stellar_agent_smart_account::ed25519_verifier::ED25519_VERIFIER_WASM_SHA256;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
-    RuleContext, decode_context_type_from_scval, parse_c_strkey_to_smart_account,
+    ContextRuleDefinition, ContextRuleManager, ContextRuleSignerInput, RuleContext,
+    decode_context_type_from_scval, parse_c_strkey_to_smart_account,
     parse_g_strkey_to_signer_address,
 };
 use stellar_agent_smart_account::spending_limit_policy::build_spending_limit_install_param;
 use stellar_agent_smart_account::submit::{
     Ed25519RuleSigner, PinCheck, SubmitInvokeArgs, submit_signed_invoke,
 };
+use stellar_agent_smart_account::test_helpers::managers_for_tests;
 use stellar_agent_test_support::testnet_helpers::fund_sac_balance;
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::{Transaction, TransactionBehavior};
@@ -108,6 +109,7 @@ use stellar_xdr::{
     ScString, ScSymbol, ScVal, SorobanAuthorizedFunction, SorobanCredentials, StringM, Uint256,
     VecM,
 };
+use tempfile::TempDir;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -166,15 +168,17 @@ fn fresh_deployer_keypair() -> (String, DeployerKeypair) {
     (g_strkey, deployer)
 }
 
-/// Constructs a `ContextRuleManager` against testnet.
-fn fresh_rule_manager() -> ContextRuleManager {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_PASSPHRASE.to_owned(),
+/// Constructs a `ContextRuleManager` against testnet with a signers manager,
+/// both writing to one audit log under the returned `TempDir`, which the
+/// caller holds while it uses the manager. Rule install and the policy verbs
+/// require the signers manager.
+fn fresh_rule_manager() -> (ContextRuleManager, TempDir) {
+    let (manager, _signers_manager, _audit_log_path, dir) = managers_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
         Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("ContextRuleManager construction must succeed")
+    );
+    (manager, dir)
 }
 
 /// Deploys a fresh smart account whose constructor-rule signer is
@@ -291,7 +295,7 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
     let agent_signer_box: Box<dyn Signer + Send + Sync> =
         Box::new(SoftwareSigningKey::new_from_zeroizing(agent_seed));
 
-    let manager = fresh_rule_manager();
+    let (manager, _manager_audit_dir) = fresh_rule_manager();
 
     // ── Step 3 (part 3): install the CallContract(token) rule ───────────────
     let call_contract_definition = ContextRuleDefinition::new(
@@ -343,6 +347,8 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
     );
 
     // ── Step 4: attach the spending-limit policy ────────────────────────────
+    // The spending-limit policy is not the simple-threshold policy, so the
+    // attach records no signer-set state row.
     let install_param =
         build_spending_limit_install_param(SPENDING_LIMIT_STROOPS, SPENDING_PERIOD_LEDGERS)
             .expect("spending-limit install param must build");
@@ -388,8 +394,9 @@ async fn agent_delegation_full_flow_testnet_acceptance() {
     let recipient_scaddr =
         parse_g_strkey_to_signer_address(&recipient_g).expect("recipient G-strkey must parse");
 
-    // The rule manager in this suite writes no audit rows, so the rule has no
-    // pin record and the check fetches the rule and passes it.
+    // The rule manager records its rows in its own audit log, so this log
+    // holds no pin record of the rule and the check fetches the rule and
+    // passes it.
     let pin_manager = pin_check_manager::pin_check_manager(
         TESTNET_RPC_URL,
         TESTNET_RPC_URL,

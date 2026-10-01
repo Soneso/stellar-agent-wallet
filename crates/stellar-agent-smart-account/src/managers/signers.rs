@@ -22,7 +22,10 @@
 //!    endpoints are read again at or past the confirmation ledger, the
 //!    resulting set must be exactly the intended change, and it is recorded as
 //!    a version-2 state row; a failure to observe or record it is returned as
-//!    [`crate::SaError::BaselineWriteFailed`] with the transaction hash.
+//!    [`crate::SaError::BaselineWriteFailed`] with the transaction hash. A rule
+//!    the wallet installs is baselined the same way from its confirmed state,
+//!    and an attach or detach of the simple-threshold policy records the
+//!    threshold change.
 //!
 //! # Architecture
 //!
@@ -37,24 +40,27 @@
 //!
 //! # Single-caller invariant for the signer-set baseline
 //!
-//! Only `SignersManager::list_signers` (first observation) and
-//! `SignersManager::refresh_signer_baseline` (explicit re-anchor) may write a
-//! baseline, a `EventKind::SaSignerSetBaselinedV2` row. The CI gate
-//! `.github/scripts/check-no-direct-sasignersetbaselined-emit.sh` enforces
-//! this over the production code of every crate:
+//! Only `SignersManager::list_signers` (first observation),
+//! `SignersManager::refresh_signer_baseline` (explicit re-anchor) and
+//! `SignersManager::baseline_confirmed_install` (a rule the wallet installed)
+//! may write a baseline, a `EventKind::SaSignerSetBaselinedV2` row. The CI
+//! gate `.github/scripts/check-no-direct-sasignersetbaselined-emit.sh`
+//! enforces this over the production code of every crate:
 //!
 //! 1. `AuditEntry::new_sa_signer_set_baselined_v2` is called exactly once,
 //!    inside `SignersManager::emit_baseline`, and the version-1 constructor
 //!    `AuditEntry::new_sa_signer_set_baselined` is not called;
-//! 2. `emit_baseline` is called exactly twice, once from `list_signers` and
-//!    once from `refresh_signer_baseline`;
+//! 2. `emit_baseline` is called exactly three times, once from each of
+//!    `list_signers`, `refresh_signer_baseline` and
+//!    `baseline_confirmed_install`;
 //! 3. no code outside `stellar-agent-core`'s `audit_log/entry.rs` constructs
 //!    `SaSignerSetBaselined` or `SaSignerSetBaselinedV2`, with any path prefix
 //!    (pattern matches are allowed);
-//! 4. `BaselineReason::first_observation`, `explicit_refresh`,
-//!    `FirstObservation` and `ExplicitRefresh` are used only from
-//!    `list_signers` and `refresh_signer_baseline` (pattern matches are
-//!    allowed);
+//! 4. each `BaselineReason` constructor and variant is used only in its own
+//!    function: `first_observation` and `FirstObservation` in
+//!    `list_signers`, `explicit_refresh` and `ExplicitRefresh` in
+//!    `refresh_signer_baseline`, `confirmed_install` and `ConfirmedInstall` in
+//!    `baseline_confirmed_install` (pattern matches are allowed);
 //! 5. no `use` statement outside `entry.rs` and `schema.rs` imports through
 //!    `EventKind::` or renames `EventKind`.
 //!
@@ -111,8 +117,8 @@ use crate::error::{
     baseline_observe_reason, baseline_write_reason,
 };
 use crate::managers::rules::{
-    BASE_FEE_STROOPS, ExpiryCheck, augment_with_oz_error_name, contract_instance_key,
-    scaddress_to_strkey,
+    BASE_FEE_STROOPS, ExpectedInstallState, ExpiryCheck, augment_with_oz_error_name,
+    contract_instance_key, scaddress_to_strkey,
 };
 use crate::managers::verifiers::PlannedPinUpdate;
 use crate::signers::policy_identification::THRESHOLD_POLICY_WASM_HASHES;
@@ -210,17 +216,25 @@ type RuleMutexMap = Mutex<HashMap<RuleMutexKey, RuleMutexInner>>;
 
 /// Process-global per-rule async mutex registry.
 ///
-/// Keyed on `(audit_log_path, rule_id, smart_account_strkey)`.  Provides a
-/// non-reentrant mutual exclusion primitive so concurrent `add_signer` /
-/// `remove_signer` / `set_threshold` calls against the same rule-ID + smart
-/// account are serialised — preventing TOCTOU windows between the divergence
-/// check and the transaction submission.
+/// Keyed on `(audit_log_path, rule_id, smart_account_strkey)`. It provides a
+/// non-reentrant mutual exclusion primitive, so this manager's calls against
+/// one rule of one smart account run one at a time. One call's comparison
+/// with the rule's state row, its submission and its row write never
+/// interleave with another call's.
 ///
-/// Six and only six acquire sites are authorised: the three mutating ops
-/// (`add_signer`, `remove_signer`, `set_threshold`) AND the three read-side
-/// ops that write to the audit log (`list_signers`, `refresh_signer_baseline`,
-/// `verify_signer_set_against_chain`).
-/// A CI gate enforces this exact-six-site allowlist.
+/// The acquire sites are the manager's verbs and entries that read or write
+/// a rule's state row, and the policy-configuration verbs that change the
+/// rule on chain:
+///
+/// - `list_signers`, `refresh_signer_baseline` and
+///   `verify_signer_set_against_chain`;
+/// - `add_signer`, `remove_signer`, `set_threshold` and `batch_add_signers`;
+/// - `baseline_confirmed_install`, `attach_threshold_policy` and
+///   `detach_threshold_policy`;
+/// - `set_spending_limit`, `set_weighted_threshold` and `set_signer_weight`.
+///
+/// Each acquires the lock once and holds it for the whole call; nothing
+/// called under the lock acquires it again.
 static RULE_MUTEX_REGISTRY: OnceLock<RuleMutexMap> = OnceLock::new();
 
 fn rule_mutex_registry() -> &'static RuleMutexMap {
@@ -827,6 +841,7 @@ impl SignersManager {
                 &smart_account_strkey,
                 &smart_account_redacted,
                 BaselineReason::first_observation(),
+                None,
                 &request_id,
             )?;
             info!(
@@ -1013,6 +1028,7 @@ impl SignersManager {
             &smart_account_strkey,
             &smart_account_redacted,
             BaselineReason::explicit_refresh(),
+            None,
             &request_id,
         )?;
 
@@ -1421,15 +1437,15 @@ impl SignersManager {
     ///
     /// # Arguments
     ///
-    /// - `smart_account` — the smart-account contract's [`ScAddress`].
-    /// - `rule_id` — the context rule to update.
-    /// - `new_threshold` — the desired new threshold.
-    /// - `signer` — the ed25519 signer.
-    /// - `request_id` — caller-supplied UUID.
+    /// - `smart_account`: the smart-account contract's [`ScAddress`].
+    /// - `rule_id`: the context rule to update.
+    /// - `new_threshold`: the desired new threshold.
+    /// - `signer`: the ed25519 signer.
+    /// - `request_id`: caller-supplied UUID.
     ///
     /// # Errors
     ///
-    /// - [`SaError::ThresholdUnreachable`] — new threshold would violate invariants.
+    /// - [`SaError::ThresholdUnreachable`]: new threshold would violate invariants.
     /// - [`SaError::ThresholdPolicyNotInstalled`]: the rule has no
     ///   simple-threshold policy.
     /// - The comparison, submission and recording errors of
@@ -1488,6 +1504,640 @@ impl SignersManager {
                 )
             },
         )
+    }
+
+    // ── Rule install and the threshold-policy entries ─────────────────────────
+
+    /// Records the signer-set baseline of a rule the wallet installed, from
+    /// the confirmed chain state.
+    ///
+    /// Acquires the rule's lock, then observes the rule through both
+    /// endpoints at or past the confirmation ledger of `submitted` and
+    /// requires the observation to be the authorized definition:
+    ///
+    /// - the observed signers' version-2 identities equal `expected.signers`
+    ///   as a multiset: the counts are equal and each expected identity is
+    ///   matched by exactly one observed signer;
+    /// - the observed threshold equals `expected.threshold`: none when the
+    ///   definition attaches no simple-threshold policy, otherwise the same
+    ///   policy with the same value.
+    ///
+    /// The validated observation is written as a `SaSignerSetBaselinedV2`
+    /// row with reason `confirmed_install`.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::BaselineWriteFailed`] with the transaction hash: the
+    ///   confirmed rule was not observed (stage `observe`), or the row was
+    ///   not written (stage `write`).
+    /// - [`SaError::InstallStateMismatch`] with the rule id and the
+    ///   transaction hash: the observed rule is not the definition. No row is
+    ///   written.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the account identity, the new rule, its expected state, the confirmed \
+                  transaction, the source account and the correlation id"
+    )]
+    pub(crate) async fn baseline_confirmed_install(
+        &self,
+        smart_account: &ScAddress,
+        smart_account_strkey: &str,
+        smart_account_redacted: &str,
+        rule_id: u32,
+        expected: &ExpectedInstallState,
+        submitted: &crate::submit::SubmitInvokeResult,
+        source_account_strkey: &str,
+        request_id: &str,
+    ) -> Result<(), SaError> {
+        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, smart_account_strkey);
+        let _guard = mutex.lock().await;
+
+        let observation = self
+            .observe_confirmed(
+                smart_account,
+                rule_id,
+                Some(source_account_strkey),
+                submitted,
+                smart_account_redacted,
+                request_id,
+            )
+            .await?;
+        if !is_installed_state(&observation.snapshot, expected) {
+            warn!(
+                rule_id,
+                smart_account = %smart_account_redacted,
+                tx_hash = %submitted.tx_hash,
+                observed_signer_count = observation.snapshot.signer_count(),
+                expected_signer_count = expected.signers.len(),
+                "baseline_confirmed_install: the confirmed rule is not the authorized definition"
+            );
+            return Err(SaError::InstallStateMismatch {
+                rule_id: Some(rule_id),
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                tx_hash: submitted.tx_hash.clone(),
+                request_id: request_id.to_owned(),
+            });
+        }
+        self.emit_baseline(
+            &observation,
+            rule_id,
+            smart_account_strkey,
+            smart_account_redacted,
+            BaselineReason::confirmed_install(),
+            Some(&submitted.tx_hash),
+            request_id,
+        )
+    }
+
+    /// Attaches the simple-threshold policy `policy` to rule `rule_id`
+    /// through `submit`, and records the threshold the attach sets.
+    ///
+    /// Acquires the rule's lock, then:
+    ///
+    /// 1. Compares the chain with the rule's version-2 state row, as
+    ///    [`Self::add_signer`] does. A missing row refuses with
+    ///    [`SaError::SignerSetMissingBaseline`] and a version-1 row with
+    ///    [`SaError::SignerSetBaselineLegacy`], both before any RPC; a changed
+    ///    set refuses with [`SaError::SignerSetDiverged`].
+    /// 2. Refuses with [`SaError::ThresholdPolicyIdentificationFailed`] when
+    ///    the rule already has a simple-threshold policy: the only change an
+    ///    attach records is from no threshold to one.
+    /// 3. Runs `submit`, which signs and submits the `add_policy` invocation.
+    /// 4. Reads the assigned policy id from the confirmed return value.
+    /// 5. Observes the rule after confirmation and requires the signers
+    ///    unchanged and the threshold `expected_threshold` on `policy`.
+    /// 6. Writes the `SaThresholdChangedV2` row: no previous threshold, and
+    ///    the resulting set with the new one.
+    ///
+    /// The threshold row is written here, so it precedes the policy, raw
+    /// invocation and pin rows the caller writes after this entry returns.
+    ///
+    /// # Returns
+    ///
+    /// `Err` when the entry returned before a confirmation; nothing was
+    /// recorded. `Ok` once the transaction confirmed. Then `parsed` is the
+    /// policy id, `None` only when the return value is not a `u32`.
+    /// `recorded` is the outcome of steps 5 and 6, or the stage-`observe`
+    /// refusal of a return value that is not a `u32`.
+    ///
+    /// # Errors
+    ///
+    /// The comparison errors of [`Self::add_signer`],
+    /// [`SaError::ThresholdPolicyIdentificationFailed`] and the errors of
+    /// `submit`. After confirmation, `recorded` carries
+    /// [`SaError::BaselineWriteFailed`] (stage `observe` or `write`) or
+    /// [`SaError::SignerSetDiverged`] with the transaction hash.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the account identity, the rule, the policy and its threshold, the source \
+                  account, the submission and the correlation id"
+    )]
+    pub(crate) async fn attach_threshold_policy<Fut>(
+        &self,
+        smart_account: &ScAddress,
+        smart_account_strkey: &str,
+        smart_account_redacted: &str,
+        rule_id: u32,
+        policy: &ScAddress,
+        expected_threshold: u32,
+        source_account_strkey: Option<&str>,
+        submit: impl FnOnce() -> Fut,
+        request_id: &str,
+    ) -> Result<ConfirmedThresholdChange<Option<u32>>, SaError>
+    where
+        Fut: Future<Output = Result<crate::submit::SubmitInvokeResult, SaError>>,
+    {
+        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, smart_account_strkey);
+        let _guard = mutex.lock().await;
+
+        let compared = self
+            .compare_signer_set_locked(
+                smart_account,
+                smart_account_strkey,
+                smart_account_redacted,
+                rule_id,
+                source_account_strkey,
+                V1Handling::RefuseLegacy,
+                request_id,
+            )
+            .await?;
+        if compared.observation.snapshot.threshold.is_some() {
+            return Err(SaError::ThresholdPolicyIdentificationFailed {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                observed_wasm_hashes_summary: compared.observation.policy_hashes,
+                request_id: request_id.to_owned(),
+            });
+        }
+        let before = compared.observation.snapshot;
+
+        let submitted = submit().await?;
+        let policy_id = match extract_u32_return(&submitted.return_val, "add_policy") {
+            Ok(policy_id) => policy_id,
+            Err(cause) => {
+                let recorded = Err(observe_failed_after(
+                    rule_id,
+                    smart_account_redacted,
+                    &submitted.tx_hash,
+                    &cause,
+                    request_id,
+                ));
+                return Ok(ConfirmedThresholdChange {
+                    submitted,
+                    parsed: None,
+                    recorded,
+                });
+            }
+        };
+        let intended = SignerSetSnapshotV2 {
+            signers: before.signers,
+            threshold: Some(ThresholdObservation {
+                policy: contract_address_bytes(policy),
+                threshold: expected_threshold,
+            }),
+        };
+        let recorded = self
+            .record_threshold_change(
+                smart_account,
+                smart_account_strkey,
+                smart_account_redacted,
+                rule_id,
+                source_account_strkey,
+                &submitted,
+                intended,
+                None,
+                request_id,
+            )
+            .await;
+        Ok(ConfirmedThresholdChange {
+            submitted,
+            parsed: Some(policy_id),
+            recorded,
+        })
+    }
+
+    /// Detaches the simple-threshold policy `policy` from rule `rule_id`
+    /// through `submit`, and records the threshold change.
+    ///
+    /// Acquires the rule's lock and compares the chain with the rule's
+    /// version-2 state row, as [`Self::attach_threshold_policy`] does. Two
+    /// deltas are recorded:
+    ///
+    /// - The rule has one simple-threshold policy. It must be `policy`, else
+    ///   the call refuses with [`SaError::ThresholdPolicyIdentificationFailed`]
+    ///   before submission: the caller identified `policy` by its executable
+    ///   before this observation, and the two reads must agree. After
+    ///   confirmation the signers must be unchanged and the threshold gone.
+    ///   The row records the observed threshold as the previous one and none
+    ///   as the resulting one.
+    /// - The rule has two simple-threshold policies, so it cannot be
+    ///   observed, and `policy` is one of them. The rule is read through both
+    ///   endpoints and its signers must equal the state row's before
+    ///   submission; a changed set writes the `SaSignerSetDiverged` row and
+    ///   refuses with [`SaError::SignerSetDiverged`] without a transaction
+    ///   hash. After confirmation the signers must equal the state row's and
+    ///   the threshold must be the other policy's. The row records no
+    ///   previous threshold, since none was observable, and the other
+    ///   policy's threshold as the resulting one.
+    ///
+    /// Any other identification failure, three or more matching policies
+    /// included, refuses unchanged. The threshold row precedes the policy,
+    /// raw invocation and pin rows the caller writes after this entry
+    /// returns.
+    ///
+    /// # Returns
+    ///
+    /// `Err` when the entry returned before a confirmation; nothing was
+    /// recorded. `Ok` once the transaction confirmed, with `recorded` the
+    /// outcome of the observation and the row write after confirmation.
+    ///
+    /// # Errors
+    ///
+    /// The comparison errors of [`Self::add_signer`],
+    /// [`SaError::ThresholdPolicyIdentificationFailed`],
+    /// [`SaError::SignerSetDiverged`] without a transaction hash, the rule
+    /// read errors and the errors of `submit`. After confirmation,
+    /// `recorded` carries [`SaError::BaselineWriteFailed`] (stage `observe`
+    /// or `write`) or [`SaError::SignerSetDiverged`] with the transaction
+    /// hash.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the account identity, the rule, the policy, the source account, the \
+                  submission and the correlation id"
+    )]
+    pub(crate) async fn detach_threshold_policy<Fut>(
+        &self,
+        smart_account: &ScAddress,
+        smart_account_strkey: &str,
+        smart_account_redacted: &str,
+        rule_id: u32,
+        policy: &ScAddress,
+        source_account_strkey: Option<&str>,
+        submit: impl FnOnce() -> Fut,
+        request_id: &str,
+    ) -> Result<ConfirmedThresholdChange<()>, SaError>
+    where
+        Fut: Future<Output = Result<crate::submit::SubmitInvokeResult, SaError>>,
+    {
+        let mutex = rule_mutex_acquire(&self.audit_log_path, rule_id, smart_account_strkey);
+        let _guard = mutex.lock().await;
+
+        let compared = match self
+            .compare_signer_set_locked(
+                smart_account,
+                smart_account_strkey,
+                smart_account_redacted,
+                rule_id,
+                source_account_strkey,
+                V1Handling::RefuseLegacy,
+                request_id,
+            )
+            .await
+        {
+            Ok(compared) => compared,
+            Err(identification @ SaError::ThresholdPolicyIdentificationFailed { .. }) => {
+                return self
+                    .detach_one_of_two_threshold_policies(
+                        smart_account,
+                        smart_account_strkey,
+                        smart_account_redacted,
+                        rule_id,
+                        policy,
+                        source_account_strkey,
+                        submit,
+                        identification,
+                        request_id,
+                    )
+                    .await;
+            }
+            Err(other) => return Err(other),
+        };
+        let detached = contract_address_bytes(policy);
+        if !compared
+            .observation
+            .snapshot
+            .threshold
+            .as_ref()
+            .is_some_and(|threshold| threshold.policy == detached)
+        {
+            return Err(SaError::ThresholdPolicyIdentificationFailed {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                observed_wasm_hashes_summary: compared.observation.policy_hashes,
+                request_id: request_id.to_owned(),
+            });
+        }
+        let before = compared.observation.snapshot;
+
+        let submitted = submit().await?;
+        let intended = SignerSetSnapshotV2 {
+            signers: before.signers,
+            threshold: None,
+        };
+        let recorded = self
+            .record_threshold_change(
+                smart_account,
+                smart_account_strkey,
+                smart_account_redacted,
+                rule_id,
+                source_account_strkey,
+                &submitted,
+                intended,
+                before.threshold,
+                request_id,
+            )
+            .await;
+        Ok(ConfirmedThresholdChange {
+            submitted,
+            parsed: (),
+            recorded,
+        })
+    }
+
+    /// The detach of one of two simple-threshold policies of
+    /// [`Self::detach_threshold_policy`]. The caller holds the rule's lock,
+    /// and its comparison refused with `identification`, which is returned
+    /// unchanged unless exactly two attached policies match and one of them
+    /// is `policy`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the account identity, the rule, the policy, the source account, the \
+                  submission, the comparison's refusal and the correlation id"
+    )]
+    async fn detach_one_of_two_threshold_policies<Fut>(
+        &self,
+        smart_account: &ScAddress,
+        smart_account_strkey: &str,
+        smart_account_redacted: &str,
+        rule_id: u32,
+        policy: &ScAddress,
+        source_account_strkey: Option<&str>,
+        submit: impl FnOnce() -> Fut,
+        identification: SaError,
+        request_id: &str,
+    ) -> Result<ConfirmedThresholdChange<()>, SaError>
+    where
+        Fut: Future<Output = Result<crate::submit::SubmitInvokeResult, SaError>>,
+    {
+        // The comparison read the state row before any RPC and refused a
+        // missing or version-1 row, so the row is version 2.
+        let baseline = match self
+            .read_signer_set_view(rule_id, smart_account_strkey, smart_account_redacted)?
+            .map(|payload| payload.view().clone())
+        {
+            Some(SignerSetView::V2(snapshot)) => snapshot,
+            _ => {
+                return Err(SaError::DeploymentFailed {
+                    phase: "simulate",
+                    redacted_reason: format!(
+                        "remove_policy: rule {rule_id} has no version-2 state row"
+                    ),
+                });
+            }
+        };
+
+        let (primary, secondary) = tokio::join!(
+            self.read_rule(
+                &self.primary_rpc_client,
+                smart_account,
+                rule_id,
+                source_account_strkey,
+                None,
+            ),
+            self.read_rule(
+                &self.secondary_rpc_client,
+                smart_account,
+                rule_id,
+                source_account_strkey,
+                None,
+            ),
+        );
+        let (primary, secondary) = (primary?, secondary?);
+        Self::require_same_rule(
+            &primary.rule,
+            &secondary.rule,
+            rule_id,
+            smart_account_redacted,
+            request_id,
+        )?;
+        let (matches, _summary) = self
+            .allowlisted_threshold_policies(
+                &primary.rule.policies,
+                rule_id,
+                smart_account_redacted,
+                request_id,
+            )
+            .await?;
+        let remaining = match matches.as_slice() {
+            [(first, _), (_, second_id)] if first == policy => *second_id,
+            [(_, first_id), (second, _)] if second == policy => *first_id,
+            _ => return Err(identification),
+        };
+
+        let observed = snapshot_of_rule(&primary.rule, None)?;
+        if observed.signers != baseline.signers {
+            let expected = SignerSetView::V2(baseline);
+            let observed = SignerSetView::V2(observed);
+            self.emit_signer_set_diverged(
+                rule_id,
+                smart_account_redacted,
+                &expected,
+                &observed,
+                request_id,
+            );
+            return Err(SaError::SignerSetDiverged {
+                rule_id,
+                expected,
+                observed,
+                tx_hash: None,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                request_id: request_id.to_owned(),
+            });
+        }
+
+        let submitted = submit().await?;
+        let recorded = self
+            .record_one_of_two_detached(
+                smart_account,
+                smart_account_strkey,
+                smart_account_redacted,
+                rule_id,
+                source_account_strkey,
+                &submitted,
+                baseline,
+                remaining,
+                request_id,
+            )
+            .await;
+        Ok(ConfirmedThresholdChange {
+            submitted,
+            parsed: (),
+            recorded,
+        })
+    }
+
+    /// Observes the rule after a confirmed attach or detach of the
+    /// simple-threshold policy, requires `intended`, and writes the
+    /// `SaThresholdChangedV2` row with `previous` as the threshold before the
+    /// change.
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::BaselineWriteFailed`] with the transaction hash at stage
+    /// `observe` or `write`, and [`SaError::SignerSetDiverged`] with it when
+    /// the confirmed state is not `intended`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the account identity, the rule, the source account, the confirmed \
+                  transaction, the intended state, the previous threshold and the correlation id"
+    )]
+    async fn record_threshold_change(
+        &self,
+        smart_account: &ScAddress,
+        smart_account_strkey: &str,
+        smart_account_redacted: &str,
+        rule_id: u32,
+        source_account_strkey: Option<&str>,
+        submitted: &crate::submit::SubmitInvokeResult,
+        intended: SignerSetSnapshotV2,
+        previous: Option<ThresholdObservation>,
+        request_id: &str,
+    ) -> Result<(), SaError> {
+        let observation = self
+            .observe_confirmed(
+                smart_account,
+                rule_id,
+                source_account_strkey,
+                submitted,
+                smart_account_redacted,
+                request_id,
+            )
+            .await?;
+        let resulting = self.require_intended_state(
+            rule_id,
+            smart_account_redacted,
+            intended,
+            observation,
+            &submitted.tx_hash,
+            request_id,
+        )?;
+        self.write_threshold_changed(
+            smart_account_strkey,
+            smart_account_redacted,
+            rule_id,
+            previous,
+            &resulting,
+            &submitted.tx_hash,
+            request_id,
+        )
+    }
+
+    /// Observes the rule after a confirmed detach of one of two
+    /// simple-threshold policies and requires the signers of `baseline` and
+    /// the threshold of the `remaining` policy. It then writes the
+    /// `SaThresholdChangedV2` row with no previous threshold.
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::BaselineWriteFailed`] with the transaction hash at stage
+    /// `observe` or `write`, and [`SaError::SignerSetDiverged`] with it,
+    /// comparing `baseline` with the observation, when the confirmed state is
+    /// not that.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the account identity, the rule, the source account, the confirmed \
+                  transaction, the state row, the remaining policy and the correlation id"
+    )]
+    async fn record_one_of_two_detached(
+        &self,
+        smart_account: &ScAddress,
+        smart_account_strkey: &str,
+        smart_account_redacted: &str,
+        rule_id: u32,
+        source_account_strkey: Option<&str>,
+        submitted: &crate::submit::SubmitInvokeResult,
+        baseline: SignerSetSnapshotV2,
+        remaining: [u8; 32],
+        request_id: &str,
+    ) -> Result<(), SaError> {
+        let observation = self
+            .observe_confirmed(
+                smart_account,
+                rule_id,
+                source_account_strkey,
+                submitted,
+                smart_account_redacted,
+                request_id,
+            )
+            .await?;
+        let remains = observation
+            .snapshot
+            .threshold
+            .as_ref()
+            .is_some_and(|threshold| threshold.policy == remaining);
+        if observation.snapshot.signers != baseline.signers || !remains {
+            return Err(self.unintended_state(
+                rule_id,
+                smart_account_redacted,
+                baseline,
+                observation.snapshot,
+                &submitted.tx_hash,
+                request_id,
+            ));
+        }
+        self.write_threshold_changed(
+            smart_account_strkey,
+            smart_account_redacted,
+            rule_id,
+            None,
+            &observation.snapshot,
+            &submitted.tx_hash,
+            request_id,
+        )
+    }
+
+    /// Writes the `SaThresholdChangedV2` row of a confirmed attach or detach
+    /// of the simple-threshold policy.
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::BaselineWriteFailed`] at stage `write` with the transaction
+    /// hash when the row is not written.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the account identity, the rule, both threshold sides, the confirmed \
+                  transaction and the correlation id"
+    )]
+    fn write_threshold_changed(
+        &self,
+        smart_account_strkey: &str,
+        smart_account_redacted: &str,
+        rule_id: u32,
+        previous: Option<ThresholdObservation>,
+        resulting: &SignerSetSnapshotV2,
+        tx_hash: &str,
+        request_id: &str,
+    ) -> Result<(), SaError> {
+        let account = account_digest(&self.network_passphrase, smart_account_strkey);
+        self.write_confirmed_state_row(rule_id, smart_account_redacted, tx_hash, request_id, |_| {
+            AuditEntry::new_sa_threshold_changed_v2(
+                rule_id,
+                previous,
+                resulting,
+                account,
+                RedactedStrkey::from_already_redacted(smart_account_redacted),
+                self.chain_id.as_str(),
+                request_id,
+            )
+        })
     }
 
     // ── set_spending_limit ─────────────────────────────────────────────────────
@@ -3750,22 +4400,7 @@ impl SignersManager {
         let threshold = threshold_policy
             .zip(primary.threshold)
             .map(|((_, policy), threshold)| ThresholdObservation { policy, threshold });
-
-        let mut signers: Vec<SignerEntryV2> = primary
-            .rule
-            .signers
-            .iter()
-            .map(|(id, signer)| SignerEntryV2 {
-                id: *id,
-                identity: signer.to_identity_v2(),
-            })
-            .collect();
-        signers.sort_by_key(|entry| entry.id);
-        let snapshot = SignerSetSnapshotV2 { signers, threshold };
-        snapshot.validate().map_err(|e| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("get_context_rule: the observed signer set is malformed: {e}"),
-        })?;
+        let snapshot = snapshot_of_rule(&primary.rule, threshold)?;
 
         let v1_signers = primary
             .rule
@@ -3797,7 +4432,9 @@ impl SignersManager {
     ///
     /// With `catch_up`, a read reporting a ledger below the floor is repeated
     /// after [`CONFIRMATION_CATCH_UP_PAUSE`] until it reaches the floor or the
-    /// budget ends.
+    /// budget ends, whether its simulation succeeded or failed: an endpoint
+    /// behind the confirmation does not hold a rule the confirmed transaction
+    /// created yet.
     async fn read_rule(
         &self,
         rpc_client: &StellarRpcClient,
@@ -3807,7 +4444,7 @@ impl SignersManager {
         catch_up: Option<CatchUp<'_>>,
     ) -> Result<EndpointRead, SaError> {
         loop {
-            let (scval, ledger) = simulate_read_only_with_ledger(
+            let (outcome, ledger) = simulate_read_only_at_ledger(
                 rpc_client.url(),
                 smart_account.clone(),
                 "get_context_rule",
@@ -3825,7 +4462,7 @@ impl SignersManager {
                 continue;
             }
             return Ok(EndpointRead {
-                rule: decode_context_rule_scval(scval)?,
+                rule: decode_context_rule_scval(outcome?)?,
                 ledger,
                 threshold: None,
             });
@@ -3838,7 +4475,9 @@ impl SignersManager {
     ///
     /// With `catch_up`, a threshold read reporting a ledger below the floor
     /// repeats the endpoint's whole observation, the rule read and the
-    /// threshold read, after [`CONFIRMATION_CATCH_UP_PAUSE`].
+    /// threshold read, after [`CONFIRMATION_CATCH_UP_PAUSE`], whether the
+    /// read succeeded or failed: an endpoint behind the confirmation does not
+    /// hold a threshold the confirmed transaction set yet.
     #[allow(
         clippy::too_many_arguments,
         reason = "endpoint, rule identity, the endpoint's rule read, the policy, the \
@@ -3860,7 +4499,7 @@ impl SignersManager {
             return Ok(read);
         };
         loop {
-            let (threshold, ledger) = self
+            let (outcome, ledger) = self
                 .read_threshold(
                     rpc_client,
                     policy,
@@ -3887,7 +4526,7 @@ impl SignersManager {
                     .await?;
                 continue;
             }
-            read.threshold = Some(threshold);
+            read.threshold = Some(outcome?);
             read.ledger = read.ledger.min(ledger);
             return Ok(read);
         }
@@ -3898,10 +4537,17 @@ impl SignersManager {
     ///
     /// The threshold policy exposes
     /// `get_threshold(e, context_rule_id: u32, smart_account: Address) -> u32`
-    /// per the OpenZeppelin stellar-accounts v0.7.2 contract. Any failure,
-    /// including a return that is not a `u32`, refuses with
-    /// [`SaError::ThresholdReadFailed`] naming the endpoint; no threshold is
-    /// inferred from the signer count.
+    /// per the OpenZeppelin stellar-accounts v0.7.2 contract. A failed
+    /// simulation or a return that is not a `u32` is the inner
+    /// [`SaError::ThresholdReadFailed`] naming the endpoint, beside the
+    /// ledger the response reported. The caller can then tell a read behind
+    /// the confirmation from a failure. No threshold is inferred from the
+    /// signer count.
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::ThresholdReadFailed`] when no response arrived, such as a
+    /// transport failure.
     #[allow(
         clippy::too_many_arguments,
         reason = "endpoint, policy, rule identity and correlation fields"
@@ -3915,9 +4561,9 @@ impl SignersManager {
         source_account_strkey: Option<&str>,
         smart_account_redacted: &str,
         request_id: &str,
-    ) -> Result<(u32, u32), SaError> {
+    ) -> Result<(Result<u32, SaError>, u32), SaError> {
         let source_kind = self.rpc_source_kind(rpc_client);
-        let read = simulate_read_only_with_ledger(
+        let read = simulate_read_only_at_ledger(
             rpc_client.url(),
             policy.clone(),
             "get_threshold",
@@ -3927,23 +4573,34 @@ impl SignersManager {
             self.timeout,
         )
         .await;
-        let detail = match read {
-            Ok((ScVal::U32(threshold), ledger)) => return Ok((threshold, ledger)),
-            Ok((other, _)) => format!("expected ScVal::U32, got {}", scval_variant_name(&other)),
-            Err(e) => e.to_string(),
+        let refused = |detail: String| {
+            debug!(
+                rule_id,
+                source_kind,
+                detail = %detail,
+                "get_threshold failed (fail closed)"
+            );
+            SaError::ThresholdReadFailed {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                source_kind,
+                request_id: request_id.to_owned(),
+            }
         };
-        debug!(
-            rule_id,
-            source_kind,
-            detail = %detail,
-            "get_threshold failed (fail closed)"
-        );
-        Err(SaError::ThresholdReadFailed {
-            rule_id,
-            smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
-            source_kind,
-            request_id: request_id.to_owned(),
-        })
+        match read {
+            Ok((Ok(ScVal::U32(threshold)), ledger)) => Ok((Ok(threshold), ledger)),
+            Ok((Ok(other), ledger)) => Ok((
+                Err(refused(format!(
+                    "expected ScVal::U32, got {}",
+                    scval_variant_name(&other)
+                ))),
+                ledger,
+            )),
+            Ok((Err(e), ledger)) => Ok((Err(refused(e.to_string())), ledger)),
+            Err(e) => Err(refused(e.to_string())),
+        }
     }
 
     /// Waits [`CONFIRMATION_CATCH_UP_PAUSE`] before an endpoint behind the
@@ -3991,21 +4648,15 @@ impl SignersManager {
 
     /// Identifies the rule's simple-threshold policy among `policies`.
     ///
-    /// Observes each distinct policy's executable through both endpoints
-    /// ([`Self::observe_contract`], which refuses a divergence, a malformed
-    /// instance or an external reference with no live tag entry). A policy is
-    /// the simple-threshold policy when its effective hash is in
-    /// [`THRESHOLD_POLICY_WASM_HASHES`]; a policy with no code (an absent
-    /// instance or a Stellar asset) is readable and never matches. Returns
-    /// the one match with its contract id, or `None` when no policy matches,
-    /// together with the summary a refusal carries: the number of attached
-    /// policies and the first 8 bytes of the first observed effective hash.
+    /// Returns the one match of [`Self::allowlisted_threshold_policies`] with
+    /// its contract id, or `None` when no policy matches, together with the
+    /// summary a refusal carries.
     ///
     /// # Errors
     ///
     /// - [`SaError::ThresholdPolicyIdentificationFailed`]: more than one
     ///   policy matches.
-    /// - The errors of [`Self::observe_contract`].
+    /// - The errors of [`Self::allowlisted_threshold_policies`].
     async fn identify_simple_threshold_policy(
         &self,
         policies: &[ScAddress],
@@ -4013,6 +4664,47 @@ impl SignersManager {
         smart_account_redacted: &str,
         request_id: &str,
     ) -> Result<(Option<(ScAddress, [u8; 32])>, WasmHashSummary), SaError> {
+        let (mut matches, summary) = self
+            .allowlisted_threshold_policies(policies, rule_id, smart_account_redacted, request_id)
+            .await?;
+        if matches.len() > 1 {
+            return Err(SaError::ThresholdPolicyIdentificationFailed {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                observed_wasm_hashes_summary: summary,
+                request_id: request_id.to_owned(),
+            });
+        }
+        Ok((matches.pop(), summary))
+    }
+
+    /// Lists the policies among `policies` that identify as the
+    /// simple-threshold policy, each with its contract id.
+    ///
+    /// Observes each distinct policy's executable through both endpoints
+    /// ([`Self::observe_contract`], which refuses a divergence, a malformed
+    /// instance or an external reference with no live tag entry). A policy
+    /// matches when its effective hash is in [`THRESHOLD_POLICY_WASM_HASHES`];
+    /// a policy with no code (an absent instance or a Stellar asset) is
+    /// readable and never matches. The matches keep the order of `policies`
+    /// and each distinct address appears once. The summary is the one a
+    /// refusal carries: the number of attached policies and the first 8 bytes
+    /// of the first observed effective hash.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::DeploymentFailed`] (phase `simulate`): a matching policy
+    ///   address is not a contract address.
+    /// - The errors of [`Self::observe_contract`].
+    async fn allowlisted_threshold_policies(
+        &self,
+        policies: &[ScAddress],
+        rule_id: u32,
+        smart_account_redacted: &str,
+        request_id: &str,
+    ) -> Result<(Vec<(ScAddress, [u8; 32])>, WasmHashSummary), SaError> {
         let mut distinct: Vec<&ScAddress> = Vec::with_capacity(policies.len());
         for policy in policies {
             if !distinct.contains(&policy) {
@@ -4021,7 +4713,7 @@ impl SignersManager {
         }
 
         let mut first_first8: Option<[u8; 8]> = None;
-        let mut matches: Vec<ScAddress> = Vec::new();
+        let mut matches: Vec<(ScAddress, [u8; 32])> = Vec::new();
         for policy in distinct {
             let observation = self
                 .observe_contract(
@@ -4041,7 +4733,15 @@ impl SignersManager {
                 first_first8 = Some(first8);
             }
             if observation.allowlisted {
-                matches.push(policy.clone());
+                let ScAddress::Contract(ContractId(Hash(policy_id))) = policy else {
+                    return Err(SaError::DeploymentFailed {
+                        phase: "simulate",
+                        redacted_reason: "get_context_rule: the simple-threshold policy address \
+                                          is not a contract address"
+                            .to_owned(),
+                    });
+                };
+                matches.push((policy.clone(), *policy_id));
             }
         }
 
@@ -4049,29 +4749,7 @@ impl SignersManager {
             count: u32::try_from(policies.len()).unwrap_or(u32::MAX),
             first_first8,
         };
-        if matches.len() > 1 {
-            return Err(SaError::ThresholdPolicyIdentificationFailed {
-                rule_id,
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted,
-                ),
-                observed_wasm_hashes_summary: summary,
-                request_id: request_id.to_owned(),
-            });
-        }
-        let Some(policy) = matches.pop() else {
-            return Ok((None, summary));
-        };
-        let ScAddress::Contract(ContractId(Hash(policy_id))) = &policy else {
-            return Err(SaError::DeploymentFailed {
-                phase: "simulate",
-                redacted_reason: "get_context_rule: the simple-threshold policy address is not \
-                                  a contract address"
-                    .to_owned(),
-            });
-        };
-        let policy_id = *policy_id;
-        Ok((Some((policy, policy_id)), summary))
+        Ok((matches, summary))
     }
 
     /// Refuses with [`SaError::NetworkRpcDivergence`] unless the two
@@ -4251,18 +4929,26 @@ impl SignersManager {
     /// Writes a `SaSignerSetBaselinedV2` row recording `observation` as the
     /// rule's baseline.
     ///
-    /// Called exclusively from `list_signers` (first observation) and
-    /// `refresh_signer_baseline` (explicit re-anchor); a CI gate enforces the
-    /// single-caller invariant and that this function is the only builder of
-    /// the row. The row carries the observation's ledger and the account
-    /// digest of this manager's network and `smart_account_strkey`.
+    /// Called only from `list_signers` (first observation),
+    /// `refresh_signer_baseline` (explicit re-anchor) and
+    /// `baseline_confirmed_install` (a confirmed install); a CI gate enforces
+    /// these three callers and that this function is the only builder of the
+    /// row. The row carries the observation's ledger and the account digest
+    /// of this manager's network and `smart_account_strkey`.
     /// `prev_chain_tip_hash` is read from `AuditWriter::current_chain_tip()`
     /// inside the write critical section, so it names the row's predecessor.
+    /// `tx_hash` is the confirmed install's transaction, which a refused
+    /// write carries; the other two callers submit nothing and pass `None`.
     ///
     /// # Errors
     ///
-    /// [`SaError::BaselineWriteFailed`] at stage `write`, without a
-    /// transaction hash, when the row is not written.
+    /// [`SaError::BaselineWriteFailed`] at stage `write`, carrying `tx_hash`,
+    /// when the row is not written.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the observation, the account identity, the reason, the confirmed transaction \
+                  and the correlation id"
+    )]
     fn emit_baseline(
         &self,
         observation: &ObservationV2,
@@ -4270,6 +4956,7 @@ impl SignersManager {
         smart_account_strkey: &str,
         smart_account_redacted: &str,
         baseline_reason: BaselineReason,
+        tx_hash: Option<&str>,
         request_id: &str,
     ) -> Result<(), SaError> {
         let account = account_digest(&self.network_passphrase, smart_account_strkey);
@@ -4293,6 +4980,7 @@ impl SignersManager {
                 target: "stellar_agent::audit",
                 rule_id,
                 smart_account_redacted = %smart_account_redacted,
+                tx_hash = tx_hash.unwrap_or("none"),
                 error = %e,
                 request_id = %request_id,
                 "SaSignerSetBaselinedV2 row not written"
@@ -4302,7 +4990,7 @@ impl SignersManager {
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
                     smart_account_redacted,
                 ),
-                tx_hash: None,
+                tx_hash: tx_hash.map(ToOwned::to_owned),
                 stage: BASELINE_WRITE_STAGE_WRITE,
                 reason: baseline_write_reason(&e.to_string()),
                 request_id: request_id.to_owned(),
@@ -5412,6 +6100,23 @@ struct ConfirmedSignerAdd<Ids> {
     pin_update: Option<PlannedPinUpdate>,
 }
 
+/// A threshold-policy attach or detach whose transaction confirmed.
+///
+/// A confirmed policy change is a fact on chain, so what the entry read from
+/// the confirmed return value sits beside the recording outcome: the caller
+/// writes its policy row from `parsed` whatever `recorded` holds.
+pub(crate) struct ConfirmedThresholdChange<T> {
+    /// The confirmed submission.
+    pub(crate) submitted: crate::submit::SubmitInvokeResult,
+    /// What the entry read from `submitted.return_val`: the attach's policy
+    /// id, `None` only when the return value is not a `u32`; nothing for a
+    /// detach.
+    pub(crate) parsed: T,
+    /// The outcome of the observation, the validation and the threshold row
+    /// after confirmation.
+    pub(crate) recorded: Result<(), SaError>,
+}
+
 /// Why an audit row was not written.
 #[derive(Debug, thiserror::Error)]
 enum BaselineWriteError {
@@ -5571,10 +6276,65 @@ fn scval_digest_first8(value: &ScVal) -> String {
     )
 }
 
+/// Whether `snapshot` is the state an install authorized: its signers'
+/// identities equal `expected.signers` as a multiset, and its threshold
+/// equals `expected.threshold` in both the policy and the value.
+///
+/// `SignerIdentityV2` has no order, so each observed identity removes one
+/// equal expected identity from a working copy; equal counts and no
+/// unmatched observation make the two multisets equal.
+fn is_installed_state(snapshot: &SignerSetSnapshotV2, expected: &ExpectedInstallState) -> bool {
+    if snapshot.threshold != expected.threshold || snapshot.signers.len() != expected.signers.len()
+    {
+        return false;
+    }
+    let mut unmatched: Vec<&SignerIdentityV2> = expected.signers.iter().collect();
+    snapshot.signers.iter().all(|entry| {
+        match unmatched
+            .iter()
+            .position(|identity| **identity == entry.identity)
+        {
+            Some(position) => {
+                unmatched.swap_remove(position);
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+/// The version-2 snapshot of `rule`'s signers with `threshold`: one entry
+/// per signer with its version-2 identity, in ascending id order, validated.
+///
+/// # Errors
+///
+/// [`SaError::DeploymentFailed`] (phase `simulate`) naming the malformed set,
+/// a chain fact such as a duplicate signer id.
+fn snapshot_of_rule(
+    rule: &OnChainContextRule,
+    threshold: Option<ThresholdObservation>,
+) -> Result<SignerSetSnapshotV2, SaError> {
+    let mut signers: Vec<SignerEntryV2> = rule
+        .signers
+        .iter()
+        .map(|(id, signer)| SignerEntryV2 {
+            id: *id,
+            identity: signer.to_identity_v2(),
+        })
+        .collect();
+    signers.sort_by_key(|entry| entry.id);
+    let snapshot = SignerSetSnapshotV2 { signers, threshold };
+    snapshot.validate().map_err(|e| SaError::DeploymentFailed {
+        phase: "simulate",
+        redacted_reason: format!("get_context_rule: the observed signer set is malformed: {e}"),
+    })?;
+    Ok(snapshot)
+}
+
 /// The [`SaError::BaselineWriteFailed`] at stage `observe` of a confirmed
 /// transaction whose resulting state could not be observed because of
 /// `cause`.
-fn observe_failed_after(
+pub(crate) fn observe_failed_after(
     rule_id: u32,
     smart_account_redacted: &str,
     tx_hash: &str,
@@ -6398,6 +7158,41 @@ pub(crate) async fn simulate_read_only_with_ledger(
     network_passphrase: &str,
     timeout: Duration,
 ) -> Result<(ScVal, u32), SaError> {
+    let (outcome, latest_ledger) = simulate_read_only_at_ledger(
+        rpc_url,
+        smart_account,
+        entrypoint,
+        invoke_args,
+        source_account_strkey,
+        network_passphrase,
+        timeout,
+    )
+    .await?;
+    outcome.map(|return_val| (return_val, latest_ledger))
+}
+
+/// Read-only simulate helper (no auth, no signing) that returns the
+/// simulation's outcome beside the `latestLedger` its response reported.
+///
+/// Every `simulateTransaction` response carries `latestLedger`, a failed
+/// simulation's included, so a caller can tell an endpoint behind a ledger
+/// it needs from a failure. The inner result is the decoded return value or
+/// the simulation's refusal, with the ledger either way.
+///
+/// # Errors
+///
+/// The outer error is a failure before any response: an argument that does
+/// not encode, the source-account fetch, the transport or a timeout. It
+/// carries no ledger.
+async fn simulate_read_only_at_ledger(
+    rpc_url: &str,
+    smart_account: ScAddress,
+    entrypoint: &str,
+    invoke_args: Vec<ScVal>,
+    source_account_strkey: Option<&str>,
+    network_passphrase: &str,
+    timeout: Duration,
+) -> Result<(Result<ScVal, SaError>, u32), SaError> {
     let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
         stage: "auth_payload",
         redacted_reason: reason,
@@ -6468,31 +7263,34 @@ pub(crate) async fn simulate_read_only_with_ledger(
     .map_err(|_| auth_payload_err("simulate_transaction_envelope timed out".to_owned()))?
     .map_err(|e| auth_payload_err(format!("simulate_transaction_envelope failed: {e}")))?;
 
+    let latest_ledger = sim.latest_ledger;
     if let Some(err) = &sim.error {
-        return Err(SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!(
-                "{entrypoint} simulation error: {}",
-                augment_with_oz_error_name(err)
-            ),
-        });
+        return Ok((
+            Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!(
+                    "{entrypoint} simulation error: {}",
+                    augment_with_oz_error_name(err)
+                ),
+            }),
+            latest_ledger,
+        ));
     }
 
-    let latest_ledger = sim.latest_ledger;
-
-    let return_val = sim
-        .results()
-        .map_err(|e| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("{entrypoint}: simulate results decode failed: {e}"),
-        })?
-        .into_iter()
-        .next()
-        .ok_or(SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!("{entrypoint}: simulate returned no result entry"),
-        })?
-        .xdr;
+    let return_val =
+        sim.results()
+            .map_err(|e| SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!("{entrypoint}: simulate results decode failed: {e}"),
+            })
+            .and_then(|results| {
+                results.into_iter().next().map(|result| result.xdr).ok_or(
+                    SaError::DeploymentFailed {
+                        phase: "simulate",
+                        redacted_reason: format!("{entrypoint}: simulate returned no result entry"),
+                    },
+                )
+            });
 
     Ok((return_val, latest_ledger))
 }
@@ -6853,7 +7651,8 @@ impl DecodedOnChainSigner {
     }
 }
 
-/// The 32-byte id of an `External` signer's verifier address.
+/// The 32-byte id of a contract address: an `External` signer's verifier,
+/// or a policy a threshold observation names.
 ///
 /// Only [`decode_signer_scval_full`] constructs an `External` signer, and
 /// only with a contract address, so the zero id of the other arm is never
@@ -7201,6 +8000,7 @@ pub(crate) mod tests {
                 "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
                 "CDABC...12345",
                 BaselineReason::FirstObservation,
+                None,
                 "req-poison",
             ));
         });

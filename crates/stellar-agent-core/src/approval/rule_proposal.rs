@@ -477,9 +477,16 @@ fn validate_rule_proposal_signer(signer: &RuleProposalSigner) -> Result<(), Stri
             let Some(address) = &signer.address else {
                 return Err("Delegated signer must carry `address`".to_owned());
             };
-            // A proposed `Delegated` signer is an ed25519 account; a C-strkey
-            // is refused.
-            validate_strkey_shape(address, 'G', "address")?;
+            // A proposed `Delegated` signer is an ed25519 account (G-strkey)
+            // or a contract (C-strkey).
+            if validate_strkey_shape(address, 'G', "address").is_err()
+                && validate_strkey_shape(address, 'C', "address").is_err()
+            {
+                return Err(
+                    "address must be a valid G-strkey or C-strkey (56 chars, ^[GC][A-Z2-7]{55}$)"
+                        .to_owned(),
+                );
+            }
             if signer.verifier.is_some() || signer.pubkey_data.is_some() {
                 return Err(
                     "Delegated signer must not carry `verifier` or `pubkey_data`".to_owned(),
@@ -607,19 +614,32 @@ mod tests {
         assert!(validate_context_rule_proposal_snapshot(&s).is_err());
     }
 
-    /// A `Delegated` signer's address must be a G-strkey; a C-strkey is
-    /// refused with the signer's index.
+    /// A `Delegated` signer's address may be a C-strkey: a contract
+    /// delegate.
     #[test]
-    fn rejects_delegated_signer_with_a_c_strkey_address() {
+    fn accepts_delegated_signer_with_a_c_strkey_address() {
         let mut s = valid_snapshot();
         s.signers
             .push(RuleProposalSigner::delegated(C_ADDR.to_owned(), false));
+        assert_eq!(validate_context_rule_proposal_snapshot(&s), Ok(()));
+    }
+
+    /// A `Delegated` signer's address that is neither a G-strkey nor a
+    /// C-strkey, a muxed M-strkey here, is refused with the signer's index.
+    #[test]
+    fn rejects_delegated_signer_with_an_m_strkey_address() {
+        let mut s = valid_snapshot();
+        let muxed = stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [0u8; 32],
+            id: 7,
+        };
+        s.signers
+            .push(RuleProposalSigner::delegated(format!("{muxed}"), false));
         assert_eq!(
             validate_context_rule_proposal_snapshot(&s),
-            Err(
-                "signers[1]: address must be a valid G-strkey (56 chars, ^G[A-Z2-7]{55}$)"
-                    .to_owned()
-            )
+            Err("signers[1]: address must be a valid G-strkey or C-strkey \
+                 (56 chars, ^[GC][A-Z2-7]{55}$)"
+                .to_owned())
         );
     }
 

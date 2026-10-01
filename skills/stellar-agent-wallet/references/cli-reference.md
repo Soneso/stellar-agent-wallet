@@ -321,14 +321,14 @@ Every verb's exact flags, the mainnet-refusal matrix, signer-kind discriminators
 
 | Verb | Purpose |
 |---|---|
-| `rules create` | Install a context rule; returns the minted `rule_id`. At least one signer required |
+| `rules create` | Install a context rule; returns the minted `rule_id`. At least one signer required; `--signer-delegated` takes a G-strkey or a C-strkey. The confirmed rule is recorded as its signer-set baseline, or the command exits `sa.install_state_mismatch` / `sa.baseline_write_failed` with the rule on chain |
 | `rules get` | Read one rule (read-only, mainnet OK) |
 | `rules set-name` | Rename a rule |
 | `rules set-valid-until` | Change a rule's expiry ledger |
 | `rules delete` | Remove a rule |
 | `rules verify-pins` | Verify pinned verifier/policy WASM hashes vs on-chain (drift; read-only, exit `1` on drift); names pinned and observed external-reference executables |
-| `rules add-policy` | Attach a policy (`--kind raw`/`spending-limit`/`simple-threshold`/`weighted-threshold`); cap 5; on a pinned rule the new policy is probed and pinned (`--accept-mutable-verifier` / `--accept-unknown-verifier`) |
-| `rules remove-policy` | Detach a policy by id; on a pinned rule its pin is dropped |
+| `rules add-policy` | Attach a policy (`--kind raw`/`spending-limit`/`simple-threshold`/`weighted-threshold`); cap 5; on a pinned rule the new policy is probed and pinned (`--accept-mutable-verifier` / `--accept-unknown-verifier`). The simple-threshold policy needs a matching version-2 baseline and records `SaThresholdChangedV2` |
+| `rules remove-policy` | Detach a policy by id; on a pinned rule its pin is dropped. The simple-threshold policy records its cleared threshold; removing one of two simple-threshold policies repairs the rule |
 | `rules list` / `list-rules` | Enumerate active rules by on-chain scan (read-only, mainnet OK) |
 | `rules get-spending-limit` | Read an installed spending-limit policy's rolling-window budget (read-only; amounts are decimal strings) |
 | `rules set-spending-limit` | Retune a spending-limit cap without resetting history. `--auth-rule-id` default 0: the retuned CallContract rule cannot authorize its own retune — name an admin-capable rule. Period is immutable |

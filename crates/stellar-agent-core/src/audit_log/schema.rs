@@ -1250,11 +1250,12 @@ pub enum EventKind {
         snapshot_version: Option<u8>,
     },
 
-    /// The signer-set baseline was recorded for a context rule.
+    /// The version-1 signer-set baseline of a context rule.
     ///
-    /// Emitted ONLY by `SignersManager::refresh_signer_baseline` (always) and
-    /// `SignersManager::list_signers` (first-observation only). A repo-gate
-    /// enforces this single-caller invariant.
+    /// No production code writes this row: the signer-set baseline is
+    /// recorded as `SaSignerSetBaselinedV2`, and the repository gate
+    /// `check-no-direct-sasignersetbaselined-emit.sh` refuses any call of the
+    /// version-1 constructor. The reader reads the row from existing logs.
     ///
     /// # TOCTOU anchor (`prev_chain_tip_hash`)
     ///
@@ -1317,7 +1318,9 @@ pub enum EventKind {
     /// Records the rule's full signer identities and its simple-threshold
     /// observation (`null` when the rule has none) as observed at
     /// `observed_at_ledger_seq`. Written only through
-    /// `SignersManager::emit_baseline`; the repository gate
+    /// `SignersManager::emit_baseline`, from `SignersManager::list_signers`,
+    /// `SignersManager::refresh_signer_baseline` and
+    /// `SignersManager::baseline_confirmed_install`; the repository gate
     /// `check-no-direct-sasignersetbaselined-emit.sh` enforces that invariant.
     /// Read by `AuditReader::find_latest_signer_set_view`, which keys this row
     /// on `(rule_id, account_digest)`.

@@ -59,9 +59,11 @@ use stellar_agent_smart_account::deployment::{
 };
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
+    ContextRuleDefinition, ContextRuleManager, ContextRuleSignerInput,
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
+use stellar_agent_smart_account::test_helpers::managers_for_tests;
+use tempfile::TempDir;
 use zeroize::Zeroizing;
 
 // ── Network constants ─────────────────────────────────────────────────────────
@@ -69,7 +71,6 @@ use zeroize::Zeroizing;
 const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 const TESTNET_FRIENDBOT_URL: &str = "https://friendbot.stellar.org";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
-const CHAIN_ID: &str = "stellar:testnet";
 const FEE_STROOPS: u32 = 1_000_000;
 const TIMEOUT_SECS: u64 = 120;
 
@@ -135,14 +136,16 @@ async fn fund_via_friendbot(g_strkey: &str) {
     );
 }
 
-fn fresh_rule_manager() -> ContextRuleManager {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_PASSPHRASE.to_owned(),
+/// A testnet rule manager with a signers manager, both writing to one audit
+/// log under the returned `TempDir`, which the caller holds for the test's
+/// duration. Rule install requires the signers manager.
+fn fresh_rule_manager() -> (ContextRuleManager, TempDir) {
+    let (manager, _signers_manager, _audit_log_path, dir) = managers_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
         Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("ContextRuleManager::new must succeed")
+    );
+    (manager, dir)
 }
 
 async fn deploy_fresh_smart_account(signer_g: &str) -> String {
@@ -354,7 +357,7 @@ async fn h_b_update_horizon_exceeded() {
 
     // ── Step 3: Install a permanent (no valid_until) context rule ────────────
     // No valid_until → horizon check is skipped; u32::MAX is safe for setup.
-    let manager = fresh_rule_manager();
+    let (manager, _audit_dir) = fresh_rule_manager();
     let sa_addr = parse_c_strkey_to_smart_account(&sa_strkey)
         .expect("[H-B] C-strkey must parse to ScAddress");
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g)

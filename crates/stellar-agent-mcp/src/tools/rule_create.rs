@@ -79,10 +79,10 @@ use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::credentials::CredentialsManager;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
-    ContextRuleSignerInput, OZ_MAX_EXTERNAL_KEY_SIZE, OZ_MAX_NAME_SIZE, OZ_MAX_POLICIES,
-    OZ_MAX_SIGNERS, RuleContext, compute_context_rule_proposal_sha256,
-    context_rule_definition_from_snapshot, parse_c_strkey_to_smart_account,
-    parse_g_strkey_to_signer_address,
+    ContextRuleSignerInput, DELEGATED_SIGNER_ADDRESS_REASON, OZ_MAX_EXTERNAL_KEY_SIZE,
+    OZ_MAX_NAME_SIZE, OZ_MAX_POLICIES, OZ_MAX_SIGNERS, RuleContext,
+    compute_context_rule_proposal_sha256, context_rule_definition_from_snapshot,
+    parse_c_strkey_to_smart_account, parse_delegated_signer_address,
 };
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
 use stellar_agent_smart_account::spending_limit_policy::{
@@ -111,8 +111,9 @@ fn default_auth_rule_ids() -> Vec<u32> {
 
 /// One signer entry in `stellar_rule_create`'s `signers` array.
 ///
-/// - `delegated`: a G-strkey (ed25519-keyed delegate). A contract-address
-///   (C-strkey) delegated signer is refused.
+/// - `delegated`: a G-strkey (an ed25519-keyed account delegate) or a
+///   C-strkey (a contract delegate, whose own authorization decides). Only
+///   an account delegate is the ed25519 fallback signer of a passkey rule.
 /// - `external`: raw escape hatch — an explicit verifier C-strkey and
 ///   hex-encoded `pubkey_data`, passed through unresolved (mirrors the
 ///   `raw` policy-kind precedent: a typed convenience path plus a raw
@@ -123,9 +124,9 @@ fn default_auth_rule_ids() -> Vec<u32> {
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde", tag = "kind", rename_all = "snake_case")]
 pub enum RuleCreateSignerArg {
-    /// Delegated (built-in ed25519) signer.
+    /// Delegated signer: an ed25519 account or a contract.
     Delegated {
-        /// G-strkey.
+        /// G-strkey of an account, or C-strkey of a contract.
         address: String,
     },
     /// Raw `External` signer: explicit verifier + hex pubkey_data.
@@ -240,9 +241,9 @@ pub struct StellarRuleCreateArgs {
     pub accept_unknown_verifier: bool,
 
     /// Acknowledge that this rule has no delegated (ed25519) fallback
-    /// signer — required when every signer is `webauthn` and/or `external`
-    /// and no `delegated` entry is present. Mirrors the CLI's
-    /// `--accept-no-delegated-fallback` external-only refusal.
+    /// signer: required when the signers include no `delegated` account
+    /// (G-strkey); a contract delegate is not a fallback signer. Mirrors the
+    /// CLI's `--accept-no-delegated-fallback` external-only refusal.
     #[serde(default)]
     pub accept_no_delegated_fallback: bool,
 }
@@ -357,9 +358,30 @@ fn context_type_to_snapshot(context: &RuleContext) -> Result<RuleProposalContext
 struct ResolvedSigners {
     typed: Vec<ContextRuleSignerInput>,
     snapshot: Vec<RuleProposalSigner>,
-    /// `true` if at least one `delegated` entry is present (external-only
-    /// fallback check).
+    /// `true` if at least one `delegated` entry is an account (G-strkey),
+    /// the ed25519 fallback signer the external-only check requires. A
+    /// contract delegate is not one: it is not a key the operator holds.
     has_delegated: bool,
+}
+
+/// Refuses a rule whose resolved signers include no account delegate, the
+/// ed25519 fallback signer, unless `accept_no_delegated_fallback`
+/// acknowledges it. A contract delegate is not a fallback signer: it is not a
+/// key the operator holds.
+fn no_delegated_fallback_refusal(
+    resolved: &ResolvedSigners,
+    accept_no_delegated_fallback: bool,
+) -> Result<(), rmcp::ErrorData> {
+    if resolved.has_delegated || accept_no_delegated_fallback {
+        return Ok(());
+    }
+    Err(rmcp::ErrorData::invalid_params(
+        "validation.passkey_only_rule_no_delegated_fallback: this rule has no \
+         delegated (ed25519) fallback signer; if the authenticator device is lost \
+         the rule becomes permanently inaccessible. A contract delegate is not a \
+         fallback signer. Pass accept_no_delegated_fallback=true to acknowledge.",
+        None,
+    ))
 }
 
 /// Resolves `signers` into both representations, tagging `is_proposer` on
@@ -403,20 +425,18 @@ fn resolve_signers(
     for (idx, s) in signers.iter().enumerate() {
         match s {
             RuleCreateSignerArg::Delegated { address } => {
-                has_delegated = true;
                 let is_proposer = address == &agent_g;
-                let sc_addr = parse_g_strkey_to_signer_address(address).map_err(|e| {
-                    let reason = if parse_c_strkey_to_smart_account(address).is_ok() {
-                        "a contract-address delegated signer is not supported; pass a G-strkey"
-                            .to_owned()
-                    } else {
-                        format!("invalid G-strkey: {e}")
-                    };
+                // The refusal carries the parser's reason: the address is
+                // caller input.
+                let sc_addr = parse_delegated_signer_address(address).map_err(|_| {
                     rmcp::ErrorData::invalid_params(
-                        format!("signers[{idx}].address: {reason}"),
+                        format!("signers[{idx}].address: {DELEGATED_SIGNER_ADDRESS_REASON}"),
                         None,
                     )
                 })?;
+                if matches!(sc_addr, stellar_xdr::ScAddress::Account(_)) {
+                    has_delegated = true;
+                }
                 typed.push(ContextRuleSignerInput::Delegated { address: sc_addr });
                 snapshot.push(RuleProposalSigner::delegated(address.clone(), is_proposer));
             }
@@ -899,15 +919,7 @@ impl WalletServer {
 
         // ── Resolve signers (typed + snapshot, together) ──────────────────────
         let resolved_signers = resolve_signers(&args.signers, self)?;
-        if !resolved_signers.has_delegated && !args.accept_no_delegated_fallback {
-            return Err(rmcp::ErrorData::invalid_params(
-                "validation.passkey_only_rule_no_delegated_fallback: this rule has no \
-                 delegated (ed25519) fallback signer; if the authenticator device is lost \
-                 the rule becomes permanently inaccessible. Pass \
-                 accept_no_delegated_fallback=true to acknowledge.",
-                None,
-            ));
-        }
+        no_delegated_fallback_refusal(&resolved_signers, args.accept_no_delegated_fallback)?;
 
         // ── Resolve policies (typed + snapshot, together) ─────────────────────
         let (policies_typed, policies_snapshot) =
@@ -1846,9 +1858,11 @@ mod tests {
         assert!(!resolved.snapshot[0].is_proposer);
     }
 
+    /// A C-strkey delegate resolves to a contract-address `Delegated`
+    /// signer, in both the typed definition and the snapshot.
     #[test]
     #[serial_test::serial(keyring)]
-    fn resolve_signers_delegated_refuses_a_c_strkey() {
+    fn resolve_signers_delegated_accepts_a_c_strkey() {
         let server = test_server();
         let signers = vec![
             RuleCreateSignerArg::Delegated {
@@ -1858,14 +1872,46 @@ mod tests {
                 address: TEST_SMART_ACCOUNT.to_owned(),
             },
         ];
+        let resolved = resolve_signers(&signers, &server).unwrap();
+        assert!(matches!(
+            &resolved.typed[1],
+            ContextRuleSignerInput::Delegated {
+                address: stellar_xdr::ScAddress::Contract(_)
+            }
+        ));
+        assert_eq!(
+            resolved.snapshot[1].address.as_deref(),
+            Some(TEST_SMART_ACCOUNT)
+        );
+        assert!(!resolved.snapshot[1].is_proposer);
+    }
+
+    /// A muxed M-strkey delegate is refused with the signer's index.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn resolve_signers_delegated_refuses_an_m_strkey() {
+        let server = test_server();
+        let muxed = format!(
+            "{}",
+            stellar_strkey::ed25519::MuxedAccount {
+                ed25519: [0u8; 32],
+                id: 7,
+            }
+        );
+        let signers = vec![
+            RuleCreateSignerArg::Delegated {
+                address: TEST_G.to_owned(),
+            },
+            RuleCreateSignerArg::Delegated { address: muxed },
+        ];
         let Err(err) = resolve_signers(&signers, &server) else {
-            panic!("a C-strkey delegated signer must be refused");
+            panic!("an M-strkey delegated signer must be refused");
         };
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert_eq!(
             err.message,
-            "signers[1].address: a contract-address delegated signer is not supported; \
-             pass a G-strkey"
+            "signers[1].address: invalid delegated signer address: expected a G-strkey or a \
+             C-strkey"
         );
     }
 
@@ -1877,12 +1923,48 @@ mod tests {
             address: "not-a-strkey".to_owned(),
         }];
         let err = resolve_signers(&signers, &server).unwrap_err();
+        assert_eq!(
+            err.message,
+            "signers[0].address: invalid delegated signer address: expected a G-strkey or a \
+             C-strkey"
+        );
+    }
+
+    /// A contract delegate is not the fallback signer of a rule with an
+    /// external signer: `[C-delegate, external]` refuses without the
+    /// acknowledgement and proceeds with it, and `[G-delegate, external]`
+    /// proceeds without it.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn only_an_account_delegate_is_the_fallback_signer() {
+        let server = test_server();
+        let external = RuleCreateSignerArg::External {
+            verifier: TEST_C.to_owned(),
+            pubkey_data_hex: "ab".repeat(65),
+        };
+        let contract_delegate = RuleCreateSignerArg::Delegated {
+            address: TEST_SMART_ACCOUNT.to_owned(),
+        };
+        let account_delegate = RuleCreateSignerArg::Delegated {
+            address: TEST_G_2.to_owned(),
+        };
+
+        let contract_rule =
+            resolve_signers(&[contract_delegate, external.clone()], &server).unwrap();
+        assert!(!contract_rule.has_delegated);
+        let err = no_delegated_fallback_refusal(&contract_rule, false).unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(
             err.message
-                .starts_with("signers[0].address: invalid G-strkey: "),
+                .starts_with("validation.passkey_only_rule_no_delegated_fallback: "),
             "{}",
             err.message
         );
+        assert!(no_delegated_fallback_refusal(&contract_rule, true).is_ok());
+
+        let account_rule = resolve_signers(&[account_delegate, external], &server).unwrap();
+        assert!(account_rule.has_delegated);
+        assert!(no_delegated_fallback_refusal(&account_rule, false).is_ok());
     }
 
     #[test]
