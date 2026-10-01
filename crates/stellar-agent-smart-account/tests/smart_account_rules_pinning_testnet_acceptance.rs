@@ -122,14 +122,17 @@ use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
-    ContextRuleSignerInput, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
+    ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
+    parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
-use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
+use stellar_agent_smart_account::managers::signers::{PreviousBaseline, SignersManager};
 use stellar_agent_smart_account::managers::verifiers::{
     PendingOverride, PendingOverrideKind, pin_referenced_contracts,
 };
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
+use stellar_agent_smart_account::test_helpers::{
+    rule_manager_for_tests, signers_manager_for_tests,
+};
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::{Transaction, TransactionBehavior};
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
@@ -263,43 +266,39 @@ fn assert_failed_install_wrote_no_override_row(
     );
 }
 
+/// Constructs a `SignersManager` for testnet over `audit_writer`, with both
+/// RPC endpoints on `TESTNET_RPC_URL`.
 fn fresh_signers_manager(
     audit_writer: Arc<Mutex<AuditWriter>>,
     audit_log_path: PathBuf,
-) -> SignersManager {
-    SignersManager::new(SignersManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_RPC_URL.to_owned(),
+) -> Arc<SignersManager> {
+    signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
         audit_writer,
         audit_log_path,
-        TESTNET_PASSPHRASE.to_owned(),
-        "testnet-pinning-acceptance".to_owned(),
         Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("SignersManager::new must succeed")
+    )
 }
 
 /// Constructs a `ContextRuleManager` with an attached `SignersManager` so
-/// the wasm-hash pin check is active.
+/// the wasm-hash pin check is active and an install records the rule's
+/// baseline.
 ///
 /// This is the production-equivalent path: the CLI's `context_rule_manager()`
-/// helper (common.rs:170-182) always wires `.with_signers_manager(...)`.
+/// helper always wires `.with_signers_manager(...)` over the writer the rule
+/// manager uses.
 fn fresh_pinning_rule_manager(
     audit_writer: Arc<Mutex<AuditWriter>>,
     signers_manager: Arc<SignersManager>,
 ) -> ContextRuleManager {
-    ContextRuleManager::new(
-        ContextRuleManagerConfig::new(
-            TESTNET_RPC_URL.to_owned(),
-            TESTNET_PASSPHRASE.to_owned(),
-            Duration::from_secs(TIMEOUT_SECS),
-            CHAIN_ID.to_owned(),
-        )
-        .with_audit_writer(audit_writer)
-        .with_signers_manager(signers_manager),
+    rule_manager_for_tests(
+        TESTNET_RPC_URL,
+        None,
+        signers_manager,
+        audit_writer,
+        Duration::from_secs(TIMEOUT_SECS),
     )
-    .expect("ContextRuleManager::new must succeed")
 }
 
 /// Deploys a fresh smart-account with `signer_g` as its bootstrap signer.
@@ -584,10 +583,7 @@ async fn pin_and_install_with_canonical_oz_threshold_policy_no_drift() {
         .expect("threshold-policy C-strkey must parse");
 
     let (audit_writer, audit_log_path, _tmp_dir) = tmp_audit_writer();
-    let sm = Arc::new(fresh_signers_manager(
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    ));
+    let sm = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
 
     let manager = fresh_pinning_rule_manager(Arc::clone(&audit_writer), Arc::clone(&sm));
 
@@ -726,10 +722,7 @@ async fn install_rule_refuses_unknown_wasm_verifier_without_override() {
         parse_c_strkey_to_smart_account(&sa_strkey).expect("SA C-strkey must parse to ScAddress");
 
     let (audit_writer, audit_log_path, _tmp_dir) = tmp_audit_writer();
-    let sm = Arc::new(fresh_signers_manager(
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    ));
+    let sm = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
 
     let manager = fresh_pinning_rule_manager(Arc::clone(&audit_writer), Arc::clone(&sm));
 
@@ -835,10 +828,7 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
     // ── Shared AuditWriter + SignersManager ───────────────────────────────────
 
     let (audit_writer, audit_log_path, _tmp_dir) = tmp_audit_writer();
-    let sm = Arc::new(fresh_signers_manager(
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    ));
+    let sm = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
 
     // Install a 1-of-1 rule with the threshold-policy via the pinning manager.
     // The real pin row (`SaContextRuleCreated` with the actual policy wasm hash)
@@ -883,14 +873,17 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
     );
     drop(manager);
 
-    // ── Baseline the signer set ───────────────────────────────────────────────
+    // ── The signer-set baseline ───────────────────────────────────────────────
     //
-    // `verify_signer_set_against_chain` in the signing pre-flight requires a
-    // baselined row in the audit log.  Call `refresh_signer_baseline` so the
-    // signer-set check passes before the drift check fires.
-    sm.refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
+    // `verify_signer_set_against_chain` in the signing pre-flight compares the
+    // chain with the baseline the install recorded, so the signer-set check
+    // passes before the drift check fires. The list confirms the chain
+    // matches it.
+    let listed = sm
+        .list_signers(sa_addr.clone(), rule_id, Some(&signer_g), rid())
         .await
-        .expect("refresh_signer_baseline must succeed");
+        .expect("list_signers after the install must succeed");
+    assert_eq!(listed.baseline, PreviousBaseline::Matched);
 
     // ── Inject fabricated SaContextRuleCreated row with wrong pinned hash ─────
     //
@@ -950,7 +943,7 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
             &sa_strkey,
             &auth_digest,
             vec![rule_id],
-            Some(Arc::clone(&sm)),
+            Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),
             |_| {}, // url callback: never invoked
@@ -1100,10 +1093,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
     // ── Shared AuditWriter + SignersManager ───────────────────────────────────
 
     let (audit_writer, audit_log_path, _tmp_dir) = tmp_audit_writer();
-    let sm = Arc::new(fresh_signers_manager(
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    ));
+    let sm = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
 
     // Install the rule via the standard path (threshold-policy in allowlist,
     // accept_unknown_verifier=false).  This writes the real-hash pin row.
@@ -1186,11 +1176,15 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
         "real policy wasm hash from install-time row must be non-zero"
     );
 
-    // ── Baseline the signer set ───────────────────────────────────────────────
-
-    sm.refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
+    // ── The signer-set baseline ───────────────────────────────────────────────
+    //
+    // The install recorded the rule's baseline; the list confirms the chain
+    // matches it.
+    let listed = sm
+        .list_signers(sa_addr.clone(), rule_id, Some(&signer_g), rid())
         .await
-        .expect("refresh_signer_baseline must succeed");
+        .expect("list_signers after the install must succeed");
+    assert_eq!(listed.baseline, PreviousBaseline::Matched);
 
     // ── Inject real-hash pin row (simulating accept_unknown_verifier=true) ─
     //
@@ -1242,7 +1236,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
             &sa_strkey,
             &auth_digest,
             vec![rule_id],
-            Some(Arc::clone(&sm)),
+            Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),
             |_| {},
@@ -1298,7 +1292,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
             &sa_strkey,
             &auth_digest,
             vec![rule_id],
-            Some(Arc::clone(&sm)),
+            Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),
             |_| {},
@@ -1405,10 +1399,7 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
     // ── Shared AuditWriter + SignersManager ───────────────────────────────────
 
     let (audit_writer, audit_log_path, _tmp_dir) = tmp_audit_writer();
-    let sm = Arc::new(fresh_signers_manager(
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    ));
+    let sm = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
 
     // Install a 1-of-1 rule with the threshold-policy.
     let manager = fresh_pinning_rule_manager(Arc::clone(&audit_writer), Arc::clone(&sm));
@@ -1454,15 +1445,17 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
     );
     drop(manager);
 
-    // ── Baseline the signer set ───────────────────────────────────────────────
+    // ── The signer-set baseline ───────────────────────────────────────────────
     //
-    // `verify_signer_set_against_chain` in the signing pre-flight requires a
-    // baselined row in the audit log.  Establishing the baseline ensures that
-    // the signer-set check passes, leaving the drift-detection path as the
-    // first point of failure.
-    sm.refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
+    // `verify_signer_set_against_chain` in the signing pre-flight compares the
+    // chain with the baseline the install recorded. The check passes, leaving
+    // the drift-detection path as the first point of failure; the list
+    // confirms the chain matches the baseline.
+    let listed = sm
+        .list_signers(sa_addr.clone(), rule_id, Some(&signer_g), rid())
         .await
-        .expect("refresh_signer_baseline must succeed");
+        .expect("list_signers after the install must succeed");
+    assert_eq!(listed.baseline, PreviousBaseline::Matched);
 
     // ── Inject fabricated SaContextRuleCreated row with TWO policy hashes ─────
     //
@@ -1526,7 +1519,7 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
             &sa_strkey,
             &auth_digest,
             vec![rule_id],
-            Some(Arc::clone(&sm)),
+            Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),
             |_| {},
@@ -1708,10 +1701,7 @@ async fn install_rule_refuses_mutable_verifier_without_override() {
         .expect("timelock C-strkey must parse to ScAddress");
 
     let (audit_writer, audit_log_path, _tmp_dir) = tmp_audit_writer();
-    let sm = Arc::new(fresh_signers_manager(
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    ));
+    let sm = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
 
     let manager = fresh_pinning_rule_manager(Arc::clone(&audit_writer), Arc::clone(&sm));
 
@@ -1829,10 +1819,7 @@ async fn accept_mutable_verifier_override_writes_no_row_for_a_failed_install() {
         .expect("timelock C-strkey must parse to ScAddress");
 
     let (audit_writer, audit_log_path, _tmp_dir) = tmp_audit_writer();
-    let sm = Arc::new(fresh_signers_manager(
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    ));
+    let sm = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
 
     let manager = fresh_pinning_rule_manager(Arc::clone(&audit_writer), Arc::clone(&sm));
 
@@ -1998,10 +1985,7 @@ async fn accept_unknown_verifier_override_writes_no_row_for_a_failed_install() {
     let verifier_addr = sa_addr.clone();
 
     let (audit_writer, audit_log_path, _tmp_dir) = tmp_audit_writer();
-    let sm = Arc::new(fresh_signers_manager(
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    ));
+    let sm = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
 
     let manager = fresh_pinning_rule_manager(Arc::clone(&audit_writer), Arc::clone(&sm));
 

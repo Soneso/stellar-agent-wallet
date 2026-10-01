@@ -114,7 +114,7 @@ async fn malformed_pin_record_routes_to_drift_check_unavailable() {
                     &smart_account_strkey,
                     &[0u8; 32],
                     vec![RULE_ID],
-                    Some(signers_manager),
+                    signers_manager,
                     "127.0.0.1:0".parse().expect("socket addr parses"),
                     Duration::from_millis(10),
                     |_| ceremony_started.store(true, Ordering::SeqCst),

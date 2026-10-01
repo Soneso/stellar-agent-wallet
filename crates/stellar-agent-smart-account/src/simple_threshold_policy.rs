@@ -1,12 +1,14 @@
-//! Typed install-parameter builder for the OZ simple-threshold policy.
+//! Typed install-parameter builder and parser for the OZ simple-threshold
+//! policy.
 //!
 //! The vendored WASM and wasm-hash allowlist for this policy already live at
 //! [`crate::signers::policy_identification`] (`THRESHOLD_POLICY_WASM`,
 //! `THRESHOLD_POLICY_WASM_HASHES`) — that module is the identification and
 //! deploy-time-artefact home. This module holds only the typed install-param
-//! builder, kept separate so `smart-account rules add-policy --kind
-//! simple-threshold` does not need to depend on the identification module's
-//! allowlist machinery.
+//! builder and its inverse, kept separate so `smart-account rules add-policy
+//! --kind simple-threshold` does not need to depend on the identification
+//! module's allowlist machinery. The parser reads the threshold an install
+//! or an attach of the policy sets, which the signer-set state row records.
 //!
 //! # Byte layout
 //!
@@ -60,6 +62,62 @@ pub fn build_simple_threshold_install_param(threshold: u32) -> Result<ScVal, SaE
     Ok(ScVal::Map(Some(ScMap(entries))))
 }
 
+/// Reads the threshold from an OZ `SimpleThresholdAccountParams`
+/// install-parameter ScVal, the inverse of
+/// [`build_simple_threshold_install_param`].
+///
+/// Accepts exactly the one-entry map `{ Symbol("threshold"): U32(t) }` with
+/// `t >= 1`, the only parameter the policy's `install` accepts with a
+/// threshold the wallet can record.
+///
+/// # Errors
+///
+/// Returns [`SaError::SimpleThresholdInstallRefused`] for any other shape: a
+/// value that is not a map, a map with no entry or more than one entry, an
+/// entry keyed by anything other than `Symbol("threshold")`, a value that is
+/// not a `U32`, or a threshold of zero. The reason names the shape and never
+/// echoes the value's bytes.
+pub fn parse_simple_threshold_install_param(param: &ScVal) -> Result<u32, SaError> {
+    let refuse = |reason: String| SaError::SimpleThresholdInstallRefused { reason };
+
+    let entries: &[ScMapEntry] = match param {
+        ScVal::Map(Some(ScMap(entries))) => entries.as_slice(),
+        ScVal::Map(None) => &[],
+        other => {
+            return Err(refuse(format!(
+                "install parameter is not a map (got {})",
+                stellar_agent_core::scval::scval_variant_name(other)
+            )));
+        }
+    };
+    let [entry] = entries else {
+        return Err(refuse(format!(
+            "install parameter map has {} entries, expected exactly one (threshold)",
+            entries.len()
+        )));
+    };
+    match &entry.key {
+        ScVal::Symbol(key) if key.as_slice() == b"threshold" => {}
+        _ => {
+            return Err(refuse(
+                "install parameter map entry is not keyed by Symbol(\"threshold\")".to_owned(),
+            ));
+        }
+    }
+    match entry.val {
+        ScVal::U32(0) => Err(refuse(
+            "install parameter threshold is zero (OZ install rejects threshold == 0 with \
+             InvalidThreshold)"
+                .to_owned(),
+        )),
+        ScVal::U32(threshold) => Ok(threshold),
+        ref other => Err(refuse(format!(
+            "install parameter threshold is not a u32 (got {})",
+            stellar_agent_core::scval::scval_variant_name(other)
+        ))),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -108,5 +166,74 @@ mod tests {
             };
             assert_eq!(entries[0].val, ScVal::U32(threshold));
         }
+    }
+
+    /// The parser reads back every threshold the builder writes.
+    #[test]
+    fn parse_round_trips_the_builder() {
+        for threshold in [1_u32, 2, 15, u32::MAX] {
+            let scval = build_simple_threshold_install_param(threshold).unwrap();
+            assert_eq!(
+                parse_simple_threshold_install_param(&scval).unwrap(),
+                threshold
+            );
+        }
+    }
+
+    fn symbol(name: &str) -> ScVal {
+        ScVal::Symbol(ScSymbol::try_from(name).unwrap())
+    }
+
+    fn map(entries: Vec<(ScVal, ScVal)>) -> ScVal {
+        let entries: VecM<ScMapEntry> = entries
+            .into_iter()
+            .map(|(key, val)| ScMapEntry { key, val })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        ScVal::Map(Some(ScMap(entries)))
+    }
+
+    fn refusal_reason(param: &ScVal) -> String {
+        match parse_simple_threshold_install_param(param) {
+            Err(SaError::SimpleThresholdInstallRefused { reason }) => reason,
+            other => panic!("expected SimpleThresholdInstallRefused, got {other:?}"),
+        }
+    }
+
+    /// Every parameter other than the one-entry threshold map with a non-zero
+    /// `U32` refuses, and the reason names the shape.
+    #[test]
+    fn parse_refuses_every_other_shape() {
+        assert!(refusal_reason(&ScVal::Void).contains("not a map (got Void)"));
+        assert!(refusal_reason(&ScVal::U32(2)).contains("not a map (got U32)"));
+        assert!(refusal_reason(&ScVal::Map(None)).contains("has 0 entries"));
+        assert!(refusal_reason(&map(vec![])).contains("has 0 entries"));
+        assert!(
+            refusal_reason(&map(vec![(symbol("limit"), ScVal::U32(2))]))
+                .contains("not keyed by Symbol(\"threshold\")")
+        );
+        assert!(
+            refusal_reason(&map(vec![(
+                ScVal::String(stellar_xdr::ScString("threshold".try_into().unwrap())),
+                ScVal::U32(2)
+            )]))
+            .contains("not keyed by Symbol(\"threshold\")")
+        );
+        assert!(
+            refusal_reason(&map(vec![
+                (symbol("threshold"), ScVal::U32(2)),
+                (symbol("weights"), ScVal::U32(1)),
+            ]))
+            .contains("has 2 entries")
+        );
+        assert!(
+            refusal_reason(&map(vec![(symbol("threshold"), ScVal::U64(2))]))
+                .contains("not a u32 (got U64)")
+        );
+        assert!(
+            refusal_reason(&map(vec![(symbol("threshold"), ScVal::U32(0))]))
+                .contains("threshold is zero")
+        );
     }
 }

@@ -30,9 +30,11 @@ operator-typed flags to agent-resolved, operator-reviewed JSON.
 
 ## Recommended agent-signer doctrine
 
-A context-rule signer is either **Delegated** (a classic `G...` account) or
-**External** (authenticated through a verifier contract, with a raw key of
-the verifier's own choosing). Two External shapes matter for an agent:
+A context-rule signer is either **Delegated** or **External**. A Delegated
+signer is a classic `G...` account, or a `C...` contract whose own
+authorization decides for it. An External signer is authenticated through a
+verifier contract, with a raw key of the verifier's own choosing. Two
+External shapes matter for an agent:
 
 - **External Ed25519** (this guide) — a raw ed25519 public key, verified
   on-chain by a deployed Ed25519-verifier contract. No funded classic account
@@ -41,7 +43,8 @@ the verifier's own choosing). Two External shapes matter for an agent:
   process that can produce an ed25519 signature, and rotating it is a
   `signers remove` + `signers add` pair — not a re-funding operation.
 - **Delegated** — a classic `G...` account, which the agent would need to
-  hold funded on its own. Workable, but it ties the agent's identity to a
+  hold funded on its own. A delegated `C...` contract fits a signer that is
+  itself a contract, not an agent's key. Workable, but it ties the agent's identity to a
   funded account and makes rotation a funding operation, not a policy edit.
 
 External Ed25519 is the recommended shape for an agent's own key precisely

@@ -27,10 +27,12 @@
 #![cfg(feature = "testnet-integration")]
 #![allow(clippy::unwrap_used, clippy::expect_used, reason = "test-only")]
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
+use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::{Signer, SoftwareSigningKey};
 use stellar_agent_smart_account::deployment::{
@@ -38,15 +40,18 @@ use stellar_agent_smart_account::deployment::{
 };
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
+    ContextRuleDefinition, ContextRuleManager, ContextRuleSignerInput,
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
+use stellar_agent_smart_account::test_helpers::{
+    rule_manager_config_for_tests, signers_manager_for_tests,
+};
+use tempfile::TempDir;
 use zeroize::Zeroizing;
 
 const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 const TESTNET_FRIENDBOT_URL: &str = "https://friendbot.stellar.org";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
-const CHAIN_ID: &str = "stellar:testnet";
 
 /// Funds an account via testnet Friendbot.
 async fn fund_via_friendbot(g_strkey: &str) {
@@ -94,18 +99,36 @@ fn fresh_deployer_keypair() -> (String, DeployerKeypair) {
 }
 
 /// Constructs a `ContextRuleManager` configured against testnet with an
-/// uncapped session-rule horizon (so the install does not trigger `HorizonExceeded`).
-fn fresh_manager() -> ContextRuleManager {
-    ContextRuleManager::new(
-        ContextRuleManagerConfig::new(
-            TESTNET_RPC_URL.to_owned(),
-            TESTNET_PASSPHRASE.to_owned(),
-            Duration::from_secs(120),
-            CHAIN_ID.to_owned(),
+/// uncapped session-rule horizon (so the install does not trigger
+/// `HorizonExceeded`) and a signers manager, which rule install requires. Both
+/// write to one audit log under the returned `TempDir`, which the caller holds
+/// for the test's duration.
+fn fresh_manager() -> (ContextRuleManager, TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir must succeed");
+    let audit_log_path = dir.path().join("audit.jsonl");
+    let audit_writer = Arc::new(Mutex::new(
+        AuditWriter::open(audit_log_path.clone(), None).expect("AuditWriter::open must succeed"),
+    ));
+    let timeout = Duration::from_secs(120);
+    let signers_manager = signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
+        Arc::clone(&audit_writer),
+        audit_log_path,
+        timeout,
+    );
+    let manager = ContextRuleManager::new(
+        rule_manager_config_for_tests(
+            TESTNET_RPC_URL,
+            None,
+            signers_manager,
+            audit_writer,
+            timeout,
         )
         .with_session_rule_max_horizon_ledgers(u32::MAX),
     )
-    .expect("ContextRuleManager construction must succeed")
+    .expect("ContextRuleManager construction must succeed");
+    (manager, dir)
 }
 
 /// Simulation-audit happy-path on testnet.
@@ -160,7 +183,7 @@ async fn sim_audit_happy_path_on_chain_submit() {
     // The fingerprint-capture + verify tripwire fires inside
     // submit_signed_invoke.  A successful submission proves the gate does NOT
     // false-positive on the wallet's own happy path.
-    let manager = fresh_manager();
+    let (manager, _audit_dir) = fresh_manager();
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g)
         .expect("signer G-strkey must parse to ScAddress");
     // Rule name must be ≤ 20 bytes (OZ MAX_NAME_SIZE).
@@ -182,7 +205,7 @@ async fn sim_audit_happy_path_on_chain_submit() {
             definition,
             auth_rule_ids,
             signer_box.as_ref(),
-            None, // audit_writer: None (no local audit log in acceptance tests)
+            None, // the manager's own audit writer records the install rows
             uuid::Uuid::new_v4().to_string(),
             false, // accept_mutable_verifier
             false, // accept_unknown_verifier

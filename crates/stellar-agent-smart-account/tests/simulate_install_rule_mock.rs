@@ -6,9 +6,14 @@
 //!
 //! | Test | Mechanism | Coverage |
 //! |------|-----------|----------|
-//! | [`success_shape_returns_pin_result_and_latest_ledger`] | wiremock | happy path: `Ok(SimulateInstallRuleOutput)` with `latest_ledger` from the mock response and an empty (skipped) `pin_result` when `signers_manager` is `None` |
+//! | [`success_shape_returns_pin_result_and_latest_ledger`] | wiremock | happy path: `Ok(SimulateInstallRuleOutput)` with `latest_ledger` from the mock response and an empty `pin_result`, since the definition references no verifier or policy contract |
 //! | [`simulate_error_propagates_as_deployment_failed`] | wiremock | a `simulateTransaction` error response propagates as `SaError::DeploymentFailed { phase: "simulate" }` |
 //! | [`does_not_modify_install_rule_path_no_extra_simulate_calls`] | wiremock | exactly ONE `simulateTransaction` call — no signing/submission side-effects |
+//! | [`a_simulation_without_a_signers_manager_refuses_before_any_rpc`] | wiremock | no signers manager: `sa.signers_manager_not_configured` with no rule id and no RPC |
+//!
+//! Each manager carries a signers manager over the same mock server, as rule
+//! install requires; the `Delegated`-only definition makes its pin check
+//! issue no RPC.
 //!
 //! # Gating
 //!
@@ -22,6 +27,9 @@
     reason = "test-only; adversarial fixtures assert invariants via panic-on-failure"
 )]
 
+use std::sync::Arc;
+
+use stellar_agent_smart_account::SaError;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
     RuleContext, parse_g_strkey_to_signer_address,
@@ -34,22 +42,35 @@ use wiremock::{
 #[path = "smart-account-fixtures/adversarial/rpc_mock_helpers.rs"]
 mod rpc_mock_helpers;
 
-use rpc_mock_helpers::{SOURCE_G, SorobanRpcDispatcher, build_ledger_entries_account};
+use rpc_mock_helpers::{
+    SOURCE_G, SorobanRpcDispatcher, build_ledger_entries_account, manager_one_url, tmp_audit_writer,
+};
 
 const NETWORK_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const CHAIN_ID: &str = "stellar:testnet";
 
-fn manager_for_server(server: &MockServer) -> ContextRuleManager {
-    let config = ContextRuleManagerConfig::new(
+fn config_for_server(server: &MockServer) -> ContextRuleManagerConfig {
+    ContextRuleManagerConfig::new(
         server.uri(),
         NETWORK_PASSPHRASE.to_owned(),
         std::time::Duration::from_secs(5),
         CHAIN_ID.to_owned(),
-    );
-    // No `.with_signers_manager(...)`: exercises the documented test-only
-    // escape hatch (pin check skipped with a `warn!` log), matching
-    // `list_active_context_rules_mock.rs::manager_for_server`.
-    ContextRuleManager::new(config).expect("ContextRuleManager::new must succeed")
+    )
+}
+
+/// A rule manager over `server` with a signers manager over the same
+/// server, both writing to one temporary audit log. Hold the returned
+/// directory for the test's duration.
+fn manager_for_server(server: &MockServer) -> (ContextRuleManager, tempfile::TempDir) {
+    let (audit_writer, audit_log_path, dir) = tmp_audit_writer();
+    let signers_manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
+    let manager = ContextRuleManager::new(
+        config_for_server(server)
+            .with_signers_manager(Arc::new(signers_manager))
+            .with_audit_writer(audit_writer),
+    )
+    .expect("ContextRuleManager::new must succeed");
+    (manager, dir)
 }
 
 fn simple_rule_definition() -> ContextRuleDefinition {
@@ -95,8 +116,8 @@ fn simulate_error_response(error_msg: &str) -> serde_json::Value {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `simulate_install_rule` returns `Ok(SimulateInstallRuleOutput)` carrying
-/// the RPC-observed `latest_ledger` and an empty `pin_result` (the
-/// `signers_manager = None` escape hatch skips the pin check).
+/// the RPC-observed `latest_ledger` and an empty `pin_result`: the
+/// definition references no verifier or policy contract to pin.
 #[tokio::test]
 async fn success_shape_returns_pin_result_and_latest_ledger() {
     use stellar_xdr::{Limits, ScVal, WriteXdr};
@@ -118,7 +139,7 @@ async fn success_shape_returns_pin_result_and_latest_ledger() {
         .mount(&server)
         .await;
 
-    let manager = manager_for_server(&server);
+    let (manager, _dir) = manager_for_server(&server);
     let output = manager
         .simulate_install_rule(
             smart_account,
@@ -170,7 +191,7 @@ async fn simulate_error_propagates_as_deployment_failed() {
         .mount(&server)
         .await;
 
-    let manager = manager_for_server(&server);
+    let (manager, _dir) = manager_for_server(&server);
     let err = manager
         .simulate_install_rule(
             smart_account,
@@ -222,7 +243,7 @@ async fn does_not_modify_install_rule_path_no_extra_simulate_calls() {
         .mount(&server)
         .await;
 
-    let manager = manager_for_server(&server);
+    let (manager, _dir) = manager_for_server(&server);
     manager
         .simulate_install_rule(
             smart_account,
@@ -238,4 +259,55 @@ async fn does_not_modify_install_rule_path_no_extra_simulate_calls() {
     // `.expect(2)` above is verified when `server` (and its underlying
     // wiremock `MockServer`) is dropped at end of scope; wiremock panics on
     // a call-count mismatch at that point.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Signers manager required
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Without a signers manager `simulate_install_rule` refuses with
+/// `sa.signers_manager_not_configured`, naming no rule, before any RPC.
+#[tokio::test]
+async fn a_simulation_without_a_signers_manager_refuses_before_any_rpc() {
+    use stellar_xdr::{ContractId, Hash, ScAddress};
+
+    let server = MockServer::start().await;
+    let smart_account = ScAddress::Contract(ContractId(Hash([0x45u8; 32])));
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(SorobanRpcDispatcher::new(
+            build_ledger_entries_account(SOURCE_G),
+            simulate_error_response("must not be reached"),
+        ))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let manager = ContextRuleManager::new(config_for_server(&server))
+        .expect("ContextRuleManager::new must succeed");
+    let err = manager
+        .simulate_install_rule(
+            smart_account,
+            simple_rule_definition(),
+            SOURCE_G,
+            false,
+            false,
+            "req-no-signers-manager".to_owned(),
+        )
+        .await
+        .expect_err("a simulation without a signers manager must refuse");
+
+    assert_eq!(err.wire_code(), "sa.signers_manager_not_configured");
+    match err {
+        SaError::SignersManagerNotConfigured {
+            rule_id,
+            request_id,
+            ..
+        } => {
+            assert_eq!(rule_id, None);
+            assert_eq!(request_id, "req-no-signers-manager");
+        }
+        other => panic!("expected SignersManagerNotConfigured; got {other:?}"),
+    }
 }

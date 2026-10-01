@@ -41,6 +41,11 @@ pub mod signing;
 pub mod simple_threshold_policy;
 pub mod spending_limit_policy;
 pub mod submit;
+// Manager builders for tests and live suites: a rule manager and its signers
+// manager over one audit writer, as production wires them. Gated at the
+// module so the builders never reach the public rustdoc of a release build.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_helpers;
 pub mod timelock;
 pub(crate) mod timelock_submit;
 pub mod verifier_allowlist;

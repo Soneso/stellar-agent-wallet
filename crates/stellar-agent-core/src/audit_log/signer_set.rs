@@ -522,7 +522,7 @@ impl BaselineReason {
     /// `pub` because the construction sites live in
     /// `stellar-agent-smart-account`, a separate compilation unit; the
     /// repository gate `check-no-direct-sasignersetbaselined-emit.sh`, not
-    /// Rust visibility, confines them to the manager's baseline paths.
+    /// Rust visibility, confines it to `SignersManager::list_signers`.
     #[must_use]
     pub fn first_observation() -> Self {
         Self::FirstObservation
@@ -533,7 +533,8 @@ impl BaselineReason {
     /// `pub` because the construction sites live in
     /// `stellar-agent-smart-account`, a separate compilation unit; the
     /// repository gate `check-no-direct-sasignersetbaselined-emit.sh`, not
-    /// Rust visibility, confines them to the manager's baseline paths.
+    /// Rust visibility, confines it to
+    /// `SignersManager::refresh_signer_baseline`.
     #[must_use]
     pub fn explicit_refresh() -> Self {
         Self::ExplicitRefresh
@@ -544,7 +545,8 @@ impl BaselineReason {
     /// `pub` because the construction sites live in
     /// `stellar-agent-smart-account`, a separate compilation unit; the
     /// repository gate `check-no-direct-sasignersetbaselined-emit.sh`, not
-    /// Rust visibility, confines them to the manager's baseline paths.
+    /// Rust visibility, confines it to
+    /// `SignersManager::baseline_confirmed_install`.
     #[must_use]
     pub fn confirmed_install() -> Self {
         Self::ConfirmedInstall

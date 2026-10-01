@@ -20,14 +20,21 @@
 //! 9. Install a context rule with `Signer::External(verifier_addr, pubkey_data)` via
 //!    `ContextRuleManager::install_rule` (pubkey_data = pubkey_65_bytes || credential_id per OZ
 //!    `canonicalize_key` at `verifiers/webauthn.rs:373-377`).
-//! 10. Call `CredentialsManager::sign_with_passkey_rule` which:
-//!     a. Inserts a `SignWithPasskey` approval entry.
-//!     b. Returns the approval URL.
+//!    The install goes through a rule manager whose signers manager records
+//!    the rule's signer-set baseline from the confirmed chain state.
+//! 10. Call `CredentialsManager::sign_with_passkey_rule` with that same signers
+//!     manager, which:
+//!     a. Compares the rule's signer set on chain with the baseline the
+//!     install recorded, and checks the pinned verifier hash.
+//!     b. Inserts a `SignWithPasskey` approval entry.
+//!     c. Returns the approval URL.
 //! 11. Navigate the chromiumoxide browser to the approval URL (the bridge's
 //!     `GET /approve/<nonce>` page).  The page's JS calls `startAuthentication()`
 //!     and the virtual authenticator completes the ceremony.
 //! 12. The bridge POST handler records the assertion; the poll loop picks it up.
-//! 13. Assert `SignWithPasskeyOutcome::Signed { .. }` is returned.
+//! 13. Assert `SignWithPasskeyOutcome::Signed { .. }` is returned, and that the
+//!     signers manager's audit log holds the install's baseline and a
+//!     successful `PasskeyAssertion` row.
 //! 14. Tear down the browser and bridge.
 //!
 //! # Audit compliance
@@ -99,6 +106,9 @@ use ed25519_dalek::SigningKey;
 use futures::StreamExt as _;
 use rand_core::OsRng;
 use stellar_agent_core::approval::store::PendingApprovalStore;
+use stellar_agent_core::audit_log::entry::AuditEntry;
+use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::signer_set::BaselineReason;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::is_loopback_http_url;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
@@ -112,9 +122,10 @@ use stellar_agent_smart_account::managers::credentials::{
 };
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
-    parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
+    ContextRuleDefinition, ContextRuleSignerInput, parse_c_strkey_to_smart_account,
+    parse_g_strkey_to_signer_address,
 };
+use stellar_agent_smart_account::test_helpers::managers_for_tests;
 use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use stellar_agent_smart_account::webauthn_verifier::WEBAUTHN_VERIFIER_WASM_SHA256;
 use tempfile::TempDir;
@@ -125,7 +136,6 @@ use zeroize::Zeroizing;
 const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 const TESTNET_FRIENDBOT_URL: &str = "https://friendbot.stellar.org";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
-const CHAIN_ID: &str = "stellar:testnet";
 
 /// RP-ID for the test ceremony.
 ///
@@ -183,17 +193,6 @@ fn fresh_deployer_keypair() -> (String, DeployerKeypair) {
         signer,
     };
     (g_strkey, deployer)
-}
-
-/// Constructs a `ContextRuleManager` against testnet.
-fn fresh_rule_manager() -> ContextRuleManager {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_PASSPHRASE.to_owned(),
-        Duration::from_secs(120),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("ContextRuleManager construction must succeed")
 }
 
 /// Deploys a fresh smart account.  Returns the deployed C-strkey.
@@ -746,7 +745,12 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
     pubkey_data.extend_from_slice(&pubkey_bytes);
     pubkey_data.extend_from_slice(&credential_id_bytes);
 
-    let rule_manager = fresh_rule_manager();
+    // One signers manager over one audit log serves the install and the
+    // passkey signing, as production wires them: the install records the
+    // rule's baseline, and the passkey path compares the chain with it before
+    // the ceremony.
+    let (rule_manager, signers_manager, signers_audit_log_path, _signers_audit_dir) =
+        managers_for_tests(TESTNET_RPC_URL, TESTNET_RPC_URL, Duration::from_secs(120));
     let signer_addr =
         parse_g_strkey_to_signer_address(&signer_g).expect("signer G-strkey must parse");
 
@@ -808,12 +812,13 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
     //
     // `sign_with_passkey_rule` does not accept an `audit_writer` parameter;
     // PasskeyAssertion audit emission is sourced from the SignersManager's shared
-    // Arc<Mutex<AuditWriter>>.  This test passes `None` for `signers_manager`
-    // (divergence check skipped for the WebAuthn ceremony acceptance path; no
-    // baseline established in this test).  No PasskeyAssertion audit row is
-    // emitted when signers_manager is None.
+    // Arc<Mutex<AuditWriter>>. The signing takes the signers manager the
+    // install ran through, so its divergence check compares the chain with
+    // the baseline the install recorded, and its PasskeyAssertion row lands in
+    // the same log.
     let signing_task = {
         let creds_manager = creds_manager.clone();
+        let signers_manager = Arc::clone(&signers_manager);
         let bridge_addr_clone = bridge_addr;
         // Clone the smart account strkey so it can be moved into the
         // `'static` async task closure.
@@ -826,7 +831,7 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
                     &smart_account_strkey_clone,
                     &auth_digest,
                     vec![webauthn_rule_id],
-                    None, // test-only: divergence check skipped; no PasskeyAssertion emit
+                    signers_manager,
                     bridge_addr_clone,
                     signing_deadline,
                     move |url| {
@@ -834,7 +839,7 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
                             let _ = tx.send(url.to_owned());
                         }
                     },
-                    true, // accept_single_verifier: bypass diversification (webauthn test; no baseline)
+                    true, // accept_single_verifier: the rule's one verifier is the WebAuthn verifier
                 )
                 .await
         })
@@ -888,6 +893,37 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
     assert_eq!(
         cred_metadata.rp_id, TEST_RP_ID,
         "credential rp_id must match TEST_RP_ID"
+    );
+
+    // The install recorded the rule's baseline in the signers manager's log,
+    // and the signing wrote its successful PasskeyAssertion row there.
+    let signers_rows: Vec<AuditEntry> = std::fs::read_to_string(&signers_audit_log_path)
+        .expect("signers audit log must be readable")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("audit row must parse"))
+        .collect();
+    assert_eq!(
+        signers_rows
+            .iter()
+            .filter(|entry| matches!(
+                &entry.event_kind,
+                EventKind::SaSignerSetBaselinedV2 {
+                    rule_id,
+                    baseline_reason: BaselineReason::ConfirmedInstall,
+                    ..
+                } if *rule_id == webauthn_rule_id
+            ))
+            .count(),
+        1,
+        "the install must record one confirmed-install baseline of the rule"
+    );
+    assert!(
+        signers_rows.iter().any(|entry| matches!(
+            &entry.event_kind,
+            EventKind::PasskeyAssertion { result, .. } if result == "success"
+        )),
+        "the signing must write a successful PasskeyAssertion row"
     );
 
     // ── Tear down ─────────────────────────────────────────────────────────────

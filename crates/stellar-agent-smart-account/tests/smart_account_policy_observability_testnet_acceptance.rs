@@ -97,17 +97,17 @@ use stellar_agent_smart_account::deployment::{
 };
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
-    ContextRuleSignerInput, RuleContext, parse_c_strkey_to_smart_account,
-    parse_g_strkey_to_signer_address,
+    ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
+    RuleContext, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
-use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
+use stellar_agent_smart_account::managers::signers::SignersManager;
 use stellar_agent_smart_account::managers::spending_limit_data::compute_spending_window;
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_agent_smart_account::spending_limit_policy::build_spending_limit_install_param;
 use stellar_agent_smart_account::submit::{
     Ed25519RuleSigner, PinCheck, SubmitInvokeArgs, submit_signed_invoke,
 };
+use stellar_agent_smart_account::test_helpers::{managers_for_tests, signers_manager_for_tests};
 use stellar_agent_test_support::keyring_mock;
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::{Transaction, TransactionBehavior};
@@ -229,15 +229,17 @@ fn read_audit_entries(log_path: &Path) -> Vec<AuditEntry> {
     entries
 }
 
-/// Constructs a `ContextRuleManager` against testnet.
-fn fresh_rule_manager() -> ContextRuleManager {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_PASSPHRASE.to_owned(),
+/// Constructs a `ContextRuleManager` against testnet with a signers manager,
+/// both writing to one audit log under the returned `TempDir`, which the
+/// caller holds while it uses the manager. Rule install requires the signers
+/// manager.
+fn fresh_rule_manager() -> (ContextRuleManager, TempDir) {
+    let (manager, _signers_manager, _audit_log_path, dir) = managers_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
         Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("ContextRuleManager::new must succeed")
+    );
+    (manager, dir)
 }
 
 /// Constructs a `SignersManager` for testnet using the given audit writer.
@@ -247,18 +249,14 @@ fn fresh_rule_manager() -> ContextRuleManager {
 fn fresh_signers_manager(
     audit_writer: Arc<Mutex<AuditWriter>>,
     audit_log_path: PathBuf,
-) -> SignersManager {
-    SignersManager::new(SignersManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_RPC_URL.to_owned(),
+) -> Arc<SignersManager> {
+    signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
         audit_writer,
         audit_log_path,
-        TESTNET_PASSPHRASE.to_owned(),
-        "policy-observability-acceptance".to_owned(),
         Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("SignersManager::new must succeed")
+    )
 }
 
 /// Deploys a fresh smart account whose bootstrap rule (rule_id 0) uses
@@ -674,7 +672,7 @@ async fn policy_observability_full_flow_testnet_acceptance() {
     let agent_signer_box: Box<dyn Signer + Send + Sync> =
         Box::new(SoftwareSigningKey::new_from_zeroizing(agent_seed));
 
-    let rule_manager = fresh_rule_manager();
+    let (rule_manager, _install_audit_dir) = fresh_rule_manager();
 
     let current_ledger_before_install = fetch_latest_ledger().await;
     let valid_until = current_ledger_before_install.saturating_add(VALID_UNTIL_HORIZON_LEDGERS);
@@ -790,8 +788,10 @@ async fn policy_observability_full_flow_testnet_acceptance() {
     );
 
     // ── Step 3: agent-signed transfer of A (under the limit) — MUST succeed ──
-    // The rule manager writes no audit rows, so the rule has no pin record in
-    // this log and the drift check fetches the rule and passes it.
+    // The install recorded its rows in the rule manager's own audit log, so
+    // this log holds no pin record of the rule and the drift check fetches
+    // the rule and passes it. The rule's two policies would make a pin record
+    // refuse every checked verb, which this test does not exercise.
     let pin_request_id = rid();
     let pin_check = || PinCheck {
         signers_manager: &signers_mgr,

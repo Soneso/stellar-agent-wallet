@@ -68,11 +68,12 @@ use stellar_agent_smart_account::managers::authorization::{
 };
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
-    ContextRuleSignerInput, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
+    ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
+    parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_agent_smart_account::submit::{PinCheck, SubmitInvokeArgs, submit_signed_invoke};
+use stellar_agent_smart_account::test_helpers::managers_for_tests;
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::{Transaction, TransactionBehavior};
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
@@ -83,6 +84,7 @@ use stellar_xdr::{
     LedgerKeyContractCode, Limits, Operation, OperationBody, PublicKey as XdrPublicKey, ScAddress,
     ScSymbol, ScVal, ScVec, SorobanAuthorizationEntry, Uint256, VecM, WriteXdr,
 };
+use tempfile::TempDir;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -151,14 +153,16 @@ async fn fund_via_friendbot(g_strkey: &str) {
     );
 }
 
-fn fresh_rule_manager() -> ContextRuleManager {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_PASSPHRASE.to_owned(),
+/// A testnet rule manager with a signers manager, both writing to one audit
+/// log under the returned `TempDir`, which the caller holds while it uses the
+/// manager. Rule install requires the signers manager.
+fn fresh_rule_manager() -> (ContextRuleManager, TempDir) {
+    let (manager, _signers_manager, _audit_log_path, dir) = managers_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
         Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("ContextRuleManager::new must succeed")
+    );
+    (manager, dir)
 }
 
 /// Deploys a fresh smart-account and returns its C-strkey.
@@ -422,7 +426,7 @@ async fn install_multisigner_threshold_rule(
     authorizing_signer: &(dyn Signer + Send + Sync),
     bootstrap_rule_id: ContextRuleId,
 ) -> (u32, String) {
-    let rule_manager = fresh_rule_manager();
+    let (rule_manager, _audit_dir) = fresh_rule_manager();
 
     let policy_strkey =
         deploy_threshold_policy_wasm(authorizing_signer_g, authorizing_signer).await;
@@ -670,8 +674,9 @@ async fn q1_and_q3_two_of_three_quorum_invocation_accepted() {
     };
     let host_function = HostFunction::InvokeContract(invoke);
 
-    // The rule was installed through a manager that writes no audit rows, so
-    // it has no pin record; the drift check fetches the rule and passes it.
+    // The pin-check manager reads its own audit log, which holds no pin
+    // record of the rule (the install recorded its rows in the install
+    // manager's log); the drift check fetches the rule and passes it.
     let pin_dir = tempfile::tempdir().expect("temporary audit directory");
     let pin_manager = pin_check_manager::pin_check_manager(
         TESTNET_RPC_URL,

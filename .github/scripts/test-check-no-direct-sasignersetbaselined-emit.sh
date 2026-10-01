@@ -122,8 +122,15 @@ expect_fail "version-2 constructor call" "FAIL (a):" "(in fn fetch_context_rule_
 # (b) An emit_baseline call in another function.
 reset_ws
 inject "$SIGNERS" '^    async fn fetch_context_rule_primary[(]' \
-  '        self.emit_baseline(&observed, rule_id, &redacted, reason, &request_id);'
+  '        self.emit_baseline(&observed, rule_id, &strkey, &redacted, reason, None, &request_id);'
 expect_fail "extra emit_baseline call" "FAIL (b):" "(in fn fetch_context_rule_primary)"
+
+# (b) An emit_baseline call from another module, a third caller beside the
+# three baseline functions.
+reset_ws
+inject "$VERIFIERS" '^pub async fn pin_referenced_contracts[(]' \
+  '    signers_manager.emit_baseline(&observed, rule_id, &strkey, &redacted, reason, None, &request_id);'
+expect_fail "third emit_baseline caller in verifiers.rs" "FAIL (b):" "at $VERIFIERS:"
 
 # (c) A struct-literal construction in another module.
 reset_ws
@@ -249,6 +256,21 @@ reset_ws
 inject "$SIGNERS" '^    async fn fetch_context_rule_primary[(]' \
   '        let _reason = BaselineReason::confirmed_install();'
 expect_fail "confirmed_install call" "FAIL (d):" "(in fn fetch_context_rule_primary)"
+
+# (d) A reason is allowed only in its own function: the confirmed-install
+# constructor inside fn list_signers fails.
+reset_ws
+inject "$SIGNERS" '^    pub async fn list_signers[(]' \
+  '        let _reason = BaselineReason::confirmed_install();'
+expect_fail "confirmed_install in list_signers" "FAIL (d):" "(in fn list_signers)"
+
+# (d) The first-observation constructor inside fn baseline_confirmed_install
+# fails.
+reset_ws
+inject "$SIGNERS" '^    pub[(]crate[)] async fn baseline_confirmed_install[(]' \
+  '        let _reason = BaselineReason::first_observation();'
+expect_fail "first_observation in baseline_confirmed_install" "FAIL (d):" \
+  "(in fn baseline_confirmed_install)"
 
 # (d) A `const fn` and an `extern "C" fn` are functions of their own: a call
 # inside one placed within `list_signers` is not attributed to it.

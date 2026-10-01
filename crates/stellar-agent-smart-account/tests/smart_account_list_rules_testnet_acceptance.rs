@@ -54,8 +54,11 @@ use stellar_agent_smart_account::deployment::{
 };
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRuleSignerInput,
-    DEFAULT_MAX_SCAN_ID, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
+    ContextRuleDefinition, ContextRuleManager, ContextRuleSignerInput, DEFAULT_MAX_SCAN_ID,
+    parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
+};
+use stellar_agent_smart_account::test_helpers::{
+    rule_manager_config_for_tests, rule_manager_for_tests, signers_manager_for_tests,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -66,7 +69,7 @@ use zeroize::Zeroizing;
 const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 const TESTNET_FRIENDBOT_URL: &str = "https://friendbot.stellar.org";
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
-const CHAIN_ID: &str = "stellar:testnet";
+const TIMEOUT: Duration = Duration::from_secs(120);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -123,17 +126,27 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
     (Arc::new(Mutex::new(writer)), path, dir)
 }
 
-fn fresh_manager_with_audit_writer(audit_writer: Arc<Mutex<AuditWriter>>) -> ContextRuleManager {
-    ContextRuleManager::new(
-        ContextRuleManagerConfig::new(
-            TESTNET_RPC_URL.to_owned(),
-            TESTNET_PASSPHRASE.to_owned(),
-            Duration::from_secs(120),
-            CHAIN_ID.to_owned(),
-        )
-        .with_audit_writer(audit_writer),
+/// A testnet rule manager writing to `audit_writer`, with a signers manager
+/// over the same writer, whose log is `audit_log_path`. Rule install requires
+/// the signers manager.
+fn fresh_manager_with_audit_writer(
+    audit_writer: Arc<Mutex<AuditWriter>>,
+    audit_log_path: PathBuf,
+) -> ContextRuleManager {
+    let signers_manager = signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
+        Arc::clone(&audit_writer),
+        audit_log_path,
+        TIMEOUT,
+    );
+    rule_manager_for_tests(
+        TESTNET_RPC_URL,
+        None,
+        signers_manager,
+        audit_writer,
+        TIMEOUT,
     )
-    .expect("manager construction with audit writer must succeed")
 }
 
 /// Manager variant with no horizon cap (`u32::MAX`).
@@ -143,15 +156,23 @@ fn fresh_manager_with_audit_writer(audit_writer: Arc<Mutex<AuditWriter>>) -> Con
 /// The default cap (1000 ledgers) would block such installs before they reach the chain.
 fn fresh_manager_uncapped_with_audit_writer(
     audit_writer: Arc<Mutex<AuditWriter>>,
+    audit_log_path: PathBuf,
 ) -> ContextRuleManager {
+    let signers_manager = signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
+        Arc::clone(&audit_writer),
+        audit_log_path,
+        TIMEOUT,
+    );
     ContextRuleManager::new(
-        ContextRuleManagerConfig::new(
-            TESTNET_RPC_URL.to_owned(),
-            TESTNET_PASSPHRASE.to_owned(),
-            Duration::from_secs(120),
-            CHAIN_ID.to_owned(),
+        rule_manager_config_for_tests(
+            TESTNET_RPC_URL,
+            None,
+            signers_manager,
+            audit_writer,
+            TIMEOUT,
         )
-        .with_audit_writer(audit_writer)
         .with_session_rule_max_horizon_ledgers(u32::MAX),
     )
     .expect("uncapped manager construction must succeed")
@@ -275,8 +296,8 @@ async fn h1_list_rules_across_sparse_id_gap_on_testnet() {
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g)
         .expect("signer G-strkey must parse to ScAddress");
 
-    let (audit_writer, _audit_log_path, _tmp_dir) = tmp_audit_writer();
-    let manager = fresh_manager_with_audit_writer(Arc::clone(&audit_writer));
+    let (audit_writer, audit_log_path, _tmp_dir) = tmp_audit_writer();
+    let manager = fresh_manager_with_audit_writer(Arc::clone(&audit_writer), audit_log_path);
 
     // ── Install rules 1, 2, 3 (bootstrap rule 0 is already installed) ────────
 
@@ -479,13 +500,14 @@ async fn h2_valid_until_some_decoded_correctly_on_testnet() {
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g)
         .expect("signer G-strkey must parse to ScAddress");
 
-    let (audit_writer, _audit_log_path, _tmp_dir) = tmp_audit_writer();
+    let (audit_writer, audit_log_path, _tmp_dir) = tmp_audit_writer();
     // Use an uncapped manager for the install step: LARGE_FUTURE_LEDGER is ~997M
     // ledgers ahead of current testnet, which exceeds the default 1000-ledger cap.
     // This test exercises the decoder (regression-lock), not horizon enforcement.
-    let uncapped_manager = fresh_manager_uncapped_with_audit_writer(Arc::clone(&audit_writer));
+    let uncapped_manager =
+        fresh_manager_uncapped_with_audit_writer(Arc::clone(&audit_writer), audit_log_path.clone());
     // Standard-capped manager for enumeration (no horizon check during list).
-    let manager = fresh_manager_with_audit_writer(Arc::clone(&audit_writer));
+    let manager = fresh_manager_with_audit_writer(Arc::clone(&audit_writer), audit_log_path);
 
     // Install rule 1 with valid_until = Some(LARGE_FUTURE_LEDGER).
     // The on-chain encode path uses encode_option_u32 (rules.rs:2398-2401)
@@ -613,8 +635,8 @@ async fn h3_cli_envelope_shape_on_testnet() {
     let signer_addr = parse_g_strkey_to_signer_address(&signer_g)
         .expect("signer G-strkey must parse to ScAddress");
 
-    let (audit_writer, _audit_log_path, _tmp_dir) = tmp_audit_writer();
-    let manager = fresh_manager_with_audit_writer(Arc::clone(&audit_writer));
+    let (audit_writer, audit_log_path, _tmp_dir) = tmp_audit_writer();
+    let manager = fresh_manager_with_audit_writer(Arc::clone(&audit_writer), audit_log_path);
 
     // ── Install rules 1, 2, 3 (bootstrap rule 0 is already installed) ────────
     let rule_1_id = install_rule_with_name(

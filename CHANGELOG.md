@@ -60,6 +60,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ListOutcome`, `RefreshOutcome` and `PreviousBaseline` in
   `stellar_agent_smart_account::managers::signers`, and `Display` for
   `SignerSetView` (`v{version} count={n} threshold={t|none}`).
+- A rule the wallet installs is recorded as its own signer-set baseline.
+  After the install confirms, both endpoints are read at or past the
+  confirmation ledger. The observed signers and simple-threshold policy must
+  be the authorized definition, and the wallet writes a
+  `SaSignerSetBaselinedV2` row with reason `confirmed_install`. The signer
+  verbs work on the new rule without a `signers list` first.
+- `sa.install_state_mismatch` (`SaError::InstallStateMismatch`) reports an
+  install that confirmed and was not baselined: the observed rule is not the
+  definition, or the return value carried no rule id. Its message names the
+  transaction and two ways to settle the rule: delete it under rule 0 or
+  accept it with `signers refresh`. An install whose baseline is not
+  observed or not written reports `sa.baseline_write_failed` with the
+  transaction hash.
+- `simple_threshold_policy::parse_simple_threshold_install_param` reads the
+  threshold from the simple-threshold policy's install parameter.
+- The `test_helpers` module (feature `test-helpers`) builds a signers
+  manager and a rule manager that share one audit writer.
 
 ### Changed
 
@@ -116,10 +133,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `external`.
 - A rule whose policy instance is an external reference with no live tag
   entry refuses signer-set reads with `sa.contract_instance_unsupported`.
-- Attaching or detaching the simple-threshold policy with `rules add-policy`
-  or `rules remove-policy` records no threshold row, so the next signer verb
-  on that rule refuses with `sa.signer_set_diverged` until `signers refresh
-  --rule-id N --accept-divergence`.
+- `rules add-policy` and `rules remove-policy` observe the policy's
+  executable through both endpoints before submission. Attaching the
+  simple-threshold policy compares the chain with the rule's baseline, refuses
+  a rule that already has one with `sa.threshold_policy_identification_failed`,
+  and requires a non-zero `{ threshold: u32 }` parameter. Once it confirms, a
+  `SaThresholdChangedV2` row records the new threshold before the
+  `SaPolicyAdded` row. Detaching it records the cleared threshold the same
+  way. A rule with two simple-threshold policies accepts the detach of one of
+  them when it has a version-2 signer-set state row, recorded before the rule
+  gained its second policy, and its signers equal the row's; the wallet then
+  records the remaining policy's threshold. Such a rule with no state row
+  refuses with `sa.signer_set_missing_baseline`, and only `rules delete
+  --rule-id N --auth-rule-id 0` removes it. A confirmed attach or detach whose
+  result is not the intended change refuses with `sa.signer_set_diverged` and
+  the transaction hash; its policy and pin rows are still written.
+- `rules remove-policy` refuses before submission when the rule is not on
+  chain or holds no policy with the given id (`sa.deployment_failed`), and
+  when the policy's executable cannot be read (`sa.deployment_failed`,
+  `sa.contract_instance_unsupported` or `network.rpc_divergence`). `rules
+  delete --rule-id N --auth-rule-id 0` removes a rule whose policy stays
+  unreadable.
+- A confirmed `rules add-policy` whose return value carries no policy id
+  returns `sa.baseline_write_failed` at stage `observe` with the transaction
+  hash and writes its pin rows, for any policy.
+- `ContextRuleManager::install_rule` and `simulate_install_rule` require a
+  signers manager and refuse without one with
+  `sa.signers_manager_not_configured` before any RPC; so do `add_policy` and
+  `remove_policy`. An install and its simulation also refuse before
+  submission in three cases. A definition that names a policy address twice
+  or attaches more than one simple-threshold policy refuses with
+  `sa.deployment_failed` (phase `build`). A simple-threshold install
+  parameter that is not a non-zero `{ threshold: u32 }` map refuses with
+  `sa.simple_threshold_install_refused`. An `External` signer with empty key
+  data refuses with `sa.auth_entry_construction_failed`.
+- A rule created before this version has no baseline until one `signers list
+  --rule-id N`, which a signer verb and an attach or detach of the
+  simple-threshold policy on it need first.
+- `SaError::SignersManagerNotConfigured.rule_id` is optional. An install's
+  refusal omits it on the wire; a refusal scoped to a rule keeps the bare
+  number.
+- `CredentialsManager::sign_with_passkey_rule` takes `Arc<SignersManager>`.
+  Every passkey signing runs the divergence and drift checks and writes its
+  `PasskeyAssertion` row through the signers manager's audit writer.
+- A context rule can hold a signer delegated to a contract address: `rules
+  create --signer-delegated`, `stellar_rule_create`, the rule proposal check
+  and `context_rule_definition_from_snapshot` accept a C-strkey beside a
+  G-strkey, through `parse_delegated_signer_address`. A contract delegate is
+  not the delegated fallback signer of a passkey or Ed25519 rule, so such a
+  rule still needs `--accept-no-delegated-fallback`
+  (`accept_no_delegated_fallback` in the MCP).
+- The signer-set observation after a confirmed transaction reads an endpoint
+  again when its read reports a ledger behind the confirmation, whether the
+  read succeeded or failed. A lagging endpoint that does not hold a new rule
+  or threshold yet is read again until the recording budget ends.
 - `smart-account migrate-verifier` records no signer-set state row, so the
   next signer verb on a migrated rule refuses with `sa.signer_set_diverged`
   until `signers refresh --rule-id N --accept-divergence`.
@@ -141,6 +208,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `SignersManager::identify_threshold_policy`; the signer-set observation
   identifies the simple-threshold policy through both endpoints.
+- The install-time pin-check skip of a rule manager without a signers
+  manager: install and its simulation refuse instead.
 
 ### Fixed
 

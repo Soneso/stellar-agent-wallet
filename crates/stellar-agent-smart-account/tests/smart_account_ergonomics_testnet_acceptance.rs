@@ -58,13 +58,10 @@
 //! 7. `weighted_threshold_negatives_testnet_acceptance` — `set_signer_weight`
 //!    / `set_weighted_threshold` against a rule with no weighted-threshold
 //!    policy fail with `WeightedThresholdNotInstalled`. On a rule whose ONLY
-//!    threshold policy is weighted-threshold — the hardening item this Block
-//!    closed — `refresh_signer_baseline` (which identifies a simple-threshold
-//!    policy internally) fails with a typed `ThresholdPolicyNotInstalled` /
-//!    `ThresholdPolicyIdentificationFailed`, and `batch_add_signers` on the
-//!    same never-baselined rule fails at its OWN first pre-flight check
-//!    (`SignerSetMissingBaseline`) before reaching policy identification at
-//!    all — either refusal leaves no on-chain side effect.
+//!    policy is weighted-threshold, the install's baseline and
+//!    `refresh_signer_baseline` record no simple threshold, and
+//!    `remove_signer` fails closed with `ThresholdPolicyIdentificationFailed`
+//!    before submission, leaving no on-chain side effect.
 //!
 //! Client-side refusal of a weighted install whose threshold exceeds the
 //! signer-weight sum, and `batch_add_signers`'s empty-batch refusal, are
@@ -147,17 +144,18 @@ use stellar_agent_smart_account::managers::authorization::{
 };
 use stellar_agent_smart_account::managers::credentials::{AddPasskeyOutcome, CredentialsManager};
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
-    ContextRuleSignerInput, RuleContext, parse_c_strkey_to_smart_account,
-    parse_g_strkey_to_signer_address,
+    ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
+    RuleContext, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
-use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
 use stellar_agent_smart_account::managers::signers::{
-    build_delegated_signer_scval, build_external_signer_scval,
+    PreviousBaseline, SignersManager, build_delegated_signer_scval, build_external_signer_scval,
 };
 use stellar_agent_smart_account::signers::SignerSetView;
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_agent_smart_account::submit::{PinCheck, SubmitInvokeArgs, submit_signed_invoke};
+use stellar_agent_smart_account::test_helpers::{
+    rule_manager_for_tests, signers_manager_for_tests,
+};
 use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use stellar_agent_smart_account::weighted_threshold_policy::{
     WEIGHTED_THRESHOLD_POLICY_WASM_SHA256, WeightedThresholdSignerInput,
@@ -269,33 +267,34 @@ fn read_audit_entries(log_path: &Path) -> Vec<AuditEntry> {
     entries
 }
 
-/// Constructs a `ContextRuleManager` against testnet.
-fn fresh_rule_manager() -> ContextRuleManager {
-    ContextRuleManager::new(ContextRuleManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_PASSPHRASE.to_owned(),
+/// Constructs a `ContextRuleManager` against testnet over `signers_manager`
+/// and its `audit_writer`, as production wires them: an install through it
+/// records the rule's signer-set baseline where `signers_manager` reads it.
+fn fresh_rule_manager(
+    signers_manager: &Arc<SignersManager>,
+    audit_writer: &Arc<Mutex<AuditWriter>>,
+) -> ContextRuleManager {
+    rule_manager_for_tests(
+        TESTNET_RPC_URL,
+        None,
+        Arc::clone(signers_manager),
+        Arc::clone(audit_writer),
         Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("ContextRuleManager::new must succeed")
+    )
 }
 
 /// Constructs a `SignersManager` for testnet using the given audit writer.
 fn fresh_signers_manager(
     audit_writer: Arc<Mutex<AuditWriter>>,
     audit_log_path: PathBuf,
-) -> SignersManager {
-    SignersManager::new(SignersManagerConfig::new(
-        TESTNET_RPC_URL.to_owned(),
-        TESTNET_RPC_URL.to_owned(),
+) -> Arc<SignersManager> {
+    signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
         audit_writer,
         audit_log_path,
-        TESTNET_PASSPHRASE.to_owned(),
-        "ergonomics-acceptance".to_owned(),
         Duration::from_secs(TIMEOUT_SECS),
-        CHAIN_ID.to_owned(),
-    ))
-    .expect("SignersManager::new must succeed")
+    )
 }
 
 /// Deploys a fresh smart account whose bootstrap rule (rule_id 0) uses
@@ -783,7 +782,9 @@ async fn weighted_threshold_ordering_proof_testnet_acceptance() {
     )
     .expect("weighted-threshold install param must build");
 
-    let rule_manager = fresh_rule_manager();
+    let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
+    let signers_mgr = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path);
+    let rule_manager = fresh_rule_manager(&signers_mgr, &audit_writer);
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
         "wt-ordering".to_owned(), // 11 bytes; OZ MAX_NAME_SIZE = 20
@@ -820,9 +821,6 @@ async fn weighted_threshold_ordering_proof_testnet_acceptance() {
         );
     let rule_id = install_out.rule_id;
     assert!(rule_id != 0, "installed rule_id must differ from bootstrap");
-
-    let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
-    let signers_mgr = fresh_signers_manager(audit_writer, audit_log_path);
 
     let identified_policy = signers_mgr
         .identify_weighted_threshold_policy(
@@ -956,7 +954,9 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
     )
     .expect("weighted-threshold install param must build");
 
-    let rule_manager = fresh_rule_manager();
+    let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
+    let signers_mgr = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
+    let rule_manager = fresh_rule_manager(&signers_mgr, &audit_writer);
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
         "wt-enforce".to_owned(), // 10 bytes
@@ -989,11 +989,10 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
         .expect("two-Delegated-signer weighted-threshold rule install must succeed");
     let rule_id = install_out.rule_id;
 
-    let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
-    let signers_mgr = fresh_signers_manager(audit_writer, audit_log_path.clone());
     let auth_rule_ids = vec![ContextRuleId::new(rule_id)];
-    // The rule manager writes no audit rows, so the rule has no pin record in
-    // this log and the drift check fetches the rule and passes it.
+    // The install recorded the rule's pin record in this log: its one policy
+    // pin is the weighted-threshold policy's hash, which the drift check
+    // compares with the live policy.
     let pin_request_id = rid();
     let pin_check = || PinCheck {
         signers_manager: &signers_mgr,
@@ -1283,7 +1282,7 @@ async fn deploy_c_external_ed25519_genesis_testnet_acceptance() {
             .expect("deployed smart-account C-strkey must parse");
 
     let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
-    let signers_mgr = fresh_signers_manager(audit_writer, audit_log_path);
+    let signers_mgr = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path);
 
     let genesis_signers = signers_mgr
         .get_rule_signers(external_genesis_smart_account_sc, 0, None)
@@ -1331,7 +1330,7 @@ async fn deploy_c_external_ed25519_genesis_testnet_acceptance() {
             .expect("simple-threshold policy C-strkey must parse");
 
     let admin_sc = parse_g_strkey_to_signer_address(&admin_g).expect("admin G-strkey must parse");
-    let rule_manager = fresh_rule_manager();
+    let rule_manager = fresh_rule_manager(&signers_mgr, &audit_writer);
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
         "fallback-add".to_owned(), // 12 bytes
@@ -1358,19 +1357,22 @@ async fn deploy_c_external_ed25519_genesis_testnet_acceptance() {
     let rule_id = install_out.rule_id;
 
     // `add_signer` requires an established audit-log baseline
-    // (`SaError::SignerSetMissingBaseline` otherwise); a freshly-installed
-    // rule has none until `refresh_signer_baseline` writes the first
-    // `SaSignerSetBaselinedV2` row.
-    signers_mgr
-        .refresh_signer_baseline(
+    // (`SaError::SignerSetMissingBaseline` otherwise). The install recorded
+    // it through the same signers manager, so `list_signers` matches it.
+    let listed = signers_mgr
+        .list_signers(
             fallback_smart_account_sc.clone(),
             rule_id,
             Some(&admin_g),
-            false,
             rid(),
         )
         .await
-        .expect("refresh_signer_baseline must succeed");
+        .expect("list_signers after the install must succeed");
+    assert_eq!(
+        listed.baseline,
+        PreviousBaseline::Matched,
+        "the install's baseline must match the chain"
+    );
 
     let (fallback_g, _fallback_signer) = fresh_signer();
     let fallback_scval =
@@ -1438,7 +1440,9 @@ async fn batch_add_delegated_signers_testnet_acceptance() {
             .expect("simple-threshold policy C-strkey must parse");
 
     let admin_sc = parse_g_strkey_to_signer_address(&admin_g).expect("admin G-strkey must parse");
-    let rule_manager = fresh_rule_manager();
+    let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
+    let signers_mgr = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
+    let rule_manager = fresh_rule_manager(&signers_mgr, &audit_writer);
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
         "batch-add-deleg".to_owned(), // 15 bytes
@@ -1464,30 +1468,24 @@ async fn batch_add_delegated_signers_testnet_acceptance() {
         .expect("simple-threshold rule install must succeed");
     let rule_id = install_out.rule_id;
 
-    let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
-    let signers_mgr = fresh_signers_manager(audit_writer, audit_log_path.clone());
-
-    // `batch_add_signers` requires an established audit-log baseline. The
-    // exact pre-batch id is not asserted here (OZ's signer-id numbering
-    // scheme — per-rule vs. account-global — is not a documented contract
-    // this test should pin); only the structural fact that exactly one
-    // signer is observed is checked. The actual id is read back and used
-    // below for the post-batch ground-truth cross-check.
-    let baseline = signers_mgr
-        .refresh_signer_baseline(
-            smart_account_sc.clone(),
-            rule_id,
-            Some(&admin_g),
-            false,
-            rid(),
-        )
+    // `batch_add_signers` requires an established audit-log baseline, which
+    // the install recorded through the same signers manager; `list_signers`
+    // matches it. The exact pre-batch id is not asserted here (OZ's
+    // signer-id numbering scheme (per-rule or account-global) is not a
+    // documented contract this test should pin); only the structural fact
+    // that exactly one signer is observed is checked. The actual id is read
+    // back and used below for the post-batch ground-truth cross-check.
+    let listed = signers_mgr
+        .list_signers(smart_account_sc.clone(), rule_id, Some(&admin_g), rid())
         .await
-        .expect("refresh_signer_baseline must succeed");
-    let SignerSetView::V2(baseline_snapshot) = &baseline.view else {
-        panic!(
-            "refresh records a version-2 baseline; got {}",
-            baseline.view
-        )
+        .expect("list_signers after the install must succeed");
+    assert_eq!(
+        listed.baseline,
+        PreviousBaseline::Matched,
+        "the install's baseline must match the chain"
+    );
+    let SignerSetView::V2(baseline_snapshot) = &listed.view else {
+        panic!("list reports a version-2 view; got {}", listed.view)
     };
     assert_eq!(
         baseline_snapshot.signers.len(),
@@ -1587,7 +1585,7 @@ async fn weighted_threshold_negatives_testnet_acceptance() {
         .expect("deployed smart-account C-strkey must parse");
 
     let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
-    let signers_mgr = fresh_signers_manager(audit_writer, audit_log_path);
+    let signers_mgr = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path);
     let admin_auth = vec![ContextRuleId::new(0)];
 
     // ── set_weighted_threshold / set_signer_weight against rule 0 (no policy) ──
@@ -1670,7 +1668,7 @@ async fn weighted_threshold_negatives_testnet_acceptance() {
     )
     .expect("weighted-threshold install param must build");
 
-    let rule_manager = fresh_rule_manager();
+    let rule_manager = fresh_rule_manager(&signers_mgr, &audit_writer);
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
         "wt-only-neg".to_owned(), // 11 bytes
@@ -1699,7 +1697,8 @@ async fn weighted_threshold_negatives_testnet_acceptance() {
     let weighted_only_rule_id = install_out.rule_id;
 
     // The weighted policy is not a simple-threshold policy, so the rule
-    // observes no threshold and the baseline records none.
+    // observes no threshold, and the refresh matches the install's baseline
+    // and records none.
     let baseline = signers_mgr
         .refresh_signer_baseline(
             smart_account_sc.clone(),
@@ -1710,6 +1709,11 @@ async fn weighted_threshold_negatives_testnet_acceptance() {
         )
         .await
         .expect("refresh_signer_baseline on a weighted-only rule must succeed");
+    assert_eq!(
+        baseline.previous_baseline,
+        PreviousBaseline::Matched,
+        "the refresh must match the install's baseline"
+    );
     let SignerSetView::V2(baseline_snapshot) = &baseline.view else {
         panic!(
             "refresh records a version-2 baseline; got {}",
@@ -2086,7 +2090,7 @@ async fn deploy_c_webauthn_genesis_and_batch_add_testnet_acceptance() {
             .expect("deployed smart-account C-strkey must parse");
 
     let (audit_writer, sm_audit_log_path, _audit_dir) = tmp_audit_writer();
-    let signers_mgr = fresh_signers_manager(audit_writer, sm_audit_log_path);
+    let signers_mgr = fresh_signers_manager(Arc::clone(&audit_writer), sm_audit_log_path);
     let genesis_signers = signers_mgr
         .get_rule_signers(webauthn_genesis_smart_account_sc, 0, None)
         .await
@@ -2146,7 +2150,7 @@ async fn deploy_c_webauthn_genesis_and_batch_add_testnet_acceptance() {
             .expect("simple-threshold policy C-strkey must parse");
 
     let admin_sc = parse_g_strkey_to_signer_address(&admin_g).expect("admin G-strkey must parse");
-    let rule_manager = fresh_rule_manager();
+    let rule_manager = fresh_rule_manager(&signers_mgr, &audit_writer);
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
         "batch-add-3kind".to_owned(), // 16 bytes
@@ -2173,19 +2177,22 @@ async fn deploy_c_webauthn_genesis_and_batch_add_testnet_acceptance() {
     let rule_id = install_out.rule_id;
 
     // `batch_add_signers` requires an established audit-log baseline
-    // (`SaError::SignerSetMissingBaseline` otherwise); a freshly-installed
-    // rule has none until `refresh_signer_baseline` writes the first
-    // `SaSignerSetBaselinedV2` row.
-    signers_mgr
-        .refresh_signer_baseline(
+    // (`SaError::SignerSetMissingBaseline` otherwise). The install recorded
+    // it through the same signers manager, so `list_signers` matches it.
+    let listed = signers_mgr
+        .list_signers(
             batch_smart_account_sc.clone(),
             rule_id,
             Some(&admin_g),
-            false,
             rid(),
         )
         .await
-        .expect("refresh_signer_baseline must succeed");
+        .expect("list_signers after the install must succeed");
+    assert_eq!(
+        listed.baseline,
+        PreviousBaseline::Matched,
+        "the install's baseline must match the chain"
+    );
 
     let (delegated_g, _delegated_signer) = fresh_signer();
     let delegated_scval =

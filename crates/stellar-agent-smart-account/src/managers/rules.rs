@@ -40,6 +40,7 @@ use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::AuditWriterHealthHandle;
 use stellar_agent_core::audit_log::reader::PinnedHashesRecord;
 use stellar_agent_core::audit_log::schema::ExecutableRefPin;
+use stellar_agent_core::audit_log::signer_set::{SignerIdentityV2, ThresholdObservation};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::{
     RedactedStrkey, redact_strkey_first5_last5, untrusted_display_bounded,
@@ -54,18 +55,20 @@ use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilde
 use stellar_rpc_client::Client;
 use stellar_xdr as xdr_curr;
 use stellar_xdr::{
-    BytesM, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Limits, Operation,
-    OperationBody, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry, ScString, ScSymbol, ScVal,
-    ScVec, SorobanAuthorizationEntry, SorobanCredentials, VecM, WriteXdr,
+    BytesM, ContractId, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Limits,
+    Operation, OperationBody, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry, ScString, ScSymbol,
+    ScVal, ScVec, SorobanAuthorizationEntry, SorobanCredentials, VecM, WriteXdr,
 };
 use tracing::warn;
 
 use crate::SaError;
-use crate::managers::signers::SignersManager;
+use crate::managers::signers::{ConfirmedThresholdChange, SignersManager};
 use crate::managers::verifiers::{
     PinnedKind, PlannedPinUpdate, pin_referenced_contracts, scaddress_cache_key,
 };
+use crate::signers::THRESHOLD_POLICY_WASM_HASHES;
 use crate::signing::divergence::AuthContextFingerprint;
+use crate::simple_threshold_policy::parse_simple_threshold_install_param;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Manager configuration
@@ -99,20 +102,22 @@ pub struct ContextRuleManagerConfig {
     pub timeout: Duration,
     /// CAIP-2 chain ID for audit-log entries (e.g. `stellar:testnet`).
     pub chain_id: String,
-    /// Optional [`SignersManager`] handle for per-operation divergence checks.
+    /// The [`SignersManager`] that observes rules through both RPC
+    /// endpoints, pins their contracts and records their signer-set state.
     ///
-    /// - `Some(arc)` — production path: `verify_signer_set_against_chain` is
-    ///   called for every `auth_rule_id` in the signing call's `auth_rule_ids`
-    ///   BEFORE submitting any transaction.  On any divergence error the
-    ///   operation is refused.  For `auth_rule_id == 0` (bootstrap rule) the
-    ///   check is skipped with a `warn!` log because the bootstrap rule has no
-    ///   threshold-policy by definition.
-    /// - `None` — test-only escape hatch: divergence check is skipped with a
-    ///   `warn!` log.  Production callers that have baseline rows SHOULD supply
-    ///   `Some(...)`. The escape hatch does not cover signing under a pinned
-    ///   rule: every mutating method authorized by a rule other than rule 0
-    ///   runs the pinned-hash drift check through this manager and refuses
-    ///   with [`SaError::SignersManagerNotConfigured`] when it is `None`.
+    /// With a manager, `verify_signer_set_against_chain` runs for every
+    /// non-zero `auth_rule_id` of a signing call before anything is
+    /// submitted, and any divergence refuses the operation. Rule 0, the
+    /// bootstrap rule, is exempt from the check.
+    ///
+    /// Without one, [`ContextRuleManager::install_rule`],
+    /// [`ContextRuleManager::simulate_install_rule`],
+    /// [`ContextRuleManager::add_policy`] and
+    /// [`ContextRuleManager::remove_policy`] refuse with
+    /// [`SaError::SignersManagerNotConfigured`] before any RPC, and so does
+    /// any submission authorized by a rule other than rule 0. The read verbs
+    /// run without one, and so do rename, expiry update and delete when rule
+    /// 0 alone authorizes them.
     pub signers_manager: Option<Arc<SignersManager>>,
     /// Optional shared audit writer supplied by higher-level handlers.
     pub audit_writer: Option<Arc<Mutex<AuditWriter>>>,
@@ -139,10 +144,11 @@ impl ContextRuleManagerConfig {
     /// Public constructor (the struct is `#[non_exhaustive]` so external
     /// crates cannot use struct-expression syntax).
     ///
-    /// Constructs a config with no divergence-check `signers_manager` and
+    /// Constructs a config with no `signers_manager` and
     /// `secondary_rpc_url = None`.  Use [`Self::with_signers_manager`] to
-    /// attach one, and [`Self::with_secondary_rpc_url`] to set the secondary
-    /// RPC URL for cross-RPC checks.
+    /// attach one, which rule install and the policy verbs require, and
+    /// [`Self::with_secondary_rpc_url`] to set the secondary RPC URL for
+    /// cross-RPC checks.
     #[must_use]
     pub fn new(
         primary_rpc_url: String,
@@ -172,10 +178,13 @@ impl ContextRuleManagerConfig {
         self
     }
 
-    /// Builder: attach a [`SignersManager`] for per-operation divergence
-    /// checks.
+    /// Builder: attach the [`SignersManager`] that checks, pins and records
+    /// the rules this manager signs under and changes.
     ///
     /// Returns `self` with `signers_manager` set, consuming the original.
+    /// Pass a manager that writes to the same audit writer as
+    /// [`Self::with_audit_writer`], so a rule's install rows and its
+    /// signer-set state rows land in one log.
     #[must_use]
     pub fn with_signers_manager(mut self, sm: Arc<SignersManager>) -> Self {
         self.signers_manager = Some(sm);
@@ -557,12 +566,59 @@ impl ContextRuleManager {
         );
     }
 
+    /// Writes the `SaRawInvocation` row of a refused or failed call: `err`'s
+    /// wire code, classified by [`sa_error_to_invocation_result`].
+    fn write_failure_row(
+        &self,
+        per_method: Option<&mut AuditWriter>,
+        smart_account_redacted: &str,
+        err: &SaError,
+        auth_rule_ids_count: u32,
+        request_id: &str,
+        op_label: &'static str,
+    ) {
+        let raw = AuditEntry::new_sa_raw_invocation(
+            smart_account_redacted,
+            err.wire_code(),
+            None,
+            auth_rule_ids_count,
+            sa_error_to_invocation_result(err),
+            &self.chain_id,
+            request_id,
+        );
+        self.write_audit_entry(per_method, raw, op_label);
+    }
+
+    /// Returns the configured signers manager, or the
+    /// [`SaError::SignersManagerNotConfigured`] refusal of an operation that
+    /// requires one, scoped to `rule_id` (`None` for an install).
+    fn require_signers_manager(
+        &self,
+        rule_id: Option<u32>,
+        smart_account_redacted: &str,
+        request_id: &str,
+    ) -> Result<&SignersManager, SaError> {
+        self.signers_manager
+            .as_deref()
+            .ok_or_else(|| SaError::SignersManagerNotConfigured {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                request_id: request_id.to_owned(),
+            })
+    }
+
     // ─── Divergence-check helper ──────────────────────────────────────────────
 
     /// Runs the per-signing divergence check for every `auth_rule_id` in
     /// `auth_rule_ids` BEFORE submitting any transaction.
     ///
-    /// - If `self.signers_manager` is `None`, logs `warn!` and returns `Ok(())`.
+    /// - If `self.signers_manager` is `None`, logs `warn!` and returns
+    ///   `Ok(())`. A manager without a signers manager serves rename, expiry
+    ///   update and delete authorized by rule 0 alone, which reach this
+    ///   check; [`Self::submit_signed_invoke`] refuses any other auth rule
+    ///   before signing.
     /// - If any `auth_rule_id == 0` (bootstrap rule), that rule is skipped with
     ///   `warn!` — the bootstrap rule has no threshold-policy by definition.
     /// - On any divergence error the check returns the `SaError` immediately;
@@ -588,9 +644,9 @@ impl ContextRuleManager {
         let Some(ref sm) = self.signers_manager else {
             warn!(
                 auth_rule_count = auth_rule_ids.len(),
-                "ContextRuleManager: signers_manager is None; \
-                 divergence check skipped (test-only escape hatch; \
-                 production callers SHOULD supply with_signers_manager)"
+                "ContextRuleManager: no signers manager; the divergence check covers \
+                 no auth rule, and a submission under a rule other than rule 0 refuses \
+                 before signing"
             );
             return Ok(());
         };
@@ -645,7 +701,8 @@ impl ContextRuleManager {
     }
 
     /// Installs a new context rule on the smart-account contract via OZ
-    /// `add_context_rule`. Returns the assigned `rule_id`.
+    /// `add_context_rule`, and records the confirmed rule as its signer-set
+    /// baseline. Returns the assigned `rule_id`.
     ///
     /// # Arguments
     ///
@@ -662,10 +719,10 @@ impl ContextRuleManager {
     /// - `signer` — the user's ed25519 signer. Must be a `Delegated` signer
     ///   registered in one of the `auth_rule_ids` rules. The same signer
     ///   pays the source-account envelope signature.
-    /// - `audit_writer` — optional audit-log handle. On success two rows
-    ///   emit (`SaContextRuleCreated` + `SaRawInvocation`); on failure one
-    ///   row emits (`SaRawInvocation`). `None` writes them through the
-    ///   manager's configured audit writer, if any.
+    /// - `audit_writer`: optional audit-log handle for the install's
+    ///   `SaContextRuleCreated` and `SaRawInvocation` rows. `None` writes them
+    ///   through the manager's configured audit writer, if any. The override
+    ///   and baseline rows go through the signers manager's writer.
     /// - `request_id` — caller-supplied UUID for forensic correlation across
     ///   every row the install writes.
     /// - `accept_mutable_verifier` — when `true`, mutable verifier / policy
@@ -678,6 +735,30 @@ impl ContextRuleManager {
     ///   instead.  Defaults to `false` (fail closed) in production.  The CLI
     ///   wires this via `--accept-unknown-verifier`.
     ///
+    /// # Sequence
+    ///
+    /// 1. Requires a signers manager: without one the install refuses with
+    ///    [`SaError::SignersManagerNotConfigured`], carrying no rule id,
+    ///    before any RPC.
+    /// 2. Runs the divergence check of every non-zero rule in
+    ///    `auth_rule_ids`.
+    /// 3. Pins every referenced verifier and policy contract.
+    /// 4. Derives the state the definition authorizes. The signers'
+    ///    version-2 identities are decoded from the bytes the submission
+    ///    carries. The threshold is the install parameter of the one policy
+    ///    whose pinned executable is the simple-threshold policy.
+    /// 5. Signs and submits `add_context_rule`.
+    /// 6. Reads the new rule's id from the confirmed return value and writes
+    ///    the override rows and the `SaContextRuleCreated` row.
+    /// 7. Observes the new rule through both endpoints, requires the
+    ///    authorized state and records it as a `SaSignerSetBaselinedV2` row
+    ///    with reason `confirmed_install`.
+    /// 8. Writes the `sa.ok` `SaRawInvocation` row.
+    ///
+    /// The pin record precedes the baseline because the rule exists on chain
+    /// whatever the baseline step returns. Every refusal writes one
+    /// `SaRawInvocation` row carrying its wire code.
+    ///
     /// # Override rows
     ///
     /// The override rows carry the installed rule's id and the install's
@@ -685,30 +766,40 @@ impl ContextRuleManager {
     /// writer after the install confirms, before the `SaContextRuleCreated`
     /// row. A refused install writes no override row: a refusal before
     /// submission leaves only the `PreSubmissionRefused` `SaRawInvocation`
-    /// row, which records no override flag.
+    /// row, which records no override flag. Neither is written when the
+    /// confirmed return value carries no rule id.
     ///
-    /// # Refusal path
+    /// # Statuses after confirmation
     ///
-    /// Returns [`SaError::RuleIdMismatch`] / [`SaError::SimulationDivergence`] /
-    /// [`SaError::AuthEntryConstructionFailed`] before any signing bytes are
-    /// produced when the pre-signing guards fire.  Returns
-    /// [`SaError::VerifierMutable`] / [`SaError::PolicyMutable`] /
-    /// [`SaError::ContractInstanceUnsupported`] /
-    /// [`SaError::VerifierWasmNotInAllowlist`] / [`SaError::PolicyWasmNotInAllowlist`]
-    /// when wasm-hash pinning rejects a referenced contract.
-    /// Returns [`SaError::DeploymentFailed`] (`phase = "submit"`) when the
-    /// on-chain submission is rejected.
+    /// The rule exists on chain in each of these cases, without a baseline:
+    ///
+    /// - [`SaError::InstallStateMismatch`] without a rule id: the return
+    ///   value did not carry the new rule's id, so no override row and no
+    ///   `SaContextRuleCreated` row is written.
+    /// - [`SaError::InstallStateMismatch`] with the rule id: the observed
+    ///   rule is not the definition.
+    /// - [`SaError::BaselineWriteFailed`] with the transaction hash: the rule
+    ///   was not observed (stage `observe`) or its baseline row was not
+    ///   written (stage `write`).
     ///
     /// # Errors
     ///
+    /// - [`SaError::SignersManagerNotConfigured`]: no signers manager is
+    ///   configured.
     /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
     ///   [`SaError::PinnedPolicyAbsent`] / [`SaError::PinCheckUnavailable`]:
     ///   the pinned-hash drift check of a non-zero rule in `auth_rule_ids`
     ///   refused before signing.
-    /// - [`SaError::SignersManagerNotConfigured`]: a non-zero rule in
-    ///   `auth_rule_ids` and no signers manager configured.
+    /// - [`SaError::SignerSetDiverged`] / [`SaError::SignerSetMissingBaseline`]:
+    ///   the divergence check of a non-zero rule in `auth_rule_ids` refused.
     /// - [`SaError::AuthEntryConstructionFailed`] — construction-time XDR
-    ///   encode failures or RPC simulate/prepare failures.
+    ///   encode failures, an `External` signer with empty or oversized key
+    ///   data, or RPC simulate/prepare failures.
+    /// - [`SaError::DeploymentFailed`] (`phase = "build"`): the definition
+    ///   names a policy address twice, or more than one of its policies is
+    ///   the simple-threshold policy.
+    /// - [`SaError::SimpleThresholdInstallRefused`]: the simple-threshold
+    ///   policy's install parameter is not a threshold the wallet can record.
     /// - [`SaError::RuleIdMismatch`] — `auth_rule_ids` count does not match
     ///   simulation auth-context count.
     /// - [`SaError::SimulationDivergence`] — caller-vs-envelope mismatch.
@@ -721,20 +812,9 @@ impl ContextRuleManager {
     /// - [`SaError::PolicyWasmNotInAllowlist`] — unknown policy hash, no override.
     /// - [`SaError::NetworkRpcDivergence`] — primary / secondary RPC disagree.
     /// - [`SaError::DeploymentFailed`] — submission or on-chain rejection.
-    ///
-    /// # Test-only escape hatch
-    ///
-    /// When `signers_manager` is `None`, the wasm-hash pin check is silently
-    /// skipped with a `warn!` log and an empty [`crate::managers::verifiers::PinResult`] is used.
-    /// Production callers MUST supply a `SignersManager` (wired via
-    /// [`ContextRuleManagerConfig::with_signers_manager`]); a CI gate enforces
-    /// that production callers always supply the manager.
-    /// This escape hatch exists only for unit tests that exercise `install_rule`
-    /// without spinning up a full manager stack.  Do NOT rely on it in
-    /// production code. It covers the install-time pin only: an install
-    /// authorized by any rule other than rule 0 runs the signing-time drift
-    /// check on that rule and is refused with
-    /// [`SaError::SignersManagerNotConfigured`] when no manager is configured.
+    /// - [`SaError::InstallStateMismatch`] / [`SaError::BaselineWriteFailed`]:
+    ///   the install confirmed and was not baselined; see "Statuses after
+    ///   confirmation".
     #[allow(
         clippy::too_many_arguments,
         reason = "irreducible auth-+rule-+signer-+observability+pin-flags arg set"
@@ -766,6 +846,21 @@ impl ContextRuleManager {
                     stage: "auth_payload",
                     redacted_reason: "auth_rule_ids count exceeds u32".to_owned(),
                 })?;
+
+        let sm = match self.require_signers_manager(None, &smart_account_redacted, &request_id) {
+            Ok(sm) => sm,
+            Err(e) => {
+                self.write_failure_row(
+                    audit_writer.as_deref_mut(),
+                    &smart_account_redacted,
+                    &e,
+                    auth_rule_ids_count,
+                    &request_id,
+                    "install_rule: SaRawInvocation (signers manager)",
+                );
+                return Err(e);
+            }
+        };
 
         // Per-operation divergence check BEFORE any signing or transaction submission.
         let source_account_strkey = signer
@@ -802,68 +897,56 @@ impl ContextRuleManager {
             return Err(e);
         }
 
-        // Wasm-hash pin check.
-        // Runs AFTER divergence check, BEFORE install_rule_inner submission.
-        // Identifies + verifies all verifier and policy contracts referenced
-        // by the rule definition.  Refuses mutable / unknown-wasm contracts
-        // unless the corresponding override flag is set; an applied override
-        // is returned pending and written once the install confirms.
-        //
-        // When signers_manager is None (test-only escape hatch), the pin check
-        // is skipped with a warn! log — same pattern as the divergence check.
-        // A CI gate enforces that production callers always supply signers_manager.
-        let pin_result = if let Some(ref sm) = self.signers_manager {
-            let pin = pin_referenced_contracts(
-                sm,
-                smart_account.clone(),
-                &smart_account_redacted,
-                &rule_definition,
-                None, // the rule has no on-chain id before install
-                &source_account_strkey,
-                accept_mutable_verifier,
-                accept_unknown_verifier,
-                request_id.clone(),
-            )
-            .await;
-            match pin {
-                Ok(r) => r,
-                Err(e) => {
-                    // Pin check refused: emit failure audit row and propagate.
-                    let raw = AuditEntry::new_sa_raw_invocation(
-                        &smart_account_redacted,
-                        e.wire_code(),
-                        None,
-                        auth_rule_ids_count,
-                        stellar_agent_core::audit_log::schema::SaInvocationResult::PreSubmissionRefused,
-                        &self.chain_id,
-                        &request_id,
-                    );
-                    self.write_audit_entry(
-                        audit_writer.as_deref_mut(),
-                        raw,
-                        "install_rule: SaRawInvocation (pin check)",
-                    );
-                    return Err(e);
-                }
-            }
-        } else {
-            warn!(
-                "ContextRuleManager: signers_manager is None; \
-                 wasm-hash pin check skipped (test-only escape hatch; \
-                 production callers MUST supply with_signers_manager)"
-            );
-            crate::managers::verifiers::PinResult {
-                pinned_verifier_wasm_hashes: vec![],
-                pinned_policy_wasm_hashes: vec![],
-                pinned_verifier_executable_refs: vec![],
-                pinned_policy_executable_refs: vec![],
-                mutable_override: false,
-                unknown_override: false,
-                pending_overrides: vec![],
+        // Wasm-hash pin check, after the divergence check and before the
+        // submission. Identifies and verifies every verifier and policy
+        // contract the definition references, and refuses mutable or
+        // unknown-wasm contracts unless the matching override flag is set.
+        // An applied override is returned pending and written once the
+        // install confirms.
+        let pin_result = match pin_referenced_contracts(
+            sm,
+            smart_account.clone(),
+            &smart_account_redacted,
+            &rule_definition,
+            None, // the rule has no on-chain id before install
+            &source_account_strkey,
+            accept_mutable_verifier,
+            accept_unknown_verifier,
+            request_id.clone(),
+        )
+        .await
+        {
+            Ok(pin_result) => pin_result,
+            Err(e) => {
+                self.write_failure_row(
+                    audit_writer.as_deref_mut(),
+                    &smart_account_redacted,
+                    &e,
+                    auth_rule_ids_count,
+                    &request_id,
+                    "install_rule: SaRawInvocation (pin check)",
+                );
+                return Err(e);
             }
         };
 
-        let outcome = self
+        let expected =
+            match expected_install_state(&rule_definition, &pin_result.pinned_policy_wasm_hashes) {
+                Ok(expected) => expected,
+                Err(e) => {
+                    self.write_failure_row(
+                        audit_writer.as_deref_mut(),
+                        &smart_account_redacted,
+                        &e,
+                        auth_rule_ids_count,
+                        &request_id,
+                        "install_rule: SaRawInvocation (expected state)",
+                    );
+                    return Err(e);
+                }
+            };
+
+        let submitted = match self
             .install_rule_inner(
                 smart_account.clone(),
                 &rule_definition,
@@ -871,78 +954,121 @@ impl ContextRuleManager {
                 signer,
                 &request_id,
             )
-            .await;
-
-        // Audit-log emission. Two-row pattern on success, one-row on failure;
-        // mirrors the deploy_smart_account convention.  Falls back to
-        // self.audit_writer when the per-method parameter is None (the
-        // production CLI pattern).
-        match &outcome {
-            Ok((rule_id, _tx_hash)) => {
-                if let Some(sm) = self.signers_manager.as_deref() {
-                    crate::managers::verifiers::write_pending_override_rows(
-                        sm,
-                        &smart_account_redacted,
-                        *rule_id,
-                        &request_id,
-                        &pin_result.pending_overrides,
-                    );
-                }
-                let created = pin_result.context_rule_created_entry(
-                    &smart_account_redacted,
-                    *rule_id,
-                    &rule_definition,
-                    &self.chain_id,
-                    &request_id,
-                );
-                self.write_audit_entry(
+            .await
+        {
+            Ok(submitted) => submitted,
+            Err(e) => {
+                self.write_failure_row(
                     audit_writer.as_deref_mut(),
-                    created,
-                    "install_rule: SaContextRuleCreated",
-                );
-                let raw = AuditEntry::new_sa_raw_invocation(
                     &smart_account_redacted,
-                    "sa.ok",
-                    Some(auth_digest_prefix_from_outcome(&outcome)),
+                    &e,
                     auth_rule_ids_count,
-                    stellar_agent_core::audit_log::schema::SaInvocationResult::Success,
-                    &self.chain_id,
                     &request_id,
-                );
-                self.write_audit_entry(
-                    audit_writer.as_deref_mut(),
-                    raw,
-                    "install_rule: SaRawInvocation",
-                );
-            }
-            Err(err) => {
-                let result = sa_error_to_invocation_result(err);
-                let raw = AuditEntry::new_sa_raw_invocation(
-                    &smart_account_redacted,
-                    err.wire_code(),
-                    None,
-                    auth_rule_ids_count,
-                    result,
-                    &self.chain_id,
-                    &request_id,
-                );
-                self.write_audit_entry(
-                    audit_writer.as_deref_mut(),
-                    raw,
                     "install_rule: SaRawInvocation (failure)",
                 );
+                return Err(e);
             }
+        };
+
+        let rule_id = match parse_context_rule_id_from_return(&submitted.return_val) {
+            Ok(rule_id) => rule_id,
+            Err(cause) => {
+                warn!(
+                    smart_account = %smart_account_redacted,
+                    tx_hash = %submitted.tx_hash,
+                    cause = %cause,
+                    "install_rule: the confirmed install's return value carries no rule id"
+                );
+                let e = SaError::InstallStateMismatch {
+                    rule_id: None,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted(
+                        &smart_account_redacted,
+                    ),
+                    tx_hash: submitted.tx_hash.clone(),
+                    request_id: request_id.clone(),
+                };
+                self.write_failure_row(
+                    audit_writer.as_deref_mut(),
+                    &smart_account_redacted,
+                    &e,
+                    auth_rule_ids_count,
+                    &request_id,
+                    "install_rule: SaRawInvocation (rule id)",
+                );
+                return Err(e);
+            }
+        };
+
+        // The rule is on chain: its pin record is written whatever the
+        // baseline step returns.
+        crate::managers::verifiers::write_pending_override_rows(
+            sm,
+            &smart_account_redacted,
+            rule_id,
+            &request_id,
+            &pin_result.pending_overrides,
+        );
+        let created = pin_result.context_rule_created_entry(
+            &smart_account_redacted,
+            rule_id,
+            &rule_definition,
+            &self.chain_id,
+            &request_id,
+        );
+        self.write_audit_entry(
+            audit_writer.as_deref_mut(),
+            created,
+            "install_rule: SaContextRuleCreated",
+        );
+
+        let baselined = sm
+            .baseline_confirmed_install(
+                &smart_account,
+                &smart_account_strkey,
+                &smart_account_redacted,
+                rule_id,
+                &expected,
+                &submitted,
+                &source_account_strkey,
+                &request_id,
+            )
+            .await;
+        if let Err(e) = baselined {
+            self.write_failure_row(
+                audit_writer.as_deref_mut(),
+                &smart_account_redacted,
+                &e,
+                auth_rule_ids_count,
+                &request_id,
+                "install_rule: SaRawInvocation (baseline)",
+            );
+            return Err(e);
         }
 
-        outcome.map(|(rule_id, tx_hash)| InstallRuleOutput {
+        let raw = AuditEntry::new_sa_raw_invocation(
+            &smart_account_redacted,
+            "sa.ok",
+            Some(auth_digest_prefix_from_outcome(&baselined)),
+            auth_rule_ids_count,
+            stellar_agent_core::audit_log::schema::SaInvocationResult::Success,
+            &self.chain_id,
+            &request_id,
+        );
+        self.write_audit_entry(
+            audit_writer.as_deref_mut(),
+            raw,
+            "install_rule: SaRawInvocation",
+        );
+
+        Ok(InstallRuleOutput {
             rule_id,
-            tx_hash,
+            tx_hash: submitted.tx_hash,
             pin_result,
         })
     }
 
-    /// Inner install_rule implementation. Returns the new rule's `rule_id`
-    /// from the on-chain return value.
+    /// Inner install_rule implementation: signs and submits
+    /// `add_context_rule` and returns the confirmed submission.
     ///
     /// When `rule_definition.valid_until` is `Some`, passes a
     /// [`HorizonCheck`] to `submit_signed_invoke` so the horizon cap is
@@ -955,7 +1081,7 @@ impl ContextRuleManager {
         auth_rule_ids: &[ContextRuleId],
         signer: &(dyn Signer + Send + Sync),
         request_id: &str,
-    ) -> Result<(u32, String), SaError> {
+    ) -> Result<crate::submit::SubmitInvokeResult, SaError> {
         let invoke_args = build_add_context_rule_args(rule_definition)?;
         // Resolve the effective horizon cap from config.  `None` in config
         // means "use the default".  The check is skipped when `valid_until`
@@ -967,31 +1093,33 @@ impl ContextRuleManager {
                 .unwrap_or(DEFAULT_SESSION_RULE_HORIZON_LEDGERS),
             rule_id_or_pending: None, // install path — rule not yet created
         });
-        let result = self
-            .submit_signed_invoke(
-                smart_account,
-                "add_context_rule",
-                invoke_args,
-                auth_rule_ids,
-                signer,
-                "install_rule",
-                horizon_check,
-                None, // no expiry check: rule not yet created, no rule_id to check
-                request_id,
-            )
-            .await?;
-        let rule_id = parse_context_rule_id_from_return(&result.return_val)?;
-        Ok((rule_id, result.tx_hash))
+        self.submit_signed_invoke(
+            smart_account,
+            "add_context_rule",
+            invoke_args,
+            auth_rule_ids,
+            signer,
+            "install_rule",
+            horizon_check,
+            None, // no expiry check: rule not yet created, no rule_id to check
+            request_id,
+        )
+        .await
     }
 
     /// Simulates an `add_context_rule` installation WITHOUT signing or
     /// submitting — the propose-time seam for agent-proposed context rules
     /// (Package D, GH issue #8).
     ///
-    /// Runs the SAME wasm-hash pin check [`Self::install_rule`] runs
-    /// ([`pin_referenced_contracts`]) and builds the SAME `add_context_rule`
-    /// invoke args via `build_add_context_rule_args`, then simulates via
-    /// the crate's no-signature recording-auth simulate primitive
+    /// Requires a signers manager, as [`Self::install_rule`] does, then runs
+    /// the SAME wasm-hash pin check ([`pin_referenced_contracts`]) and the
+    /// SAME derivation of the authorized state. A definition that names a
+    /// policy address twice, attaches the simple-threshold policy more than
+    /// once or carries an install parameter the wallet cannot record
+    /// therefore refuses at proposal time. It then builds the SAME
+    /// `add_context_rule` invoke args via `build_add_context_rule_args` and
+    /// simulates via the crate's
+    /// no-signature recording-auth simulate primitive
     /// (`managers::signers::simulate_read_only_with_ledger`). Soroban's
     /// recording auth mode returns the auth requirements for a
     /// `require_auth` entrypoint without needing a pre-signed auth entry —
@@ -1026,16 +1154,16 @@ impl ContextRuleManager {
     /// # Errors
     ///
     /// Same error surface as `install_rule`'s pre-submission checks:
-    /// [`SaError::VerifierMutable`] / [`SaError::PolicyMutable`] /
-    /// [`SaError::ContractInstanceUnsupported`] /
-    /// [`SaError::VerifierWasmNotInAllowlist`] / [`SaError::PolicyWasmNotInAllowlist`]
-    /// from the pin check; [`SaError::DeploymentFailed`] (`phase = "simulate"`)
-    /// on an RPC or simulate-transaction error.
-    ///
-    /// # Test-only escape hatch
-    ///
-    /// Same as `install_rule`: when `signers_manager` is `None`, the
-    /// wasm-hash pin check is skipped with a `warn!` log.
+    /// [`SaError::SignersManagerNotConfigured`] (no rule id) before any RPC
+    /// without a signers manager; [`SaError::VerifierMutable`] /
+    /// [`SaError::PolicyMutable`] / [`SaError::ContractInstanceUnsupported`] /
+    /// [`SaError::VerifierWasmNotInAllowlist`] /
+    /// [`SaError::PolicyWasmNotInAllowlist`] from the pin check;
+    /// [`SaError::DeploymentFailed`] (`phase = "build"`),
+    /// [`SaError::SimpleThresholdInstallRefused`] and
+    /// [`SaError::AuthEntryConstructionFailed`] from the derivation of the
+    /// authorized state; [`SaError::DeploymentFailed`]
+    /// (`phase = "simulate"`) on an RPC or simulate-transaction error.
     pub async fn simulate_install_rule(
         &self,
         smart_account: ScAddress,
@@ -1048,35 +1176,20 @@ impl ContextRuleManager {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
-        let pin_result = if let Some(ref sm) = self.signers_manager {
-            pin_referenced_contracts(
-                sm,
-                smart_account.clone(),
-                &smart_account_redacted,
-                &rule_definition,
-                None, // the rule has no on-chain id before install
-                source_account_strkey,
-                accept_mutable_verifier,
-                accept_unknown_verifier,
-                request_id.clone(),
-            )
-            .await?
-        } else {
-            warn!(
-                "ContextRuleManager: signers_manager is None; \
-                 wasm-hash pin check skipped (test-only escape hatch; \
-                 production callers MUST supply with_signers_manager)"
-            );
-            crate::managers::verifiers::PinResult {
-                pinned_verifier_wasm_hashes: vec![],
-                pinned_policy_wasm_hashes: vec![],
-                pinned_verifier_executable_refs: vec![],
-                pinned_policy_executable_refs: vec![],
-                mutable_override: false,
-                unknown_override: false,
-                pending_overrides: vec![],
-            }
-        };
+        let sm = self.require_signers_manager(None, &smart_account_redacted, &request_id)?;
+        let pin_result = pin_referenced_contracts(
+            sm,
+            smart_account.clone(),
+            &smart_account_redacted,
+            &rule_definition,
+            None, // the rule has no on-chain id before install
+            source_account_strkey,
+            accept_mutable_verifier,
+            accept_unknown_verifier,
+            request_id.clone(),
+        )
+        .await?;
+        expected_install_state(&rule_definition, &pin_result.pinned_policy_wasm_hashes)?;
 
         let invoke_args = build_add_context_rule_args(&rule_definition)?;
 
@@ -1569,9 +1682,10 @@ impl ContextRuleManager {
     /// - `smart_account` — smart-account contract [`ScAddress`].
     /// - `rule_id` — target context rule ID.
     /// - `policy_address` — policy contract [`ScAddress`].
-    /// - `install_param` — caller-supplied install parameter [`ScVal`]; the
-    ///   wallet passes this through unvalidated (raw passthrough per operator
-    ///   decision).
+    /// - `install_param`: caller-supplied install parameter [`ScVal`],
+    ///   passed through to the policy's `install`. For the simple-threshold
+    ///   policy it must be the threshold map the wallet records; see
+    ///   "Simple-threshold policy".
     /// - `auth_rule_ids` — context-rule IDs under which this call is
     ///   authorised.
     /// - `signer` — signing key for both the SA auth-entry and the
@@ -1582,13 +1696,41 @@ impl ContextRuleManager {
     ///   `rules create` takes, applied to the policy when it is pinned under
     ///   "Pin record".
     ///
+    /// # Sequence
+    ///
+    /// The add requires a signers manager and refuses without one before any
+    /// RPC. It then runs the divergence check of every non-zero rule in
+    /// `auth_rule_ids`, and observes the policy's executable through both
+    /// RPC endpoints to decide whether it is the simple-threshold policy.
+    ///
+    /// # Simple-threshold policy
+    ///
+    /// When the policy's executable is the simple-threshold policy, the
+    /// attach also records the threshold it sets, through the signers
+    /// manager:
+    ///
+    /// - `install_param` must be the `{ threshold: u32 }` map with a
+    ///   non-zero threshold, else [`SaError::SimpleThresholdInstallRefused`]
+    ///   before anything is signed;
+    /// - the rule needs a version-2 signer-set state row that matches the
+    ///   chain (`signers list` records one), and must have no
+    ///   simple-threshold policy yet;
+    /// - after confirmation the signers must be unchanged and the threshold
+    ///   the parameter's, which a `SaThresholdChangedV2` row records before
+    ///   the `SaPolicyAdded` row.
+    ///
+    /// A confirmed attach whose threshold is not recorded returns the
+    /// recording's refusal, and the `SaPolicyAdded` and pin rows are still
+    /// written, since the policy is attached on chain. Any other policy is
+    /// attached without a state row.
+    ///
     /// # Pin record
     ///
-    /// When the manager has a signers manager and the rule has a pin record
-    /// (the newest `SaContextRuleCreated` or `SaContextRulePinsUpdated`
-    /// row), the add keeps the record in step with the rule's live policy
-    /// set, so the signing-time drift check neither refuses the rule the
-    /// wallet itself changed nor leaves the new policy unchecked:
+    /// When the rule has a pin record (the newest `SaContextRuleCreated` or
+    /// `SaContextRulePinsUpdated` row), the add keeps the record in step with
+    /// the rule's live policy set, so the signing-time drift check neither
+    /// refuses the rule the wallet itself changed nor leaves the new policy
+    /// unchecked:
     ///
     /// - before submission, a policy address not already live on the rule is
     ///   identified and probed with the checks rule install applies: a hash
@@ -1613,24 +1755,49 @@ impl ContextRuleManager {
     /// installed with two policies. A rule without a pin record stays
     /// unpinned: nothing is probed and no row is written.
     ///
+    /// # Rows
+    ///
+    /// A confirmed add writes, in order: the `SaThresholdChangedV2` row (the
+    /// simple-threshold policy only), the `SaPolicyAdded` row, the
+    /// `SaRawInvocation` row (`sa.ok`, or the recording's refusal), the
+    /// override rows and the `SaContextRulePinsUpdated` row. A confirmed add
+    /// whose return value carries no policy id writes no `SaPolicyAdded` row
+    /// and returns [`SaError::BaselineWriteFailed`] at stage `observe` with
+    /// the transaction hash; its pin rows are written. An add that does not
+    /// confirm writes one `SaRawInvocation` row.
+    ///
     /// # Errors
     ///
+    /// - [`SaError::SignersManagerNotConfigured`]: no signers manager is
+    ///   configured; the refusal names `rule_id`.
     /// - [`SaError::PolicyWasmNotInAllowlist`] / [`SaError::PolicyMutable`] /
     ///   [`SaError::ContractInstanceUnsupported`]: the policy of a pinned
-    ///   rule was refused under "Pin record".
+    ///   rule was refused under "Pin record", or its executable could not be
+    ///   observed.
     /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
     ///   [`SaError::PinnedPolicyAbsent`] / [`SaError::PinCheckUnavailable`]:
     ///   the pinned-hash drift check of a non-zero rule in `auth_rule_ids`
     ///   refused before signing.
-    /// - [`SaError::SignersManagerNotConfigured`]: a non-zero rule in
-    ///   `auth_rule_ids` and no signers manager configured.
-    /// - [`SaError::AuthEntryConstructionFailed`] — transport/XDR failure.
-    /// - [`SaError::DeploymentFailed`] — simulate or submit failure.
+    /// - [`SaError::SimpleThresholdInstallRefused`],
+    ///   [`SaError::SignerSetMissingBaseline`],
+    ///   [`SaError::SignerSetBaselineLegacy`],
+    ///   [`SaError::SignerSetDiverged`] and
+    ///   [`SaError::ThresholdPolicyIdentificationFailed`]: the
+    ///   simple-threshold attach refused before submission.
+    /// - [`SaError::BaselineWriteFailed`] / [`SaError::SignerSetDiverged`]
+    ///   with the transaction hash: the simple-threshold attach confirmed and
+    ///   its threshold was not recorded, or (stage `observe`) any attach
+    ///   confirmed with a return value that carries no policy id.
+    /// - [`SaError::NetworkRpcDivergence`]: the two endpoints disagree on the
+    ///   policy's executable.
+    /// - [`SaError::AuthEntryConstructionFailed`]: transport/XDR failure.
+    /// - [`SaError::DeploymentFailed`]: simulate or submit failure.
     ///   On simulate failure the `redacted_reason` is augmented with the OZ
     ///   symbolic error name via `augment_with_oz_error_name`; notably
     ///   `TooManyPolicies = 3011` (the on-chain defence for a bypassed CLI cap),
     ///   or the pinned rule's policies could not be read.
-    /// - [`SaError::AuditLog`]: the pin record could not be read.
+    /// - [`SaError::AuditLog`]: the pin record or the state row could not be
+    ///   read.
     #[allow(
         clippy::too_many_arguments,
         reason = "irreducible auth-+rule-+signer-+observability arg set; \
@@ -1668,6 +1835,23 @@ impl ContextRuleManager {
                     redacted_reason: "auth_rule_ids count exceeds u32".to_owned(),
                 })?;
 
+        let sm =
+            match self.require_signers_manager(Some(rule_id), &smart_account_redacted, &request_id)
+            {
+                Ok(sm) => sm,
+                Err(e) => {
+                    self.write_failure_row(
+                        audit_writer.as_deref_mut(),
+                        &smart_account_redacted,
+                        &e,
+                        auth_rule_ids_count,
+                        &request_id,
+                        "add_policy: SaRawInvocation (signers manager)",
+                    );
+                    return Err(e);
+                }
+            };
+
         // Per-operation divergence check.
         let source_account_strkey = signer
             .public_key()
@@ -1701,56 +1885,75 @@ impl ContextRuleManager {
         }
 
         let outcome = self
-            .add_policy_inner(
-                smart_account.clone(),
+            .add_policy_confirmed(
+                sm,
+                &smart_account,
+                &smart_account_strkey,
+                &smart_account_redacted,
                 rule_id,
-                policy_address.clone(),
+                &policy_address,
                 install_param,
                 &auth_rule_ids,
                 signer,
+                &source_account_strkey,
                 &request_id,
-                accept_mutable_verifier,
-                accept_unknown_verifier,
+                PolicyPinOverrides {
+                    accept_mutable_verifier,
+                    accept_unknown_verifier,
+                },
             )
             .await;
 
-        // Typed audit emission on success; raw invocation row on failure.
-        // Falls back to self.audit_writer when the per-method parameter is None
-        // (the production CLI pattern).
+        // A confirmed add writes its policy row, its raw row, its override
+        // rows and its pins row, whatever the recording returned. Falls back
+        // to self.audit_writer when the per-method parameter is None (the
+        // production CLI pattern).
         match &outcome {
-            Ok((policy_id, tx_hash, pin_update)) => {
-                let tx_hash_redacted = stellar_agent_network::redact_tx_hash(tx_hash);
-                let policy_added = AuditEntry::new_sa_policy_added(
-                    rule_id,
-                    *policy_id,
-                    RedactedStrkey::from_already_redacted(&policy_address_redacted),
-                    &tx_hash_redacted,
-                    RedactedStrkey::from_already_redacted(&smart_account_redacted),
-                    &self.chain_id,
-                    &request_id,
-                );
-                self.write_audit_entry(
-                    audit_writer.as_deref_mut(),
-                    policy_added,
-                    "add_policy: SaPolicyAdded",
-                );
-                let raw = AuditEntry::new_sa_raw_invocation(
-                    &smart_account_redacted,
-                    "sa.ok",
-                    Some(auth_digest_prefix_from_outcome(&outcome)),
-                    auth_rule_ids_count,
-                    stellar_agent_core::audit_log::schema::SaInvocationResult::Success,
-                    &self.chain_id,
-                    &request_id,
-                );
-                self.write_audit_entry(
-                    audit_writer.as_deref_mut(),
-                    raw,
-                    "add_policy: SaRawInvocation",
-                );
-                if let (Some(update), Some(sm)) =
-                    (pin_update.as_ref(), self.signers_manager.as_deref())
-                {
+            Ok(confirmed) => {
+                let tx_hash_redacted = stellar_agent_network::redact_tx_hash(&confirmed.tx_hash);
+                if let Some(policy_id) = confirmed.policy_id {
+                    let policy_added = AuditEntry::new_sa_policy_added(
+                        rule_id,
+                        policy_id,
+                        RedactedStrkey::from_already_redacted(&policy_address_redacted),
+                        &tx_hash_redacted,
+                        RedactedStrkey::from_already_redacted(&smart_account_redacted),
+                        &self.chain_id,
+                        &request_id,
+                    );
+                    self.write_audit_entry(
+                        audit_writer.as_deref_mut(),
+                        policy_added,
+                        "add_policy: SaPolicyAdded",
+                    );
+                }
+                match &confirmed.result {
+                    Ok(_) => {
+                        let raw = AuditEntry::new_sa_raw_invocation(
+                            &smart_account_redacted,
+                            "sa.ok",
+                            Some(auth_digest_prefix_from_outcome(&confirmed.result)),
+                            auth_rule_ids_count,
+                            stellar_agent_core::audit_log::schema::SaInvocationResult::Success,
+                            &self.chain_id,
+                            &request_id,
+                        );
+                        self.write_audit_entry(
+                            audit_writer.as_deref_mut(),
+                            raw,
+                            "add_policy: SaRawInvocation",
+                        );
+                    }
+                    Err(err) => self.write_failure_row(
+                        audit_writer.as_deref_mut(),
+                        &smart_account_redacted,
+                        err,
+                        auth_rule_ids_count,
+                        &request_id,
+                        "add_policy: SaRawInvocation (recording)",
+                    ),
+                }
+                if let Some(update) = confirmed.pin_update.as_ref() {
                     crate::managers::verifiers::write_pending_override_rows(
                         sm,
                         &smart_account_redacted,
@@ -1759,73 +1962,91 @@ impl ContextRuleManager {
                         &update.pending_overrides,
                     );
                 }
-                self.write_policy_pins_updated_row(
-                    pin_update.as_ref().map(|update| &update.record),
+                write_policy_pins_updated_row(
+                    sm,
+                    confirmed.pin_update.as_ref().map(|update| &update.record),
                     &smart_account_redacted,
                     rule_id,
                     stellar_agent_core::audit_log::schema::PinsUpdateReason::PolicyAdded,
                     &request_id,
                 );
             }
-            Err(err) => {
-                let result = sa_error_to_invocation_result(err);
-                let raw = AuditEntry::new_sa_raw_invocation(
-                    &smart_account_redacted,
-                    err.wire_code(),
-                    None,
-                    auth_rule_ids_count,
-                    result,
-                    &self.chain_id,
-                    &request_id,
-                );
-                self.write_audit_entry(
-                    audit_writer.as_deref_mut(),
-                    raw,
-                    "add_policy: SaRawInvocation (failure)",
-                );
-            }
+            Err(err) => self.write_failure_row(
+                audit_writer.as_deref_mut(),
+                &smart_account_redacted,
+                err,
+                auth_rule_ids_count,
+                &request_id,
+                "add_policy: SaRawInvocation (failure)",
+            ),
         }
 
-        outcome.map(|(policy_id, _tx_hash, _pin_update)| policy_id)
+        outcome?.result
     }
 
-    /// Returns `(policy_id, tx_hash, pin_record_to_write)`.
-    #[allow(clippy::too_many_arguments, reason = "irreducible inner arg set")]
-    async fn add_policy_inner(
+    /// Observes the policy's executable, then attaches the policy: through
+    /// [`SignersManager::attach_threshold_policy`] when it is the
+    /// simple-threshold policy, otherwise directly. `Err` when the call
+    /// returned before a confirmation; nothing was recorded. `Ok` once the
+    /// add confirmed, whatever the steps after the confirmation returned: a
+    /// return value that is not a `u32` gives no policy id and a
+    /// stage-`observe` result on both paths, and the pin update stands.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the signers manager, the account identity, the rule, the policy and its \
+                  parameter, the authorization, the source account and the correlation id"
+    )]
+    async fn add_policy_confirmed(
         &self,
-        smart_account: ScAddress,
+        sm: &SignersManager,
+        smart_account: &ScAddress,
+        smart_account_strkey: &str,
+        smart_account_redacted: &str,
         rule_id: u32,
-        policy_address: ScAddress,
-        install_param: stellar_xdr::ScVal,
+        policy_address: &ScAddress,
+        install_param: ScVal,
         auth_rule_ids: &[ContextRuleId],
         signer: &(dyn Signer + Send + Sync),
+        source_account_strkey: &str,
         request_id: &str,
-        accept_mutable_verifier: bool,
-        accept_unknown_verifier: bool,
-    ) -> Result<(u32, String, Option<PlannedPinUpdate>), SaError> {
-        let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
-            stage: "auth_payload",
-            redacted_reason: reason,
+        overrides: PolicyPinOverrides,
+    ) -> Result<PolicyAddConfirmed, SaError> {
+        let observation = sm
+            .observe_contract(
+                policy_address,
+                stellar_agent_core::audit_log::schema::ContractKind::Policy,
+                |hash| THRESHOLD_POLICY_WASM_HASHES.contains(hash),
+                Some(rule_id),
+                smart_account_redacted,
+                request_id,
+            )
+            .await?;
+        let expected_threshold = if observation.allowlisted {
+            Some(parse_simple_threshold_install_param(&install_param)?)
+        } else {
+            None
         };
 
         let pin_update = self
             .plan_policy_add_pin_update(
-                &smart_account,
+                sm,
+                smart_account,
                 rule_id,
-                &policy_address,
-                accept_mutable_verifier,
-                accept_unknown_verifier,
+                policy_address,
+                overrides.accept_mutable_verifier,
+                overrides.accept_unknown_verifier,
                 request_id,
             )
             .await?;
-
-        // Encode policy ScAddress as ScVal::Address for the invoke args.
-        let policy_scval = ScVal::Address(policy_address);
-
-        let invoke_args = vec![ScVal::U32(rule_id), policy_scval, install_param];
-        let result = self
-            .submit_signed_invoke(
-                smart_account,
+        let invoke_args = vec![
+            ScVal::U32(rule_id),
+            ScVal::Address(policy_address.clone()),
+            install_param,
+        ];
+        let target = smart_account.clone();
+        let submit = move || {
+            self.submit_signed_invoke(
+                target,
                 "add_policy",
                 invoke_args,
                 auth_rule_ids,
@@ -1838,18 +2059,86 @@ impl ContextRuleManager {
                 Some(ExpiryCheck { rule_id }),
                 request_id,
             )
-            .await?;
+        };
 
-        // OZ `add_policy` returns `u32` (the assigned policy_id) per
-        // `mod.rs:440` + `storage.rs:1143` SHA `a9c4216`.
-        match result.return_val {
-            ScVal::U32(policy_id) => Ok((policy_id, result.tx_hash, pin_update)),
-            other => Err(auth_payload_err(format!(
-                "add_policy return value is not ScVal::U32 (got {}); \
-                 expected u32 policy_id per OZ mod.rs:440 SHA a9c4216",
-                scval_variant_name(&other)
-            ))),
-        }
+        let Some(expected_threshold) = expected_threshold else {
+            let submitted = submit().await?;
+            // OZ `add_policy` returns `u32` (the assigned policy_id) per
+            // `mod.rs:440` + `storage.rs:1143` SHA `a9c4216`. The transaction
+            // confirmed whatever the return value is, so a value without a
+            // policy id is a stage-`observe` result beside the pin update.
+            let (policy_id, result) = match submitted.return_val {
+                ScVal::U32(policy_id) => (Some(policy_id), Ok(policy_id)),
+                ref other => {
+                    let cause = SaError::AuthEntryConstructionFailed {
+                        stage: "auth_payload",
+                        redacted_reason: format!(
+                            "add_policy return value is not ScVal::U32 (got {}); \
+                             expected u32 policy_id per OZ mod.rs:440 SHA a9c4216",
+                            scval_variant_name(other)
+                        ),
+                    };
+                    (
+                        None,
+                        Err(crate::managers::signers::observe_failed_after(
+                            rule_id,
+                            smart_account_redacted,
+                            &submitted.tx_hash,
+                            &cause,
+                            request_id,
+                        )),
+                    )
+                }
+            };
+            return Ok(PolicyAddConfirmed {
+                policy_id,
+                tx_hash: submitted.tx_hash,
+                pin_update,
+                result,
+            });
+        };
+
+        let ConfirmedThresholdChange {
+            submitted,
+            parsed,
+            recorded,
+        } = sm
+            .attach_threshold_policy(
+                smart_account,
+                smart_account_strkey,
+                smart_account_redacted,
+                rule_id,
+                policy_address,
+                expected_threshold,
+                Some(source_account_strkey),
+                submit,
+                request_id,
+            )
+            .await?;
+        let result = match (parsed, recorded) {
+            (Some(policy_id), Ok(())) => Ok(policy_id),
+            (_, Err(e)) => Err(e),
+            // The entry reports a return value with no policy id as a
+            // stage-observe refusal; this arm keeps the verb's result an
+            // error if it ever reports it as recorded.
+            (None, Ok(())) => Err(crate::managers::signers::observe_failed_after(
+                rule_id,
+                smart_account_redacted,
+                &submitted.tx_hash,
+                &SaError::DeploymentFailed {
+                    phase: "simulate",
+                    redacted_reason: "add_policy: the confirmed return value carries no policy id"
+                        .to_owned(),
+                },
+                request_id,
+            )),
+        };
+        Ok(PolicyAddConfirmed {
+            policy_id: parsed,
+            tx_hash: submitted.tx_hash,
+            pin_update,
+            result,
+        })
     }
 
     /// Removes a policy from an existing context rule via OZ `remove_policy`.
@@ -1871,41 +2160,92 @@ impl ContextRuleManager {
     /// - `audit_writer` — optional per-invocation [`AuditWriter`].
     /// - `request_id` — UUID for forensic correlation.
     ///
+    /// # Sequence
+    ///
+    /// The removal requires a signers manager and refuses without one before
+    /// any RPC. It then runs the divergence check of every non-zero rule in
+    /// `auth_rule_ids` and reads the rule to resolve `policy_id` to its
+    /// address. It observes the policy's executable through both RPC
+    /// endpoints to decide whether it is the simple-threshold policy. A
+    /// missing rule and a policy id the rule does not hold each refuse before
+    /// submission.
+    ///
+    /// # Simple-threshold policy
+    ///
+    /// When the policy's executable is the simple-threshold policy, the
+    /// detach also records the threshold change, through the signers
+    /// manager:
+    ///
+    /// - the rule needs a version-2 signer-set state row that matches the
+    ///   chain, and its observed simple-threshold policy must be the
+    ///   removed one;
+    /// - after confirmation the signers must be unchanged and the threshold
+    ///   gone, which a `SaThresholdChangedV2` row records before the
+    ///   `SaPolicyRemoved` row.
+    ///
+    /// A rule with two simple-threshold policies cannot be observed, so no
+    /// other verb works on it. Detaching one of the two is accepted when the
+    /// rule has a version-2 signer-set state row, recorded before the second
+    /// policy was attached: the rule's signers must equal the row's before
+    /// submission, and after confirmation the remaining policy's threshold is
+    /// recorded. Such a rule with no state row refuses with
+    /// [`SaError::SignerSetMissingBaseline`]; it can only be deleted under
+    /// rule 0. A rule with three or more refuses. A confirmed detach whose
+    /// threshold change is not recorded returns the recording's refusal, and
+    /// the `SaPolicyRemoved` and pin rows are still written.
+    ///
     /// # Pin record
     ///
-    /// When the manager has a signers manager and the rule has a pin record,
-    /// the removal keeps the record in step with the rule's live policy set.
-    /// Before submission the policy id is resolved to its address from the
-    /// on-chain rule and the policy's executable is observed; after the
-    /// removal confirms, the first policy pin equal to the observed hash, and
-    /// its aligned executable-reference pin, are removed and a
-    /// `SaContextRulePinsUpdated` row (reason `policy_removed`) records the
-    /// rest. When the policy is the rule's only policy and the record holds
-    /// one policy pin, that pin is removed even when no pin equals the
-    /// observed hash or the observation fails: the pin can only be the
-    /// removed policy's, and the rule ends with no policy and no policy pin,
-    /// so a later `add_policy` pins its policy afresh. Otherwise, when no pin
-    /// equals the observed hash or the observation fails, nothing is written;
-    /// a record with two or more policy pins is refused by every checked
-    /// signing verb whatever it holds. Removing the last policy under such a
-    /// record leaves the rule refused with [`SaError::PinnedPolicyAbsent`]
-    /// until an `add_policy` authorized under rule 0 re-pins a policy or the
-    /// rule is reinstalled. An observation that fails does not stop the
-    /// removal, which is how an unreadable policy is detached.
+    /// When the rule has a pin record, the removal keeps the record in step
+    /// with the rule's live policy set. Before submission the policy's
+    /// executable is observed; after the removal confirms, the first policy
+    /// pin equal to the observed hash, and its aligned executable-reference
+    /// pin, are removed and a `SaContextRulePinsUpdated` row (reason
+    /// `policy_removed`) records the rest. When the policy is the rule's only
+    /// policy and the record holds one policy pin, that pin is removed even
+    /// when no pin equals the observed hash or the observation fails: the pin
+    /// can only be the removed policy's, and the rule ends with no policy and
+    /// no policy pin, so a later `add_policy` pins its policy afresh.
+    /// Otherwise, when no pin equals the observed hash or the observation
+    /// fails, nothing is written; a record with two or more policy pins is
+    /// refused by every checked signing verb whatever it holds. Removing the
+    /// last policy under such a record leaves the rule refused with
+    /// [`SaError::PinnedPolicyAbsent`] until an `add_policy` authorized under
+    /// rule 0 re-pins a policy or the rule is reinstalled.
+    ///
+    /// # Rows
+    ///
+    /// A confirmed removal writes, in order: the `SaThresholdChangedV2` row
+    /// (the simple-threshold policy only), the `SaPolicyRemoved` row, the
+    /// `SaRawInvocation` row (`sa.ok`, or the recording's refusal) and the
+    /// `SaContextRulePinsUpdated` row. A removal that does not confirm writes
+    /// one `SaRawInvocation` row.
     ///
     /// # Errors
     ///
+    /// - [`SaError::SignersManagerNotConfigured`]: no signers manager is
+    ///   configured; the refusal names `rule_id`.
     /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
     ///   [`SaError::PinnedPolicyAbsent`] / [`SaError::PinCheckUnavailable`]:
     ///   the pinned-hash drift check of a non-zero rule in `auth_rule_ids`
     ///   refused before signing.
-    /// - [`SaError::SignersManagerNotConfigured`]: a non-zero rule in
-    ///   `auth_rule_ids` and no signers manager configured.
-    /// - [`SaError::AuthEntryConstructionFailed`] — transport/XDR failure.
-    /// - [`SaError::DeploymentFailed`] — simulate or submit failure, including
-    ///   `PolicyNotFound = 3008` when the policy is not attached to the rule,
-    ///   or the pinned rule could not be read to resolve the policy id.
-    /// - [`SaError::AuditLog`]: the pin record could not be read.
+    /// - [`SaError::DeploymentFailed`] (`phase = "simulate"`): the rule is not
+    ///   found, the rule holds no policy `policy_id`, or a read failed.
+    /// - [`SaError::ContractInstanceUnsupported`] /
+    ///   [`SaError::NetworkRpcDivergence`]: the policy's executable could not
+    ///   be observed.
+    /// - [`SaError::SignerSetMissingBaseline`],
+    ///   [`SaError::SignerSetBaselineLegacy`],
+    ///   [`SaError::SignerSetDiverged`] and
+    ///   [`SaError::ThresholdPolicyIdentificationFailed`]: the
+    ///   simple-threshold detach refused before submission.
+    /// - [`SaError::BaselineWriteFailed`] / [`SaError::SignerSetDiverged`]
+    ///   with the transaction hash: the simple-threshold detach confirmed and
+    ///   its threshold change was not recorded.
+    /// - [`SaError::AuthEntryConstructionFailed`]: transport/XDR failure.
+    /// - [`SaError::DeploymentFailed`]: simulate or submit failure.
+    /// - [`SaError::AuditLog`]: the pin record or the state row could not be
+    ///   read.
     #[allow(
         clippy::too_many_arguments,
         reason = "irreducible auth-+rule-+signer-+observability arg set"
@@ -1936,6 +2276,23 @@ impl ContextRuleManager {
                     stage: "auth_payload",
                     redacted_reason: "auth_rule_ids count exceeds u32".to_owned(),
                 })?;
+
+        let sm =
+            match self.require_signers_manager(Some(rule_id), &smart_account_redacted, &request_id)
+            {
+                Ok(sm) => sm,
+                Err(e) => {
+                    self.write_failure_row(
+                        audit_writer.as_deref_mut(),
+                        &smart_account_redacted,
+                        &e,
+                        auth_rule_ids_count,
+                        &request_id,
+                        "remove_policy: SaRawInvocation (signers manager)",
+                    );
+                    return Err(e);
+                }
+            };
 
         // Per-operation divergence check.
         let source_account_strkey = signer
@@ -1970,8 +2327,11 @@ impl ContextRuleManager {
         }
 
         let outcome = self
-            .remove_policy_inner(
-                smart_account.clone(),
+            .remove_policy_confirmed(
+                sm,
+                &smart_account,
+                &smart_account_strkey,
+                &smart_account_redacted,
                 rule_id,
                 policy_id,
                 &auth_rule_ids,
@@ -1981,9 +2341,11 @@ impl ContextRuleManager {
             )
             .await;
 
+        // A confirmed removal writes its policy row, its raw row and its pins
+        // row, whatever the recording returned.
         match &outcome {
-            Ok((tx_hash, pin_update)) => {
-                let tx_hash_redacted = stellar_agent_network::redact_tx_hash(tx_hash);
+            Ok(confirmed) => {
+                let tx_hash_redacted = stellar_agent_network::redact_tx_hash(&confirmed.tx_hash);
                 let policy_removed = AuditEntry::new_sa_policy_removed(
                     rule_id,
                     policy_id,
@@ -1997,75 +2359,121 @@ impl ContextRuleManager {
                     policy_removed,
                     "remove_policy: SaPolicyRemoved",
                 );
-                let raw = AuditEntry::new_sa_raw_invocation(
-                    &smart_account_redacted,
-                    "sa.ok",
-                    Some(auth_digest_prefix_from_outcome_unit(&outcome)),
-                    auth_rule_ids_count,
-                    stellar_agent_core::audit_log::schema::SaInvocationResult::Success,
-                    &self.chain_id,
-                    &request_id,
-                );
-                self.write_audit_entry(
-                    audit_writer.as_deref_mut(),
-                    raw,
-                    "remove_policy: SaRawInvocation",
-                );
-                self.write_policy_pins_updated_row(
-                    pin_update.as_ref(),
+                match &confirmed.result {
+                    Ok(()) => {
+                        let raw = AuditEntry::new_sa_raw_invocation(
+                            &smart_account_redacted,
+                            "sa.ok",
+                            Some(auth_digest_prefix_from_outcome_unit(&confirmed.result)),
+                            auth_rule_ids_count,
+                            stellar_agent_core::audit_log::schema::SaInvocationResult::Success,
+                            &self.chain_id,
+                            &request_id,
+                        );
+                        self.write_audit_entry(
+                            audit_writer.as_deref_mut(),
+                            raw,
+                            "remove_policy: SaRawInvocation",
+                        );
+                    }
+                    Err(err) => self.write_failure_row(
+                        audit_writer.as_deref_mut(),
+                        &smart_account_redacted,
+                        err,
+                        auth_rule_ids_count,
+                        &request_id,
+                        "remove_policy: SaRawInvocation (recording)",
+                    ),
+                }
+                write_policy_pins_updated_row(
+                    sm,
+                    confirmed.pin_update.as_ref(),
                     &smart_account_redacted,
                     rule_id,
                     stellar_agent_core::audit_log::schema::PinsUpdateReason::PolicyRemoved,
                     &request_id,
                 );
             }
-            Err(err) => {
-                let result = sa_error_to_invocation_result(err);
-                let raw = AuditEntry::new_sa_raw_invocation(
-                    &smart_account_redacted,
-                    err.wire_code(),
-                    None,
-                    auth_rule_ids_count,
-                    result,
-                    &self.chain_id,
-                    &request_id,
-                );
-                self.write_audit_entry(
-                    audit_writer.as_deref_mut(),
-                    raw,
-                    "remove_policy: SaRawInvocation (failure)",
-                );
-            }
+            Err(err) => self.write_failure_row(
+                audit_writer.as_deref_mut(),
+                &smart_account_redacted,
+                err,
+                auth_rule_ids_count,
+                &request_id,
+                "remove_policy: SaRawInvocation (failure)",
+            ),
         }
 
-        outcome.map(|_| ())
+        outcome?.result
     }
 
-    /// Returns `(tx_hash, pin_record_to_write)`.
-    #[allow(clippy::too_many_arguments, reason = "irreducible inner arg set")]
-    async fn remove_policy_inner(
+    /// Resolves `policy_id` to its address on the rule, observes the policy's
+    /// executable, then removes the policy: through
+    /// [`SignersManager::detach_threshold_policy`] when it is the
+    /// simple-threshold policy, otherwise directly. `Err` when the call
+    /// returned before a confirmation; nothing was recorded. `Ok` once the
+    /// removal confirmed, with the result of the steps after it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the signers manager, the account identity, the rule, the policy id, the \
+                  authorization, the source account and the correlation id"
+    )]
+    async fn remove_policy_confirmed(
         &self,
-        smart_account: ScAddress,
+        sm: &SignersManager,
+        smart_account: &ScAddress,
+        smart_account_strkey: &str,
+        smart_account_redacted: &str,
         rule_id: u32,
         policy_id: u32,
         auth_rule_ids: &[ContextRuleId],
         signer: &(dyn Signer + Send + Sync),
         source_account_strkey: &str,
         request_id: &str,
-    ) -> Result<(String, Option<PinnedHashesRecord>), SaError> {
+    ) -> Result<PolicyRemoveConfirmed, SaError> {
+        let rule = self
+            .get_rule(smart_account.clone(), rule_id, source_account_strkey)
+            .await?;
+        let Some(rule) = rule else {
+            return Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!("remove_policy: rule {rule_id} not found"),
+            });
+        };
+        let Some(rule_policy) = rule_policy_for_id(&rule, policy_id) else {
+            return Err(SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: format!(
+                    "remove_policy: policy {policy_id} is not attached to rule {rule_id}"
+                ),
+            });
+        };
+        let observation = sm
+            .observe_contract(
+                &rule_policy.address,
+                stellar_agent_core::audit_log::schema::ContractKind::Policy,
+                |hash| THRESHOLD_POLICY_WASM_HASHES.contains(hash),
+                Some(rule_id),
+                smart_account_redacted,
+                request_id,
+            )
+            .await?;
+
         let pin_update = self
             .plan_policy_remove_pin_update(
-                &smart_account,
+                sm,
+                smart_account,
                 rule_id,
                 policy_id,
-                source_account_strkey,
+                &rule_policy,
                 request_id,
             )
             .await?;
         let invoke_args = vec![ScVal::U32(rule_id), ScVal::U32(policy_id)];
-        let result = self
-            .submit_signed_invoke(
-                smart_account,
+        let target = smart_account.clone();
+        let submit = move || {
+            self.submit_signed_invoke(
+                target,
                 "remove_policy",
                 invoke_args,
                 auth_rule_ids,
@@ -2076,21 +2484,57 @@ impl ContextRuleManager {
                 Some(ExpiryCheck { rule_id }),
                 request_id,
             )
+        };
+
+        if !observation.allowlisted {
+            let submitted = submit().await?;
+            return Ok(PolicyRemoveConfirmed {
+                tx_hash: submitted.tx_hash,
+                pin_update,
+                result: Ok(()),
+            });
+        }
+
+        let ConfirmedThresholdChange {
+            submitted,
+            parsed: (),
+            recorded,
+        } = sm
+            .detach_threshold_policy(
+                smart_account,
+                smart_account_strkey,
+                smart_account_redacted,
+                rule_id,
+                &rule_policy.address,
+                Some(source_account_strkey),
+                submit,
+                request_id,
+            )
             .await?;
-        Ok((result.tx_hash, pin_update))
+        Ok(PolicyRemoveConfirmed {
+            tx_hash: submitted.tx_hash,
+            pin_update,
+            result: recorded,
+        })
     }
 
     /// Computes the pin record a policy add writes for rule `rule_id` once
     /// the add confirms; see "Pin record" on [`Self::add_policy`].
     ///
-    /// Returns `None` without a signers manager or a pin record. Otherwise
+    /// Returns `None` without a pin record. Otherwise
     /// the returned record is the current one, with a pin appended for
     /// `policy_address` when the policy is not already live on the rule,
     /// probed here, before submission, and the overrides applied to it
     /// pending. When the rule has no live policy, the record's policy pins
     /// are replaced by that pin.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the signers manager, the rule, the policy, the two pin overrides and the \
+                  correlation id"
+    )]
     async fn plan_policy_add_pin_update(
         &self,
+        signers_manager: &SignersManager,
         smart_account: &ScAddress,
         rule_id: u32,
         policy_address: &ScAddress,
@@ -2098,9 +2542,6 @@ impl ContextRuleManager {
         accept_unknown_verifier: bool,
         request_id: &str,
     ) -> Result<Option<PlannedPinUpdate>, SaError> {
-        let Some(signers_manager) = self.signers_manager.as_deref() else {
-            return Ok(None);
-        };
         let smart_account_redacted =
             redact_strkey_first5_last5(&scaddress_to_strkey(smart_account)?);
         let Some(record) = crate::managers::verifiers::read_pinned_hashes_for_rule(
@@ -2149,27 +2590,25 @@ impl ContextRuleManager {
     /// once the removal confirms; see "Pin record" on
     /// [`Self::remove_policy`].
     ///
-    /// Returns `None` without a signers manager or a pin record, when the
-    /// rule does not hold `policy_id`, or when no policy pin is the removed
-    /// policy's. A pin is the removed policy's when it equals the policy's
-    /// observed hash, or, when the policy is the rule's only policy and the
-    /// record holds one policy pin, whatever the observation returns.
+    /// `rule_policy` is the removed policy as the caller resolved it from
+    /// the rule: its address and the number of policies the rule holds.
+    /// Returns `None` without a pin record, or when no policy pin is the
+    /// removed policy's. A pin is the removed policy's when it equals the
+    /// policy's observed hash, or, when the policy is the rule's only policy
+    /// and the record holds one policy pin, whatever the observation returns.
     ///
     /// # Errors
     ///
-    /// [`SaError::AuditLog`] when the pin record cannot be read, and the
-    /// errors of [`Self::get_rule`] when the pinned rule cannot be read.
+    /// [`SaError::AuditLog`] when the pin record cannot be read.
     async fn plan_policy_remove_pin_update(
         &self,
+        signers_manager: &SignersManager,
         smart_account: &ScAddress,
         rule_id: u32,
         policy_id: u32,
-        source_account_strkey: &str,
+        rule_policy: &RulePolicy,
         request_id: &str,
     ) -> Result<Option<PinnedHashesRecord>, SaError> {
-        let Some(signers_manager) = self.signers_manager.as_deref() else {
-            return Ok(None);
-        };
         let smart_account_redacted =
             redact_strkey_first5_last5(&scaddress_to_strkey(smart_account)?);
         let Some(mut record) = crate::managers::verifiers::read_pinned_hashes_for_rule(
@@ -2184,25 +2623,13 @@ impl ContextRuleManager {
             );
             return Ok(None);
         };
-        let rule_policy = self
-            .get_rule(smart_account.clone(), rule_id, source_account_strkey)
-            .await?
-            .and_then(|rule| rule_policy_for_id(&rule, policy_id));
-        let Some(RulePolicy {
+        let RulePolicy {
             address: policy_address,
             rule_policy_count,
-        }) = rule_policy
-        else {
-            tracing::debug!(
-                rule_id,
-                policy_id,
-                "remove_policy: the rule holds no such policy id; no pin update is written"
-            );
-            return Ok(None);
-        };
+        } = rule_policy;
         let observed_first8 = match signers_manager
             .observe_contract(
-                &policy_address,
+                policy_address,
                 stellar_agent_core::audit_log::schema::ContractKind::Policy,
                 crate::managers::signers::policy_hash_allowlisted,
                 Some(rule_id),
@@ -2236,7 +2663,7 @@ impl ContextRuleManager {
             // only policy pin is its pin whatever the policy's code is now or
             // whether it can be read. The rule ends with no policy and no
             // policy pin, the state of a rule installed without a policy.
-            None if rule_policy_count == 1 && record.pinned_policy_first8.len() == 1 => 0,
+            None if *rule_policy_count == 1 && record.pinned_policy_first8.len() == 1 => 0,
             None => {
                 tracing::debug!(
                     rule_id,
@@ -2252,29 +2679,6 @@ impl ContextRuleManager {
             record.pinned_policy_executable_refs.remove(position);
         }
         Ok(Some(record))
-    }
-
-    /// Writes the `SaContextRulePinsUpdated` row a policy add or removal
-    /// planned, through the signers manager's audit writer; nothing when no
-    /// record was planned.
-    fn write_policy_pins_updated_row(
-        &self,
-        record: Option<&PinnedHashesRecord>,
-        smart_account_redacted: &str,
-        rule_id: u32,
-        reason: stellar_agent_core::audit_log::schema::PinsUpdateReason,
-        request_id: &str,
-    ) {
-        if let (Some(record), Some(signers_manager)) = (record, self.signers_manager.as_deref()) {
-            crate::managers::verifiers::write_pins_updated_row(
-                signers_manager,
-                smart_account_redacted,
-                rule_id,
-                reason,
-                record,
-                request_id,
-            );
-        }
     }
 
     /// Reads the on-chain `ContextRule` for the given `rule_id` via
@@ -2730,15 +3134,8 @@ impl ContextRuleManager {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
-        let sm = self.signers_manager.as_deref().ok_or_else(|| {
-            SaError::SignersManagerNotConfigured {
-                rule_id,
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted.clone(),
-                ),
-                request_id: request_id.to_owned(),
-            }
-        })?;
+        let sm =
+            self.require_signers_manager(Some(rule_id), &smart_account_redacted, request_id)?;
 
         // Fetch on-chain verifier and policy addresses.
         let (verifier_addrs, policy_addrs) = sm
@@ -2909,7 +3306,7 @@ impl ContextRuleManager {
                 .find(|id| *id != 0)
         {
             return Err(SaError::SignersManagerNotConfigured {
-                rule_id,
+                rule_id: Some(rule_id),
                 smart_account_redacted: RedactedStrkey::from_full(&smart_account_strkey),
                 request_id: request_id.to_owned(),
             });
@@ -3126,14 +3523,14 @@ pub struct ContextRuleDefinition {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum ContextRuleSignerInput {
-    /// A delegated signer (built-in ed25519 verification on the OZ contract
-    /// side). The `address` is the on-chain `ScAddress` that signs auth-entry
-    /// digests; for ed25519 keys this is `ScAddress::Account(...)` derived
-    /// from the signer's G-strkey.
+    /// A delegated signer: the OZ contract requires the authorization of
+    /// `address`. For an ed25519 key this is `ScAddress::Account(...)`
+    /// derived from the signer's G-strkey, verified by the host; for a
+    /// contract it is `ScAddress::Contract(...)`, whose own authorization
+    /// decides.
     Delegated {
-        /// Signer address: a G-strkey account, `ScAddress::Account(...)`
-        /// derived from the signer's G-strkey. Rule creation through the
-        /// wallet accepts an account address only.
+        /// Signer address: an account (`ScAddress::Account`, from a
+        /// G-strkey) or a contract (`ScAddress::Contract`, from a C-strkey).
         address: ScAddress,
     },
     /// An external signer with custom verification (e.g. WebAuthn-via-verifier).
@@ -3523,6 +3920,53 @@ pub fn parse_g_strkey_to_signer_address(s: &str) -> Result<ScAddress, SaError> {
     )))
 }
 
+/// The reason [`parse_delegated_signer_address`] refuses an address with.
+/// Input-facing callers report it as is.
+pub const DELEGATED_SIGNER_ADDRESS_REASON: &str =
+    "invalid delegated signer address: expected a G-strkey or a C-strkey";
+
+/// Parses a delegated signer's address for a rule definition: a G-strkey
+/// gives the account address of an ed25519 key, a C-strkey the contract
+/// address of a contract whose own authorization decides for the signer.
+///
+/// # Errors
+///
+/// Returns [`SaError::AuthEntryConstructionFailed`] with `stage =
+/// "auth_payload"` for anything else, a muxed (M) strkey included.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
+/// use stellar_agent_smart_account::managers::rules::parse_delegated_signer_address;
+/// use stellar_xdr::ScAddress;
+///
+/// assert!(matches!(
+///     parse_delegated_signer_address(SIMULATE_SENTINEL_G),
+///     Ok(ScAddress::Account(_))
+/// ));
+/// let contract = stellar_strkey::Contract([7u8; 32]).to_string();
+/// assert!(matches!(
+///     parse_delegated_signer_address(&contract),
+///     Ok(ScAddress::Contract(_))
+/// ));
+/// assert!(parse_delegated_signer_address("not-a-strkey").is_err());
+/// ```
+pub fn parse_delegated_signer_address(s: &str) -> Result<ScAddress, SaError> {
+    if let Ok(pk) = stellar_strkey::ed25519::PublicKey::from_string(s) {
+        return Ok(ScAddress::Account(stellar_xdr::AccountId(
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(pk.0)),
+        )));
+    }
+    if let Ok(contract) = stellar_strkey::Contract::from_string(s) {
+        return Ok(ScAddress::Contract(ContractId(Hash(contract.0))));
+    }
+    Err(SaError::AuthEntryConstructionFailed {
+        stage: "auth_payload",
+        redacted_reason: DELEGATED_SIGNER_ADDRESS_REASON.to_owned(),
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3667,6 +4111,109 @@ fn build_add_context_rule_args(def: &ContextRuleDefinition) -> Result<Vec<ScVal>
     ])
 }
 
+/// The signer-set state an install of a [`ContextRuleDefinition`]
+/// authorizes, which the confirmed rule must show before it is baselined.
+#[derive(Debug)]
+pub(crate) struct ExpectedInstallState {
+    /// The version-2 identities of the definition's signers, in the
+    /// definition's order. The chain assigns the ids, so the comparison
+    /// treats them as a multiset.
+    pub(crate) signers: Vec<SignerIdentityV2>,
+    /// The simple-threshold policy and the threshold its install parameter
+    /// sets; `None` when no policy of the definition is the simple-threshold
+    /// policy.
+    pub(crate) threshold: Option<ThresholdObservation>,
+}
+
+/// Derives the state an install of `definition` authorizes.
+///
+/// Each signer's identity comes from the bytes the submission carries: the
+/// signer is encoded as `build_add_context_rule_args` encodes it, decoded as
+/// a rule read from the chain is decoded, and projected to its version-2
+/// identity. The simple-threshold policy is the policy whose pinned
+/// executable hash in `pinned_policy_wasm_hashes` is in
+/// [`THRESHOLD_POLICY_WASM_HASHES`]; the observation after confirmation
+/// identifies it by the same effective hash. Its threshold is read from the
+/// definition's install parameter for that address, which is unique because
+/// a policy address listed twice refuses.
+///
+/// # Errors
+///
+/// - [`SaError::AuthEntryConstructionFailed`]: a signer does not encode,
+///   including an `External` signer with empty or oversized key data.
+/// - [`SaError::DeploymentFailed`] (`phase = "build"`): an encoded signer
+///   does not decode, the definition names a policy address twice, more
+///   than one policy is the simple-threshold policy, or the simple-threshold
+///   policy's address is not a contract address.
+/// - [`SaError::SimpleThresholdInstallRefused`]: the simple-threshold
+///   policy's install parameter is not the threshold map with a non-zero
+///   threshold.
+pub(crate) fn expected_install_state(
+    definition: &ContextRuleDefinition,
+    pinned_policy_wasm_hashes: &[(ScAddress, [u8; 32])],
+) -> Result<ExpectedInstallState, SaError> {
+    let build_err = |redacted_reason: String| SaError::DeploymentFailed {
+        phase: "build",
+        redacted_reason,
+    };
+
+    let mut signers = Vec::with_capacity(definition.signers.len());
+    for (idx, signer) in definition.signers.iter().enumerate() {
+        let encoded = encode_signer(signer)?;
+        let decoded = crate::managers::signers::decode_signer_scval_full(&encoded)
+            .map_err(|e| build_err(format!("install: signers[{idx}] does not decode: {e}")))?;
+        signers.push(decoded.to_identity_v2());
+    }
+
+    for (idx, policy) in definition.policies.iter().enumerate() {
+        if definition.policies[..idx]
+            .iter()
+            .any(|earlier| earlier.policy_address == policy.policy_address)
+        {
+            return Err(build_err("install: policy address listed twice".to_owned()));
+        }
+    }
+
+    let threshold_policies: Vec<&ScAddress> = pinned_policy_wasm_hashes
+        .iter()
+        .filter(|(_, hash)| THRESHOLD_POLICY_WASM_HASHES.contains(hash))
+        .map(|(address, _)| address)
+        .collect();
+    let threshold = match threshold_policies.as_slice() {
+        [] => None,
+        [address] => {
+            let ScAddress::Contract(ContractId(Hash(policy))) = address else {
+                return Err(build_err(
+                    "install: the simple-threshold policy address is not a contract address"
+                        .to_owned(),
+                ));
+            };
+            let entry = definition
+                .policies
+                .iter()
+                .find(|entry| &entry.policy_address == *address)
+                .ok_or_else(|| {
+                    build_err(
+                        "install: the simple-threshold policy is not in the definition".to_owned(),
+                    )
+                })?;
+            Some(ThresholdObservation {
+                policy: *policy,
+                threshold: parse_simple_threshold_install_param(&entry.params)?,
+            })
+        }
+        more => {
+            return Err(build_err(format!(
+                "install: {} policies identify as the simple-threshold policy; at most one is \
+                 allowed",
+                more.len()
+            )));
+        }
+    };
+
+    Ok(ExpectedInstallState { signers, threshold })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Rule-proposal digest (Package D, GH issue #8)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3763,8 +4310,8 @@ pub fn compute_context_rule_proposal_sha256(
 /// the digest for [`stellar_agent_core::approval::PendingApprovalStore::verify_rule_proposal_gate`]
 /// and so [`ContextRuleManager::install_rule`] can be called with it.
 ///
-/// A `Delegated` signer's `address` must be a G-strkey; a C-strkey is
-/// refused.
+/// A `Delegated` signer's `address` is a G-strkey (an ed25519 account) or a
+/// C-strkey (a contract).
 ///
 /// # Errors
 ///
@@ -3819,7 +4366,7 @@ pub fn context_rule_definition_from_snapshot(
                     .address
                     .as_deref()
                     .ok_or_else(|| err(format!("signers[{idx}]: Delegated missing address")))?;
-                let address = parse_g_strkey_to_signer_address(address_str)
+                let address = parse_delegated_signer_address(address_str)
                     .map_err(|e| err(format!("signers[{idx}].address: {e}")))?;
                 ContextRuleSignerInput::Delegated { address }
             }
@@ -4148,10 +4695,12 @@ pub fn decode_context_type_from_scval(rule_scval: &ScVal) -> Result<RuleContext,
 ///
 /// # Errors
 ///
-/// - [`SaError::AuthEntryConstructionFailed`] with `stage: "auth_payload"` if
-///   `Symbol`, `BytesM`, or `ScVec` construction fails (unreachable on
-///   well-formed inputs).
-fn encode_signer(s: &ContextRuleSignerInput) -> Result<ScVal, SaError> {
+/// - [`SaError::AuthEntryConstructionFailed`] with `stage: "auth_payload"`
+///   for an `External` signer whose key data is empty (a rule holding one is
+///   unreadable) or longer than OZ `MAX_EXTERNAL_KEY_SIZE`.
+/// - The same error if `Symbol`, `BytesM`, or `ScVec` construction fails
+///   (unreachable on well-formed inputs).
+pub(crate) fn encode_signer(s: &ContextRuleSignerInput) -> Result<ScVal, SaError> {
     let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
         stage: "auth_payload",
         redacted_reason: reason,
@@ -4168,6 +4717,15 @@ fn encode_signer(s: &ContextRuleSignerInput) -> Result<ScVal, SaError> {
             verifier,
             pubkey_data,
         } => {
+            // A rule holding an External signer with empty key data cannot
+            // be read back (`SignerDecodeError::ExternalKeyDataEmpty`), so it
+            // is never submitted.
+            if pubkey_data.is_empty() {
+                return Err(SaError::AuthEntryConstructionFailed {
+                    stage: "auth_payload",
+                    redacted_reason: "External signer pubkey is empty".to_owned(),
+                });
+            }
             // Pre-flight cap check before the RPC round-trip.
             // OZ `MAX_EXTERNAL_KEY_SIZE = 256` enforced on-chain at
             // `packages/accounts/src/smart_account/mod.rs:530`, SHA `a9c4216`.
@@ -4466,6 +5024,10 @@ pub(crate) fn build_signed_invoke_envelope(
 
 /// Parses the simulated return value of OZ `add_context_rule` (a `ContextRule`
 /// struct ScVal) and extracts the assigned `rule_id: u32`.
+///
+/// The error names the shape that has no id. The install runs this after
+/// confirmation and reports a failure as [`SaError::InstallStateMismatch`]
+/// without a rule id, logging this error as the cause.
 fn parse_context_rule_id_from_return(scval: &ScVal) -> Result<u32, SaError> {
     let entries = match scval {
         ScVal::Map(Some(ScMap(entries))) => entries,
@@ -5080,6 +5642,61 @@ struct RulePolicy {
     rule_policy_count: usize,
 }
 
+/// The pin overrides a policy add applies to the policy it pins.
+#[derive(Clone, Copy)]
+struct PolicyPinOverrides {
+    accept_mutable_verifier: bool,
+    accept_unknown_verifier: bool,
+}
+
+/// A policy add whose transaction confirmed.
+struct PolicyAddConfirmed {
+    /// The policy id the confirmed return value carries, for the
+    /// `SaPolicyAdded` row; `None` when it carries none.
+    policy_id: Option<u32>,
+    /// The confirmed transaction's hash.
+    tx_hash: String,
+    /// The pin rows planned before submission.
+    pin_update: Option<PlannedPinUpdate>,
+    /// The verb's result: the policy id, or the refusal of the steps after
+    /// confirmation.
+    result: Result<u32, SaError>,
+}
+
+/// A policy removal whose transaction confirmed.
+struct PolicyRemoveConfirmed {
+    /// The confirmed transaction's hash.
+    tx_hash: String,
+    /// The pin record planned before submission.
+    pin_update: Option<PinnedHashesRecord>,
+    /// The verb's result: the refusal of the steps after confirmation, if
+    /// any.
+    result: Result<(), SaError>,
+}
+
+/// Writes the `SaContextRulePinsUpdated` row a policy add or removal
+/// planned, through the signers manager's audit writer; nothing when no
+/// record was planned.
+fn write_policy_pins_updated_row(
+    signers_manager: &SignersManager,
+    record: Option<&PinnedHashesRecord>,
+    smart_account_redacted: &str,
+    rule_id: u32,
+    reason: stellar_agent_core::audit_log::schema::PinsUpdateReason,
+    request_id: &str,
+) {
+    if let Some(record) = record {
+        crate::managers::verifiers::write_pins_updated_row(
+            signers_manager,
+            smart_account_redacted,
+            rule_id,
+            reason,
+            record,
+            request_id,
+        );
+    }
+}
+
 /// Returns the policy with on-chain id `policy_id` in a `ContextRule`
 /// value: the `policies` entry at the position `policy_id` holds in the
 /// aligned `policy_ids` list, and the length of `policies`. `None` when the
@@ -5237,6 +5854,9 @@ pub(crate) fn sa_error_to_invocation_result(
             None => SaInvocationResult::PreSubmissionRefused,
             Some(_) => SaInvocationResult::PostSubmitVerificationFailed,
         },
+        // InstallStateMismatch: the install confirmed and the installed rule
+        // was not baselined.
+        SaError::InstallStateMismatch { .. } => SaInvocationResult::PostSubmitVerificationFailed,
         // PolicyDenied: the wallet's own refusal, decided before the send.
         SaError::PolicyDenied { .. } => SaInvocationResult::PreSubmissionRefused,
         // MulticallSha256Drift: fires at registry-lookup time, before any I/O.
@@ -5541,39 +6161,282 @@ mod tests {
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
     use stellar_xdr::{AccountId, ContractId, PublicKey, Uint256};
 
-    /// `context_rule_definition_from_snapshot` refuses a `Delegated` signer
-    /// whose address is a C-strkey and names the signer's index.
-    #[test]
-    fn context_rule_definition_from_snapshot_refuses_a_c_strkey_delegated_signer() {
+    fn snapshot_with_delegates(
+        addresses: &[&str],
+    ) -> stellar_agent_core::approval::ContextRuleProposalSnapshot {
         use stellar_agent_core::approval::{
             ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
         };
-        let c_strkey = stellar_strkey::Contract([0x42; 32]).to_string();
-        let snapshot = ContextRuleProposalSnapshot::new(
+        ContextRuleProposalSnapshot::new(
             RuleProposalContextType::Default,
             "spend-daily".to_owned(),
             None,
-            vec![
-                RuleProposalSigner::delegated(SIMULATE_SENTINEL_G.to_owned(), true),
-                RuleProposalSigner::delegated(c_strkey.as_str().to_owned(), false),
-            ],
+            addresses
+                .iter()
+                .enumerate()
+                .map(|(idx, address)| {
+                    RuleProposalSigner::delegated((*address).to_owned(), idx == 0)
+                })
+                .collect(),
             vec![],
             vec![0],
             false,
             false,
-        );
+        )
+    }
+
+    /// `context_rule_definition_from_snapshot` reads a `Delegated` signer
+    /// whose address is a C-strkey as a contract delegate.
+    #[test]
+    fn context_rule_definition_from_snapshot_accepts_a_c_strkey_delegated_signer() {
+        let c_strkey = stellar_strkey::Contract([0x42; 32]).to_string();
+        let definition = context_rule_definition_from_snapshot(&snapshot_with_delegates(&[
+            SIMULATE_SENTINEL_G,
+            c_strkey.as_str(),
+        ]))
+        .unwrap();
+        assert!(matches!(
+            definition.signers[0],
+            ContextRuleSignerInput::Delegated {
+                address: ScAddress::Account(_)
+            }
+        ));
+        assert!(matches!(
+            &definition.signers[1],
+            ContextRuleSignerInput::Delegated {
+                address: ScAddress::Contract(ContractId(Hash(id)))
+            } if *id == [0x42; 32]
+        ));
+    }
+
+    /// `context_rule_definition_from_snapshot` refuses a `Delegated` signer
+    /// whose address is a muxed M-strkey and names the signer's index.
+    #[test]
+    fn context_rule_definition_from_snapshot_refuses_an_m_strkey_delegated_signer() {
+        let muxed = stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [0u8; 32],
+            id: 7,
+        }
+        .to_string();
         let Err(SaError::AuthEntryConstructionFailed {
             stage,
             redacted_reason,
-        }) = context_rule_definition_from_snapshot(&snapshot)
+        }) = context_rule_definition_from_snapshot(&snapshot_with_delegates(&[
+            SIMULATE_SENTINEL_G,
+            muxed.as_str(),
+        ]))
         else {
-            panic!("a C-strkey delegated signer must be refused");
+            panic!("an M-strkey delegated signer must be refused");
         };
         assert_eq!(stage, "rule_proposal_digest");
         assert!(
             redacted_reason.starts_with("signers[1].address: "),
             "{redacted_reason}"
         );
+    }
+
+    /// `parse_delegated_signer_address` reads a G-strkey as an account and a
+    /// C-strkey as a contract, keeping the key or the contract id.
+    #[test]
+    fn parse_delegated_signer_address_reads_an_account_or_a_contract() {
+        let account = stellar_strkey::ed25519::PublicKey([0x31; 32]).to_string();
+        assert_eq!(
+            parse_delegated_signer_address(&account).unwrap(),
+            ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                [0x31; 32]
+            ))))
+        );
+        let contract = stellar_strkey::Contract([0x32; 32]).to_string();
+        assert_eq!(
+            parse_delegated_signer_address(&contract).unwrap(),
+            ScAddress::Contract(ContractId(Hash([0x32; 32])))
+        );
+    }
+
+    /// `parse_delegated_signer_address` refuses a muxed M-strkey and any
+    /// other text.
+    #[test]
+    fn parse_delegated_signer_address_refuses_an_m_strkey() {
+        let muxed = stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [0x31; 32],
+            id: 7,
+        }
+        .to_string();
+        for input in [muxed.as_str(), "not-a-strkey", ""] {
+            match parse_delegated_signer_address(input) {
+                Err(SaError::AuthEntryConstructionFailed {
+                    stage: "auth_payload",
+                    redacted_reason,
+                }) => assert_eq!(
+                    redacted_reason,
+                    "invalid delegated signer address: expected a G-strkey or a C-strkey"
+                ),
+                other => panic!("{input:?}: expected AuthEntryConstructionFailed, got {other:?}"),
+            }
+        }
+    }
+
+    /// An `External` signer with empty key data is refused before any
+    /// encoding: a rule holding it could not be read back.
+    #[test]
+    fn encode_signer_refuses_an_external_signer_with_empty_key_data() {
+        let signer = ContextRuleSignerInput::External {
+            verifier: ScAddress::Contract(ContractId(Hash([0x44; 32]))),
+            pubkey_data: vec![],
+        };
+        match encode_signer(&signer) {
+            Err(SaError::AuthEntryConstructionFailed {
+                stage: "auth_payload",
+                redacted_reason,
+            }) => assert_eq!(redacted_reason, "External signer pubkey is empty"),
+            other => panic!("expected AuthEntryConstructionFailed, got {other:?}"),
+        }
+        let one_byte = ContextRuleSignerInput::External {
+            verifier: ScAddress::Contract(ContractId(Hash([0x44; 32]))),
+            pubkey_data: vec![0x01],
+        };
+        assert!(encode_signer(&one_byte).is_ok());
+    }
+
+    fn threshold_policy_hash() -> [u8; 32] {
+        THRESHOLD_POLICY_WASM_HASHES[0]
+    }
+
+    fn definition_with(
+        signers: Vec<ContextRuleSignerInput>,
+        policies: Vec<ContextRulePolicy>,
+    ) -> ContextRuleDefinition {
+        ContextRuleDefinition::new(
+            RuleContext::Default,
+            "rule".to_owned(),
+            None,
+            signers,
+            policies,
+        )
+    }
+
+    /// The expected install state carries every signer's version-2 identity
+    /// from the encoded bytes, and the simple-threshold policy with the
+    /// threshold of its install parameter. A policy whose pinned hash is not
+    /// the simple-threshold policy adds no threshold.
+    #[test]
+    fn expected_install_state_reads_the_identities_and_the_threshold() {
+        let threshold_policy = ScAddress::Contract(ContractId(Hash([0x51; 32])));
+        let other_policy = ScAddress::Contract(ContractId(Hash([0x52; 32])));
+        let definition = definition_with(
+            vec![
+                ContextRuleSignerInput::Delegated {
+                    address: ScAddress::Contract(ContractId(Hash([0x53; 32]))),
+                },
+                ContextRuleSignerInput::External {
+                    verifier: ScAddress::Contract(ContractId(Hash([0x54; 32]))),
+                    pubkey_data: vec![0x07; 65],
+                },
+            ],
+            vec![
+                ContextRulePolicy::new(other_policy.clone(), ScVal::Void),
+                ContextRulePolicy::new(
+                    threshold_policy.clone(),
+                    crate::simple_threshold_policy::build_simple_threshold_install_param(2)
+                        .unwrap(),
+                ),
+            ],
+        );
+        let expected = expected_install_state(
+            &definition,
+            &[
+                (other_policy, [0xee; 32]),
+                (threshold_policy, threshold_policy_hash()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            expected.signers,
+            vec![
+                SignerIdentityV2::DelegatedContract {
+                    contract: [0x53; 32]
+                },
+                SignerIdentityV2::External {
+                    verifier: [0x54; 32],
+                    key_data_sha256: Sha256::digest([0x07; 65]).into(),
+                    key_data_len: 65,
+                },
+            ]
+        );
+        assert_eq!(
+            expected.threshold,
+            Some(ThresholdObservation {
+                policy: [0x51; 32],
+                threshold: 2
+            })
+        );
+
+        let no_threshold = expected_install_state(
+            &definition,
+            &[(
+                ScAddress::Contract(ContractId(Hash([0x52; 32]))),
+                [0xee; 32],
+            )],
+        )
+        .unwrap();
+        assert_eq!(no_threshold.threshold, None);
+    }
+
+    /// A policy address listed twice, two simple-threshold policies and a
+    /// malformed simple-threshold parameter each refuse.
+    #[test]
+    fn expected_install_state_refuses_an_ambiguous_or_malformed_definition() {
+        let p = ScAddress::Contract(ContractId(Hash([0x61; 32])));
+        let q = ScAddress::Contract(ContractId(Hash([0x62; 32])));
+        let param =
+            crate::simple_threshold_policy::build_simple_threshold_install_param(1).unwrap();
+
+        let twice = definition_with(
+            vec![],
+            vec![
+                ContextRulePolicy::new(p.clone(), param.clone()),
+                ContextRulePolicy::new(p.clone(), param.clone()),
+            ],
+        );
+        match expected_install_state(&twice, &[(p.clone(), threshold_policy_hash())]) {
+            Err(SaError::DeploymentFailed {
+                phase: "build",
+                redacted_reason,
+            }) => assert_eq!(redacted_reason, "install: policy address listed twice"),
+            other => panic!("expected the duplicate refusal, got {other:?}"),
+        }
+
+        let two = definition_with(
+            vec![],
+            vec![
+                ContextRulePolicy::new(p.clone(), param.clone()),
+                ContextRulePolicy::new(q.clone(), param.clone()),
+            ],
+        );
+        match expected_install_state(
+            &two,
+            &[
+                (p.clone(), threshold_policy_hash()),
+                (q, THRESHOLD_POLICY_WASM_HASHES[1]),
+            ],
+        ) {
+            Err(SaError::DeploymentFailed {
+                phase: "build",
+                redacted_reason,
+            }) => assert_eq!(
+                redacted_reason,
+                "install: 2 policies identify as the simple-threshold policy; at most one is \
+                 allowed"
+            ),
+            other => panic!("expected the two-policies refusal, got {other:?}"),
+        }
+
+        let malformed =
+            definition_with(vec![], vec![ContextRulePolicy::new(p.clone(), ScVal::Void)]);
+        assert!(matches!(
+            expected_install_state(&malformed, &[(p, threshold_policy_hash())]),
+            Err(SaError::SimpleThresholdInstallRefused { .. })
+        ));
     }
 
     fn manager_for_test() -> ContextRuleManager {
@@ -6363,6 +7226,29 @@ mod tests {
             sa_error_to_invocation_result(&legacy),
             SaInvocationResult::PreSubmissionRefused
         ));
+    }
+
+    /// An install that confirmed and was not baselined is a post-submit
+    /// verification failure in both rule-id forms.
+    #[test]
+    fn sa_error_to_invocation_result_classifies_install_state_mismatch_after_submission() {
+        use stellar_agent_core::audit_log::schema::SaInvocationResult;
+
+        for rule_id in [None, Some(3)] {
+            let err = SaError::InstallStateMismatch {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                tx_hash: "ab".repeat(32),
+                request_id: "req".to_owned(),
+            };
+            assert!(
+                matches!(
+                    sa_error_to_invocation_result(&err),
+                    SaInvocationResult::PostSubmitVerificationFailed
+                ),
+                "{rule_id:?}"
+            );
+        }
     }
 
     #[test]
@@ -8281,11 +9167,10 @@ mod tests {
     // that do not require an RPC connection.  Each test constructs the minimum
     // scaffolding needed to exercise the target code path.
 
-    /// `verify_rule_wasm_pins` returns `SaError::SignersManagerNotConfigured` when
-    /// `signers_manager` is `None` (the escape hatch that is rejected at the
-    /// verify-pins call site — `self.signers_manager.ok_or_else(...)` — so that
-    /// the test-only escape hatch used for install_rule does NOT silently bypass
-    /// pin verification).
+    /// `verify_rule_wasm_pins` refuses with
+    /// `SaError::SignersManagerNotConfigured`, naming the checked rule, when
+    /// the manager has no signers manager: pin verification cannot run
+    /// without one.
     ///
     /// Wire code: `"sa.signers_manager_not_configured"`.
     #[tokio::test]
@@ -8312,6 +9197,16 @@ mod tests {
             "sa.signers_manager_not_configured",
             "error wire code must be sa.signers_manager_not_configured; got {}",
             err.wire_code()
+        );
+        assert!(
+            matches!(
+                err,
+                SaError::SignersManagerNotConfigured {
+                    rule_id: Some(1),
+                    ..
+                }
+            ),
+            "{err:?}"
         );
     }
 

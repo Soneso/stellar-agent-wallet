@@ -3,11 +3,12 @@
 # audit rows.
 #
 # A signer-set baseline is the anchor of divergence detection, so only
-# `SignersManager::list_signers` (first observation) and
-# `SignersManager::refresh_signer_baseline` (explicit re-anchor) may write one,
-# both through `SignersManager::emit_baseline`, the only builder of a
-# `SaSignerSetBaselinedV2` row. No production code builds a version-1
-# `SaSignerSetBaselined` row. The constructors involved are `pub` across
+# `SignersManager::list_signers` (first observation),
+# `SignersManager::refresh_signer_baseline` (explicit re-anchor) and
+# `SignersManager::baseline_confirmed_install` (a rule the wallet installed)
+# may write one, each through `SignersManager::emit_baseline`, the only
+# builder of a `SaSignerSetBaselinedV2` row. No production code builds a
+# version-1 `SaSignerSetBaselined` row. The constructors involved are `pub` across
 # crates, and `AuditEntry::event_kind` is a `pub` field, so Rust visibility
 # cannot enforce this; this gate does.
 #
@@ -28,8 +29,9 @@
 #   (a) no call `new_sa_signer_set_baselined(` (the version-1 constructor),
 #       and exactly one call `new_sa_signer_set_baselined_v2(`, inside
 #       `fn emit_baseline` of the signers manager;
-#   (b) exactly two calls `emit_baseline(`, one inside `fn list_signers` and
-#       one inside `fn refresh_signer_baseline` of the signers manager;
+#   (b) exactly three calls `emit_baseline(`, one inside each of
+#       `fn list_signers`, `fn refresh_signer_baseline` and
+#       `fn baseline_confirmed_install` of the signers manager;
 #   (c) no construction `SaSignerSetBaselined { .. }` or
 #       `SaSignerSetBaselinedV2 { .. }`, with any path prefix, outside the
 #       audit-entry module; each variant's definition in the schema module is
@@ -38,14 +40,14 @@
 #       closing brace is `=>`, `|`, `if` or `=`, and a construction otherwise.
 #       The match requires the opening brace on the same line as the variant
 #       name, which `cargo fmt` guarantees for code that passes the CI fmt job;
-#   (d) no use of `BaselineReason::first_observation()`,
-#       `BaselineReason::explicit_refresh()`,
-#       `BaselineReason::confirmed_install()`, `BaselineReason::FirstObservation`,
-#       `BaselineReason::ExplicitRefresh` or `BaselineReason::ConfirmedInstall`
-#       (or the `Self::` forms) outside `fn list_signers` and
-#       `fn refresh_signer_baseline` of the signers manager and outside the
-#       module that defines `BaselineReason`; a variant followed by `=>` or
-#       `|` is a pattern and allowed;
+#   (d) each `BaselineReason` constructor and variant is used only in its own
+#       function of the signers manager, outside the module that defines
+#       `BaselineReason`: `first_observation()` and `FirstObservation` in
+#       `fn list_signers`, `explicit_refresh()` and `ExplicitRefresh` in
+#       `fn refresh_signer_baseline`, `confirmed_install()` and
+#       `ConfirmedInstall` in `fn baseline_confirmed_install` (with the
+#       `Self::` forms); a variant followed by `=>` or `|` is a pattern and
+#       allowed anywhere;
 #   (e) no `use` statement importing through `EventKind::` or renaming
 #       `EventKind as`, outside the audit-entry and schema modules, so every
 #       construction in (c) is spelled with a visible path.
@@ -108,6 +110,14 @@ function loc(f, i, fnn) {
   return f ":" i " (in " (fnn == "" ? "no fn" : "fn " fnn) ")"
 }
 
+# The one signers-manager function that may use the BaselineReason
+# constructor or variant `hit`.
+function reason_owner(hit) {
+  if (hit ~ /first_observation|FirstObservation/) return "list_signers"
+  if (hit ~ /explicit_refresh|ExplicitRefresh/) return "refresh_signer_baseline"
+  return "baseline_confirmed_install"
+}
+
 # The first non-space text at or after column `col` of line `k`, continuing
 # on later non-comment production lines, with `//` comments stripped.
 function next_text(k, col, prod_end,    rest) {
@@ -162,7 +172,7 @@ BEGIN {
   na = 0; na2 = 0; nb = 0
   a_bad = ""; a2_bad = ""; b_bad = ""; c_bad = ""; c_variant = ""; d_bad = ""; e_bad = ""
   a_locs = ""; a2_locs = ""; b_locs = ""
-  b_list = 0; b_refresh = 0
+  b_list = 0; b_refresh = 0; b_install = 0
   while ((getline f < list) > 0) {
     files++
     n = 0
@@ -199,6 +209,7 @@ BEGIN {
         b_locs = b_locs (b_locs == "" ? "" : ", ") f ":" i
         if (f == signers && cur == "list_signers") b_list++
         else if (f == signers && cur == "refresh_signer_baseline") b_refresh++
+        else if (f == signers && cur == "baseline_confirmed_install") b_install++
         else if (b_bad == "") b_bad = loc(f, i, cur)
       }
 
@@ -231,7 +242,7 @@ BEGIN {
           if (before ~ /[A-Za-z0-9_]/) continue
           call = hit ~ /[(][)]$/
           if (!call && after_char ~ /[A-Za-z0-9_]/) continue
-          allowed = (f == signers && (cur == "list_signers" || cur == "refresh_signer_baseline"))
+          allowed = (f == signers && cur == reason_owner(hit))
           if (!allowed && !call) {
             after = next_text(i, stop + 1, prod_end)
             if (after ~ /^=>/ || after ~ /^[|]([^|]|$)/) allowed = 1
@@ -271,11 +282,11 @@ BEGIN {
     exit 1
   }
   if (b_bad != "") {
-    print "FAIL (b): emit_baseline( is called outside fn list_signers and fn refresh_signer_baseline of " signers " at " b_bad
+    print "FAIL (b): emit_baseline( is called outside fn list_signers, fn refresh_signer_baseline and fn baseline_confirmed_install of " signers " at " b_bad
     exit 1
   }
-  if (nb != 2 || b_list != 1 || b_refresh != 1) {
-    print "FAIL (b): expected one emit_baseline( call in each of fn list_signers and fn refresh_signer_baseline, found " nb (nb ? " at " b_locs : "")
+  if (nb != 3 || b_list != 1 || b_refresh != 1 || b_install != 1) {
+    print "FAIL (b): expected one emit_baseline( call in each of fn list_signers, fn refresh_signer_baseline and fn baseline_confirmed_install, found " nb (nb ? " at " b_locs : "")
     exit 1
   }
   if (c_bad != "") {
@@ -283,13 +294,13 @@ BEGIN {
     exit 1
   }
   if (d_bad != "") {
-    print "FAIL (d): a BaselineReason constructor or variant is used outside fn list_signers and fn refresh_signer_baseline of " signers " at " d_bad
+    print "FAIL (d): a BaselineReason constructor or variant is used outside its own function of " signers " (first_observation in fn list_signers, explicit_refresh in fn refresh_signer_baseline, confirmed_install in fn baseline_confirmed_install) at " d_bad
     exit 1
   }
   if (e_bad != "") {
     print "FAIL (e): a use statement imports through EventKind:: or renames EventKind outside " entry " and " schema " at " e_bad
     exit 1
   }
-  print name ": ok (" files " files; SaSignerSetBaselinedV2 is built only in emit_baseline, reached from list_signers and refresh_signer_baseline; no version-1 baseline constructor call exists in production code)"
+  print name ": ok (" files " files; SaSignerSetBaselinedV2 is built only in emit_baseline, reached from list_signers, refresh_signer_baseline and baseline_confirmed_install, each with its own baseline reason; no version-1 baseline constructor call exists in production code)"
 }
 '
