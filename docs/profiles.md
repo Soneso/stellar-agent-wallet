@@ -280,7 +280,7 @@ Consequences:
   backend is the actual defence for secret material.
 - `rpc_url`, `secondary_rpc_url` and `oracle_provider_url` are redacted in debug
   output because URLs may embed credentials. `profile show` prints them as
-  scheme, host and port. The TOML retains the full URLs, so avoid embedding
+  scheme, host, and port. The TOML retains the full URLs, so avoid embedding
   credentials if the file is shared.
 - `stellar-agent profile show <name>` prints the resolved configuration as a JSON
   envelope; keyring references appear as opaque `{service, account}` objects,

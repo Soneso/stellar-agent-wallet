@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `Caip2::from_passphrase` maps a network passphrase to its chain id.
 - `stellar_agent_core::redact` holds the URL redaction helpers; the network crate re-exports them.
-- `Profile::redacted` returns a `RedactedProfile`, the serialized view with URL fields reduced to scheme, host and port.
+- `Profile::redacted` returns a `RedactedProfile`, the serialized view with URL fields reduced to scheme, host, and port.
 - Four audit event kinds record a version-2 signer-set state:
   `SaSignerSetBaselinedV2`, `SaSignerAddedV2`, `SaSignerRemovedV2` and
   `SaThresholdChangedV2`. Each row carries every signer's full identity (an
@@ -106,7 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `Profile`'s debug output redacts `oracle_provider_url`.
-- `profile show`, `profile init` and the MCP profile resource report URL fields as scheme, host and port only.
+- `profile show`, `profile init` and the MCP profile resource report URL fields as scheme, host, and port only.
 - The `rpc_url` parse error names the parse failure and omits the URL text.
 - `DecodedOnChainSigner` gains `DelegatedContract` for a `Delegated` signer
   with a contract address and is `#[non_exhaustive]`, its `External` variant

@@ -884,7 +884,7 @@ pub struct Profile {
 }
 
 /// Operator-facing view of a profile.
-/// URL fields carry scheme, host and port only. Userinfo, path, query and
+/// URL fields carry scheme, host, and port only. Userinfo, path, query and
 /// fragment are omitted because they may contain provider credentials.
 #[derive(Debug, Serialize)]
 #[non_exhaustive]
@@ -893,7 +893,7 @@ pub struct RedactedProfile {
     pub version: u32,
     /// Operator-facing value of [`Profile::chain_id`].
     pub chain_id: Caip2,
-    /// Scheme, host and port of [`Profile::rpc_url`].
+    /// Scheme, host, and port of [`Profile::rpc_url`].
     pub rpc_url: String,
     /// Operator-facing value of [`Profile::network_passphrase`].
     pub network_passphrase: String,
@@ -924,7 +924,7 @@ pub struct RedactedProfile {
     pub attestation_key_id: KeyringEntryRef,
     /// Operator-facing value of [`Profile::counterparty_cache_key_id`].
     pub counterparty_cache_key_id: KeyringEntryRef,
-    /// Scheme, host and port of [`Profile::oracle_provider_url`], or `None`.
+    /// Scheme, host, and port of [`Profile::oracle_provider_url`], or `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oracle_provider_url: Option<String>,
     /// Operator-facing value of [`Profile::policy`].
@@ -937,7 +937,7 @@ pub struct RedactedProfile {
     /// Operator-facing value of [`Profile::session_rule_max_horizon_ledgers`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_rule_max_horizon_ledgers: Option<u32>,
-    /// Scheme, host and port of [`Profile::secondary_rpc_url`], or `None`.
+    /// Scheme, host, and port of [`Profile::secondary_rpc_url`], or `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secondary_rpc_url: Option<String>,
     /// Operator-facing value of [`Profile::pool_master_key_id`].

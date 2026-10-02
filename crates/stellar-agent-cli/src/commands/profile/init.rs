@@ -155,7 +155,7 @@ struct InitData {
     path: String,
     /// CAIP-2 chain id (`"stellar:testnet"` or `"stellar:mainnet"`).
     chain_id: String,
-    /// Resolved Soroban RPC endpoint as scheme, host and port only.
+    /// Resolved Soroban RPC endpoint as scheme, host, and port only.
     rpc_url: String,
     /// Selected policy engine (`"v1"` or `"noop"`).
     engine: String,

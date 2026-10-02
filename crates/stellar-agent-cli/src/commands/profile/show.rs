@@ -1,7 +1,7 @@
 //! `stellar-agent profile show <name>` prints a profile's resolved configuration.
 //!
 //! Loads the named profile with env-var overlays and prints a JSON envelope.
-//! URL fields are printed as scheme, host and port only. Keyring entry
+//! URL fields are printed as scheme, host, and port only. Keyring entry
 //! references are printed as opaque `{service, account}` objects.
 //!
 //! # Output

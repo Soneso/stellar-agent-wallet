@@ -61,7 +61,7 @@ Read-only. Reads the OS-conventional profile directory and returns the known pro
 stellar-agent profile show default
 ```
 
-URL fields (`rpc_url`, `secondary_rpc_url`, `oracle_provider_url`) are printed as scheme, host and port only.
+URL fields (`rpc_url`, `secondary_rpc_url`, `oracle_provider_url`) are printed as scheme, host, and port only.
 
 Read-only. Loads the named profile (applying any environment-variable overlays) and prints its resolved configuration as a JSON envelope. Keyring entry references appear as opaque `{service, account}` objects; the secret material they name is never read or printed.
 

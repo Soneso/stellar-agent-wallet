@@ -182,7 +182,7 @@ The server exposes three MCP resources. None contains a secret.
 
 - `mcp-resource://usage.md` — tool usage documentation.
 - `mcp-resource://profiles/<name>`: non-secret profile metadata (chain id, the RPC
-  endpoint as scheme, host and port, network passphrase, `mcp_disabled`, and
+  endpoint as scheme, host, and port, network passphrase, `mcp_disabled`, and
   the cross-check threshold in stroops).
   An agent passing this resource's `rpc_url` to `stellar_fee_stats` passes an
   authority-only URL; the allowlisted hosts have no path, so the call behaves

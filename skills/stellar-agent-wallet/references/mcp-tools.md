@@ -718,7 +718,7 @@ The server exposes three MCP resources; none contains a secret.
 
 - `mcp-resource://usage.md` — tool usage documentation.
 - `mcp-resource://profiles/<name>`: non-secret profile metadata (chain id, the RPC
-  endpoint as scheme, host and port, network passphrase, `mcp_disabled`, and
+  endpoint as scheme, host, and port, network passphrase, `mcp_disabled`, and
   the cross-check threshold in stroops).
 - `mcp-resource://accounts/<G>` — public account directory for the enrolled
   accounts across all configured profiles.
