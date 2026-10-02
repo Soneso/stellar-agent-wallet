@@ -13,13 +13,14 @@
 # cannot enforce this; this gate does.
 #
 # Scope: every `*.rs` file under a `src/` directory of `crates/`, run from the
-# repository root. The production text of a file is the text before its test
-# module: the last line equal to `#[cfg(test)]` that is followed, after any
-# `#[allow(...)]` attribute blocks, by a `mod <name> {` line. A file without
-# such a line is production text throughout; a file that declares `mod tests;`
-# keeps its tests in a separate `tests.rs` under `src/`, and that file is
-# scanned whole. A file with two test modules is cut at the last one, so the
-# earlier module is scanned as production text. Comment lines are ignored,
+# repository root. Production text excludes the last inline test module.
+# Its marker is a line equal to `#[cfg(test)]`, followed after any
+# `#[allow(...)]` attribute blocks by a `mod <name> {` line.
+# A file without such a module is production text throughout.
+# An external `mod tests;` keeps tests in a separate `tests.rs` under `src/`;
+# that file is scanned whole. The inline module is skipped by brace depth,
+# and scanning resumes after its closing brace. Earlier test modules are
+# scanned as production text. Comment lines are ignored,
 # and `//` comments are stripped before braces are matched. The enclosing
 # function of a line is the nearest preceding `fn` definition (with any
 # `pub`, `const`, `async`, `unsafe` and `extern` qualifiers).
@@ -38,8 +39,7 @@
 #       exempt once. An occurrence is a pattern when its braces end in a
 #       rest pattern (`..` after `{` or `,`) or the first token after the
 #       closing brace is `=>`, `|`, `if` or `=`, and a construction otherwise.
-#       The match requires the opening brace on the same line as the variant
-#       name, which `cargo fmt` guarantees for code that passes the CI fmt job;
+#       Only whitespace and newlines may precede the opening brace;
 #   (d) each `BaselineReason` constructor and variant is used only in its own
 #       function of the signers manager, outside the module that defines
 #       `BaselineReason`: `first_observation()` and `FirstObservation` in
@@ -50,7 +50,10 @@
 #       allowed anywhere;
 #   (e) no `use` statement importing through `EventKind::` or renaming
 #       `EventKind as`, outside the audit-entry and schema modules, so every
-#       construction in (c) is spelled with a visible path.
+#       construction in (c) is spelled with a visible path;
+#   (f) no baseline variant token inside macro arguments or a macro definition
+#       body, including patterns. Macros are inspected as text without
+#       expansion.
 set -euo pipefail
 
 SIGNERS="crates/stellar-agent-smart-account/src/managers/signers.rs"
@@ -91,19 +94,121 @@ function code(line) {
   return line
 }
 
-# Line number where the test module starts, or n + 1 when there is none.
-function test_cut(n,    i, j, cut) {
+# Strip strings and comments for module depth and macro token checks.
+# Lexical state spans lines; raw strings and block comments may span lines.
+function syntax(line,    out, c, ch, pair, tail, hashes) {
+  if (!block_depth && raw_end == "" && !quoted && is_comment(line)) return ""
+  if (!block_depth && raw_end == "" && !quoted && line !~ /["\047]|\/\/|\/[*]/) return line
+  out = ""
+  for (c = 1; c <= length(line); c++) {
+    ch = substr(line, c, 1)
+    pair = substr(line, c, 2)
+    if (block_depth) {
+      if (pair == "/*") { block_depth++; c++ }
+      else if (pair == "*/") { block_depth--; c++ }
+      out = out " "
+    } else if (raw_end != "") {
+      if (substr(line, c, length(raw_end)) == raw_end) {
+        c += length(raw_end) - 1
+        raw_end = ""
+      }
+      out = out " "
+    } else if (quoted) {
+      if (ch == "\\") c++
+      else if (ch == "\"") quoted = 0
+      out = out " "
+    } else if (pair == "//") break
+    else if (pair == "/*") { block_depth = 1; c++; out = out " " }
+    else if (ch == "r" && match(substr(line, c), /^r#*"/)) {
+      tail = substr(line, c, RLENGTH)
+      hashes = substr(tail, 2, length(tail) - 2)
+      raw_end = "\"" hashes
+      c += length(tail) - 1
+      out = out " "
+    } else if (ch == "\"") { quoted = 1; out = out " " }
+    else if (ch == sprintf("%c", 39) && match(substr(line, c), /^\047([^\047\\]|\\[^[:space:]])\047/)) {
+      c += RLENGTH - 1
+      out = out " "
+    } else out = out ch
+  }
+  return out
+}
+
+# Mask the last inline test module, retaining source line numbers.
+function skip_tests(n,    i, j, cut, start, depth, text) {
   cut = n + 1
   for (i = 1; i <= n; i++) {
-    if (L[i] != "#[cfg(test)]") continue
+    if (L[i] != "#[cfg(test)]" || C[i] != "#[cfg(test)]") continue
     j = i + 1
     while (j <= n && L[j] ~ /^#[[]allow[(]/) {
       while (j <= n && L[j] !~ /[)][]][[:space:]]*$/) j++
       j++
     }
-    if (j <= n && L[j] ~ /^(pub([(]crate[)])? )?mod [a-z_]+ [{]/) cut = i
+    if (j <= n && L[j] ~ /^(pub([(]crate[)])? )?mod [a-z_]+ [{]/) { cut = i; start = j }
   }
-  return cut
+  test_end = 0
+  if (cut > n) return
+  depth = 0
+  for (i = start; i <= n; i++) {
+    text = C[i]
+    depth += gsub(/[{]/, "{", text)
+    depth -= gsub(/[}]/, "}", text)
+    if (depth == 0) { test_end = i; break }
+  }
+  if (!test_end) test_end = n
+  for (i = cut; i <= test_end; i++) { L[i] = ""; C[i] = "" }
+}
+
+# Locate a forbidden macro token in sanitized production text.
+function macro_token(text,    rest, offset, start, c, depth, ch, body, body_start, hit, definition, prefix, lines) {
+  rest = text
+  offset = 0
+  while (match(rest, /[A-Za-z_][A-Za-z0-9_]*![[:space:]]*/)) {
+    start = offset + RSTART
+    definition = substr(rest, RSTART, RLENGTH) ~ /^macro_rules!/
+    c = start + RLENGTH
+    offset = c - 1
+    rest = substr(text, offset + 1)
+    if (definition) {
+      prefix = substr(text, c)
+      if (!match(prefix, /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*/)) continue
+      c += RLENGTH
+    }
+    while (substr(text, c, 1) ~ /[[:space:]]/) c++
+    if (substr(text, c, 1) ~ /[({[]/) {
+      depth = 1
+      body = ""
+      body_start = c + 1
+      for (c++; c <= length(text); c++) {
+        ch = substr(text, c, 1)
+        if (ch ~ /[({[]/) depth++
+        else if (ch ~ /[)}\]]/) depth--
+        if (!depth) break
+        body = body ch
+      }
+      hit = match(body, baseline_variant)
+      if (hit) {
+        prefix = substr(text, 1, body_start - 1) substr(body, 1, RSTART)
+        lines = gsub(/\n/, "\n", prefix)
+        return lines + 1
+      }
+      offset = c
+      rest = substr(text, offset + 1)
+    }
+  }
+  return 0
+}
+
+# Find a brace after whitespace and newlines.
+function opening_brace(i, col, prod_end,    rest, k) {
+  for (k = i; k < prod_end; k++) {
+    rest = substr(code(L[k]), k == i ? col : 1)
+    sub(/^[[:space:]]+/, "", rest)
+    if (rest == "") continue
+    if (rest ~ /^[{]/) { brace_line = k; return length(code(L[k])) - length(rest) + 1 }
+    return 0
+  }
+  return 0
 }
 
 function loc(f, i, fnn) {
@@ -168,26 +273,43 @@ function verdict(text, rest) {
 }
 
 BEGIN {
+  baseline_variant = "(^|[^A-Za-z0-9_])SaSignerSetBaselined(V2)?([^A-Za-z0-9_]|$)"
   files = 0
   na = 0; na2 = 0; nb = 0
-  a_bad = ""; a2_bad = ""; b_bad = ""; c_bad = ""; c_variant = ""; d_bad = ""; e_bad = ""
+  a_bad = ""; a2_bad = ""; b_bad = ""; c_bad = ""; c_variant = ""; d_bad = ""; e_bad = ""; f_bad = ""
   a_locs = ""; a2_locs = ""; b_locs = ""
   b_list = 0; b_refresh = 0; b_install = 0
   while ((getline f < list) > 0) {
     files++
     n = 0
     split("", L)
+    split("", C)
+    block_depth = 0; raw_end = ""; quoted = 0
     while ((getline line < f) > 0) {
       sub(/\r$/, "", line)
       L[++n] = line
+      C[n] = syntax(line)
     }
     close(f)
-    prod_end = test_cut(n)
+    skip_tests(n)
+    prod_end = n + 1
+    has_macro = 0; has_variant = 0
+    for (i = 1; i <= n; i++) {
+      if (C[i] ~ /[A-Za-z_][A-Za-z0-9_]*!/) has_macro = 1
+      if (C[i] ~ /SaSignerSetBaselined/) has_variant = 1
+    }
+    if (f_bad == "" && has_macro && has_variant) {
+      production = ""
+      for (i = 1; i <= n; i++) production = production C[i] "\n"
+      macro_line = macro_token(production)
+      if (macro_line) f_bad = f ":" macro_line
+    }
     cur = ""
     split("", seen)
     in_use = 0
     use_text = ""
     for (i = 1; i < prod_end; i++) {
+      if (i == test_end + 1) cur = ""
       if (is_comment(L[i])) continue
       line = code(L[i])
       def = fn_name(line)
@@ -216,16 +338,17 @@ BEGIN {
       if (f != entry && c_bad == "") {
         offset = 0
         rest = line
-        while (match(rest, /(^|[^A-Za-z0-9_])SaSignerSetBaselined(V2)?[[:space:]]*[{]/)) {
-          col = offset + RSTART + RLENGTH - 1
+        while (match(rest, baseline_variant)) {
           variant = substr(rest, RSTART, RLENGTH)
           sub(/^[^A-Za-z0-9_]/, "", variant)
-          sub(/[[:space:]]*[{]$/, "", variant)
+          sub(/[^A-Za-z0-9_]$/, "", variant)
+          stop = offset + RSTART + (substr(rest, RSTART, 1) ~ /[^A-Za-z0-9_]/ ? 1 : 0) + length(variant)
+          col = opening_brace(i, stop, prod_end)
           definition = (f == schema && !seen[variant] && line ~ ("^[[:space:]]*" variant "[[:space:]]*[{][[:space:]]*$"))
           if (definition) seen[variant] = 1
-          else if (classify(i, col, prod_end) == "construction") { c_bad = f ":" i; c_variant = variant; break }
-          offset = col
-          rest = substr(line, col + 1)
+          else if (col && classify(brace_line, col, prod_end) == "construction") { c_bad = f ":" i; c_variant = variant; break }
+          offset = stop - 1
+          rest = substr(line, stop)
         }
       }
 
@@ -287,6 +410,10 @@ BEGIN {
   }
   if (nb != 3 || b_list != 1 || b_refresh != 1 || b_install != 1) {
     print "FAIL (b): expected one emit_baseline( call in each of fn list_signers, fn refresh_signer_baseline and fn baseline_confirmed_install, found " nb (nb ? " at " b_locs : "")
+    exit 1
+  }
+  if (f_bad != "") {
+    print "FAIL (f): a macro names a baseline variant token at " f_bad
     exit 1
   }
   if (c_bad != "") {
