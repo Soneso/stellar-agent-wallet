@@ -560,9 +560,8 @@ const fn default_unlock_ttl_seconds() -> u32 {
 /// [policy]
 /// engine = "v1"
 /// ```
-/// `Debug` is implemented manually to redact `rpc_url` and `secondary_rpc_url`
-/// (both may embed RPC credentials in the URL). All other fields use their
-/// derived `Debug` output.
+/// `Debug` redacts every URL-typed field: `rpc_url`, `secondary_rpc_url`,
+/// and `oracle_provider_url`. All other fields use their derived `Debug` output.
 #[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Profile {
@@ -884,6 +883,82 @@ pub struct Profile {
     pub policy_window_state_key_id: KeyringEntryRef,
 }
 
+/// Operator-facing view of a profile.
+/// URL fields carry scheme, host and port only. Userinfo, path, query and
+/// fragment are omitted because they may contain provider credentials.
+#[derive(Debug, Serialize)]
+#[non_exhaustive]
+pub struct RedactedProfile {
+    /// Operator-facing value of [`Profile::version`].
+    pub version: u32,
+    /// Operator-facing value of [`Profile::chain_id`].
+    pub chain_id: Caip2,
+    /// Scheme, host and port of [`Profile::rpc_url`].
+    pub rpc_url: String,
+    /// Operator-facing value of [`Profile::network_passphrase`].
+    pub network_passphrase: String,
+    /// Operator-facing value of [`Profile::mcp_signer_default`].
+    pub mcp_signer_default: KeyringEntryRef,
+    /// Operator-facing value of [`Profile::mcp_nonce_key_alias`].
+    pub mcp_nonce_key_alias: KeyringEntryRef,
+    /// Operator-facing value of [`Profile::cross_check_threshold_stroops`].
+    pub cross_check_threshold_stroops: u64,
+    /// Operator-facing value of [`Profile::classic_fee_per_op_stroops`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classic_fee_per_op_stroops: Option<u32>,
+    /// Operator-facing value of [`Profile::classic_max_fee_per_op_stroops`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classic_max_fee_per_op_stroops: Option<u32>,
+    /// Operator-facing value of [`Profile::submit_timeout_seconds`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submit_timeout_seconds: Option<u64>,
+    /// Operator-facing value of [`Profile::audit_log_path`].
+    pub audit_log_path: PathBuf,
+    /// Operator-facing value of [`Profile::mcp_disabled`].
+    pub mcp_disabled: bool,
+    /// Operator-facing value of [`Profile::audit_log_hash_chain_key_id`].
+    pub audit_log_hash_chain_key_id: KeyringEntryRef,
+    /// Operator-facing value of [`Profile::policy_owner_key_id`].
+    pub policy_owner_key_id: KeyringEntryRef,
+    /// Operator-facing value of [`Profile::attestation_key_id`].
+    pub attestation_key_id: KeyringEntryRef,
+    /// Operator-facing value of [`Profile::counterparty_cache_key_id`].
+    pub counterparty_cache_key_id: KeyringEntryRef,
+    /// Scheme, host and port of [`Profile::oracle_provider_url`], or `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_provider_url: Option<String>,
+    /// Operator-facing value of [`Profile::policy`].
+    pub policy: PolicyConfig,
+    /// Operator-facing value of [`Profile::wallet`].
+    pub wallet: WalletConfig,
+    /// Operator-facing value of [`Profile::smart_account_max_context_rule_scan_id`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smart_account_max_context_rule_scan_id: Option<u32>,
+    /// Operator-facing value of [`Profile::session_rule_max_horizon_ledgers`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_rule_max_horizon_ledgers: Option<u32>,
+    /// Scheme, host and port of [`Profile::secondary_rpc_url`], or `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_rpc_url: Option<String>,
+    /// Operator-facing value of [`Profile::pool_master_key_id`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_master_key_id: Option<KeyringEntryRef>,
+    /// Operator-facing value of [`Profile::pool_config`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_config: Option<PoolConfig>,
+    /// Operator-facing value of [`Profile::pool_initialization`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_initialization: Option<PoolInitialization>,
+    /// Operator-facing value of [`Profile::remote_approval`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_approval: Option<RemoteApprovalConfig>,
+    /// Operator-facing value of [`Profile::served_pages`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_pages: Option<ServedPagesConfig>,
+    /// Operator-facing value of [`Profile::policy_window_state_key_id`].
+    pub policy_window_state_key_id: KeyringEntryRef,
+}
+
 /// A single channel record within the channel-account pool.
 ///
 /// Stores the BIP-44 derivation index and the `G...` Stellar strkey.  No
@@ -1184,8 +1259,7 @@ pub const MAX_SERVED_PAGE_DISPLAY_NAME_CHARS: usize = 64;
 
 impl std::fmt::Debug for Profile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `rpc_url` and `secondary_rpc_url` are redacted because they may
-        // embed RPC credentials in the URL.
+        // Every URL-typed field is redacted: a URL may embed credentials.
         f.debug_struct("Profile")
             .field("version", &self.version)
             .field("chain_id", &self.chain_id)
@@ -1215,7 +1289,10 @@ impl std::fmt::Debug for Profile {
             .field("policy_owner_key_id", &self.policy_owner_key_id)
             .field("attestation_key_id", &self.attestation_key_id)
             .field("counterparty_cache_key_id", &self.counterparty_cache_key_id)
-            .field("oracle_provider_url", &self.oracle_provider_url)
+            .field(
+                "oracle_provider_url",
+                &self.oracle_provider_url.as_ref().map(|_| "[redacted]"),
+            )
             .field("policy", &self.policy)
             .field("wallet", &self.wallet)
             .field(
@@ -1244,6 +1321,76 @@ impl std::fmt::Debug for Profile {
 }
 
 impl Profile {
+    /// Returns the operator-facing view with URL credentials and paths removed.
+    #[must_use]
+    pub fn redacted(&self) -> RedactedProfile {
+        // Every field is listed; a URL-typed field is redacted, every other field is cloned.
+        let Self {
+            version,
+            chain_id,
+            rpc_url,
+            network_passphrase,
+            mcp_signer_default,
+            mcp_nonce_key_alias,
+            cross_check_threshold_stroops,
+            classic_fee_per_op_stroops,
+            classic_max_fee_per_op_stroops,
+            submit_timeout_seconds,
+            audit_log_path,
+            mcp_disabled,
+            audit_log_hash_chain_key_id,
+            policy_owner_key_id,
+            attestation_key_id,
+            counterparty_cache_key_id,
+            oracle_provider_url,
+            policy,
+            wallet,
+            smart_account_max_context_rule_scan_id,
+            session_rule_max_horizon_ledgers,
+            secondary_rpc_url,
+            pool_master_key_id,
+            pool_config,
+            pool_initialization,
+            remote_approval,
+            served_pages,
+            policy_window_state_key_id,
+        } = self;
+        RedactedProfile {
+            version: *version,
+            chain_id: *chain_id,
+            rpc_url: crate::redact::redact_url_authority(rpc_url),
+            network_passphrase: network_passphrase.clone(),
+            mcp_signer_default: mcp_signer_default.clone(),
+            mcp_nonce_key_alias: mcp_nonce_key_alias.clone(),
+            cross_check_threshold_stroops: *cross_check_threshold_stroops,
+            classic_fee_per_op_stroops: *classic_fee_per_op_stroops,
+            classic_max_fee_per_op_stroops: *classic_max_fee_per_op_stroops,
+            submit_timeout_seconds: *submit_timeout_seconds,
+            audit_log_path: audit_log_path.clone(),
+            mcp_disabled: *mcp_disabled,
+            audit_log_hash_chain_key_id: audit_log_hash_chain_key_id.clone(),
+            policy_owner_key_id: policy_owner_key_id.clone(),
+            attestation_key_id: attestation_key_id.clone(),
+            counterparty_cache_key_id: counterparty_cache_key_id.clone(),
+            oracle_provider_url: oracle_provider_url
+                .as_ref()
+                .map(|url| crate::redact::redact_url_authority(url.as_str())),
+            policy: policy.clone(),
+            wallet: wallet.clone(),
+            smart_account_max_context_rule_scan_id: *smart_account_max_context_rule_scan_id,
+            session_rule_max_horizon_ledgers: *session_rule_max_horizon_ledgers,
+            secondary_rpc_url: secondary_rpc_url
+                .as_deref()
+                .map(crate::redact::redact_url_authority),
+            pool_master_key_id: pool_master_key_id.clone(),
+            pool_config: pool_config.clone(),
+            pool_initialization: pool_initialization.clone(),
+            remote_approval: remote_approval.clone(),
+            served_pages: served_pages.clone(),
+            policy_window_state_key_id: policy_window_state_key_id.clone(),
+        }
+    }
+
     /// Returns the effective cross-check threshold, enforcing the minimum floor.
     ///
     /// Returns `max(self.cross_check_threshold_stroops, MINIMUM_FLOOR)`.
@@ -1280,10 +1427,7 @@ impl Profile {
     ///
     /// Returns [`RpcUrlParseError`] if `rpc_url` is not a valid URL.
     pub fn validate_rpc_url(&self) -> Result<Url, RpcUrlParseError> {
-        Url::parse(&self.rpc_url).map_err(|e| RpcUrlParseError {
-            raw: self.rpc_url.clone(),
-            source: e,
-        })
+        Url::parse(&self.rpc_url).map_err(|source| RpcUrlParseError { source })
     }
 
     /// Convenience builder for testnet profiles.
@@ -1428,10 +1572,8 @@ impl Profile {
 
 /// Error returned when the `rpc_url` field fails URL validation.
 #[derive(Debug, thiserror::Error)]
-#[error("invalid rpc_url '{raw}': {source}")]
+#[error("invalid rpc_url: {source}")]
 pub struct RpcUrlParseError {
-    /// The raw string that failed to parse.
-    pub raw: String,
     /// The underlying parse error from the `url` crate.
     #[source]
     pub source: url::ParseError,
@@ -2749,6 +2891,60 @@ mod tests {
     // ── Profile::Debug redaction ──────────────────────────────────────────────
 
     #[test]
+    fn redacted_profile_hides_every_url_field() {
+        let mut profile = Profile::builder_testnet("svc", "acct", "nonce", "acct")
+            .rpc_url("https://user:SENTINEL-PRIMARY@primary.example:8443/v1/SENTINEL-PRIMARY-PATH?key=SENTINEL-PRIMARY-QUERY")
+            .oracle_provider_url(Url::parse("https://user:SENTINEL-ORACLE@oracle.example/SENTINEL-ORACLE-PATH?key=SENTINEL-ORACLE-QUERY").unwrap())
+            .build();
+        profile.classic_fee_per_op_stroops = Some(100);
+        profile.classic_max_fee_per_op_stroops = Some(500);
+        profile.submit_timeout_seconds = Some(60);
+        profile.smart_account_max_context_rule_scan_id = Some(50);
+        profile.session_rule_max_horizon_ledgers = Some(1000);
+        profile.secondary_rpc_url = Some("https://user:SENTINEL-SECONDARY@secondary.example/SENTINEL-SECONDARY-PATH?key=SENTINEL-SECONDARY-QUERY".to_owned());
+        profile.pool_master_key_id = Some(KeyringEntryRef::new("pool", "acct"));
+        profile.pool_config = Some(PoolConfig::new(1, vec![PoolChannelRecord::new(1, "GABC")]));
+        profile.pool_initialization = Some(PoolInitialization {
+            id: "init".to_owned(),
+            network_passphrase: profile.network_passphrase.clone(),
+            funder: "GABC".to_owned(),
+            channels: vec![PoolChannelRecord::new(1, "GABC")],
+            seed_ready: true,
+            attempt: 1,
+            submission: None,
+            completion_ledger: None,
+        });
+        profile.remote_approval = Some(RemoteApprovalConfig {
+            enabled: false,
+            bind: "127.0.0.1:8443".to_owned(),
+            rp_id: "wallet.example".to_owned(),
+            allowed_credentials: vec![],
+        });
+        profile.served_pages = Some(ServedPagesConfig::new(Some("Wallet".to_owned()), false));
+
+        let debug = format!("{profile:?}");
+        assert!(!debug.contains("SENTINEL"), "{debug}");
+        let redacted = profile.redacted();
+        let json = serde_json::to_string(&redacted).unwrap();
+        assert!(!json.contains("SENTINEL"), "{json}");
+        assert_eq!(redacted.rpc_url, "https://primary.example:8443");
+        assert_eq!(
+            redacted.secondary_rpc_url.as_deref(),
+            Some("https://secondary.example")
+        );
+        assert_eq!(
+            redacted.oracle_provider_url.as_deref(),
+            Some("https://oracle.example")
+        );
+        let full = serde_json::to_value(&profile).unwrap();
+        let view = serde_json::to_value(&redacted).unwrap();
+        assert_eq!(
+            full.as_object().unwrap().keys().collect::<Vec<_>>(),
+            view.as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn profile_debug_redacts_rpc_url() {
         let mut p = Profile::builder_testnet(
             "stellar-agent-signer",
@@ -2759,6 +2955,8 @@ mod tests {
         .rpc_url("https://user:secret-password@rpc.example.com/api")
         .build();
         p.secondary_rpc_url = Some("https://user:other-secret@secondary.example.com".to_owned());
+        p.oracle_provider_url =
+            Some(Url::parse("https://user:SENTINEL-ORACLE@oracle.example/path").unwrap());
 
         let dbg = format!("{p:?}");
 
@@ -2770,6 +2968,10 @@ mod tests {
         assert!(
             !dbg.contains("other-secret"),
             "secondary_rpc_url credentials must be redacted from Debug output; got: {dbg}"
+        );
+        assert!(
+            !dbg.contains("SENTINEL-ORACLE"),
+            "oracle URL must be redacted: {dbg}"
         );
         // The redaction placeholder must appear.
         assert!(
@@ -2793,19 +2995,14 @@ mod tests {
     // ── RpcUrlParseError display ──────────────────────────────────────────────
 
     #[test]
-    fn rpc_url_parse_error_display_contains_raw_url() {
+    fn rpc_url_parse_error_display_omits_the_url() {
         let mut p = make_testnet_profile();
-        p.rpc_url = "not-a-url".to_owned();
+        p.rpc_url = "https://user:SENTINEL@[bad".to_owned();
         let err = p.validate_rpc_url().unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("not-a-url"),
-            "RpcUrlParseError display must contain the raw URL; got: {msg}"
-        );
-        assert!(
-            msg.starts_with("invalid rpc_url"),
-            "RpcUrlParseError display must start with 'invalid rpc_url'; got: {msg}"
-        );
+        assert!(msg.starts_with("invalid rpc_url: "), "{msg}");
+        assert!(!msg.contains("SENTINEL"), "{msg}");
+        assert!(!format!("{err:?}").contains("SENTINEL"));
     }
 
     // ── ProfileBuilder setters not yet tested ─────────────────────────────────

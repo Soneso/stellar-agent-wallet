@@ -25,6 +25,7 @@ use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::SaInvocationResult;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::error::{SubmissionError, WalletError};
+use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::rpc_budget::{SequentialRpcBudget, bound_stage};
 #[cfg(any(test, feature = "test-helpers"))]
 use stellar_agent_network::SoftwareSigningKey;
@@ -338,22 +339,16 @@ pub(crate) fn decode_hex32(hex: &str) -> Result<[u8; 32], ()> {
     stellar_agent_core::hex::decode_hex32(hex).map_err(|_| ())
 }
 
-/// Returns the CAIP-2 chain identifier for the given Stellar network passphrase.
-///
-/// Maps well-known passphrases to their canonical CAIP-2 forms; unknown passphrases
-/// (custom networks, private testnets) fall back to `"stellar:unknown"`.
-/// Used for the `chain_id` field in audit-log entries.
-///
-/// `pub(crate)` so sibling deployment modules (`deploy_webauthn_verifier`) share a
-/// single source of truth — adding a network in one site without the other would
-/// silently emit `"stellar:unknown"` for the wrong subset of audit-log entries.
+/// Returns the CAIP-2 chain identifier for a Stellar network passphrase.
+/// Known networks use their canonical identifiers; other passphrases return
+/// `"stellar:unknown"`. Audit-log entries use this chain identifier.
 pub(crate) fn caip2_chain_id_for_passphrase(passphrase: &str) -> String {
-    match passphrase {
-        "Test SDF Network ; September 2015" => "stellar:testnet".to_owned(),
-        "Public Global Stellar Network ; September 2015" => "stellar:mainnet".to_owned(),
-        "Test SDF Future Network ; October 2022" => "stellar:futurenet".to_owned(),
-        _ => "stellar:unknown".to_owned(),
-    }
+    Caip2::from_passphrase(passphrase)
+        .map(|chain| chain.caip2_str().to_owned())
+        .unwrap_or_else(|| match passphrase {
+            "Test SDF Future Network ; October 2022" => "stellar:futurenet".to_owned(),
+            _ => "stellar:unknown".to_owned(),
+        })
 }
 
 /// Maps a deployment outcome to the `SaInvocationResult` wire enum.
@@ -1399,6 +1394,22 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn caip2_chain_id_for_passphrase_maps_all_networks() {
+        use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
+        for (passphrase, expected) in [
+            (TESTNET_PASSPHRASE, "stellar:testnet"),
+            (MAINNET_PASSPHRASE, "stellar:mainnet"),
+            (
+                "Test SDF Future Network ; October 2022",
+                "stellar:futurenet",
+            ),
+            ("unknown", "stellar:unknown"),
+        ] {
+            assert_eq!(caip2_chain_id_for_passphrase(passphrase), expected);
+        }
+    }
 
     /// Asserts that `SHA256(MULTISIG_ACCOUNT_WASM)` matches the pinned `MULTISIG_ACCOUNT_WASM_SHA256`.
     ///

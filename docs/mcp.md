@@ -181,9 +181,12 @@ After the client connects it issues an MCP `initialize`, then `tools/list` and
 The server exposes three MCP resources. None contains a secret.
 
 - `mcp-resource://usage.md` — tool usage documentation.
-- `mcp-resource://profiles/<name>` — non-secret profile metadata (chain id, RPC
-  URL, network passphrase, `mcp_disabled`, and the cross-check threshold
-  (stroops)).
+- `mcp-resource://profiles/<name>`: non-secret profile metadata (chain id, the RPC
+  endpoint as scheme, host and port, network passphrase, `mcp_disabled`, and
+  the cross-check threshold in stroops).
+  An agent passing this resource's `rpc_url` to `stellar_fee_stats` passes an
+  authority-only URL; the allowlisted hosts have no path, so the call behaves
+  the same.
 - `mcp-resource://accounts/<G>` — public account directory for the enrolled
   accounts across all configured profiles.
 

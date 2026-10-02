@@ -41,12 +41,10 @@ use uuid::Uuid;
 use crate::commands::smart_account::common::{
     SignerSourceFlags, emit_sa_error, open_profile_audit_writer, resolve_signer,
 };
-use crate::common::network::TargetNetwork;
+use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 use crate::common::signer_ceremony::record_mlock_degradation;
-
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
 /// Arguments for `smart-account timelock cancel`.
 #[derive(Debug, Args)]

@@ -1540,7 +1540,6 @@ mod tests {
             ProfileLoadError::InvalidRpcUrl {
                 name: "p".to_owned(),
                 source: crate::profile::schema::RpcUrlParseError {
-                    raw: "not a url".to_owned(),
                     source: url::ParseError::RelativeUrlWithoutBase,
                 },
             },

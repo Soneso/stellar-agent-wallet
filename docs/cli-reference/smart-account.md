@@ -599,7 +599,7 @@ Flags:
 - `--smart-account <C_STRKEY>` (required) — the smart-account executing the bundle.
 - `--rule-id <U32>` (required) — the context rule authorizing the bundle.
 - `--invocation <TARGET:FN:JSON_ARGS>` (required, repeatable, 1–50) — one invocation descriptor.
-- `--secondary-rpc-url <URL>` — secondary RPC for cross-verification. Resolved as: `profile.secondary_rpc_url`, then this flag (which overrides the profile value), then a typed error if neither is set.
+- `--secondary-rpc-url <URL>`: secondary RPC for cross-verification. Resolved from the flag, else the profile's `secondary_rpc_url`, else a typed error.
 - `--fee <STROOPS>` — per-op base fee in stroops (default 100). Unlike the deploy verb, `auto[:pNN]` is rejected here.
 - Signer-source flags are required (one of `--signer-secret-env` or `--sign-with-ledger`); `--account-index <INDEX>` defaults to `0`.
 - Shared: `--network`, `--rpc-url`, `--timeout-seconds`, `--profile`.

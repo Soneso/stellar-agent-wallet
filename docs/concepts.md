@@ -40,7 +40,7 @@ A handful of commands need neither model directly. `profile`, `credentials`, `ap
 
 ## Key custody and the unlock window
 
-Secrets are never stored in configuration. A profile is a per-environment TOML file (schema version 2) that binds a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no secret material; each `*_key_id` field is a Keyring entry reference (a `service` + `account` pair) that names a platform-keyring secret. The signer seed, the nonce key, and every HMAC key live in the platform keyring (macOS Keychain, Linux Secret Service, Windows Credential Manager). The profile TOML is therefore safe to back up. The profile's `Debug` output additionally redacts `rpc_url` and `secondary_rpc_url`, since those may embed RPC credentials.
+Secrets are never stored in configuration. A profile is a per-environment TOML file (schema version 2) that binds a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no secret material; each `*_key_id` field is a Keyring entry reference (a `service` + `account` pair) that names a platform-keyring secret. The signer seed, the nonce key, and every HMAC key live in the platform keyring (macOS Keychain, Linux Secret Service, Windows Credential Manager). The profile TOML is therefore safe to back up. The profile's `Debug` output additionally redacts `rpc_url`, `secondary_rpc_url` and `oracle_provider_url`, since those may embed RPC credentials.
 
 When a tool needs to sign, the 32-byte signing seed is loaded into a short Unlock window:
 

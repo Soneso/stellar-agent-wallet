@@ -111,7 +111,7 @@ use crate::commands::policy_engine::{
     build_v1_policy_engine, caip2_chain_id_for_network, claim_policy_args,
     evaluate_opaque_signing_policy, evaluate_value_moving_policy,
 };
-use crate::common::network::TargetNetwork;
+use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::profile_access::{
     ProfileOrigin, injected_profile_load, load_profile_or_synthesize_testnet_with,
 };
@@ -128,9 +128,6 @@ const DEFAULT_FEE_STROOPS: u32 = 100;
 
 /// Default submission timeout in seconds.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
-
-/// Stellar testnet RPC endpoint (SDF operated).
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ClaimResult — the structured success payload

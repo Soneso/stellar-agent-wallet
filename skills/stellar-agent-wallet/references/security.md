@@ -61,8 +61,8 @@ material.
   live in the platform keyring: macOS Keychain, Linux Secret Service, Windows
   Credential Manager.
 - Because the TOML names secrets but does not contain them, profile TOML is safe to
-  back up. The profile's `Debug` output additionally redacts `rpc_url` and
-  `secondary_rpc_url`, since those may embed RPC credentials.
+  back up. The profile's `Debug` output additionally redacts `rpc_url`,
+  `secondary_rpc_url` and `oracle_provider_url`, since those may embed RPC credentials.
 - The core library compiles under `#![forbid(unsafe_code)]`. Secret material is
   never written to logs at any level.
 

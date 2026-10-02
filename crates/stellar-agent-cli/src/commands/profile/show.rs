@@ -1,8 +1,8 @@
-//! `stellar-agent profile show <name>` — print a profile's resolved configuration.
+//! `stellar-agent profile show <name>` prints a profile's resolved configuration.
 //!
-//! Loads the named profile (applying env-var overlays) and prints its resolved
-//! fields as a JSON envelope to stdout.  Keyring entry references are printed
-//! as opaque `{service, account}` objects — never the secret itself.
+//! Loads the named profile with env-var overlays and prints a JSON envelope.
+//! URL fields are printed as scheme, host and port only. Keyring entry
+//! references are printed as opaque `{service, account}` objects.
 //!
 //! # Output
 //!
@@ -90,7 +90,7 @@ pub async fn run(args: &ShowArgs) -> i32 {
     // Every other production load routes through `common::profile_access`,
     // which refuses a profile whose `policy_owner_key_id.service` names a
     // different profile. This command exists to DISPLAY that field: the
-    // envelope below serialises the whole `Profile`, `policy_owner_key_id`
+    // envelope below serialises the redacted view, `policy_owner_key_id`
     // included, and it is what an operator reads to repair the mismatch.
     // Reconciling here would make a mismatched profile impossible to inspect
     // and leave the refusal's own recovery advice — "correct
@@ -104,7 +104,7 @@ pub async fn run(args: &ShowArgs) -> i32 {
     // pins this file as the sole allowlist entry.
     match loader::load(args.profile_name(), None) {
         Ok(profile) => {
-            render::render_json(&Envelope::ok(profile));
+            render::render_json(&Envelope::ok(profile.redacted()));
             0
         }
         Err(err) => {

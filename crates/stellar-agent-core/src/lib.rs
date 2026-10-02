@@ -123,6 +123,7 @@ pub mod policy;
 /// version-dispatched migration ([`profile::migrate`]), and the profile-local
 /// submission receipt store ([`profile::receipt`]).
 pub mod profile;
+pub mod redact;
 
 pub mod smart_account;
 

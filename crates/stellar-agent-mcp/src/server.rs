@@ -131,7 +131,7 @@ impl From<&Profile> for ProfileMetadataResource {
     fn from(profile: &Profile) -> Self {
         Self {
             chain_id: profile.chain_id.caip2_str().to_owned(),
-            rpc_url: profile.rpc_url.clone(),
+            rpc_url: stellar_agent_core::redact::redact_url_authority(&profile.rpc_url),
             network_passphrase: profile.network_passphrase.clone(),
             mcp_disabled: profile.mcp_disabled,
             cross_check_threshold_stroops: profile.cross_check_threshold_stroops,
@@ -1341,6 +1341,14 @@ mod tests {
         assert!(!text.contains("audit_log_hash_chain_key_id"));
         assert!(!text.contains("attestation_key_id"));
         assert!(!text.contains("counterparty_cache_key_id"));
+
+        let profile = Profile::builder_testnet("svc", "acct", "nonce", "acct")
+            .rpc_url("https://user:SENTINEL-CRED@rpc.example:8443/SENTINEL-PATH?key=SENTINEL-QUERY")
+            .build();
+        let text = profile_metadata_json(&profile).expect("metadata serializes");
+        let value: Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(value["rpc_url"], "https://rpc.example:8443");
+        assert!(!text.contains("SENTINEL"), "{text}");
     }
 
     #[test]

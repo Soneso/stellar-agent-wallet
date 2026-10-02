@@ -51,7 +51,7 @@ use stellar_agent_smart_account::deployment::{
 };
 use tracing::info;
 
-use crate::common::network::TargetNetwork;
+use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::signer_ceremony::{SignerCeremonyOutcome, resolve_software_signer_from_env};
 
@@ -69,9 +69,6 @@ const DEFAULT_FEE_STROOPS: u32 = 100;
 
 /// Default submission timeout in seconds.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
-
-/// Stellar testnet Soroban RPC endpoint (SDF operated).
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DeployWebAuthnVerifierArgs

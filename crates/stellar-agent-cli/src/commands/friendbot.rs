@@ -32,20 +32,16 @@ use std::str::FromStr;
 use clap::Args;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{InternalError, NetworkError, WalletError};
-use stellar_agent_core::profile::caip2::Caip2;
+use stellar_agent_core::profile::caip2::{Caip2, TESTNET_PASSPHRASE};
 use stellar_agent_network::{
     FriendbotResult, default_friendbot_url, fund_with_friendbot, redact_url_userinfo,
     validate_friendbot_url,
 };
 
-/// Stellar testnet network passphrase.
-const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+use crate::common::network::TESTNET_RPC_URL;
 
 /// Stellar Futurenet network passphrase.
 const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
-
-/// Default RPC URL used to verify testnet Friendbot funding landed.
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
 /// Default RPC URL used to verify Futurenet Friendbot funding landed.
 ///

@@ -21,6 +21,7 @@ use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::WalletError;
 use stellar_agent_network::{AccountView, Asset, StellarRpcClient, fetch_account};
 
+use crate::common::network::TESTNET_RPC_URL;
 use crate::render::table::render_balances_table;
 
 /// Arguments for the `balances` subcommand.
@@ -41,10 +42,10 @@ pub struct BalancesArgs {
     /// Stellar RPC endpoint URL.
     ///
     /// Defaults to the Stellar testnet RPC.
-    /// The active-profile config does not yet override this default.
+    /// No profile is consulted; the flag is the only source.
     #[arg(
         long,
-        default_value = "https://soroban-testnet.stellar.org",
+        default_value = TESTNET_RPC_URL,
         value_name = "URL"
     )]
     pub rpc_url: String,
@@ -76,8 +77,7 @@ pub struct BalancesArgs {
 /// Only if UUID generation or `serde_json` serialisation panics
 /// (effectively never in practice).
 pub async fn run(args: &BalancesArgs) -> i32 {
-    // Resolve the account ID. `--account` is currently required; profile
-    // resolution via the profile-config module is not yet wired.
+    // `--account` is required and no profile is read.
     let account_id = match &args.account {
         Some(id) => id.clone(),
         None => {

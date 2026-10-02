@@ -149,12 +149,8 @@ pub fn validate_friendbot_url_allowing_loopback(url: &str) -> Result<(), Friendb
     validate_friendbot_url_inner(url, true)
 }
 
-/// Re-export of the userinfo-stripping display redactor.
-///
-/// The canonical definition lives in [`crate::redact`] next to
-/// [`crate::redact::redact_url_authority`] so the two URL redaction
-/// semantics are co-located; this re-export keeps the
-/// `friendbot::redact_url_userinfo` import path stable for callers.
+/// Re-export of the core URL userinfo helper.
+/// Keeps the `friendbot::redact_url_userinfo` path stable.
 pub use crate::redact::redact_url_userinfo;
 
 /// Returns the default Friendbot URL for the given CAIP-2 chain, or `None`
@@ -933,35 +929,6 @@ mod tests {
                 "error message must not reveal credentials: {msg}"
             );
         }
-    }
-
-    // ── redact_url_userinfo tests ─────────────────────────────────────────────
-
-    #[test]
-    fn redact_url_userinfo_strips_user_password() {
-        let result = redact_url_userinfo("https://user:pass@friendbot.stellar.org/");
-        assert_eq!(
-            result, "https://friendbot.stellar.org/",
-            "userinfo must be stripped"
-        );
-    }
-
-    #[test]
-    fn redact_url_userinfo_passes_clean_url_unchanged() {
-        // Note: the url crate normalises https://... to include a trailing slash.
-        let result = redact_url_userinfo("https://friendbot.stellar.org");
-        assert_eq!(
-            result, "https://friendbot.stellar.org/",
-            "clean URL without userinfo must pass through (normalised)"
-        );
-    }
-
-    #[test]
-    fn redact_url_userinfo_passes_malformed_url_unchanged_string() {
-        // Defensive: malformed input must never panic; returns original string.
-        let input = "not-a-url";
-        let result = redact_url_userinfo(input);
-        assert_eq!(result, input, "malformed URL must be returned unchanged");
     }
 
     // ── default_friendbot_url unit tests ──────────────────────────────────────

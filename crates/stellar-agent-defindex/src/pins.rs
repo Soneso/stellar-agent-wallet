@@ -46,6 +46,7 @@
 //! GPL boundary clear.
 
 use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_agent_network::{StellarRpcClient, WasmHashFetch, fetch_contract_wasm_hash};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,9 +171,7 @@ pub async fn verify_defindex_vault_wasm(
 #[must_use]
 pub fn is_blend_strategy(strategy_wasm_hash: &[u8; 32], network: &str) -> bool {
     let pinned = match network {
-        "pubnet" | "stellar:pubnet" | "Public Global Stellar Network ; September 2015" => {
-            &BLEND_STRATEGY_WASM_HASH_PUBNET
-        }
+        "pubnet" | "stellar:pubnet" | MAINNET_PASSPHRASE => &BLEND_STRATEGY_WASM_HASH_PUBNET,
         _ => &BLEND_STRATEGY_WASM_HASH_TESTNET,
     };
     strategy_wasm_hash == pinned
@@ -323,6 +322,10 @@ mod tests {
 
     #[test]
     fn blend_strategy_detected_on_pubnet() {
+        assert!(is_blend_strategy(
+            &BLEND_STRATEGY_WASM_HASH_PUBNET,
+            MAINNET_PASSPHRASE
+        ));
         assert!(is_blend_strategy(
             &BLEND_STRATEGY_WASM_HASH_PUBNET,
             "pubnet"

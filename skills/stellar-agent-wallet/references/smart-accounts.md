@@ -206,7 +206,7 @@ Each `--invocation` is `<target>:<fn>:<json-args>` where `<target>` is the C-str
 | `--smart-account <C>` (req) | Smart-account executing the bundle |
 | `--rule-id <U32>` (req) | Context rule authorizing the bundle |
 | `--invocation <TARGET:FN:JSON_ARGS>` (req, repeatable, 1–50) | One invocation descriptor |
-| `--secondary-rpc-url <URL>` | Secondary RPC for cross-verification; resolved as `profile.secondary_rpc_url`, then this flag (overrides the profile value), then a typed error if neither set |
+| `--secondary-rpc-url <URL>` | Secondary RPC for cross-verification: the flag, else the profile's `secondary_rpc_url`, else a typed error. |
 | `--fee <STROOPS>` | Per-op base fee, default `100`; `auto[:pNN]` is rejected here (unlike the deploy verbs) |
 
 ```bash

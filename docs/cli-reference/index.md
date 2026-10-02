@@ -54,7 +54,7 @@ A few commands derive their network from the loaded profile rather than from a `
 
 ### RPC endpoints
 
-- `--rpc-url <URL>` — the primary Soroban RPC endpoint. On most commands the default is `https://soroban-testnet.stellar.org`. URLs are validated against an allow-list on the commands that resolve them.
+- `--rpc-url <URL>`: the primary Soroban RPC endpoint. On most commands the default is `https://soroban-testnet.stellar.org`. `fees stats` validates the URL against an allowlist; the other commands accept any URL that parses.
 - `--secondary-rpc-url <URL>` — a second RPC endpoint for two-RPC cross-checks (for example, divergence detection on WASM-hash pins). Optional; its absence resolves per command:
   - On `lend`, `vault`, `trade`, and `smart-account rules` the dual-RPC cross-check is disabled and verification proceeds against the primary endpoint only.
   - On the `smart-account timelock` commands it falls back to the primary `--rpc-url` and warns that the divergence defence is then off.
