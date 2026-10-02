@@ -28,15 +28,19 @@
 //! manager that pins, a context rule with one External signer pointing to
 //! verifier-A.  Calls `MigrationPlan::submit` to execute the remove+add pair
 //! on-chain (verifier-A → verifier-B).  Asserts the submit result has no
-//! failure, the audit log contains one `SaVerifierMigrated` row and one
-//! `SaContextRulePinsUpdated` row naming verifier-B's hash, the post-migration
-//! on-chain `ContextRule` satisfies seven decoded invariants (External verifier
-//! address, pubkey preservation, policies list preservation, Delegated signer
-//! address preservation, policy_ids preservation, and Delegated signer on-chain
-//! id invariance across the remove+add pair), a transfer signed by the rule's
-//! Delegated co-signer through `submit_signed_invoke` with the pinned-hash
-//! drift check confirms, and `verify_rule_wasm_pins` reports a match against
-//! verifier-B's hash.
+//! failure. The pair's rows under the submit's request id are, in order, one
+//! `SaSignerRemovedV2`, one `SaContextRulePinsUpdated` naming verifier-B's
+//! hash, one `SaSignerAddedV2` and one `SaVerifierMigrated`. The added row's
+//! snapshot holds the original key data on verifier-B beside the unchanged
+//! Delegated signer and threshold. A refresh after the pair finds the chain
+//! matching the add's row without accepting a divergence. The post-migration
+//! on-chain `ContextRule` satisfies seven decoded invariants: the External
+//! verifier address, pubkey preservation, policies list preservation,
+//! Delegated signer address preservation, policy_ids preservation, and
+//! Delegated signer on-chain id invariance across the remove+add pair. A
+//! transfer signed by the rule's Delegated co-signer through
+//! `submit_signed_invoke` with the pinned-hash drift check confirms, and
+//! `verify_rule_wasm_pins` reports a match against verifier-B's hash.
 //!
 //! # Gating
 //!
@@ -67,6 +71,7 @@ use rand_core::OsRng;
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EventKind, PinsUpdateReason};
+use stellar_agent_core::audit_log::signer_set::{SignerEntryV2, SignerIdentityV2};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
@@ -1803,19 +1808,23 @@ async fn d3_migrate_verifier_on_chain_submit() {
     // the wrong signer; real tx hashes only prove confirmation, not signer-set
     // correctness.
     let post_baseline_rid = uuid::Uuid::new_v4().to_string();
-    // The migration replaced the External signer on chain; this refresh
-    // exists to accept and inspect that intended change, so it passes
-    // `accept_divergence`.
+    // The pair recorded both of its state rows, so the refresh finds the
+    // chain matching the add's row and needs no acceptance of a divergence.
     let post_baseline = manager
         .refresh_signer_baseline(
             smart_account_addr.clone(),
             new_rule_id,
             Some(&signer_g),
-            RefreshOptions::new(true),
+            RefreshOptions::new(false),
             post_baseline_rid,
         )
         .await
         .expect("post-submit refresh_signer_baseline must succeed");
+    assert_eq!(
+        post_baseline.previous_baseline,
+        PreviousBaseline::Matched,
+        "the pair recorded the migrated set, which the chain matches"
+    );
 
     assert_eq!(
         post_baseline.view.signer_count(),
@@ -1889,6 +1898,96 @@ async fn d3_migrate_verifier_on_chain_submit() {
             "audit log OK — {} SaVerifierMigrated row(s) in {} total entries",
             migrated_rows.len(),
             entries.len()
+        );
+    }
+
+    // ── The pair's state rows ────────────────────────────────────────────────
+    //
+    // The pair recorded its removal and its add as version-2 state rows under
+    // the submit's request id, with the pins row between them and the
+    // migrated row last.
+    {
+        let pair_rows: Vec<AuditEntry> = read_audit_entries(&audit_log_path)
+            .into_iter()
+            .filter(|entry| entry.request_id == submit_request_id)
+            .collect();
+        let kinds: Vec<&str> = pair_rows
+            .iter()
+            .map(|entry| match &entry.event_kind {
+                EventKind::SaSignerRemovedV2 { rule_id, .. } if *rule_id == new_rule_id => {
+                    "sa_signer_removed_v2"
+                }
+                EventKind::SaContextRulePinsUpdated { rule_id, .. } if *rule_id == new_rule_id => {
+                    "sa_context_rule_pins_updated"
+                }
+                EventKind::SaSignerAddedV2 { rule_id, .. } if *rule_id == new_rule_id => {
+                    "sa_signer_added_v2"
+                }
+                EventKind::SaVerifierMigrated { rule_id, .. } if *rule_id == new_rule_id => {
+                    "sa_verifier_migrated"
+                }
+                _ => "another row",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "sa_signer_removed_v2",
+                "sa_context_rule_pins_updated",
+                "sa_signer_added_v2",
+                "sa_verifier_migrated",
+            ],
+            "the pair's rows under the submit's request id"
+        );
+
+        let SignerSetView::V2(installed) = &baseline.view else {
+            panic!(
+                "the installed rule's baseline is version 2: {}",
+                baseline.view
+            )
+        };
+        let added = pair_rows
+            .iter()
+            .find_map(|entry| match &entry.event_kind {
+                EventKind::SaSignerAddedV2 { snapshot, .. } => Some(snapshot),
+                _ => None,
+            })
+            .expect("the added row");
+        let ScAddress::Contract(stellar_xdr::ContractId(Hash(verifier_b_id))) = &verifier_b_addr
+        else {
+            panic!("verifier-B is a contract address")
+        };
+        let restored = SignerIdentityV2::External {
+            verifier: *verifier_b_id,
+            key_data_sha256: Sha256::digest(pubkey_data).into(),
+            key_data_len: u32::try_from(pubkey_data.len()).expect("fits u32"),
+        };
+        let externals: Vec<&SignerIdentityV2> = added
+            .signers
+            .iter()
+            .map(|entry| &entry.identity)
+            .filter(|identity| matches!(identity, SignerIdentityV2::External { .. }))
+            .collect();
+        assert_eq!(
+            externals,
+            vec![&restored],
+            "one External signer: the original key data on verifier-B"
+        );
+        let others = |signers: &[SignerEntryV2]| -> Vec<SignerEntryV2> {
+            signers
+                .iter()
+                .filter(|entry| !matches!(entry.identity, SignerIdentityV2::External { .. }))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            others(&added.signers),
+            others(&installed.signers),
+            "the Delegated signer and its id are unchanged"
+        );
+        assert_eq!(
+            added.threshold, installed.threshold,
+            "the threshold is unchanged"
         );
     }
 
@@ -2090,9 +2189,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
     // Signed by the rule's Delegated co-signer (the rule is 1-of-2), so
     // verifier-B's `verify` is not called; the drift check compares
     // verifier-B and the policy against the rewritten pin record before
-    // anything is simulated. The pairs above signed under the migrating-rule
-    // exemption and left the rule diverged; the refresh re-anchored it, so
-    // this transfer compares and signs.
+    // anything is simulated.
     let funded = fund_sac_balance(
         "d3-migrate-verifier",
         TESTNET_RPC_URL,
@@ -2187,7 +2284,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
     assert_eq!(
         pins_updated.len(),
         1,
-        "one SaContextRulePinsUpdated row per confirmed migration pair"
+        "one SaContextRulePinsUpdated row: the pair's repoint"
     );
     assert_eq!(pins_updated[0].request_id, submit_request_id);
     match &pins_updated[0].event_kind {
@@ -2236,7 +2333,8 @@ async fn d3_migrate_verifier_on_chain_submit() {
 
     eprintln!(
         "d3 PASS: migration complete — verifier address changed from {} to {}; \
-         remove+add pair confirmed on-chain; 1 SaVerifierMigrated audit row; \
+         remove+add pair confirmed on-chain and recorded as SaSignerRemovedV2 + \
+         SaSignerAddedV2; 1 SaVerifierMigrated audit row; \
          1 SaContextRulePinsUpdated row naming verifier-B's hash; \
          on-chain ContextRule verifier-B address + Delegated invariant + \
          policies preservation + Delegated signer-id invariance verified; \

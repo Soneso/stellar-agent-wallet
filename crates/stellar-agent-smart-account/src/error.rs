@@ -579,10 +579,10 @@ pub enum SaError {
     /// [`SaError::SignerSetDiverged`], [`SaError::NetworkRpcDivergence`] and
     /// [`SaError::AuditLog`] from the baseline read or the comparison, and
     /// [`SaError::AuthEntryConstructionFailed`] at the lock and signer-set
-    /// stages. The baseline read scans the audit log before the pin check
-    /// does, so an audit-log integrity error under a rule other than rule 0
-    /// is reported as [`SaError::AuditLog`]; under the migrating rule of a
-    /// verifier migration, which has no baseline read, it is reported here.
+    /// stages. The baseline read, or the comparison of the entry that holds
+    /// the rule's lock, scans the audit log before the pin check does. An
+    /// audit-log integrity error under a rule other than rule 0 is therefore
+    /// reported as [`SaError::AuditLog`].
     ///
     /// `reason` is the inner error's wire code, a colon and its Display,
     /// capped at [`PIN_CHECK_REASON_MAX_BYTES`] bytes.
@@ -2213,12 +2213,15 @@ pub enum SaError {
     ///   `VERIFIER_ALLOWLIST`.
     /// - `"preflight_destination_mutable"` — destination contract is
     ///   upgradeable (mutability detected via `detect_contract_mutability`).
-    /// - `"plan_build"` — rule-discovery or audit-log read failed during
-    ///   `MigrationPlan::build`.
-    /// - `"submit_simulate"` — on-chain simulation of the migration
-    ///   `ExecutionEntryPoint::execute` call failed.
-    /// - `"submit_send"` — on-chain submission of the migration transaction
-    ///   failed after simulation succeeded.
+    /// - `"plan_build"`: rule-discovery or audit-log read failed during
+    ///   `MigrationPlanner::build`, or a pair's plan does not match the rule
+    ///   it migrates (checked before anything is sent).
+    /// - `"submit_simulate"`: the simulation of a migration step failed or
+    ///   returned another shape than the step reads, or a step's host
+    ///   function did not decode.
+    /// - `"submit_send"`: every other failure of a migration step after its
+    ///   simulation, including a transaction refused on send or failed on
+    ///   chain.
     ///
     /// # Security
     ///

@@ -71,6 +71,7 @@ use crate::managers::verifiers::{PinnedKind, pin_referenced_contracts, scaddress
 use crate::signers::THRESHOLD_POLICY_WASM_HASHES;
 use crate::signing::divergence::AuthContextFingerprint;
 use crate::simple_threshold_policy::parse_simple_threshold_install_param;
+use crate::submit::ExpectedReturn;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Manager configuration
@@ -993,6 +994,8 @@ impl ContextRuleManager {
             request_id,
             // No lock is held: the submit path locks and checks the auth rules.
             None,
+            // The install reads the new rule's id from the return value.
+            Some(ExpectedReturn::ContextRuleId),
         )
         .await
     }
@@ -1207,6 +1210,7 @@ impl ContextRuleManager {
             request_id,
             // No lock is held: the submit path locks and checks the auth rules.
             None,
+            None,
         )
         .await?;
         Ok(())
@@ -1333,6 +1337,7 @@ impl ContextRuleManager {
             request_id,
             // No lock is held: the submit path locks and checks the auth rules.
             None,
+            None,
         )
         .await?;
         Ok(())
@@ -1456,6 +1461,7 @@ impl ContextRuleManager {
             None, // no expiry check: delete is a destructive revocation alternative
             request_id,
             // No lock is held: the submit path locks and checks the auth rules.
+            None,
             None,
         )
         .await?;
@@ -1764,8 +1770,10 @@ impl ContextRuleManager {
     /// and, for the simple-threshold policy, records the threshold under the
     /// rule's lock. `Err` when the call returned before a confirmation;
     /// nothing was recorded. `Ok` once the add confirmed, whatever the steps
-    /// after the confirmation returned: a return value that is not a `u32`
-    /// gives no policy id and a stage-`observe` result.
+    /// after the confirmation returned. The submission refuses a simulated
+    /// return value that is not a `u32` before signing. After the
+    /// confirmation, a return value the entry cannot read as a `u32` gives
+    /// no policy id and a stage-`observe` result.
     #[allow(
         clippy::too_many_arguments,
         reason = "the signers manager, the account identity, the rule, the policy and its \
@@ -1818,6 +1826,9 @@ impl ContextRuleManager {
                         Some(ExpiryCheck { rule_id }),
                         request_id,
                         Some(locked.rule_locks()),
+                        // The attach reads the assigned policy id from the
+                        // return value.
+                        Some(ExpectedReturn::U32),
                     ))
                 },
                 request_id,
@@ -2162,6 +2173,7 @@ impl ContextRuleManager {
                         Some(ExpiryCheck { rule_id }),
                         request_id,
                         Some(locked.rule_locks()),
+                        None,
                     ))
                 },
                 request_id,
@@ -2794,6 +2806,9 @@ impl ContextRuleManager {
     /// the configured signers manager with `request_id`
     /// ([`crate::submit::PinCheck`]). `rule_locks` is the held-lock context
     /// of a caller that holds the locks of those rules, `None` otherwise.
+    /// `expected_return` is the shape a caller that reads an id from the
+    /// return value requires of the simulated result before signing
+    /// ([`ExpectedReturn`]).
     /// Without a signers manager, a submission authorized by any rule other
     /// than rule 0 is refused with [`SaError::SignersManagerNotConfigured`]
     /// before anything is simulated or signed; a submission under rule 0
@@ -2815,6 +2830,7 @@ impl ContextRuleManager {
         expiry_check: Option<ExpiryCheck>,
         request_id: &str,
         rule_locks: Option<&BorrowedRuleLocks<'_>>,
+        expected_return: Option<ExpectedReturn>,
     ) -> Result<crate::submit::SubmitInvokeResult, SaError> {
         // Convert smart_account ScAddress → C-strkey so the free function can
         // call `parse_c_strkey_to_smart_account` uniformly.
@@ -2880,6 +2896,7 @@ impl ContextRuleManager {
                 .maybe_expiry_check(expiry_check)
                 .maybe_pin_check(pin_check)
                 .maybe_rule_locks(rule_locks)
+                .maybe_expected_return(expected_return)
                 .build(),
         )
         .await
@@ -4624,10 +4641,13 @@ pub(crate) fn build_signed_invoke_envelope(
 /// Parses the simulated return value of OZ `add_context_rule` (a `ContextRule`
 /// struct ScVal) and extracts the assigned `rule_id: u32`.
 ///
-/// The error names the shape that has no id. The install runs this after
-/// confirmation and reports a failure as [`SaError::InstallStateMismatch`]
-/// without a rule id, logging this error as the cause.
-fn parse_context_rule_id_from_return(scval: &ScVal) -> Result<u32, SaError> {
+/// The error names the shape that has no id. The submit path checks the
+/// shape with this parser before the install is signed
+/// ([`crate::submit::ExpectedReturn::ContextRuleId`]). The install reads the
+/// id with it after confirmation, and reports a failure as
+/// [`SaError::InstallStateMismatch`] without a rule id, logging this error
+/// as the cause.
+pub(crate) fn parse_context_rule_id_from_return(scval: &ScVal) -> Result<u32, SaError> {
     let entries = match scval {
         ScVal::Map(Some(ScMap(entries))) => entries,
         other => {

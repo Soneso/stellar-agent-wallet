@@ -46,16 +46,32 @@
 //!
 //! A migration with `N` affected rules each with `M` External signers produces
 //! `2 × N × M` separate Soroban transactions (`N × M` remove + `N × M` add pairs).
-//! Between the `remove_signer` and `add_signer` of a pair, the rule's signer set
-//! is temporarily degraded. If `add_signer` fails after `remove_signer` succeeds,
-//! the rule is left without that signer's authorisation weight. If the rule's
-//! threshold equalled its pre-migration signer count, the rule may be bricked —
-//! the same `ThresholdUnreachable` condition.
+//! Each pair runs under its rule's lock as two checked signer mutations. The
+//! removal compares the rule with its newest state row and records the
+//! confirmed removal as a `SaSignerRemovedV2` row. The add then compares the
+//! rule with that row and records the restored signer as a `SaSignerAddedV2`
+//! row. Between the two transactions the rule's signer set lacks the
+//! migrated signer.
 //!
-//! Re-running `migrate-verifier` after a partial failure re-plans from the current
-//! on-chain state — already-migrated signers no longer match `from_hash`.
-//! The dry-run envelope surfaces this hazard as a `warnings` field so the
-//! operator can assess it before authorising execution. See [`MigrationPlan::warnings`].
+//! The removal's preconditions are those of `smart-account signers remove`.
+//! A rule whose threshold equals its signer count, a 1-of-1 rule included,
+//! is refused with `ThresholdUnreachable` before anything is sent, and a
+//! rule with policies and no simple-threshold policy with
+//! `ThresholdPolicyIdentificationFailed`. Each pair signs under the
+//! migrating rule with the source key alone, so that key must be a
+//! Delegated signer of the rule. A rule that cannot be administered under
+//! itself is deleted and reinstalled with the destination verifier.
+//!
+//! A failure after a pair's removal was sent returns the add that completes
+//! the pair as [`MigrationSubmitResult::pending_add`]. Running that add with
+//! `smart-account signers add` completes the pair; when the removal's state
+//! row was not written, or its outcome is unknown, `smart-account signers
+//! refresh --accept-divergence` records the chain state first. A re-run of
+//! `migrate-verifier` does not find a removed signer: the planner matches the
+//! signers the rule holds. It migrates the signers no pair has started. The
+//! dry-run envelope surfaces this hazard as a `warnings` field so the
+//! operator can assess it before authorising execution. See
+//! [`MigrationPlan::warnings`].
 //!
 //! # Entrypoint names (OZ stellar-contracts v0.7.2 SHA `a9c4216`)
 //!
@@ -91,13 +107,14 @@
 //!    Migration is necessarily a remove+add pair per affected External signer.
 //!
 //! For `N` rules each with `M` affected External signers, migration requires
-//! `2 × N × M` sequential transactions. Audit cadence is one `SaVerifierMigrated`
-//! row per signer-step pair, emitted only after the post-remove `add_signer`
-//! transaction succeeds. The emitted tx-hash field is the first-8-last-8
-//! redaction of the confirmed add-signing transaction hash. For a rule with a
-//! pin record, each pair is followed by a `SaContextRulePinsUpdated` row
-//! naming the destination verifier as the rule's verifier pin, so the
-//! signing-time drift check does not refuse the rule the migration changed.
+//! `2 × N × M` sequential transactions. A completed pair writes four rows, in
+//! order: `SaSignerRemovedV2`, `SaContextRulePinsUpdated` (reason
+//! `verifier_migrated`), `SaSignerAddedV2` and `SaVerifierMigrated`. The pins
+//! row names the destination verifier as the rule's verifier pin, so the
+//! signing-time drift check compares the rule against the destination. It is
+//! written for a rule with a pin record that does not already name the
+//! destination alone. The `SaVerifierMigrated` tx-hash field is the
+//! first-8-last-8 redaction of the confirmed add transaction hash.
 
 use stellar_xdr::{
     HostFunction, InvokeContractArgs, ScAddress, ScBytes, ScSymbol, ScVal, ScVec, VecM,
@@ -108,15 +125,15 @@ use crate::SaError;
 use crate::error::MIGRATION_PHASES;
 use crate::managers::rules::{ContextRuleManager, ContextRuleManagerConfig, scaddress_to_strkey};
 use crate::managers::signers::{
-    DecodedOnChainSigner, SignersManager, context_rule_list_items, decode_signer_scval_full,
-    fetch_observed_executable, simulate_read_only, verifier_hash_allowlisted,
+    DecodedOnChainSigner, PairFailure, SignersManager, context_rule_list_items,
+    decode_signer_scval_full, fetch_observed_executable, simulate_read_only,
+    verifier_hash_allowlisted,
 };
 use crate::managers::verifiers::{
     MutabilityStatus, detect_contract_mutability, same_executable_reference,
 };
 use crate::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
-use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::{ContractKind, PinsUpdateReason};
+use stellar_agent_core::audit_log::schema::ContractKind;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_network::Signer;
@@ -230,10 +247,10 @@ pub struct MigrationPlan {
     ///
     /// Non-empty when `total_transaction_count > 2`.  Contains the inter-transaction
     /// failure-mode advisory: between paired `remove_signer` / `add_signer` transactions
-    /// a rule's signer set is degraded.  If `add_signer` fails after `remove_signer`
-    /// succeeds, the rule may lose its authorisation signer.  Per-rule idempotency is
-    /// provided by re-running `MigrationPlanner::build` after a partial failure —
-    /// already-migrated signers no longer match `from_hash`.
+    /// a rule's signer set lacks the migrated signer. A failure between a pair's
+    /// two transactions leaves a pending add
+    /// ([`MigrationSubmitResult::pending_add`]), which `signers add` completes;
+    /// a re-run of the migration migrates the signers no pair has started.
     pub warnings: Vec<String>,
     /// Number of rule IDs the enumeration skipped during the `plan_build`
     /// phase: IDs whose `get_rule` simulation failed, plus deleted or
@@ -316,12 +333,99 @@ struct ExternalSignerData {
 pub struct SignerStepSubmitOutcome {
     /// Context-rule identifier for this step.
     pub rule_id: u32,
-    /// On-chain signer ID that was migrated.
+    /// On-chain signer ID that was migrated (removed).
     pub signer_id: u32,
     /// Full 64-character hex of the `remove_signer` transaction hash.
     pub remove_tx_hash: String,
     /// Full 64-character hex of the `add_signer` transaction hash.
     pub add_tx_hash: String,
+    /// The id the chain assigned to the signer the add restored on the
+    /// destination verifier.
+    pub new_signer_id: u32,
+}
+
+/// The add that completes a migration pair whose removal was sent, carried
+/// by a [`MigrationSubmitResult`] that stopped after the send.
+///
+/// The pair's removal took signer `signer_id` off rule `rule_id`; the add
+/// puts the same key data back as an `External` signer on
+/// `to_verifier_addr`. `smart-account signers add --rule-id <rule_id>
+/// --signer-external <to_verifier_addr> --signer-key-data <hex(key_data)>`
+/// runs it. A re-run of `migrate-verifier` does not find a removed signer,
+/// because the planner matches the signers the rule holds.
+///
+/// The recovery depends on how the pair stopped:
+///
+/// - the removal confirmed and was recorded, and the add failed: the
+///   `signers add` alone completes the pair;
+/// - the removal confirmed and its state row was not written
+///   (`sa.baseline_write_failed`), or the chain differs from the pair's
+///   newest state row (`sa.signer_set_diverged`): `signers refresh
+///   --accept-divergence` records the chain state, then the `signers add`
+///   completes the pair;
+/// - the removal's outcome is unknown (`remove_confirmed` false): once the
+///   removal is confirmed on chain, the refresh then the `signers add`
+///   complete the pair. A removal that is not found leaves the signer in
+///   place, and a re-run of `migrate-verifier` migrates it;
+/// - the add's outcome is unknown (`add_tx_hash` set): once the add is
+///   confirmed, the refresh records the chain state. An add that is not
+///   found is completed with the `signers add`.
+///
+/// The rule's pin record names the destination verifier from the moment
+/// the removal was sent. Until the add lands, a signing under the rule
+/// refuses with `sa.verifier_hash_drift` for a source signer still on the
+/// rule. On a rule with remaining source signers, a re-run of
+/// `migrate-verifier` migrates them after the refresh or the wait, and the
+/// `signers add` runs last.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingAddStep {
+    /// The rule the pair migrates.
+    pub rule_id: u32,
+    /// The id of the removed signer.
+    pub signer_id: u32,
+    /// The destination verifier the add names.
+    pub to_verifier_addr: ScAddress,
+    /// The source signer's full key data, taken from the plan's add
+    /// argument; it is public on chain.
+    pub key_data: Vec<u8>,
+    /// Full 64-character hex of the removal's transaction hash.
+    pub remove_tx_hash: String,
+    /// Whether the removal confirmed; `false` only when its outcome is
+    /// unknown.
+    pub remove_confirmed: bool,
+    /// Full 64-character hex of the add's transaction hash, set only when
+    /// the add was sent and its outcome is unknown.
+    pub add_tx_hash: Option<String>,
+}
+
+impl PendingAddStep {
+    /// The pending add of a pair whose removal `remove_tx_hash` was sent.
+    pub(crate) fn new(
+        rule_id: u32,
+        signer_id: u32,
+        to_verifier_addr: ScAddress,
+        key_data: Vec<u8>,
+        remove_tx_hash: String,
+        remove_confirmed: bool,
+    ) -> Self {
+        Self {
+            rule_id,
+            signer_id,
+            to_verifier_addr,
+            key_data,
+            remove_tx_hash,
+            remove_confirmed,
+            add_tx_hash: None,
+        }
+    }
+
+    /// This pending add with the hash of an add sent with an unknown
+    /// outcome, `None` when the add was not sent.
+    pub(crate) fn with_add_tx_hash(mut self, add_tx_hash: Option<String>) -> Self {
+        self.add_tx_hash = add_tx_hash;
+        self
+    }
 }
 
 /// Result returned by [`MigrationPlan::submit`].
@@ -332,10 +436,12 @@ pub struct SignerStepSubmitOutcome {
 ///
 /// On partial failure at step index K, `failed_step_index == Some(K)`,
 /// `successful_steps.len() == K`, and `failed_step_error` carries the
-/// wrapped `SaError`.  The plan is idempotent at planning time: re-running
-/// `MigrationPlanner::build` + `submit` will re-detect only the remaining
-/// affected signers (the already-migrated ones are no longer matching
-/// `from_hash`).
+/// error the pair stopped on. When the pair stopped after its removal was
+/// sent, `pending_add` carries the add that completes it; see
+/// [`PendingAddStep`] for the recovery cases. A re-run of
+/// `MigrationPlanner::build` + `submit` detects the signers no pair has
+/// started: a migrated signer does not match `from_hash`, and a removed
+/// signer is not on the rule.
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct MigrationSubmitResult {
@@ -349,11 +455,19 @@ pub struct MigrationSubmitResult {
     ///
     /// `None` on complete success.
     pub failed_step_error: Option<SaError>,
-    /// Remove transaction hash for the failed step when `remove_signer` succeeded
-    /// and the subsequent `add_signer` failed.
+    /// The confirmed removal's transaction hash of the failed pair: equal to
+    /// the `pending_add` removal hash when that removal confirmed.
     ///
-    /// `None` when failure happened before or during remove, or on complete success.
+    /// `None` when the pair failed before its removal was sent, when the
+    /// removal's outcome is unknown (its hash is in `pending_add` alone), when
+    /// the add confirmed, and on complete success.
     pub failed_step_remove_tx_hash: Option<String>,
+    /// The add that completes the failed pair, when its removal was sent and
+    /// its add did not confirm.
+    ///
+    /// `None` when the pair failed before its removal was sent, when the add
+    /// confirmed, and on complete success.
+    pub pending_add: Option<PendingAddStep>,
     /// Total number of steps attempted (successful + failed).
     pub total_steps_attempted: usize,
 }
@@ -361,19 +475,30 @@ pub struct MigrationSubmitResult {
 impl MigrationPlan {
     /// Submits all transactions in this plan sequentially.
     ///
-    /// For each [`RuleMigration`] in `affected_rules`, for each [`SignerMigrationStep`]
-    /// in `signer_steps`:
+    /// For each [`RuleMigration`] in `affected_rules`, for each
+    /// [`SignerMigrationStep`] in `signer_steps`, the pair runs under the
+    /// rule's lock, released between two pairs:
     ///
-    /// 1. Simulate + sign + submit the `remove_signer` [`HostFunction`].
-    /// 2. Simulate + sign + submit the `add_signer` [`HostFunction`].
-    /// 3. Emit one `SaVerifierMigrated` audit row per signer step.
-    /// 4. When the rule has a pin record, emit a `SaContextRulePinsUpdated`
-    ///    row (reason `verifier_migrated`) naming the destination verifier's
-    ///    hash as the rule's verifier pin, with the policy pins unchanged.
+    /// 1. The removal compares the rule with its newest state row, which must
+    ///    be version 2, and the pair's plan is checked against the compared
+    ///    set before anything is sent.
+    /// 2. The removal is submitted, confirmed, validated (the signer absent,
+    ///    every other signer and the threshold unchanged) and recorded as a
+    ///    `SaSignerRemovedV2` row.
+    /// 3. When the rule has a pin record, a `SaContextRulePinsUpdated` row
+    ///    (reason `verifier_migrated`) names the destination verifier's hash
+    ///    as the rule's verifier pin, the policy pins unchanged.
+    /// 4. The add compares the rule with the removal's row, is submitted and
+    ///    confirmed. The confirmed rule must hold the removed key data on the
+    ///    destination verifier under the id the simulation returned, every
+    ///    other signer and the threshold unchanged, and is recorded as a
+    ///    `SaSignerAddedV2` row.
+    /// 5. A `SaVerifierMigrated` row records the completed pair.
     ///
     /// Both steps sign under the migrating rule with the pinned-hash drift
     /// check: the rule's policies are checked against its pin record, its
     /// verifiers are not (see [`crate::submit::PinCheck::migrating_rule`]).
+    /// The add's simulated return value must be a `u32` before it is signed.
     ///
     /// Returns a [`MigrationSubmitResult`] describing the outcome.  On partial
     /// failure, `failed_step_index` and `failed_step_error` are set so the
@@ -381,35 +506,65 @@ impl MigrationPlan {
     ///
     /// # Partial-failure semantics
     ///
-    /// If submission of step K fails, the method stops immediately and returns
+    /// If pair K fails, the method stops immediately and returns
     /// `MigrationSubmitResult { successful_steps: steps_0..K-1, failed_step_index: Some(K), ... }`.
-    /// Steps K+1 onwards are NOT attempted.  The operator can re-run
-    /// `MigrationPlanner::build` to produce a new plan reflecting the remaining
-    /// affected signers (already-migrated signers no longer match `from_hash`).
+    /// Pairs K+1 onwards are NOT attempted. When pair K stopped after its
+    /// removal was sent and before its add confirmed, `pending_add` carries
+    /// the add that completes it ([`PendingAddStep`] lists the recovery
+    /// cases). A re-run of `MigrationPlanner::build` plans the signers no
+    /// pair has started.
     ///
     /// # Audit emission
     ///
-    /// Each successful signer-step pair emits one `SaVerifierMigrated` audit row.
-    /// Rows are emitted only after both `remove_signer` and `add_signer` succeed.
+    /// A completed pair writes `SaSignerRemovedV2`, `SaContextRulePinsUpdated`
+    /// (for a rule with a pin record that does not already name the
+    /// destination alone), `SaSignerAddedV2` and `SaVerifierMigrated`, in that
+    /// order, under the rule's lock. A comparison that finds the chain changed
+    /// and a confirmed step whose state is not the intended one write a
+    /// `SaSignerSetDiverged` row. The two state rows are required; the pins
+    /// row and `SaVerifierMigrated` are logged and skipped when the audit log
+    /// refuses them.
     ///
     /// # Arguments
     ///
-    /// - `signer` — the source-account signer (G-key) authorising the transactions.
+    /// - `signer`: the source-account signer (G-key) authorising the
+    ///   transactions; it must be a Delegated signer of each migrating rule.
     /// - `signers_manager` — provides the RPC client, network passphrase, timeout,
     ///   and audit writer.  Must be the same manager used to build the plan.
     /// - `request_id` — per-request UUID for audit-row correlation.
     ///
     /// # Errors
     ///
+    /// The failed pair's error is returned as the step raised it:
+    ///
+    /// - [`SaError::SignerSetMissingBaseline`] /
+    ///   [`SaError::SignerSetBaselineLegacy`]: the rule has no version-2
+    ///   state row; nothing is sent.
+    /// - [`SaError::SignerSetDiverged`]: the chain differs from the rule's
+    ///   newest state row before a step (no transaction hash), or a confirmed
+    ///   step left another state than the intended one (with its hash).
+    /// - [`SaError::ThresholdUnreachable`] /
+    ///   [`SaError::ThresholdPolicyIdentificationFailed`]: the removal's
+    ///   preconditions; nothing is sent.
+    /// - [`SaError::BaselineWriteFailed`]: a confirmed step's state was not
+    ///   observed or not recorded.
+    /// - [`SaError::AuditLog`] / [`SaError::NetworkRpcDivergence`]: a
+    ///   comparison met an audit-log integrity error or endpoints that
+    ///   disagree.
     /// - [`SaError::PolicyHashDrift`] / [`SaError::PinnedPolicyAbsent`] /
     ///   [`SaError::PinCheckUnavailable`]: the drift check of the migrating
-    ///   rule refused a step before signing.
-    /// - [`SaError::VerifierMigrationFailed`] with `phase: "submit_simulate"` —
-    ///   on simulation failure of any step.
-    /// - [`SaError::VerifierMigrationFailed`] with `phase: "submit_send"` —
-    ///   on `sendTransaction` failure of any step.
-    /// - [`SaError::AuthEntryConstructionFailed`] — signer public-key fetch failed.
-    ///
+    ///   rule refused a step before signing. The check skips the rule's
+    ///   verifiers, so no verifier finding is returned.
+    /// - [`SaError::SubmissionUnresolved`]: a step was sent and its outcome
+    ///   is unknown.
+    /// - [`SaError::VerifierMigrationFailed`]: at phase `plan_build` the
+    ///   pair's plan does not match the rule. At `submit_simulate` a
+    ///   simulation failed or returned another shape, or a host function did
+    ///   not decode or invokes another entrypoint than its step. At
+    ///   `submit_send` any other step failed.
+    /// - [`SaError::AuthEntryConstructionFailed`]: the signer public-key
+    ///   fetch failed, the rule lock was not acquired within its budget, or
+    ///   a step's auth entry could not be built.
     pub async fn submit(
         &self,
         signer: &(dyn Signer + Send + Sync),
@@ -437,6 +592,7 @@ impl MigrationPlan {
                         request_id: request_id.to_owned(),
                     }),
                     failed_step_remove_tx_hash: None,
+                    pending_add: None,
                     total_steps_attempted: 0,
                 };
             }
@@ -458,13 +614,12 @@ impl MigrationPlan {
                         redacted_reason: format!("signer public_key fetch failed: {e}"),
                     }),
                     failed_step_remove_tx_hash: None,
+                    pending_add: None,
                     total_steps_attempted: 0,
                 };
             }
         };
         let source_pubkey_strkey = stellar_strkey::ed25519::PublicKey(source_pubkey.0).to_string();
-
-        let chain_id = signers_manager.chain_id_ref().to_owned();
 
         let mut successful_steps: Vec<SignerStepSubmitOutcome> = Vec::new();
         let mut global_step_index: usize = 0;
@@ -479,112 +634,63 @@ impl MigrationPlan {
                     to_hash_first8 = %to_hash_first8,
                     step_index = global_step_index,
                     request_id,
-                    "MigrationPlan::submit: submitting remove_signer step"
+                    "MigrationPlan::submit: migrating signer pair"
                 );
 
-                // Extract invoke_args from the pre-formed remove HostFunction.
-                let (remove_function_name, remove_args) =
-                    match extract_invoke_args(&step.remove_host_function) {
-                        Ok(pair) => pair,
-                        Err(detail) => {
-                            return MigrationSubmitResult {
-                                successful_steps,
-                                failed_step_index: Some(global_step_index),
-                                failed_step_error: Some(SaError::VerifierMigrationFailed {
-                                    phase: MIGRATION_PHASES[3], // "submit_simulate"
-                                    smart_account_redacted: RedactedStrkey::from_already_redacted(
-                                        smart_account_redacted.clone(),
-                                    ),
-                                    detail: format!("remove HostFunction decode failed: {detail}"),
-                                    request_id: request_id.to_owned(),
-                                }),
-                                failed_step_remove_tx_hash: None,
-                                total_steps_attempted: global_step_index + 1,
-                            };
-                        }
-                    };
-
-                // Step 1: submit remove_signer.
-                let remove_result = signers_manager
-                    .submit_migration_step(
-                        self.smart_account.clone(),
-                        rule.rule_id,
-                        remove_function_name,
-                        remove_args,
-                        signer,
-                        &source_pubkey_strkey,
-                        &smart_account_redacted,
-                        request_id,
-                    )
-                    .await;
-
-                let remove_tx_hash = match remove_result {
-                    Ok(result) => result.tx_hash,
-                    Err(e) => {
+                // Extract invoke_args from both pre-formed host functions
+                // before anything is sent.
+                let decoded = pair_invoke_args(step).map_err(|detail| {
+                    SaError::VerifierMigrationFailed {
+                        phase: MIGRATION_PHASES[3], // "submit_simulate"
+                        smart_account_redacted: RedactedStrkey::from_already_redacted(
+                            smart_account_redacted.clone(),
+                        ),
+                        detail,
+                        request_id: request_id.to_owned(),
+                    }
+                });
+                let (remove_args, add_args) = match decoded {
+                    Ok(args) => args,
+                    Err(error) => {
                         return MigrationSubmitResult {
                             successful_steps,
                             failed_step_index: Some(global_step_index),
-                            failed_step_error: Some(e),
+                            failed_step_error: Some(error),
                             failed_step_remove_tx_hash: None,
+                            pending_add: None,
                             total_steps_attempted: global_step_index + 1,
                         };
                     }
                 };
 
-                info!(
-                    smart_account = %smart_account_redacted,
-                    rule_id = rule.rule_id,
-                    signer_id = step.signer_id,
-                    remove_tx_hash = %stellar_agent_network::redact_tx_hash(&remove_tx_hash),
-                    step_index = global_step_index,
-                    request_id,
-                    "MigrationPlan::submit: remove_signer confirmed; submitting add_signer step"
-                );
-
-                // Extract invoke_args from the pre-formed add HostFunction.
-                let (add_function_name, add_args) =
-                    match extract_invoke_args(&step.add_host_function) {
-                        Ok(pair) => pair,
-                        Err(detail) => {
-                            return MigrationSubmitResult {
-                                successful_steps,
-                                failed_step_index: Some(global_step_index),
-                                failed_step_error: Some(SaError::VerifierMigrationFailed {
-                                    phase: MIGRATION_PHASES[3], // "submit_simulate"
-                                    smart_account_redacted: RedactedStrkey::from_already_redacted(
-                                        smart_account_redacted.clone(),
-                                    ),
-                                    detail: format!("add HostFunction decode failed: {detail}"),
-                                    request_id: request_id.to_owned(),
-                                }),
-                                failed_step_remove_tx_hash: Some(remove_tx_hash.clone()),
-                                total_steps_attempted: global_step_index + 1,
-                            };
-                        }
-                    };
-
-                // Step 2: submit add_signer.
-                let add_result = signers_manager
-                    .submit_migration_step(
-                        self.smart_account.clone(),
+                let pair = signers_manager
+                    .migrate_signer_pair(
+                        &self.smart_account,
                         rule.rule_id,
-                        add_function_name,
+                        step.signer_id,
+                        &self.to_verifier_addr,
+                        &from_hash_first8,
+                        &to_hash_first8,
+                        remove_args,
                         add_args,
                         signer,
                         &source_pubkey_strkey,
-                        &smart_account_redacted,
                         request_id,
                     )
                     .await;
-
-                let add_tx_hash = match add_result {
-                    Ok(result) => result.tx_hash,
-                    Err(e) => {
+                let migrated = match pair {
+                    Ok(migrated) => migrated,
+                    Err(PairFailure { error, pending_add }) => {
+                        let failed_step_remove_tx_hash = pending_add
+                            .as_ref()
+                            .filter(|pending| pending.remove_confirmed)
+                            .map(|pending| pending.remove_tx_hash.clone());
                         return MigrationSubmitResult {
                             successful_steps,
                             failed_step_index: Some(global_step_index),
-                            failed_step_error: Some(e),
-                            failed_step_remove_tx_hash: Some(remove_tx_hash.clone()),
+                            failed_step_error: Some(error),
+                            failed_step_remove_tx_hash,
+                            pending_add,
                             total_steps_attempted: global_step_index + 1,
                         };
                     }
@@ -594,80 +700,20 @@ impl MigrationPlan {
                     smart_account = %smart_account_redacted,
                     rule_id = rule.rule_id,
                     signer_id = step.signer_id,
-                    add_tx_hash = %stellar_agent_network::redact_tx_hash(&add_tx_hash),
+                    new_signer_id = migrated.new_signer_id,
+                    remove_tx_hash = %stellar_agent_network::redact_tx_hash(&migrated.remove_tx_hash),
+                    add_tx_hash = %stellar_agent_network::redact_tx_hash(&migrated.add_tx_hash),
                     step_index = global_step_index,
-                    from_hash_first8 = %from_hash_first8,
-                    to_hash_first8 = %to_hash_first8,
                     request_id,
-                    "MigrationPlan::submit: add_signer confirmed; emitting SaVerifierMigrated audit row"
-                );
-
-                // Step 3: emit SaVerifierMigrated audit row.
-                // tx_hash_redacted uses the add_signer tx as the representative
-                // hash (the add_signer completes the migration pair).
-                let add_tx_hash_redacted = stellar_agent_network::redact_tx_hash(&add_tx_hash);
-                let audit_entry = AuditEntry::new_sa_verifier_migrated(
-                    rule.rule_id,
-                    RedactedStrkey::from_already_redacted(smart_account_redacted.clone()),
-                    &from_hash_first8,
-                    &to_hash_first8,
-                    &add_tx_hash_redacted,
-                    chain_id.as_str(),
-                    request_id,
-                );
-
-                let writer_arc = signers_manager.audit_writer_arc_migration();
-                match writer_arc.lock() {
-                    Ok(mut writer) => {
-                        if let Err(e) = writer.write_entry(audit_entry) {
-                            warn!(
-                                smart_account = %smart_account_redacted,
-                                rule_id = rule.rule_id,
-                                signer_id = step.signer_id,
-                                error = %e,
-                                request_id,
-                                "MigrationPlan::submit: SaVerifierMigrated audit write failed \
-                                 (non-fatal; migration pair already succeeded on-chain)"
-                            );
-                        }
-                    }
-                    // Poisoned mutex: a previous thread panicked while holding
-                    // the lock.  The audit row is silently dropped without this
-                    // branch; warn explicitly so the gap is visible in structured
-                    // logs.  Non-fatal: the on-chain migration state is already
-                    // committed and correct.  (Sibling pattern to the
-                    // AuditWriterPoisoned discipline in credentials.rs, where
-                    // the override-emission IS fatal; here it is not because the
-                    // chain state is the source of truth.)
-                    Err(_poison) => {
-                        signers_manager.mark_audit_writer_degraded();
-                        warn!(
-                            smart_account = %smart_account_redacted,
-                            rule_id = rule.rule_id,
-                            signer_id = step.signer_id,
-                            request_id,
-                            "MigrationPlan::submit: SaVerifierMigrated audit-writer mutex \
-                             poisoned; row dropped (non-fatal, on-chain state committed)"
-                        );
-                    }
-                }
-
-                // Step 4: keep the rule's pin record in step with its live
-                // verifier set, so the signing-time drift check compares the
-                // rule against the destination verifier.
-                write_migrated_pin_record(
-                    signers_manager,
-                    &smart_account_redacted,
-                    rule.rule_id,
-                    &to_hash_first8,
-                    request_id,
+                    "MigrationPlan::submit: signer pair migrated"
                 );
 
                 successful_steps.push(SignerStepSubmitOutcome {
                     rule_id: rule.rule_id,
                     signer_id: step.signer_id,
-                    remove_tx_hash,
-                    add_tx_hash,
+                    remove_tx_hash: migrated.remove_tx_hash,
+                    add_tx_hash: migrated.add_tx_hash,
+                    new_signer_id: migrated.new_signer_id,
                 });
 
                 global_step_index = global_step_index.saturating_add(1);
@@ -680,64 +726,37 @@ impl MigrationPlan {
             failed_step_index: None,
             failed_step_error: None,
             failed_step_remove_tx_hash: None,
+            pending_add: None,
         }
     }
 }
 
 // ── Submit internal helpers ───────────────────────────────────────────────────
 
-/// Writes the `SaContextRulePinsUpdated` row (reason `verifier_migrated`) of
-/// rule `rule_id` after a migration pair confirmed, when the rule has a pin
-/// record.
+/// The invoke arguments of a pair's two host functions: the
+/// `remove_signer` call's, then the `add_signer` call's.
 ///
-/// The row carries the rule's current record with its verifier pins
-/// replaced by the destination's hash `to_hash_first8` and no
-/// executable-reference pin: the migration preflight identified the
-/// destination, required it in the allowlist and refused a mutable one,
-/// which includes every external reference. The policy pins and override
-/// flags are unchanged. A rule without a pin record stays unpinned and no
-/// row is written.
+/// # Errors
 ///
-/// The pair already confirmed on-chain, so a failure to read the record is
-/// logged, and the rule keeps its previous record, which the drift check
-/// compares against the new live verifier set and refuses on.
-fn write_migrated_pin_record(
-    signers_manager: &SignersManager,
-    smart_account_redacted: &str,
-    rule_id: u32,
-    to_hash_first8: &str,
-    request_id: &str,
-) {
-    match crate::managers::verifiers::read_pinned_hashes_for_rule(
-        signers_manager,
-        rule_id,
-        smart_account_redacted,
-    ) {
-        Ok(Some(mut record)) => {
-            record.pinned_verifier_first8 = vec![to_hash_first8.to_owned()];
-            record.pinned_verifier_executable_refs = Vec::new();
-            crate::managers::verifiers::write_pins_updated_row(
-                signers_manager,
-                smart_account_redacted,
-                rule_id,
-                PinsUpdateReason::VerifierMigrated,
-                &record,
-                request_id,
-            );
-        }
-        Ok(None) => debug!(
-            rule_id,
-            request_id,
-            "MigrationPlan::submit: the rule has no pin record; no pin update is written"
-        ),
-        Err(e) => warn!(
-            rule_id,
-            error = %e,
-            request_id,
-            "MigrationPlan::submit: pin record unreadable after a confirmed migration pair; \
-             SaContextRulePinsUpdated row not written"
-        ),
+/// The detail of the refusal: a host function that does not decode, or a
+/// pair whose remove step does not invoke `remove_signer` or whose add step
+/// does not invoke `add_signer`.
+fn pair_invoke_args(step: &SignerMigrationStep) -> Result<(Vec<ScVal>, Vec<ScVal>), String> {
+    let (remove_function_name, remove_args) = extract_invoke_args(&step.remove_host_function)
+        .map_err(|detail| format!("remove HostFunction decode failed: {detail}"))?;
+    if remove_function_name != "remove_signer" {
+        return Err(format!(
+            "the remove step invokes '{remove_function_name}', expected 'remove_signer'"
+        ));
     }
+    let (add_function_name, add_args) = extract_invoke_args(&step.add_host_function)
+        .map_err(|detail| format!("add HostFunction decode failed: {detail}"))?;
+    if add_function_name != "add_signer" {
+        return Err(format!(
+            "the add step invokes '{add_function_name}', expected 'add_signer'"
+        ));
+    }
+    Ok((remove_args, add_args))
 }
 
 /// Extracts the `entrypoint` (`&'static str`) and `invoke_args` (`Vec<ScVal>`) from
@@ -749,8 +768,8 @@ fn write_migrated_pin_record(
 /// # Entrypoint mapping
 ///
 /// The `function_name` bytes in the pre-formed `HostFunction` must match one of the
-/// two known migration entrypoints.  The `&'static str` output is used as the
-/// `entrypoint` parameter of [`SignersManager::submit_migration_step`].
+/// two known migration entrypoints. The `&'static str` output is checked
+/// against the step the host function belongs to ([`pair_invoke_args`]).
 fn extract_invoke_args(host_function: &HostFunction) -> Result<(&'static str, Vec<ScVal>), String> {
     let args_ref = match host_function {
         HostFunction::InvokeContract(a) => a,
@@ -833,20 +852,52 @@ impl SignerStepSubmitOutcome {
         signer_id: u32,
         remove_tx_hash: impl Into<String>,
         add_tx_hash: impl Into<String>,
+        new_signer_id: u32,
     ) -> Self {
         Self {
             rule_id,
             signer_id,
             remove_tx_hash: remove_tx_hash.into(),
             add_tx_hash: add_tx_hash.into(),
+            new_signer_id,
         }
     }
 }
 
-/// Test-only constructors for `MigrationSubmitResult`.
+/// Test-only constructor for `PendingAddStep`.
+#[cfg(any(test, feature = "test-helpers"))]
+impl PendingAddStep {
+    /// Constructs a `PendingAddStep` for testing.
+    ///
+    /// Bypasses the `#[non_exhaustive]` restriction for out-of-crate struct literals.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments, reason = "one argument per field")]
+    pub fn new_for_test(
+        rule_id: u32,
+        signer_id: u32,
+        to_verifier_addr: ScAddress,
+        key_data: Vec<u8>,
+        remove_tx_hash: impl Into<String>,
+        remove_confirmed: bool,
+        add_tx_hash: Option<String>,
+    ) -> Self {
+        Self {
+            rule_id,
+            signer_id,
+            to_verifier_addr,
+            key_data,
+            remove_tx_hash: remove_tx_hash.into(),
+            remove_confirmed,
+            add_tx_hash,
+        }
+    }
+}
+
+/// Test-only constructor for `MigrationSubmitResult`.
 #[cfg(any(test, feature = "test-helpers"))]
 impl MigrationSubmitResult {
-    /// Constructs a `MigrationSubmitResult` for testing.
+    /// Constructs a `MigrationSubmitResult` for testing, with the confirmed
+    /// removal's hash and the pending add of the failed pair.
     ///
     /// Bypasses the `#[non_exhaustive]` restriction for out-of-crate struct literals.
     #[doc(hidden)]
@@ -854,24 +905,8 @@ impl MigrationSubmitResult {
         successful_steps: Vec<SignerStepSubmitOutcome>,
         failed_step_index: Option<usize>,
         failed_step_error: Option<crate::SaError>,
-        total_steps_attempted: usize,
-    ) -> Self {
-        Self {
-            successful_steps,
-            failed_step_index,
-            failed_step_error,
-            failed_step_remove_tx_hash: None,
-            total_steps_attempted,
-        }
-    }
-
-    /// Constructs a `MigrationSubmitResult` for testing with a failed remove hash.
-    #[doc(hidden)]
-    pub fn new_for_test_with_failed_remove_tx_hash(
-        successful_steps: Vec<SignerStepSubmitOutcome>,
-        failed_step_index: Option<usize>,
-        failed_step_error: Option<crate::SaError>,
         failed_step_remove_tx_hash: Option<String>,
+        pending_add: Option<PendingAddStep>,
         total_steps_attempted: usize,
     ) -> Self {
         Self {
@@ -879,6 +914,7 @@ impl MigrationSubmitResult {
             failed_step_index,
             failed_step_error,
             failed_step_remove_tx_hash,
+            pending_add,
             total_steps_attempted,
         }
     }
@@ -1706,28 +1742,26 @@ fn build_external_signer_scval(
 /// authorising execution:
 ///
 /// - Between paired `remove_signer` / `add_signer` transactions a rule's signer
-///   set is degraded.
-/// - If `add_signer` fails after `remove_signer` succeeds, the rule may lose its
-///   authorisation signer.  If the rule's threshold equalled its pre-migration
-///   signer count, the rule may be bricked (`ThresholdUnreachable`).
-/// - Re-running `migrate-verifier` after a partial failure re-plans from the
-///   current on-chain state (already-migrated signers no longer match `from_hash`).
+///   set lacks the migrated signer.
+/// - A failure between a pair's two transactions leaves a pending add, which
+///   the result names as the `signers add` command that completes it; a
+///   re-run of `migrate-verifier` migrates the signers no pair has started.
 ///
 /// A single-signer migration (exactly 1 affected External signer = 2 txs)
-/// produces an empty `warnings` because the hazard resolves atomically at rule
-/// scope: either both transactions succeed or the rule is back to its pre-migration
-/// state on the first failure.  The warning fires at `> 2` transactions where
-/// a partial commit on one rule leaves a second rule's transition unstarted.
+/// produces an empty `warnings`: its one pair is the whole migration, and a
+/// failure of it is reported with its pending add. The warning fires at
+/// `> 2` transactions where a partial commit on one pair leaves another
+/// pair unstarted.
 pub(crate) fn build_warnings(total_transaction_count: usize) -> Vec<String> {
     if total_transaction_count > 2 {
         vec![format!(
             "This migration produces {total_transaction_count} separate Soroban \
              transactions (one remove_signer and one add_signer per affected \
              External signer per context rule). Between paired remove/add \
-             transactions the rule's signer set is degraded; if the add_signer \
-             tx fails after remove_signer succeeds, the rule may be left without \
-             its authorisation signer. Re-run migrate-verifier after a partial \
-             failure to resume from the current on-chain state."
+             transactions the rule's signer set lacks the migrated signer. A \
+             failure between a pair's two transactions leaves a pending add: \
+             the result names the signers add command that completes it, and a \
+             re-run of migrate-verifier migrates the remaining signers."
         )]
     } else {
         vec![]

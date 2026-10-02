@@ -56,8 +56,8 @@ pub mod weighted_threshold_policy;
 
 pub use error::{AdminOrOwnerKey, SaError, SubmissionUnresolvedKind};
 pub use managers::migration::{
-    MigrationPlan, MigrationPlanner, MigrationSubmitResult, RuleMigration, SignerMigrationStep,
-    SignerStepSubmitOutcome,
+    MigrationPlan, MigrationPlanner, MigrationSubmitResult, PendingAddStep, RuleMigration,
+    SignerMigrationStep, SignerStepSubmitOutcome,
 };
 pub use submit::{MulticallCheck, ResolvedFeePerOp};
 pub use verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAllowlistEntry, VerifierAuditStatus};

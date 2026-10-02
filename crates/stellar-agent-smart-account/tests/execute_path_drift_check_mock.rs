@@ -52,6 +52,7 @@ use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_las
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::SoftwareSigningKey;
 use stellar_agent_network::SubmissionRecorder;
+use stellar_agent_smart_account::PendingAddStep;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::migration::{
     MigrationPlan, RuleMigration, SignerMigrationStep,
@@ -85,7 +86,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 #[path = "smart-account-fixtures/adversarial/rpc_mock_helpers.rs"]
 mod rpc_mock_helpers;
 
-use rpc_mock_helpers::{KNOWN_WASM_HASH, signer_set_n_of_n, write_baseline};
+use rpc_mock_helpers::KNOWN_WASM_HASH;
 
 const PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const CHAIN_ID: &str = "stellar:testnet";
@@ -346,19 +347,26 @@ struct Chain {
     /// A state change that lands while an endpoint is behind, applied once a
     /// read behind the confirmation is served, and where it lands.
     after_behind_read: Option<(AfterSend, Landing)>,
-    /// What a simulated function returns, by function name. Unset, a
-    /// simulated `add_signer` or `add_policy` returns `U32(7)`, an
+    /// What a simulated function returns, by function name, in send order.
+    /// The front value serves every simulation until a send of the function
+    /// advances the queue; the last value serves every later simulation.
+    /// Unset, a simulated `add_signer` or `add_policy` returns `U32(7)`, an
     /// `add_context_rule` the map `{ id: U32(next rule id) }`, and any other
     /// invocation `Void`.
-    returns: HashMap<&'static str, ScVal>,
+    returns: HashMap<&'static str, VecDeque<ScVal>>,
     /// An entry that replaces the one under its key once the key has been
     /// read the given number of times, by key.
     entries_after_reads: HashMap<String, (usize, Value)>,
     /// How many times each ledger-entry key has been read.
     entry_reads: HashMap<String, usize>,
-    /// The change a send of each function makes to the chain as it stands at
-    /// the send, by function name; each applies once.
-    effects: HashMap<String, SendEffect>,
+    /// A rule value that replaces the rule once it has been read through
+    /// `get_context_rule` the given number of times, by rule id.
+    rules_after_reads: HashMap<u32, (usize, ScVal)>,
+    /// How many times each rule has been read through `get_context_rule`.
+    rule_reads: HashMap<u32, usize>,
+    /// The changes the sends of each function make to the chain as it stands
+    /// at the send, by function name, in send order; each applies once.
+    effects: HashMap<String, VecDeque<SendEffect>>,
 }
 
 /// The change a confirmed submission of one function makes to the rule it
@@ -376,6 +384,8 @@ enum SendEffect {
     /// Removes `policy` and its id from rule `rule_id`; the remaining
     /// policies' ids count from 0, as this file's rule builders number them.
     RemovePolicy { rule_id: u32, policy: ScAddress },
+    /// Removes the signer `signer_id` from rule `rule_id`.
+    RemoveSigner { rule_id: u32, signer_id: u32 },
 }
 
 /// Where a [`Chain::after_behind_read`] change lands.
@@ -431,16 +441,45 @@ impl Chain {
         }
     }
 
-    /// Applies a send of `function`: keeps the current rules and thresholds
+    /// Counts a `get_context_rule` read of rule `rule_id`, and replaces the
+    /// rule with the value [`Chain::rules_after_reads`] registers for it
+    /// once the reads before this one reach the registered count.
+    fn count_rule_read(&mut self, rule_id: u32) {
+        let reads = self.rule_reads.entry(rule_id).or_insert(0);
+        let served_before = *reads;
+        *reads += 1;
+        if let Some((n, _)) = self.rules_after_reads.get(&rule_id)
+            && served_before >= *n
+        {
+            let (_, value) = self.rules_after_reads.remove(&rule_id).unwrap();
+            self.rules.insert(rule_id, value);
+        }
+    }
+
+    /// The value a simulation of `function` returns, if a test set one.
+    fn simulated_return(&self, function: &str) -> Option<ScVal> {
+        self.returns
+            .get(function)
+            .and_then(|queue| queue.front().cloned())
+    }
+
+    /// Applies a send of `function`. Keeps the current rules and thresholds
     /// for reads behind the confirmation, then applies the pending post-send
-    /// state and the effect registered for `function`.
+    /// state and the next effect registered for `function`. Advances
+    /// `function`'s return queue past the value this send's step was
+    /// simulated with.
     fn apply_send(&mut self, function: &str) {
         self.before_send = Some((self.rules.clone(), self.thresholds.clone()));
         if let Some(after) = self.after_send.take() {
             self.apply(&after);
         }
-        if let Some(effect) = self.effects.remove(function) {
+        if let Some(effect) = self.effects.get_mut(function).and_then(VecDeque::pop_front) {
             self.apply_effect(effect);
+        }
+        if let Some(queue) = self.returns.get_mut(function)
+            && queue.len() > 1
+        {
+            queue.pop_front();
         }
     }
 
@@ -461,6 +500,15 @@ impl Chain {
                 let (ids, signers, policies) = rule_parts(&self.rules[&rule_id]);
                 let policies = policies.into_iter().filter(|p| *p != policy).collect();
                 (rule_id, ids.into_iter().zip(signers).collect(), policies)
+            }
+            SendEffect::RemoveSigner { rule_id, signer_id } => {
+                let (ids, signers, policies) = rule_parts(&self.rules[&rule_id]);
+                let signers = ids
+                    .into_iter()
+                    .zip(signers)
+                    .filter(|(id, _)| *id != signer_id)
+                    .collect();
+                (rule_id, signers, policies)
             }
         };
         self.rules
@@ -551,6 +599,19 @@ impl Ledgers {
     }
 }
 
+/// Whether `getTransaction` confirms the sent transactions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Unconfirmed {
+    /// Every `getTransaction` answers `SUCCESS`.
+    #[default]
+    Off,
+    /// The next send switches to [`Unconfirmed::Blocking`].
+    NextSend,
+    /// Every `getTransaction` answers `NOT_FOUND`, so a confirmation poll
+    /// runs until its timeout.
+    Blocking,
+}
+
 /// Poisons the audit writer's mutex when the endpoint receives `at` (a
 /// JSON-RPC method or a simulated function name), once.
 struct Poison {
@@ -580,6 +641,9 @@ struct Rpc {
     ledgers: Arc<Ledgers>,
     /// Whether a submission was sent, shared by both endpoints.
     sent: Arc<AtomicBool>,
+    /// Whether `getTransaction` withholds the confirmation, shared by both
+    /// endpoints.
+    unconfirmed: Arc<Mutex<Unconfirmed>>,
     poison: Arc<Mutex<Option<Poison>>>,
     /// How late this endpoint answers the `nth` `getLedgerEntries` request
     /// naming a key, by `(key, nth)`.
@@ -776,7 +840,13 @@ impl Respond for Rpc {
                 if sent && ledger < CONFIRMATION_LEDGER {
                     self.land_after_behind_read();
                 }
-                let chain = self.chain.lock().unwrap();
+                let mut chain = self.chain.lock().unwrap();
+                if function == "get_context_rule" {
+                    let ScVal::U32(rule_id) = invoke.args[0] else {
+                        panic!("get_context_rule takes a u32")
+                    };
+                    chain.count_rule_read(rule_id);
+                }
                 // A read behind the confirmation ledger serves the state
                 // before the send.
                 let (rules, thresholds) = match &chain.before_send {
@@ -810,17 +880,16 @@ impl Respond for Rpc {
                         reply(simulate_result(&value, &[], ledger))
                     }
                     _ => {
-                        let value = chain
-                            .returns
-                            .get(function.as_str())
-                            .cloned()
-                            .unwrap_or_else(|| match function.as_str() {
-                                "add_signer" | "add_policy" => ScVal::U32(7),
-                                "add_context_rule" => context_rule_return(
-                                    rules.keys().max().map_or(0, |rule_id| rule_id + 1),
-                                ),
-                                _ => ScVal::Void,
-                            });
+                        let value =
+                            chain
+                                .simulated_return(function.as_str())
+                                .unwrap_or_else(|| match function.as_str() {
+                                    "add_signer" | "add_policy" => ScVal::U32(7),
+                                    "add_context_rule" => context_rule_return(
+                                        rules.keys().max().map_or(0, |rule_id| rule_id + 1),
+                                    ),
+                                    _ => ScVal::Void,
+                                });
                         let auth = if op.auth.is_empty() {
                             vec![SorobanAuthorizationEntry {
                                 credentials: SorobanCredentials::Address(
@@ -870,6 +939,12 @@ impl Respond for Rpc {
                     chain.lock().unwrap().apply_send(&function);
                 }
                 self.sent.store(true, Ordering::SeqCst);
+                {
+                    let mut unconfirmed = self.unconfirmed.lock().unwrap();
+                    if *unconfirmed == Unconfirmed::NextSend {
+                        *unconfirmed = Unconfirmed::Blocking;
+                    }
+                }
                 let hash = send_transaction_hash_hex(&body, PASSPHRASE);
                 reply(json!({
                     "status": "PENDING", "hash": hash,
@@ -877,11 +952,19 @@ impl Respond for Rpc {
                 }))
             }
             "getTransaction" => {
-                let response = reply(json!({
-                    "status": "SUCCESS", "latestLedger": CONFIRMATION_LEDGER, "oldestLedger": 1,
-                    "ledger": CONFIRMATION_LEDGER,
-                    "createdAt": (stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000).to_string(),
-                }));
+                let response = if *self.unconfirmed.lock().unwrap() == Unconfirmed::Blocking {
+                    reply(json!({
+                        "status": "NOT_FOUND", "latestLedger": CONFIRMATION_LEDGER,
+                        "oldestLedger": 1,
+                    }))
+                } else {
+                    reply(json!({
+                        "status": "SUCCESS", "latestLedger": CONFIRMATION_LEDGER,
+                        "oldestLedger": 1, "ledger": CONFIRMATION_LEDGER,
+                        "createdAt": (stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1_000)
+                            .to_string(),
+                    }))
+                };
                 match *self.ledgers.delay_poll.lock().unwrap() {
                     Some(delay) => response.set_delay(delay),
                     None => response,
@@ -913,6 +996,7 @@ struct Harness {
     secondary_ledgers: Arc<Ledgers>,
     primary_poison: Arc<Mutex<Option<Poison>>>,
     primary_entry_delays: EntryDelays,
+    unconfirmed: Arc<Mutex<Unconfirmed>>,
     audit: Arc<Mutex<AuditWriter>>,
     log_path: PathBuf,
     manager: Arc<SignersManager>,
@@ -1005,6 +1089,7 @@ impl Harness {
         let primary_poison = Arc::new(Mutex::new(None));
         let primary_entry_delays = EntryDelays::default();
         let sent = Arc::new(AtomicBool::new(false));
+        let unconfirmed = Arc::new(Mutex::new(Unconfirmed::Off));
         let primary = MockServer::start().await;
         let secondary = MockServer::start().await;
         for (server, served, log, ledgers, poison, entry_delays) in [
@@ -1032,6 +1117,7 @@ impl Harness {
                     log: Arc::clone(log),
                     ledgers: Arc::clone(ledgers),
                     sent: Arc::clone(&sent),
+                    unconfirmed: Arc::clone(&unconfirmed),
                     poison,
                     entry_delays,
                 })
@@ -1066,6 +1152,7 @@ impl Harness {
             secondary_ledgers,
             primary_poison,
             primary_entry_delays,
+            unconfirmed,
             audit,
             log_path,
             manager,
@@ -1132,20 +1219,48 @@ impl Harness {
         }
     }
 
-    /// Makes a send of `function` apply `effect` to every endpoint's chain as
-    /// it stands at that send, once. Both endpoints of a [`Harness::new`]
-    /// harness serve one chain, which a send changes once.
+    /// Makes the next send of `function` without an effect apply `effect`
+    /// to every endpoint's chain as it stands at that send, once. Effects
+    /// registered for one function apply in registration order, one per
+    /// send. Both endpoints of a [`Harness::new`] harness serve one chain,
+    /// which a send changes once.
     fn on_send(&self, function: &'static str, effect: SendEffect) {
-        self.secondary_chain
-            .lock()
-            .unwrap()
-            .effects
-            .insert(function.to_owned(), effect.clone());
+        if !Arc::ptr_eq(&self.chain, &self.secondary_chain) {
+            self.secondary_chain
+                .lock()
+                .unwrap()
+                .effects
+                .entry(function.to_owned())
+                .or_default()
+                .push_back(effect.clone());
+        }
         self.chain
             .lock()
             .unwrap()
             .effects
-            .insert(function.to_owned(), effect);
+            .entry(function.to_owned())
+            .or_default()
+            .push_back(effect);
+    }
+
+    /// Replaces rule `rule_id` with `value` on the primary's chain once `n`
+    /// `get_context_rule` reads of the rule have been answered. Read `n + 1`
+    /// and every later read serve `value`, a change made outside the wallet
+    /// between two reads. Both endpoints of a [`Harness::new`]
+    /// harness share the count.
+    fn replace_rule_after_reads(&self, rule_id: u32, n: usize, value: ScVal) {
+        self.chain
+            .lock()
+            .unwrap()
+            .rules_after_reads
+            .insert(rule_id, (n, value));
+    }
+
+    /// Makes every `getTransaction` after the next send answer `NOT_FOUND`,
+    /// so that send's confirmation poll ends at its timeout with the
+    /// outcome unknown.
+    fn never_confirm_next_send(&self) {
+        *self.unconfirmed.lock().unwrap() = Unconfirmed::NextSend;
     }
 
     /// Delays the primary's answer to its `nth` `getLedgerEntries` request
@@ -1181,7 +1296,19 @@ impl Harness {
 
     /// Makes the primary's simulated `function` return `value`.
     fn set_simulated_return(&self, function: &'static str, value: ScVal) {
-        self.chain.lock().unwrap().returns.insert(function, value);
+        self.set_simulated_returns(function, vec![value]);
+    }
+
+    /// Makes the primary's simulated `function` return `values` in order:
+    /// each value serves the simulations of one submission, a send of
+    /// `function` advances to the next, and the last value serves every
+    /// later simulation.
+    fn set_simulated_returns(&self, function: &'static str, values: Vec<ScVal>) {
+        self.chain
+            .lock()
+            .unwrap()
+            .returns
+            .insert(function, values.into());
     }
 
     /// Poisons the audit writer now, before the next submission.
@@ -1830,9 +1957,8 @@ async fn an_rpc_failure_during_the_check_refuses_and_sends_nothing() {
 ///
 /// An audit log that fails its integrity check refuses with `sa.audit_log`
 /// at the baseline read, which scans the log before the pin check does; the
-/// rule is never fetched. Under the migrating rule, whose baseline read is
-/// skipped, the pin check's own scan meets the error and refuses as
-/// unavailable carrying `sa.audit_log`.
+/// rule is never fetched. The migrating rule's baseline is read like any
+/// rule's, so the error is `sa.audit_log` under it too.
 #[tokio::test]
 async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
@@ -1880,12 +2006,8 @@ async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
         .submit_as_migrating_rule(1, "req-integrity-migrating")
         .await
         .unwrap_err();
-    match &err {
-        SaError::PinCheckUnavailable { reason, .. } => {
-            assert!(reason.starts_with("sa.audit_log: "), "{reason}");
-        }
-        other => panic!("expected PinCheckUnavailable; got {other:?}"),
-    }
+    assert!(matches!(err, SaError::AuditLog(_)), "{err:?}");
+    assert_eq!(err.wire_code(), "sa.audit_log");
     assert_eq!(h.sends(), 0);
 }
 
@@ -2070,18 +2192,22 @@ fn signer_add_rule_after(added: Vec<(u32, ScVal)>) -> ScVal {
 const SIMULATED_SIGNER_ID: u32 = 7;
 
 /// Rule 1 served with [`signer_add_rule_before`], simple-threshold policy P
-/// at threshold 1, and the verifiers the add tests use; its version-2
-/// baseline recorded from the served chain, and a pin record when `pinned`.
-async fn signer_add_harness(pinned: bool) -> Harness {
-    let chain = Chain::default()
+/// at threshold 1, and the verifiers the add tests use.
+fn signer_add_chain() -> Chain {
+    Chain::default()
         .with_rule(1, signer_add_rule_before())
         .with_wasm(&verifier_v(), webauthn_hash())
         .with_wasm(&verifier_w(), ed25519_hash())
         .with_wasm(&contract(0x22), [0xdd; 32])
         .with_wasm(&passkey_verifier(), webauthn_hash())
         .with_wasm(&policy_p(), KNOWN_WASM_HASH)
-        .with_threshold(&policy_p(), 1, 1);
-    let h = Harness::new(chain).await;
+        .with_threshold(&policy_p(), 1, 1)
+}
+
+/// A [`signer_add_chain`] harness with rule 1's version-2 baseline recorded
+/// from the served chain, and a pin record when `pinned`.
+async fn signer_add_harness(pinned: bool) -> Harness {
+    let h = Harness::new(signer_add_chain()).await;
     h.baseline_v2(1);
     if pinned {
         h.pin_created(
@@ -2221,8 +2347,10 @@ async fn a_signer_on_a_second_verifier_writes_two_pins_and_the_next_verb_refuses
 }
 
 /// A passkey signer (an External signer on a WebAuthn verifier) added to a
-/// pinned rule pins its verifier like any other new verifier: the record
-/// gains the WebAuthn verifier's pin.
+/// pinned rule pins its verifier like any other new verifier. Its verifier
+/// runs the hash the record already pins for verifier V, with no executable
+/// reference, so the pin is the recorded one. The list stays unchanged, the
+/// pins row is written, and the rule signs.
 #[tokio::test]
 async fn a_passkey_signer_added_to_a_pinned_rule_pins_its_verifier() {
     let h = signer_add_harness(true).await;
@@ -2233,13 +2361,18 @@ async fn a_passkey_signer_added_to_a_pinned_rule_pins_its_verifier() {
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].request_id, "req-add-passkey");
-    let (verifiers, _, _, reason) = pins_updated_fields(&rows[0]);
+    let (verifiers, policies, _, reason) = pins_updated_fields(&rows[0]);
     assert_eq!(
         verifiers,
-        vec![first8(&webauthn_hash()), first8(&webauthn_hash())],
-        "the passkey's verifier is pinned beside verifier V"
+        vec![first8(&webauthn_hash())],
+        "the passkey's verifier has the pin verifier V has"
     );
+    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::SignerAdded);
+    assert!(verifier_refs_of(&rows[0]).is_empty());
+
+    h.submit(&[1], Some("req-after-passkey")).await.unwrap();
+    assert_eq!(h.sends(), 2);
 }
 
 /// A new verifier outside the allowlist is refused before submission unless
@@ -2438,32 +2571,1046 @@ async fn a_refused_batch_writes_no_override_row_for_an_admitted_verifier() {
 
 // ── Verifier migration ────────────────────────────────────────────────────────
 
-fn migration_plan(from: [u8; 32], to: [u8; 32]) -> MigrationPlan {
-    let step = SignerMigrationStep::new_for_test(
-        1,
+/// The `remove_signer(1, signer_id)` host function of a migration step.
+fn remove_signer_call(signer_id: u32) -> HostFunction {
+    HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address: smart_account(),
+        function_name: ScSymbol::try_from("remove_signer").unwrap(),
+        args: vec![ScVal::U32(1), ScVal::U32(signer_id)]
+            .try_into()
+            .unwrap(),
+    })
+}
+
+/// The `add_signer(1, signer)` host function of a migration step.
+fn add_signer_call(signer: ScVal) -> HostFunction {
+    HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address: smart_account(),
+        function_name: ScSymbol::try_from("add_signer").unwrap(),
+        args: vec![ScVal::U32(1), signer].try_into().unwrap(),
+    })
+}
+
+/// The step migrating signer `signer_id` of rule 1: its removal, then the
+/// add of `key` on `add_verifier`.
+fn migration_step(
+    signer_id: u32,
+    from: [u8; 32],
+    add_verifier: &ScAddress,
+    key: &[u8],
+) -> SignerMigrationStep {
+    SignerMigrationStep::new_for_test(
+        signer_id,
         first8(&from),
-        HostFunction::InvokeContract(InvokeContractArgs {
-            contract_address: smart_account(),
-            function_name: ScSymbol::try_from("remove_signer").unwrap(),
-            args: vec![ScVal::U32(1), ScVal::U32(1)].try_into().unwrap(),
-        }),
-        HostFunction::InvokeContract(InvokeContractArgs {
-            contract_address: smart_account(),
-            function_name: ScSymbol::try_from("add_signer").unwrap(),
-            args: vec![ScVal::U32(1), external_signer(&verifier_w(), &[0x11; 32])]
-                .try_into()
-                .unwrap(),
-        }),
-    );
+        remove_signer_call(signer_id),
+        add_signer_call(external_signer(add_verifier, key)),
+    )
+}
+
+/// A plan migrating `steps` of rule 1 from `from` to `to` on verifier W.
+fn plan_of(from: [u8; 32], to: [u8; 32], steps: Vec<SignerMigrationStep>) -> MigrationPlan {
     MigrationPlan::new_for_test(
         smart_account(),
         from,
         to,
         verifier_w(),
-        vec![RuleMigration::new_for_test(1, first8(&from), vec![step])],
+        vec![RuleMigration::new_for_test(1, first8(&from), steps)],
         VerifierAuditStatus::Unaudited,
         "req-migration-plan",
     )
+}
+
+/// The plan migrating signer 1 of [`signers_before_add`] (key `0x11` on
+/// verifier V) to verifier W.
+fn migration_plan(from: [u8; 32], to: [u8; 32]) -> MigrationPlan {
+    plan_of(
+        from,
+        to,
+        vec![migration_step(1, from, &verifier_w(), &[0x11; 32])],
+    )
+}
+
+/// Adds a second External signer on verifier V (id 2, key `0x12`) to rule 1
+/// of the served chain and records rule 1's version-2 baseline again.
+/// Returns the plan migrating signers 1 and 2, the second add naming
+/// `second_add_verifier`.
+fn migration_plan_two_signers(h: &Harness, second_add_verifier: &ScAddress) -> MigrationPlan {
+    let mut signers = signers_before_add();
+    signers.push((2, external_signer(&verifier_v(), &[0x12; 32])));
+    h.set_rule(1, &rule_with_ids(1, signers, vec![policy_p()]));
+    h.baseline_v2(1);
+    plan_of(
+        webauthn_hash(),
+        ed25519_hash(),
+        vec![
+            migration_step(1, webauthn_hash(), &verifier_w(), &[0x11; 32]),
+            migration_step(2, webauthn_hash(), second_add_verifier, &[0x12; 32]),
+        ],
+    )
+}
+
+/// Makes the one-pair plan's sends change the chain: the removal takes
+/// signer 1 off rule 1, and the add puts its key on verifier W under the
+/// simulated id.
+fn on_send_one_pair(h: &Harness) {
+    h.on_send(
+        "remove_signer",
+        SendEffect::RemoveSigner {
+            rule_id: 1,
+            signer_id: 1,
+        },
+    );
+    h.on_send(
+        "add_signer",
+        SendEffect::AddSigner {
+            rule_id: 1,
+            signer_id: SIMULATED_SIGNER_ID,
+            signer: external_signer(&verifier_w(), &[0x11; 32]),
+        },
+    );
+}
+
+/// Submits `plan` through the harness's manager under `request_id`.
+async fn migrate(
+    h: &Harness,
+    plan: &MigrationPlan,
+    request_id: &str,
+) -> stellar_agent_smart_account::MigrationSubmitResult {
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    plan.submit(&signer, &h.manager, request_id).await
+}
+
+/// The identity of an External signer holding `key` on `verifier`.
+fn external_identity(verifier: &ScAddress, key: &[u8]) -> SignerIdentityV2 {
+    SignerIdentityV2::External {
+        verifier: contract_id(verifier),
+        key_data_sha256: Sha256::digest(key).into(),
+        key_data_len: u32::try_from(key.len()).unwrap(),
+    }
+}
+
+/// The row of `kind` written under `request_id`; exactly one must exist.
+fn the_row(h: &Harness, request_id: &str, kind: &str) -> AuditEntry {
+    let rows: Vec<AuditEntry> = rows_of(h, request_id)
+        .into_iter()
+        .filter(|e| serde_json::to_value(&e.event_kind).unwrap()["kind"] == kind)
+        .collect();
+    assert_eq!(rows.len(), 1, "one {kind} row under {request_id}");
+    rows.into_iter().next().unwrap()
+}
+
+/// The verifier executable-reference pins of a pins-updated row.
+fn verifier_refs_of(entry: &AuditEntry) -> Vec<Option<ExecutableRefPin>> {
+    match &entry.event_kind {
+        EventKind::SaContextRulePinsUpdated {
+            pinned_verifier_executable_refs,
+            ..
+        } => pinned_verifier_executable_refs.clone(),
+        other => panic!("expected SaContextRulePinsUpdated; got {other:?}"),
+    }
+}
+
+/// The rows of a completed pair, in order.
+const PAIR_ROWS: [&str; 4] = [
+    "sa_signer_removed_v2",
+    "sa_context_rule_pins_updated",
+    "sa_signer_added_v2",
+    "sa_verifier_migrated",
+];
+
+/// A pair on a pinned rule records its removal, repoints the pin record to
+/// the destination, and records the add under the simulated id and the
+/// migrated pair, in that order. It holds the rule's lock from its first
+/// comparison to its last row: a `signers list` started after the removal
+/// was sent completes after the pair.
+#[tokio::test]
+async fn a_migration_pair_records_its_rows_in_order_under_the_rule_lock() {
+    let h = signer_add_harness(true).await;
+    on_send_one_pair(&h);
+    h.delay_poll(Duration::from_secs(2));
+    let plan = migration_plan(webauthn_hash(), ed25519_hash());
+
+    let migrated = async {
+        let result = migrate(&h, &plan, "req-pair").await;
+        (result, tokio::time::Instant::now())
+    };
+    let listed = async {
+        while h.sends() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        h.manager
+            .list_signers(smart_account(), 1, None, "req-list-during-pair".to_owned())
+            .await
+            .unwrap();
+        tokio::time::Instant::now()
+    };
+    let ((result, migrated_at), listed_at) = tokio::join!(migrated, listed);
+    assert!(
+        result.failed_step_error.is_none(),
+        "{:?}",
+        result.failed_step_error
+    );
+    assert!(
+        listed_at > migrated_at,
+        "the list waited for the pair's lock until the pair completed"
+    );
+    assert_eq!(h.sends(), 2);
+    assert_eq!(row_kinds(&h.rows(), "req-pair"), PAIR_ROWS);
+
+    let resulting = h.snapshot_of(1);
+    let removed = the_row(&h, "req-pair", "sa_signer_removed_v2");
+    let expected_removed = SignerSetSnapshotV2 {
+        signers: resulting
+            .signers
+            .iter()
+            .filter(|entry| entry.id != SIMULATED_SIGNER_ID)
+            .cloned()
+            .collect(),
+        threshold: resulting.threshold.clone(),
+    };
+    assert_eq!(state_row_snapshot(&removed), &expected_removed);
+    assert!(
+        matches!(
+            removed.event_kind,
+            EventKind::SaSignerRemovedV2 { signer_id: 1, .. }
+        ),
+        "{:?}",
+        removed.event_kind
+    );
+    let added = the_row(&h, "req-pair", "sa_signer_added_v2");
+    assert_eq!(state_row_snapshot(&added), &resulting);
+    assert!(
+        resulting.signers.contains(&SignerEntryV2 {
+            id: SIMULATED_SIGNER_ID,
+            identity: external_identity(&verifier_w(), &[0x11; 32]),
+        }),
+        "{resulting:?}"
+    );
+    assert!(
+        matches!(
+            added.event_kind,
+            EventKind::SaSignerAddedV2 {
+                signer_id: SIMULATED_SIGNER_ID,
+                ..
+            }
+        ),
+        "{:?}",
+        added.event_kind
+    );
+
+    let pins = the_row(&h, "req-pair", "sa_context_rule_pins_updated");
+    let (verifiers, policies, _, reason) = pins_updated_fields(&pins);
+    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
+    assert!(verifier_refs_of(&pins).is_empty());
+
+    assert_eq!(result.successful_steps.len(), 1);
+    assert_eq!(result.successful_steps[0].signer_id, 1);
+    assert_eq!(
+        result.successful_steps[0].new_signer_id,
+        SIMULATED_SIGNER_ID
+    );
+    assert!(result.pending_add.is_none());
+}
+
+/// Asserts a migration refused at its first pair before anything was sent:
+/// the error's wire code, step 0, no pending add, no send and no state row.
+fn assert_first_pair_refused_unsent(
+    h: &Harness,
+    result: &stellar_agent_smart_account::MigrationSubmitResult,
+    wire_code: &str,
+    request_id: &str,
+) {
+    assert_eq!(h.sends(), 0, "{wire_code}: nothing is sent");
+    let err = result.failed_step_error.as_ref().expect("the pair refused");
+    assert_eq!(err.wire_code(), wire_code, "{err:?}");
+    assert_eq!(result.failed_step_index, Some(0));
+    assert_eq!(result.total_steps_attempted, 1);
+    assert!(result.successful_steps.is_empty());
+    assert!(result.pending_add.is_none());
+    assert!(result.failed_step_remove_tx_hash.is_none());
+    let kinds = row_kinds(&h.rows(), request_id);
+    assert!(
+        !kinds
+            .iter()
+            .any(|kind| kind == "sa_signer_removed_v2" || kind == "sa_signer_added_v2"),
+        "{wire_code}: {kinds:?}"
+    );
+}
+
+/// The removal of a pair refuses before anything is sent. A rule without a
+/// state row and a rule with a version-1 row refuse before any RPC. A chain
+/// changed since the row, a rule whose threshold equals its signer count and
+/// a rule with a policy and no simple-threshold policy refuse after the
+/// comparison's reads. So do a plan whose add does not restore the removed
+/// identity on the destination, and an audit log that fails its integrity
+/// check.
+#[tokio::test]
+async fn a_migration_pair_refuses_before_any_send() {
+    let plan = migration_plan(webauthn_hash(), ed25519_hash());
+
+    let h = Harness::new(signer_add_chain()).await;
+    let result = migrate(&h, &plan, "req-no-row").await;
+    assert_first_pair_refused_unsent(&h, &result, "sa.signer_set_missing_baseline", "req-no-row");
+    assert!(h.primary_log.is_untouched(), "no RPC before the refusal");
+    assert!(h.secondary_log.is_untouched(), "no RPC before the refusal");
+
+    let h = Harness::new(signer_add_chain()).await;
+    h.baseline_v1(1);
+    let result = migrate(&h, &plan, "req-legacy").await;
+    assert_first_pair_refused_unsent(&h, &result, "sa.signer_set_baseline_legacy", "req-legacy");
+    assert!(h.primary_log.is_untouched(), "no RPC before the refusal");
+    assert!(h.secondary_log.is_untouched(), "no RPC before the refusal");
+
+    let h = signer_add_harness(false).await;
+    let mut changed = signers_before_add();
+    changed.push((3, delegated_account(0x13)));
+    h.set_rule(1, &rule_with_ids(1, changed, vec![policy_p()]));
+    let result = migrate(&h, &plan, "req-changed").await;
+    assert_first_pair_refused_unsent(&h, &result, "sa.signer_set_diverged", "req-changed");
+    assert!(
+        matches!(
+            result.failed_step_error,
+            Some(SaError::SignerSetDiverged { tx_hash: None, .. })
+        ),
+        "{:?}",
+        result.failed_step_error
+    );
+    assert_eq!(
+        row_kinds(&h.rows(), "req-changed"),
+        vec!["sa_signer_set_diverged"]
+    );
+
+    let h = Harness::new(signer_add_chain().with_threshold(&policy_p(), 1, 2)).await;
+    h.baseline_v2(1);
+    let result = migrate(&h, &plan, "req-unreachable").await;
+    assert_first_pair_refused_unsent(&h, &result, "sa.threshold_unreachable", "req-unreachable");
+
+    let h = Harness::new(
+        signer_add_chain()
+            .with_rule(1, rule_with_ids(1, signers_before_add(), vec![policy_q()]))
+            .with_wasm(&policy_q(), spending_limit_hash()),
+    )
+    .await;
+    h.baseline_v2(1);
+    let result = migrate(&h, &plan, "req-weighted").await;
+    assert_first_pair_refused_unsent(
+        &h,
+        &result,
+        "sa.threshold_policy_identification_failed",
+        "req-weighted",
+    );
+
+    let h = signer_add_harness(false).await;
+    let mismatched = plan_of(
+        webauthn_hash(),
+        ed25519_hash(),
+        vec![migration_step(
+            1,
+            webauthn_hash(),
+            &verifier_v(),
+            &[0x11; 32],
+        )],
+    );
+    let result = migrate(&h, &mismatched, "req-mismatch").await;
+    assert_first_pair_refused_unsent(&h, &result, "sa.verifier_migration_failed", "req-mismatch");
+    match &result.failed_step_error {
+        Some(SaError::VerifierMigrationFailed { phase, detail, .. }) => {
+            assert_eq!(*phase, "plan_build");
+            assert_eq!(
+                detail,
+                "migrate_verifier: the add step of signer 1 does not restore the removed \
+                 identity on the destination verifier"
+            );
+        }
+        other => panic!("expected VerifierMigrationFailed; got {other:?}"),
+    }
+
+    let h = signer_add_harness(false).await;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&h.log_path)
+        .unwrap()
+        .write_all(b"not an audit row\n")
+        .unwrap();
+    let result = migrate(&h, &plan, "req-integrity").await;
+    let err = result.failed_step_error.as_ref().expect("the pair refused");
+    assert!(matches!(err, SaError::AuditLog(_)), "{err:?}");
+    assert_eq!(err.wire_code(), "sa.audit_log");
+    assert_eq!(result.failed_step_index, Some(0));
+    assert!(result.pending_add.is_none());
+    assert_eq!(h.sends(), 0);
+}
+
+/// An add refused before signing after the removal confirmed stops the
+/// pair with the removal recorded and the record repointed, and returns the
+/// pending add. Running it through `signers add` completes the pair, keeps
+/// the repointed pin and lets the rule sign.
+#[tokio::test]
+async fn an_add_refused_after_the_removal_returns_the_pending_add_that_completes_the_pair() {
+    let h = signer_add_harness(true).await;
+    on_send_one_pair(&h);
+    h.set_simulated_return("add_signer", ScVal::Void);
+    let result = migrate(
+        &h,
+        &migration_plan(webauthn_hash(), ed25519_hash()),
+        "req-add-refused",
+    )
+    .await;
+
+    match &result.failed_step_error {
+        Some(SaError::VerifierMigrationFailed { phase, detail, .. }) => {
+            assert_eq!(*phase, "submit_simulate");
+            assert!(
+                detail.contains("add_signer: expected ScVal::U32 return, got Void"),
+                "{detail}"
+            );
+        }
+        other => panic!("expected VerifierMigrationFailed; got {other:?}"),
+    }
+    assert_eq!(h.sends(), 1, "the add was refused before it was signed");
+    assert!(h.simulated("add_signer"));
+    let pending = result.pending_add.as_ref().expect("the pending add");
+    assert_eq!(pending.remove_tx_hash.len(), 64);
+    assert_eq!(
+        pending,
+        &PendingAddStep::new_for_test(
+            1,
+            1,
+            verifier_w(),
+            vec![0x11; 32],
+            pending.remove_tx_hash.clone(),
+            true,
+            None,
+        )
+    );
+    assert_eq!(
+        result.failed_step_remove_tx_hash.as_deref(),
+        Some(pending.remove_tx_hash.as_str())
+    );
+    assert_eq!(
+        row_kinds(&h.rows(), "req-add-refused"),
+        vec!["sa_signer_removed_v2", "sa_context_rule_pins_updated"]
+    );
+
+    h.set_simulated_return("add_signer", ScVal::U32(SIMULATED_SIGNER_ID));
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    let id = h
+        .manager
+        .add_signer(
+            smart_account(),
+            pending.rule_id,
+            external_signer(&verifier_w(), &pending.key_data),
+            &signer,
+            "req-recovery".to_owned(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(id, SIMULATED_SIGNER_ID);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-recovery"),
+        vec!["sa_signer_added_v2", "sa_context_rule_pins_updated"]
+    );
+    let pins = the_row(&h, "req-recovery", "sa_context_rule_pins_updated");
+    let (verifiers, policies, _, reason) = pins_updated_fields(&pins);
+    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(reason, PinsUpdateReason::SignerAdded);
+
+    h.submit(&[1], Some("req-after-recovery")).await.unwrap();
+    assert_eq!(h.sends(), 3);
+}
+
+/// A removal whose state row the audit log refuses stops the pair at stage
+/// `write` with the removal's hash and the pending add; the add is not
+/// submitted.
+#[tokio::test]
+async fn a_removal_whose_row_is_refused_stops_the_pair_with_the_pending_add() {
+    let h = signer_add_harness(false).await;
+    on_send_one_pair(&h);
+    h.poison_audit_writer_at("sendTransaction");
+    let result = migrate(
+        &h,
+        &migration_plan(webauthn_hash(), ed25519_hash()),
+        "req-remove-unrecorded",
+    )
+    .await;
+
+    assert_eq!(h.sends(), 1, "the add was not submitted");
+    let pending = result.pending_add.as_ref().expect("the pending add");
+    match &result.failed_step_error {
+        Some(SaError::BaselineWriteFailed {
+            stage,
+            tx_hash: Some(hash),
+            ..
+        }) => {
+            assert_eq!(*stage, "write");
+            assert_eq!(hash, &pending.remove_tx_hash);
+        }
+        other => panic!("expected BaselineWriteFailed at stage write; got {other:?}"),
+    }
+    assert!(pending.remove_confirmed);
+    assert!(h.manager.audit_writer_degraded());
+}
+
+/// A pair whose removal row and repoint the audit log refused leaves the
+/// record on the source verifier. Once the writer is repaired, the printed
+/// recovery completes the pair. `signers refresh --accept-divergence`
+/// records the removed set and drops the pin no live `External` signer
+/// uses, and the pending `signers add` then pins the destination as the
+/// rule's only verifier, so the rule signs.
+#[tokio::test]
+async fn the_refresh_drops_the_dead_source_pin_and_the_recovery_add_signs() {
+    let h = signer_add_harness(true).await;
+    on_send_one_pair(&h);
+    h.poison_audit_writer_at("sendTransaction");
+    let result = migrate(
+        &h,
+        &migration_plan(webauthn_hash(), ed25519_hash()),
+        "req-pair-unrecorded",
+    )
+    .await;
+    assert!(
+        matches!(
+            result.failed_step_error,
+            Some(SaError::BaselineWriteFailed { stage: "write", .. })
+        ),
+        "{:?}",
+        result.failed_step_error
+    );
+    let pending = result.pending_add.clone().expect("the pending add");
+    assert!(
+        row_kinds(&h.rows(), "req-pair-unrecorded").is_empty(),
+        "neither the removal row nor the repoint was written"
+    );
+    h.audit.clear_poison();
+
+    let refreshed = h
+        .manager
+        .refresh_signer_baseline(
+            smart_account(),
+            1,
+            None,
+            RefreshOptions::new(true),
+            "req-refresh-dead-pin".to_owned(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refreshed.previous_baseline, PreviousBaseline::Diverged);
+    assert!(!refreshed.verifier_pinned);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-refresh-dead-pin"),
+        vec![
+            "sa_signer_set_diverged",
+            "sa_signer_set_baselined_v2",
+            "sa_context_rule_pins_updated",
+        ]
+    );
+    let dropped = the_row(&h, "req-refresh-dead-pin", "sa_context_rule_pins_updated");
+    let (verifiers, policies, _, reason) = pins_updated_fields(&dropped);
+    assert!(verifiers.is_empty(), "the dead source pin is dropped");
+    assert!(verifier_refs_of(&dropped).is_empty());
+    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(reason, PinsUpdateReason::BaselineRefreshed);
+
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    h.manager
+        .add_signer(
+            smart_account(),
+            pending.rule_id,
+            external_signer(&verifier_w(), &pending.key_data),
+            &signer,
+            "req-recovery-after-refresh".to_owned(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    let pinned = the_row(
+        &h,
+        "req-recovery-after-refresh",
+        "sa_context_rule_pins_updated",
+    );
+    let (verifiers, _, _, reason) = pins_updated_fields(&pinned);
+    assert_eq!(
+        verifiers,
+        vec![first8(&ed25519_hash())],
+        "the destination is the rule's only verifier pin"
+    );
+    assert_eq!(reason, PinsUpdateReason::SignerAdded);
+
+    h.submit(&[1], Some("req-after-dead-pin")).await.unwrap();
+    assert_eq!(h.sends(), 3);
+}
+
+/// The verifier, policy and override fields of a pins-updated row.
+struct PinRecordFields {
+    verifiers: Vec<String>,
+    verifier_refs: Vec<Option<ExecutableRefPin>>,
+    policies: Vec<String>,
+    policy_refs: Vec<Option<ExecutableRefPin>>,
+    mutable_override: bool,
+    unknown_override: bool,
+    reason: PinsUpdateReason,
+}
+
+fn pin_record_fields(entry: &AuditEntry) -> PinRecordFields {
+    match &entry.event_kind {
+        EventKind::SaContextRulePinsUpdated {
+            pinned_verifier_wasm_hashes_first8,
+            pinned_verifier_executable_refs,
+            pinned_policy_wasm_hashes_first8,
+            pinned_policy_executable_refs,
+            mutable_override,
+            unknown_override,
+            reason,
+            ..
+        } => PinRecordFields {
+            verifiers: pinned_verifier_wasm_hashes_first8.clone(),
+            verifier_refs: pinned_verifier_executable_refs.clone(),
+            policies: pinned_policy_wasm_hashes_first8.clone(),
+            policy_refs: pinned_policy_executable_refs.clone(),
+            mutable_override: *mutable_override,
+            unknown_override: *unknown_override,
+            reason: *reason,
+        },
+        other => panic!("expected SaContextRulePinsUpdated; got {other:?}"),
+    }
+}
+
+/// A dead verifier pin dropped by the refresh takes its executable
+/// reference with it, and nothing else. The pair runs on a rule whose
+/// simple-threshold policy is served through an executable reference. Its
+/// record pins the source verifier with a reference, the policy with a
+/// reference, and both override flags. After the removal row and the
+/// repoint are refused, `signers refresh --accept-divergence` writes a pins
+/// row whose verifier pin and verifier reference lists are empty. The
+/// policy pin, the policy reference and the two override flags are the
+/// seeded ones. A second refresh finds no verifier pin to drop and writes
+/// no pins row, and the recovery add pins the destination beside the kept
+/// policy reference, so the rule signs.
+#[tokio::test]
+async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags() {
+    let mut chain = Chain::default()
+        .with_rule(1, signer_add_rule_before())
+        .with_wasm(&verifier_v(), webauthn_hash())
+        .with_wasm(&verifier_w(), ed25519_hash())
+        .with_entry(external_ref_instance(&policy_p()))
+        .with_entry(tag_entry(KNOWN_WASM_HASH))
+        .with_threshold(&policy_p(), 1, 1);
+    // The baseline helpers identify the simple-threshold policy by the hash
+    // its reference resolves to.
+    chain.wasm.insert(strkey(&policy_p()), KNOWN_WASM_HASH);
+    let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    let policy_refs = vec![Some(reference_pin(KNOWN_WASM_HASH))];
+    h.write(AuditEntry::new_sa_context_rule_created(
+        smart_account_redacted(),
+        1,
+        "default",
+        2,
+        1,
+        None,
+        CHAIN_ID,
+        "req-install-references",
+        vec![first8(&webauthn_hash())],
+        vec![first8(&KNOWN_WASM_HASH)],
+        true,
+        true,
+        vec![Some(reference_pin(webauthn_hash()))],
+        policy_refs.clone(),
+    ));
+    on_send_one_pair(&h);
+    h.poison_audit_writer_at("sendTransaction");
+    let result = migrate(
+        &h,
+        &migration_plan(webauthn_hash(), ed25519_hash()),
+        "req-pair-references",
+    )
+    .await;
+    assert!(
+        matches!(
+            result.failed_step_error,
+            Some(SaError::BaselineWriteFailed { stage: "write", .. })
+        ),
+        "{:?}",
+        result.failed_step_error
+    );
+    h.audit.clear_poison();
+
+    let refresh = |request_id: &'static str| {
+        h.manager.refresh_signer_baseline(
+            smart_account(),
+            1,
+            None,
+            RefreshOptions::new(true),
+            request_id.to_owned(),
+        )
+    };
+    refresh("req-refresh-references").await.unwrap();
+    assert_eq!(
+        row_kinds(&h.rows(), "req-refresh-references"),
+        vec![
+            "sa_signer_set_diverged",
+            "sa_signer_set_baselined_v2",
+            "sa_context_rule_pins_updated",
+        ]
+    );
+    let dropped = pin_record_fields(&the_row(
+        &h,
+        "req-refresh-references",
+        "sa_context_rule_pins_updated",
+    ));
+    assert!(dropped.verifiers.is_empty(), "{:?}", dropped.verifiers);
+    assert!(
+        dropped.verifier_refs.is_empty(),
+        "{:?}",
+        dropped.verifier_refs
+    );
+    assert_eq!(dropped.policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(dropped.policy_refs, policy_refs);
+    assert!(
+        dropped.mutable_override,
+        "the mutable-contract override is kept"
+    );
+    assert!(
+        dropped.unknown_override,
+        "the unknown-contract override is kept"
+    );
+    assert_eq!(dropped.reason, PinsUpdateReason::BaselineRefreshed);
+
+    refresh("req-refresh-again").await.unwrap();
+    assert_eq!(
+        row_kinds(&h.rows(), "req-refresh-again"),
+        vec!["sa_signer_set_baselined_v2"],
+        "a record that pins no verifier is not rewritten"
+    );
+
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    h.manager
+        .add_signer(
+            smart_account(),
+            1,
+            external_signer(&verifier_w(), &[0x11; 32]),
+            &signer,
+            "req-recovery-references".to_owned(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    let pinned = pin_record_fields(&the_row(
+        &h,
+        "req-recovery-references",
+        "sa_context_rule_pins_updated",
+    ));
+    assert_eq!(pinned.verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(pinned.policy_refs, policy_refs);
+    h.submit(&[1], Some("req-after-references")).await.unwrap();
+    assert_eq!(h.sends(), 3);
+}
+
+/// A rule without `External` signers whose record pins two verifier hashes
+/// keeps its record through a refresh: only a record with exactly one
+/// verifier pin is dropped.
+#[tokio::test]
+async fn a_refresh_keeps_a_two_verifier_record_of_a_rule_without_external_signers() {
+    let chain = Chain::default()
+        .with_rule(
+            1,
+            rule_with_ids(1, vec![(0, delegated_signer())], vec![policy_p()]),
+        )
+        .with_wasm(&policy_p(), KNOWN_WASM_HASH)
+        .with_threshold(&policy_p(), 1, 1);
+    let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    h.pin_created(
+        1,
+        vec![first8(&webauthn_hash()), first8(&ed25519_hash())],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    let refreshed = h
+        .manager
+        .refresh_signer_baseline(
+            smart_account(),
+            1,
+            None,
+            RefreshOptions::new(false),
+            "req-refresh-two-pins".to_owned(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refreshed.previous_baseline, PreviousBaseline::Matched);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-refresh-two-pins"),
+        vec!["sa_signer_set_baselined_v2"]
+    );
+}
+
+/// A rule with an `External` signer keeps its verifier pin through a
+/// refresh, even one its live verifier does not match. A pinned verifier
+/// that changed is the drift check's finding, and only a rule without
+/// `External` signers drops its verifier pin.
+#[tokio::test]
+async fn a_refresh_keeps_the_verifier_pin_of_a_rule_with_a_live_external_signer() {
+    let h = signer_add_harness(false).await;
+    h.pin_created(
+        1,
+        vec![FOREIGN_FIRST8.to_owned()],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    let refreshed = h
+        .manager
+        .refresh_signer_baseline(
+            smart_account(),
+            1,
+            None,
+            RefreshOptions::new(false),
+            "req-refresh-live".to_owned(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refreshed.previous_baseline, PreviousBaseline::Matched);
+    assert!(!refreshed.verifier_pinned);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-refresh-live"),
+        vec!["sa_signer_set_baselined_v2"]
+    );
+}
+
+/// A confirmed removal whose resulting state is not the intended one stops
+/// the pair with the removal's hash and the pending add. The pin record
+/// already names the destination: the removal is on chain, so the
+/// recovery's `signers add` finds the destination's pin recorded.
+#[tokio::test]
+async fn a_removal_whose_confirmed_state_is_wrong_stops_with_the_record_repointed() {
+    let h = signer_add_harness(true).await;
+    let result = migrate(
+        &h,
+        &migration_plan(webauthn_hash(), ed25519_hash()),
+        "req-remove-wrong",
+    )
+    .await;
+
+    assert_eq!(h.sends(), 1, "the add was not submitted");
+    let pending = result.pending_add.as_ref().expect("the pending add");
+    match &result.failed_step_error {
+        Some(SaError::SignerSetDiverged {
+            tx_hash: Some(hash),
+            ..
+        }) => assert_eq!(hash, &pending.remove_tx_hash),
+        other => panic!("expected SignerSetDiverged with the removal's hash; got {other:?}"),
+    }
+    assert!(pending.remove_confirmed);
+    assert_eq!(
+        result.failed_step_remove_tx_hash.as_deref(),
+        Some(pending.remove_tx_hash.as_str())
+    );
+    assert_eq!(
+        row_kinds(&h.rows(), "req-remove-wrong"),
+        vec!["sa_signer_set_diverged", "sa_context_rule_pins_updated"]
+    );
+    let pins = the_row(&h, "req-remove-wrong", "sa_context_rule_pins_updated");
+    let (verifiers, _, _, reason) = pins_updated_fields(&pins);
+    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
+}
+
+/// A change made outside the wallet after the removal's observation is
+/// found by the add's comparison against the removal's row. The add is not
+/// sent, the divergence row follows the removal's row, and the pair returns
+/// its pending add.
+///
+/// Five reads of rule 1 precede the add's comparison: the removal's
+/// comparison on both endpoints, the drift check's read on the primary and
+/// the removal's observation on both endpoints.
+#[tokio::test]
+async fn a_change_after_the_removal_refuses_the_add_before_it_is_sent() {
+    let h = signer_add_harness(false).await;
+    on_send_one_pair(&h);
+    h.replace_rule_after_reads(
+        1,
+        5,
+        rule_with_ids(
+            1,
+            vec![(0, delegated_signer()), (3, delegated_account(0x13))],
+            vec![policy_p()],
+        ),
+    );
+    let result = migrate(
+        &h,
+        &migration_plan(webauthn_hash(), ed25519_hash()),
+        "req-changed-between",
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result.failed_step_error,
+            Some(SaError::SignerSetDiverged { tx_hash: None, .. })
+        ),
+        "{:?}",
+        result.failed_step_error
+    );
+    assert_eq!(h.sends(), 1, "the add was not sent");
+    assert!(
+        result
+            .pending_add
+            .as_ref()
+            .is_some_and(|p| p.remove_confirmed)
+    );
+    assert_eq!(
+        row_kinds(&h.rows(), "req-changed-between"),
+        vec!["sa_signer_removed_v2", "sa_signer_set_diverged"]
+    );
+    assert_eq!(h.primary_log.rule_reads(), vec![1, 1, 1, 1]);
+    assert_eq!(h.secondary_log.rule_reads(), vec![1, 1, 1]);
+}
+
+/// An add whose confirmed state is not the restored identity refuses with
+/// the add's hash after both sends. The divergence row is written, no added
+/// row, and no pending add, since the add confirmed. The error names the
+/// refresh.
+#[tokio::test]
+async fn an_add_whose_confirmed_state_is_wrong_refuses_without_a_pending_add() {
+    let h = signer_add_harness(false).await;
+    h.on_send(
+        "remove_signer",
+        SendEffect::RemoveSigner {
+            rule_id: 1,
+            signer_id: 1,
+        },
+    );
+    let result = migrate(
+        &h,
+        &migration_plan(webauthn_hash(), ed25519_hash()),
+        "req-add-wrong",
+    )
+    .await;
+
+    let err = result.failed_step_error.as_ref().expect("the pair failed");
+    match err {
+        SaError::SignerSetDiverged {
+            tx_hash: Some(hash),
+            ..
+        } => assert_eq!(hash.len(), 64),
+        other => panic!("expected SignerSetDiverged with the add's hash; got {other:?}"),
+    }
+    assert!(
+        err.to_string().contains("--accept-divergence"),
+        "the error names the refresh: {err}"
+    );
+    assert_eq!(h.sends(), 2);
+    assert!(result.pending_add.is_none(), "the add confirmed");
+    assert!(result.failed_step_remove_tx_hash.is_none());
+    assert_eq!(
+        row_kinds(&h.rows(), "req-add-wrong"),
+        vec!["sa_signer_removed_v2", "sa_signer_set_diverged"]
+    );
+}
+
+/// Two pairs on one rule run one after the other, the second comparing
+/// against the first pair's added row. Both complete, and the final state
+/// row holds both restored signers on the destination and no source signer.
+/// The pin record is repointed once, by the first pair.
+#[tokio::test]
+async fn two_pairs_on_one_rule_each_compare_against_the_newest_row() {
+    let h = signer_add_harness(true).await;
+    let plan = migration_plan_two_signers(&h, &verifier_w());
+    for signer_id in [1, 2] {
+        h.on_send(
+            "remove_signer",
+            SendEffect::RemoveSigner {
+                rule_id: 1,
+                signer_id,
+            },
+        );
+    }
+    for (signer_id, key) in [(7, [0x11; 32]), (8, [0x12; 32])] {
+        h.on_send(
+            "add_signer",
+            SendEffect::AddSigner {
+                rule_id: 1,
+                signer_id,
+                signer: external_signer(&verifier_w(), &key),
+            },
+        );
+    }
+    h.set_simulated_returns("add_signer", vec![ScVal::U32(7), ScVal::U32(8)]);
+
+    let result = migrate(&h, &plan, "req-two-pairs").await;
+    assert!(
+        result.failed_step_error.is_none(),
+        "{:?}",
+        result.failed_step_error
+    );
+    assert_eq!(h.sends(), 4);
+    let new_ids: Vec<u32> = result
+        .successful_steps
+        .iter()
+        .map(|step| step.new_signer_id)
+        .collect();
+    assert_eq!(new_ids, vec![7, 8]);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-two-pairs"),
+        vec![
+            "sa_signer_removed_v2",
+            "sa_context_rule_pins_updated",
+            "sa_signer_added_v2",
+            "sa_verifier_migrated",
+            "sa_signer_removed_v2",
+            "sa_signer_added_v2",
+            "sa_verifier_migrated",
+        ]
+    );
+    let final_row = rows_of(&h, "req-two-pairs")
+        .into_iter()
+        .rfind(|e| matches!(e.event_kind, EventKind::SaSignerAddedV2 { .. }))
+        .unwrap();
+    let final_state = state_row_snapshot(&final_row);
+    assert_eq!(final_state, &h.snapshot_of(1));
+    let ids: Vec<u32> = final_state.signers.iter().map(|entry| entry.id).collect();
+    assert_eq!(ids, vec![0, 7, 8]);
+    assert_eq!(
+        final_state.signers[1].identity,
+        external_identity(&verifier_w(), &[0x11; 32])
+    );
+    assert_eq!(
+        final_state.signers[2].identity,
+        external_identity(&verifier_w(), &[0x12; 32])
+    );
+    let pins = the_row(&h, "req-two-pairs", "sa_context_rule_pins_updated");
+    let (verifiers, _, _, reason) = pins_updated_fields(&pins);
+    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
+}
+
+/// A second pair whose plan does not restore its signer on the destination
+/// stops at its plan check after the first pair completed: step 1, one
+/// successful step, no pending add, two sends.
+#[tokio::test]
+async fn a_second_pair_whose_plan_does_not_match_stops_after_the_first() {
+    let h = signer_add_harness(false).await;
+    let plan = migration_plan_two_signers(&h, &verifier_v());
+    on_send_one_pair(&h);
+
+    let result = migrate(&h, &plan, "req-second-mismatch").await;
+    match &result.failed_step_error {
+        Some(SaError::VerifierMigrationFailed { phase, .. }) => assert_eq!(*phase, "plan_build"),
+        other => panic!("expected VerifierMigrationFailed at plan_build; got {other:?}"),
+    }
+    assert_eq!(result.failed_step_index, Some(1));
+    assert_eq!(result.total_steps_attempted, 2);
+    assert_eq!(result.successful_steps.len(), 1);
+    assert!(result.pending_add.is_none());
+    assert_eq!(h.sends(), 2);
 }
 
 /// The migration steps sign under the migrating rule with its verifier
@@ -2480,10 +3627,13 @@ async fn a_migration_skips_the_verifier_check_of_the_migrating_rule() {
         vec![],
         vec![],
     );
-    let signer = SoftwareSigningKey::new_from_bytes(SEED);
-    let result = migration_plan(webauthn_hash(), ed25519_hash())
-        .submit(&signer, &h.manager, "req-migrate")
-        .await;
+    on_send_one_pair(&h);
+    let result = migrate(
+        &h,
+        &migration_plan(webauthn_hash(), ed25519_hash()),
+        "req-migrate",
+    )
+    .await;
     assert!(
         result.failed_step_error.is_none(),
         "{:?}",
@@ -2496,6 +3646,7 @@ async fn a_migration_skips_the_verifier_check_of_the_migrating_rule() {
             .any(|e| matches!(e.event_kind, EventKind::SaVerifierHashDrift { .. })),
         "the migrating rule's verifier is not checked"
     );
+    assert_eq!(row_kinds(&h.rows(), "req-migrate"), PAIR_ROWS);
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].request_id, "req-migrate");
@@ -2517,10 +3668,12 @@ async fn a_migration_still_checks_the_migrating_rules_policies() {
         vec![],
         vec![],
     );
-    let signer = SoftwareSigningKey::new_from_bytes(SEED);
-    let result = migration_plan(webauthn_hash(), ed25519_hash())
-        .submit(&signer, &h.manager, "req-migrate-policy")
-        .await;
+    let result = migrate(
+        &h,
+        &migration_plan(webauthn_hash(), ed25519_hash()),
+        "req-migrate-policy",
+    )
+    .await;
     assert_eq!(result.failed_step_index, Some(0));
     assert!(
         matches!(
@@ -2534,20 +3687,127 @@ async fn a_migration_still_checks_the_migrating_rules_policies() {
     assert!(h.pins_updated_rows().is_empty());
 }
 
-/// A migration on a rule without a pin record writes no pins-updated row.
+/// A migration on a rule without a pin record writes no pins-updated row,
+/// and records both state rows of the pair.
 #[tokio::test]
 async fn a_migration_on_an_unpinned_rule_writes_no_row() {
     let h = signer_add_harness(false).await;
-    let signer = SoftwareSigningKey::new_from_bytes(SEED);
-    let result = migration_plan(webauthn_hash(), ed25519_hash())
-        .submit(&signer, &h.manager, "req-migrate-unpinned")
-        .await;
+    on_send_one_pair(&h);
+    let result = migrate(
+        &h,
+        &migration_plan(webauthn_hash(), ed25519_hash()),
+        "req-migrate-unpinned",
+    )
+    .await;
     assert!(
         result.failed_step_error.is_none(),
         "{:?}",
         result.failed_step_error
     );
     assert!(h.pins_updated_rows().is_empty());
+    assert_eq!(
+        row_kinds(&h.rows(), "req-migrate-unpinned"),
+        vec![
+            "sa_signer_removed_v2",
+            "sa_signer_added_v2",
+            "sa_verifier_migrated"
+        ]
+    );
+}
+
+/// A secondary endpoint one ledger behind the removal's confirmation for
+/// one read is read again, and the pair completes with its rows.
+#[tokio::test]
+async fn a_secondary_behind_the_removal_is_read_again_and_the_pair_completes() {
+    let h = signer_add_harness(true).await;
+    on_send_one_pair(&h);
+    h.secondary_ledgers
+        .queued
+        .lock()
+        .unwrap()
+        .push_back(PRE_SEND_LEDGER);
+    let result = migrate(
+        &h,
+        &migration_plan(webauthn_hash(), ed25519_hash()),
+        "req-pair-lagging",
+    )
+    .await;
+    assert!(
+        result.failed_step_error.is_none(),
+        "{:?}",
+        result.failed_step_error
+    );
+    assert_eq!(row_kinds(&h.rows(), "req-pair-lagging"), PAIR_ROWS);
+    assert_eq!(
+        h.secondary_log.simulated(),
+        vec![
+            "get_context_rule",
+            "get_threshold",
+            "get_context_rule",
+            "get_context_rule",
+            "get_threshold",
+            "get_context_rule",
+            "get_threshold",
+            "get_context_rule",
+            "get_threshold",
+        ],
+        "the behind rule read after the removal is repeated"
+    );
+}
+
+/// A removal whose confirmation never arrives stops the pair with the
+/// unknown outcome and its hash. The pin record already names the
+/// destination, no state row is written, and the pending add carries the
+/// hash with the removal unconfirmed.
+#[tokio::test]
+async fn an_unresolved_removal_repoints_the_record_and_returns_the_pending_add() {
+    let h = Harness::with_timeout(signer_add_chain(), Duration::from_secs(2)).await;
+    h.baseline_v2(1);
+    h.pin_created(
+        1,
+        vec![first8(&webauthn_hash())],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    h.never_confirm_next_send();
+    let result = migrate(
+        &h,
+        &migration_plan(webauthn_hash(), ed25519_hash()),
+        "req-remove-unresolved",
+    )
+    .await;
+
+    let hash = match &result.failed_step_error {
+        Some(SaError::SubmissionUnresolved {
+            kind: stellar_agent_smart_account::SubmissionUnresolvedKind::Timeout,
+            tx_hash: Some(hash),
+            ..
+        }) => hash.clone(),
+        other => panic!("expected SubmissionUnresolved (timeout) with a hash; got {other:?}"),
+    };
+    assert_eq!(h.sends(), 1);
+    assert_eq!(
+        result.pending_add,
+        Some(PendingAddStep::new_for_test(
+            1,
+            1,
+            verifier_w(),
+            vec![0x11; 32],
+            hash,
+            false,
+            None,
+        ))
+    );
+    assert!(result.failed_step_remove_tx_hash.is_none());
+    assert_eq!(
+        row_kinds(&h.rows(), "req-remove-unresolved"),
+        vec!["sa_context_rule_pins_updated"]
+    );
+    let pins = the_row(&h, "req-remove-unresolved", "sa_context_rule_pins_updated");
+    let (verifiers, _, _, reason) = pins_updated_fields(&pins);
+    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
 }
 
 // ── Rule manager without a signers manager ────────────────────────────────────
@@ -3377,12 +4637,7 @@ async fn a_migration_refuses_a_rule_whose_pinned_policy_is_absent() {
         .with_entry(wasm_instance(&verifier_v(), webauthn_hash()))
         .with_entry(wasm_instance(&verifier_w(), ed25519_hash()));
     let h = Harness::new(chain).await;
-    write_baseline(
-        &h.audit,
-        1,
-        &smart_account_redacted(),
-        &signer_set_n_of_n(2),
-    );
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -3390,10 +4645,12 @@ async fn a_migration_refuses_a_rule_whose_pinned_policy_is_absent() {
         vec![],
         vec![],
     );
-    let signer = SoftwareSigningKey::new_from_bytes(SEED);
-    let result = migration_plan(webauthn_hash(), ed25519_hash())
-        .submit(&signer, &h.manager, "req-migrate-absent")
-        .await;
+    let result = migrate(
+        &h,
+        &migration_plan(webauthn_hash(), ed25519_hash()),
+        "req-migrate-absent",
+    )
+    .await;
     assert_eq!(result.failed_step_index, Some(0));
     assert!(
         matches!(
@@ -4053,11 +5310,27 @@ fn verifierless_rule_with_the_passkey() -> ScVal {
     )
 }
 
-/// A passkey add whose simulated return is not a `u32` confirms without an
-/// id the wallet can report: it fails at stage `observe` with the
-/// transaction hash, and the pin rows of the confirmed add are written.
+/// The deployment failure of a simulated return value that is not the
+/// shape the caller reads, refused before signing.
+fn assert_return_shape_refusal(err: &SaError, expected_reason: &str) {
+    match err {
+        SaError::DeploymentFailed {
+            phase,
+            redacted_reason,
+        } => {
+            assert_eq!(*phase, "simulate");
+            assert_eq!(redacted_reason, expected_reason);
+        }
+        other => panic!("expected DeploymentFailed at phase simulate; got {other:?}"),
+    }
+    assert_eq!(err.wire_code(), "sa.deployment_failed");
+}
+
+/// A passkey add whose simulated return value is not a `u32` is refused
+/// before it is signed: nothing is sent, and no pin or state row is
+/// written.
 #[tokio::test]
-async fn an_add_whose_simulated_return_is_not_a_u32_fails_at_stage_observe_and_pins() {
+async fn an_add_whose_simulated_return_is_not_a_u32_refuses_before_signing() {
     let h = verifierless_pinned_rule().await;
     h.set_simulated_return("add_signer", ScVal::Void);
     h.after_send(1, verifierless_rule_with_the_passkey());
@@ -4076,31 +5349,10 @@ async fn an_add_whose_simulated_return_is_not_a_u32_fails_at_stage_observe_and_p
         )
         .await
         .unwrap_err();
-    match &err {
-        SaError::BaselineWriteFailed {
-            tx_hash: Some(hash),
-            stage,
-            reason,
-            ..
-        } => {
-            assert_eq!(*stage, "observe");
-            assert_eq!(hash.len(), 64);
-            assert!(
-                reason.starts_with("sa.deployment_failed: ")
-                    && reason.contains("add_signer: expected ScVal::U32 return, got Void"),
-                "{reason}"
-            );
-        }
-        other => panic!("expected BaselineWriteFailed at stage observe; got {other:?}"),
-    }
-    assert_eq!(h.sends(), 1);
-    assert_eq!(
-        row_kinds(&h.rows(), "req-void-return"),
-        vec!["sa_context_rule_pins_updated"]
-    );
-    let (verifiers, _, _, reason) = pins_updated_fields(&h.pins_updated_rows()[0]);
-    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
-    assert_eq!(reason, PinsUpdateReason::SignerAdded);
+    assert_return_shape_refusal(&err, "add_signer: expected ScVal::U32 return, got Void");
+    assert!(h.simulated("add_signer"));
+    assert_eq!(h.sends(), 0);
+    assert!(row_kinds(&h.rows(), "req-void-return").is_empty());
 }
 
 /// A passkey add, single or batched, on a rule whose pin record holds no
@@ -5133,9 +6385,10 @@ async fn an_install_whose_served_signers_differ_in_one_identity_refuses() {
     assert_mismatch_without_baseline(&h, &err, "req-install-signers");
 }
 
-/// A confirmed install whose return value carries no rule id refuses with
-/// `sa.install_state_mismatch` without a rule id, and writes neither the
-/// override row nor the created row, since neither has a rule to name.
+/// An install whose simulated return value carries no rule id is refused
+/// before it is signed. Nothing is sent, and the raw row carries the
+/// refusal. Neither the override row nor the created row is written, since
+/// no rule exists.
 #[tokio::test]
 async fn an_install_whose_return_carries_no_rule_id_refuses_without_one() {
     let h = Harness::new(install_chain()).await;
@@ -5156,18 +6409,17 @@ async fn an_install_whose_return_carries_no_rule_id_refuses_without_one() {
     )
     .await
     .unwrap_err();
-    let (rule_id, tx_hash) = install_state_mismatch(&err);
-    assert_eq!(rule_id, None);
-    assert_eq!(tx_hash.len(), 64);
+    assert_return_shape_refusal(&err, "install_rule: expected a map with a u32 id, got Void");
+    assert!(h.simulated("add_context_rule"));
+    assert_eq!(h.sends(), 0);
     assert_eq!(
         row_kinds(&h.rows(), "req-install-void"),
         vec!["sa_raw_invocation"]
     );
     assert_eq!(
         raw_wire_code(&h, "req-install-void"),
-        "sa.install_state_mismatch"
+        "sa.deployment_failed"
     );
-    assert_eq!(h.sends(), 1);
 }
 
 /// A confirmed install whose baseline row the audit log refuses (the
@@ -5694,11 +6946,11 @@ async fn a_confirmed_threshold_attach_whose_threshold_differs_refuses_with_the_h
     assert_eq!(h.sends(), 1);
 }
 
-/// A confirmed attach whose simulated return is not a `u32` fails at stage
-/// `observe` with the hash: no policy row and no threshold row, and the pins
-/// row of the confirmed attach is written.
+/// An attach of the simple-threshold policy whose simulated return value is
+/// not a `u32` is refused before it is signed. Nothing is sent, no pin,
+/// policy or threshold row is written, and the raw row carries the refusal.
 #[tokio::test]
-async fn a_confirmed_threshold_attach_whose_return_is_not_a_u32_fails_at_stage_observe() {
+async fn a_threshold_attach_whose_simulated_return_is_not_a_u32_refuses_before_signing() {
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
     h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
@@ -5713,28 +6965,14 @@ async fn a_confirmed_threshold_attach_whose_return_is_not_a_u32_fails_at_stage_o
     )
     .await
     .unwrap_err();
-    match &err {
-        SaError::BaselineWriteFailed {
-            rule_id: 1,
-            tx_hash: Some(hash),
-            stage,
-            reason,
-            ..
-        } => {
-            assert_eq!(*stage, "observe");
-            assert_eq!(hash.len(), 64);
-            assert!(
-                reason.contains("add_policy: expected ScVal::U32 return, got Void"),
-                "{reason}"
-            );
-        }
-        other => panic!("expected BaselineWriteFailed at stage observe; got {other:?}"),
-    }
+    assert_return_shape_refusal(&err, "add_policy: expected ScVal::U32 return, got Void");
+    assert!(h.simulated("add_policy"));
+    assert_eq!(h.sends(), 0);
     assert_eq!(
         row_kinds(&h.rows(), "req-attach-void"),
-        vec!["sa_context_rule_pins_updated", "sa_raw_invocation"]
+        vec!["sa_raw_invocation"]
     );
-    assert_eq!(h.sends(), 1);
+    assert_eq!(raw_wire_code(&h, "req-attach-void"), "sa.deployment_failed");
 }
 
 /// An attach of the simple-threshold policy refuses a rule with no state
@@ -5769,12 +7007,12 @@ async fn a_threshold_attach_without_a_version_2_baseline_refuses() {
     assert_refused_before_submission(&h, &err, "add_policy", "req-attach-legacy");
 }
 
-/// A confirmed attach of a policy other than the simple-threshold policy
-/// whose simulated return is not a `u32` fails at stage `observe` with the
-/// hash: no policy row, a raw row that records the confirmed transaction,
-/// and the pins row of the confirmed attach.
+/// An attach of a policy other than the simple-threshold policy whose
+/// simulated return value is not a `u32` is refused before it is signed.
+/// Nothing is sent, no pin or policy row is written, and the raw row
+/// carries the refusal.
 #[tokio::test]
-async fn a_confirmed_direct_attach_whose_return_is_not_a_u32_fails_at_stage_observe_and_pins() {
+async fn a_direct_attach_whose_simulated_return_is_not_a_u32_refuses_before_signing() {
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
     h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
@@ -5783,37 +7021,15 @@ async fn a_confirmed_direct_attach_whose_return_is_not_a_u32_fails_at_stage_obse
     let err = add_policy_with(&h, &policy_q(), ScVal::Void, "req-direct-void", false)
         .await
         .unwrap_err();
-    match &err {
-        SaError::BaselineWriteFailed {
-            rule_id: 1,
-            tx_hash: Some(hash),
-            stage,
-            reason,
-            ..
-        } => {
-            assert_eq!(*stage, "observe");
-            assert_eq!(hash.len(), 64);
-            assert!(
-                reason.contains("add_policy: expected ScVal::U32 return, got Void"),
-                "{reason}"
-            );
-        }
-        other => panic!("expected BaselineWriteFailed at stage observe; got {other:?}"),
-    }
+    assert_return_shape_refusal(&err, "add_policy: expected ScVal::U32 return, got Void");
+    assert!(h.simulated("add_policy"));
+    assert_eq!(h.sends(), 0);
     assert_eq!(
         row_kinds(&h.rows(), "req-direct-void"),
-        vec!["sa_context_rule_pins_updated", "sa_raw_invocation"]
+        vec!["sa_raw_invocation"]
     );
-    assert_eq!(
-        raw_wire_code(&h, "req-direct-void"),
-        "sa.baseline_write_failed"
-    );
-    let pins = h.pins_updated_rows();
-    assert_eq!(pins.len(), 1);
-    let (policies, _, reason) = policy_pins_of(&pins[0]);
-    assert_eq!(policies, vec![first8(&spending_limit_hash())]);
-    assert_eq!(reason, PinsUpdateReason::PolicyAdded);
-    assert_eq!(h.sends(), 1);
+    assert_eq!(raw_wire_code(&h, "req-direct-void"), "sa.deployment_failed");
+    assert!(h.pins_updated_rows().is_empty());
 }
 
 /// A spending-limit attach records no signer-set state row and keeps its

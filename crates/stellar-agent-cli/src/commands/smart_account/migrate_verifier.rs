@@ -7,8 +7,10 @@
 //! - **Dry-run** (`--dry-run`): renders the plan as a JSON envelope without
 //!   submitting any transactions.
 //! - **Submit** (default): signs + submits each `remove_signer` / `add_signer`
-//!   pair sequentially and renders a `MigrateVerifierResult` with per-step
-//!   tx hashes.
+//!   pair sequentially, each pair under its rule's lock as two checked signer
+//!   mutations, and renders a `MigrateVerifierResult` with per-step tx hashes.
+//!   A failure after a pair's removal was sent renders the pending add and
+//!   prints, before the JSON envelope, the command that completes the pair.
 //!
 //! # Flags
 //!
@@ -48,6 +50,15 @@
 //! - `sa.verifier_wasm_revoked` — [`SaError::VerifierWasmRevoked`]
 //! - `sa.verifier_wasm_retired` — [`SaError::VerifierWasmRetired`]
 //! - `network.rpc_divergence` — [`SaError::NetworkRpcDivergence`]
+//! - `sa.signer_set_missing_baseline`: [`SaError::SignerSetMissingBaseline`]
+//! - `sa.signer_set_baseline_legacy`: [`SaError::SignerSetBaselineLegacy`]
+//! - `sa.signer_set_diverged`: [`SaError::SignerSetDiverged`]
+//! - `sa.baseline_write_failed`: [`SaError::BaselineWriteFailed`]
+//! - `submission.tx_timeout`, `submission.tx_already_submitted`,
+//!   `submission.hash_mismatch`: [`SaError::SubmissionUnresolved`], by kind
+//! - `sa.threshold_unreachable`: [`SaError::ThresholdUnreachable`]
+//! - `sa.threshold_policy_identification_failed`:
+//!   [`SaError::ThresholdPolicyIdentificationFailed`]
 
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -57,11 +68,14 @@ use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::migration::{
-    MigrationPlan, MigrationPlanner, MigrationSubmitResult,
+    MigrationPlan, MigrationPlanner, MigrationSubmitResult, PendingAddStep, SignerMigrationStep,
 };
 use stellar_agent_smart_account::managers::rules::parse_c_strkey_to_smart_account;
-use stellar_agent_smart_account::managers::signers::SignersManager;
+use stellar_agent_smart_account::managers::signers::{
+    DecodedOnChainSigner, SignersManager, decode_signer_scval_full,
+};
 use stellar_agent_smart_account::verifier_allowlist::VerifierAuditStatus;
+use stellar_xdr::HostFunction;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -104,12 +118,11 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 \n\
 INTER-TRANSACTION HAZARD: A migration with multiple affected External signers \
 or multiple affected context rules produces more than 2 Soroban transactions. Between \
-paired remove_signer / add_signer transactions the rule's signer set is degraded. If \
-add_signer fails after remove_signer succeeds, the rule may be left without its \
-authorisation signer. The `warnings` field in the JSON envelope is non-empty when \
-total_transaction_count > 2. Re-running migrate-verifier after a partial failure \
-re-plans from the current on-chain state (already-migrated signers no longer match \
-from_hash)."
+paired remove_signer / add_signer transactions the rule's signer set lacks the \
+migrated signer. The `warnings` field in the JSON envelope is non-empty when \
+total_transaction_count > 2. A failure between a pair's two transactions leaves a \
+pending add: the result names the signers add command that completes it, and a re-run \
+of migrate-verifier migrates the remaining signers."
 )]
 pub struct MigrateVerifierArgs {
     /// Smart-account contract C-strkey to migrate.
@@ -214,6 +227,12 @@ pub struct MigrateStepResult {
     pub signer_id: u32,
     /// First-8 hex chars of the old verifier wasm hash.
     pub current_hash_first8: String,
+    /// The key data the step's add restores on the destination verifier, as
+    /// lower-case hex, taken from the plan's add argument. With
+    /// `--signer-external <to_verifier_address>` it rebuilds the step's
+    /// `signers add` from the plan alone. Empty only for an add argument that
+    /// is not an `External` signer, which the planner never builds.
+    pub key_data_hex: String,
     /// Confirmed 64-character `remove_signer` tx hash.
     ///
     /// `null` in dry-run mode; populated on submit.
@@ -224,6 +243,38 @@ pub struct MigrateStepResult {
     /// `null` in dry-run mode; populated on submit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub add_tx_hash: Option<String>,
+    /// The id the chain assigned to the restored signer; set for a
+    /// completed pair.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_signer_id: Option<u32>,
+}
+
+/// The add that completes a pair whose removal was sent, in the result
+/// envelope of a migration that stopped after the send.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigratePendingAdd {
+    /// The rule the pair migrates.
+    pub rule_id: u32,
+    /// The id of the removed signer.
+    pub signer_id: u32,
+    /// The destination verifier C-strkey the add names.
+    pub to_verifier_address: String,
+    /// The removed signer's key data, as lower-case hex.
+    pub key_data_hex: String,
+    /// The removal's 64-character transaction hash.
+    pub remove_tx_hash: String,
+    /// Whether the removal confirmed; `false` only when its outcome is
+    /// unknown.
+    pub remove_confirmed: bool,
+    /// The add's 64-character transaction hash, set only when the add was
+    /// sent and its outcome is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add_tx_hash: Option<String>,
+    /// The `signers add` command that completes the pair, with the
+    /// signer-source, `--profile`, `--network` and `--timeout-seconds` flags
+    /// of the invocation. The endpoint flags are not echoed, since a URL can
+    /// carry a credential; the operator adds those of the invocation.
+    pub recovery_command: String,
 }
 
 /// Per-rule summary in the result envelope.
@@ -276,9 +327,15 @@ pub struct MigrateVerifierResult {
     /// `null` on complete success or in dry-run mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_step_index: Option<usize>,
-    /// Remove tx hash for the failed step when remove succeeded and add failed.
+    /// The confirmed remove tx hash of the failed pair, when its removal
+    /// confirmed and its add did not. A removal whose outcome is unknown
+    /// carries its hash in `pending_add` alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_step_remove_tx_hash: Option<String>,
+    /// The add that completes the failed pair, when its removal was sent and
+    /// its add did not confirm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_add: Option<MigratePendingAdd>,
     /// Whether this is a dry-run (no transactions submitted).
     pub dry_run: bool,
     /// Per-request correlation UUID.
@@ -515,19 +572,24 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
         .submit(ctx.signer.as_ref(), &manager, &request_id)
         .await;
 
-    let result = migration_plan_to_result_submitted(
-        &plan,
-        &submit_result,
-        &args.account,
-        &args.to_verifier,
-        &ctx.chain_id,
-    );
+    let result = migration_plan_to_result_submitted(&plan, &submit_result, args, &ctx.chain_id);
 
     // If the submission failed at any step, emit the error alongside the
     // partial result and return exit code 1.  The canonical
     // `Envelope::partial_failure_with_request_id` constructor is used so the
     // CLI emits a single JSON root carrying both `data` and `error` fields.
+    // A pair that stopped after its removal was sent prints the command that
+    // completes it first.
     if let Some(ref err) = submit_result.failed_step_error {
+        if let Some(line) = partial_failure_recovery_line(args, &result, err) {
+            #[allow(
+                clippy::print_stderr,
+                reason = "the operator's recovery instruction, beside the JSON envelope on stdout"
+            )]
+            {
+                eprintln!("{line}");
+            }
+        }
         let wrapped = WalletError::SmartAccount {
             wire_code: err.wire_code(),
             message: err.to_string(),
@@ -622,8 +684,10 @@ fn migration_plan_to_result_dry_run(
                 .map(|s| MigrateStepResult {
                     signer_id: s.signer_id,
                     current_hash_first8: s.current_hash_first8.clone(),
+                    key_data_hex: add_step_key_data_hex(s),
                     remove_tx_hash: None,
                     add_tx_hash: None,
+                    new_signer_id: None,
                 })
                 .collect(),
         })
@@ -640,6 +704,7 @@ fn migration_plan_to_result_dry_run(
         submitted_steps_count: 0,
         failed_step_index: None,
         failed_step_remove_tx_hash: None,
+        pending_add: None,
         dry_run: true,
         request_id: plan.request_id.clone(),
         chain_id: chain_id.to_owned(),
@@ -653,28 +718,38 @@ fn migration_plan_to_result_dry_run(
 fn migration_plan_to_result_submitted(
     plan: &MigrationPlan,
     submit_result: &MigrationSubmitResult,
-    account_strkey: &str,
-    to_verifier_strkey: &str,
+    args: &MigrateVerifierArgs,
     chain_id: &str,
 ) -> MigrateVerifierResult {
-    // Build a lookup from (rule_id, signer_id) → optional (remove_tx, add_tx).
-    let mut step_lookup: std::collections::HashMap<(u32, u32), Option<(&str, &str)>> =
-        submit_result
-            .successful_steps
-            .iter()
-            .map(|s| {
-                (
-                    (s.rule_id, s.signer_id),
-                    Some((s.remove_tx_hash.as_str(), s.add_tx_hash.as_str())),
-                )
-            })
-            .collect();
+    // The submitted hashes and the assigned id of each pair, by
+    // (rule_id, signer_id).
+    let mut step_lookup: std::collections::HashMap<(u32, u32), SubmittedStep> = submit_result
+        .successful_steps
+        .iter()
+        .map(|s| {
+            (
+                (s.rule_id, s.signer_id),
+                SubmittedStep {
+                    remove_tx_hash: Some(s.remove_tx_hash.clone()),
+                    add_tx_hash: Some(s.add_tx_hash.clone()),
+                    new_signer_id: Some(s.new_signer_id),
+                },
+            )
+        })
+        .collect();
     if let (Some(failed_index), Some(remove_tx_hash)) = (
         submit_result.failed_step_index,
         submit_result.failed_step_remove_tx_hash.as_deref(),
     ) && let Some((rule_id, signer_id)) = flattened_step_key(plan, failed_index)
     {
-        step_lookup.insert((rule_id, signer_id), Some((remove_tx_hash, "")));
+        step_lookup.insert(
+            (rule_id, signer_id),
+            SubmittedStep {
+                remove_tx_hash: Some(remove_tx_hash.to_owned()),
+                add_tx_hash: None,
+                new_signer_id: None,
+            },
+        );
     }
 
     let affected_rules = plan
@@ -688,44 +763,242 @@ fn migration_plan_to_result_submitted(
                 .signer_steps
                 .iter()
                 .map(|s| {
-                    let txs = step_lookup.get(&(r.rule_id, s.signer_id)).and_then(|v| *v);
-                    let (remove_tx, add_tx) = txs.unwrap_or(("", ""));
+                    let submitted = step_lookup.remove(&(r.rule_id, s.signer_id));
                     MigrateStepResult {
                         signer_id: s.signer_id,
                         current_hash_first8: s.current_hash_first8.clone(),
-                        remove_tx_hash: if remove_tx.is_empty() {
-                            None
-                        } else {
-                            Some(remove_tx.to_owned())
-                        },
-                        add_tx_hash: if add_tx.is_empty() {
-                            None
-                        } else {
-                            Some(add_tx.to_owned())
-                        },
+                        key_data_hex: add_step_key_data_hex(s),
+                        remove_tx_hash: submitted
+                            .as_ref()
+                            .and_then(|step| step.remove_tx_hash.clone()),
+                        add_tx_hash: submitted.as_ref().and_then(|step| step.add_tx_hash.clone()),
+                        new_signer_id: submitted.and_then(|step| step.new_signer_id),
                     }
                 })
                 .collect(),
         })
         .collect();
 
+    let pending_add = submit_result
+        .pending_add
+        .as_ref()
+        .map(|pending| MigratePendingAdd {
+            rule_id: pending.rule_id,
+            signer_id: pending.signer_id,
+            to_verifier_address: args.to_verifier.clone(),
+            key_data_hex: hex::encode(&pending.key_data),
+            remove_tx_hash: pending.remove_tx_hash.clone(),
+            remove_confirmed: pending.remove_confirmed,
+            add_tx_hash: pending.add_tx_hash.clone(),
+            recovery_command: recovery_command(args, pending),
+        });
+
     MigrateVerifierResult {
-        smart_account: account_strkey.to_owned(),
+        smart_account: args.account.clone(),
         from_hash_first8: plan.from_hash_first8(),
         to_hash_first8: plan.to_hash_first8(),
-        to_verifier_address: to_verifier_strkey.to_owned(),
+        to_verifier_address: args.to_verifier.clone(),
         destination_audit_status: audit_status_label(&plan.destination_audit_status),
         total_transaction_count: plan.total_transaction_count(),
         affected_rules,
         submitted_steps_count: submit_result.successful_steps.len(),
         failed_step_index: submit_result.failed_step_index,
         failed_step_remove_tx_hash: submit_result.failed_step_remove_tx_hash.clone(),
+        pending_add,
         dry_run: false,
         request_id: plan.request_id.clone(),
         chain_id: chain_id.to_owned(),
         warnings: plan.warnings.clone(),
         rules_skipped_count: plan.rules_skipped_count,
     }
+}
+
+/// What a submission recorded for one plan step.
+struct SubmittedStep {
+    remove_tx_hash: Option<String>,
+    add_tx_hash: Option<String>,
+    new_signer_id: Option<u32>,
+}
+
+/// The key data the add step of `step` restores, as lower-case hex: the
+/// `Bytes` item of the `Signer::External` value the planner built. Empty
+/// when the add argument is not an `External` signer.
+fn add_step_key_data_hex(step: &SignerMigrationStep) -> String {
+    let HostFunction::InvokeContract(invoke) = &step.add_host_function else {
+        return String::new();
+    };
+    match invoke.args.get(1).map(decode_signer_scval_full) {
+        Some(Ok(DecodedOnChainSigner::External { key_data, .. })) => hex::encode(key_data),
+        _ => String::new(),
+    }
+}
+
+/// `value` as one POSIX shell word: unchanged when it holds only characters
+/// no shell interprets, otherwise single-quoted.
+fn shell_word(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '@'));
+    if plain {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// The signer-source, `--profile`, `--network` and `--timeout-seconds`
+/// flags of the invocation, each preceded by a space. The endpoint flags
+/// are omitted: a URL can carry a credential.
+fn invocation_flags(args: &MigrateVerifierArgs) -> String {
+    let mut flags = String::new();
+    if let Some(var) = &args.signer_source.signer_secret_env {
+        flags.push_str(&format!(" --signer-secret-env {}", shell_word(var)));
+    } else if args.signer_source.sign_with_ledger {
+        flags.push_str(&format!(
+            " --sign-with-ledger --account-index {}",
+            args.signer_source.account_index.unwrap_or(0)
+        ));
+    }
+    if let Some(profile) = &args.profile {
+        flags.push_str(&format!(" --profile {}", shell_word(profile)));
+    }
+    flags.push_str(&format!(
+        " --network {} --timeout-seconds {}",
+        args.network, args.timeout_seconds
+    ));
+    flags
+}
+
+/// The `signers add` command that completes the pair of `pending`, with the
+/// invocation's flags ([`invocation_flags`]). The destination is the `--to`
+/// verifier the plan's destination was parsed from.
+fn recovery_command(args: &MigrateVerifierArgs, pending: &PendingAddStep) -> String {
+    format!(
+        "stellar-agent smart-account signers add --account {} --rule-id {} \
+         --signer-external {} --signer-key-data {}{}",
+        shell_word(&args.account),
+        pending.rule_id,
+        shell_word(&args.to_verifier),
+        hex::encode(&pending.key_data),
+        invocation_flags(args),
+    )
+}
+
+/// The `signers refresh --accept-divergence` command that records the chain
+/// state of rule `rule_id`, with the invocation's flags.
+fn refresh_command(args: &MigrateVerifierArgs, rule_id: u32) -> String {
+    format!(
+        "stellar-agent smart-account signers refresh --account {} --rule-id {rule_id} \
+         --accept-divergence{}",
+        shell_word(&args.account),
+        invocation_flags(args),
+    )
+}
+
+/// One step of a printed recovery.
+enum RecoveryStep {
+    /// A command to run.
+    Run(String),
+    /// A re-run of `migrate-verifier` for the remaining signers of the rule.
+    ReRunRemaining(u32),
+}
+
+/// Renders `steps` as one instruction, in order: the first as `run: <command>`
+/// or the re-run, each later one as `then: <command>` or `then` and the
+/// re-run, separated by commas.
+fn render_steps(steps: &[RecoveryStep]) -> String {
+    let rendered: Vec<String> = steps
+        .iter()
+        .enumerate()
+        .map(|(position, step)| match (position, step) {
+            (0, RecoveryStep::Run(command)) => format!("run: {command}"),
+            (_, RecoveryStep::Run(command)) => format!("then: {command}"),
+            (0, RecoveryStep::ReRunRemaining(rule_id)) => {
+                format!("re-run migrate-verifier for the remaining signers of rule {rule_id}")
+            }
+            (_, RecoveryStep::ReRunRemaining(rule_id)) => {
+                format!("then re-run migrate-verifier for the remaining signers of rule {rule_id}")
+            }
+        })
+        .collect();
+    rendered.join(", ")
+}
+
+/// The stderr line that tells the operator how to complete the pair a
+/// migration stopped on. `None` when it stopped before a removal was sent
+/// (`result.pending_add` is `None`), and the error alone is printed.
+///
+/// The case is decided on the variant of `error`, the pair's error:
+///
+/// - [`SaError::BaselineWriteFailed`] and [`SaError::SignerSetDiverged`]:
+///   the rule's newest state row is not the chain's state, so the refresh
+///   comes first, then the `signers add`;
+/// - [`SaError::SubmissionUnresolved`] of the removal: wait for the removal,
+///   then the refresh and the `signers add`, or re-run the migration when the
+///   removal is not found;
+/// - [`SaError::SubmissionUnresolved`] of the add: wait for the add, then the
+///   refresh, or the `signers add` when the add is not found;
+/// - every other error: the `signers add`.
+///
+/// When the plan holds a later step on the same rule that was not submitted,
+/// the re-run for the remaining signers comes after the repair step and
+/// before the `signers add`. The rule's pin record already names the
+/// destination, so the `signers add` is refused with `sa.verifier_hash_drift`
+/// while a source signer is still on the rule. The re-run compares the rule
+/// with its newest state row, so it follows the refresh.
+fn partial_failure_recovery_line(
+    args: &MigrateVerifierArgs,
+    result: &MigrateVerifierResult,
+    error: &SaError,
+) -> Option<String> {
+    let pending = result.pending_add.as_ref()?;
+    let add = || RecoveryStep::Run(pending.recovery_command.clone());
+    let refresh = || RecoveryStep::Run(refresh_command(args, pending.rule_id));
+    let remaining = has_later_step_on_rule(result, pending.rule_id).then_some(pending.rule_id);
+    let steps = |repair: Option<RecoveryStep>, then_add: bool| -> String {
+        let mut steps: Vec<RecoveryStep> = repair.into_iter().collect();
+        if let Some(rule_id) = remaining {
+            steps.push(RecoveryStep::ReRunRemaining(rule_id));
+        }
+        if then_add {
+            steps.push(add());
+        }
+        render_steps(&steps)
+    };
+    let line = match (error, pending.add_tx_hash.as_deref()) {
+        (SaError::BaselineWriteFailed { .. } | SaError::SignerSetDiverged { .. }, _) => {
+            steps(Some(refresh()), true)
+        }
+        (SaError::SubmissionUnresolved { .. }, _) if !pending.remove_confirmed => format!(
+            "the remove transaction {} has an unknown outcome. Once it is confirmed, {}. If it \
+             is not found, re-run migrate-verifier.",
+            pending.remove_tx_hash,
+            steps(Some(refresh()), true)
+        ),
+        (SaError::SubmissionUnresolved { .. }, Some(add_tx_hash)) => format!(
+            "the add transaction {add_tx_hash} has an unknown outcome. Once it is confirmed, \
+             {}. If it is not found, {}.",
+            steps(Some(refresh()), false),
+            steps(None, true)
+        ),
+        _ => steps(None, true),
+    };
+    Some(line)
+}
+
+/// Whether the plan `result` renders holds a step on rule `rule_id` after
+/// the failed step, which the run therefore did not submit.
+fn has_later_step_on_rule(result: &MigrateVerifierResult, rule_id: u32) -> bool {
+    let Some(failed_index) = result.failed_step_index else {
+        return false;
+    };
+    result
+        .affected_rules
+        .iter()
+        .flat_map(|rule| rule.signer_steps.iter().map(move |_| rule.rule_id))
+        .enumerate()
+        .any(|(index, step_rule_id)| index > failed_index && step_rule_id == rule_id)
 }
 
 fn flattened_step_key(plan: &MigrationPlan, target_index: usize) -> Option<(u32, u32)> {
@@ -784,71 +1057,425 @@ fn emit_error_sa(err: &SaError, request_id: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_agent_core::error::{ValidationError, WalletError};
+    use stellar_agent_smart_account::managers::migration::{
+        RuleMigration, SignerStepSubmitOutcome,
+    };
+    use stellar_xdr::ScVal;
 
-    /// Verifies that `Envelope::partial_failure_with_request_id` produces a
-    /// single JSON root containing `ok: false`, `data`, `error`, and
-    /// `request_id`.
-    #[test]
+    /// A smart-account C-strkey for the recovery fixtures.
+    const ACCOUNT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+    /// A destination verifier C-strkey for the recovery fixtures.
+    const DESTINATION: &str = "CCVTVW2CVA7JLH4ROQGP3CU4T3EXVCK66AZGSM4MUQPXAI4QHCZPOATS";
+
+    /// The submit args of the recovery fixtures: an env-var signer, a named
+    /// profile, testnet and a 90 s timeout, with endpoint flags that must not
+    /// be echoed.
+    fn recovery_args() -> MigrateVerifierArgs {
+        let mut args = minimal_args();
+        args.account = ACCOUNT.to_owned();
+        args.to_verifier = DESTINATION.to_owned();
+        args.signer_source.signer_secret_env = Some("MIGRATE_SEED".to_owned());
+        args.profile = Some("ops".to_owned());
+        args.rpc_url = "https://user:secret@rpc.example".to_owned();
+        args.secondary_rpc_url = Some("https://user:secret@rpc2.example".to_owned());
+        args.timeout_seconds = 90;
+        args
+    }
+
+    /// The pending add of signer 7 of rule 1 on [`DESTINATION`].
+    #[allow(clippy::unwrap_used, reason = "test-only; the fixture strkey parses")]
+    fn pending_step(remove_confirmed: bool, add_tx_hash: Option<String>) -> PendingAddStep {
+        PendingAddStep::new_for_test(
+            1,
+            7,
+            parse_c_strkey_to_smart_account(DESTINATION).unwrap(),
+            vec![0xab; 4],
+            "a".repeat(64),
+            remove_confirmed,
+            add_tx_hash,
+        )
+    }
+
+    /// The step of a plan on rule 1 that removes signer `signer_id` and adds
+    /// `key` on [`DESTINATION`], as the planner builds it.
+    #[allow(clippy::unwrap_used, reason = "test-only; the fixture values encode")]
+    fn plan_step(signer_id: u32, key: &[u8]) -> SignerMigrationStep {
+        use stellar_xdr::{InvokeContractArgs, ScBytes, ScSymbol, ScVec};
+        let call = |name: &str, args: Vec<ScVal>| {
+            HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: parse_c_strkey_to_smart_account(ACCOUNT).unwrap(),
+                function_name: ScSymbol::try_from(name).unwrap(),
+                args: args.try_into().unwrap(),
+            })
+        };
+        let external = ScVal::Vec(Some(ScVec(
+            vec![
+                ScVal::Symbol(ScSymbol::try_from("External").unwrap()),
+                ScVal::Address(parse_c_strkey_to_smart_account(DESTINATION).unwrap()),
+                ScVal::Bytes(ScBytes(key.to_vec().try_into().unwrap())),
+            ]
+            .try_into()
+            .unwrap(),
+        )));
+        SignerMigrationStep::new_for_test(
+            signer_id,
+            "aabbccdd",
+            call("remove_signer", vec![ScVal::U32(1), ScVal::U32(signer_id)]),
+            call("add_signer", vec![ScVal::U32(1), external]),
+        )
+    }
+
+    /// A plan on rule 1 migrating signer 7 (key `0xab` x 4), then
+    /// `later_steps` more signers from id 8 on.
+    #[allow(clippy::unwrap_used, reason = "test-only; the fixture strkeys parse")]
+    fn plan_with(later_steps: u32) -> MigrationPlan {
+        let mut steps = vec![plan_step(7, &[0xab; 4])];
+        steps.extend((0..later_steps).map(|offset| plan_step(8 + offset, &[0xcd; 4])));
+        MigrationPlan::new_for_test(
+            parse_c_strkey_to_smart_account(ACCOUNT).unwrap(),
+            [0xaa; 32],
+            [0x11; 32],
+            parse_c_strkey_to_smart_account(DESTINATION).unwrap(),
+            vec![RuleMigration::new_for_test(1, "aabbccdd", steps)],
+            VerifierAuditStatus::Unaudited,
+            "req-partial",
+        )
+    }
+
+    /// The envelope data the production converter renders for a plan with
+    /// `later_steps` after step 0. Step 0 failed with `pending` as its
+    /// pending add and `failed_step_remove_tx_hash` as the confirmed
+    /// removal's hash the library reports.
+    fn partial_result(
+        args: &MigrateVerifierArgs,
+        pending: Option<PendingAddStep>,
+        failed_step_remove_tx_hash: Option<String>,
+        later_steps: u32,
+    ) -> MigrateVerifierResult {
+        let submitted = MigrationSubmitResult::new_for_test(
+            vec![],
+            Some(0),
+            None,
+            failed_step_remove_tx_hash,
+            pending,
+            1,
+        );
+        migration_plan_to_result_submitted(
+            &plan_with(later_steps),
+            &submitted,
+            args,
+            "stellar:testnet",
+        )
+    }
+
+    /// Renders `result` with `error` as the partial-failure envelope and
+    /// returns it parsed, asserting it is one JSON root.
     #[allow(
         clippy::unwrap_used,
         reason = "test-only; unwrap on expected-Ok is the assertion"
     )]
-    fn partial_failure_envelope_serializes_as_single_json_root() {
-        let result = MigrateVerifierResult {
-            smart_account: "CAAAA...ZZZZZ".to_owned(),
-            from_hash_first8: "aabbccdd".to_owned(),
-            to_hash_first8: "11223344".to_owned(),
-            to_verifier_address: "CBBBB...YYYYY".to_owned(),
-            destination_audit_status: "unaudited".to_owned(),
-            total_transaction_count: 2,
-            affected_rules: vec![MigrateRuleResult {
-                rule_id: 1,
-                current_hash_first8: "aabbccdd".to_owned(),
-                transaction_count: 2,
-                signer_steps: vec![MigrateStepResult {
-                    signer_id: 7,
-                    current_hash_first8: "aabbccdd".to_owned(),
-                    remove_tx_hash: Some("a".repeat(64)),
-                    add_tx_hash: None,
-                }],
-            }],
-            submitted_steps_count: 0,
-            failed_step_index: Some(0),
-            failed_step_remove_tx_hash: Some("a".repeat(64)),
-            dry_run: false,
-            request_id: "req-partial".to_owned(),
-            chain_id: "stellar:testnet".to_owned(),
-            warnings: vec![],
-            rules_skipped_count: 0,
+    fn partial_envelope(result: MigrateVerifierResult, error: &SaError) -> serde_json::Value {
+        let wrapped = WalletError::SmartAccount {
+            wire_code: error.wire_code(),
+            message: error.to_string(),
         };
-
-        let err = WalletError::Validation(ValidationError::AddressInvalid {
-            input: "sa.verifier_migration_failed: failed".to_owned(),
-        });
         let envelope =
-            Envelope::partial_failure_with_request_id(result, &err, "req-partial".to_owned());
+            Envelope::partial_failure_with_request_id(result, &wrapped, "req-partial".to_owned());
         let json = serde_json::to_string(&envelope).unwrap();
-
-        // Single JSON root — no stray concatenated objects.
         let roots = serde_json::Deserializer::from_str(&json)
             .into_iter::<serde_json::Value>()
             .count();
         assert_eq!(roots, 1, "partial failure output must be one JSON root");
-
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["ok"], false, "ok must be false for partial failure");
-        assert!(
-            value.get("data").is_some(),
-            "data must be present (partial progress)"
+        assert!(value.get("error").is_some(), "error must be present");
+        assert_eq!(value["request_id"], "req-partial");
+        value
+    }
+
+    fn redacted() -> stellar_agent_core::observability::RedactedStrkey {
+        stellar_agent_core::observability::RedactedStrkey::from_already_redacted("CAAAA...AD2KM")
+    }
+
+    fn baseline_write_failed() -> SaError {
+        SaError::BaselineWriteFailed {
+            rule_id: 1,
+            smart_account_redacted: redacted(),
+            tx_hash: Some("a".repeat(64)),
+            stage: "write",
+            reason: "the audit writer is poisoned".to_owned(),
+            request_id: "req-partial".to_owned(),
+        }
+    }
+
+    /// A `SignerSetDiverged` of rule 1 carrying `tx_hash`: the removal's hash
+    /// when the confirmed removal left another state, none when the chain
+    /// changed between the two steps.
+    fn diverged(tx_hash: Option<String>) -> SaError {
+        use stellar_agent_core::audit_log::signer_set::{SignerSetSnapshotV2, SignerSetView};
+        let empty = || {
+            SignerSetView::V2(SignerSetSnapshotV2 {
+                signers: vec![],
+                threshold: None,
+            })
+        };
+        SaError::SignerSetDiverged {
+            rule_id: 1,
+            expected: empty(),
+            observed: empty(),
+            tx_hash,
+            smart_account_redacted: redacted(),
+            request_id: "req-partial".to_owned(),
+        }
+    }
+
+    fn unresolved(tx_hash: String) -> SaError {
+        SaError::SubmissionUnresolved {
+            kind: stellar_agent_smart_account::SubmissionUnresolvedKind::Timeout,
+            message: "the transaction was not confirmed in time".to_owned(),
+            tx_hash: Some(tx_hash),
+            envelope_hash: Some("c".repeat(64)),
+            timeout_seconds: Some(90),
+        }
+    }
+
+    /// The partial-failure envelope is one JSON root carrying the converted
+    /// result, its pending add and the error. The stderr line printed before
+    /// it matches the case the pair's error decides, with the re-run for
+    /// remaining signers after the repair step and before the add.
+    #[test]
+    fn partial_failure_envelope_serializes_as_single_json_root() {
+        let args = recovery_args();
+        let refresh = format!(
+            "stellar-agent smart-account signers refresh --account {ACCOUNT} --rule-id 1 \
+             --accept-divergence --signer-secret-env MIGRATE_SEED --profile ops \
+             --network testnet --timeout-seconds 90"
+        );
+        let remaining = "re-run migrate-verifier for the remaining signers of rule 1";
+        let confirmed_hash = Some("a".repeat(64));
+
+        // (a) The removal confirmed and was recorded; the add failed.
+        let pending = pending_step(true, None);
+        let command = recovery_command(&args, &pending);
+        let error = SaError::VerifierMigrationFailed {
+            phase: "submit_simulate",
+            smart_account_redacted: redacted(),
+            detail: "add_signer migration step failed".to_owned(),
+            request_id: "req-partial".to_owned(),
+        };
+        let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 0);
+        assert_eq!(
+            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            Some(format!("run: {command}").as_str())
+        );
+        let value = partial_envelope(result, &error);
+        let data = &value["data"];
+        assert_eq!(data["failed_step_remove_tx_hash"], "a".repeat(64));
+        assert_eq!(data["pending_add"]["rule_id"], 1);
+        assert_eq!(data["pending_add"]["signer_id"], 7);
+        assert_eq!(data["pending_add"]["to_verifier_address"], DESTINATION);
+        assert_eq!(data["pending_add"]["key_data_hex"], "abababab");
+        assert_eq!(data["pending_add"]["remove_tx_hash"], "a".repeat(64));
+        assert_eq!(data["pending_add"]["remove_confirmed"], true);
+        assert!(data["pending_add"].get("add_tx_hash").is_none());
+        assert_eq!(data["pending_add"]["recovery_command"], command.as_str());
+        let failed_row = &data["affected_rules"][0]["signer_steps"][0];
+        assert_eq!(failed_row["key_data_hex"], "abababab");
+        assert_eq!(failed_row["remove_tx_hash"], "a".repeat(64));
+        assert!(failed_row.get("add_tx_hash").is_none());
+        assert!(failed_row.get("new_signer_id").is_none());
+        assert_eq!(value["error"]["code"], "sa.verifier_migration_failed");
+
+        // A later step on the rule: the re-run precedes the add.
+        let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 1);
+        assert_eq!(
+            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            Some(format!("{remaining}, then: {command}").as_str())
+        );
+
+        // (b) The removal's state row was not written: the refresh first.
+        let error = baseline_write_failed();
+        let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 0);
+        assert_eq!(
+            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            Some(format!("run: {refresh}, then: {command}").as_str())
+        );
+        let value = partial_envelope(result, &error);
+        assert_eq!(value["error"]["code"], "sa.baseline_write_failed");
+
+        // (b) with a later step on the rule: refresh, the re-run, the add.
+        let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 1);
+        assert_eq!(
+            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            Some(format!("run: {refresh}, then {remaining}, then: {command}").as_str())
+        );
+
+        // (b) The confirmed removal left another state (the removal's hash),
+        // and the chain changed between the steps (no hash): the newest
+        // state row is not the chain's in both, so the refresh comes first.
+        for tx_hash in [Some("a".repeat(64)), None] {
+            let error = diverged(tx_hash.clone());
+            let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 0);
+            assert_eq!(
+                partial_failure_recovery_line(&args, &result, &error).as_deref(),
+                Some(format!("run: {refresh}, then: {command}").as_str()),
+                "{tx_hash:?}"
+            );
+            let value = partial_envelope(result, &error);
+            assert_eq!(value["error"]["code"], "sa.signer_set_diverged");
+        }
+
+        // A pair that stopped before its removal was sent prints no line:
+        // the error's own Display names the refresh.
+        let error = baseline_write_failed();
+        let result = partial_result(&args, None, None, 0);
+        assert_eq!(partial_failure_recovery_line(&args, &result, &error), None);
+        let value = partial_envelope(result, &error);
+        assert!(value["data"].get("pending_add").is_none());
+        assert!(value["data"].get("failed_step_remove_tx_hash").is_none());
+
+        // (c) The removal's outcome is unknown: its hash is in the pending
+        // add alone.
+        let pending = pending_step(false, None);
+        let error = unresolved("a".repeat(64));
+        let result = partial_result(&args, Some(pending.clone()), None, 1);
+        assert_eq!(
+            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            Some(
+                format!(
+                    "the remove transaction {} has an unknown outcome. Once it is confirmed, \
+                     run: {refresh}, then {remaining}, then: {command}. If it is not found, \
+                     re-run migrate-verifier.",
+                    "a".repeat(64)
+                )
+                .as_str()
+            )
+        );
+        let value = partial_envelope(result, &error);
+        assert!(value["data"].get("failed_step_remove_tx_hash").is_none());
+        assert_eq!(value["data"]["pending_add"]["remove_confirmed"], false);
+        assert_eq!(
+            value["data"]["pending_add"]["remove_tx_hash"],
+            "a".repeat(64)
         );
         assert!(
-            value.get("error").is_some(),
-            "error must be present (terminal failure)"
+            value["data"]["affected_rules"][0]["signer_steps"][0]
+                .get("remove_tx_hash")
+                .is_none()
+        );
+        assert_eq!(value["error"]["code"], "submission.tx_timeout");
+
+        // (c) The add's outcome is unknown.
+        let pending = pending_step(true, Some("b".repeat(64)));
+        let error = unresolved("b".repeat(64));
+        let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 0);
+        assert_eq!(
+            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            Some(
+                format!(
+                    "the add transaction {} has an unknown outcome. Once it is confirmed, \
+                     run: {refresh}. If it is not found, run: {command}.",
+                    "b".repeat(64)
+                )
+                .as_str()
+            )
+        );
+        let value = partial_envelope(result, &error);
+        assert_eq!(value["data"]["pending_add"]["add_tx_hash"], "b".repeat(64));
+
+        // (c) The add's outcome is unknown with a later step on the rule.
+        let result = partial_result(&args, Some(pending), confirmed_hash, 1);
+        assert_eq!(
+            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            Some(
+                format!(
+                    "the add transaction {} has an unknown outcome. Once it is confirmed, \
+                     run: {refresh}, then {remaining}. If it is not found, {remaining}, \
+                     then: {command}.",
+                    "b".repeat(64)
+                )
+                .as_str()
+            )
+        );
+    }
+
+    /// A completed step renders both transaction hashes and the restored
+    /// signer's id; a step that failed before its removal was sent renders
+    /// neither, and the result carries no pending add.
+    #[test]
+    fn a_submitted_result_renders_the_completed_and_the_failed_step() {
+        let args = recovery_args();
+        let submitted = MigrationSubmitResult::new_for_test(
+            vec![SignerStepSubmitOutcome::new_for_test(
+                1,
+                7,
+                "a".repeat(64),
+                "b".repeat(64),
+                21,
+            )],
+            Some(1),
+            None,
+            None,
+            None,
+            2,
+        );
+        let result =
+            migration_plan_to_result_submitted(&plan_with(1), &submitted, &args, "stellar:testnet");
+        assert_eq!(result.submitted_steps_count, 1);
+        assert_eq!(result.failed_step_index, Some(1));
+        assert!(result.pending_add.is_none());
+        let rows = &result.affected_rules[0].signer_steps;
+        assert_eq!(rows[0].signer_id, 7);
+        assert_eq!(
+            rows[0].remove_tx_hash.as_deref(),
+            Some("a".repeat(64).as_str())
         );
         assert_eq!(
-            value["request_id"], "req-partial",
-            "request_id must be threaded through"
+            rows[0].add_tx_hash.as_deref(),
+            Some("b".repeat(64).as_str())
+        );
+        assert_eq!(rows[0].new_signer_id, Some(21));
+        assert_eq!(rows[0].key_data_hex, "abababab");
+        assert_eq!(rows[1].signer_id, 8);
+        assert_eq!(rows[1].remove_tx_hash, None);
+        assert_eq!(rows[1].add_tx_hash, None);
+        assert_eq!(rows[1].new_signer_id, None);
+        assert_eq!(rows[1].key_data_hex, "cdcdcdcd");
+    }
+
+    /// The recovery command names the account, the rule, the destination
+    /// and the key data, then the invocation's signer-source, profile,
+    /// network and timeout flags. It never echoes an endpoint URL, and a
+    /// value a shell would interpret is quoted.
+    #[test]
+    fn recovery_command_renders_the_signers_add_of_the_pending_step() {
+        let args = recovery_args();
+        let command = recovery_command(&args, &pending_step(true, None));
+        assert_eq!(
+            command,
+            format!(
+                "stellar-agent smart-account signers add --account {ACCOUNT} --rule-id 1 \
+                 --signer-external {DESTINATION} --signer-key-data abababab \
+                 --signer-secret-env MIGRATE_SEED --profile ops --network testnet \
+                 --timeout-seconds 90"
+            )
+        );
+        assert!(!command.contains("rpc"), "{command}");
+        assert!(!command.contains("secret@"), "{command}");
+
+        let mut ledger = recovery_args();
+        ledger.signer_source.signer_secret_env = None;
+        ledger.signer_source.sign_with_ledger = true;
+        ledger.signer_source.account_index = Some(3);
+        ledger.profile = Some("ops team's".to_owned());
+        let command = recovery_command(&ledger, &pending_step(true, None));
+        assert!(
+            command.ends_with(
+                " --sign-with-ledger --account-index 3 --profile 'ops team'\\''s' \
+                 --network testnet --timeout-seconds 90"
+            ),
+            "{command}"
         );
     }
 

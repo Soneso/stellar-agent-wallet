@@ -27,7 +27,8 @@
 //!    bootstrap rule, is exempt from the rule lock, the signer-set check and
 //!    the pin check; it has no pins, and the submit path never reads a
 //!    baseline for it. A submission under rule 0 only may omit the check.
-//! 2. Simulate: primary RPC; harvest `latestLedger`.
+//! 2. Simulate: primary RPC; harvest `latestLedger`; check the shape of the
+//!    simulated return value when the caller set one.
 //! 3. Required-check enforcement + `Option<*Check>` dispatch.
 //! 4. Cross-RPC simulate check (passthrough when `secondary_rpc_url` is `None`
 //!    or `multicall_check` is `None`).
@@ -258,11 +259,11 @@ pub struct PinCheck<'a> {
     /// The rule a verifier migration is rewriting; see [`MigratingRule`].
     ///
     /// `Some` is accepted only when `auth_rule_ids` is exactly the migrating
-    /// rule; any other combination is refused with
+    /// rule. Any other combination is refused with
     /// [`SaError::AuthEntryConstructionFailed`] at stage
     /// `"migrating_rule_mismatch"`, so only a submission signed under the
-    /// migrating rule alone carries the exemptions. Every other caller passes
-    /// `None`.
+    /// migrating rule alone skips its verifier check. Every other caller
+    /// passes `None`.
     pub migrating_rule: Option<MigratingRule>,
 }
 
@@ -270,18 +271,16 @@ pub struct PinCheck<'a> {
 // MigratingRule
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The rule a verifier migration rewrites, exempt from two checks of a
-/// submission signed under it alone.
+/// The rule a verifier migration rewrites, whose verifier check a
+/// submission signed under it alone skips.
 ///
-/// - The verifier check of the pinned-hash drift check is skipped; the
-///   policy check still runs. The migration's own preflight identifies,
-///   allowlists and probes the destination verifier, and its remove step
-///   signs while the source verifier, which may be the drifted contract the
-///   migration moves away from, is still live.
-/// - The signer-set baseline read and comparison are skipped; the rule is
-///   still locked. The remove step changes the signer set the add step
-///   signs under, and the migration writes no signer-set state row between
-///   them.
+/// The verifier check of the pinned-hash drift check is skipped; the policy
+/// check still runs. The migration's own preflight identifies, allowlists
+/// and probes the destination verifier, and its remove step signs while the
+/// source verifier, which may be the drifted contract the migration moves
+/// away from, is still live. The rule is compared by the entry that holds
+/// its lock: the migration compares it with its newest state row before
+/// each of its two steps and records the state each step leaves.
 ///
 /// Only the migration step constructs one. A caller outside this crate
 /// cannot, except through the test constructor the `test-helpers` feature
@@ -307,6 +306,57 @@ impl MigratingRule {
     #[must_use]
     pub fn rule_id(&self) -> u32 {
         self.0
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ExpectedReturn
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The shape a submission's simulated return value must have before the
+/// transaction is signed.
+///
+/// A caller that reads an id from the confirmed transaction's return value
+/// sets the shape it reads, so a simulation that returns another shape is
+/// refused before anything is signed or sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExpectedReturn {
+    /// `ScVal::U32`: the id `add_signer` and `add_policy` assign.
+    U32,
+    /// A map whose `id` entry is `ScVal::U32`: the `ContextRule`
+    /// `add_context_rule` returns.
+    ContextRuleId,
+}
+
+impl ExpectedReturn {
+    /// Checks `value`, the first simulated result of the `op_label`
+    /// submission, against this shape.
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::DeploymentFailed`] at phase `simulate`, naming the
+    /// expected shape and the variant `value` holds.
+    fn check(self, value: &ScVal, op_label: &str) -> Result<(), SaError> {
+        let matches = match self {
+            Self::U32 => matches!(value, ScVal::U32(_)),
+            Self::ContextRuleId => {
+                crate::managers::rules::parse_context_rule_id_from_return(value).is_ok()
+            }
+        };
+        if matches {
+            return Ok(());
+        }
+        let variant = stellar_agent_core::scval::scval_variant_name(value);
+        let redacted_reason = match self {
+            Self::U32 => format!("{op_label}: expected ScVal::U32 return, got {variant}"),
+            Self::ContextRuleId => {
+                format!("{op_label}: expected a map with a u32 id, got {variant}")
+            }
+        };
+        Err(SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason,
+        })
     }
 }
 
@@ -643,6 +693,19 @@ pub struct SubmitInvokeArgs<'a> {
     /// signers manager, from the guards of one lock acquisition.
     #[builder(setters(vis = "pub(crate)"))]
     pub(crate) rule_locks: Option<&'a BorrowedRuleLocks<'a>>,
+
+    /// The shape the simulated return value must have; see
+    /// [`ExpectedReturn`].
+    ///
+    /// With `Some`, the first simulated result is checked right after the
+    /// simulation and before anything is signed: another shape refuses with
+    /// [`SaError::DeploymentFailed`] at phase `simulate`, and nothing is
+    /// signed or sent. `None` checks nothing.
+    ///
+    /// Field and setter are `pub(crate)`: the callers that read an id from
+    /// the return value are the crate's own managers.
+    #[builder(setters(vis = "pub(crate)"))]
+    pub(crate) expected_return: Option<ExpectedReturn>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -673,7 +736,9 @@ pub struct SubmitInvokeArgs<'a> {
 ///    under rule 0 only may pass `pin_check: None`; any other submission
 ///    without a check is refused before network I/O. The locks acquired here
 ///    are released immediately before the send.
-/// 2. **Simulate**: primary RPC; harvest `latestLedger`.
+/// 2. **Simulate**: primary RPC; harvest `latestLedger`. With
+///    `expected_return` set, the first simulated result must have the shape
+///    the caller reads an id from; another shape refuses before signing.
 /// 3. **Required-check enforcement + `Option<*Check>` dispatch**: for each
 ///    name in `args.required_checks`, the corresponding `Option<*Check>` MUST
 ///    be `Some`. Refuses with [`SaError::SubmitCheckMissing`] if `None`.
@@ -726,7 +791,8 @@ pub struct SubmitInvokeArgs<'a> {
 ///   `"signer_set_compare"`), or a pubkey fetch, XDR encoding, simulate, or
 ///   auth-entry construction failure, or another pre-submit stage exceeding
 ///   the collective pre-submit deadline (`args.timeout`).
-/// - [`SaError::DeploymentFailed`] — simulate error, envelope build, or
+/// - [`SaError::DeploymentFailed`]: simulate error, a simulated return
+///   value of another shape than `expected_return`, envelope build, or
 ///   submission failure.
 /// - [`SaError::RuleIdMismatch`] / [`SaError::SimulationDivergence`] — from
 ///   [`build_authorization_entry`].
@@ -1052,6 +1118,11 @@ pub async fn submit_signed_invoke(
             redacted_reason: "simulate_transaction returned no result entry".to_owned(),
         })?;
     let return_val = sim_first_result.xdr;
+    // A caller that reads an id from the return value checks its shape here,
+    // before anything is signed or sent.
+    if let Some(expected) = args.expected_return {
+        expected.check(&return_val, args.op_label)?;
+    }
     let mut prepared_auth_entries = sim_first_result.auth;
 
     // Locate the auth entry credentialed for auth_scaddr.
@@ -1644,9 +1715,9 @@ pub(crate) fn map_submit_error(
 /// - `pin_check: None` is accepted only when every entry of `auth_rule_ids`
 ///   is rule 0, the bootstrap rule with no pins (stage
 ///   `"pin_check_required"`).
-/// - `pin_check.migrating_rule: Some(rule)` is accepted only when
-///   `auth_rule_ids` is exactly that rule (stage
-///   `"migrating_rule_mismatch"`).
+/// - `pin_check.migrating_rule: Some(rule)`, which skips the rule's
+///   verifier check, is accepted only when `auth_rule_ids` is exactly that
+///   rule (stage `"migrating_rule_mismatch"`).
 ///
 /// # Errors
 ///
@@ -1697,8 +1768,9 @@ fn validate_submit_invoke_args(args: &SubmitInvokeArgs<'_>) -> Result<(), SaErro
                 return Err(SaError::AuthEntryConstructionFailed {
                     stage: "migrating_rule_mismatch",
                     redacted_reason: format!(
-                        "{}: the exemptions of migrating rule {migrating_rule} \
-                         require auth_rule_ids to be exactly [{migrating_rule}]",
+                        "{}: the verifier-check exemption of migrating rule \
+                         {migrating_rule} requires auth_rule_ids to be exactly \
+                         [{migrating_rule}]",
                         args.op_label
                     ),
                 });
@@ -1720,8 +1792,8 @@ fn validate_submit_invoke_args(args: &SubmitInvokeArgs<'_>) -> Result<(), SaErro
 ///    lock on the account of `smart_account`; with a held-lock context,
 ///    none, and a checked rule the context holds no guard for, on that
 ///    account and in the log of the `pin_check` manager, refuses.
-/// 2. Baseline reads, each followed by a deadline check, skipping the
-///    migrating rule and the rules the context compared.
+/// 2. Baseline reads, each followed by a deadline check, skipping the rules
+///    the context compared.
 /// 3. The pinned-hash drift check ([`run_pin_check`]).
 /// 4. The signer-set comparison of each rule read in step 2.
 ///
@@ -1783,12 +1855,11 @@ async fn run_rule_checks(
     };
 
     // Step 2: the baseline reads, before any RPC.
-    let migrating_rule = pin_check.migrating_rule.map(|rule| rule.rule_id());
     let mut baselines = Vec::with_capacity(rule_ids.len());
     for &rule_id in &rule_ids {
         let compared_by_holder =
             rule_locks.is_some_and(|borrowed| borrowed.compared_for(rule_id).is_some());
-        if compared_by_holder || migrating_rule == Some(rule_id) {
+        if compared_by_holder {
             continue;
         }
         let baseline = bound_pre_submit_stage(
@@ -1898,7 +1969,8 @@ async fn run_pin_check(
 /// each verifier (unless the rule is the migrating rule) and each policy
 /// against the rule's pin record, sharing `cache` across calls, then
 /// refuses a rule with no policy on chain whose record pins policies. The
-/// migrating-rule exemption covers the verifiers only.
+/// migrating rule skips its verifiers only; its policies are checked like
+/// any rule's.
 ///
 /// Each comparison and the presence check scan the audit log
 /// synchronously; `budget` is checked after each, with the elapse identity
