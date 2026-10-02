@@ -52,7 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and reports `previous_baseline`; `--accept-divergence` records a changed
   set or a version-1 baseline the chain cannot be compared with.
 - `sa.signer_set_baseline_legacy` (`SaError::SignerSetBaselineLegacy`)
-  refuses a signer mutation on a rule whose baseline is version 1.
+  refuses a signer mutation, and a `rules add-policy` or `rules
+  remove-policy` of any policy, on a rule whose baseline is version 1.
   `sa.baseline_write_failed` (`SaError::BaselineWriteFailed`, stages in
   `BASELINE_WRITE_STAGES`, reason capped at
   `BASELINE_WRITE_REASON_MAX_BYTES`) reports a signer-set state row that was
@@ -77,6 +78,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   threshold from the simple-threshold policy's install parameter.
 - The `test_helpers` module (feature `test-helpers`) builds a signers
   manager and a rule manager that share one audit writer.
+- `sa.pinned_verifier_absent` (`SaError::PinnedVerifierAbsent`) refuses
+  signing under a rule that holds an `External` signer while its pin record
+  pins no verifier, since the live verifier would sign unchecked. The
+  pinned-hash drift check raises it before anything is simulated, writes no
+  drift row, and passes it through unfolded; `multicall` reports it at phase
+  `policy_gate`, and `rules verify-pins` reports the verifier as `drift`.
+  `signers refresh --rule-id N` repairs the record.
+- `signers refresh` pins the live verifier of a rule whose pin record pins
+  none while the rule holds `External` signers. Each live verifier is probed
+  as `rules create` probes one; the new `--accept-mutable-verifier` and
+  `--accept-unknown-verifier` flags admit a mutable or unknown one. After the
+  baseline row, the override rows and a `SaContextRulePinsUpdated` row with
+  the new reason `baseline_refreshed` record the pin, and the envelope
+  reports `verifier_pinned`. Two verifier addresses whose pins are equal, in
+  hash and executable reference, share one pin. Live verifiers whose pins
+  differ refuse with `sa.multiple_pinned_hashes_unsupported` before the
+  baseline or any pin row is written.
+- `PinsUpdateReason::BaselineRefreshed` (`baseline_refreshed`), and
+  `RefreshOptions` in `stellar_agent_smart_account::managers::signers`, the
+  options of `refresh_signer_baseline`. `RefreshOutcome` gains
+  `verifier_pinned`.
 
 ### Changed
 
@@ -135,28 +157,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry refuses signer-set reads with `sa.contract_instance_unsupported`.
 - `rules add-policy` and `rules remove-policy` observe the policy's
   executable through both endpoints before submission. Attaching the
-  simple-threshold policy compares the chain with the rule's baseline, refuses
-  a rule that already has one with `sa.threshold_policy_identification_failed`,
-  and requires a non-zero `{ threshold: u32 }` parameter. Once it confirms, a
-  `SaThresholdChangedV2` row records the new threshold before the
-  `SaPolicyAdded` row. Detaching it records the cleared threshold the same
-  way. A rule with two simple-threshold policies accepts the detach of one of
+  simple-threshold policy refuses a rule that already has one with
+  `sa.threshold_policy_identification_failed`, and requires a non-zero
+  `{ threshold: u32 }` parameter. Once it confirms, a `SaThresholdChangedV2`
+  row records the new threshold. Detaching it records the cleared threshold
+  the same way. A rule with two simple-threshold policies accepts the detach of one of
   them when it has a version-2 signer-set state row, recorded before the rule
   gained its second policy, and its signers equal the row's; the wallet then
   records the remaining policy's threshold. Such a rule with no state row
   refuses with `sa.signer_set_missing_baseline`, and only `rules delete
-  --rule-id N --auth-rule-id 0` removes it. A confirmed attach or detach whose
-  result is not the intended change refuses with `sa.signer_set_diverged` and
-  the transaction hash; its policy and pin rows are still written.
-- `rules remove-policy` refuses before submission when the rule is not on
-  chain or holds no policy with the given id (`sa.deployment_failed`), and
-  when the policy's executable cannot be read (`sa.deployment_failed`,
-  `sa.contract_instance_unsupported` or `network.rpc_divergence`). `rules
-  delete --rule-id N --auth-rule-id 0` removes a rule whose policy stays
-  unreadable.
+  --rule-id N --auth-rule-id 0` removes it; removing a policy other than the
+  two from such a rule refuses with
+  `sa.threshold_policy_identification_failed`. A confirmed attach or detach
+  whose result is not the intended change refuses with
+  `sa.signer_set_diverged` and the transaction hash; its pin and policy rows
+  are still written.
+- `rules add-policy` and `rules remove-policy` lock the target rule and their
+  non-zero auth rules. Under the locks they compare the target with its
+  version-2 signer-set state, observe the policy, plan the pin record,
+  submit, record the threshold change and write the pin rows; the policy and
+  raw rows follow. A concurrent `signers add` on the rule runs before or
+  after the whole verb. The comparison runs for any policy. A rule without a
+  version-2 state therefore refuses an attach or removal of any policy with
+  `sa.signer_set_missing_baseline` or `sa.signer_set_baseline_legacy` before
+  submission. The row order of a confirmed attach is `SaThresholdChangedV2`
+  (simple-threshold policy only), the override rows,
+  `SaContextRulePinsUpdated`, `SaPolicyAdded`, `SaRawInvocation`; of a
+  confirmed removal `SaThresholdChangedV2` (simple-threshold policy only),
+  `SaContextRulePinsUpdated`, `SaPolicyRemoved`, `SaRawInvocation`.
+- `rules remove-policy` refuses before submission when the rule has no
+  signer-set state (`sa.signer_set_missing_baseline`, before any RPC), and
+  when a rule with a state is not on chain (from the comparison's rule read).
+  It refuses a policy id the rule does not hold (`sa.deployment_failed`,
+  after the comparison), and a policy whose executable cannot be read
+  (`sa.deployment_failed`, `sa.contract_instance_unsupported` or
+  `network.rpc_divergence`). `rules delete --rule-id N --auth-rule-id 0`
+  removes a rule whose policy stays unreadable.
 - A confirmed `rules add-policy` whose return value carries no policy id
   returns `sa.baseline_write_failed` at stage `observe` with the transaction
   hash and writes its pin rows, for any policy.
+- `SignersManager::refresh_signer_baseline` takes `RefreshOptions` in place
+  of its `accept_divergence` flag.
+- The `sa.verifier_wasm_not_in_allowlist` and
+  `sa.policy_wasm_not_in_allowlist` messages name
+  `--accept-unknown-verifier`.
+- The multicall testnet suite installs a rule other than 0, submits a bundle
+  under it, and asserts that a signer added through another audit log makes
+  the next bundle refuse with `sa.signer_set_diverged` at phase
+  `policy_gate`.
 - `ContextRuleManager::install_rule` and `simulate_install_rule` require a
   signers manager and refuse without one with
   `sa.signers_manager_not_configured` before any RPC; so do `add_policy` and
@@ -269,6 +317,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A policy removal confirmed beside a concurrent signer add on the same rule
+  keeps the add's verifier pin. The removal reads the pin record and writes
+  its row under the rule's lock, so it plans from the record the add left.
 - The `stellar_sep43_sign_auth_entry` MCP tool, its server instructions and
   the skill references described the `auth_entry_xdr` argument as a full
   `SorobanAuthorizationEntry`. They describe it as the base64 `HashIdPreimage`

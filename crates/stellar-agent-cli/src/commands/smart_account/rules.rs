@@ -532,11 +532,13 @@ pub struct CreateArgs {
     /// reference changes or the executable kind changes, the pinned-hash
     /// drift check refuses signing under the rule with
     /// `sa.verifier_hash_drift` / `sa.policy_hash_drift` before anything is
-    /// simulated: in `smart-account execute`, `smart-account multicall`, the
-    /// rule and signer write verbs, and `smart-account migrate-verifier` for
-    /// the rule's policies. A rule whose record holds policy pins while the
-    /// rule has no policy on chain refuses with `sa.pinned_policy_absent`, and
-    /// a check that cannot run with `sa.pin_check_unavailable`.
+    /// simulated. It refuses in `smart-account execute`, `smart-account
+    /// multicall`, the rule and signer write verbs, and `smart-account
+    /// migrate-verifier` for the rule's policies. A rule whose record holds
+    /// policy pins while the rule has no policy on chain refuses with
+    /// `sa.pinned_policy_absent`. A rule holding an `External` signer while
+    /// its record pins no verifier refuses with `sa.pinned_verifier_absent`,
+    /// and a check that cannot run with `sa.pin_check_unavailable`.
     /// `--accept-unknown-verifier` is also required when the resolved hash is
     /// outside the allowlist.
     ///

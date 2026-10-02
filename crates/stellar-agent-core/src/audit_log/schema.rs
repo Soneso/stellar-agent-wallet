@@ -280,6 +280,10 @@ pub enum PinsUpdateReason {
     /// `smart-account rules remove-policy` detached a policy from the rule.
     #[serde(rename = "policy_removed")]
     PolicyRemoved,
+    /// `smart-account signers refresh` pinned the live verifier of a rule
+    /// whose pin record pinned none while the rule held an External signer.
+    #[serde(rename = "baseline_refreshed")]
+    BaselineRefreshed,
 }
 
 impl fmt::Display for PinsUpdateReason {
@@ -289,6 +293,7 @@ impl fmt::Display for PinsUpdateReason {
             Self::SignerAdded => f.write_str("signer_added"),
             Self::PolicyAdded => f.write_str("policy_added"),
             Self::PolicyRemoved => f.write_str("policy_removed"),
+            Self::BaselineRefreshed => f.write_str("baseline_refreshed"),
         }
     }
 }
@@ -3579,7 +3584,7 @@ mod tests {
         assert!(s.contains("pinned_policy_executable_refs"), "{s}");
     }
 
-    /// Round-trip: `SaContextRulePinsUpdated` with both reasons, aligned
+    /// Round-trip: `SaContextRulePinsUpdated` with every reason, aligned
     /// executable-reference pins and the override flags.
     #[test]
     fn event_kind_sa_context_rule_pins_updated_round_trip() {
@@ -3589,6 +3594,7 @@ mod tests {
             PinsUpdateReason::VerifierMigrated,
             PinsUpdateReason::PolicyAdded,
             PinsUpdateReason::PolicyRemoved,
+            PinsUpdateReason::BaselineRefreshed,
         ] {
             let ev = EventKind::SaContextRulePinsUpdated {
                 smart_account: "CDABC...XYZ12".to_owned(),
@@ -3626,6 +3632,10 @@ mod tests {
         assert_eq!(
             PinsUpdateReason::PolicyRemoved.to_string(),
             "policy_removed"
+        );
+        assert_eq!(
+            PinsUpdateReason::BaselineRefreshed.to_string(),
+            "baseline_refreshed"
         );
     }
 

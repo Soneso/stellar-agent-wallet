@@ -8,6 +8,7 @@
 //! | [`h1_happy_path_3_transfer_bundle`] | Deploy SA; install rule; submit 3-transfer bundle against a testnet-deployed multicall router — asserts `MulticallResult { inner_count: 3 }` |
 //! | [`h2_per_period_cap_deny_at_inner_3`] | Policy engine denies 5-transfer bundle at inner 3 (0-based) via `bundle_per_period_cap` 100 USDC with 30 USDC per inner — host-side only, no network required |
 //! | [`h3_bundle_aggregate_cap_deny`] | Policy engine denies 6-transfer bundle via `bundle_aggregate_cap` 150 USDC when sum is 180 USDC — host-side only, no network required |
+//! | [`h5_bundle_under_a_rule_other_than_0_checks_its_signer_set`] | Install a rule other than 0 and submit a bundle under it, which the submit path checks against the rule's signer-set state. After an out-of-band `signers add`, the next bundle refuses with `sa.signer_set_diverged` at phase `policy_gate` |
 //!
 //! # Gating
 //!
@@ -17,14 +18,16 @@
 //! cargo test --features testnet-integration --test smart_account_multicall_testnet_acceptance
 //! ```
 //!
-//! `h1_happy_path_3_transfer_bundle` additionally requires:
+//! `h1_happy_path_3_transfer_bundle` and
+//! `h5_bundle_under_a_rule_other_than_0_checks_its_signer_set` additionally
+//! require:
 //! - `STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS` env var set to a deployed
 //!   multicall router C-strkey on testnet.
 //! - `STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL` env var set (e.g. another Soroban
 //!   RPC endpoint) for cross-RPC trust-anchor verification.
 //!
-//! If either env var is absent, `h1_happy_path_3_transfer_bundle` logs a skip
-//! message and returns without failing. `h2_per_period_cap_deny_at_inner_3` and
+//! If either env var is absent, each of the two logs a skip message and
+//! returns without failing. `h2_per_period_cap_deny_at_inner_3` and
 //! `h3_bundle_aggregate_cap_deny` are host-side and require no network access.
 //!
 //! # Reference cross-check
@@ -52,11 +55,14 @@
 #[path = "common/pin_check_manager.rs"]
 mod pin_check_manager;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
+use stellar_agent_core::audit_log::entry::AuditEntry;
+use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::policy::Decision;
 use stellar_agent_core::policy::v1::PolicyEngineV1;
 use stellar_agent_core::policy::v1::criteria::bundle_aggregate_cap::BundleAggregateCapCriterion;
@@ -64,11 +70,22 @@ use stellar_agent_core::policy::v1::criteria::bundle_per_period_cap::BundlePerPe
 use stellar_agent_core::policy::v1::criteria::per_period_cap::Window;
 use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
 use stellar_agent_core::profile::schema::Profile;
-use stellar_agent_smart_account::ResolvedFeePerOp;
+use stellar_agent_core::smart_account::rule_id::ContextRuleId;
+use stellar_agent_smart_account::managers::rules::{
+    ContextRuleDefinition, ContextRuleSignerInput, RuleContext, parse_c_strkey_to_smart_account,
+    parse_g_strkey_to_signer_address,
+};
+use stellar_agent_smart_account::managers::signers::{
+    PreviousBaseline, build_delegated_signer_scval,
+};
 use stellar_agent_smart_account::multicall::{
     MULTICALL_WASM_SHA256, MulticallInvocation, MulticallRegistry, MulticallRegistryEntry,
     MulticallSubmitArgs, submit_multicall_bundle,
 };
+use stellar_agent_smart_account::test_helpers::{
+    rule_manager_for_tests, signers_manager_for_tests,
+};
+use stellar_agent_smart_account::{ResolvedFeePerOp, SaError};
 use zeroize::Zeroizing;
 
 // ── Network constants ─────────────────────────────────────────────────────────
@@ -274,6 +291,23 @@ fn dummy_transfer_invocation(amount_usdc_units: i128) -> MulticallInvocation {
     }
 }
 
+/// A bundle of three self-transfers of `signer_g` (10, 20 and 30 USDC) on the
+/// USDC SAC named by `STELLAR_AGENT_TESTNET_USDC_SAC_ADDRESS`, or on
+/// [`DUMMY_C_STRKEY`] (structurally valid) when it is not set.
+fn three_transfer_bundle(signer_g: &str) -> Vec<MulticallInvocation> {
+    let usdc_sac = std::env::var("STELLAR_AGENT_TESTNET_USDC_SAC_ADDRESS")
+        .unwrap_or_else(|_| DUMMY_C_STRKEY.to_owned());
+    // 10, 20 and 30 USDC at 7 decimal places.
+    ["100000000", "200000000", "300000000"]
+        .into_iter()
+        .map(|amount| MulticallInvocation {
+            target_contract: usdc_sac.clone(),
+            fn_name: "transfer".to_owned(),
+            args_json: serde_json::json!([signer_g, signer_g, amount]),
+        })
+        .collect()
+}
+
 /// Builds an in-memory `MulticallRegistry` with a single testnet entry pointing
 /// to the given `router_address` C-strkey and `MULTICALL_WASM_SHA256`.
 fn registry_with_entry(router_address: &str) -> MulticallRegistry {
@@ -372,39 +406,7 @@ async fn h1_happy_path_3_transfer_bundle() {
     let rule_id: u32 = 0;
 
     // ── Step 4: Build a 3-transfer bundle ─────────────────────────────────────
-    // Use USDC SAC address from env or fall back to dummy (structurally valid).
-    let usdc_sac = std::env::var("STELLAR_AGENT_TESTNET_USDC_SAC_ADDRESS")
-        .unwrap_or_else(|_| DUMMY_C_STRKEY.to_owned());
-
-    let bundle = vec![
-        MulticallInvocation {
-            target_contract: usdc_sac.clone(),
-            fn_name: "transfer".to_owned(),
-            args_json: serde_json::json!([
-                signer_g,
-                signer_g,
-                "100000000", // 10 USDC at 7 decimal places
-            ]),
-        },
-        MulticallInvocation {
-            target_contract: usdc_sac.clone(),
-            fn_name: "transfer".to_owned(),
-            args_json: serde_json::json!([
-                signer_g,
-                signer_g,
-                "200000000", // 20 USDC
-            ]),
-        },
-        MulticallInvocation {
-            target_contract: usdc_sac.clone(),
-            fn_name: "transfer".to_owned(),
-            args_json: serde_json::json!([
-                signer_g,
-                signer_g,
-                "300000000", // 30 USDC
-            ]),
-        },
-    ];
+    let bundle = three_transfer_bundle(&signer_g);
 
     // ── Step 5: Build registry + policy engine ────────────────────────────────
     let registry = registry_with_entry(&router_address);
@@ -972,4 +974,219 @@ async fn h4_release_binary_acceptance() {
             .unwrap_or(""),
     );
     eprintln!("[h4] PASS: all 3 CLI subcommand acceptance steps complete");
+}
+
+// ── h5_bundle_under_a_rule_other_than_0_checks_its_signer_set ────────────────
+
+/// The rows of the audit log at `path`, in order.
+fn audit_rows(path: &std::path::Path) -> Vec<AuditEntry> {
+    std::fs::read_to_string(path)
+        .expect("the audit log reads")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("an audit row parses"))
+        .collect()
+}
+
+/// A fresh audit writer over `audit.jsonl` in `dir`, with the log's path.
+fn audit_writer_in(dir: &std::path::Path) -> (Arc<Mutex<AuditWriter>>, std::path::PathBuf) {
+    let path = dir.join("audit.jsonl");
+    let writer = Arc::new(Mutex::new(
+        AuditWriter::open(path.clone(), None).expect("the audit log opens"),
+    ));
+    (writer, path)
+}
+
+/// A bundle under a rule other than 0 goes through the submit path's
+/// signer-set check of that rule.
+///
+/// Installs a `Default` rule whose one signer is the bundle signer's G key
+/// as a `Delegated` signer. The rule manager's signers manager shares one
+/// audit log with it, so the install records the rule's version-2 state
+/// there. A bundle under the rule then confirms, `signers
+/// list` matches and the log holds no divergence row. A second signers
+/// manager over another log records its own state of the rule and adds a
+/// fresh `Delegated` signer to it, a change the first log never sees. The
+/// next bundle under the rule through the first manager refuses at phase
+/// `policy_gate` with `sa.signer_set_diverged`, writing the divergence row
+/// and the denied-bundle row into the first log.
+///
+/// # Environment variables required
+///
+/// The two of [`h1_happy_path_3_transfer_bundle`]; the test skips without
+/// either.
+#[tokio::test]
+#[serial_test::serial]
+async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
+    let data_root = tempfile::tempdir().expect("temporary wallet data root");
+    let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
+    let Ok(router_address) = std::env::var("STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS") else {
+        eprintln!("[h5] SKIP: STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS not set.");
+        return;
+    };
+    let Ok(secondary_rpc_url) = std::env::var("STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL") else {
+        eprintln!("[h5] SKIP: STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL not set.");
+        return;
+    };
+    let timeout = Duration::from_secs(TIMEOUT_SECS);
+    let rid = || uuid::Uuid::new_v4().to_string();
+
+    // ── Step 1: a fresh signer and smart account ──────────────────────────────
+    let (signer_g, _s_strkey, signer_box) = fresh_signer();
+    fund_via_friendbot(&signer_g).await;
+    let sa_strkey = deploy_fresh_smart_account(&signer_g).await;
+    let sa_addr = parse_c_strkey_to_smart_account(&sa_strkey).expect("C-strkey must parse");
+    eprintln!("[h5] smart_account: {}", &sa_strkey[..8]);
+
+    // ── Step 2: the managers over one log, and the rule ───────────────────────
+    let log_dir = tempfile::tempdir().expect("temporary audit-log directory");
+    let (writer, log_path) = audit_writer_in(log_dir.path());
+    let signers_manager = signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        &secondary_rpc_url,
+        Arc::clone(&writer),
+        log_path.clone(),
+        timeout,
+    );
+    let rule_manager = rule_manager_for_tests(
+        TESTNET_RPC_URL,
+        None,
+        Arc::clone(&signers_manager),
+        Arc::clone(&writer),
+        timeout,
+    );
+    let definition = ContextRuleDefinition::new(
+        RuleContext::Default,
+        "h5-multicall".to_owned(),
+        None,
+        vec![ContextRuleSignerInput::Delegated {
+            address: parse_g_strkey_to_signer_address(&signer_g).expect("G-strkey must parse"),
+        }],
+        vec![],
+    );
+    let rule_id = rule_manager
+        .install_rule(
+            sa_addr.clone(),
+            definition,
+            vec![ContextRuleId::new(0)],
+            signer_box.as_ref(),
+            None,
+            rid(),
+            false,
+            false,
+        )
+        .await
+        .expect("the rule installs and records its version-2 state")
+        .rule_id;
+    assert_ne!(
+        rule_id, 0,
+        "[h5] the installed rule is not the bootstrap rule"
+    );
+    eprintln!("[h5] rule installed: {rule_id}");
+
+    // ── Step 3: a bundle under the rule ───────────────────────────────────────
+    let registry = registry_with_entry(&router_address);
+    let profile = testnet_profile();
+    let submit = |request_id: &'static str| {
+        submit_multicall_bundle(
+            MulticallSubmitArgs {
+                smart_account: &sa_strkey,
+                rule_id,
+                bundle: three_transfer_bundle(&signer_g),
+                signer: signer_box.as_ref(),
+                primary_rpc_url: TESTNET_RPC_URL,
+                secondary_rpc_url: &secondary_rpc_url,
+                network_passphrase: TESTNET_PASSPHRASE,
+                policy_engine: policy_engine_allow_all(),
+                profile: &profile,
+                audit_writer: Some(Arc::clone(&writer)),
+                timeout,
+                fee: ResolvedFeePerOp::default(),
+                chain_id: CHAIN_ID,
+                request_id,
+                signers_manager: &signers_manager,
+            },
+            &registry,
+        )
+    };
+    let confirmed = submit("h5-bundle-under-the-rule")
+        .await
+        .unwrap_or_else(|e| panic!("[h5] the bundle under rule {rule_id} must confirm: {e:?}"));
+    assert_eq!(confirmed.inner_count, 3, "[h5] inner_count");
+    assert!(confirmed.ledger > 0, "[h5] the bundle confirmed on chain");
+    let listed = signers_manager
+        .list_signers(sa_addr.clone(), rule_id, Some(&signer_g), rid())
+        .await
+        .expect("signers list reads the rule");
+    assert_eq!(listed.baseline, PreviousBaseline::Matched);
+    assert!(
+        !audit_rows(&log_path)
+            .iter()
+            .any(|row| matches!(row.event_kind, EventKind::SaSignerSetDiverged { .. })),
+        "[h5] the matched rule writes no divergence row"
+    );
+
+    // ── Step 4: an out-of-band signer add through another manager ────────────
+    let other_dir = tempfile::tempdir().expect("temporary audit-log directory");
+    let (other_writer, other_log_path) = audit_writer_in(other_dir.path());
+    let other_manager = signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        &secondary_rpc_url,
+        other_writer,
+        other_log_path,
+        timeout,
+    );
+    let first = other_manager
+        .list_signers(sa_addr.clone(), rule_id, Some(&signer_g), rid())
+        .await
+        .expect("signers list records the rule in the other log");
+    assert_eq!(first.baseline, PreviousBaseline::None);
+    let (added_g, _added_s, _added_signer) = fresh_signer();
+    other_manager
+        .add_signer(
+            sa_addr.clone(),
+            rule_id,
+            build_delegated_signer_scval(&added_g).expect("a Delegated signer value"),
+            signer_box.as_ref(),
+            rid(),
+            false,
+            false,
+        )
+        .await
+        .expect("the out-of-band signer add confirms");
+    eprintln!("[h5] out-of-band signer added");
+
+    // ── Step 5: the next bundle under the rule refuses ───────────────────────
+    let request_id = "h5-bundle-after-the-out-of-band-add";
+    let refused = submit(request_id)
+        .await
+        .expect_err("[h5] the bundle under the changed rule must refuse");
+    match &refused {
+        SaError::MulticallFailed {
+            phase,
+            redacted_reason,
+            ..
+        } => {
+            assert_eq!(*phase, "policy_gate");
+            assert_eq!(redacted_reason, "submit error: sa.signer_set_diverged");
+        }
+        other => panic!("[h5] expected MulticallFailed at policy_gate; got {other:?}"),
+    }
+    let rows = audit_rows(&log_path);
+    assert!(
+        rows.iter().any(|row| row.request_id == request_id
+            && matches!(row.event_kind, EventKind::SaSignerSetDiverged { rule_id: diverged, .. } if diverged == rule_id)),
+        "[h5] the divergence row of the rule is in the bundle manager's log"
+    );
+    assert!(
+        rows.iter().any(|row| row.request_id == request_id
+            && matches!(
+                &row.event_kind,
+                EventKind::SaMulticallBundleDenied { deny_wire_code, refusal_phase, .. }
+                    if deny_wire_code == "multicall.sa.signer_set_diverged"
+                        && refusal_phase == "policy_gate"
+            )),
+        "[h5] the denied-bundle row names the divergence"
+    );
+    eprintln!("[h5] PASS: the bundle under rule {rule_id} checks its signer set");
 }

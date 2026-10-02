@@ -522,7 +522,9 @@ pub enum CredentialsError {
     /// an RPC error occurred while fetching the rule's verifier/policy addresses.
     /// It also carries `SaError::PinnedPolicyAbsent`, the refusal of a rule
     /// whose pin record holds policy pins while the rule has no policy on
-    /// chain, for which no drift row is written.
+    /// chain. It carries `SaError::PinnedVerifierAbsent` too, the refusal of
+    /// a rule holding a live `External` signer whose pin record pins no
+    /// verifier. No drift row is written for either.
     ///
     /// The WebAuthn ceremony is aborted (fail-closed) BEFORE any bridge I/O.
     /// No `SaVerifierHashDrift` / `SaPolicyHashDrift` audit row is emitted
@@ -2549,10 +2551,11 @@ async fn check_passkey_rules(
 /// return `SaError::VerifierHashDrift` or `SaError::PolicyHashDrift`
 /// respectively.  All other `SaError` variants from those functions
 /// (infrastructure failures: `NetworkRpcDivergence`, `DeploymentFailed`,
-/// `MultiplePinnedHashesUnsupported`, `AuditLog`) and `PinnedPolicyAbsent`
-/// from `verify_policy_pins_present` do NOT emit a drift row, so wrapping
-/// them in `WasmHashDrift` would break the result-tag ↔ audit-row join that
-/// operator tooling relies on.
+/// `MultiplePinnedHashesUnsupported`, `AuditLog`) emit no drift row. Neither
+/// do `PinnedVerifierAbsent` from `verify_pinned_verifier_against_chain` and
+/// `PinnedPolicyAbsent` from `verify_policy_pins_present`. Wrapping them in
+/// `WasmHashDrift` would break the result-tag ↔ audit-row join that operator
+/// tooling relies on.
 ///
 /// This function enforces the invariant at a single call site rather than
 /// repeating the match in every loop.
@@ -4094,6 +4097,31 @@ registered_at_unix_ms = 1700000000000
                 }
             ),
             "inner source must be PinnedPolicyAbsent: {source:?}"
+        );
+    }
+
+    /// A live verifier the pin record does not pin is no drift row: it
+    /// routes to `DriftCheckUnavailable` like the absent-policy refusal.
+    #[test]
+    fn drift_err_route_pinned_verifier_absent_routes_to_drift_check_unavailable() {
+        use stellar_agent_core::observability::RedactedStrkey;
+
+        let sa_err = crate::SaError::PinnedVerifierAbsent {
+            rule_id: 4,
+            verifier_redacted: RedactedStrkey::from_already_redacted("CBBBB...BBBBB"),
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
+            request_id: "req-id-verifier-absent".to_owned(),
+        };
+        let result = drift_err_route(sa_err);
+        let CredentialsError::DriftCheckUnavailable { ref source } = result else {
+            panic!("PinnedVerifierAbsent must route to DriftCheckUnavailable: {result:?}");
+        };
+        assert!(
+            matches!(
+                source.as_ref(),
+                crate::SaError::PinnedVerifierAbsent { rule_id: 4, .. }
+            ),
+            "inner source must be PinnedVerifierAbsent: {source:?}"
         );
     }
 

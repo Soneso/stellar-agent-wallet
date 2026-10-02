@@ -1158,8 +1158,26 @@ impl PreSubmitBudget {
     /// [`SaError::AuthEntryConstructionFailed`] with `stage` as its stage
     /// when `Instant::now()` is at or past the deadline.
     pub(crate) fn check(self, stage: &'static str) -> Result<(), SaError> {
+        self.check_at(stage, stage)
+    }
+
+    /// Refuses once the deadline has passed, with the elapse identity of
+    /// [`bound_pre_submit_stage`] for `stage` reported at `elapse_stage`: the
+    /// check after a synchronous scan inside a stage that the closed stage
+    /// set reports at another stage.
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::AuthEntryConstructionFailed`] with `elapse_stage` as its
+    /// stage and `stage` named in the reason when `Instant::now()` is at or
+    /// past the deadline.
+    pub(crate) fn check_at(
+        self,
+        stage: &'static str,
+        elapse_stage: &'static str,
+    ) -> Result<(), SaError> {
         if tokio::time::Instant::now() >= self.deadline {
-            return Err(self.elapsed(stage, stage));
+            return Err(self.elapsed(stage, elapse_stage));
         }
         Ok(())
     }
@@ -2692,6 +2710,38 @@ mod tests {
         assert_eq!(
             redacted_reason,
             "baseline_read exceeded collective pre-submit budget of 5s"
+        );
+    }
+
+    /// `check_at` passes before the deadline and, once it has passed, refuses
+    /// at the elapse stage with the checked stage named in the reason.
+    #[test]
+    fn pre_submit_budget_check_at_reports_the_elapse_stage() {
+        let open = PreSubmitBudget {
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            total: std::time::Duration::from_secs(30),
+        };
+        open.check_at("pin_plan", "auth_payload")
+            .expect("the deadline has not passed");
+
+        let passed = PreSubmitBudget {
+            deadline: tokio::time::Instant::now(),
+            total: std::time::Duration::from_secs(4),
+        };
+        let err = passed
+            .check_at("pin_plan", "auth_payload")
+            .expect_err("the deadline has been reached");
+        let SaError::AuthEntryConstructionFailed {
+            stage,
+            redacted_reason,
+        } = err
+        else {
+            panic!("expected AuthEntryConstructionFailed; got {err:?}");
+        };
+        assert_eq!(stage, "auth_payload");
+        assert_eq!(
+            redacted_reason,
+            "pin_plan exceeded collective pre-submit budget of 4s"
         );
     }
 }

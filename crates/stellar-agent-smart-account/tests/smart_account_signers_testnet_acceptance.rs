@@ -93,7 +93,7 @@ use stellar_agent_smart_account::managers::rules::{
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
 use stellar_agent_smart_account::managers::signers::{
-    PreviousBaseline, SignersManager, build_external_signer_scval,
+    PreviousBaseline, RefreshOptions, SignersManager, build_external_signer_scval,
 };
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_agent_smart_account::test_helpers::{
@@ -647,7 +647,13 @@ async fn b4_fresh_wallet_missing_baseline_then_refresh_then_verify_ok() {
 
     // refresh_signer_baseline writes the SaSignerSetBaselinedV2 row.
     let observed = mgr
-        .refresh_signer_baseline(sa_addr.clone(), rule_id, Some(&signer_g), false, rid())
+        .refresh_signer_baseline(
+            sa_addr.clone(),
+            rule_id,
+            Some(&signer_g),
+            RefreshOptions::new(false),
+            rid(),
+        )
         .await
         .expect("refresh_signer_baseline must succeed");
     assert_eq!(observed.previous_baseline, PreviousBaseline::None);
@@ -1606,7 +1612,13 @@ async fn b2_set_threshold_single_op() {
 
     // ── Step 3: Refresh the baseline the install recorded ────────────────────
     let baseline = mgr
-        .refresh_signer_baseline(sa_addr.clone(), new_rule_id, Some(&signer_g), false, rid())
+        .refresh_signer_baseline(
+            sa_addr.clone(),
+            new_rule_id,
+            Some(&signer_g),
+            RefreshOptions::new(false),
+            rid(),
+        )
         .await
         .expect("refresh_signer_baseline must succeed");
     assert_eq!(
@@ -1707,7 +1719,13 @@ async fn b5_a_policyless_rule_baselines_without_a_threshold() {
     // `refresh_signer_baseline` compares with that baseline and records it
     // again.
     let refreshed = mgr
-        .refresh_signer_baseline(sa_addr.clone(), 0, Some(&signer_g), false, rid())
+        .refresh_signer_baseline(
+            sa_addr.clone(),
+            0,
+            Some(&signer_g),
+            RefreshOptions::new(false),
+            rid(),
+        )
         .await
         .expect("refresh_signer_baseline on a policyless rule must succeed");
     assert_eq!(refreshed.previous_baseline, PreviousBaseline::Matched);

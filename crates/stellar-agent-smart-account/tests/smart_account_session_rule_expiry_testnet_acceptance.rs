@@ -65,6 +65,7 @@ use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRuleSignerInput,
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
+use stellar_agent_smart_account::managers::signers::SignersManager;
 use stellar_agent_smart_account::test_helpers::{
     rule_manager_config_for_tests, signers_manager_for_tests,
 };
@@ -252,25 +253,33 @@ fn fresh_rule_manager_uncapped(
     audit_writer: Arc<Mutex<AuditWriter>>,
     audit_log_path: std::path::PathBuf,
 ) -> ContextRuleManager {
-    // Use a very large cap so the substrate install with `current + 5`
-    // does not trigger the horizon enforcement.  The horizon test is in
-    // `smart_account_session_rule_horizon_testnet_acceptance.rs`; here we focus
-    // on the expiry detection.
-    let timeout = Duration::from_secs(TIMEOUT_SECS);
     let signers_manager = signers_manager_for_tests(
         TESTNET_RPC_URL,
         TESTNET_RPC_URL,
         Arc::clone(&audit_writer),
         audit_log_path,
-        timeout,
+        Duration::from_secs(TIMEOUT_SECS),
     );
+    rule_manager_uncapped_over(signers_manager, audit_writer)
+}
+
+/// A testnet rule manager over `signers_manager`, writing to `audit_writer`,
+/// the writer `signers_manager` writes to.
+fn rule_manager_uncapped_over(
+    signers_manager: Arc<SignersManager>,
+    audit_writer: Arc<Mutex<AuditWriter>>,
+) -> ContextRuleManager {
+    // Use a very large cap so the substrate install with `current + 5`
+    // does not trigger the horizon enforcement.  The horizon test is in
+    // `smart_account_session_rule_horizon_testnet_acceptance.rs`; here we focus
+    // on the expiry detection.
     ContextRuleManager::new(
         rule_manager_config_for_tests(
             TESTNET_RPC_URL,
             None,
             signers_manager,
             audit_writer,
-            timeout,
+            Duration::from_secs(TIMEOUT_SECS),
         )
         .with_session_rule_max_horizon_ledgers(u32::MAX),
     )
@@ -558,11 +567,13 @@ async fn h_2_post_revocation_new_sign_refused() {
 
     // ── Step 6: Attempt add_policy against the revoked rule ──────────────────
     // `ContextRuleManager::add_policy` is one of the signing paths wired with
-    // the pre-submission expiry check. Authorized by rule 0, the divergence
-    // check covers no rule. The dummy policy's executable is observed first;
-    // it is not the simple-threshold policy, so the attach takes the direct
-    // path, and the second manager's fresh audit log holds no pin record of
-    // the rule to plan an update for.
+    // the pre-submission expiry check. The attach compares the target rule
+    // with its version-2 signer-set state under the rule's lock. The second
+    // manager's fresh audit log therefore records one through `signers list`
+    // first; that log holds no pin record of the rule to plan an update for.
+    // Authorized by rule 0, the submit path compares no further rule. The
+    // dummy policy's executable is observed next; it is not the
+    // simple-threshold policy, so the attach takes the direct path.
     //
     // The call reaches `submit_signed_invoke` which:
     //   1. Calls `simulateTransaction` — succeeds (sim doesn't validate auth
@@ -576,7 +587,18 @@ async fn h_2_post_revocation_new_sign_refused() {
     // the expiry check fires.
     let dummy_policy_addr = sa_addr.clone();
     let (attach_audit_writer, attach_audit_log_path, _attach_tmpdir) = tmp_audit_writer();
-    let attach_manager = fresh_rule_manager_uncapped(attach_audit_writer, attach_audit_log_path);
+    let attach_signers_manager = signers_manager_for_tests(
+        TESTNET_RPC_URL,
+        TESTNET_RPC_URL,
+        Arc::clone(&attach_audit_writer),
+        attach_audit_log_path,
+        Duration::from_secs(TIMEOUT_SECS),
+    );
+    attach_signers_manager
+        .list_signers(sa_addr.clone(), rule_id, Some(&signer_g), rid())
+        .await
+        .expect("signers list records the revoked rule's version-2 state in the attach log");
+    let attach_manager = rule_manager_uncapped_over(attach_signers_manager, attach_audit_writer);
     let result = attach_manager
         .add_policy(
             sa_addr.clone(),
