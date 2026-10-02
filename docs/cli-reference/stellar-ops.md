@@ -4,7 +4,7 @@ This page documents the everyday Stellar operations exposed by the `stellar-agen
 
 The binary is `stellar-agent`. It is also discoverable as a `stellar-cli` plugin, so when `stellar` is installed the same command runs as `stellar agent <command> ...`. The examples here use the direct form.
 
-Conventions shared by every command — profile resolution, the `--output` format, the JSON envelope and exit codes, the signer-source group, and the mainnet-write refusal — are defined once in the [CLI reference index](index.md). This page references that index for the shared flags and documents only what is specific to each command.
+Conventions shared by every command are defined once in the [CLI reference index](index.md). These are profile resolution, the `--output` format, the JSON envelope and exit codes, the signer-source group, and the mainnet-write refusal. This page references that index for the shared flags and documents only what is specific to each command.
 
 For the concepts referenced below (profiles, the policy engine, the approval spine, the audit log), see [concepts](../concepts.md). For SEP-29 memo enforcement and the counterparty `stellar.toml` resolution, see [protocols](../protocols.md).
 
@@ -12,13 +12,13 @@ For the concepts referenced below (profiles, the policy engine, the approval spi
 
 Several flags recur across the commands on this page with the same meaning. Their full description lives in the [global conventions](index.md#global-conventions) section of the index:
 
-- `--profile <NAME>` — selects the [profile](../concepts.md). Every command on this page that loads a profile resolves it in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `accounts create`, `pay`, and `claim` a profile that resolves to no file is synthesised only when no name was given; a name you supplied through the flag or the variable is refused if its file does not exist. `accounts deploy-c` and `fees stats` default to no profile at all. Each command's table states its own default.
-- `--network <NETWORK>` — `testnet` (default) or `mainnet`, case-insensitive. Write and signing commands structurally refuse `mainnet`; see [Mainnet-write refusal](index.md#mainnet-write-refusal).
-- `--rpc-url <URL>` — the Soroban RPC endpoint. Default `https://soroban-testnet.stellar.org` where applicable.
-- `--output <FORMAT>` — `json` (default) or `table`.
-- `--timeout-seconds <SECONDS>` — bounds submission. Default `60`.
-- Signer source — `--secret-env <VAR>` / `--deployer-secret-env <VAR>` (an env-var name, never the secret) or `--sign-with-ledger`, with `--account-index <INDEX>` for the Ledger derivation path (default `0`).
-- `--fee <STROOPS|auto[:pNN]>` — the classic per-operation fee. An integer sets an explicit stroop value; `auto` selects the p95 percentile from `getFeeStats`; `auto:pNN` selects an explicit percentile (`p50`, `p75`, `p95`, `p99`). When absent, the profile default (100 stroops) applies. For Soroban operations the resource fee is set by simulation and is additional to this base.
+- `--profile <NAME>`: selects the [profile](../concepts.md). Every command on this page that loads a profile resolves it in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `accounts create`, `pay`, and `claim` a profile that resolves to no file is synthesised only when no name was given. For these commands, a name you supplied through the flag or the variable is refused if its file does not exist. `accounts deploy-c` and `fees stats` default to no profile at all. Each command's table states its own default.
+- `--network <NETWORK>`: `testnet` (default) or `mainnet`, case-insensitive. Write and signing commands structurally refuse `mainnet`; see [Mainnet-write refusal](index.md#mainnet-write-refusal).
+- `--rpc-url <URL>`: the Soroban RPC endpoint. Default `https://soroban-testnet.stellar.org` where applicable.
+- `--output <FORMAT>`: `json` (default) or `table`.
+- `--timeout-seconds <SECONDS>`: bounds submission. Default `60`.
+- Signer source: `--secret-env <VAR>` / `--deployer-secret-env <VAR>` (an env-var name, never the secret) or `--sign-with-ledger`, with `--account-index <INDEX>` for the Ledger derivation path (default `0`).
+- `--fee <STROOPS|auto[:pNN]>`: the classic per-operation fee. An integer sets an explicit stroop value; `auto` selects the p95 percentile from `getFeeStats`; `auto:pNN` selects an explicit percentile (`p50`, `p75`, `p95`, `p99`). When absent, the profile default (100 stroops) applies. For Soroban operations the resource fee is set by simulation and is additional to this base.
 
 Every command prints one JSON envelope on stdout by default and exits `0` on success, `1` on any error.
 
@@ -31,7 +31,7 @@ Account-management group. Subcommands: `create`, `deploy-c`.
 Creates a new Stellar account in one of two mutually exclusive modes: a sponsored `CreateAccount` operation, or Friendbot funding.
 
 - **Signing.** Sponsored mode signs the `CreateAccount` operation with the sponsor's key. Friendbot mode performs no signing and touches no key.
-- **Policy (sponsored mode only).** After `--starting-balance` and the new account's public key are resolved and before signing, the sponsored `CreateAccount` is evaluated against `--profile`'s policy engine — the same evaluation the `stellar_create_account` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized, so sponsored mode works without an authored profile file until an operator opts into `policy.engine = "v1"`; a profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`), and a profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). Friendbot mode is not gated: it debits no wallet-held funds.
+- **Policy (sponsored mode only).** After `--starting-balance` and the new account's public key are resolved and before signing, the sponsored `CreateAccount` is evaluated against `--profile`'s policy engine. This is the same evaluation the `stellar_create_account` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized. So sponsored mode works without an authored profile file until an operator opts into `policy.engine = "v1"`. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`). A profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). Friendbot mode is not gated: it debits no wallet-held funds.
 - **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` is structurally refused before any RPC, HTTP, or key access. Sponsored mode returns `network.mainnet_write_forbidden`; Friendbot mode returns `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only.
 - **Account identity.** Provide the new account's G-strkey as the positional argument, or pass `--generate` to mint a fresh ed25519 keypair in-process. Exactly one is required.
 - **Secret-key discipline.** `--generate` returns the new S-strkey in the JSON envelope's `data.secret_key` field. It is never emitted in `--output table` and never logged. Capture it from the JSON output and store it securely; for example, redirect with a restrictive umask: `umask 077 && stellar-agent accounts create --generate ... > secret.json`.
@@ -44,12 +44,12 @@ Argument groups (enforced by the parser):
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
-| `<NEW_G_STRKEY>` (positional) | G-strkey of the account to create | one of the account group | — |
+| `<NEW_G_STRKEY>` (positional) | G-strkey of the account to create | one of the account group | none |
 | `--generate` | Generate a fresh ed25519 keypair in-process; returns the G- and S-strkey in JSON | one of the account group | `false` |
 | `--profile <NAME>` | Profile to evaluate operator policy against (sponsored mode only) | optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--sponsor <G_STRKEY>` | Sponsor/source account for the `CreateAccount` op | one of the mode group | — |
-| `--starting-balance <AMOUNT>` | Starting balance with explicit units, e.g. `"5 XLM"` (bare numbers rejected) | sponsored mode | — |
-| `--secret-env <VAR>` | Env-var name holding the sponsor S-strkey | signer group (sponsored) | — |
+| `--sponsor <G_STRKEY>` | Sponsor/source account for the `CreateAccount` op | one of the mode group | none |
+| `--starting-balance <AMOUNT>` | Starting balance with explicit units, e.g. `"5 XLM"` (bare numbers rejected) | sponsored mode | none |
+| `--secret-env <VAR>` | Env-var name holding the sponsor S-strkey | signer group (sponsored) | none |
 | `--sign-with-ledger` | Sign with a connected Ledger | signer group (sponsored) | `false` |
 | `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
 | `--fund-with-friendbot` | Fund the account via Friendbot (testnet only) | one of the mode group | `false` |
@@ -62,7 +62,7 @@ Argument groups (enforced by the parser):
 
 The sponsor's public key must match the public key derived from the signer; a mismatch fails before submission.
 
-Example — generate a new keypair and create it under a sponsor:
+Example: generate a new keypair and create it under a sponsor:
 
 ```bash
 export SPONSOR_SK="S..."   # sponsor account secret key
@@ -81,7 +81,7 @@ Deploys a new OpenZeppelin smart-account (C-account) contract instance on Soroba
 - **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` is structurally refused (`network.mainnet_write_forbidden`) before any RPC or key access, with a passphrase-layer refusal at submit as defence in depth.
 - **Salt.** The salt determines the deployed C-strkey. By default a fresh random 32-byte salt is generated. Pass `--salt-hex` to re-derive a known address (for example, recovery or interop verification); the same deployer plus the same salt always recovers the same C-strkey.
 - **Audit.** Pass `--profile` to route deployment entries to that profile's audit-log writer. When omitted, the handler emits no `deploy-c` audit entries.
-- **Genesis signer source.** Exactly one signer is installed at genesis — `__constructor` takes a single-element `Vec<Signer>`. Four mutually exclusive sources cover this: a Delegated (native) G-key, an already-registered WebAuthn passkey by name, a raw External-Ed25519 public key, or a generic External signer against any registered verifier contract. Only the Delegated source is fail-open by default; the other three require an explicit acknowledgement flag because the resulting account has no built-in G-key fallback until a second signer is added post-deploy.
+- **Genesis signer source.** Exactly one signer is installed at genesis: `__constructor` takes a single-element `Vec<Signer>`. Four mutually exclusive sources cover this: a Delegated (native) G-key, an already-registered WebAuthn passkey by name, a raw External-Ed25519 public key, or a generic External signer against any registered verifier contract. Only the Delegated source is fail-open by default; the other three require an explicit acknowledgement flag because the resulting account has no built-in G-key fallback until a second signer is added post-deploy.
 
 Argument groups (enforced by the parser):
 
@@ -91,17 +91,17 @@ Argument groups (enforced by the parser):
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--initial-signer <G_STRKEY>` | Delegated (native) genesis signer | one of the genesis-signer group | — |
-| `--signer-webauthn <CREDENTIAL_NAME>` | Genesis signer is an already-registered WebAuthn passkey, looked up by name in the local passkeys registry; requires a WebAuthn verifier already deployed for the target network (`smart-account deploy-webauthn-verifier`) | one of the genesis-signer group | — |
-| `--signer-ed25519 <HEX_PUBKEY_64>` | Genesis signer is a raw 32-byte ed25519 public key (64 hex chars), verified by the Ed25519 verifier resolved from `--verifier` when supplied, else from the verifier registry | one of the genesis-signer group | — |
+| `--initial-signer <G_STRKEY>` | Delegated (native) genesis signer | one of the genesis-signer group | none |
+| `--signer-webauthn <CREDENTIAL_NAME>` | Genesis signer is an already-registered WebAuthn passkey, looked up by name in the local passkeys registry; requires a WebAuthn verifier already deployed for the target network (`smart-account deploy-webauthn-verifier`) | one of the genesis-signer group | none |
+| `--signer-ed25519 <HEX_PUBKEY_64>` | Genesis signer is a raw 32-byte ed25519 public key (64 hex chars), verified by the Ed25519 verifier resolved from `--verifier` when supplied, else from the verifier registry | one of the genesis-signer group | none |
 | `--verifier <C_STRKEY>` | Ed25519-verifier contract override for `--signer-ed25519`. Omitted, it resolves from the verifier registry (populated by `smart-account deploy-ed25519-verifier`), failing closed if none is registered | with `--signer-ed25519` | registry lookup |
-| `--signer-external <C_STRKEY>` | Genesis signer is verified by this verifier contract; requires `--signer-key-data` | one of the genesis-signer group | — |
-| `--signer-key-data <HEX>` | Verifier-specific key material for `--signer-external` | required with `--signer-external` | — |
+| `--signer-external <C_STRKEY>` | Genesis signer is verified by this verifier contract; requires `--signer-key-data` | one of the genesis-signer group | none |
+| `--signer-key-data <HEX>` | Verifier-specific key material for `--signer-external` | required with `--signer-external` | none |
 | `--accept-no-delegated-fallback` | Acknowledges that `--signer-webauthn` / `--signer-ed25519` / `--signer-external` leaves the account with NO Delegated (G-key) fallback signer at genesis; refused without this flag (`validation.passkey_only_rule_no_delegated_fallback`) | required with a non-Delegated genesis source | `false` |
-| `--deployer-secret-env <VAR>` | Env-var name holding the deployer S-strkey | one of the deployer group | — |
+| `--deployer-secret-env <VAR>` | Env-var name holding the deployer S-strkey | one of the deployer group | none |
 | `--sign-with-ledger` | Use a Ledger as the deployer | one of the deployer group | `false` |
 | `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
-| `--salt-hex <HEX64>` | 32-byte salt as 64-char lowercase hex (re-deploy at a known C-strkey) | one of the salt group | — |
+| `--salt-hex <HEX64>` | 32-byte salt as 64-char lowercase hex (re-deploy at a known C-strkey) | one of the salt group | none |
 | `--salt-random` | Generate a fresh random 32-byte salt | one of the salt group | random when `--salt-hex` absent |
 | `--profile <NAME>` | Profile whose audit writer receives deploy entries | optional | none |
 | `--network <NETWORK>` | Target network; `testnet` or `mainnet` (`mainnet` parses but is structurally refused for writes) | optional | `testnet` |
@@ -115,7 +115,7 @@ The deployer account must be funded; it pays the deployment fee.
 
 A genesis signer that is not Delegated cannot itself authorize any further rule mutation (`smart-account rules`, `smart-account signers`) on the account: `add_signer` / `batch_add_signers` / rule installs authorize only via a Delegated signer's key. Deployments using `--signer-webauthn` / `--signer-ed25519` / `--signer-external` should follow up promptly with `smart-account signers add` to attach a Delegated co-signer capable of administering the account, once a policy is attached to the target rule (see [`smart-account rules add-policy`](smart-account.md#smart-account-rules-add-policy) and [`smart-account signers add`](smart-account.md#smart-account-signers-add)).
 
-Example — deploy with a random salt, signing from an env-var secret:
+Example: deploy with a random salt, signing from an env-var secret:
 
 ```bash
 export DEPLOYER_SK="S..."   # deployer account secret key
@@ -125,7 +125,7 @@ stellar-agent accounts deploy-c \
   --salt-random
 ```
 
-Example — deploy with a registered WebAuthn passkey as the sole genesis signer:
+Example: deploy with a registered WebAuthn passkey as the sole genesis signer:
 
 ```bash
 export DEPLOYER_SK="S..."   # deployer account secret key
@@ -141,7 +141,7 @@ stellar-agent accounts deploy-c \
 Sends a payment from a source account to a destination, enforcing SEP-29 memo-required before signing (see [protocols](../protocols.md)).
 
 - **Signing.** By default the command builds, signs, and submits atomically. Three staged flags split the pipeline: `--build-only` emits the unsigned envelope XDR and exits (no signing); `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope. The stage flags are mutually exclusive. `--submit-only` requires an envelope that is already signed: handing it the unsigned XDR that `--build-only` emitted is refused with `network.envelope_unsigned` before anything is sent.
-- **Policy.** After the envelope is built and before signing (in both the full pipeline and `--build-only`), the amount/asset/destination are evaluated against `--profile`'s policy engine — the same evaluation the `stellar_pay` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized, so the command works without an authored profile file until an operator opts into `policy.engine = "v1"`; a profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`), and a profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). The staged `--sign-only` and `--submit-only` flows are gated too: each decodes the supplied envelope through the same decoder the MCP `stellar_pay_commit` path uses and evaluates the decoded amount/asset/destination before signing (`--sign-only`) or before broadcasting (`--submit-only` — the envelope arrives pre-signed, but broadcasting still spends funds). An envelope the decoder cannot classify into a sized shape follows the opaque-signing posture: under a matched value rule it denies `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. The staged flows match policy rules under the `stellar_pay_commit` tool name (the same name the MCP commit phase matches); a ruleset that names only `stellar_pay` default-denies them, so author rules for both names, or `tool = "*"`, for uniform behavior. Under `policy.engine = "noop"` the staged flows are ungated, matching the rest of the command. `--submit-only` additionally runs the endpoint identity probe on its own client before the policy gate and before the audit-key pre-flight, so an `--rpc-url` pointing at a different network than `--network` is refused early.
+- **Policy.** After the envelope is built and before signing (in both the full pipeline and `--build-only`), the amount/asset/destination are evaluated against `--profile`'s policy engine. This is the same evaluation the `stellar_pay` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized. So the command works without an authored profile file until an operator opts into `policy.engine = "v1"`. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`). A profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). The staged `--sign-only` and `--submit-only` flows are gated too. Each decodes the supplied envelope through the same decoder the MCP `stellar_pay_commit` path uses. It evaluates the decoded amount/asset/destination before signing (`--sign-only`) or before broadcasting (`--submit-only`). For `--submit-only`, the envelope arrives pre-signed, but broadcasting still spends funds. An envelope the decoder cannot classify into a sized shape follows the opaque-signing posture: under a matched value rule it denies `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. The staged flows match policy rules under the `stellar_pay_commit` tool name (the same name the MCP commit phase matches). A ruleset that names only `stellar_pay` default-denies them, so author rules for both names, or `tool = "*"`, for uniform behavior. Under `policy.engine = "noop"` the staged flows are ungated, matching the rest of the command. `--submit-only` additionally runs the endpoint identity probe on its own client before the policy gate and before the audit-key pre-flight, so an `--rpc-url` pointing at a different network than `--network` is refused early.
 - **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns `network.mainnet_write_forbidden` before any RPC call, with a submit-layer URL rejection as defence in depth. Beyond those two zero-RPC refusals, the submit layer asks the endpoint which network it serves and binds the submission to that answer rather than to `--network`, refusing a mainnet endpoint, a mismatch, an unestablishable endpoint identity, and any signature that was not made for the network the endpoint reported. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
 - **Submission record.** Before the transaction is sent, the command records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. A submission whose confirmation does not arrive exits 1 with `submission.tx_timeout` and keeps that record. Resolve it with `stellar-agent tx status <HASH>`, never by rebuilding and re-sending: a second submission for the same source account and sequence is refused with `submission.tx_already_submitted` while the first stands. `error.details` carries the full transaction hash and the envelope hash the operator verbs take. See [`stellar-agent tx`](#stellar-agent-tx).
 - **Relayer.** `--use-oz-relayer` is not implemented in this build. Passing it emits an AGPL-3.0 disclosure to stderr and declines the operation rather than submitting.
@@ -154,21 +154,21 @@ Argument groups (enforced by the parser):
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
-| `<DESTINATION>` (positional) | Destination account G-strkey | yes | — |
-| `<AMOUNT>` (positional) | Amount with explicit units, e.g. `"10 XLM"`, `"10.5 USDC"` (raw stroop strings rejected) | yes | — |
+| `<DESTINATION>` (positional) | Destination account G-strkey | yes | none |
+| `<AMOUNT>` (positional) | Amount with explicit units, e.g. `"10 XLM"`, `"10.5 USDC"` (raw stroop strings rejected) | yes | none |
 | `[ASSET]` (positional) | `native`, `XLM`, or `CODE:ISSUER_GSTRKEY` | optional | `native` |
 | `--profile <NAME>` | Profile to evaluate operator policy against | optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--source <G_STRKEY>` | Source account; required for signing | conditional | — |
-| `--memo-text <STRING>` | Memo text (UTF-8, up to 28 bytes) | one of the memo group | — |
-| `--memo-id <U64>` | Memo ID (u64 decimal) | one of the memo group | — |
-| `--memo-hash <64_HEX>` | Memo hash (64 hex chars / 32 bytes) | one of the memo group | — |
-| `--memo-return <64_HEX>` | Memo return hash (64 hex chars / 32 bytes) | one of the memo group | — |
-| `--secret-env <VAR>` | Env-var name holding the source S-strkey | signer group | — |
+| `--source <G_STRKEY>` | Source account; required for signing | conditional | none |
+| `--memo-text <STRING>` | Memo text (UTF-8, up to 28 bytes) | one of the memo group | none |
+| `--memo-id <U64>` | Memo ID (u64 decimal) | one of the memo group | none |
+| `--memo-hash <64_HEX>` | Memo hash (64 hex chars / 32 bytes) | one of the memo group | none |
+| `--memo-return <64_HEX>` | Memo return hash (64 hex chars / 32 bytes) | one of the memo group | none |
+| `--secret-env <VAR>` | Env-var name holding the source S-strkey | signer group | none |
 | `--sign-with-ledger` | Sign with a connected Ledger | signer group | `false` |
 | `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
 | `--build-only` | Emit the unsigned envelope XDR and exit | stage group | `false` |
-| `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | — |
-| `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | — |
+| `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | none |
+| `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | none |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile default (100) |
 | `--network <NETWORK>` | Target network; `testnet` or `mainnet` (`mainnet` parses but is structurally refused for writes) | optional | `testnet` |
 | `--timeout-seconds <SECONDS>` | Submission timeout | optional | `60` |
@@ -176,7 +176,7 @@ Argument groups (enforced by the parser):
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 | `--use-oz-relayer` | Opt into the OZ Relayer path (not implemented; declines) | optional | `false` |
 
-Example — send 10 XLM with a text memo:
+Example: send 10 XLM with a text memo:
 
 ```bash
 export WALLET_SK="S..."   # source account secret key
@@ -188,15 +188,14 @@ stellar-agent pay GDEST...WXYZ "10 XLM" \
 
 ## `stellar-agent claim <BALANCE_ID> [flags]`
 
-Claims a classic claimable balance by its ID, after an RPC-backed pre-flight:
-the entry is fetched via `getLedgerEntries`, a typed preview is rendered
-(asset, amount, claimants, clawback flag, predicate verdict with the
-claimability window), and the command refuses before signing unless the source
-account is a claimant (`claim.not_claimant`), the claimant's predicate is
-currently satisfied (`claim.predicate_not_satisfied`), and — for a non-native
-asset — an authorized trustline with enough limit headroom exists
-(`claim.trustline_missing` / `claim.trustline_not_authorized` /
-`claim.trustline_limit`).
+Claims a classic claimable balance by its ID, after an RPC-backed pre-flight.
+The entry is fetched via `getLedgerEntries`, and a typed preview is rendered
+(asset, amount, claimants, clawback flag, predicate verdict with the claimability window). The command refuses before signing unless the source
+account is a claimant, its predicate is currently satisfied, and, for a non-native
+asset, an authorized trustline with enough limit headroom exists.
+The respective refusals are `claim.not_claimant`, `claim.predicate_not_satisfied`, and
+`claim.trustline_missing` / `claim.trustline_not_authorized` /
+`claim.trustline_limit`.
 
 - **Balance ID forms.** The canonical 72-hex form (eight-`0` V0 prefix plus the
   64-hex hash), the bare 64-hex hash, or the `B...` strkey. Any non-V0
@@ -211,24 +210,22 @@ asset — an authorized trustline with enough limit headroom exists
   before anything is sent.
 - **Policy.** After the build stage (guards, preview, envelope construction)
   and before signing (in both the full pipeline and `--build-only`), the claim
-  is evaluated against `--profile`'s policy engine — the same evaluation the
+  is evaluated against `--profile`'s policy engine. This is the same evaluation the
   `stellar_claim` MCP tool runs. When no profile was named and no
-  `default.toml` exists, an in-memory `Noop`-engine testnet profile is
-  synthesized, so the command works without an authored profile file until an
-  operator opts into `policy.engine = "v1"`; a profile named through
+  `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized. So the command works without an authored profile file until an
+  operator opts into `policy.engine = "v1"`. A profile named through
   `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused
-  (`profile.load_failed`), and a profile file whose owner-key coordinate names
+  (`profile.load_failed`). A profile file whose owner-key coordinate names
   a DIFFERENT profile is refused (`profile.name_mismatch`). The staged `--sign-only` and `--submit-only` flows are
-  gated too: each decodes the supplied envelope through the same decoder the
-  MCP `stellar_claim_commit` path uses and evaluates it before signing
-  (`--sign-only`) or before broadcasting (`--submit-only` — the envelope
-  arrives pre-signed, but broadcasting still spends funds). An envelope the
+  gated too. Each decodes the supplied envelope through the same decoder the
+  MCP `stellar_claim_commit` path uses. It evaluates it before signing
+  (`--sign-only`) or before broadcasting (`--submit-only`). For `--submit-only`, the envelope
+  arrives pre-signed, but broadcasting still spends funds. An envelope the
   decoder cannot classify into a sized shape follows the opaque-signing
   posture: under a matched value rule it denies
   `policy.deny.unsizable_value_effect` unless the rule sets
   `allow_opaque_signing = true`. The staged flows match policy rules under the
-  `stellar_claim_commit` tool name (the same name the MCP commit phase
-  matches); a ruleset that names only `stellar_claim` default-denies them, so
+  `stellar_claim_commit` tool name (the same name the MCP commit phase matches). A ruleset that names only `stellar_claim` default-denies them, so
   author rules for both names, or `tool = "*"`, for uniform behavior. Under
   `policy.engine = "noop"` the staged flows are ungated, matching the rest of
   the command. `--submit-only` additionally runs the endpoint identity probe on
@@ -249,22 +246,22 @@ asset — an authorized trustline with enough limit headroom exists
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
-| `<BALANCE_ID>` (positional) | Claimable balance ID (72-hex, 64-hex, or `B...` strkey) | yes | — |
+| `<BALANCE_ID>` (positional) | Claimable balance ID (72-hex, 64-hex, or `B...` strkey) | yes | none |
 | `--profile <NAME>` | Profile to evaluate operator policy against | optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--source <G_STRKEY>` | Claiming account; must be a claimant | yes | — |
-| `--secret-env <VAR>` | Env-var name holding the source S-strkey | signer group | — |
+| `--source <G_STRKEY>` | Claiming account; must be a claimant | yes | none |
+| `--secret-env <VAR>` | Env-var name holding the source S-strkey | signer group | none |
 | `--sign-with-ledger` | Sign with a connected Ledger | signer group | `false` |
 | `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
 | `--build-only` | Emit the unsigned envelope XDR and exit | stage group | `false` |
-| `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | — |
-| `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | — |
+| `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | none |
+| `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | none |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile default (100) |
 | `--network <NETWORK>` | Target network; `testnet` or `mainnet` (`mainnet` parses but is structurally refused for writes) | optional | `testnet` |
 | `--timeout-seconds <SECONDS>` | Submission timeout | optional | `60` |
 | `--rpc-url <URL>` | Soroban RPC endpoint | optional | `https://soroban-testnet.stellar.org` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
-Example — claim a balance received from a payment sender:
+Example: claim a balance received from a payment sender:
 
 ```bash
 export WALLET_SK="S..."   # claiming account secret key
@@ -284,12 +281,12 @@ Reads the native XLM balance and trustlines for an account via the Stellar RPC `
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--account <G_STRKEY>` | Account to query | required in practice | — |
+| `--account <G_STRKEY>` | Account to query | required in practice | none |
 | `--asset <CODE:ISSUER>` | Trustline asset to query; repeatable | optional | none |
 | `--rpc-url <URL>` | Stellar RPC endpoint | optional | `https://soroban-testnet.stellar.org` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
-Example — read XLM plus a USDC trustline:
+Example: read XLM plus a USDC trustline:
 
 ```bash
 stellar-agent balances \
@@ -302,21 +299,21 @@ stellar-agent balances \
 Creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust gate: operator policy evaluation, denomination resolution (USDT hard-refusal plus a known-lookalike denylist and pinned-issuer checks), a live issuer-flag fetch that fail-closes on error, a clawback gate, and a typed preview, before the envelope is built, signed, and submitted.
 
 - **Signing.** Signs via the profile's keyring signer; builds, signs, submits, and waits atomically. There is no staged pipeline.
-- **Network.** Derived from the loaded profile (`rpc_url`, `network_passphrase`, `chain_id`). `--chain-id` overrides the CAIP-2 value. There is no `--network` flag: the network comes from the profile configuration. The command goes through the same submit layer as every other verb, so it gets the same binding — a mainnet passphrase or a known mainnet RPC URL is refused with `network.mainnet_write_forbidden` and no RPC call, the endpoint is then asked which network it serves and that answer is authoritative, and the envelope's signatures are verified against it. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
+- **Network.** Derived from the loaded profile (`rpc_url`, `network_passphrase`, `chain_id`). `--chain-id` overrides the CAIP-2 value. There is no `--network` flag: the network comes from the profile configuration. The command goes through the same submit layer as every other verb, so it gets the same binding. A mainnet passphrase or a known mainnet RPC URL is refused with `network.mainnet_write_forbidden` and no RPC call. The endpoint is then asked which network it serves and that answer is authoritative. The envelope's signatures are verified against it. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
 - **USDT is hard-refused.** The denomination resolver rejects USDT outright; the command cannot create a USDT trustline.
 - **Limit.** `--limit-stroops 0` removes the trustline. When absent the Stellar default (`i64::MAX`, unlimited) applies.
 - **Asset grammar.** A bare code such as `USDC` resolves through the pin table; `CODE:ISSUER` names an explicit issuer; a 56-char `C...` SAC address is deferred and returns a typed error.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--from <G_STRKEY>` | Account that will hold the trustline | yes | — |
-| `--asset <ASSET>` | `USDC` (bare, pin table), `CODE:ISSUER`, or a `C...` SAC address (deferred) | yes | — |
+| `--from <G_STRKEY>` | Account that will hold the trustline | yes | none |
+| `--asset <ASSET>` | `USDC` (bare, pin table), `CODE:ISSUER`, or a `C...` SAC address (deferred) | yes | none |
 | `--limit-stroops <I64>` | Explicit trustline limit; `0` removes the trustline | optional | unlimited (`i64::MAX`) |
 | `--profile <NAME>` | Profile to load | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--chain-id <CAIP2>` | CAIP-2 chain id, e.g. `stellar:testnet` | optional | profile value |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile `classic_fee_per_op_stroops` |
 
-Example — establish a USDC trustline:
+Example: establish a USDC trustline:
 
 ```bash
 stellar-agent trustline \
@@ -335,14 +332,14 @@ Funds a testnet or futurenet account via the Stellar Friendbot HTTP endpoint.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--account <G_STRKEY>` | Account to fund | yes | — |
+| `--account <G_STRKEY>` | Account to fund | yes | none |
 | `--network <NETWORK>` | `testnet`, `futurenet`, or `mainnet` (mainnet refused at dispatch) | optional | `testnet` |
 | `--friendbot-url <URL>` | Override the Friendbot endpoint URL; when omitted, resolves at runtime to the SDF testnet URL (`https://friendbot.stellar.org`) regardless of `--network`, so `futurenet` needs an explicit override | optional | `https://friendbot.stellar.org` (testnet) |
 | `--friendbot-url-unchecked` | Bypass the URL allow-list (development/test escape hatch) | optional | `false` |
 | `--rpc-url <URL>` | Soroban RPC endpoint used to verify that funding landed; the default follows `--network` so the verification queries the network the funding targeted | optional | derived from `--network` (`https://soroban-testnet.stellar.org` / `https://rpc-futurenet.stellar.org`) |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
-Example — fund a testnet account:
+Example: fund a testnet account:
 
 ```bash
 stellar-agent friendbot --account GABC...WXYZ --network testnet
@@ -365,7 +362,7 @@ Fetches Stellar RPC fee statistics, the helper behind classic fee selection.
 | `--rpc-url <URL>` | Allow-listed RPC endpoint override | optional | `https://soroban-testnet.stellar.org` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
-Example — print fee stats as a table:
+Example: print fee stats as a table:
 
 ```bash
 stellar-agent fees stats --output table
@@ -381,7 +378,7 @@ Subcommands: `list`, `refresh`, `evict`, `warm-up`, `rotate-hmac-key`.
 
 ### `stellar-agent counterparty list [flags]`
 
-Lists the cached bindings for a profile — home domain plus fetched and expiry timestamps. Entries whose HMAC fails verification are silently skipped. Read-only (local cache read).
+Lists the cached bindings for a profile: home domain plus fetched and expiry timestamps. Entries whose HMAC fails verification are silently skipped. Read-only (local cache read).
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
@@ -398,7 +395,7 @@ Force-fetches `https://<home-domain>/.well-known/stellar.toml`, HMAC-protects th
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
-| `<HOME_DOMAIN>` (positional) | Domain to refresh (strict ASCII, 1-32 chars) | yes | — |
+| `<HOME_DOMAIN>` (positional) | Domain to refresh (strict ASCII, 1-32 chars) | yes | none |
 | `--profile <NAME>` | Profile whose cache to update | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 
 ```bash
@@ -411,7 +408,7 @@ Deletes a single cached binding, leaving other domains untouched. Exits `0` even
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
-| `<HOME_DOMAIN>` (positional) | Domain whose cache file to remove | yes | — |
+| `<HOME_DOMAIN>` (positional) | Domain whose cache file to remove | yes | none |
 | `--profile <NAME>` | Profile whose cache to update | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 
 ```bash
@@ -457,15 +454,15 @@ This is the way out of `submission.tx_timeout`.
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
-| `<HASH>` (positional) | Transaction hash, 64 lowercase hex characters — the `error.details.tx_hash` a timed-out submission reports | yes | — |
+| `<HASH>` (positional) | Transaction hash, 64 lowercase hex characters: the `error.details.tx_hash` a timed-out submission reports | yes | none |
 | `--profile <NAME>` | Profile whose submission records and spending window are settled | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
 What it changes:
 
-- `SUCCESS` — the transaction reached a ledger. The reservation becomes recorded spend, the receipt becomes `success`, and the value-action row the submission never got to write is appended. Running the verb again appends no second row.
-- `FAILED` — the transaction applied and failed. The reservation is released and the receipt records the failure.
-- `NOT_FOUND` — the endpoint has no record of it. Within the retention window, an expired time bound permits release. A consumed sequence requires a second transaction lookup: `SUCCESS` records the spend, `FAILED` releases it, and a second `NOT_FOUND` permits release. Otherwise the record stands; run the verb again later.
+- `SUCCESS`: the transaction reached a ledger. The reservation becomes recorded spend, the receipt becomes `success`, and the value-action row the submission never got to write is appended. Running the verb again appends no second row.
+- `FAILED`: the transaction applied and failed. The reservation is released and the receipt records the failure.
+- `NOT_FOUND`: the endpoint has no record of it. Within the retention window, an expired time bound permits release. A consumed sequence requires a second transaction lookup: `SUCCESS` records the spend, `FAILED` releases it, and a second `NOT_FOUND` permits release. Otherwise the record stands; run the verb again later.
 
 Automatic reconciliation applies the same chain and retention checks when the
 receipts file is absent. A definitive chain answer restores the receipt's
@@ -507,7 +504,7 @@ already carry a clear row for the submission.
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
-| `<ENVELOPE_HASH>` (positional) | Envelope hash of the submission, 64 lowercase hex characters — `tx status` reports it as `record.envelope_hash` | yes | — |
+| `<ENVELOPE_HASH>` (positional) | Envelope hash of the submission, 64 lowercase hex characters: `tx status` reports it as `record.envelope_hash` | yes | none |
 | `--profile <NAME>` | Profile whose record and spending window are cleared | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--acknowledge` | State that the transaction did not move value | yes | `false` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |

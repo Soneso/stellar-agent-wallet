@@ -5,33 +5,33 @@ shipping a `stellar-agent` CLI and a `stellar-agent-mcp` MCP server.
 
 ## For users
 
-- [What is the Stellar Agent Wallet?](onboarding.md) — the non-technical
+- [What is the Stellar Agent Wallet?](onboarding.md): the non-technical
   tour: what it is, what an agent can do with it, and how a first session
   with Claude Code looks. Start here.
-- [Getting started](getting-started.md) — install, create a profile, fund a
+- [Getting started](getting-started.md): install, create a profile, fund a
   testnet account, and make a first payment.
-- [Concepts](concepts.md) — the security and governance model: profiles, key
+- [Concepts](concepts.md): the security and governance model: profiles, key
   custody, the policy engine, the approval spine, and the audit log.
-- [CLI reference](cli-reference/index.md) — the `stellar-agent` command surface.
+- [CLI reference](cli-reference/index.md): the `stellar-agent` command surface.
   - [Smart-account governance](cli-reference/smart-account.md)
   - [Accounts and core Stellar operations](cli-reference/stellar-ops.md)
   - [DeFi and the channel pool](cli-reference/defi-and-pool.md)
   - [Profiles, credentials, approvals, and audit](cli-reference/profile-and-governance.md)
-- [The MCP server](mcp.md) — run the server and wire it into an MCP client.
-- [Driving the wallet from an AI agent](agents.md) — connect an agent to the MCP
+- [The MCP server](mcp.md): run the server and wire it into an MCP client.
+- [Driving the wallet from an AI agent](agents.md): connect an agent to the MCP
   server and the call patterns that keep funds safe.
-- [Protocols and integrations](protocols.md) — the supported SEPs, x402, and DeFi
+- [Protocols and integrations](protocols.md): the supported SEPs, x402, and DeFi
   venues.
-- [Agent payments with MPP](agent-payments.md) — sponsored testnet charge
+- [Agent payments with MPP](agent-payments.md): sponsored testnet charge
   authorization, CLI/MCP workflows, receipt and settlement semantics, and the
   trusted-host boundary.
-- [Agent toolsets](toolsets.md) — packaging, signing, and running the wallet's
+- [Agent toolsets](toolsets.md): packaging, signing, and running the wallet's
   capability-restricting toolsets.
-- [Profile configuration](profiles.md) — the profile TOML reference and the
+- [Profile configuration](profiles.md): the profile TOML reference and the
   key-rotation runbook.
-- [Remote approval](remote-approval.md) — approving or rejecting pending
+- [Remote approval](remote-approval.md): approving or rejecting pending
   actions from another device over TLS with a passkey, without SSH.
-- [Agent delegation](agent-delegation.md) — scoping an autonomous agent to one
+- [Agent delegation](agent-delegation.md): scoping an autonomous agent to one
   contract under a spending cap, with its own revocable Ed25519 key.
 
 The downloadable [agent knowledge skill](../skills/) (`skills/`) teaches an AI
@@ -40,19 +40,19 @@ from the capability-restriction toolsets feature above.
 
 ## For maintainers
 
-- [Architecture](maintainers/architecture.md) — the crate map and dependency
+- [Architecture](maintainers/architecture.md): the crate map and dependency
   layering.
-- [Stability tiers](maintainers/stability-tiers.md) — per-crate support intent,
+- [Stability tiers](maintainers/stability-tiers.md): per-crate support intent,
   maturity, and mainnet posture.
-- [Building and testing](maintainers/building.md) — the build, the gate suite,
+- [Building and testing](maintainers/building.md): the build, the gate suite,
   and the test tiers.
-- [Security internals](maintainers/security-internals.md) — the cryptographic
+- [Security internals](maintainers/security-internals.md): the cryptographic
   detail behind the model.
-- [MPP internals](maintainers/mpp.md) — protocol pins, module ownership, durable
+- [MPP internals](maintainers/mpp.md): protocol pins, module ownership, durable
   lifecycle, fixtures, and release gates.
-- [Audit-log recovery](maintainers/audit-log-recovery.md) — the states that block
+- [Audit-log recovery](maintainers/audit-log-recovery.md): the states that block
   the audit writer, and how to get out of each.
-- [Review checklist](maintainers/review-checklist.md) — the production-readiness
+- [Review checklist](maintainers/review-checklist.md): the production-readiness
   gate every change passes.
 
 ---

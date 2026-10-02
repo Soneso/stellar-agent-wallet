@@ -176,28 +176,27 @@ Stable errors use the `mpp.*` namespace, including `mpp.challenge_invalid`,
 `mpp.credential_too_large`, `mpp.receipt_invalid`, `mpp.receipt_conflict`, and
 `mpp.reconciliation_unavailable`.
 
-The verbs that record an audit row before they return — charge commit, record
-receipt, reconcile, prune — answer a problem with the audit LOG under its own
-`audit.*` code instead: `audit.chain_key_unavailable` when the profile's
-chain-root key is not acquirable, `audit.tip_anchor_mismatch` when the log no
-longer holds the chain tip its keyring-held anchor names. Those name a different
+The verbs that record an audit row before they return (charge commit, record
+receipt, reconcile, prune) answer a problem with the audit LOG under its own
+`audit.*` code instead. They answer with `audit.chain_key_unavailable` when the profile's
+chain-root key is not acquirable. They answer with `audit.tip_anchor_mismatch` when the log no longer holds the chain tip its keyring-held anchor names. Those name a different
 thing to fix from the MPP state file, and each has its own recovery in
 [Audit-log recovery](maintainers/audit-log-recovery.md).
 
 Two of those are easy to confuse, and an agent should route on them
 differently. `mpp.authorization_not_found` means no authorization matches the
-identifier you supplied — including on a profile that has never prepared a
+identifier you supplied, including on a profile that has never prepared a
 charge, where nothing is stored yet. It is a normal answer, not a fault:
 correct the identifier or prepare a charge.
 
 `mpp.state_unavailable` means the durable state, or a prerequisite of it,
 exists and cannot be used. Its causes fall into two groups with different
-remedies. Store causes — an unreadable or unverifiable store, an unreadable
-state key over an existing store, an unusable clock, a capacity ceiling — are
-operator problems, and retrying will not clear them. The exception is a
+remedies. Store causes (an unreadable or unverifiable store, an unreadable
+state key over an existing store, an unusable clock, a capacity ceiling) are
+operator problems. Retrying will not clear them. The exception is a
 concurrent update, whose message says the state changed during the update and
-asks for a retry; retry the call. Call causes — a malformed
-identifier, an input file that is not a bounded regular file — mean the call
+asks for a retry; retry the call. Call causes (a malformed
+identifier, an input file that is not a bounded regular file) mean the call
 was wrong: correct it and retry. A malformed identifier answers this way on
 every store state, including a profile with no MPP state, so the answer never
 reveals whether a profile has one.

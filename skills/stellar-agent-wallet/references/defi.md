@@ -1,7 +1,7 @@
 # DeFi and the channel pool
 
-This reference covers the wallet's DeFi venues — Soroswap
-swaps (`trade`) and quotes (`quote`), and DeFindex vaults (`vault`) — and the
+This reference covers the wallet's DeFi venues (Soroswap
+swaps (`trade`) and quotes (`quote`), and DeFindex vaults (`vault`)) and the
 SEP-5-derived channel-account pool (`pool`). It lists the CLI commands of the
 `stellar-agent` binary and the matching tool names on the `stellar-agent-mcp`
 stdio server.
@@ -12,10 +12,10 @@ stdio server.
   convention it is also reachable as `stellar agent ...`.
 - **Result envelope:** every CLI command emits a JSON envelope on stdout and
   returns exit code `0` on success, `1` on any error. The envelope shape is
-  `{ok, data|error, request_id}` — `ok: true` carries `data`; `ok: false`
+  `{ok, data|error, request_id}`: `ok: true` carries `data`; `ok: false`
   carries `error` (with `code` and `message`).
 - **Amounts:** at the agent surface, amounts are decimal strings with a unit,
-  e.g. `"10 XLM"` or `"500 USDC:GA..."` — never JSON numbers. The CLI DeFi
+  e.g. `"10 XLM"` or `"500 USDC:GA..."`, never JSON numbers. The CLI DeFi
   signing flags below take raw integer base units (`<i128>`); the agent-facing
   unitful string is parsed to that base unit before signing.
 - **Assets:** `native` / `XLM`, or `CODE:GISSUER`, or a contract `C-strkey`.
@@ -29,7 +29,7 @@ The MCP tool catalog and envelope details are in `./mcp-tools.md`.
 
 ## Shared posture across DeFi commands
 
-`lend`, `vault deposit`, `vault withdraw`, and `trade` are signing commands.
+`vault deposit`, `vault withdraw`, and `trade` are signing commands.
 Before signing, each one:
 
 1. Loads the named profile (`--profile`, else `STELLAR_AGENT_PROFILE`, else
@@ -41,7 +41,7 @@ Before signing, each one:
 3. Evaluates the operator policy engine for the tool descriptor. A `Deny`
    refuses with `policy.deny.<code>`. A `RequireApproval` refuses with
    `policy.approval_required` and directs you to the MCP server for two-phase
-   approval — the CLI has no interactive approval path for these verbs. A policy
+   approval. The CLI has no interactive approval path for these verbs. A policy
    engine configured but unbuildable refuses with `policy.engine_unavailable`
    (fail-closed).
 4. Loads the signing key from the OS keyring entry named by the profile, then
@@ -66,7 +66,7 @@ per network.
 | Soroswap | trade | `stellar-agent trade` | `stellar_dex_trade` | signs + submits |
 | Soroswap | quote | (no CLI subcommand) | `stellar_dex_quote` | read-only |
 
-## DeFindex — `stellar-agent vault` / `stellar_defindex_vault_*`
+## DeFindex: `stellar-agent vault` / `stellar_defindex_vault_*`
 
 DeFindex vault deposit and withdraw with four-role disclosure (Manager,
 EmergencyManager, RebalanceManager, VaultFeeReceiver), self-managed versus
@@ -86,7 +86,7 @@ Ordered trust gate (both deposit and withdraw):
    `--override-upgradable` to proceed; doing so emits a `vault.upgradable_override`
    audit event.
 
-A slippage floor is required. Its absence is a structural pre-sign refusal —
+A slippage floor is required. Its absence is a structural pre-sign refusal:
 there is no implicit "no minimum". A value of `0` per asset means no slippage
 protection on that asset, opted into explicitly.
 
@@ -95,10 +95,10 @@ protection on that asset, opted into explicitly.
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
 | `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--vault <C-strkey>` | DeFindex vault contract address | Required | — |
-| `--from <C-strkey>` | Wallet smart-account address submitting the deposit | Required | — |
-| `--amounts-desired <i128>...` | Desired deposit amount per asset, in declaration order (one or more) | Required | — |
-| `--amounts-min <i128>...` | Minimum accepted amount per asset (same length as `--amounts-desired`); `0` disables slippage protection on that asset | Required | — |
+| `--vault <C-strkey>` | DeFindex vault contract address | Required | none |
+| `--from <C-strkey>` | Wallet smart-account address submitting the deposit | Required | none |
+| `--amounts-desired <i128>...` | Desired deposit amount per asset, in declaration order (one or more) | Required | none |
+| `--amounts-min <i128>...` | Minimum accepted amount per asset (same length as `--amounts-desired`); `0` disables slippage protection on that asset | Required | none |
 | `--invest` | Auto-invest immediately after deposit | Optional | `false` |
 | `--override-upgradable` | Proceed on an `upgradable:true` vault; emits a `vault.upgradable_override` audit event | Optional | `false` |
 | `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | none |
@@ -121,10 +121,10 @@ pre-sign refusal.
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
 | `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--vault <C-strkey>` | DeFindex vault contract address | Required | — |
-| `--from <C-strkey>` | Wallet smart-account address submitting the withdrawal | Required | — |
-| `--shares <i128>` | Number of vault shares to redeem (raw on-chain value) | Required | — |
-| `--min-amounts-out <i128>...` | Minimum amount to receive per asset (one or more) | Required | — |
+| `--vault <C-strkey>` | DeFindex vault contract address | Required | none |
+| `--from <C-strkey>` | Wallet smart-account address submitting the withdrawal | Required | none |
+| `--shares <i128>` | Number of vault shares to redeem (raw on-chain value) | Required | none |
+| `--min-amounts-out <i128>...` | Minimum amount to receive per asset (one or more) | Required | none |
 | `--override-upgradable` | Proceed on an `upgradable:true` vault | Optional | `false` |
 | `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | none |
 
@@ -140,7 +140,7 @@ stellar-agent vault withdraw \
 Refusal codes: `vault.upgradable_refused`, `vault.asset_count_mismatch`, plus the
 shared policy codes.
 
-## Soroswap — `stellar-agent trade` / `stellar_dex_trade`
+## Soroswap: `stellar-agent trade` / `stellar_dex_trade`
 
 Swap tokens via the Soroswap router (`swap_exact_tokens_for_tokens`) through the
 wallet smart-account. The router address and WASM hash are resolved per-network;
@@ -148,7 +148,7 @@ a network with no pinned router is refused with `dex.unrecognised_network`.
 Soroswap is the only wired venue; routes through an un-allowlisted venue are
 refused. The adapter's trust gate runs the venue allowlist check, the two-RPC
 router WASM-hash pin, and an on-chain `router_get_amounts_out` slippage re-check
-immediately before signing — an absent quote or a quote below the floor refuses
+immediately before signing. An absent quote or a quote below the floor refuses
 the swap. This re-check is a front-run floor using the swap's own routine, not an
 independent oracle.
 
@@ -161,10 +161,10 @@ explicit address vector and is never auto-routed.
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
 | `--profile <NAME>` | Profile to load | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--from <C-strkey>` | Wallet smart-account address submitting the swap | Required | — |
-| `--amount-in <i128>` | Exact input token amount in base units | Required | — |
-| `--amount-out-min <i128>` | Minimum output amount, as an absolute floor (not a percent) | Required | — |
-| `--path <ASSET>` | One swap-path element; repeat the flag to build the path. First element is the input token, last is the output token. Validated to have at least two elements before signing. Each value is a C-strkey, `native`, or `CODE:ISSUER` | Required | — |
+| `--from <C-strkey>` | Wallet smart-account address submitting the swap | Required | none |
+| `--amount-in <i128>` | Exact input token amount in base units | Required | none |
+| `--amount-out-min <i128>` | Minimum output amount, as an absolute floor (not a percent) | Required | none |
+| `--path <ASSET>` | One swap-path element; repeat the flag to build the path. First element is the input token, last is the output token. Validated to have at least two elements before signing. Each value is a C-strkey, `native`, or `CODE:ISSUER` | Required | none |
 | `--deadline <UNIX_SECS>` | Swap deadline as a Unix timestamp in seconds; a missing, zero, or excessively-far deadline is refused | Optional | `now + 300s` |
 | `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC router WASM-hash cross-check | Optional | none |
 
@@ -184,13 +184,13 @@ There is no `quote` subcommand on the CLI. CLI price discovery happens inside
 Out of scope: the Soroswap aggregator, Aquarius/Phoenix execution, classic SDEX
 limit orders (`CreatePassiveSellOffer`), and oracle price-deviation checks.
 
-### Quote — `stellar_dex_quote` (MCP, read-only)
+### Quote: `stellar_dex_quote` (MCP, read-only)
 
 A read-only on-chain Soroswap `router_get_amounts_out` quote for a token path.
 Surfaced only as an MCP tool (no CLI subcommand). Requires `chain_id`. Returns a
 quote envelope; it signs nothing and submits nothing.
 
-## The channel-account pool — `stellar-agent pool`
+## The channel-account pool: `stellar-agent pool`
 
 The channel pool is a set of channel accounts derived from a single pool master
 seed, used to submit transactions concurrently. It is not a DeFi venue. Channel
@@ -223,7 +223,7 @@ master orphans all previously funded channels.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--size <N>` | Number of channel accounts to create (`1..=19`) | Required | — |
+| `--size <N>` | Number of channel accounts to create (`1..=19`) | Required | none |
 | `--profile <NAME>` | Profile for the funder key and RPC endpoint | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--force` | Overwrite an existing pool master key (orphans previously funded channels) | Optional | `false` |
 | `--output <FORMAT>` | `json` or `table` | Optional | `json` |
@@ -258,7 +258,7 @@ stellar-agent pool list --profile default
 ### `stellar-agent pool status`
 
 Report pool utilisation: `initialised`, `pool_size`, `free`, and `in_flight`.
-Read-only and makes no network call — it reads the persisted `PoolConfig` only.
+Read-only and makes no network call: it reads the persisted `PoolConfig` only.
 In a fresh CLI invocation `free == pool_size` and `in_flight == 0`. The result
 carries a note that `free` and `in_flight` reflect the persisted config of a
 stateless process, not a live allocator; do not read `in_flight: 0` as "safe to
@@ -280,7 +280,7 @@ stellar-agent pool status --profile default
 | `policy.deny.<code>` | all signing verbs | Operator policy denied the operation |
 | `policy.approval_required` | all signing verbs | Needs two-phase approval via the MCP server |
 | `policy.engine_unavailable` | all signing verbs | Policy engine configured but unbuildable (fail-closed) |
-| `oracle.staleness_exceeded` | `lend` | Oracle price older than the staleness threshold |
+| `oracle.staleness_exceeded` | none | Oracle price older than the staleness threshold |
 | `vault.upgradable_refused` | `vault` | Vault `upgradable:true`; not overridden |
 | `vault.asset_count_mismatch` | `vault` | Slippage-vector length differs from pinned asset count |
 | `dex.unrecognised_network` | `trade` | No pinned Soroswap router for the network |

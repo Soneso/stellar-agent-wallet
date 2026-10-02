@@ -1,7 +1,7 @@
 # Remote approval
 
 Approve or reject pending agent actions from a device other than the wallet
-host — without an SSH tunnel. `approve serve --remote` binds a TLS-protected
+host, without an SSH tunnel. `approve serve --remote` binds a TLS-protected
 HTTP listener beyond loopback, authenticates you with a registered passkey,
 and requires a fresh passkey assertion for every approve or reject action.
 
@@ -15,7 +15,7 @@ runs on a headless host or a different machine than the one you carry around.
 
 Nothing about what an approval means changes. The attestation is still minted
 on the wallet host, from the same HMAC preimage, over the same pending-entry
-data the wallet itself parked — remote mode changes *who* may consent and
+data the wallet itself parked. Remote mode changes *who* may consent and
 *from where*, never what consent produces. A commit cannot tell whether an
 attestation came from the local inbox or the remote listener; only the audit
 log records the distinction (`ApprovalAttestedRemote` / `ApprovalRejectedRemote`
@@ -27,7 +27,7 @@ effect:
 
 - The HTTP layer verifies a fresh WebAuthn passkey assertion, computed over a
   challenge cryptographically bound to the exact pending entry you are
-  deciding — an assertion produced for one entry can never authorize a
+  deciding. An assertion produced for one entry can never authorize a
   different one, and a stolen session cookie alone can neither approve nor
   reject anything (it carries no assertion).
 - The wallet's own approval gate independently re-checks that the passkey
@@ -41,7 +41,7 @@ TLS is mandatory; there is no plaintext remote path. Session cookies are
 
 ### The `[remote_approval]` profile block
 
-Absent by default — remote mode does not exist for a profile until you add
+Absent by default: remote mode does not exist for a profile until you add
 this block. Field by field:
 
 ```toml
@@ -52,19 +52,19 @@ rp_id = "wallet.example.internal"
 allowed_credentials = ["c9k3JGxPq1c_..."]
 ```
 
-- **`enabled`** — must be `true`, together with the CLI's
+- **`enabled`**: must be `true`, together with the CLI's
   `--confirm-remote-exposure` flag, for `--remote` to actually start the
   listener. The block alone is not consent; both are required.
-- **`bind`** — the socket address to bind, e.g. `"0.0.0.0:8443"` to listen on
+- **`bind`**: the socket address to bind, e.g. `"0.0.0.0:8443"` to listen on
   all interfaces, or a specific interface address. Validated as a real socket
   address before anything else happens; a malformed value refuses to start.
-- **`rp_id`** — the WebAuthn Relying Party ID. This MUST be a DNS hostname
-  that resolves to the wallet host from the device you will approve from — an
+- **`rp_id`**: the WebAuthn Relying Party ID. This MUST be a DNS hostname
+  that resolves to the wallet host from the device you will approve from. An
   IP address is not a valid Relying Party ID per WebAuthn Level 2 §5.1.2 and
   is refused outright, not silently accepted. See the worked example below.
-- **`allowed_credentials`** — the base64url WebAuthn credential IDs permitted
+- **`allowed_credentials`**: the base64url WebAuthn credential IDs permitted
   to approve or reject. A credential enrolled (see below) but absent from
-  this list is refused exactly like an unrecognized credential — enrollment
+  this list is refused exactly like an unrecognized credential. Enrollment
   and authorization are two separate, both-required steps.
 
 ### Making `rp_id` resolve
@@ -72,10 +72,8 @@ allowed_credentials = ["c9k3JGxPq1c_..."]
 The approving device needs to resolve `rp_id` to the wallet host. Two common
 ways, depending on your setup:
 
-- **Internal DNS** — if the wallet host already has an internal name (e.g. on
-  a home network with a local DNS resolver, or a company VPN with split-horizon
-  DNS), use that name as `rp_id` and skip straight to enrollment.
-- **A hosts-file entry on the approving device** — if there is no internal
+- **Internal DNS**: if the wallet host already has an internal name, use that name as `rp_id` and skip straight to enrollment. Examples include a home network with a local DNS resolver, or a company VPN with split-horizon DNS.
+- **A hosts-file entry on the approving device**: if there is no internal
   DNS, add a line to the approving device's hosts file mapping the chosen
   hostname to the wallet host's IP address:
 
@@ -88,7 +86,7 @@ ways, depending on your setup:
   per-approving-device edit; it does not require control over any real DNS
   zone.
 
-Either way, `rp_id` is never an IP literal — WebAuthn binds credentials to a
+Either way, `rp_id` is never an IP literal. WebAuthn binds credentials to a
 domain, not an address, and a browser will not run the ceremony against one.
 
 ## Starting the listener
@@ -107,7 +105,7 @@ Certificate SHA-256 fingerprint (verify out-of-band before trusting): ab:cd:...
 ```
 
 Verify the fingerprint out-of-band before trusting the certificate on the
-approving device — read it over a channel other than the connection you are
+approving device. Read it over a channel other than the connection you are
 about to trust (a phone call, a message on an already-trusted channel, or
 simply because you are standing at both machines). The certificate is
 persisted and reused across restarts, so this verification is a one-time step
@@ -121,18 +119,18 @@ before you point a browser at it.
 
 `approve operator enroll` has two modes, and which one applies here comes
 down to one fact: a WebAuthn credential is bound to the origin that created
-it — the browser requires the page's domain to match the credential's
+it. The browser requires the page's domain to match the credential's
 Relying Party ID at creation time.
 
 - This listener's `rp_id` is a real domain (`wallet.example.internal` in the
   examples above), so the credential has to be created by a page served from
   `https://<rp_id>` itself. That page can only be the remote listener's own
-  `/enroll` page — a local file, or any other origin, cannot produce a
+  `/enroll` page. A local file, or any other origin, cannot produce a
   credential usable against this listener. This section covers that path:
   **argument-import mode**.
 - If you instead want to approve from the wallet host itself, or through an
   SSH tunnel (no `[remote_approval]` domain involved at all), use
-  `approve operator enroll --interactive` on the wallet host directly — see
+  `approve operator enroll --interactive` on the wallet host directly. See
   [CLI reference: `approve operator enroll`](cli-reference/profile-and-governance.md#approve-operator-enroll).
   That mode only ever produces `rp_id: "localhost"` credentials, which is why
   it cannot be used for this listener's domain-bound `rp_id`.
@@ -158,54 +156,54 @@ after verifying the certificate fingerprint above:
 
 4. Run that command on the **wallet host** (not the approving device).
    `approve operator enroll` validates the values and writes them to the
-   profile's dedicated operator-approval credential store — this step never
+   profile's dedicated operator-approval credential store. This step never
    touches the network; it is a local write on the machine running the
    wallet.
 
 The `/enroll` page itself saves nothing: it has no corresponding write
 endpoint, and the wallet's network-exposed surface never accepts a new
 credential over the wire (see [Trust model](#trust-model)). It only runs the
-registration ceremony and displays the result for you to copy — the actual
+registration ceremony and displays the result for you to copy. The actual
 enrollment write happens when you run the command above, on the wallet host.
 Server-verified registration (the wallet confirming the ceremony's
 attestation itself) is not implemented in this alpha; treat the displayed
 values as you would any other credential material you are about to hand to a
 CLI command over a channel you already trust.
 
-- `--credential-id` — the base64url `PublicKeyCredential.id`, prefilled in
+- `--credential-id`: the base64url `PublicKeyCredential.id`, prefilled in
   the displayed command.
-- `--public-key` — the base64url-encoded 65-byte uncompressed SEC1 public key
+- `--public-key`: the base64url-encoded 65-byte uncompressed SEC1 public key
   (`0x04 || X || Y`), prefilled in the displayed command.
-- `--rp-id` — must match the profile's `rp_id` exactly; prefilled.
-- `--label` — a name you choose, so `credentials list`-style tooling can show
-  which device a credential belongs to (e.g. `"laptop"`, `"phone"`) — replace
+- `--rp-id`: must match the profile's `rp_id` exactly; prefilled.
+- `--label`: a name you choose, so `credentials list`-style tooling can show
+  which device a credential belongs to (e.g. `"laptop"`, `"phone"`). Replace
   the placeholder in the displayed command before running it.
-- `--sign-count` — the counter the page read at enrollment time, prefilled.
+- `--sign-count`: the counter the page read at enrollment time, prefilled.
   It seeds the clone-detection baseline that assertion-time verification
   checks against; it never affects authorization by itself.
 
 Finally, add the enrolled credential's id to the profile's
 `[remote_approval] allowed_credentials` list (see
-[Prerequisites](#the-remote_approval-profile-block)) — enrollment and
+[Prerequisites](#the-remote_approval-profile-block)). Enrollment and
 authorization are two separate, both-required steps, in EITHER mode.
 `allowed_credentials` is read once when the listener starts, so restart
-`approve serve --remote` after editing it — the newly enrolled credential is
+`approve serve --remote` after editing it. The newly enrolled credential is
 not recognized until you do.
 
 ## Logging in and approving
 
 1. Open `https://<rp_id>:<port>/` on the approving device. You will see a
-   "Sign in with passkey" button — no credential picker or password field;
+   "Sign in with passkey" button, with no credential picker or password field;
    the passkey ceremony IS the sign-in.
 2. Click it and complete the passkey prompt your platform shows (Touch ID,
    Windows Hello, or a security key), same as any other passkey sign-in.
 3. You land on the inbox: the pending approvals list, updating automatically.
-4. Click an entry to see its detail page — the wallet-decoded summary
+4. Click an entry to see its detail page: the wallet-decoded summary
    (destination, amount, asset, fee) the server itself parked, never the
    agent's description of it.
-5. Click Approve or Reject. Each one prompts a FRESH passkey assertion —
-   the browser calls out to your authenticator again, over a challenge bound
-   to that exact entry — before the decision is applied. This is by design:
+5. Click Approve or Reject. Each one prompts a FRESH passkey assertion.
+   The browser calls out to your authenticator again, over a challenge bound
+   to that exact entry, before the decision is applied. This is by design:
    see [Operational notes](#operational-notes).
 6. On approve, the attestation appears with a copy button; hand it to the
    agent to complete the commit, the same as the local inbox's flow.

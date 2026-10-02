@@ -44,11 +44,11 @@ Each invocation is evaluated before it does anything. Three decisions:
 | RequireApproval | The call is held pending an out-of-band operator approval. |
 
 The engine that runs is selected per profile in `[policy]`. Two structural rules
-apply on every surface: the default network is `stellar:testnet`, and every
+apply on every surface: the default network is `stellar:testnet`. Every
 write or signing command structurally refuses `stellar:mainnet`
-(`network.mainnet_write_forbidden`) — `--network` commands before any RPC call
-or signature, and at the submit layer both a declared mainnet passphrase and a
-known mainnet RPC URL, each with no RPC call at all — while `stellar:mainnet`
+(`network.mainnet_write_forbidden`). This covers `--network` commands before any RPC call
+or signature. At the submit layer it covers both a declared mainnet passphrase and a
+known mainnet RPC URL, each with no RPC call at all. Meanwhile `stellar:mainnet`
 stays accepted for read-only commands. The submit layer additionally asks the
 endpoint which network it serves and binds the submission to that answer rather
 than to the declared network, verifying every signature on the envelope against
@@ -151,7 +151,7 @@ of pending entries:
 Entry kinds: `PaymentSimulated`, `ClaimSimulated`, `SignWithPasskey`,
 `RegisterPasskey`, `ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`,
 `RuleProposalSimulated`. An eighth kind, `Rejected`, is not a fresh entry an
-agent's build/simulate step creates — it is the short-TTL tombstone the
+agent's build/simulate step creates. It is the short-TTL tombstone the
 store writes in place of an entry after the operator rejects it.
 
 ### What `approve` does
@@ -174,7 +174,7 @@ Per kind:
 | `PaymentSimulated` / `ClaimSimulated` | Computes the HMAC attestation over the envelope SHA-256 and persists it; returns `approval_attestation`. Both kinds share the same attestation path. |
 | `TrustlineClawbackOptIn` | Computes a domain-separated HMAC over `(network, code, issuer)` and stores it; the trustline gate recomputes and verifies it. No `approval_attestation` returned. |
 | `ToolsetFirstInvokeGate` | Builds and persists a time-boxed toolset grant, then consumes (removes) the pending entry. Does not set an attestation blob on the entry. No `approval_attestation` returned. |
-| `RuleProposalSimulated` | Computes the HMAC attestation over `proposal_sha256` (the domain-separated digest of the FULL resolved rule definition), not an envelope hash; persists it and returns `approval_attestation`. A DEDICATED gate verifies it at commit — the shared `PaymentSimulated`/`ClaimSimulated` gate rejects this kind outright. |
+| `RuleProposalSimulated` | Computes the HMAC attestation over `proposal_sha256` (the domain-separated digest of the FULL resolved rule definition), not an envelope hash; persists it and returns `approval_attestation`. A DEDICATED gate verifies it at commit. The shared `PaymentSimulated`/`ClaimSimulated` gate rejects this kind outright. |
 
 ### The attestation
 
@@ -200,7 +200,7 @@ AlreadyAttested, forged) into the single wire code `policy.approval_required`,
 so a caller cannot probe which state a nonce is in. The CLI `approve` path
 surfaces distinguishable errors to the operator, who is the wallet owner.
 
-The attestation proves the keyring holder ran `approve` — not that a human
+The attestation proves the keyring holder ran `approve`, not that a human
 clicked "yes" in an agent-controlled UI. An attacker who can write to the store
 file can delete a pending entry (a denial-of-service nuisance forcing
 re-approval) but cannot forge an attestation, because the HMAC key is in the
@@ -209,12 +209,12 @@ pending approvals.
 
 ### `approve` command reference
 
-`stellar-agent approve --id <NONCE>` — state-changing (records an attestation or
+`stellar-agent approve --id <NONCE>`: state-changing (records an attestation or
 a grant in the on-disk store).
 
 | Flag | Required | Default / resolution | Meaning |
 |---|---|---|---|
-| `--id <NONCE>` | yes (this form) | — | The approval nonce from the agent surface's simulate/build response. |
+| `--id <NONCE>` | yes (this form) | none | The approval nonce from the agent surface's simulate/build response. |
 | `--profile <NAME>` | no | `--profile`, then `STELLAR_AGENT_PROFILE`, then `default` | Profile whose attestation key and store to use. |
 | `--yes` | no | off | Non-interactive auto-approve. Bypasses the stdin prompt; the wallet-controlled summary is still printed for a visible record. For trusted automation and tests, not routine operator use. |
 
@@ -229,7 +229,7 @@ stellar-agent approve --id ABCxyzNonce
 stellar-agent approve --id ABCxyzNonce --profile myprofile --yes
 ```
 
-`stellar-agent approve gc` — state-changing. Evicts every pending entry whose
+`stellar-agent approve gc`: state-changing. Evicts every pending entry whose
 TTL has elapsed and reports the count. When `gc` is present, any `--id` is
 ignored. Evicting zero entries is a success.
 
@@ -251,20 +251,19 @@ the `approval_nonce` from the simulate/build response, wait for the operator
 to produce an `approval_attestation`, then call the matching `*_commit` tool
 with it. Three surfaces exist for the operator side of that handshake:
 
-- **CLI, one at a time** — `stellar-agent approve --id <NONCE>` (above), or
+- **CLI, one at a time**: `stellar-agent approve --id <NONCE>` (above), or
   `stellar-agent approve list` to enumerate every pending entry first
   (read-only; `--include-expired` also shows expired ones).
-- **Loopback web inbox** — `stellar-agent approve serve` binds a local HTTP
+- **Loopback web inbox**: `stellar-agent approve serve` binds a local HTTP
   server and opens a browser to the pending-approval queue, so the operator
   clicks Approve/Reject per entry instead of running `approve --id` per nonce.
-- **Remote approval** — `stellar-agent approve serve --remote
+- **Remote approval**: `stellar-agent approve serve --remote
   --confirm-remote-exposure` binds a TLS-protected listener reachable from a
-  device other than the wallet host, authenticated by a registered WebAuthn
-  passkey, for when the agent runs on a headless machine. Every approve or
+  device other than the wallet host, authenticated by a registered WebAuthn passkey. Use it when the agent runs on a headless machine. Every approve or
   reject additionally requires a fresh passkey assertion bound to the exact
   entry.
 
-None of this changes what the agent does or what an attestation proves — see
+None of this changes what the agent does or what an attestation proves. See
 "The attestation" above. Setup for remote approval (the profile's
 `[remote_approval]` block, enrolling a passkey via `approve operator enroll`,
 the trust model, DNS requirements) is out of scope here; see
@@ -273,11 +272,10 @@ guide.
 
 A remote approve or reject is recorded in the audit log under
 `ApprovalAttestedRemote` / `ApprovalRejectedRemote` event kinds rather than
-the loopback `ApprovalAttested` / `ApprovalRejected` ones — the distinguishing
-detail when reading the audit log directly. Both remote kinds also carry
+the loopback `ApprovalAttested` / `ApprovalRejected` ones. This is the distinguishing detail when reading the audit log directly. Both remote kinds also carry
 `operator_credential_id_redacted`, a stable, non-reversible pseudonym for
 which passkey credential consented (the first 8 hex characters of
-`SHA-256(credential_id_b64url)`); nothing else about the attestation or its
+`SHA-256(credential_id_b64url)`). Nothing else about the attestation or its
 binding differs from a local approval.
 
 ## First-invoke gate vs. per-action payment approval
@@ -307,7 +305,7 @@ Each entry carries: a timestamp, the tool name, the chain id, the argument key
 names (`arg_keys`), the envelope hash, the nonce id, the policy decision
 (`allow` / `deny:<reason>` / `require_approval`), an optional decision reason, a
 request id, the event kind, and the previous entry's hash. Argument values are
-never logged — only their key names. Strkeys in a decision reason are redacted to
+never logged; only their key names are. Strkeys in a decision reason are redacted to
 first-five-last-five and transaction hashes to first-eight-last-eight; the
 envelope hash is left intact (it is a SHA-256 digest carrying no user data).
 
@@ -369,13 +367,13 @@ snapshot is refused rather than absorbed.
 The anchor is written after the entry it covers is fsynced, so it is not
 continuous in time. Three states, differing in kind:
 
-- **Lagging** — between an entry's fsync and its anchor write, the anchor names
+- **Lagging**: between an entry's fsync and its anchor write, the anchor names
   the previous entry of this file. A rollback to that entry or later is
   absorbed; anything earlier is still refused. Retried on the next append.
-- **Off, nothing anchored yet** — until the first keyed append on a log path (a
+- **Off, nothing anchored yet**: until the first keyed append on a log path (a
   new profile, a changed `audit_log_path`, a log written before the anchor
   existed). Adoption takes the file as it finds it.
-- **Off, freshly rotated file** — from a rotation until the first append into
+- **Off, freshly rotated file**: from a rotation until the first append into
   the new file is anchored. Any prefix of that file is accepted if it chains
   from the archive's handoff.
 
@@ -393,9 +391,9 @@ why the log changed before accepting it.
 ### Fail-closed on an unminted audit key
 
 `profile init` mints the audit chain-root key's keyring coordinate only, no key
-material. Every value-moving signing verb — CLI and MCP alike — loaded from a
+material. Every value-moving signing verb, CLI and MCP alike, loaded from a
 persisted profile proves the audit writer is acquirable BEFORE the signing key
-is touched or a transaction is submitted; if the key was never minted (run
+is touched or a transaction is submitted. If the key was never minted (run
 `stellar-agent profile rotate-audit-key <name>`), the verb refuses
 `audit.chain_key_unavailable` instead of signing unaudited. This applies on
 both policy engines. It is distinct from the writer's post-confirm emission
@@ -413,11 +411,8 @@ produced.
 
 ### `audit verify` command reference
 
-`stellar-agent audit verify <LOG_PATH>` — read-only. Walks the log oldest-first,
-follows rotation manifests across rotated files, and verifies the hash chain end
-to end: each entry's recorded previous-hash matches the recomputed prior-entry
-hash, each file's first entry chains correctly across the rotation boundary, and
-each rotation handoff names the actual next file (defeating file-substitution).
+`stellar-agent audit verify <LOG_PATH>`: read-only. Walks the log oldest-first,
+follows rotation manifests across rotated files, and verifies the hash chain end to end. Each entry's recorded previous-hash matches the recomputed prior-entry hash. Each file's first entry chains correctly across the rotation boundary. Each rotation handoff names the actual next file (defeating file-substitution).
 When `--profile` is supplied it also verifies the chain-root HMAC sidecars;
 without it, only the hash chain is checked and `hmac_verified` is `false`.
 
@@ -460,7 +455,7 @@ stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --pr
 
 ### `audit reanchor` command reference
 
-`stellar-agent audit reanchor --profile <NAME> --acknowledge-rollback` — the only
+`stellar-agent audit reanchor --profile <NAME> --acknowledge-rollback`: the only
 way out of an `audit.tip_anchor_mismatch` refusal. Operator-only; an agent must
 never run it on its own initiative, because it accepts a log that may have been
 tampered with.
@@ -506,7 +501,7 @@ reversible; each one invalidates material minted under the old key. Each takes
 the profile as either a positional `<NAME>` or a `--profile <NAME>` flag
 (exactly one).
 
-The policy-file owner key is not rotated here — it is enrolled with `profile enroll-owner-key` (public key stored) and used by `profile sign-policy`. The rotation subcommands below mint 32-byte HMAC keys.
+The policy-file owner key is not rotated here. It is enrolled with `profile enroll-owner-key` (public key stored) and used by `profile sign-policy`. The rotation subcommands below mint 32-byte HMAC keys.
 
 | Subcommand | Key kind | Effect on outstanding material |
 |---|---|---|
