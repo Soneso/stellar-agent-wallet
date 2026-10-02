@@ -326,6 +326,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The baseline emitter gate rejects macro variant arguments, constructions
   after test modules, and constructions with a brace on a later line.
+- The cross-RPC consumer audit scans production code after individual
+  `#[cfg(test)]` items.
 - A policy removal confirmed beside a concurrent signer add on the same rule
   keeps the add's verifier pin. The removal reads the pin record and writes
   its row under the rule's lock, so it plans from the record the add left.
