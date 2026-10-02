@@ -44,7 +44,7 @@ envelope itself, never from toolset-supplied text.
    - On the first commit to a new destination, asset, and amount, the wallet
      refuses with `toolset.first_invoke_approval_required` and returns an approval
      nonce. The operator approves out of band with
-     `stellar-agent approve --id <nonce>` in a trusted context. Then re-invoke
+     `stellar-agent approve --id <nonce> --profile <name>` in a trusted context. Then re-invoke
      the commit; once a grant exists, the first-invoke re-prompt is suppressed.
    - The per-action approval still fires on every toolset-routed payment, even
      after a first-invoke grant exists. Wait for the operator to approve before

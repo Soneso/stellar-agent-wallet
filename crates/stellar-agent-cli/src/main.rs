@@ -48,12 +48,12 @@ enum Commands {
     /// Wallet-owned approval spine — interactive y/n for pending approvals.
     ///
     /// Provides:
-    /// - `approve --id <nonce>` — read a pending approval from the store,
+    /// - `approve --id <nonce> --profile <name>`: read a pending approval from the store,
     ///   render a wallet-controlled summary, prompt y/n, and on approval
     ///   compute and record the HMAC attestation blob.
-    /// - `approve --id <nonce> --yes` — non-interactive auto-approve.
+    /// - `approve --id <nonce> --profile <name> --yes`: non-interactive auto-approve.
     ///   Bypasses the tty prompt; use only in trusted automation flows.
-    /// - `approve gc` — evict all expired pending approvals for a profile.
+    /// - `approve gc`: evict all expired pending approvals for a profile.
     Approve(commands::approve::ApproveArgs),
 
     /// Submission-record subcommand group.

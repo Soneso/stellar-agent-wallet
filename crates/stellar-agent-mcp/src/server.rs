@@ -868,9 +868,7 @@ impl WalletServer {
     /// logic.  The method derives only a non-secret string (the profile name);
     /// there is no security concern with public visibility.
     pub fn profile_name_for_approval(&self) -> String {
-        stellar_agent_core::profile::name::derive_profile_name_from_owner_key(&self.profile)
-            .unwrap_or("default")
-            .to_owned()
+        stellar_agent_core::profile::name::profile_name_for_approval(&self.profile)
     }
 
     /// Resolves the pending-approval store directory, honoring the test-only

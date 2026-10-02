@@ -326,6 +326,10 @@ async fn assert_approved_submission_audit(
         let nonce = pending[0].approval_nonce.clone();
         let blob = compute_attestation(
             key,
+            &stellar_agent_core::approval::AttestationBinding::new(
+                name,
+                profile.chain_id.caip2_str(),
+            ),
             &nonce,
             &envelope_sha256(data["envelope_xdr"].as_str().unwrap().as_bytes()),
             &process_uid_for_attestation().unwrap(),
@@ -370,7 +374,7 @@ fn error_message(err: &rmcp::ErrorData) -> String {
 /// Inserts a current, matching `ToolsetGrant` directly into the grant store.
 ///
 /// Used to simulate a previously-approved first-invoke gate (i.e., the operator
-/// ran `stellar-agent approve --id <nonce>` successfully).
+/// ran `stellar-agent approve --id <nonce> --profile <name>` successfully).
 #[allow(clippy::too_many_arguments)]
 fn insert_valid_grant(
     grant_store_path: &std::path::Path,
@@ -395,6 +399,7 @@ fn insert_valid_grant(
         now_ms,
         TOOLSET_GRANT_DEFAULT_TTL_MS,
         attestation_key,
+        &stellar_agent_core::approval::AttestationBinding::new("acct", "stellar:testnet"),
     )
     .expect("build_attested_grant must succeed");
 

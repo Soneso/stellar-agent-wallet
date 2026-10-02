@@ -310,9 +310,14 @@ Declining the prompt exits `1` with `error.code` `credentials.delete_canceled`; 
 
 ## `approve`
 
-`approve` is the operator-side half of the approval spine. When a signing-adjacent action requires an out-of-band approval, the agent surface (the MCP server) records a pending approval and returns an approval nonce. The wallet owner runs `approve --id <NONCE>` in a separate, trusted context to inspect a wallet-controlled summary and consent.
+`approve` is the operator-side half of the approval spine. When a signing-adjacent action requires an out-of-band approval, the agent surface (the MCP server) records a pending approval and returns an approval nonce. The wallet owner runs `approve --id <NONCE> --profile <name>` in a separate, trusted context to inspect a wallet-controlled summary and consent.
 
-The summary is rendered by this command from the stored pending-approval fields, not from anything the agent supplied, so the agent cannot influence what the operator sees. Approval is bound to the local user: the process uid recorded when the approval was created is re-derived at approve time and must match, so a different local user cannot consent on the holder's behalf. On consent, the command records an HMAC attestation (or, for a toolset first-invoke gate, mints and persists a toolset grant and consumes the pending entry). The attestation is an HMAC-SHA256 tag keyed by the profile attestation key over a canonical input including the approval nonce, the envelope SHA-256, and the process uid; the agent surface verifies it before executing. See [concepts](../concepts.md) for the spine and attestation model, and [toolsets](../toolsets.md) for the first-invoke gate versus per-action approval distinction.
+The command renders stored request data alongside the serving profile context.
+The recorded process uid must match the approving local user.
+Consent records an HMAC attestation, or persists a toolset grant and consumes its pending request.
+The versioned HMAC binds the profile name, CAIP-2 chain id, approval nonce, digest, and process uid.
+The agent verifies it before executing.
+See [concepts](../concepts.md) for the attestation model and [toolsets](../toolsets.md) for first-invoke grants.
 
 A `require_approval` rule's `ttl_secs` sets the pending entry's lifetime,
 from 1 second to 604800 seconds (seven days); when omitted, the lifetime is 24
@@ -320,7 +325,13 @@ hours. Its optional `reason`, at most 512 characters, is shown in the
 MCP approval response, `approve list` JSON and table output, and the trusted
 CLI approval prompt. The reason is display text and grants no authority.
 
-### `approve --id <NONCE>`
+The CLI summary and both inbox detail pages show the profile name, CAIP-2 chain id, endpoint authority, and enrolled signer.
+An enrollment placeholder appears as `(not enrolled)`.
+Payment and claim rows show the envelope's effective source; an operation source overrides the transaction source.
+An undecodable envelope appears as `(undecodable envelope)`.
+A claim whose stored summary source differs also shows `Source (stored summary)`.
+
+### `approve --id <NONCE> --profile <name>`
 
 State-changing (records an attestation or a grant in the on-disk pending-approval store).
 
@@ -333,7 +344,7 @@ Interactively, the command prints the summary and prompts `Approve? [y/N]:`; any
 For a payment-style approval the response also returns `approval_attestation`: the HMAC blob the agent surface must present as the `approval_attestation` argument to the matching `*_commit` tool. The operator relays it to the agent over a trusted channel; the attestation binds the specific envelope, so it authorises only that one transaction. The field is omitted for approval kinds whose gate reads the recorded consent from the store directly (toolset first-invoke grants, trustline clawback opt-ins).
 
 ```bash
-stellar-agent approve --id ABCxyzNonce
+stellar-agent approve --id ABCxyzNonce --profile <name>
 ```
 
 ```json
@@ -372,7 +383,7 @@ agent relaying a nonce.
   entry with an expires-in countdown.
 
 ```json
-{"ok":true,"data":{"profile":"default","pending":[{"approval_nonce":"ABCxyzNonce","kind_name":"PaymentSimulated","created_at_unix_ms":1717000000000,"expires_at_unix_ms":1717086400000,"expired":false,"attested":false,"summary":{"kind":"payment","to":"GDEST...","amount_stroops":"100000000","asset":"XLM","memo":null,"fee_stroops":"100","seq_num":12345}}],"expired_count":0},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","pending":[{"approval_nonce":"ABCxyzNonce","kind_name":"PaymentSimulated","created_at_unix_ms":1717000000000,"expires_at_unix_ms":1717086400000,"expired":false,"attested":false,"summary":{"kind":"payment","source":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","to":"GDEST...","amount_stroops":"100000000","asset":"XLM","memo":null,"fee_stroops":"100","seq_num":12345}}],"expired_count":0},"request_id":"..."}
 ```
 
 ### `approve serve`
@@ -384,10 +395,10 @@ stellar-agent approve serve --profile default
 Starts a resident, loopback-only approval inbox: a local web page that lists
 pending approvals as they arrive, renders each wallet-controlled summary, and
 offers Approve and Reject. Approve drives the same attestation path as
-`approve --id` and displays the attestation for copying back to the agent;
+`approve --id <nonce> --profile <name>` and displays the attestation for copying back to the agent.
 Reject replaces the entry with a short-lived rejection marker so the agent's
 next commit attempt is refused with the distinct `policy.approval_rejected`
-code instead of waiting out the TTL. (`approve --id` answering `n` keeps its
+code. (`approve --id <nonce> --profile <name>` answering `n` keeps its
 leave-to-expire behavior; only the inbox's Reject records an explicit
 rejection.)
 
@@ -540,7 +551,7 @@ For the causes worth ruling out before acknowledging, see [Audit-log recovery](.
 `approve` and `audit verify` are the operator's two touch points in the guardrail loop:
 
 1. The agent surface evaluates an action against the policy engine. An action that needs operator consent records a pending approval and returns its nonce instead of executing.
-2. The wallet owner runs `approve --id <NONCE>` in a trusted context, reads the wallet-controlled summary, and consents. The command writes an HMAC attestation (or a toolset grant) bound to the approval nonce, the executed envelope's hash, and the local user.
+2. The wallet owner runs `approve --id <NONCE> --profile <name>` in a trusted context, reads the wallet-controlled summary, and consents. The command writes an HMAC attestation (or a toolset grant) bound to the profile name, chain id, approval nonce, envelope digest, and local user.
 3. The agent surface verifies the attestation and executes. Every invocation and lifecycle event is appended to the hash-chained audit log.
 4. The operator periodically runs `audit verify` to confirm the log has not been tampered with, supplying `--profile` to check the chain-root HMAC sidecars and the tip anchor as well as the hash chain.
 

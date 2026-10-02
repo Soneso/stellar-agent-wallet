@@ -1,4 +1,4 @@
-//! `stellar-agent approve --id <nonce>` — interactive y/n for a pending approval.
+//! `stellar-agent approve --id <nonce> --profile <name>`: interactive y/n for a pending approval.
 //!
 //! Fetches the pending approval entry from the on-disk store, renders a
 //! wallet-controlled summary to stderr (NOT the agent's rendering, and NOT
@@ -54,7 +54,7 @@
 //! - `0` — approved and attested.
 //! - `1` — denied, expired, not found, user mismatch, or I/O error.
 //!
-//! This is the `approve --id` CLI path of the wallet-owned approval spine.
+//! This is the `approve --id <nonce> --profile <name>` CLI path of the wallet-owned approval spine.
 
 use std::io::{BufRead as _, Write};
 use std::path::PathBuf;
@@ -82,12 +82,12 @@ use crate::commands::smart_account::common::open_profile_audit_writer;
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::{render, resolve_profile_name};
 
-/// Arguments for `stellar-agent approve --id <nonce>`.
+/// Arguments for `stellar-agent approve --id <nonce> --profile <name>`.
 ///
 /// # Examples
 ///
 /// ```text
-/// stellar-agent approve --id ABCxyzNonce
+/// stellar-agent approve --id ABCxyzNonce --profile <name>
 /// stellar-agent approve --id ABCxyzNonce --profile myprofile --yes
 /// ```
 #[derive(Debug, Args)]
@@ -119,7 +119,7 @@ pub struct RunArgs {
     pub yes: bool,
 }
 
-/// Success payload for the `approve --id` JSON envelope.
+/// Success payload for the `approve --id <nonce> --profile <name>` JSON envelope.
 #[derive(Debug, Serialize)]
 struct ApproveRunData {
     /// The approval nonce that was attested.
@@ -144,7 +144,7 @@ struct ApproveRunData {
     approval_attestation: Option<String>,
 }
 
-/// Runs `stellar-agent approve --id <nonce>`.
+/// Runs `stellar-agent approve --id <nonce> --profile <name>`.
 ///
 /// Returns `0` on approval and attestation, `1` on any error or denial.
 ///
@@ -185,6 +185,9 @@ pub async fn run(args: RunArgs) -> i32 {
             return 1;
         }
     };
+
+    let context =
+        stellar_agent_core::approval::ApprovalContext::from_profile(&profile_name, &profile);
 
     // ── 4. Open the pending-approval store ───────────────────────────────────
     let store_path = match build_store_path(&profile_name) {
@@ -229,7 +232,7 @@ pub async fn run(args: RunArgs) -> i32 {
     };
 
     // ── 6. Render wallet-controlled summary and read y/n ─────────────────────
-    match prompt_approval(&entry, args.yes) {
+    match prompt_approval(&entry, &context, args.yes) {
         Ok(true) => {}
         Ok(false) => {
             let err = WalletError::Internal(InternalError::UnexpectedState {
@@ -295,6 +298,7 @@ pub async fn run(args: RunArgs) -> i32 {
         &mut store,
         &entry,
         &key_bytes,
+        &context.binding(),
         Surface::Cli,
         audit_writer_ref,
         None,
@@ -310,6 +314,7 @@ pub async fn run(args: RunArgs) -> i32 {
                 req.process_uid,
                 req.now_unix_ms,
                 key,
+                req.binding,
                 None, // No grant-store-path override in the production CLI approve path.
             )
             .map(|_grant| ())
@@ -351,8 +356,12 @@ fn build_store_path(profile_name: &str) -> Result<PathBuf, WalletError> {
     Ok(dir.join(format!("{profile_name}.toml")))
 }
 
-fn prompt_approval(entry: &PendingApproval, auto_approve: bool) -> Result<bool, WalletError> {
-    render_summary(entry);
+fn prompt_approval(
+    entry: &PendingApproval,
+    context: &stellar_agent_core::approval::ApprovalContext,
+    auto_approve: bool,
+) -> Result<bool, WalletError> {
+    render_summary(entry, context);
     if auto_approve {
         return Ok(true);
     }
@@ -500,10 +509,48 @@ fn render_rule_proposal_definition(definition: &ContextRuleProposalSnapshot) -> 
 /// single terminal JSON envelope; factored out so the block formatting is
 /// unit-testable against an in-memory sink.
 ///
-/// For `PaymentSimulated` entries, displays payment-summary fields.
-/// For `SignWithPasskey` entries, displays the smart-account redacted address
-/// and rule IDs (no amount — this is a passkey signing request, not a payment).
-fn write_summary(entry: &PendingApproval, out: &mut dyn Write) -> std::io::Result<()> {
+/// Every kind opens with the context's profile, network, endpoint, and signer rows.
+/// Payments and claims add the envelope's effective source; claims show a stored
+/// summary source when it differs. Passkey signing entries show the redacted
+/// smart-account address and rule IDs.
+fn write_summary(
+    entry: &PendingApproval,
+    context: &stellar_agent_core::approval::ApprovalContext,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    writeln!(out, "  Profile:           {}", context.profile_name)?;
+    writeln!(out, "  Network:           {}", context.chain_id)?;
+    writeln!(out, "  Endpoint:          {}", context.endpoint_host)?;
+    writeln!(
+        out,
+        "  Signer:            {}",
+        context
+            .signer_account
+            .as_deref()
+            .unwrap_or("(not enrolled)")
+    )?;
+    match &entry.kind {
+        ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64, ..
+        }
+        | ApprovalKind::ClaimSimulated {
+            envelope_xdr_b64, ..
+        } => {
+            let source =
+                stellar_agent_core::envelope_decode::envelope_source_account(envelope_xdr_b64).ok();
+            writeln!(
+                out,
+                "  Source:            {}",
+                source.as_deref().unwrap_or("(undecodable envelope)")
+            )?;
+            if let ApprovalKind::ClaimSimulated { summary_source, .. } = &entry.kind
+                && source.as_ref() != Some(summary_source)
+            {
+                writeln!(out, "  Source (stored summary): {summary_source}")?;
+            }
+        }
+        _ => {}
+    }
     if let Some(reason) = &entry.reason {
         writeln!(
             out,
@@ -626,7 +673,6 @@ fn write_summary(entry: &PendingApproval, out: &mut dyn Write) -> std::io::Resul
             summary_balance_id_strkey,
             summary_asset,
             summary_amount_stroops,
-            summary_source,
             summary_simulated_fee_stroops,
             summary_simulated_seq_num,
             ..
@@ -649,7 +695,6 @@ fn write_summary(entry: &PendingApproval, out: &mut dyn Write) -> std::io::Resul
                  Balance ID (hex):  {summary_balance_id_hex72}\n  \
                  Asset:             {summary_asset}\n  \
                  Amount:            {amount}\n  \
-                 Source:            {summary_source}\n  \
                  Simulated fee:     {summary_simulated_fee_stroops} stroops\n  \
                  Simulated seq num: {summary_simulated_seq_num}"
             )
@@ -704,11 +749,14 @@ fn write_summary(entry: &PendingApproval, out: &mut dyn Write) -> std::io::Resul
 /// (the documented programmatic contract — `approve ... > out.json` must yield
 /// exactly one parseable envelope). Always called regardless of `--yes` so
 /// there is a visible record.
-fn render_summary(entry: &PendingApproval) {
+fn render_summary(
+    entry: &PendingApproval,
+    context: &stellar_agent_core::approval::ApprovalContext,
+) {
     let mut err = std::io::stderr();
     // The summary is advisory; the JSON envelope on stdout is the authoritative
     // result, so a stderr write failure must not abort the approval.
-    let _ = write_summary(entry, &mut err);
+    let _ = write_summary(entry, context, &mut err);
     // Flush stderr so the summary is visible before the prompt blocks on read.
     let _ = err.flush();
 }
@@ -779,6 +827,13 @@ mod tests {
     use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
     use tempfile::TempDir;
 
+    fn test_context() -> stellar_agent_core::approval::ApprovalContext {
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "default", "nonce", "default",
+        )
+        .build();
+        stellar_agent_core::approval::ApprovalContext::from_profile("render-test", &profile)
+    }
     use super::*;
 
     // ── Helper: seed an attestation key into the mock keyring ────────────────
@@ -1017,6 +1072,17 @@ mod tests {
         let svc = "stellar-agent-attestation-run-test-valid";
         let raw_key = seed_key_32(svc, "default");
 
+        let profile = stellar_agent_core::profile::schema::Profile::builder_mainnet_named(
+            "mainnet-store",
+            "svc",
+            "default",
+            "nonce",
+            "default",
+        )
+        .rpc_url("https://mainnet-store.example".to_owned())
+        .build();
+        let context =
+            stellar_agent_core::approval::ApprovalContext::from_profile("mainnet-store", &profile);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("__stellar_agent_approve_test_valid.toml");
         let mut store = PendingApprovalStore::open(path.clone()).unwrap();
@@ -1051,6 +1117,7 @@ mod tests {
             &mut store2,
             &entry2,
             &key,
+            &context.binding(),
             Surface::Cli,
             None,
             None,
@@ -1083,7 +1150,13 @@ mod tests {
             .expect("envelope_sha256_hex must be valid hex")
             .try_into()
             .expect("SHA-256 must be exactly 32 bytes");
-        let expected = compute_attestation(&raw_key, &nonce, &sha256_bytes, &process_uid);
+        let expected = compute_attestation(
+            &raw_key,
+            &context.binding(),
+            &nonce,
+            &sha256_bytes,
+            &process_uid,
+        );
 
         assert_eq!(
             persisted_bytes, expected,
@@ -1154,7 +1227,7 @@ mod tests {
     #[test]
     fn prompt_approval_auto_approve_returns_true() {
         let entry = make_entry(DEFAULT_TTL_MS);
-        let approved = prompt_approval(&entry, true).unwrap();
+        let approved = prompt_approval(&entry, &test_context(), true).unwrap();
         assert!(approved);
     }
 
@@ -1176,8 +1249,17 @@ mod tests {
     fn write_summary_payment_writes_block_to_sink() {
         let entry = make_entry(DEFAULT_TTL_MS);
         let mut sink: Vec<u8> = Vec::new();
-        write_summary(&entry, &mut sink).expect("write to in-memory sink");
+        write_summary(&entry, &test_context(), &mut sink).expect("write to in-memory sink");
         let s = String::from_utf8(sink).expect("summary is utf-8");
+        for row in [
+            "  Profile:           render-test",
+            "  Network:           stellar:testnet",
+            "  Endpoint:          https://",
+            "  Signer:            (not enrolled)",
+            "  Source:            (undecodable envelope)",
+        ] {
+            assert!(s.contains(row), "missing {row}: {s}");
+        }
         assert!(
             s.contains("Pending approval"),
             "must render the header: {s}"
@@ -1260,7 +1342,7 @@ mod tests {
         )
         .expect("build RuleProposalSimulated pending entry");
         let mut sink: Vec<u8> = Vec::new();
-        write_summary(&entry, &mut sink).expect("write to in-memory sink");
+        write_summary(&entry, &test_context(), &mut sink).expect("write to in-memory sink");
         let s = String::from_utf8(sink).expect("summary is utf-8");
         for field in [
             "\n  Smart account:",
@@ -1538,7 +1620,7 @@ mod tests {
             .with_reason("Treasury review\nconfirm".to_owned());
         let entry = make_entry(DEFAULT_TTL_MS).with_policy_request(&request);
         let mut sink = Vec::new();
-        write_summary(&entry, &mut sink).unwrap();
+        write_summary(&entry, &test_context(), &mut sink).unwrap();
         let text = String::from_utf8(sink).unwrap();
         assert!(text.contains("Reason: Treasury review"), "{text}");
         assert!(!text.contains("review\nconfirm"), "{text}");
@@ -1546,5 +1628,22 @@ mod tests {
             text.contains(&unix_ms_to_rfc3339(entry.created_at_unix_ms + 617_000)),
             "{text}"
         );
+    }
+
+    #[test]
+    fn write_summary_claim_shows_envelope_and_stored_sources() {
+        let entry = PendingApproval::new_claim_pending(
+            "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAPAAAAAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAAAAAAAAA=".to_owned(), b"AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAPAAAAAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAAAAAAAAA=", "00".repeat(36), format!("B{}", "A".repeat(57)), "XLM".to_owned(), 1_000_000,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(), 100, 1, "1000".to_owned(), DEFAULT_TTL_MS,
+        ).unwrap();
+        let mut sink = Vec::new();
+        write_summary(&entry, &test_context(), &mut sink).unwrap();
+        let text = String::from_utf8(sink).unwrap();
+        assert!(text.contains(
+            "  Source:            GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA"
+        ));
+        assert!(text.contains(
+            "  Source (stored summary): GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ));
     }
 }

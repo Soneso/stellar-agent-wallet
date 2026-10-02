@@ -13,14 +13,12 @@ runs on a headless host or a different machine than the one you carry around.
 
 ## Trust model
 
-Nothing about what an approval means changes. The attestation is still minted
-on the wallet host, from the same HMAC preimage, over the same pending-entry
-data the wallet itself parked. Remote mode changes *who* may consent and
-*from where*, never what consent produces. A commit cannot tell whether an
-attestation came from the local inbox or the remote listener; only the audit
-log records the distinction (`ApprovalAttestedRemote` / `ApprovalRejectedRemote`
-event kinds, separate from the loopback `ApprovalAttested` / `ApprovalRejected`
-ones).
+The wallet host mints an attestation under the serving profile name and CAIP-2 chain id.
+The shared HMAC also binds the pending nonce, digest, and process uid.
+The detail page shows the profile, network, endpoint authority, and enrolled signer above the request summary.
+Summary rows render challenge-bound entry data. Header rows come from the serving profile and are not challenge-bound.
+A commit cannot tell whether an attestation came from the local inbox or the remote listener.
+The audit log distinguishes remote `ApprovalAttestedRemote` / `ApprovalRejectedRemote` events from loopback `ApprovalAttested` / `ApprovalRejected` events.
 
 Two independent layers must both hold for a remote approve or reject to take
 effect:

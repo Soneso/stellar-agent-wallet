@@ -104,7 +104,7 @@ use super::audit_emit::emit_keyring_key_written;
 /// The literal placeholder account minted by `profile init` and the first-run
 /// fallback. Only this exact value is populated at enrollment; any other
 /// non-G-strkey value is refused as a malformed pin.
-const PLACEHOLDER_ACCOUNT: &str = "default";
+use stellar_agent_core::profile::schema::SIGNER_PLACEHOLDER_ACCOUNT as PLACEHOLDER_ACCOUNT;
 
 /// Arguments for `stellar-agent profile enroll-signer`.
 #[derive(Debug, Args)]
@@ -333,7 +333,7 @@ where
         return 1;
     }
 
-    if !account_is_pinned_identity && signer_ref.account != PLACEHOLDER_ACCOUNT {
+    if !account_is_pinned_identity && !signer_ref.is_signer_placeholder() {
         render::render_json(&Envelope::<()>::err_raw(
             "enroll_signer.account_malformed",
             format!(

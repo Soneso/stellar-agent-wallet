@@ -2,7 +2,7 @@
 //!
 //! Starts a loopback HTTP server (crate `stellar-agent-approval-ui`) that lets
 //! the operator review and approve/reject pending approvals in a browser
-//! instead of running `approve --id <nonce>` per entry on a terminal. The server
+//! instead of running `approve --id <nonce> --profile <name>` per entry on a terminal. The server
 //! drives the exact same wallet-controlled attest/reject spine as the CLI, with
 //! `Surface::Serve`.
 //!
@@ -168,7 +168,7 @@ pub async fn run(args: ServeArgs) -> i32 {
         };
 
     let context = DecisionContext::new(
-        profile_name.clone(),
+        stellar_agent_core::approval::ApprovalContext::from_profile(&profile_name, &profile),
         store_path,
         profile.attestation_key_id.clone(),
         audit_writer,

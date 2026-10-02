@@ -1,9 +1,10 @@
-//! Wallet-owned approval spine — storage and cryptographic substrate.
+//! Wallet-owned approval spine: storage and cryptographic substrate.
 //!
-//! Provides the `stellar-agent approve --id <nonce>` CLI half and the MCP
+//! Provides the `stellar-agent approve --id <nonce> --profile <name>` CLI half and the MCP
 //! commit-path verifier.  Supports a kinded approval shape:
-//! `PaymentSimulated` | `SignWithPasskey` | `RegisterPasskey` |
-//! `ToolsetFirstInvokeGate` | `TrustlineClawbackOptIn`.
+//! `PaymentSimulated`, `ClaimSimulated`, `SignWithPasskey`, `RegisterPasskey`,
+//! `ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`, `RuleProposalSimulated`,
+//! `MppChargeSimulated`, `Rejected` and `Consumed`.
 //!
 //! # Security posture
 //!
@@ -11,7 +12,7 @@
 //!
 //! 1. **Keyring-holder attestation, NOT user-attestation.** The attestation
 //!    key lives in the platform keyring (macOS Keychain / Linux Secret Service).
-//!    Approving `stellar-agent approve --id <nonce>` proves that the keyring
+//!    Approving `stellar-agent approve --id <nonce> --profile <name>` proves that the keyring
 //!    holder (the wallet owner) ran the approve command — not that a
 //!    human clicked "yes" in the agent UI.  The UI rendering at step 3 of
 //!    the flow is agent-controlled; the wallet-controlled rendering at step 4
@@ -45,7 +46,7 @@
 //!
 //! # Integration consumers
 //!
-//! - **CLI** `stellar-agent approve --id <nonce>`: loads the store, renders
+//! - **CLI** `stellar-agent approve --id <nonce> --profile <name>`: loads the store, renders
 //!   the wallet-controlled summary, reads y/n from tty, calls
 //!   [`PendingApprovalStore::record_attestation`] on approval.
 //! - **MCP `_commit` verifier**: calls [`verify_attestation`] with the
@@ -58,6 +59,7 @@
 pub mod assertion_input;
 pub mod attest;
 pub mod attestation;
+mod context;
 pub mod error;
 pub mod operator_credentials;
 pub mod registration_input;
@@ -73,12 +75,14 @@ pub use attest::{
     Surface, ToolsetGrantRequest, attest_and_persist, decode_sha256_hex, load_and_validate_entry,
     load_attestation_key,
 };
+pub use attestation::AttestationBinding;
 pub use attestation::{
     RULE_PROPOSAL_DOMAIN_TAG, TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG,
     compute_attestation, compute_rule_proposal_digest, compute_toolset_gate_digest,
     compute_trustline_clawback_opt_in_digest, envelope_sha256, verify_attestation,
     verify_toolset_gate_attestation,
 };
+pub use context::{ApprovalContext, approve_hint};
 pub use error::ApprovalError;
 pub use operator_credentials::{
     OperatorApprovalCredential, OperatorApprovalCredentialStore,

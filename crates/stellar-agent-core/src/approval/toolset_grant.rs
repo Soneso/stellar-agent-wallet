@@ -6,7 +6,7 @@
 //! # Purpose
 //!
 //! After the operator approves a `ToolsetFirstInvokeGate` approval via
-//! `stellar-agent approve --id <nonce>`, the gated resolver persists a
+//! `stellar-agent approve --id <nonce> --profile <name>`, the gated resolver persists a
 //! `ToolsetGrant` record here.  On subsequent invocations the resolver checks
 //! this store FIRST: if a current, matching grant exists, the first-invoke
 //! gate is short-circuited (but the per-action `PaymentSimulated` approval
@@ -171,7 +171,11 @@ impl ToolsetGrant {
     /// Returns `false` (not an error) when the blob is missing or wrong.  The
     /// caller handles the refusal path.
     #[must_use]
-    pub fn verify_attestation(&self, key: &[u8; 32]) -> bool {
+    pub fn verify_attestation(
+        &self,
+        key: &[u8; 32],
+        binding: &super::AttestationBinding<'_>,
+    ) -> bool {
         let Some(blob_b64) = &self.attestation_blob_b64 else {
             return false;
         };
@@ -183,6 +187,7 @@ impl ToolsetGrant {
         };
         verify_toolset_gate_attestation(
             key,
+            binding,
             &self.grant_id,
             &self.toolset_name,
             &self.capability,
@@ -441,6 +446,7 @@ pub fn build_attested_grant(
     now_unix_ms: u64,
     ttl_ms: u64,
     attestation_key: &[u8; 32],
+    binding: &super::AttestationBinding<'_>,
 ) -> Result<ToolsetGrant, ApprovalError> {
     // Generate a random grant_id.
     let mut raw = [0u8; 16];
@@ -460,7 +466,8 @@ pub fn build_attested_grant(
     );
 
     // Compute the HMAC attestation blob.
-    let attestation_blob = compute_attestation(attestation_key, &grant_id, &digest, &process_uid);
+    let attestation_blob =
+        compute_attestation(attestation_key, binding, &grant_id, &digest, &process_uid);
     let attestation_blob_b64 = URL_SAFE_NO_PAD.encode(attestation_blob);
 
     Ok(ToolsetGrant {
@@ -533,6 +540,7 @@ mod tests {
             NOW_MS,
             ttl,
             key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
         )
         .unwrap()
     }
@@ -708,7 +716,13 @@ mod tests {
             86_400_000,
             &key,
         );
-        assert!(grant.verify_attestation(&key), "attestation must verify");
+        assert!(
+            grant.verify_attestation(
+                &key,
+                &crate::approval::AttestationBinding::new("default", "stellar:testnet")
+            ),
+            "attestation must verify"
+        );
     }
 
     #[test]
@@ -723,7 +737,13 @@ mod tests {
             86_400_000,
             &key,
         );
-        assert!(!grant.verify_attestation(&wrong_key), "wrong key must fail");
+        assert!(
+            !grant.verify_attestation(
+                &wrong_key,
+                &crate::approval::AttestationBinding::new("default", "stellar:testnet")
+            ),
+            "wrong key must fail"
+        );
     }
 
     #[test]
@@ -739,7 +759,10 @@ mod tests {
         );
         grant.attestation_blob_b64 = None;
         assert!(
-            !grant.verify_attestation(&key),
+            !grant.verify_attestation(
+                &key,
+                &crate::approval::AttestationBinding::new("default", "stellar:testnet")
+            ),
             "missing attestation must fail"
         );
     }
@@ -905,12 +928,24 @@ mod tests {
             NOW_MS,
             TOOLSET_GRANT_DEFAULT_TTL_MS,
             &key,
+            &crate::approval::AttestationBinding::new("grant-profile", "stellar:mainnet"),
         )
         .unwrap();
 
         // The attestation must pass with the correct key.
-        assert!(grant.verify_attestation(&key));
+        assert!(grant.verify_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("grant-profile", "stellar:mainnet")
+        ));
 
+        assert!(!grant.verify_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("other", "stellar:mainnet")
+        ));
+        assert!(!grant.verify_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("grant-profile", "stellar:testnet")
+        ));
         // The grant must not be expired immediately after creation.
         assert!(!grant.is_expired(NOW_MS));
         assert!(grant.is_expired(NOW_MS + TOOLSET_GRANT_DEFAULT_TTL_MS + 1));
@@ -934,6 +969,7 @@ mod tests {
             NOW_MS,
             86_400_000,
             &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
         )
         .unwrap();
 
@@ -958,6 +994,7 @@ mod tests {
         // Verify the HMAC directly.
         let ok = crate::approval::attestation::verify_attestation(
             &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             &grant.grant_id,
             &expected_digest,
             "1234",

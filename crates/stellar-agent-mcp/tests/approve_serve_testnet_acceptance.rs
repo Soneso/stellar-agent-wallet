@@ -220,7 +220,7 @@ async fn start_serve_for_profile(
         AuditWriter::open(audit_path, None).expect("audit writer open"),
     ));
     let ctx = DecisionContext::new(
-        profile_name,
+        stellar_agent_core::approval::ApprovalContext::from_profile(&profile_name, profile),
         store_path,
         profile.attestation_key_id.clone(),
         audit_writer,
@@ -448,6 +448,10 @@ async fn t1_serve_approve_then_commit_on_testnet() {
     assert!(
         stellar_agent_core::approval::verify_attestation(
             &attestation_key,
+            &stellar_agent_core::approval::AttestationBinding::new(
+                &server.profile_name_for_approval(),
+                "stellar:testnet"
+            ),
             &approval_nonce,
             &sha,
             &uid,

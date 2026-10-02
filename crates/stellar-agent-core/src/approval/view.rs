@@ -3,10 +3,9 @@
 //! [`PendingApprovalStore::snapshot`](super::store::PendingApprovalStore::snapshot)
 //! is the only way to enumerate the store's contents from outside this crate
 //! — `entries` stays private on the store itself. Every field exposed here is
-//! either public on-chain data or already redacted, mirroring the CLI
-//! `approve --id` wallet-controlled summary discipline, so every consumer of
-//! a snapshot (the CLI, a resident approval-inbox server) shares one
-//! non-secret rendering instead of re-deriving it from the raw entry.
+//! either public on-chain data or already redacted, matching the CLI
+//! `approve --id <nonce> --profile <name>` wallet-controlled summary. The CLI and
+//! resident approval-inbox servers share this non-secret rendering.
 
 use serde::Serialize;
 
@@ -18,7 +17,7 @@ use super::store::{ApprovalKind, PendingApproval, redact_g_strkey, redact_tx_has
 /// Never carries raw secret material: `SignWithPasskey` / `RegisterPasskey`
 /// byte fields (`auth_digest`, `credential_id`, `csrf_token`, `user_handle`)
 /// and the `attestation_blob_b64` contents never appear here — only the same
-/// redacted / summary fields the CLI `approve --id` prompt renders.
+/// redacted / summary fields the CLI `approve --id <nonce> --profile <name>` prompt renders.
 ///
 /// `Serialize` renders every field as JSON with no additional redaction: the
 /// fields on this type are already the non-secret, wallet-controlled summary
@@ -66,7 +65,7 @@ pub struct PendingApprovalView {
 
 /// Kind-specific summary fields rendered for [`PendingApprovalView::summary`].
 ///
-/// Mirrors the wallet-controlled rendering in the CLI `approve --id` prompt:
+/// Mirrors the wallet-controlled rendering in the CLI `approve --id <nonce> --profile <name>` prompt:
 /// every field here is either public on-chain data or already redacted.
 ///
 /// Serialises as a JSON object tagged with a `"kind"` discriminator
@@ -89,6 +88,8 @@ pub struct PendingApprovalView {
 pub enum ApprovalSummaryView {
     /// [`ApprovalKind::PaymentSimulated`] summary fields.
     Payment {
+        /// Effective source decoded from the envelope.
+        source: Option<String>,
         /// Destination G-strkey.
         to: String,
         /// Amount in stroops, decimal-string encoded on the wire (see
@@ -108,6 +109,8 @@ pub enum ApprovalSummaryView {
 
     /// [`ApprovalKind::ClaimSimulated`] summary fields.
     Claim {
+        /// Effective source decoded from the envelope.
+        envelope_source: Option<String>,
         /// `B...` strkey rendering of the balance id.
         balance_id_strkey: String,
         /// Asset identifier.
@@ -267,6 +270,7 @@ impl PendingApprovalView {
 
         let summary = match &entry.kind {
             ApprovalKind::PaymentSimulated {
+                envelope_xdr_b64,
                 summary_to,
                 summary_amount_stroops,
                 summary_asset,
@@ -275,6 +279,7 @@ impl PendingApprovalView {
                 summary_simulated_seq_num,
                 ..
             } => ApprovalSummaryView::Payment {
+                source: crate::envelope_decode::envelope_source_account(envelope_xdr_b64).ok(),
                 to: summary_to.clone(),
                 amount_stroops: *summary_amount_stroops,
                 asset: summary_asset.clone(),
@@ -283,6 +288,7 @@ impl PendingApprovalView {
                 seq_num: *summary_simulated_seq_num,
             },
             ApprovalKind::ClaimSimulated {
+                envelope_xdr_b64,
                 summary_balance_id_strkey,
                 summary_asset,
                 summary_amount_stroops,
@@ -291,6 +297,8 @@ impl PendingApprovalView {
                 summary_simulated_seq_num,
                 ..
             } => ApprovalSummaryView::Claim {
+                envelope_source: crate::envelope_decode::envelope_source_account(envelope_xdr_b64)
+                    .ok(),
                 balance_id_strkey: summary_balance_id_strkey.clone(),
                 asset: summary_asset.clone(),
                 amount_stroops: *summary_amount_stroops,
@@ -777,6 +785,7 @@ mod tests {
     #[test]
     fn summary_view_serializes_with_snake_case_kind_tag() {
         let payment = ApprovalSummaryView::Payment {
+            source: Some("GSOURCE".to_owned()),
             to: "GAAA".to_owned(),
             amount_stroops: 1,
             asset: "XLM".to_owned(),
@@ -806,6 +815,7 @@ mod tests {
     #[test]
     fn claim_summary_view_encodes_stroop_fields_as_strings() {
         let claim = ApprovalSummaryView::Claim {
+            envelope_source: Some("GENVELOPE".to_owned()),
             balance_id_strkey: "B".to_owned() + &"A".repeat(57),
             asset: "XLM".to_owned(),
             amount_stroops: 9_007_199_254_740_993_i64, // 2^53 + 1
@@ -819,6 +829,7 @@ mod tests {
             "amount_stroops must survive the f64 precision boundary as a string"
         );
         assert_eq!(json["fee_stroops"], "100");
+        assert_eq!(json["envelope_source"], "GENVELOPE");
     }
 
     #[test]
@@ -862,6 +873,22 @@ mod tests {
         assert_eq!(json["expired"], false);
         assert_eq!(json["attested"], false);
         assert_eq!(json["summary"]["kind"], "payment");
+        assert!(json["summary"].get("source").is_some());
+        let claim = PendingApproval::new_claim_pending(
+            "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAPAAAAAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAAAAAAAAA=".to_owned(),
+            b"claim-envelope", "00".repeat(36), format!("B{}", "A".repeat(57)), "XLM".to_owned(), 1_000_000,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(), 100, 1, uid(), DEFAULT_TTL_MS,
+        ).unwrap();
+        let claim_view = PendingApprovalView::from_entry(&claim, TEST_NOW_MS);
+        let claim_json = serde_json::to_value(claim_view).unwrap();
+        assert_eq!(
+            claim_json["summary"]["envelope_source"],
+            "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA"
+        );
+        assert_eq!(
+            claim_json["summary"]["source"],
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
     }
 
     #[test]

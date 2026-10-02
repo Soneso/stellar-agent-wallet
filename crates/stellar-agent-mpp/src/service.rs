@@ -286,6 +286,7 @@ pub async fn commit_authorization<BeforeSign, BeforeDelivery, OnWithheld>(
     state_store: &MppAuthorizationStore,
     approval_store: Option<&PendingApprovalStore>,
     approval_key: Option<&[u8; 32]>,
+    binding: &stellar_agent_core::approval::AttestationBinding<'_>,
     authorization_id: &str,
     now_unix: i64,
     network_passphrase: &str,
@@ -313,6 +314,7 @@ where
         let now_ms = u64::try_from(now_unix).unwrap_or(0).saturating_mul(1_000);
         if !approvals.verify_mpp_charge_attestation(
             key,
+            binding,
             nonce,
             record.fingerprint(),
             prepared.artifact_hash(),
@@ -492,6 +494,7 @@ pub fn verify_pending_approval(
     state_store: &MppAuthorizationStore,
     approval_store: Option<&PendingApprovalStore>,
     approval_key: Option<&[u8; 32]>,
+    binding: &stellar_agent_core::approval::AttestationBinding<'_>,
     authorization_id: &str,
     now_unix: i64,
 ) -> Result<AuthorizationRecord, MppError> {
@@ -509,6 +512,7 @@ pub fn verify_pending_approval(
     let now_ms = u64::try_from(now_unix).unwrap_or(0).saturating_mul(1_000);
     if !approvals.verify_mpp_charge_attestation(
         key,
+        binding,
         nonce,
         record.fingerprint(),
         prepared.artifact_hash(),
@@ -600,6 +604,113 @@ mod tests {
 
     fn store(directory: &TempDir) -> MppAuthorizationStore {
         crate::store::tests::test_store(directory.path().join("mpp.state"), [7; 32])
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn approval_service_paths_require_the_attested_binding() {
+        use stellar_agent_core::approval::{AttestationBinding, Surface, attest_and_persist};
+
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let binding = AttestationBinding::new("mpp-profile", "stellar:testnet");
+        let other = AttestationBinding::new("other", "stellar:testnet");
+        let key = [0x42; 32];
+        let now = i64::try_from(stellar_agent_core::timefmt::now_unix_ms().expect("clock") / 1_000)
+            .expect("timestamp fits i64");
+        for commit in [false, true] {
+            let directory = TempDir::new().expect("tempdir");
+            let state = store(&directory);
+            let (prepared, signer, rpc) = prepared_fixture(now).await;
+            let mut approvals = PendingApprovalStore::open(directory.path().join("approvals.toml"))
+                .expect("approval store");
+            let preview = persist_prepared_authorization(
+                "mpp-profile",
+                TESTNET_PASSPHRASE,
+                &prepared,
+                ApprovalDisposition::RequireApproval,
+                "424242",
+                now,
+                &state,
+                Some(&mut approvals),
+            )
+            .expect("persist pending approval");
+            let nonce = preview.approval_id.expect("approval nonce");
+            let entry = approvals.get(&nonce).expect("pending entry").clone();
+            attest_and_persist(
+                &mut approvals,
+                &entry,
+                &key,
+                &binding,
+                Surface::Cli,
+                None,
+                None,
+                |_, _| Err("MPP cannot persist a toolset grant".to_owned()),
+            )
+            .expect("attest MPP entry");
+            if commit {
+                let error = commit_authorization(
+                    &state,
+                    Some(&approvals),
+                    Some(&key),
+                    &other,
+                    &preview.authorization_id,
+                    now + 1,
+                    TESTNET_PASSPHRASE,
+                    &signer,
+                    &rpc,
+                    |_, _, _| Ok(()),
+                    |_| Ok(()),
+                    |_| {},
+                )
+                .await
+                .expect_err("commit must refuse another profile");
+                assert_eq!(error.code(), "mpp.approval_invalid");
+                assert_eq!(
+                    state
+                        .load(&preview.authorization_id)
+                        .expect("pending state")
+                        .status(),
+                    AuthorizationStatus::ApprovalPending
+                );
+                commit_authorization(
+                    &state,
+                    Some(&approvals),
+                    Some(&key),
+                    &binding,
+                    &preview.authorization_id,
+                    now + 1,
+                    TESTNET_PASSPHRASE,
+                    &signer,
+                    &rpc,
+                    |_, _, _| Ok(()),
+                    |_| Ok(()),
+                    |_| {},
+                )
+                .await
+                .expect("commit must accept the attested binding");
+            } else {
+                let error = verify_pending_approval(
+                    &state,
+                    Some(&approvals),
+                    Some(&key),
+                    &other,
+                    &preview.authorization_id,
+                    now + 1,
+                )
+                .expect_err("pending verification must refuse another profile");
+                assert_eq!(error.code(), "mpp.approval_invalid");
+                let verified = verify_pending_approval(
+                    &state,
+                    Some(&approvals),
+                    Some(&key),
+                    &binding,
+                    &preview.authorization_id,
+                    now + 1,
+                )
+                .expect("pending verification must accept the attested binding");
+                assert_eq!(verified.status(), AuthorizationStatus::Ready);
+            }
+        }
     }
 
     #[tokio::test]
@@ -756,6 +867,7 @@ mod tests {
             &state,
             None,
             None,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
             &preview.authorization_id,
             NOW + 1,
             TESTNET_PASSPHRASE,
@@ -800,6 +912,7 @@ mod tests {
             &state,
             None,
             None,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
             &preview.authorization_id,
             NOW + 2,
             TESTNET_PASSPHRASE,
@@ -867,6 +980,7 @@ mod tests {
             &state,
             None,
             None,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
             &preview.authorization_id,
             NOW + 1,
             TESTNET_PASSPHRASE,
@@ -899,6 +1013,7 @@ mod tests {
             &state,
             None,
             None,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
             &preview.authorization_id,
             NOW + 2,
             TESTNET_PASSPHRASE,
@@ -937,6 +1052,7 @@ mod tests {
             &state,
             None,
             None,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
             &preview.authorization_id,
             NOW + 1,
             TESTNET_PASSPHRASE,
@@ -1041,6 +1157,7 @@ mod tests {
             &state,
             None,
             None,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
             &preview.authorization_id,
             NOW + 1,
             TESTNET_PASSPHRASE,
@@ -1117,6 +1234,7 @@ mod tests {
             &state,
             None,
             None,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
             &preview.authorization_id,
             NOW + 1,
             TESTNET_PASSPHRASE,

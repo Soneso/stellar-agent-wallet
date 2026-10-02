@@ -520,7 +520,7 @@ async fn clawback_gate_opt_in_round_trip() {
 
     // ── Step 4: Record opt-in via real store write path ───────────────────────
     // Uses the same public constructor + insert + attest path that the
-    // `approve --id` CLI uses. Test-only HMAC key in Zeroizing guard — never
+    // `approve --id <nonce> --profile <name>` CLI uses. Test-only HMAC key in Zeroizing guard: never
     // touches the platform keyring.
     let uid = process_uid_for_attestation().expect("process_uid_for_attestation must succeed");
 
@@ -555,7 +555,7 @@ async fn clawback_gate_opt_in_round_trip() {
     // Compute the HMAC blob — same path as attest_and_persist in approve/run.rs.
     // Test-only key: 32 bytes of 0x42.  The digest input uses the caip2_str
     // canonical network key ("stellar:testnet"), not the passphrase, matching
-    // how the live `approve --id` flow computes it.  The blob is later verified
+    // how the live `approve --id <nonce> --profile <name>` flow computes it.  The blob is later verified
     // via verify_attested_trustline_clawback_opt_in using the same key.
     let test_hmac_key = Zeroizing::new([0x42u8; 32]);
     let digest = compute_trustline_clawback_opt_in_digest(
@@ -563,7 +563,13 @@ async fn clawback_gate_opt_in_round_trip() {
         &resolved.code,
         &resolved.issuer,
     );
-    let attestation_blob = compute_attestation(&test_hmac_key, &approval_nonce, &digest, &uid);
+    let attestation_blob = compute_attestation(
+        &test_hmac_key,
+        &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
+        &approval_nonce,
+        &digest,
+        &uid,
+    );
 
     store
         .record_trustline_clawback_opt_in_attestation(&approval_nonce, attestation_blob)
@@ -575,6 +581,7 @@ async fn clawback_gate_opt_in_round_trip() {
     // A forged or absent blob returns false (fail-closed).
     let opt_in_present = store.verify_attested_trustline_clawback_opt_in(
         &test_hmac_key,
+        &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
         "stellar:testnet",
         &resolved.code,
         &resolved.issuer,

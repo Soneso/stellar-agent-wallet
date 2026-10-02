@@ -235,7 +235,7 @@ ungated path. The gated resolver enforces, in order:
 If no current matching grant exists (first call, expired grant, or a novel
 destination / asset / amount bucket), the gate queues a one-time
 `ToolsetFirstInvokeGate` pending approval and refuses, returning an approval nonce.
-The operator approves out of band with `stellar-agent approve --id <nonce>` (see
+The operator approves out of band with `stellar-agent approve --id <nonce> --profile <name>` (see
 [cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md)),
 which records a time-boxed grant. The agent then re-invokes.
 

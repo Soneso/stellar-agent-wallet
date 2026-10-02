@@ -2,7 +2,7 @@
 //!
 //! This crate implements a loopback HTTP server that gives the operator a
 //! browser view of the pending-approval queue that would otherwise be actioned
-//! only via `stellar-agent approve --id <nonce>` on a terminal. It renders the
+//! only via `stellar-agent approve --id <nonce> --profile <name>` on a terminal. It renders the
 //! wallet-controlled summary for each pending entry and drives the exact same
 //! attest / reject spine ([`stellar_agent_core::approval`]) as the CLI, with
 //! [`stellar_agent_core::approval::Surface::Serve`].
@@ -75,7 +75,7 @@ pub use stellar_agent_loopback_http::security_headers::SecurityHeadersLayer;
 // `/static/app-shared.js`; the server-side half renders the decision card.
 pub use templates::{
     DETAIL_STYLE, INBOX_STYLE, approve_button_label, asset_code, html_escape, kind_pill,
-    render_rule_proposal_definition_html, render_summary_html,
+    render_context_header_html, render_rule_proposal_definition_html, render_summary_html,
 };
 pub use web::APP_SHARED_JS;
 

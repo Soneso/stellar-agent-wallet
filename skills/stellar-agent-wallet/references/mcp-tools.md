@@ -172,9 +172,9 @@ A mismatch is refused before any network call.
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
-| `stellar_pay` | Build a Payment envelope, run the SEP-29 memo-required check, mint a single-use nonce. | No signing; no submission. Mints the nonce the commit step consumes. |
+| `stellar_pay` | Build a Payment envelope, run the SEP-29 memo-required check, mint a single-use nonce. | No signing; no submission. Mints the nonce the commit step consumes. An approval block includes `profile` and `chain_id`. |
 | `stellar_pay_commit` | Verify the nonce, re-check the envelope, sign from the keyring, submit. | Signs and submits. Two-phase; approval spine. |
-| `stellar_create_account` | Build the CreateAccount envelope, mint a single-use nonce. | No signing; no submission. Mints the nonce the commit step consumes. |
+| `stellar_create_account` | Build the CreateAccount envelope, mint a single-use nonce. | No signing; no submission. Mints the nonce the commit step consumes. An approval block includes `profile` and `chain_id`. |
 | `stellar_create_account_commit` | Verify the nonce, re-check the envelope, sign, submit. | Signs and submits. Two-phase; approval spine. |
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
@@ -256,7 +256,7 @@ resolved chain is used when omitted.)
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
-| `stellar_trustline` | Build the ChangeTrust envelope, run the issuer clawback-flag gate, mint a single-use nonce. | No signing; no submission. Mints the nonce the commit step consumes. |
+| `stellar_trustline` | Build the ChangeTrust envelope, run the issuer clawback-flag gate, mint a single-use nonce. | No signing; no submission. Mints the nonce the commit step consumes. An approval block includes `profile` and `chain_id`. |
 | `stellar_trustline_commit` | Verify the nonce, re-derive the authoritative asset/issuer/limit from the envelope, sign, submit. | Signs and submits. Two-phase; approval spine. |
 
 ### stellar_trustline (simulate) arguments
@@ -278,7 +278,7 @@ from `envelope_xdr`, not from caller-supplied args.
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
-| `stellar_claim` | Fetch the on-chain claimable-balance entry, render a typed preview, enforce the claim guards (claimant, predicate, trustline, fee affordability), build the `ClaimClaimableBalance` envelope, mint a single-use nonce. | No signing; no submission. Mints the nonce the commit step consumes. |
+| `stellar_claim` | Fetch the on-chain claimable-balance entry, render a typed preview, enforce the claim guards (claimant, predicate, trustline, fee affordability), build the `ClaimClaimableBalance` envelope, mint a single-use nonce. | No signing; no submission. Mints the nonce the commit step consumes. An approval block includes `profile` and `chain_id`. |
 | `stellar_claim_commit` | Re-derive the authoritative args from the envelope, re-fetch and re-check the entry, verify the nonce, rebuild and byte-compare the envelope, sign from the keyring, submit. | Signs and submits. Two-phase; approval spine. |
 
 ### stellar_claim (simulate) arguments
@@ -382,7 +382,7 @@ submission, which can still fail `SpendingLimitExceeded`.
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
-| `stellar_rule_create` | Testnet-only. Resolve and simulate an `add_context_rule` installation you are proposing — signers, policies, context, name, expiry, `auth_rule_ids` — and park it as a pending approval. | No signing; no submission. Always mints an `approval_nonce`. |
+| `stellar_rule_create` | Testnet-only. Resolve and simulate an `add_context_rule` installation with its signers, policies, context, name, expiry, and `auth_rule_ids`. Park the result as a pending approval. | No signing; no submission. Always mints an `approval_nonce`. Response includes top-level `profile` and `chain_id`. |
 | `stellar_rule_create_commit` | Testnet-only. Verify the operator's attestation over the resolved definition and install the rule. | Signs and submits. Two-phase verb; approval spine. ALWAYS requires operator attestation, regardless of any policy verdict. |
 
 You never hold rule-write authority: `stellar_rule_create` only resolves and

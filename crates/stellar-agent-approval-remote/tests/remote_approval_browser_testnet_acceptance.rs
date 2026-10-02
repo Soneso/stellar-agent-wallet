@@ -378,7 +378,7 @@ async fn start_remote_serve_for_profile(
         AuditWriter::open(audit_path, None).expect("audit writer open"),
     ));
     let ctx = DecisionContext::new(
-        profile_name,
+        stellar_agent_core::approval::ApprovalContext::from_profile(&profile_name, profile),
         store_path,
         profile.attestation_key_id.clone(),
         audit_writer,
@@ -839,6 +839,10 @@ async fn remote_approval_browser_drives_real_payment_commit() {
     assert!(
         stellar_agent_core::approval::verify_attestation(
             &attestation_key,
+            &stellar_agent_core::approval::AttestationBinding::new(
+                &server.profile_name_for_approval(),
+                "stellar:testnet"
+            ),
             &approval_nonce,
             &envelope_sha256,
             &uid,

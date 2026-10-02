@@ -210,7 +210,7 @@ the agent's say-so. It is held in a per-profile pending-approval store until the
 operator approves it out-of-band:
 
 ```text
-stellar-agent approve --id <nonce>
+stellar-agent approve --id <nonce> --profile <name>
 ```
 
 `approve` renders a wallet-controlled summary (the destination G-strkey and asset
@@ -219,8 +219,7 @@ the operator confirms at the terminal, and the command records an HMAC-SHA256
 attestation. The attestation:
 
 - Is keyed by the profile's attestation key, which lives only in the keyring.
-- Binds the approval nonce, the SHA-256 of the exact transaction envelope that will
-  be signed, and the OS process uid.
+- Binds the profile name, CAIP-2 chain id, approval nonce, envelope digest, and OS process uid under a versioned domain tag.
 - Is recorded one-shot: a nonce that is expired, of the wrong kind, or already
   attested is rejected.
 - Is verified in constant time on the commit path.

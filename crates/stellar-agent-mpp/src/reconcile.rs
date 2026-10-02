@@ -440,6 +440,7 @@ mod tests {
             &state,
             None,
             None,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
             &preview.authorization_id,
             NOW + 1,
             TESTNET_PASSPHRASE,

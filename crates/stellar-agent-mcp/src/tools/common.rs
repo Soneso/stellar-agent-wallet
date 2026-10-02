@@ -867,11 +867,15 @@ pub(crate) fn redact_rpc_error_detail(prefix: &str, err: &impl std::fmt::Display
 ///
 /// Internal `tracing::debug!` calls in each failure arm MAY distinguish for
 /// operator forensics; the wire payload is uniform.
-pub(crate) fn approval_required_indistinguishable() -> rmcp::model::CallToolResult {
+pub(crate) fn approval_required_indistinguishable(
+    profile_name: &str,
+) -> rmcp::model::CallToolResult {
     business_error_result(
         "policy.approval_required",
-        "approval attestation absent, invalid, or expired; \
-         run `stellar-agent approve --id <nonce>` then re-submit with attestation",
+        format!(
+            "approval attestation absent, invalid, or expired; run `{}` then re-submit with attestation",
+            stellar_agent_core::approval::approve_hint("<nonce>", profile_name)
+        ),
     )
 }
 
@@ -1043,6 +1047,7 @@ pub(crate) fn load_attestation_key(
     use keyring_core::Entry as KeyringEntry;
     use stellar_agent_network::keyring::classify_keyring_error;
 
+    let profile_name = stellar_agent_core::profile::name::profile_name_for_approval(profile);
     let entry_ref = &profile.attestation_key_id;
     // The outward wire error stays uniform for every failure mode per the
     // indistinguishability rule (see `approval_required_indistinguishable`), so
@@ -1054,7 +1059,7 @@ pub(crate) fn load_attestation_key(
             cause = ?classify_keyring_error(&e, &entry_ref.service),
             "attestation key entry open failed"
         );
-        approval_required_indistinguishable()
+        approval_required_indistinguishable(&profile_name)
     })?;
 
     let raw = entry.get_password().map_err(|e| {
@@ -1063,19 +1068,19 @@ pub(crate) fn load_attestation_key(
             cause = ?classify_keyring_error(&e, &entry_ref.service),
             "attestation key read failed"
         );
-        approval_required_indistinguishable()
+        approval_required_indistinguishable(&profile_name)
     })?;
 
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(raw.trim())
         .map_err(|e| {
             tracing::debug!(error = %e, "attestation key base64 decode failed");
-            approval_required_indistinguishable()
+            approval_required_indistinguishable(&profile_name)
         })?;
 
     if bytes.len() != 32 {
         tracing::debug!(len = bytes.len(), "attestation key length mismatch");
-        return Err(approval_required_indistinguishable());
+        return Err(approval_required_indistinguishable(&profile_name));
     }
 
     let mut arr = [0u8; 32];
@@ -1675,8 +1680,8 @@ fn nonce_replayed_error_result() -> rmcp::model::CallToolResult {
 
 /// Runs the 8-step attestation verification gate for a `*_commit` MCP tool.
 ///
-/// This helper encapsulates the `RequireApproval` attestation path shared by
-/// `stellar_pay_commit` and `stellar_create_account_commit`.  It MUST be called
+/// Payments, claims, account creation and trustlines share this approval gate.
+/// The attestation binds the profile name and chain id. Call this gate
 /// **before** [`commit_envelope_and_verify_nonce`] per the commit-step ordering:
 ///
 /// > dispatch_gate → re-derive args → re-evaluate → **attestation gate** →
@@ -1738,7 +1743,7 @@ pub(crate) async fn verify_attestation_gate(
                 tool = tool_name,
                 "approval_nonce or approval_attestation absent"
             );
-            return Err(approval_required_indistinguishable());
+            return Err(approval_required_indistinguishable(&profile_name));
         }
     };
 
@@ -1749,7 +1754,7 @@ pub(crate) async fn verify_attestation_gate(
         .and_then(|v| v.try_into().ok())
         .ok_or_else(|| {
             tracing::debug!(tool = tool_name, "attestation base64 decode failed");
-            approval_required_indistinguishable()
+            approval_required_indistinguishable(&profile_name)
         })?;
 
     // 3. Open store and look up entry.
@@ -1767,7 +1772,7 @@ pub(crate) async fn verify_attestation_gate(
             default_approval_dir().map_err(|e| {
                 tracing::debug!(tool = tool_name, "approval dir resolution failed");
                 tracing::trace!(error = %e, tool = tool_name, "approval dir resolution failure detail");
-                approval_required_indistinguishable()
+                approval_required_indistinguishable(&profile_name)
             })?
         }
     };
@@ -1775,14 +1780,14 @@ pub(crate) async fn verify_attestation_gate(
     let approvals_dir = default_approval_dir().map_err(|e| {
         tracing::debug!(tool = tool_name, "approval dir resolution failed");
         tracing::trace!(error = %e, tool = tool_name, "approval dir resolution failure detail");
-        approval_required_indistinguishable()
+        approval_required_indistinguishable(&profile_name)
     })?;
     let store_path = approvals_dir.join(format!("{profile_name}.toml"));
     let store = open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
         .map_err(|e| {
             tracing::debug!(tool = tool_name, "approval store open failed");
             tracing::trace!(error = %e, tool = tool_name, "approval store open failure detail");
-            approval_required_indistinguishable()
+            approval_required_indistinguishable(&profile_name)
         })?;
 
     // 4. Entry must exist.
@@ -1794,14 +1799,14 @@ pub(crate) async fn verify_attestation_gate(
                 tool = tool_name,
                 "approval entry not found"
             );
-            return Err(approval_required_indistinguishable());
+            return Err(approval_required_indistinguishable(&profile_name));
         }
     };
 
     // 5. Confirm not expired.
     let now_ms_attest = server.clock.now_unix_ms().map_err(|e| {
         tracing::debug!(error = %e, tool = tool_name, "clock error for expiry check");
-        approval_required_indistinguishable()
+        approval_required_indistinguishable(&profile_name)
     })?;
     // The requiring rule's lifetime bounds the entry as well as the stored expiry.
     let rule_expires_at_unix_ms = entry
@@ -1813,7 +1818,7 @@ pub(crate) async fn verify_attestation_gate(
             tool = tool_name,
             "approval entry expired"
         );
-        return Err(approval_required_indistinguishable());
+        return Err(approval_required_indistinguishable(&profile_name));
     }
 
     // 5b. A live rejection tombstone maps to a distinct wire code so the agent
@@ -1849,10 +1854,10 @@ pub(crate) async fn verify_attestation_gate(
 
     // The submission receipt holds a spent approval while its tombstone is owed.
     let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name)
-        .map_err(|_| approval_required_indistinguishable())?;
+        .map_err(|_| approval_required_indistinguishable(&profile_name))?;
     if receipts
         .find_by_approval_nonce(approval_nonce_str)
-        .map_err(|_| approval_required_indistinguishable())?
+        .map_err(|_| approval_required_indistinguishable(&profile_name))?
         .is_some()
     {
         return Err(approval_consumed_error());
@@ -1880,7 +1885,7 @@ pub(crate) async fn verify_attestation_gate(
                 "approval kind mismatch: expected PaymentSimulated or ClaimSimulated for HMAC \
                  attestation path"
             );
-            return Err(approval_required_indistinguishable());
+            return Err(approval_required_indistinguishable(&profile_name));
         }
     };
     let presented_sha256 = envelope_sha256(envelope_xdr.as_bytes());
@@ -1892,7 +1897,7 @@ pub(crate) async fn verify_attestation_gate(
             tool = tool_name,
             "envelope hash mismatch"
         );
-        return Err(approval_required_indistinguishable());
+        return Err(approval_required_indistinguishable(&profile_name));
     }
 
     // 7. Load attestation key from keyring (zeroized via drop).
@@ -1902,6 +1907,10 @@ pub(crate) async fn verify_attestation_gate(
     // 8. Verify HMAC (constant-time).
     if !verify_attestation(
         &attestation_key,
+        &stellar_agent_core::approval::AttestationBinding::new(
+            &profile_name,
+            server.profile.chain_id.caip2_str(),
+        ),
         approval_nonce_str,
         &presented_sha256,
         &entry.process_uid,
@@ -1912,7 +1921,7 @@ pub(crate) async fn verify_attestation_gate(
             tool = tool_name,
             "HMAC attestation verification failed"
         );
-        return Err(approval_required_indistinguishable());
+        return Err(approval_required_indistinguishable(&profile_name));
     }
     // Attestation key zeroized here on `attestation_key` drop (Zeroizing fires).
 
@@ -2857,7 +2866,7 @@ mod tests {
 
     #[test]
     fn approval_required_indistinguishable_has_expected_wire_code() {
-        let result = approval_required_indistinguishable();
+        let result = approval_required_indistinguishable("default");
         let (is_err, code, _message) = error_envelope_parts(&result);
         assert!(is_err, "indistinguishable error must set is_error = true");
         assert_eq!(
@@ -2889,7 +2898,7 @@ mod tests {
     #[test]
     fn no_approval_refusal_carries_a_details_object() {
         for (label, result) in [
-            ("required", approval_required_indistinguishable()),
+            ("required", approval_required_indistinguishable("default")),
             ("rejected", approval_rejected_error()),
             ("consumed", approval_consumed_error()),
         ] {
@@ -3383,11 +3392,10 @@ mod tests {
 
     // ── Cross-check: a core-minted attestation verifies through this gate ─────
     //
-    // `stellar_agent_core::approval::attest_and_persist` is the same function
-    // `stellar-agent approve --id <nonce>` calls (lifted from the CLI into
-    // core so both share one canonical attest path). This test proves the
-    // blob it mints is byte-for-byte what `verify_attestation_gate` accepts —
-    // the CLI and the MCP commit boundary agree on the attestation format.
+    // The CLI and this test use the shared core attester,
+    // `stellar_agent_core::approval::attest_and_persist`. Its blob verifies
+    // through `verify_attestation_gate`, so the CLI and the MCP commit
+    // boundary agree on the attestation format.
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
@@ -3402,12 +3410,13 @@ mod tests {
         // Unique service/account names (not shared with any other test in this
         // file) so this test cannot race on the process-global mock keyring
         // store against a test using a different `serial_test` group.
-        let profile = Profile::builder_testnet(
+        let profile = Profile::builder_mainnet(
             "cross-check-svc",
             "cross-check-acct",
             "cross-check-n-svc",
             "cross-check-n-acct",
         )
+        .rpc_url("https://mainnet-gate.example".to_owned())
         .with_noop_engine()
         .build();
 
@@ -3451,11 +3460,15 @@ mod tests {
         store.insert(entry.clone(), now_ms).unwrap();
 
         // Mint the attestation via the SAME core path `stellar-agent approve
-        // --id <nonce>` calls — not a hand-rolled HMAC in this test.
+        // --id <nonce> --profile <name>` calls.
         let attestation_b64 = attest_and_persist(
             &mut store,
             &entry,
             &attestation_key,
+            &stellar_agent_core::approval::AttestationBinding::new(
+                &server.profile_name_for_approval(),
+                "stellar:mainnet",
+            ),
             Surface::Cli,
             None,
             None,
@@ -3490,6 +3503,172 @@ mod tests {
         assert!(
             result.is_ok(),
             "a core-minted attestation must verify through verify_attestation_gate: {result:?}; debug log: {}",
+            capture.captured_str()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    async fn attestation_gate_rejects_cross_profile_and_both_cross_chain_bindings() {
+        use base64::Engine as _;
+        use stellar_agent_core::approval::{
+            DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, Surface, attest_and_persist,
+            process_uid_for_attestation,
+        };
+
+        stellar_agent_test_support::keyring_mock::install().ok();
+        // Unique service/account names (not shared with any other test in this
+        // file) so this test cannot race on the process-global mock keyring
+        // store against a test using a different `serial_test` group.
+        let profile = Profile::builder_mainnet(
+            "cross-check-svc",
+            "cross-check-acct",
+            "cross-check-n-svc",
+            "cross-check-n-acct",
+        )
+        .rpc_url("https://mainnet-gate.example".to_owned())
+        .with_noop_engine()
+        .build();
+
+        // Seed the attestation key the profile resolves to.
+        let attestation_key = [0x77_u8; 32];
+        let attestation_key_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(attestation_key);
+        keyring_core::Entry::new(
+            &profile.attestation_key_id.service,
+            &profile.attestation_key_id.account,
+        )
+        .expect("Entry::new for attestation key")
+        .set_password(&attestation_key_b64)
+        .expect("set_password for attestation key");
+
+        let mut server =
+            crate::server::WalletServer::new(profile).expect("WalletServer::new must not fail");
+        let approvals_dir = tempfile::tempdir().unwrap();
+        server.set_approval_dir_for_test(approvals_dir.path().to_path_buf());
+
+        let envelope_xdr = "AAAA";
+        let store_path = approvals_dir
+            .path()
+            .join(format!("{}.toml", server.profile_name_for_approval()));
+        let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+        let entry = PendingApproval::new_payment_pending(
+            envelope_xdr.to_owned(),
+            envelope_xdr.as_bytes(),
+            "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned(),
+            1_000_000,
+            "XLM".to_owned(),
+            None,
+            100,
+            123,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let approval_nonce = entry.approval_nonce.clone();
+        let now_ms = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        store.insert(entry.clone(), now_ms).unwrap();
+
+        // Mint the attestation via the SAME core path `stellar-agent approve
+        // --id <nonce> --profile <name>` calls.
+        let attestation_b64 = attest_and_persist(
+            &mut store,
+            &entry,
+            &attestation_key,
+            &stellar_agent_core::approval::AttestationBinding::new(
+                &server.profile_name_for_approval(),
+                "stellar:mainnet",
+            ),
+            Surface::Cli,
+            None,
+            None,
+            |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
+        )
+        .unwrap()
+        .expect("PaymentSimulated must surface an attestation blob");
+        drop(store);
+
+        let dispatch_outcome = DispatchOutcome::RequireApproval(
+            ApprovalRequest::new(approval_nonce.clone(), 120).into(),
+        );
+
+        use stellar_agent_test_support::CaptureWriter;
+        let capture = CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        assert_eq!(
+            load_attestation_key(&server.profile).unwrap(),
+            attestation_key
+        );
+        assert!(
+            PendingApprovalStore::open(store_path)
+                .unwrap()
+                .get(&approval_nonce)
+                .is_some()
+        );
+        for (profile_name, chain_id) in [
+            ("other-profile", "stellar:mainnet"),
+            ("cross-check-acct", "stellar:testnet"),
+        ] {
+            let wrong_blob = stellar_agent_core::approval::compute_attestation(
+                &attestation_key,
+                &stellar_agent_core::approval::AttestationBinding::new(profile_name, chain_id),
+                &approval_nonce,
+                &stellar_agent_core::approval::envelope_sha256(envelope_xdr.as_bytes()),
+                &entry.process_uid,
+            );
+            let wrong_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wrong_blob);
+            capture.clear();
+            let result = verify_attestation_gate(
+                &server,
+                &dispatch_outcome,
+                envelope_xdr,
+                Some(&approval_nonce),
+                Some(&wrong_b64),
+                "stellar_pay_commit",
+            )
+            .await
+            .unwrap_err();
+            let (code, message, _) = assert_business_envelope(&result);
+            assert_eq!(code, "policy.approval_required");
+            let (_, expected_message, _) =
+                assert_business_envelope(&approval_required_indistinguishable("cross-check-acct"));
+            assert_eq!(message, expected_message);
+            assert!(
+                capture
+                    .captured_str()
+                    .contains("HMAC attestation verification failed"),
+                "{profile_name}/{chain_id} must reach HMAC verification: {}",
+                capture.captured_str()
+            );
+        }
+        std::sync::Arc::make_mut(&mut server.profile).chain_id =
+            stellar_agent_core::profile::caip2::Caip2::Testnet;
+        capture.clear();
+        let result = verify_attestation_gate(
+            &server,
+            &dispatch_outcome,
+            envelope_xdr,
+            Some(&approval_nonce),
+            Some(&attestation_b64),
+            "stellar_pay_commit",
+        )
+        .await
+        .unwrap_err();
+        let (code, message, _) = assert_business_envelope(&result);
+        assert_eq!(code, "policy.approval_required");
+        let (_, expected_message, _) =
+            assert_business_envelope(&approval_required_indistinguishable("cross-check-acct"));
+        assert_eq!(message, expected_message);
+        assert!(
+            capture
+                .captured_str()
+                .contains("HMAC attestation verification failed"),
+            "mainnet blob under testnet must reach HMAC verification: {}",
             capture.captured_str()
         );
     }
@@ -4169,5 +4348,12 @@ mod value_descriptor_enumeration {
                 "MPP destination must be the validated challenge recipient"
             );
         }
+    }
+    #[test]
+    fn approval_required_hint_quotes_profile_name() {
+        let result = super::approval_required_indistinguishable("treasury ops");
+        let (code, message, _) = super::assert_business_envelope(&result);
+        assert_eq!(code, "policy.approval_required");
+        assert!(message.contains("--profile 'treasury ops'"));
     }
 }

@@ -444,9 +444,9 @@ Closed set of `error.code` values across the group: the verb-specific codes in t
 
 ## approve
 
-The operator-side half of the approval spine. When a signing-adjacent action needs out-of-band approval, the agent surface records a pending approval and returns an approval nonce; the wallet owner runs `approve --id <NONCE>` in a separate trusted context to inspect a wallet-controlled summary and consent. The summary is rendered from stored fields, not from anything the agent supplied. Approval is bound to the local user (recorded process uid must match at approve time). Uses the `{ok, data, request_id}` envelope.
+The operator-side half of the approval spine. When a signing-adjacent action needs out-of-band approval, the agent surface records a pending approval and returns an approval nonce. The wallet owner runs `approve --id <NONCE> --profile <name>` in a separate trusted context to inspect a wallet-controlled summary and consent. The summary is rendered from stored fields, not from anything the agent supplied. Approval is bound to the local user (recorded process uid must match at approve time). Uses the `{ok, data, request_id}` envelope.
 
-### `approve --id <NONCE>`
+### `approve --id <NONCE> --profile <name>`
 
 State-changing (records an HMAC attestation, or for a toolset first-invoke gate mints a toolset grant and consumes the entry).
 
@@ -459,7 +459,7 @@ State-changing (records an HMAC attestation, or for a toolset first-invoke gate 
 Interactively prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. Exits `1` when the nonce is unknown, expired, already attested, created by a different local user, denied, or on I/O error. For payment-style approvals the response returns `approval_attestation` (the HMAC blob the agent must pass as the `approval_attestation` argument to the matching `*_commit` tool); omitted for kinds whose gate reads recorded consent directly (toolset first-invoke grants, trustline clawback opt-ins).
 
 ```bash
-stellar-agent approve --id ABCxyzNonce
+stellar-agent approve --id ABCxyzNonce --profile <name>
 ```
 
 ```json
@@ -492,7 +492,7 @@ stellar-agent approve list --profile default --output table
 
 ### `approve serve`
 
-Binds a loopback-only HTTP server with a local web UI for the pending-approval queue, so the operator can review and approve/reject entries in a browser instead of running `approve --id <NONCE>` per entry. Runs until Ctrl-C.
+Binds a loopback-only HTTP server with a local web UI for the pending-approval queue. The operator can review and approve or reject entries in a browser. Runs until Ctrl-C.
 
 | Flag | Meaning | Default |
 |---|---|---|
@@ -606,7 +606,7 @@ stellar-agent audit reanchor --profile default --acknowledge-rollback
 ### Governance loop
 
 1. The agent surface evaluates an action against the policy engine; an action needing consent records a pending approval and returns its nonce instead of executing.
-2. The wallet owner runs `approve --id <NONCE>`, reads the wallet-controlled summary, and consents; an HMAC attestation (or toolset grant) is written, bound to the nonce, the executed envelope's hash, and the local user.
+2. The wallet owner runs `approve --id <NONCE> --profile <name>`, reads the wallet-controlled summary, and consents. The command writes an HMAC attestation (or toolset grant) bound to the profile name, chain id, nonce, envelope digest, and local user.
 3. The agent surface verifies the attestation and executes; every invocation is appended to the hash-chained log.
 4. The operator periodically runs `audit verify --profile <NAME>` to confirm the chain, the chain-root HMAC sidecars, and the tip anchor are intact.
 

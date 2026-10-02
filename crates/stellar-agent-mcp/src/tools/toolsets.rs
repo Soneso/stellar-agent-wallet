@@ -559,7 +559,7 @@ impl WalletServer {
                 capability,
             }) => {
                 // Gate fired: return the approval_nonce for the agent to pass
-                // to `stellar-agent approve --id <nonce>`.  The agent then
+                // to `stellar-agent approve --id <nonce> --profile <name>`.  The agent then
                 // re-invokes.
                 let payload = serde_json::json!({
                     "approval_nonce": &approval_nonce,
@@ -567,7 +567,7 @@ impl WalletServer {
                     "capability": &capability,
                     "message": format!(
                         "toolset.first_invoke_approval_required: run \
-                         `stellar-agent approve --id {approval_nonce}` then re-invoke"
+                         `{}` then re-invoke", stellar_agent_core::approval::approve_hint(&approval_nonce, &profile_name)
                     )
                 });
                 Err(rmcp::ErrorData::invalid_params(
@@ -810,7 +810,7 @@ impl WalletServer {
                     "capability": &capability,
                     "message": format!(
                         "toolset.first_invoke_approval_required: run \
-                         `stellar-agent approve --id {approval_nonce}` then re-invoke"
+                         `{}` then re-invoke", stellar_agent_core::approval::approve_hint(&approval_nonce, &profile_name)
                     )
                 });
                 Err(rmcp::ErrorData::invalid_params(
@@ -873,7 +873,7 @@ impl WalletServer {
     /// `PaymentSimulated` pending approval), the commit proceeds.  If absent,
     /// `stellar_pay_commit` returns `policy.approval_required` as usual —
     /// this is the correct behaviour (the forced gate fired; the operator must
-    /// approve via `stellar-agent approve --id <nonce>`).
+    /// approve via `stellar-agent approve --id <nonce> --profile <name>`).
     ///
     /// # Errors
     ///

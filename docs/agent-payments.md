@@ -78,7 +78,7 @@ reviews and approves it through the normal `approve` command or approval inbox;
 then resume only the stored authorization:
 
 ```bash
-stellar-agent approve --id <approval-id>
+stellar-agent approve --id <approval-id> --profile <name>
 stellar-agent mpp charge authorize --profile default --approval-id <approval-id>
 ```
 

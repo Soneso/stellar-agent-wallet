@@ -462,6 +462,7 @@ async fn dangerous_key_tojson_rejected_gated() {
         now_ms,
         TOOLSET_GRANT_DEFAULT_TTL_MS,
         &attestation_key,
+        &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
     )
     .expect("build_attested_grant");
     let mut store = ToolsetGrantStore::open(grant_store_path.clone(), now_ms).expect("open grants");
@@ -555,6 +556,7 @@ async fn dangerous_key_chain_id_injected_gated_still_caught() {
         now_ms,
         TOOLSET_GRANT_DEFAULT_TTL_MS,
         &attestation_key,
+        &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
     )
     .expect("build_attested_grant");
     let mut store = ToolsetGrantStore::open(grant_store_path.clone(), now_ms).expect("open grants");

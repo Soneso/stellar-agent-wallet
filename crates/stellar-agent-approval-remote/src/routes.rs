@@ -566,6 +566,7 @@ async fn approval_detail_get(
     let csrf = compute_csrf(&session.csrf_key, &nonce);
     Html(render_detail_page(
         &view,
+        &state.ctx.context,
         &csrf,
         attestation_blob.as_deref(),
         &state.identity,
@@ -796,6 +797,10 @@ fn outcome_to_response(outcome: stellar_agent_approval_ui::Outcome) -> Response 
             json!({"status": "already_resolved", "attestation": attestation}),
         ),
         Outcome::Expired => (StatusCode::OK, json!({"status": "expired"})),
+        Outcome::BindingMismatch => (
+            StatusCode::OK,
+            json!({"status": "binding_mismatch", "message": "this request belongs to another profile or network"}),
+        ),
         Outcome::UserMismatch => (StatusCode::OK, json!({"status": "user_mismatch"})),
         Outcome::NotFound => (StatusCode::OK, json!({"status": "not_found"})),
         Outcome::WrongKind => (StatusCode::OK, json!({"status": "wrong_kind"})),
@@ -899,7 +904,13 @@ mod tests {
             AuditWriter::open(audit_path, None).expect("open audit writer"),
         ));
         let ctx = DecisionContext::new(
-            "remote-test".to_owned(),
+            stellar_agent_core::approval::ApprovalContext::from_profile(
+                "remote-test",
+                &stellar_agent_core::profile::schema::Profile::builder_testnet(
+                    "svc", "default", "nonce", "default",
+                )
+                .build(),
+            ),
             store_path,
             KeyringEntryRef::new(svc, "default"),
             audit_writer,
@@ -1189,6 +1200,75 @@ mod tests {
 
     #[test]
     #[serial]
+    fn approve_route_reports_binding_mismatch() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("binding-mismatch-route");
+            let definition = stellar_agent_core::approval::ContextRuleProposalSnapshot::new(
+                stellar_agent_core::approval::RuleProposalContextType::Default,
+                "rule".to_owned(),
+                None,
+                vec![stellar_agent_core::approval::RuleProposalSigner::delegated(
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                    true,
+                )],
+                vec![],
+                vec![0],
+                false,
+                false,
+            );
+            let entry = stellar_agent_core::approval::PendingApproval::new_rule_proposal_pending(
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                "Public Global Stellar Network ; September 2015".to_owned(),
+                "stellar:mainnet".to_owned(),
+                definition,
+                [1; 32],
+                "rule".to_owned(),
+                stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
+                stellar_agent_core::approval::DEFAULT_TTL_MS,
+            )
+            .unwrap();
+            let nonce = entry.approval_nonce.clone();
+            {
+                let mut store =
+                    PendingApprovalStore::open(fx.state.ctx.store_path.clone()).unwrap();
+                store
+                    .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
+                    .unwrap();
+            }
+            let router = build_router();
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+            let challenge = mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
+            let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 2);
+            let response = router
+                .with_state(fx.state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/approval/{nonce}/decision"))
+                        .header(header::COOKIE, &cookie)
+                        .header(CSRF_HEADER_NAME, &csrf)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(decision_body("approve", &assertion)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            assert_eq!(body["status"], "binding_mismatch");
+            assert_eq!(
+                body["message"],
+                "this request belongs to another profile or network"
+            );
+            let store = PendingApprovalStore::open(fx.state.ctx.store_path.clone()).unwrap();
+            assert!(store.get(&nonce).unwrap().attestation_blob_b64.is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
     fn happy_path_approve_mints_attestation() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -1242,6 +1322,7 @@ mod tests {
                 stellar_agent_core::approval::decode_sha256_hex(&envelope_sha256_hex).unwrap();
             let expected = stellar_agent_core::approval::compute_attestation(
                 &[0xABu8; 32],
+                &fx.state.ctx.context.binding(),
                 &nonce,
                 &envelope_sha256,
                 &entry.process_uid,
@@ -2246,5 +2327,34 @@ mod tests {
             rest = &after[close + 1..];
         }
         false
+    }
+
+    #[test]
+    #[serial]
+    fn authenticated_detail_renders_selected_context_and_envelope_source() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut fx = fixture("context-source");
+            let context = &mut Arc::get_mut(&mut fx.state.ctx).unwrap().context;
+            context.profile_name = "remote-treasury".to_owned();
+            context.chain_id = "stellar:mainnet".to_owned();
+            context.endpoint_host = "https://remote-rpc.example".to_owned();
+            context.signer_account = Some("GREMOTEENROLLED".to_owned());
+            let entry = stellar_agent_core::approval::PendingApproval::new_payment_pending(
+                "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=".to_owned(), b"AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=", "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(), 1_000_000, "XLM".to_owned(), None, 100, 1, "1000".to_owned(), stellar_agent_core::approval::DEFAULT_TTL_MS,
+            ).unwrap();
+            let nonce = entry.approval_nonce.clone();
+            let mut store = PendingApprovalStore::open(fx.state.ctx.store_path.clone()).unwrap();
+            store.insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap()).unwrap();
+            drop(store);
+            let router = build_router();
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let response = router.with_state(fx.state).oneshot(Request::builder().uri(format!("/approval/{nonce}")).header(header::COOKIE, cookie).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = html_body(response).await;
+            for value in ["remote-treasury", "stellar:mainnet", "https://remote-rpc.example", "GREMOTEENROLLED", "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA"] {
+                assert!(html.contains(value), "missing {value}: {html}");
+            }
+        });
     }
 }

@@ -371,3 +371,89 @@ fn it_returns_unsupported_tool_for_unknown_tool() {
         "expected UnsupportedTool, got: {err}"
     );
 }
+
+#[test]
+fn envelope_source_account_operation_overrides_transaction() {
+    let op = Operation {
+        source_account: Some(g_to_muxed(DEST_G)),
+        body: OperationBody::Payment(PaymentOp {
+            destination: g_to_muxed(SOURCE_G),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+    let env = build_tx1_envelope(SOURCE_G, op, Memo::None);
+    assert_eq!(
+        stellar_agent_core::envelope_decode::envelope_source_account(&to_b64(&env)).unwrap(),
+        DEST_G
+    );
+}
+
+#[test]
+fn envelope_source_account_transaction_only() {
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::Payment(PaymentOp {
+            destination: g_to_muxed(DEST_G),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+    let env = build_tx1_envelope(SOURCE_G, op, Memo::None);
+    assert_eq!(
+        stellar_agent_core::envelope_decode::envelope_source_account(&to_b64(&env)).unwrap(),
+        SOURCE_G
+    );
+}
+
+#[test]
+fn envelope_source_account_refuses_two_operations() {
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::Payment(PaymentOp {
+            destination: g_to_muxed(DEST_G),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+    let mut env = build_tx1_envelope(SOURCE_G, op.clone(), Memo::None);
+    if let TransactionEnvelope::Tx(v1) = &mut env {
+        v1.tx.operations = vec![op.clone(), op].try_into().unwrap();
+    }
+    assert!(matches!(
+        stellar_agent_core::envelope_decode::envelope_source_account(&to_b64(&env)),
+        Err(EnvelopeDecodeError::UnexpectedOperationCount { count: 2 })
+    ));
+}
+
+#[test]
+fn envelope_source_account_refuses_fee_bump() {
+    use stellar_xdr::{
+        FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+        FeeBumpTransactionInnerTx,
+    };
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::Payment(PaymentOp {
+            destination: g_to_muxed(DEST_G),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+    let TransactionEnvelope::Tx(inner) = build_tx1_envelope(SOURCE_G, op, Memo::None) else {
+        unreachable!()
+    };
+    let env = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: FeeBumpTransaction {
+            fee_source: g_to_muxed(SOURCE_G),
+            fee: 200,
+            inner_tx: FeeBumpTransactionInnerTx::Tx(inner),
+            ext: FeeBumpTransactionExt::V0,
+        },
+        signatures: VecM::default(),
+    });
+    assert!(matches!(
+        stellar_agent_core::envelope_decode::envelope_source_account(&to_b64(&env)),
+        Err(EnvelopeDecodeError::NotTransactionV1)
+    ));
+}

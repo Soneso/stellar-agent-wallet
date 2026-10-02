@@ -3,23 +3,23 @@
 //! Wallet-owned approval spine — CLI half.
 //!
 //! Provides:
-//! - `stellar-agent approve --id <approval-nonce>` — interactive y/n for a
+//! - `stellar-agent approve --id <approval-nonce> --profile <name>`: interactive y/n for a
 //!   pending approval.  Computes the HMAC attestation and writes back to the
 //!   pending-approvals store.
-//! - `stellar-agent approve --id <approval-nonce> --yes` — non-interactive
+//! - `stellar-agent approve --id <approval-nonce> --profile <name> --yes`: non-interactive
 //!   auto-approve for scripting and tests.  Bypasses the tty prompt; use only
 //!   in trusted automation flows.
-//! - `stellar-agent approve gc` — evict expired pending approvals.
-//! - `stellar-agent approve gc --profile <name>` — per-profile gc.
-//! - `stellar-agent approve list` — enumerate pending approvals (read-only).
-//! - `stellar-agent approve serve` — local web UI for the pending-approval
+//! - `stellar-agent approve gc`: evict expired pending approvals.
+//! - `stellar-agent approve gc --profile <name>`: per-profile gc.
+//! - `stellar-agent approve list`: enumerate pending approvals (read-only).
+//! - `stellar-agent approve serve`: local web UI for the pending-approval
 //!   queue (loopback HTTP; approve/reject in a browser).
 //!
 //! # Dispatch
 //!
 //! [`ApproveArgs`] is a `clap` [`Args`] struct with:
 //!
-//! - A flattened [`run::RunArgs`] for the bare `approve --id <nonce>` form.
+//! - A flattened [`run::RunArgs`] for the bare `approve --id <nonce> --profile <name>` form.
 //! - An optional nested [`ApproveSubcommand`] for subcommands (`gc`, `list`,
 //!   `serve`).
 //!
@@ -30,8 +30,8 @@
 //! # UX forms
 //!
 //! ```text
-//! stellar-agent approve --id ABCnonce
-//! stellar-agent approve --id ABCnonce --yes
+//! stellar-agent approve --id ABCnonce --profile <name>
+//! stellar-agent approve --id ABCnonce --profile <name> --yes
 //! stellar-agent approve gc
 //! stellar-agent approve gc --profile <name>
 //! stellar-agent approve list
@@ -54,7 +54,7 @@ use clap::{Args, Subcommand};
 /// Arguments for the `approve` subcommand group.
 ///
 /// Accepts either:
-/// - A bare `approve --id <nonce>` invocation (interactive or `--yes`
+/// - A bare `approve --id <nonce> --profile <name>` invocation (interactive or `--yes`
 ///   non-interactive), or
 /// - A nested `gc`, `list`, or `serve` subcommand.
 ///
@@ -66,7 +66,7 @@ use clap::{Args, Subcommand};
 pub struct ApproveArgs {
     /// Optional nested subcommand (`gc`, `list`, or `serve`).
     ///
-    /// When `None`, the `approve --id <nonce>` run path is taken and
+    /// When `None`, the `approve --id <nonce> --profile <name>` run path is taken and
     /// `--id` from the flattened [`run::RunArgs`] is required.
     #[command(subcommand)]
     pub subcommand: Option<ApproveSubcommand>,
@@ -110,7 +110,7 @@ pub enum ApproveSubcommand {
 ///
 /// Dispatches to [`gc::run`], [`list::run`], or [`serve::run`] when the
 /// matching subcommand is present, or to [`run::run`] for the bare
-/// `approve --id <nonce>` form.
+/// `approve --id <nonce> --profile <name>` form.
 ///
 /// Returns `0` on success, `1` on any error.
 ///

@@ -274,9 +274,18 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
         // Store dropped: lock released so the commit gate can open it.
     }
 
-    // The attestation blob exactly as `stellar-agent approve --id` surfaces it.
+    // The attestation blob exactly as `stellar-agent approve --id <nonce> --profile <name>` surfaces it.
     let sha = envelope_sha256(envelope_xdr.as_bytes());
-    let blob = compute_attestation(&attestation_key, &approval_nonce, &sha, &uid);
+    let blob = compute_attestation(
+        &attestation_key,
+        &stellar_agent_core::approval::AttestationBinding::new(
+            &server.profile_name_for_approval(),
+            "stellar:testnet",
+        ),
+        &approval_nonce,
+        &sha,
+        &uid,
+    );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
 
     // ── 3. Commit: gate verifies the attestation, signs, and submits on-chain ──
