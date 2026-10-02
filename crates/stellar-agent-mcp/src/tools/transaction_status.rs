@@ -107,7 +107,7 @@ impl WalletServer {
             }
         };
 
-        let client = StellarRpcClient::new(&self.profile.rpc_url).map_err(|err| {
+        let client = StellarRpcClient::new(&self.context.rpc_url).map_err(|err| {
             rmcp::ErrorData::internal_error(redact_rpc_error_detail("rpc_client_error", &err), None)
         })?;
 

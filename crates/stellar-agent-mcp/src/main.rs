@@ -133,7 +133,8 @@ Options:
   -V, --version         Print the version and exit.
 
 The selected profile binds at startup and stays bound for the life of the
-process.";
+process. A mainnet profile needs `--profile <NAME>`, including `--profile default`.
+STELLAR_AGENT_PROFILE never selects a mainnet profile.";
 
 /// What a parsed argv asks the process to do.
 #[derive(Debug, PartialEq, Eq)]
@@ -297,11 +298,13 @@ fn resolve_and_validate_profile_name(requested: Option<&str>) -> ResolvedProfile
 fn load_selected_profile(
     resolved: &ResolvedProfileName,
 ) -> Result<Profile, loader::ProfileLoadError> {
-    if resolved.source.is_explicit() {
-        loader::load(&resolved.name, None)
+    let profile = if resolved.source.is_explicit() {
+        loader::load(&resolved.name, None)?
     } else {
-        loader::load_default_or_testnet_fallback()
-    }
+        loader::load_default_or_testnet_fallback()?
+    };
+    stellar_agent_core::profile::check_mainnet_selection(&profile, resolved)?;
+    Ok(profile)
 }
 
 #[tokio::main]
@@ -390,6 +393,16 @@ async fn main() {
             );
             p
         }
+        Err(err @ loader::ProfileLoadError::MainnetRequiresExplicitProfile { .. }) => {
+            tracing::error!(
+                profile = %resolved_profile.name,
+                profile_source = resolved_profile.source.as_str(),
+                code = err.to_validation_error(&resolved_profile.name).code(),
+                "stellar-agent-mcp: {err}; run `stellar-agent-mcp --profile {}`",
+                resolved_profile.name
+            );
+            std::process::exit(1);
+        }
         Err(loader::ProfileLoadError::NotFound { name, path }) => {
             let origin = match resolved_profile.source {
                 ProfileNameSource::Flag => "the --profile flag",
@@ -413,6 +426,7 @@ async fn main() {
                 error = %err,
                 profile = %resolved_profile.name,
                 profile_source = resolved_profile.source.as_str(),
+                code = err.to_validation_error(&resolved_profile.name).code(),
                 "stellar-agent-mcp: failed to load profile; aborting"
             );
             std::process::exit(1);
@@ -646,6 +660,8 @@ mod tests {
     fn usage_text_documents_the_profile_flag_and_environment_variable() {
         assert!(super::USAGE.contains("--profile <NAME>"));
         assert!(super::USAGE.contains("STELLAR_AGENT_PROFILE"));
+        assert!(super::USAGE.contains("A mainnet profile needs `--profile <NAME>`"));
+        assert!(super::USAGE.contains("STELLAR_AGENT_PROFILE never selects a mainnet profile"));
         assert!(
             !super::USAGE.contains("Takes no arguments"),
             "the help text must not claim the binary takes no arguments"

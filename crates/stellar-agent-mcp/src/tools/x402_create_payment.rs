@@ -195,7 +195,7 @@ impl WalletServer {
         // wallet does not submit. Refuse on a mainnet profile so no valid
         // mainnet payment signature is ever produced. Wire code:
         // network.mainnet_write_forbidden.
-        if self.profile.chain_id.is_mainnet() {
+        if self.context.chain_id.is_mainnet() {
             return Ok(crate::tools::common::x402_mainnet_signing_forbidden_result());
         }
 
@@ -315,8 +315,8 @@ impl WalletServer {
 
         // ── Resolve RPC URL from active profile (NEVER from input) ────────────
         // RPC URL is operator-controlled, not facilitator-supplied.
-        let rpc_url = self.profile.rpc_url.as_str();
-        let profile_passphrase = self.profile.network_passphrase.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
+        let profile_passphrase = self.context.network_passphrase();
 
         let payer_address = account.to_owned();
 

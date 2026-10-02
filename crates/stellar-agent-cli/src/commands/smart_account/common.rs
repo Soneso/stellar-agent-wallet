@@ -19,6 +19,7 @@ use stellar_agent_core::error::{IoSource, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_path_in_message;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::wallet::MlockDegradation;
+use stellar_agent_network::NetworkContext;
 use stellar_agent_network::Signer;
 use stellar_agent_smart_account::SaError;
 use stellar_agent_smart_account::managers::rules::{
@@ -29,9 +30,7 @@ use stellar_agent_smart_account::managers::signers::{SignersManager, SignersMana
 use uuid::Uuid;
 
 use crate::common::network::TargetNetwork;
-use crate::common::profile_access::{
-    ProfileAccessError, load_profile_reconciled_by_requested_name,
-};
+use crate::common::profile_access::{ProfileAccessError, load_profile_reconciled};
 use crate::common::render::render_json;
 use crate::common::signer_ceremony::{
     SignerCeremonyOutcome, record_mlock_degradation, resolve_software_signer_from_env,
@@ -91,20 +90,16 @@ pub struct CommonHandlerContext {
     pub smart_account: SmartAccountAddress,
     /// Resolved profile name.
     pub profile_name: String,
+    /// Profile name and selection source used for reconciled loads.
+    resolved_profile: ResolvedProfileName,
     /// Shared audit writer handle.
     pub audit_writer: Arc<Mutex<AuditWriter>>,
     /// Audit log path backing `audit_writer`.
     pub audit_log_path: PathBuf,
-    /// Stellar network passphrase.
-    pub network_passphrase: String,
-    /// Primary RPC URL.
-    pub rpc_url: String,
-    /// Secondary RPC URL after defaulting to `rpc_url`.
-    pub secondary_rpc_url: String,
+    /// Network identity resolved by the command.
+    pub context: NetworkContext,
     /// Submission timeout.
     pub timeout: Duration,
-    /// CAIP-2 chain ID.
-    pub chain_id: String,
 }
 
 impl CommonHandlerContext {
@@ -114,24 +109,20 @@ impl CommonHandlerContext {
     ///
     /// Returns a wallet error when signer resolution, smart-account parsing,
     /// audit-log opening, or path setup fails.
-    pub async fn new(args: &impl CommonArgsView) -> Result<Self, WalletError> {
+    pub async fn new(
+        args: &impl CommonArgsView,
+        context: &NetworkContext,
+    ) -> Result<Self, WalletError> {
         let resolved = resolve_profile_name(args.profile());
         let profile_name = resolved.name.clone();
         let (signer, mlock_degradation) =
-            resolve_signer(args.signer_source(), Some(&profile_name)).await?;
+            resolve_signer(args.signer_source(), Some(&resolved)).await?;
         let smart_account = parse_c_strkey_to_smart_account(args.account()).map_err(|e| {
             WalletError::Validation(ValidationError::AddressInvalid {
                 input: format!("--account: {e}"),
             })
         })?;
-        let network_passphrase = args.network().passphrase().to_owned();
-        let rpc_url = args.rpc_url().to_owned();
-        let secondary_rpc_url = args
-            .secondary_rpc_url()
-            .unwrap_or(args.rpc_url())
-            .to_owned();
         let timeout = Duration::from_secs(args.timeout_seconds());
-        let chain_id = args.network().caip2().caip2_str().to_owned();
 
         let (_audit_profile, audit_writer, audit_log_path) = open_profile_audit_writer(&resolved)?;
         record_mlock_degradation(
@@ -145,13 +136,11 @@ impl CommonHandlerContext {
             signer,
             smart_account,
             profile_name,
+            resolved_profile: resolved,
             audit_writer,
             audit_log_path,
-            network_passphrase,
-            rpc_url,
-            secondary_rpc_url,
+            context: context.clone(),
             timeout,
-            chain_id,
         })
     }
 
@@ -166,10 +155,7 @@ impl CommonHandlerContext {
     pub fn signers_manager(&self) -> Result<SignersManager, WalletError> {
         construct_signers_manager_from_fields(
             &self.profile_name,
-            &self.network_passphrase,
-            &self.chain_id,
-            &self.rpc_url,
-            &self.secondary_rpc_url,
+            &self.context,
             self.timeout,
             Arc::clone(&self.audit_writer),
             &self.audit_log_path,
@@ -204,28 +190,16 @@ impl CommonHandlerContext {
 
         // Resolve the effective horizon cap from the profile's
         // `session_rule_max_horizon_ledgers`.
-        let horizon_override =
-            match load_profile_reconciled_by_requested_name(&self.profile_name, None) {
-                Ok(profile) => profile.session_rule_max_horizon_ledgers,
-                Err(e @ ProfileAccessError::NameMismatch(_)) => {
-                    return Err(e.to_wallet_error(&self.profile_name));
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        profile = %self.profile_name,
-                        error = %e,
-                        "smart-account: profile load for the session-rule horizon cap failed; \
-                         using DEFAULT_SESSION_RULE_HORIZON_LEDGERS"
-                    );
-                    None
-                }
-            };
+        let horizon_override = horizon_override_from_profile(
+            load_profile_reconciled(&self.resolved_profile, None),
+            &self.profile_name,
+        )?;
 
         let mut config = ContextRuleManagerConfig::new(
-            self.rpc_url.clone(),
-            self.network_passphrase.clone(),
+            self.context.rpc_url.clone(),
+            self.context.network_passphrase().to_owned(),
             self.timeout,
-            self.chain_id.clone(),
+            self.context.chain_id.caip2_str().to_owned(),
         )
         .with_signers_manager(Arc::new(signers_manager))
         .with_audit_writer(Arc::clone(&self.audit_writer));
@@ -266,7 +240,7 @@ impl CommonHandlerContext {
 /// `validation.secret_env_invalid`).
 pub(crate) async fn resolve_signer(
     signer_source: &SignerSourceFlags,
-    profile_name: Option<&str>,
+    profile_name: Option<&ResolvedProfileName>,
 ) -> Result<(Box<dyn Signer + Send + Sync>, Option<MlockDegradation>), WalletError> {
     if signer_source.sign_with_ledger {
         use stellar_agent_network::signing::hardware::HardwareSigningKey;
@@ -307,26 +281,26 @@ pub(crate) async fn resolve_signer(
 /// Returns [`WalletError::Validation`] wrapping
 /// [`ValidationError::ConfigInvalid`] with `component = "SignersManager"`
 /// when [`SignersManager::new`] fails (e.g. invalid RPC URL format).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn construct_signers_manager_from_fields(
     profile_name: &str,
-    network_passphrase: &str,
-    chain_id: &str,
-    rpc_url: &str,
-    secondary_rpc_url: &str,
+    context: &NetworkContext,
     timeout: Duration,
     audit_writer: Arc<Mutex<AuditWriter>>,
     audit_log_path: &std::path::Path,
 ) -> Result<SignersManager, WalletError> {
     let config = SignersManagerConfig::new(
-        rpc_url.to_owned(),
-        secondary_rpc_url.to_owned(),
+        context.rpc_url.clone(),
+        context
+            .secondary_rpc_url
+            .as_deref()
+            .unwrap_or(&context.rpc_url)
+            .to_owned(),
         audit_writer,
         audit_log_path.to_path_buf(),
-        network_passphrase.to_owned(),
+        context.network_passphrase().to_owned(),
         profile_name.to_owned(),
         timeout,
-        chain_id.to_owned(),
+        context.chain_id.caip2_str().to_owned(),
     );
     SignersManager::new(config).map_err(|e| {
         WalletError::Validation(ValidationError::ConfigInvalid {
@@ -499,17 +473,21 @@ pub(crate) fn open_profile_audit_writer(
 /// Maps a profile-access failure onto the typed error the audit-writer helpers
 /// return.
 ///
-/// A name mismatch keeps its own `profile.name_mismatch` wire code rather than
-/// being flattened into an I/O failure: it is the refusal every caller of these
-/// helpers must be able to recognise, and several of them treat a writer-open
-/// I/O failure as non-fatal.
+/// `profile.name_mismatch`, `profile.non_overlayable_field`, and
+/// `profile.mainnet_requires_explicit_profile` keep their own wire codes.
+/// Other load failures map to an audit-writer I/O error.
 fn map_access_error(
     err: &crate::common::profile_access::ProfileAccessError,
     profile_name: &str,
 ) -> WalletError {
-    use crate::common::profile_access::ProfileAccessError;
+    use stellar_agent_core::profile::loader::ProfileLoadError;
+
     match err {
-        ProfileAccessError::NameMismatch(_) => err.to_wallet_error(profile_name),
+        ProfileAccessError::NameMismatch(_)
+        | ProfileAccessError::Load(
+            ProfileLoadError::NonOverlayableField { .. }
+            | ProfileLoadError::MainnetRequiresExplicitProfile { .. },
+        ) => err.to_wallet_error(profile_name),
         ProfileAccessError::Load(_) => wallet_io_error(
             IoSource::AuditWriterSetup,
             format!("profile resolution failed: {}", err.message(profile_name)),
@@ -553,6 +531,24 @@ pub(crate) fn open_profile_audit_writer_read_only(
     Ok((profile, writer, log_path))
 }
 
+fn horizon_override_from_profile(
+    loaded: Result<stellar_agent_core::profile::schema::Profile, ProfileAccessError>,
+    profile_name: &str,
+) -> Result<Option<u32>, WalletError> {
+    match loaded {
+        Ok(profile) => Ok(profile.session_rule_max_horizon_ledgers),
+        Err(error) if error.requires_refusal() => Err(error.to_wallet_error(profile_name)),
+        Err(error) => {
+            tracing::debug!(
+                profile = profile_name,
+                error = %error,
+                "session-rule horizon profile unavailable; using the default"
+            );
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::panic, reason = "test-only assertions")]
@@ -560,6 +556,32 @@ mod tests {
     use stellar_agent_core::profile::name::ProfileNameSource;
 
     use super::*;
+
+    #[test]
+    fn audit_writer_mapping_preserves_protected_refusals() {
+        for error in crate::common::profile_access::protected_load_errors_for_test() {
+            let expected = error.code();
+            let result = Err::<(), _>(map_access_error(&error, "mainnet"));
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("protected refusal was swallowed"),
+            };
+            assert_eq!(error.code(), expected);
+        }
+    }
+
+    #[test]
+    fn horizon_override_preserves_protected_refusals() {
+        for error in crate::common::profile_access::protected_load_errors_for_test() {
+            let expected = error.code();
+            let result = horizon_override_from_profile(Err(error), "mainnet");
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("protected refusal was swallowed"),
+            };
+            assert_eq!(error.code(), expected);
+        }
+    }
 
     /// A refusal the spending window decided keeps the criterion's own code
     /// through the smart-account bridge, rather than reading as an `sa.*`

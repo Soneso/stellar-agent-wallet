@@ -56,8 +56,8 @@ pub mod schema;
 
 pub use caip2::{ChainIdValidationError, validate_chain_id_matches_profile};
 pub use name::{
-    PROFILE_ENV_VAR, ProfileNameSource, ResolvedProfileName, resolve_profile_name,
-    validate_path_component_ascii_safe,
+    PROFILE_ENV_VAR, ProfileNameSource, ResolvedProfileName, check_mainnet_selection,
+    resolve_profile_name, validate_path_component_ascii_safe,
 };
 pub use receipt::{
     BeginOutcome, ReceiptStatus, ReceiptStore, ReceiptStoreError, SubmissionReceipt,

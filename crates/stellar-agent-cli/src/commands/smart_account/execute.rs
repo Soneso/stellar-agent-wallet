@@ -103,6 +103,7 @@ use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{AuthError, NetworkError, ValidationError, WalletError};
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
+use stellar_agent_network::NetworkContext;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::submit::redact_tx_hash;
 use stellar_agent_smart_account::error::SaError;
@@ -291,9 +292,12 @@ struct ExecutePlan {
 /// - [`ValidationError::XdrArgumentMalformed`] — an `--arg` value that does
 ///   not decode as bounded standard-base64 XDR `ScVal` (the failing index is
 ///   named).
-fn validate_execute_inputs(args: &ExecuteArgs) -> Result<ExecutePlan, WalletError> {
+fn validate_execute_inputs(
+    args: &ExecuteArgs,
+    context: &NetworkContext,
+) -> Result<ExecutePlan, WalletError> {
     // ── Mainnet structural refusal — before any RPC or key access ──────────
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
     }
 
@@ -334,7 +338,7 @@ fn validate_execute_inputs(args: &ExecuteArgs) -> Result<ExecutePlan, WalletErro
     // Resolve the Ed25519-verifier address: --verifier override else the
     // VerifierRegistry's registered entry for the target network. Fail
     // closed, mirroring `signers add --signer-ed25519`'s pattern exactly.
-    let network_passphrase = args.network.passphrase();
+    let network_passphrase = context.network_passphrase();
     let verifier_c_strkey = if let Some(explicit) = &args.verifier {
         explicit.clone()
     } else {
@@ -403,6 +407,8 @@ fn validate_execute_inputs(args: &ExecuteArgs) -> Result<ExecutePlan, WalletErro
 ///
 /// Never panics.
 pub async fn run(args: &ExecuteArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone())
+        .with_secondary(args.secondary_rpc_url.clone());
     let request_id = new_request_id();
     let account_redacted = redact_strkey_first5_last5(&args.account);
 
@@ -410,7 +416,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     // and fail-closed verifier resolution — all before any key material or
     // RPC access. Extracted so tests assert the typed refusal, not an exit
     // code.
-    let plan = match validate_execute_inputs(args) {
+    let plan = match validate_execute_inputs(args, &context) {
         Ok(p) => p,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -420,7 +426,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         verifier_c_strkey,
         arg_count,
     } = plan;
-    let network_passphrase = args.network.passphrase();
+    let network_passphrase = context.network_passphrase();
     let resolved_profile = resolve_profile_name(args.profile.as_deref());
     let profile_name = resolved_profile.name.clone();
 
@@ -441,10 +447,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     // check use the submission's RPC endpoints under the rule's lock.
     let signers_manager = match construct_signers_manager_from_fields(
         &profile_name,
-        network_passphrase,
-        args.network.caip2().caip2_str(),
-        &args.rpc_url,
-        args.secondary_rpc_url.as_deref().unwrap_or(&args.rpc_url),
+        &context,
         Duration::from_secs(args.timeout_seconds),
         Arc::clone(&audit_writer),
         &audit_log_path,
@@ -463,7 +466,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     } = match resolve_software_signer_from_env(
         &args.rule_signer_ed25519_secret_env,
         "smart-account-execute",
-        Some(&profile_name),
+        Some(&resolved_profile),
     )
     .await
     {
@@ -501,7 +504,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
 
     // ── Fee-payer signer ────────────────────────────────────────────────────
     let (fee_payer_signer, fee_payer_mlock_degradation) =
-        match resolve_signer(&args.signer_source, Some(&profile_name)).await {
+        match resolve_signer(&args.signer_source, Some(&resolved_profile)).await {
             Ok(pair) => pair,
             Err(e) => {
                 drop(rule_signer);
@@ -509,7 +512,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             }
         };
 
-    let chain_id = args.network.caip2().caip2_str();
+    let chain_id = context.chain_id.caip2_str();
     let auth_rule_ids_display: Vec<u32> = args.auth_rule_id.clone();
     let auth_rule_ids: Vec<ContextRuleId> = args
         .auth_rule_id
@@ -536,7 +539,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     };
     // Settle what stands open before this verb's own submission, so a
     // reservation an earlier verb left behind stops counting against the cap.
-    if let Ok(reconcile_client) = stellar_agent_network::StellarRpcClient::new(&args.rpc_url) {
+    if let Ok(reconcile_client) = stellar_agent_network::StellarRpcClient::new(&context.rpc_url) {
         crate::commands::submission_record::reconcile_open_reservations(
             &profile,
             &profile_name,
@@ -577,8 +580,8 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
                 signer: &rule_signer,
                 verifier: verifier_sc_addr,
             })
-            .primary_rpc_url(&args.rpc_url)
-            .maybe_secondary_rpc_url(args.secondary_rpc_url.as_deref())
+            .primary_rpc_url(&context.rpc_url)
+            .maybe_secondary_rpc_url(context.secondary_rpc_url.as_deref())
             .network_passphrase(network_passphrase)
             .chain_id(chain_id)
             .timeout(Duration::from_secs(args.timeout_seconds))
@@ -1124,7 +1127,11 @@ mod tests {
     fn validate_inputs_mainnet_yields_mainnet_write_forbidden() {
         let mut args = minimal_args();
         args.network = TargetNetwork::Mainnet;
-        let err = validate_execute_inputs(&args).expect_err("mainnet must refuse");
+        let err = validate_execute_inputs(
+            &args,
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+        )
+        .expect_err("mainnet must refuse");
         assert_eq!(err.code(), "network.mainnet_write_forbidden");
     }
 
@@ -1134,7 +1141,11 @@ mod tests {
     fn validate_inputs_empty_function_names_the_flag() {
         let mut args = minimal_args();
         args.function = String::new();
-        let err = validate_execute_inputs(&args).expect_err("empty function must refuse");
+        let err = validate_execute_inputs(
+            &args,
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+        )
+        .expect_err("empty function must refuse");
         assert_eq!(err.code(), "validation.address_invalid");
         assert!(
             err.to_string().contains("--function"),
@@ -1149,7 +1160,11 @@ mod tests {
     fn validate_inputs_malformed_arg_names_failing_index() {
         let mut args = minimal_args();
         args.arg = vec![VOID_ARG_B64.to_owned(), "not-valid-base64!!".to_owned()];
-        let err = validate_execute_inputs(&args).expect_err("malformed arg must refuse");
+        let err = validate_execute_inputs(
+            &args,
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+        )
+        .expect_err("malformed arg must refuse");
         assert_eq!(err.code(), "validation.xdr_argument_malformed");
         assert!(
             err.to_string().contains("--arg[1]"),
@@ -1166,7 +1181,11 @@ mod tests {
         let _home = StellarAgentHomeGuard::new(dir.path());
         let mut args = minimal_args();
         args.verifier = None;
-        let err = validate_execute_inputs(&args).expect_err("missing verifier must refuse");
+        let err = validate_execute_inputs(
+            &args,
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+        )
+        .expect_err("missing verifier must refuse");
         assert_eq!(err.code(), "validation.address_invalid");
         assert!(
             err.to_string().contains("deploy-ed25519-verifier"),
@@ -1186,7 +1205,11 @@ mod tests {
         args.contract = VALID_C.to_owned();
         args.verifier = Some(VALID_C.to_owned());
         args.arg = vec![VOID_ARG_B64.to_owned()];
-        let plan = validate_execute_inputs(&args).expect("valid inputs must produce a plan");
+        let plan = validate_execute_inputs(
+            &args,
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+        )
+        .expect("valid inputs must produce a plan");
         assert_eq!(plan.arg_count, 1);
         assert_eq!(plan.verifier_c_strkey, VALID_C);
         assert!(matches!(

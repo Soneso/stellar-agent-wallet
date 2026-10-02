@@ -57,6 +57,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Args;
 use keyring_core::Entry as KeyringEntry;
 use serde_json::json;
+use stellar_agent_network::NetworkContext;
 
 use stellar_agent_core::approval::store::PendingApproval;
 use stellar_agent_core::approval::user_id::process_uid_for_attestation;
@@ -213,7 +214,8 @@ where
 {
     // ── Resolve the profile name ──────────────────────────────────────────────
     // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved.name.clone();
 
     // ── Load profile ──────────────────────────────────────────────────────────
     // Reconciled in the CALLER of the injected loader: a check placed inside
@@ -222,9 +224,9 @@ where
     // The load failure keeps this verb's own `trustline.profile_load_failed`
     // code; a name mismatch reports the shared `profile.name_mismatch`, which
     // is the same code every other CLI surface emits for it.
-    let profile = match reconcile_loaded_profile(load_profile(&profile_name), &profile_name) {
+    let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
         Ok(p) => p,
-        Err(e @ ProfileAccessError::Load(_)) => {
+        Err(e @ ProfileAccessError::Load(_)) if !e.requires_refusal() => {
             render_json(&Envelope::<()>::err_raw(
                 "trustline.profile_load_failed",
                 e.message(&profile_name),
@@ -246,12 +248,13 @@ where
         return 1;
     }
 
-    let rpc_url = profile.rpc_url.as_str();
-    let network_passphrase = profile.network_passphrase.as_str();
+    let context = NetworkContext::from_profile(&profile);
+    let rpc_url = context.rpc_url.as_str();
+    let network_passphrase = context.network_passphrase();
     let chain_id: String = args
         .chain_id
         .clone()
-        .unwrap_or_else(|| profile.chain_id.caip2_str().to_owned());
+        .unwrap_or_else(|| context.chain_id.caip2_str().to_owned());
     let chain_id = chain_id.as_str();
 
     // ── Validate G-strkey ─────────────────────────────────────────────────────
@@ -433,7 +436,7 @@ where
     // loads the attestation key from the keyring and calls `verify_attestation`
     // (constant-time HMAC-SHA256).  A presence-only check allows forged blobs.
     //
-    // Network key: `profile.chain_id.caip2_str()` — canonical and consistent
+    // Network key: `context.chain_id.caip2_str()` is canonical and consistent
     // across mint, digest, record, and lookup.
     //
     // Keyring unavailable → fail-closed: opt-in treated as absent.
@@ -447,7 +450,7 @@ where
             return 1;
         }
     };
-    let network_key = profile.chain_id.caip2_str();
+    let network_key = context.chain_id.caip2_str();
     let opt_in_present: bool = {
         match load_attestation_key_for_verify(&profile) {
             Ok(key_bytes) => {
@@ -462,7 +465,7 @@ where
                                     &attestation_key,
                                     &stellar_agent_core::approval::AttestationBinding::new(
                                         &profile_name,
-                                        profile.chain_id.caip2_str(),
+                                        context.chain_id.caip2_str(),
                                     ),
                                     network_key,
                                     &resolved.code,

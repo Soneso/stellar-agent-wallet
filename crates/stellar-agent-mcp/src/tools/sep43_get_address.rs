@@ -100,7 +100,7 @@ impl WalletServer {
         // `chain_id` entirely.  When omitted, fall back to the profile's CAIP-2 chain so
         // `dispatch_gate`'s chain-ID validation step always receives a non-empty string.
         // The WalletConnect host passes `{}` (no chain_id).
-        let profile_chain = self.profile.chain_id.caip2_str();
+        let profile_chain = self.context.chain_id.caip2_str();
         let effective_chain: &str = args.chain_id.as_deref().unwrap_or(profile_chain);
         let args_value = json!({ "chain_id": effective_chain });
         // Read-only tool: RequireApproval produces no signing material; proceed.

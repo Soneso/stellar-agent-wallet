@@ -193,8 +193,8 @@ impl WalletServer {
             crate::tools::amount_wire::parse_i128_field("qty_out_min", &args.qty_out_min)?;
 
         // ── Resolve network settings ──────────────────────────────────────────
-        let network_passphrase = self.profile.network_passphrase.as_str();
-        let rpc_url = self.profile.rpc_url.as_str();
+        let network_passphrase = self.context.network_passphrase();
+        let rpc_url = self.context.rpc_url.as_str();
 
         // ── Resolve pinned router address and WASM hash for network ──────────
         // Table lookup only (no RPC); safe to resolve ahead of the policy gate.
@@ -508,8 +508,8 @@ impl WalletServer {
         }
 
         // ── Resolve network settings ──────────────────────────────────────────
-        let network_passphrase = self.profile.network_passphrase.as_str();
-        let rpc_url = self.profile.rpc_url.as_str();
+        let network_passphrase = self.context.network_passphrase();
+        let rpc_url = self.context.rpc_url.as_str();
 
         // ── Resolve pinned router address ─────────────────────────────────────
         let (router_address, _) = pinned_router_for_network(&args.chain_id).map_err(|e| {

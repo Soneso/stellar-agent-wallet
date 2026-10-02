@@ -71,6 +71,7 @@ use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::profile::caip2::MAINNET_RPC_URL;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
+use stellar_agent_network::NetworkContext;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::credentials::CredentialsManager;
 use stellar_agent_smart_account::managers::rules::{
@@ -229,6 +230,7 @@ pub struct CommonRulesReadArgs {
 /// Returns `Err(1)` with a JSON envelope emitted to stdout when context
 /// construction or manager creation fails.
 async fn prepare_write_context<A>(
+    context: &NetworkContext,
     args: &A,
     output: OutputFormat,
     request_id: &str,
@@ -236,7 +238,7 @@ async fn prepare_write_context<A>(
 where
     A: CommonArgsView + Sync,
 {
-    let ctx = CommonHandlerContext::new(args)
+    let ctx = CommonHandlerContext::new(args, context)
         .await
         .map_err(|e| emit_error(&e, output, request_id))?;
     let manager = ctx
@@ -669,10 +671,12 @@ pub struct CreateResult {
 }
 
 async fn create_run(args: &CreateArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
     let account_redacted = redact_strkey_first5_last5(&args.common.account);
 
-    if args.common.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             args.common.output,
@@ -806,7 +810,7 @@ async fn create_run(args: &CreateArgs) -> i32 {
             }
         };
 
-        let network_passphrase = args.common.network.passphrase();
+        let network_passphrase = context.network_passphrase();
         let verifier_entry = match verifier_registry.webauthn_verifier_for(network_passphrase) {
             Some(e) => e,
             None => {
@@ -974,7 +978,7 @@ async fn create_run(args: &CreateArgs) -> i32 {
                     );
                 }
             };
-            let network_passphrase = args.common.network.passphrase();
+            let network_passphrase = context.network_passphrase();
             match verifier_registry.ed25519_verifier_for(network_passphrase) {
                 Some(entry) => entry.address.clone(),
                 None => {
@@ -1046,7 +1050,7 @@ async fn create_run(args: &CreateArgs) -> i32 {
     // `prepare_write_context` because it has substantial pre-validation above.
     // The explicit `context_rule_manager()` call is required to wire the
     // `SignersManager` for wasm-hash pin enforcement.
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.common.output, &request_id),
     };
@@ -1163,6 +1167,8 @@ pub struct GetResult {
 }
 
 async fn get_run(args: &GetArgs) -> i32 {
+    let context =
+        NetworkContext::from_flags(args.common.network.caip2(), args.common.rpc_url.clone());
     let request_id = new_request_id();
     let account_redacted = redact_strkey_first5_last5(&args.common.account);
 
@@ -1184,11 +1190,7 @@ async fn get_run(args: &GetArgs) -> i32 {
     // Use the read-only builder (no SignersManager): get_rule is a simulation-
     // only read path; there is nothing to authorise and no divergence check is
     // warranted.
-    let manager = match build_readonly_manager(
-        args.common.network,
-        &args.common.rpc_url,
-        args.common.timeout_seconds,
-    ) {
+    let manager = match build_readonly_manager(&context, args.common.timeout_seconds) {
         Ok(m) => m,
         Err(e) => return emit_error(&e, args.common.output, &request_id),
     };
@@ -1266,10 +1268,12 @@ pub struct SetNameResult {
 }
 
 async fn set_name_run(args: &SetNameArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
     let account_redacted = redact_strkey_first5_last5(&args.common.account);
 
-    if args.common.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             args.common.output,
@@ -1289,10 +1293,11 @@ async fn set_name_run(args: &SetNameArgs) -> i32 {
         );
     }
 
-    let (ctx, manager) = match prepare_write_context(args, args.common.output, &request_id).await {
-        Ok(pair) => pair,
-        Err(code) => return code,
-    };
+    let (ctx, manager) =
+        match prepare_write_context(&context, args, args.common.output, &request_id).await {
+            Ok(pair) => pair,
+            Err(code) => return code,
+        };
 
     let auth_rule_ids = vec![ContextRuleId::new(
         args.auth_rule_id.unwrap_or(args.rule_id),
@@ -1365,10 +1370,12 @@ pub struct SetValidUntilResult {
 }
 
 async fn set_valid_until_run(args: &SetValidUntilArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
     let account_redacted = redact_strkey_first5_last5(&args.common.account);
 
-    if args.common.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             args.common.output,
@@ -1381,10 +1388,11 @@ async fn set_valid_until_run(args: &SetValidUntilArgs) -> i32 {
         Err(e) => return emit_error(&e, args.common.output, &request_id),
     };
 
-    let (ctx, manager) = match prepare_write_context(args, args.common.output, &request_id).await {
-        Ok(pair) => pair,
-        Err(code) => return code,
-    };
+    let (ctx, manager) =
+        match prepare_write_context(&context, args, args.common.output, &request_id).await {
+            Ok(pair) => pair,
+            Err(code) => return code,
+        };
 
     let auth_rule_ids = vec![ContextRuleId::new(
         args.auth_rule_id.unwrap_or(args.rule_id),
@@ -1493,10 +1501,12 @@ impl_common_args_view!(SetValidUntilArgs);
 impl_common_args_view!(DeleteArgs);
 
 async fn delete_run(args: &DeleteArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
     let account_redacted = redact_strkey_first5_last5(&args.common.account);
 
-    if args.common.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             args.common.output,
@@ -1504,10 +1514,11 @@ async fn delete_run(args: &DeleteArgs) -> i32 {
         );
     }
 
-    let (ctx, manager) = match prepare_write_context(args, args.common.output, &request_id).await {
-        Ok(pair) => pair,
-        Err(code) => return code,
-    };
+    let (ctx, manager) =
+        match prepare_write_context(&context, args, args.common.output, &request_id).await {
+            Ok(pair) => pair,
+            Err(code) => return code,
+        };
 
     let auth_rule_ids = vec![ContextRuleId::new(
         args.auth_rule_id.unwrap_or(args.rule_id),
@@ -1721,10 +1732,12 @@ fn verify_pins_exit_code(result: &VerifyPinsResult) -> i32 {
 }
 
 async fn verify_pins_run(args: &VerifyPinsArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
     let account_redacted = redact_strkey_first5_last5(&args.account);
 
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -1763,7 +1776,7 @@ async fn verify_pins_run(args: &VerifyPinsArgs) -> i32 {
         .await
     {
         Ok(sa_result) => {
-            let chain_id = ctx.chain_id.clone();
+            let chain_id = ctx.context.chain_id.caip2_str().to_owned();
             let result = VerifyPinsResult::from_sa(sa_result, chain_id);
             // Log the verdict at info level (no secret data in status strings).
             info!(
@@ -2023,11 +2036,13 @@ pub struct AddPolicyResult {
 }
 
 async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
     let account_redacted = redact_strkey_first5_last5(&args.account);
 
     // Mainnet write defence — structurally refuse before any RPC call.
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             args.output,
@@ -2195,7 +2210,7 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                         );
                     }
                 };
-                let passphrase = args.network.passphrase();
+                let passphrase = context.network_passphrase();
                 match registry.spending_limit_policy_for(passphrase) {
                     Some(entry) => entry.address.clone(),
                     None => {
@@ -2278,7 +2293,7 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
 
             let policy_address = match resolve_policy_address_override_or_registry(
                 &args.policy,
-                args.network.passphrase(),
+                context.network_passphrase(),
                 "simple-threshold",
                 |reg, net| {
                     reg.simple_threshold_policy_for(net)
@@ -2362,7 +2377,7 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
 
             let policy_address = match resolve_policy_address_override_or_registry(
                 &args.policy,
-                args.network.passphrase(),
+                context.network_passphrase(),
                 "weighted-threshold",
                 |reg, net| {
                     reg.weighted_threshold_policy_for(net)
@@ -2415,7 +2430,7 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                         );
                     }
                 };
-                let network_passphrase = args.network.passphrase();
+                let network_passphrase = context.network_passphrase();
                 let verifier_entry = match verifier_registry
                     .webauthn_verifier_for(network_passphrase)
                 {
@@ -2502,7 +2517,7 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
     };
 
     // Build CommonHandlerContext (signer + manager + audit writer).
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -2738,11 +2753,13 @@ pub struct RemovePolicyResult {
 }
 
 async fn remove_policy_run(args: &RemovePolicyArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
     let account_redacted = redact_strkey_first5_last5(&args.account);
 
     // Mainnet write defence — structurally refuse before any RPC call.
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             args.output,
@@ -2757,7 +2774,7 @@ async fn remove_policy_run(args: &RemovePolicyArgs) -> i32 {
     };
 
     // Build CommonHandlerContext.
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -2884,6 +2901,8 @@ pub struct GetSpendingLimitResult {
 }
 
 async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
+    let context =
+        NetworkContext::from_flags(args.common.network.caip2(), args.common.rpc_url.clone());
     let request_id = new_request_id();
     let account_redacted = redact_strkey_first5_last5(&args.common.account);
 
@@ -2914,13 +2933,9 @@ async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
             Ok(triple) => triple,
             Err(e) => return emit_error(&e, args.common.output, &request_id),
         };
-    let chain_id = args.common.network.caip2().caip2_str();
     let manager = match construct_signers_manager_from_fields(
         &profile_name,
-        args.common.network.passphrase(),
-        chain_id,
-        &args.common.rpc_url,
-        &args.common.rpc_url,
+        &context,
         Duration::from_secs(args.common.timeout_seconds),
         audit_writer,
         &audit_log_path,
@@ -3100,11 +3115,13 @@ pub struct SetSpendingLimitResult {
 }
 
 async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
     let account_redacted = redact_strkey_first5_last5(&args.account);
 
     // Mainnet write defence — structurally refuse before any RPC call.
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             args.output,
@@ -3131,7 +3148,7 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
         );
     }
 
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -3448,14 +3465,13 @@ fn parse_rule_context(s: &str) -> Result<RuleContext, WalletError> {
 /// Write paths use the full `build_manager` which injects a `SignersManager`
 /// for the divergence check.
 fn build_readonly_manager(
-    network: TargetNetwork,
-    rpc_url: &str,
+    context: &NetworkContext,
     timeout_seconds: u64,
 ) -> Result<ContextRuleManager, WalletError> {
-    let chain_id = network.caip2().caip2_str();
+    let chain_id = context.chain_id.caip2_str();
     ContextRuleManager::new(ContextRuleManagerConfig::new(
-        rpc_url.to_owned(),
-        network.passphrase().to_owned(),
+        context.rpc_url.clone(),
+        context.network_passphrase().to_owned(),
         Duration::from_secs(timeout_seconds),
         chain_id.to_owned(),
     ))

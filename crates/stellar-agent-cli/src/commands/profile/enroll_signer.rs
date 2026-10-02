@@ -215,7 +215,8 @@ where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved.name.clone();
 
     // ── Load profile first, then initialise the keyring store ─────────────────
     // The env-merged load supplies the audit-emission context at the end of
@@ -224,7 +225,7 @@ where
     // Reconciled in the CALLER of the injected loader: several test closures
     // ignore the name they are handed, so a check placed inside one would be
     // bypassed by every test that supplies it.
-    let profile = match reconcile_loaded_profile(load_profile(&profile_name), &profile_name) {
+    let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
@@ -271,7 +272,7 @@ where
     let derived_g = match resolve_software_signer_from_env(
         &args.secret_env,
         "profile-enroll-signer",
-        Some(&profile_name),
+        Some(&resolved),
     )
     .await
     {

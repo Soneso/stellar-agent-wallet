@@ -249,7 +249,7 @@ fn no_production_call_site_loads_a_profile_outside_the_choke_point() {
             violations.push(format!(
                 "{rel}:{} — a production profile load bypasses the reconciliation choke \
                  point; route it through `crate::common::profile_access` \
-                 (`load_profile_reconciled`, `load_profile_reconciled_by_requested_name`, \
+                 (`load_profile_reconciled`, \
                  `load_profile_or_synthesize_testnet`, `reconcile_loaded_profile`, or \
                  `injected_profile_load` for a dependency-injection seam whose CALLER \
                  reconciles). Adding an allow-set entry instead re-opens #107 for this \

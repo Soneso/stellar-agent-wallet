@@ -62,7 +62,7 @@ impl WalletServer {
                 validate_rpc_url_for_mcp(url)?;
                 url
             }
-            None => self.profile.rpc_url.as_str(),
+            None => self.context.rpc_url.as_str(),
         };
 
         let client = StellarRpcClient::new(rpc_url).map_err(|err| {

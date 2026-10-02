@@ -239,11 +239,12 @@ pub(crate) fn submit_timeout(profile: &Profile) -> std::time::Duration {
 /// [`stellar_agent_core::error::NetworkError::EndpointIdentityUnavailable`].
 pub(crate) async fn probe_endpoint_network(
     client: &stellar_agent_network::StellarRpcClient,
-    profile: &Profile,
+    context: &stellar_agent_network::NetworkContext,
+    timeout: std::time::Duration,
 ) -> Result<(), stellar_agent_core::error::WalletError> {
-    let deadline = tokio::time::Instant::now() + submit_timeout(profile);
+    let deadline = tokio::time::Instant::now() + timeout;
     client
-        .verify_network_passphrase(&profile.network_passphrase, deadline)
+        .verify_network_passphrase(context.network_passphrase(), deadline)
         .await
 }
 
@@ -1215,7 +1216,7 @@ impl WalletServer {
             tracing::debug!("window reconcile: system clock unavailable; reservations stand");
             return;
         };
-        let Ok(client) = stellar_agent_network::StellarRpcClient::new(&self.profile.rpc_url) else {
+        let Ok(client) = stellar_agent_network::StellarRpcClient::new(&self.context.rpc_url) else {
             return;
         };
         let profile_name = self.profile_name_for_approval();
@@ -1909,7 +1910,7 @@ pub(crate) async fn verify_attestation_gate(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new(
             &profile_name,
-            server.profile.chain_id.caip2_str(),
+            server.context.chain_id.caip2_str(),
         ),
         approval_nonce_str,
         &presented_sha256,
@@ -1995,6 +1996,7 @@ pub(crate) enum CrossCheckOutcome {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn high_value_cross_check<F, Fut>(
     profile: &Profile,
+    primary_rpc_url: &str,
     primary_rebuilt_xdr: &str,
     source_account: &str,
     asset_is_native: bool,
@@ -2039,7 +2041,7 @@ where
         return Ok(CrossCheckOutcome::Skipped);
     };
 
-    if rpc_urls_equivalent_for_cross_check(oracle_provider_url.as_str(), &profile.rpc_url) {
+    if rpc_urls_equivalent_for_cross_check(oracle_provider_url.as_str(), primary_rpc_url) {
         tracing::warn!(
             target: "policy.cross_check",
             tool = tool_name,
@@ -2934,6 +2936,7 @@ mod tests {
 
         let outcome = high_value_cross_check(
             &profile,
+            &profile.rpc_url,
             "same-envelope-xdr",
             "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
             true,
@@ -2984,6 +2987,7 @@ mod tests {
 
         let err = high_value_cross_check(
             &profile,
+            &profile.rpc_url,
             &primary_xdr,
             "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
             true,
@@ -3051,6 +3055,7 @@ mod tests {
 
         let outcome = high_value_cross_check(
             &profile,
+            &profile.rpc_url,
             "same-envelope-xdr",
             "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
             true,
@@ -3100,6 +3105,7 @@ mod tests {
 
         let err = high_value_cross_check(
             &profile,
+            &profile.rpc_url,
             "same-envelope-xdr",
             "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
             true,
@@ -3648,6 +3654,7 @@ mod tests {
         }
         std::sync::Arc::make_mut(&mut server.profile).chain_id =
             stellar_agent_core::profile::caip2::Caip2::Testnet;
+        server.context = stellar_agent_network::NetworkContext::from_profile(&server.profile);
         capture.clear();
         let result = verify_attestation_gate(
             &server,

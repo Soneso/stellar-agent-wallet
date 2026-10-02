@@ -3,10 +3,11 @@
 use clap::Args;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{ValidationError, WalletError};
+use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_network::{FeeStatsView, StellarRpcClient, fetch_fee_stats, validate_rpc_url};
 
 use crate::common::network::TESTNET_RPC_URL;
-use crate::common::profile_access::load_profile_reconciled_by_requested_name;
+use crate::common::profile_access::load_profile_reconciled;
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::render::table::render_fee_stats_table;
 
@@ -79,7 +80,7 @@ fn resolve_rpc_url(args: &FeesStatsArgs) -> Result<String, WalletError> {
         // not routed through the resolver. It is still reconciled — an endpoint
         // taken from a file that names another profile would send the query to
         // a network the operator did not select.
-        return load_profile_reconciled_by_requested_name(profile_name, None)
+        return load_profile_reconciled(&ResolvedProfileName::from_flag(profile_name), None)
             .map(|profile| profile.rpc_url)
             .map_err(|e| e.to_wallet_error(profile_name));
     }

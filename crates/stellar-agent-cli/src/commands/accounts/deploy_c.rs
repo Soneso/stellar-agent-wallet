@@ -45,8 +45,10 @@ use rand_core::{OsRng, RngCore};
 use stellar_agent_core::audit_log::writer::{AuditWriter, AuditWriterRegistry};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{InternalError, NetworkError, ValidationError, WalletError};
+use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::wallet::MlockDegradation;
+use stellar_agent_network::NetworkContext;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 use stellar_agent_network::{
     StellarRpcClient, parse_classic_fee_choice, resolve_classic_fee_selection,
@@ -321,8 +323,10 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone());
+    let resolved = resolve_profile_name(args.profile.as_deref());
     // First layer: structural mainnet rejection before any key access.
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
         let envelope = Envelope::<()>::err(&err);
         print_error(&envelope, args.output);
@@ -354,7 +358,7 @@ where
     // `signer_external` is non-None, enforced by the `genesis_signer_source`
     // ArgGroup at parse time.
     let (initial_signer_display, genesis_signer_scval_override) =
-        match resolve_genesis_signer_source(args).await {
+        match resolve_genesis_signer_source(args, &context).await {
             Ok(pair) => pair,
             Err(e) => {
                 let envelope = Envelope::<()>::err(&e);
@@ -374,7 +378,7 @@ where
     };
 
     // Resolve the deployer keypair.
-    let (deployer, deployer_mlock_degradation) = match resolve_deployer(args).await {
+    let (deployer, deployer_mlock_degradation) = match resolve_deployer(args, &resolved).await {
         Ok(d) => d,
         Err(e) => {
             let envelope = Envelope::<()>::err(&e);
@@ -383,7 +387,7 @@ where
         }
     };
 
-    let passphrase = args.network.passphrase();
+    let passphrase = context.network_passphrase();
 
     // Resolve the fee via ClassicFeeChoice. For dry-run mode we skip the RPC call
     // (no network access) and fall back to the profile default.
@@ -405,7 +409,7 @@ where
 
         // Only construct the RPC client when needed (non-dry-run). This avoids an
         // unnecessary network dependency in dry-run mode.
-        let fee_client = match StellarRpcClient::new(&args.rpc_url) {
+        let fee_client = match StellarRpcClient::new(&context.rpc_url) {
             Ok(c) => c,
             Err(e) => {
                 let envelope = Envelope::<()>::err(&e);
@@ -432,22 +436,25 @@ where
         initial_signer: initial_signer_display,
         salt,
         network_passphrase: passphrase.to_owned(),
-        rpc_url: args.rpc_url.clone(),
+        rpc_url: context.rpc_url.clone(),
         timeout: Duration::from_secs(args.timeout_seconds),
         fee: resolved_fee,
         dry_run: args.dry_run,
         genesis_signer_scval_override,
     };
 
-    let audit_writer_arc =
-        match resolve_audit_writer(args.profile.as_deref(), load_profile, init_keyring) {
-            Ok(writer) => writer,
-            Err(e) => {
-                let envelope = Envelope::<()>::err(&e);
-                print_error(&envelope, args.output);
-                return 1;
-            }
-        };
+    let audit_writer_arc = match resolve_audit_writer(
+        args.profile.as_ref().map(|_| &resolved),
+        load_profile,
+        init_keyring,
+    ) {
+        Ok(writer) => writer,
+        Err(e) => {
+            let envelope = Envelope::<()>::err(&e);
+            print_error(&envelope, args.output);
+            return 1;
+        }
+    };
 
     // Record any `mlock` degradation from the deployer ceremony now, before
     // `guard` below takes an exclusive lock on the same writer (recording
@@ -456,7 +463,7 @@ where
         record_mlock_degradation(
             writer,
             deployer_mlock_degradation.as_ref(),
-            &resolve_profile_name(args.profile.as_deref()).name,
+            &resolved.name,
             &Uuid::new_v4().to_string(),
         );
     }
@@ -526,7 +533,7 @@ where
 /// `profile_name` within the process, preventing multiple writers from racing
 /// to open the same file (single-writer invariant).
 fn resolve_audit_writer<LoadProfile, InitKeyring>(
-    profile_name: Option<&str>,
+    resolved: Option<&ResolvedProfileName>,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
 ) -> Result<Option<Arc<Mutex<AuditWriter>>>, WalletError>
@@ -534,22 +541,22 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let Some(profile_name) = profile_name else {
+    let Some(resolved) = resolved else {
         return Ok(None);
     };
 
+    let profile_name = &resolved.name;
     // Reconciled in the CALLER of the injected loader. A check inside the
     // closure would be bypassed by every test that supplies its own, which is
     // the placement `crate::common::profile_access`'s module docs call out.
-    let profile =
-        reconcile_loaded_profile(load_profile(profile_name), profile_name).map_err(|e| {
-            tracing::debug!(
-                profile = %profile_name,
-                error = %e,
-                "profile access refused for deploy-c"
-            );
-            e.to_wallet_error(profile_name)
-        })?;
+    let profile = reconcile_loaded_profile(load_profile(profile_name), resolved).map_err(|e| {
+        tracing::debug!(
+            profile = %profile_name,
+            error = %e,
+            "profile access refused for deploy-c"
+        );
+        e.to_wallet_error(profile_name)
+    })?;
     init_keyring()?;
     open_profile_audit_writer_via_registry(profile_name, &profile).map(Some)
 }
@@ -602,6 +609,7 @@ fn open_profile_audit_writer_via_registry(
 /// as [`WalletError::SmartAccount`].
 async fn resolve_genesis_signer_source(
     args: &DeployCArgs,
+    context: &NetworkContext,
 ) -> Result<(String, Option<stellar_xdr::ScVal>), WalletError> {
     if let Some(g_strkey) = &args.initial_signer {
         if let Err(e) = stellar_strkey::ed25519::PublicKey::from_string(g_strkey) {
@@ -618,7 +626,7 @@ async fn resolve_genesis_signer_source(
                 input: format!("could not open verifier registry: {e}"),
             })
         })?;
-        let network_passphrase = args.network.passphrase();
+        let network_passphrase = context.network_passphrase();
         let verifier_entry = verifier_registry
             .webauthn_verifier_for(network_passphrase)
             .ok_or_else(|| {
@@ -731,7 +739,7 @@ async fn resolve_genesis_signer_source(
                     input: format!("could not open verifier registry: {e}"),
                 })
             })?;
-            let network_passphrase = args.network.passphrase();
+            let network_passphrase = context.network_passphrase();
             verifier_registry
                 .ed25519_verifier_for(network_passphrase)
                 .map(|entry| entry.address.clone())
@@ -856,6 +864,7 @@ fn decode_hex32(hex: &str) -> Result<[u8; 32], ()> {
 ///   public-key mismatch.
 async fn resolve_deployer(
     args: &DeployCArgs,
+    resolved: &ResolvedProfileName,
 ) -> Result<(DeployerKeypair, Option<MlockDegradation>), WalletError> {
     if args.sign_with_ledger {
         // Ledger mode: we don't yet know the expected G-strkey before fetching it from
@@ -893,11 +902,10 @@ async fn resolve_deployer(
     // Unlike `create` (which has an explicit `--sponsor` G-strkey), `deploy-c` derives
     // the deployer G-strkey from the secret. We construct the signer first without
     // the mismatch check, then wrap in DeployerKeypair::SecretEnv.
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
     let SignerCeremonyOutcome {
         signer,
         mlock_degradation,
-    } = resolve_software_signer_from_env(var_name, "deploy-c", Some(&profile_name)).await?;
+    } = resolve_software_signer_from_env(var_name, "deploy-c", Some(resolved)).await?;
     let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(signer);
 
     Ok((

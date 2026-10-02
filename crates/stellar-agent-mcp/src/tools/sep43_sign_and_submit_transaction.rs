@@ -319,7 +319,7 @@ impl WalletServer {
         };
 
         // ── Construct RPC client from active profile ──────────────────────────
-        let rpc_url = self.profile.rpc_url.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
         let client = match StellarRpcClient::new(rpc_url) {
             Ok(c) => c,
             Err(err) => {
@@ -337,7 +337,7 @@ impl WalletServer {
         // Reuses `stellar_agent_network::submit::submit_transaction_and_wait`.
         // Timeout from profile or default (60 s).
         let timeout = crate::tools::common::submit_timeout(&self.profile);
-        let network_passphrase = self.profile.network_passphrase.as_str();
+        let network_passphrase = self.context.network_passphrase();
 
         // Record the submission before the bytes leave. The envelope is the
         // caller's, so the policy engine sized no value for it and no
@@ -360,7 +360,7 @@ impl WalletServer {
                 profile: &self.profile,
                 profile_name: profile_name.clone(),
                 tool: "stellar_sep43_sign_and_submit_transaction",
-                chain_id: self.profile.chain_id.caip2_str().to_owned(),
+                chain_id: self.context.chain_id.caip2_str().to_owned(),
                 legs: Vec::new(),
                 engine: self.policy_engine.as_ref(),
                 descriptor: None,

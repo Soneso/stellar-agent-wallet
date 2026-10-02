@@ -41,6 +41,7 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_network::NetworkContext;
 use stellar_agent_smart_account::timelock::{PendingTimelockOperation, TimelockOperationStateView};
 use tracing::info;
 use uuid::Uuid;
@@ -170,6 +171,8 @@ fn pending_op_to_entry(op: PendingTimelockOperation) -> PendingOperationEntry {
 ///
 /// Never panics.
 pub async fn run(args: &ListPendingArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone())
+        .with_secondary(args.secondary_rpc_url.clone());
     let resolved_profile = resolve_profile_name(args.profile.as_deref());
     let request_id = Uuid::new_v4().to_string();
 
@@ -183,16 +186,16 @@ pub async fn run(args: &ListPendingArgs) -> i32 {
             }
         };
 
-    let secondary_rpc_url = args
+    let secondary_rpc_url = context
         .secondary_rpc_url
         .clone()
-        .unwrap_or_else(|| args.rpc_url.clone());
+        .unwrap_or_else(|| context.rpc_url.clone());
 
     let timelock_redacted = redact_strkey_first5_last5(&args.timelock);
 
     info!(
         timelock = %timelock_redacted,
-        network = %args.network,
+        network = %context.chain_id,
         request_id = %request_id,
         "smart-account timelock list-pending: querying pending operations"
     );
@@ -200,9 +203,9 @@ pub async fn run(args: &ListPendingArgs) -> i32 {
     let pending = match stellar_agent_smart_account::timelock::list_pending(
         &args.timelock,
         &audit_writer,
-        &args.rpc_url,
+        &context.rpc_url,
         &secondary_rpc_url,
-        args.network.passphrase(),
+        context.network_passphrase(),
         &request_id,
     )
     .await
@@ -318,7 +321,7 @@ mod tests {
         // And that schedule's guard DOES fire — proving the guard function
         // exists in sibling modules but is intentionally absent here.
         assert!(
-            mainnet_forbidden_error(TargetNetwork::Mainnet).is_some(),
+            mainnet_forbidden_error(TargetNetwork::Mainnet.caip2()).is_some(),
             "schedule/cancel/execute guard must fire on mainnet; list_pending is the exception"
         );
     }

@@ -131,7 +131,7 @@ impl WalletServer {
         // submit-layer mainnet gate never fires because the wallet does not
         // submit. Refuse on a mainnet profile so no valid mainnet signature is
         // ever produced. Wire code: network.mainnet_write_forbidden.
-        if self.profile.chain_id.is_mainnet() {
+        if self.context.chain_id.is_mainnet() {
             return Ok(crate::tools::common::mainnet_signing_forbidden_result());
         }
 

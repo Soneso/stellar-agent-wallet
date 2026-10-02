@@ -254,7 +254,7 @@ impl WalletServer {
         // ── Resolve RPC URL from profile ─────────────────────────────────────
         // The profile's rpc_url takes precedence over the chain_id argument's
         // default RPC.  The chain_id was validated above.
-        let rpc_url = self.profile.rpc_url.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
 
         // ── Fetch account state ──────────────────────────────────────────────
         let client = match stellar_agent_network::StellarRpcClient::new(rpc_url) {

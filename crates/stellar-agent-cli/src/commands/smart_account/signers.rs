@@ -90,6 +90,7 @@ use stellar_agent_core::audit_log::signer_set::{SignerIdentityV2, SignerPubkey, 
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{CapKind, NetworkError, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_network::NetworkContext;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::credentials::CredentialsManager;
 use stellar_agent_smart_account::managers::rules::{
@@ -418,17 +419,19 @@ fn list_result(
 }
 
 async fn list_run(args: &ListArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
 
     // Mainnet defence.
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             &request_id,
         );
     }
 
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -653,16 +656,18 @@ async fn refresh_outcome(
 }
 
 async fn refresh_run(args: &RefreshArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
 
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             &request_id,
         );
     }
 
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -923,10 +928,12 @@ pub struct AddResult {
 }
 
 async fn add_run(args: &AddArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
 
     // Mainnet defence.
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             &request_id,
@@ -1026,7 +1033,7 @@ async fn add_run(args: &AddArgs) -> i32 {
             }
         };
 
-        let network_passphrase = args.network.passphrase();
+        let network_passphrase = context.network_passphrase();
         let verifier_entry = match verifier_registry.webauthn_verifier_for(network_passphrase) {
             Some(e) => e,
             None => {
@@ -1237,7 +1244,7 @@ async fn add_run(args: &AddArgs) -> i32 {
                     );
                 }
             };
-            let network_passphrase = args.network.passphrase();
+            let network_passphrase = context.network_passphrase();
             match verifier_registry.ed25519_verifier_for(network_passphrase) {
                 Some(entry) => entry.address.clone(),
                 None => {
@@ -1288,7 +1295,7 @@ async fn add_run(args: &AddArgs) -> i32 {
         unreachable!("ArgGroup `new_signer_source` guarantees one signer-source flag is set")
     };
 
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -1460,16 +1467,18 @@ pub struct RemoveResult {
 }
 
 async fn remove_run(args: &RemoveArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
 
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             &request_id,
         );
     }
 
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -1613,16 +1622,18 @@ impl_common_args_view!(RemoveArgs);
 impl_common_args_view!(SetThresholdArgs);
 
 async fn set_threshold_run(args: &SetThresholdArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
 
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             &request_id,
         );
     }
 
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -1728,16 +1739,18 @@ pub struct SetWeightedThresholdResult {
 impl_common_args_view!(SetWeightedThresholdArgs);
 
 async fn set_weighted_threshold_run(args: &SetWeightedThresholdArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
 
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             &request_id,
         );
     }
 
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -1905,9 +1918,11 @@ pub struct SetSignerWeightResult {
 impl_common_args_view!(SetSignerWeightArgs);
 
 async fn set_signer_weight_run(args: &SetSignerWeightArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
 
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             &request_id,
@@ -1923,7 +1938,7 @@ async fn set_signer_weight_run(args: &SetSignerWeightArgs) -> i32 {
             ed25519_hex_pubkey: args.signer_ed25519.as_deref(),
             ed25519_verifier_override: args.verifier.as_deref(),
         },
-        args.network,
+        &context,
         args.profile.as_deref(),
     )
     .await
@@ -1932,7 +1947,7 @@ async fn set_signer_weight_run(args: &SetSignerWeightArgs) -> i32 {
         Err(e) => return emit_error(&e, &request_id),
     };
 
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -2069,9 +2084,11 @@ pub struct BatchAddResult {
 impl_common_args_view!(BatchAddArgs);
 
 async fn batch_add_run(args: &BatchAddArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
+        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
 
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         return emit_error(
             &WalletError::Network(NetworkError::MainnetWriteForbidden),
             &request_id,
@@ -2105,7 +2122,7 @@ async fn batch_add_run(args: &BatchAddArgs) -> i32 {
             ed25519_hex_pubkey: None,
             ed25519_verifier_override: None,
         };
-        match resolve_batch_signer_scval(spec, args.network, args.profile.as_deref()).await {
+        match resolve_batch_signer_scval(spec, &context, args.profile.as_deref()).await {
             Ok(scval) => new_signers.push(scval),
             Err(e) => return emit_error(&e, &request_id),
         }
@@ -2119,7 +2136,7 @@ async fn batch_add_run(args: &BatchAddArgs) -> i32 {
             ed25519_hex_pubkey: None,
             ed25519_verifier_override: None,
         };
-        match resolve_batch_signer_scval(spec, args.network, args.profile.as_deref()).await {
+        match resolve_batch_signer_scval(spec, &context, args.profile.as_deref()).await {
             Ok(scval) => new_signers.push(scval),
             Err(e) => return emit_error(&e, &request_id),
         }
@@ -2133,13 +2150,13 @@ async fn batch_add_run(args: &BatchAddArgs) -> i32 {
             ed25519_hex_pubkey: Some(hex_pubkey.as_str()),
             ed25519_verifier_override: args.verifier.as_deref(),
         };
-        match resolve_batch_signer_scval(spec, args.network, args.profile.as_deref()).await {
+        match resolve_batch_signer_scval(spec, &context, args.profile.as_deref()).await {
             Ok(scval) => new_signers.push(scval),
             Err(e) => return emit_error(&e, &request_id),
         }
     }
 
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -2200,7 +2217,7 @@ struct WeightedSignerSourceSpec<'a> {
 /// key_data)`, shared by `set-signer-weight` and `batch-add`.
 async fn resolve_webauthn_source(
     credential_name: &str,
-    network: TargetNetwork,
+    context: &NetworkContext,
     profile: Option<&str>,
 ) -> Result<(stellar_xdr::ScAddress, Vec<u8>), WalletError> {
     let verifier_registry = VerifierRegistry::open().map_err(|e| {
@@ -2208,7 +2225,7 @@ async fn resolve_webauthn_source(
             input: format!("could not open verifier registry: {e}"),
         })
     })?;
-    let network_passphrase = network.passphrase();
+    let network_passphrase = context.network_passphrase();
     let verifier_entry = verifier_registry
         .webauthn_verifier_for(network_passphrase)
         .ok_or_else(|| {
@@ -2295,7 +2312,7 @@ async fn resolve_webauthn_source(
 fn resolve_ed25519_source(
     hex_pubkey: &str,
     verifier_override: Option<&str>,
-    network: TargetNetwork,
+    context: &NetworkContext,
 ) -> Result<(stellar_xdr::ScAddress, Vec<u8>), WalletError> {
     let key_data = hex::decode(hex_pubkey).map_err(|e| {
         WalletError::Validation(ValidationError::AddressInvalid {
@@ -2319,7 +2336,7 @@ fn resolve_ed25519_source(
                 input: format!("could not open verifier registry: {e}"),
             })
         })?;
-        let network_passphrase = network.passphrase();
+        let network_passphrase = context.network_passphrase();
         verifier_registry
             .ed25519_verifier_for(network_passphrase)
             .map(|entry| entry.address.clone())
@@ -2346,7 +2363,7 @@ fn resolve_ed25519_source(
 /// for `set-signer-weight`'s TARGET-signer identification.
 async fn resolve_weighted_signer_input(
     spec: WeightedSignerSourceSpec<'_>,
-    network: TargetNetwork,
+    context: &NetworkContext,
     profile: Option<&str>,
 ) -> Result<
     stellar_agent_smart_account::weighted_threshold_policy::WeightedThresholdSignerInput,
@@ -2389,12 +2406,12 @@ async fn resolve_weighted_signer_input(
     }
     if let Some(credential_name) = spec.webauthn_credential {
         let (verifier, key_data) =
-            resolve_webauthn_source(credential_name, network, profile).await?;
+            resolve_webauthn_source(credential_name, context, profile).await?;
         return Ok(WeightedThresholdSignerInput::External { verifier, key_data });
     }
     if let Some(hex_pubkey) = spec.ed25519_hex_pubkey {
         let (verifier, key_data) =
-            resolve_ed25519_source(hex_pubkey, spec.ed25519_verifier_override, network)?;
+            resolve_ed25519_source(hex_pubkey, spec.ed25519_verifier_override, context)?;
         return Ok(WeightedThresholdSignerInput::External { verifier, key_data });
     }
 
@@ -2409,7 +2426,7 @@ async fn resolve_weighted_signer_input(
 /// signer's identity and verifier from it.
 async fn resolve_batch_signer_scval(
     spec: WeightedSignerSourceSpec<'_>,
-    network: TargetNetwork,
+    context: &NetworkContext,
     profile: Option<&str>,
 ) -> Result<stellar_xdr::ScVal, WalletError> {
     if let Some(g_strkey) = spec.delegated {
@@ -2420,7 +2437,7 @@ async fn resolve_batch_signer_scval(
     }
     if let Some(credential_name) = spec.webauthn_credential {
         let (verifier, key_data) =
-            resolve_webauthn_source(credential_name, network, profile).await?;
+            resolve_webauthn_source(credential_name, context, profile).await?;
         return build_external_signer_scval(verifier, &key_data).map_err(|e| {
             WalletError::SmartAccount {
                 wire_code: e.wire_code(),
@@ -2430,7 +2447,7 @@ async fn resolve_batch_signer_scval(
     }
     if let Some(hex_pubkey) = spec.ed25519_hex_pubkey {
         let (verifier, key_data) =
-            resolve_ed25519_source(hex_pubkey, spec.ed25519_verifier_override, network)?;
+            resolve_ed25519_source(hex_pubkey, spec.ed25519_verifier_override, context)?;
         return build_external_signer_scval(verifier, &key_data).map_err(|e| {
             WalletError::SmartAccount {
                 wire_code: e.wire_code(),
@@ -3548,7 +3565,13 @@ mod tests {
             &verifier,
         ];
         let args = AddArgsHarness::parse_from(base).args;
-        let ctx = CommonHandlerContext::new(&args).await.unwrap();
+        let ctx = CommonHandlerContext::new(
+            &args,
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone())
+                .with_secondary(args.secondary_rpc_url.clone()),
+        )
+        .await
+        .unwrap();
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(OverrideRpcResponder::new(
                 &verifier,

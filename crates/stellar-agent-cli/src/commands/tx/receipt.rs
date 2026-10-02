@@ -64,6 +64,7 @@ use serde::Serialize;
 use stellar_agent_core::audit_log::AuditEntry;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::profile::receipt::ReceiptStore;
+use stellar_agent_network::NetworkContext;
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::policy_state::PersistedWindowStore;
 
@@ -261,7 +262,8 @@ async fn run_clear(args: &ClearArgs) -> i32 {
     // and the endpoint is the only thing that can contradict that. An endpoint
     // that cannot answer is not a licence to clear: a transaction in flight is
     // exactly the case the operator would be wrong about.
-    let client = match StellarRpcClient::new(&profile.rpc_url) {
+    let context = NetworkContext::from_profile(&profile);
+    let client = match StellarRpcClient::new(&context.rpc_url) {
         Ok(c) => c,
         Err(e) => {
             render_json(&Envelope::<()>::err(&e));
@@ -423,7 +425,7 @@ async fn run_clear(args: &ClearArgs) -> i32 {
         let request_id = uuid::Uuid::new_v4().to_string();
         let entry = AuditEntry::new_submission_receipt_cleared(
             "tx receipt clear",
-            profile.chain_id.caip2_str(),
+            context.chain_id.caip2_str(),
             tx_hash_redacted.as_str(),
             cleared_from.as_str(),
             reservation_released,

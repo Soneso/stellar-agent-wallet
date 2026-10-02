@@ -1,6 +1,11 @@
 //! figment-backed profile loader.
 //!
-//! Loads a [`Profile`] from three layered sources in priority order:
+//! The profile file is the record the operator audits. `chain_id` comes only
+//! from that file. On mainnet, overlays also cannot name `rpc_url`.
+//! Naming either protected field is refused, including an equal value,
+//! because an overlay can hide a later edit to that record.
+//!
+//! Loads the remaining fields from three sources in priority order:
 //!
 //! 1. **CLI overlay** — programmatically-supplied key/value pairs (highest
 //!    priority; used by `stellar-agent profile show <name>` to surface the
@@ -155,6 +160,24 @@ const ENV_PREFIX: &str = "STELLAR_AGENT_";
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProfileLoadError {
+    /// An overlay names a field whose value belongs to the profile file.
+    #[error(
+        "profile field `{field}` is read from the profile file only; remove it from the environment or the overlay"
+    )]
+    NonOverlayableField {
+        /// The protected field named by the overlay.
+        field: &'static str,
+    },
+
+    /// A mainnet profile was selected without an explicit profile flag.
+    #[error("profile `{name}` is a mainnet profile and loads only with `--profile {name}`; {}", named_by.mainnet_selection_description())]
+    MainnetRequiresExplicitProfile {
+        /// The selected profile name.
+        name: String,
+        /// The input that supplied the profile name.
+        named_by: crate::profile::ProfileNameSource,
+    },
+
     /// The profile file was not found at the expected path.
     #[error("profile '{name}' not found at '{path}'")]
     NotFound {
@@ -363,6 +386,31 @@ pub enum ProfileLoadDisposition {
 }
 
 impl ProfileLoadError {
+    /// Maps a loader refusal to its operator-facing validation error.
+    /// Absolute paths are redacted once in the generic configuration message.
+    #[must_use]
+    pub fn to_validation_error(&self, requested_name: &str) -> crate::error::ValidationError {
+        use crate::error::ValidationError;
+        match self {
+            Self::NonOverlayableField { field } => {
+                ValidationError::ProfileNonOverlayableField { field }
+            }
+            Self::MainnetRequiresExplicitProfile { name, named_by } => {
+                ValidationError::MainnetRequiresExplicitProfile {
+                    name: name.clone(),
+                    named_by: *named_by,
+                }
+            }
+            Self::NotFound { name, .. } => ValidationError::ProfileNotFound { name: name.clone() },
+            _ => ValidationError::ConfigInvalid {
+                component: "profile",
+                reason: crate::observability::redact_path_in_message(&format!(
+                    "profile '{requested_name}' failed to load: {self}"
+                )),
+            },
+        }
+    }
+
     /// The disposition an operator-facing surface reports this failure under.
     ///
     /// The match is exhaustive and lives in the crate that owns the enum, so a
@@ -380,7 +428,9 @@ impl ProfileLoadError {
             Self::NotFound { .. } => ProfileLoadDisposition::NotFound,
             // Operator-authored input: the name, the file's syntax, its
             // version, or a field whose value is out of bounds.
-            Self::InvalidName { .. }
+            Self::NonOverlayableField { .. }
+            | Self::MainnetRequiresExplicitProfile { .. }
+            | Self::InvalidName { .. }
             | Self::VersionUnsupported { .. }
             | Self::InvalidRpcUrl { .. }
             | Self::MissingPolicySection { .. }
@@ -512,6 +562,18 @@ pub fn load_from_path(
     path: &Path,
     multicall_hook: Option<&dyn MulticallRegistryHook>,
 ) -> Result<Profile, ProfileLoadError> {
+    load_from_path_with_overlays(name, path, Env::prefixed(ENV_PREFIX), multicall_hook)
+}
+
+/// Reads identity from the file before applying permitted overlays.
+/// The file is the operator's audited record. Naming `chain_id`, or a mainnet
+/// `rpc_url`, in an overlay can hide edits to that record and is refused.
+fn load_from_path_with_overlays(
+    name: &str,
+    path: &Path,
+    overlays: impl figment::Provider,
+    multicall_hook: Option<&dyn MulticallRegistryHook>,
+) -> Result<Profile, ProfileLoadError> {
     // ── Step 1: read the raw `version` field before full extraction so we
     // can provide a typed error (VersionUnsupported) rather than a generic
     // figment error when the version is wrong.  figment does not allow us to
@@ -533,10 +595,34 @@ pub fn load_from_path(
         });
     }
 
-    // ── Step 2: full extraction with env-var overlay.
+    // ── Step 2: read the file identity, refuse protected overlays, and extract the profile.
+    let on_disk: OnDiskChainId = Figment::new()
+        .merge(Toml::file(path))
+        .extract()
+        .map_err(|e| ProfileLoadError::Figment {
+            name: name.to_owned(),
+            source: Box::new(e),
+        })?;
+    let overlay_data = overlays.data().map_err(|e| ProfileLoadError::Figment {
+        name: name.to_owned(),
+        source: Box::new(e),
+    })?;
+    if overlay_data
+        .values()
+        .any(|dict| dict.contains_key("chain_id"))
+    {
+        return Err(ProfileLoadError::NonOverlayableField { field: "chain_id" });
+    }
+    if on_disk.chain_id.is_mainnet()
+        && overlay_data
+            .values()
+            .any(|dict| dict.contains_key("rpc_url"))
+    {
+        return Err(ProfileLoadError::NonOverlayableField { field: "rpc_url" });
+    }
     let partial: PartialProfile = Figment::new()
         .merge(Toml::file(path))
-        .merge(Env::prefixed(ENV_PREFIX))
+        .merge(&overlays)
         .extract()
         .map_err(|e| ProfileLoadError::Figment {
             name: name.to_owned(),
@@ -545,7 +631,7 @@ pub fn load_from_path(
     let policy = require_policy_section(partial.policy, path)?;
 
     // ── Step 3: resolve derived fields.
-    let chain_id = partial.chain_id;
+    let chain_id = on_disk.chain_id;
     let rpc_url = partial
         .rpc_url
         .unwrap_or_else(|| chain_id.default_rpc_url().to_owned());
@@ -1206,142 +1292,14 @@ pub fn load_with_overlay_from_dir(
         });
     }
 
-    let raw: RawVersion = Figment::new()
-        .merge(Toml::file(&path))
-        .extract()
-        .map_err(|e| ProfileLoadError::Figment {
-            name: name.to_owned(),
-            source: Box::new(e),
-        })?;
-
-    if raw.version != SUPPORTED_VERSION {
-        return Err(ProfileLoadError::VersionUnsupported {
-            name: name.to_owned(),
-            found: raw.version,
-            supported: SUPPORTED_VERSION,
-        });
-    }
-
-    let partial: PartialProfile = Figment::new()
-        .merge(Toml::file(&path))
-        .merge(Env::prefixed(ENV_PREFIX))
-        .merge(Serialized::defaults(overlay))
-        .extract()
-        .map_err(|e| ProfileLoadError::Figment {
-            name: name.to_owned(),
-            source: Box::new(e),
-        })?;
-    let policy = require_policy_section(partial.policy, &path)?;
-
-    let chain_id = partial.chain_id;
-    let rpc_url = partial
-        .rpc_url
-        .unwrap_or_else(|| chain_id.default_rpc_url().to_owned());
-    let network_passphrase = chain_id.network_passphrase().to_owned();
-    // Unset audit_log_path resolves to the PER-PROFILE location the field's
-    // contract documents (`<root>/audit/<name>.jsonl`), never a host-global
-    // shared file: hash-chained logs from unrelated profiles must not
-    // interleave.
-    let audit_log_path = partial
-        .audit_log_path
-        .unwrap_or_else(|| default_audit_log_path_for(name));
-    let policy_window_state_key_id = partial
-        .policy_window_state_key_id
-        .clone()
-        .unwrap_or_else(|| super::schema::KeyringEntryRef::default_policy_window_state_key(name));
-
-    // Validate smart_account_max_context_rule_scan_id bound.
-    // Uses module-level `MIRRORED_UPPER_BOUND_MAX_SCAN_ID`.
-    if let Some(scan_id) = partial.smart_account_max_context_rule_scan_id
-        && scan_id > MIRRORED_UPPER_BOUND_MAX_SCAN_ID
-    {
-        return Err(ProfileLoadError::InvalidScanIdBound {
-            name: name.to_owned(),
-            value: scan_id,
-            upper_bound: MIRRORED_UPPER_BOUND_MAX_SCAN_ID,
-        });
-    }
-
-    // Validate session_rule_max_horizon_ledgers bound.
-    // Uses module-level `MIRRORED_UPPER_BOUND_HORIZON_LEDGERS`.
-    if let Some(horizon) = partial.session_rule_max_horizon_ledgers
-        && horizon > MIRRORED_UPPER_BOUND_HORIZON_LEDGERS
-    {
-        return Err(ProfileLoadError::InvalidHorizonBound {
-            name: name.to_owned(),
-            value: horizon,
-            upper_bound: MIRRORED_UPPER_BOUND_HORIZON_LEDGERS,
-        });
-    }
-
-    // Validate the served-page display name's length bound. The renderer
-    // truncates, so an over-long value would silently render as a prefix of
-    // what the operator wrote; refusing at load says so instead.
-    if let Some(name_value) = partial
-        .served_pages
-        .as_ref()
-        .and_then(|cfg| cfg.display_name.as_deref())
-    {
-        let chars = name_value.chars().count();
-        if chars > MAX_SERVED_PAGE_DISPLAY_NAME_CHARS {
-            return Err(ProfileLoadError::InvalidServedPageDisplayName {
-                name: name.to_owned(),
-                chars,
-                upper_bound: MAX_SERVED_PAGE_DISPLAY_NAME_CHARS,
-            });
-        }
-    }
-
-    let profile = Profile {
-        version: partial.version,
-        chain_id,
-        rpc_url,
-        network_passphrase,
-        mcp_signer_default: partial.mcp_signer_default,
-        mcp_nonce_key_alias: partial.mcp_nonce_key_alias,
-        cross_check_threshold_stroops: partial.cross_check_threshold_stroops,
-        classic_fee_per_op_stroops: partial.classic_fee_per_op_stroops,
-        classic_max_fee_per_op_stroops: partial.classic_max_fee_per_op_stroops,
-        submit_timeout_seconds: partial.submit_timeout_seconds,
-        audit_log_path,
-        mcp_disabled: partial.mcp_disabled,
-        audit_log_hash_chain_key_id: partial.audit_log_hash_chain_key_id,
-        policy_owner_key_id: partial.policy_owner_key_id,
-        attestation_key_id: partial.attestation_key_id,
-        counterparty_cache_key_id: partial.counterparty_cache_key_id,
-        oracle_provider_url: partial.oracle_provider_url,
-        policy,
-        wallet: partial.wallet,
-        smart_account_max_context_rule_scan_id: partial.smart_account_max_context_rule_scan_id,
-        session_rule_max_horizon_ledgers: partial.session_rule_max_horizon_ledgers,
-        secondary_rpc_url: partial.secondary_rpc_url,
-        pool_master_key_id: partial.pool_master_key_id,
-        pool_config: partial.pool_config,
-        pool_initialization: partial.pool_initialization,
-        remote_approval: partial.remote_approval,
-        served_pages: partial.served_pages,
-        policy_window_state_key_id,
-    };
-
-    profile
-        .validate_rpc_url()
-        .map_err(|e| ProfileLoadError::InvalidRpcUrl {
-            name: name.to_owned(),
-            source: e,
-        })?;
-
-    // Multicall guard — same as in `load_from_path`.
-    if let Some(hook) = multicall_hook
-        && hook.lookup(&profile.network_passphrase).is_some()
-        && profile.secondary_rpc_url.is_none()
-    {
-        return Err(ProfileLoadError::MulticallRequiresSecondaryRpc {
-            profile_name: name.to_owned(),
-            network_safename: network_safename_from_passphrase(&profile.network_passphrase),
-        });
-    }
-
-    Ok(profile)
+    load_from_path_with_overlays(
+        name,
+        &path,
+        Figment::new()
+            .merge(Env::prefixed(ENV_PREFIX))
+            .merge(Serialized::defaults(overlay)),
+        multicall_hook,
+    )
 }
 
 /// Loads the `default` profile, or returns a synthetic testnet profile if no
@@ -1417,6 +1375,12 @@ struct RawVersion {
     version: u32,
 }
 
+/// The chain identity read from the profile file alone; overlays never reach it.
+#[derive(serde::Deserialize)]
+struct OnDiskChainId {
+    chain_id: Caip2,
+}
+
 /// Partial profile with optional fields that have derived defaults.
 ///
 /// `rpc_url` and `audit_log_path` are optional in the TOML; they are resolved
@@ -1434,7 +1398,6 @@ struct RawVersion {
 #[derive(serde::Deserialize)]
 struct PartialProfile {
     version: u32,
-    chain_id: Caip2,
     rpc_url: Option<String>,
     mcp_signer_default: super::schema::KeyringEntryRef,
     mcp_nonce_key_alias: super::schema::KeyringEntryRef,
@@ -1528,6 +1491,11 @@ mod tests {
     /// match already forces the classification decision at compile time.
     fn one_of_every_variant() -> Vec<ProfileLoadError> {
         vec![
+            ProfileLoadError::NonOverlayableField { field: "chain_id" },
+            ProfileLoadError::MainnetRequiresExplicitProfile {
+                name: "p".to_owned(),
+                named_by: crate::profile::ProfileNameSource::Env,
+            },
             ProfileLoadError::NotFound {
                 name: "p".to_owned(),
                 path: PathBuf::from("/tmp/p.toml"),
@@ -1665,6 +1633,170 @@ mod tests {
         let path = dir.path().join(format!("{name}.toml"));
         std::fs::write(&path, content).unwrap();
         (dir, name.to_owned())
+    }
+
+    fn provider_load(
+        toml: &str,
+        field: &'static str,
+        value: serde_json::Value,
+    ) -> Result<Profile, ProfileLoadError> {
+        let (dir, name) = write_profile(toml);
+        load_from_path_with_overlays(
+            &name,
+            &dir.path().join(format!("{name}.toml")),
+            Serialized::defaults(HashMap::from([(field, value)])),
+            None,
+        )
+    }
+
+    #[test]
+    fn protected_chain_overlay_refuses_different_value() {
+        let result = provider_load(
+            minimal_toml(),
+            "chain_id",
+            serde_json::json!("stellar:mainnet"),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ProfileLoadError::NonOverlayableField { field: "chain_id" })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn protected_chain_overlay_refuses_equal_value() {
+        let result = provider_load(
+            minimal_toml(),
+            "chain_id",
+            serde_json::json!("stellar:testnet"),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ProfileLoadError::NonOverlayableField { field: "chain_id" })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn protected_chain_overlay_public_entry_refuses() {
+        let (dir, name) = write_profile(minimal_toml());
+        let result = load_with_overlay_from_dir(
+            &name,
+            dir.path(),
+            HashMap::from([("chain_id", serde_json::json!("stellar:mainnet"))]),
+            None,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ProfileLoadError::NonOverlayableField { field: "chain_id" })
+            ),
+            "{result:?}"
+        );
+    }
+
+    fn mainnet_toml() -> String {
+        minimal_toml()
+            .replace("stellar:testnet", "stellar:mainnet")
+            .replace(
+                "version = 2",
+                "version = 2\nrpc_url = \"https://file.example\"",
+            )
+    }
+
+    #[test]
+    fn protected_rpc_overlay_refuses_different_value() {
+        let result = provider_load(
+            &mainnet_toml(),
+            "rpc_url",
+            serde_json::json!("https://overlay.example"),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ProfileLoadError::NonOverlayableField { field: "rpc_url" })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn protected_rpc_overlay_refuses_equal_value() {
+        let result = provider_load(
+            &mainnet_toml(),
+            "rpc_url",
+            serde_json::json!("https://file.example"),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ProfileLoadError::NonOverlayableField { field: "rpc_url" })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn testnet_rpc_overlay_loads() {
+        let profile = provider_load(
+            minimal_toml(),
+            "rpc_url",
+            serde_json::json!("https://overlay.example"),
+        )
+        .unwrap();
+        assert_eq!(profile.rpc_url, "https://overlay.example");
+    }
+
+    #[test]
+    fn mainnet_unprotected_overlay_loads() {
+        let profile =
+            provider_load(&mainnet_toml(), "mcp_disabled", serde_json::json!(true)).unwrap();
+        assert!(profile.mcp_disabled);
+        assert_eq!(profile.chain_id, Caip2::Mainnet);
+    }
+
+    #[test]
+    fn version_check_precedes_identity_and_overlay_checks() {
+        let result = provider_load(
+            "version = 99",
+            "chain_id",
+            serde_json::json!("stellar:mainnet"),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ProfileLoadError::VersionUnsupported { found: 99, .. })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn validation_mapping_preserves_protected_codes_and_redacts_paths() {
+        for err in one_of_every_variant() {
+            let validation = err.to_validation_error("p");
+            let expected = match &err {
+                ProfileLoadError::NonOverlayableField { .. } => "profile.non_overlayable_field",
+                ProfileLoadError::MainnetRequiresExplicitProfile { .. } => {
+                    "profile.mainnet_requires_explicit_profile"
+                }
+                ProfileLoadError::NotFound { .. } => "validation.profile_not_found",
+                _ => "validation.config_invalid",
+            };
+            assert_eq!(validation.code(), expected, "{err:?}");
+        }
+        let home = std::env::var("HOME").expect("HOME is set in the test environment");
+        let error = ProfileLoadError::MissingPolicySection {
+            path: PathBuf::from(&home).join("mapping-sentinel.toml"),
+        };
+        let message = error.to_validation_error("p").to_string();
+        assert!(message.contains("<HOME>"), "home prefix must be redacted");
+        assert!(!message.contains(home.as_str()));
+        assert!(message.contains("mapping-sentinel.toml"));
     }
 
     fn minimal_toml() -> &'static str {

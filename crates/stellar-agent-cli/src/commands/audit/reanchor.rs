@@ -40,6 +40,7 @@
 
 use clap::Args;
 use serde::Serialize;
+use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::{
     audit_log::{AuditWriter, TipAnchor, WriterError},
     envelope::Envelope,
@@ -48,7 +49,7 @@ use stellar_agent_core::{
 };
 use stellar_agent_network::keyring::{KeyringTipAnchorStore, init_platform_keyring_store};
 
-use crate::common::profile_access::load_profile_reconciled_by_requested_name;
+use crate::common::profile_access::load_profile_reconciled;
 use crate::common::render;
 
 use super::super::profile::audit_emit::load_audit_hmac_key;
@@ -190,7 +191,7 @@ where
 /// Loads the named profile, reconciled, mapping the failure into the CLI
 /// envelope model.
 fn load_profile(profile_name: &str) -> Result<Profile, WalletError> {
-    load_profile_reconciled_by_requested_name(profile_name, None).map_err(|e| {
+    load_profile_reconciled(&ResolvedProfileName::from_flag(profile_name), None).map_err(|e| {
         tracing::debug!(
             profile = %profile_name,
             error = %e,

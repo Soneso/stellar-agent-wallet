@@ -113,21 +113,16 @@ impl WalletServer {
             Err(error) => return Ok(mpp_error_result(&error)),
         };
         let payer = self.profile.mcp_signer_default.account.as_str();
-        let rpc = match StellarSponsoredRpc::new(&self.profile.rpc_url) {
+        let rpc = match StellarSponsoredRpc::new(&self.context.rpc_url) {
             Ok(rpc) => rpc,
             Err(error) => return Ok(mpp_error_result(&error)),
         };
-        let prepared = match prepare_sponsored(
-            selected,
-            payer,
-            &self.profile.network_passphrase,
-            &rpc,
-        )
-        .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => return Ok(mpp_error_result(&error)),
-        };
+        let prepared =
+            match prepare_sponsored(selected, payer, self.context.network_passphrase(), &rpc).await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => return Ok(mpp_error_result(&error)),
+            };
         let effects = mpp_value_effects(prepared.selected());
         let args_value = serde_json::to_value(&args)
             .map_err(|_| rmcp::ErrorData::invalid_params("invalid MPP arguments", None))?;
@@ -170,7 +165,7 @@ impl WalletServer {
         };
         let preview = match persist_prepared_authorization(
             &args.profile,
-            &self.profile.network_passphrase,
+            self.context.network_passphrase(),
             &prepared,
             disposition,
             &process_uid,
@@ -309,7 +304,7 @@ impl WalletServer {
             approval_key.as_ref(),
             &stellar_agent_core::approval::AttestationBinding::new(
                 &self.profile_name_for_approval(),
-                self.profile.chain_id.caip2_str(),
+                self.context.chain_id.caip2_str(),
             ),
             &args.authorization_id,
             i64::try_from(now_ms / 1_000).unwrap_or(i64::MAX),
@@ -323,7 +318,7 @@ impl WalletServer {
             Ok(signer) => signer,
             Err(_) => return Ok(mpp_signing_error()),
         };
-        let rpc = match StellarSponsoredRpc::new(&self.profile.rpc_url) {
+        let rpc = match StellarSponsoredRpc::new(&self.context.rpc_url) {
             Ok(rpc) => rpc,
             Err(error) => return Ok(mpp_error_result(&error)),
         };
@@ -349,11 +344,11 @@ impl WalletServer {
             approval_key.as_ref(),
             &stellar_agent_core::approval::AttestationBinding::new(
                 &self.profile_name_for_approval(),
-                self.profile.chain_id.caip2_str(),
+                self.context.chain_id.caip2_str(),
             ),
             &args.authorization_id,
             i64::try_from(now_ms / 1_000).unwrap_or(i64::MAX),
-            &self.profile.network_passphrase,
+            self.context.network_passphrase(),
             &signer,
             &rpc,
             move |_record, _prepared, exact_effects| {
@@ -514,7 +509,7 @@ impl WalletServer {
             Ok(None) => return Ok(mpp_absent_state_lookup_error(&args.authorization_id)),
             Err(error) => return Ok(mpp_error_result(&error)),
         };
-        let rpc = match StellarReconciliationRpc::new(&self.profile.rpc_url) {
+        let rpc = match StellarReconciliationRpc::new(&self.context.rpc_url) {
             Ok(rpc) => rpc,
             Err(error) => return Ok(mpp_error_result(&error)),
         };
@@ -581,7 +576,7 @@ impl WalletServer {
     }
 
     fn mpp_preflight_profile(&self, requested_profile: &str) -> Result<(), CallToolResult> {
-        if self.profile.network_passphrase != TESTNET_PASSPHRASE {
+        if self.context.network_passphrase() != TESTNET_PASSPHRASE {
             return Err(mpp_error_result(&MppError::new(
                 MppErrorCode::NetworkForbidden,
                 "MPP charge is enabled only on Stellar testnet",

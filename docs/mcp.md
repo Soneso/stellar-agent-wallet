@@ -66,6 +66,20 @@ per-request profile switching. Any other argument is refused with a non-zero
 exit rather than ignored, so a mistyped flag cannot silently start the server on
 a different profile than intended.
 
+A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE` never selects one, and a mainnet `default.toml` needs `--profile default`. Keep the filename: its identity is bound to its keyring entries.
+
+Implicit mainnet selection exits with `profile.mainnet_requires_explicit_profile`.
+The message names the selection source and the recovery command:
+`stellar-agent-mcp --profile <name>`.
+Protected overlays exit with `profile.non_overlayable_field` and ask the operator
+to remove the field from the environment or the overlay.
+
+Unset `STELLAR_AGENT_CHAIN_ID` and, for a mainnet profile, `STELLAR_AGENT_RPC_URL` first. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
+
+The server resolves one `NetworkContext` at construction for tool network reads.
+Profile resources keep their loader behavior: a mainnet profile under a protected
+overlay reads as `profile_resource_unloadable`. Account enumeration skips that profile.
+
 On startup the process, in order:
 
 1. Parses the command line, resolves the profile name (`--profile`, then

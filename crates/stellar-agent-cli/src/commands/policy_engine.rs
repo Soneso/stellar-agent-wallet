@@ -7,10 +7,8 @@
 //! `trade`, `bridge`, and `trustline` CLI subcommands, as well as `pay`,
 //! `claim`, and `accounts create` (sponsored mode).
 //!
-//! Also provides [`caip2_chain_id_for_network`] (chain-id derivation for verbs
-//! that select their network via `--network` rather than a profile's
-//! `chain_id`) and [`evaluate_value_moving_policy`] (the shared
-//! `PolicyEngine::evaluate` call plus refusal-envelope construction). The
+//! Also provides [`evaluate_value_moving_policy`] for shared policy evaluation
+//! and refusal-envelope construction. The
 //! zero-config profile resolution `pay`/`claim`/`accounts create` use instead
 //! of a hard `--profile` requirement lives in
 //! [`crate::common::profile_access`].
@@ -58,8 +56,6 @@ use stellar_agent_core::profile::name::{
 };
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile, default_policy_dir};
 use stellar_agent_network::policy_state::PersistedWindowStore;
-
-use crate::common::network::TargetNetwork;
 
 /// Constructs the [`PolicyEngine`] for a value-moving CLI verb from the
 /// profile's `policy.engine` kind.
@@ -309,15 +305,6 @@ fn owner_pubkey_b64(profile_name: &str, verb: &str) -> Result<String, String> {
                  be read from the keyring ({e}); {verb} refuses (fail-closed)"
             )
         })
-}
-
-/// Returns the policy gate's chain identifier for the CLI network flag.
-///
-/// `pay`, `claim` and `accounts create` take their network from `--network`,
-/// so the policy gate's chain identifier is derived from that flag.
-#[must_use]
-pub(crate) fn caip2_chain_id_for_network(network: TargetNetwork) -> &'static str {
-    network.caip2().caip2_str()
 }
 
 /// Builds the `stellar_pay` policy args the dispatch gate derives the value

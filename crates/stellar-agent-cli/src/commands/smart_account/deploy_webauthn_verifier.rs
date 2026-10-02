@@ -42,6 +42,7 @@ use std::time::Duration;
 use clap::{ArgGroup, Args};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
+use stellar_agent_network::NetworkContext;
 use stellar_agent_network::{
     StellarRpcClient, parse_classic_fee_choice, resolve_classic_fee_selection,
 };
@@ -173,8 +174,9 @@ pub struct DeployWebAuthnVerifierArgs {
 ///
 /// Never panics.
 pub async fn run(args: &DeployWebAuthnVerifierArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone());
     // First layer: structural mainnet rejection before any key access.
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
         let envelope = Envelope::<()>::err(&err);
         print_error(&envelope, args.output);
@@ -191,7 +193,7 @@ pub async fn run(args: &DeployWebAuthnVerifierArgs) -> i32 {
         }
     };
 
-    let passphrase = args.network.passphrase();
+    let passphrase = context.network_passphrase();
 
     // Resolve the fee. In dry-run mode there is no network access so we skip
     // getFeeStats and fall back to the profile default.
@@ -210,7 +212,7 @@ pub async fn run(args: &DeployWebAuthnVerifierArgs) -> i32 {
             }
         };
 
-        let fee_client = match StellarRpcClient::new(&args.rpc_url) {
+        let fee_client = match StellarRpcClient::new(&context.rpc_url) {
             Ok(c) => c,
             Err(e) => {
                 let envelope = Envelope::<()>::err(&e);
@@ -235,7 +237,7 @@ pub async fn run(args: &DeployWebAuthnVerifierArgs) -> i32 {
     let deploy_args = WebAuthnVerifierDeployArgs {
         deployer,
         network_passphrase: passphrase.to_owned(),
-        rpc_url: args.rpc_url.clone(),
+        rpc_url: context.rpc_url.clone(),
         timeout: Duration::from_secs(args.timeout_seconds),
         fee: resolved_fee,
         dry_run: args.dry_run,

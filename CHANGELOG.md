@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `stellar_agent_network::NetworkContext` carries the chain identity and RPC endpoints for a command, with a canonical passphrase and redacted `Debug` output.
+- Core profile APIs `check_mainnet_selection` and `ResolvedProfileName::from_flag` preserve explicit profile selection. `ProfileLoadError::to_validation_error` maps loader refusals to validation errors.
+- Wire codes `profile.non_overlayable_field` and `profile.mainnet_requires_explicit_profile` identify protected overlays and implicit mainnet selection.
 - `AttestationBinding` and `ApprovalContext` name the profile and the chain an approval is bound to and rendered under.
 - `envelope_source_account` returns the effective source of a single-operation envelope; `approve list` reports it as `source` on payments and `envelope_source` on claims.
 - `approve` prints the profile, the network, the endpoint host, the enrolled signer, and the envelope source before the approval prompt; the loopback and remote inbox pages show the same rows.
@@ -133,6 +136,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `chain_id` comes from the profile file only. `STELLAR_AGENT_CHAIN_ID` and programmatic overlays naming `chain_id` are refused on every profile.
+- Mainnet profiles refuse `STELLAR_AGENT_RPC_URL` and programmatic overlays naming `rpc_url`, including values equal to the file.
+- A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE` never selects one, and a mainnet `default.toml` needs `--profile default`. Keep the filename: its identity is bound to its keyring entries.
+- Unset `STELLAR_AGENT_CHAIN_ID` and, for a mainnet profile, `STELLAR_AGENT_RPC_URL` first. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
+- MCP tools and CLI transaction verbs read their network identity from one context per invocation.
+- A mainnet profile under a protected overlay reads as `profile_resource_unloadable` on MCP profile resources. Account enumeration skips profiles whose load is refused.
 - The approval attestation binds the profile name and the chain id under a versioned domain tag. The commit refuses an approval attested on an earlier build; the inbox shows it as resolved until it expires, and the agent simulates and approves again. The CLI and the MCP server must run the same build.
 - Pending entries without an attestation can be approved under the new layout. The store needs no migration. Earlier blobs receive the existing payment, claim, MPP, or clawback refusal and expire normally.
 - Toolset grants recorded on an earlier build keep suppressing the first-invoke prompt; each action still needs its own approval.

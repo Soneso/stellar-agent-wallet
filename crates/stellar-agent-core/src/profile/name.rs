@@ -85,6 +85,15 @@ pub enum ProfileNameSource {
 }
 
 impl ProfileNameSource {
+    /// Describes the selection source in a mainnet profile refusal.
+    pub(crate) fn mainnet_selection_description(self) -> &'static str {
+        match self {
+            Self::Flag => "it was selected by `--profile`",
+            Self::Env => "it was selected by the `STELLAR_AGENT_PROFILE` environment variable",
+            Self::Default => "no `--profile` flag was given",
+        }
+    }
+
     /// Returns the stable short token for structured-log fields.
     ///
     /// Values are `"flag"`, `"env"`, and `"default"`.
@@ -122,6 +131,43 @@ pub struct ResolvedProfileName {
     pub name: String,
     /// Which input supplied it.
     pub source: ProfileNameSource,
+}
+
+impl ResolvedProfileName {
+    /// Records an explicit profile name at a command-line argument boundary.
+    #[must_use]
+    pub fn from_flag(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            source: ProfileNameSource::Flag,
+        }
+    }
+}
+
+/// Requires an explicit profile flag for a mainnet profile.
+/// `--profile default` has source `Flag` and passes this check.
+/// The `Default` source never selects a mainnet profile.
+///
+/// # Errors
+/// Returns `ProfileLoadError::MainnetRequiresExplicitProfile` for implicit mainnet selection.
+pub fn check_mainnet_selection(
+    profile: &Profile,
+    resolved: &ResolvedProfileName,
+) -> Result<(), super::loader::ProfileLoadError> {
+    if profile.chain_id.is_mainnet() {
+        match resolved.source {
+            ProfileNameSource::Flag => {}
+            ProfileNameSource::Env | ProfileNameSource::Default => {
+                return Err(
+                    super::loader::ProfileLoadError::MainnetRequiresExplicitProfile {
+                        name: resolved.name.clone(),
+                        named_by: resolved.source,
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolves the effective profile name from an explicit argument or the
@@ -638,6 +684,79 @@ mod tests {
     use super::*;
 
     // ── validate_path_component_ascii_safe ───────────────────────────────────
+
+    fn selection_profile(chain: super::super::caip2::Caip2, name: &str) -> Profile {
+        let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+        profile.chain_id = chain;
+        profile
+    }
+
+    #[test]
+    fn mainnet_selection_flag_passes_for_both_chains_and_default_name() {
+        use super::super::caip2::Caip2;
+        for chain in [Caip2::Testnet, Caip2::Mainnet] {
+            for name in ["alice", "default"] {
+                let resolved = ResolvedProfileName::from_flag(name);
+                assert_eq!(resolved.source, ProfileNameSource::Flag);
+                assert_eq!(resolved.name, name);
+                assert!(
+                    check_mainnet_selection(&selection_profile(chain, name), &resolved).is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mainnet_selection_environment_refuses() {
+        use super::super::caip2::Caip2;
+        let resolved = resolve_from_parts(None, Some("alice".to_owned()));
+        let err = check_mainnet_selection(&selection_profile(Caip2::Mainnet, "alice"), &resolved)
+            .expect_err("implicit mainnet selection refuses");
+        assert!(matches!(
+            err,
+            super::super::loader::ProfileLoadError::MainnetRequiresExplicitProfile {
+                named_by: ProfileNameSource::Env,
+                ..
+            }
+        ));
+        assert!(
+            err.to_string()
+                .contains("`STELLAR_AGENT_PROFILE` environment variable")
+        );
+    }
+
+    #[test]
+    fn mainnet_selection_default_refuses() {
+        use super::super::caip2::Caip2;
+        let resolved = resolve_from_parts(None, None);
+        let err = check_mainnet_selection(&selection_profile(Caip2::Mainnet, "default"), &resolved)
+            .expect_err("implicit mainnet selection refuses");
+        assert!(matches!(
+            err,
+            super::super::loader::ProfileLoadError::MainnetRequiresExplicitProfile {
+                named_by: ProfileNameSource::Default,
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("no `--profile` flag was given"));
+    }
+
+    #[test]
+    fn testnet_selection_environment_and_default_pass() {
+        use super::super::caip2::Caip2;
+        for resolved in [
+            resolve_from_parts(None, Some("alice".to_owned())),
+            resolve_from_parts(None, None),
+        ] {
+            assert!(
+                check_mainnet_selection(
+                    &selection_profile(Caip2::Testnet, &resolved.name),
+                    &resolved
+                )
+                .is_ok()
+            );
+        }
+    }
 
     #[test]
     fn validate_path_component_accepts_simple_names() {

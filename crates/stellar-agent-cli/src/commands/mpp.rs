@@ -11,6 +11,7 @@ use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
+use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::{
     approval::{store::PendingApprovalStore, user_id::process_uid_for_attestation},
     audit_log::{AuditEntry, NewToolInvocation, PolicyDecision, ValueLegRecord},
@@ -20,8 +21,8 @@ use stellar_agent_core::{
     policy::v1::ValueClass,
     policy::{Decision, McpToolRegistration, PolicyEngine, ToolDescriptor, ToolValueKind},
     profile::{
-        caip2::{Caip2, TESTNET_PASSPHRASE},
-        schema::default_approval_dir,
+        caip2::Caip2,
+        schema::{Profile, default_approval_dir},
     },
 };
 use stellar_agent_mpp::{
@@ -31,6 +32,7 @@ use stellar_agent_mpp::{
     commit_authorization, mpp_value_effects, parse_receipt, persist_prepared_authorization,
     prepare_sponsored, reconcile_transaction, select_and_validate, verify_pending_approval,
 };
+use stellar_agent_network::NetworkContext;
 use stellar_agent_network::{
     init_platform_keyring_store,
     keyring::{lazy_signer_from_keyring, load_hmac_key_32},
@@ -40,7 +42,7 @@ use crate::commands::{
     policy_engine::build_v1_policy_engine, value_audit::emit_value_audit_row_strict,
 };
 use crate::common::profile_access::{
-    ProfileAccessError, load_profile_reconciled_by_requested_name, profile_access_envelope,
+    ProfileAccessError, load_profile_reconciled, profile_access_envelope,
 };
 use crate::common::resolve_profile_name;
 
@@ -241,11 +243,13 @@ pub async fn run(args: MppArgs) -> i32 {
 }
 
 async fn authorize(args: MppAuthorizeArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
-    let profile = match load_testnet_profile(&profile_name) {
+    let resolved = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved.name.clone();
+    let (profile, context) = match load_testnet_profile(&resolved) {
         Ok(profile) => profile,
         Err(error) => return render_profile_error(&error, &profile_name),
     };
+
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
     }
@@ -266,16 +270,17 @@ async fn authorize(args: MppAuthorizeArgs) -> i32 {
             Ok(record) => record,
             Err(error) => return render_error(&error),
         };
-        return commit_cli(&profile_name, &profile, &state, &record, now_unix).await;
+        return commit_cli(&context, &profile_name, &profile, &state, &record, now_unix).await;
     }
     // First-use key material is created only after validation and successful simulation.
-    prepare_and_authorize_without_state(&args, &profile_name, profile, now_unix).await
+    prepare_and_authorize_without_state(&context, &args, &profile_name, profile, now_unix).await
 }
 
 async fn prepare_and_authorize_without_state(
+    context: &NetworkContext,
     args: &MppAuthorizeArgs,
     profile_name: &str,
-    profile: stellar_agent_core::profile::schema::Profile,
+    profile: Profile,
     now_unix: i64,
 ) -> i32 {
     let input = match read_authorize_input(args) {
@@ -286,14 +291,14 @@ async fn prepare_and_authorize_without_state(
         Ok(selected) => selected,
         Err(error) => return render_error(&error),
     };
-    let rpc = match StellarSponsoredRpc::new(&profile.rpc_url) {
+    let rpc = match StellarSponsoredRpc::new(&context.rpc_url) {
         Ok(rpc) => rpc,
         Err(error) => return render_error(&error),
     };
     let prepared = match prepare_sponsored(
         selected,
         &profile.mcp_signer_default.account,
-        &profile.network_passphrase,
+        context.network_passphrase(),
         &rpc,
     )
     .await
@@ -305,12 +310,13 @@ async fn prepare_and_authorize_without_state(
         Ok(state) => state,
         Err(error) => return render_error(&error),
     };
-    persist_and_maybe_commit(profile_name, &profile, &state, prepared, now_unix).await
+    persist_and_maybe_commit(context, profile_name, &profile, &state, prepared, now_unix).await
 }
 
 async fn persist_and_maybe_commit(
+    context: &NetworkContext,
     profile_name: &str,
-    profile: &stellar_agent_core::profile::schema::Profile,
+    profile: &Profile,
     state: &MppAuthorizationStore,
     prepared: stellar_agent_mpp::PreparedSponsoredCharge,
     now_unix: i64,
@@ -321,6 +327,7 @@ async fn persist_and_maybe_commit(
             Err(_) => return render_error(&state_error()),
         };
     let disposition = match evaluate_policy(
+        context,
         engine.as_ref(),
         profile,
         "stellar_mpp_charge_prepare",
@@ -343,7 +350,7 @@ async fn persist_and_maybe_commit(
     };
     let preview = match persist_prepared_authorization(
         profile_name,
-        &profile.network_passphrase,
+        context.network_passphrase(),
         &prepared,
         disposition,
         &uid,
@@ -373,12 +380,13 @@ async fn persist_and_maybe_commit(
         Ok(record) => record,
         Err(error) => return render_error(&error),
     };
-    commit_cli(profile_name, profile, state, &record, now_unix).await
+    commit_cli(context, profile_name, profile, state, &record, now_unix).await
 }
 
 async fn commit_cli(
+    context: &NetworkContext,
     profile_name: &str,
-    profile: &stellar_agent_core::profile::schema::Profile,
+    profile: &Profile,
     state: &MppAuthorizationStore,
     record: &stellar_agent_mpp::AuthorizationRecord,
     now_unix: i64,
@@ -393,6 +401,7 @@ async fn commit_cli(
         Err(error) => return render_error(&error),
     };
     let disposition = match evaluate_policy(
+        context,
         engine.as_ref(),
         profile,
         "stellar_mpp_charge_commit",
@@ -422,7 +431,7 @@ async fn commit_cli(
         approval_key.as_deref(),
         &stellar_agent_core::approval::AttestationBinding::new(
             profile_name,
-            profile.chain_id.caip2_str(),
+            context.chain_id.caip2_str(),
         ),
         record.authorization_id(),
         now_unix,
@@ -436,11 +445,11 @@ async fn commit_cli(
         Ok(signer) => signer,
         Err(_) => return render_error(&signing_error()),
     };
-    let rpc = match StellarSponsoredRpc::new(&profile.rpc_url) {
+    let rpc = match StellarSponsoredRpc::new(&context.rpc_url) {
         Ok(rpc) => rpc,
         Err(error) => return render_error(&error),
     };
-    let descriptor = policy_descriptor("stellar_mpp_charge_commit");
+    let descriptor = policy_descriptor(context, "stellar_mpp_charge_commit");
     // Policy and audit refusals retain their wallet code while the MPP
     // service withholds the credential at its accounting or delivery gate.
     let wallet_refusal: Arc<Mutex<Option<WalletError>>> = Arc::new(Mutex::new(None));
@@ -452,11 +461,11 @@ async fn commit_cli(
         approval_key.as_deref(),
         &stellar_agent_core::approval::AttestationBinding::new(
             profile_name,
-            profile.chain_id.caip2_str(),
+            context.chain_id.caip2_str(),
         ),
         record.authorization_id(),
         now_unix,
-        &profile.network_passphrase,
+        context.network_passphrase(),
         &signer,
         &rpc,
         |_record, _prepared, effects| {
@@ -472,7 +481,7 @@ async fn commit_cli(
         |authorized| {
             let entry = AuditEntry::new_mpp_charge_authorized(
                 "stellar_mpp_charge_commit",
-                Caip2::Testnet.caip2_str(),
+                context.chain_id.caip2_str(),
                 hex::encode(Sha256::digest(
                     authorized.record.authorization_id().as_bytes(),
                 )),
@@ -526,8 +535,9 @@ async fn commit_cli(
 }
 
 fn status(args: &MppStatusArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
-    let profile = match load_testnet_profile(&profile_name) {
+    let resolved = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved.name.clone();
+    let (profile, _context) = match load_testnet_profile(&resolved) {
         Ok(profile) => profile,
         Err(error) => return render_profile_error(&error, &profile_name),
     };
@@ -551,8 +561,9 @@ fn status(args: &MppStatusArgs) -> i32 {
 }
 
 fn record_receipt(args: &MppReceiptArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
-    let profile = match load_testnet_profile(&profile_name) {
+    let resolved = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved.name.clone();
+    let (profile, _context) = match load_testnet_profile(&resolved) {
         Ok(profile) => profile,
         Err(error) => return render_profile_error(&error, &profile_name),
     };
@@ -617,11 +628,13 @@ fn record_receipt(args: &MppReceiptArgs) -> i32 {
 }
 
 async fn reconcile(args: MppReconcileArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
-    let profile = match load_testnet_profile(&profile_name) {
+    let resolved = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved.name.clone();
+    let (profile, context) = match load_testnet_profile(&resolved) {
         Ok(profile) => profile,
         Err(error) => return render_profile_error(&error, &profile_name),
     };
+
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
     }
@@ -638,7 +651,7 @@ async fn reconcile(args: MppReconcileArgs) -> i32 {
         Ok(None) => return render_error(&absent_state_lookup_error(&args.authorization_id)),
         Err(error) => return render_error(&error),
     };
-    let rpc = match StellarReconciliationRpc::new(&profile.rpc_url) {
+    let rpc = match StellarReconciliationRpc::new(&context.rpc_url) {
         Ok(rpc) => rpc,
         Err(error) => return render_error(&error),
     };
@@ -664,10 +677,12 @@ async fn reconcile(args: MppReconcileArgs) -> i32 {
 }
 
 fn prune(args: &MppPruneArgs) -> i32 {
-    let profile = match load_testnet_profile(&args.profile) {
-        Ok(profile) => profile,
-        Err(error) => return render_profile_error(&error, &args.profile),
-    };
+    let (profile, context) =
+        match load_testnet_profile(&ResolvedProfileName::from_flag(&args.profile)) {
+            Ok(profile) => profile,
+            Err(error) => return render_profile_error(&error, &args.profile),
+        };
+
     let reason = match read_selected_input(
         args.reason_stdin,
         args.reason_file.as_deref(),
@@ -686,7 +701,7 @@ fn prune(args: &MppPruneArgs) -> i32 {
     let reason_sha256 = hex::encode(Sha256::digest(&reason));
     let mut audit = NewToolInvocation::new(
         "stellar_mpp_state_prune",
-        Caip2::Testnet.caip2_str(),
+        context.chain_id.caip2_str(),
         vec!["profile".to_owned(), "reason_sha256".to_owned()],
         PolicyDecision::Allow,
         uuid::Uuid::new_v4().to_string(),
@@ -719,12 +734,13 @@ fn prune(args: &MppPruneArgs) -> i32 {
 }
 
 fn evaluate_policy(
+    context: &NetworkContext,
     engine: &dyn PolicyEngine,
-    profile: &stellar_agent_core::profile::schema::Profile,
+    profile: &Profile,
     tool_name: &'static str,
     effects: &stellar_agent_core::policy::v1::ValueEffects,
 ) -> Result<ApprovalDisposition, MppError> {
-    let descriptor = policy_descriptor(tool_name);
+    let descriptor = policy_descriptor(context, tool_name);
     let evaluation = engine
         .evaluate_with_value_full(
             &descriptor,
@@ -749,7 +765,7 @@ fn evaluate_policy(
     }
 }
 
-fn policy_descriptor(tool_name: &'static str) -> ToolDescriptor {
+fn policy_descriptor(context: &NetworkContext, tool_name: &'static str) -> ToolDescriptor {
     let registration = McpToolRegistration {
         name: tool_name,
         destructive_hint: true,
@@ -758,7 +774,7 @@ fn policy_descriptor(tool_name: &'static str) -> ToolDescriptor {
         value_kind: ToolValueKind::MovesValue,
     };
     let mut descriptor = ToolDescriptor::from_registration(&registration);
-    descriptor.chain_id = Caip2::Testnet.caip2_str().to_owned();
+    descriptor.chain_id = context.chain_id.caip2_str().to_owned();
     descriptor
 }
 
@@ -777,14 +793,19 @@ enum MppProfileError {
 }
 
 fn load_testnet_profile(
-    profile_name: &str,
-) -> Result<stellar_agent_core::profile::schema::Profile, MppProfileError> {
-    let profile = load_profile_reconciled_by_requested_name(profile_name, None)
-        .map_err(MppProfileError::Access)?;
-    if profile.network_passphrase != TESTNET_PASSPHRASE {
+    resolved: &ResolvedProfileName,
+) -> Result<(Profile, NetworkContext), MppProfileError> {
+    let profile = load_profile_reconciled(resolved, None).map_err(MppProfileError::Access)?;
+    let context = testnet_context(&profile)?;
+    Ok((profile, context))
+}
+
+fn testnet_context(profile: &Profile) -> Result<NetworkContext, MppProfileError> {
+    let context = NetworkContext::from_profile(profile);
+    if context.chain_id != Caip2::Testnet {
         return Err(MppProfileError::Network(network_error()));
     }
-    Ok(profile)
+    Ok(context)
 }
 
 /// Renders an [`MppProfileError`] and returns the CLI exit code.
@@ -1004,6 +1025,30 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn testnet_context_derives_the_canonical_passphrase() {
+        let mut profile = Profile::builder_testnet_named("context", "s", "a", "n", "a")
+            .with_noop_engine()
+            .build();
+        profile.network_passphrase = "not the passphrase".to_owned();
+        let context = testnet_context(&profile).ok().expect("testnet context");
+        assert_eq!(
+            context.network_passphrase(),
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE
+        );
+    }
+
+    #[test]
+    fn testnet_context_refuses_mainnet_with_network_error() {
+        let profile = Profile::builder_mainnet_named("context", "s", "a", "n", "a")
+            .with_noop_engine()
+            .build();
+        assert!(matches!(
+            testnet_context(&profile),
+            Err(MppProfileError::Network(error)) if error.code() == network_error().code()
+        ));
+    }
 
     #[test]
     fn accounting_denial_preserves_the_policy_code() {
