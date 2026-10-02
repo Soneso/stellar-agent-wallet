@@ -42,7 +42,7 @@ This is a public alpha. Install with
 tagged GitHub release, resolved via crates.io), with
 `cargo install stellar-agent-mcp@0.1.0-alpha.9` (built from the published
 sources), or build from source. While only prerelease versions are published
-on crates.io, the version must be spelled out — a bare crate name matches
+on crates.io, the version must be spelled out. A bare crate name matches
 stable versions only. See
 [the CLI reference](./cli-reference/) and the repository README for build
 instructions; the build that produces `stellar-agent` produces

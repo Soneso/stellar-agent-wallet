@@ -1133,43 +1133,11 @@ pub async fn submit_signed_invoke(
     // Network ID (sha256 of passphrase) for the auth-digest preimage.
     let network_id: [u8; 32] = Sha256::digest(args.network_passphrase.as_bytes()).into();
 
-    // Build matching simulation + envelope contexts (single-source pattern).
-    //
-    // Auto-expand `auth_rule_ids` to match `invocation_context_count`.
-    //
-    // OZ `__check_auth` requires one rule ID per auth::Context (one per node in
-    // the invocation tree).  Callers that supply a single rule ID (the common
-    // case: bootstrap rule `[0]` for all operations) have that rule replicated
-    // across all contexts automatically.  Callers that supply the exact count
-    // already pass through unchanged.
-    //
-    // Per-node rule resolution iterates the tree and returns one rule per
-    // context; external-contract callers
-    // (e.g. Soroswap ROUTER-DIRECT where the SAC transfer is a sub-invocation)
-    // need one rule per tree node.
-    //
-    // The `auth_contexts_vec` is replicated `invocation_context_count` times
-    // so that the `rule_ids.len() == auth_contexts.len()` check in
-    // `build_authorization_entry_with_sub_invocations` (auth_entry.rs:165-178)
-    // passes with the expanded rule IDs.
-    //
-    // The 1→N replication here is valid ONLY when the supplied rule is
-    // `ContextRuleType::Default` (the bootstrap rule ID 0 installed at deploy).
-    // This is the only rule ID currently passed by all callers in this repo
-    // (`&[ContextRuleId::new(0)]`), so a single ID uniformly applies to every
-    // invocation tree node.
-    //
-    // Non-Default multi-node callers — where different tree nodes require
-    // different context-rule types (e.g. a mix of Default and custom rules) —
-    // MUST pass one rule ID per node rather than relying on this replication.
-    //
-    // The canonical per-node context-type resolution
-    // walks the tree and resolves each node's rule ID independently based on
-    // the node's `ContextRuleType`.  That per-node approach is strictly more
-    // correct for multi-rule deployments.  This wallet currently uses only the
-    // Default/bootstrap rule (ID 0), so the replication shortcut is safe for all
-    // current call sites.  Per-node resolution is not yet
-    // implemented; the replication shortcut is safe for single-rule deployments.
+    // A singleton `auth_rule_ids` list is replicated to every invocation context.
+    // The caller must choose a rule valid for every context receiving that ID.
+    // An explicit list passes through unchanged and must contain one ID per context.
+    // Multicall rejects mismatched lengths above; authorization-entry construction
+    // rejects mismatched rule and context counts before signing.
     let expanded_auth_rule_ids: Vec<ContextRuleId> =
         if args.auth_rule_ids.len() == 1 && invocation_context_count > 1 {
             vec![args.auth_rule_ids[0]; invocation_context_count]
@@ -1179,7 +1147,7 @@ pub async fn submit_signed_invoke(
     let auth_context_fingerprint = fingerprint_invocation(&prepared_entry);
     // `auth_contexts_vec` is a count-carrier: one fingerprint replica per tree
     // node for length alignment with `expanded_auth_rule_ids` in the
-    // `rule_ids.len() == auth_contexts.len()` check (auth_entry.rs:165-178).
+    // `build_authorization_entry_with_sub_invocations` length check.
     // This is NOT a per-node tamper-detection vector; the divergence-detector
     // uses `auth_context_fingerprint` independently.
     let auth_contexts_vec: Vec<_> =

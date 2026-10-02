@@ -153,6 +153,160 @@ inject "$VERIFIERS" '^pub async fn pin_referenced_contracts[(]' \
 expect_fail "version-2 construction in verifiers.rs" "FAIL (c): SaSignerSetBaselinedV2" \
   "at $VERIFIERS:"
 
+# (f) A macro receives a baseline variant token and builds a generic variant.
+reset_ws
+cat >"$WS/crates/stellar-agent-mcp/src/macro_baseline.rs" <<'RS'
+use stellar_agent_core::audit_log::{schema::EventKind, signer_set::{BaselineReason, SignerSetSnapshotV2}};
+use stellar_agent_core::observability::RedactedStrkey;
+
+pub fn forged(snapshot: SignerSetSnapshotV2, reason: BaselineReason, redacted: RedactedStrkey) -> EventKind {
+    macro_rules! kind {
+        ($variant:ident, $reason:expr) => {
+            EventKind::$variant {
+                rule_id: 1,
+                snapshot,
+                observed_at_ledger_seq: 1,
+                observed_at_unix_ms: 1,
+                baseline_reason: $reason,
+                prev_chain_tip_hash: [0; 32],
+                account_digest: [0; 32],
+                smart_account_redacted: redacted,
+            }
+        };
+    }
+    kind!(SaSignerSetBaselinedV2, reason)
+}
+RS
+expect_fail "macro variant argument construction" "FAIL (f):" \
+  "at crates/stellar-agent-mcp/src/macro_baseline.rs:19"
+
+# Macro arguments may be separated by whitespace without a comma.
+sed 's/\$variant:ident, \$reason:expr/\$variant:ident \$reason:expr/; s/SaSignerSetBaselinedV2, reason/SaSignerSetBaselinedV2 reason/' \
+  "$WS/crates/stellar-agent-mcp/src/macro_baseline.rs" >"$TMP/whitespace-macro.rs"
+cp "$TMP/whitespace-macro.rs" "$WS/crates/stellar-agent-mcp/src/macro_baseline.rs"
+expect_fail "macro variant argument without a comma" "FAIL (f):" \
+  "at crates/stellar-agent-mcp/src/macro_baseline.rs:19"
+
+# (f) Braces after a macro argument do not make it a pattern.
+sed 's/\$variant:ident \$reason:expr/\$variant:ident { .. } \$reason:expr/; s/SaSignerSetBaselinedV2 reason/SaSignerSetBaselinedV2 { .. } reason/' \
+  "$TMP/whitespace-macro.rs" >"$WS/crates/stellar-agent-mcp/src/macro_baseline.rs"
+expect_fail "macro variant argument followed by braces" "FAIL (f):" \
+  "at crates/stellar-agent-mcp/src/macro_baseline.rs:19"
+
+# (f) Attributes after a macro argument do not exempt the variant token.
+sed 's/\$variant:ident \$reason:expr/\$variant:ident #[$m:meta] \$reason:expr/; s/SaSignerSetBaselinedV2 reason/SaSignerSetBaselinedV2 #[doc = "x"] reason/' \
+  "$TMP/whitespace-macro.rs" >"$WS/crates/stellar-agent-mcp/src/macro_baseline.rs"
+expect_fail "macro variant argument followed by an attribute" "FAIL (f):" \
+  "at crates/stellar-agent-mcp/src/macro_baseline.rs:19"
+
+# (f) A multi-line invocation reports the token line.
+sed 's/    kind!(SaSignerSetBaselinedV2 reason)/    kind!(\
+        SaSignerSetBaselinedV2 reason\
+    )/' "$TMP/whitespace-macro.rs" >"$WS/crates/stellar-agent-mcp/src/macro_baseline.rs"
+expect_fail "multi-line macro reports the variant token line" "FAIL (f):" \
+  "at crates/stellar-agent-mcp/src/macro_baseline.rs:20"
+
+# (f) A macro definition names the baseline token and builds a generic variant.
+reset_ws
+cat >"$WS/crates/stellar-agent-mcp/src/macro_definition_baseline.rs" <<'RS'
+macro_rules! kind {
+    (SaSignerSetBaselined, $variant:ident, $reason:expr) => {
+        EventKind::$variant { baseline_reason: $reason }
+    };
+}
+RS
+expect_fail "macro definition naming a baseline token" "FAIL (f):" \
+  "at crates/stellar-agent-mcp/src/macro_definition_baseline.rs:2"
+
+# (c) Production construction after the last inline test module is scanned.
+reset_ws
+cat >"$WS/crates/stellar-agent-mcp/src/after_tests_baseline.rs" <<'RS'
+use stellar_agent_core::audit_log::{schema::EventKind, signer_set::{BaselineReason, SignerSetSnapshotV2}};
+use stellar_agent_core::observability::RedactedStrkey;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn nested_braces() {
+        let _text = r#"} // {"#;
+        /* } /* { */ } */
+        assert_eq!('{', '{');
+    }
+}
+
+pub fn forged(snapshot: SignerSetSnapshotV2, reason: BaselineReason, redacted: RedactedStrkey) -> EventKind {
+    EventKind::SaSignerSetBaselinedV2 {
+        rule_id: 1,
+        snapshot,
+        observed_at_ledger_seq: 1,
+        observed_at_unix_ms: 1,
+        baseline_reason: reason,
+        prev_chain_tip_hash: [0; 32],
+        account_digest: [0; 32],
+        smart_account_redacted: redacted,
+    }
+}
+RS
+expect_fail "construction after the last inline test module" "FAIL (c):" \
+  "at crates/stellar-agent-mcp/src/after_tests_baseline.rs:15"
+
+# (c) A skipped-format item may put the construction brace on a later line.
+reset_ws
+cat >"$WS/crates/stellar-agent-mcp/src/split_brace_baseline.rs" <<'RS'
+use stellar_agent_core::audit_log::{schema::EventKind, signer_set::{BaselineReason, SignerSetSnapshotV2}};
+use stellar_agent_core::observability::RedactedStrkey;
+
+#[rustfmt::skip]
+pub fn forged(snapshot: SignerSetSnapshotV2, reason: BaselineReason, redacted: RedactedStrkey) -> EventKind {
+    EventKind::SaSignerSetBaselinedV2
+    {
+        rule_id: 1,
+        snapshot,
+        observed_at_ledger_seq: 1,
+        observed_at_unix_ms: 1,
+        baseline_reason: reason,
+        prev_chain_tip_hash: [0; 32],
+        account_digest: [0; 32],
+        smart_account_redacted: redacted,
+    }
+}
+RS
+expect_fail "construction with a next-line brace in a rustfmt skip item" "FAIL (c):" \
+  "at crates/stellar-agent-mcp/src/split_brace_baseline.rs:6"
+
+# The resumed production scan excludes constructions and macros in test modules.
+reset_ws
+cat >"$WS/crates/stellar-agent-mcp/src/resumed_tests_baseline.rs" <<'RS'
+#[cfg(test)]
+mod tests {
+    use stellar_agent_core::audit_log::{schema::EventKind, signer_set::{BaselineReason, SignerSetSnapshotV2}};
+    use stellar_agent_core::observability::RedactedStrkey;
+
+    macro_rules! kind {
+        ($variant:ident, $reason:expr) => { $reason };
+    }
+
+    fn baseline(snapshot: SignerSetSnapshotV2, reason: BaselineReason, redacted: RedactedStrkey) -> EventKind {
+        let reason = kind!(SaSignerSetBaselinedV2, reason);
+        EventKind::SaSignerSetBaselinedV2 {
+            rule_id: 1,
+            snapshot,
+            observed_at_ledger_seq: 1,
+            observed_at_unix_ms: 1,
+            baseline_reason: reason,
+            prev_chain_tip_hash: [0; 32],
+            account_digest: [0; 32],
+            smart_account_redacted: redacted,
+        }
+    }
+}
+
+pub fn rule_id() -> u32 {
+    1
+}
+RS
+expect_pass "resumed scan excludes test module constructions"
+
 # (c) Trailing comments inside the braces are not code: neither `...` nor a
 # comment ending in `, ..` makes a construction a rest pattern.
 reset_ws
@@ -317,7 +471,7 @@ printf '%s\n' \
 expect_fail "construction in a new MCP file" "FAIL (c):" \
   "at crates/stellar-agent-mcp/src/forged_baseline.rs:4"
 
-# The cut rule: a `#[cfg(test)]` on a static does not start the test module,
+# A `#[cfg(test)]` on a static does not start the test module,
 # so the production code after it is scanned.
 reset_ws
 printf '%s\n' \
@@ -393,14 +547,21 @@ printf '%s\n' \
   '}' >"$WS/crates/stellar-agent-core/src/audit_log/allow_attributed_tests.rs"
 expect_pass "construction inside an allow-attributed test module"
 
-# A production pattern match is not a construction. Each occurrence below is
-# a pattern by one rule only: `..` inside the braces, or the token after the
-# closing brace (`=>`, `|`, `if`, `=` on a later line).
+# (f) A `matches!` pattern is a macro argument, so its baseline token is refused in production text.
 reset_ws
 inject "$VERIFIERS" '^pub async fn pin_referenced_contracts[(]' \
   "$(printf '%s\n' \
     '    let _baselined = matches!(kind, EventKind::SaSignerSetBaselined { .. });' \
-    '    let _baselined_v2 = matches!(kind, EventKind::SaSignerSetBaselinedV2 { .. });' \
+    '    let _baselined_v2 = matches!(kind, EventKind::SaSignerSetBaselinedV2 { .. });')"
+expect_fail "production matches! baseline patterns are refused" "FAIL (f):" \
+  "at $VERIFIERS:"
+
+# A production pattern match is not a construction. Each occurrence below is
+# a pattern by the token after the closing brace (`=>`, `|`, `if`, `=` on a
+# later line).
+reset_ws
+inject "$VERIFIERS" '^pub async fn pin_referenced_contracts[(]' \
+  "$(printf '%s\n' \
     '    match kind {' \
     '        EventKind::SaSignerSetBaselined { rule_id } => {}' \
     '        EventKind::SaSignerSetBaselined { rule_id } | EventKind::Other => {}' \
