@@ -3447,7 +3447,9 @@ mod tests {
         );
     }
 
-    // Manager pass-through tests and fixtures.
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Manager pass-through tests and fixtures
+    // ─────────────────────────────────────────────────────────────────────────────
 
     fn rule_scval(id: u32, signers: Vec<ScVal>, policies: Vec<ScVal>) -> ScVal {
         let entry = |key: &str, val| ScMapEntry {
