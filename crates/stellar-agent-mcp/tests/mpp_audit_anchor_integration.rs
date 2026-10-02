@@ -213,6 +213,127 @@ fn result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
     serde_json::from_str(&text).expect("tool results carry a JSON envelope")
 }
 
+/// CLI library orchestration and the MCP handler preserve identical authorization terms.
+#[tokio::test]
+#[serial]
+async fn cli_and_mcp_authorization_fingerprint_and_preview_match() {
+    use std::time::{Duration, UNIX_EPOCH};
+    use stellar_agent_core::{
+        approval::user_id::process_uid_for_attestation,
+        profile::schema::KeyringEntryRef,
+        timefmt::{format_rfc3339_utc, now_unix_ms},
+    };
+    use stellar_agent_mpp::{
+        ApprovalDisposition, McpOperationKind, McpRequestContext, MppAuthorizationStore,
+        StellarSponsoredRpc, persist_prepared_authorization, prepare_sponsored,
+        select_and_validate,
+    };
+
+    const PROFILE_NAME: &str = "mpp-preview-parity";
+    let home = tempfile::tempdir().expect("temp home");
+    let _home_guard = StellarAgentHomeGuard::new(home.path());
+    keyring_mock::install().expect("mock keyring");
+    install_test_nonce_key(243);
+    let payer = gstrkey_for_seed([0x6f; 32]);
+    let rpc_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(SponsoredSimulateResponder {
+            payer: payer_sc_address(&payer),
+        })
+        .expect(2)
+        .mount(&rpc_server)
+        .await;
+    let mut profile =
+        Profile::builder_testnet_named(PROFILE_NAME, SIGNER_SERVICE, &payer, "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+    profile.rpc_url = rpc_server.uri();
+    common::install_test_audit_key(&mut profile);
+    let server = WalletServer::new(profile.clone()).expect("wallet server");
+
+    // An explicit expiry keeps both selections stable across clock ticks.
+    let now_seconds = now_unix_ms().expect("clock") / 1_000;
+    let now_unix = i64::try_from(now_seconds).expect("Unix seconds");
+    let input = ChallengeInput::Mcp {
+        challenges: vec![serde_json::json!({
+            "id": "Challenge-Parity",
+            "realm": " Merchant.Example ",
+            "method": "stellar",
+            "intent": "charge",
+            "expires": format_rfc3339_utc(UNIX_EPOCH + Duration::from_secs(now_seconds + 120)),
+            "request": {
+                "amount": "10000000",
+                "currency": CONTRACT,
+                "recipient": RECIPIENT,
+                "methodDetails": {"feePayer": true, "network": "stellar:testnet"},
+            },
+        })],
+        selected_challenge_id: Some("Challenge-Parity".into()),
+        context: McpRequestContext::from_params(
+            " Merchant.Example ",
+            McpOperationKind::Tool,
+            " Checkout ",
+            Some(&serde_json::json!({"quantity": 1, "sku": "Item-A"})),
+        )
+        .expect("MCP context"),
+    };
+
+    // The CLI decodes tagged JSON before these shared library calls.
+    let cli_input = serde_json::from_value(
+        stellar_agent_mpp::json::parse_strict_json(
+            &serde_json::to_vec(&input).expect("tagged challenge JSON"),
+        )
+        .expect("strict JSON"),
+    )
+    .expect("typed CLI input");
+    let selected = select_and_validate(&cli_input, now_unix).expect("CLI selection");
+    let rpc = StellarSponsoredRpc::new(&profile.rpc_url).expect("CLI RPC");
+    let prepared = prepare_sponsored(
+        selected,
+        &profile.mcp_signer_default.account,
+        &profile.network_passphrase,
+        &rpc,
+    )
+    .await
+    .expect("CLI preparation");
+
+    // Independent stores ensure each surface constructs its own preview.
+    let generation = KeyringEntryRef::new("mpp-preview-parity-cli", "generation");
+    keyring_core::Entry::new(&generation.service, &generation.account)
+        .expect("generation entry")
+        .set_password("0")
+        .expect("initial generation");
+    let cli_state =
+        MppAuthorizationStore::at_path(home.path().join("cli.state"), [0x71; 32], generation);
+    let cli_preview = persist_prepared_authorization(
+        PROFILE_NAME,
+        &profile.network_passphrase,
+        &prepared,
+        ApprovalDisposition::Allow,
+        &process_uid_for_attestation().expect("process UID"),
+        now_unix,
+        &cli_state,
+        None,
+    )
+    .expect("CLI preview");
+    let mcp_result = server
+        .call_stellar_mpp_charge_prepare(PROFILE_NAME.into(), input)
+        .await
+        .expect("MCP prepare");
+    let mcp_envelope = result_json(&mcp_result);
+    assert_ne!(mcp_result.is_error, Some(true), "{mcp_envelope}");
+    let mcp_preview = &mcp_envelope["data"]["authorization"];
+    assert_eq!(
+        mcp_preview["authorization_fingerprint"], cli_preview.authorization_fingerprint,
+        "CLI and MCP authorization fingerprints must match"
+    );
+    assert_eq!(
+        mcp_preview,
+        &serde_json::to_value(&cli_preview).expect("CLI preview JSON"),
+        "CLI and MCP must agree on every serialized preview field"
+    );
+}
+
 /// Prepares one charge and commits it, returning the commit tool's result.
 ///
 /// Each commit needs its own authorization and its own process-bound nonce, so

@@ -11,16 +11,20 @@ on:
     branches: [main]
     # Plain documentation and the root plugin manifest cannot affect a gate.
     # Skill changes do run CI because release-contracts verifies the archive.
-    paths-ignore:
-      - '**/*.md'
-      - 'LICENSE'
-      - '.claude-plugin/**'
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!LICENSE'
+      - '!.claude-plugin/**'
+      - 'skills/**'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'LICENSE'
-      - '.claude-plugin/**'
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!LICENSE'
+      - '!.claude-plugin/**'
+      - 'skills/**'
 
 # Supersede in-flight runs for the same ref so rapid pushes do not queue stale
 # work.

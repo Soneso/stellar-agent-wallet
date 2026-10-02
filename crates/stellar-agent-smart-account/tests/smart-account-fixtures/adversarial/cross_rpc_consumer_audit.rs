@@ -154,12 +154,9 @@ fn count_emit_sites(workspace: &Path, file_path: &str) -> usize {
     let full = workspace.join(file_path);
     let contents =
         fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {full:?} failed: {e}"));
-    contents
-        .lines()
-        // Production code only: the unit-test module that follows the
-        // `#[cfg(test)]` attribute holds destructuring patterns, which rustfmt
-        // lays out in the constructor shape.
-        .take_while(|line| line.trim() != "#[cfg(test)]")
+    let lines: Vec<_> = contents.lines().collect();
+    lines[..test_module_cut(&lines)]
+        .iter()
         .filter(|line| {
             let trimmed = line.trim_start();
             // Skip rustdoc + line comments + block-comment continuations.
@@ -177,6 +174,134 @@ fn count_emit_sites(workspace: &Path, file_path: &str) -> usize {
                 && !line.contains(", ..")
         })
         .count()
+}
+
+/// The last in-file test module bounds production text, matching
+/// `.github/scripts/check-no-direct-sasignersetbaselined-emit.sh`.
+fn test_module_cut(lines: &[&str]) -> usize {
+    lines
+        .iter()
+        .enumerate()
+        .rfind(|(index, line)| {
+            if **line != "#[cfg(test)]" {
+                return false;
+            }
+            let mut following = lines[index + 1..].iter().copied();
+            let mut next = following.next();
+            while next.is_some_and(|line| line.starts_with("#[allow(")) {
+                while next.is_some_and(|line| !line.trim_end().ends_with(")]")) {
+                    next = following.next();
+                }
+                next = following.next();
+            }
+            next.is_some_and(|line| {
+                let declaration = line
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| line.strip_prefix("pub "))
+                    .unwrap_or(line);
+                declaration
+                    .strip_prefix("mod ")
+                    .and_then(|tail| tail.split_once(" {"))
+                    .is_some_and(|(name, _)| {
+                        !name.is_empty()
+                            && name
+                                .bytes()
+                                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                    })
+            })
+        })
+        .map_or(lines.len(), |(index, _)| index)
+}
+
+#[test]
+fn cross_rpc_consumer_after_cfg_test_item_is_scanned() {
+    let workspace = tempfile::tempdir().expect("fixture directory");
+    for item in [
+        "static TEST_FLAG: bool = true;",
+        "fn test_helper() {}",
+        "use std::sync::Mutex;",
+    ] {
+        let source = format!(
+            "#[cfg(test)]\n{item}\n\
+             fn production_consumer() {{\n\
+                 let error = SaError::NetworkRpcDivergence {{\n\
+                     rule_id: 1,\n\
+                 }};\n\
+             }}\n\
+             #[cfg(test)]\n\
+             mod tests {{}}\n"
+        );
+        fs::write(workspace.path().join("fixture.rs"), source).expect("fixture source");
+        assert_eq!(
+            count_emit_sites(workspace.path(), "fixture.rs"),
+            1,
+            "production consumer after cfg(test) item must be scanned: {item}"
+        );
+    }
+}
+
+#[test]
+fn cross_rpc_consumer_in_final_test_module_is_not_scanned() {
+    let workspace = tempfile::tempdir().expect("fixture directory");
+    for attributes in [
+        "",
+        "#[allow(dead_code)]\n",
+        "#[allow(\n    dead_code,\n)]\n#[allow(unused_imports)]\n",
+    ] {
+        let source = format!(
+            "fn production() {{}}\n\
+             #[cfg(test)]\n{attributes}\
+             mod checks {{\n\
+                 fn test_pattern() {{\n\
+                     let SaError::NetworkRpcDivergence {{\n\
+                         rule_id, ..\n\
+                     }} = error;\n\
+                 }}\n\
+             }}\n"
+        );
+        fs::write(workspace.path().join("fixture.rs"), source).expect("fixture source");
+        assert_eq!(
+            count_emit_sites(workspace.path(), "fixture.rs"),
+            0,
+            "final test module must be excluded with attributes: {attributes}"
+        );
+    }
+}
+
+#[test]
+fn cross_rpc_consumer_between_test_modules_is_scanned() {
+    let workspace = tempfile::tempdir().expect("fixture directory");
+    let source = "#[cfg(test)]\n\
+                  mod early {}\n\
+                  fn production_consumer() {\n\
+                      let error = SaError::NetworkRpcDivergence {\n\
+                          rule_id: 1,\n\
+                      };\n\
+                  }\n\
+                  #[cfg(test)]\n\
+                  mod tests {\n\
+                      fn test_consumer() {\n\
+                          let error = SaError::NetworkRpcDivergence {\n\
+                              rule_id: 2,\n\
+                          };\n\
+                      }\n\
+                  }\n";
+    let lines: Vec<_> = source.lines().collect();
+    let final_module = lines
+        .iter()
+        .position(|line| *line == "mod tests {")
+        .expect("final test module");
+    assert_eq!(
+        test_module_cut(&lines),
+        final_module - 1,
+        "the cut must land at the final test module's cfg(test) attribute"
+    );
+    fs::write(workspace.path().join("fixture.rs"), source).expect("fixture source");
+    assert_eq!(
+        count_emit_sites(workspace.path(), "fixture.rs"),
+        1,
+        "the production consumer between test modules must be counted and the final module excluded"
+    );
 }
 
 // ── Audit-list completeness ───────────────────────────────────────────────────
