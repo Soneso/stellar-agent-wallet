@@ -4,14 +4,13 @@
 //!
 //! | Test | Mechanism | Coverage |
 //! |------|-----------|----------|
-//! | [`submit_returns_simulate_failure_on_first_step_when_rpc_simulate_errors`] | wiremock + `MigrationPlan::submit` | `VerifierMigrationFailed { phase: "submit_simulate" }` at `failed_step_index=0` |
-//! | [`submit_send_failure_error_shape`] | wiremock + `MigrationPlan::submit` | `VerifierMigrationFailed { phase: "submit_send" }` wire code + display |
-//! | [`submit_partial_failure_result_shape`] | wiremock + `MigrationPlan::submit` | partial failure when step 1 fails after step 0 succeeds |
+//! | [`submit_refuses_the_first_step_without_a_state_row_before_any_rpc`] | wiremock + `MigrationPlan::submit` | `sa.signer_set_missing_baseline` at `failed_step_index=0`, no pending add, no RPC request |
 //!
-//! All tests invoke [`MigrationPlan::submit`] against a wiremock-backed
-//! [`SignersManager`]. The send-failure and partial-failure tests use the
-//! `test-helpers` submit shim to force deterministic send-phase outcomes
-//! without constructing live Soroban auth entries by hand.
+//! The test invokes [`MigrationPlan::submit`] against a wiremock-backed
+//! [`SignersManager`] whose audit log holds no signer-set state row. The
+//! pair entry, its state rows, its pending add and its partial-failure
+//! shapes are pinned against the stateful mock RPC in
+//! `tests/execute_path_drift_check_mock.rs`.
 //!
 //! # Gating
 //!
@@ -129,54 +128,44 @@ fn mock_signer_g() -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// simulate failure on first step — wiremock end-to-end
+// a first step without a state row: wiremock end-to-end
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `MigrationPlan::submit` returns `VerifierMigrationFailed { phase: "submit_simulate" }`
-/// at `failed_step_index = Some(0)` when the mock RPC returns a simulate error.
+/// `MigrationPlan::submit` refuses the first pair with
+/// `sa.signer_set_missing_baseline` when the migrating rule has no
+/// signer-set state row, before any RPC request.
 ///
 /// # Mock sequence
 ///
-/// 1. `getLedgerEntries` → account entry for the source G-key (so `fetch_account`
-///    succeeds and the source-account sequence is available).
-/// 2. The first `simulateTransaction` is the pinned-hash drift check's
-///    `get_context_rule` read of the migrating rule, answered with the rule;
-///    the rule has no pin record in the fixture's audit log, so the check
-///    passes.
-/// 3. Every later `simulateTransaction` →
-///    `{"error": "mock-rpc-simulate-error", "latestLedger": 1000}`.
-///    This causes `submit_signed_invoke` to return
-///    `SaError::DeploymentFailed { phase: "simulate", ... }`, which
-///    `submit_migration_step` re-maps to `VerifierMigrationFailed { phase: "submit_simulate" }`.
+/// The dispatcher would answer `getLedgerEntries` with the source account,
+/// the first `simulateTransaction` with rule 1 holding one External signer
+/// (id 10) and every later one with an error. The fixture's audit log is
+/// fresh, so the pair's comparison reads no state row for rule 1 and
+/// refuses before it reaches the dispatcher.
 ///
 /// # Assertions
 ///
-/// - `result.failed_step_index == Some(0)`.
-/// - `result.successful_steps.is_empty()`.
-/// - `result.total_steps_attempted == 1`.
-/// - `result.failed_step_error` is `Some(SaError::VerifierMigrationFailed)` with
-///   `phase == "submit_simulate"` in the Display string.
+/// - `result.failed_step_index == Some(0)`, `total_steps_attempted == 1`,
+///   no successful step.
+/// - `result.failed_step_error` has the wire code
+///   `sa.signer_set_missing_baseline`.
+/// - `result.pending_add` and `failed_step_remove_tx_hash` are `None`.
+/// - The dispatcher received no request.
 ///
 /// # Implements
 ///
-/// Verifier diversification submit-simulate phase error path.
+/// Verifier diversification: a migration compares each rule with its state
+/// row before anything is sent.
 #[tokio::test]
-async fn submit_returns_simulate_failure_on_first_step_when_rpc_simulate_errors() {
+async fn submit_refuses_the_first_step_without_a_state_row_before_any_rpc() {
     let server = MockServer::start().await;
 
     let signer_g = mock_signer_g();
-
-    // getLedgerEntries → valid account entry so fetch_account succeeds.
     let account_resp = build_ledger_entries_account(&signer_g);
-
-    // simulateTransaction → error response.
-    // `submit_signed_invoke` checks `sim_response.error.is_some()` and returns
-    // `SaError::DeploymentFailed { phase: "simulate", ... }`.
     let simulate_resp = serde_json::json!({
         "error": "mock-rpc-simulate-error",
         "latestLedger": 1000
     });
-
     let rule_resp = build_simulate_response(&build_context_rule_external_signers_xdr(
         1,
         &[10],
@@ -197,10 +186,8 @@ async fn submit_returns_simulate_failure_on_first_step_when_rpc_simulate_errors(
 
     let smart_account = addr(0x01);
 
-    // Build a plan with one affected rule containing one signer step.
-    // The `remove_host_function` and `add_host_function` targets must be the
-    // smart_account address (contract_address in InvokeContractArgs) so that
-    // `extract_invoke_args` decodes them correctly.
+    // One affected rule with one signer step; `extract_invoke_args` decodes
+    // both host functions, whose target is the smart account.
     let step = SignerMigrationStep::new_for_test(
         10,
         "aabbccdd",
@@ -221,7 +208,6 @@ async fn submit_returns_simulate_failure_on_first_step_when_rpc_simulate_errors(
         Uuid::new_v4().to_string(),
     );
 
-    // Build a software signer from the fixed seed.
     use zeroize::Zeroizing;
     let seed = Zeroizing::new(MOCK_SIGNER_SEED);
     let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> =
@@ -230,257 +216,31 @@ async fn submit_returns_simulate_failure_on_first_step_when_rpc_simulate_errors(
     let request_id = Uuid::new_v4().to_string();
     let result = plan.submit(signer.as_ref(), &manager, &request_id).await;
 
-    // Assertion 1: failed at step 0.
-    assert_eq!(
-        result.failed_step_index,
-        Some(0),
-        "failed_step_index must be Some(0) when simulate fails on first step; got: {:?}",
-        result.failed_step_index
-    );
-
-    // Assertion 2: no successful steps.
+    assert_eq!(result.failed_step_index, Some(0));
     assert!(
         result.successful_steps.is_empty(),
-        "successful_steps must be empty when first step fails immediately; got: {:?}",
+        "successful_steps must be empty; got: {:?}",
         result.successful_steps
     );
-
-    // Assertion 3: total_steps_attempted == 1 (step 0 was attempted).
-    assert_eq!(
-        result.total_steps_attempted, 1,
-        "total_steps_attempted must be 1 when first step fails; got {}",
-        result.total_steps_attempted
-    );
-
-    // Assertion 4: the error is VerifierMigrationFailed with phase "submit_simulate".
-    let err = result
-        .failed_step_error
-        .expect("failed_step_error must be Some when failed_step_index is Some");
-
-    // Wire code must be "sa.verifier_migration_failed".
-    assert_eq!(
-        err.wire_code(),
-        "sa.verifier_migration_failed",
-        "wire_code must be 'sa.verifier_migration_failed'; got: {}",
-        err.wire_code()
-    );
-
-    // Display must contain "submit_simulate".
-    let msg = err.to_string();
-    assert!(
-        msg.contains("submit_simulate"),
-        "Display must contain 'submit_simulate'; got: {msg}"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// submit_send failure via MigrationPlan::submit
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `MigrationPlan::submit` returns `VerifierMigrationFailed { phase:
-/// "submit_send" }` at `failed_step_index = Some(0)` when the send phase
-/// fails on the first migration step.
-///
-/// # Implements
-///
-/// Verifier diversification submit-send phase error shape.
-#[tokio::test]
-async fn submit_send_failure_error_shape() {
-    let server = MockServer::start().await;
-    let signer_g = mock_signer_g();
-    let account_resp = build_ledger_entries_account(&signer_g);
-    let simulate_resp = serde_json::json!({
-        "error": "mock-rpc-simulate-response-unused-by-test-helper",
-        "latestLedger": 1000
-    });
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(SorobanRpcDispatcher::new(account_resp, simulate_resp))
-        .mount(&server)
-        .await;
-
-    let (manager, _tmp_dir) = manager_with_server(&server).await;
-    let smart_account = addr(0x01);
-    let step = SignerMigrationStep::new_for_test(
-        10,
-        "aabbccdd",
-        dummy_host_function(&smart_account, "remove_signer"),
-        dummy_host_function(&smart_account, "add_signer"),
-    );
-    let rule = RuleMigration::new_for_test(1, "aabbccdd", vec![step]);
-    let plan = MigrationPlan::new_for_test(
-        smart_account,
-        [0x11u8; 32],
-        OZ_VERIFIER_HASH,
-        addr(0x02),
-        vec![rule],
-        VerifierAuditStatus::Provisional {
-            attested_by: "OpenZeppelin",
-            attested_at: "2025-11-01",
-        },
-        Uuid::new_v4().to_string(),
-    );
-    use zeroize::Zeroizing;
-    let seed = Zeroizing::new(MOCK_SIGNER_SEED);
-    let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> =
-        Box::new(SoftwareSigningKey::new_from_zeroizing(seed));
-
-    let request_id = format!("mock-submit-send-failure-{}", Uuid::new_v4());
-    let result = plan.submit(signer.as_ref(), &manager, &request_id).await;
-
-    assert_eq!(result.failed_step_index, Some(0));
-    assert!(result.successful_steps.is_empty());
     assert_eq!(result.total_steps_attempted, 1);
     let err = result
         .failed_step_error
-        .expect("failed_step_error must be set");
-
-    // Wire code must be "sa.verifier_migration_failed".
+        .expect("failed_step_error must be Some when failed_step_index is Some");
     assert_eq!(
         err.wire_code(),
-        "sa.verifier_migration_failed",
-        "wire_code must be 'sa.verifier_migration_failed'"
+        "sa.signer_set_missing_baseline",
+        "the pair refuses a rule without a state row; got: {err:?}"
     );
+    assert!(result.pending_add.is_none());
+    assert!(result.failed_step_remove_tx_hash.is_none());
 
-    // Display must contain the phase.
-    let msg = err.to_string();
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock records requests");
     assert!(
-        msg.contains("submit_send"),
-        "Display must contain 'submit_send'; got: {msg}"
-    );
-
-    // Display must NOT contain "submit_simulate" (distinct phase).
-    assert!(
-        !msg.contains("submit_simulate"),
-        "Display must NOT contain 'submit_simulate' for submit_send phase; got: {msg}"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// partial failure via MigrationPlan::submit
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `MigrationPlan::submit` records one successful signer step and returns
-/// `failed_step_index = Some(1)` when the second signer step fails.
-///
-/// # Partial-failure idempotency note
-///
-/// The partial-failure design allows re-running `MigrationPlanner::build` +
-/// `submit` to resume from the last failed step: already-migrated signers
-/// no longer match `from_hash`, so the planner emits a reduced plan covering
-/// only the remaining affected signers.
-///
-/// # Implements
-///
-/// Verifier diversification partial-failure semantics for the submit path.
-#[tokio::test]
-async fn submit_partial_failure_result_shape() {
-    let server = MockServer::start().await;
-    let signer_g = mock_signer_g();
-    let account_resp = build_ledger_entries_account(&signer_g);
-    let simulate_resp = serde_json::json!({
-        "error": "mock-rpc-simulate-response-unused-by-test-helper",
-        "latestLedger": 1000
-    });
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(SorobanRpcDispatcher::new(account_resp, simulate_resp))
-        .mount(&server)
-        .await;
-
-    let (manager, _tmp_dir) = manager_with_server(&server).await;
-    let smart_account = addr(0x01);
-    let step_0 = SignerMigrationStep::new_for_test(
-        10,
-        "aabbccdd",
-        dummy_host_function(&smart_account, "remove_signer"),
-        dummy_host_function(&smart_account, "add_signer"),
-    );
-    let step_1 = SignerMigrationStep::new_for_test(
-        11,
-        "aabbccdd",
-        dummy_host_function(&smart_account, "remove_signer"),
-        dummy_host_function(&smart_account, "add_signer"),
-    );
-    let rule = RuleMigration::new_for_test(1, "aabbccdd", vec![step_0, step_1]);
-    let plan = MigrationPlan::new_for_test(
-        smart_account,
-        [0x11u8; 32],
-        OZ_VERIFIER_HASH,
-        addr(0x02),
-        vec![rule],
-        VerifierAuditStatus::Provisional {
-            attested_by: "OpenZeppelin",
-            attested_at: "2025-11-01",
-        },
-        Uuid::new_v4().to_string(),
-    );
-    use zeroize::Zeroizing;
-    let seed = Zeroizing::new(MOCK_SIGNER_SEED);
-    let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> =
-        Box::new(SoftwareSigningKey::new_from_zeroizing(seed));
-
-    let request_id = format!("mock-partial-submit-send-failure-{}", Uuid::new_v4());
-    let result = plan.submit(signer.as_ref(), &manager, &request_id).await;
-
-    // Assertion 1: failed_step_index == Some(1).
-    assert_eq!(
-        result.failed_step_index,
-        Some(1),
-        "failed_step_index must be Some(1)"
-    );
-
-    // Assertion 2: successful_steps.len() == 1 (step 0 succeeded).
-    assert_eq!(
-        result.successful_steps.len(),
-        1,
-        "successful_steps must have 1 entry (step 0 succeeded before failure at step 1)"
-    );
-
-    // Assertion 3: step 0 fields are accessible.
-    let step = &result.successful_steps[0];
-    assert_eq!(step.rule_id, 1, "step.rule_id must be 1");
-    assert_eq!(step.signer_id, 10, "step.signer_id must be 10");
-    assert_eq!(
-        step.remove_tx_hash.len(),
-        64,
-        "step.remove_tx_hash must be a mock 64-char tx hash"
-    );
-    assert_eq!(
-        step.add_tx_hash.len(),
-        64,
-        "step.add_tx_hash must be a mock 64-char tx hash"
-    );
-
-    // Assertion 4: failed_step_error carries the expected phase.
-    let err = result
-        .failed_step_error
-        .expect("failed_step_error must be Some");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("submit_send"),
-        "failed_step_error Display must contain 'submit_send'; got: {msg}"
-    );
-
-    // Assertion 5: total_steps_attempted == 2 (step 0 + step 1 both attempted).
-    assert_eq!(
-        result.total_steps_attempted, 2,
-        "total_steps_attempted must be 2 (step 0 ok, step 1 failed)"
-    );
-    assert_eq!(
-        result.failed_step_remove_tx_hash.as_deref(),
-        None,
-        "failed step remove hash is None because the second step fails before remove confirmation"
-    );
-
-    // Assertion 6: partial-failure invariant — successful_steps.len() == failed_step_index.
-    //
-    // This is the canonical postcondition of `MigrationPlan::submit`:
-    // all steps prior to failure are in successful_steps.
-    assert_eq!(
-        result.successful_steps.len(),
-        result.failed_step_index.unwrap(),
-        "successful_steps.len() must equal failed_step_index for a \
-         well-formed partial-failure result"
+        requests.is_empty(),
+        "the refusal comes before any RPC request; got {} requests",
+        requests.len()
     );
 }

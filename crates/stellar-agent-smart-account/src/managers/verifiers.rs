@@ -1298,11 +1298,13 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
 
     // Multi-verifier indexing guard.
     //
-    // The check supports exactly one distinct verifier address per rule. With
-    // several pins, the caller passes one `verifier_addr` per iteration, but
-    // the pin position would not align with `[0]` for the second and
-    // subsequent verifiers. Fail closed to avoid silently checking the wrong
-    // pin (a false-negative security risk).
+    // The check supports exactly one distinct verifier pin per rule. Several
+    // live verifier addresses whose pins are equal, in hash and executable
+    // reference, share that pin, and each is compared with it. With several
+    // pins, the caller passes one `verifier_addr` per iteration, but the pin
+    // position would not align with `[0]` for the second and subsequent
+    // verifiers. Fail closed to avoid silently checking the wrong pin (a
+    // false-negative security risk).
     if verifier_hashes_first8.len() > 1 {
         return Err(SaError::MultiplePinnedHashesUnsupported {
             kind: "verifier",

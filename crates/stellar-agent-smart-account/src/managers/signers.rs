@@ -47,9 +47,12 @@
 //! and `detach_policy`, which follow the same shape. They lock the rule and
 //! its auth rules, then, under the locks, compare the rule, plan the pin
 //! record, submit, record the threshold change of the simple-threshold
-//! policy and write the pin rows. The signer verbs, the policy verbs and
-//! `refresh_signer_baseline` therefore write each pin row under the lock of
-//! the rule it pins, held since the record read it was planned from.
+//! policy and write the pin rows. The migration pair
+//! (`migrate_signer_pair`) holds the rule's lock across its removal and its
+//! add, and writes both state rows and the pin repoint under it. The signer
+//! verbs, the policy verbs, `refresh_signer_baseline` and the migration pair
+//! therefore write each pin row under the lock of the rule it pins, held
+//! since the record read it was planned from.
 //!
 //! # Single-caller invariant for the signer-set baseline
 //!
@@ -131,6 +134,7 @@ use crate::error::{
     baseline_observe_reason, baseline_write_reason,
 };
 use crate::managers::auth_entry::{PreSubmitBudget, bound_pre_submit_stage};
+use crate::managers::migration::PendingAddStep;
 use crate::managers::rules::{
     BASE_FEE_STROOPS, ExpectedInstallState, ExpiryCheck, augment_with_oz_error_name,
     contract_instance_key, scaddress_to_strkey,
@@ -141,6 +145,7 @@ use crate::signers::types::{
     FrozenChainStateTuple, PolicyIdentifiedKind, ThresholdAffectingOp, WasmHashSummary,
 };
 use crate::simple_threshold_policy::parse_simple_threshold_install_param;
+use crate::submit::ExpectedReturn;
 use crate::weighted_threshold_policy::WEIGHTED_THRESHOLD_POLICY_WASM_HASHES;
 
 /// Weighted-threshold policy's on-chain view state: the current threshold
@@ -580,6 +585,7 @@ impl SignersManagerConfig {
 /// | `batch_add_signers` | Compares, adds signers, validates the confirmed set | yes | `SaSignerAddedV2` per signer |
 /// | `remove_signer` | Compares, removes a signer, validates the confirmed set | yes | `SaSignerRemovedV2` |
 /// | `set_threshold` | Compares, changes the threshold, validates the confirmed set | yes | `SaThresholdChangedV2` |
+/// | `migrate_signer_pair` (through `MigrationPlan::submit`) | Compares, removes an `External` signer, validates the confirmed set, repoints the pin record, compares again, adds the key data on the destination verifier, validates the confirmed set | yes | `SaSignerRemovedV2`, `SaContextRulePinsUpdated` (pinned rule), `SaSignerAddedV2`, `SaVerifierMigrated` |
 /// | `verify_signer_set_against_chain` | Compares the chain with the audit-log baseline | yes | `SaSignerSetDiverged` (on mismatch) |
 /// | `identify_verifier` | Verifier wasm-hash two-RPC lookup | no | (internal; no audit row) |
 ///
@@ -777,18 +783,20 @@ impl SignersManager {
 
     /// Returns the chain ID string.
     ///
-    /// `pub(crate)` — used by [`crate::managers::migration`] to pass
-    /// the chain ID into `SaVerifierMigrated` audit rows.
+    /// `pub(crate)`: used by [`crate::managers::migration::MigrationPlanner`]
+    /// to configure the rule manager it lists the account's rules through.
     #[must_use]
     pub(crate) fn chain_id_ref(&self) -> &str {
         &self.chain_id
     }
 
-    /// Returns the shared `Arc<Mutex<AuditWriter>>` for migration audit emission.
+    /// Returns the shared `Arc<Mutex<AuditWriter>>` for the migration
+    /// planner.
     ///
-    /// `pub(crate)` — used by [`crate::managers::migration`] to emit
-    /// `SaVerifierMigrated` audit rows after each signer-step pair submission.
-    /// Mirrors the `audit_writer()` accessor used by `CredentialsManager`.
+    /// `pub(crate)`: used by [`crate::managers::migration::MigrationPlanner`]
+    /// to give the rule manager it lists the account's rules through this
+    /// manager's audit writer. Mirrors the `audit_writer()` accessor used by
+    /// `CredentialsManager`.
     #[must_use]
     pub(crate) fn audit_writer_arc_migration(
         &self,
@@ -796,45 +804,550 @@ impl SignersManager {
         Arc::clone(&self.audit_writer)
     }
 
-    /// Submits a single migration step (remove_signer or add_signer) for a smart account.
+    // ── migrate_signer_pair ───────────────────────────────────────────────────
+
+    /// Migrates the `External` signer `signer_id` of rule `rule_id` to the
+    /// destination verifier `to_verifier_addr` as two checked signer
+    /// mutations, a removal and an add of the same key data, under the
+    /// rule's lock.
     ///
-    /// Wraps `submit_signed_invoke` for the migration submit path.
-    /// Called by [`crate::managers::migration::MigrationPlan::submit`] for each
-    /// `HostFunction` in a `SignerMigrationStep`.
+    /// Called by [`crate::managers::migration::MigrationPlan::submit`] once
+    /// per pair. `remove_args` and `add_args` are the invoke arguments of the
+    /// pair's two host functions; `from_hash_first8` and `to_hash_first8`
+    /// name the source and destination verifier hashes.
     ///
-    /// `entrypoint` MUST be one of `"remove_signer"` or `"add_signer"`.
+    /// # Order
     ///
-    /// The step signs under `rule_id` alone, with the pinned-hash drift check
-    /// marking `rule_id` as the migrating rule: the rule's policies are
-    /// checked against its pin record, its verifiers are not. The migration
-    /// preflight already identified, allowlisted and probed the destination
-    /// verifier, and the remove step signs while the source verifier, which
-    /// may be the drifted contract the migration moves away from, is still
-    /// live. The submit path also skips the signer-set baseline read and
-    /// comparison of the migrating rule, which it still locks: the remove
-    /// step changes the signer set the add step signs under, and the
-    /// migration writes no signer-set state row between them.
+    /// One acquisition of the rule's lock is held through both submissions
+    /// and both confirmations, and released when the entry returns. Under
+    /// it:
+    ///
+    /// 1. The removal compares the rule with its newest state row, which
+    ///    must be version 2.
+    /// 2. The plan is checked before anything is sent. The compared set
+    ///    holds signer `signer_id` with an `External` identity, `add_args`
+    ///    add the same key data on the destination verifier, and
+    ///    `remove_args` remove signer `signer_id` of rule `rule_id`.
+    /// 3. The removal's preconditions of [`Self::remove_signer`] apply: a
+    ///    rule with policies and no simple-threshold policy, and a rule whose
+    ///    threshold the removal would make unreachable, are refused. The
+    ///    pair signs under the rule with the source key alone, so that key
+    ///    must be a Delegated signer of the rule.
+    /// 4. The removal is submitted, the confirmed rule is observed through
+    ///    both endpoints and must be the compared set without the signer,
+    ///    and `SaSignerRemovedV2` records it.
+    /// 5. The rule's pin record is repointed to the destination verifier.
+    /// 6. The add compares the rule with the removal's state row.
+    /// 7. The add is submitted; its simulated return value must be a `u32`
+    ///    before it is signed. The confirmed rule must hold the removed
+    ///    identity on the destination verifier under the id the simulation
+    ///    returned, every other signer and the threshold unchanged.
+    ///    `SaSignerAddedV2` records it.
+    /// 8. `SaVerifierMigrated` records the completed pair.
+    ///
+    /// A completed pair writes `[SaSignerRemovedV2, SaContextRulePinsUpdated,
+    /// SaSignerAddedV2, SaVerifierMigrated]`; the pins row is written only
+    /// for a rule with a pin record that does not already name the
+    /// destination alone. The pins row and `SaVerifierMigrated` are logged
+    /// and skipped when the audit log refuses them; the two state rows are
+    /// required.
+    ///
+    /// # Pin record
+    ///
+    /// The repoint replaces the record's verifier pins by `to_hash_first8`
+    /// with no executable-reference pin, the policy pins and override flags
+    /// unchanged. The migration preflight identified the destination,
+    /// required it in the allowlist and refused a mutable one, which
+    /// includes every external reference. It runs as soon as the removal
+    /// was sent and before the add, so a pair that stops after the send
+    /// leaves a record that already names the destination. A rule without a
+    /// pin record stays unpinned, and a record that already names the
+    /// destination alone is not rewritten.
+    ///
+    /// # Pending add
+    ///
+    /// A failure after the removal was sent returns the add that completes
+    /// the pair as [`PendingAddStep`] data. That is the case when the
+    /// removal confirmed and a later step before the add's confirmation
+    /// failed, and when the removal's outcome is unknown
+    /// ([`SaError::SubmissionUnresolved`], `remove_confirmed: false`). An
+    /// add whose outcome is unknown sets `add_tx_hash`. Once the add
+    /// confirmed, a failure to validate or record its state returns no
+    /// pending add: the add is on chain, and
+    /// `signers refresh --accept-divergence` records the chain state. A
+    /// failure before the removal was sent returns no pending add and
+    /// leaves the rule unchanged.
+    ///
+    /// # Budgets
+    ///
+    /// The lock wait runs under the manager's timeout from the call. Each
+    /// submission runs its pre-flight under its own pre-submit budget, and
+    /// each confirmation's observation under the manager's timeout from
+    /// that confirmation.
     ///
     /// # Errors
+    ///
+    /// Raised by the entry and returned unchanged:
+    ///
+    /// - [`SaError::SignerSetMissingBaseline`] /
+    ///   [`SaError::SignerSetBaselineLegacy`]: the rule has no state row, or
+    ///   a version-1 one, before any RPC.
+    /// - [`SaError::SignerSetDiverged`]: the chain differs from the newest
+    ///   state row before a step is submitted (no transaction hash), or a
+    ///   confirmed step left another state than the intended one (with its
+    ///   hash).
+    /// - [`SaError::ThresholdPolicyIdentificationFailed`] /
+    ///   [`SaError::ThresholdUnreachable`]: the removal's preconditions.
+    /// - [`SaError::BaselineWriteFailed`]: a confirmed step's state was not
+    ///   observed (stage `observe`) or not recorded (stage `write`).
+    /// - [`SaError::AuditLog`] / [`SaError::NetworkRpcDivergence`]: a
+    ///   comparison met an audit-log integrity error or endpoints that
+    ///   disagree.
+    /// - [`SaError::VerifierMigrationFailed`] at phase `plan_build`: the
+    ///   plan check of step 2.
+    /// - [`SaError::AuthEntryConstructionFailed`] at stage `rule_lock`: the
+    ///   lock was not acquired within its budget.
+    /// - The errors of [`Self::submit_migration_step`] for either step.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the rule and the signer, the destination and both hash labels, both steps' \
+                  arguments, the signer and its source account, and the correlation id"
+    )]
+    pub(crate) async fn migrate_signer_pair(
+        &self,
+        smart_account: &ScAddress,
+        rule_id: u32,
+        signer_id: u32,
+        to_verifier_addr: &ScAddress,
+        from_hash_first8: &str,
+        to_hash_first8: &str,
+        remove_args: Vec<ScVal>,
+        add_args: Vec<ScVal>,
+        signer: &(dyn Signer + Send + Sync),
+        source_pubkey_strkey: &str,
+        request_id: &str,
+    ) -> Result<MigratedPair, PairFailure> {
+        let without_pending_add = |error: SaError| PairFailure {
+            error,
+            pending_add: None,
+        };
+        let smart_account_strkey =
+            scaddress_to_strkey(smart_account).map_err(without_pending_add)?;
+        let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
+
+        // The migrating rule is the only rule each step signs under.
+        let guards = self
+            .acquire_rule_locks(&smart_account_strkey, [rule_id], self.lock_budget())
+            .await
+            .map_err(without_pending_add)?;
+        let guard =
+            held_guard(&guards, &smart_account_strkey, rule_id).map_err(without_pending_add)?;
+
+        // The removal's comparison.
+        let compared = [self
+            .verify_signer_set_locked(
+                guard,
+                V1Handling::RefuseLegacy,
+                Some(source_pubkey_strkey),
+                request_id,
+            )
+            .await
+            .map_err(without_pending_add)?];
+        let before = compared[0].snapshot();
+
+        let (intended, key_data) = check_migration_pair_plan(
+            before,
+            rule_id,
+            signer_id,
+            to_verifier_addr,
+            &remove_args,
+            &add_args,
+        )
+        .map_err(|detail| {
+            without_pending_add(SaError::VerifierMigrationFailed {
+                phase: crate::error::MIGRATION_PHASES[2], // "plan_build"
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted.as_str(),
+                ),
+                detail,
+                request_id: request_id.to_owned(),
+            })
+        })?;
+        check_remove_preconditions(&compared[0], signer_id, &smart_account_redacted, request_id)
+            .map_err(without_pending_add)?;
+
+        let pending = |remove_tx_hash: &str, remove_confirmed: bool| {
+            PendingAddStep::new(
+                rule_id,
+                signer_id,
+                to_verifier_addr.clone(),
+                key_data.clone(),
+                remove_tx_hash.to_owned(),
+                remove_confirmed,
+            )
+        };
+
+        // The removal.
+        let removal = self
+            .submit_migration_step(
+                smart_account.clone(),
+                rule_id,
+                "remove_signer",
+                remove_args,
+                signer,
+                source_pubkey_strkey,
+                &smart_account_redacted,
+                request_id,
+                &borrowed(&guards, &compared),
+                None,
+            )
+            .await;
+        let removed = match removal {
+            Ok(removed) => removed,
+            Err(error) => {
+                let pending_add = match &error {
+                    // The removal was sent and may land: the record names the
+                    // destination before the pair stops.
+                    SaError::SubmissionUnresolved {
+                        tx_hash: Some(tx_hash),
+                        ..
+                    } => {
+                        self.repoint_migrated_pins(
+                            rule_id,
+                            &smart_account_redacted,
+                            to_hash_first8,
+                            request_id,
+                        );
+                        Some(pending(tx_hash, false))
+                    }
+                    _ => None,
+                };
+                return Err(PairFailure { error, pending_add });
+            }
+        };
+        let pending_add = pending(&removed.tx_hash, true);
+        let stopped = |error: SaError| PairFailure {
+            error,
+            pending_add: Some(pending_add.clone()),
+        };
+
+        let recorded = self
+            .record_confirmed_remove(
+                smart_account,
+                &smart_account_strkey,
+                &smart_account_redacted,
+                rule_id,
+                signer_id,
+                source_pubkey_strkey,
+                before,
+                &removed,
+                request_id,
+            )
+            .await;
+        // The removal is on chain: the record names the destination whatever
+        // its recording returned.
+        self.repoint_migrated_pins(rule_id, &smart_account_redacted, to_hash_first8, request_id);
+        recorded.map_err(stopped)?;
+
+        // The add's comparison, against the removal's state row.
+        let compared_add = [self
+            .verify_signer_set_locked(
+                guard,
+                V1Handling::RefuseLegacy,
+                Some(source_pubkey_strkey),
+                request_id,
+            )
+            .await
+            .map_err(stopped)?];
+
+        let added = self
+            .submit_migration_step(
+                smart_account.clone(),
+                rule_id,
+                "add_signer",
+                add_args,
+                signer,
+                source_pubkey_strkey,
+                &smart_account_redacted,
+                request_id,
+                &borrowed(&guards, &compared_add),
+                Some(ExpectedReturn::U32),
+            )
+            .await
+            .map_err(|error| {
+                let add_tx_hash = match &error {
+                    SaError::SubmissionUnresolved { tx_hash, .. } => tx_hash.clone(),
+                    _ => None,
+                };
+                PairFailure {
+                    error,
+                    pending_add: Some(pending_add.clone().with_add_tx_hash(add_tx_hash)),
+                }
+            })?;
+
+        // The add confirmed: a failure from here on returns no pending add,
+        // since the add is on chain and the refresh records the chain state.
+        let (new_signer_id, mutation) = self
+            .validate_confirmed_add(
+                smart_account,
+                rule_id,
+                &smart_account_redacted,
+                source_pubkey_strkey,
+                compared_add[0].snapshot(),
+                intended,
+                added,
+                request_id,
+            )
+            .await
+            .map_err(without_pending_add)?;
+        let account = account_digest(&self.network_passphrase, &smart_account_strkey);
+        self.write_confirmed_state_row(
+            rule_id,
+            &smart_account_redacted,
+            &mutation.tx_hash,
+            request_id,
+            |_| {
+                AuditEntry::new_sa_signer_added_v2(
+                    rule_id,
+                    new_signer_id,
+                    &mutation.resulting,
+                    account,
+                    RedactedStrkey::from_already_redacted(smart_account_redacted.as_str()),
+                    self.chain_id.as_str(),
+                    request_id,
+                )
+            },
+        )
+        // The add confirmed; its state row was not written.
+        .map_err(without_pending_add)?;
+
+        self.write_verifier_migrated_row(
+            rule_id,
+            &smart_account_redacted,
+            from_hash_first8,
+            to_hash_first8,
+            &mutation.tx_hash,
+            request_id,
+        );
+
+        Ok(MigratedPair {
+            remove_tx_hash: removed.tx_hash,
+            add_tx_hash: mutation.tx_hash,
+            new_signer_id,
+        })
+    }
+
+    /// Observes the rule after the confirmed removal of a migration pair,
+    /// requires the compared set `before` without signer `signer_id`, and
+    /// writes the `SaSignerRemovedV2` row.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::BaselineWriteFailed`] at stage `observe` or `write`, with
+    ///   the removal's hash.
+    /// - [`SaError::SignerSetDiverged`] with the removal's hash: the
+    ///   confirmed state is not the intended removal.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the account identity, the rule and the signer, the source account, the \
+                  compared set, the confirmed removal and the correlation id"
+    )]
+    async fn record_confirmed_remove(
+        &self,
+        smart_account: &ScAddress,
+        smart_account_strkey: &str,
+        smart_account_redacted: &str,
+        rule_id: u32,
+        signer_id: u32,
+        source_pubkey_strkey: &str,
+        before: &SignerSetSnapshotV2,
+        removed: &crate::submit::SubmitInvokeResult,
+        request_id: &str,
+    ) -> Result<(), SaError> {
+        let observation = self
+            .observe_confirmed(
+                smart_account,
+                rule_id,
+                Some(source_pubkey_strkey),
+                removed,
+                smart_account_redacted,
+                request_id,
+            )
+            .await?;
+        let resulting = self.require_intended_state(
+            rule_id,
+            smart_account_redacted,
+            without_signer(before, signer_id),
+            observation,
+            &removed.tx_hash,
+            request_id,
+        )?;
+        let account = account_digest(&self.network_passphrase, smart_account_strkey);
+        self.write_confirmed_state_row(
+            rule_id,
+            smart_account_redacted,
+            &removed.tx_hash,
+            request_id,
+            |_| {
+                AuditEntry::new_sa_signer_removed_v2(
+                    rule_id,
+                    signer_id,
+                    &resulting,
+                    account,
+                    RedactedStrkey::from_already_redacted(smart_account_redacted),
+                    self.chain_id.as_str(),
+                    request_id,
+                )
+            },
+        )
+    }
+
+    /// Repoints the pin record of rule `rule_id` to the destination verifier
+    /// of a migration pair; see "Pin record" on
+    /// [`Self::migrate_signer_pair`].
+    ///
+    /// Every caller holds the rule's lock. The pair's removal was sent, so a
+    /// record that cannot be read or written is logged and the rule keeps
+    /// its previous record, which the drift check compares against the live
+    /// verifier set.
+    fn repoint_migrated_pins(
+        &self,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        to_hash_first8: &str,
+        request_id: &str,
+    ) {
+        match crate::managers::verifiers::read_pinned_hashes_for_rule(
+            self,
+            rule_id,
+            smart_account_redacted,
+        ) {
+            Ok(Some(record)) => {
+                if record.pinned_verifier_first8 == [to_hash_first8]
+                    && record.pinned_verifier_executable_refs.is_empty()
+                {
+                    debug!(
+                        rule_id,
+                        request_id,
+                        "migrate_signer_pair: the pin record already names the destination; \
+                         no pin update is written"
+                    );
+                    return;
+                }
+                let mut update = PlannedPinUpdate::unchanged(record);
+                update.record.pinned_verifier_first8 = vec![to_hash_first8.to_owned()];
+                update.record.pinned_verifier_executable_refs = Vec::new();
+                self.write_pin_rows(
+                    rule_id,
+                    smart_account_redacted,
+                    Some(update),
+                    PinsUpdateReason::VerifierMigrated,
+                    request_id,
+                );
+            }
+            Ok(None) => debug!(
+                rule_id,
+                request_id,
+                "migrate_signer_pair: the rule has no pin record; no pin update is written"
+            ),
+            Err(e) => warn!(
+                rule_id,
+                error = %e,
+                request_id,
+                "migrate_signer_pair: the pin record is unreadable after the removal was sent; \
+                 SaContextRulePinsUpdated row not written"
+            ),
+        }
+    }
+
+    /// Writes the `SaVerifierMigrated` row of a completed migration pair,
+    /// carrying the redacted hash of its add transaction.
+    ///
+    /// The pair's state rows carry its integrity, so a row the audit log
+    /// refuses is logged, and a poisoned writer marks the session degraded.
+    fn write_verifier_migrated_row(
+        &self,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        from_hash_first8: &str,
+        to_hash_first8: &str,
+        add_tx_hash: &str,
+        request_id: &str,
+    ) {
+        let add_tx_hash_redacted = stellar_agent_network::redact_tx_hash(add_tx_hash);
+        let written = self.write_state_row(|_| {
+            AuditEntry::new_sa_verifier_migrated(
+                rule_id,
+                RedactedStrkey::from_already_redacted(smart_account_redacted),
+                from_hash_first8,
+                to_hash_first8,
+                &add_tx_hash_redacted,
+                self.chain_id.as_str(),
+                request_id,
+            )
+        });
+        if let Err(e) = written {
+            warn!(
+                target: "stellar_agent::audit",
+                rule_id,
+                smart_account_redacted = %smart_account_redacted,
+                error = %e,
+                request_id = %request_id,
+                "SaVerifierMigrated row not written; the pair's state rows record it"
+            );
+        }
+    }
+
+    /// Submits one step of a migration pair (`remove_signer` or
+    /// `add_signer`) under the held lock of rule `rule_id`.
+    ///
+    /// Called by [`Self::migrate_signer_pair`] for each step, with the
+    /// pair's guards and the comparison it ran for that step as
+    /// `rule_locks`. `entrypoint` MUST be one of `"remove_signer"` or
+    /// `"add_signer"`.
+    ///
+    /// The step signs under `rule_id` alone, with the pinned-hash drift
+    /// check marking `rule_id` as the migrating rule: the rule's policies
+    /// are checked against its pin record, its verifiers are not. The
+    /// migration preflight already identified, allowlisted and probed the
+    /// destination verifier, and the remove step signs while the source
+    /// verifier, which may be the drifted contract the migration moves away
+    /// from, is still live. The submit path skips the rule's signer-set
+    /// baseline read and comparison because `rule_locks` carries the pair's
+    /// own comparison of the rule; it acquires no lock. `expected_return` is
+    /// checked against the simulated result before signing.
+    ///
+    /// # Errors
+    ///
+    /// Returned as themselves:
     ///
     /// - [`SaError::PolicyHashDrift`]: a policy of the rule differs from the
     ///   rule's pin record.
     /// - [`SaError::PinnedPolicyAbsent`]: the rule's pin record holds policy
     ///   pins while the rule has no policy on chain.
-    /// - [`SaError::PinCheckUnavailable`]: the drift check could not run.
-    /// - [`SaError::VerifierMigrationFailed`] with `phase: "submit_simulate"` — simulation
-    ///   of the migration `HostFunction` failed.
-    /// - [`SaError::VerifierMigrationFailed`] with `phase: "submit_send"`: every
-    ///   other failure of the step, including `sendTransaction` failing after
-    ///   simulation succeeded.
+    /// - [`SaError::PinCheckUnavailable`]: the drift check could not run,
+    ///   including an audit-log integrity error or an endpoint divergence it
+    ///   met.
+    /// - [`SaError::AuthEntryConstructionFailed`] at every stage, including
+    ///   `rule_lock_missing` and `migrating_rule_mismatch`.
+    /// - [`SaError::SubmissionUnresolved`]: the transaction was sent and its
+    ///   outcome is unknown; it keeps its transaction and envelope hashes.
+    ///
+    /// Folded into [`SaError::VerifierMigrationFailed`], whose `detail`
+    /// carries the folded error's Display:
+    ///
+    /// - phase `submit_simulate`: the simulation failed, or its return value
+    ///   is not the `expected_return` shape;
+    /// - phase `submit_send`: every other failure of the step, including a
+    ///   transaction refused on send or failed on chain.
     ///
     /// # Implements
     ///
     /// Verifier diversification: each migration step submits a single
-    /// `HostFunction` (`remove_signer` or `add_signer`) that atomically
-    /// replaces one verifier contract in the signer set.
+    /// `HostFunction` (`remove_signer` or `add_signer`) under the rule's
+    /// lock.
     #[allow(clippy::too_many_arguments, reason = "irreducible migration-step args")]
-    pub(crate) async fn submit_migration_step(
+    async fn submit_migration_step(
         &self,
         smart_account: ScAddress,
         rule_id: u32,
@@ -844,15 +1357,10 @@ impl SignersManager {
         source_pubkey_strkey: &str,
         smart_account_redacted: &str,
         request_id: &str,
+        rule_locks: &BorrowedRuleLocks<'_>,
+        expected_return: Option<ExpectedReturn>,
     ) -> Result<crate::submit::SubmitInvokeResult, SaError> {
         use crate::error::MIGRATION_PHASES;
-
-        #[cfg(feature = "test-helpers")]
-        if let Some(result) =
-            mock_migration_submit_result(rule_id, entrypoint, smart_account_redacted, request_id)
-        {
-            return result;
-        }
 
         let auth_rule_ids = vec![ContextRuleId::from(rule_id)];
 
@@ -872,32 +1380,32 @@ impl SignersManager {
             // replacing the verifier, not adding a new session credential).
             None,
             request_id,
-            // The verifier check and the signer-set steps of the migrating
-            // rule are skipped; its policy check runs. See
-            // `PinCheck::migrating_rule`.
+            // The verifier check of the migrating rule is skipped; its policy
+            // check runs. See `PinCheck::migrating_rule`.
             Some(crate::submit::MigratingRule::new(rule_id)),
-            None,
+            Some(rule_locks),
+            expected_return,
         )
         .await
         .map_err(|e| {
-            // The drift check's refusals and an unavailable drift check keep
-            // their own wire codes: nothing was simulated, and the operator's
-            // next step is to inspect the contract or the audit log, not the
-            // migration.
+            // The drift check's findings, every argument and lock stage, and
+            // an unknown submission outcome keep their own identity. The
+            // operator's next step is to inspect the contract, the audit log
+            // or the transaction hash, not the migration. The step signs under
+            // the migrating rule alone, whose verifier check is skipped, so no
+            // verifier finding reaches it.
             if matches!(
                 e,
-                SaError::VerifierHashDrift { .. }
-                    | SaError::PolicyHashDrift { .. }
+                SaError::PolicyHashDrift { .. }
                     | SaError::PinnedPolicyAbsent { .. }
-                    | SaError::PinnedVerifierAbsent { .. }
                     | SaError::PinCheckUnavailable { .. }
+                    | SaError::AuthEntryConstructionFailed { .. }
+                    | SaError::SubmissionUnresolved { .. }
             ) {
                 return e;
             }
-            // Classify the error phase: simulate vs send.
-            // `submit_signed_invoke` uses `SaError::DeploymentFailed` internally
-            // for both phases.  We re-map to `VerifierMigrationFailed` with the
-            // correct phase label so the caller can triage by phase.
+            // `submit_signed_invoke` reports both phases as
+            // `SaError::DeploymentFailed`; the migration names the phase.
             let phase = match &e {
                 SaError::DeploymentFailed { phase, .. } if *phase == "simulate" => {
                     MIGRATION_PHASES[3] // "submit_simulate"
@@ -1236,9 +1744,19 @@ impl SignersManager {
     /// the baseline row, the refresh writes the applied overrides' rows and a
     /// `SaContextRulePinsUpdated` row (reason `baseline_refreshed`) that
     /// adds the verifier pin to the record. A record that already pins a
-    /// verifier is left as it is, whatever the live verifier runs: a pinned
-    /// verifier that changed is the drift check's finding. A rule without a
-    /// pin record, such as one installed outside the wallet, gets no record.
+    /// verifier is left as it is while the rule holds `External` signers,
+    /// whatever the live verifier runs: a pinned verifier that changed is the
+    /// drift check's finding. A rule without a pin record, such as one
+    /// installed outside the wallet, gets no record.
+    ///
+    /// When the observation holds no `External` signer and the record pins
+    /// exactly one verifier, the refresh drops that pin. A verifier pin on a
+    /// rule without `External` signers protects nothing, and the refresh is
+    /// the operator's explicit reconciliation of the record with the chain.
+    /// After the baseline row, a `SaContextRulePinsUpdated` row (reason
+    /// `baseline_refreshed`) records the record without a verifier pin, the
+    /// policy pins and override flags unchanged. A signer added on a verifier
+    /// later pins that verifier.
     ///
     /// Call this after an intentional out-of-band signer change, once on a
     /// rule whose baseline is version 1, or on a rule refused with
@@ -1373,9 +1891,11 @@ impl SignersManager {
                 &request_id,
             )
             .await?;
-        // A plan exists only for a record that pinned no verifier, and it
-        // holds the one verifier pin the rule can carry.
-        let verifier_pinned = pin_update.is_some();
+        let (pin_update, verifier_pinned, verifier_pin_dropped) = match pin_update {
+            RefreshPinPlan::Unchanged => (None, false, false),
+            RefreshPinPlan::PinLiveVerifier(update) => (Some(update), true, false),
+            RefreshPinPlan::DropDeadPin(update) => (Some(update), false, true),
+        };
 
         self.emit_baseline(
             &observation,
@@ -1402,6 +1922,7 @@ impl SignersManager {
             threshold = ?observation.snapshot.threshold.as_ref().map(|t| t.threshold),
             previous_baseline = ?previous_baseline,
             verifier_pinned,
+            verifier_pin_dropped,
             "refresh_signer_baseline: baseline written"
         );
 
@@ -1416,11 +1937,19 @@ impl SignersManager {
     /// "Verifier reconciliation" on [`Self::refresh_signer_baseline`].
     ///
     /// `observed` is the rule's signer set the refresh observed under the
-    /// rule's lock. Returns `None` when it holds no `External` signer, when
-    /// the rule has no pin record, or when the record already pins a
-    /// verifier. Otherwise the returned update is the record with the one pin
-    /// every live verifier's probe produced, equal in hash and executable
-    /// reference, and the overrides applied while probing them pending.
+    /// rule's lock. A rule without a pin record is left unchanged.
+    ///
+    /// - With no live `External` signer, a record that pins exactly one
+    ///   verifier drops that pin ([`RefreshPinPlan::DropDeadPin`]). A
+    ///   verifier pin on a rule without `External` signers protects nothing,
+    ///   and the refresh is the operator's explicit reconciliation of the
+    ///   record with the chain. Any other record is left unchanged.
+    /// - With live `External` signers, a record that already pins a verifier
+    ///   is left unchanged: a pinned verifier that changed is the drift
+    ///   check's finding. A record that pins none gains the one pin every
+    ///   live verifier's probe produced, equal in hash and executable
+    ///   reference, with the overrides applied while probing them pending
+    ///   ([`RefreshPinPlan::PinLiveVerifier`]).
     ///
     /// # Errors
     ///
@@ -1435,7 +1964,7 @@ impl SignersManager {
         observed: &SignerSetSnapshotV2,
         overrides: PinOverrides,
         request_id: &str,
-    ) -> Result<Option<PlannedPinUpdate>, SaError> {
+    ) -> Result<RefreshPinPlan, SaError> {
         let mut live_verifiers: Vec<ScAddress> = Vec::new();
         for entry in &observed.signers {
             if let SignerIdentityV2::External { verifier, .. } = &entry.identity {
@@ -1444,9 +1973,6 @@ impl SignersManager {
                     live_verifiers.push(address);
                 }
             }
-        }
-        if live_verifiers.is_empty() {
-            return Ok(None);
         }
         let Some(record) = crate::managers::verifiers::read_pinned_hashes_for_rule(
             self,
@@ -1458,10 +1984,19 @@ impl SignersManager {
                 rule_id,
                 "signers refresh: the rule has no pin record; no verifier is pinned"
             );
-            return Ok(None);
+            return Ok(RefreshPinPlan::Unchanged);
         };
+        if live_verifiers.is_empty() {
+            if record.pinned_verifier_first8.len() != 1 {
+                return Ok(RefreshPinPlan::Unchanged);
+            }
+            let mut update = PlannedPinUpdate::unchanged(record);
+            update.record.pinned_verifier_first8 = Vec::new();
+            update.record.pinned_verifier_executable_refs = Vec::new();
+            return Ok(RefreshPinPlan::DropDeadPin(update));
+        }
         if !record.pinned_verifier_first8.is_empty() {
-            return Ok(None);
+            return Ok(RefreshPinPlan::Unchanged);
         }
 
         let mut update = PlannedPinUpdate::unchanged(record);
@@ -1503,7 +2038,7 @@ impl SignersManager {
                 });
             }
         }
-        Ok(Some(update))
+        Ok(RefreshPinPlan::PinLiveVerifier(update))
     }
 
     // ── verify_signer_set_against_chain ───────────────────────────────────────
@@ -1650,10 +2185,11 @@ impl SignersManager {
     ///   `accept_mutable_verifier` is set;
     /// - once the add confirms, each applied override writes its override
     ///   row carrying the rule id; a refused add writes none;
-    /// - then a `SaContextRulePinsUpdated` row (reason
-    ///   `signer_added`) records the verifier pins deduplicated by address:
-    ///   a signer on a verifier already live leaves the list unchanged, a
-    ///   signer on a new verifier appends its pin.
+    /// - then a `SaContextRulePinsUpdated` row (reason `signer_added`)
+    ///   records the verifier pins, one per distinct pin in hash and
+    ///   executable reference. A signer on a verifier already live, or on a
+    ///   new verifier whose pin equals a recorded one, leaves the list
+    ///   unchanged. A signer on a new verifier with another pin appends it.
     ///
     /// The pin rows are written exactly once after the add confirms. They
     /// follow the `SaSignerAddedV2` row when the change is recorded. When the
@@ -3257,6 +3793,7 @@ impl SignersManager {
                 request_id,
                 None,
                 Some(&borrowed(guards, &[])),
+                None,
             )
             .await?;
 
@@ -4146,6 +4683,7 @@ impl SignersManager {
                 request_id,
                 None,
                 Some(&borrowed(guards, &[])),
+                None,
             )
             .await?;
 
@@ -4410,6 +4948,7 @@ impl SignersManager {
                 request_id,
                 None,
                 Some(&borrowed(guards, &[])),
+                None,
             )
             .await?;
 
@@ -4629,6 +5168,7 @@ impl SignersManager {
                 Some(ExpiryCheck { rule_id }),
                 request_id,
                 &borrowed(guards, &compared),
+                None,
             )
             .await?;
 
@@ -6290,6 +6830,8 @@ impl SignersManager {
                 Some(ExpiryCheck { rule_id }),
                 request_id,
                 &borrowed(guards, &compared),
+                // The add reads the assigned signer id from the return value.
+                Some(ExpectedReturn::U32),
             )
             .await?;
 
@@ -6406,12 +6948,15 @@ impl SignersManager {
     /// `External` signers, decoded from the signers being added. `live` is
     /// the rule's signer set as the pre-submission comparison observed it
     /// through both endpoints. Returns `None` when `new_verifiers` is empty
-    /// or the rule has no pin record. Otherwise the returned record is the
-    /// current one with a pin appended for each new verifier address that no
-    /// `External` signer of `live` uses. Each such verifier is identified and
-    /// probed here, before submission, with the overrides applied to it
-    /// pending. A refusal of any new verifier refuses the add, and no
-    /// override row is written for it.
+    /// or the rule has no pin record. Otherwise each new verifier address
+    /// that no `External` signer of `live` uses is identified and probed
+    /// here, before submission, with the overrides applied to it pending. A
+    /// probed pin equal to a recorded verifier pin, in hash and executable
+    /// reference, adds no pin. The signing check compares the verifier with
+    /// that pin and accepts it, and only the overrides applied to it are
+    /// recorded. Every other probed pin is appended to the record. A refusal
+    /// of any new verifier refuses the add, and no override row is written
+    /// for it.
     ///
     /// # Errors
     ///
@@ -6468,7 +7013,22 @@ impl SignersManager {
                 request_id,
             )
             .await?;
-            update.append_pin(PinnedKind::Verifier, pin);
+            let recorded = update.record.pinned_verifier_first8.iter().enumerate().any(
+                |(position, first8)| {
+                    *first8 == pin.hash_first8
+                        && update.record.verifier_executable_ref(position)
+                            == pin.executable_ref.as_ref()
+                },
+            );
+            if recorded {
+                update.fold_overrides(
+                    pin.mutable_override,
+                    pin.unknown_override,
+                    pin.pending_overrides,
+                );
+            } else {
+                update.append_pin(PinnedKind::Verifier, pin);
+            }
         }
         Ok(Some(update))
     }
@@ -6496,36 +7056,8 @@ impl SignersManager {
                 request_id,
             )
             .await?];
-
-        // A rule whose policies include no simple-threshold policy lets
-        // another policy decide which signers suffice (OZ
-        // `weighted_threshold.rs:16-22`); a removal can make that policy's
-        // threshold unreachable, and the wallet cannot check it.
-        if compared[0].snapshot().threshold.is_none() && !compared[0].policies().is_empty() {
-            return Err(SaError::ThresholdPolicyIdentificationFailed {
-                rule_id,
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted,
-                ),
-                observed_wasm_hashes_summary: compared[0].policy_hashes().clone(),
-                request_id: request_id.to_owned(),
-            });
-        }
+        check_remove_preconditions(&compared[0], signer_id, smart_account_redacted, request_id)?;
         let before = compared[0].snapshot();
-
-        // Threshold invariant check. The threshold is unchanged (no bundle);
-        // if the post-op count falls below it, the op would brick the rule.
-        if let Some(threshold) = &before.threshold {
-            compute_post_op_invariant(
-                rule_id,
-                before.signer_count().saturating_sub(1),
-                threshold.threshold,
-                threshold.threshold,
-                ThresholdAffectingOp::RemoveSigner { signer_id },
-                smart_account_redacted,
-                request_id,
-            )?;
-        }
 
         // Single-op: remove_signer.
         // `remove_signer` calls `e.current_contract_address().require_auth()`.
@@ -6546,6 +7078,7 @@ impl SignersManager {
                 Some(ExpiryCheck { rule_id }),
                 request_id,
                 &borrowed(guards, &compared),
+                None,
             )
             .await?;
 
@@ -6678,6 +7211,7 @@ impl SignersManager {
                 Some(ExpiryCheck { rule_id }),
                 request_id,
                 &borrowed(guards, &compared),
+                None,
             )
             .await?;
 
@@ -6750,6 +7284,7 @@ impl SignersManager {
         expiry_check: Option<ExpiryCheck>,
         request_id: &str,
         rule_locks: &BorrowedRuleLocks<'_>,
+        expected_return: Option<ExpectedReturn>,
     ) -> Result<crate::submit::SubmitInvokeResult, SaError> {
         self.submit_signed_invoke(
             contract,
@@ -6764,6 +7299,7 @@ impl SignersManager {
             request_id,
             None,
             Some(rule_locks),
+            expected_return,
         )
         .await
     }
@@ -6786,10 +7322,13 @@ impl SignersManager {
     ///
     /// Every call runs the pinned-hash drift check through this manager
     /// ([`crate::submit::PinCheck`]) with `request_id`; `migrating_rule`
-    /// names the rule exempt from the verifier check and the signer-set
-    /// steps, and only [`Self::submit_migration_step`] sets it. `rule_locks`
-    /// is the caller's held-lock context, `None` when the caller holds no
-    /// lock and the submit path acquires the locks of the rules it checks.
+    /// names the rule whose verifier check is skipped, and only
+    /// [`Self::submit_migration_step`] sets it. `rule_locks` is the caller's
+    /// held-lock context, `None` when the caller holds no lock and the
+    /// submit path acquires the locks of the rules it checks.
+    /// `expected_return` is the shape a caller that reads an id from the
+    /// return value requires of the simulated result before signing
+    /// ([`ExpectedReturn`]).
     ///
     /// # Implements
     ///
@@ -6814,6 +7353,7 @@ impl SignersManager {
         request_id: &str,
         migrating_rule: Option<crate::submit::MigratingRule>,
         rule_locks: Option<&BorrowedRuleLocks<'_>>,
+        expected_return: Option<ExpectedReturn>,
     ) -> Result<crate::submit::SubmitInvokeResult, SaError> {
         // Convert ScAddress → C-strkey for the free function.
         let contract_strkey = scaddress_to_strkey(&contract)?;
@@ -6861,6 +7401,7 @@ impl SignersManager {
                     migrating_rule,
                 })
                 .maybe_rule_locks(rule_locks)
+                .maybe_expected_return(expected_return)
                 .build(),
         )
         .await
@@ -7127,6 +7668,40 @@ struct ConfirmedMutation {
     resulting: SignerSetSnapshotV2,
     /// The confirmed transaction's hash.
     tx_hash: String,
+}
+
+/// The verifier reconciliation a refresh plans for a rule's pin record.
+enum RefreshPinPlan {
+    /// The record stays as it is, or the rule has none.
+    Unchanged,
+    /// The record pinned no verifier while `External` signers are live: the
+    /// update pins the live verifier.
+    PinLiveVerifier(PlannedPinUpdate),
+    /// The record pins one verifier while no `External` signer is live: the
+    /// update drops the pin.
+    DropDeadPin(PlannedPinUpdate),
+}
+
+/// A migration pair that completed: both transactions confirmed and both
+/// state rows were written.
+pub(crate) struct MigratedPair {
+    /// The confirmed removal's transaction hash.
+    pub(crate) remove_tx_hash: String,
+    /// The confirmed add's transaction hash.
+    pub(crate) add_tx_hash: String,
+    /// The id the chain assigned to the restored signer.
+    pub(crate) new_signer_id: u32,
+}
+
+/// A migration pair that stopped: the refusal or failure, and the add that
+/// completes the pair once its removal was sent.
+pub(crate) struct PairFailure {
+    /// The error the pair stopped on, as the step raised it.
+    pub(crate) error: SaError,
+    /// The add that completes the pair; `None` when the removal was not
+    /// sent or the add confirmed. See "Pending add" on
+    /// [`SignersManager::migrate_signer_pair`].
+    pub(crate) pending_add: Option<PendingAddStep>,
 }
 
 /// A signer add whose transaction confirmed: the outcome of the steps after
@@ -7616,6 +8191,116 @@ fn warn_failed(verb: &str, rule_id: u32, smart_account_redacted: &str, err: &SaE
     );
 }
 
+/// Checks the plan of a migration pair against `before`, the compared set
+/// of rule `rule_id`, before anything is sent. Returns the identity the add
+/// restores and the key data it carries.
+///
+/// The removed signer `signer_id` must be on the rule with an `External`
+/// identity. `add_args` must be `[U32(rule_id), signer]`, where `signer`
+/// decodes to that identity's key data on `to_verifier_addr`. `remove_args`
+/// must be `[U32(rule_id), U32(signer_id)]`.
+///
+/// # Errors
+///
+/// The detail of the `plan_build` refusal naming the first mismatch.
+fn check_migration_pair_plan(
+    before: &SignerSetSnapshotV2,
+    rule_id: u32,
+    signer_id: u32,
+    to_verifier_addr: &ScAddress,
+    remove_args: &[ScVal],
+    add_args: &[ScVal],
+) -> Result<(SignerIdentityV2, Vec<u8>), String> {
+    let removed = before
+        .signers
+        .iter()
+        .find(|entry| entry.id == signer_id)
+        .ok_or_else(|| format!("migrate_verifier: signer {signer_id} is not on rule {rule_id}"))?;
+    let SignerIdentityV2::External {
+        key_data_sha256,
+        key_data_len,
+        ..
+    } = &removed.identity
+    else {
+        return Err(format!(
+            "migrate_verifier: the removed signer {signer_id} is not an External signer"
+        ));
+    };
+    let intended = SignerIdentityV2::External {
+        verifier: contract_address_bytes(to_verifier_addr),
+        key_data_sha256: *key_data_sha256,
+        key_data_len: *key_data_len,
+    };
+    let not_restored = || {
+        format!(
+            "migrate_verifier: the add step of signer {signer_id} does not restore the removed \
+             identity on the destination verifier"
+        )
+    };
+    let [ScVal::U32(add_rule_id), signer] = add_args else {
+        return Err(not_restored());
+    };
+    let Ok(decoded) = decode_signer_scval_full(signer) else {
+        return Err(not_restored());
+    };
+    let restores = *add_rule_id == rule_id && decoded.to_identity_v2() == intended;
+    let DecodedOnChainSigner::External { key_data, .. } = decoded else {
+        return Err(not_restored());
+    };
+    if !restores {
+        return Err(not_restored());
+    }
+    if remove_args != [ScVal::U32(rule_id), ScVal::U32(signer_id)] {
+        return Err("migrate_verifier: the remove step's arguments are not the pair's".to_owned());
+    }
+    Ok((intended, key_data))
+}
+
+/// Checks the preconditions of removing signer `signer_id` from the rule
+/// `compared` holds, before anything is sent. One body decides them for
+/// [`SignersManager::remove_signer`] and the remove step of
+/// [`SignersManager::migrate_signer_pair`].
+///
+/// # Errors
+///
+/// - [`SaError::ThresholdPolicyIdentificationFailed`]: the rule has
+///   policies and none is the simple-threshold policy. Another policy then
+///   decides which signers suffice (OZ `weighted_threshold.rs:16-22`); a
+///   removal can make its threshold unreachable, and the wallet cannot
+///   check it.
+/// - [`SaError::ThresholdUnreachable`]: the rule's simple threshold would
+///   exceed its signer count after the removal. The threshold is unchanged
+///   (no bundle), so the removal would leave the rule unable to sign.
+fn check_remove_preconditions(
+    compared: &ComparedState,
+    signer_id: u32,
+    smart_account_redacted: &str,
+    request_id: &str,
+) -> Result<(), SaError> {
+    let rule_id = compared.rule_id();
+    let before = compared.snapshot();
+    if before.threshold.is_none() && !compared.policies().is_empty() {
+        return Err(SaError::ThresholdPolicyIdentificationFailed {
+            rule_id,
+            smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
+            observed_wasm_hashes_summary: compared.policy_hashes().clone(),
+            request_id: request_id.to_owned(),
+        });
+    }
+    if let Some(threshold) = &before.threshold {
+        compute_post_op_invariant(
+            rule_id,
+            before.signer_count().saturating_sub(1),
+            threshold.threshold,
+            threshold.threshold,
+            ThresholdAffectingOp::RemoveSigner { signer_id },
+            smart_account_redacted,
+            request_id,
+        )?;
+    }
+    Ok(())
+}
+
 /// Pre-flight threshold + count invariant check.
 ///
 /// Returns `Ok(())` when both:
@@ -7852,72 +8537,6 @@ async fn fetch_entries_by_key(
         by_pos[pos] = Some(entry_data);
     }
     Ok(by_pos)
-}
-
-#[cfg(feature = "test-helpers")]
-fn mock_migration_submit_result(
-    _rule_id: u32,
-    entrypoint: &'static str,
-    smart_account_redacted: &str,
-    request_id: &str,
-) -> Option<Result<crate::submit::SubmitInvokeResult, SaError>> {
-    use std::collections::hash_map::Entry;
-    use std::sync::{Mutex, OnceLock};
-
-    static CALLS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
-
-    if request_id.starts_with("mock-submit-send-failure") {
-        return Some(Err(SaError::VerifierMigrationFailed {
-            phase: crate::error::MIGRATION_PHASES[4],
-            smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
-            detail: format!("{entrypoint} migration step failed: mock sendTransaction failure"),
-            request_id: request_id.to_owned(),
-        }));
-    }
-
-    if !request_id.starts_with("mock-partial-submit-send-failure") {
-        return None;
-    }
-
-    let call_index = {
-        let calls = CALLS.get_or_init(|| Mutex::new(HashMap::new()));
-        let Ok(mut calls) = calls.lock() else {
-            return Some(Err(SaError::AuthEntryConstructionFailed {
-                stage: "auth_payload",
-                redacted_reason: "test-helper migration submit call map poisoned".to_owned(),
-            }));
-        };
-        match calls.entry(request_id.to_owned()) {
-            Entry::Occupied(mut entry) => {
-                let current = *entry.get();
-                entry.insert(current.saturating_add(1));
-                current
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(1);
-                0
-            }
-        }
-    };
-
-    if call_index == 2 {
-        return Some(Err(SaError::VerifierMigrationFailed {
-            phase: crate::error::MIGRATION_PHASES[4],
-            smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
-            detail: format!(
-                "{entrypoint} migration step failed: mock second-step sendTransaction failure"
-            ),
-            request_id: request_id.to_owned(),
-        }));
-    }
-
-    let fill = u8::try_from(call_index + 1).unwrap_or(0xff);
-    let tx_hash = format!("{fill:064x}");
-    Some(Ok(crate::submit::SubmitInvokeResult {
-        return_val: ScVal::Void,
-        tx_hash,
-        ledger: 1000 + u32::try_from(call_index).unwrap_or(0),
-    }))
 }
 
 /// The executable a verifier or policy contract instance runs, as agreed by

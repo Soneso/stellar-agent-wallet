@@ -102,6 +102,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RefreshOptions` in `stellar_agent_smart_account::managers::signers`, the
   options of `refresh_signer_baseline`. `RefreshOutcome` gains
   `verifier_pinned`.
+- `PendingAddStep` (re-exported at the crate root) and
+  `MigrationSubmitResult::pending_add`: the add that completes a migration
+  pair whose removal was sent. It carries the rule, the removed signer's
+  id, the destination verifier and the key data. It also carries the
+  removal's hash, whether the removal confirmed, and the add's hash when its
+  outcome is unknown. `SignerStepSubmitOutcome::new_signer_id` is the id the
+  chain assigned to the restored signer.
+- The `migrate-verifier` envelope reports `pending_add` (with
+  `recovery_command`, the exact `signers add` with the invocation's
+  signer-source, `--profile`, `--network` and `--timeout-seconds` flags),
+  each step's `key_data_hex`, and `new_signer_id` for a completed pair. On a
+  pair that stopped after its removal was sent, the command prints the line
+  that completes it on stderr before the envelope. The line is the
+  `signers add`, or the `signers refresh --accept-divergence` then the add
+  after `sa.baseline_write_failed` or `sa.signer_set_diverged`, or the wait
+  for a transaction whose outcome is unknown. On a rule with remaining
+  source signers the line names the re-run of `migrate-verifier` for them
+  after the refresh or the wait, and before the add.
 
 ### Changed
 
@@ -222,12 +240,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sa.simple_threshold_install_refused`. An `External` signer with empty key
   data refuses with `sa.auth_entry_construction_failed`.
 - A rule created before this version has no baseline until one `signers list
-  --rule-id N`, which every signing authorized by the rule needs first:
+  --rule-id N`. Every signing authorized by the rule needs it first:
   `execute`, `multicall`, `rules update-name`, `update-valid-until` and
-  `delete`, `set-spending-limit`, `set-weighted-threshold` and
-  `set-signer-weight`, the signer verbs, the policy verbs' target and auth
-  rules, and the passkey path's rules. The migrating rule of
-  `migrate-verifier` is exempt.
+  `delete`, `set-spending-limit`, `set-weighted-threshold`,
+  `set-signer-weight` and the signer verbs. So do the policy verbs' target
+  and auth rules, the passkey path's rules, and the migrating rule of
+  `migrate-verifier`.
 - `SaError::SignersManagerNotConfigured.rule_id` is optional. An install's
   refusal omits it on the wire; a refusal scoped to a rule keeps the bare
   number.
@@ -245,10 +263,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   again when its read reports a ledger behind the confirmation, whether the
   read succeeded or failed. A lagging endpoint that does not hold a new rule
   or threshold yet is read again until the recording budget ends.
-- `smart-account migrate-verifier` records no signer-set state row, so a
-  signer verb, an `execute`, or any other signature under a migrated rule
-  refuses with `sa.signer_set_diverged` until `signers refresh --rule-id N
-  --accept-divergence`.
+- `smart-account migrate-verifier` runs each pair as two checked signer
+  mutations under the rule's lock. The removal compares the rule with its
+  version-2 state row, checks the pair's plan and the removal's
+  preconditions (`sa.threshold_unreachable`,
+  `sa.threshold_policy_identification_failed`) before anything is sent, and
+  records `SaSignerRemovedV2`. The pin record then names the destination,
+  and the add compares against the removal's row and records
+  `SaSignerAddedV2`, then `SaVerifierMigrated`. A migrated rule needs no
+  refresh. A failure after a removal was sent returns the pending add; a
+  re-run of `migrate-verifier` does not find a removed signer.
+- A migration step returns the drift check's policy findings,
+  `sa.pin_check_unavailable`, `sa.auth_entry_construction_failed` at every
+  stage and an unresolved submission (`submission.*`, with its transaction
+  and envelope hashes) as themselves. Every other failure of a step is
+  `sa.verifier_migration_failed` at phase `submit_simulate` or
+  `submit_send`. A pair whose plan does not match the rule refuses at phase
+  `plan_build` before anything is sent.
+- `signers add`, `rules add-policy` and `rules create` check the simulated
+  return value before signing: a value that is not the id they read refuses
+  with `sa.deployment_failed` (phase `simulate`), and nothing is signed or
+  sent. The add step of `migrate-verifier` runs the same check and reports
+  it as `sa.verifier_migration_failed` at phase `submit_simulate`.
+- `signers add` and `signers batch-add` on a pinned rule add no pin for a
+  new verifier whose pin equals a recorded one, in hash and executable
+  reference; the record keeps one pin per distinct pin.
+- `signers refresh` on a pinned rule with no `External` signer drops the
+  record's one verifier pin and writes a `SaContextRulePinsUpdated` row
+  (reason `baseline_refreshed`) without it, the policy pins unchanged.
 - A confirmed `signers add` or `signers batch-add` on a pinned rule writes
   its pin rows before it refuses when its resulting state is not observed or
   not the intended change. When the audit log refuses the state row, the pin
@@ -277,8 +319,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sa.audit_log` or `sa.signer_set_missing_baseline`, then the pin
   refusals, then `sa.signer_set_diverged` or `network.rpc_divergence`. An
   audit-log integrity error under a rule other than rule 0 is reported as
-  `sa.audit_log` by the baseline read; under the migrating rule of
-  `migrate-verifier` it stays `sa.pin_check_unavailable`.
+  `sa.audit_log` by the baseline read, under the migrating rule of
+  `migrate-verifier` too.
 - A lock not acquired within the pre-submit budget refuses with
   `sa.auth_entry_construction_failed` at stage `rule_lock`, and a deadline
   elapse during a baseline read or a comparison at stage `baseline_read` or
@@ -299,7 +341,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuse with `sa.auth_entry_construction_failed` at stage `rule_lock`.
 - `PinCheck::migrating_rule` is `Option<MigratingRule>`. Only the migration
   step constructs a `MigratingRule`; its rule is exempt from the verifier
-  check and from the signer-set baseline read and comparison.
+  check, and the migration compares it under the lock it holds.
 - `rules list`, `list-rules`, `stellar_rules_list` and `stellar_rules_get`
   report each rule's signer-set baseline in the audit log as `baseline`:
   `none`, `v1`, `v2`, `unreadable` or `unknown`. `ContextRuleSummary`
