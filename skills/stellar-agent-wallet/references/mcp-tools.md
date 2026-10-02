@@ -438,7 +438,14 @@ Returns `{ rule_id, tx_hash }` on success. Verifies the attestation through a
 DEDICATED gate (distinct from the payment/claim attestation gate) and
 recomputes the digest from the stored snapshot UNCONDITIONALLY before
 installing — a mismatch refuses with `simulation.divergence` regardless of
-the policy verdict.
+the policy verdict. An `auth_rule_ids` entry other than `0` first passes the
+pre-submission checks of `smart-accounts.md`, and nothing is signed when one
+refuses. The refusals are `sa.signer_set_missing_baseline`,
+`sa.signer_set_diverged`, `sa.verifier_hash_drift` / `sa.policy_hash_drift`,
+`sa.pinned_policy_absent`, `sa.pinned_verifier_absent` and
+`sa.pin_check_unavailable`. `sa.pinned_verifier_absent` names an authorizing
+rule that holds an External signer whose verifier its pin record does not
+pin; the operator runs `smart-account signers refresh --rule-id N`.
 
 ## DeFi
 

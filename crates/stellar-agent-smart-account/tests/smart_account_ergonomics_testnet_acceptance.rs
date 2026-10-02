@@ -148,7 +148,8 @@ use stellar_agent_smart_account::managers::rules::{
     RuleContext, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
 use stellar_agent_smart_account::managers::signers::{
-    PreviousBaseline, SignersManager, build_delegated_signer_scval, build_external_signer_scval,
+    PreviousBaseline, RefreshOptions, SignersManager, build_delegated_signer_scval,
+    build_external_signer_scval,
 };
 use stellar_agent_smart_account::signers::SignerSetView;
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
@@ -1704,7 +1705,7 @@ async fn weighted_threshold_negatives_testnet_acceptance() {
             smart_account_sc.clone(),
             weighted_only_rule_id,
             Some(&bootstrap_g),
-            false,
+            RefreshOptions::new(false),
             rid(),
         )
         .await

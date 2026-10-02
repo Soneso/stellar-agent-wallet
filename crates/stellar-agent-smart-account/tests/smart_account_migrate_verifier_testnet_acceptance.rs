@@ -84,7 +84,9 @@ use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
     PinStatus, parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
-use stellar_agent_smart_account::managers::signers::{PreviousBaseline, SignersManager};
+use stellar_agent_smart_account::managers::signers::{
+    PreviousBaseline, RefreshOptions, SignersManager,
+};
 use stellar_agent_smart_account::signers::SignerSetView;
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_agent_smart_account::submit::{PinCheck, SubmitInvokeArgs, submit_signed_invoke};
@@ -1809,7 +1811,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
             smart_account_addr.clone(),
             new_rule_id,
             Some(&signer_g),
-            true,
+            RefreshOptions::new(true),
             post_baseline_rid,
         )
         .await

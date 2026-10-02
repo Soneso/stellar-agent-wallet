@@ -3471,6 +3471,56 @@ mod tests {
         assert!(!record.mutable_override);
     }
 
+    /// A pins-updated row a `signers refresh` wrote, which adds a verifier pin
+    /// to a record that pinned none, is the rule's pin record for both
+    /// readers.
+    #[test]
+    fn pin_record_reads_a_baseline_refreshed_pins_row() {
+        use crate::audit_log::schema::PinsUpdateReason;
+
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(
+                &mut w,
+                context_rule_created_event(
+                    4,
+                    "CDABC...12345",
+                    vec![],
+                    vec!["1111111111111111".to_owned()],
+                    false,
+                    false,
+                ),
+            );
+            write_event(
+                &mut w,
+                pins_updated_event(
+                    4,
+                    "CDABC...12345",
+                    vec!["aaaaaaaaaaaaaaaa".to_owned()],
+                    vec!["1111111111111111".to_owned()],
+                    false,
+                    true,
+                    vec![],
+                    PinsUpdateReason::BaselineRefreshed,
+                ),
+            );
+        }
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let record = reader
+            .find_latest_context_rule_pinned_hashes(4, "CDABC...12345")
+            .unwrap()
+            .expect("the rule has a pin record");
+        assert_eq!(record.pinned_verifier_first8, vec!["aaaaaaaaaaaaaaaa"]);
+        assert_eq!(record.pinned_policy_first8, vec!["1111111111111111"]);
+        assert!(record.unknown_override);
+        let all = reader.scan_all_context_rule_pin_records().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].2.pinned_verifier_first8, vec!["aaaaaaaaaaaaaaaa"]);
+    }
+
     /// A pins-updated row in the newer file of a rotated chain wins over the
     /// created row in the older file.
     #[test]

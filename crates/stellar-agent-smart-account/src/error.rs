@@ -521,6 +521,45 @@ pub enum SaError {
         request_id: String,
     },
 
+    /// The rule holds a live `External` signer while its pin record pins no
+    /// verifier.
+    ///
+    /// Fired at signing time by the pinned-hash drift check, and reported as
+    /// a `drift` verifier status by `verify_rule_wasm_pins`. The pin record is
+    /// the wallet's knowledge of the rule's shape: a verifier the record does
+    /// not pin would sign unchecked, so the rule is refused before anything is
+    /// signed. The state arises from a signer-set state row written without
+    /// its pin rows, or from a submission whose outcome was never resolved.
+    /// It also arises from a verb interrupted between its confirmation and
+    /// its pin rows, or from an `External` signer added through another
+    /// client. `signers refresh`
+    /// pins the live verifier and clears the state.
+    ///
+    /// # Forensic spine
+    ///
+    /// `smart_account_redacted` and `verifier_redacted` MUST be passed through
+    /// `stellar_agent_core::observability::redact_strkey_first5_last5`
+    /// at the call site.
+    #[error(
+        "rule {rule_id} holds the live External verifier {verifier_redacted} and its pin record \
+         pins no verifier; run 'smart-account signers refresh --rule-id {rule_id}' to pin it"
+    )]
+    #[serde(rename = "sa.pinned_verifier_absent")]
+    PinnedVerifierAbsent {
+        /// Context-rule identifier whose record pins no verifier.
+        rule_id: u32,
+        /// Redacted address of the live verifier the record does not pin
+        /// (first-5-last-5 C-strkey).
+        verifier_redacted: RedactedStrkey,
+        /// Redacted smart-account contract address (first-5-last-5 C-strkey).
+        ///
+        /// MUST be redacted at the call site via
+        /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
+        smart_account_redacted: RedactedStrkey,
+        /// Per-request correlation identifier (UUIDv4).
+        request_id: String,
+    },
+
     /// The pre-signing drift check of a rule-authorized submission could not
     /// run to a verdict.
     ///
@@ -532,8 +571,9 @@ pub enum SaError {
     /// (`sa.multiple_pinned_hashes_unsupported`), an unpinnable instance, or
     /// the check exceeding the pre-submit budget. Nothing is signed. The
     /// check's own refusals, [`SaError::VerifierHashDrift`],
-    /// [`SaError::PolicyHashDrift`] and [`SaError::PinnedPolicyAbsent`],
-    /// propagate as themselves and are never folded into this variant. The
+    /// [`SaError::PolicyHashDrift`], [`SaError::PinnedPolicyAbsent`] and
+    /// [`SaError::PinnedVerifierAbsent`], propagate as themselves and are
+    /// never folded into this variant. The
     /// signer-set steps that run beside the pin check propagate as themselves
     /// too: [`SaError::SignerSetMissingBaseline`],
     /// [`SaError::SignerSetDiverged`], [`SaError::NetworkRpcDivergence`] and
@@ -729,11 +769,13 @@ pub enum SaError {
 
     /// Verifier wasm hash is not in the `VERIFIER_ALLOWLIST` allowlist (fail-closed).
     ///
-    /// Fired at rule-install time when the verifier contract's deployed wasm hash
-    /// does not match any entry in the compile-time `VERIFIER_ALLOWLIST`
-    /// (`crates/stellar-agent-smart-account/src/verifier_allowlist.rs`).
-    /// The wallet refuses rule-install unless the operator passes
-    /// `--accept-unknown-verifier`.
+    /// Fired when the wallet pins a verifier whose deployed wasm hash does not
+    /// match any entry in the compile-time `VERIFIER_ALLOWLIST`
+    /// (`crates/stellar-agent-smart-account/src/verifier_allowlist.rs`). That
+    /// happens at rule install and at a signer add of a verifier the rule
+    /// does not use yet. It also happens at a `signers refresh` that pins the
+    /// live verifier of a pin record that pins none. The wallet refuses
+    /// unless the operator passes `--accept-unknown-verifier`.
     ///
     /// # Forensic spine
     ///
@@ -751,7 +793,7 @@ pub enum SaError {
     /// not in the wallet's `VERIFIER_ALLOWLIST`.
     #[error(
         "verifier wasm hash not in VERIFIER_ALLOWLIST{}: \
-         observed={observed_hash_first8}",
+         observed={observed_hash_first8}; --accept-unknown-verifier is required",
         rule_suffix(.rule_id)
     )]
     #[serde(rename = "sa.verifier_wasm_not_in_allowlist")]
@@ -779,7 +821,8 @@ pub enum SaError {
     /// Fired when the policy contract's deployed wasm hash is not the hash of
     /// a vendored policy Wasm (simple-threshold, weighted-threshold,
     /// spending-limit): when a rule is installed with the policy, and when
-    /// the policy is added to a rule that has a pin record.
+    /// the policy is added to a rule that has a pin record. The wallet
+    /// refuses unless the operator passes `--accept-unknown-verifier`.
     ///
     /// # Forensic spine
     ///
@@ -795,7 +838,7 @@ pub enum SaError {
     /// not the hash of a vendored policy Wasm.
     #[error(
         "policy wasm hash is not a policy Wasm the wallet vendors{}: \
-         observed={observed_hash_first8}",
+         observed={observed_hash_first8}; --accept-unknown-verifier is required",
         rule_suffix(.rule_id)
     )]
     #[serde(rename = "sa.policy_wasm_not_in_allowlist")]
@@ -2950,6 +2993,7 @@ impl SaError {
             Self::PolicyHashDrift { .. } => "sa.policy_hash_drift",
             Self::MultiplePinnedHashesUnsupported { .. } => "sa.multiple_pinned_hashes_unsupported",
             Self::PinnedPolicyAbsent { .. } => "sa.pinned_policy_absent",
+            Self::PinnedVerifierAbsent { .. } => "sa.pinned_verifier_absent",
             Self::PinCheckUnavailable { .. } => "sa.pin_check_unavailable",
             Self::VerifierMutable { .. } => "sa.verifier_mutable",
             Self::PolicyMutable { .. } => "sa.policy_mutable",
@@ -3191,6 +3235,15 @@ mod tests {
                     pinned_count: 1,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     request_id: "test-req-policy-absent-001".to_owned(),
+                },
+            ),
+            (
+                "sa.pinned_verifier_absent",
+                SaError::PinnedVerifierAbsent {
+                    rule_id: 7,
+                    verifier_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-verifier-absent-001".to_owned(),
                 },
             ),
             (
@@ -3982,6 +4035,21 @@ mod tests {
                 ],
             ),
             (
+                "sa.pinned_verifier_absent",
+                SaError::PinnedVerifierAbsent {
+                    rule_id: 77,
+                    verifier_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-verifier-absent-002".to_owned(),
+                },
+                &[
+                    "rule_id",
+                    "verifier_redacted",
+                    "smart_account_redacted",
+                    "request_id",
+                ],
+            ),
+            (
                 "sa.pin_check_unavailable",
                 SaError::PinCheckUnavailable {
                     rule_id: 77,
@@ -4675,14 +4743,17 @@ mod tests {
             ),
             (
                 verifier_not_allowlisted,
-                "verifier wasm hash not in VERIFIER_ALLOWLIST: observed=deadbeef",
-                "verifier wasm hash not in VERIFIER_ALLOWLIST for rule 7: observed=deadbeef",
+                "verifier wasm hash not in VERIFIER_ALLOWLIST: observed=deadbeef; \
+                 --accept-unknown-verifier is required",
+                "verifier wasm hash not in VERIFIER_ALLOWLIST for rule 7: observed=deadbeef; \
+                 --accept-unknown-verifier is required",
             ),
             (
                 policy_not_allowlisted,
-                "policy wasm hash is not a policy Wasm the wallet vendors: observed=cafebabe",
+                "policy wasm hash is not a policy Wasm the wallet vendors: observed=cafebabe; \
+                 --accept-unknown-verifier is required",
                 "policy wasm hash is not a policy Wasm the wallet vendors for rule 7: \
-                 observed=cafebabe",
+                 observed=cafebabe; --accept-unknown-verifier is required",
             ),
             (
                 rpc_divergence,
@@ -4747,6 +4818,23 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "pin record holds 2 policy pin(s) for rule 3 but the rule has no policy on chain"
+        );
+    }
+
+    /// The absent-verifier refusal names the rule, the verifier and the
+    /// refresh that repairs the record.
+    #[test]
+    fn pinned_verifier_absent_display_names_the_verifier_and_the_refresh() {
+        let err = SaError::PinnedVerifierAbsent {
+            rule_id: 3,
+            verifier_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            request_id: "req".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "rule 3 holds the live External verifier CBBBB...YYYYY and its pin record pins no \
+             verifier; run 'smart-account signers refresh --rule-id 3' to pin it"
         );
     }
 
@@ -4831,6 +4919,12 @@ mod tests {
                 pinned_count: 1,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 request_id: "test-req-policy-absent-003".to_owned(),
+            },
+            SaError::PinnedVerifierAbsent {
+                rule_id: 88,
+                verifier_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                request_id: "test-req-verifier-absent-003".to_owned(),
             },
             SaError::PinCheckUnavailable {
                 rule_id: 88,
@@ -5219,6 +5313,7 @@ mod tests {
             "sa.policy_hash_drift",
             "sa.multiple_pinned_hashes_unsupported",
             "sa.pinned_policy_absent",
+            "sa.pinned_verifier_absent",
             "sa.pin_check_unavailable",
             "sa.verifier_mutable",
             "sa.policy_mutable",
@@ -5320,7 +5415,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 78, "closed set must have exactly 78 wire codes");
+        assert_eq!(seen.len(), 79, "closed set must have exactly 79 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.

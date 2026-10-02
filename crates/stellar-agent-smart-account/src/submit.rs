@@ -220,14 +220,17 @@ pub struct Ed25519RuleSigner<'a> {
 ///   [`SaError::PolicyHashDrift`], and the check writes a
 ///   `SaVerifierHashDrift` / `SaPolicyHashDrift` row carrying `request_id`;
 /// - a rule with no policy on chain whose pin record holds policy pins
-///   refuses with [`SaError::PinnedPolicyAbsent`] (no drift row);
+///   refuses with [`SaError::PinnedPolicyAbsent`]. A rule with a live
+///   `External` signer whose pin record pins no verifier refuses with
+///   [`SaError::PinnedVerifierAbsent`]. Neither writes a drift row;
 /// - any other failure of the address fetch or of a check (RPC failure or
 ///   divergence, audit-log integrity error, a record with more than one
 ///   verifier or policy pin, an unpinnable instance, the pre-submit budget
 ///   elapsing) refuses with [`SaError::PinCheckUnavailable`] carrying the
 ///   inner error's wire code;
-/// - a rule without a pin record, or without pins of a kind, passes that
-///   part of the check (the check skips it with a debug line);
+/// - a rule without a pin record passes the check; a rule with no
+///   `External` signer passes its verifier half, and a rule with no policy
+///   and no policy pin passes its policy half;
 /// - a signer set that differs from the state row refuses with
 ///   [`SaError::SignerSetDiverged`] and writes a `SaSignerSetDiverged` row
 ///   carrying `request_id`; endpoints that disagree refuse with
@@ -704,6 +707,8 @@ pub struct SubmitInvokeArgs<'a> {
 ///   verifier or policy of a checked rule differs from the rule's pin record.
 /// - [`SaError::PinnedPolicyAbsent`]: a checked rule's pin record holds
 ///   policy pins while the rule has no policy on chain.
+/// - [`SaError::PinnedVerifierAbsent`]: a checked rule holds a live
+///   `External` signer while its pin record pins no verifier.
 /// - [`SaError::PinCheckUnavailable`]: the drift check of a rule could not
 ///   run to a verdict.
 /// - [`SaError::SubmitCheckMissing`] — a name in `required_checks` maps to a
@@ -1862,7 +1867,8 @@ async fn run_rule_checks(
 /// # Errors
 ///
 /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
-///   [`SaError::PinnedPolicyAbsent`] unchanged from the check.
+///   [`SaError::PinnedPolicyAbsent`] / [`SaError::PinnedVerifierAbsent`]
+///   unchanged from the check.
 /// - [`SaError::PinCheckUnavailable`] for every other failure, including the
 ///   budget elapsing.
 /// - [`SaError::ScAddressEncodingFailed`] when the smart account has no
@@ -1895,7 +1901,8 @@ async fn run_pin_check(
             Ok(Err(
                 refusal @ (SaError::VerifierHashDrift { .. }
                 | SaError::PolicyHashDrift { .. }
-                | SaError::PinnedPolicyAbsent { .. }),
+                | SaError::PinnedPolicyAbsent { .. }
+                | SaError::PinnedVerifierAbsent { .. }),
             )) => {
                 return Err(refusal);
             }

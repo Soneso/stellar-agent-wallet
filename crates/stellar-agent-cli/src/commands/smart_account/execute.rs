@@ -38,10 +38,12 @@
 //! rule's live verifier and policy contracts must match the hashes (and, for
 //! a CAP-85 external reference, the owner, tag and resolved hash) pinned when
 //! the rule was installed or last updated by the wallet. Drift refuses with
-//! `sa.verifier_hash_drift` / `sa.policy_hash_drift`; a rule whose record
-//! holds policy pins while the rule has no policy on chain refuses with
-//! `sa.pinned_policy_absent`; a check that cannot run refuses with
-//! `sa.pin_check_unavailable`. A rule without a pin record signs unchecked.
+//! `sa.verifier_hash_drift` / `sa.policy_hash_drift`, and a check that cannot
+//! run refuses with `sa.pin_check_unavailable`. A rule whose record holds
+//! policy pins while the rule has no policy on chain refuses with
+//! `sa.pinned_policy_absent`. A rule holding an `External` signer while its
+//! record pins no verifier refuses with `sa.pinned_verifier_absent`, which
+//! `signers refresh` repairs. A rule without a pin record signs unchecked.
 //!
 //! # Mainnet defence
 //!

@@ -72,7 +72,7 @@ use stellar_agent_smart_account::managers::rules::{
     OZ_MAX_SIGNERS, decode_signer_count_from_scval, parse_c_strkey_to_smart_account,
 };
 use stellar_agent_smart_account::managers::signers::{
-    PreviousBaseline, RefreshOutcome, SignersManager, build_delegated_signer_scval,
+    PreviousBaseline, RefreshOptions, RefreshOutcome, SignersManager, build_delegated_signer_scval,
     build_external_signer_scval,
 };
 use stellar_agent_smart_account::verifiers::VerifierRegistry;
@@ -461,7 +461,9 @@ async fn list_run(args: &ListArgs) -> i32 {
 /// Observes the signer set, compares it with the rule's audit-log baseline
 /// and writes a new `SaSignerSetBaselinedV2` row. A set that differs from the
 /// baseline, or a version 1 baseline the chain state cannot be compared with,
-/// is recorded only with `--accept-divergence`.
+/// is recorded only with `--accept-divergence`. On a rule whose pin record
+/// pins no verifier while the rule holds `External` signers, the refresh also
+/// pins the live verifier, probed as `rules create` probes one.
 #[non_exhaustive]
 #[derive(Debug, Args)]
 pub struct RefreshArgs {
@@ -479,6 +481,31 @@ pub struct RefreshArgs {
     /// differing set) and refuses with `sa.signer_set_diverged`.
     #[arg(long)]
     pub accept_divergence: bool,
+
+    /// Opt-in to pinning a live verifier that is mutable: it has an admin /
+    /// owner storage key, or its executable is an owner-managed external
+    /// reference.
+    ///
+    /// Applies only to a rule that holds `External` signers while its pin
+    /// record pins no verifier, which signing refuses with
+    /// `sa.pinned_verifier_absent`. Each live verifier is identified and
+    /// probed as `rules create` probes one. A mutable verifier fails with
+    /// `sa.verifier_mutable` unless this flag is set. With it the refresh pins
+    /// the verifier and the audit log emits `SaMutableContractOverride`
+    /// carrying the rule id. The flag does not admit an unpinnable instance
+    /// (`sa.contract_instance_unsupported`).
+    #[arg(long)]
+    pub accept_mutable_verifier: bool,
+
+    /// Opt-in to pinning a live verifier whose wasm hash is outside the
+    /// verifier allowlist.
+    ///
+    /// Applies under the same conditions as `--accept-mutable-verifier`; an
+    /// unknown hash fails with `sa.verifier_wasm_not_in_allowlist` unless
+    /// this flag is set, in which case the refresh pins it and the audit log
+    /// emits `SaUnknownContractOverride` carrying the rule id.
+    #[arg(long)]
+    pub accept_unknown_verifier: bool,
 
     /// Profile name for audit-log path resolution.
     #[arg(long, value_name = "NAME")]
@@ -521,15 +548,20 @@ pub struct RefreshResult {
     /// How the chain compared with the baseline the refresh replaced:
     /// `none`, `matched`, `diverged` or `not_comparable`.
     pub previous_baseline: PreviousBaseline,
+    /// Whether the refresh pinned the live verifier of a pin record that
+    /// pinned no verifier while the rule held `External` signers.
+    pub verifier_pinned: bool,
 }
 
-/// Builds the `signers refresh` envelope from the recorded view and its
-/// comparison with the state row it replaced.
+/// Builds the `signers refresh` envelope from the recorded view, its
+/// comparison with the state row it replaced and whether it pinned the live
+/// verifier.
 fn refresh_result(
     smart_account: &str,
     rule_id: u32,
     view: &SignerSetView,
     previous_baseline: PreviousBaseline,
+    verifier_pinned: bool,
 ) -> RefreshResult {
     let fields = view_fields(view);
     RefreshResult {
@@ -539,27 +571,42 @@ fn refresh_result(
         threshold: fields.threshold,
         snapshot_version: fields.snapshot_version,
         previous_baseline,
+        verifier_pinned,
     }
 }
 
-/// The one warning line a refresh that accepted a changed or incomparable
-/// set prints; `None` when the chain matched the baseline or there was none.
-fn refresh_warning(rule_id: u32, previous_baseline: PreviousBaseline) -> Option<String> {
+/// The warning lines a refresh prints: one when it accepted a changed or
+/// incomparable set, and one when it pinned the live verifier of a pin
+/// record that pinned none. Empty when the chain matched the baseline, or
+/// there was none, and no verifier was pinned.
+fn refresh_warnings(
+    rule_id: u32,
+    previous_baseline: PreviousBaseline,
+    verifier_pinned: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
     match previous_baseline {
-        PreviousBaseline::Diverged => Some(format!(
+        PreviousBaseline::Diverged => lines.push(format!(
             "warning: rule {rule_id}'s on-chain signer set differed from its audit-log \
              baseline; the refresh recorded the current chain state"
         )),
-        PreviousBaseline::NotComparable => Some(format!(
+        PreviousBaseline::NotComparable => lines.push(format!(
             "warning: rule {rule_id}'s version 1 baseline could not be compared with the \
              chain; the refresh recorded the current chain state"
         )),
-        _ => None,
+        _ => {}
     }
+    if verifier_pinned {
+        lines.push(format!(
+            "warning: rule {rule_id}'s pin record pinned no verifier while the rule held \
+             External signers; the refresh pinned the live verifier"
+        ));
+    }
+    lines
 }
 
-/// Runs the manager's refresh for `args`, passing `--accept-divergence`
-/// through.
+/// Runs the manager's refresh for `args`, passing `--accept-divergence` and
+/// the two verifier overrides through.
 #[allow(
     clippy::result_large_err,
     reason = "returns the manager's own error type unchanged"
@@ -576,7 +623,9 @@ async fn refresh_outcome(
             smart_account,
             args.rule_id,
             source_account_strkey,
-            args.accept_divergence,
+            RefreshOptions::new(args.accept_divergence)
+                .with_accept_mutable_verifier(args.accept_mutable_verifier)
+                .with_accept_unknown_verifier(args.accept_unknown_verifier),
             request_id,
         )
         .await
@@ -630,10 +679,14 @@ async fn refresh_run(args: &RefreshArgs) -> i32 {
     .await
     {
         Ok(outcome) => {
-            if let Some(warning) = refresh_warning(args.rule_id, outcome.previous_baseline) {
+            for warning in refresh_warnings(
+                args.rule_id,
+                outcome.previous_baseline,
+                outcome.verifier_pinned,
+            ) {
                 #[allow(
                     clippy::print_stderr,
-                    reason = "one warning line beside the JSON envelope on stdout"
+                    reason = "warning lines beside the JSON envelope on stdout"
                 )]
                 {
                     eprintln!("{warning}");
@@ -645,6 +698,7 @@ async fn refresh_run(args: &RefreshArgs) -> i32 {
                     args.rule_id,
                     &outcome.view,
                     outcome.previous_baseline,
+                    outcome.verifier_pinned,
                 ),
                 &request_id,
             )
@@ -3282,38 +3336,93 @@ mod tests {
             2,
             &v2_view(Some(2)),
             PreviousBaseline::NotComparable,
+            true,
         ))
         .unwrap();
         assert_eq!(json["signer_count"], 3);
         assert_eq!(json["threshold"], 2);
         assert_eq!(json["snapshot_version"], 2);
         assert_eq!(json["previous_baseline"], "not_comparable");
+        assert_eq!(json["verifier_pinned"], true);
 
         let json = serde_json::to_value(refresh_result(
             ACCOUNT,
             2,
             &v2_view(None),
             PreviousBaseline::Matched,
+            false,
         ))
         .unwrap();
         assert!(json["threshold"].is_null(), "{json}");
         assert_eq!(json["previous_baseline"], "matched");
+        assert_eq!(json["verifier_pinned"], false);
     }
 
     /// A refresh that recorded a changed or incomparable set prints one
-    /// warning line; a matching or first refresh prints none.
+    /// warning line, and one more when it pinned the live verifier; a
+    /// matching or first refresh that pinned nothing prints none.
     #[test]
     fn refresh_warning_names_an_accepted_change() {
-        assert_eq!(refresh_warning(3, PreviousBaseline::None), None);
-        assert_eq!(refresh_warning(3, PreviousBaseline::Matched), None);
-        let diverged = refresh_warning(3, PreviousBaseline::Diverged).unwrap();
+        assert!(refresh_warnings(3, PreviousBaseline::None, false).is_empty());
+        assert!(refresh_warnings(3, PreviousBaseline::Matched, false).is_empty());
+        let [diverged] = refresh_warnings(3, PreviousBaseline::Diverged, false)
+            .try_into()
+            .unwrap();
         assert!(diverged.starts_with("warning: rule 3's"), "{diverged}");
         assert!(!diverged.contains('\n'));
-        let not_comparable = refresh_warning(3, PreviousBaseline::NotComparable).unwrap();
+        let [not_comparable] = refresh_warnings(3, PreviousBaseline::NotComparable, false)
+            .try_into()
+            .unwrap();
         assert!(
             not_comparable.contains("version 1 baseline"),
             "{not_comparable}"
         );
+
+        let [pinned] = refresh_warnings(3, PreviousBaseline::Matched, true)
+            .try_into()
+            .unwrap();
+        assert!(
+            pinned.starts_with("warning: rule 3's pin record"),
+            "{pinned}"
+        );
+        assert!(pinned.contains("pinned the live verifier"), "{pinned}");
+        assert!(!pinned.contains('\n'));
+        let [diverged, pinned] = refresh_warnings(3, PreviousBaseline::Diverged, true)
+            .try_into()
+            .unwrap();
+        assert!(
+            diverged.contains("differed from its audit-log"),
+            "{diverged}"
+        );
+        assert!(pinned.contains("pinned the live verifier"), "{pinned}");
+    }
+
+    /// The two verifier overrides default to off, and each flag sets its
+    /// own field.
+    #[test]
+    fn refresh_args_verifier_overrides_default_off() {
+        let base = [
+            "test",
+            "--account",
+            ACCOUNT,
+            "--rule-id",
+            "2",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
+        ];
+        let default = RefreshArgsHarness::parse_from(base).args;
+        assert!(!default.accept_mutable_verifier);
+        assert!(!default.accept_unknown_verifier);
+        let with = |flag: &'static str| {
+            let argv: Vec<&str> = base.iter().copied().chain(std::iter::once(flag)).collect();
+            RefreshArgsHarness::parse_from(argv).args
+        };
+        let mutable = with("--accept-mutable-verifier");
+        assert!(mutable.accept_mutable_verifier);
+        assert!(!mutable.accept_unknown_verifier);
+        let unknown = with("--accept-unknown-verifier");
+        assert!(unknown.accept_unknown_verifier);
+        assert!(!unknown.accept_mutable_verifier);
     }
 
     /// `--accept-divergence` defaults to off.

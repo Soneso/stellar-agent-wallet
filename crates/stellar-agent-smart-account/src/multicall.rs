@@ -1941,7 +1941,8 @@ const RULE_CHECK_STAGES: &[&str] = &[
 /// - `"sa.submit_check_missing"` → `"build"` (programming-gate; fires before any I/O).
 /// - `"sa.horizon_exceeded"` / `"sa.rule_expired"` / `"sa.simulation_divergence"` → `"policy_gate"`.
 /// - `"sa.verifier_hash_drift"` / `"sa.policy_hash_drift"` / `"sa.pinned_policy_absent"` /
-///   `"sa.pin_check_unavailable"` → `"policy_gate"` (the pinned-hash drift check).
+///   `"sa.pinned_verifier_absent"` / `"sa.pin_check_unavailable"` → `"policy_gate"` (the
+///   pinned-hash drift check).
 /// - `"sa.signer_set_missing_baseline"` / `"sa.signer_set_baseline_legacy"` /
 ///   `"sa.signer_set_diverged"` / `"sa.audit_log"` / `"network.rpc_divergence"` /
 ///   `"sa.threshold_policy_not_installed"` /
@@ -1990,6 +1991,7 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
         "sa.verifier_hash_drift"
         | "sa.policy_hash_drift"
         | "sa.pinned_policy_absent"
+        | "sa.pinned_verifier_absent"
         | "sa.pin_check_unavailable" => {
             // The pinned-hash drift check refuses before simulation: a wallet
             // security gate on the authorizing rule, not a network failure.
@@ -3205,8 +3207,9 @@ wasm_sha256 = "{drifted_sha}"
         assert_eq!(map_sa_error_to_multicall_phase(&err), "policy_gate");
     }
 
-    /// A drift refusal, a pinned policy absent from chain and an unavailable
-    /// drift check map to `"policy_gate"`: all refuse before simulation.
+    /// A drift refusal, a pinned policy absent from chain, a live verifier
+    /// the pin record does not pin and an unavailable drift check map to
+    /// `"policy_gate"`: all refuse before simulation.
     #[test]
     fn map_sa_error_to_phase_pin_check_refusals_map_to_policy_gate() {
         use stellar_agent_core::observability::RedactedStrkey;
@@ -3233,6 +3236,12 @@ wasm_sha256 = "{drifted_sha}"
             SaError::PinnedPolicyAbsent {
                 rule_id: 2,
                 pinned_count: 1,
+                smart_account_redacted: redacted(),
+                request_id: "req".to_owned(),
+            },
+            SaError::PinnedVerifierAbsent {
+                rule_id: 2,
+                verifier_redacted: redacted(),
                 smart_account_redacted: redacted(),
                 request_id: "req".to_owned(),
             },

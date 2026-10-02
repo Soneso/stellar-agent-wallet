@@ -43,6 +43,14 @@
 //!    transaction confirms: after the state row, or before a refusal that
 //!    follows the confirmation.
 //!
+//! The policy verbs of `ContextRuleManager` submit through `attach_policy`
+//! and `detach_policy`, which follow the same shape. They lock the rule and
+//! its auth rules, then, under the locks, compare the rule, plan the pin
+//! record, submit, record the threshold change of the simple-threshold
+//! policy and write the pin rows. The signer verbs, the policy verbs and
+//! `refresh_signer_baseline` therefore write each pin row under the lock of
+//! the rule it pins, held since the record read it was planned from.
+//!
 //! # Single-caller invariant for the signer-set baseline
 //!
 //! Only `SignersManager::list_signers` (first observation),
@@ -88,6 +96,7 @@ use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::AuditLogIntegrityError;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::{AuditWriterHealth, AuditWriterHealthHandle};
+use stellar_agent_core::audit_log::reader::PinnedHashesRecord;
 use stellar_agent_core::audit_log::schema::{ContractKind, PinsUpdateReason};
 use stellar_agent_core::audit_log::signer_set::{
     BaselineReason, ObservedSignerSet, SignerEntryV2, SignerIdentityV2, SignerPubkey,
@@ -121,16 +130,17 @@ use crate::error::{
     AdminOrOwnerKey, BASELINE_WRITE_STAGE_OBSERVE, BASELINE_WRITE_STAGE_WRITE,
     baseline_observe_reason, baseline_write_reason,
 };
-use crate::managers::auth_entry::PreSubmitBudget;
+use crate::managers::auth_entry::{PreSubmitBudget, bound_pre_submit_stage};
 use crate::managers::rules::{
     BASE_FEE_STROOPS, ExpectedInstallState, ExpiryCheck, augment_with_oz_error_name,
     contract_instance_key, scaddress_to_strkey,
 };
-use crate::managers::verifiers::PlannedPinUpdate;
+use crate::managers::verifiers::{PinnedKind, PlannedPinUpdate};
 use crate::signers::policy_identification::THRESHOLD_POLICY_WASM_HASHES;
 use crate::signers::types::{
     FrozenChainStateTuple, PolicyIdentifiedKind, ThresholdAffectingOp, WasmHashSummary,
 };
+use crate::simple_threshold_policy::parse_simple_threshold_install_param;
 use crate::weighted_threshold_policy::WEIGHTED_THRESHOLD_POLICY_WASM_HASHES;
 
 /// Weighted-threshold policy's on-chain view state: the current threshold
@@ -416,8 +426,8 @@ impl<'a> BorrowedRuleLocks<'a> {
     }
 }
 
-/// The held-lock context a threshold-policy entry hands the submission it
-/// runs under its locks.
+/// The held-lock context a policy entry hands the submission it runs under
+/// its locks.
 ///
 /// `'l` is the life of the context, which the entry owns; `'env` is the life
 /// of the borrows the submission captures. The type records that `'env`
@@ -443,7 +453,7 @@ impl<'l> LockedSubmission<'l, '_> {
     }
 }
 
-/// The submission a threshold-policy entry runs under its locks.
+/// The submission a policy entry runs under its locks.
 pub(crate) type LockedSubmitFuture<'l> = std::pin::Pin<
     Box<dyn Future<Output = Result<crate::submit::SubmitInvokeResult, SaError>> + Send + 'l>,
 >;
@@ -565,7 +575,7 @@ impl SignersManagerConfig {
 /// | Method | Effect | Mutex | Audit row |
 /// |--------|--------|-------|-----------|
 /// | `list_signers` | Observes the signer set (two-RPC); baselines if no prior row, otherwise compares | yes | `SaSignerSetBaselinedV2` (first observation) |
-/// | `refresh_signer_baseline` | Observes and compares; writes a fresh baseline (a changed set needs `accept_divergence`) | yes | `SaSignerSetDiverged` (changed set), `SaSignerSetBaselinedV2` |
+/// | `refresh_signer_baseline` | Observes and compares; writes a fresh baseline (a changed set needs `accept_divergence`) and pins the live verifier of a pin record that pins none | yes | `SaSignerSetDiverged` (changed set), `SaSignerSetBaselinedV2`, override rows and `SaContextRulePinsUpdated` (verifier pinned) |
 /// | `add_signer` | Compares, adds a signer, validates the confirmed set | yes | `SaSignerAddedV2` |
 /// | `batch_add_signers` | Compares, adds signers, validates the confirmed set | yes | `SaSignerAddedV2` per signer |
 /// | `remove_signer` | Compares, removes a signer, validates the confirmed set | yes | `SaSignerRemovedV2` |
@@ -879,6 +889,7 @@ impl SignersManager {
                 SaError::VerifierHashDrift { .. }
                     | SaError::PolicyHashDrift { .. }
                     | SaError::PinnedPolicyAbsent { .. }
+                    | SaError::PinnedVerifierAbsent { .. }
                     | SaError::PinCheckUnavailable { .. }
             ) {
                 return e;
@@ -1188,40 +1199,72 @@ impl SignersManager {
     /// audit-log state and records it as a new `SaSignerSetBaselinedV2` row.
     ///
     /// The signer set is observed once in version 2 through both RPC
-    /// endpoints. With a prior state row it is compared in that row's
-    /// version, a version-1 row through the version-1 projection of the same
-    /// reads (see [`RefreshOutcome`]):
+    /// endpoints, under the rule's lock. With a prior state row it is
+    /// compared in that row's version, a version-1 row through the version-1
+    /// projection of the same reads (see [`RefreshOutcome`]):
     ///
     /// - no prior row, or a matching one: the baseline is written;
     /// - a changed set ([`PreviousBaseline::Diverged`]): a
     ///   `SaSignerSetDiverged` row records the two states, then the baseline
-    ///   is written only when `accept_divergence` is `true`; otherwise the
-    ///   call refuses with [`SaError::SignerSetDiverged`];
+    ///   is written only with [`RefreshOptions::accept_divergence`];
+    ///   otherwise the call refuses with [`SaError::SignerSetDiverged`];
     /// - a version-1 row with no comparable projection
     ///   ([`PreviousBaseline::NotComparable`]: a signer delegated to a
-    ///   contract address, or no simple-threshold policy): nothing is written
-    ///   and the call refuses with [`SaError::SignerSetDiverged`] carrying
-    ///   the version-1 row and the version-2 observation, unless
-    ///   `accept_divergence` is `true`, which writes the baseline.
+    ///   contract address, or no simple-threshold policy): nothing is
+    ///   written. The call refuses with [`SaError::SignerSetDiverged`]
+    ///   carrying the version-1 row and the version-2 observation, unless
+    ///   [`RefreshOptions::accept_divergence`] is set, which writes the
+    ///   baseline.
     ///
-    /// Call this after an intentional out-of-band signer change, or once on
-    /// a rule whose baseline is version 1, to re-anchor the wallet's
-    /// divergence-detection view.
+    /// # Verifier reconciliation
+    ///
+    /// When the rule has a pin record that pins no verifier and the
+    /// observation holds `External` signers, the signing-time drift check
+    /// refuses the rule with [`SaError::PinnedVerifierAbsent`]. Before the
+    /// baseline is written, the refresh then identifies and probes each
+    /// distinct live verifier as `rules create` probes one. A mutable
+    /// verifier needs [`RefreshOptions::with_accept_mutable_verifier`], and
+    /// one whose hash is outside the verifier allowlist needs
+    /// [`RefreshOptions::with_accept_unknown_verifier`]. An unpinnable
+    /// instance refuses regardless. A refusal returns before the baseline or
+    /// any pin row is written.
+    ///
+    /// Two verifier addresses whose pins are equal, in hash and executable
+    /// reference, share one pin. Live verifiers whose pins differ refuse with
+    /// [`SaError::MultiplePinnedHashesUnsupported`] before the baseline or
+    /// any pin row is written, since a rule is pinned to one verifier. After
+    /// the baseline row, the refresh writes the applied overrides' rows and a
+    /// `SaContextRulePinsUpdated` row (reason `baseline_refreshed`) that
+    /// adds the verifier pin to the record. A record that already pins a
+    /// verifier is left as it is, whatever the live verifier runs: a pinned
+    /// verifier that changed is the drift check's finding. A rule without a
+    /// pin record, such as one installed outside the wallet, gets no record.
+    ///
+    /// Call this after an intentional out-of-band signer change, once on a
+    /// rule whose baseline is version 1, or on a rule refused with
+    /// [`SaError::PinnedVerifierAbsent`], to re-anchor the wallet's view of
+    /// the rule.
     ///
     /// # Arguments
     ///
     /// - `smart_account` — the smart-account contract's [`ScAddress`].
     /// - `rule_id` — the context rule to baseline.
     /// - `source_account_strkey` — G-strkey of the fee-paying account.
-    /// - `accept_divergence`: record the chain state even when it differs
-    ///   from, or cannot be compared with, the prior state row.
+    /// - `options`: whether a differing state is recorded, and the verifier
+    ///   overrides of the reconciliation.
     /// - `request_id` — caller-supplied UUID for audit-log correlation.
     ///
     /// # Errors
     ///
     /// - [`SaError::SignerSetDiverged`] (no transaction hash): the chain
     ///   differs from the prior row, or a version-1 row cannot be compared,
-    ///   and `accept_divergence` is `false`.
+    ///   and `accept_divergence` is not set.
+    /// - [`SaError::VerifierMutable`], [`SaError::VerifierWasmNotInAllowlist`]
+    ///   and [`SaError::ContractInstanceUnsupported`]: a live verifier the
+    ///   reconciliation probed was refused; the Display names the override
+    ///   it needs.
+    /// - [`SaError::MultiplePinnedHashesUnsupported`] (kind `verifier`): the
+    ///   live verifiers' pins differ in hash or executable reference.
     /// - [`SaError::BaselineWriteFailed`] (stage `write`): the baseline row
     ///   was not written.
     /// - [`SaError::AuditLog`]: audit-log integrity violation.
@@ -1237,11 +1280,12 @@ impl SignersManager {
         smart_account: ScAddress,
         rule_id: u32,
         source_account_strkey: Option<&str>,
-        accept_divergence: bool,
+        options: RefreshOptions,
         request_id: String,
     ) -> Result<RefreshOutcome, SaError> {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
+        let accept_divergence = options.accept_divergence();
 
         let _guard = self
             .acquire_rule_lock(&smart_account_strkey, rule_id, self.lock_budget())
@@ -1317,6 +1361,22 @@ impl SignersManager {
             }
         };
 
+        let pin_update = self
+            .plan_refresh_pin_update(
+                rule_id,
+                &smart_account_redacted,
+                &observation.snapshot,
+                PinOverrides {
+                    accept_mutable_verifier: options.accept_mutable_verifier(),
+                    accept_unknown_verifier: options.accept_unknown_verifier(),
+                },
+                &request_id,
+            )
+            .await?;
+        // A plan exists only for a record that pinned no verifier, and it
+        // holds the one verifier pin the rule can carry.
+        let verifier_pinned = pin_update.is_some();
+
         self.emit_baseline(
             &observation,
             rule_id,
@@ -1326,6 +1386,13 @@ impl SignersManager {
             None,
             &request_id,
         )?;
+        self.write_pin_rows(
+            rule_id,
+            &smart_account_redacted,
+            pin_update,
+            PinsUpdateReason::BaselineRefreshed,
+            &request_id,
+        );
 
         info!(
             profile = %self.profile_name,
@@ -1334,13 +1401,109 @@ impl SignersManager {
             signer_count = observation.snapshot.signer_count(),
             threshold = ?observation.snapshot.threshold.as_ref().map(|t| t.threshold),
             previous_baseline = ?previous_baseline,
+            verifier_pinned,
             "refresh_signer_baseline: baseline written"
         );
 
         Ok(RefreshOutcome {
             view: SignerSetView::V2(observation.snapshot),
             previous_baseline,
+            verifier_pinned,
         })
+    }
+
+    /// Plans the verifier reconciliation of a refresh of rule `rule_id`; see
+    /// "Verifier reconciliation" on [`Self::refresh_signer_baseline`].
+    ///
+    /// `observed` is the rule's signer set the refresh observed under the
+    /// rule's lock. Returns `None` when it holds no `External` signer, when
+    /// the rule has no pin record, or when the record already pins a
+    /// verifier. Otherwise the returned update is the record with the one pin
+    /// every live verifier's probe produced, equal in hash and executable
+    /// reference, and the overrides applied while probing them pending.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::AuditLog`]: the pin record could not be read.
+    /// - The refusals of `pin_added_contract` for a live verifier.
+    /// - [`SaError::MultiplePinnedHashesUnsupported`] (kind `verifier`, count
+    ///   2): two live verifiers' pins differ in hash or executable reference.
+    async fn plan_refresh_pin_update(
+        &self,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        observed: &SignerSetSnapshotV2,
+        overrides: PinOverrides,
+        request_id: &str,
+    ) -> Result<Option<PlannedPinUpdate>, SaError> {
+        let mut live_verifiers: Vec<ScAddress> = Vec::new();
+        for entry in &observed.signers {
+            if let SignerIdentityV2::External { verifier, .. } = &entry.identity {
+                let address = ScAddress::Contract(ContractId(Hash(*verifier)));
+                if !live_verifiers.contains(&address) {
+                    live_verifiers.push(address);
+                }
+            }
+        }
+        if live_verifiers.is_empty() {
+            return Ok(None);
+        }
+        let Some(record) = crate::managers::verifiers::read_pinned_hashes_for_rule(
+            self,
+            rule_id,
+            smart_account_redacted,
+        )?
+        else {
+            debug!(
+                rule_id,
+                "signers refresh: the rule has no pin record; no verifier is pinned"
+            );
+            return Ok(None);
+        };
+        if !record.pinned_verifier_first8.is_empty() {
+            return Ok(None);
+        }
+
+        let mut update = PlannedPinUpdate::unchanged(record);
+        for verifier in &live_verifiers {
+            let pin = crate::managers::verifiers::pin_added_contract(
+                self,
+                verifier,
+                PinnedKind::Verifier,
+                rule_id,
+                smart_account_redacted,
+                overrides.accept_mutable_verifier,
+                overrides.accept_unknown_verifier,
+                request_id,
+            )
+            .await?;
+            if update.record.pinned_verifier_first8.is_empty() {
+                update.append_pin(PinnedKind::Verifier, pin);
+            } else if update.record.pinned_verifier_first8.first() == Some(&pin.hash_first8)
+                && update.record.verifier_executable_ref(0) == pin.executable_ref.as_ref()
+            {
+                // Another address whose pin equals the recorded one, in hash
+                // and executable reference. The signing check compares it
+                // with that pin and accepts it, so it adds no pin, and the
+                // overrides applied to it are recorded.
+                update.fold_overrides(
+                    pin.mutable_override,
+                    pin.unknown_override,
+                    pin.pending_overrides,
+                );
+            } else {
+                return Err(SaError::MultiplePinnedHashesUnsupported {
+                    kind: "verifier",
+                    rule_id,
+                    count: 2,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted(
+                        smart_account_redacted,
+                    ),
+                    request_id: request_id.to_owned(),
+                });
+            }
+        }
+        Ok(Some(update))
     }
 
     // ── verify_signer_set_against_chain ───────────────────────────────────────
@@ -1794,7 +1957,7 @@ impl SignersManager {
         )
     }
 
-    // ── Rule install and the threshold-policy entries ─────────────────────────
+    // ── Rule install and the policy entries ───────────────────────────────────
 
     /// Records the signer-set baseline of a rule the wallet installed, from
     /// the confirmed chain state.
@@ -1892,55 +2055,85 @@ impl SignersManager {
         )
     }
 
-    /// Attaches the simple-threshold policy `policy` to rule `rule_id`
-    /// through `submit`, and records the threshold the attach sets.
+    /// Attaches `policy` to rule `rule_id` through `submit`, and writes the
+    /// rows the confirmed attach records under the locks.
     ///
     /// Acquires, in one acquisition, the locks of the rule and of the
     /// distinct non-zero rules in `auth_rule_ids`, the rules the attach is
-    /// signed under, then:
+    /// signed under, then, every step under the locks:
     ///
     /// 1. Compares the chain with the rule's version-2 state row, as
     ///    [`Self::add_signer`] does. A missing row refuses with
     ///    [`SaError::SignerSetMissingBaseline`] and a version-1 row with
     ///    [`SaError::SignerSetBaselineLegacy`], both before any RPC; a changed
     ///    set refuses with [`SaError::SignerSetDiverged`].
-    /// 2. Refuses with [`SaError::ThresholdPolicyIdentificationFailed`] when
-    ///    the rule already has a simple-threshold policy: the only change an
+    /// 2. Observes the policy's executable through both endpoints to tell
+    ///    whether it is the simple-threshold policy. For that policy,
+    ///    `install_param` must be the `{ threshold: u32 }` map with a non-zero
+    ///    threshold ([`SaError::SimpleThresholdInstallRefused`]). A rule that
+    ///    already has a simple-threshold policy refuses with
+    ///    [`SaError::ThresholdPolicyIdentificationFailed`]: the only change an
     ///    attach records is from no threshold to one.
-    /// 3. Runs `submit` with the held locks and the comparison of step 1;
-    ///    it signs and submits the `add_policy` invocation, and the submit
-    ///    path compares every auth rule other than the target under the
-    ///    held locks.
-    /// 4. Reads the assigned policy id from the confirmed return value.
-    /// 5. Observes the rule after confirmation and requires the signers
-    ///    unchanged and the threshold `expected_threshold` on `policy`.
-    /// 6. Writes the `SaThresholdChangedV2` row: no previous threshold, and
-    ///    the resulting set with the new one.
+    /// 3. Plans the pin record the attach writes when the rule has one, from
+    ///    the record read here and the live policies of the comparison; a
+    ///    policy not already live is probed as `rules create` probes one.
+    /// 4. Runs `submit` with the held locks, the comparison of step 1 and the
+    ///    invocation arguments built here. It signs and submits the
+    ///    `add_policy` invocation, and the submit path compares every auth
+    ///    rule other than the target under the held locks.
+    /// 5. Reads the assigned policy id from the confirmed return value. For
+    ///    the simple-threshold policy it observes the rule after confirmation,
+    ///    requires the signers unchanged and the threshold the parameter's,
+    ///    and writes the `SaThresholdChangedV2` row.
+    /// 6. Writes the planned override rows and the `SaContextRulePinsUpdated`
+    ///    row, whatever step 5 returned, since the policy is on chain.
     ///
-    /// The threshold row is written here, so it precedes the policy, raw
-    /// invocation and pin rows the caller writes after this entry returns.
+    /// A concurrent verb on the rule is therefore serialized before or after
+    /// the whole attach. The rows written here precede the policy and raw
+    /// invocation rows the caller writes after this entry returns.
+    ///
+    /// The held-lock context lends the target compared and any non-zero auth
+    /// rule uncompared; the submit path reads and compares the latter under
+    /// the lent guard. An attach authorized under rule 0 alone locks the
+    /// target only.
+    ///
+    /// `budget`, the manager's timeout from the start of the call, bounds the
+    /// lock wait, the policy's observation and the plan. The comparison's
+    /// reads carry the manager's per-read timeout, and the submission carries
+    /// the caller's own pre-submit budget.
     ///
     /// # Returns
     ///
     /// `Err` when the entry returned before a confirmation; nothing was
     /// recorded. `Ok` once the transaction confirmed. Then `parsed` is the
     /// policy id, `None` only when the return value is not a `u32`.
-    /// `recorded` is the outcome of steps 5 and 6, or the stage-`observe`
-    /// refusal of a return value that is not a `u32`.
+    /// `recorded` is the outcome of the threshold recording of step 5,
+    /// `Ok(())` for any other policy, or the stage-`observe` refusal of a
+    /// return value that is not a `u32`.
     ///
     /// # Errors
     ///
-    /// The comparison errors of [`Self::add_signer`],
-    /// [`SaError::ThresholdPolicyIdentificationFailed`] and the errors of
-    /// `submit`. After confirmation, `recorded` carries
-    /// [`SaError::BaselineWriteFailed`] (stage `observe` or `write`) or
-    /// [`SaError::SignerSetDiverged`] with the transaction hash.
+    /// - The comparison errors of [`Self::add_signer`].
+    /// - The observation errors of the policy
+    ///   ([`SaError::ContractInstanceUnsupported`],
+    ///   [`SaError::NetworkRpcDivergence`], [`SaError::DeploymentFailed`]).
+    /// - [`SaError::SimpleThresholdInstallRefused`] and
+    ///   [`SaError::ThresholdPolicyIdentificationFailed`].
+    /// - The pin refusals of a probed policy
+    ///   ([`SaError::PolicyWasmNotInAllowlist`], [`SaError::PolicyMutable`]),
+    ///   and [`SaError::AuditLog`] when the pin record cannot be read.
+    /// - [`SaError::AuthEntryConstructionFailed`] when the budget elapses.
+    /// - The errors of `submit`.
+    /// - After confirmation, `recorded` carries
+    ///   [`SaError::BaselineWriteFailed`] (stage `observe` or `write`) or
+    ///   [`SaError::SignerSetDiverged`] with the transaction hash.
     #[allow(
         clippy::too_many_arguments,
         reason = "the account identity, the rule and its auth rules, the policy and its \
-                  threshold, the source account, the submission and the correlation id"
+                  parameter, the pin overrides, the source account, the submission and the \
+                  correlation id"
     )]
-    pub(crate) async fn attach_threshold_policy<'env>(
+    pub(crate) async fn attach_policy<'env>(
         &self,
         smart_account: &ScAddress,
         smart_account_strkey: &str,
@@ -1948,16 +2141,18 @@ impl SignersManager {
         rule_id: u32,
         auth_rule_ids: &[ContextRuleId],
         policy: &ScAddress,
-        expected_threshold: u32,
+        install_param: ScVal,
+        overrides: PinOverrides,
         source_account_strkey: Option<&str>,
-        submit: impl for<'l> FnOnce(LockedSubmission<'l, 'env>) -> LockedSubmitFuture<'l>,
+        submit: impl for<'l> FnOnce(LockedSubmission<'l, 'env>, Vec<ScVal>) -> LockedSubmitFuture<'l>,
         request_id: &str,
     ) -> Result<ConfirmedThresholdChange<Option<u32>>, SaError> {
+        let budget = self.lock_budget();
         let guards = self
             .acquire_rule_locks(
                 smart_account_strkey,
                 holder_lock_set(rule_id, auth_rule_ids),
-                self.lock_budget(),
+                budget,
             )
             .await?;
 
@@ -1969,134 +2164,202 @@ impl SignersManager {
                 request_id,
             )
             .await?];
-        if compared[0].snapshot().threshold.is_some() {
-            return Err(SaError::ThresholdPolicyIdentificationFailed {
-                rule_id,
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted,
-                ),
-                observed_wasm_hashes_summary: compared[0].policy_hashes().clone(),
-                request_id: request_id.to_owned(),
-            });
-        }
 
+        let observation = self
+            .observe_policy_path(policy, rule_id, smart_account_redacted, request_id, budget)
+            .await?;
+        let expected_threshold = if observation.allowlisted {
+            let threshold = parse_simple_threshold_install_param(&install_param)?;
+            if compared[0].snapshot().threshold.is_some() {
+                return Err(SaError::ThresholdPolicyIdentificationFailed {
+                    rule_id,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted(
+                        smart_account_redacted,
+                    ),
+                    observed_wasm_hashes_summary: compared[0].policy_hashes().clone(),
+                    request_id: request_id.to_owned(),
+                });
+            }
+            Some(threshold)
+        } else {
+            None
+        };
+
+        let pin_update = bound_pre_submit_stage(
+            budget,
+            "pin_plan",
+            "auth_payload",
+            self.plan_policy_add_pin_update(
+                rule_id,
+                smart_account_redacted,
+                compared[0].policies(),
+                policy,
+                overrides,
+                request_id,
+            ),
+        )
+        .await??;
+
+        let invoke_args = vec![
+            ScVal::U32(rule_id),
+            ScVal::Address(policy.clone()),
+            install_param,
+        ];
         let rule_locks = borrowed(&guards, &compared);
-        let submitted = submit(LockedSubmission::new(&rule_locks)).await?;
-        let policy_id = match extract_u32_return(&submitted.return_val, "add_policy") {
-            Ok(policy_id) => policy_id,
-            Err(cause) => {
-                let recorded = Err(observe_failed_after(
+        let submitted = submit(LockedSubmission::new(&rule_locks), invoke_args).await?;
+        let (parsed, recorded) = match extract_u32_return(&submitted.return_val, "add_policy") {
+            Err(cause) => (
+                None,
+                Err(observe_failed_after(
                     rule_id,
                     smart_account_redacted,
                     &submitted.tx_hash,
                     &cause,
                     request_id,
-                ));
-                return Ok(ConfirmedThresholdChange {
-                    submitted,
-                    parsed: None,
-                    recorded,
-                });
+                )),
+            ),
+            Ok(policy_id) => {
+                let recorded = match expected_threshold {
+                    Some(threshold) => {
+                        let intended = SignerSetSnapshotV2 {
+                            signers: compared[0].snapshot().signers.clone(),
+                            threshold: Some(ThresholdObservation {
+                                policy: contract_address_bytes(policy),
+                                threshold,
+                            }),
+                        };
+                        self.record_threshold_change(
+                            smart_account,
+                            smart_account_strkey,
+                            smart_account_redacted,
+                            rule_id,
+                            source_account_strkey,
+                            &submitted,
+                            intended,
+                            None,
+                            request_id,
+                        )
+                        .await
+                    }
+                    None => Ok(()),
+                };
+                (Some(policy_id), recorded)
             }
         };
-        let intended = SignerSetSnapshotV2 {
-            signers: compared[0].snapshot().signers.clone(),
-            threshold: Some(ThresholdObservation {
-                policy: contract_address_bytes(policy),
-                threshold: expected_threshold,
-            }),
-        };
-        let recorded = self
-            .record_threshold_change(
-                smart_account,
-                smart_account_strkey,
-                smart_account_redacted,
-                rule_id,
-                source_account_strkey,
-                &submitted,
-                intended,
-                None,
-                request_id,
-            )
-            .await;
+        self.write_pin_rows(
+            rule_id,
+            smart_account_redacted,
+            pin_update,
+            PinsUpdateReason::PolicyAdded,
+            request_id,
+        );
         Ok(ConfirmedThresholdChange {
             submitted,
-            parsed: Some(policy_id),
+            parsed,
             recorded,
         })
     }
 
-    /// Detaches the simple-threshold policy `policy` from rule `rule_id`
-    /// through `submit`, and records the threshold change.
+    /// Removes the policy with on-chain id `policy_id` from rule `rule_id`
+    /// through `submit`, and writes the rows the confirmed removal records
+    /// under the locks.
     ///
     /// Acquires the locks of the rule and of the distinct non-zero rules in
-    /// `auth_rule_ids`, compares the chain with the rule's version-2 state
-    /// row and runs `submit` with the held locks, as
-    /// [`Self::attach_threshold_policy`] does. Two deltas are recorded:
+    /// `auth_rule_ids`, as [`Self::attach_policy`] does, then, every step
+    /// under the locks:
     ///
-    /// - The rule has one simple-threshold policy. It must be `policy`, else
-    ///   the call refuses with [`SaError::ThresholdPolicyIdentificationFailed`]
-    ///   before submission: the caller identified `policy` by its executable
-    ///   before this observation, and the two reads must agree. After
-    ///   confirmation the signers must be unchanged and the threshold gone.
-    ///   The row records the observed threshold as the previous one and none
-    ///   as the resulting one.
-    /// - The rule has two simple-threshold policies, so it cannot be
-    ///   observed, and `policy` is one of them. The rule is read through both
-    ///   endpoints and its signers must equal the state row's before
-    ///   submission; a changed set writes the `SaSignerSetDiverged` row and
-    ///   refuses with [`SaError::SignerSetDiverged`] without a transaction
-    ///   hash. After confirmation the signers must equal the state row's and
-    ///   the threshold must be the other policy's. The row records no
-    ///   previous threshold, since none was observable, and the other
-    ///   policy's threshold as the resulting one. The held-lock context of
-    ///   this case carries no comparison, so the submit path compares the
-    ///   rule again when it is among `auth_rule_ids`, and that comparison
-    ///   refuses the two-policy rule: the repair is authorized through
-    ///   another rule, such as rule 0.
+    /// 1. Compares the chain with the rule's version-2 state row. A rule with
+    ///    no state row refuses with [`SaError::SignerSetMissingBaseline`]
+    ///    before any RPC; a rule with a state row that is not on chain
+    ///    refuses from the comparison's rule read.
+    /// 2. Resolves `policy_id` to its address from the comparison's rule
+    ///    value; an id the rule does not hold refuses with
+    ///    [`SaError::DeploymentFailed`] (phase `simulate`).
+    /// 3. Observes the policy's executable through both endpoints. When it
+    ///    is the simple-threshold policy, it must be the rule's observed
+    ///    threshold policy, else the call refuses with
+    ///    [`SaError::ThresholdPolicyIdentificationFailed`].
+    /// 4. Plans the pin record the removal writes when the rule has one: the
+    ///    first policy pin equal to the observed hash is dropped. The single
+    ///    pin of the rule's only policy is dropped whatever the hash, since it
+    ///    can only be that policy's.
+    /// 5. Runs `submit` with the held locks, the comparison and the
+    ///    invocation arguments built here.
+    /// 6. For the simple-threshold policy, observes the rule after
+    ///    confirmation, requires the signers unchanged and the threshold
+    ///    gone, and writes the `SaThresholdChangedV2` row with the observed
+    ///    threshold as the previous one.
+    /// 7. Writes the `SaContextRulePinsUpdated` row of the plan, whatever
+    ///    step 6 returned.
     ///
-    /// Any other identification failure, three or more matching policies
-    /// included, refuses unchanged. The threshold row precedes the policy,
-    /// raw invocation and pin rows the caller writes after this entry
-    /// returns.
+    /// A rule with two simple-threshold policies cannot be observed, so the
+    /// comparison of step 1 refuses it with
+    /// [`SaError::ThresholdPolicyIdentificationFailed`]. The removal of one
+    /// of the two is then accepted, under the same locks, when the rule has
+    /// a version-2 state row. The rule is read through both endpoints, and
+    /// its signers must equal the state row's before submission. A changed
+    /// set writes the `SaSignerSetDiverged` row and refuses with
+    /// [`SaError::SignerSetDiverged`] without a transaction hash. The
+    /// removed policy's hash comes from that read's identification of the
+    /// two policies. After confirmation the signers must equal the state
+    /// row's and the threshold must be the other policy's. The row records
+    /// no previous threshold, since none was observable, and the other
+    /// policy's threshold as the resulting one. The pin rows follow as in
+    /// step 7. The held-lock context of this case carries no comparison. The
+    /// submit path therefore compares the rule again when it is among
+    /// `auth_rule_ids`, and that comparison refuses the two-policy rule: the
+    /// repair is authorized through another rule, such as rule 0. Any other
+    /// identification failure, a third matching policy or the removal of a
+    /// policy other than the two included, refuses unchanged.
+    ///
+    /// The rows written here precede the policy and raw invocation rows the
+    /// caller writes after this entry returns, and a concurrent verb on the
+    /// rule is serialized before or after the whole removal. The held-lock
+    /// context and `budget` are as on [`Self::attach_policy`]; the plan's
+    /// only read is the synchronous pin-record scan.
     ///
     /// # Returns
     ///
     /// `Err` when the entry returned before a confirmation; nothing was
     /// recorded. `Ok` once the transaction confirmed, with `recorded` the
-    /// outcome of the observation and the row write after confirmation.
+    /// outcome of the threshold recording, `Ok(())` for any other policy.
     ///
     /// # Errors
     ///
-    /// The comparison errors of [`Self::add_signer`],
-    /// [`SaError::ThresholdPolicyIdentificationFailed`],
-    /// [`SaError::SignerSetDiverged`] without a transaction hash, the rule
-    /// read errors and the errors of `submit`. After confirmation,
-    /// `recorded` carries [`SaError::BaselineWriteFailed`] (stage `observe`
-    /// or `write`) or [`SaError::SignerSetDiverged`] with the transaction
-    /// hash.
+    /// - The comparison errors of [`Self::add_signer`].
+    /// - [`SaError::DeploymentFailed`] for a policy id the rule does not
+    ///   hold, and the observation errors of the policy.
+    /// - [`SaError::ThresholdPolicyIdentificationFailed`], and
+    ///   [`SaError::SignerSetDiverged`] without a transaction hash.
+    /// - [`SaError::AuditLog`] when the pin record cannot be read, and
+    ///   [`SaError::AuthEntryConstructionFailed`] when the budget elapses.
+    /// - The rule read errors and the errors of `submit`.
+    /// - After confirmation, `recorded` carries
+    ///   [`SaError::BaselineWriteFailed`] (stage `observe` or `write`) or
+    ///   [`SaError::SignerSetDiverged`] with the transaction hash.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the account identity, the rule and its auth rules, the policy, the source \
+        reason = "the account identity, the rule and its auth rules, the policy id, the source \
                   account, the submission and the correlation id"
     )]
-    pub(crate) async fn detach_threshold_policy<'env>(
+    pub(crate) async fn detach_policy<'env>(
         &self,
         smart_account: &ScAddress,
         smart_account_strkey: &str,
         smart_account_redacted: &str,
         rule_id: u32,
         auth_rule_ids: &[ContextRuleId],
-        policy: &ScAddress,
+        policy_id: u32,
         source_account_strkey: Option<&str>,
-        submit: impl for<'l> FnOnce(LockedSubmission<'l, 'env>) -> LockedSubmitFuture<'l>,
+        submit: impl for<'l> FnOnce(LockedSubmission<'l, 'env>, Vec<ScVal>) -> LockedSubmitFuture<'l>,
         request_id: &str,
     ) -> Result<ConfirmedThresholdChange<()>, SaError> {
+        let budget = self.lock_budget();
         let guards = self
             .acquire_rule_locks(
                 smart_account_strkey,
                 holder_lock_set(rule_id, auth_rule_ids),
-                self.lock_budget(),
+                budget,
             )
             .await?;
 
@@ -2118,22 +2381,32 @@ impl SignersManager {
                         smart_account_redacted,
                         rule_id,
                         &guards,
-                        policy,
+                        policy_id,
                         source_account_strkey,
                         submit,
                         identification,
+                        budget,
                         request_id,
                     )
                     .await;
             }
             Err(other) => return Err(other),
         };
-        let detached = contract_address_bytes(policy);
+
+        let RulePolicy {
+            address: policy,
+            rule_policy_count,
+        } = rule_policy_for_id(compared[0].primary_rule(), policy_id)
+            .ok_or_else(|| policy_not_attached(rule_id, policy_id))?;
+        let observation = self
+            .observe_policy_path(&policy, rule_id, smart_account_redacted, request_id, budget)
+            .await?;
         let before = compared[0].snapshot();
-        if !before
-            .threshold
-            .as_ref()
-            .is_some_and(|threshold| threshold.policy == detached)
+        if observation.allowlisted
+            && !before
+                .threshold
+                .as_ref()
+                .is_some_and(|threshold| threshold.policy == contract_address_bytes(&policy))
         {
             return Err(SaError::ThresholdPolicyIdentificationFailed {
                 rule_id,
@@ -2145,14 +2418,29 @@ impl SignersManager {
             });
         }
 
+        // The plan's only read is a synchronous scan: the wrapper records the
+        // `pin_plan` stage's timing, and the plan checks the budget itself.
+        let pin_record = bound_pre_submit_stage(budget, "pin_plan", "auth_payload", async {
+            self.plan_policy_remove_pin_update(
+                rule_id,
+                smart_account_redacted,
+                policy_id,
+                &observation.effective_hash,
+                rule_policy_count,
+                budget,
+            )
+        })
+        .await??;
+
+        let invoke_args = vec![ScVal::U32(rule_id), ScVal::U32(policy_id)];
         let rule_locks = borrowed(&guards, &compared);
-        let submitted = submit(LockedSubmission::new(&rule_locks)).await?;
-        let intended = SignerSetSnapshotV2 {
-            signers: before.signers.clone(),
-            threshold: None,
-        };
-        let recorded = self
-            .record_threshold_change(
+        let submitted = submit(LockedSubmission::new(&rule_locks), invoke_args).await?;
+        let recorded = if observation.allowlisted {
+            let intended = SignerSetSnapshotV2 {
+                signers: before.signers.clone(),
+                threshold: None,
+            };
+            self.record_threshold_change(
                 smart_account,
                 smart_account_strkey,
                 smart_account_redacted,
@@ -2163,7 +2451,17 @@ impl SignersManager {
                 before.threshold.clone(),
                 request_id,
             )
-            .await;
+            .await
+        } else {
+            Ok(())
+        };
+        self.write_pin_rows(
+            rule_id,
+            smart_account_redacted,
+            pin_record.map(PlannedPinUpdate::unchanged),
+            PinsUpdateReason::PolicyRemoved,
+            request_id,
+        );
         Ok(ConfirmedThresholdChange {
             submitted,
             parsed: (),
@@ -2171,16 +2469,17 @@ impl SignersManager {
         })
     }
 
-    /// The detach of one of two simple-threshold policies of
-    /// [`Self::detach_threshold_policy`]. The caller holds `guards`, the
-    /// locks of the rule and its auth rules, and nothing here acquires a
-    /// lock; its comparison refused with `identification`, which is returned
+    /// The removal of one of two simple-threshold policies of
+    /// [`Self::detach_policy`]. The caller holds `guards`, the locks of the
+    /// rule and its auth rules, and nothing here acquires a lock. The
+    /// caller's comparison refused with `identification`, which is returned
     /// unchanged unless exactly two attached policies match and one of them
-    /// is `policy`.
+    /// is the policy with id `policy_id`.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the account identity, the rule and its held locks, the policy, the source \
-                  account, the submission, the comparison's refusal and the correlation id"
+        reason = "the account identity, the rule and its held locks, the policy id, the source \
+                  account, the submission, the comparison's refusal, the budget and the \
+                  correlation id"
     )]
     async fn detach_one_of_two_threshold_policies<'env>(
         &self,
@@ -2189,10 +2488,11 @@ impl SignersManager {
         smart_account_redacted: &str,
         rule_id: u32,
         guards: &[RuleLockGuard],
-        policy: &ScAddress,
+        policy_id: u32,
         source_account_strkey: Option<&str>,
-        submit: impl for<'l> FnOnce(LockedSubmission<'l, 'env>) -> LockedSubmitFuture<'l>,
+        submit: impl for<'l> FnOnce(LockedSubmission<'l, 'env>, Vec<ScVal>) -> LockedSubmitFuture<'l>,
         identification: SaError,
+        budget: PreSubmitBudget,
         request_id: &str,
     ) -> Result<ConfirmedThresholdChange<()>, SaError> {
         // The comparison read the state row before any RPC and refused a
@@ -2236,6 +2536,11 @@ impl SignersManager {
             smart_account_redacted,
             request_id,
         )?;
+        let RulePolicy {
+            address: policy,
+            rule_policy_count,
+        } = rule_policy_for_id(&primary.rule.raw_scval, policy_id)
+            .ok_or_else(|| policy_not_attached(rule_id, policy_id))?;
         let (matches, _summary) = self
             .allowlisted_threshold_policies(
                 &primary.rule.policies,
@@ -2244,9 +2549,13 @@ impl SignersManager {
                 request_id,
             )
             .await?;
-        let remaining = match matches.as_slice() {
-            [(first, _), (_, second_id)] if first == policy => *second_id,
-            [(_, first_id), (second, _)] if second == policy => *first_id,
+        let (removed_hash, remaining) = match matches.as_slice() {
+            [first, second] if first.address == policy => {
+                (first.executable_hash, second.contract_id)
+            }
+            [first, second] if second.address == policy => {
+                (second.executable_hash, first.contract_id)
+            }
             _ => return Err(identification),
         };
 
@@ -2273,8 +2582,23 @@ impl SignersManager {
             });
         }
 
+        // The plan's only read is a synchronous scan: the wrapper records the
+        // `pin_plan` stage's timing, and the plan checks the budget itself.
+        let pin_record = bound_pre_submit_stage(budget, "pin_plan", "auth_payload", async {
+            self.plan_policy_remove_pin_update(
+                rule_id,
+                smart_account_redacted,
+                policy_id,
+                &removed_hash,
+                rule_policy_count,
+                budget,
+            )
+        })
+        .await??;
+
+        let invoke_args = vec![ScVal::U32(rule_id), ScVal::U32(policy_id)];
         let rule_locks = borrowed(guards, &[]);
-        let submitted = submit(LockedSubmission::new(&rule_locks)).await?;
+        let submitted = submit(LockedSubmission::new(&rule_locks), invoke_args).await?;
         let recorded = self
             .record_one_of_two_detached(
                 smart_account,
@@ -2288,11 +2612,183 @@ impl SignersManager {
                 request_id,
             )
             .await;
+        self.write_pin_rows(
+            rule_id,
+            smart_account_redacted,
+            pin_record.map(PlannedPinUpdate::unchanged),
+            PinsUpdateReason::PolicyRemoved,
+            request_id,
+        );
         Ok(ConfirmedThresholdChange {
             submitted,
             parsed: (),
             recorded,
         })
+    }
+
+    /// Observes the executable of `policy`, a policy of rule `rule_id`,
+    /// through both endpoints under `budget`, to tell whether it is the
+    /// simple-threshold policy.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::observe_contract`], and
+    /// [`SaError::AuthEntryConstructionFailed`] (stage `auth_payload`) when
+    /// `budget` elapses.
+    async fn observe_policy_path(
+        &self,
+        policy: &ScAddress,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        request_id: &str,
+        budget: PreSubmitBudget,
+    ) -> Result<ContractObservation, SaError> {
+        bound_pre_submit_stage(
+            budget,
+            "policy_path",
+            "auth_payload",
+            self.observe_contract(
+                policy,
+                ContractKind::Policy,
+                |hash| THRESHOLD_POLICY_WASM_HASHES.contains(hash),
+                Some(rule_id),
+                smart_account_redacted,
+                request_id,
+            ),
+        )
+        .await?
+    }
+
+    /// Computes the pin record a policy add writes for rule `rule_id` once
+    /// the add confirms.
+    ///
+    /// `live_policies` are the rule's policies as the comparison under the
+    /// rule's lock observed them. Returns `None` without a pin record.
+    /// Otherwise the returned record is the current one, with a pin appended
+    /// for `policy` when the policy is not already live on the rule, probed
+    /// here, before submission, with the overrides applied to it pending.
+    /// When the rule has no live policy, the record's policy pins are
+    /// replaced by that pin, so the record pins exactly the policy set the
+    /// add produces.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::AuditLog`]: the pin record could not be read.
+    /// - The refusals of `pin_added_contract` for the policy.
+    async fn plan_policy_add_pin_update(
+        &self,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        live_policies: &[ScAddress],
+        policy: &ScAddress,
+        overrides: PinOverrides,
+        request_id: &str,
+    ) -> Result<Option<PlannedPinUpdate>, SaError> {
+        let Some(record) = crate::managers::verifiers::read_pinned_hashes_for_rule(
+            self,
+            rule_id,
+            smart_account_redacted,
+        )?
+        else {
+            debug!(
+                rule_id,
+                "add_policy: the rule has no pin record; no pin update is written"
+            );
+            return Ok(None);
+        };
+        let mut update = PlannedPinUpdate::unchanged(record);
+        if live_policies.contains(policy) {
+            return Ok(Some(update));
+        }
+        let pin = crate::managers::verifiers::pin_added_contract(
+            self,
+            policy,
+            PinnedKind::Policy,
+            rule_id,
+            smart_account_redacted,
+            overrides.accept_mutable_verifier,
+            overrides.accept_unknown_verifier,
+            request_id,
+        )
+        .await?;
+        if live_policies.is_empty() {
+            // With no live policy, the record's policy pins describe no
+            // policy of the rule; the row pins exactly the policy set the
+            // add produces. The override flags stay, since they record
+            // overrides applied to the rule's contracts.
+            update.record.pinned_policy_first8.clear();
+            update.record.pinned_policy_executable_refs.clear();
+        }
+        update.append_pin(PinnedKind::Policy, pin);
+        Ok(Some(update))
+    }
+
+    /// Computes the pin record a policy removal writes for rule `rule_id`
+    /// once the removal confirms.
+    ///
+    /// `removed_hash` is the removed policy's effective hash as observed
+    /// under the rule's lock, and `rule_policy_count` the number of policies
+    /// the rule held there. Returns `None` without a pin record, or when no
+    /// policy pin is the removed policy's. A pin is the removed policy's when
+    /// it equals `removed_hash`. When the policy is the rule's only policy
+    /// and the record holds one policy pin, that pin is the removed policy's
+    /// whatever the hash: it can only be that policy's. The rule then ends
+    /// with no policy and no policy pin, the state of a rule installed
+    /// without a policy.
+    ///
+    /// The record is read by a synchronous audit-log scan, which no timeout
+    /// can stop, so `budget` is checked once the scan returns.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::AuditLog`] when the pin record cannot be read.
+    /// - [`SaError::AuthEntryConstructionFailed`] (stage `auth_payload`, the
+    ///   reason naming `pin_plan`) when `budget` elapsed during the scan.
+    fn plan_policy_remove_pin_update(
+        &self,
+        rule_id: u32,
+        smart_account_redacted: &str,
+        policy_id: u32,
+        removed_hash: &[u8; 32],
+        rule_policy_count: usize,
+        budget: PreSubmitBudget,
+    ) -> Result<Option<PinnedHashesRecord>, SaError> {
+        let record = crate::managers::verifiers::read_pinned_hashes_for_rule(
+            self,
+            rule_id,
+            smart_account_redacted,
+        )?;
+        budget.check_at("pin_plan", "auth_payload")?;
+        let Some(mut record) = record else {
+            debug!(
+                rule_id,
+                "remove_policy: the rule has no pin record; no pin update is written"
+            );
+            return Ok(None);
+        };
+        let removed_first8 = hash_first8_hex(removed_hash);
+        let position = match record
+            .pinned_policy_first8
+            .iter()
+            .position(|pinned| *pinned == removed_first8)
+        {
+            Some(position) => position,
+            None if rule_policy_count == 1 && record.pinned_policy_first8.len() == 1 => 0,
+            None => {
+                debug!(
+                    rule_id,
+                    policy_id,
+                    removed_first8 = %removed_first8,
+                    "remove_policy: no policy pin is the removed policy's; no pin update is written"
+                );
+                return Ok(None);
+            }
+        };
+        record.pinned_policy_first8.remove(position);
+        if position < record.pinned_policy_executable_refs.len() {
+            record.pinned_policy_executable_refs.remove(position);
+        }
+        Ok(Some(record))
     }
 
     /// Observes the rule after a confirmed attach or detach of the
@@ -5076,7 +5572,7 @@ impl SignersManager {
         smart_account_redacted: &str,
         request_id: &str,
     ) -> Result<(Option<(ScAddress, [u8; 32])>, WasmHashSummary), SaError> {
-        let (mut matches, summary) = self
+        let (matches, summary) = self
             .allowlisted_threshold_policies(policies, rule_id, smart_account_redacted, request_id)
             .await?;
         if matches.len() > 1 {
@@ -5089,11 +5585,16 @@ impl SignersManager {
                 request_id: request_id.to_owned(),
             });
         }
-        Ok((matches.pop(), summary))
+        let identified = matches
+            .into_iter()
+            .next()
+            .map(|matched| (matched.address, matched.contract_id));
+        Ok((identified, summary))
     }
 
     /// Lists the policies among `policies` that identify as the
-    /// simple-threshold policy, each with its contract id.
+    /// simple-threshold policy, each with its contract id and its observed
+    /// executable hash.
     ///
     /// Observes each distinct policy's executable through both endpoints
     /// ([`Self::observe_contract`], which refuses a divergence, a malformed
@@ -5116,7 +5617,7 @@ impl SignersManager {
         rule_id: u32,
         smart_account_redacted: &str,
         request_id: &str,
-    ) -> Result<(Vec<(ScAddress, [u8; 32])>, WasmHashSummary), SaError> {
+    ) -> Result<(Vec<ThresholdPolicyMatch>, WasmHashSummary), SaError> {
         let mut distinct: Vec<&ScAddress> = Vec::with_capacity(policies.len());
         for policy in policies {
             if !distinct.contains(&policy) {
@@ -5125,7 +5626,7 @@ impl SignersManager {
         }
 
         let mut first_first8: Option<[u8; 8]> = None;
-        let mut matches: Vec<(ScAddress, [u8; 32])> = Vec::new();
+        let mut matches: Vec<ThresholdPolicyMatch> = Vec::new();
         for policy in distinct {
             let observation = self
                 .observe_contract(
@@ -5153,7 +5654,11 @@ impl SignersManager {
                             .to_owned(),
                     });
                 };
-                matches.push((policy.clone(), *policy_id));
+                matches.push(ThresholdPolicyMatch {
+                    address: policy.clone(),
+                    contract_id: *policy_id,
+                    executable_hash: observation.effective_hash,
+                });
             }
         }
 
@@ -5555,23 +6060,29 @@ impl SignersManager {
                 }
                 Ok(added_ids)
             });
-        self.write_signer_add_pin_rows(
+        self.write_pin_rows(
             rule_id,
             smart_account_redacted,
             confirmed.pin_update,
+            PinsUpdateReason::SignerAdded,
             request_id,
         );
         recorded
     }
 
-    /// Writes a confirmed signer add's pin rows: the pending override rows,
-    /// then the `SaContextRulePinsUpdated` row. Writes nothing when the add
-    /// planned no pin update.
-    fn write_signer_add_pin_rows(
+    /// Writes the pin rows a wallet mutation of rule `rule_id` planned: the
+    /// pending override rows, then the `SaContextRulePinsUpdated` row with
+    /// `reason`. Writes nothing when the mutation planned no pin update.
+    ///
+    /// Every caller holds the rule's lock, from the read of the record it
+    /// planned from through this write, so no other wallet verb on the rule
+    /// writes a pin row in between.
+    fn write_pin_rows(
         &self,
         rule_id: u32,
         smart_account_redacted: &str,
         pin_update: Option<PlannedPinUpdate>,
+        reason: PinsUpdateReason,
         request_id: &str,
     ) {
         let Some(update) = pin_update else {
@@ -5588,7 +6099,7 @@ impl SignersManager {
             self,
             smart_account_redacted,
             rule_id,
-            PinsUpdateReason::SignerAdded,
+            reason,
             &update.record,
             request_id,
         );
@@ -5949,7 +6460,7 @@ impl SignersManager {
             let pin = crate::managers::verifiers::pin_added_contract(
                 self,
                 verifier,
-                crate::managers::verifiers::PinnedKind::Verifier,
+                PinnedKind::Verifier,
                 rule_id,
                 smart_account_redacted,
                 overrides.accept_mutable_verifier,
@@ -5957,7 +6468,7 @@ impl SignersManager {
                 request_id,
             )
             .await?;
-            update.append_pin(crate::managers::verifiers::PinnedKind::Verifier, pin);
+            update.append_pin(PinnedKind::Verifier, pin);
         }
         Ok(Some(update))
     }
@@ -6358,12 +6869,74 @@ impl SignersManager {
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
 
-/// The overrides `rules create` takes, applied to a verifier a signer add
-/// pins for an existing rule.
+/// The overrides `rules create` takes, applied to a verifier or policy a
+/// wallet mutation pins for an existing rule.
 #[derive(Clone, Copy, Debug)]
-struct PinOverrides {
-    accept_mutable_verifier: bool,
-    accept_unknown_verifier: bool,
+pub(crate) struct PinOverrides {
+    /// Admit a mutable contract, recording a mutable-contract override.
+    pub(crate) accept_mutable_verifier: bool,
+    /// Admit a contract whose hash is outside the allowlist, recording an
+    /// unknown-contract override.
+    pub(crate) accept_unknown_verifier: bool,
+}
+
+/// A policy of an on-chain `ContextRule`, with the number of policies the
+/// rule holds.
+struct RulePolicy {
+    /// The policy's address.
+    address: ScAddress,
+    /// The number of policies the rule holds.
+    rule_policy_count: usize,
+}
+
+/// Returns the policy with on-chain id `policy_id` in a `ContextRule`
+/// value: the `policies` entry at the position `policy_id` holds in the
+/// aligned `policy_ids` list, and the length of `policies`. `None` when the
+/// value is not a rule map or holds no such id.
+fn rule_policy_for_id(rule: &ScVal, policy_id: u32) -> Option<RulePolicy> {
+    let ScVal::Map(Some(map)) = rule else {
+        return None;
+    };
+    let field = |name: &[u8]| {
+        map.iter().find_map(|entry| match (&entry.key, &entry.val) {
+            (ScVal::Symbol(symbol), ScVal::Vec(Some(values))) if symbol.as_slice() == name => {
+                Some(values)
+            }
+            _ => None,
+        })
+    };
+    let position = field(b"policy_ids")?
+        .iter()
+        .position(|id| *id == ScVal::U32(policy_id))?;
+    let policies = field(b"policies")?;
+    match policies.get(position)? {
+        ScVal::Address(address) => Some(RulePolicy {
+            address: address.clone(),
+            rule_policy_count: policies.len(),
+        }),
+        _ => None,
+    }
+}
+
+/// The refusal of a policy removal naming a policy id the rule does not
+/// hold.
+fn policy_not_attached(rule_id: u32, policy_id: u32) -> SaError {
+    SaError::DeploymentFailed {
+        phase: "simulate",
+        redacted_reason: format!(
+            "remove_policy: policy {policy_id} is not attached to rule {rule_id}"
+        ),
+    }
+}
+
+/// An attached policy that identifies as the simple-threshold policy.
+struct ThresholdPolicyMatch {
+    /// The policy's address.
+    address: ScAddress,
+    /// The policy's contract id.
+    contract_id: [u8; 32],
+    /// The policy's effective executable hash, as both endpoints observed it.
+    executable_hash: [u8; 32],
 }
 
 // ── Signer-set observation and comparison ─────────────────────────────────────
@@ -6569,11 +7142,12 @@ struct ConfirmedSignerAdd<Ids> {
     pin_update: Option<PlannedPinUpdate>,
 }
 
-/// A threshold-policy attach or detach whose transaction confirmed.
+/// A policy attach or removal whose transaction confirmed.
 ///
 /// A confirmed policy change is a fact on chain, so what the entry read from
-/// the confirmed return value sits beside the recording outcome: the caller
-/// writes its policy row from `parsed` whatever `recorded` holds.
+/// the confirmed return value sits beside the recording outcome. The entry
+/// has written its pin rows, and the caller writes its policy row from
+/// `parsed` whatever `recorded` holds.
 pub(crate) struct ConfirmedThresholdChange<T> {
     /// The confirmed submission.
     pub(crate) submitted: crate::submit::SubmitInvokeResult,
@@ -6582,7 +7156,8 @@ pub(crate) struct ConfirmedThresholdChange<T> {
     /// detach.
     pub(crate) parsed: T,
     /// The outcome of the observation, the validation and the threshold row
-    /// after confirmation.
+    /// after confirmation; `Ok(())` for a policy other than the
+    /// simple-threshold policy.
     pub(crate) recorded: Result<(), SaError>,
 }
 
@@ -6639,6 +7214,75 @@ pub struct RefreshOutcome {
     /// How the observation compared with the state row the refresh
     /// replaced.
     pub previous_baseline: PreviousBaseline,
+    /// Whether the refresh pinned the live verifier of a pin record that
+    /// pinned no verifier while the rule held `External` signers. A rule is
+    /// pinned to one verifier, so the refresh adds at most one pin.
+    pub verifier_pinned: bool,
+}
+
+/// The options of [`SignersManager::refresh_signer_baseline`].
+///
+/// `accept_divergence` records a chain state that differs from, or cannot be
+/// compared with, the rule's state row. The two verifier overrides apply when
+/// the refresh pins the live verifier of a rule whose pin record pins none.
+/// The verifier is identified and probed as `rules create` probes one. A
+/// mutable verifier, or one whose hash is outside the allowlist, is pinned
+/// only with its override, which then records an override row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RefreshOptions {
+    accept_divergence: bool,
+    accept_mutable_verifier: bool,
+    accept_unknown_verifier: bool,
+}
+
+impl RefreshOptions {
+    /// Options with `accept_divergence` and neither verifier override.
+    #[must_use]
+    pub fn new(accept_divergence: bool) -> Self {
+        Self {
+            accept_divergence,
+            ..Self::default()
+        }
+    }
+
+    /// These options with the mutable-verifier override set to `accept`.
+    #[must_use]
+    pub fn with_accept_mutable_verifier(self, accept: bool) -> Self {
+        Self {
+            accept_mutable_verifier: accept,
+            ..self
+        }
+    }
+
+    /// These options with the unknown-verifier override set to `accept`.
+    #[must_use]
+    pub fn with_accept_unknown_verifier(self, accept: bool) -> Self {
+        Self {
+            accept_unknown_verifier: accept,
+            ..self
+        }
+    }
+
+    /// Whether a chain state that differs from, or cannot be compared with,
+    /// the rule's state row is recorded.
+    #[must_use]
+    pub fn accept_divergence(&self) -> bool {
+        self.accept_divergence
+    }
+
+    /// Whether a mutable live verifier is pinned.
+    #[must_use]
+    pub fn accept_mutable_verifier(&self) -> bool {
+        self.accept_mutable_verifier
+    }
+
+    /// Whether a live verifier whose hash is outside the allowlist is
+    /// pinned.
+    #[must_use]
+    pub fn accept_unknown_verifier(&self) -> bool {
+        self.accept_unknown_verifier
+    }
 }
 
 /// Projects an observation to the version-1 view a version-1 row compares

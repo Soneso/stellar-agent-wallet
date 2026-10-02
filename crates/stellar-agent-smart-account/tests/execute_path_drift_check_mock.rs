@@ -61,7 +61,7 @@ use stellar_agent_smart_account::managers::rules::{
     ContextRuleSignerInput, PinStatus, RuleContext,
 };
 use stellar_agent_smart_account::managers::signers::{
-    PreviousBaseline, SignersManager, SignersManagerConfig,
+    PreviousBaseline, RefreshOptions, SignersManager, SignersManagerConfig,
 };
 use stellar_agent_smart_account::signers::THRESHOLD_POLICY_WASM_HASHES;
 use stellar_agent_smart_account::submit::{
@@ -73,11 +73,11 @@ use stellar_agent_test_support::signed_envelope::{
 };
 use stellar_agent_test_support::xdr_fixtures;
 use stellar_xdr::{
-    AccountId, BytesM, ContractId, Hash, HostFunction, Int128Parts, InvokeContractArgs, LedgerKey,
-    Limits, OperationBody, PublicKey, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry, ScString,
-    ScSymbol, ScVal, ScVec, SorobanAddressCredentials, SorobanAuthorizationEntry,
-    SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials,
-    TransactionEnvelope, Uint256, VecM, WriteXdr,
+    AccountId, BytesM, ContractId, Hash, HostFunction, Int128Parts, InvokeContractArgs,
+    InvokeHostFunctionOp, LedgerKey, Limits, OperationBody, PublicKey, ReadXdr, ScAddress, ScBytes,
+    ScMap, ScMapEntry, ScString, ScSymbol, ScVal, ScVec, SorobanAddressCredentials,
+    SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+    SorobanCredentials, TransactionEnvelope, Uint256, VecM, WriteXdr,
 };
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -356,6 +356,26 @@ struct Chain {
     entries_after_reads: HashMap<String, (usize, Value)>,
     /// How many times each ledger-entry key has been read.
     entry_reads: HashMap<String, usize>,
+    /// The change a send of each function makes to the chain as it stands at
+    /// the send, by function name; each applies once.
+    effects: HashMap<String, SendEffect>,
+}
+
+/// The change a confirmed submission of one function makes to the rule it
+/// targets, applied to the chain as it stands at the send. Two verbs in
+/// flight therefore each change the state the other's send left, in either
+/// order.
+#[derive(Clone)]
+enum SendEffect {
+    /// Appends the signer `signer` under `signer_id` to rule `rule_id`.
+    AddSigner {
+        rule_id: u32,
+        signer_id: u32,
+        signer: ScVal,
+    },
+    /// Removes `policy` and its id from rule `rule_id`; the remaining
+    /// policies' ids count from 0, as this file's rule builders number them.
+    RemovePolicy { rule_id: u32, policy: ScAddress },
 }
 
 /// Where a [`Chain::after_behind_read`] change lands.
@@ -411,13 +431,40 @@ impl Chain {
         }
     }
 
-    /// Applies a send: keeps the current rules and thresholds for reads
-    /// behind the confirmation, then applies the pending post-send state.
-    fn apply_send(&mut self) {
+    /// Applies a send of `function`: keeps the current rules and thresholds
+    /// for reads behind the confirmation, then applies the pending post-send
+    /// state and the effect registered for `function`.
+    fn apply_send(&mut self, function: &str) {
         self.before_send = Some((self.rules.clone(), self.thresholds.clone()));
         if let Some(after) = self.after_send.take() {
             self.apply(&after);
         }
+        if let Some(effect) = self.effects.remove(function) {
+            self.apply_effect(effect);
+        }
+    }
+
+    /// Applies `effect` to the rule it names, as the rule stands now.
+    fn apply_effect(&mut self, effect: SendEffect) {
+        let (rule_id, signers, policies) = match effect {
+            SendEffect::AddSigner {
+                rule_id,
+                signer_id,
+                signer,
+            } => {
+                let (ids, signers, policies) = rule_parts(&self.rules[&rule_id]);
+                let mut signers: Vec<(u32, ScVal)> = ids.into_iter().zip(signers).collect();
+                signers.push((signer_id, signer));
+                (rule_id, signers, policies)
+            }
+            SendEffect::RemovePolicy { rule_id, policy } => {
+                let (ids, signers, policies) = rule_parts(&self.rules[&rule_id]);
+                let policies = policies.into_iter().filter(|p| *p != policy).collect();
+                (rule_id, ids.into_iter().zip(signers).collect(), policies)
+            }
+        };
+        self.rules
+            .insert(rule_id, rule_with_ids(rule_id, signers, policies));
     }
 
     /// Replaces the rules and thresholds `state` names.
@@ -436,6 +483,9 @@ impl Chain {
 #[derive(Default)]
 struct Log {
     ledger_keys: Mutex<Vec<String>>,
+    /// How many `getLedgerEntries` requests named each key, by key; a request
+    /// naming a key more than once counts once.
+    entry_requests: Mutex<HashMap<String, usize>>,
     simulated: Mutex<Vec<String>>,
     /// The rule id of each `get_context_rule` simulation, in order.
     rule_reads: Mutex<Vec<u32>>,
@@ -531,6 +581,37 @@ struct Rpc {
     /// Whether a submission was sent, shared by both endpoints.
     sent: Arc<AtomicBool>,
     poison: Arc<Mutex<Option<Poison>>>,
+    /// How late this endpoint answers the `nth` `getLedgerEntries` request
+    /// naming a key, by `(key, nth)`.
+    entry_delays: EntryDelays,
+}
+
+/// Answer delays of one endpoint's `getLedgerEntries` requests, by the key a
+/// request names and the request's position among those naming that key.
+type EntryDelays = Arc<Mutex<HashMap<(String, usize), Duration>>>;
+
+impl Rpc {
+    /// Counts one request naming each distinct key of `keys` on this
+    /// endpoint, and returns the longest delay registered for a key at its
+    /// new count.
+    fn count_entry_request(&self, keys: &[String]) -> Option<Duration> {
+        let mut requests = self.log.entry_requests.lock().unwrap();
+        let delays = self.entry_delays.lock().unwrap();
+        let mut counted: Vec<&String> = Vec::with_capacity(keys.len());
+        let mut delay: Option<Duration> = None;
+        for key in keys {
+            if counted.contains(&key) {
+                continue;
+            }
+            counted.push(key);
+            let count = requests.entry(key.clone()).or_insert(0);
+            *count += 1;
+            if let Some(registered) = delays.get(&(key.clone(), *count)) {
+                delay = delay.max(Some(*registered));
+            }
+        }
+        delay
+    }
 }
 
 impl Rpc {
@@ -606,6 +687,22 @@ fn sub_invocations(function: &str) -> VecM<SorobanAuthorizedInvocation> {
     .unwrap()
 }
 
+/// The invocation operation of a transaction envelope and the contract call
+/// it makes.
+fn envelope_invocation(envelope_xdr: &str) -> (InvokeHostFunctionOp, InvokeContractArgs) {
+    let envelope = TransactionEnvelope::from_xdr_base64(envelope_xdr, Limits::none()).unwrap();
+    let TransactionEnvelope::Tx(tx) = envelope else {
+        panic!("expected a v1 envelope")
+    };
+    let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+        panic!("expected an invocation")
+    };
+    let HostFunction::InvokeContract(invoke) = &op.host_function else {
+        panic!("expected a contract invocation")
+    };
+    (op.clone(), invoke.clone())
+}
+
 impl Respond for Rpc {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
@@ -628,13 +725,20 @@ impl Respond for Rpc {
                     .lock()
                     .unwrap()
                     .extend(keys.iter().cloned());
+                // wiremock awaits the delay after this responder returned, so
+                // the endpoint keeps answering other requests meanwhile.
+                let delay = self.count_entry_request(&keys);
+                let delayed = |response: ResponseTemplate| match delay {
+                    Some(delay) => response.set_delay(delay),
+                    None => response,
+                };
                 let mut chain = self.chain.lock().unwrap();
                 if keys.iter().any(|k| chain.failing_keys.contains(k)) {
-                    return ResponseTemplate::new(200).set_body_json(json!({
+                    return delayed(ResponseTemplate::new(200).set_body_json(json!({
                         "jsonrpc": "2.0",
                         "id": body["id"],
                         "error": {"code": -32603, "message": "mock ledger read failure"}
-                    }));
+                    })));
                 }
                 let entries: Vec<Value> = keys
                     .iter()
@@ -653,23 +757,13 @@ impl Respond for Rpc {
                         chain.read_entry(key)
                     })
                     .collect();
-                reply(json!({"entries": entries, "latestLedger": PRE_SEND_LEDGER}))
+                delayed(reply(
+                    json!({"entries": entries, "latestLedger": PRE_SEND_LEDGER}),
+                ))
             }
             "simulateTransaction" => {
-                let envelope = TransactionEnvelope::from_xdr_base64(
-                    body["params"]["transaction"].as_str().unwrap(),
-                    Limits::none(),
-                )
-                .unwrap();
-                let TransactionEnvelope::Tx(tx) = envelope else {
-                    panic!("expected a v1 envelope")
-                };
-                let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
-                    panic!("expected an invocation")
-                };
-                let HostFunction::InvokeContract(invoke) = &op.host_function else {
-                    panic!("expected a contract invocation")
-                };
+                let (op, invoke) =
+                    envelope_invocation(body["params"]["transaction"].as_str().unwrap());
                 let function = invoke.function_name.0.to_utf8_string().unwrap();
                 self.log.simulated.lock().unwrap().push(function.clone());
                 self.poison_at(&function);
@@ -765,12 +859,15 @@ impl Respond for Rpc {
             }
             "sendTransaction" => {
                 self.log.sends.fetch_add(1, Ordering::SeqCst);
+                let (_, invoke) =
+                    envelope_invocation(body["params"]["transaction"].as_str().unwrap());
+                let function = invoke.function_name.0.to_utf8_string().unwrap();
                 for (index, chain) in self.chains.iter().enumerate() {
                     // Both endpoints may serve one chain; apply the send once.
                     if self.chains[..index].iter().any(|c| Arc::ptr_eq(c, chain)) {
                         continue;
                     }
-                    chain.lock().unwrap().apply_send();
+                    chain.lock().unwrap().apply_send(&function);
                 }
                 self.sent.store(true, Ordering::SeqCst);
                 let hash = send_transaction_hash_hex(&body, PASSPHRASE);
@@ -815,6 +912,7 @@ struct Harness {
     primary_ledgers: Arc<Ledgers>,
     secondary_ledgers: Arc<Ledgers>,
     primary_poison: Arc<Mutex<Option<Poison>>>,
+    primary_entry_delays: EntryDelays,
     audit: Arc<Mutex<AuditWriter>>,
     log_path: PathBuf,
     manager: Arc<SignersManager>,
@@ -905,16 +1003,18 @@ impl Harness {
         let primary_ledgers = Arc::new(Ledgers::default());
         let secondary_ledgers = Arc::new(Ledgers::default());
         let primary_poison = Arc::new(Mutex::new(None));
+        let primary_entry_delays = EntryDelays::default();
         let sent = Arc::new(AtomicBool::new(false));
         let primary = MockServer::start().await;
         let secondary = MockServer::start().await;
-        for (server, served, log, ledgers, poison) in [
+        for (server, served, log, ledgers, poison, entry_delays) in [
             (
                 &primary,
                 &chain,
                 &primary_log,
                 &primary_ledgers,
                 Arc::clone(&primary_poison),
+                Arc::clone(&primary_entry_delays),
             ),
             (
                 &secondary,
@@ -922,6 +1022,7 @@ impl Harness {
                 &secondary_log,
                 &secondary_ledgers,
                 Arc::new(Mutex::new(None)),
+                EntryDelays::default(),
             ),
         ] {
             Mock::given(method("POST"))
@@ -932,6 +1033,7 @@ impl Harness {
                     ledgers: Arc::clone(ledgers),
                     sent: Arc::clone(&sent),
                     poison,
+                    entry_delays,
                 })
                 .mount(server)
                 .await;
@@ -963,6 +1065,7 @@ impl Harness {
             primary_ledgers,
             secondary_ledgers,
             primary_poison,
+            primary_entry_delays,
             audit,
             log_path,
             manager,
@@ -1027,6 +1130,32 @@ impl Harness {
         for chain in [&self.chain, &self.secondary_chain] {
             chain.lock().unwrap().after_send = Some(after.clone());
         }
+    }
+
+    /// Makes a send of `function` apply `effect` to every endpoint's chain as
+    /// it stands at that send, once. Both endpoints of a [`Harness::new`]
+    /// harness serve one chain, which a send changes once.
+    fn on_send(&self, function: &'static str, effect: SendEffect) {
+        self.secondary_chain
+            .lock()
+            .unwrap()
+            .effects
+            .insert(function.to_owned(), effect.clone());
+        self.chain
+            .lock()
+            .unwrap()
+            .effects
+            .insert(function.to_owned(), effect);
+    }
+
+    /// Delays the primary's answer to its `nth` `getLedgerEntries` request
+    /// naming `key` by `delay`. The primary keeps answering other requests
+    /// during the delay.
+    fn delay_entry_read(&self, key: &str, nth: usize, delay: Duration) {
+        self.primary_entry_delays
+            .lock()
+            .unwrap()
+            .insert((key.to_owned(), nth), delay);
     }
 
     /// Sets a state change that lands on every endpoint's chain once a read
@@ -2574,13 +2703,28 @@ async fn add_policy_with(
 /// Removes the policy with on-chain id `policy_id` from rule 1, authorized
 /// under rule 0.
 async fn remove_policy(h: &Harness, policy_id: u32, request_id: &str) -> Result<(), SaError> {
+    remove_policy_under(h, policy_id, &[0], request_id).await
+}
+
+/// Removes the policy with on-chain id `policy_id` from rule 1, authorized
+/// under `auth_rule_ids`.
+async fn remove_policy_under(
+    h: &Harness,
+    policy_id: u32,
+    auth_rule_ids: &[u32],
+    request_id: &str,
+) -> Result<(), SaError> {
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
     h.rule_manager()
         .remove_policy(
             smart_account(),
             1,
             policy_id,
-            vec![ContextRuleId::new(0)],
+            auth_rule_ids
+                .iter()
+                .copied()
+                .map(ContextRuleId::new)
+                .collect(),
             &signer,
             None,
             request_id.to_owned(),
@@ -2650,6 +2794,8 @@ async fn a_policy_added_to_a_pinned_rule_is_pinned_and_checked() {
 #[tokio::test]
 async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
     let h = policy_harness(vec![policy_p()]).await;
+    h.set_threshold(&policy_p(), 1, 1);
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -2671,8 +2817,6 @@ async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
     );
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
 
-    h.set_threshold(&policy_p(), 1, 1);
-    h.baseline_v2(1);
     let err = h
         .submit(&[1], Some("req-after-second-policy"))
         .await
@@ -2692,6 +2836,7 @@ async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
 #[tokio::test]
 async fn an_unknown_new_policy_needs_the_override() {
     let h = policy_harness(vec![]).await;
+    h.baseline_v2(1);
     h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
     let err = add_policy(&h, &policy_r(), "req-policy-unknown", false)
         .await
@@ -2739,6 +2884,7 @@ async fn an_unknown_new_policy_needs_the_override() {
 #[tokio::test]
 async fn a_policy_add_on_an_unpinned_rule_writes_no_row() {
     let h = policy_harness(vec![]).await;
+    h.baseline_v2(1);
     add_policy(&h, &policy_r(), "req-policy-unpinned", false)
         .await
         .unwrap();
@@ -2746,12 +2892,13 @@ async fn a_policy_add_on_an_unpinned_rule_writes_no_row() {
     assert_eq!(h.sends(), 1);
 }
 
-/// A confirmed policy add of an unknown policy under the override writes
-/// `SaPolicyAdded`, the raw-invocation row, then the override row naming the
-/// rule, then the pins-updated row.
+/// A confirmed policy add of an unknown policy under the override writes,
+/// under the rule's lock, the override row naming the rule and the
+/// pins-updated row, then `SaPolicyAdded` and the raw-invocation row.
 #[tokio::test]
-async fn a_policy_add_writes_the_override_row_after_the_raw_invocation() {
+async fn a_policy_add_writes_the_override_row_before_the_policy_row() {
     let h = policy_harness(vec![]).await;
+    h.baseline_v2(1);
     h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
     h.after_send(1, rule_one_with_policies(vec![policy_r()]));
     add_policy(&h, &policy_r(), "req-policy-order", true)
@@ -2761,10 +2908,10 @@ async fn a_policy_add_writes_the_override_row_after_the_raw_invocation() {
     assert_eq!(
         row_kinds(&h.rows(), "req-policy-order"),
         vec![
-            "sa_policy_added",
-            "sa_raw_invocation",
             "unknown_override(rule Some(1))",
             "sa_context_rule_pins_updated",
+            "sa_policy_added",
+            "sa_raw_invocation",
         ]
     );
 }
@@ -2819,6 +2966,16 @@ async fn removing_a_drifted_only_policy_drops_its_pin() {
         vec![],
     );
     h.set_entry(wasm_instance(&policy_p(), [0xab; 32]));
+    // The served P runs no simple-threshold executable, so the comparison
+    // observes no threshold.
+    h.set_threshold(&policy_p(), 1, 1);
+    h.write_v2_baseline(
+        1,
+        &SignerSetSnapshotV2 {
+            signers: h.snapshot_of(1).signers,
+            threshold: None,
+        },
+    );
     h.after_send(1, rule_one_with_policies(vec![]));
     remove_policy(&h, 0, "req-drifted-remove").await.unwrap();
 
@@ -2852,6 +3009,8 @@ async fn removing_a_drifted_only_policy_drops_its_pin() {
 #[tokio::test]
 async fn removing_an_unreadable_only_policy_refuses_before_submission() {
     let h = policy_harness(vec![policy_p()]).await;
+    h.set_threshold(&policy_p(), 1, 1);
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -2880,6 +3039,8 @@ async fn removing_an_unreadable_only_policy_refuses_before_submission() {
 #[tokio::test]
 async fn removing_one_of_two_policies_drops_the_pin_of_its_hash() {
     let h = policy_harness(vec![policy_p(), policy_q()]).await;
+    h.set_threshold(&policy_p(), 1, 1);
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -2897,8 +3058,6 @@ async fn removing_one_of_two_policies_drops_the_pin_of_its_hash() {
     assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::PolicyRemoved);
 
-    h.set_threshold(&policy_p(), 1, 1);
-    h.baseline_v2(1);
     h.submit(&[1], Some("req-after-remove-second"))
         .await
         .unwrap();
@@ -2909,6 +3068,8 @@ async fn removing_one_of_two_policies_drops_the_pin_of_its_hash() {
 #[tokio::test]
 async fn removing_an_unpinned_policy_beside_a_pinned_one_keeps_the_pin() {
     let h = policy_harness(vec![policy_p(), policy_r()]).await;
+    h.set_threshold(&policy_p(), 1, 1);
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -2920,8 +3081,6 @@ async fn removing_an_unpinned_policy_beside_a_pinned_one_keeps_the_pin() {
     remove_policy(&h, 1, "req-remove-unpinned").await.unwrap();
     assert!(h.pins_updated_rows().is_empty());
 
-    h.set_threshold(&policy_p(), 1, 1);
-    h.baseline_v2(1);
     h.set_entry(wasm_instance(&policy_p(), [0xab; 32]));
     let err = h
         .submit(&[1], Some("req-after-remove-unpinned"))
@@ -2940,6 +3099,7 @@ async fn removing_an_unpinned_policy_beside_a_pinned_one_keeps_the_pin() {
 #[tokio::test]
 async fn removing_a_policy_no_pin_of_two_matches_writes_no_row() {
     let h = policy_harness(vec![policy_r()]).await;
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -2954,7 +3114,6 @@ async fn removing_a_policy_no_pin_of_two_matches_writes_no_row() {
     assert_eq!(h.sends(), 1);
     assert!(h.pins_updated_rows().is_empty());
 
-    h.baseline_v2(1);
     let err = h
         .submit(&[1], Some("req-after-remove-under-two-pins"))
         .await
@@ -3026,6 +3185,7 @@ async fn a_rule_without_policies_or_policy_pins_signs() {
 #[tokio::test]
 async fn a_policy_added_with_no_live_policy_replaces_a_stale_pin() {
     let h = policy_harness(vec![]).await;
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -3046,7 +3206,6 @@ async fn a_policy_added_with_no_live_policy_replaces_a_stale_pin() {
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
     assert_eq!(h.sends(), 1);
 
-    h.baseline_v2(1);
     h.submit(&[1], Some("req-after-repin")).await.unwrap();
     assert_eq!(h.sends(), 2);
 }
@@ -3086,6 +3245,7 @@ async fn a_policy_added_after_the_last_of_two_pinned_policies_replaces_both_pins
 #[tokio::test]
 async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
     let h = policy_harness(vec![]).await;
+    h.baseline_v2(1);
     h.pin_created(
         1,
         vec![first8(&webauthn_hash())],
@@ -3121,7 +3281,6 @@ async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
         other => panic!("expected SaContextRulePinsUpdated for rule 1; got {other:?}"),
     }
 
-    h.baseline_v2(1);
     h.submit(&[1], Some("req-after-repin-reference"))
         .await
         .unwrap();
@@ -4033,7 +4192,7 @@ async fn a_confirmed_passkey_add_that_fails_to_record_still_pins_its_verifier() 
                 smart_account(),
                 1,
                 None,
-                true,
+                RefreshOptions::new(true),
                 format!("req-accept-{batch}"),
             )
             .await
@@ -4306,7 +4465,13 @@ async fn a_refresh_over_a_matching_version_1_baseline_records_version_2() {
     h.baseline_v1(1);
     let outcome = h
         .manager
-        .refresh_signer_baseline(smart_account(), 1, None, false, "req-upgrade".to_owned())
+        .refresh_signer_baseline(
+            smart_account(),
+            1,
+            None,
+            RefreshOptions::new(false),
+            "req-upgrade".to_owned(),
+        )
         .await
         .unwrap();
     assert_eq!(outcome.previous_baseline, PreviousBaseline::Matched);
@@ -4335,7 +4500,13 @@ async fn a_refresh_over_a_diverged_version_1_baseline_needs_the_flag() {
 
     let err = h
         .manager
-        .refresh_signer_baseline(smart_account(), 1, None, false, "req-refresh-no".to_owned())
+        .refresh_signer_baseline(
+            smart_account(),
+            1,
+            None,
+            RefreshOptions::new(false),
+            "req-refresh-no".to_owned(),
+        )
         .await
         .unwrap_err();
     match &err {
@@ -4357,7 +4528,13 @@ async fn a_refresh_over_a_diverged_version_1_baseline_needs_the_flag() {
 
     let outcome = h
         .manager
-        .refresh_signer_baseline(smart_account(), 1, None, true, "req-refresh-yes".to_owned())
+        .refresh_signer_baseline(
+            smart_account(),
+            1,
+            None,
+            RefreshOptions::new(true),
+            "req-refresh-yes".to_owned(),
+        )
         .await
         .unwrap();
     assert_eq!(outcome.previous_baseline, PreviousBaseline::Diverged);
@@ -4436,7 +4613,7 @@ async fn a_contract_delegate_reads_in_version_2_and_is_not_comparable_with_versi
             smart_account(),
             1,
             None,
-            false,
+            RefreshOptions::new(false),
             "req-contract-no".to_owned(),
         )
         .await
@@ -4458,7 +4635,7 @@ async fn a_contract_delegate_reads_in_version_2_and_is_not_comparable_with_versi
             smart_account(),
             1,
             None,
-            true,
+            RefreshOptions::new(true),
             "req-contract-yes".to_owned(),
         )
         .await
@@ -5341,8 +5518,9 @@ fn observation(policy: &ScAddress, threshold: u32) -> Option<ThresholdObservatio
 
 /// Attaching the simple-threshold policy to a baselined rule records the
 /// threshold row (no previous threshold, the resulting set with the
-/// parameter's threshold on the policy) before the policy row, then the raw
-/// row and the pins row; the next `signers list` matches.
+/// parameter's threshold on the policy) and the pins row under the rule's
+/// lock. The policy row and the raw row follow, and the next `signers list`
+/// matches.
 #[tokio::test]
 async fn a_threshold_attach_records_the_threshold_before_the_policy_row() {
     let h = threshold_policy_harness(vec![], &[]).await;
@@ -5357,9 +5535,9 @@ async fn a_threshold_attach_records_the_threshold_before_the_policy_row() {
         row_kinds(&h.rows(), "req-attach"),
         vec![
             "sa_threshold_changed_v2",
+            "sa_context_rule_pins_updated",
             "sa_policy_added",
             "sa_raw_invocation",
-            "sa_context_rule_pins_updated",
         ]
     );
     assert_eq!(raw_wire_code(&h, "req-attach"), "sa.ok");
@@ -5472,8 +5650,8 @@ async fn a_threshold_attach_with_a_malformed_parameter_refuses() {
 }
 
 /// A confirmed attach whose served threshold is not the parameter's refuses
-/// with `sa.signer_set_diverged` carrying the hash; the policy row and the
-/// pins row are still written, and no threshold row.
+/// with `sa.signer_set_diverged` carrying the hash; the pins row and the
+/// policy row are still written, and no threshold row.
 #[tokio::test]
 async fn a_confirmed_threshold_attach_whose_threshold_differs_refuses_with_the_hash() {
     let h = threshold_policy_harness(vec![], &[]).await;
@@ -5504,9 +5682,9 @@ async fn a_confirmed_threshold_attach_whose_threshold_differs_refuses_with_the_h
         row_kinds(&h.rows(), "req-attach-differs"),
         vec![
             "sa_signer_set_diverged",
+            "sa_context_rule_pins_updated",
             "sa_policy_added",
             "sa_raw_invocation",
-            "sa_context_rule_pins_updated",
         ]
     );
     assert_eq!(
@@ -5554,7 +5732,7 @@ async fn a_confirmed_threshold_attach_whose_return_is_not_a_u32_fails_at_stage_o
     }
     assert_eq!(
         row_kinds(&h.rows(), "req-attach-void"),
-        vec!["sa_raw_invocation", "sa_context_rule_pins_updated"]
+        vec!["sa_context_rule_pins_updated", "sa_raw_invocation"]
     );
     assert_eq!(h.sends(), 1);
 }
@@ -5598,6 +5776,7 @@ async fn a_threshold_attach_without_a_version_2_baseline_refuses() {
 #[tokio::test]
 async fn a_confirmed_direct_attach_whose_return_is_not_a_u32_fails_at_stage_observe_and_pins() {
     let h = threshold_policy_harness(vec![], &[]).await;
+    h.baseline_v2(1);
     h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
     h.set_simulated_return("add_policy", ScVal::Void);
     h.after_send(1, rule_one_with_policies(vec![policy_q()]));
@@ -5615,7 +5794,7 @@ async fn a_confirmed_direct_attach_whose_return_is_not_a_u32_fails_at_stage_obse
             assert_eq!(*stage, "observe");
             assert_eq!(hash.len(), 64);
             assert!(
-                reason.contains("add_policy return value is not ScVal::U32 (got Void)"),
+                reason.contains("add_policy: expected ScVal::U32 return, got Void"),
                 "{reason}"
             );
         }
@@ -5623,7 +5802,7 @@ async fn a_confirmed_direct_attach_whose_return_is_not_a_u32_fails_at_stage_obse
     }
     assert_eq!(
         row_kinds(&h.rows(), "req-direct-void"),
-        vec!["sa_raw_invocation", "sa_context_rule_pins_updated"]
+        vec!["sa_context_rule_pins_updated", "sa_raw_invocation"]
     );
     assert_eq!(
         raw_wire_code(&h, "req-direct-void"),
@@ -5638,10 +5817,11 @@ async fn a_confirmed_direct_attach_whose_return_is_not_a_u32_fails_at_stage_obse
 }
 
 /// A spending-limit attach records no signer-set state row and keeps its
-/// pin rows.
+/// pin rows, which precede the policy row.
 #[tokio::test]
 async fn a_spending_limit_attach_writes_no_state_row_and_keeps_its_pin_rows() {
     let h = threshold_policy_harness(vec![], &[]).await;
+    h.baseline_v2(1);
     h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
     h.after_send(1, rule_one_with_policies(vec![policy_q()]));
     add_policy_with(&h, &policy_q(), ScVal::Void, "req-attach-limit", false)
@@ -5650,9 +5830,9 @@ async fn a_spending_limit_attach_writes_no_state_row_and_keeps_its_pin_rows() {
     assert_eq!(
         row_kinds(&h.rows(), "req-attach-limit"),
         vec![
+            "sa_context_rule_pins_updated",
             "sa_policy_added",
             "sa_raw_invocation",
-            "sa_context_rule_pins_updated",
         ]
     );
     assert_eq!(h.sends(), 1);
@@ -5710,8 +5890,9 @@ async fn the_policy_verbs_without_a_signers_manager_refuse_before_any_rpc() {
 }
 
 /// Detaching the observed simple-threshold policy records the threshold row
-/// (the observed threshold as previous, none as resulting) before the policy
-/// row, then the raw row and the pins row; the next `signers list` matches.
+/// (the observed threshold as previous, none as resulting) and the pins row
+/// under the rule's lock. The policy row and the raw row follow, and the
+/// next `signers list` matches.
 #[tokio::test]
 async fn a_threshold_detach_records_the_cleared_threshold_before_the_policy_row() {
     let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 2)]).await;
@@ -5729,9 +5910,9 @@ async fn a_threshold_detach_records_the_cleared_threshold_before_the_policy_row(
         row_kinds(&h.rows(), "req-detach"),
         vec![
             "sa_threshold_changed_v2",
+            "sa_context_rule_pins_updated",
             "sa_policy_removed",
             "sa_raw_invocation",
-            "sa_context_rule_pins_updated",
         ]
     );
     assert_eq!(raw_wire_code(&h, "req-detach"), "sa.ok");
@@ -5749,7 +5930,7 @@ async fn a_threshold_detach_records_the_cleared_threshold_before_the_policy_row(
 }
 
 /// A confirmed detach whose served state keeps the threshold refuses with
-/// `sa.signer_set_diverged` carrying the hash; the policy row and the pins
+/// `sa.signer_set_diverged` carrying the hash; the pins row and the policy
 /// row are written, and no threshold row.
 #[tokio::test]
 async fn a_confirmed_threshold_detach_whose_threshold_stays_refuses_with_the_hash() {
@@ -5779,29 +5960,29 @@ async fn a_confirmed_threshold_detach_whose_threshold_stays_refuses_with_the_has
         row_kinds(&h.rows(), "req-detach-stays"),
         vec![
             "sa_signer_set_diverged",
+            "sa_context_rule_pins_updated",
             "sa_policy_removed",
             "sa_raw_invocation",
-            "sa_context_rule_pins_updated",
         ]
     );
     assert_eq!(h.sends(), 1);
 }
 
-/// A detach whose policy identified as the simple-threshold policy at the
-/// verb's read and not at the rule's observation refuses before submission:
-/// the observed rule has no simple-threshold policy to detach. The policy's
-/// executable changes after the verb's two reads, one per endpoint of the
-/// shared chain.
+/// A removal whose policy identifies as the simple-threshold policy at the
+/// path observation and not at the rule's observation before it refuses
+/// before submission: the compared rule has no simple-threshold policy to
+/// detach. The policy's executable changes after the comparison's two
+/// reads, one per endpoint of the shared chain.
 #[tokio::test]
-async fn a_detach_whose_policy_stops_identifying_after_the_verb_read_refuses() {
+async fn a_detach_whose_policy_starts_identifying_after_the_comparison_refuses() {
     let chain = Chain::default()
         .with_rule(1, rule_one_with_policies(vec![policy_p()]))
         .with_entry(wasm_instance(&verifier_v(), webauthn_hash()))
-        .with_entry(wasm_instance(&policy_p(), KNOWN_WASM_HASH))
+        .with_entry(wasm_instance(&policy_p(), [0xab; 32]))
         .entry_after_reads(
             rpc_mock_helpers::contract_instance_key_xdr(&policy_p()),
             2,
-            wasm_instance(&policy_p(), [0xab; 32]),
+            wasm_instance(&policy_p(), KNOWN_WASM_HASH),
         );
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
@@ -5961,9 +6142,10 @@ async fn three_threshold_policies_refuse_the_detach() {
     assert_refused_before_submission(&h, &err, "remove_policy", "req-three");
 }
 
-/// A removal from a rule that is not on chain and a removal of a policy id
-/// the rule does not hold each refuse before submission with their own
-/// reason.
+/// A removal from a rule that has no state row refuses with
+/// `sa.signer_set_missing_baseline` before any RPC. A removal of a policy id
+/// a baselined rule does not hold refuses after the comparison. Both refuse
+/// before submission.
 #[tokio::test]
 async fn a_missing_rule_and_an_unattached_policy_id_refuse_the_removal() {
     let h = threshold_policy_harness(vec![policy_p()], &[(policy_p(), 1)]).await;
@@ -5981,33 +6163,44 @@ async fn a_missing_rule_and_an_unattached_policy_id_refuse_the_removal() {
         )
         .await
         .unwrap_err();
+    assert!(
+        matches!(
+            missing_rule,
+            SaError::SignerSetMissingBaseline { rule_id: 9, .. }
+        ),
+        "{missing_rule:?}"
+    );
+    assert_refused_before_submission(
+        &h,
+        &missing_rule,
+        "remove_policy",
+        "req-remove-missing-rule",
+    );
+    assert!(h.primary_log.is_untouched());
+
+    h.baseline_v2(1);
     let missing_policy = remove_policy(&h, 5, "req-remove-missing-policy")
         .await
         .unwrap_err();
-    for (err, expected, request_id) in [
-        (
-            &missing_rule,
-            "remove_policy: rule 9 not found",
-            "req-remove-missing-rule",
-        ),
-        (
-            &missing_policy,
-            "remove_policy: policy 5 is not attached to rule 1",
-            "req-remove-missing-policy",
-        ),
-    ] {
-        match err {
-            SaError::DeploymentFailed {
-                phase,
+    match &missing_policy {
+        SaError::DeploymentFailed {
+            phase,
+            redacted_reason,
+        } => {
+            assert_eq!(*phase, "simulate");
+            assert_eq!(
                 redacted_reason,
-            } => {
-                assert_eq!(*phase, "simulate");
-                assert_eq!(redacted_reason, expected);
-            }
-            other => panic!("expected DeploymentFailed; got {other:?}"),
+                "remove_policy: policy 5 is not attached to rule 1"
+            );
         }
-        assert_refused_before_submission(&h, err, "remove_policy", request_id);
+        other => panic!("expected DeploymentFailed; got {other:?}"),
     }
+    assert_refused_before_submission(
+        &h,
+        &missing_policy,
+        "remove_policy",
+        "req-remove-missing-policy",
+    );
 }
 
 /// A secondary one ledger behind for its first read after the install
@@ -6747,8 +6940,19 @@ async fn set_spending_limit_under(
     auth_rule_ids: &[u32],
     request_id: &str,
 ) -> Result<(), SaError> {
+    set_spending_limit_of(h, 1, auth_rule_ids, request_id).await
+}
+
+/// Retunes the spending limit of rule `target_rule_id`, authorized under
+/// `admin_rule_ids`.
+async fn set_spending_limit_of(
+    h: &Harness,
+    target_rule_id: u32,
+    admin_rule_ids: &[u32],
+    request_id: &str,
+) -> Result<(), SaError> {
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
-    let auth_rule_ids: Vec<ContextRuleId> = auth_rule_ids
+    let admin_rule_ids: Vec<ContextRuleId> = admin_rule_ids
         .iter()
         .copied()
         .map(ContextRuleId::new)
@@ -6756,8 +6960,8 @@ async fn set_spending_limit_under(
     h.manager
         .set_spending_limit(
             smart_account(),
-            1,
-            &auth_rule_ids,
+            target_rule_id,
+            &admin_rule_ids,
             2_000,
             &signer,
             request_id.to_owned(),
@@ -6824,4 +7028,977 @@ async fn a_spending_limit_retune_waits_for_its_admin_rules_lock() {
     assert!(h.primary_log.simulated().is_empty());
     assert_eq!(h.sends(), 0);
     drop(holder);
+}
+
+// ── Policy removals racing a signer add on the same rule ──────────────────────
+
+/// The External signer on verifier V a racing add puts on rule 1, which held
+/// no signer on a verifier before it.
+fn racing_signer() -> ScVal {
+    external_signer(&verifier_v(), &[0x11; 32])
+}
+
+/// Makes a send of `add_signer` append [`racing_signer`] to rule 1 under the
+/// simulated id, as the rule stands at that send.
+fn on_racing_add_send(h: &Harness) {
+    h.on_send(
+        "add_signer",
+        SendEffect::AddSigner {
+            rule_id: 1,
+            signer_id: SIMULATED_SIGNER_ID,
+            signer: racing_signer(),
+        },
+    );
+}
+
+/// Adds [`racing_signer`] to rule 1 through the signers manager.
+async fn add_racing_signer(h: &Harness, request_id: &str) -> Result<u32, SaError> {
+    let signer = SoftwareSigningKey::new_from_bytes(SEED);
+    h.manager
+        .add_signer(
+            smart_account(),
+            1,
+            racing_signer(),
+            &signer,
+            request_id.to_owned(),
+            false,
+            false,
+        )
+        .await
+}
+
+/// The verifier and policy pins of the newest `SaContextRulePinsUpdated` row
+/// of rule 1.
+fn last_rule_one_pins(h: &Harness) -> (Vec<String>, Vec<String>) {
+    let rows = h.pins_updated_rows();
+    let last = rows.last().expect("rule 1 has a pins-updated row");
+    let (verifiers, policies, _, _) = pins_updated_fields(last);
+    (verifiers, policies)
+}
+
+/// Asserts that the rows written under each of `request_ids` form one
+/// contiguous block of the log, and returns each block's kinds.
+fn contiguous_blocks(h: &Harness, request_ids: &[&str]) -> Vec<Vec<String>> {
+    let rows = h.rows();
+    request_ids
+        .iter()
+        .map(|request_id| {
+            let positions: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.request_id == *request_id)
+                .map(|(position, _)| position)
+                .collect();
+            let (first, last) = (positions[0], positions[positions.len() - 1]);
+            assert_eq!(
+                last - first + 1,
+                positions.len(),
+                "the rows of {request_id} are interleaved with another verb's: {:?}",
+                rows.iter()
+                    .map(|row| row.request_id.as_str())
+                    .collect::<Vec<_>>()
+            );
+            row_kinds(&rows, request_id)
+        })
+        .collect()
+}
+
+/// The race outcome of a policy removal and a verifier-adding signer add on
+/// rule 1. Both confirmed, the newest pin record holds the added verifier's
+/// pin and no policy pin, and each verb's rows form one block.
+fn assert_the_added_verifier_pin_survives(h: &Harness, removal: &str, add: &str) -> Vec<String> {
+    assert_eq!(h.sends(), 2);
+    let (verifiers, policies) = last_rule_one_pins(h);
+    assert_eq!(
+        verifiers,
+        vec![first8(&webauthn_hash())],
+        "the newest pin record keeps the added verifier's pin"
+    );
+    assert!(policies.is_empty(), "{policies:?}");
+    let mut blocks = contiguous_blocks(h, &[removal, add]);
+    assert_eq!(
+        blocks[1],
+        vec!["sa_signer_added_v2", "sa_context_rule_pins_updated"]
+    );
+    blocks.swap_remove(0)
+}
+
+/// A direct-path removal of the spending-limit policy Q from rule 1,
+/// authorized under rule 2, holds rule 1's lock while its comparison's read
+/// of Q is delayed. A signer add on rule 1 started meanwhile waits on the
+/// lock. The removal plans from the record it reads under the lock and the
+/// add plans from the removal's record, so the newest record keeps the
+/// add's verifier pin.
+#[tokio::test]
+async fn a_direct_removal_racing_a_verifier_add_keeps_the_added_pin() {
+    let h = Harness::new(spending_limit_chain()).await;
+    h.pin_created(
+        1,
+        vec![],
+        vec![first8(&spending_limit_hash())],
+        vec![],
+        vec![],
+    );
+    h.baseline_v2(1);
+    h.baseline_v2(2);
+    h.delay_entry_read(
+        &rpc_mock_helpers::contract_instance_key_xdr(&policy_q()),
+        1,
+        Duration::from_secs(2),
+    );
+    h.on_send(
+        "remove_policy",
+        SendEffect::RemovePolicy {
+            rule_id: 1,
+            policy: policy_q(),
+        },
+    );
+    on_racing_add_send(&h);
+
+    let (removed, added) = tokio::join!(
+        remove_policy_under(&h, 0, &[2], "req-race-direct-remove"),
+        add_racing_signer(&h, "req-race-direct-add"),
+    );
+    removed.unwrap();
+    added.unwrap();
+    let removal_block =
+        assert_the_added_verifier_pin_survives(&h, "req-race-direct-remove", "req-race-direct-add");
+    assert_eq!(
+        removal_block,
+        vec![
+            "sa_context_rule_pins_updated",
+            "sa_policy_removed",
+            "sa_raw_invocation",
+        ]
+    );
+}
+
+/// Rule 1 holding the simple-threshold policy P at threshold 1 beside
+/// [`two_rule_chain`]'s rule 2.
+fn threshold_race_chain() -> Chain {
+    two_rule_chain()
+        .with_rule(1, rule(1, vec![delegated_account(0x31)], vec![policy_p()]))
+        .with_wasm(&policy_p(), KNOWN_WASM_HASH)
+        .with_threshold(&policy_p(), 1, 1)
+}
+
+/// The threshold-path twin of
+/// [`a_direct_removal_racing_a_verifier_add_keeps_the_added_pin`]. The
+/// detach of P holds rule 1's lock through its delayed comparison and
+/// records the cleared threshold and its pins row. The add's block lands
+/// after the removal's, never inside it.
+#[tokio::test]
+async fn a_threshold_detach_racing_a_verifier_add_keeps_the_added_pin() {
+    let h = Harness::new(threshold_race_chain()).await;
+    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.baseline_v2(1);
+    h.baseline_v2(2);
+    h.delay_entry_read(
+        &rpc_mock_helpers::contract_instance_key_xdr(&policy_p()),
+        1,
+        Duration::from_secs(2),
+    );
+    h.on_send(
+        "remove_policy",
+        SendEffect::RemovePolicy {
+            rule_id: 1,
+            policy: policy_p(),
+        },
+    );
+    on_racing_add_send(&h);
+
+    let (removed, added) = tokio::join!(
+        remove_policy_under(&h, 0, &[2], "req-race-threshold-remove"),
+        add_racing_signer(&h, "req-race-threshold-add"),
+    );
+    removed.unwrap();
+    added.unwrap();
+    let removal_block = assert_the_added_verifier_pin_survives(
+        &h,
+        "req-race-threshold-remove",
+        "req-race-threshold-add",
+    );
+    assert_eq!(
+        removal_block,
+        vec![
+            "sa_threshold_changed_v2",
+            "sa_context_rule_pins_updated",
+            "sa_policy_removed",
+            "sa_raw_invocation",
+        ]
+    );
+}
+
+/// The reverse start order: the signer add takes rule 1's lock first and
+/// holds it while its probe of verifier V is delayed. The removal started
+/// meanwhile waits on the lock, then plans from the record that holds the
+/// add's pin.
+#[tokio::test]
+async fn a_signer_add_racing_a_direct_removal_keeps_its_pin() {
+    let h = Harness::new(spending_limit_chain()).await;
+    h.pin_created(
+        1,
+        vec![],
+        vec![first8(&spending_limit_hash())],
+        vec![],
+        vec![],
+    );
+    h.baseline_v2(1);
+    h.baseline_v2(2);
+    h.delay_entry_read(
+        &rpc_mock_helpers::contract_instance_key_xdr(&verifier_v()),
+        1,
+        Duration::from_secs(2),
+    );
+    h.on_send(
+        "remove_policy",
+        SendEffect::RemovePolicy {
+            rule_id: 1,
+            policy: policy_q(),
+        },
+    );
+    on_racing_add_send(&h);
+
+    let (added, removed) = tokio::join!(
+        add_racing_signer(&h, "req-race-reverse-add"),
+        remove_policy_under(&h, 0, &[2], "req-race-reverse-remove"),
+    );
+    added.unwrap();
+    removed.unwrap();
+    assert_the_added_verifier_pin_survives(&h, "req-race-reverse-remove", "req-race-reverse-add");
+    let rows = h.rows();
+    let add_end = rows
+        .iter()
+        .rposition(|row| row.request_id == "req-race-reverse-add")
+        .unwrap();
+    let removal_start = rows
+        .iter()
+        .position(|row| row.request_id == "req-race-reverse-remove")
+        .unwrap();
+    assert!(add_end < removal_start, "the add completes first");
+}
+
+/// Rules 1 and 2, each with one delegated signer and the spending-limit
+/// policy Q, Q served.
+fn crossed_spending_limit_chain() -> Chain {
+    Chain::default()
+        .with_rule(1, rule(1, vec![delegated_account(0x31)], vec![policy_q()]))
+        .with_rule(2, rule(2, vec![delegated_account(0x31)], vec![policy_q()]))
+        .with_entry(wasm_instance(&policy_q(), spending_limit_hash()))
+}
+
+/// Two retunes with crossed target and admin rules, rule 1 under admin rule
+/// 2 and rule 2 under admin rule 1, each acquire the sorted set {1, 2} in
+/// one acquisition. With rule 1 held when they start, both queue on rule 1.
+/// Once it is released the first takes both locks and completes, then the
+/// second: neither holds one lock while it waits on the other.
+#[tokio::test]
+async fn crossed_retunes_complete_without_a_deadlock() {
+    let h = Harness::with_timeout(crossed_spending_limit_chain(), Duration::from_secs(2)).await;
+    h.baseline_v2(1);
+    h.baseline_v2(2);
+    h.set_simulated_return("get_spending_limit_data", spending_limit_data(1_000, 100));
+    let held = stellar_agent_smart_account::test_helpers::hold_rule_lock(
+        &h.manager,
+        &strkey(&smart_account()),
+        1,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let reads = h.primary_log.rule_reads();
+        assert!(
+            !reads.contains(&1) && !reads.contains(&2),
+            "both retunes wait on a lock before any read: {reads:?}"
+        );
+        drop(held);
+    };
+    let (first, second, ()) = tokio::join!(
+        set_spending_limit_of(&h, 1, &[2], "req-crossed-1"),
+        set_spending_limit_of(&h, 2, &[1], "req-crossed-2"),
+        release,
+    );
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(h.sends(), 2);
+    for request_id in ["req-crossed-1", "req-crossed-2"] {
+        assert_eq!(
+            row_kinds(&h.rows(), request_id),
+            vec!["sa_spending_limit_retuned"],
+            "{request_id}"
+        );
+    }
+}
+
+/// A direct attach compares the target rule as a threshold attach does: a
+/// rule without a state row refuses with `sa.signer_set_missing_baseline`
+/// before submission.
+#[tokio::test]
+async fn a_direct_attach_without_a_baseline_refuses() {
+    let h = policy_harness(vec![]).await;
+    let err = add_policy(&h, &policy_q(), "req-direct-missing", false)
+        .await
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "sa.signer_set_missing_baseline", "{err:?}");
+    assert_refused_before_submission(&h, &err, "add_policy", "req-direct-missing");
+}
+
+/// A direct attach on a rule whose state row is version 1 refuses with
+/// `sa.signer_set_baseline_legacy` before submission, before the policy's
+/// install parameter is parsed.
+#[tokio::test]
+async fn a_direct_attach_over_a_version_1_baseline_refuses() {
+    let h = threshold_policy_harness(vec![policy_p2()], &[(policy_p2(), 1)]).await;
+    h.baseline_v1(1);
+    let err = add_policy_with(&h, &policy_q(), ScVal::Void, "req-direct-legacy", false)
+        .await
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "sa.signer_set_baseline_legacy", "{err:?}");
+    assert_refused_before_submission(&h, &err, "add_policy", "req-direct-legacy");
+}
+
+// ── A pinned rule whose record pins no verifier ───────────────────────────────
+
+/// Rule 1 with a delegated signer and an External signer on the passkey
+/// verifier, and the simple-threshold policy P at threshold 1.
+fn absent_verifier_pin_chain() -> Chain {
+    Chain::default()
+        .with_rule(
+            1,
+            rule_with_ids(
+                1,
+                vec![
+                    (0, delegated_signer()),
+                    (1, external_signer(&passkey_verifier(), &[0x22; 32])),
+                ],
+                vec![policy_p()],
+            ),
+        )
+        .with_wasm(&passkey_verifier(), webauthn_hash())
+        .with_wasm(&policy_p(), KNOWN_WASM_HASH)
+        .with_threshold(&policy_p(), 1, 1)
+}
+
+/// An [`absent_verifier_pin_chain`] harness with rule 1's version-2 baseline
+/// and a pin record that pins P and no verifier.
+async fn absent_verifier_pin_harness() -> Harness {
+    let h = Harness::new(absent_verifier_pin_chain()).await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h
+}
+
+/// Refreshes rule 1's baseline with `options`.
+async fn refresh(
+    h: &Harness,
+    options: RefreshOptions,
+    request_id: &str,
+) -> Result<stellar_agent_smart_account::managers::signers::RefreshOutcome, SaError> {
+    h.manager
+        .refresh_signer_baseline(smart_account(), 1, None, options, request_id.to_owned())
+        .await
+}
+
+/// A rule whose pin record pins no verifier while it holds an External
+/// signer refuses the submission with `sa.pinned_verifier_absent` naming the
+/// verifier. The refusal follows the pin check's rule read and precedes any
+/// simulation. The same rule without a pin record signs.
+#[tokio::test]
+async fn a_live_verifier_the_record_does_not_pin_refuses_the_submission() {
+    let h = absent_verifier_pin_harness().await;
+    let err = h
+        .submit(&[1], Some("req-verifier-absent"))
+        .await
+        .unwrap_err();
+    match &err {
+        SaError::PinnedVerifierAbsent {
+            rule_id: 1,
+            verifier_redacted,
+            smart_account_redacted: redacted,
+            request_id,
+        } => {
+            assert_eq!(
+                verifier_redacted.as_str(),
+                redact_strkey_first5_last5(&strkey(&passkey_verifier()))
+            );
+            assert_eq!(redacted.as_str(), smart_account_redacted());
+            assert_eq!(request_id, "req-verifier-absent");
+        }
+        other => panic!("expected PinnedVerifierAbsent; got {other:?}"),
+    }
+    assert_eq!(err.wire_code(), "sa.pinned_verifier_absent");
+    assert!(h.primary_log.rule_reads().contains(&1));
+    assert!(!h.simulated("noop"));
+    assert_eq!(h.sends(), 0);
+
+    let h = Harness::new(absent_verifier_pin_chain()).await;
+    h.baseline_v2(1);
+    h.submit(&[1], Some("req-verifier-unpinned-rule"))
+        .await
+        .unwrap();
+    assert_eq!(h.sends(), 1);
+}
+
+/// `verify-pins` reports a live verifier the pin record does not pin as
+/// verifier drift with no observed hash, beside the matching policy.
+#[tokio::test]
+async fn verify_pins_reports_drift_for_a_live_verifier_the_record_does_not_pin() {
+    let h = absent_verifier_pin_harness().await;
+    let result = h
+        .rule_manager()
+        .verify_rule_wasm_pins(
+            smart_account(),
+            1,
+            &account_id_for_seed(SEED),
+            "req-verify-verifier-absent",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.verifier_pin_status, PinStatus::Drift);
+    assert!(result.observed_verifier_first8.is_empty());
+    assert_eq!(result.policy_pin_status, PinStatus::Match);
+    assert_eq!(result.unavailable_wire_code, None);
+    assert_eq!(h.sends(), 0);
+}
+
+/// `signers refresh` repairs the record: it writes the baseline, then a
+/// pins row (reason `baseline_refreshed`) adding the live verifier's pin and
+/// keeping the policy pin, reports one verifier pinned, and the next
+/// submission signs.
+#[tokio::test]
+async fn a_refresh_pins_the_live_verifier_of_a_record_that_pins_none() {
+    let h = absent_verifier_pin_harness().await;
+    let outcome = refresh(&h, RefreshOptions::new(false), "req-repair")
+        .await
+        .unwrap();
+    assert_eq!(
+        row_kinds(&h.rows(), "req-repair"),
+        vec!["sa_signer_set_baselined_v2", "sa_context_rule_pins_updated"]
+    );
+    let (verifiers, policies, _, reason) = pins_updated_fields(&h.pins_updated_rows()[0]);
+    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
+    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(reason, PinsUpdateReason::BaselineRefreshed);
+    assert_eq!(outcome.previous_baseline, PreviousBaseline::Matched);
+    assert!(outcome.verifier_pinned);
+
+    h.submit(&[1], Some("req-after-repair")).await.unwrap();
+    assert_eq!(h.sends(), 1);
+}
+
+/// Over a diverged rule the reconciliation follows the divergence handling.
+/// Without `accept_divergence` the refresh refuses after the divergence row
+/// and writes no pins row. With it the refresh records the chain and pins
+/// the live verifier, and the next submission signs.
+#[tokio::test]
+async fn a_diverged_refresh_pins_the_live_verifier_only_with_the_flag() {
+    let h = absent_verifier_pin_harness().await;
+    h.set_rule(
+        1,
+        &rule_with_ids(
+            1,
+            vec![
+                (0, delegated_signer()),
+                (1, external_signer(&passkey_verifier(), &[0x22; 32])),
+                (2, delegated_account(0x13)),
+            ],
+            vec![policy_p()],
+        ),
+    );
+    let err = refresh(&h, RefreshOptions::new(false), "req-repair-diverged-no")
+        .await
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "sa.signer_set_diverged", "{err:?}");
+    assert_eq!(
+        row_kinds(&h.rows(), "req-repair-diverged-no"),
+        vec!["sa_signer_set_diverged"]
+    );
+
+    let outcome = refresh(&h, RefreshOptions::new(true), "req-repair-diverged-yes")
+        .await
+        .unwrap();
+    assert_eq!(outcome.previous_baseline, PreviousBaseline::Diverged);
+    assert!(outcome.verifier_pinned);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-repair-diverged-yes"),
+        vec![
+            "sa_signer_set_diverged",
+            "sa_signer_set_baselined_v2",
+            "sa_context_rule_pins_updated",
+        ]
+    );
+    let (verifiers, _, _, _) = pins_updated_fields(&h.pins_updated_rows()[0]);
+    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
+    h.submit(&[1], Some("req-after-diverged-repair"))
+        .await
+        .unwrap();
+    assert_eq!(h.sends(), 1);
+}
+
+/// A record that already pins a verifier is left alone, whether the live
+/// verifier matches the pin or not, and a rule without a pin record gets
+/// none: each refresh writes the baseline only. A pinned verifier that
+/// changed stays the drift check's finding.
+#[tokio::test]
+async fn a_refresh_leaves_a_record_with_a_verifier_pin_or_no_record_alone() {
+    let h = Harness::new(absent_verifier_pin_chain()).await;
+    h.baseline_v2(1);
+    h.pin_created(
+        1,
+        vec![first8(&webauthn_hash())],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    let outcome = refresh(&h, RefreshOptions::new(false), "req-refresh-pinned")
+        .await
+        .unwrap();
+    assert!(!outcome.verifier_pinned);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-refresh-pinned"),
+        vec!["sa_signer_set_baselined_v2"]
+    );
+
+    let h = Harness::new(absent_verifier_pin_chain()).await;
+    h.baseline_v2(1);
+    h.pin_created(
+        1,
+        vec![FOREIGN_FIRST8.to_owned()],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    let outcome = refresh(&h, RefreshOptions::new(false), "req-refresh-foreign")
+        .await
+        .unwrap();
+    assert!(!outcome.verifier_pinned);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-refresh-foreign"),
+        vec!["sa_signer_set_baselined_v2"]
+    );
+    let err = h
+        .submit(&[1], Some("req-after-foreign-refresh"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "sa.verifier_hash_drift", "{err:?}");
+
+    let h = Harness::new(absent_verifier_pin_chain()).await;
+    h.baseline_v2(1);
+    let outcome = refresh(&h, RefreshOptions::new(false), "req-refresh-unpinned")
+        .await
+        .unwrap();
+    assert!(!outcome.verifier_pinned);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-refresh-unpinned"),
+        vec!["sa_signer_set_baselined_v2"]
+    );
+    assert!(h.pins_updated_rows().is_empty());
+}
+
+/// Two External signers on one verifier address share one pin.
+#[tokio::test]
+async fn two_signers_on_one_verifier_are_pinned_once() {
+    let chain = absent_verifier_pin_chain().with_rule(
+        1,
+        rule_with_ids(
+            1,
+            vec![
+                (0, delegated_signer()),
+                (1, external_signer(&passkey_verifier(), &[0x22; 32])),
+                (2, external_signer(&passkey_verifier(), &[0x23; 32])),
+            ],
+            vec![policy_p()],
+        ),
+    );
+    let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    let outcome = refresh(&h, RefreshOptions::new(false), "req-refresh-shared")
+        .await
+        .unwrap();
+    assert!(outcome.verifier_pinned);
+    let rows = h.pins_updated_rows();
+    assert_eq!(rows.len(), 1);
+    let (verifiers, _, _, _) = pins_updated_fields(&rows[0]);
+    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
+    h.submit(&[1], Some("req-after-shared-refresh"))
+        .await
+        .unwrap();
+    assert_eq!(h.sends(), 1);
+}
+
+/// Rule 1 of [`absent_verifier_pin_chain`] with its External signer on
+/// `verifier` instead, served by `entries`.
+fn absent_verifier_pin_chain_on(verifier: &ScAddress, entries: Vec<Value>) -> Chain {
+    let mut chain = absent_verifier_pin_chain().with_rule(
+        1,
+        rule_with_ids(
+            1,
+            vec![
+                (0, delegated_signer()),
+                (1, external_signer(verifier, &[0x22; 32])),
+            ],
+            vec![policy_p()],
+        ),
+    );
+    for entry in entries {
+        chain = chain.with_entry(entry);
+    }
+    chain
+}
+
+/// A live verifier whose hash is outside the allowlist is pinned only with
+/// the unknown-verifier override. Without it the refresh refuses before any
+/// write. With it the override row sits between the baseline row and the
+/// pins row, and the next submission signs.
+#[tokio::test]
+async fn a_refresh_pins_an_unknown_verifier_only_with_its_override() {
+    let unknown = [0xdd; 32];
+    let h = Harness::new(absent_verifier_pin_chain_on(
+        &verifier_w(),
+        vec![wasm_instance(&verifier_w(), unknown)],
+    ))
+    .await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+
+    let err = refresh(&h, RefreshOptions::new(false), "req-refresh-unknown-no")
+        .await
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "sa.verifier_wasm_not_in_allowlist");
+    assert!(
+        err.to_string().contains("--accept-unknown-verifier"),
+        "{err}"
+    );
+    assert!(row_kinds(&h.rows(), "req-refresh-unknown-no").is_empty());
+
+    let outcome = refresh(
+        &h,
+        RefreshOptions::new(false).with_accept_unknown_verifier(true),
+        "req-refresh-unknown-yes",
+    )
+    .await
+    .unwrap();
+    assert!(outcome.verifier_pinned);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-refresh-unknown-yes"),
+        vec![
+            "sa_signer_set_baselined_v2",
+            "unknown_override(rule Some(1))",
+            "sa_context_rule_pins_updated",
+        ]
+    );
+    let (verifiers, _, unknown_override, _) = pins_updated_fields(&h.pins_updated_rows()[0]);
+    assert_eq!(verifiers, vec![first8(&unknown)]);
+    assert!(unknown_override);
+    h.submit(&[1], Some("req-after-unknown-refresh"))
+        .await
+        .unwrap();
+    assert_eq!(h.sends(), 1);
+}
+
+/// A live verifier whose executable is an owner-managed external reference
+/// is mutable, and is pinned only with the mutable-verifier override, with
+/// its reference pin.
+#[tokio::test]
+async fn a_refresh_pins_a_mutable_verifier_only_with_its_override() {
+    let h = Harness::new(absent_verifier_pin_chain_on(
+        &verifier_v(),
+        vec![
+            external_ref_instance(&verifier_v()),
+            tag_entry(webauthn_hash()),
+        ],
+    ))
+    .await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+
+    let err = refresh(&h, RefreshOptions::new(false), "req-refresh-mutable-no")
+        .await
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "sa.verifier_mutable");
+    assert!(
+        err.to_string().contains("--accept-mutable-verifier"),
+        "{err}"
+    );
+    assert!(row_kinds(&h.rows(), "req-refresh-mutable-no").is_empty());
+
+    refresh(
+        &h,
+        RefreshOptions::new(false).with_accept_mutable_verifier(true),
+        "req-refresh-mutable-yes",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        row_kinds(&h.rows(), "req-refresh-mutable-yes"),
+        vec![
+            "sa_signer_set_baselined_v2",
+            "mutable_override(rule Some(1))",
+            "sa_context_rule_pins_updated",
+        ]
+    );
+    match &h.pins_updated_rows()[0].event_kind {
+        EventKind::SaContextRulePinsUpdated {
+            pinned_verifier_wasm_hashes_first8,
+            pinned_verifier_executable_refs,
+            mutable_override,
+            ..
+        } => {
+            assert_eq!(
+                pinned_verifier_wasm_hashes_first8,
+                &vec![first8(&webauthn_hash())]
+            );
+            assert_eq!(
+                pinned_verifier_executable_refs,
+                &vec![Some(reference_pin(webauthn_hash()))]
+            );
+            assert!(*mutable_override);
+        }
+        other => panic!("expected SaContextRulePinsUpdated; got {other:?}"),
+    }
+    h.submit(&[1], Some("req-after-mutable-refresh"))
+        .await
+        .unwrap();
+    assert_eq!(h.sends(), 1);
+}
+
+/// A Wasm verifier and an external reference resolving to the same hash have
+/// different pins, since the signing check compares the executable kind and
+/// reference too. The one-pin record cannot hold both, so the refresh
+/// refuses before any write. The reference still needs its mutable-verifier
+/// override before the comparison of the two pins is reached.
+#[tokio::test]
+async fn a_refresh_refuses_a_wasm_verifier_and_a_reference_on_one_hash() {
+    let chain = absent_verifier_pin_chain()
+        .with_rule(
+            1,
+            rule_with_ids(
+                1,
+                vec![
+                    (0, delegated_signer()),
+                    (1, external_signer(&passkey_verifier(), &[0x22; 32])),
+                    (2, external_signer(&verifier_v(), &[0x23; 32])),
+                ],
+                vec![policy_p()],
+            ),
+        )
+        .with_entry(external_ref_instance(&verifier_v()))
+        .with_entry(tag_entry(webauthn_hash()));
+    let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+
+    let err = refresh(&h, RefreshOptions::new(false), "req-refresh-mixed-pins-no")
+        .await
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "sa.verifier_mutable");
+    assert!(row_kinds(&h.rows(), "req-refresh-mixed-pins-no").is_empty());
+
+    let err = refresh(
+        &h,
+        RefreshOptions::new(false).with_accept_mutable_verifier(true),
+        "req-refresh-mixed-pins-yes",
+    )
+    .await
+    .unwrap_err();
+    match &err {
+        SaError::MultiplePinnedHashesUnsupported {
+            kind,
+            rule_id,
+            count,
+            ..
+        } => {
+            assert_eq!(*kind, "verifier");
+            assert_eq!(*rule_id, 1);
+            assert_eq!(*count, 2);
+        }
+        other => panic!("expected MultiplePinnedHashesUnsupported; got {other:?}"),
+    }
+    assert!(row_kinds(&h.rows(), "req-refresh-mixed-pins-yes").is_empty());
+}
+
+/// Two verifier addresses whose pins are equal share one pin. Two external
+/// references on one owner and tag resolve to one hash, so the refresh
+/// records one reference pin and writes the mutable-contract override row
+/// of each address. The next submission signs.
+#[tokio::test]
+async fn two_references_on_one_tag_share_one_pin_and_record_both_overrides() {
+    let chain = absent_verifier_pin_chain()
+        .with_rule(
+            1,
+            rule_with_ids(
+                1,
+                vec![
+                    (0, delegated_signer()),
+                    (1, external_signer(&verifier_v(), &[0x22; 32])),
+                    (2, external_signer(&verifier_w(), &[0x23; 32])),
+                ],
+                vec![policy_p()],
+            ),
+        )
+        .with_entry(external_ref_instance(&verifier_v()))
+        .with_entry(external_ref_instance(&verifier_w()))
+        .with_entry(tag_entry(webauthn_hash()));
+    let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+
+    let outcome = refresh(
+        &h,
+        RefreshOptions::new(false).with_accept_mutable_verifier(true),
+        "req-refresh-one-tag",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        row_kinds(&h.rows(), "req-refresh-one-tag"),
+        vec![
+            "sa_signer_set_baselined_v2",
+            "mutable_override(rule Some(1))",
+            "mutable_override(rule Some(1))",
+            "sa_context_rule_pins_updated",
+        ]
+    );
+    match &h.pins_updated_rows()[0].event_kind {
+        EventKind::SaContextRulePinsUpdated {
+            pinned_verifier_wasm_hashes_first8,
+            pinned_verifier_executable_refs,
+            mutable_override,
+            ..
+        } => {
+            assert_eq!(
+                pinned_verifier_wasm_hashes_first8,
+                &vec![first8(&webauthn_hash())]
+            );
+            assert_eq!(
+                pinned_verifier_executable_refs,
+                &vec![Some(reference_pin(webauthn_hash()))]
+            );
+            assert!(*mutable_override);
+        }
+        other => panic!("expected SaContextRulePinsUpdated; got {other:?}"),
+    }
+    assert!(outcome.verifier_pinned);
+    h.submit(&[1], Some("req-after-one-tag-refresh"))
+        .await
+        .unwrap();
+    assert_eq!(h.sends(), 1);
+}
+
+/// Two External signers on one mutable verifier address are one verifier to
+/// the refresh: it probes the address once, writes one override row and one
+/// pin, and the next submission signs. One probe reads the address's
+/// instance as often as the refresh of a rule with one signer on it does.
+#[tokio::test]
+async fn two_signers_on_one_mutable_verifier_are_probed_once() {
+    let entries = || {
+        vec![
+            external_ref_instance(&verifier_v()),
+            tag_entry(webauthn_hash()),
+        ]
+    };
+    let single = Harness::new(absent_verifier_pin_chain_on(&verifier_v(), entries())).await;
+    single.baseline_v2(1);
+    single.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    refresh(
+        &single,
+        RefreshOptions::new(false).with_accept_mutable_verifier(true),
+        "req-refresh-one-signer",
+    )
+    .await
+    .unwrap();
+    let one_probe_reads = single.primary_instance_reads(&verifier_v());
+    assert!(one_probe_reads > 0);
+
+    let mut chain = absent_verifier_pin_chain().with_rule(
+        1,
+        rule_with_ids(
+            1,
+            vec![
+                (0, delegated_signer()),
+                (1, external_signer(&verifier_v(), &[0x22; 32])),
+                (2, external_signer(&verifier_v(), &[0x23; 32])),
+            ],
+            vec![policy_p()],
+        ),
+    );
+    for entry in entries() {
+        chain = chain.with_entry(entry);
+    }
+    let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    let outcome = refresh(
+        &h,
+        RefreshOptions::new(false).with_accept_mutable_verifier(true),
+        "req-refresh-two-signers-one-address",
+    )
+    .await
+    .unwrap();
+    assert_eq!(h.primary_instance_reads(&verifier_v()), one_probe_reads);
+    assert_eq!(
+        row_kinds(&h.rows(), "req-refresh-two-signers-one-address"),
+        vec![
+            "sa_signer_set_baselined_v2",
+            "mutable_override(rule Some(1))",
+            "sa_context_rule_pins_updated",
+        ]
+    );
+    let (verifiers, _, _, _) = pins_updated_fields(&h.pins_updated_rows()[0]);
+    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
+    assert!(outcome.verifier_pinned);
+    h.submit(&[1], Some("req-after-one-address-refresh"))
+        .await
+        .unwrap();
+    assert_eq!(h.sends(), 1);
+}
+
+/// Live verifiers whose hashes differ cannot share the rule's one verifier
+/// pin: the refresh refuses before any write, even with the override the
+/// second verifier needs.
+#[tokio::test]
+async fn a_refresh_refuses_live_verifiers_running_two_executables() {
+    let chain = absent_verifier_pin_chain()
+        .with_rule(
+            1,
+            rule_with_ids(
+                1,
+                vec![
+                    (0, delegated_signer()),
+                    (1, external_signer(&passkey_verifier(), &[0x22; 32])),
+                    (2, external_signer(&verifier_w(), &[0x23; 32])),
+                ],
+                vec![policy_p()],
+            ),
+        )
+        .with_entry(wasm_instance(&verifier_w(), [0xdd; 32]));
+    let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+
+    let err = refresh(
+        &h,
+        RefreshOptions::new(false).with_accept_unknown_verifier(true),
+        "req-refresh-two-hashes",
+    )
+    .await
+    .unwrap_err();
+    match &err {
+        SaError::MultiplePinnedHashesUnsupported {
+            kind,
+            rule_id,
+            count,
+            ..
+        } => {
+            assert_eq!(*kind, "verifier");
+            assert_eq!(*rule_id, 1);
+            assert_eq!(*count, 2);
+        }
+        other => panic!("expected MultiplePinnedHashesUnsupported; got {other:?}"),
+    }
+    assert!(row_kinds(&h.rows(), "req-refresh-two-hashes").is_empty());
 }

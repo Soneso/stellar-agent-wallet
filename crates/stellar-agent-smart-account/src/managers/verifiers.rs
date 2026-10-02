@@ -597,9 +597,25 @@ impl PlannedPinUpdate {
             refs.push(pin.executable_ref);
         }
         first8.push(pin.hash_first8);
-        record.mutable_override |= pin.mutable_override;
-        record.unknown_override |= pin.unknown_override;
-        self.pending_overrides.extend(pin.pending_overrides);
+        self.fold_overrides(
+            pin.mutable_override,
+            pin.unknown_override,
+            pin.pending_overrides,
+        );
+    }
+
+    /// Folds the overrides applied to a contract into the record's override
+    /// flags and queues their override rows, without adding a pin: the
+    /// contract runs an executable the record already pins.
+    pub(crate) fn fold_overrides(
+        &mut self,
+        mutable_override: bool,
+        unknown_override: bool,
+        pending_overrides: Vec<PendingOverride>,
+    ) {
+        self.record.mutable_override |= mutable_override;
+        self.record.unknown_override |= unknown_override;
+        self.pending_overrides.extend(pending_overrides);
     }
 }
 
@@ -1220,6 +1236,9 @@ async fn observe_with_cache(
 /// - [`SaError::NetworkRpcDivergence`] — RPCs disagree before drift check.
 /// - [`SaError::VerifierHashDrift`]: the live executable differs from the pin
 ///   in kind, reference or hash.
+/// - [`SaError::PinnedVerifierAbsent`]: the rule has a pin record that pins
+///   no verifier. A rule without a pin record, such as one installed outside
+///   the wallet, is not checked.
 /// - [`SaError::ContractInstanceUnsupported`]: an endpoint returned a
 ///   malformed entry.
 /// - [`SaError::MultiplePinnedHashesUnsupported`]: the rule pins more than one
@@ -1259,14 +1278,22 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
     let verifier_hashes_first8 = &record.pinned_verifier_first8;
 
     if verifier_hashes_first8.is_empty() {
-        // Rule was installed without External signers (no verifier pin).
-        debug!(
+        // The rule holds a live External signer, since this check runs once
+        // per live verifier, and the record pins no verifier: the verifier
+        // would sign unchecked.
+        warn!(
             rule_id,
+            smart_account_redacted,
             verifier_redacted = %verifier_redacted,
-            "verify_pinned_verifier_against_chain: no pinned verifier hashes for rule_id; \
-             drift-detection skipped"
+            "verify_pinned_verifier_against_chain: the pin record pins no verifier while the \
+             rule holds an External signer; aborting signing"
         );
-        return Ok(());
+        return Err(SaError::PinnedVerifierAbsent {
+            rule_id,
+            verifier_redacted: RedactedStrkey::from_already_redacted(verifier_redacted),
+            smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
+            request_id: request_id.to_owned(),
+        });
     }
 
     // Multi-verifier indexing guard.
@@ -1501,11 +1528,14 @@ pub(crate) async fn verify_pinned_policy_against_chain(
 /// A rule whose record pins policies must show those policies on chain; a
 /// rule with policy pins and no policy on chain is refused before signing.
 /// The record is the wallet's knowledge of the rule's shape, and a policy
-/// removed outside the wallet changes what the rule authorizes. Verifier
-/// presence is not checked here: signer-set changes are covered by the
-/// signer-set baseline on the signer verbs, and the wallet's own
-/// `signers remove` writes no pin update, so a verifier-presence rule would
-/// refuse a rule the wallet itself changed.
+/// removed outside the wallet changes what the rule authorizes. The verifier
+/// side is checked per live verifier by
+/// [`verify_pinned_verifier_against_chain`]: a record that pins no verifier
+/// while the rule holds an `External` signer refuses with
+/// [`SaError::PinnedVerifierAbsent`], and `signers refresh` repairs it by
+/// pinning the live verifier. A verifier pin with no `External` signer on
+/// chain is not refused, since the wallet's own `signers remove` writes no
+/// pin update.
 ///
 /// `policy_addrs` are the rule's live policy addresses. When it is not
 /// empty this returns `Ok(())` without reading the record: the per-policy
