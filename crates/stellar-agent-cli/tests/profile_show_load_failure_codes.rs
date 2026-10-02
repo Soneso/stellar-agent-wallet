@@ -251,3 +251,30 @@ fn a_path_bearing_load_failure_is_redacted_identically_on_both_surfaces() {
         choke.stdout
     );
 }
+
+#[test]
+fn protected_overlay_has_its_own_code_on_both_surfaces() {
+    let home = tempfile::tempdir().unwrap();
+    write_profile(home.path(), PROFILE);
+    for args in [
+        vec!["profile", "show", PROFILE],
+        vec!["counterparty", "list", "--profile", PROFILE],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
+            .args(args)
+            .env("STELLAR_AGENT_HOME", home.path())
+            .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+            .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+            .env_remove("STELLAR_AGENT_PROFILE")
+            .env_remove("STELLAR_AGENT_RPC_URL")
+            .env("STELLAR_AGENT_CHAIN_ID", "stellar:mainnet")
+            .output()
+            .unwrap();
+        let run = Run {
+            code: output.status.code().unwrap(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+        };
+        assert_eq!(run.code, 1, "{}", run.stdout);
+        assert_eq!(run.error_code(), "profile.non_overlayable_field");
+    }
+}

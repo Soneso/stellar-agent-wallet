@@ -87,6 +87,8 @@ impl ProfileHome {
             .env("STELLAR_AGENT_HOME", self.dir.path())
             // An ambient value in the developer's shell must not leak in.
             .env_remove("STELLAR_AGENT_PROFILE")
+            .env_remove("STELLAR_AGENT_CHAIN_ID")
+            .env_remove("STELLAR_AGENT_RPC_URL")
             // Keep the subprocess away from the login keychain. A Noop profile
             // never reads a key, but the store is still registered at startup.
             .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
@@ -313,23 +315,23 @@ fn environment_variable_selects_the_profile_file() {
         "default",
         &noop_profile_toml(
             "default",
-            "stellar:testnet",
-            "https://testnet.example.invalid",
+            "stellar:mainnet",
+            "https://mainnet.example.invalid",
         ),
     )
     .write_profile(
         "alice",
         &noop_profile_toml(
             "alice",
-            "stellar:mainnet",
-            "https://mainnet.example.invalid",
+            "stellar:testnet",
+            "https://testnet.example.invalid",
         ),
     );
 
     let mut command = home.command(&[]);
     command.env("STELLAR_AGENT_PROFILE", "alice");
     let mut session = McpSession::start(command);
-    assert_eq!(session.active_network_passphrase(), MAINNET_PASSPHRASE);
+    assert_eq!(session.active_network_passphrase(), TESTNET_PASSPHRASE);
 }
 
 /// The flag wins over the environment variable.
@@ -596,5 +598,90 @@ fn profile_without_a_derivable_owner_key_name_refuses() {
     assert!(
         stderr.contains("hand-written-owner-service"),
         "the refusal must quote the offending policy_owner_key_id.service: {stderr}"
+    );
+}
+
+#[test]
+fn environment_variable_never_selects_a_mainnet_profile() {
+    let home = ProfileHome::new();
+    home.write_profile(
+        "mainnet",
+        &noop_profile_toml(
+            "mainnet",
+            "stellar:mainnet",
+            "https://mainnet.example.invalid",
+        ),
+    );
+    let mut command = home.command(&[]);
+    command.env("STELLAR_AGENT_PROFILE", "mainnet");
+    let stderr = assert_refused_with(&run_with_initialize(command), 1);
+    assert!(
+        stderr.contains("profile.mainnet_requires_explicit_profile"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("STELLAR_AGENT_PROFILE"), "{stderr}");
+    assert!(
+        stderr.contains("stellar-agent-mcp --profile mainnet"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn profile_flag_serves_a_mainnet_profile() {
+    let home = ProfileHome::new();
+    home.write_profile(
+        "mainnet",
+        &noop_profile_toml(
+            "mainnet",
+            "stellar:mainnet",
+            "https://mainnet.example.invalid",
+        ),
+    );
+    let mut session = McpSession::start(home.command(&["--profile", "mainnet"]));
+    assert_eq!(session.active_network_passphrase(), MAINNET_PASSPHRASE);
+}
+
+#[test]
+fn a_mainnet_default_profile_needs_the_flag() {
+    let home = ProfileHome::new();
+    home.write_profile(
+        "default",
+        &noop_profile_toml(
+            "default",
+            "stellar:mainnet",
+            "https://mainnet.example.invalid",
+        ),
+    );
+    let stderr = assert_refused_with(&run_with_initialize(home.command(&[])), 1);
+    assert!(
+        stderr.contains("profile.mainnet_requires_explicit_profile"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("stellar-agent-mcp --profile default"),
+        "{stderr}"
+    );
+    let mut session = McpSession::start(home.command(&["--profile", "default"]));
+    assert_eq!(session.active_network_passphrase(), MAINNET_PASSPHRASE);
+}
+
+#[test]
+fn protected_environment_overlay_reports_wire_code() {
+    let home = ProfileHome::new();
+    home.write_profile(
+        "mainnet",
+        &noop_profile_toml(
+            "mainnet",
+            "stellar:mainnet",
+            "https://mainnet.example.invalid",
+        ),
+    );
+    let mut command = home.command(&["--profile", "mainnet"]);
+    command.env("STELLAR_AGENT_RPC_URL", "https://overlay.example.invalid");
+    let stderr = assert_refused_with(&run_with_initialize(command), 1);
+    assert!(stderr.contains("profile.non_overlayable_field"), "{stderr}");
+    assert!(
+        stderr.contains("remove it from the environment or the overlay"),
+        "{stderr}"
     );
 }

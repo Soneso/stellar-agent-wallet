@@ -30,6 +30,7 @@ use stellar_agent_core::profile::{
     loader,
     receipt::{ReceiptStatus, ReceiptStore},
 };
+use stellar_agent_network::NetworkContext;
 use stellar_agent_network::{
     SoftwareSigningKey, StellarRpcClient, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
     WalletSubmissionRecorder, fetch_account, keyring::signer_from_keyring,
@@ -299,6 +300,7 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
     let _lock = lifecycle_lock(&resolved.name)?;
     let profile = load_profile_reconciled(&resolved, None)
         .map_err(|error| error.to_wallet_error(&resolved.name))?;
+    let context = NetworkContext::from_profile(&profile);
     let name = &resolved.name;
     if profile.pool_initialization.is_some() && !args.resume {
         return Err(unavailable(format!(
@@ -342,7 +344,7 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
                 .ok_or_else(|| unavailable("pool size is required"))?;
             let pending = PoolInitialization {
                 id: uuid::Uuid::new_v4().to_string(),
-                network_passphrase: profile.network_passphrase.clone(),
+                network_passphrase: context.network_passphrase().to_owned(),
                 funder: signer.public_key().to_string().as_str().to_owned(),
                 channels: channels(&seed, size)?,
                 seed_ready: false,
@@ -354,7 +356,7 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
             (pending, Some(seed))
         }
     };
-    if pending.network_passphrase != profile.network_passphrase {
+    if pending.network_passphrase != context.network_passphrase() {
         return Err(unavailable(
             "the pending pool belongs to a different network",
         ));
@@ -363,10 +365,10 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
     if pending.completion_ledger.is_some() {
         return complete(&profile, name, &master, &pending, &audit);
     }
-    let client = StellarRpcClient::new(&profile.rpc_url)?;
+    let client = StellarRpcClient::new(&context.rpc_url)?;
     client
         .verify_network_passphrase(
-            &pending.network_passphrase,
+            context.network_passphrase(),
             tokio::time::Instant::now() + Duration::from_secs(30),
         )
         .await?;
@@ -488,7 +490,7 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
         profile_name: name.clone(),
         verb: "pool init",
         tool: "pool init",
-        chain_id: profile.chain_id.caip2_str(),
+        chain_id: context.chain_id.caip2_str(),
         effects: None,
         audit: Some(audit.clone()),
         now_ms: stellar_agent_core::timefmt::now_unix_ms()
@@ -525,7 +527,7 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
                 .iter()
                 .map(|channel| channel.index)
                 .collect(),
-            network_passphrase: &pending.network_passphrase,
+            network_passphrase: context.network_passphrase(),
             fee_per_op: profile
                 .classic_fee_per_op_stroops
                 .unwrap_or(stellar_agent_core::DEFAULT_CLASSIC_FEE_STROOPS),

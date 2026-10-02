@@ -113,7 +113,7 @@ impl WalletServer {
         // This tool returns a signature the caller can use externally; refuse on
         // a mainnet profile so no mainnet signature is ever produced. Wire code:
         // network.mainnet_write_forbidden.
-        if self.profile.chain_id.is_mainnet() {
+        if self.context.chain_id.is_mainnet() {
             return Ok(crate::tools::common::mainnet_signing_forbidden_result());
         }
 
@@ -320,6 +320,35 @@ mod tests {
             !text.contains("signedMessage"),
             "no signature must be produced on mainnet; got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn sign_message_mainnet_refusal_reads_context() {
+        use crate::tools::common::{assert_business_envelope, mainnet_signing_forbidden_result};
+        let profile = Profile::builder_testnet_named("context", "s", "a", "n", "a")
+            .with_noop_engine()
+            .build();
+        let mut server = crate::server::WalletServer::new(profile).unwrap();
+        server.context = stellar_agent_network::NetworkContext::from_flags(
+            stellar_agent_core::profile::caip2::Caip2::Mainnet,
+            server.profile.rpc_url.clone(),
+        );
+        let result = server
+            .stellar_sep43_sign_message(rmcp::handler::server::wrapper::Parameters(
+                crate::tools::sep43_sign_message::Sep43SignMessageArgs {
+                    chain_id: "stellar:testnet".to_owned(),
+                    message: "context pin".to_owned(),
+                    network_passphrase: None,
+                    address: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let (code, message, _) = assert_business_envelope(&result);
+        let (expected_code, expected_message, _) =
+            assert_business_envelope(&mainnet_signing_forbidden_result());
+        assert_eq!(code, expected_code);
+        assert_eq!(message, expected_message);
     }
 
     /// A `RequireApproval` policy verdict on `stellar_sep43_sign_message` must

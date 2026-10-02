@@ -2,6 +2,17 @@
 
 `stellar-agent` is a self-custodial Stellar wallet for AI agents. It builds, signs, and submits transactions on testnet under a policy engine, an operator-approval spine, and a tamper-evident hash-chained audit log. This file documents the full command surface for an agent driving the CLI. For the MCP tool surface, see `./mcp-tools.md` (ships alongside this file).
 
+## Mainnet profile selection
+
+A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE` never selects one, and a mainnet `default.toml` needs `--profile default`. Keep the filename: its identity is bound to its keyring entries.
+
+Unset `STELLAR_AGENT_CHAIN_ID` and, for a mainnet profile, `STELLAR_AGENT_RPC_URL` first. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
+
+| Wire code | Meaning |
+|---|---|
+| `profile.non_overlayable_field` | An environment or programmatic overlay names `chain_id`, or names `rpc_url` on a mainnet profile. Equal values are refused too. |
+| `profile.mainnet_requires_explicit_profile` | A mainnet profile was selected by the environment or the default source. Supply `--profile <name>`. |
+
 ## Invocation and global model
 
 The binary is `stellar-agent` on `PATH`. When `stellar` is installed it is also reachable as a plugin: `stellar agent <command> ...`. Examples below use the direct form.

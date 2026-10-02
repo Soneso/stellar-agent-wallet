@@ -52,6 +52,7 @@ use stellar_agent_core::approval::retry::{
 };
 use stellar_agent_core::audit_log::writer::{AuditWriter, AuditWriterRegistry};
 use stellar_agent_core::envelope::Envelope;
+use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::redact_first5_last5;
 use stellar_agent_smart_account::managers::credentials::{AddPasskeyOutcome, CredentialsManager};
 use stellar_agent_webauthn_bridge::start_bridge_register_only;
@@ -60,7 +61,7 @@ use tracing::warn;
 
 use crate::commands::credentials::credentials_error_code;
 use crate::common::profile_access::{
-    ProfileAccessError, load_profile_reconciled_by_requested_name, profile_access_envelope,
+    ProfileAccessError, load_profile_reconciled, profile_access_envelope,
 };
 use crate::common::render::render_json;
 use crate::common::served_pages::page_identity_for;
@@ -136,7 +137,8 @@ pub struct AddPasskeyArgs {
 ///
 /// Returns `0` on success, `1` on any error, user cancel, or timeout.
 pub async fn run(args: &AddPasskeyArgs) -> i32 {
-    let profile = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved = resolve_profile_name(args.profile.as_deref());
+    let profile = resolved.name.clone();
 
     // Validate the profile name as a path component before it is used to
     // construct filesystem paths.
@@ -155,18 +157,17 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     // while the audit rows follow the FILE, so a registration under a
     // mismatched profile would split the credential from its own trail.
     //
-    // A profile that merely fails to LOAD is tolerated here: registration
-    // predates a fully-configured profile, and the audit-writer open below
-    // already degrades for that case. The bridge pages then carry the neutral
-    // identity, which is what an unconfigured profile would have given anyway.
-    let loaded_profile = match load_profile_reconciled_by_requested_name(&profile, None) {
-        Ok(loaded) => Some(loaded),
-        Err(e @ ProfileAccessError::NameMismatch(_)) => {
-            render_json(&profile_access_envelope(&e, &profile));
-            return 1;
-        }
-        Err(_) => None,
-    };
+    // Protected refusals are not tolerated. Other load failures yield the
+    // neutral identity for registration with an unconfigured profile, and
+    // the audit-writer open below also tolerates those failures.
+    let loaded_profile =
+        match optional_registration_profile(load_profile_reconciled(&resolved, None)) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                render_json(&profile_access_envelope(&e, &profile));
+                return 1;
+            }
+        };
 
     // ── Open the approval store ONCE; wrap in Arc<Mutex<>> ───────────────────
     // This single Arc is shared between the bridge and the manager.
@@ -285,7 +286,7 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     // Use AuditWriterRegistry::get_or_open instead of AuditWriter::open
     // directly so the single-writer invariant is enforced.
     let audit_writer_arc: Option<Arc<StdMutex<AuditWriter>>> =
-        open_profile_audit_writer_non_fatal(&profile).await;
+        open_profile_audit_writer_non_fatal(&resolved).await;
 
     // Lock the Arc<StdMutex<AuditWriter>> for the duration of poll_registration
     // so we can pass `Option<&mut AuditWriter>` to the manager.
@@ -446,9 +447,10 @@ fn launch_browser(url: &str) -> bool {
 /// `AuditWriterRegistry::get_or_open_keyed`. Each step is non-fatal — returns
 /// `None` on the first failure.
 async fn open_profile_audit_writer_non_fatal(
-    profile_name: &str,
+    resolved: &ResolvedProfileName,
 ) -> Option<Arc<StdMutex<AuditWriter>>> {
-    let profile = match load_profile_reconciled_by_requested_name(profile_name, None) {
+    let profile_name = &resolved.name;
+    let profile = match load_profile_reconciled(resolved, None) {
         Ok(p) => p,
         Err(e) => {
             warn!(
@@ -490,6 +492,16 @@ fn emit_error(code: &'static str, message: String) -> i32 {
     1
 }
 
+fn optional_registration_profile(
+    loaded: Result<stellar_agent_core::profile::schema::Profile, ProfileAccessError>,
+) -> Result<Option<stellar_agent_core::profile::schema::Profile>, ProfileAccessError> {
+    match loaded {
+        Ok(profile) => Ok(Some(profile)),
+        Err(error) if error.requires_refusal() => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -500,6 +512,16 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn passkey_registration_preserves_protected_refusals() {
+        for error in crate::common::profile_access::protected_load_errors_for_test() {
+            let expected = error.code();
+            let result = optional_registration_profile(Err(error));
+            let error = result.expect_err("protected refusal was swallowed");
+            assert_eq!(error.code(), expected);
+        }
+    }
+
     /// Audit writer failure must not prevent registration.
     ///
     /// Simulated by calling `open_profile_audit_writer_non_fatal` with a
@@ -508,7 +530,10 @@ mod tests {
     #[tokio::test]
     async fn audit_writer_failure_returns_none_not_panic() {
         // A profile that is almost certainly not configured on any test machine.
-        let result = open_profile_audit_writer_non_fatal("test-nonexistent-profile-xyz123").await;
+        let result = open_profile_audit_writer_non_fatal(&ResolvedProfileName::from_flag(
+            "test-nonexistent-profile-xyz123",
+        ))
+        .await;
         // Must return None, not panic.
         assert!(
             result.is_none(),

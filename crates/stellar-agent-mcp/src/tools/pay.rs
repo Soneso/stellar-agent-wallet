@@ -619,7 +619,7 @@ impl WalletServer {
         // ── Fetch source account state ────────────────────────────────────────
         // For non-native payments, also fetch the source trustline in the SAME
         // batched getLedgerEntries call (one RPC round-trip for account + trustline).
-        let rpc_url = self.profile.rpc_url.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
         let client = match StellarRpcClient::new(rpc_url) {
             Ok(c) => c,
             Err(err) => {
@@ -863,7 +863,7 @@ impl WalletServer {
         let mut builder = ClassicOpBuilder::new(
             &args.source,
             source_sequence,
-            &self.profile.network_passphrase,
+            self.context.network_passphrase(),
             fee_per_op_stroops,
         );
         if let Err(err) = builder.payment(&args.destination, payment_amount, &asset) {
@@ -982,7 +982,7 @@ impl WalletServer {
                         Some(json!({
                             "approval_nonce": approval_nonce,
                             "profile": &profile_name,
-                            "chain_id": self.profile.chain_id.caip2_str(),
+                            "chain_id": self.context.chain_id.caip2_str(),
                             "expires_at_unix_ms": approval_expires,
                             "reason": entry.reason,
                             "summary": {
@@ -1214,7 +1214,7 @@ impl WalletServer {
         // Policy evaluates the account state that also supplies the rebuild's
         // sequence number. No nonce consumption, approval write or signing
         // occurs before the gate.
-        let rpc_url = self.profile.rpc_url.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
         let client = match StellarRpcClient::new(rpc_url) {
             Ok(c) => c,
             Err(err) => {
@@ -1443,7 +1443,7 @@ impl WalletServer {
         let mut builder = ClassicOpBuilder::new(
             &args.source,
             source_sequence,
-            &self.profile.network_passphrase,
+            self.context.network_passphrase(),
             fee_per_op_stroops,
         );
         if let Err(err) = builder.payment(&args.destination, payment_amount, &asset) {
@@ -1495,12 +1495,13 @@ impl WalletServer {
             let oracle_destination = args.destination.clone();
             let oracle_asset = asset.clone();
             let oracle_memo = memo.clone();
-            let oracle_network_passphrase = self.profile.network_passphrase.clone();
+            let oracle_network_passphrase = self.context.network_passphrase().to_owned();
             // Use the pre-captured payment amount (cloned before primary rebuild consumed it).
             let oracle_payment_amount = payment_amount_for_oracle;
 
             if let Err(result) = high_value_cross_check(
                 &self.profile,
+                &self.context.rpc_url,
                 &rebuilt_envelope_xdr,
                 &args.source,
                 asset_is_native,
@@ -1606,7 +1607,13 @@ impl WalletServer {
         // consumed. A commit aimed at the wrong network is a configuration
         // error the caller can correct and retry; burning the nonce first
         // would cost them the approval as well.
-        if let Err(e) = crate::tools::common::probe_endpoint_network(&client, &self.profile).await {
+        if let Err(e) = crate::tools::common::probe_endpoint_network(
+            &client,
+            &self.context,
+            crate::tools::common::submit_timeout(&self.profile),
+        )
+        .await
+        {
             return Ok(crate::tools::common::commit_refusal_result(&e));
         }
 
@@ -1677,7 +1684,7 @@ impl WalletServer {
         let signed_xdr = match attach_signature(
             &args.envelope_xdr,
             &handle,
-            &self.profile.network_passphrase,
+            self.context.network_passphrase(),
         )
         .await
         {
@@ -1745,7 +1752,7 @@ impl WalletServer {
             &client,
             &signed_xdr,
             submit_timeout(&self.profile),
-            &self.profile.network_passphrase,
+            self.context.network_passphrase(),
             Some(SubmissionSignerKind::Keyring),
             Some(&recorder),
         )

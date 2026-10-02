@@ -108,9 +108,22 @@ pub async fn run(args: &RegisterMulticallArgs) -> i32 {
     let request_id = Uuid::new_v4().to_string();
 
     // Open audit writer (non-fatal: log warning and continue on failure).
-    let audit_writer = open_profile_audit_writer(&resolved_profile)
-        .map(|(_, w, p)| (w, p))
-        .ok();
+    let audit_writer = match open_profile_audit_writer(&resolved_profile) {
+        Ok((_, writer, path)) => Some((writer, path)),
+        Err(error)
+            if matches!(
+                error,
+                WalletError::Validation(
+                    ValidationError::ProfileNonOverlayableField { .. }
+                        | ValidationError::MainnetRequiresExplicitProfile { .. }
+                )
+            ) =>
+        {
+            render_json(&Envelope::<()>::err(&error));
+            return 1;
+        }
+        Err(_) => None,
+    };
 
     // CLI-level binary-const check: refuse if --wasm-sha256 != MULTICALL_WASM_SHA256.
     if args.wasm_sha256 != MULTICALL_WASM_SHA256 {

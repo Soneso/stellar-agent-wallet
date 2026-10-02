@@ -523,7 +523,7 @@ fn resolve_webauthn_signer(
     let registry = VerifierRegistry::open()
         .map_err(|e| bad(format!("could not open verifier registry: {e}")))?;
     let verifier_entry = registry
-        .webauthn_verifier_for(&server.profile.network_passphrase)
+        .webauthn_verifier_for(server.context.network_passphrase())
         .ok_or_else(|| {
             bad("no WebAuthn verifier deployed for this network; run \
                  `smart-account deploy-webauthn-verifier`"
@@ -754,9 +754,9 @@ fn open_rule_create_audit_writer(
 )]
 fn build_write_context_rule_manager(server: &WalletServer) -> Result<ContextRuleManager, SaError> {
     let audit_writer = open_rule_create_audit_writer(server)?;
-    let rpc_url = server.profile.rpc_url.as_str();
-    let network_passphrase = server.profile.network_passphrase.as_str();
-    let chain_id = server.profile.chain_id.caip2_str();
+    let rpc_url = server.context.rpc_url.as_str();
+    let network_passphrase = server.context.network_passphrase();
+    let chain_id = server.context.chain_id.caip2_str();
 
     let log_path = server.profile.audit_log_path.clone();
     let signers_manager = SignersManager::new(SignersManagerConfig::new(
@@ -927,7 +927,7 @@ impl WalletServer {
 
         // ── Resolve policies (typed + snapshot, together) ─────────────────────
         let (policies_typed, policies_snapshot) =
-            resolve_policies(&args.policies, &context, &self.profile.network_passphrase)?;
+            resolve_policies(&args.policies, &context, self.context.network_passphrase())?;
 
         if args.auth_rule_ids.is_empty() {
             return Err(rmcp::ErrorData::invalid_params(
@@ -1058,7 +1058,7 @@ impl WalletServer {
         let entry = self
             .persist_rule_create_pending_approval(
                 &args.smart_account,
-                &self.profile.network_passphrase,
+                self.context.network_passphrase(),
                 &args.chain_id,
                 snapshot,
                 proposal_sha256,
@@ -1073,7 +1073,7 @@ impl WalletServer {
         let mut view = json!({
             "approval_nonce": entry.approval_nonce,
             "profile": &profile_name,
-            "chain_id": self.profile.chain_id.caip2_str(),
+            "chain_id": self.context.chain_id.caip2_str(),
             "expires_at_unix_ms": entry.expires_at_unix_ms,
             "requires_operator_approval": requires_operator_approval,
             "proposal_sha256_hex": proposal_sha256.iter().map(|b| format!("{b:02x}")).collect::<String>(),
@@ -1447,7 +1447,7 @@ impl WalletServer {
                 &attestation_key,
                 &stellar_agent_core::approval::AttestationBinding::new(
                     &self.profile_name_for_approval(),
-                    self.profile.chain_id.caip2_str(),
+                    self.context.chain_id.caip2_str(),
                 ),
                 &attestation_bytes,
                 now_ms,

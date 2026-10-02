@@ -574,6 +574,8 @@ fn build_policy_engine(
 #[derive(Clone)]
 pub struct WalletServer {
     pub(crate) profile: Arc<Profile>,
+    /// Network identity shared by all transaction tools.
+    pub(crate) context: stellar_agent_network::NetworkContext,
     pub(crate) policy_engine: Arc<dyn PolicyEngine>,
     /// Tool registry built from `#[mcp_tool_item]` attributes at startup.
     ///
@@ -727,6 +729,7 @@ impl WalletServer {
         let counterparty_resolver = build_counterparty_resolver(&profile);
 
         Ok(Self {
+            context: stellar_agent_network::NetworkContext::from_profile(&profile),
             profile: Arc::new(profile),
             policy_engine,
             tool_registry,
@@ -1260,6 +1263,17 @@ mod tests {
         )
         .with_profile_name("alice")
         .build()
+    }
+
+    #[test]
+    fn server_context_copies_mainnet_profile() {
+        let profile = Profile::builder_mainnet_named("context", "s", "a", "n", "a")
+            .rpc_url("https://mainnet.example")
+            .with_noop_engine()
+            .build();
+        let server = WalletServer::new(profile).unwrap();
+        assert_eq!(server.context.chain_id, server.profile.chain_id);
+        assert_eq!(server.context.rpc_url, server.profile.rpc_url);
     }
 
     /// The owner key being absent keeps the `OwnerKeyAbsent` contract.

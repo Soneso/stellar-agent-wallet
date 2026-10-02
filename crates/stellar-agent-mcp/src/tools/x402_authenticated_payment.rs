@@ -317,7 +317,7 @@ impl WalletServer {
         // because the wallet does not submit. Refuse on a mainnet profile so no
         // valid mainnet payment signature is ever produced. Wire code:
         // network.mainnet_write_forbidden.
-        if self.profile.chain_id.is_mainnet() {
+        if self.context.chain_id.is_mainnet() {
             return Ok(crate::tools::common::x402_mainnet_signing_forbidden_result());
         }
 
@@ -422,7 +422,7 @@ impl WalletServer {
         // attacker-chosen host.
         //
         // Any failure here aborts BEFORE create_payment is called.
-        let network_passphrase = self.profile.network_passphrase.as_str();
+        let network_passphrase = self.context.network_passphrase();
         let session =
             match resolve_and_verify_counterparty(&args.home_domain, network_passphrase).await {
                 Ok(s) => s,
@@ -477,7 +477,7 @@ impl WalletServer {
             };
 
         // ── Step 4: Resolve RPC URL from active profile (NEVER from input) ───
-        let rpc_url = self.profile.rpc_url.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
         let payer_address = account.to_owned();
 
         // ── Step 5: Dispatch to stellar_agent_x402::create_payment ───────────

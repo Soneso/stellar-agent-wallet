@@ -87,6 +87,7 @@ use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{
     AuthError, InternalError, LedgerError, NetworkError, ValidationError, WalletError,
 };
+use stellar_agent_network::NetworkContext;
 
 use stellar_agent_claimable::entry::{fetch_claimable_balance_entry, fetch_trustline_state};
 use stellar_agent_claimable::error::ClaimError;
@@ -108,8 +109,8 @@ use stellar_agent_network::{
 };
 
 use crate::commands::policy_engine::{
-    build_v1_policy_engine, caip2_chain_id_for_network, claim_policy_args,
-    evaluate_opaque_signing_policy, evaluate_value_moving_policy,
+    build_v1_policy_engine, claim_policy_args, evaluate_opaque_signing_policy,
+    evaluate_value_moving_policy,
 };
 use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::profile_access::{
@@ -303,6 +304,7 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone());
     let resolved = resolve_profile_name(args.profile.as_deref());
     // The resolved name and the input that supplied it are logged together:
     // a report of a run signing against the wrong profile is diagnosable only
@@ -315,7 +317,7 @@ where
     );
 
     // ── Mainnet structural rejection (first layer) ────────────────────────────
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
         print_error(&Envelope::<()>::err(&err), args.output);
         return 1;
@@ -327,13 +329,13 @@ where
     // before signing/broadcasting — so all four stages receive the
     // injected profile-loader/keyring-initialiser pair.
     if args.build_only {
-        run_build_only(args, &resolved, load_profile, init_keyring).await
+        run_build_only(&context, args, &resolved, load_profile, init_keyring).await
     } else if let Some(ref xdr) = args.sign_only {
-        run_sign_only(args, &resolved, xdr, load_profile, init_keyring).await
+        run_sign_only(&context, args, &resolved, xdr, load_profile, init_keyring).await
     } else if let Some(ref xdr) = args.submit_only {
-        run_submit_only(args, &resolved, xdr, load_profile, init_keyring).await
+        run_submit_only(&context, args, &resolved, xdr, load_profile, init_keyring).await
     } else {
-        run_full_pipeline(args, &resolved, load_profile, init_keyring).await
+        run_full_pipeline(&context, args, &resolved, load_profile, init_keyring).await
     }
 }
 
@@ -342,6 +344,7 @@ where
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_build_only<LoadProfile, InitKeyring>(
+    context: &NetworkContext,
     args: &ClaimArgs,
     resolved: &ResolvedProfileName,
     load_profile: LoadProfile,
@@ -382,9 +385,9 @@ where
         return 1;
     }
 
-    match build_unsigned_envelope(args).await {
+    match build_unsigned_envelope(context, args).await {
         Ok(built) => {
-            let chain_id = caip2_chain_id_for_network(args.network);
+            let chain_id = context.chain_id.caip2_str();
             // Build-only: gate but do not submit, so the gate-sized effects are
             // not recorded (no confirmed on-chain action to attest).
             if let Err(code) =
@@ -410,6 +413,7 @@ where
 }
 
 async fn run_sign_only<LoadProfile, InitKeyring>(
+    context: &NetworkContext,
     args: &ClaimArgs,
     resolved: &ResolvedProfileName,
     unsigned_xdr: &str,
@@ -425,9 +429,16 @@ where
             Ok(p) => p,
             Err(code) => return code,
         };
-    let chain_id = caip2_chain_id_for_network(args.network);
-    if let Err(code) =
-        evaluate_staged_claim_policy(args, unsigned_xdr, chain_id, &profile, &resolved.name).await
+    let chain_id = context.chain_id.caip2_str();
+    if let Err(code) = evaluate_staged_claim_policy(
+        context,
+        args,
+        unsigned_xdr,
+        chain_id,
+        &profile,
+        &resolved.name,
+    )
+    .await
     {
         return code;
     }
@@ -447,7 +458,7 @@ where
         return 1;
     }
 
-    match sign_envelope(args, unsigned_xdr).await {
+    match sign_envelope(context, args, unsigned_xdr).await {
         Ok(signed_xdr) => {
             let result = ClaimResult {
                 envelope_xdr: signed_xdr,
@@ -467,6 +478,7 @@ where
 }
 
 async fn run_submit_only<LoadProfile, InitKeyring>(
+    context: &NetworkContext,
     args: &ClaimArgs,
     resolved: &ResolvedProfileName,
     signed_xdr: &str,
@@ -488,7 +500,7 @@ where
     // `--network`, so that flag has to describe the endpoint the envelope will
     // reach; the probe is what makes it so, and a mismatch refuses here rather
     // than after a policy decision taken for the wrong chain.
-    if let Err(e) = probe_endpoint_network(args).await {
+    if let Err(e) = probe_endpoint_network(context, args).await {
         print_error(&Envelope::<()>::err(&e), args.output);
         return 1;
     }
@@ -507,7 +519,7 @@ where
             return 1;
         }
     };
-    if let Ok(reconcile_client) = StellarRpcClient::new(&args.rpc_url) {
+    if let Ok(reconcile_client) = StellarRpcClient::new(&context.rpc_url) {
         crate::commands::submission_record::reconcile_open_reservations(
             &profile,
             &resolved.name,
@@ -517,16 +529,22 @@ where
         .await;
     }
 
-    let chain_id = caip2_chain_id_for_network(args.network);
+    let chain_id = context.chain_id.caip2_str();
     // The envelope arrives pre-signed, but broadcasting it still spends
     // funds — gate here even though signing already happened elsewhere.
-    let claim_effects =
-        match evaluate_staged_claim_policy(args, signed_xdr, chain_id, &profile, &resolved.name)
-            .await
-        {
-            Ok(effects) => effects,
-            Err(code) => return code,
-        };
+    let claim_effects = match evaluate_staged_claim_policy(
+        context,
+        args,
+        signed_xdr,
+        chain_id,
+        &profile,
+        &resolved.name,
+    )
+    .await
+    {
+        Ok(effects) => effects,
+        Err(code) => return code,
+    };
     // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
     // policy gate (a denial is a clean refusal that submits nothing and
     // needs no audit setup) but BEFORE the transaction below is submitted,
@@ -569,7 +587,7 @@ where
         }
     };
 
-    match submit_envelope(args, signed_xdr, Some(&recorder)).await {
+    match submit_envelope(context, args, signed_xdr, Some(&recorder)).await {
         Ok((signed_xdr, sub_result)) => {
             let result = ClaimResult {
                 envelope_xdr: signed_xdr,
@@ -657,6 +675,7 @@ where
 /// — no destination concept, matching `evaluate_claim_policy`'s established
 /// posture.
 async fn evaluate_staged_claim_policy(
+    context: &NetworkContext,
     args: &ClaimArgs,
     envelope_xdr: &str,
     chain_id: &str,
@@ -685,7 +704,7 @@ async fn evaluate_staged_claim_policy(
     // matching `claim`'s established posture.
     let mut source_view_holder = None;
     if let Ok(ref authoritative_args) = decode_result {
-        let client = match StellarRpcClient::new(&args.rpc_url) {
+        let client = match StellarRpcClient::new(&context.rpc_url) {
             Ok(c) => c,
             Err(e) => {
                 print_error(&Envelope::<()>::err(&e), args.output);
@@ -772,6 +791,7 @@ fn dispatch_staged_claim_gate(
 }
 
 async fn run_full_pipeline<LoadProfile, InitKeyring>(
+    context: &NetworkContext,
     args: &ClaimArgs,
     resolved: &ResolvedProfileName,
     load_profile: LoadProfile,
@@ -820,7 +840,7 @@ where
     }
 
     // 1. Build (fetch entry, preview, guards).
-    let built = match build_unsigned_envelope(args).await {
+    let built = match build_unsigned_envelope(context, args).await {
         Ok(built) => built,
         Err(e) => {
             print_error(&claim_error_envelope(&e), args.output);
@@ -843,7 +863,7 @@ where
             return 1;
         }
     };
-    if let Ok(reconcile_client) = StellarRpcClient::new(&args.rpc_url) {
+    if let Ok(reconcile_client) = StellarRpcClient::new(&context.rpc_url) {
         crate::commands::submission_record::reconcile_open_reservations(
             &profile,
             &resolved.name,
@@ -854,7 +874,7 @@ where
     }
 
     // ── Operator policy evaluation (before signing) ───────────────────────────
-    let chain_id = caip2_chain_id_for_network(args.network);
+    let chain_id = context.chain_id.caip2_str();
     let claim_effects =
         match evaluate_claim_policy(args, &built, chain_id, &profile, &resolved.name) {
             Ok(effects) => effects,
@@ -882,7 +902,7 @@ where
     };
 
     // 2. Sign.
-    let signed_xdr = match sign_envelope(args, &unsigned_xdr).await {
+    let signed_xdr = match sign_envelope(context, args, &unsigned_xdr).await {
         Ok(xdr) => xdr,
         Err(e) => {
             print_error(&Envelope::<()>::err(&e), args.output);
@@ -916,7 +936,7 @@ where
         }
     };
 
-    match submit_envelope(args, &signed_xdr, Some(&recorder)).await {
+    match submit_envelope(context, args, &signed_xdr, Some(&recorder)).await {
         Ok((xdr, sub_result)) => {
             let result = ClaimResult {
                 envelope_xdr: xdr,
@@ -947,7 +967,10 @@ where
 ///
 /// The preview is rendered to stdout before the guards run so the operator sees
 /// the balance disclosure even when a guard subsequently refuses.
-async fn build_unsigned_envelope(args: &ClaimArgs) -> Result<BuiltClaimEnvelope, ClaimError> {
+async fn build_unsigned_envelope(
+    context: &NetworkContext,
+    args: &ClaimArgs,
+) -> Result<BuiltClaimEnvelope, ClaimError> {
     let id = BalanceId::parse(&args.balance_id)?;
 
     // Validate the source G-strkey up front.
@@ -957,7 +980,7 @@ async fn build_unsigned_envelope(args: &ClaimArgs) -> Result<BuiltClaimEnvelope,
         })
     })?;
 
-    let client = StellarRpcClient::new(&args.rpc_url)?;
+    let client = StellarRpcClient::new(&context.rpc_url)?;
 
     let entry = fetch_claimable_balance_entry(&client, &id).await?;
 
@@ -1022,7 +1045,7 @@ async fn build_unsigned_envelope(args: &ClaimArgs) -> Result<BuiltClaimEnvelope,
     let mut builder = ClassicOpBuilder::new(
         &args.source,
         account_view.sequence_number,
-        args.network.passphrase(),
+        context.network_passphrase(),
         fee_per_op,
     );
     builder.claim_claimable_balance(&id.to_hex64())?;
@@ -1128,9 +1151,13 @@ fn current_unix_secs() -> Result<u64, ClaimError> {
 /// Propagates `WalletError` from seed parsing, `Wallet::unlock`, the pubkey
 /// mismatch check, or the signing call. Returns
 /// `ValidationError::SignerSourceRequired` when neither signer flag is provided.
-async fn sign_envelope(args: &ClaimArgs, unsigned_xdr: &str) -> Result<String, WalletError> {
+async fn sign_envelope(
+    context: &NetworkContext,
+    args: &ClaimArgs,
+    unsigned_xdr: &str,
+) -> Result<String, WalletError> {
     let source = args.source.as_str();
-    let passphrase = args.network.passphrase();
+    let passphrase = context.network_passphrase();
 
     if args.sign_with_ledger {
         let signer = signer_from_ledger(args.account_index, source).await?;
@@ -1181,22 +1208,26 @@ async fn sign_envelope(args: &ClaimArgs, unsigned_xdr: &str) -> Result<String, W
 ///
 /// `--sign-only` does not call this: it sends nothing, so no endpoint answers
 /// for it.
-async fn probe_endpoint_network(args: &ClaimArgs) -> Result<(), WalletError> {
-    let client = StellarRpcClient::new(&args.rpc_url)?;
+async fn probe_endpoint_network(
+    context: &NetworkContext,
+    args: &ClaimArgs,
+) -> Result<(), WalletError> {
+    let client = StellarRpcClient::new(&context.rpc_url)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout_seconds);
     client
-        .verify_network_passphrase(args.network.passphrase(), deadline)
+        .verify_network_passphrase(context.network_passphrase(), deadline)
         .await
 }
 
 async fn submit_envelope(
+    context: &NetworkContext,
     args: &ClaimArgs,
     signed_xdr: &str,
     recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>,
 ) -> Result<(String, SubmissionResult), WalletError> {
-    let client = StellarRpcClient::new(&args.rpc_url)?;
+    let client = StellarRpcClient::new(&context.rpc_url)?;
     let timeout = Duration::from_secs(args.timeout_seconds);
-    let passphrase = args.network.passphrase();
+    let passphrase = context.network_passphrase();
     let result = submit_transaction_and_wait(
         &client,
         signed_xdr,

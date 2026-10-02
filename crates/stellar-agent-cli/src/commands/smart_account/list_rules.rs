@@ -59,6 +59,9 @@ use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_core::profile::ResolvedProfileName;
+use stellar_agent_network::NetworkContext;
+
 /// Well-known interop deployer G-strkey derived from the publicly-documented
 /// SHA256("openzeppelin-smart-account-kit") seed.  Used as a funded testnet
 /// simulation source when `--source-account` is not supplied.
@@ -75,7 +78,7 @@ use tracing::{info, warn};
 use crate::commands::smart_account::common::open_profile_audit_writer_read_only;
 use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::profile_access::{
-    ProfileAccessError, load_profile_reconciled_by_requested_name, profile_access_envelope,
+    ProfileAccessError, load_profile_reconciled, profile_access_envelope,
 };
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
@@ -329,6 +332,8 @@ pub struct ListRulesResult {
 ///
 /// Never panics.
 pub async fn run(args: &ListRulesArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone())
+        .with_secondary(args.secondary_rpc_url.clone());
     let resolved_profile = resolve_profile_name(args.profile.as_deref());
     let profile_name = resolved_profile.name.clone();
 
@@ -347,7 +352,7 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
     //   1. --max-scan-id CLI flag (already range-validated by clap value-parser).
     //   2. profile.smart_account_max_context_rule_scan_id (validated at profile-load).
     //   3. DEFAULT_MAX_SCAN_ID (50).
-    let max_scan_id = match resolve_max_scan_id(args, &profile_name) {
+    let max_scan_id = match resolve_max_scan_id(args, &resolved_profile) {
         Ok(n) => n,
         Err(e) => {
             render_json(&profile_access_envelope(&e, &profile_name));
@@ -367,7 +372,7 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
     // `--secondary-rpc-url` is accepted in the Args struct for future use and
     // for consistency with other smart-account subcommands. Log a warn! when the operator
     // supplies it, so they know it is currently a no-op.
-    if args.secondary_rpc_url.is_some() {
+    if context.secondary_rpc_url.is_some() {
         warn!(
             "--secondary-rpc-url is accepted for forward compatibility but is \
              not consulted by `smart-account list-rules`; the primary RPC \
@@ -383,11 +388,11 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
         );
     }
     let timeout = Duration::from_secs(args.timeout_seconds);
-    let chain_id = args.network.caip2().caip2_str().to_owned();
+    let chain_id = context.chain_id.caip2_str().to_owned();
 
     let config = ContextRuleManagerConfig::new(
-        args.rpc_url.clone(),
-        args.network.passphrase().to_owned(),
+        context.rpc_url.clone(),
+        context.network_passphrase().to_owned(),
         timeout,
         chain_id.clone(),
     )
@@ -405,7 +410,7 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
     info!(
         account = redact_strkey_first5_last5(&args.account),
         max_scan_id,
-        network = %args.network,
+        network = %context.chain_id,
         chain_id = %chain_id,
         "smart-account list-rules: enumerating active context rules"
     );
@@ -420,7 +425,7 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
     let source_account_strkey = match &args.source_account {
         Some(g) => g.clone(),
         None => {
-            if args.network == TargetNetwork::Mainnet {
+            if context.chain_id.is_mainnet() {
                 return emit_error(&WalletError::Validation(ValidationError::AddressInvalid {
                     input: "--source-account is required for mainnet enumeration; \
                              pass a funded G-strkey (no signing is performed against it)"
@@ -520,33 +525,34 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
 /// falls back to [`DEFAULT_MAX_SCAN_ID`].
 fn resolve_max_scan_id(
     args: &ListRulesArgs,
-    profile_name: &str,
+    resolved: &ResolvedProfileName,
 ) -> Result<u32, ProfileAccessError> {
     // Priority 1: explicit CLI flag.
     if let Some(n) = args.max_scan_id {
         return Ok(n);
     }
 
-    // Priority 2: profile field (validated at profile-load time).
-    match load_profile_reconciled_by_requested_name(profile_name, None) {
-        Ok(profile) => {
-            if let Some(n) = profile.smart_account_max_context_rule_scan_id {
-                return Ok(n);
-            }
-        }
-        Err(e @ ProfileAccessError::NameMismatch(_)) => return Err(e),
-        Err(e) => {
+    max_scan_id_from_profile(load_profile_reconciled(resolved, None), &resolved.name)
+}
+
+fn max_scan_id_from_profile(
+    loaded: Result<stellar_agent_core::profile::schema::Profile, ProfileAccessError>,
+    profile_name: &str,
+) -> Result<u32, ProfileAccessError> {
+    match loaded {
+        Ok(profile) => Ok(profile
+            .smart_account_max_context_rule_scan_id
+            .unwrap_or(DEFAULT_MAX_SCAN_ID)),
+        Err(error) if error.requires_refusal() => Err(error),
+        Err(error) => {
             tracing::debug!(
-                profile = %profile_name,
-                error = %e,
-                "smart-account list-rules: profile load for max_scan_id resolution failed; \
-                 using DEFAULT_MAX_SCAN_ID"
+                profile = profile_name,
+                error = %error,
+                "scan bound profile unavailable; using the default"
             );
+            Ok(DEFAULT_MAX_SCAN_ID)
         }
     }
-
-    // Priority 3: compiled-in default.
-    Ok(DEFAULT_MAX_SCAN_ID)
 }
 
 // ── Error emission helpers ─────────────────────────────────────────────────────
@@ -585,6 +591,19 @@ mod tests {
     use super::*;
 
     // ── parse_max_scan_id ──────────────────────────────────────────────────────
+
+    #[test]
+    fn scan_bound_preserves_protected_refusals() {
+        for error in crate::common::profile_access::protected_load_errors_for_test() {
+            let expected = error.code();
+            let result = max_scan_id_from_profile(Err(error), "mainnet");
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("protected refusal was swallowed"),
+            };
+            assert_eq!(error.code(), expected);
+        }
+    }
 
     #[test]
     fn parse_max_scan_id_rejects_zero() {

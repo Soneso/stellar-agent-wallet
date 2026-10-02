@@ -297,11 +297,11 @@ impl WalletServer {
             }
         };
 
-        let rpc_url = self.profile.rpc_url.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
         let manager = match build_context_rule_manager(
             rpc_url,
-            &self.profile.network_passphrase,
-            self.profile.chain_id.caip2_str(),
+            self.context.network_passphrase(),
+            self.context.chain_id.caip2_str(),
             profile_audit_writer(self, "stellar_rules_list"),
         ) {
             Ok(m) => m,
@@ -314,8 +314,8 @@ impl WalletServer {
         };
         let signers_manager = match build_signers_manager(
             rpc_url,
-            &self.profile.network_passphrase,
-            self.profile.chain_id.caip2_str(),
+            self.context.network_passphrase(),
+            self.context.chain_id.caip2_str(),
         ) {
             Ok(m) => m,
             Err(err) => {
@@ -508,11 +508,11 @@ impl WalletServer {
             }
         };
 
-        let rpc_url = self.profile.rpc_url.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
         let manager = match build_context_rule_manager(
             rpc_url,
-            &self.profile.network_passphrase,
-            self.profile.chain_id.caip2_str(),
+            self.context.network_passphrase(),
+            self.context.chain_id.caip2_str(),
             profile_audit_writer(self, "stellar_rules_get"),
         ) {
             Ok(m) => m,
@@ -525,8 +525,8 @@ impl WalletServer {
         };
         let signers_manager = match build_signers_manager(
             rpc_url,
-            &self.profile.network_passphrase,
-            self.profile.chain_id.caip2_str(),
+            self.context.network_passphrase(),
+            self.context.chain_id.caip2_str(),
         ) {
             Ok(m) => m,
             Err(err) => {

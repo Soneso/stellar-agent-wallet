@@ -250,7 +250,7 @@ impl WalletServer {
         }
 
         // ── Build RPCs ────────────────────────────────────────────────────────
-        let rpc_url = self.profile.rpc_url.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
         let primary_rpc = StellarRpcClient::new(rpc_url).map_err(|e| {
             rmcp::ErrorData::internal_error(format!("vault.rpc_init_failed: {e}"), None)
         })?;
@@ -541,7 +541,7 @@ impl WalletServer {
         };
 
         let timeout = crate::tools::common::submit_timeout(&self.profile);
-        let network = self.profile.network_passphrase.as_str();
+        let network = self.context.network_passphrase();
 
         // WASM hash already verified at step 1; use the real hash so the pin
         // carries a meaningful value for audit and downstream checks.
@@ -765,7 +765,7 @@ impl WalletServer {
         }
 
         // ── Build RPCs ────────────────────────────────────────────────────────
-        let rpc_url = self.profile.rpc_url.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
         let primary_rpc = StellarRpcClient::new(rpc_url).map_err(|e| {
             rmcp::ErrorData::internal_error(format!("vault.rpc_init_failed: {e}"), None)
         })?;
@@ -998,7 +998,7 @@ impl WalletServer {
         };
 
         let timeout = crate::tools::common::submit_timeout(&self.profile);
-        let network = self.profile.network_passphrase.as_str();
+        let network = self.context.network_passphrase();
 
         // WASM hash already verified at step 1; use the real hash for audit.
         let vault_pin = DefiContractPin::new(

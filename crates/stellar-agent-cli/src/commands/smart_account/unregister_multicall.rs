@@ -145,9 +145,22 @@ pub async fn run(args: &UnregisterMulticallArgs) -> i32 {
     let chain_id: Option<String> = None;
 
     // Open audit writer (non-fatal: log warning and continue on failure).
-    let audit_writer = open_profile_audit_writer(&resolved_profile)
-        .map(|(_, w, p)| (w, p))
-        .ok();
+    let audit_writer = match open_profile_audit_writer(&resolved_profile) {
+        Ok((_, writer, path)) => Some((writer, path)),
+        Err(error)
+            if matches!(
+                error,
+                WalletError::Validation(
+                    ValidationError::ProfileNonOverlayableField { .. }
+                        | ValidationError::MainnetRequiresExplicitProfile { .. }
+                )
+            ) =>
+        {
+            render_json(&Envelope::<()>::err(&error));
+            return 1;
+        }
+        Err(_) => None,
+    };
 
     // Load the registry.
     let networks_toml_path = match default_networks_toml_path() {

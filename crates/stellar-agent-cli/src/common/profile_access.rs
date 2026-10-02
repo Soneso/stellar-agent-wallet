@@ -58,7 +58,8 @@ use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::observability::redact_path_in_message;
 use stellar_agent_core::profile::loader::{self as profile_loader, MulticallRegistryHook};
 use stellar_agent_core::profile::name::{
-    ProfileNameMismatch, ProfileStateLayout, ResolvedProfileName, profile_name_mismatch_refusal,
+    ProfileNameMismatch, ProfileStateLayout, ResolvedProfileName, check_mainnet_selection,
+    profile_name_mismatch_refusal,
 };
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
 
@@ -110,13 +111,17 @@ pub(crate) enum ProfileAccessError {
 impl ProfileAccessError {
     /// The wire code for this failure on the surfaces that render a raw code.
     ///
-    /// Load failures keep `profile.load_failed`; a mismatch reports the
-    /// `profile.name_mismatch` code owned by
-    /// [`ValidationError::ProfileNameMismatch`], so a refusal carries the same
-    /// code whether the surface renders a raw code or a typed
-    /// [`WalletError`].
+    /// Protected overlays and implicit mainnet selections preserve their typed codes.
+    /// Other load failures keep `profile.load_failed`.
+    /// A name mismatch reports `profile.name_mismatch`.
     pub(crate) fn code(&self) -> &'static str {
         match self {
+            Self::Load(profile_loader::ProfileLoadError::NonOverlayableField { .. }) => {
+                "profile.non_overlayable_field"
+            }
+            Self::Load(profile_loader::ProfileLoadError::MainnetRequiresExplicitProfile {
+                ..
+            }) => "profile.mainnet_requires_explicit_profile",
             Self::Load(_) => "profile.load_failed",
             Self::NameMismatch(_) => PROFILE_NAME_MISMATCH_CODE,
         }
@@ -129,25 +134,9 @@ impl ProfileAccessError {
     /// keeps its own wire code through their existing rendering.
     pub(crate) fn to_wallet_error(&self, requested_name: &str) -> WalletError {
         match self {
-            // Dispositions come from `ProfileLoadError::disposition`, whose
-            // match is exhaustive in the crate owning the enum, so this surface
-            // and `profile show` cannot drift apart as variants are added.
-            Self::Load(load_err) => match load_err.disposition() {
-                profile_loader::ProfileLoadDisposition::NotFound => {
-                    // The loader's own `name` is kept rather than
-                    // `requested_name`: they agree today, and the error's field
-                    // is the one that names the profile actually looked up.
-                    let name = match load_err {
-                        profile_loader::ProfileLoadError::NotFound { name, .. } => name.clone(),
-                        _ => requested_name.to_owned(),
-                    };
-                    WalletError::Validation(ValidationError::ProfileNotFound { name })
-                }
-                _ => WalletError::Validation(ValidationError::ConfigInvalid {
-                    component: "profile",
-                    reason: self.message(requested_name),
-                }),
-            },
+            Self::Load(load_err) => {
+                WalletError::Validation(load_err.to_validation_error(requested_name))
+            }
             Self::NameMismatch(_) => {
                 WalletError::Validation(ValidationError::ProfileNameMismatch {
                     detail: self.message(requested_name),
@@ -176,6 +165,18 @@ impl ProfileAccessError {
         redact_path_in_message(&rendered)
     }
 
+    /// Whether an optional profile read must preserve this refusal.
+    pub(crate) fn requires_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::NameMismatch(_)
+                | Self::Load(
+                    profile_loader::ProfileLoadError::NonOverlayableField { .. }
+                        | profile_loader::ProfileLoadError::MainnetRequiresExplicitProfile { .. }
+                )
+        )
+    }
+
     /// `true` when the profile file simply does not exist.
     ///
     /// The one disposition that may treat an error as "no profile configured"
@@ -202,11 +203,7 @@ impl std::fmt::Display for ProfileAccessError {
 /// Loads the resolved profile and refuses it when its owner-key coordinate
 /// names a different profile.
 ///
-/// This is the entry point for command bodies, which hold the
-/// [`ResolvedProfileName`] the resolver produced. Helpers that receive only the
-/// requested name call [`load_profile_reconciled_by_requested_name`]; the
-/// resolver itself is enforced separately by
-/// `crates/stellar-agent-cli/tests/profile_flag_discipline.rs`.
+/// The resolved name retains the input that selected the profile.
 ///
 /// `multicall_hook` is threaded to the loader for the one command that needs
 /// the multicall registry available while the profile is parsed
@@ -222,29 +219,9 @@ pub(crate) fn load_profile_reconciled(
     resolved: &ResolvedProfileName,
     multicall_hook: Option<&dyn MulticallRegistryHook>,
 ) -> Result<Profile, ProfileAccessError> {
-    load_profile_reconciled_by_requested_name(&resolved.name, multicall_hook)
-}
-
-/// [`load_profile_reconciled`] for helpers that receive only the requested
-/// name.
-///
-/// The reconciliation compares the requested name against the one the file
-/// carries and does not consult the name's provenance, so a helper that was
-/// handed `<resolved>.name` several frames down loses nothing by calling this
-/// form. Threading [`ResolvedProfileName`] through every such helper —
-/// the signer ceremony, the smart-account context, `list-rules`' scan-id
-/// resolution — would move a value none of them read.
-///
-/// # Errors
-///
-/// Identical to [`load_profile_reconciled`].
-pub(crate) fn load_profile_reconciled_by_requested_name(
-    requested_name: &str,
-    multicall_hook: Option<&dyn MulticallRegistryHook>,
-) -> Result<Profile, ProfileAccessError> {
     let profile =
-        profile_loader::load(requested_name, multicall_hook).map_err(ProfileAccessError::Load)?;
-    reconcile(profile, requested_name)
+        profile_loader::load(&resolved.name, multicall_hook).map_err(ProfileAccessError::Load)?;
+    reconcile(profile, resolved)
 }
 
 /// The load step the `run_with_dependencies` seams inject in production.
@@ -283,9 +260,9 @@ pub(crate) fn injected_profile_load(
 /// profile.
 pub(crate) fn reconcile_loaded_profile(
     loaded: Result<Profile, profile_loader::ProfileLoadError>,
-    requested_name: &str,
+    resolved: &ResolvedProfileName,
 ) -> Result<Profile, ProfileAccessError> {
-    reconcile(loaded.map_err(ProfileAccessError::Load)?, requested_name)
+    reconcile(loaded.map_err(ProfileAccessError::Load)?, resolved)
 }
 
 /// Refuses `profile` when its owner-key coordinate names a profile other than
@@ -296,11 +273,15 @@ pub(crate) fn reconcile_loaded_profile(
 /// branch of [`load_profile_or_synthesize_testnet_with`] does not call it, and
 /// must not: that profile is built from the requested name by
 /// [`Profile::builder_testnet_named`] and is self-consistent by construction.
-fn reconcile(profile: Profile, requested_name: &str) -> Result<Profile, ProfileAccessError> {
-    match profile_name_mismatch_refusal(&profile, requested_name) {
-        Some(mismatch) => Err(ProfileAccessError::NameMismatch(mismatch)),
-        None => Ok(profile),
+fn reconcile(
+    profile: Profile,
+    resolved: &ResolvedProfileName,
+) -> Result<Profile, ProfileAccessError> {
+    if let Some(mismatch) = profile_name_mismatch_refusal(&profile, &resolved.name) {
+        return Err(ProfileAccessError::NameMismatch(mismatch));
     }
+    check_mainnet_selection(&profile, resolved).map_err(ProfileAccessError::Load)?;
+    Ok(profile)
 }
 
 /// Renders a [`ProfileAccessError`] as the CLI's error envelope.
@@ -422,7 +403,7 @@ where
         // A file that exists and names another profile is refused, never
         // treated as absent: the synthesis fallback below answers only for a
         // profile that was neither named nor authored.
-        Ok(profile) => reconcile(profile, name).map(|p| (p, ProfileOrigin::Persisted)),
+        Ok(profile) => reconcile(profile, resolved).map(|p| (p, ProfileOrigin::Persisted)),
         Err(profile_loader::ProfileLoadError::NotFound { .. })
             if !resolved.source.is_explicit() =>
         {
@@ -442,6 +423,21 @@ where
 }
 
 #[cfg(test)]
+pub(crate) fn protected_load_errors_for_test() -> Vec<ProfileAccessError> {
+    vec![
+        ProfileAccessError::Load(profile_loader::ProfileLoadError::NonOverlayableField {
+            field: "chain_id",
+        }),
+        ProfileAccessError::Load(
+            profile_loader::ProfileLoadError::MainnetRequiresExplicitProfile {
+                name: "mainnet".to_owned(),
+                named_by: stellar_agent_core::profile::ProfileNameSource::Env,
+            },
+        ),
+    ]
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(
         clippy::expect_used,
@@ -452,6 +448,79 @@ mod tests {
     use stellar_agent_core::profile::name::ProfileNameSource;
 
     use super::*;
+
+    fn mainnet_fixture(name: &str) -> Profile {
+        Profile::builder_mainnet_named(name, "s", "a", "n", "a")
+            .with_noop_engine()
+            .build()
+    }
+
+    #[test]
+    fn protected_load_codes_match_typed_and_raw_routes() {
+        for error in protected_load_errors_for_test() {
+            let ProfileAccessError::Load(ref load) = error else {
+                panic!("load fixture")
+            };
+            assert_eq!(error.code(), load.to_validation_error("mainnet").code());
+            assert_eq!(error.to_wallet_error("mainnet").code(), error.code());
+            let value = serde_json::to_value(profile_access_envelope(&error, "mainnet"))
+                .expect("valid test fixture");
+            assert_eq!(value["error"]["code"], error.code());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mainnet_environment_refuses_through_all_load_routes() {
+        let home = tempfile::tempdir().expect("valid test fixture");
+        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let resolved = resolved("mainnet", ProfileNameSource::Env);
+        let profile = mainnet_fixture("mainnet");
+        profile_loader::save_to_dir("mainnet", &profile, &home.path().join("profiles"))
+            .expect("valid test fixture");
+        for result in [
+            load_profile_reconciled(&resolved, None),
+            reconcile_loaded_profile(Ok(profile.clone()), &resolved),
+            load_profile_or_synthesize_testnet_with(&resolved, |_| Ok(profile.clone()))
+                .map(|(p, _)| p),
+        ] {
+            let error = result.expect_err("implicit mainnet selection refuses");
+            assert_eq!(error.code(), "profile.mainnet_requires_explicit_profile");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mainnet_flag_loads_through_all_load_routes() {
+        let home = tempfile::tempdir().expect("valid test fixture");
+        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let resolved = resolved("mainnet", ProfileNameSource::Flag);
+        let profile = mainnet_fixture("mainnet");
+        profile_loader::save_to_dir("mainnet", &profile, &home.path().join("profiles"))
+            .expect("valid test fixture");
+        for result in [
+            load_profile_reconciled(&resolved, None),
+            reconcile_loaded_profile(Ok(profile.clone()), &resolved),
+            load_profile_or_synthesize_testnet_with(&resolved, |_| Ok(profile.clone()))
+                .map(|(p, _)| p),
+        ] {
+            assert!(result.expect("valid test fixture").chain_id.is_mainnet());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mainnet_default_file_refuses_without_flag() {
+        let home = tempfile::tempdir().expect("valid test fixture");
+        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let profile = mainnet_fixture("default");
+        profile_loader::save_to_dir("default", &profile, &home.path().join("profiles"))
+            .expect("valid test fixture");
+        let error =
+            load_profile_or_synthesize_testnet(&resolved("default", ProfileNameSource::Default))
+                .expect_err("implicit mainnet selection refuses");
+        assert_eq!(error.code(), "profile.mainnet_requires_explicit_profile");
+    }
 
     fn resolved(name: &str, source: ProfileNameSource) -> ResolvedProfileName {
         ResolvedProfileName {
@@ -747,8 +816,11 @@ mod tests {
                 .build())
         };
 
-        let err = reconcile_loaded_profile(unchecked("ignored"), "alice")
-            .expect_err("the caller reconciles what the closure returns");
+        let err = reconcile_loaded_profile(
+            unchecked("ignored"),
+            &ResolvedProfileName::from_flag("alice"),
+        )
+        .expect_err("the caller reconciles what the closure returns");
         assert_eq!(err.code(), "profile.name_mismatch");
     }
 
@@ -851,7 +923,7 @@ mod tests {
             "default",
         );
 
-        let err = reconcile_loaded_profile(Ok(profile), "alice")
+        let err = reconcile_loaded_profile(Ok(profile), &ResolvedProfileName::from_flag("alice"))
             .expect_err("a prefix-less coordinate must refuse");
         let message = err.message("alice");
         assert!(

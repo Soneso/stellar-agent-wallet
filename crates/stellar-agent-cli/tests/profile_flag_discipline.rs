@@ -631,3 +631,57 @@ fn matching_brace(bytes: &[u8], open_idx: usize) -> Option<usize> {
     }
     None
 }
+
+#[test]
+fn from_flag_is_confined_to_explicit_argument_boundaries() {
+    let allowed = [
+        ("commands/profile/rotate_nonce_key.rs", "run"),
+        ("commands/profile/rotate_attestation_key.rs", "run"),
+        ("commands/profile/rotate_audit_key.rs", "rotate"),
+        ("commands/profile/rotate_counterparty_key.rs", "run"),
+        ("commands/profile/rotate_policy_state_key.rs", "run"),
+        ("commands/profile/reset_window_state.rs", "run"),
+        ("commands/profile/reset_mpp_state.rs", "run"),
+        ("commands/fees/stats.rs", "resolve_rpc_url"),
+        ("commands/mpp.rs", "prune"),
+        ("commands/audit/verify.rs", "resolve_profile_inputs"),
+        ("commands/audit/reanchor.rs", "load_profile"),
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs_files(&root, &mut files);
+    let mut seen = std::collections::BTreeMap::new();
+    let mut violations = Vec::new();
+    for path in files {
+        let source = std::fs::read_to_string(&path).expect("source reads");
+        let production = strip_test_modules(&clean_source(&source));
+        let relative = relative_path(&path, &root);
+        let mut function = "";
+        for (index, line) in production.lines().enumerate() {
+            if let Some((_, rest)) = line.split_once("fn ") {
+                function = rest.split(['(', '<', ' ']).next().expect("function name");
+            }
+            let calls = line.matches("::from_flag(").count();
+            if calls == 0 {
+                continue;
+            }
+            let key = (relative.clone(), function.to_owned());
+            *seen.entry(key).or_insert(0usize) += calls;
+            if !allowed.contains(&(relative.as_str(), function)) {
+                violations.push(format!(
+                    "{relative}:{}: from_flag outside an explicit argument boundary",
+                    index + 1
+                ));
+            }
+        }
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+    for (file, function) in allowed {
+        assert_eq!(
+            seen.get(&(file.to_owned(), function.to_owned())),
+            Some(&1),
+            "exactly one from_flag call at {file}::{function}"
+        );
+    }
+    assert_eq!(seen.len(), allowed.len());
+}

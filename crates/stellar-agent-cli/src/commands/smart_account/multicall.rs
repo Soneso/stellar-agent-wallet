@@ -66,7 +66,9 @@ use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{IoSource, ValidationError, WalletError};
 use stellar_agent_core::policy::v1::PolicyEngineV1;
+use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::wallet::MlockDegradation;
+use stellar_agent_network::NetworkContext;
 use stellar_agent_network::{ClassicFeeChoice, parse_classic_fee_choice};
 use stellar_agent_smart_account::ResolvedFeePerOp;
 use stellar_agent_smart_account::multicall::{
@@ -286,7 +288,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
             sign_with_ledger: args.sign_with_ledger,
             account_index: Some(args.account_index),
         };
-        match resolve_signer(&signer_flags, Some(&profile_name)).await {
+        match resolve_signer(&signer_flags, Some(&resolved_profile)).await {
             Ok(pair) => pair,
             Err(e) => {
                 render_json(&Envelope::<()>::err(&e));
@@ -294,9 +296,6 @@ pub async fn run(args: &MulticallArgs) -> i32 {
             }
         }
     };
-
-    let network_passphrase = args.network.passphrase().to_owned();
-    let chain_id = args.network.caip2().caip2_str().to_owned();
 
     // Load the multicall registry.
     let networks_toml_path = match default_networks_toml_path() {
@@ -368,6 +367,10 @@ pub async fn run(args: &MulticallArgs) -> i32 {
             }
         }
     };
+    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone())
+        .with_secondary(Some(secondary_rpc_url));
+    let network_passphrase = context.network_passphrase().to_owned();
+    let chain_id = context.chain_id.caip2_str().to_owned();
 
     // Parse the fee.
     let fee = match resolve_multicall_fee(args.fee.as_ref()) {
@@ -393,17 +396,14 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     };
 
     // Build a minimal profile for policy evaluation.
-    let profile = build_minimal_profile(args.network, secondary_rpc_url.clone());
+    let profile = build_minimal_profile(&context);
 
     // Every non-zero authorizing rule reads its baseline and pin record from
     // this profile's audit log. The signer-set comparison and executable pin
     // check use the submission's RPC endpoints under the rule's lock.
     let signers_manager = match construct_signers_manager_from_fields(
         &profile_name,
-        &network_passphrase,
-        &chain_id,
-        &args.rpc_url,
-        &secondary_rpc_url,
+        &context,
         Duration::from_secs(args.timeout_seconds),
         profile_audit_writer,
         &audit_log_path,
@@ -442,7 +442,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     // Settle what stands open before this verb's own submission. The
     // multicall gate reads the window store for its own accounting, so a
     // reservation an earlier verb left behind would count there unreconciled.
-    if let Ok(reconcile_client) = stellar_agent_network::StellarRpcClient::new(&args.rpc_url) {
+    if let Ok(reconcile_client) = stellar_agent_network::StellarRpcClient::new(&context.rpc_url) {
         crate::commands::submission_record::reconcile_open_reservations(
             &profile,
             &profile_name,
@@ -457,8 +457,11 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         rule_id: args.rule_id,
         bundle,
         signer: signer.as_ref(),
-        primary_rpc_url: &args.rpc_url,
-        secondary_rpc_url: &secondary_rpc_url,
+        primary_rpc_url: &context.rpc_url,
+        secondary_rpc_url: context
+            .secondary_rpc_url
+            .as_deref()
+            .unwrap_or(&context.rpc_url),
         network_passphrase: &network_passphrase,
         policy_engine,
         profile: &profile,
@@ -618,30 +621,19 @@ fn load_policy_engine_for_profile(profile_name: &str) -> Result<Arc<PolicyEngine
 /// Constructs a network-appropriate profile with `secondary_rpc_url` set.
 /// Only `chain_id`, `network_passphrase`, and `secondary_rpc_url` need to be
 /// correct for `evaluate_bundle` in `submit_multicall_bundle`.
-fn build_minimal_profile(
-    network: crate::common::network::TargetNetwork,
-    secondary_rpc_url: String,
-) -> stellar_agent_core::profile::schema::Profile {
-    use crate::common::network::TargetNetwork;
-    use stellar_agent_core::profile::schema::Profile;
-    match network {
-        TargetNetwork::Testnet => Profile::builder_testnet(
-            "stellar-agent-signer",
-            "multicall-cli",
-            "stellar-agent-nonce",
-            "multicall-cli",
-        )
-        .secondary_rpc_url(Some(secondary_rpc_url))
-        .build(),
-        TargetNetwork::Mainnet => Profile::builder_mainnet(
-            "stellar-agent-signer",
-            "multicall-cli",
-            "stellar-agent-nonce",
-            "multicall-cli",
-        )
-        .secondary_rpc_url(Some(secondary_rpc_url))
-        .build(),
-    }
+fn build_minimal_profile(context: &NetworkContext) -> stellar_agent_core::profile::schema::Profile {
+    let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+        "stellar-agent-signer",
+        "multicall-cli",
+        "stellar-agent-nonce",
+        "multicall-cli",
+    )
+    .build();
+    profile.chain_id = context.chain_id;
+    profile.network_passphrase = context.network_passphrase().to_owned();
+    profile.rpc_url = context.rpc_url.clone();
+    profile.secondary_rpc_url = context.secondary_rpc_url.clone();
+    profile
 }
 
 /// Resolves the signer from the two mutually-exclusive flag modes.
@@ -654,7 +646,7 @@ fn build_minimal_profile(
 /// [`record_mlock_degradation`] once its audit writer is open.
 async fn resolve_signer(
     flags: &SignerSourceFlags,
-    profile_name: Option<&str>,
+    profile_name: Option<&ResolvedProfileName>,
 ) -> Result<
     (
         Box<dyn stellar_agent_network::Signer + Send + Sync>,

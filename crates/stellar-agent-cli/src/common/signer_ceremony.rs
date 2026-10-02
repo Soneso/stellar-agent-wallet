@@ -34,14 +34,13 @@ use std::sync::{Arc, Mutex};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::error::{ValidationError, WalletError, WalletStateError};
+use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::wallet::{DEFAULT_TTL_SECONDS, MlockDegradation, MlockRequired, Wallet};
 use stellar_agent_network::SoftwareSigningKey;
 use stellar_agent_network::signing::wallet::signer_from_wallet;
 use zeroize::Zeroizing;
 
-use crate::common::profile_access::{
-    ProfileAccessError, load_profile_reconciled_by_requested_name,
-};
+use crate::common::profile_access::{ProfileAccessError, load_profile_reconciled};
 
 /// Resolves the effective `mlock_required` posture and unlock TTL from
 /// `profile_name`'s `[wallet]` profile section.
@@ -63,20 +62,28 @@ use crate::common::profile_access::{
 ///
 /// # Errors
 ///
-/// Returns the profile-name-mismatch refusal as
-/// [`WalletError::Validation`] carrying `profile.name_mismatch`.
+/// Returns [`WalletError::Validation`] with `profile.name_mismatch`,
+/// `profile.non_overlayable_field`, or `profile.mainnet_requires_explicit_profile`
+/// for a protected refusal.
 fn resolve_wallet_unlock_controls(
-    profile_name: Option<&str>,
+    profile_name: Option<&ResolvedProfileName>,
 ) -> Result<(MlockRequired, u32), WalletError> {
     let Some(name) = profile_name else {
         return Ok((MlockRequired::Warn, DEFAULT_TTL_SECONDS));
     };
-    match load_profile_reconciled_by_requested_name(name, None) {
+    wallet_unlock_controls_from_profile(load_profile_reconciled(name, None), &name.name)
+}
+
+fn wallet_unlock_controls_from_profile(
+    loaded: Result<stellar_agent_core::profile::schema::Profile, ProfileAccessError>,
+    name: &str,
+) -> Result<(MlockRequired, u32), WalletError> {
+    match loaded {
         Ok(profile) => Ok((
             profile.wallet.mlock_required,
             profile.wallet.unlock_ttl_seconds,
         )),
-        Err(e @ ProfileAccessError::NameMismatch(_)) => Err(e.to_wallet_error(name)),
+        Err(e) if e.requires_refusal() => Err(e.to_wallet_error(name)),
         Err(e) => {
             tracing::debug!(
                 profile = name,
@@ -131,7 +138,7 @@ pub(crate) struct SignerCeremonyOutcome {
 pub(crate) async fn resolve_software_signer_from_env(
     var_name: &str,
     wallet_label: &str,
-    profile_name: Option<&str>,
+    profile_name: Option<&ResolvedProfileName>,
 ) -> Result<SignerCeremonyOutcome, WalletError> {
     let (mlock_required, ttl_seconds) = resolve_wallet_unlock_controls(profile_name)?;
 
@@ -358,11 +365,16 @@ mod tests {
             std::env::set_var(&var, &s_strkey);
         }
 
-        let err =
-            match resolve_software_signer_from_env(&var, "unit-test", Some(profile_name)).await {
-                Ok(_) => panic!("an over-maximum TTL must be refused at unlock"),
-                Err(e) => e,
-            };
+        let err = match resolve_software_signer_from_env(
+            &var,
+            "unit-test",
+            Some(&ResolvedProfileName::from_flag(profile_name)),
+        )
+        .await
+        {
+            Ok(_) => panic!("an over-maximum TTL must be refused at unlock"),
+            Err(e) => e,
+        };
         assert_eq!(err.code(), "wallet_state.unlock_failed");
 
         unsafe {
@@ -507,6 +519,19 @@ mod tests {
         assert!(wallet.mlock_degradation().is_none());
     }
 
+    #[test]
+    fn wallet_unlock_controls_preserve_protected_refusals() {
+        for error in crate::common::profile_access::protected_load_errors_for_test() {
+            let expected = error.code();
+            let result = wallet_unlock_controls_from_profile(Err(error), "mainnet");
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("protected refusal was swallowed"),
+            };
+            assert_eq!(error.code(), expected);
+        }
+    }
+
     /// `record_mlock_degradation` writes a `WalletMlockFailed` audit-log
     /// entry carrying the supplied reason and errno when `degradation` is
     /// `Some`.
@@ -611,7 +636,13 @@ mod tests {
             std::env::set_var(&var, &s_strkey);
         }
 
-        let err = match resolve_software_signer_from_env(&var, "unit-test", Some(requested)).await {
+        let err = match resolve_software_signer_from_env(
+            &var,
+            "unit-test",
+            Some(&ResolvedProfileName::from_flag(requested)),
+        )
+        .await
+        {
             Ok(_) => panic!("a mismatched profile must not supply the unlock posture"),
             Err(e) => e,
         };
@@ -656,10 +687,13 @@ mod tests {
             std::env::set_var(&var, &s_strkey);
         }
 
-        let outcome =
-            resolve_software_signer_from_env(&var, "unit-test", Some("i107-never-authored"))
-                .await
-                .expect("an absent profile must degrade, not refuse");
+        let outcome = resolve_software_signer_from_env(
+            &var,
+            "unit-test",
+            Some(&ResolvedProfileName::from_flag("i107-never-authored")),
+        )
+        .await
+        .expect("an absent profile must degrade, not refuse");
         let expected_g = {
             let vk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
             stellar_strkey::ed25519::PublicKey(vk.to_bytes())

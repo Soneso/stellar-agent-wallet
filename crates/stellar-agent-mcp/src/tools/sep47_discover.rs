@@ -111,7 +111,7 @@ impl WalletServer {
         }
 
         // Resolve the RPC URL from the active profile.
-        let rpc_url = self.profile.rpc_url.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
 
         match discover_claimed_seps(rpc_url, &args.contract_id).await {
             Ok(seps) => {

@@ -45,6 +45,8 @@ use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_core::profile::caip2::Caip2;
+use stellar_agent_network::NetworkContext;
 use tracing::info;
 use url::Url;
 use uuid::Uuid;
@@ -151,8 +153,8 @@ fn decode_hex32(s: &str) -> Option<[u8; 32]> {
 ///
 /// Extracted so tests can assert the exact `wire_code` without going through
 /// stdout. The read-only `list_pending` verb is exempt from this guard.
-pub(crate) fn mainnet_forbidden_error(network: TargetNetwork) -> Option<WalletError> {
-    if network == TargetNetwork::Mainnet {
+pub(crate) fn mainnet_forbidden_error(network: Caip2) -> Option<WalletError> {
+    if network.is_mainnet() {
         Some(WalletError::Network(NetworkError::MainnetWriteForbidden))
     } else {
         None
@@ -171,11 +173,13 @@ pub(crate) fn mainnet_forbidden_error(network: TargetNetwork) -> Option<WalletEr
 ///
 /// Never panics.
 pub async fn run(args: &ExecuteArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone())
+        .with_secondary(args.secondary_rpc_url.clone());
     // Structural mainnet pre-reject: refuse before loading any signer key.
     // The downstream submit_transaction_and_wait passphrase check also
     // blocks mainnet writes, but rejecting here avoids key access for a
     // doomed submission and makes the refusal explicit at the CLI layer.
-    if let Some(err) = mainnet_forbidden_error(args.network) {
+    if let Some(err) = mainnet_forbidden_error(context.chain_id) {
         let envelope: Envelope<()> = Envelope::err(&err);
         render_json(&envelope);
         return 1;
@@ -224,7 +228,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     };
 
     let (signer, mlock_degradation) =
-        match resolve_signer(&args.signer_source, Some(&profile_name)).await {
+        match resolve_signer(&args.signer_source, Some(&resolved_profile)).await {
             Ok(pair) => pair,
             Err(e) => {
                 let envelope: Envelope<()> = Envelope::err(&e);
@@ -249,21 +253,21 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         &request_id,
     );
 
-    let secondary_rpc_url = args
+    let secondary_rpc_url = context
         .secondary_rpc_url
         .clone()
-        .unwrap_or_else(|| args.rpc_url.clone());
+        .unwrap_or_else(|| context.rpc_url.clone());
 
     // Warn when secondary == primary: the dual-RPC divergence defence is
     // degraded. A single compromised RPC can satisfy both confirmation checks.
     // Provide --secondary-rpc-url pointing to an independent endpoint.
     // Log host-only at INFO; full URL at DEBUG.
-    let rpc_host = Url::parse(&args.rpc_url)
+    let rpc_host = Url::parse(&context.rpc_url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
         .unwrap_or_else(|| "<unparseable>".to_owned());
 
-    if secondary_rpc_url == args.rpc_url {
+    if secondary_rpc_url == context.rpc_url {
         info!(
             request_id = %request_id,
             rpc_host = %rpc_host,
@@ -272,7 +276,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
              provide an independent secondary RPC endpoint for production use"
         );
     }
-    tracing::debug!(rpc_url = %args.rpc_url, "execute rpc_url (full, debug-only)");
+    tracing::debug!(rpc_url = %context.rpc_url, "execute rpc_url (full, debug-only)");
 
     let timelock_redacted = redact_strkey_first5_last5(&args.timelock);
 
@@ -280,7 +284,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         timelock = %timelock_redacted,
         operation_id = %&args.operation_id[..8],
         function = %args.function,
-        network = %args.network,
+        network = %context.chain_id,
         request_id = %request_id,
         "smart-account timelock execute: submitting"
     );
@@ -300,7 +304,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         }
     };
     // Settle open reservations before this operation records or signs a submission.
-    if let Ok(reconcile_client) = stellar_agent_network::StellarRpcClient::new(&args.rpc_url) {
+    if let Ok(reconcile_client) = stellar_agent_network::StellarRpcClient::new(&context.rpc_url) {
         crate::commands::submission_record::reconcile_open_reservations(
             &audit_profile,
             &profile_name,
@@ -342,9 +346,9 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             // No target-function args at CLI level.
             .salt(salt_bytes)
             .signer(signer.as_ref())
-            .primary_rpc_url(&args.rpc_url)
+            .primary_rpc_url(&context.rpc_url)
             .secondary_rpc_url(&secondary_rpc_url)
-            .network_passphrase(args.network.passphrase())
+            .network_passphrase(context.network_passphrase())
             .audit_writer(&audit_writer)
             .request_id(&request_id)
             .expected_operation_id(&user_supplied_op_id)
@@ -407,7 +411,7 @@ mod tests {
     #[test]
     fn execute_mainnet_guard_emits_correct_wire_code() {
         use crate::common::network::TargetNetwork;
-        let err = mainnet_forbidden_error(TargetNetwork::Mainnet)
+        let err = mainnet_forbidden_error(TargetNetwork::Mainnet.caip2())
             .expect("mainnet must yield Some(WalletError)");
         assert_eq!(
             err.code(),
@@ -416,7 +420,7 @@ mod tests {
             err.code()
         );
         assert!(
-            mainnet_forbidden_error(TargetNetwork::Testnet).is_none(),
+            mainnet_forbidden_error(TargetNetwork::Testnet.caip2()).is_none(),
             "testnet must not trigger the mainnet guard"
         );
     }

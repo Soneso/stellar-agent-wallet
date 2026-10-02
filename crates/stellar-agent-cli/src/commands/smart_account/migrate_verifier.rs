@@ -75,6 +75,8 @@ use std::time::Duration;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_core::profile::caip2::Caip2;
+use stellar_agent_network::NetworkContext;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::migration::{
     MigrationPlan, MigrationPlanner, MigrationSubmitResult, PendingAddStep, SignerMigrationStep,
@@ -381,25 +383,18 @@ pub struct MigrateVerifierResult {
 /// - [`stellar_agent_smart_account::managers::signers::SignersManager::new`] fails →
 ///   propagated from [`construct_signers_manager_from_fields`].
 fn dry_run_signers_manager(
+    context: &NetworkContext,
     args: &MigrateVerifierArgs,
 ) -> Result<(SignersManager, String), WalletError> {
     let resolved_profile = resolve_profile_name(args.profile.as_deref());
     let profile_name = resolved_profile.name.clone();
-    let chain_id = args.network.caip2().caip2_str().to_owned();
+    let chain_id = context.chain_id.caip2_str().to_owned();
     let timeout = Duration::from_secs(args.timeout_seconds);
-    let secondary_rpc_url = args
-        .secondary_rpc_url
-        .as_deref()
-        .unwrap_or(&args.rpc_url)
-        .to_owned();
     let (_audit_profile, audit_writer, audit_log_path) =
         open_profile_audit_writer_read_only(&resolved_profile)?;
     let manager = construct_signers_manager_from_fields(
         &profile_name,
-        args.network.passphrase(),
-        &chain_id,
-        &args.rpc_url,
-        &secondary_rpc_url,
+        context,
         timeout,
         audit_writer,
         &audit_log_path,
@@ -419,12 +414,14 @@ fn dry_run_signers_manager(
 ///
 /// Never panics.
 pub async fn run(args: &MigrateVerifierArgs) -> i32 {
+    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone())
+        .with_secondary(args.secondary_rpc_url.clone());
     let request_id = Uuid::new_v4().to_string();
 
     // Structural mainnet refusal — first gate, before flag-value validation,
     // key access, or any RPC call.  Dry-run on mainnet stays allowed
     // (read-only).
-    if let Some(err) = mainnet_submit_refusal(args.network, args.dry_run) {
+    if let Some(err) = mainnet_submit_refusal(context.chain_id, args.dry_run) {
         return emit_error(&err, &request_id);
     }
 
@@ -467,7 +464,7 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
     };
 
     if args.dry_run {
-        let (manager, chain_id) = match dry_run_signers_manager(args) {
+        let (manager, chain_id) = match dry_run_signers_manager(&context, args) {
             Ok(ctx) => ctx,
             Err(e) => return emit_error(&e, &request_id),
         };
@@ -506,7 +503,7 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
     }
 
     // Build handler context: resolves signer, opens audit writer, constructs RPC handles.
-    let ctx = match CommonHandlerContext::new(args).await {
+    let ctx = match CommonHandlerContext::new(args, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
     };
@@ -562,7 +559,7 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
             &plan,
             &args.account,
             &args.to_verifier,
-            &ctx.chain_id,
+            ctx.context.chain_id.caip2_str(),
         );
         // Return as a submit result with 0 submitted steps.
         let mut submit_result = result;
@@ -581,7 +578,13 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
         .submit(ctx.signer.as_ref(), &manager, &request_id)
         .await;
 
-    let result = migration_plan_to_result_submitted(&plan, &submit_result, args, &ctx.chain_id);
+    let result = migration_plan_to_result_submitted(
+        &context,
+        &plan,
+        &submit_result,
+        args,
+        ctx.context.chain_id.caip2_str(),
+    );
 
     // If the submission failed at any step, emit the error alongside the
     // partial result and return exit code 1.  The canonical
@@ -590,7 +593,7 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
     // A pair that stopped after its removal was sent prints the command that
     // completes it first.
     if let Some(ref err) = submit_result.failed_step_error {
-        if let Some(line) = partial_failure_recovery_line(args, &result, err) {
+        if let Some(line) = partial_failure_recovery_line(&context, args, &result, err) {
             #[allow(
                 clippy::print_stderr,
                 reason = "the operator's recovery instruction, beside the JSON envelope on stdout"
@@ -622,8 +625,8 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
 /// forbids mainnet writes unconditionally in this alpha, so the command
 /// surface refuses up front with the same wire code as every other write
 /// surface (`network.mainnet_write_forbidden`).
-fn mainnet_submit_refusal(network: TargetNetwork, dry_run: bool) -> Option<WalletError> {
-    (network == TargetNetwork::Mainnet && !dry_run)
+fn mainnet_submit_refusal(network: Caip2, dry_run: bool) -> Option<WalletError> {
+    (network.is_mainnet() && !dry_run)
         .then_some(WalletError::Network(NetworkError::MainnetWriteForbidden))
 }
 
@@ -725,6 +728,7 @@ fn migration_plan_to_result_dry_run(
 /// Converts a [`MigrationPlan`] + [`MigrationSubmitResult`] into a
 /// submitted [`MigrateVerifierResult`].
 fn migration_plan_to_result_submitted(
+    context: &NetworkContext,
     plan: &MigrationPlan,
     submit_result: &MigrationSubmitResult,
     args: &MigrateVerifierArgs,
@@ -799,7 +803,7 @@ fn migration_plan_to_result_submitted(
             remove_tx_hash: pending.remove_tx_hash.clone(),
             remove_confirmed: pending.remove_confirmed,
             add_tx_hash: pending.add_tx_hash.clone(),
-            recovery_command: recovery_command(args, pending),
+            recovery_command: recovery_command(context, args, pending),
         });
 
     MigrateVerifierResult {
@@ -859,7 +863,7 @@ fn shell_word(value: &str) -> String {
 /// The signer-source, `--profile`, `--network` and `--timeout-seconds`
 /// flags of the invocation, each preceded by a space. The endpoint flags
 /// are omitted: a URL can carry a credential.
-fn invocation_flags(args: &MigrateVerifierArgs) -> String {
+fn invocation_flags(context: &NetworkContext, args: &MigrateVerifierArgs) -> String {
     let mut flags = String::new();
     if let Some(var) = &args.signer_source.signer_secret_env {
         flags.push_str(&format!(" --signer-secret-env {}", shell_word(var)));
@@ -874,7 +878,12 @@ fn invocation_flags(args: &MigrateVerifierArgs) -> String {
     }
     flags.push_str(&format!(
         " --network {} --timeout-seconds {}",
-        args.network, args.timeout_seconds
+        if context.chain_id.is_mainnet() {
+            "mainnet"
+        } else {
+            "testnet"
+        },
+        args.timeout_seconds
     ));
     flags
 }
@@ -882,7 +891,11 @@ fn invocation_flags(args: &MigrateVerifierArgs) -> String {
 /// The `signers add` command that completes the pair of `pending`, with the
 /// invocation's flags ([`invocation_flags`]). The destination is the `--to`
 /// verifier the plan's destination was parsed from.
-fn recovery_command(args: &MigrateVerifierArgs, pending: &PendingAddStep) -> String {
+fn recovery_command(
+    context: &NetworkContext,
+    args: &MigrateVerifierArgs,
+    pending: &PendingAddStep,
+) -> String {
     format!(
         "stellar-agent smart-account signers add --account {} --rule-id {} \
          --signer-external {} --signer-key-data {}{}",
@@ -890,18 +903,18 @@ fn recovery_command(args: &MigrateVerifierArgs, pending: &PendingAddStep) -> Str
         pending.rule_id,
         shell_word(&args.to_verifier),
         hex::encode(&pending.key_data),
-        invocation_flags(args),
+        invocation_flags(context, args),
     )
 }
 
 /// The `signers refresh --accept-divergence` command that records the chain
 /// state of rule `rule_id`, with the invocation's flags.
-fn refresh_command(args: &MigrateVerifierArgs, rule_id: u32) -> String {
+fn refresh_command(context: &NetworkContext, args: &MigrateVerifierArgs, rule_id: u32) -> String {
     format!(
         "stellar-agent smart-account signers refresh --account {} --rule-id {rule_id} \
          --accept-divergence{}",
         shell_word(&args.account),
-        invocation_flags(args),
+        invocation_flags(context, args),
     )
 }
 
@@ -957,13 +970,14 @@ fn render_steps(steps: &[RecoveryStep]) -> String {
 /// while a source signer is still on the rule. The re-run compares the rule
 /// with its newest state row, so it follows the refresh.
 fn partial_failure_recovery_line(
+    context: &NetworkContext,
     args: &MigrateVerifierArgs,
     result: &MigrateVerifierResult,
     error: &SaError,
 ) -> Option<String> {
     let pending = result.pending_add.as_ref()?;
     let add = || RecoveryStep::Run(pending.recovery_command.clone());
-    let refresh = || RecoveryStep::Run(refresh_command(args, pending.rule_id));
+    let refresh = || RecoveryStep::Run(refresh_command(context, args, pending.rule_id));
     let remaining = has_later_step_on_rule(result, pending.rule_id).then_some(pending.rule_id);
     let steps = |repair: Option<RecoveryStep>, then_add: bool| -> String {
         let mut steps: Vec<RecoveryStep> = repair.into_iter().collect();
@@ -1171,6 +1185,7 @@ mod tests {
             1,
         );
         migration_plan_to_result_submitted(
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
             &plan_with(later_steps),
             &submitted,
             args,
@@ -1266,7 +1281,11 @@ mod tests {
 
         // (a) The removal confirmed and was recorded; the add failed.
         let pending = pending_step(true, None);
-        let command = recovery_command(&args, &pending);
+        let command = recovery_command(
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+            &args,
+            &pending,
+        );
         let error = SaError::VerifierMigrationFailed {
             phase: "submit_simulate",
             smart_account_redacted: redacted(),
@@ -1275,7 +1294,13 @@ mod tests {
         };
         let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 0);
         assert_eq!(
-            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            partial_failure_recovery_line(
+                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+                &args,
+                &result,
+                &error
+            )
+            .as_deref(),
             Some(format!("run: {command}").as_str())
         );
         let value = partial_envelope(result, &error);
@@ -1299,7 +1324,13 @@ mod tests {
         // A later step on the rule: the re-run precedes the add.
         let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 1);
         assert_eq!(
-            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            partial_failure_recovery_line(
+                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+                &args,
+                &result,
+                &error
+            )
+            .as_deref(),
             Some(format!("{remaining}, then: {command}").as_str())
         );
 
@@ -1307,7 +1338,13 @@ mod tests {
         let error = baseline_write_failed();
         let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 0);
         assert_eq!(
-            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            partial_failure_recovery_line(
+                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+                &args,
+                &result,
+                &error
+            )
+            .as_deref(),
             Some(format!("run: {refresh}, then: {command}").as_str())
         );
         let value = partial_envelope(result, &error);
@@ -1316,7 +1353,13 @@ mod tests {
         // (b) with a later step on the rule: refresh, the re-run, the add.
         let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 1);
         assert_eq!(
-            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            partial_failure_recovery_line(
+                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+                &args,
+                &result,
+                &error
+            )
+            .as_deref(),
             Some(format!("run: {refresh}, then {remaining}, then: {command}").as_str())
         );
 
@@ -1327,7 +1370,13 @@ mod tests {
             let error = diverged(tx_hash.clone());
             let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 0);
             assert_eq!(
-                partial_failure_recovery_line(&args, &result, &error).as_deref(),
+                partial_failure_recovery_line(
+                    &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+                    &args,
+                    &result,
+                    &error
+                )
+                .as_deref(),
                 Some(format!("run: {refresh}, then: {command}").as_str()),
                 "{tx_hash:?}"
             );
@@ -1339,7 +1388,15 @@ mod tests {
         // the error's own Display names the refresh.
         let error = baseline_write_failed();
         let result = partial_result(&args, None, None, 0);
-        assert_eq!(partial_failure_recovery_line(&args, &result, &error), None);
+        assert_eq!(
+            partial_failure_recovery_line(
+                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+                &args,
+                &result,
+                &error
+            ),
+            None
+        );
         let value = partial_envelope(result, &error);
         assert!(value["data"].get("pending_add").is_none());
         assert!(value["data"].get("failed_step_remove_tx_hash").is_none());
@@ -1350,7 +1407,13 @@ mod tests {
         let error = unresolved("a".repeat(64));
         let result = partial_result(&args, Some(pending.clone()), None, 1);
         assert_eq!(
-            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            partial_failure_recovery_line(
+                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+                &args,
+                &result,
+                &error
+            )
+            .as_deref(),
             Some(
                 format!(
                     "the remove transaction {} has an unknown outcome. Once it is confirmed, \
@@ -1380,7 +1443,13 @@ mod tests {
         let error = unresolved("b".repeat(64));
         let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 0);
         assert_eq!(
-            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            partial_failure_recovery_line(
+                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+                &args,
+                &result,
+                &error
+            )
+            .as_deref(),
             Some(
                 format!(
                     "the add transaction {} has an unknown outcome. Once it is confirmed, \
@@ -1396,7 +1465,13 @@ mod tests {
         // (c) The add's outcome is unknown with a later step on the rule.
         let result = partial_result(&args, Some(pending), confirmed_hash, 1);
         assert_eq!(
-            partial_failure_recovery_line(&args, &result, &error).as_deref(),
+            partial_failure_recovery_line(
+                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+                &args,
+                &result,
+                &error
+            )
+            .as_deref(),
             Some(
                 format!(
                     "the add transaction {} has an unknown outcome. Once it is confirmed, \
@@ -1429,8 +1504,13 @@ mod tests {
             None,
             2,
         );
-        let result =
-            migration_plan_to_result_submitted(&plan_with(1), &submitted, &args, "stellar:testnet");
+        let result = migration_plan_to_result_submitted(
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+            &plan_with(1),
+            &submitted,
+            &args,
+            "stellar:testnet",
+        );
         assert_eq!(result.submitted_steps_count, 1);
         assert_eq!(result.failed_step_index, Some(1));
         assert!(result.pending_add.is_none());
@@ -1460,7 +1540,11 @@ mod tests {
     #[test]
     fn recovery_command_renders_the_signers_add_of_the_pending_step() {
         let args = recovery_args();
-        let command = recovery_command(&args, &pending_step(true, None));
+        let command = recovery_command(
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+            &args,
+            &pending_step(true, None),
+        );
         assert_eq!(
             command,
             format!(
@@ -1478,7 +1562,11 @@ mod tests {
         ledger.signer_source.sign_with_ledger = true;
         ledger.signer_source.account_index = Some(3);
         ledger.profile = Some("ops team's".to_owned());
-        let command = recovery_command(&ledger, &pending_step(true, None));
+        let command = recovery_command(
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+            &ledger,
+            &pending_step(true, None),
+        );
         assert!(
             command.ends_with(
                 " --sign-with-ledger --account-index 3 --profile 'ops team'\\''s' \
@@ -1518,7 +1606,7 @@ mod tests {
         reason = "test-only; expect on expected-Some is the assertion"
     )]
     fn mainnet_submit_refused_with_mainnet_write_forbidden() {
-        let err = mainnet_submit_refusal(TargetNetwork::Mainnet, false)
+        let err = mainnet_submit_refusal(TargetNetwork::Mainnet.caip2(), false)
             .expect("mainnet submit must refuse");
         assert_eq!(err.code(), "network.mainnet_write_forbidden");
     }
@@ -1527,11 +1615,11 @@ mod tests {
     #[test]
     fn mainnet_dry_run_and_testnet_submit_pass_the_structural_gate() {
         assert!(
-            mainnet_submit_refusal(TargetNetwork::Mainnet, true).is_none(),
+            mainnet_submit_refusal(TargetNetwork::Mainnet.caip2(), true).is_none(),
             "mainnet dry-run must stay available (read-only)"
         );
         assert!(
-            mainnet_submit_refusal(TargetNetwork::Testnet, false).is_none(),
+            mainnet_submit_refusal(TargetNetwork::Testnet.caip2(), false).is_none(),
             "testnet submit must pass the structural gate"
         );
     }

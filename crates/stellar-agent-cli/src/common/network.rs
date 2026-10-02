@@ -172,7 +172,7 @@ mod tests {
         assert_eq!(TargetNetwork::Testnet.caip2(), Caip2::Testnet);
         assert_eq!(TargetNetwork::Mainnet.caip2(), Caip2::Mainnet);
         assert_eq!(
-            crate::commands::policy_engine::caip2_chain_id_for_network(TargetNetwork::Mainnet),
+            TargetNetwork::Mainnet.caip2().caip2_str(),
             "stellar:mainnet"
         );
     }

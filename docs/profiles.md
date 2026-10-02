@@ -114,14 +114,24 @@ one.
 
 ## Loader source order
 
-A profile is assembled from three layered sources. Higher-priority sources
-override lower ones field-by-field:
+The profile file is the record the operator audits. Its `chain_id` is
+non-overlayable on every chain. On mainnet, `rpc_url` is also protected.
+An environment or programmatic overlay naming either protected field is
+refused with `profile.non_overlayable_field`, even when its value equals the file.
+An equal overlay can hide a later edit to the audited record.
 
-1. **TOML file** — `<profile_dir>/<name>.toml` (lowest priority).
-2. **Environment overlay** — variables prefixed `STELLAR_AGENT_`. For example,
-   `STELLAR_AGENT_RPC_URL=https://...` overrides the `rpc_url` field.
-3. **CLI overlay** — programmatic key/value pairs supplied by a command at
-   resolve time (highest priority).
+The remaining fields merge in increasing priority:
+
+1. **TOML file:** `<profile_dir>/<name>.toml`.
+2. **Environment overlay:** variables prefixed `STELLAR_AGENT_`.
+3. **Programmatic overlay:** key/value pairs supplied by a command.
+
+A testnet `rpc_url` remains overlayable. `secondary_rpc_url` remains overlayable
+on both chains.
+
+A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE` never selects one, and a mainnet `default.toml` needs `--profile default`. Keep the filename: its identity is bound to its keyring entries.
+
+Unset `STELLAR_AGENT_CHAIN_ID` and, for a mainnet profile, `STELLAR_AGENT_RPC_URL` first. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
 
 After merging, the loader resolves derived fields and validates:
 

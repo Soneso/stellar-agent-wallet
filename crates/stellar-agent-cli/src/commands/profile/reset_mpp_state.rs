@@ -2,10 +2,11 @@
 
 use clap::{ArgGroup, Args};
 use stellar_agent_core::envelope::Envelope;
+use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_mpp::MppAuthorizationStore;
 
 use crate::common::{
-    profile_access::{load_profile_reconciled_by_requested_name, profile_access_envelope},
+    profile_access::{load_profile_reconciled, profile_access_envelope},
     render,
 };
 
@@ -57,7 +58,8 @@ pub(crate) fn run(args: &ResetMppStateArgs) -> i32 {
         return 1;
     }
     let profile_name = args.profile_name();
-    let profile = match load_profile_reconciled_by_requested_name(profile_name, None) {
+    let profile = match load_profile_reconciled(&ResolvedProfileName::from_flag(profile_name), None)
+    {
         Ok(profile) => profile,
         Err(error) => {
             render::render_json(&profile_access_envelope(&error, profile_name));

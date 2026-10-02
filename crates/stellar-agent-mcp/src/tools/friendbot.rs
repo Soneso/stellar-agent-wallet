@@ -161,7 +161,7 @@ impl WalletServer {
         let friendbot_url: String = args
             .friendbot_url
             .clone()
-            .or_else(|| default_friendbot_url(self.profile.chain_id).map(str::to_owned))
+            .or_else(|| default_friendbot_url(self.context.chain_id).map(str::to_owned))
             .ok_or_else(|| {
                 rmcp::ErrorData::invalid_params("no default friendbot URL for this chain", None)
             })?;
@@ -176,13 +176,13 @@ impl WalletServer {
         // Pass the profile's network passphrase (not the chain_id string) to
         // fund_with_friendbot so the mainnet-passphrase gate fires even if
         // the policy gate were somehow bypassed.
-        let network_passphrase = self.profile.network_passphrase.as_str();
+        let network_passphrase = self.context.network_passphrase();
 
         match stellar_agent_network::fund_with_friendbot(
             &friendbot_url,
             &args.account_id,
             network_passphrase,
-            &self.profile.rpc_url,
+            &self.context.rpc_url,
         )
         .await
         {

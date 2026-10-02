@@ -97,6 +97,7 @@ use stellar_agent_core::StellarAmount;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{AuthError, NetworkError, ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_network::NetworkContext;
 use zeroize::Zeroizing;
 
 use stellar_agent_network::builder::ClassicOpBuilder;
@@ -111,8 +112,7 @@ use stellar_agent_network::{
 use stellar_agent_network::{FriendbotResult, fund_with_friendbot};
 
 use crate::commands::policy_engine::{
-    build_v1_policy_engine, caip2_chain_id_for_network, create_policy_args,
-    evaluate_value_moving_policy,
+    build_v1_policy_engine, create_policy_args, evaluate_value_moving_policy,
 };
 use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::profile_access::{
@@ -429,8 +429,9 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone());
     if args.fund_with_friendbot {
-        run_friendbot(args).await
+        run_friendbot(&context, args).await
     } else {
         let resolved = resolve_profile_name(args.profile.as_deref());
         // The resolved name and the input that supplied it are logged
@@ -443,7 +444,7 @@ where
             profile_source = resolved.source.as_str(),
             "accounts create: profile resolved"
         );
-        run_sponsored(args, &resolved, load_profile, init_keyring).await
+        run_sponsored(&context, args, &resolved, load_profile, init_keyring).await
     }
 }
 
@@ -529,12 +530,12 @@ fn resolve_new_account(args: &CreateArgs) -> Result<NewAccount, WalletError> {
 // Friendbot mode
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn run_friendbot(args: &CreateArgs) -> i32 {
+async fn run_friendbot(context: &NetworkContext, args: &CreateArgs) -> i32 {
     // No operator-policy gate here: Friendbot mode funds the new account from
     // the external testnet faucet and debits no wallet-held funds, so there is
     // no value-moving leg for the policy engine to evaluate.
     // First layer: structural mainnet rejection.
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         let err = WalletError::Network(NetworkError::FriendbotMainnetForbidden);
         let envelope = Envelope::<()>::err(&err);
         print_error(&envelope, args.output);
@@ -550,14 +551,14 @@ async fn run_friendbot(args: &CreateArgs) -> i32 {
         }
     };
 
-    let passphrase = args.network.passphrase();
+    let passphrase = context.network_passphrase();
 
     // Second layer: fund_with_friendbot rejects mainnet passphrase.
     match fund_with_friendbot(
         &args.friendbot_url,
         &new_account.g_strkey,
         passphrase,
-        &args.rpc_url,
+        &context.rpc_url,
     )
     .await
     {
@@ -671,6 +672,7 @@ fn evaluate_create_policy(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_sponsored<LoadProfile, InitKeyring>(
+    context: &NetworkContext,
     args: &CreateArgs,
     resolved: &ResolvedProfileName,
     load_profile: LoadProfile,
@@ -681,7 +683,7 @@ where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     // Sponsored mode — mainnet write forbidden.
-    if args.network == TargetNetwork::Mainnet {
+    if context.chain_id.is_mainnet() {
         let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
         let envelope = Envelope::<()>::err(&err);
         print_error(&envelope, args.output);
@@ -794,7 +796,7 @@ where
     // runs strictly before any build/sign/submit work in this command, so
     // the fetched view cannot be threaded into that later call without
     // restructuring the build pipeline — a known, accepted extra round-trip).
-    let client = match StellarRpcClient::new(&args.rpc_url) {
+    let client = match StellarRpcClient::new(&context.rpc_url) {
         Ok(c) => c,
         Err(e) => {
             print_error(&Envelope::<()>::err(&e), args.output);
@@ -833,7 +835,7 @@ where
     .await;
 
     // ── Operator policy evaluation (before signing/submission) ───────────────
-    let chain_id = caip2_chain_id_for_network(args.network);
+    let chain_id = context.chain_id.caip2_str();
     let starting_balance_stroops = starting_balance.as_stroops();
     let create_effects = match evaluate_create_policy(
         args,
@@ -896,6 +898,7 @@ where
     };
 
     match sponsored_create(
+        context,
         args,
         &sponsor,
         &new_account.g_strkey,
@@ -949,6 +952,7 @@ where
 ///
 /// Propagates errors from account fetch, signing, or submission.
 async fn sponsored_create(
+    context: &NetworkContext,
     args: &CreateArgs,
     sponsor: &str,
     new_account: &str,
@@ -956,9 +960,10 @@ async fn sponsored_create(
     recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>,
 ) -> Result<SponsoredCreateResult, WalletError> {
     let built =
-        build_sponsored_unsigned_envelope(args, sponsor, new_account, starting_balance).await?;
+        build_sponsored_unsigned_envelope(context, args, sponsor, new_account, starting_balance)
+            .await?;
 
-    let passphrase = args.network.passphrase();
+    let passphrase = context.network_passphrase();
 
     let signed_xdr = if args.sign_with_ledger {
         // Hardware path: seed never enters process memory.
@@ -1007,7 +1012,7 @@ async fn sponsored_create(
     };
 
     // Submit and wait for confirmation.
-    let client = StellarRpcClient::new(&args.rpc_url)?;
+    let client = StellarRpcClient::new(&context.rpc_url)?;
     let timeout = Duration::from_secs(args.timeout_seconds);
     let submission = submit_transaction_and_wait(
         &client,
@@ -1026,12 +1031,13 @@ async fn sponsored_create(
 }
 
 async fn build_sponsored_unsigned_envelope(
+    context: &NetworkContext,
     args: &CreateArgs,
     sponsor: &str,
     new_account: &str,
     starting_balance: StellarAmount,
 ) -> Result<BuiltCreateAccountEnvelope, WalletError> {
-    let client = StellarRpcClient::new(&args.rpc_url)?;
+    let client = StellarRpcClient::new(&context.rpc_url)?;
     let fee_choice = parse_classic_fee_choice(args.fee.as_deref())?;
     let fee_selection =
         resolve_classic_fee_selection(&client, DEFAULT_FEE_STROOPS, fee_choice).await?;
@@ -1044,7 +1050,7 @@ async fn build_sponsored_unsigned_envelope(
     // here would produce CURRENT+2 → TxBadSeq.
     let sequence_number = sponsor_account.sequence_number;
 
-    let passphrase = args.network.passphrase();
+    let passphrase = context.network_passphrase();
 
     // Build the unsigned CreateAccount transaction.
     let mut builder = ClassicOpBuilder::new(
@@ -1508,9 +1514,15 @@ mod tests {
         let starting_balance =
             StellarAmount::parse_with_unit("1 XLM").expect("test amount with unit must parse");
 
-        let built = build_sponsored_unsigned_envelope(&args, SOURCE_G, DEST_G, starting_balance)
-            .await
-            .expect("explicit fee create-account build succeeds");
+        let built = build_sponsored_unsigned_envelope(
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+            &args,
+            SOURCE_G,
+            DEST_G,
+            starting_balance,
+        )
+        .await
+        .expect("explicit fee create-account build succeeds");
         assert_eq!(built.fee_selection.per_op_stroops, 250);
         assert_eq!(built.fee_selection.selected_fee_percentile, "explicit");
         assert_eq!(tx_fee_from_envelope_xdr(&built.envelope_xdr), 250);
@@ -1563,9 +1575,15 @@ mod tests {
         let starting_balance =
             StellarAmount::parse_with_unit("1 XLM").expect("test amount with unit must parse");
 
-        let built = build_sponsored_unsigned_envelope(&args, SOURCE_G, DEST_G, starting_balance)
-            .await
-            .expect("default fee create-account build succeeds");
+        let built = build_sponsored_unsigned_envelope(
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+            &args,
+            SOURCE_G,
+            DEST_G,
+            starting_balance,
+        )
+        .await
+        .expect("default fee create-account build succeeds");
         assert_eq!(built.fee_selection.per_op_stroops, DEFAULT_FEE_STROOPS);
         assert_eq!(
             built.fee_selection.selected_fee_percentile,
@@ -1582,9 +1600,15 @@ mod tests {
         let starting_balance =
             StellarAmount::parse_with_unit("1 XLM").expect("test amount with unit must parse");
 
-        let built = build_sponsored_unsigned_envelope(&args, SOURCE_G, DEST_G, starting_balance)
-            .await
-            .expect("auto fee create-account build succeeds");
+        let built = build_sponsored_unsigned_envelope(
+            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+            &args,
+            SOURCE_G,
+            DEST_G,
+            starting_balance,
+        )
+        .await
+        .expect("auto fee create-account build succeeds");
         assert_eq!(built.fee_selection.per_op_stroops, 333);
         assert_eq!(built.fee_selection.selected_fee_percentile, "p95");
         assert_eq!(tx_fee_from_envelope_xdr(&built.envelope_xdr), 333);

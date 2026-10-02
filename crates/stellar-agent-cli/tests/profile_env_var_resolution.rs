@@ -134,6 +134,15 @@ impl Run {
 /// Spawns the CLI with `STELLAR_AGENT_HOME` pointed at `home` and an optional
 /// `STELLAR_AGENT_PROFILE` value, and returns the captured output.
 fn run_cli(home: &Path, env_profile: Option<&str>, args: &[&str]) -> Run {
+    run_cli_with_env(home, env_profile, args, &[])
+}
+
+fn run_cli_with_env(
+    home: &Path,
+    env_profile: Option<&str>,
+    args: &[&str],
+    overlay: &[(&str, &str)],
+) -> Run {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
     let mut command = Command::new(bin_path);
     command
@@ -148,6 +157,12 @@ fn run_cli(home: &Path, env_profile: Option<&str>, args: &[&str]) -> Run {
         None => command.env_remove("STELLAR_AGENT_PROFILE"),
     };
 
+    command
+        .env_remove("STELLAR_AGENT_CHAIN_ID")
+        .env_remove("STELLAR_AGENT_RPC_URL");
+    for (name, value) in overlay {
+        command.env(name, value);
+    }
     let output = command.output().expect("stellar-agent binary must run");
     Run {
         code: output.status.code().expect("process must exit with a code"),
@@ -651,4 +666,140 @@ fn the_moved_verbs_let_the_profile_flag_beat_the_environment_variable() {
             run.stderr
         );
     }
+}
+
+fn write_mainnet_profile(home: &Path, name: &str, rpc_url: &str) {
+    let profile = Profile::builder_mainnet_named(name, "s", "a", "n", "a")
+        .rpc_url(rpc_url)
+        .audit_log_path(home.join("audit").join(format!("{name}.jsonl")))
+        .with_noop_engine()
+        .build();
+    save_new_to_dir(name, &profile, &home.join("profiles")).unwrap();
+}
+
+#[test]
+fn chain_id_environment_overlay_refuses_testnet_profile() {
+    let home = tempfile::tempdir().unwrap();
+    write_profile(home.path(), "testnet", UNREACHABLE_RPC, None);
+    let run = run_cli_with_env(
+        home.path(),
+        None,
+        &["profile", "show", "--profile", "testnet"],
+        &[("STELLAR_AGENT_CHAIN_ID", "stellar:mainnet")],
+    );
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
+}
+
+#[test]
+fn rpc_environment_overlay_refuses_mainnet_profile() {
+    let home = tempfile::tempdir().unwrap();
+    write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_RPC);
+    let run = run_cli_with_env(
+        home.path(),
+        None,
+        &["profile", "show", "--profile", "mainnet"],
+        &[("STELLAR_AGENT_RPC_URL", "https://overlay.example")],
+    );
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
+}
+
+#[tokio::test]
+async fn trustline_mainnet_rpc_overlay_refuses_before_endpoint_contact() {
+    let home = tempfile::tempdir().unwrap();
+    let endpoint = wiremock::MockServer::start().await;
+    let overlay_url = endpoint.uri();
+    write_mainnet_profile(home.path(), "mainnet", &overlay_url);
+    let run = tokio::task::spawn_blocking(move || {
+        run_cli_with_env(
+            home.path(),
+            None,
+            &[
+                "trustline",
+                "--from",
+                SOURCE_G,
+                "--asset",
+                "USDC",
+                "--profile",
+                "mainnet",
+            ],
+            &[("STELLAR_AGENT_RPC_URL", &overlay_url)],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
+    assert!(endpoint.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn trustline_mainnet_environment_refuses_before_endpoint_contact() {
+    let home = tempfile::tempdir().unwrap();
+    let endpoint = wiremock::MockServer::start().await;
+    write_mainnet_profile(home.path(), "mainnet", &endpoint.uri());
+    let run = tokio::task::spawn_blocking(move || run_trustline(home.path(), Some("mainnet"), &[]))
+        .await
+        .unwrap();
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    assert_eq!(
+        run.json()["error"]["code"],
+        "profile.mainnet_requires_explicit_profile"
+    );
+    assert!(endpoint.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn trustline_mainnet_flag_passes_selection() {
+    let home = tempfile::tempdir().unwrap();
+    write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_RPC);
+    let run = run_trustline(home.path(), Some("mainnet"), &["--profile", "mainnet"]);
+    assert_ne!(
+        run.json()["error"]["code"],
+        "profile.mainnet_requires_explicit_profile",
+        "{}",
+        run.stdout
+    );
+}
+
+fn assert_registration_environment_refuses(verb: &str, extra: &[&str]) {
+    let home = tempfile::tempdir().unwrap();
+    write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_RPC);
+    let registry = home.path().join("networks.toml");
+    let mut args = vec!["smart-account", verb];
+    args.extend_from_slice(extra);
+    let run = run_cli_with_env(
+        home.path(),
+        Some("mainnet"),
+        &args,
+        &[(
+            stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            registry.to_str().unwrap(),
+        )],
+    );
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    assert_eq!(
+        run.json()["error"]["code"],
+        "profile.mainnet_requires_explicit_profile"
+    );
+    assert!(!registry.exists(), "refusal must precede registry writes");
+}
+
+#[test]
+fn register_multicall_mainnet_environment_refuses_without_registry_write() {
+    assert_registration_environment_refuses(
+        "register-multicall",
+        &[
+            "--address",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--wasm-sha256",
+            stellar_agent_smart_account::multicall::MULTICALL_WASM_SHA256,
+        ],
+    );
+}
+
+#[test]
+fn unregister_multicall_mainnet_environment_refuses_without_registry_write() {
+    assert_registration_environment_refuses("unregister-multicall", &[]);
 }

@@ -41,6 +41,7 @@ use stellar_agent_core::error::WalletError;
 use stellar_agent_core::policy::v1::{ValueClass, ValueEffects};
 use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_network::NetworkContext;
 
 use crate::commands::policy_engine::{
     build_v1_policy_engine, evaluate_value_moving_policy_with_value,
@@ -150,12 +151,13 @@ where
 {
     // ── Resolve the profile name ──────────────────────────────────────────────
     // `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved.name.clone();
 
     // ── Load profile ──────────────────────────────────────────────────────────
     // Reconciled in the CALLER of the injected loader: a check placed inside
     // the closure would be bypassed by every test that supplies its own.
-    let profile = match reconcile_loaded_profile(load_profile(&profile_name), &profile_name) {
+    let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
         Ok(p) => p,
         Err(e) => {
             render_json(&Envelope::<()>::err_raw(e.code(), e.message(&profile_name)));
@@ -173,9 +175,11 @@ where
     }
 
     // ── Resolve network settings ──────────────────────────────────────────────
-    let rpc_url = profile.rpc_url.as_str();
-    let network_passphrase = profile.network_passphrase.as_str();
-    let chain_id = profile.chain_id.caip2_str();
+    let context =
+        NetworkContext::from_profile(&profile).with_secondary(args.secondary_rpc_url.clone());
+    let rpc_url = context.rpc_url.as_str();
+    let network_passphrase = context.network_passphrase();
+    let chain_id = context.chain_id.caip2_str();
 
     // ── Resolve pinned router address and WASM hash ───────────────────────────
     let (router_address, router_wasm_hash) = match pinned_router_for_network(chain_id) {
@@ -197,7 +201,7 @@ where
             return 1;
         }
     };
-    let secondary_rpc: Option<StellarRpcClient> = match args
+    let secondary_rpc: Option<StellarRpcClient> = match context
         .secondary_rpc_url
         .as_deref()
         .map(StellarRpcClient::new)

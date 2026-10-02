@@ -432,7 +432,7 @@ impl WalletServer {
         // ── Step 1: Resolve denomination (USDT deny + lookalike + pinned) ────
         let input = parse_denomination_input(&args.asset);
         let resolved: ResolvedAsset =
-            match resolve_denomination(input, &self.profile.network_passphrase) {
+            match resolve_denomination(input, self.context.network_passphrase()) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::info!(
@@ -456,7 +456,7 @@ impl WalletServer {
             };
 
         // ── Step 2: Live issuer account fetch ─────────────────────────────────
-        let rpc_url = self.profile.rpc_url.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
         let client = match StellarRpcClient::new(rpc_url) {
             Ok(c) => c,
             Err(err) => {
@@ -580,7 +580,7 @@ impl WalletServer {
         // so they always agree.
         let now_ms = now_unix_ms()
             .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
-        let network_key = self.profile.chain_id.caip2_str();
+        let network_key = self.context.chain_id.caip2_str();
         let opt_in_present = {
             // Load the attestation key for HMAC verification.  Fail-closed on
             // any keyring error — the gate then fires RefuseWithWarning for
@@ -604,7 +604,7 @@ impl WalletServer {
                                     &attestation_key,
                                     &stellar_agent_core::approval::AttestationBinding::new(
                                         &self.profile_name_for_approval(),
-                                        self.profile.chain_id.caip2_str(),
+                                        self.context.chain_id.caip2_str(),
                                     ),
                                     network_key,
                                     &resolved.code,
@@ -821,7 +821,7 @@ impl WalletServer {
         let mut builder = ClassicOpBuilder::new(
             &args.from,
             source_sequence,
-            &self.profile.network_passphrase,
+            self.context.network_passphrase(),
             fee_per_op_stroops,
         );
         if let Err(err) = builder.change_trust(&asset, limit_stroops) {
@@ -894,7 +894,7 @@ impl WalletServer {
                         Some(json!({
                             "approval_nonce": approval_nonce,
                             "profile": &profile_name,
-                            "chain_id": self.profile.chain_id.caip2_str(),
+                            "chain_id": self.context.chain_id.caip2_str(),
                             "expires_at_unix_ms": approval_expires,
                             "reason": entry.reason,
                             "summary": {
@@ -1072,7 +1072,7 @@ impl WalletServer {
 
         // ── Re-fetch source + issuer accounts (feed the policy gate's views;
         // sequence number also consumed by the rebuild below) ────────────────
-        let rpc_url = self.profile.rpc_url.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
         let client = match StellarRpcClient::new(rpc_url) {
             Ok(c) => c,
             Err(err) => {
@@ -1153,7 +1153,7 @@ impl WalletServer {
         let mut builder = ClassicOpBuilder::new(
             &args.from,
             source_sequence,
-            &self.profile.network_passphrase,
+            self.context.network_passphrase(),
             fee_per_op_stroops,
         );
         if let Err(err) = builder.change_trust(&asset, auth_limit_stroops) {
@@ -1198,7 +1198,13 @@ impl WalletServer {
         // consumed. A commit aimed at the wrong network is a configuration
         // error the caller can correct and retry; burning the nonce first
         // would cost them the approval as well.
-        if let Err(e) = crate::tools::common::probe_endpoint_network(&client, &self.profile).await {
+        if let Err(e) = crate::tools::common::probe_endpoint_network(
+            &client,
+            &self.context,
+            crate::tools::common::submit_timeout(&self.profile),
+        )
+        .await
+        {
             return Ok(crate::tools::common::commit_refusal_result(&e));
         }
 
@@ -1240,7 +1246,7 @@ impl WalletServer {
         let signed_xdr = match attach_signature(
             &args.envelope_xdr,
             &handle,
-            &self.profile.network_passphrase,
+            self.context.network_passphrase(),
         )
         .await
         {
@@ -1320,7 +1326,7 @@ impl WalletServer {
             &client,
             &signed_xdr,
             submit_timeout(&self.profile),
-            &self.profile.network_passphrase,
+            self.context.network_passphrase(),
             Some(SubmissionSignerKind::Keyring),
             Some(&recorder),
         )

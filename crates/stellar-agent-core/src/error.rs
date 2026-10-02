@@ -861,6 +861,24 @@ pub enum ValidationError {
         path: String,
     },
 
+    /// An overlay names a field whose value belongs to the profile file.
+    #[error(
+        "profile field `{field}` is read from the profile file only; remove it from the environment or the overlay"
+    )]
+    ProfileNonOverlayableField {
+        /// The protected field named by the overlay.
+        field: &'static str,
+    },
+
+    /// A mainnet profile was selected without an explicit profile flag.
+    #[error("profile `{name}` is a mainnet profile and loads only with `--profile {name}`; {}", named_by.mainnet_selection_description())]
+    MainnetRequiresExplicitProfile {
+        /// The selected profile name.
+        name: String,
+        /// The input that supplied the profile name.
+        named_by: crate::profile::ProfileNameSource,
+    },
+
     /// The selected profile's `policy_owner_key_id.service` names a different
     /// profile than the one that was requested.
     ///
@@ -1150,6 +1168,10 @@ impl ValidationError {
             // names the subsystem (profile.*) while the category stays
             // Validation, as `AuditLogNotFound` does for audit.*.
             Self::ProfileNameMismatch { .. } => "profile.name_mismatch",
+            Self::ProfileNonOverlayableField { .. } => "profile.non_overlayable_field",
+            Self::MainnetRequiresExplicitProfile { .. } => {
+                "profile.mainnet_requires_explicit_profile"
+            }
             // Audit taxonomy code on a validation-class variant: see
             // `AuditLogNotFound` above for the same rationale.
             Self::AuditChainKeyUnavailable { .. } => "audit.chain_key_unavailable",
@@ -2434,6 +2456,17 @@ mod tests {
                 "validation.profile_already_exists",
             ),
             (
+                ValidationError::ProfileNonOverlayableField { field: "chain_id" },
+                "profile.non_overlayable_field",
+            ),
+            (
+                ValidationError::MainnetRequiresExplicitProfile {
+                    name: "p".to_owned(),
+                    named_by: crate::profile::ProfileNameSource::Env,
+                },
+                "profile.mainnet_requires_explicit_profile",
+            ),
+            (
                 ValidationError::ProfileNameMismatch {
                     detail: "profile 'alice' was selected, but its \
                              policy_owner_key_id.service is \
@@ -2608,6 +2641,15 @@ mod tests {
                     ValidationError::ProfileAlreadyExists {
                         name: name.clone(),
                         path: path.clone(),
+                    }
+                }
+                ValidationError::ProfileNonOverlayableField { field } => {
+                    ValidationError::ProfileNonOverlayableField { field }
+                }
+                ValidationError::MainnetRequiresExplicitProfile { name, named_by } => {
+                    ValidationError::MainnetRequiresExplicitProfile {
+                        name: name.clone(),
+                        named_by: *named_by,
                     }
                 }
                 ValidationError::ProfileNameMismatch { detail } => {

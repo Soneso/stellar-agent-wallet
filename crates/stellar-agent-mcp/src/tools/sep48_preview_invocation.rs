@@ -138,7 +138,7 @@ impl WalletServer {
         }
 
         // Resolve the RPC URL from the active profile.
-        let rpc_url = self.profile.rpc_url.as_str();
+        let rpc_url = self.context.rpc_url.as_str();
 
         // ── Decode invocation (Mode A: from XDR; Mode B: from explicit fields) ──
         let (contract_strkey, function_name, arg_vals) = if let Some(xdr) = &args.transaction_xdr {

@@ -39,6 +39,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Args;
 use keyring_core::Entry as KeyringEntry;
 use serde::{Deserialize, Serialize};
+use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::{
     audit_log::{
         health::AuditWriterHealth,
@@ -54,7 +55,7 @@ use stellar_agent_network::keyring::{
 };
 use zeroize::Zeroizing;
 
-use crate::common::profile_access::load_profile_reconciled_by_requested_name;
+use crate::common::profile_access::load_profile_reconciled;
 
 /// Arguments for the `audit verify` subcommand.
 #[derive(Debug, Args)]
@@ -306,8 +307,8 @@ fn resolve_profile_inputs(
             ),
         });
     };
-
-    let profile = load_profile_for_verify(profile_name)?;
+    let resolved = ResolvedProfileName::from_flag(profile_name);
+    let profile = load_profile_for_verify(&resolved)?;
     init_platform_keyring_store()?;
     resolve_profile_inputs_with_profile(&profile, profile_name, log_path)
 }
@@ -364,8 +365,9 @@ fn resolve_profile_inputs_with_profile(
 /// profile supplies decides whether the log verifies, so "the file names
 /// another profile" and "the file is malformed" must be distinguishable in the
 /// refusal.
-fn load_profile_for_verify(profile_name: &str) -> Result<Profile, WalletError> {
-    load_profile_reconciled_by_requested_name(profile_name, None).map_err(|e| {
+fn load_profile_for_verify(resolved: &ResolvedProfileName) -> Result<Profile, WalletError> {
+    let profile_name = &resolved.name;
+    load_profile_reconciled(resolved, None).map_err(|e| {
         tracing::debug!(
             profile = %profile_name,
             error = %e,
@@ -603,6 +605,18 @@ mod tests {
     use stellar_agent_core::profile::schema::Profile;
     use stellar_agent_test_support::keyring_mock;
     use tempfile::TempDir;
+
+    #[test]
+    fn no_profile_inputs_skip_hmac_and_anchor() {
+        let inputs = resolve_profile_inputs(None, std::path::Path::new("audit.jsonl"))
+            .expect("no profile is needed for hash-chain verification");
+        assert!(inputs.hmac_key.is_none());
+        assert!(inputs.anchor.is_none());
+        assert_eq!(
+            inputs.anchor_skip_reason.as_deref(),
+            Some("no --profile supplied; the tip anchor is held per profile")
+        );
+    }
 
     fn make_writer_and_entries(path: PathBuf, count: usize, hmac_key: Option<&[u8; 32]>) {
         let hmac_key = hmac_key.map(|key| Zeroizing::new(*key));

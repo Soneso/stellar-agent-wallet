@@ -60,6 +60,7 @@ use stellar_agent_core::audit_log::{
 };
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, WalletError};
+use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::keyring::{KeyringTipAnchorStore, init_platform_keyring_store};
@@ -244,8 +245,11 @@ where
     // the keyring init.  Eliminates the process-global keyring-store race.
     // Reconciled in the CALLER of the injected loader: a check inside the
     // closure would be bypassed by every test that supplies its own.
-    let profile = reconcile_loaded_profile(load_profile(args.profile_name()), args.profile_name())
-        .map_err(RotateRefusal::ProfileAccess)?;
+    let profile = reconcile_loaded_profile(
+        load_profile(args.profile_name()),
+        &ResolvedProfileName::from_flag(args.profile_name()),
+    )
+    .map_err(RotateRefusal::ProfileAccess)?;
 
     // ── Setup B: initialise the platform keyring store.
     init_keyring()?;

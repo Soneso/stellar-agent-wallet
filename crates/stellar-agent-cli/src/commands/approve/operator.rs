@@ -50,11 +50,12 @@ use stellar_agent_core::approval::operator_credentials::{
 };
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, WalletError};
+use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::timefmt;
 use stellar_agent_loopback_http::brand::PageIdentity;
 
 use crate::common::display_available;
-use crate::common::profile_access::load_profile_reconciled_by_requested_name;
+use crate::common::profile_access::load_profile_reconciled;
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 use crate::common::served_pages::page_identity_for;
@@ -197,9 +198,10 @@ pub async fn dispatch(args: OperatorArgs) -> i32 {
 }
 
 async fn run_enroll(args: EnrollArgs) -> i32 {
-    let profile_name = resolve_profile_name(args.profile.as_deref()).name;
+    let resolved = resolve_profile_name(args.profile.as_deref());
+    let profile_name = resolved.name.clone();
     if args.interactive {
-        run_enroll_interactive(profile_name, args).await
+        run_enroll_interactive(resolved, args).await
     } else {
         run_enroll_args(profile_name, args).await
     }
@@ -309,7 +311,8 @@ struct EnrollResult {
 // Interactive mode
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn run_enroll_interactive(profile_name: String, args: EnrollArgs) -> i32 {
+async fn run_enroll_interactive(resolved: ResolvedProfileName, args: EnrollArgs) -> i32 {
+    let profile_name = resolved.name.clone();
     let store_path = match default_operator_approval_credentials_path(&profile_name) {
         Ok(p) => p,
         Err(e) => {
@@ -336,12 +339,15 @@ async fn run_enroll_interactive(profile_name: String, args: EnrollArgs) -> i32 {
         }
     };
 
-    // The identity the page announces is presentation only, so a profile that
-    // cannot be loaded yields the neutral identity rather than blocking the
-    // ceremony: this command creates a credential and needs no profile file.
-    let page_identity = load_profile_reconciled_by_requested_name(&profile_name, None)
-        .as_ref()
-        .map_or_else(|_| PageIdentity::neutral(), page_identity_for);
+    // A protected refusal or a name mismatch blocks the ceremony.
+    // Any other load failure yields the neutral identity.
+    let page_identity = match page_identity_from_profile(load_profile_reconciled(&resolved, None)) {
+        Ok(identity) => identity,
+        Err(error) => {
+            render_json(&Envelope::<()>::err(&error.to_wallet_error(&profile_name)));
+            return 1;
+        }
+    };
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     let mut handle = match start_operator_enroll_server(
@@ -507,6 +513,19 @@ impl OperatorArgs {
     }
 }
 
+fn page_identity_from_profile(
+    loaded: Result<
+        stellar_agent_core::profile::schema::Profile,
+        crate::common::profile_access::ProfileAccessError,
+    >,
+) -> Result<PageIdentity, crate::common::profile_access::ProfileAccessError> {
+    match loaded {
+        Ok(profile) => Ok(page_identity_for(&profile)),
+        Err(error) if error.requires_refusal() => Err(error),
+        Err(_) => Ok(PageIdentity::neutral()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -516,6 +535,16 @@ mod tests {
     )]
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn operator_page_identity_preserves_protected_refusals() {
+        for error in crate::common::profile_access::protected_load_errors_for_test() {
+            let expected = error.code();
+            let result = page_identity_from_profile(Err(error));
+            let error = result.expect_err("protected refusal was swallowed");
+            assert_eq!(error.code(), expected);
+        }
+    }
 
     #[derive(Debug, Parser)]
     struct Wrap {
