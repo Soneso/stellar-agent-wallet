@@ -140,24 +140,22 @@ pub enum SmartAccountSubcommand {
     /// Signer-set lifecycle for an existing OZ smart-account.
     ///
     /// Provides:
-    /// - `smart-account signers list` — reads on-chain signer set; emits
-    ///   `SaSignerSetBaselined` on first observation (divergence anchor).
-    /// - `smart-account signers refresh` — unconditionally writes a fresh
-    ///   `SaSignerSetBaselined` row (re-anchor after intentional out-of-band
-    ///   mutation).
-    /// - `smart-account signers add` — adds one signer to a context rule via OZ
-    ///   `add_signer`; emits `SaSignerAdded`. Accepts exactly one of
-    ///   `--signer-delegated` (G-key), `--signer-ed25519` (raw Ed25519 pubkey
-    ///   verified by the registered Ed25519 verifier; optional `--verifier`
-    ///   override), `--signer-webauthn` (passkey), or `--signer-external`
-    ///   (raw External escape hatch). Refuses if adding would exceed internal
-    ///   counters (upstream guard).
-    /// - `smart-account signers remove` — removes one signer by `signer_id` via OZ
-    ///   `remove_signer`; emits `SaSignerRemoved`. Refuses if removing would
-    ///   drop `signer_count` below `threshold` (brick-prevention).
-    /// - `smart-account signers set-threshold` — changes the threshold via the
-    ///   threshold-policy contract's `set_threshold`; emits `SaThresholdChanged`.
-    ///   Refuses if `new_threshold > signer_count`.
+    /// - `smart-account signers list`: reads both RPC endpoints, which must
+    ///   agree. Emits `SaSignerSetBaselinedV2` with no state row;
+    ///   otherwise compares the row and reports `baseline`.
+    /// - `smart-account signers refresh`: compares and records
+    ///   `SaSignerSetBaselinedV2`. A changed or incomparable set requires
+    ///   `--accept-divergence`. Reconciles an absent or unused verifier pin.
+    /// - `smart-account signers add`: adds one signer and emits
+    ///   `SaSignerAddedV2`. Accepts exactly one of `--signer-delegated`,
+    ///   `--signer-ed25519`, `--signer-webauthn`, or `--signer-external`.
+    /// - `smart-account signers remove`: removes one signer by id and emits
+    ///   `SaSignerRemovedV2`. Refuses an unreachable threshold.
+    /// - `smart-account signers set-threshold`: changes the simple-threshold
+    ///   value and emits `SaThresholdChangedV2`.
+    /// - `smart-account signers batch-add`: adds multiple signers.
+    /// - `smart-account signers set-weighted-threshold`: changes a weighted threshold.
+    /// - `smart-account signers set-signer-weight`: changes one signer's weight.
     ///
     /// All subcommands structurally refuse mainnet and invoke
     /// `Signer::sign_auth_digest` exclusively.

@@ -382,26 +382,22 @@ submission, which can still fail `SpendingLimitExceeded`.
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
-| `stellar_rule_create` | Testnet-only. Resolve and simulate an `add_context_rule` installation with its signers, policies, context, name, expiry, and `auth_rule_ids`. Park the result as a pending approval. | No signing; no submission. Always mints an `approval_nonce`. Response includes top-level `profile` and `chain_id`. |
-| `stellar_rule_create_commit` | Testnet-only. Verify the operator's attestation over the resolved definition and install the rule. | Signs and submits. Two-phase verb; approval spine. ALWAYS requires operator attestation, regardless of any policy verdict. |
+| `stellar_rule_create` | Testnet-only. Resolve and simulate an `add_context_rule` installation you are proposing (signers, policies, context, name, expiry, `auth_rule_ids`), and park it as a pending approval. A delegated signer is a G-strkey account or a C-strkey contract address. Install and simulation refuse an invalid simple-threshold parameter with `sa.simple_threshold_install_refused`. A duplicate policy address or two simple-threshold policies refuse with `sa.deployment_failed` at phase `build`. An `external` entry whose `pubkey_data_hex` decodes to empty key data refuses with `sa.auth_entry_construction_failed`. | No signing; no submission. Always mints an `approval_nonce`. Response includes top-level `profile` and `chain_id`. |
+| `stellar_rule_create_commit` | Testnet-only. Verify the operator's attestation over the resolved definition through a dedicated gate and recompute its digest from the stored snapshot. Operator attestation is always required, regardless of the policy verdict. Install and simulation refuse an invalid simple-threshold parameter with `sa.simple_threshold_install_refused`. A duplicate policy address or two simple-threshold policies refuse with `sa.deployment_failed` at phase `build`. An `external` entry whose `pubkey_data_hex` decodes to empty key data refuses with `sa.auth_entry_construction_failed`. Every non-zero `auth_rule_ids` entry first passes the pre-submission checks, and a refusal signs nothing. Baseline and comparison refusals are `sa.signer_set_missing_baseline`, `sa.signer_set_diverged`, `sa.audit_log`, and `network.rpc_divergence`. Lock timeout is `sa.auth_entry_construction_failed` at stage `rule_lock`. A deadline that elapses during the baseline read or the comparison uses that code at `baseline_read` or `signer_set_compare`. Pin refusals are `sa.verifier_hash_drift`, `sa.policy_hash_drift`, `sa.pinned_policy_absent`, `sa.pinned_verifier_absent`, and `sa.pin_check_unavailable`. A version 1 authorizing rule compares through its projection. Its own refusals are `sa.threshold_policy_not_installed`, `sa.threshold_policy_identification_failed`, and `sa.deployment_failed`. After the install confirms, the observed rule's signer identities and simple threshold must equal the proposal's. That observation is recorded as the rule's signer-set baseline. The name, context, expiry, and other policy attachments are not compared. Otherwise the rule stays on chain without a baseline, and the tool returns `sa.install_state_mismatch` or `sa.baseline_write_failed` with the transaction hash. | Signs and submits. Two-phase verb; approval spine. ALWAYS requires operator attestation, regardless of any policy verdict. |
 
-You never hold rule-write authority: `stellar_rule_create` only resolves and
-simulates; `stellar_rule_create_commit` installs only after the operator has
-attested to the EXACT definition you proposed, reviewed on one of the
-operator's approval surfaces (CLI, loopback inbox, or remote inbox), which
-render the full rule — every signer, every policy, the context, and a
-prominent callout if you proposed `Default` (account-wide authority).
-Unlike the payment/claim commit tools, a policy engine `Allow` verdict can
-never let `stellar_rule_create_commit` skip the operator attestation step —
-this pair only operates on testnet.
+You never hold rule-write authority. `stellar_rule_create` resolves and
+simulates; commit installs only with the operator's attestation over the exact
+definition. Approval surfaces (CLI, loopback inbox, or remote inbox) render
+every signer, every policy, the context, and a callout for `Default`
+(account-wide authority). A policy engine `Allow` verdict cannot skip
+attestation. This pair operates only on testnet.
 
-If you hold an External-Ed25519 rule key installed on a scoped
-`CallContract` rule (see `smart-accounts.md`'s "Agent-signed execute"),
-there is no MCP tool for submitting a call under it — that surface is the
-CLI verb `smart-account execute`, run by the operator or an out-of-process
-agent runtime, not by you through this MCP connection. An arbitrary-invocation
-tool would have no meaningful preview for the operator to consent to, which
-is why this catalog does not expose one.
+An External-Ed25519 rule key on a scoped `CallContract` rule supports the
+CLI `smart-account execute` verb. The operator or an out-of-process agent
+runtime runs it. See [Agent-signed execute](smart-accounts.md#agent-signed-execute).
+You cannot submit under such a rule through this MCP connection.
+This MCP catalog has no arbitrary-invocation tool because that call would
+have no meaningful preview for operator consent.
 
 ### stellar_rule_create arguments
 
@@ -410,7 +406,7 @@ is why this catalog does not expose one.
 | `chain_id` | string | yes | |
 | `smart_account` | string | yes | Smart-account contract C-strkey. |
 | `context` | string | no | `"default"` (default), `"call-contract:<C-strkey>"`, or `"create-contract:<64-hex-wasm-hash>"`. |
-| `name` | string | yes | 1–20 bytes (OZ cap). |
+| `name` | string | yes | 1 to 20 bytes (OZ cap). |
 | `valid_until` | integer (u32) | no | Ledger sequence at which the rule expires; omit for permanent. |
 | `signers` | array | yes | At least one entry (OZ cap 15). A delegated entry is `{"kind": "delegated", "address": <G-strkey or C-strkey>}`: an account, or a contract whose own authorization decides for the signer. An external entry is `{"kind": "external", "verifier": <C-strkey>, "pubkey_data_hex": <hex>}`, and a passkey entry is `{"kind": "webauthn", "credential_name": <name>}`, resolved from the passkey store at propose time. |
 | `policies` | array | no | Up to 5. Each is `{"kind": "raw", "policy_address": <C-strkey>, "install_param_xdr_b64": <base64>}` or `{"kind": "spending_limit", "limit_stroops": <decimal string>, "period_ledgers": <u32>, "policy_address": <C-strkey, optional>}`. |
@@ -422,7 +418,7 @@ is why this catalog does not expose one.
 Returns `{ approval_nonce, expires_at_unix_ms, requires_operator_approval,
 proposal_sha256_hex, summary: { context_type_label, name, signer_count,
 policy_count, auth_rule_ids, summary_line } }`. `approval_nonce` is always
-present — unlike `stellar_pay` / `stellar_claim`, there is no envelope
+present: unlike `stellar_pay` / `stellar_claim`, there is no envelope
 fallback for the commit step, so the pending approval is the sole carrier of
 the resolved definition.
 
@@ -434,18 +430,17 @@ the resolved definition.
 | `approval_nonce` | string | yes | From `stellar_rule_create`'s response. REQUIRED (not optional, unlike the pay/claim commit pair). |
 | `approval_attestation` | string | when `requires_operator_approval` was `true` | HMAC-SHA256 attestation blob the operator's `approve` produced. |
 
-Returns `{ rule_id, tx_hash }` on success. Verifies the attestation through a
-DEDICATED gate (distinct from the payment/claim attestation gate) and
-recomputes the digest from the stored snapshot UNCONDITIONALLY before
-installing — a mismatch refuses with `simulation.divergence` regardless of
-the policy verdict. An `auth_rule_ids` entry other than `0` first passes the
-pre-submission checks of `smart-accounts.md`, and nothing is signed when one
-refuses. The refusals are `sa.signer_set_missing_baseline`,
-`sa.signer_set_diverged`, `sa.verifier_hash_drift` / `sa.policy_hash_drift`,
-`sa.pinned_policy_absent`, `sa.pinned_verifier_absent` and
-`sa.pin_check_unavailable`. `sa.pinned_verifier_absent` names an authorizing
-rule that holds an External signer whose verifier its pin record does not
-pin; the operator runs `smart-account signers refresh --rule-id N`.
+Returns `{ rule_id, tx_hash }` on success. A dedicated attestation gate
+recomputes the digest from the stored snapshot before installing.
+A mismatch refuses with `simulation.divergence` regardless of the policy verdict.
+
+Install and simulation refuse an invalid simple-threshold parameter with `sa.simple_threshold_install_refused`. A duplicate policy address or two simple-threshold policies refuse with `sa.deployment_failed` at phase `build`. An `external` entry whose `pubkey_data_hex` decodes to empty key data refuses with `sa.auth_entry_construction_failed`.
+
+Every non-zero `auth_rule_ids` entry first passes the pre-submission checks, and a refusal signs nothing. Baseline and comparison refusals are `sa.signer_set_missing_baseline`, `sa.signer_set_diverged`, `sa.audit_log`, and `network.rpc_divergence`. Lock timeout is `sa.auth_entry_construction_failed` at stage `rule_lock`. A deadline that elapses during the baseline read or the comparison uses that code at `baseline_read` or `signer_set_compare`. Pin refusals are `sa.verifier_hash_drift`, `sa.policy_hash_drift`, `sa.pinned_policy_absent`, `sa.pinned_verifier_absent`, and `sa.pin_check_unavailable`. A version 1 authorizing rule compares through its projection. Its own refusals are `sa.threshold_policy_not_installed`, `sa.threshold_policy_identification_failed`, and `sa.deployment_failed`. After the install confirms, the observed rule's signer identities and simple threshold must equal the proposal's. That observation is recorded as the rule's signer-set baseline. The name, context, expiry, and other policy attachments are not compared. Otherwise the rule stays on chain without a baseline, and the tool returns `sa.install_state_mismatch` or `sa.baseline_write_failed` with the transaction hash.
+
+`sa.pinned_verifier_absent` names an authorizing rule holding an External signer
+whose verifier its pin record does not pin. The operator runs
+`smart-account signers refresh --rule-id N`.
 
 ## DeFi
 

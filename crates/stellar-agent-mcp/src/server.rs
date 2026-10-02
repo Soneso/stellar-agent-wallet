@@ -1093,8 +1093,10 @@ impl ServerHandler for WalletServer {
              routed to a trusted tool through capability enforcement); \
              stellar_rules_list (enumerate active context rules on a smart account: \
              rule_id, name, context_type_label, valid_until, signer_count, \
-             policy_count, plus as_of_ledger, read_only=true); \
-             stellar_rules_get (read a single context rule's metadata, its policies \
+             policy_count, baseline (none, v1, v2, unreadable, or unknown), \
+             plus as_of_ledger, read_only=true); \
+             stellar_rules_get (read a single context rule's metadata, baseline \
+             (none, v1, v2, unreadable, or unknown), and its policies \
              with best-effort identified_kind classification, and — when exactly \
              one attached policy identifies as spending-limit — the budget \
              snapshot (spending_limit, period_ledgers, in_window_spent, \
@@ -1111,8 +1113,13 @@ impl ServerHandler for WalletServer {
              requires operator attestation regardless of the policy verdict — \
              the agent never holds rule-write authority; verify the operator's \
              attestation over the resolved definition via a dedicated gate, \
-             recompute the digest from the stored snapshot, install the rule — \
-             destructive). \
+             recompute the digest from the stored snapshot. Every non-zero \
+             auth_rule_ids entry passes the rule lock, baseline read, executable \
+             pin check, and two-RPC signer-set comparison before signing. \
+             After confirmation, the observed rule's signer identities and simple \
+             threshold must equal the proposal's. Record that observation as the \
+             signer-set baseline. The name, context, expiry, and other policy \
+             attachments are not compared; destructive). \
              Resources: mcp-resource://usage.md (tool documentation), \
              mcp-resource://profiles/<name> (non-secret profile metadata), \
              mcp-resource://accounts/<G> (public account directory). \

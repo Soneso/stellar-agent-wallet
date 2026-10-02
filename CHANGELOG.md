@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `approve` prints the profile, the network, the endpoint host, the enrolled signer, and the envelope source before the approval prompt; the loopback and remote inbox pages show the same rows.
 - The approve hints name the profile; the simulate responses name the profile and the chain id.
 - `shell_word` quotes a word for a POSIX shell.
+- `test_helpers::HeldRuleLock` and `test_helpers::hold_rule_lock`, under the
+  `test-helpers` feature, hold a rule lock until the returned value is dropped.
+- `DELEGATED_SIGNER_ADDRESS_REASON` states the G-strkey or C-strkey input requirement.
+- `PendingAddStep::new_for_test` constructs a pending add under `test-helpers`.
 - `Caip2::from_passphrase` maps a network passphrase to its chain id.
 - `stellar_agent_core::redact` holds the URL redaction helpers; the network crate re-exports them.
 - `Profile::redacted` returns a `RedactedProfile`, the serialized view with URL fields reduced to scheme, host, and port.
@@ -60,8 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and reports `previous_baseline`; `--accept-divergence` records a changed
   set or a version-1 baseline the chain cannot be compared with.
 - `sa.signer_set_baseline_legacy` (`SaError::SignerSetBaselineLegacy`)
-  refuses a signer mutation, and a `rules add-policy` or `rules
-  remove-policy` of any policy, on a rule whose baseline is version 1.
+  refuses `signers add`, `remove`, `set-threshold`, and `batch-add` on version 1.
+  It also refuses `rules add-policy` and `rules remove-policy` for any policy,
+  and a `migrate-verifier` removal.
   `sa.baseline_write_failed` (`SaError::BaselineWriteFailed`, stages in
   `BASELINE_WRITE_STAGES`, reason capped at
   `BASELINE_WRITE_REASON_MAX_BYTES`) reports a signer-set state row that was
@@ -133,6 +138,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Toolset grants recorded on an earlier build keep suppressing the first-invoke prompt; each action still needs its own approval.
 - `compute_attestation`, `verify_attestation`, `verify_toolset_gate_attestation`, `attest_and_persist`, `record_first_invoke_grant`, `build_attested_grant`, and `ToolsetGrant::verify_attestation` take the attestation binding. The three `PendingApprovalStore` verifiers, `commit_authorization`, and `verify_pending_approval` also take it. `DecisionContext::new` takes the approval context; `ToolsetGrantRequest` carries the binding.
 - `approval_required_indistinguishable` names the profile in its hint.
+- `EVENT_KIND_VARIANT_COUNT` increases from 65 to 69.
+- Under `test-helpers`, `SignerStepSubmitOutcome::new_for_test` takes
+  `new_signer_id`. `MigrationSubmitResult::new_for_test` takes
+  `failed_step_remove_tx_hash` and `pending_add` for the failed pair.
+- `rules create --signer-delegated` takes `<STRKEY>`.
 - `Profile`'s debug output redacts `oracle_provider_url`.
 - `profile show`, `profile init` and the MCP profile resource report URL fields as scheme, host, and port only.
 - The `rpc_url` parse error names the parse failure and omits the URL text.
@@ -147,8 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read and for the executable pin check of every rule-authorized signing
   verb.
 - `SignersManager::get_rule_signers` returns `Vec<SignerEntryV2>`.
-  `list_signers` returns `ListOutcome`. `refresh_signer_baseline` takes
-  `accept_divergence` and returns `RefreshOutcome`. `add_signer` and
+  `list_signers` returns `ListOutcome`. `add_signer` and
   `batch_add_signers` take the signer `ScVal`s only and decode each identity
   from it; `batch_add_signers` returns the id the chain assigned to each
   signer, in input order.
@@ -170,9 +179,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   endpoints at or past the confirmation ledger, require exactly the intended
   change and record it; any other result is `sa.signer_set_diverged` with the
   transaction hash.
-- A rule whose baseline is version 1 refuses signer mutations until one
-  `signers refresh --rule-id N`, which compares the chain with the version-1
-  baseline and records a version-2 baseline.
+- A version 1 baseline needs one `signers refresh --rule-id N` before
+  `signers add`, `remove`, `set-threshold`, or `batch-add`. The same step is
+  required before `rules add-policy` or `rules remove-policy` for any policy,
+  and a `migrate-verifier` removal. Refresh compares the version 1 projection
+  and records version 2 state.
 - The `signers list` and `signers refresh` envelopes carry `threshold` as
   optional (`null` without a simple-threshold policy) and
   `snapshot_version`; `list` adds `signer_summaries` and `baseline`, and
@@ -185,8 +196,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The passkey signing path works on a rule without a simple-threshold policy
   once the rule has a version-2 baseline.
 - A passkey signer added to a pinned rule pins its WebAuthn verifier like any
-  other `External` verifier, and a passkey add reports signer type
-  `external`.
+  other `External` verifier. For a passkey, the `signers list` entry in
+  `signer_kinds` and a `sa.threshold_unreachable` refusal's
+  `requested_op.signer_type` read `external`. The `signers add` envelope
+  keeps `signer_source` as `webauthn`.
 - A rule whose policy instance is an external reference with no live tag
   entry refuses signer-set reads with `sa.contract_instance_unsupported`.
 - `rules add-policy` and `rules remove-policy` observe the policy's
@@ -230,8 +243,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A confirmed `rules add-policy` whose return value carries no policy id
   returns `sa.baseline_write_failed` at stage `observe` with the transaction
   hash and writes its pin rows, for any policy.
-- `SignersManager::refresh_signer_baseline` takes `RefreshOptions` in place
-  of its `accept_divergence` flag.
+- `SignersManager::refresh_signer_baseline` takes `RefreshOptions` and returns
+  `RefreshOutcome`.
 - The `sa.verifier_wasm_not_in_allowlist` and
   `sa.policy_wasm_not_in_allowlist` messages name
   `--accept-unknown-verifier`.
@@ -249,13 +262,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parameter that is not a non-zero `{ threshold: u32 }` map refuses with
   `sa.simple_threshold_install_refused`. An `External` signer with empty key
   data refuses with `sa.auth_entry_construction_failed`.
-- A rule created before this version has no baseline until one `signers list
-  --rule-id N`. Every signing authorized by the rule needs it first:
-  `execute`, `multicall`, `rules update-name`, `update-valid-until` and
-  `delete`, `set-spending-limit`, `set-weighted-threshold`,
-  `set-signer-weight` and the signer verbs. So do the policy verbs' target
-  and auth rules, the passkey path's rules, and the migrating rule of
-  `migrate-verifier`.
+- A rule created under an earlier release has no state row unless that
+  release recorded it through `signers list` or `signers refresh` while it
+  held a simple-threshold policy. Such a recorded rule holds version 1 state.
+  `rules list` reports `none` or `v1`. A non-zero rule reporting `none`
+  needs one `signers list --rule-id N` before any signature it authorizes.
+  This includes `execute`, `multicall`, `rules set-name`, `rules set-valid-until`,
+  and `rules delete`, alongside policy, signer, passkey, and migration paths.
+  A rule reporting `v1` signs through the version 1 projection.
+  `set-weighted-threshold`, `set-signer-weight`, and `set-spending-limit` use
+  that projection. A lost simple-threshold policy or a contract delegate
+  makes version 1 incomparable; `signers refresh --accept-divergence`
+  records the current state.
 - `SaError::SignersManagerNotConfigured.rule_id` is optional. An install's
   refusal omits it on the wire; a refusal scoped to a rule keeps the bare
   number.
@@ -320,7 +338,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RPC, the pinned-hash drift check, and the comparison of the rule's signer
   set through both endpoints with the baseline. A version-1 baseline is
   compared through its version-1 projection. This covers `execute`,
-  `multicall`, `rules create`, `update-name`, `update-valid-until`,
+  `multicall`, `rules create`, `set-name`, `set-valid-until`,
   `delete`, `add-policy`, `remove-policy`, `set-spending-limit`,
   `set-weighted-threshold`, `set-signer-weight`, the signer verbs and the
   passkey signing path.
@@ -331,13 +349,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   audit-log integrity error under a rule other than rule 0 is reported as
   `sa.audit_log` by the baseline read, under the migrating rule of
   `migrate-verifier` too.
-- A lock not acquired within the pre-submit budget refuses with
-  `sa.auth_entry_construction_failed` at stage `rule_lock`, and a deadline
-  elapse during a baseline read or a comparison at stage `baseline_read` or
-  `signer_set_compare`. A verb holds the lock of each rule it signs under
-  while it signs and confirms, so a concurrent verb on the same rule
-  refuses at stage `rule_lock` when its own budget ends. A submission that
-  acquired the locks itself releases them before it sends.
+- `sa.auth_entry_construction_failed` has five signer-set check stages:
+
+  - `rule_lock`: the rule's lock was not acquired within the pre-submit deadline
+    or the locking verb's timeout.
+  - `baseline_read`: the pre-submit deadline elapsed during or immediately after
+    a baseline read.
+  - `signer_set_compare`: the pre-submit deadline elapsed during comparison.
+  - `rule_lock_missing`: the caller's held-lock context lacks an authorizing rule.
+  - `rule_locks_without_pin_check`: a held-lock context has no pin check.
+
+  The last two stages are submit API invariant violations a correct build
+  never emits; CLI and MCP inputs cannot reach them.
+  Signer mutations and migration pairs hold their caller-held locks through
+  confirmation.
+  A concurrent verb waits for a held lock until its budget ends.
+  A submission that acquires its own locks releases them before sending.
 - `set-spending-limit`, `set-weighted-threshold` and `set-signer-weight`
   lock their `--auth-rule-id` rules beside the target rule, and the
   submission compares those rules with their baselines.
@@ -365,6 +392,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and signer-set stages.
 
 ### Removed
+
+- `MigrationSubmitResult::new_for_test_with_failed_remove_tx_hash`; use
+  `MigrationSubmitResult::new_for_test` under `test-helpers`.
 
 - `RpcUrlParseError::raw`; the error carries the parse failure only.
 - `SignersManager::identify_threshold_policy`; the signer-set observation

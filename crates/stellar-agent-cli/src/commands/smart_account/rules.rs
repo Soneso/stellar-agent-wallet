@@ -19,6 +19,13 @@
 //!   `smart-account list-rules` is retained as an alias for backwards-compatibility
 //!   (no deprecation warning is emitted).
 //!
+//! Each non-zero `--auth-rule-id` passes the pre-submission checks under
+//! its lock: baseline read, executable pin check, and two-RPC signer-set comparison.
+//! Install compares the confirmed signer identities and simple threshold with
+//! the proposal and records that observation as a version 2 signer-set baseline.
+//! Policy add and removal hold the target lock and compare its version 2 state
+//! for any policy, then retain the lock through their state and pin rows.
+//!
 //! # Command-name aliasing
 //!
 //! `smart-account rules list` is the canonical name. `smart-account list-rules` is retained
@@ -260,7 +267,11 @@ pub enum RulesSubcommand {
     /// Builds an InvokeHostFunction op, simulates, signs the auth-entry
     /// digest, signs the SEP-23 source-account envelope, submits, and
     /// returns the new `rule_id` parsed from the simulated `ContextRule`
-    /// return value.
+    /// return value. Non-zero `--auth-rule-id` rules pass the pre-submission checks.
+    /// After confirmation, both endpoints must observe signer identities and a
+    /// simple threshold equal to the proposal's. That observation is recorded
+    /// as a version 2 signer-set baseline. The name, context, expiry, and other
+    /// policy attachments are not compared.
     Create(Box<CreateArgs>),
 
     /// Read a single context rule by `rule_id` (OZ `get_context_rule`).
@@ -306,13 +317,18 @@ pub enum RulesSubcommand {
     /// policy cap (`OZ_MAX_POLICIES = 5`) before simulate, then constructs an
     /// `InvokeHostFunctionOp` calling `add_policy(rule_id, policy, install_param)`,
     /// simulates, signs the auth-entry digest, submits, and returns the
-    /// assigned `policy_id`.
+    /// assigned `policy_id`. For any policy, holds the target rule's lock and
+    /// compares its version 2 state. Non-zero `--auth-rule-id` rules pass
+    /// the pre-submission checks. State and pin rows are written under the lock.
     AddPolicy(Box<AddPolicyArgs>),
 
     /// Remove a policy from an existing context rule (OZ `remove_policy`).
     ///
     /// Constructs an `InvokeHostFunctionOp` calling
     /// `remove_policy(rule_id, policy_id)`, simulates, signs, and submits.
+    /// For any policy, holds the target lock and compares its version 2 state.
+    /// Non-zero `--auth-rule-id` rules pass the pre-submission checks.
+    /// State and pin rows are written under the target lock.
     RemovePolicy(Box<RemovePolicyArgs>),
 
     /// Read an installed spending-limit policy's budget state (read-only).
@@ -416,6 +432,10 @@ async fn list_rules_run(args: &ListArgs) -> i32 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Arguments for `smart-account rules create`.
+///
+/// Non-zero `--auth-rule-id` rules pass the pre-submission checks.
+/// The confirmed signer identities and simple threshold must equal the
+/// proposal's. That observation is recorded as a version 2 signer-set baseline.
 ///
 /// One required signer-source mode (mutually exclusive). One required
 /// smart-account flag. At least one of `--signer-delegated` or
@@ -1793,6 +1813,9 @@ pub enum PolicyKind {
 
 /// Arguments for `smart-account rules add-policy`.
 ///
+/// Non-zero `--auth-rule-id` rules pass the pre-submission checks.
+/// Any policy requires a matching version 2 target baseline under its lock.
+///
 /// Adds a policy contract to an existing context rule.  Two mutually-exclusive
 /// modes selected by `--kind`:
 ///
@@ -2612,6 +2635,9 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Arguments for `smart-account rules remove-policy`.
+///
+/// Non-zero `--auth-rule-id` rules pass the pre-submission checks.
+/// Any policy requires a matching version 2 target baseline under its lock.
 ///
 /// Removes a policy from an existing context rule by its on-chain `policy_id`.
 ///

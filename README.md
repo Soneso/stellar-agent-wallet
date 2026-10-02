@@ -75,7 +75,8 @@ each tagged release, and the workspace crates are published to
   testnet-only; the trusted host sends the paid request and server submission.
 - OpenZeppelin smart-account governance: deployment, context rules, threshold
   updates, and WebAuthn passkey signers, with signing bound to the on-chain
-  authorization rules.
+  authorization rules. Each non-zero authorizing rule passes the signer-set
+  comparison and executable pin check before signing.
 - Signed agent toolsets with capability isolation: toolsets are installed only
   after publisher-signature and hash verification, and a structural boundary keeps
   a toolset from reaching a signing tool it was not granted.

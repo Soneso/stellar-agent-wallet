@@ -39,6 +39,19 @@
 //! with sentinel error fields; `submit_multicall_bundle` Step 1 (build) validates
 //! all fields and refuses with `SaMulticallBundleDenied { refusal_phase: "build" }`.
 //!
+//! Every non-zero authorizing rule passes the pre-submission checks under
+//! its lock: baseline read, executable pin check, and signer-set comparison
+//! through both RPC endpoints. Baseline read and comparison run without a
+//! pin record too. A deadline that elapses during the baseline read or the
+//! comparison refuses with `sa.auth_entry_construction_failed` at stage
+//! `baseline_read` or `signer_set_compare`; during the pin check, with
+//! `sa.pin_check_unavailable`. Refusals render as `sa.multicall_failed`. Most
+//! refusals render at phase `policy_gate`; a `sa.deployment_failed` keeps its
+//! `simulate` or `submit` phase. A version 1 authorizing rule with a contract
+//! delegate cannot form its projection and refuses at phase `simulate`. A
+//! signer-set read that refuses with `sa.contract_instance_unsupported`
+//! renders at phase `submit`.
+//!
 //! # Output
 //!
 //! JSON envelope on stdout. On success: `{ "bundle_tx_hash": "...", "inner_count": N,
@@ -382,9 +395,9 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     // Build a minimal profile for policy evaluation.
     let profile = build_minimal_profile(args.network, secondary_rpc_url.clone());
 
-    // The pinned-hash drift check of the authorizing rule reads the rule's
-    // pin record from this profile's audit log and fetches the live verifier
-    // and policy contracts through the submission's RPC endpoints.
+    // Every non-zero authorizing rule reads its baseline and pin record from
+    // this profile's audit log. The signer-set comparison and executable pin
+    // check use the submission's RPC endpoints under the rule's lock.
     let signers_manager = match construct_signers_manager_from_fields(
         &profile_name,
         &network_passphrase,

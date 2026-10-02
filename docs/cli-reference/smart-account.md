@@ -41,7 +41,7 @@ Nothing is sent when a check refuses. `smart-account multicall` reports the refu
 - A check that cannot run refuses with `sa.pin_check_unavailable`. Its message leads with the inner wire code: an RPC failure or divergence, an instance the wallet cannot read, or a record with more than one verifier or policy pin (`sa.multiple_pinned_hashes_unsupported`). The baseline read, which runs first, reports an audit-log integrity error as `sa.audit_log`, under the migrating rule of `migrate-verifier` too.
 - A rule without a pin record, such as one installed outside the wallet, is not checked for drift. Rule 0, the bootstrap rule, is exempt from the rule lock, the signer-set check and the pin check; it has no pins, and the submit path never reads a baseline for it.
 
-A write verb whose `--auth-rule-id` names a rule other than `0` needs the rule's pin record and signer-set baseline to match the chain, so a rule whose verifier, policy, or signers changed outside the wallet (an upgraded contract, a repointed reference, or a signer or policy changed through another client) is refused for its own administration too; authorize the repair through rule `0`, or reinstall the rule.
+A write verb whose `--auth-rule-id` names a rule other than `0` compares its signer-set baseline and any executable pins with the chain. Where a pin is checked, the first eight bytes of the live code hash must equal the pinned value. An external reference must also match its pinned owner, tag, and resolved hash prefix. Changes to a verifier, policy, or signer outside the wallet can refuse the rule's own administration. Authorize the repair through rule `0`, or reinstall the rule.
 
 The pin record is the newest `SaContextRuleCreated` or `SaContextRulePinsUpdated` row for the rule. `smart-account migrate-verifier`, `signers add`, `signers batch-add`, `rules add-policy` and `rules remove-policy` write a `SaContextRulePinsUpdated` row when they change the verifier or policy set of a pinned rule (see those verbs). The check therefore follows the wallet's own changes. The signer verbs, the policy verbs and `migrate-verifier` read the record and write their row under the rule's lock, so two of them on one rule never overwrite each other's pins. `smart-account signers refresh` writes one when it pins the live verifier of a record that pins none. `smart-account rules verify-pins` runs the same comparison on demand without signing, and reports a live verifier the record does not pin as verifier `drift`.
 
@@ -77,18 +77,18 @@ Installs a new context rule (OZ `add_context_rule`) and returns the newly minted
 
 Flags:
 
-- `--account <C_STRKEY>` (required) — smart-account contract address.
-- `--name <STRING>` (required) — rule name; refused as `validation.rule_name_too_long` over 20 bytes.
-- `--context <SPEC>` — the rule's context type. `default` (also the default when the flag is omitted) authorizes any invocation; `call-contract:<C_STRKEY>` scopes the rule to invocations of one target contract; `create-contract:<64_HEX_WASM_HASH>` scopes it to creating a contract with that wasm hash. A malformed spec is refused before any network call, naming the accepted grammar. See [Agent delegation](../agent-delegation.md) for the `call-contract` shape used to scope an autonomous agent to one token contract.
+- `--account <C_STRKEY>` (required): smart-account contract address.
+- `--name <STRING>` (required): rule name; refused as `validation.rule_name_too_long` over 20 bytes.
+- `--context <SPEC>`: the rule's context type. `default` (also the default when the flag is omitted) authorizes any invocation; `call-contract:<C_STRKEY>` scopes the rule to invocations of one target contract; `create-contract:<64_HEX_WASM_HASH>` scopes it to creating a contract with that wasm hash. A malformed spec is refused before any network call, naming the accepted grammar. See [Agent delegation](../agent-delegation.md) for the `call-contract` shape for scoping an autonomous agent to one token contract.
 - `--signer-delegated <STRKEY>`: a delegated signer, given as a G-strkey for an ed25519 account or a C-strkey for a contract whose own authorization decides for the signer. Repeatable. Only an account delegate counts as the delegated fallback of `--accept-no-delegated-fallback`.
-- `--signer-webauthn <CREDENTIAL_NAME>` — a passkey signer, resolved from the profile's passkey registry (see [`credentials add-passkey`](profile-and-governance.md)). Repeatable. The verifier contract address is read from the verifier registry, which is populated by `smart-account deploy-webauthn-verifier`.
-- `--signer-ed25519 <HEX_PUBKEY_64>` — a first-class External-Ed25519 signer (a raw 32-byte ed25519 public key). Repeatable. The recommended shape for an autonomous agent's own key (see [Agent delegation](../agent-delegation.md)) — no funded classic account is required. Encodes the same on-chain shape as [`signers add --signer-ed25519`](#smart-account-signers-add).
-- `--verifier <C_STRKEY>` — Ed25519-verifier contract override for `--signer-ed25519`. Omitted, it resolves from the verifier registry (populated by `smart-account deploy-ed25519-verifier`), failing closed if none is registered.
+- `--signer-webauthn <CREDENTIAL_NAME>`: a passkey signer, resolved from the profile's passkey registry (see [`credentials add-passkey`](profile-and-governance.md)). Repeatable. The verifier contract address is read from the verifier registry, which is populated by `smart-account deploy-webauthn-verifier`.
+- `--signer-ed25519 <HEX_PUBKEY_64>`: a first-class External-Ed25519 signer (a raw 32-byte ed25519 public key). Repeatable. The recommended shape for an autonomous agent's own key (see [Agent delegation](../agent-delegation.md)): no funded classic account is required. Encodes the same on-chain shape as [`signers add --signer-ed25519`](#smart-account-signers-add).
+- `--verifier <C_STRKEY>`: Ed25519-verifier contract override for `--signer-ed25519`. Omitted, it resolves from the verifier registry (populated by `smart-account deploy-ed25519-verifier`), failing closed if none is registered.
 - `--accept-no-delegated-fallback`: acknowledge an External-only rule (no delegated ed25519-G-key fallback). Required when `--signer-webauthn` or `--signer-ed25519` signers, or both, are given and no `--signer-delegated` is a G-strkey; without it the command refuses with `validation.passkey_only_rule_no_delegated_fallback` after printing a stderr warning. A contract delegate is not a fallback signer: it is not a key the operator holds. An invalid `--signer-delegated` value is refused before this check.
-- `--accept-mutable-verifier`: proceed even if a referenced verifier or policy contract is mutable: it has an admin/owner key, or its executable is an owner-managed external reference (reason `owner-managed external reference`). The envelope reports `mutable_override: true`. For an external reference the pin records the owner, the tag and the hash the tag resolves to, and the envelope lists them in `pinned_verifier_executable_refs` / `pinned_policy_executable_refs`. When the owner repoints the tag, the reference changes or the executable kind changes, the [pinned-hash drift check](#pinned-hash-drift-check) refuses signing under the rule with `sa.verifier_hash_drift` / `sa.policy_hash_drift`. It refuses in `execute`, `multicall`, the rule and signer write verbs, and `migrate-verifier` for the rule's policies. A rule whose record holds policy pins while the rule has no policy on chain refuses with `sa.pinned_policy_absent`. A rule holding an `External` signer while its record pins no verifier refuses with `sa.pinned_verifier_absent`, and a check that cannot run with `sa.pin_check_unavailable`. `--accept-unknown-verifier` is also required when the resolved hash is not in the allowlist. A referenced contract that is an external reference with no live tag entry (reason `external reference with no live tag entry`), whose instance is undecodable or was returned under a key the wallet did not request (`undecodable instance`), has a non-Wasm executable (`non-Wasm executable`), or whose executable changed while it was being identified (`executable changed during install`) is refused with `sa.contract_instance_unsupported` whether or not this flag or `--accept-unknown-verifier` is set, because the wallet cannot pin its code.
+- `--accept-mutable-verifier`: proceed even if a referenced verifier or policy contract is mutable. It has an admin/owner key, or its executable is an owner-managed external reference (reason `owner-managed external reference`). The envelope reports `mutable_override: true`. For an external reference the pin records the owner, the tag, and the first eight bytes of the resolved code hash. The envelope lists them in `pinned_verifier_executable_refs` / `pinned_policy_executable_refs`. When the resolved hash prefix, reference identity, or executable kind differs from the pin, the [pinned-hash drift check](#pinned-hash-drift-check) refuses signing under the rule with `sa.verifier_hash_drift` / `sa.policy_hash_drift`. It refuses in `execute`, `multicall`, the rule and signer write verbs, and `migrate-verifier` for the rule's policies. A rule whose record holds policy pins while the rule has no policy on chain refuses with `sa.pinned_policy_absent`. A rule holding an `External` signer while its record pins no verifier refuses with `sa.pinned_verifier_absent`, and a check that cannot run refuses with `sa.pin_check_unavailable`. `--accept-unknown-verifier` is also required when the resolved hash is not in the allowlist. The wallet refuses an external reference with no live tag entry, an undecodable instance, or an instance returned under an unrequested key. It also refuses a non-Wasm executable or an executable that changes during install. These cases return `sa.contract_instance_unsupported`. The reason is `external reference with no live tag entry`, `undecodable instance`, `non-Wasm executable`, or `executable changed during install`. Neither override flag admits them, because the wallet cannot pin their code.
 - `--accept-unknown-verifier`: proceed even if a referenced verifier or policy WASM hash (for an external reference, the hash its tag resolves to) is not in the allowlist. The envelope reports `unknown_override: true`.
-- `--auth-rule-id <U32>` — authorizing rule id(s). Repeatable. Default `[0]` (the bootstrap rule installed at deploy time).
-- `--valid-until <LEDGER>` — expiry ledger sequence, or `none` for a permanent rule. Default `none`.
+- `--auth-rule-id <U32>`: authorizing rule id(s). Repeatable. Default `[0]` (the bootstrap rule installed at deploy time).
+- `--valid-until <LEDGER>`: expiry ledger sequence, or `none` for a permanent rule. Default `none`.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
 At least one `--signer-delegated`, `--signer-webauthn`, or `--signer-ed25519` is required.
@@ -215,24 +215,24 @@ Adds a policy contract to a rule (OZ `add_policy`). The per-rule policy cap (5) 
 
 `--kind <raw|spending-limit|simple-threshold|weighted-threshold>` (default `raw`) selects the install-parameter mode:
 
-- `--kind raw` (default) — the caller supplies `--policy-address` and a hand-encoded `--install-param`. Works with any policy contract.
-- `--kind spending-limit` — the wallet resolves the deployed OZ spending-limit policy from the [`VerifierRegistry`](../agent-delegation.md) (or an explicit `--policy` override) and builds the typed `SpendingLimitAccountParams` install parameter internally. Refused client-side before any network call when `--limit <= 0` or `--period == 0` (mirroring the on-chain `InvalidLimitOrPeriod` constraint), and when the target rule's context type is not `call-contract` (mirroring `OnlyCallContractAllowed`) — see [Agent delegation](../agent-delegation.md).
-- `--kind simple-threshold` — the wallet resolves the deployed OZ simple threshold-policy (signer-count based; use `smart-account deploy-policy --kind simple-threshold` first) and builds the `SimpleThresholdAccountParams { threshold }` install parameter from `--threshold`. Refused client-side when `--threshold == 0`.
-- `--kind weighted-threshold` — the wallet resolves the deployed OZ weighted-threshold policy (`smart-account deploy-policy --kind weighted-threshold`) and builds the `WeightedThresholdAccountParams { signer_weights, threshold }` install parameter from one or more `--weighted-signer-delegated` / `--weighted-signer-webauthn` flags plus `--threshold`. Refused client-side when the signer-weight set is empty, when `--threshold == 0`, or when `--threshold` exceeds the sum of the supplied weights.
+- `--kind raw` (default): the caller supplies `--policy-address` and a hand-encoded `--install-param`. Works with any policy contract.
+- `--kind spending-limit`: the wallet resolves the deployed OZ spending-limit policy from the [`VerifierRegistry`](../agent-delegation.md) (or an explicit `--policy` override) and builds the typed `SpendingLimitAccountParams` install parameter internally. Refused client-side before any network call when `--limit <= 0` or `--period == 0` (mirroring the on-chain `InvalidLimitOrPeriod` constraint), and when the target rule's context type is not `call-contract` (mirroring `OnlyCallContractAllowed`): see [Agent delegation](../agent-delegation.md).
+- `--kind simple-threshold`: the wallet resolves the deployed OZ simple threshold-policy (signer-count based; use `smart-account deploy-policy --kind simple-threshold` first) and builds the `SimpleThresholdAccountParams { threshold }` install parameter from `--threshold`. Refused client-side when `--threshold == 0`.
+- `--kind weighted-threshold`: the wallet resolves the deployed OZ weighted-threshold policy (`smart-account deploy-policy --kind weighted-threshold`) and builds the `WeightedThresholdAccountParams { signer_weights, threshold }` install parameter from one or more `--weighted-signer-delegated` / `--weighted-signer-webauthn` flags plus `--threshold`. Refused client-side when the signer-weight set is empty, when `--threshold == 0`, or when `--threshold` exceeds the sum of the supplied weights.
 
 Flags:
 
 - `--account <C_STRKEY>` (required).
-- `--rule-id <U32>` (required) — rule to add the policy to.
-- `--policy-address <C_STRKEY>` — policy contract address. Required with `--kind raw`; rejected with the other kinds.
-- `--install-param <SCVAL_BASE64>` — a standard-base64 XDR `ScVal` install parameter (not base64url), passed to `add_policy` without further validation (raw passthrough). Required with `--kind raw`; rejected with the other kinds.
-- `--limit <STROOPS>` — spending limit in stroops (`--kind spending-limit`, required). The `i128` amount the rolling window admits before the policy panics `SpendingLimitExceeded`.
-- `--period <LEDGERS>` — rolling-window length in ledgers (`--kind spending-limit`, required).
-- `--policy <C_STRKEY>` — spending-limit policy contract override (`--kind spending-limit`). When omitted, resolves from the registry populated by `smart-account deploy-spending-limit-policy`; fails closed with a deploy-first hint if absent.
-- `--threshold <U32>` — signer threshold (`--kind simple-threshold` / `--kind weighted-threshold`, required with both). For `simple-threshold` this is the minimum signer count; for `weighted-threshold` this is the minimum total weight.
-- `--weighted-signer-delegated <G_STRKEY=WEIGHT>` — one Delegated (ed25519) signer-weight pair (`--kind weighted-threshold`). Repeatable.
-- `--weighted-signer-webauthn <CREDENTIAL_NAME=WEIGHT>` — one External WebAuthn signer-weight pair, resolved by credential name from the passkeys registry (`--kind weighted-threshold`). Repeatable.
-- `--auth-rule-id <U32>` (optional) — authorizing rule id(s). Repeatable. Defaults to `--rule-id`.
+- `--rule-id <U32>` (required): rule to add the policy to.
+- `--policy-address <C_STRKEY>`: policy contract address. Required with `--kind raw`; rejected with the other kinds.
+- `--install-param <SCVAL_BASE64>`: a standard-base64 XDR `ScVal` install parameter (not base64url), passed to `add_policy` without further validation (raw passthrough). Required with `--kind raw`; rejected with the other kinds.
+- `--limit <STROOPS>`: spending limit in stroops (`--kind spending-limit`, required). The `i128` amount the rolling window admits before the policy panics `SpendingLimitExceeded`.
+- `--period <LEDGERS>`: rolling-window length in ledgers (`--kind spending-limit`, required).
+- `--policy <C_STRKEY>`: spending-limit policy contract override (`--kind spending-limit`). When omitted, resolves from the registry populated by `smart-account deploy-spending-limit-policy`; fails closed with a deploy-first hint if absent.
+- `--threshold <U32>`: signer threshold (`--kind simple-threshold` / `--kind weighted-threshold`, required with both). For `simple-threshold` this is the minimum signer count; for `weighted-threshold` this is the minimum total weight.
+- `--weighted-signer-delegated <G_STRKEY=WEIGHT>`: one Delegated (ed25519) signer-weight pair (`--kind weighted-threshold`). Repeatable.
+- `--weighted-signer-webauthn <CREDENTIAL_NAME=WEIGHT>`: one External WebAuthn signer-weight pair, resolved by credential name from the passkeys registry (`--kind weighted-threshold`). Repeatable.
+- `--auth-rule-id <U32>` (optional): authorizing rule id(s). Repeatable. Defaults to `--rule-id`.
 - `--accept-mutable-verifier`: pin a policy that is mutable (admin/owner key, or an owner-managed external reference). Applies only as described under "Pin record" below; the audit log then records `SaMutableContractOverride`, carrying the rule id, after the add confirms; a refused add writes none.
 - `--accept-unknown-verifier`: pin a policy whose hash is outside the policy allowlist (the simple-threshold, weighted-threshold and spending-limit Wasms the wallet vendors). Same scope; the audit log then records `SaUnknownContractOverride`, carrying the rule id, after the add confirms.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
@@ -247,7 +247,7 @@ The add holds the lock of `--rule-id` and of every `--auth-rule-id` other than `
 
 The add attaches any other policy without a signer-set state row. A simulated return value that carries no policy id, for any policy, refuses the add before it is signed with `sa.deployment_failed`; nothing is sent, and only the `SaRawInvocation` row is written. A confirmed add whose return value still carries no policy id returns `sa.baseline_write_failed` at stage `observe` with the transaction hash, writes its pin rows and no `SaPolicyAdded` row; `rules get --rule-id N` shows the attached policy's id. [Audit row order](#audit-row-order) lists the rows of each outcome.
 
-**Pin record.** When the rule has a pin record and the policy is not already attached to it, the add keeps the record in step with the rule's policies. The record is read, and the rule's policies observed, under the rule's lock. Before submission the policy is identified and probed as `rules create` probes one: a hash outside the policy allowlist fails with `sa.policy_wasm_not_in_allowlist` and a mutable contract with `sa.policy_mutable` unless the matching flag above is set, and an unpinnable instance fails with `sa.contract_instance_unsupported` regardless. After the add confirms, a `SaContextRulePinsUpdated` row (reason `policy_added`) records the policy pins with the new pin appended, so later signing under the rule checks the policy too. When the rule has no policy on chain, the row replaces the policy pins with the added policy's pin. A record with two policy pins is refused by every checked signing verb with `sa.pin_check_unavailable` (inner code `sa.multiple_pinned_hashes_unsupported`), the same outcome as a rule installed with two policies. A rule without a pin record stays unpinned: nothing is probed and no row is written.
+**Pin record.** When the rule has a pin record and the policy is not already attached to it, the add keeps the record in step with the rule's policies. The record is read, and the rule's policies observed, under the rule's lock. Before submission the policy is identified and probed as `rules create` probes one. A hash outside the policy allowlist fails with `sa.policy_wasm_not_in_allowlist` and a mutable contract with `sa.policy_mutable` unless the matching flag above is set. An unpinnable instance fails with `sa.contract_instance_unsupported` regardless. After the add confirms, a `SaContextRulePinsUpdated` row (reason `policy_added`) records the policy pins with the new pin appended, so later signing under the rule checks the policy too. When the rule has no policy on chain, the row replaces the policy pins with the added policy's pin. A record with two policy pins is refused by every checked signing verb with `sa.pin_check_unavailable` (inner code `sa.multiple_pinned_hashes_unsupported`), the same outcome as a rule installed with two policies. A rule without a pin record stays unpinned: nothing is probed and no row is written.
 
 ```bash
 stellar-agent smart-account rules add-policy \
@@ -286,9 +286,9 @@ Removes a policy from a rule by its on-chain `policy_id` (OZ `remove_policy`). S
 Flags:
 
 - `--account <C_STRKEY>` (required).
-- `--rule-id <U32>` (required) — rule to remove the policy from.
-- `--policy-id <U32>` (required) — on-chain policy id to remove.
-- `--auth-rule-id <U32>` (optional) — authorizing rule id(s). Repeatable. Defaults to `--rule-id`.
+- `--rule-id <U32>` (required): rule to remove the policy from.
+- `--policy-id <U32>` (required): on-chain policy id to remove.
+- `--auth-rule-id <U32>` (optional): authorizing rule id(s). Repeatable. Defaults to `--rule-id`.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
 The removal holds the lock of `--rule-id` and of every `--auth-rule-id` other than `0` from before its first read until its pins row is written. A concurrent verb on the rule, such as `signers add`, therefore runs before or after the whole removal, and neither loses the other's pin. Under the lock, whatever the policy, the wallet compares the chain with the rule's version 2 signer-set state, with the refusals of [`rules add-policy`](#smart-account-rules-add-policy). A rule without a signer-set state refuses with `sa.signer_set_missing_baseline` before any RPC. A rule with a state that is not on chain refuses from the comparison's rule read. A `--policy-id` the rule does not hold refuses with `sa.deployment_failed` after the comparison. The comparison reads every attached policy's executable through both RPC endpoints, and the wallet reads the removed policy's again to tell whether it is the simple-threshold policy. A policy whose executable cannot be read refuses with `sa.deployment_failed` when the read fails. An undecodable instance or an external reference with no live tag entry gives `sa.contract_instance_unsupported`, and endpoints that disagree give `network.rpc_divergence`. The removal signs under `--auth-rule-id`, so those rules pass the [pre-submission checks](#pre-submission-checks). The wallet sends nothing on a refusal. Remove a rule whose policy stays unreadable with `rules delete --rule-id N --auth-rule-id 0`.
@@ -351,7 +351,7 @@ Flags:
 
 - `--account <C_STRKEY>` (required).
 - `--rule-id <U32>` (required) — rule whose spending-limit policy to retune. This rule keys the policy's storage; it does NOT authorize the call.
-- `--auth-rule-id <U32>`: rule that AUTHORIZES the retune. Default `0` (the bootstrap rule installed at deploy time), NOT `--rule-id`: the retune executes on the smart account itself, an auth context the CallContract-scoped rule named by `--rule-id` always refuses on-chain (`UnvalidatedContext`), so the target rule can never authorize its own retune. Supply a different admin-capable rule id if the bootstrap rule has been replaced. An authorizing rule other than `0` has its signer-set baseline checked before signing (see [pre-submission checks](#pre-submission-checks)).
+- `--auth-rule-id <U32>`: rule that authorizes the retune. Default `0` (the bootstrap rule), not `--rule-id`. The retune executes on the smart account itself. A CallContract-scoped target rule refuses that context on chain (`UnvalidatedContext`). Supply another admin-capable rule id when the bootstrap rule has been replaced. An authorizing rule other than `0` passes the [pre-submission checks](#pre-submission-checks).
 - `--limit <STROOPS>` (required) — new spending limit, in stroops. Must be positive.
 - `--profile <NAME>` — profile name for audit-log path resolution.
 - Signer-source group (see [Signer source](#signer-source)); the signer must satisfy the `--auth-rule-id` rule.
@@ -377,9 +377,11 @@ Every verb waits for the rule's lock at most `--timeout-seconds`, then refuses w
 
 **Signer-set baseline.** The audit log keeps each rule's signer-set state: a baseline row, then one state row per signer change the wallet makes. A version 2 state records every signer's full identity, an `External` signer by the SHA-256 and the length of its whole key data. It also records the rule's simple-threshold policy and threshold, or no threshold when the rule has no simple-threshold policy. A version 1 state keeps the first 16 bytes of an `External` signer's key data. Both RPC endpoints (`--rpc-url` and `--secondary-rpc-url`) read the rule, the executable of each attached policy and the threshold, and must agree; otherwise the verb refuses with `network.rpc_divergence`.
 
-- Every signature under a rule other than `0` compares the chain with the rule's state before it is signed, as part of the [pre-submission checks](#pre-submission-checks): the signer verbs, `execute`, `multicall`, the authorizing rules of the `rules` write verbs and the passkey signing path. A rule without a state refuses with `sa.signer_set_missing_baseline`; run `signers list --rule-id N` to record one. `add`, `remove`, `set-threshold` and `batch-add`, and `rules add-policy` and `rules remove-policy` for any policy, require a version 2 state of their target rule. A version 1 state refuses before any RPC with `sa.signer_set_baseline_legacy`; run `signers refresh --rule-id N` once to record a version 2 state. Every other signature compares a version 1 state through its version 1 projection. A chain that differs from the state writes a `SaSignerSetDiverged` row and refuses with `sa.signer_set_diverged`; nothing is sent.
+- Every signature under a rule other than `0` compares the chain with the rule's state before signing, through the [pre-submission checks](#pre-submission-checks). This covers the signer verbs, `execute`, `multicall`, authorizing rules of `rules` write verbs, and the passkey path. A rule without a state refuses with `sa.signer_set_missing_baseline`; run `signers list --rule-id N` to record one. `signers add`, `remove`, `set-threshold`, and `batch-add` require version 2 state. So do `rules add-policy` and `rules remove-policy` for any policy, and a `migrate-verifier` removal. Version 1 refuses these operations before any RPC with `sa.signer_set_baseline_legacy`; run `signers refresh --rule-id N` once. Other signatures compare version 1 state through its version 1 projection. A changed chain writes `SaSignerSetDiverged` and refuses with `sa.signer_set_diverged`; nothing is sent.
 - After the transaction confirms, both endpoints are read again at or past the confirmation ledger, and the result must be exactly the intended change. It is recorded as a `SaSignerAddedV2`, `SaSignerRemovedV2` or `SaThresholdChangedV2` row. A different result writes a `SaSignerSetDiverged` row and refuses with `sa.signer_set_diverged` naming the transaction hash.
 - When the confirmed result cannot be observed within `--timeout-seconds` (stage `observe`) or its row cannot be written (stage `write`), the verb returns `sa.baseline_write_failed` with the transaction hash. The transaction stands; `signers refresh --rule-id N --accept-divergence` records the chain state. The same holds for the confirmed removal and add of a [`migrate-verifier`](#smart-account-migrate-verifier) pair. On a pinned rule, a confirmed `add` or `batch-add` writes its pin rows once. They follow the state row when the change is recorded, and precede the refusal when the result is not observed or not the intended change. The pin record then holds every verifier the transaction added. When the state row is not written, the pin rows are attempted and are usually refused too. A pin row the audit log refuses is logged as a warning, and the rule keeps its previous pin record. A record left without the added verifier's pin refuses the next signature under the rule with `sa.pinned_verifier_absent`; the same `signers refresh` pins the live verifier.
+
+**A log from an earlier release.** A rule created under an earlier release has no state row. The exception is a rule that `signers list` or `signers refresh` recorded while it held a simple-threshold policy; that row is version 1. `rules list` reports `none` or `v1` for these rules. A non-zero rule reporting `none` needs one `signers list --rule-id N` before any signature it authorizes. This includes `execute`, `multicall`, `rules set-name`, `rules set-valid-until`, and `rules delete`. A rule reporting `v1` signs through the version 1 projection. Run `signers refresh --rule-id N` once before `signers add`, `remove`, `set-threshold`, or `batch-add`. Also refresh before `rules add-policy` or `rules remove-policy` for any policy, and before a `migrate-verifier` removal. `set-weighted-threshold`, `set-signer-weight`, and `set-spending-limit` compare version 1 state through the projection. A version 1 row cannot compare a rule that lost its simple-threshold policy or gained a contract delegate, so signing refuses. `signers refresh --rule-id N --accept-divergence` records that rule's current state.
 
 ### `smart-account signers list`
 
@@ -419,19 +421,19 @@ Adds one signer to a rule (OZ `add_signer`). Signs and submits. Testnet only. Th
 
 Exactly one of the following signer-source forms is required (mutually exclusive group):
 
-- `--signer-delegated <G_STRKEY>` (alias `--new-signer`) — a delegated ed25519 signer.
-- `--signer-ed25519 <HEX_PUBKEY_64>` — a first-class external Ed25519 signer: the raw 32-byte public key, hex-encoded. The recommended signer shape for an autonomous agent's own key — see [Agent delegation](../agent-delegation.md). Optional `--verifier <C_STRKEY>` overrides the verifier contract; when omitted it resolves from the verifier registry's registered Ed25519 verifier for the target network (deploy one via `smart-account deploy-ed25519-verifier`), failing closed if none is registered.
-- `--signer-external <C_STRKEY>` — a custom external-verifier signer with caller-supplied key data. Requires `--signer-key-data <HEX>`. `--signer-ed25519` is the typed equivalent for the Ed25519 verifier specifically and produces the identical on-chain signer entry.
-- `--signer-webauthn <CREDENTIAL_NAME>` — a passkey signer resolved from the profile's passkey registry; the verifier address is read from the verifier registry.
+- `--signer-delegated <G_STRKEY>` (alias `--new-signer`): a delegated ed25519 signer.
+- `--signer-ed25519 <HEX_PUBKEY_64>`: a first-class external Ed25519 signer: the raw 32-byte public key, hex-encoded. The recommended signer shape for an autonomous agent's own key: see [Agent delegation](../agent-delegation.md). Optional `--verifier <C_STRKEY>` overrides the verifier contract; when omitted it resolves from the verifier registry's registered Ed25519 verifier for the target network (deploy one via `smart-account deploy-ed25519-verifier`), failing closed if none is registered.
+- `--signer-external <C_STRKEY>`: a custom external-verifier signer with caller-supplied key data. Requires `--signer-key-data <HEX>`. `--signer-ed25519` is the typed equivalent for the Ed25519 verifier specifically and produces the identical on-chain signer entry.
+- `--signer-webauthn <CREDENTIAL_NAME>`: a passkey signer resolved from the profile's passkey registry; the verifier address is read from the verifier registry.
 
 Plus:
 
-- `--signer-key-data <HEX>` — raw hex key-data for an external signer; required with, and only valid with, `--signer-external`.
+- `--signer-key-data <HEX>`: raw hex key-data for an external signer; required with, and only valid with, `--signer-external`.
 - `--accept-mutable-verifier`: pin a new verifier that is mutable (admin/owner key, or an owner-managed external reference). Applies only as described under "Pin record" below; the audit log then records `SaMutableContractOverride`, carrying the rule id, after the add confirms; a refused add writes none.
 - `--accept-unknown-verifier`: pin a new verifier whose hash is outside the verifier allowlist. Same scope; the audit log then records `SaUnknownContractOverride`, carrying the rule id, after the add confirms.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`.
 
-The add signs under `--rule-id`, so the rule passes the [pinned-hash drift check](#pinned-hash-drift-check) first.
+The add first compares the target rule with its version 2 state under its lock. It then passes the [pinned-hash drift check](#pinned-hash-drift-check) before signing under `--rule-id`.
 
 **Pin record.** When the new signer is `External` (`--signer-ed25519`, `--signer-external`, `--signer-webauthn`) and the rule has a pin record, the add keeps the record in step with the rule's verifiers. Before submission, a verifier address the rule does not already use is identified and probed as `rules create` probes one. A hash outside the allowlist fails with `sa.verifier_wasm_not_in_allowlist` and a mutable contract with `sa.verifier_mutable` unless the matching flag above is set. An unpinnable instance fails with `sa.contract_instance_unsupported` regardless. After the add confirms, a `SaContextRulePinsUpdated` row (reason `signer_added`) records the verifier pins, one per distinct pin, in hash and executable reference, whether or not the resulting state is then recorded. A signer on a verifier the rule already uses, or on a new verifier whose pin equals a recorded pin, leaves them unchanged. A signer on a new verifier with another pin appends its pin. A record with two verifier pins is refused by every checked signing verb with `sa.pin_check_unavailable` (inner code `sa.multiple_pinned_hashes_unsupported`), the same outcome as a rule installed with two verifiers. When the rule has no `External` signer, [`signers refresh`](#smart-account-signers-refresh) removes the record's sole verifier pin and its reference before the add, as after a `migrate-verifier` pair whose repoint was not written. The policy pins, the policy references and the override flags stay as they are. A rule without a pin record stays unpinned: nothing is probed and no row is written.
 
@@ -457,7 +459,7 @@ Removes a signer by its on-chain id (OZ `remove_signer`). Signs and submits. Tes
 
 Extra flag:
 
-- `--signer-id <U32>` (required) — the on-chain signer id to remove, from `smart-account signers list`.
+- `--signer-id <U32>` (required): the on-chain signer id to remove, from `smart-account signers list`.
 
 ```bash
 stellar-agent smart-account signers remove \
@@ -473,7 +475,7 @@ Changes the rule's signing threshold via the threshold-policy contract's `set_th
 
 Extra flag:
 
-- `--new-threshold <U32>` (required) — the new threshold. There is no `--auth-rule-id` override on this verb; the authorizing rule is `--rule-id`.
+- `--new-threshold <U32>` (required): the new threshold. There is no `--auth-rule-id` override on this verb; the authorizing rule is `--rule-id`.
 
 ```bash
 stellar-agent smart-account signers set-threshold \
@@ -485,7 +487,7 @@ stellar-agent smart-account signers set-threshold \
 
 ### `smart-account signers set-weighted-threshold`
 
-Changes a rule's weighted-threshold policy's `threshold` (OZ `set_threshold` on the weighted-threshold policy contract). Signs and submits. Testnet only. The policy is identified by wasm-hash allowlist lookup (a SEPARATE allowlist from the simple threshold-policy's — the two kinds never cross-identify); zero or multiple matches refuse with the typed `WeightedThresholdNotInstalled` / `WeightedThresholdPolicyIdentificationFailed`. Refused client-side before any network call when the new threshold is `0` or exceeds the checked sum of current signer weights.
+Changes a rule's weighted-threshold policy's `threshold` (OZ `set_threshold` on the weighted-threshold policy contract). Signs and submits. Testnet only. The policy is identified by wasm-hash allowlist lookup (a SEPARATE allowlist from the simple threshold-policy's: the two kinds never cross-identify); zero or multiple matches refuse with the typed `WeightedThresholdNotInstalled` / `WeightedThresholdPolicyIdentificationFailed`. Refused client-side before any network call when the new threshold is `0` or exceeds the checked sum of current signer weights.
 
 Extra flags:
 
@@ -506,14 +508,14 @@ Changes one signer's weight in a rule's weighted-threshold policy (OZ `set_signe
 
 Exactly one of the following identifies the TARGET signer (mutually exclusive group):
 
-- `--signer-delegated <G_STRKEY>` — a delegated ed25519 signer.
-- `--signer-ed25519 <HEX_PUBKEY_64>` — a first-class external Ed25519 signer; optional `--verifier <C_STRKEY>` override.
-- `--signer-external <C_STRKEY>` — a custom external-verifier signer; requires `--signer-key-data <HEX>`.
-- `--signer-webauthn <CREDENTIAL_NAME>` — a passkey signer resolved from the profile's passkey registry.
+- `--signer-delegated <G_STRKEY>`: a delegated ed25519 signer.
+- `--signer-ed25519 <HEX_PUBKEY_64>`: a first-class external Ed25519 signer; optional `--verifier <C_STRKEY>` override.
+- `--signer-external <C_STRKEY>`: a custom external-verifier signer; requires `--signer-key-data <HEX>`.
+- `--signer-webauthn <CREDENTIAL_NAME>`: a passkey signer resolved from the profile's passkey registry.
 
 Plus:
 
-- `--new-weight <U32>` (required) — the target signer's new weight.
+- `--new-weight <U32>` (required): the target signer's new weight.
 - `--auth-rule-id <U32>` (optional): same default-to-`--rule-id` / scoped-rule override rule as `set-weighted-threshold`. An authorizing rule other than `0` has its signer-set baseline checked before signing (see [pre-submission checks](#pre-submission-checks)).
 
 ```bash
@@ -531,12 +533,12 @@ Adds MULTIPLE signers to a rule in ONE transaction (OZ `batch_add_signer`). Sign
 
 Flags (each repeatable, any combination, at least one signer required across all three):
 
-- `--signer-delegated <G_STRKEY>` — one Delegated (ed25519) signer per occurrence.
-- `--signer-webauthn <CREDENTIAL_NAME>` — one WebAuthn passkey signer (resolved from the profile's passkey registry) per occurrence.
-- `--signer-ed25519 <HEX_PUBKEY_64>` — one first-class External-Ed25519 signer per occurrence; `--verifier <C_STRKEY>` (optional) overrides the verifier used for ALL `--signer-ed25519` entries in the call.
+- `--signer-delegated <G_STRKEY>`: one Delegated (ed25519) signer per occurrence.
+- `--signer-webauthn <CREDENTIAL_NAME>`: one WebAuthn passkey signer (resolved from the profile's passkey registry) per occurrence.
+- `--signer-ed25519 <HEX_PUBKEY_64>`: one first-class External-Ed25519 signer per occurrence; `--verifier <C_STRKEY>` (optional) overrides the verifier used for ALL `--signer-ed25519` entries in the call.
 - `--accept-mutable-verifier`, `--accept-unknown-verifier`: as on `signers add`.
 
-The batch keeps the rule's pin record in step exactly as `signers add` does (see "Pin record" there): every distinct new verifier address the rule does not already use is probed before submission, and one `SaContextRulePinsUpdated` row (reason `signer_added`) records the resulting verifier pins after the batch confirms.
+The batch keeps the rule's pin record in step as `signers add` does (see "Pin record" there). Each distinct new verifier address the rule does not use is probed before submission. After confirmation, one `SaContextRulePinsUpdated` row (reason `signer_added`) records the resulting verifier pins.
 
 ```bash
 stellar-agent smart-account signers batch-add \
@@ -561,19 +563,19 @@ Two distinct signers participate — neither is the other:
 
 Flags:
 
-- `--account <C_STRKEY>` (required) — the smart account whose rule authorizes the call (`auth_address`).
-- `--contract <C_STRKEY>` (required) — the external target contract (`target_contract`). For most delegated calls this differs from `--account`.
-- `--function <NAME>` (required) — the contract function to invoke.
-- `--arg <SCVAL_BASE64>` — one standard-base64 XDR `ScVal` argument, in call order. Repeatable. Decoded client-side only to validate well-formedness (bounded XDR decode) — never re-encoded; a malformed value is refused with the failing argument's index named.
-- `--auth-rule-id <U32>` (required) — the authorizing rule id(s). Repeatable. Unlike every other smart-account write verb, this flag has NO default: the delegation use case always names a specific scoped rule, and a defaulted bootstrap rule (`[0]`) would either authorize against the wrong rule or fail on-chain in a way that hides the caller's mistake.
-- `--rule-signer-ed25519-secret-env <VAR>` (required) — environment variable holding the rule signer's S-strkey seed.
-- `--expect-rule-signer <64_HEX>` — fail closed, before any signing, if the seed-derived public key differs from this value. Surfaces a misconfigured environment variable client-side instead of as an on-chain refusal.
-- `--verifier <C_STRKEY>` — Ed25519-verifier contract override. Omitted, it resolves from the verifier registry (populated by `smart-account deploy-ed25519-verifier`), failing closed if none is registered.
+- `--account <C_STRKEY>` (required): the smart account whose rule authorizes the call (`auth_address`).
+- `--contract <C_STRKEY>` (required): the external target contract (`target_contract`). For most delegated calls this differs from `--account`.
+- `--function <NAME>` (required): the contract function to invoke.
+- `--arg <SCVAL_BASE64>`: one standard-base64 XDR `ScVal` argument, in call order. Repeatable. Decoded client-side only to validate well-formedness (bounded XDR decode): never re-encoded; a malformed value is refused with the failing argument's index named.
+- `--auth-rule-id <U32>` (required): authorizing rule id(s). Repeatable, with no default. The delegation call names a specific scoped rule. A default bootstrap rule (`[0]`) could authorize against the wrong rule or produce an on-chain refusal that hides the caller's mistake.
+- `--rule-signer-ed25519-secret-env <VAR>` (required): environment variable holding the rule signer's S-strkey seed.
+- `--expect-rule-signer <64_HEX>`: fail closed, before any signing, if the seed-derived public key differs from this value. Surfaces a misconfigured environment variable before any signing.
+- `--verifier <C_STRKEY>`: Ed25519-verifier contract override. Omitted, it resolves from the verifier registry (populated by `smart-account deploy-ed25519-verifier`), failing closed if none is registered.
 - Shared: `--profile`, fee-payer signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
-On success the envelope carries `status: "submitted"`, `contract`, `function`, `arg_count`, `auth_rule_ids`, `rule_signer_pubkey_first8` (never the full key or seed), `verifier_address`, and `tx_hash`. On-chain refusals (spending-limit cap, scope mismatch, expired rule) surface through the same typed `SaError` wire codes and message annotations (e.g. `[OZ:SpendingLimitExceeded]`, `[OZ:UnvalidatedContext]`) every other smart-account write verb renders.
+On success the envelope carries `status: "submitted"`, `contract`, `function`, `arg_count`, `auth_rule_ids`, `rule_signer_pubkey_first8` (never the full key or seed), `verifier_address`, and `tx_hash`. On-chain refusals (spending-limit cap, scope mismatch, expired rule) surface through the same typed `SaError` wire codes and message annotations (for example `[OZ:SpendingLimitExceeded]`, `[OZ:UnvalidatedContext]`) every other smart-account write verb renders.
 
-Before anything is simulated or signed, every `--auth-rule-id` other than `0` goes through the [pre-submission checks](#pre-submission-checks) against the profile's audit log. A rule without a signer-set baseline refuses with `sa.signer_set_missing_baseline`, and an audit-log integrity error with `sa.audit_log`. A verifier or policy that differs from its pin refuses with `sa.verifier_hash_drift` / `sa.policy_hash_drift`, and a drift check that cannot run with `sa.pin_check_unavailable`. A rule whose record holds policy pins while the rule has no policy on chain refuses with `sa.pinned_policy_absent`. A rule holding an `External` signer while its record pins no verifier refuses with `sa.pinned_verifier_absent`. A signer set that differs from the baseline refuses with `sa.signer_set_diverged`. The checks read and fetch through the same `--rpc-url` / `--secondary-rpc-url` endpoints as the submission.
+Before anything is simulated or signed, every `--auth-rule-id` other than `0` goes through the [pre-submission checks](#pre-submission-checks) against the profile's audit log. A rule without a signer-set baseline refuses with `sa.signer_set_missing_baseline`, and an audit-log integrity error with `sa.audit_log`. For a checked verifier or policy, the first eight bytes of the live code hash must equal the pinned value. An external reference must also match its pinned owner, tag, and resolved hash prefix. A mismatch refuses with `sa.verifier_hash_drift` / `sa.policy_hash_drift`, and a drift check that cannot run with `sa.pin_check_unavailable`. A rule whose record holds policy pins while the rule has no policy on chain refuses with `sa.pinned_policy_absent`. A rule holding an `External` signer while its record pins no verifier refuses with `sa.pinned_verifier_absent`. A signer set that differs from the baseline refuses with `sa.signer_set_diverged`. The checks read and fetch through the same `--rpc-url` / `--secondary-rpc-url` endpoints as the submission. Endpoint disagreement is `network.rpc_divergence`. Lock timeout is `sa.auth_entry_construction_failed` at stage `rule_lock`. A deadline that elapses during the baseline read or the comparison uses that code at `baseline_read` or `signer_set_compare`. A version 1 authorizing rule compares through its projection. Its own refusals are `sa.threshold_policy_not_installed`, `sa.threshold_policy_identification_failed`, and `sa.deployment_failed`.
 
 ```bash
 stellar-agent smart-account execute \
@@ -594,17 +596,17 @@ There is currently no MCP tool for this verb; see [MCP: why there is no agent-fa
 
 ## `smart-account multicall`
 
-Submits an atomic multicall bundle (1–50 invocations) through the registered multicall router contract for the target network. Signs and submits. The router address is resolved from the local registry (`<canonical_data_root>/networks.toml`); `mainnet` is accepted at the flag level but requires a router registered for mainnet. A signer source is required.
+Submits an atomic multicall bundle (1 to 50 invocations) through the registered multicall router contract for the target network. Signs and submits. The router address is resolved from the local registry (`<canonical_data_root>/networks.toml`); `mainnet` is accepted at the flag level but requires a router registered for mainnet. A signer source is required.
 
 Each `--invocation` value has the form `<target>:<fn>:<json-args>`, where `<target>` is the C-strkey of the contract to invoke, `<fn>` is the function name, and `<json-args>` is a JSON array of XDR-encoded arguments.
 
 Flags:
 
-- `--smart-account <C_STRKEY>` (required) — the smart-account executing the bundle.
-- `--rule-id <U32>` (required) — the context rule authorizing the bundle.
-- `--invocation <TARGET:FN:JSON_ARGS>` (required, repeatable, 1–50) — one invocation descriptor.
+- `--smart-account <C_STRKEY>` (required): the smart-account executing the bundle.
+- `--rule-id <U32>` (required): the context rule authorizing the bundle.
+- `--invocation <TARGET:FN:JSON_ARGS>` (required, repeatable, 1 to 50): one invocation descriptor.
 - `--secondary-rpc-url <URL>`: secondary RPC for cross-verification. Resolved from the flag, else the profile's `secondary_rpc_url`, else a typed error.
-- `--fee <STROOPS>` — per-op base fee in stroops (default 100). Unlike the deploy verb, `auto[:pNN]` is rejected here.
+- `--fee <STROOPS>`: per-op base fee in stroops (default 100). Unlike the deploy verb, `auto[:pNN]` is rejected here.
 - Signer-source flags are required (one of `--signer-secret-env` or `--sign-with-ledger`); `--account-index <INDEX>` defaults to `0`.
 - Shared: `--network`, `--rpc-url`, `--timeout-seconds`, `--profile`.
 
@@ -720,10 +722,10 @@ The result envelope lists, for each step, `key_data_hex` (the key data its add r
 
 Flags:
 
-- `--account <C_STRKEY>` (required) — smart-account to migrate.
-- `--from <HASH_HEX>` (required) — 64-char hex SHA-256 of the source verifier WASM; only `External` signers whose verifier matches are included.
-- `--to <C_STRKEY>` (required) — destination verifier contract.
-- `--dry-run` — plan only, no transactions submitted.
+- `--account <C_STRKEY>` (required): smart-account to migrate.
+- `--from <HASH_HEX>` (required): 64-char hex SHA-256 of the source verifier WASM; only `External` signers whose verifier matches are included.
+- `--to <C_STRKEY>` (required): destination verifier contract.
+- `--dry-run`: plan only, no transactions submitted.
 - Shared: `--profile`, signer-source group (required for submit, not for dry-run), `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`.
 
 ```bash
@@ -748,15 +750,15 @@ Enumerates the active context rules on a smart-account by scanning the on-chain 
 
 Flags:
 
-- `--account <C_STRKEY>` (required) — smart-account to query.
-- `--source-account <G_STRKEY>` (optional) — simulation source account. On testnet it defaults to a well-known funded interop deployer; on mainnet pass any funded account (it is not debited).
-- `--rpc-url <URL>` — default testnet RPC.
-- `--secondary-rpc-url <URL>` — defaults to `--rpc-url`.
-- `--network <NETWORK>` — default `testnet`.
+- `--account <C_STRKEY>` (required): smart-account to query.
+- `--source-account <G_STRKEY>` (optional): simulation source account. On testnet it defaults to a well-known funded interop deployer; on mainnet pass any funded account (it is not debited).
+- `--rpc-url <URL>`: default testnet RPC.
+- `--secondary-rpc-url <URL>`: defaults to `--rpc-url`.
+- `--network <NETWORK>`: default `testnet`.
 - `--profile <NAME>`.
-- `--max-scan-id <N>` — override the scan upper bound. Must be in `1..=10000`; values outside that range are rejected at parse time. When unset, the profile value is used, else `50`.
+- `--max-scan-id <N>`: override the scan upper bound. Must be in `1..=10000`; values outside that range are rejected at parse time. When unset, the profile value is used, else `50`.
 - `--timeout-seconds <SECONDS>`: default `60`; covers the full enumeration, the baseline reads included.
-- `--output <FORMAT>` — `json` default; `table` mode is deferred (the flag is accepted but renders the JSON envelope).
+- `--output <FORMAT>`: `json` default; `table` mode is deferred (the flag is accepted but renders the JSON envelope).
 
 Each entry of `rules` carries `rule_id`, `name`, `context_type_label`, `signer_count`, `policy_count`, `valid_until` (omitted for a permanent rule) and `baseline`. `baseline` is the rule's signer-set baseline in the profile's audit log: `none` (no state row), `v1`, `v2`, `unreadable` (an audit-log integrity error for that rule) or `unknown` (the log was not read). Every signature under a rule other than `0` needs the baseline: a rule reporting `none` refuses with `sa.signer_set_missing_baseline` until one `signers list --rule-id N` records it. Rule `0` reports its own state like any rule.
 
@@ -802,7 +804,7 @@ stellar-agent smart-account unregister-multicall --network testnet
 
 Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelock contract. The signer must hold the appropriate timelock role for each write verb. All four share `--timelock <C_STRKEY>` (required), `--rpc-url`, `--secondary-rpc-url`, `--network`, and `--profile`; the write verbs add the signer-source group. The write verbs (`schedule`, `cancel`, `execute`) structurally refuse `mainnet`; `list-pending` is read-only and accepts `mainnet`.
 
-When `--secondary-rpc-url` is omitted it defaults to `--rpc-url`; supplying an independent endpoint restores the cross-RPC divergence defence.
+When `--secondary-rpc-url` is omitted it defaults to `--rpc-url`; supplying an independent endpoint restores the cross-RPC divergence defense.
 
 #### `smart-account timelock schedule`
 

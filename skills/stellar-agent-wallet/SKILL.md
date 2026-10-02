@@ -118,13 +118,16 @@ Read-only tools never sign and are safe to call freely.
 `stellar_fee_stats` returns network fee statistics; `stellar_dex_quote` returns an
 on-chain Soroswap quote. On testnet, fund a fresh account with `stellar_friendbot`.
 
-`stellar_rules_list` and `stellar_rules_get` read the agent's own context rules —
-including any spending-limit budget (`spending_limit`, `in_window_spent`,
-`remaining_budget`) and expiry (`expires_in_ledgers`). Read these before a
-transfer that might be near a cap: `in_window_spent`/`remaining_budget` are
-exact only as of the `as_of_ledger` they were read at, so treat them as an
-estimate, not a guarantee — an intervening spend can still make a later
-submission fail `SpendingLimitExceeded`. See
+`stellar_rules_list` and `stellar_rules_get` read the agent's own context rules,
+including spending-limit budget and expiry. Their `baseline` field reports
+`none`, `v1`, `v2`, `unreadable`, or `unknown`. A non-zero rule reporting `none`
+refuses every signature until the operator runs `signers list` at the CLI.
+A rule reporting `v1` signs the agent's commits through the version 1 projection.
+The operator runs `signers refresh` before signer or policy mutations and a
+`migrate-verifier` removal. MCP has no tool for either step.
+Read budget fields before transfers near a cap. `in_window_spent` and
+`remaining_budget` are exact only at `as_of_ledger`. An intervening spend can
+make submission fail `SpendingLimitExceeded`. See
 [references/smart-accounts.md](references/smart-accounts.md).
 
 ## 3. Sending a payment — the two-phase pattern
@@ -202,12 +205,16 @@ payments. See `references/cli-reference.md` and `references/mcp-tools.md`.
 The wallet manages OpenZeppelin smart accounts: context rules, ed25519
 (delegated and first-class external) and WebAuthn passkey signers, quorum
 thresholds, verifier/policy WASM-hash pinning, multicall, and an upgrade
-timelock. A context rule scoped to one contract (`--context call-contract:<C>`)
-combined with a fresh external Ed25519 signer and a spending-limit policy is
-the bounded-agent-delegation shape: an operator can hand an autonomous agent
-its own key, capped to one contract and a spending limit, without exposing the
-account's full authority. These run under the CLI `smart-account` (alias `sa`)
-command group and submit through the smart account. See
+timelock. Every signature under a non-zero rule compares its live signer set
+with its audit-log baseline and checks executable pins. The operator runs
+`signers list` once for `none` and `signers refresh` once for `v1` before
+signer or policy mutations or a `migrate-verifier` removal.
+A context rule scoped to one contract (`--context call-contract:<C>`) with an
+external Ed25519 signer and a spending-limit policy bounds agent delegation.
+The operator gives the agent its own key, capped to one contract and a spending
+limit, without exposing the account's full authority. These governance features
+run under the CLI `smart-account` (alias `sa`) command group and submit through
+the smart account. See
 `references/smart-accounts.md`.
 
 You can also PROPOSE a new rule yourself via `stellar_rule_create` /
