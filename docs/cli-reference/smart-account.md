@@ -189,6 +189,9 @@ Verifies a rule's pinned verifier and policy WASM hashes against the live on-cha
 
 Each `*_pin_status` is one of `match`, `drift`, `unavailable`, `no_pin`, or `no_contracts`. `drift` also covers a pinned policy with no policy on chain: the pin record holds policy pins while the rule has none, and `policy_pin_status` is `drift` with an empty observed list. It covers a live verifier the record does not pin too: the rule holds an `External` signer while the record pins no verifier, and `verifier_pin_status` is `drift` with an empty observed list; `signers refresh` repairs it. The signer-source flags are used only to derive a source account for the simulation; no transaction is signed.
 
+A rule with one drifted and one unavailable pin reports both statuses, carries the unavailable probe's code in `unavailable_reason`, and exits 1.
+A failed executable read reports `sa.deployment_failed` in `unavailable_reason`.
+
 Flags:
 
 - `--account <C_STRKEY>` (required).

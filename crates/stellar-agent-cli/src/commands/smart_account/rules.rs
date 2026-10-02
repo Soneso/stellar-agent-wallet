@@ -1691,6 +1691,15 @@ impl VerifyPinsResult {
     }
 }
 
+/// Exit code of `rules verify-pins`: `1` when either pin status is `Drift`,
+/// `0` otherwise. `Unavailable` alone exits `0`: an infrastructure failure is
+/// not confirmed drift. The JSON envelope is emitted in both cases.
+fn verify_pins_exit_code(result: &VerifyPinsResult) -> i32 {
+    let drift = matches!(result.verifier_pin_status, PinStatus::Drift)
+        || matches!(result.policy_pin_status, PinStatus::Drift);
+    if drift { 1 } else { 0 }
+}
+
 async fn verify_pins_run(args: &VerifyPinsArgs) -> i32 {
     let request_id = new_request_id();
     let account_redacted = redact_strkey_first5_last5(&args.account);
@@ -1744,13 +1753,7 @@ async fn verify_pins_run(args: &VerifyPinsArgs) -> i32 {
                 policy_pin_status = ?result.policy_pin_status,
                 "smart-account rules verify-pins: completed",
             );
-            // Return exit code 1 when any status is Drift (operator-visible
-            // signal that intervention is needed) while still emitting a
-            // well-formed JSON envelope. Unavailable exits 0 (infrastructure
-            // failure, not confirmed drift).
-            let drift = matches!(result.verifier_pin_status, PinStatus::Drift)
-                || matches!(result.policy_pin_status, PinStatus::Drift);
-            let exit = if drift { 1 } else { 0 };
+            let exit = verify_pins_exit_code(&result);
             emit_success(&result, args.output, &request_id, exit)
         }
         Err(e) => emit_error_sa(&e, args.output, &request_id),
@@ -4343,6 +4346,43 @@ mod tests {
             parsed.args.secondary_rpc_url.as_deref(),
             Some("https://secondary.example")
         );
+    }
+
+    /// Any drift exits 1 even beside an unavailable pin; unavailable alone exits 0.
+    #[test]
+    fn verify_pins_exit_code_preserves_drift_beside_unavailable() {
+        for (verifier_pin_status, policy_pin_status, expected) in [
+            (PinStatus::Drift, PinStatus::Unavailable, 1),
+            (PinStatus::Unavailable, PinStatus::Drift, 1),
+            (PinStatus::Unavailable, PinStatus::Match, 0),
+        ] {
+            let result = VerifyPinsResult {
+                smart_account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                    .to_owned(),
+                rule_id: 7,
+                verifier_pin_status,
+                policy_pin_status,
+                pinned_verifier_first8: vec![],
+                pinned_policy_first8: vec![],
+                observed_verifier_first8: vec![],
+                observed_policy_first8: vec![],
+                observed_verifier_executable: vec![],
+                observed_policy_executable: vec![],
+                pinned_verifier_executable_refs: vec![],
+                pinned_policy_executable_refs: vec![],
+                mutable_override: false,
+                unknown_override: false,
+                unavailable_reason: Some("sa.deployment_failed".to_owned()),
+                chain_id: "stellar:testnet".to_owned(),
+            };
+            assert_eq!(
+                verify_pins_exit_code(&result),
+                expected,
+                "verifier={:?}, policy={:?}",
+                result.verifier_pin_status,
+                result.policy_pin_status
+            );
+        }
     }
 
     #[test]
