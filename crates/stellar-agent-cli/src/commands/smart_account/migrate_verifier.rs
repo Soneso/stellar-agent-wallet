@@ -45,6 +45,10 @@
 //!
 //! # Wire codes rendered
 //!
+//! - `sa.audit_log`: `SaError::AuditLog`
+//! - `sa.contract_instance_unsupported`: `SaError::ContractInstanceUnsupported`
+//! - `sa.threshold_read_failed`: `SaError::ThresholdReadFailed`
+//! - `sa.deployment_failed`: `SaError::DeploymentFailed`
 //! - `network.mainnet_write_forbidden` — structural mainnet-submit refusal
 //! - `sa.verifier_migration_failed` — [`SaError::VerifierMigrationFailed`]
 //! - `sa.verifier_wasm_revoked` — [`SaError::VerifierWasmRevoked`]
@@ -56,6 +60,11 @@
 //! - `sa.baseline_write_failed`: [`SaError::BaselineWriteFailed`]
 //! - `submission.tx_timeout`, `submission.tx_already_submitted`,
 //!   `submission.hash_mismatch`: [`SaError::SubmissionUnresolved`], by kind
+//! - `sa.policy_hash_drift`: [`SaError::PolicyHashDrift`], passed through by a step
+//! - `sa.pinned_policy_absent`: [`SaError::PinnedPolicyAbsent`], passed through by a step
+//! - `sa.pin_check_unavailable`: [`SaError::PinCheckUnavailable`], passed through by a step
+//! - `sa.auth_entry_construction_failed`: [`SaError::AuthEntryConstructionFailed`],
+//!   passed through by a step, including lock and signer-set deadline stages
 //! - `sa.threshold_unreachable`: [`SaError::ThresholdUnreachable`]
 //! - `sa.threshold_policy_identification_failed`:
 //!   [`SaError::ThresholdPolicyIdentificationFailed`]

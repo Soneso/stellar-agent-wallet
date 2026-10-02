@@ -13,20 +13,25 @@
 //!   re-anchor after intentional out-of-band mutation, and the one-time upgrade
 //!   of a version 1 baseline); a changed or incomparable set needs
 //!   `--accept-divergence`.
-//! - [`AddArgs`] — `smart-account signers add` — adds one signer to a context rule via
-//!   OZ `add_signer`; emits `SaSignerAddedV2`. Accepts three mutually-exclusive
-//!   signer-source flags:
-//!   - `--signer-delegated <G-strkey>` — ed25519 delegated signer.
-//!   - `--signer-external <verifier-C-strkey> --signer-key-data <hex>` — custom
-//!     external-verifier signer with raw key-data.
-//!   - `--signer-webauthn <credential-name>` — WebAuthn passkey signer resolved
-//!     from the credential store and `VerifierRegistry`.
-//! - [`RemoveArgs`] — `smart-account signers remove` — removes one signer by `signer_id`
-//!   via OZ `remove_signer`; emits `SaSignerRemovedV2`. Refuses operations that
-//!   would violate `signer_count >= threshold` with `safe_ordering_hint`.
-//! - [`SetThresholdArgs`] — `smart-account signers set-threshold` — changes the
-//!   signing threshold via OZ `ThresholdPolicyContract::set_threshold`; emits
-//!   `SaThresholdChangedV2`.
+//! - [`AddArgs`], `smart-account signers add`: adds one signer via OZ
+//!   `add_signer` and emits `SaSignerAddedV2`. Four signer-source flags are exclusive:
+//!   - `--signer-delegated <G-strkey>`: ed25519 delegated signer.
+//!   - `--signer-external <verifier-C-strkey> --signer-key-data <hex>`:
+//!     external-verifier signer with raw key data.
+//!   - `--signer-webauthn <credential-name>`: WebAuthn passkey signer from
+//!     the credential store and `VerifierRegistry`.
+//!   - `--signer-ed25519 <64-hex-pubkey>`: External Ed25519 signer using the
+//!     registered verifier, or an explicit `--verifier`.
+//! - [`RemoveArgs`], `smart-account signers remove`: removes a signer by id
+//!   and emits `SaSignerRemovedV2`. An unreachable threshold refuses with `safe_ordering_hint`.
+//! - [`SetThresholdArgs`], `smart-account signers set-threshold`: changes the
+//!   simple-threshold value and emits `SaThresholdChangedV2`.
+//! - [`BatchAddArgs`], `smart-account signers batch-add`: adds multiple signers
+//!   and emits one `SaSignerAddedV2` row per signer.
+//! - [`SetWeightedThresholdArgs`], `smart-account signers set-weighted-threshold`:
+//!   changes a weighted-threshold value.
+//! - [`SetSignerWeightArgs`], `smart-account signers set-signer-weight`:
+//!   changes one signer's weight.
 //!
 //! # Signer-source modes (mirror of `smart-account rules`)
 //!
@@ -49,15 +54,34 @@
 //!
 //! # Wire codes rendered
 //!
-//! - `sa.threshold_unreachable` — `SaError::ThresholdUnreachable`
-//! - `sa.signer_set_missing_baseline` — `SaError::SignerSetMissingBaseline`
+//! - `sa.context_rule_caps_exceeded`: `SaError::ContextRuleCapsExceeded`
+//! - `sa.weighted_threshold_install_refused`: `SaError::WeightedThresholdInstallRefused`
+//! - `sa.weighted_threshold_not_installed`: `SaError::WeightedThresholdNotInstalled`
+//! - `sa.weighted_threshold_policy_identification_failed`: `SaError::WeightedThresholdPolicyIdentificationFailed`
+//! - `sa.rule_expired`: `SaError::RuleExpired`
+//! - `sa.threshold_unreachable`: `SaError::ThresholdUnreachable`
+//! - `sa.signer_set_missing_baseline`: `SaError::SignerSetMissingBaseline`
 //! - `sa.signer_set_baseline_legacy`: `SaError::SignerSetBaselineLegacy`
-//! - `sa.signer_set_diverged` — `SaError::SignerSetDiverged`
+//! - `sa.signer_set_diverged`: `SaError::SignerSetDiverged`
 //! - `sa.baseline_write_failed`: `SaError::BaselineWriteFailed`
-//! - `network.rpc_divergence` — `SaError::NetworkRpcDivergence`
-//! - `sa.threshold_policy_not_installed` — `SaError::ThresholdPolicyNotInstalled`
-//! - `sa.threshold_policy_identification_failed` — `SaError::ThresholdPolicyIdentificationFailed`
+//! - `sa.threshold_policy_not_installed`: `SaError::ThresholdPolicyNotInstalled`
+//! - `sa.threshold_policy_identification_failed`: `SaError::ThresholdPolicyIdentificationFailed`
 //! - `sa.threshold_read_failed`: `SaError::ThresholdReadFailed`
+//! - `sa.pinned_verifier_absent`: `SaError::PinnedVerifierAbsent`
+//! - `sa.pinned_policy_absent`: `SaError::PinnedPolicyAbsent`
+//! - `sa.verifier_hash_drift`: `SaError::VerifierHashDrift`
+//! - `sa.policy_hash_drift`: `SaError::PolicyHashDrift`
+//! - `sa.pin_check_unavailable`: `SaError::PinCheckUnavailable`
+//! - `sa.auth_entry_construction_failed`: `SaError::AuthEntryConstructionFailed` (stage `rule_lock` for lock timeout)
+//! - `sa.verifier_mutable`: `SaError::VerifierMutable`
+//! - `sa.verifier_wasm_not_in_allowlist`: `SaError::VerifierWasmNotInAllowlist`
+//! - `sa.contract_instance_unsupported`: `SaError::ContractInstanceUnsupported`
+//! - `sa.multiple_pinned_hashes_unsupported`: `SaError::MultiplePinnedHashesUnsupported`
+//! - `sa.audit_log`: `SaError::AuditLog`
+//! - `sa.deployment_failed`: `SaError::DeploymentFailed`
+//! - `submission.tx_timeout`, `submission.tx_already_submitted`,
+//!   `submission.hash_mismatch`: `SaError::SubmissionUnresolved`, by kind
+//! - `network.rpc_divergence`: `SaError::NetworkRpcDivergence`
 
 use base64::Engine as _;
 use clap::{ArgGroup, Args, Subcommand};
@@ -133,23 +157,23 @@ pub struct SignersArgs {
 pub enum SignersSubcommand {
     /// List the on-chain signer set for a context rule.
     ///
-    /// Reads the current signer set from the primary RPC (two-RPC consultation
-    /// for agreement). Emits a `SaSignerSetBaselined` audit row if no prior
-    /// baseline or state-change row exists for this `(rule_id, smart_account)`
-    /// pair — establishing the baseline for future divergence detection.
+    /// Reads the signer set through both RPC endpoints, which must agree.
+    /// With no state row, emits `SaSignerSetBaselinedV2`.
+    /// With an existing row, compares it and reports `baseline`.
     List(Box<ListArgs>),
 
-    /// Unconditionally write a fresh `SaSignerSetBaselined` audit row.
+    /// Compare and record a fresh `SaSignerSetBaselinedV2` audit row.
     ///
-    /// Call this after an intentional out-of-band signer change to re-anchor
-    /// the wallet's divergence-detection view. Idempotent: always writes a new
-    /// row regardless of prior baseline state.
+    /// A changed or incomparable set requires `--accept-divergence`.
+    /// Upgrades version 1 state and reconciles the pin record: pins a live
+    /// unpinned verifier, or drops the sole verifier pin when the rule has
+    /// no `External` signer.
     Refresh(Box<RefreshArgs>),
 
     /// Add a signer to a context rule.
     ///
     /// Constructs and submits an `InvokeHostFunctionOp` calling OZ
-    /// `add_signer(rule_id, new_signer)`. Emits `SaSignerAdded`.
+    /// `add_signer(rule_id, new_signer)`. Emits `SaSignerAddedV2`.
     ///
     /// Refuses operations that would violate `threshold <= signer_count`
     /// with `SaError::ThresholdUnreachable` + `safe_ordering_hint`.
@@ -167,10 +191,10 @@ pub enum SignersSubcommand {
     /// Remove a signer from a context rule.
     ///
     /// Constructs and submits an `InvokeHostFunctionOp` calling OZ
-    /// `remove_signer(rule_id, signer_id)`. Emits `SaSignerRemoved`.
+    /// `remove_signer(rule_id, signer_id)`. Emits `SaSignerRemovedV2`.
     ///
     /// Refuses if removing the signer would drop `signer_count` below
-    /// `threshold` — error includes `safe_ordering_hint` naming the safe
+    /// `threshold`; the error includes `safe_ordering_hint` naming the safe
     /// two-command sequence (lower threshold first, then remove).
     Remove(Box<RemoveArgs>),
 
@@ -178,7 +202,7 @@ pub enum SignersSubcommand {
     ///
     /// Constructs and submits an `InvokeHostFunctionOp` calling the OZ
     /// threshold-policy contract's `set_threshold(rule_id, new_threshold)`.
-    /// Emits `SaThresholdChanged`.
+    /// Emits `SaThresholdChangedV2`.
     ///
     /// The threshold-policy contract is identified by wasm-hash allowlist
     /// lookup (`THRESHOLD_POLICY_WASM_HASHES`); zero or multiple matches

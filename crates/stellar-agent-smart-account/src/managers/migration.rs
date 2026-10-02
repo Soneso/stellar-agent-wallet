@@ -305,9 +305,9 @@ impl MigrationPlan {
 
 /// Full External signer data extracted from an on-chain `get_context_rule` result.
 ///
-/// `SignerPubkey::External` in the audit-log layer only stores the first 16 bytes
-/// of `key_data` (for display). The migration planner needs the FULL bytes to
-/// reconstruct the `add_signer` ScVal correctly.
+/// The migration planner needs full key bytes to reconstruct the `add_signer` ScVal.
+/// Version 2 audit rows store the SHA-256 and length of the key data;
+/// version 1 rows store its first 16 bytes. Neither representation reconstructs the key.
 struct ExternalSignerData {
     /// On-chain signer ID (from `signer_ids` field of `ContextRule`).
     signer_id: u32,

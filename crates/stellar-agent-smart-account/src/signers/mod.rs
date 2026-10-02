@@ -16,7 +16,7 @@
 //!
 //! # Re-exports from `stellar-agent-core`
 //!
-//! For downstream convenience, the four signer-set value types
+//! For downstream convenience, the ten signer-set value types
 //! from `stellar_agent_core::audit_log::signer_set` are re-exported here so
 //! `managers/signers.rs` can import everything from one path:
 //!
@@ -25,13 +25,16 @@
 //!     FrozenChainStateTuple, WasmHashSummary, ThresholdAffectingOp,
 //!     THRESHOLD_POLICY_WASM_HASHES, THRESHOLD_POLICY_WASM,
 //!     ObservedSignerSet, SignerPubkey, SignerSetStatePayload, BaselineReason,
+//!     SignerEntryV2, SignerIdentityV2, SignerSetSnapshotV2, SignerSetView,
+//!     SignerSetViewPayload, ThresholdObservation,
 //! };
 //! ```
 //!
 //! # Cross-crate type placement
 //!
-//! `ObservedSignerSet`, `SignerPubkey`, `SignerSetStatePayload`, and
-//! `BaselineReason` live in `stellar_agent_core::audit_log::signer_set` so the
+//! `ObservedSignerSet`, `SignerPubkey`, `SignerSetStatePayload`,
+//! `BaselineReason`, `SignerEntryV2`, `SignerIdentityV2`, `SignerSetSnapshotV2`,
+//! `SignerSetView`, `SignerSetViewPayload`, and `ThresholdObservation` live in `stellar_agent_core::audit_log::signer_set` so the
 //! audit-log substrate is self-contained (core must not depend on
 //! smart-account). Smart-account-specific wrappers live here; the audit-log
 //! value types live in core.  See `signer_set.rs` module-level rustdoc

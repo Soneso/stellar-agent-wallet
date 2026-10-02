@@ -727,6 +727,9 @@ pub enum SaError {
     /// code. No flag overrides this refusal; `--accept-mutable-verifier`
     /// covers only [`SaError::VerifierMutable`] and [`SaError::PolicyMutable`],
     /// and `--accept-unknown-verifier` covers only an allowlist miss.
+    /// The reason is `external reference with no live tag entry`,
+    /// `undecodable instance`, `non-Wasm executable`, or
+    /// `executable changed during install`.
     ///
     /// # Forensic spine
     ///
@@ -1722,7 +1725,7 @@ pub enum SaError {
         redacted_reason: String,
     },
 
-    /// The rule's `policies` list is empty; no threshold policy is installed.
+    /// The rule has no simple-threshold policy, whether other policies are present or absent.
     ///
     /// Fired by the signers manager's signer-set observation when a
     /// comparison with a version-1 baseline needs a threshold and the rule
@@ -1735,14 +1738,14 @@ pub enum SaError {
     /// `smart_account_redacted` MUST be pre-redacted (first-5-last-5 C-strkey)
     /// at the call site.
     #[error(
-        "threshold-policy not installed: rule {rule_id} has empty policies list; \
-         run 'smart-account deploy-policy --kind simple-threshold' then \
+        "threshold-policy not installed: rule {rule_id} has no simple-threshold policy. \
+         Run 'smart-account deploy-policy --kind simple-threshold' then \
          'smart-account rules add-policy --rule-id {rule_id} --kind simple-threshold' \
          to install one"
     )]
     #[serde(rename = "sa.threshold_policy_not_installed")]
     ThresholdPolicyNotInstalled {
-        /// Context-rule identifier for which the policies list was empty.
+        /// Context-rule identifier with no simple-threshold policy.
         rule_id: u32,
         /// Redacted smart-account contract address (first-5-last-5 C-strkey).
         smart_account_redacted: RedactedStrkey,
@@ -1776,11 +1779,12 @@ pub enum SaError {
         request_id: String,
     },
 
-    /// The rule's newest signer-set state row is version 1, and a signer
-    /// mutation compares only against a version-2 state.
+    /// The rule's newest state row is version 1, and this mutation requires version 2.
     ///
-    /// Fired by `add_signer`, `remove_signer`, `set_threshold` and
-    /// `batch_add_signers` before any RPC. `smart-account signers refresh
+    /// Fired by `add_signer`, `remove_signer`, `set_threshold`, and
+    /// `batch_add_signers` before any RPC. Also fires for `add_policy` and
+    /// `remove_policy` for any policy, and a migration pair's removal.
+    /// `smart-account signers refresh
     /// --rule-id <N>` compares the chain with the version-1 baseline and, when
     /// they match, records a version-2 baseline; a changed or incomparable set
     /// needs `--accept-divergence` on that command.
@@ -1911,7 +1915,7 @@ pub enum SaError {
 
     /// Threshold-policy identification failed: no or multiple allowlist matches.
     ///
-    /// Fired by the signers manager's signer-set observation in three cases:
+    /// Fired by the signers manager's signer-set observation in six cases:
     ///
     /// - more than one attached policy matches `THRESHOLD_POLICY_WASM_HASHES`;
     /// - a comparison with a version-1 baseline needs a threshold, and the
@@ -1985,9 +1989,9 @@ pub enum SaError {
 
     /// Primary and secondary RPC disagreed on the on-chain view before any signer-set check.
     ///
-    /// Fired when the two-RPC consultation finds divergent `(signer_count, threshold)`
-    /// or policy wasm-hash responses from the primary and secondary RPCs.  Aborts
-    /// BEFORE the `sa.signer_set_diverged` check fires; the ordering invariant is:
+    /// The primary and secondary observations must agree on signers, ids,
+    /// the policy list, each executable, and the threshold. Disagreement aborts
+    /// before `sa.signer_set_diverged`; the ordering invariant is:
     /// audit-log read → two-RPC check → audit-vs-chain comparison.
     ///
     /// `primary_view_digest_first8` and `secondary_view_digest_first8` carry a
@@ -2538,8 +2542,8 @@ impl From<stellar_agent_core::audit_log::AuditLogIntegrityError> for SaError {
 /// into [`SaError::AuditLog`].
 ///
 /// `SignerSetCanonicalBodyError` signals malformed stored data inside an audit
-/// row (e.g. an `External` signer whose `verifier_contract` is not a valid
-/// C-strkey, or length-parity failures in `ObservedSignerSet` fields). These
+/// row: an invalid `External` verifier C-strkey, length-parity failures in
+/// `ObservedSignerSet`, or `MalformedSnapshotV2` in a version 2 snapshot. These
 /// are routed through the `AuditLog` envelope so the wire chain stays
 /// consistent with the audit-log integrity error taxonomy.
 ///

@@ -34,16 +34,28 @@
 //! # Pinned-hash drift check
 //!
 //! Before anything is simulated or signed, every authorizing rule other than
-//! rule 0 is checked against its pin record in the profile's audit log: the
-//! rule's live verifier and policy contracts must match the hashes (and, for
-//! a CAP-85 external reference, the owner, tag and resolved hash) pinned when
-//! the rule was installed or last updated by the wallet. Drift refuses with
+//! rule 0 passes four checks under one deadline: rule lock, baseline read,
+//! executable pin check, and signer-set comparison through both endpoints.
+//! The endpoints must agree. The baseline read and comparison run with or
+//! without a pin record. Missing state refuses with `sa.signer_set_missing_baseline`;
+//! integrity errors refuse with `sa.audit_log`, and changed signers with
+//! `sa.signer_set_diverged`. Endpoint disagreement is `network.rpc_divergence`.
+//! Lock timeout or a deadline elapse in baseline read or comparison is
+//! `sa.auth_entry_construction_failed`, at `rule_lock`, `baseline_read`, or
+//! `signer_set_compare`. On a rule with a pin record, each live verifier is
+//! compared with the verifier pin, and each live policy with the policy pins.
+//! The first eight bytes of the live code hash must equal the pinned value;
+//! the record stores that prefix. A CAP-85 external reference must also match
+//! its pinned owner, tag, and resolved hash prefix. An empty policy-pin list
+//! checks no policy code, so pins do not detect a policyless rule gaining a
+//! policy outside the wallet. During a `migrate-verifier` pair, the migrating
+//! rule skips its verifier pin check. Drift refuses with
 //! `sa.verifier_hash_drift` / `sa.policy_hash_drift`, and a check that cannot
 //! run refuses with `sa.pin_check_unavailable`. A rule whose record holds
 //! policy pins while the rule has no policy on chain refuses with
 //! `sa.pinned_policy_absent`. A rule holding an `External` signer while its
 //! record pins no verifier refuses with `sa.pinned_verifier_absent`, which
-//! `signers refresh` repairs. A rule without a pin record signs unchecked.
+//! `signers refresh` repairs. A rule without a pin record has no code check.
 //!
 //! # Mainnet defence
 //!
@@ -51,6 +63,26 @@
 //! call or key-material access.
 //!
 //! # Wire codes rendered
+//!
+//! - `sa.contract_instance_unsupported`: `SaError::ContractInstanceUnsupported`
+//! - `sa.rule_id_mismatch`: `SaError::RuleIdMismatch`
+//! - `sa.signer_set_missing_baseline`: `SaError::SignerSetMissingBaseline`
+//! - `sa.signer_set_diverged`: `SaError::SignerSetDiverged`
+//! - `sa.audit_log`: `SaError::AuditLog`
+//! - `sa.auth_entry_construction_failed`: `SaError::AuthEntryConstructionFailed`
+//! - `sa.verifier_hash_drift`: `SaError::VerifierHashDrift`
+//! - `sa.policy_hash_drift`: `SaError::PolicyHashDrift`
+//! - `sa.pinned_policy_absent`: `SaError::PinnedPolicyAbsent`
+//! - `sa.pinned_verifier_absent`: `SaError::PinnedVerifierAbsent`
+//! - `sa.pin_check_unavailable`: `SaError::PinCheckUnavailable`
+//! - `sa.threshold_policy_not_installed`: `SaError::ThresholdPolicyNotInstalled`
+//! - `sa.threshold_policy_identification_failed`: `SaError::ThresholdPolicyIdentificationFailed`
+//! - `sa.threshold_read_failed`: `SaError::ThresholdReadFailed`
+//! - `sa.deployment_failed`: `SaError::DeploymentFailed`
+//! - `submission.tx_timeout`, `submission.tx_already_submitted`,
+//!   `submission.hash_mismatch`, `submission.record_unavailable`:
+//!   `SaError::SubmissionUnresolved`, by kind
+//! - `network.rpc_divergence`: `SaError::NetworkRpcDivergence`
 //!
 //! On-chain `SaError::DeploymentFailed { phase: "simulate", .. }` failures
 //! carry the OZ symbolic error name inline in `message` (e.g.
@@ -404,10 +436,9 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         }
     };
 
-    // The pinned-hash drift check of every authorizing rule reads the rule's
-    // pin record from this profile's audit log and fetches the live
-    // verifier and policy contracts through the same RPC endpoints the
-    // submission uses.
+    // Every non-zero authorizing rule reads its baseline and pin record from
+    // this profile's audit log. The signer-set comparison and executable pin
+    // check use the submission's RPC endpoints under the rule's lock.
     let signers_manager = match construct_signers_manager_from_fields(
         &profile_name,
         network_passphrase,

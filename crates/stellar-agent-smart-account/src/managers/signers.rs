@@ -2066,7 +2066,7 @@ impl SignersManager {
     /// observed view in the row's version, the smallest `latestLedger` the
     /// observation's reads reported and the matched row's hash.
     ///
-    /// The submit path runs the same two steps for every rule a submission
+    /// The submit path runs the same three steps for every non-zero rule a submission
     /// is signed under, under the rule's lock, through
     /// [`crate::submit::submit_signed_invoke`]; this entry is the standalone
     /// form of that check. The `FrozenChainStateTuple` is a data-only record

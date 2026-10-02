@@ -868,15 +868,18 @@ impl WalletServer {
     )]
     #[tool(
         name = "stellar_rule_create",
-        description = "Resolve and simulate an agent-proposed add_context_rule installation \
-                       (propose step). Testnet-only; refuses chain_id=stellar:mainnet. \
-                       Signers accept delegated (G-strkey), external (raw \
-                       verifier+pubkey hex), or webauthn (passkey credential name, resolved to \
-                       bytes at propose time). Policies accept raw (address+XDR) or \
-                       spending_limit (typed). Returns {approval_nonce, expires_at_unix_ms, \
-                       summary}. Simulate responses include profile and chain_id at the top level. \
-                       Pass approval_nonce to stellar_rule_create_commit after the \
-                       operator approves via `stellar-agent approve --id <nonce> --profile <profile>`. \
+        description = "Resolve and simulate an agent-proposed add_context_rule installation (propose step). \
+                       Testnet-only; refuses chain_id=stellar:mainnet. Signers accept delegated (G-strkey \
+                       account or C-strkey contract address), external (raw verifier and pubkey hex), or \
+                       webauthn (passkey credential name resolved to bytes). Policies accept raw (address and \
+                       XDR) or spending_limit (typed). Install and simulation refuse an invalid \
+                       simple-threshold parameter with sa.simple_threshold_install_refused. A duplicate policy \
+                       address or two simple-threshold policies refuse with sa.deployment_failed at phase \
+                       build. An external entry whose pubkey_data_hex decodes to empty key data refuses with \
+                       sa.auth_entry_construction_failed. Returns {approval_nonce, expires_at_unix_ms, \
+                       summary}. Simulate responses include profile and chain_id at the top level. Pass \
+                       approval_nonce to stellar_rule_create_commit once the operator approves via \
+                       `stellar-agent approve --id <nonce> --profile <profile>`. \
                        destructive_hint=false; read_only_hint=false.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
@@ -1134,13 +1137,31 @@ impl WalletServer {
     )]
     #[tool(
         name = "stellar_rule_create_commit",
-        description = "Verify the operator's attestation and install the proposed context rule \
-                       (commit step). Testnet-only — refuses chain_id=stellar:mainnet. ALWAYS \
-                       requires operator attestation, regardless of the \
-                       policy engine's verdict for this call — the agent never holds rule-write \
-                       authority. Requires the approval_nonce from stellar_rule_create and \
-                       approval_attestation. Returns {rule_id, tx_hash}. destructive_hint=true; \
-                       read_only_hint=false.",
+        description = "Verify the operator's attestation and install the proposed context rule (commit \
+                       step). Testnet-only; refuses chain_id=stellar:mainnet. Always requires operator \
+                       attestation, regardless of the policy verdict. Requires approval_nonce from \
+                       stellar_rule_create and approval_attestation. Install and simulation refuse an \
+                       invalid simple-threshold parameter with sa.simple_threshold_install_refused. A \
+                       duplicate policy address or two simple-threshold policies refuse with \
+                       sa.deployment_failed at phase build. An external entry whose pubkey_data_hex \
+                       decodes to empty key data refuses with sa.auth_entry_construction_failed. Every \
+                       non-zero auth_rule_ids entry first passes the pre-submission checks, and a refusal \
+                       signs nothing. Baseline and comparison refusals are \
+                       sa.signer_set_missing_baseline, sa.signer_set_diverged, sa.audit_log, and \
+                       network.rpc_divergence. Lock timeout is sa.auth_entry_construction_failed at stage \
+                       rule_lock. A deadline that elapses during the baseline read or the comparison uses \
+                       that code at baseline_read or signer_set_compare. Pin refusals are \
+                       sa.verifier_hash_drift, sa.policy_hash_drift, sa.pinned_policy_absent, \
+                       sa.pinned_verifier_absent, and sa.pin_check_unavailable. A version 1 authorizing \
+                       rule compares through its projection. Its own refusals are \
+                       sa.threshold_policy_not_installed, sa.threshold_policy_identification_failed, and \
+                       sa.deployment_failed. After the install confirms, the observed rule's signer \
+                       identities and simple threshold must equal the proposal's. That observation is \
+                       recorded as the rule's signer-set baseline. The name, context, expiry, and other \
+                       policy attachments are not compared. Otherwise the rule stays on chain without a \
+                       baseline, and the tool returns sa.install_state_mismatch or \
+                       sa.baseline_write_failed with the transaction hash. Returns {rule_id, tx_hash}. \
+                       destructive_hint=true; read_only_hint=false.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn stellar_rule_create_commit(

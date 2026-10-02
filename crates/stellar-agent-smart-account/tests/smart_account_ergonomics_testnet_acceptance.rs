@@ -54,7 +54,7 @@
 //!    `new_signer_ids` extraction (`rev().take(n).rev()` over the resulting
 //!    `signer_ids`) into every routine (non-Chromium) CI leg — cross-checked
 //!    against a separate `get_rule_signers` read of the complete post-batch
-//!    signer-id set, plus the per-signer `SaSignerAdded` audit rows.
+//!    signer-id set. The per-signer `SaSignerAddedV2` audit rows are checked too.
 //! 7. `weighted_threshold_negatives_testnet_acceptance` — `set_signer_weight`
 //!    / `set_weighted_threshold` against a rule with no weighted-threshold
 //!    policy fail with `WeightedThresholdNotInstalled`. On a rule whose ONLY
@@ -1422,7 +1422,7 @@ async fn deploy_c_external_ed25519_genesis_testnet_acceptance() {
 ///   SEPARATE `get_rule_signers` read) — this directly exercises the
 ///   `rev().take(n).rev()` extraction against ground truth, not merely a
 ///   length check.
-/// - One `SaSignerAdded` audit row per new signer, each carrying the correct
+/// - One `SaSignerAddedV2` audit row per new signer, each carrying the correct
 ///   `rule_id` and one of the returned `new_signer_ids`.
 #[tokio::test]
 async fn batch_add_delegated_signers_testnet_acceptance() {
