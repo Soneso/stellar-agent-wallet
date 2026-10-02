@@ -100,7 +100,7 @@ Prebuilt binaries are published on the
 tagged release, and the crates are published to crates.io with each release.
 
 While only prerelease (alpha) versions are published, `cargo install` and
-`cargo binstall` need the version spelled out — a bare crate name matches
+`cargo binstall` need the version spelled out. A bare crate name matches
 stable versions only.
 
 ### cargo binstall (prebuilt binaries)
@@ -125,7 +125,7 @@ tar -xJf stellar-agent-0.1.0-alpha.9-aarch64-apple-darwin.tar.xz
 
 then move the two binaries onto your `PATH`. On macOS, prefer this terminal
 download over the browser: archives fetched with `curl` carry no quarantine
-attribute, while browser downloads do — and the macOS binaries are ad-hoc
+attribute, while browser downloads do. The macOS binaries are ad-hoc
 signed, so Gatekeeper blocks a quarantined binary on first run. The override
 and the reasoning are documented in the
 [macOS Gatekeeper note](docs/getting-started.md#macos-gatekeeper-note).
@@ -212,10 +212,10 @@ stellar-agent pay GDEST...WXYZ "10 XLM" --source GABC...WXYZ --secret-env WALLET
 
 `stellar-agent profile show default` requires an existing profile file and exits
 `1` on a clean install. The synthesised in-memory testnet default is used by
-`stellar-agent-mcp` startup and by `pay` / `claim` / `accounts create` — and
-only when no profile was named and no `default.toml` exists — never by
+`stellar-agent-mcp` startup and by `pay` / `claim` / `accounts create`, and
+only when no profile was named and no `default.toml` exists, never by
 `profile show`. Run
-`stellar-agent profile init` to create `default.toml` — it writes
+`stellar-agent profile init` to create `default.toml`. It writes
 `engine = "v1"` by default, which keeps the MCP server refusing to start until
 the V1 key ceremony completes; pass `--engine noop` for a zero-ceremony testnet
 profile that works immediately.
@@ -244,10 +244,10 @@ behind the same policy engine, approval spine, and audit log as the CLI. See
 
 ## Documentation
 
-- [Documentation for users](docs/README.md#for-users) — getting started,
+- [Documentation for users](docs/README.md#for-users): getting started,
   concepts, the CLI and MCP references, protocols, toolsets, profiles, and
   remote approval.
-- [Documentation for maintainers](docs/README.md#for-maintainers) —
+- [Documentation for maintainers](docs/README.md#for-maintainers):
   architecture, building and testing, security internals, and the review
   checklist.
 

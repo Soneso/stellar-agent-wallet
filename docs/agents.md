@@ -47,7 +47,7 @@ The server resolves its profile from `--profile <NAME>`, then
 resolved from the platform keyring named by that profile. After connecting, the
 client issues `initialize`, then
 `tools/list` and `resources/list`. The tool schemas returned by `tools/list` are
-the authoritative argument contract — prefer them over any example here. See
+the authoritative argument contract. Prefer them over any example here. See
 [mcp.md](mcp.md#configuring-an-mcp-client) for startup details and the resources
 the server exposes.
 
@@ -119,7 +119,7 @@ with a `*_commit`).
 
 If the policy engine allows the action outright, the commit signs and submits
 directly. If it returns `RequireApproval`, the commit is held until the operator
-approves — see below.
+approves. See below.
 
 ## When approval is required
 
@@ -130,7 +130,7 @@ toolset-routed payment) routes through the operator. The handshake:
    `approval_nonce` instead of executing.
 2. The operator runs `stellar-agent approve --id <approval_nonce>` in a trusted
    context, reviews the wallet-rendered summary, and consents. The command
-   returns an `approval_attestation` — an HMAC blob bound to that exact envelope.
+   returns an `approval_attestation`, an HMAC blob bound to that exact envelope.
 3. The operator relays the `approval_attestation` to the agent over a trusted
    channel. The agent re-invokes the commit with `approval_nonce` and
    `approval_attestation` added. The wallet verifies the attestation against its
@@ -141,7 +141,7 @@ A commit that reaches the gate without a valid attestation is refused with
 `policy.approval_required` (the same envelope whether the attestation is absent,
 forged, or expired, so a caller learns nothing from the failure). Treat
 `policy.approval_required` as "ask the operator to approve, then retry the commit"
-— never as a transient error to retry blindly.
+and never as a transient error to retry blindly.
 
 ## Mainnet is read-only in this alpha
 
@@ -150,7 +150,7 @@ independent layers enforce this. The policy layer refuses fund-moving tools
 under the default Noop engine with `policy.engine_required`, before any RPC
 call or signing. Below it, the network layer structurally refuses every
 mainnet write with `network.mainnet_write_forbidden`, regardless of the
-configured policy engine or enrolled keys — no profile configuration unlocks
+configured policy engine or enrolled keys. No profile configuration unlocks
 mainnet writes in this alpha. A V1 engine with enrolled keys (see
 [profiles.md](profiles.md)) is the intended foundation for a future explicit
 mainnet opt-in, not a current unlock. Design the agent to treat every mainnet
@@ -162,8 +162,8 @@ changes to get past it.
 A [toolset](toolsets.md) grants the agent a narrow, declared set of capabilities. Two
 tools drive them:
 
-- `stellar_toolset_list` — enumerate installed toolsets and their invocable actions.
-- `stellar_toolset_invoke` — run a named action, routed through capability
+- `stellar_toolset_list`: enumerate installed toolsets and their invocable actions.
+- `stellar_toolset_invoke`: run a named action, routed through capability
   enforcement to a trusted tool.
 
 ```json
@@ -179,9 +179,9 @@ No signing, key, or policy tool is reachable through any capability, so an
 `action` naming one returns `toolset.unknown_action`. Two signing-adjacent
 capabilities route through the gated path: `sign-payment` reaches
 `stellar_pay_commit`, and `sign-rule-create` reaches `stellar_rule_create_commit`
-(agent-proposed context rules). Each is guarded by a first-invoke gate — the
+(agent-proposed context rules). Each is guarded by a first-invoke gate. The
 first use with no matching grant returns `toolset.first_invoke_approval_required`
-with a nonce for the operator to approve — and for `sign-payment` an
+with a nonce for the operator to approve. And for `sign-payment` an
 unconditional per-action approval additionally fires on every toolset-routed
 payment regardless of policy. To drive a payment, invoke `action: "stellar_pay"`
 to build the envelope, then `action: "stellar_pay_commit"` with `args` carrying
@@ -219,7 +219,7 @@ server transaction instead. The complete testnet-only workflow is in
   the gate matches the authoritative envelope and the audit log records every
   attempt.
 - The operator verifies the tamper-evident log with `stellar-agent audit verify`.
-  Argument values are never logged — only key names — so passing data through the
+  Argument values are never logged; only key names are. So passing data through the
   wallet does not leak it into the audit trail.
 - A commit/submit tool refuses `audit.chain_key_unavailable` if the profile's audit
   chain-root key was never minted (an `init`-minted profile, before the operator runs

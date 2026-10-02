@@ -14,7 +14,7 @@ Write and signing paths are testnet-only in this alpha. Every signing tool struc
 
 - MCP result envelope: `{ ok, data | error, request_id }`. On success `ok` is true and the payload is in `data`; on failure `error` carries a stable wire code.
 - `chain_id` is the CAIP-2 chain id (`"stellar:testnet"` or `"stellar:mainnet"`) and is **required** by most tools. SEP-43 `get_address`/`get_network` accept it as optional and fall back to the active profile's chain; the WalletConnect host passes `{}`. (Note: x402 uses the distinct wire-network string `stellar:pubnet` for mainnet in its `network` field; that is not a `chain_id` value.)
-- Asset format: `"native"`/`"XLM"`, or `"CODE:GISSUER"`. Amounts are decimal strings with a unit, e.g. `"10 XLM"` — never JSON numbers.
+- Asset format: `"native"`/`"XLM"`, or `"CODE:GISSUER"`. Amounts are decimal strings with a unit, e.g. `"10 XLM"`, never JSON numbers.
 - A `chain_id` that does not match the active profile is rejected by the dispatch gate as a JSON-RPC-level error before any work runs.
 - Signing tools are single-shot: if the policy engine returns `RequireApproval`, the tool is fail-closed with wire code `policy.approval_required_unsupported` (message mentions "single-shot") and **no signature is produced**. Two-phase approval is not supported on the single-shot signing tools (the SEP-43 sign verbs and SEP-53 `sign_message`).
 
@@ -23,16 +23,16 @@ Write and signing paths are testnet-only in this alpha. Every signing tool struc
 | SEP | Spec version | Capability | Tool(s) | Read-only |
 |---|---|---|---|---|
 | SEP-7 | 0007 | Parse `web+stellar:` URI into a preview; optional fresh-`stellar.toml` origin-signature verify | `stellar_sep7_parse_uri` | yes |
-| SEP-10 | 3.4.1 | Client Web Auth (fetch, 13-point validate, submit) → JWT; ephemeral-key flow | used by anchor + x402 flows | — |
-| SEP-6 | 0006 | Discovery only — `GET /info` capability set | `stellar_sep6_deposit_info` | yes |
+| SEP-10 | 3.4.1 | Client Web Auth (fetch, 13-point validate, submit) → JWT; ephemeral-key flow | used by anchor + x402 flows | n/a |
+| SEP-6 | 0006 | Discovery only, `GET /info` capability set | `stellar_sep6_deposit_info` | yes |
 | SEP-24 | 0024 | Interactive deposit/withdraw URL via `POST .../interactive`; returned for browser hand-off | `stellar_sep24_interactive_url` | no (uses JWT) |
 | SEP-43 | 1.2.1 | Wallet signing: address/network/sign tx/sign auth entry/sign message/sign+submit | six tools (below) | mixed |
-| SEP-45 | 0.1.1 | Client Web Auth for contract (C-) accounts (steps 1–12); ephemeral + persistent-signer | used by anchor flows | — |
+| SEP-45 | 0.1.1 | Client Web Auth for contract (C-) accounts (steps 1–12); ephemeral + persistent-signer | used by anchor flows | n/a |
 | SEP-47 | 0047 | Discover SEPs a contract claims via `contractmetav0` `sep` meta | `stellar_sep47_discover` | yes |
 | SEP-48 | 0048 | Typed-argument preview of an `InvokeHostFunction` (display only) | `stellar_sep48_preview_invocation` | yes |
 | SEP-53 | 0053 | Sign and verify prefixed off-chain messages | `stellar_sep53_sign_message`, `stellar_sep53_verify_message` | mixed |
 
-## SEP-7 — `web+stellar:` URI parsing
+## SEP-7: `web+stellar:` URI parsing
 
 Parses an inbound `web+stellar:tx?...` or `web+stellar:pay?...` URI from an untrusted dApp into a structured preview, and optionally verifies the dApp's origin-domain signature.
 
@@ -48,13 +48,13 @@ Preview fields: `operation` (`"tx"`/`"pay"`), parsed operation fields, `callback
 
 Does NOT: sign a URI; auto-POST to a `callback`; auto-submit. Origin-domain verification always fetches a fresh `stellar.toml` (never cached). SEP-7 carries no nonce/timestamp, so replay protection is the host's responsibility. Parse and verify failures are business errors under the standard envelope with `sep7.*` wire codes (e.g. `sep7.malformed_uri`, `sep7.missing_required_param`, `sep7.invalid_param_value`, `sep7.msg_too_long` [`msg` max 300 chars], `sep7.too_many_chain_levels` [max 7], `sep7.toml_fetch_failed` [URL redacted], `sep7.signing_key_not_in_toml`, `sep7.signature_verification_failed`, `sep7.signature_missing_with_origin_domain`).
 
-## SEP-10 — Stellar Web Authentication
+## SEP-10: Stellar Web Authentication
 
 Client-side Web Auth: fetch the challenge transaction, run the 13-point challenge validation, submit the signed challenge to obtain a JWT session. A per-request ephemeral ed25519 key flow is provided. There is no standalone SEP-10 MCP tool; it is consumed internally by the anchor (SEP-24) and the x402 identity gate.
 
 Does NOT: verify the server-issued JWT signature (the JWT is trusted via TLS). Challenge validation is fail-closed on every check. Ephemeral keys are generated fresh per call from the OS RNG and zeroized on drop.
 
-## SEP-6 and SEP-24 — anchor deposit/withdraw
+## SEP-6 and SEP-24: anchor deposit/withdraw
 
 SEP-6 discovery is `GET {transfer_server}/info` only. SEP-24 obtains the anchor's interactive URL via `POST .../transactions/{op}/interactive` using a caller-supplied JWT and returns that URL for browser hand-off.
 
@@ -86,9 +86,9 @@ Tool `stellar_sep24_interactive_url`:
 
 Returns: `interactive_url` (HTTPS, anchor-hosted), `transaction_id`, `handoff_note`.
 
-Both tools do NOT: transmit any SEP-9 KYC field — the arg structs have none by design. SEP-6 is structurally incapable of calling `/deposit`, `/withdraw`, `/deposit-exchange`, `/withdraw-exchange`, `/customer` (SEP-12), `/fee`, or `/transaction(s)`. The wallet does not perform SEP-10/45 itself (the caller supplies the opaque JWT) and never opens, scrapes, or follows the interactive URL. Same-domain SSRF bind: the resolved transfer-server host must equal the operator-typed anchor domain or be a subdomain of it; the anchor domain is validated as a public FQDN first.
+Both tools do NOT transmit any SEP-9 KYC field. The arg structs have none by design. SEP-6 is structurally incapable of calling `/deposit`, `/withdraw`, `/deposit-exchange`, `/withdraw-exchange`, `/customer` (SEP-12), `/fee`, or `/transaction(s)`. The wallet does not perform SEP-10/45 itself (the caller supplies the opaque JWT) and never opens, scrapes, or follows the interactive URL. Same-domain SSRF bind: the resolved transfer-server host must equal the operator-typed anchor domain or be a subdomain of it; the anchor domain is validated as a public FQDN first.
 
-## SEP-43 — Wallet Protocol (signing)
+## SEP-43: Wallet Protocol (signing)
 
 Agent-side `ModuleInterface` dispatch. Results use the standard `{ ok, data | error, request_id }` envelope like every other tool; the SEP-43 raw protocol payload (`{ address }`, `{ signedTxXdr, signerAddress }`, etc.) is carried inside `data` on success.
 
@@ -106,8 +106,8 @@ Common signing args: `chain_id` (required), the payload field, optional `network
 - `get_address` / `get_network`: `chain_id` is optional (chain-agnostic per spec); when omitted, the profile's chain is used. No keyring access.
 - `sign_transaction`: arg `transaction_xdr` (base64 `TransactionEnvelope`). Signs only; the optional SEP-43 `submit`/`submitUrl` opts are NOT implemented here.
 - `sign_auth_entry`: arg `auth_entry_xdr` (the base64 `HashIdPreimage` of the authorization entry, envelope type 9 `SorobanAuthorization` or type 10 `SorobanAuthorizationWithAddress`). Signs the SHA-256 of the received preimage with one ed25519 G-key and returns the raw signature; the requester assembles it into the entry. A type 10 preimage must be bound to the signing key's account; other addresses refuse with `sep43.invalid_address`; other preimage cases refuse with `sep43.malformed_auth_entry`. The preimage does not carry the credential arm, so the address binding is the check whichever credential type the entry uses. No multi-signer quorum.
-- `sign_message`: arg `message` (non-empty UTF-8). Computes `sha256(message_bytes)` with **no prefix** and signs; result `signedMessage` is hex. Optional `network_passphrase` is a caller-intent gate only — it is not mixed into the signed bytes (message signing is network-independent).
-- `sign_and_submit_transaction`: arg `transaction_xdr`. Signs, submits via Stellar RPC, and polls until ledger confirmation. `status` is `"success"` (confirmed; `txHash` is a hex64) or `"pending"` (polling window expired before confirmation; `txHash` is the hex64 the wallet computed before the send, and the tx may still confirm — reconcile it with `stellar_transaction_status`). RPC endpoint/timeout errors strip the URL before surfacing.
+- `sign_message`: arg `message` (non-empty UTF-8). Computes `sha256(message_bytes)` with **no prefix** and signs; result `signedMessage` is hex. Optional `network_passphrase` is a caller-intent gate only: it is not mixed into the signed bytes (message signing is network-independent).
+- `sign_and_submit_transaction`: arg `transaction_xdr`. Signs, submits via Stellar RPC, and polls until ledger confirmation. `status` is `"success"` (confirmed; `txHash` is a hex64) or `"pending"` (polling window expired before confirmation; `txHash` is the hex64 the wallet computed before the send, and the tx may still confirm). For a pending transaction, reconcile it with `stellar_transaction_status`. RPC endpoint/timeout errors strip the URL before surfacing.
 
 SEP-43 wire codes (`error.code` under the standard envelope, from `Sep43Error::wire_code()`):
 
@@ -122,19 +122,19 @@ The structural mainnet refusal (sign-only tools, before any key access) carries 
 
 SEP-43 opens no HTTP/HTTPS connections of its own (interop is stdio via MCP); `sign_and_submit` is the only path that submits, via the profile-configured RPC.
 
-## SEP-45 — Web Authentication for Contract Accounts
+## SEP-45: Web Authentication for Contract Accounts
 
 Client-side Web Auth for contract (C-) accounts: fetch the challenge, validate the authorization entries, submit the signed challenge to obtain a JWT. Both an ephemeral-key flow and a persistent-signer flow exist. Consumed internally by anchor flows; no standalone tool.
 
 Steps 1 through 12 of the 13-point validation are enforced; step 13 (footprint `read_write` keys) is deferred because it requires simulation results unavailable at challenge-fetch time. Fail-closed on any step. The JWT signature is not verified (trusted via TLS). HTTPS-only at the transport layer. Does not access the keyring or wallet seed (pure decode and validate); the ephemeral path suits only contracts that accept the ephemeral public key or need no client signature.
 
-## SEP-47 — Contract Interface Discovery
+## SEP-47: Contract Interface Discovery
 
 Discovers the SEPs a contract claims to implement by reading the `sep` entry of its `contractmetav0` metadata (comma-separated, leading zeros stripped, e.g. `"41,40"`).
 
 Tool `stellar_sep47_discover` (read-only): args `contract_id` (C-strkey, required), `chain_id` (required, resolves the RPC endpoint). Returns `{ supported_seps: ["41", "40"] }`; returns `{ supported_seps: [] }` (not an error) when the contract has no `contractmetav0` section or no `sep` entry. Errors on invalid C-strkey, unreachable RPC, or unfetchable WASM. Submits nothing; modifies no chain state.
 
-## SEP-48 — Contract Interface Specification
+## SEP-48: Contract Interface Specification
 
 Renders a typed-argument preview of an `InvokeHostFunction` against the on-chain contract spec (`contractspecv0`).
 
@@ -149,7 +149,7 @@ Tool `stellar_sep48_preview_invocation` (read-only):
 
 At least one of `transaction_xdr` or (`contract_id` + `function`) must be supplied; if both, `transaction_xdr` wins. Does NOT submit or modify chain state. Does not validate spec semantics beyond a bounded XDR parse; upstream specs are treated as trusted. The typed preview is non-authoritative display only and does not gate signing.
 
-## SEP-53 — signed messages
+## SEP-53: signed messages
 
 Canonical prefixed message sign and verify. Signing computes `SHA-256("Stellar Signed Message:\n" ‖ message)` and ed25519-signs the 32-byte digest, producing a 64-byte signature; verification recomputes the digest and ed25519-verifies it.
 
@@ -163,11 +163,11 @@ Tool `stellar_sep53_sign_message`:
 
 Returns `{ signature (base64), signer_public_key (G...), message_encoding }`.
 
-Tool `stellar_sep53_verify_message` (read-only): args `chain_id` (required, dispatch-gate compat — verification is chain-agnostic), `message`, `message_encoding` (`"utf8"`/`"base64"`, must match signing), `signature` (standard base64, 64-byte ed25519), `public_key` (G-strkey). Returns `{ valid: true }` or an error envelope on failure.
+Tool `stellar_sep53_verify_message` (read-only): args `chain_id` (required, dispatch-gate compat, verification is chain-agnostic), `message`, `message_encoding` (`"utf8"`/`"base64"`, must match signing), `signature` (standard base64, 64-byte ed25519), `public_key` (G-strkey). Returns `{ valid: true }` or an error envelope on failure.
 
 Distinct from SEP-43 `signMessage`: SEP-53 applies the 24-byte `"Stellar Signed Message:\n"` prefix, SEP-43 does not. The two signatures are incompatible and not interchangeable. SEP-53 is a pure off-chain scheme; it submits no transaction, does not base64-encode the message for you, and caps message length at 64 KiB (65,536 bytes).
 
-## x402 v2 Exact Stellar — agent payments
+## x402 v2 Exact Stellar: agent payments
 
 Payer-side construction and signing of a `PAYMENT-SIGNATURE` payload for the x402 v2 Exact Stellar scheme, wire-compatible with the published `@x402/stellar` package. The wallet is the **payer**; the MCP host performs the actual HTTP request/retry to the facilitator.
 
@@ -185,7 +185,7 @@ Flow: validate → build SAC transfer → simulate → sign auth entry → re-si
 
 ### `stellar_x402_authenticated_payment`
 
-Runs the SEP-10 counterparty-identity gate BEFORE building the payment. Any identity-gate failure aborts before `create_payment` runs — no `PaymentPayload`, no SAC auth entry, no nonce is generated.
+Runs the SEP-10 counterparty-identity gate BEFORE building the payment. Any identity-gate failure aborts before `create_payment` runs: no `PaymentPayload`, no SAC auth entry, no nonce is generated.
 
 | Arg | Type | Required | Notes |
 |---|---|---|---|
@@ -194,7 +194,7 @@ Runs the SEP-10 counterparty-identity gate BEFORE building the payment. Any iden
 | `home_domain` | string | yes | operator-supplied domain for SEP-10 identity verification (e.g. `"testanchor.stellar.org"`); the gate resolves its `stellar.toml`, extracts `WEB_AUTH_ENDPOINT` + `SIGNING_KEY`, verifies the SSRF bind, and runs the SEP-10 ephemeral challenge/response |
 | `address` | string | no | signer G-strkey; must match the active signer if given |
 
-Returns `{ paymentSignature, authorization, payer, asset, amount, payTo, home_domain, network, payto_anchored }`. `authorization` is the `Bearer <jwt>` value for the HTTP `Authorization:` header. The JWT is an HTTP-layer companion only — the Soroban transaction XDR, the SAC auth entry, and the payment memo are NEVER mutated to carry it. The SEP-10 ephemeral key is unfunded, fresh per call, not persisted, and not the payment funding signer. `payto_anchored` is a display signal (`"anchored"`/`"not_anchored"`/`"unknown"`) of whether `payTo` appears in the verified domain's `stellar.toml` `ACCOUNTS` list; the tool does NOT hard-deny on `"not_anchored"`.
+Returns `{ paymentSignature, authorization, payer, asset, amount, payTo, home_domain, network, payto_anchored }`. `authorization` is the `Bearer <jwt>` value for the HTTP `Authorization:` header. The JWT is an HTTP-layer companion only: the Soroban transaction XDR, the SAC auth entry, and the payment memo are NEVER mutated to carry it. The SEP-10 ephemeral key is unfunded, fresh per call, not persisted, and not the payment funding signer. `payto_anchored` is a display signal (`"anchored"`/`"not_anchored"`/`"unknown"`) of whether `payTo` appears in the verified domain's `stellar.toml` `ACCOUNTS` list; the tool does NOT hard-deny on `"not_anchored"`.
 
 ### `stellar_x402_parse_receipt`
 
@@ -202,9 +202,9 @@ Read-only. Arg `payment_response` (base64 `PAYMENT-RESPONSE` header value or raw
 
 ### x402 constraints
 
-- Payer/client only — no payee or facilitator logic.
-- Stellar only — no EVM or other chains.
-- `exact` scheme only — no `upto`.
+- Payer/client only, no payee or facilitator logic.
+- Stellar only, no EVM or other chains.
+- `exact` scheme only, no `upto`.
 - Targets x402 v2, not v3.x.
 - No HTTP retry loop; the host orchestrates the HTTP exchange. The wallet produces the signed payload (and, for the authenticated variant, the Bearer token); it does not submit.
 - `create_payment` validation refuses when `scheme != "exact"`, `network` is not `"stellar:pubnet"`/`"stellar:testnet"`, the x402 `network` passphrase mismatches the profile, `extra.areFeesSponsored != true`, or `amount` cannot be parsed as `i128`.

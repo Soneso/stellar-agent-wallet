@@ -900,8 +900,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - `webbrowser` is bumped `1.2.1` to `1.2.4` (RUSTSEC advisory
-  GHSA-2ph8-5cr8-hr33: a URL could smuggle extra arguments — such as
-  `--remote-debugging-port` or `--proxy-server` — into the browser named by a
+  GHSA-2ph8-5cr8-hr33: a URL could smuggle extra arguments, such as
+  `--remote-debugging-port` or `--proxy-server`, into the browser named by a
   `BROWSER` environment-variable template). The crate's `hardened` feature is
   also enabled: the passkey-registration handoff URL is the only thing this
   workspace ever opens, and it is always http(s), so launches of any other
@@ -914,9 +914,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read a different destination or amount than the one being signed while the
   page stayed well-formed.
 - Both approval surfaces branch on the decision response's HTTP status. A
-  refused decision — a rejected passkey assertion, a stale CSRF value, an entry
-  already resolved — rendered as "Status: unknown" and could be read as
-  success; it now renders in its own refusal treatment and states that nothing
+  refused decision (a rejected passkey assertion, a stale CSRF value, an entry
+  already resolved) rendered as "Status: unknown" and could be read as
+  success. It now renders in its own refusal treatment and states that nothing
   was recorded.
 
 ### Added
@@ -935,15 +935,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[non_exhaustive]`, so a third surface's layout stays additive.
 - **API note on the re-exported `ProfileNameMismatch`.** Its `Display` is now
   layout-independent: it renders which profile was selected, the offending
-  `policy_owner_key_id.service`, and which profile that names — but NOT the
-  per-profile-state consequence or the recovery text, because both differ
-  between the two binaries. Callers that relied on `to_string()` for the full
+  `policy_owner_key_id.service`, and which profile that names. It omits the per-profile-state consequence and the recovery text, because both differ between the two binaries. Callers that relied on `to_string()` for the full
   refusal, including the recovery sentence, call
   `message(ProfileStateLayout::DerivedThroughout)` to get the previous
   `stellar-agent-mcp` wording.
 - `stellar-agent-mcp` now selects its profile per invocation. It accepts
   `--profile <NAME>` and `--profile=<NAME>`, and honours `STELLAR_AGENT_PROFILE`
-  when the flag is absent, resolving flag > environment > `default` — the order
+  when the flag is absent, resolving flag > environment > `default`, the order
   the CLI already documented. The selected profile binds at startup and stays
   bound for the life of the process. `--help` documents both inputs. The
   resolved name and which input supplied it are logged at startup.
@@ -983,11 +981,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   classifiers are added for adapters that must answer a lookup without a store
   handle. `MppErrorCode` gains an `AuthorizationNotFound` variant; the enum is
   not `#[non_exhaustive]` and is not being made so, since that would itself be
-  breaking — an exhaustive `match` on it downstream needs one new arm.
-- The operator-facing web pages now render the project's visual design: the
-  WebAuthn bridge's registration and approval pages, the approval inbox and
-  detail pages, the operator-enrollment page, and the remote-approval sign-in,
-  enrollment, inbox, detail, and message pages. `stellar-agent-loopback-http`
+  breaking. An exhaustive `match` on it downstream needs one new arm.
+- The operator-facing web pages now render the project's visual design. This covers the WebAuthn bridge's registration and approval pages, the approval inbox and detail pages, and the operator-enrollment page. It also covers the remote-approval sign-in, enrollment, inbox, detail, and message pages. `stellar-agent-loopback-http`
   gained a `brand` module carrying what the pages emit inline: `BRAND_STYLE`,
   `BUDDY_MARK_SVG`, `TRUST_LINE_LOOPBACK`, and `TRUST_LINE_SELF_HOSTED`. The
   pages fetch no external font, stylesheet, or image; the
@@ -1022,7 +1017,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   API: `stellar-agent-loopback-http` gains `brand::PageIdentity`,
   `brand::MAX_DISPLAY_NAME_CHARS`, and an `escape` module holding
-  `html_escape` — the one escaping definition every served page now applies,
+  `html_escape`: the one escaping definition every served page now applies,
   re-exported unchanged as `stellar_agent_approval_ui::html_escape`. The
   `brand::CARD_BRAND_HEADER` constant is removed in favour of
   `PageIdentity::card_header_html`. `ServeConfig` and `RemoteServeConfig` gain
@@ -1065,11 +1060,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Behaviour change.** Every `stellar-agent` command that loads a profile now
   refuses a profile file whose `policy_owner_key_id.service` names a different
   profile than the one selected, with the wire code `profile.name_mismatch`.
-  A `<name>.toml` copied or renamed from another profile used to load: the
+  A `<name>.toml` copied or renamed from another profile used to load. The
   signed policy file and the owner-key keyring entry resolve through the name
-  the FILE carries, while the pending-approval store, the audit log, and the
-  policy-window state key on the name the operator ASKED for, so the run was
-  governed by one profile's policy and accounted against another's state — and
+  the FILE carries. The pending-approval store, the audit log, and the
+  policy-window state key on the name the operator ASKED for. So the run was
+  governed by one profile's policy and accounted against another's state, and
   every message named the profile that was asked for. `profile sign-policy` and
   `profile enroll-owner-key` were the sharpest edge: run against such a file
   they overwrote a DIFFERENT profile's signed policy or owner-key entry. The
@@ -1084,16 +1079,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-profile state out differently. Closes #107.
 - **Behaviour change.** `pay`, `claim`, and `accounts create` now refuse a
   profile that was named but has no file, where they previously ran under a
-  synthesised permissive profile. Naming a profile that does not exist — a
+  synthesised permissive profile. Naming a profile that does not exist (a
   mistyped `--profile`, or a stale `STELLAR_AGENT_PROFILE` in a shell rc or a
-  CI job — used to substitute the in-memory zero-config profile, which is a
-  testnet, `noop`-engine configuration with no policy gate, and the run signed
+  CI job) used to substitute the in-memory zero-config profile. That is a
+  testnet, `noop`-engine configuration with no policy gate. The run signed
   and submitted under it. The substitution is now keyed on where the name came
   from, not on the name: it fires only when no profile was named at all, so the
   documented zero-config quickstart is unchanged, and `--profile default` on a
   host with no `default.toml` refuses like any other named profile. The same
   rule governs the smart-account audit-writer surface. These three verbs also
-  gained `STELLAR_AGENT_PROFILE` resolution in this change — deliberately in
+  gained `STELLAR_AGENT_PROFILE` resolution in this change, deliberately in
   the same commit as the refusal, since honouring the variable without it would
   have widened the substitution rather than closing it. Closes #112.
 
@@ -1102,10 +1097,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `profile show` no longer reports an operator-correctable profile fault as
   `internal.unexpected_state`. An out-of-bounds cap, an unparseable `rpc_url`, a
   missing `[policy]` section, an over-long served-page display name, or a
-  malformed TOML file now answer `validation.config_invalid` with the cause, and
-  the path in a path-bearing message is redacted as it already was on every
-  other verb. `show` loads directly rather than through the profile-access choke
-  point — it exists to display a profile the other verbs refuse — so the same
+  malformed TOML file now answer `validation.config_invalid` with the cause. The path in a path-bearing message is redacted as it already was on every
+  other verb. `show` loads directly rather than through the profile-access choke point. It exists to display a profile the other verbs refuse. So the same
   malformed profile answered `internal.unexpected_state` from `show` and
   `validation.config_invalid` from everything else, sending an operator to the
   issue tracker over a file they could have edited. The disposition now lives
@@ -1118,14 +1111,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   charge answers `mpp.authorization_not_found`, and `mpp state prune` succeeds
   with `pruned: 0` while still recording the maintenance request and its reason
   digest in the audit log. The state key is minted only on the prepare path, so
-  every read verb refused with `mpp.state_unavailable` until the first charge —
+  every read verb refused with `mpp.state_unavailable` until the first charge,
   indistinguishable from a genuinely unreadable store. A store that exists
   without a usable key still fails closed: only the provable never-minted state
   (no key and no state file) reads as first run, so deleting or rotating the
   key cannot reset replay protection. Closes #106.
 - An MPP read against a store whose key is minted but whose first record was
-  never written — the state a prepare denied by policy leaves behind — reported
-  `mpp.state_unavailable` because the store directory did not exist yet. Lock
+  never written reported `mpp.state_unavailable` because the store directory did not exist yet. A prepare denied by policy leaves this state behind. Lock
   acquisition now establishes the directory on every path, so the read answers
   from the empty store it actually has.
 - A symlink whose target does not exist at the MPP store's state or lock path
@@ -1161,9 +1153,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file the read selects still did not exist. The refusal named the derived
   profile in its `profile reset-window-state` hint while the reset resets the
   requested profile's store, so following it did not clear the condition. The
-  read now selects the requested name's file — the one both write paths
+  read now selects the requested name's file, the one both write paths
   (`record_confirmed_window_state`, `record_authorized_window_state`) already
-  use and the one `profile reset-window-state` resets — and the hint names that
+  use and the one `profile reset-window-state` resets, and the hint names that
   same profile. Only the file selector moved: the name attached to hydrated
   entries and the engine's lookup namespace stay derived and stay equal to each
   other, so hydration still lands in the namespace the engine queries. Closes
@@ -1186,18 +1178,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself uses, taking the name from the parsed subcommand and resolving it the
   way that subcommand does. It resolved the profile through a private argv scan
   that fell back to the literal `"default"` and never read
-  `STELLAR_AGENT_PROFILE`, so under that variable the advisory read — and
-  appended its advisory rows to — one profile's log while the command operated
+  `STELLAR_AGENT_PROFILE`. So under that variable the advisory read, and
+  appended its advisory rows to, one profile's log while the command operated
   on another's. Closes #108.
 - Profile names are validated as filesystem path components inside the profile
   loader, before the path is built, on both the read and the write half. A name
   carrying `..`, a path separator, or a control character is refused with a
-  typed error instead of being joined into a path. The guard previously sat at
-  individual call sites, so subcommands that did not call it — `profile show`,
+  typed error instead of being joined into a path. The guard previously sat at individual call sites. Subcommands that did not call it reached the loader with an unvalidated operator-supplied name. These included `profile show`,
   `pool list`, `pool init`, `counterparty refresh`, `counterparty list`,
   `approve serve`, `audit verify`, `fees stats`, `mpp`, and
-  `profile rotate-audit-key` among them — reached the loader with an unvalidated
-  operator-supplied name.
+  `profile rotate-audit-key` among others.
 - A profile named through `--profile` or `STELLAR_AGENT_PROFILE` is never
   replaced by the MCP server's synthesised first-run profile. That fallback is a
   testnet, `noop`-engine configuration, so substituting it for a named-but-
@@ -1222,8 +1212,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the path itself still reports as present; a name beginning with `-` is read as
   the next flag by every argument parser that has to take it, so `--profile -x`
   selects no profile at all. The device comparison is case-insensitive and
-  reduces the name the way Windows does — cut at the first `.`, then drop
-  trailing spaces — so `NUL.toml`, `nul `, and `nul .toml` are all refused, while
+  reduces the name the way Windows does: cut at the first `.`, then drop trailing spaces. So `NUL.toml`, `nul `, and `nul .toml` are all refused, while
   `COM0`, `COM10`, and `LPT0` are not reserved and remain valid names. The
   audit-log and policy-window path builders, which sanitise such a stem rather
   than refusing it, now read the same reserved-name table, so the two surfaces
@@ -1238,8 +1227,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profile never had a file. Recover with `stellar-agent profile init --profile
   <new-name>` and the enrollment steps it prints, or by renaming the file and
   correcting its `policy_owner_key_id.service` to
-  `stellar-agent-owner-<new-name>` — a `v1` profile then also needs `profile
-  enroll-owner-key` and `profile sign-policy` re-run under the new name, because
+  `stellar-agent-owner-<new-name>`. A `v1` profile then also needs `profile
+  enroll-owner-key` and `profile sign-policy` re-run under the new name. This is because
   the owner key is stored under the old name's coordinate and the signed policy
   file carries the old name in its signed scope.
 
@@ -1261,10 +1250,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TOML with per-profile-derived keyring entry references. `--profile` defaults
   to `default`, `--network` to `testnet`, `--engine` to `v1`. `--rpc-url` is
   optional for testnet (defaults to the built-in testnet endpoint) but
-  required — and required to be `https://` — for `--network mainnet` (the
+  required, and required to be `https://`, for `--network mainnet`. The
   built-in mainnet default requires an API key and answers HTTP 401
-  unauthenticated, so persisting it would mint a broken configuration);
-  mainnet without `--rpc-url` is refused with
+  unauthenticated, so persisting it would mint a broken configuration. Mainnet without `--rpc-url` is refused with
   `validation.mainnet_rpc_url_required`, and a plaintext mainnet endpoint
   with `validation.config_invalid`. Refuses without writing or modifying
   anything if the named profile already exists
@@ -1273,10 +1261,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emits no audit row; docs and the MCP server's first-run guidance, which
   already referenced this command, now match an implemented one.
 - Every `profile` subcommand now accepts a `--profile <NAME>` flag. `show`,
-  `migrate`, the `rotate-*` subcommands, and `reset-window-state` — which
-  previously took only a positional `<NAME>` — now accept either the positional
+  `migrate`, the `rotate-*` subcommands, and `reset-window-state` previously took only a positional `<NAME>`. They now accept either the positional
   `<NAME>` or `--profile <NAME>` (exactly one; supplying both, or neither, is a
-  usage error), so a single profile-naming convention works across the group.
+  usage error). So a single profile-naming convention works across the group.
   The positional forms remain valid, and these subcommands still require a
   target with no default.
 
@@ -1316,18 +1303,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   acquirable BEFORE the signing key is touched or a transaction is
   submitted, refusing `audit.chain_key_unavailable` if not. Previously, a
   missing or unopenable audit writer logged a `tracing::warn!` and the
-  action proceeded unaudited — silently, with no `value_action_submitted`
+  action proceeded unaudited, silently, with no `value_action_submitted`
   row, and `lend`/`vault` had no pre-flight or audit row at all. `profile
   init` mints the audit-log keyring coordinate only, no key material, so an
   init-minted profile now requires `stellar-agent profile rotate-audit-key
   <name>` before any of these verbs will sign or submit, on both policy
   engines; `next_steps` in the `profile init` success payload names it,
   right after `enroll-signer`. This pre-flight fails closed only for a
-  persisted `<name>.toml` profile: `pay`, `claim`, and `accounts create`
-  keep their documented zero-config posture — the in-memory profile
+  persisted `<name>.toml` profile. `pay`, `claim`, and `accounts create`
+  keep their documented zero-config posture. The in-memory profile
   synthesized when no profile file exists stays fail-open on this specific
   check, so the no-setup quickstart is unaffected. The post-confirm
-  `value_action_submitted` emission itself stays non-fatal — the transaction
+  `value_action_submitted` emission itself stays non-fatal. The transaction
   has already committed by then, so refusing would help nobody.
   `stellar_mpp_charge_commit` is unaffected: it already failed closed on the
   same condition via its own stricter authorization-withholding mechanism.
@@ -1340,8 +1327,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - Breaking (CLI): the `smart-account migrate-verifier --confirm-mainnet-migrate`
-  flag. The flag could never lead to a successful submit — the network layer
-  forbids mainnet writes unconditionally in this alpha — so the command now
+  flag. The flag could never lead to a successful submit. The network layer
+  forbids mainnet writes unconditionally in this alpha. So the command now
   structurally refuses mainnet submit up front with
   `network.mainnet_write_forbidden`, matching every other write surface.
   Mainnet dry-run stays available (read-only). The `mainnet_confirm_missing`
@@ -1377,9 +1364,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   classified instead of being reported as `auth.keyring_not_found` or
   discarded. `stellar-agent audit verify`, `accounts deploy-c`, the CLI, core,
   and MCP attestation-key loaders, the `profile sign-policy` owner-key read,
-  and the MCP server's owner-key read now surface the precise cause — most
-  importantly `auth.keyring_interactive_session_required` for a
-  non-interactive Windows session — while key absence still maps to
+  and the MCP server's owner-key read now surface the precise cause. Most importantly, this includes `auth.keyring_interactive_session_required` for a non-interactive Windows session. Key absence still maps to
   `auth.keyring_not_found` (and to `OwnerKeyAbsent` for the MCP owner key).
   The fail-closed and indistinguishable read paths (the trustline opt-in
   verify, the MPP state-key read, the MCP attestation gate, the
@@ -1391,37 +1376,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so no call site or wire code changed for existing callers.
 - An unset `audit_log_path` now resolves to the per-profile location the
   field documents (`<root>/audit/<name>.jsonl`) in the profile builder, the
-  loader, and the v1 migration, instead of a host-global `audit.log` shared
-  by every profile on the machine — hash-chained logs from unrelated
-  profiles no longer interleave. Explicit `audit_log_path` values are
+  loader, and the v1 migration. This replaces a host-global `audit.log` shared
+  by every profile on the machine. Hash-chained logs from unrelated profiles no longer interleave. Explicit `audit_log_path` values are
   unchanged. The test-gated `STELLAR_AGENT_HOME` override now reaches every
   canonical-data-root-derived path, including the audit directory.
 - Every audit-writer acquisition now registers the profile's configured
   `audit_log_path` under the profile's audit chain-root key discipline.
   `stellar_rule_create`/`stellar_rule_create_commit` and the smart-account,
-  approve, and timelock command families previously registered a
-  name-derived default path with no HMAC key; the first such open pinned the
+  approve, and timelock command families previously registered a name-derived default path with no HMAC key. The first such open pinned the
   process-lifetime writer-registry entry and bricked every later keyed open
-  for the same profile name, and rows written unkeyed fell outside
-  `stellar-agent audit verify` coverage. For a persisted profile, every
-  audit-writing signing verb in these families — `smart-account execute`,
+  for the same profile name. Rows written unkeyed fell outside
+  `stellar-agent audit verify` coverage. For a persisted profile, every audit-writing signing verb in these families now fails closed. These include `smart-account execute`,
   `smart-account multicall`, the timelock `schedule`/`execute`/`cancel`
   commands, the rules write path, `migrate-verifier`'s submit path,
-  `approve serve`, `rule_create`, and `pool init` — now fails closed
-  (`audit.chain_key_unavailable` until `profile rotate-audit-key` mints the
-  chain key). Read-only surfaces (`list-rules`, `timelock list-pending`,
+  `approve serve`, `rule_create`, and `pool init`. They report `audit.chain_key_unavailable` until `profile rotate-audit-key` mints the
+  chain key. Read-only surfaces (`list-rules`, `timelock list-pending`,
   `rules get-spending-limit`, `migrate-verifier --dry-run`), `approve run`'s
   post-approval emission, and the local multicall registry commands
   (`register-multicall`, `unregister-multicall`) stay best-effort: they
-  degrade with a warning, but their acquisition now goes through the same
+  degrade with a warning. Their acquisition now goes through the same
   keyed-first discipline, so a failure never poisons the registry. The
   zero-config synthesized testnet profile keeps its quickstart behavior.
   Source-scan tests pin the discipline in both the CLI and the MCP server.
 - The SEP-43 sign-only pair (`stellar_sep43_sign_transaction`,
   `stellar_sep43_sign_auth_entry`) now proves the audit writer acquirable
-  before signing and records an `opaque_payload_signed` audit row — the
-  redacted payload digest and redacted signer address, never the signature
-  or payload — at the point the signature is produced. The caller broadcasts
+  before signing and records an `opaque_payload_signed` audit row. It records the redacted payload digest and redacted signer address, never the signature
+  or payload, at the point the signature is produced. The caller broadcasts
   externally, so the row records signature production, not on-chain
   confirmation. `pool init` likewise acquires the audit writer before any
   seed generation or on-chain submit and reuses it for the post-confirm
@@ -1494,22 +1474,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handles (the partial-rotation last-entry scan, the chain-recovery read at
   open, and the append handle itself). `LockFileEx`'s exclusive lock is
   enforced against I/O issued through any OTHER handle to the same file,
-  including a second handle opened by the SAME process — unlike POSIX
+  including a second handle opened by the SAME process. This differs from POSIX
   advisory locks, which never restrict I/O through a different descriptor.
   Re-opening a non-empty audit log (the common case once a profile has any
   history) failed with `ERROR_ACCESS_DENIED`, surfaced through the smart-account
   MCP flow as a misattributed `"networks.toml I/O error"` at the audit path.
-  `AuditWriter` now locks a sidecar file (`<log>.lock`) instead of the log
-  itself — the log file carries no OS lock on any platform — and keeps a
+  `AuditWriter` now locks a sidecar file (`<log>.lock`) instead of the log itself. The log file carries no OS lock on any platform. The writer keeps a
   single handle for every read and write against the active log. Adds
   `SaError::AuditWriterIo` so an audit-writer-open failure is attributed to
   the audit subsystem rather than the networks-registry subsystem. Adds a
   `windows-storage` CI job running the audit-log and touched-crate tests on
   `windows-latest`. (#59)
 - Windows: audit-log READERS (`audit verify`, the `find_*` state scans) failed
-  wholesale — and one blocked indefinitely — while any writer was alive,
-  because the writer's exclusive lock lived on the log file itself and
-  Windows enforces such a lock against reads through every other handle. With
+  wholesale, and one blocked indefinitely, while any writer was alive. The writer's exclusive lock lived on the log file itself. Windows enforces such a lock against reads through every other handle. With
   the writer's lock on the sidecar, readers never contend with it. Readers
   and `verify` additionally tolerate the transient active-file absence during
   a concurrent rotation (bounded re-scan, gated on a live writer holding the
@@ -1528,9 +1505,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-interactive deployments remains a separate, open item. (#57)
 - Windows: `PendingApprovalStore` (the approval spine, including
   `credentials add-passkey`'s registration flow) and `ToolsetGrantStore`
-  (toolset first-invoke grants) durably persist a write by renaming a temp
-  file into place, then opening the PARENT DIRECTORY as a file to fsync it —
-  a POSIX idiom. `std::fs::File::open` on a directory path requires
+  (toolset first-invoke grants) durably persist a write by renaming a temp file into place. They then open the PARENT DIRECTORY as a file to fsync it, a POSIX idiom. `std::fs::File::open` on a directory path requires
   `FILE_FLAG_BACKUP_SEMANTICS` on Windows (not set by the stable API) and
   fails with `ERROR_ACCESS_DENIED`, even though the content write and rename
   immediately before it succeed. Both stores now skip the directory fsync on
@@ -1560,7 +1535,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`stellar_x402_create_payment`, `stellar_x402_authenticated_payment`,
   `stellar_x402_parse_receipt`) are wrapped under `data` for the same
   consistency; their business errors were already normalised. The agent-facing
-  contract — one envelope shape, one dotted-code taxonomy — now holds across
+  contract (one envelope shape, one dotted-code taxonomy) now holds across
   every MCP tool and CLI verb these fixes touch. (#60)
 - `credentials add-passkey`'s declined-RP-ID-binding-warning outcome no longer
   leaks the internal requirement-tracking tag into the wire code: renamed to
@@ -1612,7 +1587,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - An opt-in, file-backed headless keyring store
   (`stellar-agent-headless-keyring`) for deployments where the platform
-  keyring is unavailable or unusable — a Windows service, an SSH/WinRM
+  keyring is unavailable or unusable. This covers a Windows service, an SSH/WinRM
   session, or a scheduled task (Windows Credential Manager requires an
   interactive logon session), and Linux services/CI. Activated via
   `STELLAR_AGENT_KEYRING_BACKEND=headless-env` (XChaCha20-Poly1305, key from
@@ -1634,8 +1609,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `counterparty_allowlist`'s `KNOWN_ISSUER` kind gains an opt-in `gate_inflows`
   flag (default `false`, so existing policy files parse and behave unchanged).
-  When `true`, `KNOWN_ISSUER` evaluates every leg of the descriptor — debit
-  and inflow alike — instead of debit legs only, so tokens received from an
+  When `true`, `KNOWN_ISSUER` evaluates every leg of the descriptor, debit
+  and inflow alike, instead of debit legs only, so tokens received from an
   un-allowlisted issuer (Blend withdraw/borrow proceeds, vault withdrawals)
   are gated too. An inflow leg whose asset is unresolvable denies fail-closed,
   the same posture as the existing debit handling. The other counterparty
@@ -1669,9 +1644,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `evaluate_with_value` remain as thin views. Value-verb dispatch uses the
   `_full` methods so the post-submit audit row records exactly the legs the gate
   evaluated rather than re-deriving them. (#21)
-- The six key-writing profile commands — `enroll-signer`, `enroll-owner-key`,
+- The six key-writing profile commands (`enroll-signer`, `enroll-owner-key`,
   `rotate-nonce-key`, `rotate-attestation-key`, `rotate-counterparty-key`, and
-  `rotate-audit-key` — now write a `keyring_key_written` audit row recording the
+  `rotate-audit-key`) now write a `keyring_key_written` audit row recording the
   key purpose and, where applicable, the redacted public address. (#34)
 - `profile rotate-audit-key` rotates the audit chain-root HMAC key and re-signs
   every per-file chain-root sidecar with the new key so `audit verify` stays
@@ -1714,17 +1689,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signing or broadcasting, instead of running unconditionally under
   `policy.engine = "v1"`. Each stage decodes the envelope through the same
   decoder the MCP `stellar_pay_commit` / `stellar_claim_commit` path uses and
-  evaluates the decoded amount/asset/destination — sizing comes from the
+  evaluates the decoded amount/asset/destination. Sizing comes from the
   envelope, not caller-supplied args. `--submit-only` gates even though the
   envelope arrives pre-signed, because broadcasting still spends funds. An
   envelope the decoder cannot classify into a sized shape follows the
   opaque-signing posture: denies `policy.deny.unsizable_value_effect` under a
   matched value rule unless it sets `allow_opaque_signing = true`, mirroring
-  the `stellar_sep43_*` tools' posture. `policy.engine = "noop"` is unaffected
-  — the staged flows remain ungated there, as before. The staged flows
+  the `stellar_sep43_*` tools' posture. `policy.engine = "noop"` is unaffected. The staged flows remain ungated there, as before. The staged flows
   match policy rules under the `stellar_pay_commit` / `stellar_claim_commit`
-  tool names (the same names the MCP commit phase matches), not `stellar_pay`
-  / `stellar_claim`: a ruleset that names only the base tools default-denies
+  tool names (the same names the MCP commit phase matches), not `stellar_pay` / `stellar_claim`. A ruleset that names only the base tools default-denies
   the staged flows, so operators cover both names, or use `tool = "*"`, for
   uniform behavior across invocation modes. (#40)
 - The per-period rolling-window accumulator (`PolicyStateStore`) is now
@@ -1747,10 +1720,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule that matches a value-moving tool constrains every debit leg it carries
   (classic pay/create, Blend supply/repay, DEX trades, vault deposits, x402
   payments), and per-asset caps aggregate across the legs of a multi-leg call.
-  A value rule that matches a call whose value cannot be sized — a tool that
-  reached the gate without resolved effects, or a raw signing tool
-  (`stellar_sep43_*`) — now denies fail-closed with
-  `policy.deny.unsizable_value_effect` rather than passing silently. A rule may
+  A value rule that matches a call whose value cannot be sized now denies fail closed with `policy.deny.unsizable_value_effect` rather than passing silently. This covers a tool that reached the gate without resolved effects, or a raw signing tool (`stellar_sep43_*`). A rule may
   opt a signing tool back in with `allow_opaque_signing = true`.
   `minimum_reserve` now counts only native-XLM outflow legs; a token-only move
   no longer reduces the native reserve. Operators with existing value rules
@@ -1776,7 +1746,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   submits and evaluates them through `PolicyEngine::evaluate_with_value`, so
   `per_tx_cap` / `per_period_cap` / `minimum_reserve` constrain CLI DeFi debits
   exactly as they constrain the MCP calls. Previously these verbs gated on the
-  tool name alone — with `trade` classified read-only — leaving the traded,
+  tool name alone, with `trade` classified read-only, leaving the traded,
   lent, and deposited amounts unconstrained. CLI `trustline` gates through the
   shared args-path descriptor builder; its refusals now carry the shared
   `policy.deny.<code>` / `policy.approval_required` / `policy.unexpected_decision`
@@ -1798,12 +1768,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Breaking (policy file behavior): `counterparty_allowlist`'s `HOME_DOMAIN`
   kind now requires the destination's on-chain `home_domain` to be
   independently VERIFIED through the operator's counterparty cache before the
-  allowlist is even consulted — a resolved cache entry for that domain, whose
+  allowlist is even consulted. This requires a resolved cache entry for that domain, whose
   cached `stellar.toml` `ACCOUNTS` list names the counterparty account.
   Previously a bare self-asserted `home_domain` match sufficed: any account
   could set `home_domain` to an allowlisted string via `SetOptions` at zero
   cost and pass. Existing `HOME_DOMAIN` rules now deny until the operator
-  populates the cache for the domains they allowlist — `stellar-agent
+  populates the cache for the domains they allowlist. `stellar-agent
   counterparty warm-up` refreshes every domain already in the policy file's
   `HOME_DOMAIN` allowlists in one pass; `stellar-agent counterparty refresh
   <domain>` refreshes one domain. `G_ACCOUNT` / `C_ACCOUNT` / `KNOWN_ISSUER`
@@ -1829,7 +1799,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP `stellar_pay_commit`, `stellar_claim_commit`, and
   `stellar_create_account_commit` now supply the source account (and, for
   `stellar_pay_commit`, the destination) as the policy gate's
-  `account_view`/`identity_view` — mirroring `stellar_trustline_commit` — so a
+  `account_view`/`identity_view`, mirroring `stellar_trustline_commit`. So a
   `minimum_reserve` criterion configured on these verbs is actually evaluated
   at commit instead of failing closed on every call, even when the same rule
   passed at simulate. The account fetch each commit path already made for the
@@ -1860,8 +1830,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetch was already made by the existing ordered gate (for the sequence
   number); the policy gate now runs after it. `identity_view` stays `None` on
   this verb: the only counterparty account is the asset issuer, whose on-chain
-  `home_domain` is self-asserted — supplying it to `counterparty_allowlist`
-  HOME_DOMAIN matching would let an issuer alias an allowlisted domain, so
+  `home_domain` is self-asserted. Supplying it to `counterparty_allowlist`
+  HOME_DOMAIN matching would let an issuer alias an allowlisted domain. So
   identity-class criteria configured on `stellar_trustline` fail closed by
   design. (#47)
 - `approve --id` writes the human-readable approval summary and the y/n prompt
@@ -1901,9 +1871,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependency they need (gated solely on the `test-helpers` feature). The
   module is now gated on the feature alone. (#37)
 - CLI `pay`, `claim`, and `accounts create` (sponsored) now supply the same
-  `account_view` / `identity_view` their MCP twins supply — `pay` a source
+  `account_view` / `identity_view` their MCP twins supply. `pay` supplies a source
   `account_view` plus a destination-derived `identity_view`; `claim` and
-  `accounts create` a source/sponsor `account_view` only — so a `minimum_reserve`
+  `accounts create` supply a source/sponsor `account_view` only. So a `minimum_reserve`
   or identity-class criterion configured on these verbs is actually evaluated
   instead of failing closed on every call. `trustline` is unchanged: its MCP
   twin supplies no views at all, so the CLI mirrors that exactly. The
@@ -1929,7 +1899,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `stellar_pay` / `stellar_pay_commit` path-payment envelopes
   (`PathPaymentStrictReceive` / `PathPaymentStrictSend`) now size the policy
   gate's debit leg from the SEND side (`send_max` / `send_amount`), not the
-  destination side (`dest_amount`) — the wallet's actual spendable-balance
+  destination side (`dest_amount`). The SEND side is the wallet's actual spendable-balance
   debit. `PathPaymentStrictSend` additionally now uses `send_asset` (not
   `dest_asset`) for the debit's asset. The destination side is still
   surfaced, as a separate non-debit informational leg, so counterparty checks
@@ -1967,8 +1937,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Testnet acceptance CI now provisions a headless Linux Secret Service
   (gnome-keyring under a private D-Bus session) for the CLI's `pay` v1-policy
   acceptance suite, which registers the platform keyring store before its
-  policy gate; the suite's self-skip on missing keyring is removed — keyring
-  init failure now fails the suite instead of silently skipping it. (#52)
+  policy gate. The suite's self-skip on missing keyring is removed. Keyring init failure now fails the suite instead of silently skipping it. (#52)
 - Acceptance-suite environmental-flake hardening, none of it weakening any
   assertion: the shared test-support Friendbot funding helper re-requests
   funding once and re-confirms if the account is still absent after the

@@ -17,9 +17,9 @@ reads secret keys from a named environment variable, not from the command line.
 ## Network and safety defaults
 
 - `stellar:testnet` is the default network. Friendbot funding is testnet-only.
-- `stellar:mainnet` is accepted for read-only commands — selected via
+- `stellar:mainnet` is accepted for read-only commands. Select it via
   `--network` where the command exposes it, or via `--rpc-url` for `balances`
-  (which has no `--network` flag) — but every write or signing command
+  (which has no `--network` flag). Every write or signing command
   structurally refuses mainnet (see [Mainnet is refused for
   writes](#mainnet-is-refused-for-writes)).
 - CLI commands print a JSON envelope on stdout by default. Exit code is `0` on
@@ -51,7 +51,7 @@ cargo binstall stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
 ```
 
 While only prerelease (alpha) versions are published on crates.io, the version
-must be spelled out — a bare crate name matches stable versions only. The
+must be spelled out. A bare crate name matches stable versions only. The
 release archives this command fetches are published with each tagged release
 on the repository's releases page.
 
@@ -71,7 +71,7 @@ build provenance. Verify a download against those before running it.
 
 The macOS binaries are currently ad-hoc signed, not Developer-ID signed or
 notarized. Gatekeeper blocks a QUARANTINED binary on first run with "Apple
-cannot check it for malicious software" — and the quarantine attribute is set
+cannot check it for malicious software", and the quarantine attribute is set
 by browser downloads, not by terminal downloads. Fetching the archive with
 `curl` (or `cargo binstall`) avoids the block entirely. For an archive that
 came through a browser, verify it against `SHA256SUMS` or its Sigstore
@@ -130,8 +130,8 @@ Keychain, Linux Secret Service, Windows Credential Manager). The profile TOML is
 safe to back up.
 
 **Windows: Credential Manager requires an interactive logon session.** A
-non-interactive process — a Windows service, an SSH session, or a scheduled
-task — cannot access Credential Manager and every keyring operation fails with
+non-interactive process, such as a Windows service, an SSH session, or a scheduled
+task, cannot access Credential Manager and every keyring operation fails with
 `auth.keyring_interactive_session_required`. Run the wallet from an interactive
 desktop session (Remote Desktop counts), deploy it inside a container / Linux
 VM where the platform keyring backend does not have this restriction, or opt
@@ -159,9 +159,8 @@ The default profile name is `default`. The `balances` and `pay` commands below
 take an explicit `--account`/`--source` and `--rpc-url` (defaulting to the
 testnet RPC), so they work without authoring a profile file. Profile-aware
 commands synthesise an in-memory testnet profile when no profile was *named*
-and no `default.toml` exists. A profile you name — with `--profile` or
-`STELLAR_AGENT_PROFILE` — is never replaced by that fallback: if its file does
-not exist, the command refuses.
+and no `default.toml` exists. A profile you name (with `--profile` or `STELLAR_AGENT_PROFILE`) is never replaced by that fallback.
+If its file does not exist, the command refuses.
 
 To create a persistent profile, run `profile init`:
 
@@ -172,9 +171,9 @@ stellar-agent profile init
 This writes `<profile_dir>/default.toml` with `engine = "v1"` (the default)
 and placeholder signer/nonce keyring coordinates. The full setup flow is:
 
-1. `profile init` — create the profile file (this step).
-2. [`profile enroll-signer`](#enroll-the-mcp-signer) — register the MCP signer seed.
-3. `profile rotate-audit-key` — mint the audit chain-root key. Required on
+1. `profile init`: create the profile file (this step).
+2. [`profile enroll-signer`](#enroll-the-mcp-signer): register the MCP signer seed.
+3. `profile rotate-audit-key`: mint the audit chain-root key. Required on
    **every** engine, `noop` included: `init` mints the audit-log keyring
    coordinate only, no key material, so every signing verb refuses
    `audit.chain_key_unavailable` until this runs.
@@ -185,10 +184,9 @@ and placeholder signer/nonce keyring coordinates. The full setup flow is:
    see also [Opt in to V1](profiles.md#opt-in-to-v1)).
 
 Pass `--profile <NAME>` for a non-default profile, `--rpc-url <URL>` to
-override the testnet default, `--network mainnet --rpc-url <URL>` for a
-mainnet profile (mainnet requires an explicit `https://` `--rpc-url` — the
-built-in default requires an API key and answers HTTP 401 unauthenticated, so
-persisting it would mint a broken configuration), and `--engine noop` to
+override the testnet default. Pass `--network mainnet --rpc-url <URL>` for a
+mainnet profile. Mainnet requires an explicit `https://` `--rpc-url`. The
+built-in default requires an API key and answers HTTP 401 unauthenticated, so persisting it would mint a broken configuration. Pass `--engine noop` to
 skip the V1 owner-key ceremony for now. See [`profile
 init`](cli-reference/profile-and-governance.md#profile-init) for the full
 flag reference.
@@ -197,15 +195,15 @@ Every profile-aware command takes the same `--profile <NAME>`, and so does the
 MCP server (`stellar-agent-mcp --profile <NAME>`); `STELLAR_AGENT_PROFILE` in
 the environment sets the name for both when the flag is absent. A profile file
 belongs to its name: back it up freely, but restoring it under a different file
-name does not create a second profile — run `profile init` for that.
+name does not create a second profile. Run `profile init` for that.
 
 A `v1` profile does not serve MCP requests until the ceremony below is complete;
 the server refuses to start and names the step that is missing. `--engine noop`
 is the way to have a working server immediately.
 
 For reference, here is the shape a testnet profile takes after enrolling a
-signer (a minimal version-2 profile; shown here with `engine = "noop"` for a
-permissive testnet start — `profile init`'s default is `engine = "v1"`):
+signer (a minimal version-2 profile). It is shown here with `engine = "noop"` for a
+permissive testnet start. `profile init`'s default is `engine = "v1"`:
 
 ```toml
 version = 2
@@ -247,17 +245,17 @@ placeholder such as `"default"` never signs. A profile minted by `profile init`
 starts with that placeholder; running
 [`profile enroll-signer`](#enroll-the-mcp-signer) populates it automatically
 with the enrolled seed's derived address. To pin the signer identity to a
-specific address in advance — refusing any other seed — set `account` to that
+specific address in advance, refusing any other seed, set `account` to that
 G-strkey yourself before enrolling. The `account` field on the other entries is
 only a keyring coordinate label and may stay `"default"`.
 
 The `[policy] engine` value is `noop` or `v1`. Both engines require
-`profile rotate-audit-key` before any signing verb will proceed — that
+`profile rotate-audit-key` before any signing verb will proceed. That
 requirement is independent of the policy engine.
 
-- `noop` — the Noop engine: testnet allow-all; on mainnet it allows read-only
+- `noop`: the Noop engine: testnet allow-all; on mainnet it allows read-only
   commands and refuses destructive ones with `policy.engine_required`.
-- `v1` — the V1 engine: a signature-verified, typed-criteria, first-match
+- `v1`: the V1 engine: a signature-verified, typed-criteria, first-match
   default-deny engine. On top of the audit key above, the V1 engine requires
   the owner public key enrolled (`profile enroll-owner-key`) plus the
   attestation keyring key (`profile rotate-attestation-key`), and a policy
@@ -309,22 +307,22 @@ stellar-agent friendbot --account GABC...WXYZ --network testnet
 
 Flags:
 
-- `--account <G_STRKEY>` — the account to fund (required).
-- `--network <NETWORK>` — `testnet` (default) or `futurenet`; `mainnet` is
+- `--account <G_STRKEY>`: the account to fund (required).
+- `--network <NETWORK>`: `testnet` (default) or `futurenet`; `mainnet` is
   rejected at dispatch.
-- `--friendbot-url <URL>` — override the Friendbot endpoint; the URL is validated
+- `--friendbot-url <URL>`: override the Friendbot endpoint; the URL is validated
   against an allow-list unless `--friendbot-url-unchecked` is set.
-- `--output <FORMAT>` — `json` (default) or `table`.
+- `--output <FORMAT>`: `json` (default) or `table`.
 
 ## Enroll the MCP signer
 
 The MCP fund-movement tools and the keyring-signing CLI verbs (`trustline`,
-`lend`, `trade`, `vault`) resolve their signer from the profile's
+`trade`, `vault`) resolve their signer from the profile's
 `mcp_signer_default` keyring entry. On a fresh install that entry is empty, so
 those paths fail with `auth.keyring_not_found` until you enroll a seed. Enrollment
 reads the `S...` secret from a named environment variable, derives its public
-address, and stores it in the platform keyring — the secret is never printed.
-These same four verbs also require the profile's audit chain-root key to be
+address, and stores it in the platform keyring. The secret is never printed.
+These same three verbs also require the profile's audit chain-root key to be
 minted (`profile rotate-audit-key <name>`, step 3 above); before that they
 refuse `audit.chain_key_unavailable`.
 
@@ -337,19 +335,19 @@ export WALLET_SK=S...your-testnet-secret...
 stellar-agent profile enroll-signer --profile default --secret-env WALLET_SK
 ```
 
-To pin the signer identity to a specific address in advance — refusing any
-other seed — set `account` to that G-strkey yourself before enrolling;
+To pin the signer identity to a specific address in advance, refusing any
+other seed, set `account` to that G-strkey yourself before enrolling;
 enrollment then refuses on a mismatch rather than overwriting it.
 
 Flags:
 
-- `--secret-env <VAR>` — name of the environment variable holding the signer's
+- `--secret-env <VAR>`: name of the environment variable holding the signer's
   S-strkey. The flag takes the variable name, never the secret.
-- `--profile <NAME>` — profile whose `mcp_signer_default` entry is written
+- `--profile <NAME>`: profile whose `mcp_signer_default` entry is written
   (default `default`).
-- `--expected-address <G_STRKEY>` — optional guard; enrollment refuses unless the
+- `--expected-address <G_STRKEY>`: optional guard; enrollment refuses unless the
   seed derives to this address.
-- `--force` — replace an already-enrolled entry.
+- `--force`: replace an already-enrolled entry.
 
 The JSON envelope reports the derived `public_address`, the keyring coordinate
 written, and `account_populated` (`true` when a placeholder was filled in,
@@ -369,12 +367,12 @@ stellar-agent balances --account GABC...WXYZ
 
 Flags:
 
-- `--account <G_STRKEY>` — the account to query (required).
-- `--rpc-url <URL>` — Stellar RPC endpoint; defaults to
+- `--account <G_STRKEY>`: the account to query (required).
+- `--rpc-url <URL>`: Stellar RPC endpoint; defaults to
   `https://soroban-testnet.stellar.org`.
-- `--asset <CODE:ISSUER>` — a trustline asset to query alongside native XLM;
+- `--asset <CODE:ISSUER>`: a trustline asset to query alongside native XLM;
   repeat to query several. Assets the account does not trust are omitted.
-- `--output <FORMAT>` — `json` (default) or `table`.
+- `--output <FORMAT>`: `json` (default) or `table`.
 
 ```bash
 stellar-agent balances \
@@ -402,34 +400,34 @@ stellar-agent pay GDEST...WXYZ "10 XLM" \
 
 Signer source (one of the following, mutually exclusive):
 
-- `--secret-env <VAR>` — name of the environment variable holding the source
+- `--secret-env <VAR>`: name of the environment variable holding the source
   account's S-strkey.
-- `--sign-with-ledger` — sign with a connected Ledger; the seed never enters
+- `--sign-with-ledger`: sign with a connected Ledger; the seed never enters
   process memory. Pair with `--account-index <INDEX>` (default `0`).
 
 Other common flags:
 
-- `<DESTINATION>` (positional) — destination account G-strkey (required).
-- `<AMOUNT>` (positional) — amount with units, e.g. `"10 XLM"`, `"10.5 USDC"`.
-- `[ASSET]` (positional) — `native`, `XLM`, or `CODE:ISSUER_GSTRKEY`; defaults to
+- `<DESTINATION>` (positional), destination account G-strkey (required).
+- `<AMOUNT>` (positional), amount with units, e.g. `"10 XLM"`, `"10.5 USDC"`.
+- `[ASSET]` (positional), `native`, `XLM`, or `CODE:ISSUER_GSTRKEY`; defaults to
   `native`.
-- `--source <G_STRKEY>` — source account; required for signing.
+- `--source <G_STRKEY>`: source account; required for signing.
 - `--memo-text <STRING>` / `--memo-id <U64>` / `--memo-hash <64_HEX>` /
-  `--memo-return <64_HEX>` — mutually exclusive memo options.
-- `--fee <STROOPS|auto[:pNN]>` — classic fee per operation.
-- `--timeout-seconds <SECONDS>` — submission/confirmation polling timeout;
+  `--memo-return <64_HEX>`: mutually exclusive memo options.
+- `--fee <STROOPS|auto[:pNN]>`: classic fee per operation.
+- `--timeout-seconds <SECONDS>`: submission/confirmation polling timeout;
   defaults to `60`.
-- `--rpc-url <URL>` — RPC endpoint override; defaults to the testnet RPC.
-- `--output <FORMAT>` — `json` (default) or `table`.
+- `--rpc-url <URL>`: RPC endpoint override; defaults to the testnet RPC.
+- `--output <FORMAT>`: `json` (default) or `table`.
 
 ### The unlock window
 
 For the `--secret-env` path, the 32-byte signing seed is loaded into the unlock
 window: a short TTL-bounded period during which the seed is resident in pinned,
 zeroize-on-drop memory (mlock). The TTL is the profile's `[wallet]
-unlock_ttl_seconds` (default 30 seconds); it must be in the range 1 to 600
+unlock_ttl_seconds` (default 30 seconds). It must be in the range 1 to 600
 seconds, and a value of 0 or above 600 is refused when the window is constructed
-— never clamped. The profile's `[wallet] mlock_required` governs what happens
+and never clamped. The profile's `[wallet] mlock_required` governs what happens
 if the seed cannot be pinned in RAM: `true` (the default on Linux/macOS) fails
 the signing call closed. The window is active only for the duration of a single
 signing call; the seed is zeroized and the lock released on every exit path. The
@@ -439,10 +437,10 @@ signing call; the seed is zeroized and the lock released on every exit path. The
 
 You can run the stages independently. The flags are mutually exclusive:
 
-- `--build-only` — emit the unsigned envelope XDR and exit (no signing).
-- `--sign-only <BASE64_XDR>` — sign a previously built envelope and emit signed
+- `--build-only`: emit the unsigned envelope XDR and exit (no signing).
+- `--sign-only <BASE64_XDR>`: sign a built envelope and emit signed
   XDR.
-- `--submit-only <BASE64_XDR>` — submit a signed envelope.
+- `--submit-only <BASE64_XDR>`: submit a signed envelope.
 
 `--use-oz-relayer` is an opt-in that is not implemented in this build: it prints
 an AGPL-3.0 disclosure to stderr and declines with
@@ -470,10 +468,10 @@ submitted under another network's passphrase.
 
 ## Next steps
 
-- [Concepts](concepts.md) — the profile, unlock window, policy engine and
+- [Concepts](concepts.md): the profile, unlock window, policy engine and
   criteria, approval spine and attestation, audit log, and smart-account context
   rules.
-- [CLI reference](cli-reference/index.md) — every subcommand, flag, and default.
-- [MCP server](mcp.md) — running `stellar-agent-mcp` as an MCP stdio server.
-- [Profiles](profiles.md) — the full profile schema and the key-rotation
+- [CLI reference](cli-reference/index.md): every subcommand, flag, and default.
+- [MCP server](mcp.md): running `stellar-agent-mcp` as an MCP stdio server.
+- [Profiles](profiles.md): the full profile schema and the key-rotation
   ceremony.

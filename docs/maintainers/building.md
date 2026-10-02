@@ -165,17 +165,17 @@ Unit, integration, and doc-tests run with no network access. They are the defaul
 under `cargo test`. The feature flags that gate the offline test surface, all
 declared on individual crates (and on `stellar-agent-test-support`), are:
 
-- `test-helpers` — exposes test-only helpers and fixtures. Must not be enabled in
+- `test-helpers`: exposes test-only helpers and fixtures. Must not be enabled in
   production builds.
-- `test-hooks` — test-only observation and fault-injection hooks in
+- `test-hooks`: test-only observation and fault-injection hooks in
   `stellar-agent-network` and `stellar-agent-nonce`.
-- `test-loopback` — loopback-listener test surface in `stellar-agent-network`.
-- `testnet-helpers` — keypair generation, Friendbot HTTP, and live-network client
+- `test-loopback`: loopback-listener test surface in `stellar-agent-network`.
+- `testnet-helpers`: keypair generation, Friendbot HTTP, and live-network client
   helpers in `stellar-agent-test-support`. Pulled in transitively by the
   `testnet-acceptance` feature of the crates that submit on-chain.
-- `verifier-registry` — temp-dir-backed verifier-registry fixtures in
+- `verifier-registry`: temp-dir-backed verifier-registry fixtures in
   `stellar-agent-test-support`.
-- `wiremock-helpers` — `wiremock`-based HTTP doubles in
+- `wiremock-helpers`: `wiremock`-based HTTP doubles in
   `stellar-agent-test-support`.
 
 The CI `test (offline)` and coverage jobs run the offline tier with

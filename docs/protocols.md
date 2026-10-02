@@ -8,11 +8,11 @@ Three principles shape every integration:
 - **Fail-closed.** Validation refuses on any failed check rather than proceeding on a guess. Unknown discriminants, ambiguous tokens, missing slippage floors, and stale oracle reads are refused before signing.
 - **Never auto-submit untrusted requests.** Inbound requests (a SEP-7 URI, a contract invocation) are parsed into a preview for the operator and policy engine. The wallet does not sign or submit on a dApp's behalf without going through the policy engine and [approval spine](concepts.md#the-approval-spine).
 
-All write and signing paths are testnet-only in this alpha: every signing command structurally refuses `stellar:mainnet` (wire code `network.mainnet_write_forbidden`) — `--network` commands before any RPC call or signing, and at the submit layer both a declared mainnet network passphrase and a known mainnet RPC URL, each at zero RPC cost. Beyond those two, the submit layer binds each submission to the network the endpoint reports it serves rather than to the declared one, and requires every signature on the envelope to verify under it. Read-only commands accept mainnet.
+All write and signing paths are testnet-only in this alpha. Every signing command structurally refuses `stellar:mainnet` (wire code `network.mainnet_write_forbidden`). This covers `--network` commands before any RPC call or signing. At the submit layer it covers both a declared mainnet network passphrase and a known mainnet RPC URL, each at zero RPC cost. Beyond those two, the submit layer binds each submission to the network the endpoint reports it serves rather than to the declared one, and requires every signature on the envelope to verify under it. Read-only commands accept mainnet.
 
 ## SEP protocols
 
-### SEP-7 — `web+stellar:` URI parsing
+### SEP-7: `web+stellar:` URI parsing
 
 - **Spec:** SEP-7 (`sep-0007.md`).
 - **Capability:** Parses an inbound `web+stellar:tx?...` or `web+stellar:pay?...` URI from an untrusted dApp into a structured preview, and optionally verifies the dApp's origin-domain signature.
@@ -22,7 +22,7 @@ All write and signing paths are testnet-only in this alpha: every signing comman
   - Origin-domain signature verification always fetches a fresh `stellar.toml`; it is never cached.
   - Stateless with no replay protection: SEP-7 signatures carry no nonce or timestamp, so idempotency is the operator/host's responsibility.
 
-### SEP-10 — Stellar Web Authentication
+### SEP-10: Stellar Web Authentication
 
 - **Spec:** SEP-10 version 3.4.1.
 - **Capability:** Client-side Web Auth: fetch the challenge transaction, run the full 13-point challenge validation, and submit the signed challenge to obtain a JWT session. A per-request ephemeral ed25519 key flow is also provided.
@@ -32,11 +32,11 @@ All write and signing paths are testnet-only in this alpha: every signing comman
   - The server-issued JWT signature is not verified by the client; the JWT is trusted via TLS.
   - Ephemeral keys are generated fresh per call from the OS RNG and zeroized on drop.
 
-### SEP-24 and SEP-6 — anchor deposit/withdraw
+### SEP-24 and SEP-6: anchor deposit/withdraw
 
 - **Spec:** SEP-6 (discovery) and SEP-24 (interactive).
 - **Capability:**
-  - SEP-6 discovery is `GET {transfer_server}/info` only — it reads the anchor's capability set and `authentication_required` flags.
+  - SEP-6 discovery is `GET {transfer_server}/info` only: it reads the anchor's capability set and `authentication_required` flags.
   - SEP-24 interactive obtains the anchor's interactive deposit/withdraw URL via `POST .../transactions/{op}/interactive` (using a SEP-10 or SEP-45 JWT supplied by the caller) and returns that URL to the operator for browser hand-off.
 - **Side:** Client side, privacy-first. Surfaced as the `stellar_sep6_deposit_info` and `stellar_sep24_interactive_url` MCP tools.
 - **Refusals and constraints:**
@@ -46,7 +46,7 @@ All write and signing paths are testnet-only in this alpha: every signing comman
   - Does not perform the SEP-10/SEP-45 authentication itself; the caller supplies an opaque JWT string.
   - Same-domain SSRF bind: the resolved `TRANSFER_SERVER*` host must equal the operator-typed anchor domain or be a subdomain of it. The anchor domain is validated as a public FQDN first.
 
-### SEP-43 — Wallet Protocol (message and transaction signing)
+### SEP-43: Wallet Protocol (message and transaction signing)
 
 - **Spec:** SEP-43 version 1.2.1.
 - **Capability:** Agent-side `ModuleInterface` dispatch over five methods: `get_address`, `sign_transaction`, `sign_auth_entry`, `sign_message`, `get_network`. Errors use the spec's stable wire codes and `{ code, message, ext? }` JSON shape.
@@ -56,7 +56,7 @@ All write and signing paths are testnet-only in this alpha: every signing comman
   - No multi-signer quorum. `sign_auth_entry` signs the base64 `HashIdPreimage` of a single-signer authorization entry with one ed25519 G-key and returns the raw signature; the requester assembles the credentials. Both Soroban authorization preimage types are signed for the wallet's own G-key: envelope type 9 (`SorobanAuthorization`) and envelope type 10 (`SorobanAuthorizationWithAddress`, CAP-71). The preimage does not carry the credential arm: a type 10 preimage is signed only when it is bound to the signing key's `ScAddress::Account`, whichever credential type the entry uses, and a preimage bound to any other address is refused with `sep43.invalid_address`. Every other preimage case is refused with `sep43.malformed_auth_entry`.
   - Opens no HTTP/HTTPS connections; interop is stdio via MCP only.
 
-### SEP-45 — Web Authentication for Contract Accounts
+### SEP-45: Web Authentication for Contract Accounts
 
 - **Spec:** SEP-45 version 0.1.1.
 - **Capability:** Client-side Web Auth for contract (C-) accounts: fetch the challenge, validate the authorization entries, and submit the signed challenge to obtain a JWT session. Both an ephemeral-key flow and a persistent-signer flow are provided.
@@ -67,14 +67,14 @@ All write and signing paths are testnet-only in this alpha: every signing comman
   - HTTPS-only floor enforced at the transport layer.
   - Does not access the keyring or wallet seed (pure decode and validate). The ephemeral path suits only contracts that accept the ephemeral public key or need no client signature.
 
-### SEP-47 — Contract Interface Discovery
+### SEP-47: Contract Interface Discovery
 
 - **Spec:** SEP-47 (Contract Interface Discovery).
 - **Capability:** Discovers the SEPs a contract claims to implement by reading the `sep` entry of its `contractmetav0` metadata.
 - **Side:** Agent/wallet (read side). Surfaced as the `stellar_sep47_discover` MCP tool. Shipped together with SEP-48.
 - **Refusals and constraints:** Read-only discovery; submits nothing and modifies no chain state.
 
-### SEP-48 — Contract Interface Specification
+### SEP-48: Contract Interface Specification
 
 - **Spec:** SEP-48 (Contract Interface Specification).
 - **Capability:** Renders a typed-argument preview of an `InvokeHostFunction` XDR against the on-chain contract spec.
@@ -84,7 +84,7 @@ All write and signing paths are testnet-only in this alpha: every signing comman
   - Does not validate spec semantics beyond a bounded XDR parse; upstream contract specs are treated as trusted.
   - The typed preview is non-authoritative display only and does not gate signing.
 
-### SEP-53 — message signing
+### SEP-53: message signing
 
 - **Spec:** SEP-53 (`sep-0053.md`).
 - **Capability:** Canonical prefixed message sign and verify. Signing computes `SHA-256("Stellar Signed Message:\n" ‖ message)` and ed25519-signs the 32-byte digest, producing a 64-byte signature; verification recomputes the digest and ed25519-verifies it.
@@ -96,15 +96,15 @@ All write and signing paths are testnet-only in this alpha: every signing comman
 
 ## Agent payments (x402)
 
-### x402 v2 Exact Stellar — payer side
+### x402 v2 Exact Stellar: payer side
 
 - **Spec:** x402 v2 wire format, Exact Stellar scheme; wire-compatible with the published `@x402/stellar` package.
 - **Capability:** Payer-side construction and signing of a `PAYMENT-SIGNATURE` payload through a validate, build, simulate, sign, re-simulate, finalize flow.
 - **Side:** Payer/client only.
 - **Refusals and constraints:**
   - Payer-only; no payee or facilitator logic.
-  - Stellar only — no EVM or other chains.
-  - The `exact` scheme only — no `upto`.
+  - Stellar only, no EVM or other chains.
+  - The `exact` scheme only, no `upto`.
   - No HTTP retry loop; the host orchestrates the HTTP exchange.
   - Targets x402 v2, not v3.x.
 
@@ -140,9 +140,9 @@ to a Payment challenge. See [Agent payments with MPP](agent-payments.md).
 
 ## DeFi venues
 
-Each DeFi venue is a signing adapter behind a common interface. They share a posture: no raw-vector or opaque-calldata signing, a venue/WASM pin verified before any signing, and predicted post-op figures shown for display only — never as a signing gate. See [DeFi and pool commands](cli-reference/defi-and-pool.md) for the CLI surface.
+Each DeFi venue is a signing adapter behind a common interface. They share a posture: no raw-vector or opaque-calldata signing, a venue/WASM pin verified before any signing, and predicted post-op figures shown for display only, never as a signing gate. See [DeFi and pool commands](cli-reference/defi-and-pool.md) for the CLI surface.
 
-### Blend — removed
+### Blend: removed
 
 The Blend lending integration was removed after the August 2026 incident in
 which the Comet pool holding Blend's backstop insurance capital was drained.
@@ -153,7 +153,7 @@ crates.io; no new versions are published. Re-integration would require a
 published post-mortem, a backstop rebuilt on an audited AMM, and a fresh
 integration review of the rebuilt protocol.
 
-### Soroswap — trade (`trade`, `stellar_dex_quote`)
+### Soroswap: trade (`trade`, `stellar_dex_quote`)
 
 - **Protocol:** Soroswap router-direct swap.
 - **Capability:** Real on-chain swap with an absolute `amount_out_min`, plus a read-only quote. The `trade` (signing) verb is dispatched through both MCP and the CLI. The read-only quote is the MCP `stellar_dex_quote` tool; the CLI has no separate `quote` subcommand, so CLI price discovery happens inside `trade` via the on-chain `router_get_amounts_out` re-check at signing time.
@@ -166,7 +166,7 @@ integration review of the rebuilt protocol.
   - Soroswap is the only wired venue; routes through an un-allowlisted venue are refused, and the router WASM pin is verified first.
   - The Soroswap aggregator, Aquarius/Phoenix execution, classic SDEX limit orders (`CreatePassiveSellOffer`), and oracle price-deviation checks are out of scope.
 
-### DeFindex — vault (`vault`)
+### DeFindex: vault (`vault`)
 
 - **Protocol:** DeFindex vault.
 - **Capability:** Typed deposit and withdraw preview and submit, with four-role disclosure (Manager, EmergencyManager, RebalanceManager, VaultFeeReceiver), self-managed versus delegated detection, and Blend-strategy detection by WASM hash. The `vault` verb is dispatched through MCP and the CLI.
@@ -182,7 +182,7 @@ integration review of the rebuilt protocol.
 |---|---|---|
 | SEP-7 | Parse inbound `web+stellar:` URI into a preview; optional fresh-`stellar.toml` origin-signature verify; never signs or submits | MCP |
 | SEP-10 | Client Web Auth (fetch, 13-point validate, submit) to obtain a JWT; ephemeral-key flow | (used by anchor and x402 flows) |
-| SEP-6 | Discovery only — `GET /info` capability set | MCP |
+| SEP-6 | Discovery only, `GET /info` capability set | MCP |
 | SEP-24 | Interactive deposit/withdraw URL via `POST .../interactive`; returned to operator, never followed | MCP |
 | SEP-43 | Agent `ModuleInterface`: `get_address`, `sign_transaction`, `sign_auth_entry`, `sign_message`, `get_network`; never submits | MCP |
 | SEP-45 | Client Web Auth for contract accounts (steps 1–12); ephemeral and persistent-signer flows | (used by anchor flows) |
@@ -192,13 +192,13 @@ integration review of the rebuilt protocol.
 | x402 v2 Exact Stellar | Payer-side `PAYMENT-SIGNATURE` construction and signing (Stellar-only, `exact`-only) | MCP |
 | x402 identity gate | SEP-10 counterparty-identity gate returning a Bearer JWT companion (never in the XDR) | MCP |
 | MPP sponsored Stellar charge | Testnet G-account payer authorization; returns one HTTP/native-MCP credential, records a host receipt, and independently reconciles settlement | CLI, MCP |
-| Blend | removed (see above) | — |
+| Blend | removed (see above) | n/a |
 | Soroswap | `trade` (signing, CLI + MCP) and the read-only `stellar_dex_quote` (MCP only); absolute slippage floor, pre-sign re-verify, WASM-pinned | CLI, MCP |
 | DeFindex | `vault` deposit/withdraw; `min_out` required, role disclosure, `Upgradable:true` refused by default | CLI, MCP |
 
 ## Related pages
 
-- [Stellar operations CLI reference](cli-reference/stellar-ops.md) — core on-chain commands.
-- [DeFi and pool commands](cli-reference/defi-and-pool.md) — `lend`, `trade`, `vault`, and channel-account pool commands.
-- [MCP server](mcp.md) — the `stellar-agent-mcp` stdio server and its tool catalog.
-- [Toolsets](toolsets.md) — how toolset-routed capabilities reach signing-adjacent tools under the first-invoke gate and per-action approval.
+- [Stellar operations CLI reference](cli-reference/stellar-ops.md): core on-chain commands.
+- [DeFi and pool commands](cli-reference/defi-and-pool.md): `trade`, `vault`, and channel-account pool commands.
+- [MCP server](mcp.md): the `stellar-agent-mcp` stdio server and its tool catalog.
+- [Toolsets](toolsets.md): how toolset-routed capabilities reach signing-adjacent tools under the first-invoke gate and per-action approval.

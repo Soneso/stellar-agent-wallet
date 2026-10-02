@@ -62,11 +62,11 @@ The capability manifest is the space-separated value of
 | `suggest-destination` | Suggest a destination via read-only discovery/preview tools. |
 | `observe-event` | Observe a ledger event. No tool is wired to this capability yet, so it grants nothing. |
 | `sign-payment` | Sign and submit a classic payment. Signing-adjacent and gated; inert until the first-invoke gate converts it to a runtime grant. |
-| `read-rules` | Read the agent's own context rules (spending-limit budgets, expiry, signer/policy counts). Separately grantable from `read-balance` — rule visibility and balance visibility are distinct concerns. |
+| `read-rules` | Read the agent's own context rules (spending-limit budgets, expiry, signer/policy counts). Separately grantable from `read-balance`: rule visibility and balance visibility are distinct concerns. |
 | `sign-rule-create` | Install an agent-proposed context rule on-chain. Signing-adjacent and gated; inert until the first-invoke gate converts it to a runtime grant. The per-proposal operator attestation (`RuleProposalSimulated`) fires unconditionally regardless of the grant. |
 
 The bare token `sign-transaction` is always refused with a format error. There is
-no flat "sign" capability — signing is never grantable as a plain manifest token.
+no flat "sign" capability. Signing is never grantable as a plain manifest token.
 
 ### Parse safety
 
@@ -136,7 +136,7 @@ A toolset action passes only the **four-part check**:
 
 1. The action name resolves, through a closed lookup against the matrix, to a
    `&'static str` registry tool name `T`. The resolved name is a compile-time
-   constant — a toolset-supplied string can never become the routed tool name.
+   constant. A toolset-supplied string can never become the routed tool name.
 2. `T` is in the grant set of some capability `C` (implied by step 1).
 3. `C` is in the toolset's declared capability set, read from the pin record.
 4. `T` is in the toolset's `allowed_tools`. `allowed_tools` can only subtract from a
@@ -228,7 +228,7 @@ ungated path. The gated resolver enforces, in order:
    within `allowed_tools`.
 2. The first-invoke gate: it looks for a current matching grant in the per-profile
    grant store. Matching is computed from the authoritative destination, asset, and
-   amount decoded from the transaction envelope — never from toolset-supplied
+   amount decoded from the transaction envelope, never from toolset-supplied
    arguments. A non-positive authoritative amount is refused before any grant
    lookup.
 
@@ -249,7 +249,7 @@ lives only in the keyring.
 ## CLI commands
 
 The subcommand group is `stellar-agent toolsets` (plural). All four subcommands are
-local and offline — no network calls, no chain signing — and print a JSON envelope.
+local and offline (no network calls, no chain signing) and print a JSON envelope.
 Each prints its success envelope on stdout. `install` and `uninstall` write the
 error envelope to stderr; `list` and `run` write the error envelope to stdout.
 Exit code is `0` on success, `1` on any error. The toolsets root defaults to the
@@ -261,14 +261,14 @@ subcommand.
 Installs a toolset from a local signed `.tar.gz` and runs the verification and
 attestation pipeline above.
 
-Positional: `<PKG@VERSION>` — `<name>@<version>`, e.g. `balance-reporter@1.0.0`.
+Positional: `<PKG@VERSION>`: `<name>@<version>`, e.g. `balance-reporter@1.0.0`.
 
 | Flag | Meaning | Req/Opt | Default |
 |---|---|---|---|
-| `--file <PATH>` | Path to the `.tar.gz` package. | Required | — |
-| `--shasum <HEX>` | Expected SHA-256 of the package (64 lowercase hex chars). | Required | — |
-| `--signature <HEX>` | Publisher ed25519 signature (128 hex chars / 64 bytes). | Required | — |
-| `--publisher <G-STRKEY>` | Publisher ed25519 public key as a Stellar G-strkey. | Required | — |
+| `--file <PATH>` | Path to the `.tar.gz` package. | Required | none |
+| `--shasum <HEX>` | Expected SHA-256 of the package (64 lowercase hex chars). | Required | none |
+| `--signature <HEX>` | Publisher ed25519 signature (128 hex chars / 64 bytes). | Required | none |
+| `--publisher <G-STRKEY>` | Publisher ed25519 public key as a Stellar G-strkey. | Required | none |
 | `--trust-set <PATH>` | Publisher trust-set file. | Optional | `<toolsets_dir>/trust.txt` |
 | `--toolsets-dir <PATH>` | Toolsets root override. | Optional | OS-conventional toolsets dir |
 | `--force` | Reinstall even if already installed. | Optional | `false` |
@@ -293,7 +293,7 @@ install-library failure); the distinguishing detail is in `error.message`.
 ### `toolsets list`
 
 Enumerates installed toolsets and their declared actions as JSON. This is the
-canonical scriptable enumeration — it is read from pin records, not parsed from
+canonical scriptable enumeration. It is read from pin records, not parsed from
 help text. Each entry reports `name`, `description` (always empty; the pin record stores no
 description), `capabilities`, `allowed_tools`, `version`, and `actions` (the tool names reachable
 through the ungated matrix; gated tools such as `stellar_pay_commit` are not listed
@@ -314,8 +314,8 @@ trusted registry tool it routes to. It does **not** execute the routed tool; on
 success `data` carries the `routed_to` tool name and a note that execution is
 not wired in the CLI. Use the MCP surface for execution.
 
-Positionals: `<TOOLSET-NAME>` — the installed package name (e.g. `balance-reporter`);
-`<ACTION>` — the exact registry tool name granted by the toolset's capabilities
+Positionals: `<TOOLSET-NAME>`: the installed package name (e.g. `balance-reporter`);
+`<ACTION>`: the exact registry tool name granted by the toolset's capabilities
 (e.g. `stellar_balances`).
 
 | Flag | Meaning | Req/Opt | Default |
@@ -328,7 +328,7 @@ stellar-agent toolsets run balance-reporter stellar_balances
 
 On enforcement failure `error.code` is one of `toolset.not_installed`,
 `toolset.unknown_action`, `toolset.capability_not_declared`, or
-`toolset.tool_not_allowed` — the same codes the MCP `stellar_toolset_invoke`
+`toolset.tool_not_allowed`: the same codes the MCP `stellar_toolset_invoke`
 tool uses for the identical enforcement failures.
 
 ### `toolsets uninstall <PACKAGE>`
@@ -336,7 +336,7 @@ tool uses for the identical enforcement failures.
 Removes an installed toolset's directory and pin record. Refuses if the toolset is not
 installed.
 
-Positional: `<PACKAGE>` — the package name (`[a-z0-9-]`).
+Positional: `<PACKAGE>`: the package name (`[a-z0-9-]`).
 
 | Flag | Meaning | Req/Opt | Default |
 |---|---|---|---|

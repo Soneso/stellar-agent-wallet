@@ -1,8 +1,8 @@
 # Stability tiers
 
 What each workspace crate is for, how settled its API is, and what a
-deployer can rely on. Tiers express support intent and relative maturity —
-they are not SemVer guarantees. Every crate is pre-1.0: any surface may
+deployer can rely on. Tiers express support intent and relative maturity.
+They are not SemVer guarantees. Every crate is pre-1.0: any surface may
 change between alpha releases, and the CHANGELOG records every change that
 matters. What the tiers add is where change is likely, where it is avoided,
 and where a report of breakage is treated as a bug rather than as expected
@@ -24,15 +24,15 @@ Facts that apply to every crate:
 
 ## Tier definitions
 
-- **Level 1 — stable core.** The agent-payment runtime. Strongest
+- **Level 1, stable core.** The agent-payment runtime. Strongest
   compatibility intent: breaking changes are avoided where possible, always
   called out with migration notes, and breakage reports are treated as
   bugs. Covered by the full acceptance gates on every release.
-- **Level 2 — supported optional.** Maintained and tested with the same
+- **Level 2, supported optional.** Maintained and tested with the same
   gates, but the API may evolve before 1.0 with less ceremony. Protocol
   surfaces (SEPs), operational tooling, and the approval interfaces live
   here.
-- **Level 3 — experimental.** Best effort, testnet-first. APIs and formats
+- **Level 3, experimental.** Best effort, testnet-first. APIs and formats
   may change without migration notes. Guaranteed maintenance of a Level 3
   surface requires sponsorship.
 - **Internal.** Workspace machinery published only because crates.io
@@ -104,7 +104,7 @@ allowlist regardless.
 Verified 2026-09-02 against crates.io reverse dependencies: no crate in
 this workspace has an external dependent (the only registered dependents
 are workspace siblings). In particular `stellar-agent-approval-remote`,
-the crate most likely to attract external integration, has none — its API
+the crate most likely to attract external integration, has none. Its API
 may evolve under Level 2 rules without external coordination.
 
 ## Intent, not yet implemented

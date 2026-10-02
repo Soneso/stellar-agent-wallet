@@ -6,11 +6,11 @@ every reviewer approves with no blocking findings.
 
 ## Reviewers
 
-- **Security reviewer** — security and key hygiene, dependency licensing, and the
+- **Security reviewer**: security and key hygiene, dependency licensing, and the
   project invariants.
-- **Code reviewer** — documentation, public API and dead code, reuse and
+- **Code reviewer**: documentation, public API and dead code, reuse and
   duplication, and test quality and coverage.
-- **Architecture reviewer** — reuse-versus-build and dependency choices, module
+- **Architecture reviewer**: reuse-versus-build and dependency choices, module
   architecture, and overall production readiness.
 
 ## Dimensions
@@ -46,7 +46,7 @@ every reviewer approves with no blocking findings.
   regresses. A test that only raises the coverage number by exercising or
   asserting wrong or buggy behavior, or that would still pass if the code were
   broken, is a blocking finding and must be reported. The fix is to correct the
-  code or the expected value — never to keep the test for the coverage number.
+  code or the expected value, never to keep the test for the coverage number.
 
 ### 4. Documentation
 

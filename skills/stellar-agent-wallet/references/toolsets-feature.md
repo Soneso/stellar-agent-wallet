@@ -312,14 +312,14 @@ every subcommand.
 Installs a toolset from a local signed `.tar.gz` and runs the verification and
 attestation pipeline.
 
-Positional: `<PKG@VERSION>` — `<name>@<version>`, e.g. `balance-reporter@1.0.0`.
+Positional: `<PKG@VERSION>`: `<name>@<version>`, e.g. `balance-reporter@1.0.0`.
 
 | Flag | Meaning | Req/Opt | Default |
 |---|---|---|---|
-| `--file <PATH>` | Path to the `.tar.gz` package. | Required | — |
-| `--shasum <HEX>` | Expected SHA-256 of the package (64 lowercase hex chars). | Required | — |
-| `--signature <HEX>` | Publisher ed25519 signature (128 hex chars / 64 bytes). | Required | — |
-| `--publisher <G-STRKEY>` | Publisher ed25519 public key as a Stellar G-strkey. | Required | — |
+| `--file <PATH>` | Path to the `.tar.gz` package. | Required | none |
+| `--shasum <HEX>` | Expected SHA-256 of the package (64 lowercase hex chars). | Required | none |
+| `--signature <HEX>` | Publisher ed25519 signature (128 hex chars / 64 bytes). | Required | none |
+| `--publisher <G-STRKEY>` | Publisher ed25519 public key as a Stellar G-strkey. | Required | none |
 | `--trust-set <PATH>` | Publisher trust-set file. | Optional | `<toolsets_dir>/trust.txt` |
 | `--toolsets-dir <PATH>` | Toolsets root override. | Optional | OS-conventional toolsets dir |
 | `--force` | Reinstall even if already installed. | Optional | `false` |
@@ -363,8 +363,8 @@ the trusted registry tool it routes to. It does **not** execute the routed tool;
 on success it reports `status: "resolved"` with the `routed_to` tool name and a
 note that execution is not wired in the CLI. Use the MCP surface for execution.
 
-Positionals: `<TOOLSET-NAME>` — the installed package name (e.g.
-`balance-reporter`); `<ACTION>` — the exact registry tool name granted by the
+Positionals: `<TOOLSET-NAME>`: the installed package name (e.g.
+`balance-reporter`); `<ACTION>`: the exact registry tool name granted by the
 toolset's capabilities (e.g. `stellar_balances`).
 
 | Flag | Meaning | Req/Opt | Default |
@@ -386,7 +386,7 @@ not installed. Uninstall reads the pin, re-validates the stored package name,
 reconstructs the directory path from that validated name (never from a stored
 path), refuses a symlinked leaf, and removes the directory and pin.
 
-Positional: `<PACKAGE>` — the package name (`[a-z0-9-]`).
+Positional: `<PACKAGE>`: the package name (`[a-z0-9-]`).
 
 | Flag | Meaning | Req/Opt | Default |
 |---|---|---|---|
