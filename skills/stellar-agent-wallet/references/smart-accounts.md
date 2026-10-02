@@ -68,6 +68,9 @@ stellar-agent smart-account rules create \
 
 `verify-pins` reports each `*_pin_status` as one of `match`, `drift`, `unavailable`, `no_pin`, `no_contracts`. `drift` also covers a pinned policy with no policy on chain: `policy_pin_status` is `drift` with an empty observed list.
 
+A rule with one drifted and one unavailable pin reports both statuses, carries the unavailable probe's code in `unavailable_reason`, and exits 1.
+A failed executable read reports `sa.deployment_failed` in `unavailable_reason`.
+
 ## Signer kinds
 
 The wallet maps to three OpenZeppelin signer kinds. `smart-account signers list` returns parallel `signer_ids`, `signer_kinds` and `signer_summaries` lists. Observed on chain, a signer's kind string is `delegated_ed25519`, `external` (a passkey signer included) or `delegated_contract`, a signer delegated to a contract address. `rules create --signer-delegated <C>` installs one; the signer add verbs do not add one. The kinds the add verbs take are:

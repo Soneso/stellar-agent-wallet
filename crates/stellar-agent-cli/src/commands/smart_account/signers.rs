@@ -3447,6 +3447,336 @@ mod tests {
         );
     }
 
+    // Manager pass-through tests and fixtures.
+
+    fn rule_scval(id: u32, signers: Vec<ScVal>, policies: Vec<ScVal>) -> ScVal {
+        let entry = |key: &str, val| ScMapEntry {
+            key: ScVal::Symbol(ScSymbol(key.try_into().unwrap())),
+            val,
+        };
+        let vec_of = |items: Vec<ScVal>| ScVal::Vec(Some(ScVec(items.try_into().unwrap())));
+        let signer_ids = (0..u32::try_from(signers.len()).unwrap())
+            .map(ScVal::U32)
+            .collect();
+        ScVal::Map(Some(ScMap(
+            vec![
+                entry("id", ScVal::U32(id)),
+                entry("policies", vec_of(policies)),
+                entry("signer_ids", vec_of(signer_ids)),
+                entry("signers", vec_of(signers)),
+                entry("valid_until", ScVal::Void),
+            ]
+            .try_into()
+            .unwrap(),
+        )))
+    }
+
+    /// Each override reaches the manager's pin gate, and an absent flag
+    /// leaves that gate closed, including when only the other flag is set.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn add_and_batch_add_pass_pin_overrides_to_the_manager() {
+        use stellar_agent_core::audit_log::AuditEntry;
+        use stellar_agent_core::profile::schema::Profile;
+        use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
+
+        let dir = tempfile::tempdir().unwrap();
+        let _home = StellarAgentHomeGuard::new(dir.path());
+        keyring_mock::install().unwrap();
+        let _secret = OverrideSecretGuard::new();
+        let profile_name = format!("signers-overrides-{}", Uuid::new_v4());
+        let profile = Profile::builder_testnet("overrides", "owner", "overrides", "nonce")
+            .with_profile_name(&profile_name)
+            .audit_log_path(dir.path().join("audit.jsonl"))
+            .build();
+        let profiles = dir.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join(format!("{profile_name}.toml")),
+            toml::to_string(&profile).unwrap(),
+        )
+        .unwrap();
+        let key = &profile.audit_log_hash_chain_key_id;
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&key.service, &key.account)
+            .unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let verifier = stellar_strkey::Contract([0x42; 32]).to_string();
+        let pubkey = "ab".repeat(32);
+        let rpc_url = server.uri();
+        let base = [
+            "test",
+            "--account",
+            ACCOUNT,
+            "--rule-id",
+            "1",
+            "--profile",
+            &profile_name,
+            "--rpc-url",
+            &rpc_url,
+            "--signer-secret-env",
+            OverrideSecretGuard::NAME,
+            "--signer-ed25519",
+            &pubkey,
+            "--verifier",
+            &verifier,
+        ];
+        let args = AddArgsHarness::parse_from(base).args;
+        let ctx = CommonHandlerContext::new(&args).await.unwrap();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(OverrideRpcResponder::new(
+                &verifier,
+                VerifierFixture::UnknownImmutable,
+            ))
+            .mount(&server)
+            .await;
+        ctx.signers_manager()
+            .unwrap()
+            .list_signers(
+                ctx.smart_account.clone(),
+                1,
+                Some(SIMULATE_SENTINEL_G),
+                "baseline".to_owned(),
+            )
+            .await
+            .unwrap();
+        ctx.audit_writer
+            .lock()
+            .unwrap()
+            .write_entry(AuditEntry::new_sa_context_rule_created(
+                redact_strkey_first5_last5(ACCOUNT),
+                1,
+                "default",
+                1,
+                0,
+                None,
+                "stellar:testnet",
+                "pins",
+                vec![],
+                vec![],
+                false,
+                false,
+                vec![],
+                vec![],
+            ))
+            .unwrap();
+
+        for verb in ["add", "batch-add"] {
+            for (flag, field, fixture, other_flag) in [
+                (
+                    "--accept-mutable-verifier",
+                    "accept_mutable_verifier",
+                    VerifierFixture::AllowlistedMutable,
+                    "--accept-unknown-verifier",
+                ),
+                (
+                    "--accept-unknown-verifier",
+                    "accept_unknown_verifier",
+                    VerifierFixture::UnknownImmutable,
+                    "--accept-mutable-verifier",
+                ),
+            ] {
+                for flags in [vec![], vec![other_flag], vec![flag], vec![flag, other_flag]] {
+                    server.reset().await;
+                    let responder = OverrideRpcResponder::new(&verifier, fixture);
+                    let invokes = responder.invokes.clone();
+                    let probes = responder.probes.clone();
+                    wiremock::Mock::given(wiremock::matchers::method("POST"))
+                        .respond_with(responder)
+                        .mount(&server)
+                        .await;
+                    let argv = base.iter().copied().chain(flags.iter().copied());
+                    let exit = if verb == "add" {
+                        add_run(&AddArgsHarness::parse_from(argv).args).await
+                    } else {
+                        batch_add_run(&BatchAddArgsHarness::parse_from(argv).args).await
+                    };
+                    let case = format!("{verb}: {flag} -> {field}; flags={flags:?}");
+                    assert_eq!(exit, 1, "{case}: the mock refuses mutation simulation");
+                    assert!(
+                        probes.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                        "{case}: manager must probe the new verifier"
+                    );
+                    let expected = if flags.contains(&flag) {
+                        vec![if verb == "add" {
+                            "add_signer"
+                        } else {
+                            "batch_add_signer"
+                        }]
+                    } else {
+                        vec![]
+                    };
+                    assert_eq!(*invokes.lock().unwrap(), expected, "{case}");
+                }
+            }
+        }
+    }
+
+    const OVERRIDE_SIGNER_SEED: [u8; 32] = [0x11; 32];
+
+    struct OverrideSecretGuard(Option<std::ffi::OsString>);
+
+    impl OverrideSecretGuard {
+        const NAME: &str = "__STELLAR_AGENT_SIGNERS_OVERRIDE_SECRET";
+
+        fn new() -> Self {
+            let previous = std::env::var_os(Self::NAME);
+            // SAFETY: the caller holds the serial test lock for this guard's lifetime.
+            #[allow(unsafe_code, reason = "serial test environment fixture")]
+            unsafe {
+                std::env::set_var(
+                    Self::NAME,
+                    stellar_strkey::ed25519::PrivateKey(OVERRIDE_SIGNER_SEED)
+                        .as_unredacted()
+                        .to_string()
+                        .as_str(),
+                );
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for OverrideSecretGuard {
+        fn drop(&mut self) {
+            // SAFETY: the caller holds the serial test lock until the guard drops.
+            #[allow(unsafe_code, reason = "restore the serial test environment on unwind")]
+            unsafe {
+                if let Some(previous) = self.0.take() {
+                    std::env::set_var(Self::NAME, previous);
+                } else {
+                    std::env::remove_var(Self::NAME);
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum VerifierFixture {
+        AllowlistedMutable,
+        UnknownImmutable,
+    }
+
+    struct OverrideRpcResponder {
+        instance: serde_json::Value,
+        invokes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl OverrideRpcResponder {
+        fn new(verifier: &str, fixture: VerifierFixture) -> Self {
+            use stellar_agent_test_support::xdr_fixtures::contract_instance_ledger_entries_json;
+            use stellar_xdr::{LedgerEntryData, Limits, ReadXdr, WriteXdr};
+            let hash = match fixture {
+                VerifierFixture::AllowlistedMutable => {
+                    stellar_agent_smart_account::VERIFIER_ALLOWLIST[0].wasm_hash
+                }
+                VerifierFixture::UnknownImmutable => [0xdd; 32],
+            };
+            let mut body: serde_json::Value =
+                serde_json::from_str(&contract_instance_ledger_entries_json(verifier, hash))
+                    .unwrap();
+            if matches!(fixture, VerifierFixture::AllowlistedMutable) {
+                let xdr = &mut body["result"]["entries"][0]["xdr"];
+                let mut data =
+                    LedgerEntryData::from_xdr_base64(xdr.as_str().unwrap(), Limits::none())
+                        .unwrap();
+                let LedgerEntryData::ContractData(entry) = &mut data else {
+                    panic!("contract data")
+                };
+                let ScVal::ContractInstance(instance) = &mut entry.val else {
+                    panic!("contract instance")
+                };
+                instance.storage = Some(ScMap(
+                    vec![ScMapEntry {
+                        key: ScVal::Vec(Some(ScVec(
+                            vec![ScVal::Symbol(ScSymbol("Admin".try_into().unwrap()))]
+                                .try_into()
+                                .unwrap(),
+                        ))),
+                        val: ScVal::Address(parse_c_strkey_to_smart_account(verifier).unwrap()),
+                    }]
+                    .try_into()
+                    .unwrap(),
+                ));
+                *xdr = data.to_xdr_base64(Limits::none()).unwrap().into();
+            }
+            Self {
+                instance: body["result"].clone(),
+                invokes: Default::default(),
+                probes: Default::default(),
+            }
+        }
+    }
+
+    impl wiremock::Respond for OverrideRpcResponder {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use stellar_agent_test_support::xdr_fixtures::account_entry_xdr_with_seq;
+            use stellar_xdr::{
+                HostFunction, LedgerKey, Limits, OperationBody, ReadXdr, TransactionEnvelope,
+                WriteXdr,
+            };
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "getLedgerEntries" => {
+                    let key = &body["params"]["keys"][0];
+                    match LedgerKey::from_xdr_base64(key.as_str().unwrap(), Limits::none()).unwrap()
+                    {
+                        LedgerKey::Account(_) => {
+                            let source = stellar_strkey::ed25519::PublicKey(
+                                ed25519_dalek::SigningKey::from_bytes(&OVERRIDE_SIGNER_SEED)
+                                    .verifying_key()
+                                    .to_bytes(),
+                            )
+                            .to_string();
+                            serde_json::json!({"entries": [{"key": key, "xdr": account_entry_xdr_with_seq(&source, 100_000_000, 0, 100), "lastModifiedLedgerSeq": 100}], "latestLedger": 1000})
+                        }
+                        LedgerKey::ContractData(_) => {
+                            self.probes
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            self.instance.clone()
+                        }
+                        other => panic!("unexpected ledger key: {other:?}"),
+                    }
+                }
+                "simulateTransaction" => {
+                    let TransactionEnvelope::Tx(tx) = TransactionEnvelope::from_xdr_base64(
+                        body["params"]["transaction"].as_str().unwrap(),
+                        Limits::none(),
+                    )
+                    .unwrap() else {
+                        panic!("transaction")
+                    };
+                    let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+                        panic!("invoke")
+                    };
+                    let HostFunction::InvokeContract(invoke) = &op.host_function else {
+                        panic!("contract invoke")
+                    };
+                    let function = invoke.function_name.to_utf8_string_lossy();
+                    if function == "get_context_rule" {
+                        let rule = rule_scval(
+                            1,
+                            vec![build_delegated_signer_scval(SIMULATE_SENTINEL_G).unwrap()],
+                            vec![],
+                        );
+                        serde_json::json!({"results": [{"auth": [], "xdr": rule.to_xdr_base64(Limits::none()).unwrap()}], "latestLedger": 1000})
+                    } else {
+                        assert!(
+                            matches!(function.as_str(), "add_signer" | "batch_add_signer"),
+                            "{function}"
+                        );
+                        self.invokes.lock().unwrap().push(function);
+                        serde_json::json!({"error": "mutation simulation stopped by fixture", "latestLedger": 1000})
+                    }
+                }
+                other => panic!("unexpected RPC method: {other}"),
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc": "2.0", "id": body["id"], "result": result}),
+            )
+        }
+    }
+
     /// A mock endpoint answering every `get_context_rule` simulation with
     /// `rule`.
     struct RuleResponder(ScVal);
@@ -3495,21 +3825,7 @@ mod tests {
                 .unwrap(),
             )))
         };
-        let entry = |key: &str, val: ScVal| ScMapEntry {
-            key: ScVal::Symbol(ScSymbol(key.try_into().unwrap())),
-            val,
-        };
-        let vec_of = |items: Vec<ScVal>| ScVal::Vec(Some(ScVec(items.try_into().unwrap())));
-        let rule = ScVal::Map(Some(ScMap(
-            vec![
-                entry("id", ScVal::U32(1)),
-                entry("policies", vec_of(vec![])),
-                entry("signer_ids", vec_of(vec![ScVal::U32(0)])),
-                entry("signers", vec_of(vec![delegated(0x11)])),
-            ]
-            .try_into()
-            .unwrap(),
-        )));
+        let rule = rule_scval(1, vec![delegated(0x11)], vec![]);
 
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
