@@ -284,7 +284,9 @@ impl WalletServer {
                        nonce (simulate step). Fetches the on-chain claimable-balance entry, \
                        renders a typed preview, and enforces the claim guards (claimant, \
                        predicate, trustline, fee affordability). Returns \
-                       {envelope_xdr, nonce, expires_at_unix_ms, preview}. Pass all three to \
+                       {envelope_xdr, nonce, expires_at_unix_ms, preview}. \
+                       The approval response includes profile and chain_id. \
+                       Pass all three to \
                        stellar_claim_commit to sign and submit. \
                        destructive_hint=false; read_only_hint=false.",
         annotations(read_only_hint = false, destructive_hint = false)
@@ -537,6 +539,8 @@ impl WalletServer {
                 ) {
                     Ok(entry) => Some(json!({
                         "approval_nonce": entry.approval_nonce,
+                        "profile": &profile_name,
+                        "chain_id": self.profile.chain_id.caip2_str(),
                         "expires_at_unix_ms": entry.expires_at_unix_ms,
                         "reason": entry.reason,
                         "summary": {

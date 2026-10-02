@@ -401,7 +401,16 @@ async fn t1_claim_two_phase_happy_path() {
     // ── 2. Recompute the attestation blob exactly as `approve` would ───────────
     let uid = process_uid_for_attestation().expect("process uid");
     let sha = envelope_sha256(envelope_xdr.as_bytes());
-    let blob = compute_attestation(&attestation_key, &approval_nonce, &sha, &uid);
+    let blob = compute_attestation(
+        &attestation_key,
+        &stellar_agent_core::approval::AttestationBinding::new(
+            &server.profile_name_for_approval(),
+            "stellar:testnet",
+        ),
+        &approval_nonce,
+        &sha,
+        &uid,
+    );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
 
     // ── 3. Commit: gate verifies the attestation, signs, and submits on-chain ──

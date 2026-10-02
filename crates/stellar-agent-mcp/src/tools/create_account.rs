@@ -198,7 +198,7 @@ pub struct StellarCreateAccountCommitArgs {
     /// HMAC-SHA256 attestation blob, URL-safe base64 no-pad encoded (32 bytes).
     ///
     /// Written to the pending-approvals store by `stellar-agent approve --id
-    /// <approval_nonce>` after the user confirms on their own tty.  The commit
+    /// <approval_nonce> --profile <name>` after the user confirms on their own tty.  The commit
     /// handler re-computes and constant-time-compares the HMAC against the stored
     /// attestation key before proceeding to signing.
     ///
@@ -343,7 +343,9 @@ impl WalletServer {
         name = "stellar_create_account",
         description = "Build a CreateAccount transaction envelope and mint a single-use nonce \
                        (simulate step). Returns {envelope_xdr, nonce, expires_at_unix_ms, \
-                       simulation}. Pass all three to stellar_create_account_commit to sign \
+                       simulation}. \
+                       The approval response includes profile and chain_id. \
+                       Pass all three to stellar_create_account_commit to sign \
                        and submit. destructive_hint=false; read_only_hint=false.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
@@ -576,6 +578,8 @@ impl WalletServer {
             ) {
                 Ok(entry) => Some(json!({
                     "approval_nonce": entry.approval_nonce,
+                    "profile": &profile_name,
+                    "chain_id": self.profile.chain_id.caip2_str(),
                     "expires_at_unix_ms": entry.expires_at_unix_ms,
                     "reason": entry.reason,
                     "summary": {

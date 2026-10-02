@@ -45,7 +45,7 @@
 //!
 //! ```toml
 //! [pending.trustline_clawback_opt_in]
-//! network = "Test SDF Network ; September 2015"
+//! network = "stellar:testnet"
 //! code = "USDC"
 //! issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
 //! ```
@@ -363,7 +363,7 @@ pub enum ApprovalKind {
     ///
     /// Queued by the gated resolver when a toolset invokes a `sign-payment`
     /// action and no current, matching grant exists.  After the operator
-    /// approves via `stellar-agent approve --id <nonce>`, a `ToolsetGrant` is
+    /// approves via `stellar-agent approve --id <nonce> --profile <name>`, a `ToolsetGrant` is
     /// persisted and the toolset may proceed to the `stellar_pay` build step,
     /// after which the per-action `PaymentSimulated` approval fires
     /// unconditionally.
@@ -441,7 +441,7 @@ pub enum ApprovalKind {
     /// construction time.  `issuer` is a canonical G-strkey; it is redacted to
     /// first-5-last-5 in the `Debug` impl.
     TrustlineClawbackOptIn {
-        /// Network passphrase (e.g. `"Test SDF Network ; September 2015"`).
+        /// CAIP-2 chain id (e.g. `"stellar:testnet"`).
         ///
         /// Validated at construction: non-empty, ≤ 64 bytes.
         network: String,
@@ -1435,7 +1435,7 @@ pub struct PendingApproval {
 
     /// HMAC-SHA256 attestation blob, base64-encoded (URL-safe no-pad).
     ///
-    /// `None` until the operator runs `stellar-agent approve --id <nonce>`.
+    /// `None` until the operator runs `stellar-agent approve --id <nonce> --profile <name>`.
     /// Set by `record_attestation` (`PaymentSimulated` / `ClaimSimulated`,
     /// over `envelope_sha256_hex`) or by `record_rule_proposal_attestation`
     /// (`RuleProposalSimulated`, over `proposal_sha256`) — the generic slot
@@ -2619,7 +2619,7 @@ impl PendingApproval {
     /// # Parameters
     ///
     /// - `envelope_xdr_b64`: base64-encoded envelope XDR (simulated).
-    /// - `envelope_xdr_bytes`: raw XDR bytes for SHA-256 computation.
+    /// - `envelope_xdr_bytes`: the envelope's base64 text bytes for SHA-256 computation.
     /// - `summary_to`: destination address string.
     /// - `summary_amount_stroops`: payment amount in stroops.
     /// - `summary_asset`: asset identifier (e.g. `"XLM"`).
@@ -3155,7 +3155,7 @@ impl PendingApproval {
     ///
     /// - `envelope_xdr_b64`: base64-encoded simulated `ClaimClaimableBalance`
     ///   envelope XDR.
-    /// - `envelope_xdr_bytes`: raw XDR bytes for SHA-256 computation.
+    /// - `envelope_xdr_bytes`: the envelope's base64 text bytes for SHA-256 computation.
     /// - `balance_id_hex72`: canonical 72-hex balance id being claimed.
     /// - `balance_id_strkey`: `B...` strkey rendering of the balance id.
     /// - `asset`: asset identifier (`"XLM"` or `"<code>:<G-strkey>"`).
@@ -4289,13 +4289,14 @@ impl PendingApprovalStore {
 
     /// Verifies an attested MPP approval against the exact stored digests.
     ///
-    /// This fail-closed accessor intentionally returns only a boolean so
+    /// This accessor intentionally returns only a boolean so
     /// absence, expiry, wrong kind, substitution, malformed base64, and HMAC
     /// failure remain indistinguishable at credential-commit boundaries.
     #[must_use]
     pub fn verify_mpp_charge_attestation(
         &self,
         key: &[u8; 32],
+        binding: &super::AttestationBinding<'_>,
         approval_nonce: &str,
         authorization_fingerprint: &[u8; 32],
         prepared_artifact_hash: &[u8; 32],
@@ -4310,6 +4311,8 @@ impl PendingApprovalStore {
             return false;
         }
         let ApprovalKind::MppChargeSimulated {
+            profile,
+            chain_id,
             authorization_fingerprint: stored_fingerprint,
             prepared_artifact_hash: stored_artifact,
             ..
@@ -4317,6 +4320,9 @@ impl PendingApprovalStore {
         else {
             return false;
         };
+        if profile != binding.profile_name || chain_id != binding.chain_id {
+            return false;
+        }
         if stored_fingerprint != authorization_fingerprint
             || stored_artifact != prepared_artifact_hash
         {
@@ -4333,6 +4339,7 @@ impl PendingApprovalStore {
         };
         verify_attestation(
             key,
+            binding,
             &entry.approval_nonce,
             prepared_artifact_hash,
             &entry.process_uid,
@@ -4363,11 +4370,10 @@ impl PendingApprovalStore {
     /// This is the only way to enumerate the store's contents from outside
     /// this module — `entries` stays private. Every
     /// [`super::view::PendingApprovalView`] carries the same non-secret
-    /// summary fields the CLI `approve --id` prompt renders (never raw
-    /// secret material such as `csrf_token`, credential bytes, or the
-    /// attestation blob contents), so callers such as `approve list` or a
-    /// resident approval-inbox server can render pending entries without
-    /// duplicating the redaction discipline.
+    /// summary fields the CLI `approve --id <nonce> --profile <name>` prompt renders.
+    /// It excludes raw secrets such as `csrf_token`, credential bytes, and
+    /// attestation blob contents. Callers such as `approve list` and a resident
+    /// approval-inbox server share this redaction for pending-entry rendering.
     ///
     /// Order matches insertion order; expired entries are included (with
     /// `expired: true`) rather than filtered, so a caller that wants to
@@ -4690,7 +4696,7 @@ impl PendingApprovalStore {
     /// The opt-in MUST come from the wallet-controlled approval store.  It is
     /// NOT an agent-suppliable bool in the tool's arguments.  Requiring the
     /// store lookup here ensures the gate can only be cleared by a prior
-    /// `approve --id <nonce>` ceremony that produced an HMAC-attested entry.
+    /// `approve --id <nonce> --profile <name>` ceremony that produced an HMAC-attested entry.
     ///
     /// An attested entry is one where `attestation_blob_b64` is `Some(_)`.
     /// An entry where the attestation is absent (issued but not yet confirmed
@@ -4744,7 +4750,7 @@ impl PendingApprovalStore {
             if e.is_expired(now_unix_ms) {
                 return false;
             }
-            // Must be attested (HMAC blob set by `approve --id`).
+            // Must be attested (HMAC blob set by `approve --id <nonce> --profile <name>`).
             if e.attestation_blob_b64.is_none() {
                 return false;
             }
@@ -4769,7 +4775,7 @@ impl PendingApprovalStore {
     ///
     /// 1. Decodes the stored `attestation_blob_b64` from URL-safe base64 no-pad.
     /// 2. Recomputes `compute_trustline_clawback_opt_in_digest(network, code, issuer)`.
-    /// 3. Calls `verify_attestation(key, nonce, &digest, process_uid, &blob)`
+    /// 3. Calls `verify_attestation(key, binding, nonce, &digest, process_uid, &blob)`
     ///    (constant-time HMAC-SHA256 comparison).
     ///
     /// A missing blob, a blob with a wrong length, or a blob that does not match
@@ -4795,7 +4801,7 @@ impl PendingApprovalStore {
     /// let key = [0x42u8; 32];
     /// let store = PendingApprovalStore::open(std::path::PathBuf::from("/tmp/t/d.toml"))?;
     /// let verified = store.verify_attested_trustline_clawback_opt_in(
-    ///     &key,
+    ///     &key, &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
     ///     "stellar:testnet",
     ///     "USDC",
     ///     "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
@@ -4809,6 +4815,7 @@ impl PendingApprovalStore {
     pub fn verify_attested_trustline_clawback_opt_in(
         &self,
         key: &[u8; 32],
+        binding: &super::AttestationBinding<'_>,
         network: &str,
         code: &str,
         issuer: &str,
@@ -4850,7 +4857,14 @@ impl PendingApprovalStore {
                 Err(_) => return false,
             };
             // HMAC-SHA256 verify (constant-time).  A forged or wrong-key blob fails here.
-            verify_attestation(key, &e.approval_nonce, &digest, &e.process_uid, &blob_arr)
+            verify_attestation(
+                key,
+                binding,
+                &e.approval_nonce,
+                &digest,
+                &e.process_uid,
+                &blob_arr,
+            )
         })
     }
 
@@ -4880,7 +4894,7 @@ impl PendingApprovalStore {
     /// stored in `attestation_blob_b64`.  After this call the entry will be
     /// recognised by [`Self::has_attested_trustline_clawback_opt_in`].
     ///
-    /// Called by `stellar-agent approve --id <nonce>` when the pending entry is
+    /// Called by `stellar-agent approve --id <nonce> --profile <name>` when the pending entry is
     /// of kind `TrustlineClawbackOptIn`.  The caller computes the attestation
     /// blob via [`super::attestation::compute_attestation`] using the stored
     /// `approval_nonce`, the SHA-256 commitment of `(network, code, issuer)`,
@@ -5000,47 +5014,24 @@ impl PendingApprovalStore {
         self.persist()
     }
 
-    /// Verifies the `RuleProposalSimulated` commit-gate for `approval_nonce`
-    /// (Package D, GH issue #8).
+    /// Verifies a live rule proposal against its recomputed digest and attestation.
     ///
-    /// This is a DEDICATED gate — distinct from the shared pay/claim
-    /// `verify_attestation_gate` in `stellar-agent-mcp` (which continues to
-    /// reject `RuleProposalSimulated` via its `other =>` fallback arm; defense
-    /// in depth in both directions). The caller (`stellar_rule_create_commit`)
-    /// re-derives `recomputed_proposal_sha256` from the entry's OWN
-    /// `definition` snapshot via
-    /// `stellar-agent-smart-account::managers::rules::compute_context_rule_proposal_sha256`
-    /// — the SAME builder used at propose time — and passes it here so a
-    /// digest recomputed through the builder must still match what was
-    /// attested.
-    ///
-    /// # Checks (in order)
-    ///
-    /// 1. Entry exists for `approval_nonce`.
-    /// 2. Entry is not expired.
-    /// 3. A live `Rejected` tombstone returns [`RuleProposalGateError::Rejected`]
-    ///    — a distinct outcome from every other refusal reason, mirroring the
-    ///    pay/claim gate's `policy.approval_rejected` wire code.
-    /// 4. Entry kind is `RuleProposalSimulated`.
-    /// 5. `recomputed_proposal_sha256` matches the entry's stored
-    ///    `proposal_sha256`.
-    /// 6. The HMAC attestation blob verifies (constant-time).
-    ///
-    /// Every refusal reason other than a live rejection collapses to
-    /// [`RuleProposalGateError::Refused`] — the caller cannot distinguish
-    /// unknown-nonce from expired from digest-mismatch from HMAC-mismatch,
-    /// preserving the same indistinguishability invariant
-    /// `stellar-agent-mcp`'s `verify_attestation_gate` upholds for
-    /// `PaymentSimulated` / `ClaimSimulated`.
+    /// The attestation binds the approving and verifying profiles' chain ids.
+    /// This gate compares the stored chain id with the binding.
+    /// The commit also compares the stored chain with the presented `args.chain_id`.
+    /// The caller recomputes the proposal digest from the stored definition.
     ///
     /// # Errors
     ///
-    /// See [`RuleProposalGateError`].
+    /// A live rejection returns [`RuleProposalGateError::Rejected`].
+    /// Missing, expired, wrong-kind, digest, binding and HMAC failures return
+    /// [`RuleProposalGateError::Refused`].
     pub fn verify_rule_proposal_gate(
         &self,
         approval_nonce: &str,
         recomputed_proposal_sha256: &[u8; 32],
         attestation_key: &[u8; 32],
+        binding: &super::AttestationBinding<'_>,
         attestation_blob: &[u8; 32],
         now_unix_ms: u64,
     ) -> Result<(), RuleProposalGateError> {
@@ -5059,18 +5050,21 @@ impl PendingApprovalStore {
         }
 
         let ApprovalKind::RuleProposalSimulated {
-            proposal_sha256, ..
+            proposal_sha256,
+            chain_id,
+            ..
         } = &entry.kind
         else {
             return Err(RuleProposalGateError::Refused);
         };
 
-        if proposal_sha256 != recomputed_proposal_sha256 {
+        if chain_id != binding.chain_id || proposal_sha256 != recomputed_proposal_sha256 {
             return Err(RuleProposalGateError::Refused);
         }
 
         if !super::attestation::verify_attestation(
             attestation_key,
+            binding,
             approval_nonce,
             proposal_sha256,
             &entry.process_uid,
@@ -7526,7 +7520,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
 
         let real_key: [u8; 32] = [0x11; 32];
         let wrong_key: [u8; 32] = [0x22; 32];
-        let network = "stellar:testnet";
+        let network = "stellar:mainnet";
         let code = "USDC";
         let issuer = TESTNET_USDC_ISSUER;
 
@@ -7549,34 +7543,74 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
 
         // Pre-attestation: no blob → gate stays closed.
         assert!(
-            !store.verify_attested_trustline_clawback_opt_in(&real_key, network, code, issuer, now),
+            !store.verify_attested_trustline_clawback_opt_in(
+                &real_key,
+                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+                network,
+                code,
+                issuer,
+                now
+            ),
             "unattested opt-in must NOT clear the gate"
         );
 
         // Attest with the REAL key over the canonical digest.
         let digest = compute_trustline_clawback_opt_in_digest(network, code, issuer);
-        let real_blob = compute_attestation(&real_key, &nonce, &digest, &process_uid);
+        let real_blob = compute_attestation(
+            &real_key,
+            &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+            &nonce,
+            &digest,
+            &process_uid,
+        );
         store
             .record_trustline_clawback_opt_in_attestation(&nonce, real_blob)
             .unwrap();
 
         // Correct key → verifies.
         assert!(
-            store.verify_attested_trustline_clawback_opt_in(&real_key, network, code, issuer, now),
+            store.verify_attested_trustline_clawback_opt_in(
+                &real_key,
+                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+                network,
+                code,
+                issuer,
+                now
+            ),
             "opt-in attested with the real key MUST verify"
         );
 
+        assert!(!store.verify_attested_trustline_clawback_opt_in(
+            &real_key,
+            &crate::approval::AttestationBinding::new("other", "stellar:mainnet"),
+            network,
+            code,
+            issuer,
+            now
+        ));
         // Wrong key → rejected (the core forged-consent defence).
         assert!(
-            !store
-                .verify_attested_trustline_clawback_opt_in(&wrong_key, network, code, issuer, now),
+            !store.verify_attested_trustline_clawback_opt_in(
+                &wrong_key,
+                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+                network,
+                code,
+                issuer,
+                now
+            ),
             "a blob verified under the WRONG key must be rejected"
         );
 
         // Wrong (network, code, issuer) → digest differs → rejected.
         assert!(
-            !store
-                .verify_attested_trustline_clawback_opt_in(&real_key, network, "EURC", issuer, now),
+            !store.verify_attested_trustline_clawback_opt_in(
+                &real_key,
+                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+                network,
+                "EURC",
+                issuer,
+                now
+            ),
             "a different asset code must not match the attested digest"
         );
 
@@ -7598,14 +7632,26 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         .unwrap();
         let forged_nonce = forged_entry.approval_nonce.clone();
         let forged_uid = forged_entry.process_uid.clone();
-        let attacker_blob = compute_attestation(&wrong_key, &forged_nonce, &digest, &forged_uid);
+        let attacker_blob = compute_attestation(
+            &wrong_key,
+            &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+            &forged_nonce,
+            &digest,
+            &forged_uid,
+        );
         forged_store.insert(forged_entry, TEST_NOW_MS).unwrap();
         forged_store
             .record_trustline_clawback_opt_in_attestation(&forged_nonce, attacker_blob)
             .unwrap();
         assert!(
-            !forged_store
-                .verify_attested_trustline_clawback_opt_in(&real_key, network, code, issuer, now),
+            !forged_store.verify_attested_trustline_clawback_opt_in(
+                &real_key,
+                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+                network,
+                code,
+                issuer,
+                now
+            ),
             "a blob forged with a non-keyring key must be rejected under the real key"
         );
     }
@@ -9455,25 +9501,58 @@ is_proposer = true
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
         let digest = [0x44u8; 32];
-        let entry = make_rule_proposal_entry_with(
+        let mut entry = make_rule_proposal_entry_with(
             RULE_PROPOSAL_SMART_ACCOUNT,
             valid_rule_proposal_snapshot(),
             digest,
             DEFAULT_TTL_MS,
         );
+        if let ApprovalKind::RuleProposalSimulated {
+            chain_id,
+            network_passphrase,
+            ..
+        } = &mut entry.kind
+        {
+            *chain_id = "stellar:mainnet".to_owned();
+            *network_passphrase = "Public Global Stellar Network ; September 2015".to_owned();
+        }
         let nonce = entry.approval_nonce.clone();
         let process_uid = entry.process_uid.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         let key = [0x55u8; 32];
-        let blob =
-            super::super::attestation::compute_attestation(&key, &nonce, &digest, &process_uid);
+        let blob = super::super::attestation::compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("rule-profile", "stellar:mainnet"),
+            &nonce,
+            &digest,
+            &process_uid,
+        );
         store
             .record_rule_proposal_attestation(&nonce, blob)
             .unwrap();
 
-        let result = store.verify_rule_proposal_gate(&nonce, &digest, &key, &blob, TEST_NOW_MS);
+        let result = store.verify_rule_proposal_gate(
+            &nonce,
+            &digest,
+            &key,
+            &crate::approval::AttestationBinding::new("rule-profile", "stellar:mainnet"),
+            &blob,
+            TEST_NOW_MS,
+        );
         assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            store
+                .verify_rule_proposal_gate(
+                    &nonce,
+                    &digest,
+                    &key,
+                    &crate::approval::AttestationBinding::new("other", "stellar:mainnet"),
+                    &blob,
+                    TEST_NOW_MS
+                )
+                .is_err()
+        );
     }
 
     /// Stands in for the "tamper matrix" requirement at the gate layer: any
@@ -9502,6 +9581,7 @@ is_proposer = true
         let key = [0x55u8; 32];
         let blob = super::super::attestation::compute_attestation(
             &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             &nonce,
             &stored_digest,
             &process_uid,
@@ -9513,8 +9593,14 @@ is_proposer = true
         let mut recomputed_digest = stored_digest;
         recomputed_digest[0] ^= 0xff; // simulate a tampered snapshot re-encoding to a different digest
 
-        let result =
-            store.verify_rule_proposal_gate(&nonce, &recomputed_digest, &key, &blob, TEST_NOW_MS);
+        let result = store.verify_rule_proposal_gate(
+            &nonce,
+            &recomputed_digest,
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            &blob,
+            TEST_NOW_MS,
+        );
         assert_eq!(result, Err(RuleProposalGateError::Refused));
     }
 
@@ -9534,15 +9620,26 @@ is_proposer = true
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         let key = [0x55u8; 32];
-        let blob =
-            super::super::attestation::compute_attestation(&key, &nonce, &digest, &process_uid);
+        let blob = super::super::attestation::compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            &nonce,
+            &digest,
+            &process_uid,
+        );
         store
             .record_rule_proposal_attestation(&nonce, blob)
             .unwrap();
 
         let wrong_key = [0x66u8; 32];
-        let result =
-            store.verify_rule_proposal_gate(&nonce, &digest, &wrong_key, &blob, TEST_NOW_MS);
+        let result = store.verify_rule_proposal_gate(
+            &nonce,
+            &digest,
+            &wrong_key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            &blob,
+            TEST_NOW_MS,
+        );
         assert_eq!(result, Err(RuleProposalGateError::Refused));
     }
 
@@ -9563,7 +9660,14 @@ is_proposer = true
 
         let key = [0x55u8; 32];
         let blob = [0u8; 32]; // never attested; any bytes exercise the Rejected short-circuit
-        let result = store.verify_rule_proposal_gate(&nonce, &digest, &key, &blob, TEST_NOW_MS);
+        let result = store.verify_rule_proposal_gate(
+            &nonce,
+            &digest,
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            &blob,
+            TEST_NOW_MS,
+        );
         assert_eq!(result, Err(RuleProposalGateError::Rejected));
     }
 
@@ -9575,6 +9679,7 @@ is_proposer = true
             "unknown-nonce-AAAAAAAA",
             &[0u8; 32],
             &[0u8; 32],
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             &[0u8; 32],
             TEST_NOW_MS,
         );
@@ -9593,6 +9698,7 @@ is_proposer = true
             &nonce,
             &[0u8; 32],
             &[0u8; 32],
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             &[0u8; 32],
             TEST_NOW_MS,
         );
@@ -9615,7 +9721,11 @@ is_proposer = true
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         let result = store.verify_rule_proposal_gate(
-            &nonce, &digest, &[0u8; 32], &[0u8; 32],
+            &nonce,
+            &digest,
+            &[0u8; 32],
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            &[0u8; 32],
             expiry, // now == expiry ⟹ expired (is_expired uses <=)
         );
         assert_eq!(result, Err(RuleProposalGateError::Refused));
@@ -9629,17 +9739,29 @@ is_proposer = true
         assert!(debug_str.contains("smart_account_redacted"));
     }
 
-    #[test]
-    fn mpp_attestation_round_trip_rejects_digest_substitution() {
-        let dir = TempDir::new().unwrap();
-        let mut store = open_store(&dir);
+    struct AttestedMppStore {
+        reopened: PendingApprovalStore,
+        now: u64,
+        fingerprint: [u8; 32],
+        artifact: [u8; 32],
+        nonce: String,
+        process_uid: String,
+        key: [u8; 32],
+        blob: [u8; 32],
+    }
+
+    /// Builds, attests and reopens one MPP entry under `mpp-profile`, asserting the
+    /// positive, the cross-binding refusal, both digest substitutions and the wrong key;
+    /// the stored-field tests mutate one field on the returned store.
+    fn attested_mpp_store(dir: &TempDir) -> AttestedMppStore {
+        let mut store = open_store(dir);
         let now = crate::timefmt::now_unix_ms().unwrap();
         let fingerprint = [0x11; 32];
         let artifact = [0x22; 32];
         let entry = PendingApproval::new_mpp_charge_pending(
             fingerprint,
             artifact,
-            "default".to_owned(),
+            "mpp-profile".to_owned(),
             "stellar:testnet".to_owned(),
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             "mcp".to_owned(),
@@ -9658,20 +9780,44 @@ is_proposer = true
         let process_uid = entry.process_uid.clone();
         store.insert(entry, now).unwrap();
         let key = [0x33; 32];
-        let blob =
-            super::super::attestation::compute_attestation(&key, &nonce, &artifact, &process_uid);
+        let blob = super::super::attestation::compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("mpp-profile", "stellar:testnet"),
+            &nonce,
+            &artifact,
+            &process_uid,
+        );
         store.record_attestation(&nonce, blob).unwrap();
         drop(store);
 
-        let reopened = open_store(&dir);
-        assert!(
-            reopened.verify_mpp_charge_attestation(&key, &nonce, &fingerprint, &artifact, now,)
-        );
-        assert!(
-            !reopened.verify_mpp_charge_attestation(&key, &nonce, &[0x44; 32], &artifact, now,)
-        );
+        let reopened = open_store(dir);
+        assert!(reopened.verify_mpp_charge_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("mpp-profile", "stellar:testnet"),
+            &nonce,
+            &fingerprint,
+            &artifact,
+            now,
+        ));
         assert!(!reopened.verify_mpp_charge_attestation(
             &key,
+            &crate::approval::AttestationBinding::new("other", "stellar:testnet"),
+            &nonce,
+            &fingerprint,
+            &artifact,
+            now
+        ));
+        assert!(!reopened.verify_mpp_charge_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("mpp-profile", "stellar:testnet"),
+            &nonce,
+            &[0x44; 32],
+            &artifact,
+            now,
+        ));
+        assert!(!reopened.verify_mpp_charge_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("mpp-profile", "stellar:testnet"),
             &nonce,
             &fingerprint,
             &[0x55; 32],
@@ -9679,11 +9825,28 @@ is_proposer = true
         ));
         assert!(!reopened.verify_mpp_charge_attestation(
             &[0x66; 32],
+            &crate::approval::AttestationBinding::new("mpp-profile", "stellar:testnet"),
             &nonce,
             &fingerprint,
             &artifact,
             now,
         ));
+        AttestedMppStore {
+            reopened,
+            now,
+            fingerprint,
+            artifact,
+            nonce,
+            process_uid,
+            key,
+            blob,
+        }
+    }
+
+    #[test]
+    fn mpp_attestation_round_trip_rejects_digest_substitution() {
+        let dir = TempDir::new().unwrap();
+        let _fixture = attested_mpp_store(&dir);
     }
 
     // ── Consumed tombstone ───────────────────────────────────────────────────
@@ -9893,6 +10056,167 @@ is_proposer = true
         assert!(matches!(
             err,
             ApprovalError::Toml { .. } | ApprovalError::InvalidEntry { .. }
+        ));
+    }
+    #[test]
+    fn verify_rule_proposal_gate_refuses_stored_chain_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let mut store = open_store(&dir);
+        let digest = [0x44u8; 32];
+        let mut entry = make_rule_proposal_entry_with(
+            RULE_PROPOSAL_SMART_ACCOUNT,
+            valid_rule_proposal_snapshot(),
+            digest,
+            DEFAULT_TTL_MS,
+        );
+        if let ApprovalKind::RuleProposalSimulated {
+            chain_id,
+            network_passphrase,
+            ..
+        } = &mut entry.kind
+        {
+            *chain_id = "stellar:mainnet".to_owned();
+            *network_passphrase = "Public Global Stellar Network ; September 2015".to_owned();
+        }
+        let nonce = entry.approval_nonce.clone();
+        let process_uid = entry.process_uid.clone();
+        store.insert(entry, TEST_NOW_MS).unwrap();
+
+        let key = [0x55u8; 32];
+        let blob = super::super::attestation::compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("rule-profile", "stellar:mainnet"),
+            &nonce,
+            &digest,
+            &process_uid,
+        );
+        store
+            .record_rule_proposal_attestation(&nonce, blob)
+            .unwrap();
+
+        let result = store.verify_rule_proposal_gate(
+            &nonce,
+            &digest,
+            &key,
+            &crate::approval::AttestationBinding::new("rule-profile", "stellar:mainnet"),
+            &blob,
+            TEST_NOW_MS,
+        );
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            store
+                .verify_rule_proposal_gate(
+                    &nonce,
+                    &digest,
+                    &key,
+                    &crate::approval::AttestationBinding::new("other", "stellar:mainnet"),
+                    &blob,
+                    TEST_NOW_MS
+                )
+                .is_err()
+        );
+        if let ApprovalKind::RuleProposalSimulated { chain_id, .. } = &mut store
+            .entries
+            .iter_mut()
+            .find(|e| e.approval_nonce == nonce)
+            .unwrap()
+            .kind
+        {
+            *chain_id = "stellar:testnet".to_owned();
+        }
+        let binding = crate::approval::AttestationBinding::new("rule-profile", "stellar:mainnet");
+        assert!(crate::approval::verify_attestation(
+            &key,
+            &binding,
+            &nonce,
+            &digest,
+            &process_uid,
+            &blob
+        ));
+        assert!(
+            store
+                .verify_rule_proposal_gate(&nonce, &digest, &key, &binding, &blob, TEST_NOW_MS)
+                .is_err()
+        );
+    }
+    #[test]
+    fn verify_mpp_charge_attestation_refuses_stored_profile_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let AttestedMppStore {
+            mut reopened,
+            now,
+            fingerprint,
+            artifact,
+            nonce,
+            process_uid,
+            key,
+            blob,
+        } = attested_mpp_store(&dir);
+        if let ApprovalKind::MppChargeSimulated { profile, .. } = &mut reopened
+            .entries
+            .iter_mut()
+            .find(|e| e.approval_nonce == nonce)
+            .unwrap()
+            .kind
+        {
+            *profile = "other".to_owned();
+        }
+        let binding = crate::approval::AttestationBinding::new("mpp-profile", "stellar:testnet");
+        assert!(crate::approval::verify_attestation(
+            &key,
+            &binding,
+            &nonce,
+            &artifact,
+            &process_uid,
+            &blob
+        ));
+        assert!(!reopened.verify_mpp_charge_attestation(
+            &key,
+            &binding,
+            &nonce,
+            &fingerprint,
+            &artifact,
+            now
+        ));
+    }
+    #[test]
+    fn verify_mpp_charge_attestation_refuses_stored_chain_id_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let AttestedMppStore {
+            mut reopened,
+            now,
+            fingerprint,
+            artifact,
+            nonce,
+            process_uid,
+            key,
+            blob,
+        } = attested_mpp_store(&dir);
+        if let ApprovalKind::MppChargeSimulated { chain_id, .. } = &mut reopened
+            .entries
+            .iter_mut()
+            .find(|e| e.approval_nonce == nonce)
+            .unwrap()
+            .kind
+        {
+            *chain_id = "stellar:mainnet".to_owned();
+        }
+        let binding = crate::approval::AttestationBinding::new("mpp-profile", "stellar:testnet");
+        assert!(crate::approval::verify_attestation(
+            &key,
+            &binding,
+            &nonce,
+            &artifact,
+            &process_uid,
+            &blob
+        ));
+        assert!(!reopened.verify_mpp_charge_attestation(
+            &key,
+            &binding,
+            &nonce,
+            &fingerprint,
+            &artifact,
+            now
         ));
     }
 }

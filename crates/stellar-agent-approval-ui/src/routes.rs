@@ -339,6 +339,7 @@ async fn approval_detail_get(
     let csrf = crate::auth::compute_csrf(&session.csrf_key, &nonce);
     Html(render_detail_page(
         &view,
+        &state.ctx.context,
         &csrf,
         attestation_blob.as_deref(),
         &state.identity,
@@ -444,6 +445,10 @@ fn outcome_to_response(outcome: Outcome) -> Response {
             json!({ "status": "already_resolved", "attestation": attestation }),
         ),
         Outcome::Expired => (StatusCode::OK, json!({ "status": "expired" })),
+        Outcome::BindingMismatch => (
+            StatusCode::OK,
+            json!({"status": "binding_mismatch", "message": "this request belongs to another profile or network"}),
+        ),
         Outcome::UserMismatch => (
             StatusCode::OK,
             json!({
@@ -470,4 +475,67 @@ fn outcome_to_response(outcome: Outcome) -> Response {
         body.to_string(),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "route test fixture assertions")]
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+    };
+    use stellar_agent_core::approval::PendingApprovalStore;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn approve_route_reports_binding_mismatch() {
+        let h = crate::tests::Harness::new("binding-mismatch-route");
+        let definition = stellar_agent_core::approval::ContextRuleProposalSnapshot::new(
+            stellar_agent_core::approval::RuleProposalContextType::Default,
+            "rule".to_owned(),
+            None,
+            vec![stellar_agent_core::approval::RuleProposalSigner::delegated(
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                true,
+            )],
+            vec![],
+            vec![0],
+            false,
+            false,
+        );
+        let entry = stellar_agent_core::approval::PendingApproval::new_rule_proposal_pending(
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "Public Global Stellar Network ; September 2015".to_owned(),
+            "stellar:mainnet".to_owned(),
+            definition,
+            [1; 32],
+            "rule".to_owned(),
+            stellar_agent_core::approval::process_uid_for_attestation().unwrap(),
+            stellar_agent_core::approval::DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let nonce = h.insert(entry);
+        let cookie = h.bootstrap().await;
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/approval/{nonce}/approve"))
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::ORIGIN, "http://127.0.0.1:8080")
+            .header(header::COOKIE, cookie)
+            .header("x-stellar-approval-csrf", h.csrf_for(&nonce))
+            .body(Body::empty())
+            .unwrap();
+        let response = h.router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "binding_mismatch");
+        assert_eq!(
+            body["message"],
+            "this request belongs to another profile or network"
+        );
+        let store = PendingApprovalStore::open(h.store_path.clone()).unwrap();
+        assert!(store.get(&nonce).unwrap().attestation_blob_b64.is_none());
+    }
 }

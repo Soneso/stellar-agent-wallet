@@ -321,6 +321,67 @@ fn structured_memo_field(memo: &stellar_xdr::Memo) -> Option<(&'static str, Stri
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Returns the effective G-strkey source of a single-operation v1 envelope.
+///
+/// The operation source overrides the transaction source.
+///
+/// # Errors
+/// Returns an error for malformed XDR, other envelope kinds, or operation counts.
+pub fn envelope_source_account(envelope_xdr_b64: &str) -> Result<String, EnvelopeDecodeError> {
+    decode_single_operation(envelope_xdr_b64).map(|(_, _, source)| source)
+}
+
+fn decode_single_operation(
+    envelope_xdr_b64: &str,
+) -> Result<(stellar_xdr::Transaction, stellar_xdr::Operation, String), EnvelopeDecodeError> {
+    use stellar_xdr::{ReadXdr, TransactionEnvelope};
+    // 2. Decode base64 → raw XDR bytes (via from_xdr_base64).
+    //    Bounded limits are required because the envelope is caller-supplied and
+    //    untrusted. A deeply nested `SorobanAuthorizedInvocation.sub_invocations`
+    //    chain would otherwise exhaust the stack (the XDR reader calls
+    //    `with_limited_depth` per recursive node). Both depth and len are capped:
+    //    depth prevents stack exhaustion, len prevents an oversized-allocation
+    //    attack from a forged length field.
+    let envelope = TransactionEnvelope::from_xdr_base64(
+        envelope_xdr_b64,
+        stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr_b64.len()),
+    )
+    .map_err(|e| {
+        // Decode error details exclude raw envelope bytes.
+        // Decode failures must not echo XDR byte content.
+        EnvelopeDecodeError::XdrDecode {
+            detail: e.to_string(),
+        }
+    })?;
+
+    // 3. Extract the TransactionV1 body.
+    let tx = match envelope {
+        TransactionEnvelope::Tx(v1) => v1.tx,
+        // FeeBump and legacy Tx envelopes are not produced by the wallet and
+        // are not handled by the policy layer.
+        _ => return Err(EnvelopeDecodeError::NotTransactionV1),
+    };
+
+    // 4. Enforce exactly-1-operation invariant.
+    if tx.operations.len() != 1 {
+        return Err(EnvelopeDecodeError::UnexpectedOperationCount {
+            count: tx.operations.len(),
+        });
+    }
+    // SAFETY: len == 1 asserted above; index 0 is valid.
+    let op = tx.operations[0].clone();
+
+    // 5. Resolve the effective source account (op-level overrides tx-level).
+    let effective_source_muxed: &stellar_xdr::MuxedAccount = match &op.source_account {
+        Some(op_src) => op_src,
+        None => &tx.source_account,
+    };
+    // muxed_account_to_strkey is infallible for XDR-decoded keys.
+    let source_strkey = muxed_account_to_strkey(effective_source_muxed);
+
+    Ok((tx, op, source_strkey))
+}
+
 /// Decodes a base64 XDR `TransactionEnvelope` and extracts authoritative
 /// operation fields for the named `tool`.
 ///
@@ -418,8 +479,6 @@ pub fn decode_authoritative_args(
     envelope_xdr_b64: &str,
     tool: &'static str,
 ) -> Result<serde_json::Value, EnvelopeDecodeError> {
-    use stellar_xdr::{ReadXdr, TransactionEnvelope};
-
     // 1. Validate tool name before touching the XDR (fail fast on bad tool).
     match tool {
         "stellar_pay_commit"
@@ -433,49 +492,8 @@ pub fn decode_authoritative_args(
         }
     }
 
-    // 2. Decode base64 → raw XDR bytes (via from_xdr_base64).
-    //    Bounded limits are required because the envelope is caller-supplied and
-    //    untrusted. A deeply nested `SorobanAuthorizedInvocation.sub_invocations`
-    //    chain would otherwise exhaust the stack (the XDR reader calls
-    //    `with_limited_depth` per recursive node). Both depth and len are capped:
-    //    depth prevents stack exhaustion, len prevents an oversized-allocation
-    //    attack from a forged length field.
-    let envelope = TransactionEnvelope::from_xdr_base64(
-        envelope_xdr_b64,
-        stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr_b64.len()),
-    )
-    .map_err(|e| {
-        // Do NOT include raw bytes in the detail — only the error kind.
-        // Decode failures must not echo XDR byte content.
-        EnvelopeDecodeError::XdrDecode {
-            detail: e.to_string(),
-        }
-    })?;
-
-    // 3. Extract the TransactionV1 body.
-    let tx = match envelope {
-        TransactionEnvelope::Tx(v1) => v1.tx,
-        // FeeBump and legacy Tx envelopes are not produced by the wallet and
-        // are not handled by the policy layer.
-        _ => return Err(EnvelopeDecodeError::NotTransactionV1),
-    };
-
-    // 4. Enforce exactly-1-operation invariant.
-    if tx.operations.len() != 1 {
-        return Err(EnvelopeDecodeError::UnexpectedOperationCount {
-            count: tx.operations.len(),
-        });
-    }
-    // SAFETY: len == 1 asserted above; index 0 is valid.
-    let op = &tx.operations[0];
-
-    // 5. Resolve the effective source account (op-level overrides tx-level).
-    let effective_source_muxed: &stellar_xdr::MuxedAccount = match &op.source_account {
-        Some(op_src) => op_src,
-        None => &tx.source_account,
-    };
-    // muxed_account_to_strkey is infallible for XDR-decoded keys.
-    let source_strkey = muxed_account_to_strkey(effective_source_muxed);
+    let (tx, op, source_strkey) = decode_single_operation(envelope_xdr_b64)?;
+    let op = &op;
 
     // 6. Dispatch by tool.
     match tool {

@@ -231,7 +231,7 @@ If no current matching grant exists (first call, expired grant, or a novel
 destination / asset / amount bucket), the gate queues a one-time
 `ToolsetFirstInvokeGate` pending approval and refuses, returning an approval
 nonce. The operator approves out of band with
-`stellar-agent approve --id <nonce>`, which records a time-boxed grant. The
+`stellar-agent approve --id <nonce> --profile <name>`, which records a time-boxed grant. The
 agent then re-invokes.
 
 A matching grant suppresses only the first-invoke re-prompt. The per-action
@@ -404,4 +404,4 @@ stellar-agent toolsets uninstall balance-reporter
 | `toolset.unknown_action` | Action does not resolve through the matrix (includes any signing tool named directly). |
 | `toolset.capability_not_declared` | Resolved tool's capability is not in the toolset's declared set. |
 | `toolset.tool_not_allowed` | Resolved tool is excluded by the toolset's `allowed_tools` narrowing. |
-| `toolset.first_invoke_approval_required` | Gated payment has no current matching grant; returns an approval nonce for `stellar-agent approve --id <nonce>`. |
+| `toolset.first_invoke_approval_required` | Gated payment has no current matching grant; returns an approval nonce for `stellar-agent approve --id <nonce> --profile <name>`. |

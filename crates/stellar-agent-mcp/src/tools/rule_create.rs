@@ -869,13 +869,14 @@ impl WalletServer {
     #[tool(
         name = "stellar_rule_create",
         description = "Resolve and simulate an agent-proposed add_context_rule installation \
-                       (propose step). Testnet-only — refuses chain_id=stellar:mainnet. \
+                       (propose step). Testnet-only; refuses chain_id=stellar:mainnet. \
                        Signers accept delegated (G-strkey), external (raw \
                        verifier+pubkey hex), or webauthn (passkey credential name, resolved to \
                        bytes at propose time). Policies accept raw (address+XDR) or \
                        spending_limit (typed). Returns {approval_nonce, expires_at_unix_ms, \
-                       summary} — pass approval_nonce to stellar_rule_create_commit after the \
-                       operator approves via `stellar-agent approve --id <nonce>`. \
+                       summary}. Simulate responses include profile and chain_id at the top level. \
+                       Pass approval_nonce to stellar_rule_create_commit after the \
+                       operator approves via `stellar-agent approve --id <nonce> --profile <profile>`. \
                        destructive_hint=false; read_only_hint=false.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
@@ -1068,6 +1069,8 @@ impl WalletServer {
         // ── Build response ─────────────────────────────────────────────────────
         let mut view = json!({
             "approval_nonce": entry.approval_nonce,
+            "profile": &profile_name,
+            "chain_id": self.profile.chain_id.caip2_str(),
             "expires_at_unix_ms": entry.expires_at_unix_ms,
             "requires_operator_approval": requires_operator_approval,
             "proposal_sha256_hex": proposal_sha256.iter().map(|b| format!("{b:02x}")).collect::<String>(),
@@ -1259,7 +1262,9 @@ impl WalletServer {
                     tool = "stellar_rule_create_commit",
                     "approval dir resolution failed"
                 );
-                return Ok(approval_required_indistinguishable());
+                return Ok(approval_required_indistinguishable(
+                    &self.profile_name_for_approval(),
+                ));
             }
         };
         let store_path = approvals_dir.join(format!("{}.toml", self.profile_name_for_approval()));
@@ -1271,13 +1276,19 @@ impl WalletServer {
                         tool = "stellar_rule_create_commit",
                         "approval store open failed"
                     );
-                    return Ok(approval_required_indistinguishable());
+                    return Ok(approval_required_indistinguishable(
+                        &self.profile_name_for_approval(),
+                    ));
                 }
             };
 
         let entry = match store.get(&args.approval_nonce).cloned() {
             Some(e) => e,
-            None => return Ok(approval_required_indistinguishable()),
+            None => {
+                return Ok(approval_required_indistinguishable(
+                    &self.profile_name_for_approval(),
+                ));
+            }
         };
 
         let now_ms = now_unix_ms()
@@ -1287,7 +1298,9 @@ impl WalletServer {
                 tool = "stellar_rule_create_commit",
                 "approval entry expired"
             );
-            return Ok(approval_required_indistinguishable());
+            return Ok(approval_required_indistinguishable(
+                &self.profile_name_for_approval(),
+            ));
         }
 
         let (smart_account_str, entry_chain_id, definition_snapshot, stored_proposal_sha256) =
@@ -1313,7 +1326,11 @@ impl WalletServer {
                     definition.clone(),
                     *proposal_sha256,
                 ),
-                _ => return Ok(approval_required_indistinguishable()),
+                _ => {
+                    return Ok(approval_required_indistinguishable(
+                        &self.profile_name_for_approval(),
+                    ));
+                }
             };
 
         if entry_chain_id != args.chain_id {
@@ -1375,7 +1392,9 @@ impl WalletServer {
                         tool = "stellar_rule_create_commit",
                         "approval_attestation absent"
                     );
-                    return Ok(approval_required_indistinguishable());
+                    return Ok(approval_required_indistinguishable(
+                        &self.profile_name_for_approval(),
+                    ));
                 }
             };
             let attestation_bytes: [u8; 32] = match base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -1389,7 +1408,9 @@ impl WalletServer {
                         tool = "stellar_rule_create_commit",
                         "attestation base64 decode failed"
                     );
-                    return Ok(approval_required_indistinguishable());
+                    return Ok(approval_required_indistinguishable(
+                        &self.profile_name_for_approval(),
+                    ));
                 }
             };
 
@@ -1403,6 +1424,10 @@ impl WalletServer {
                 nonce_str,
                 &recomputed_digest,
                 &attestation_key,
+                &stellar_agent_core::approval::AttestationBinding::new(
+                    &self.profile_name_for_approval(),
+                    self.profile.chain_id.caip2_str(),
+                ),
                 &attestation_bytes,
                 now_ms,
             ) {
@@ -1416,7 +1441,7 @@ impl WalletServer {
                             tool = "stellar_rule_create_commit",
                             "verify_rule_proposal_gate refused"
                         );
-                        approval_required_indistinguishable()
+                        approval_required_indistinguishable(&self.profile_name_for_approval())
                     }
                 });
             }

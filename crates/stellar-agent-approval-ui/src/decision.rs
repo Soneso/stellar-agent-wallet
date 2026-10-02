@@ -87,8 +87,9 @@ pub enum Decision {
 /// mock) before the first [`apply_decision`] call.
 #[non_exhaustive]
 pub struct DecisionContext {
-    /// Profile whose approval store and grant store are acted upon.
-    pub profile_name: String,
+    /// Serving profile context: the store name, the chain id, the endpoint host and
+    /// the enrolled signer; its binding enters every attestation.
+    pub context: stellar_agent_core::approval::ApprovalContext,
     /// Path to the profile's pending-approval store file.
     pub store_path: PathBuf,
     /// Keyring reference for the profile's attestation HMAC key.
@@ -106,14 +107,14 @@ impl DecisionContext {
     /// `grant_store_path_override`.
     #[must_use]
     pub fn new(
-        profile_name: String,
+        context: stellar_agent_core::approval::ApprovalContext,
         store_path: PathBuf,
         attestation_key_entry_ref: KeyringEntryRef,
         audit_writer: Arc<Mutex<AuditWriter>>,
         grant_store_path_override: Option<PathBuf>,
     ) -> Self {
         Self {
-            profile_name,
+            context,
             store_path,
             attestation_key_entry_ref,
             audit_writer,
@@ -156,6 +157,8 @@ pub enum Outcome {
     Unavailable,
     /// The entry was created by a different OS user than the caller.
     UserMismatch,
+    /// This request belongs to another profile or network.
+    BindingMismatch,
     /// No entry with this nonce exists.
     NotFound,
     /// The entry's kind is not one the attest path supports (for example a
@@ -348,11 +351,12 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
     let audit_ref: Option<&mut AuditWriter> = audit_guard.as_deref_mut().map(|w| &mut *w);
 
     let grant_override = ctx.grant_store_path_override.clone();
-    let profile_name = ctx.profile_name.as_str();
+    let profile_name = ctx.context.profile_name.as_str();
     let result = attest_and_persist(
         &mut store,
         &entry,
         &key,
+        &ctx.context.binding(),
         surface,
         audit_ref,
         operator_credential_id.as_deref(),
@@ -368,6 +372,7 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
                 req.process_uid,
                 req.now_unix_ms,
                 grant_key,
+                req.binding,
                 grant_override.clone(),
             )
             .map(|_grant| ())
@@ -381,6 +386,9 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
             expires_at_unix_ms: entry.expires_at_unix_ms,
         },
         Err(e) => {
+            if approval_detail_code_is(&e, "approval.binding_mismatch") {
+                return Outcome::BindingMismatch;
+            }
             if approval_detail_code_is(&e, "approval.wrong_kind") {
                 return Outcome::WrongKind;
             }
@@ -547,7 +555,13 @@ mod tests {
             AuditWriter::open(audit_path, None).expect("open audit writer"),
         ));
         let ctx = DecisionContext::new(
-            "ui-test".to_owned(),
+            stellar_agent_core::approval::ApprovalContext::from_profile(
+                "ui-test",
+                &stellar_agent_core::profile::schema::Profile::builder_testnet(
+                    "svc", "default", "nonce", "default",
+                )
+                .build(),
+            ),
             store_path,
             KeyringEntryRef::new(svc, "default"),
             audit_writer,
@@ -638,7 +652,13 @@ mod tests {
 
         // Independently verify the surfaced blob against the attestation key.
         let sha = decode_sha256_hex(&envelope_sha256_hex).unwrap();
-        let expected = compute_attestation(&fx.raw_key, &nonce, &sha, &process_uid);
+        let expected = compute_attestation(
+            &fx.raw_key,
+            &fx.ctx.context.binding(),
+            &nonce,
+            &sha,
+            &process_uid,
+        );
         let blob: [u8; 32] = URL_SAFE_NO_PAD
             .decode(&attestation)
             .unwrap()
@@ -647,6 +667,61 @@ mod tests {
         assert_eq!(blob, expected);
         assert!(verify_attestation(
             &fx.raw_key,
+            &fx.ctx.context.binding(),
+            &nonce,
+            &sha,
+            &process_uid,
+            &blob
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn approve_payment_mainnet_mints_verifiable_attestation() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fx = fixture("payment-mainnet");
+        fx.ctx.context.chain_id = "stellar:mainnet".to_owned();
+        let entry = payment_entry(DEFAULT_TTL_MS);
+        let process_uid = entry.process_uid.clone();
+        let envelope_sha256_hex = match &entry.kind {
+            ApprovalKind::PaymentSimulated {
+                envelope_sha256_hex,
+                ..
+            } => envelope_sha256_hex.clone(),
+            _ => unreachable!(),
+        };
+        let nonce = insert(&fx.ctx, entry);
+
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Approve {
+                nonce: nonce.clone(),
+            },
+            &RequestIdentity::Local,
+        );
+        let attestation = match outcome {
+            Outcome::Attested { attestation, .. } => attestation.expect("payment surfaces a blob"),
+            other => panic!("expected Attested, got {other:?}"),
+        };
+
+        // Independently verify the surfaced blob against the attestation key.
+        let sha = decode_sha256_hex(&envelope_sha256_hex).unwrap();
+        let expected = compute_attestation(
+            &fx.raw_key,
+            &fx.ctx.context.binding(),
+            &nonce,
+            &sha,
+            &process_uid,
+        );
+        let blob: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&attestation)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(blob, expected);
+        assert!(verify_attestation(
+            &fx.raw_key,
+            &fx.ctx.context.binding(),
             &nonce,
             &sha,
             &process_uid,
@@ -987,5 +1062,48 @@ mod tests {
             &RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
+    }
+    #[test]
+    #[serial]
+    fn approve_refuses_another_chain_with_binding_mismatch() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("binding-mismatch");
+        let definition = stellar_agent_core::approval::ContextRuleProposalSnapshot::new(
+            stellar_agent_core::approval::RuleProposalContextType::Default,
+            "rule".to_owned(),
+            None,
+            vec![stellar_agent_core::approval::RuleProposalSigner::delegated(
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                true,
+            )],
+            vec![],
+            vec![0],
+            false,
+            false,
+        );
+        let entry = stellar_agent_core::approval::PendingApproval::new_rule_proposal_pending(
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "Public Global Stellar Network ; September 2015".to_owned(),
+            "stellar:mainnet".to_owned(),
+            definition,
+            [1; 32],
+            "rule".to_owned(),
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let nonce = insert(&fx.ctx, entry);
+        assert_eq!(
+            apply_decision(
+                &fx.ctx,
+                Decision::Approve {
+                    nonce: nonce.clone()
+                },
+                &RequestIdentity::Local
+            ),
+            Outcome::BindingMismatch
+        );
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        assert!(store.get(&nonce).unwrap().attestation_blob_b64.is_none());
     }
 }

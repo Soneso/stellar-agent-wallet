@@ -299,6 +299,7 @@ async fn exercise_approval_consumption(fail_once: bool) {
     let approval_nonce = entry.approval_nonce.clone();
     let blob = compute_attestation(
         &attestation_key,
+        &stellar_agent_core::approval::AttestationBinding::new("acct-consumed", "stellar:testnet"),
         &approval_nonce,
         &envelope_sha256(envelope_xdr.as_bytes()),
         &process_uid,
@@ -552,6 +553,7 @@ async fn a_refused_commit_leaves_its_approval_untouched() {
     let approval_nonce = entry.approval_nonce.clone();
     let blob = compute_attestation(
         &attestation_key,
+        &stellar_agent_core::approval::AttestationBinding::new("acct-rejected", "stellar:testnet"),
         &approval_nonce,
         &envelope_sha256(envelope_xdr.as_bytes()),
         &process_uid,

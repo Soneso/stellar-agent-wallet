@@ -718,6 +718,7 @@ pub fn record_first_invoke_grant(
     process_uid: &str,
     now_unix_ms: u64,
     attestation_key: &[u8; 32],
+    binding: &stellar_agent_core::approval::AttestationBinding<'_>,
     // Optional override for the grant store path.
     // Pass `None` in production; `Some(path)` in integration tests.
     grant_store_path_override: GrantStorePathOverride,
@@ -733,6 +734,7 @@ pub fn record_first_invoke_grant(
         now_unix_ms,
         TOOLSET_GRANT_DEFAULT_TTL_MS,
         attestation_key,
+        binding,
     )
     .map_err(|e| ToolsetRuntimeError::GrantStoreError {
         detail: format!("build_attested_grant: {e}"),
@@ -1743,6 +1745,7 @@ mod tests {
             &uid,
             now_unix_ms,
             &attestation_key,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
             Some(grant_path.clone()),
         )
         .unwrap();
@@ -1878,6 +1881,7 @@ mod tests {
             &uid,
             now_unix_ms,
             &attestation_key,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
             Some(grant_path.clone()),
         )
         .unwrap();
@@ -1961,6 +1965,7 @@ mod tests {
             &uid,
             now_unix_ms,
             &attestation_key,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
             Some(grant_path.clone()),
         )
         .unwrap();
@@ -2157,6 +2162,7 @@ mod tests {
             &uid,
             now_unix_ms,
             &attestation_key,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
             Some(grant_path.clone()),
         )
         .unwrap();
@@ -2227,6 +2233,7 @@ mod tests {
             &uid,
             now_unix_ms,
             &attestation_key,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
             Some(grant_path.clone()),
         )
         .unwrap();
@@ -2239,11 +2246,23 @@ mod tests {
         // cryptographic output: it must verify against the real key and be
         // rejected under a wrong key.
         assert!(
-            grant.verify_attestation(&attestation_key),
+            grant.verify_attestation(
+                &attestation_key,
+                &stellar_agent_core::approval::AttestationBinding::new(
+                    "default",
+                    "stellar:testnet"
+                )
+            ),
             "grant must verify against the attestation key it was built with"
         );
         assert!(
-            !grant.verify_attestation(&[0xff; 32]),
+            !grant.verify_attestation(
+                &[0xff; 32],
+                &stellar_agent_core::approval::AttestationBinding::new(
+                    "default",
+                    "stellar:testnet"
+                )
+            ),
             "grant must NOT verify against a wrong attestation key"
         );
 

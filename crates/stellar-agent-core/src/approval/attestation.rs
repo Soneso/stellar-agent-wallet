@@ -1,23 +1,24 @@
 //! HMAC-SHA256 attestation primitive for the wallet-owned approval spine.
 //!
-//! The `compute_attestation` function produces a 32-byte HMAC-SHA256 tag that
-//! binds an `approval_nonce`, the `envelope_sha256` of the simulated
-//! transaction, and the `process_uid` of the approving process.
+//! The attestation binds the profile name, CAIP-2 chain id, approval nonce,
+//! envelope digest, and approving process UID.
 //!
 //! # Canonical input layout
 //!
 //! ```text
-//! mac.update(approval_nonce.len() as BE u32)  // 4 bytes — length prefix
-//! mac.update(approval_nonce UTF-8)             // variable-length
-//! mac.update(envelope_sha256)                  // 32 bytes — fixed-length; no prefix needed
-//! mac.update(process_uid.len() as BE u32)      // 4 bytes — length prefix
-//! mac.update(process_uid UTF-8)                // variable-length
+//! mac.update(b"stellar-agent-approval-attestation:v2")
+//! mac.update(u32_be(len(profile_name)))   mac.update(profile_name)
+//! mac.update(u32_be(len(chain_id)))       mac.update(chain_id)
+//! mac.update(u32_be(len(approval_nonce))) mac.update(approval_nonce)
+//! mac.update(envelope_sha256)
+//! mac.update(u32_be(len(process_uid)))    mac.update(process_uid)
 //! ```
 //!
-//! Length prefixes on the two variable-length fields (`approval_nonce` and
-//! `process_uid`) prevent boundary-collision attacks: without them, two
-//! different `(nonce, user_id)` pairs that concatenate to the same byte
-//! sequence would produce identical HMAC tags.
+//! Lengths count UTF-8 bytes, encoded as big-endian u32 with saturation.
+//! The 37-byte tag and 32-byte digest have no prefix or NUL terminator.
+//! The tag separates this HMAC from every other use of the key.
+//! Binding fields make a blob unverifiable under another profile or chain.
+//! A layout change bumps the tag; blobs under the previous tag do not verify.
 //!
 //! # Key discipline
 //!
@@ -34,6 +35,30 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+/// Profile and chain that mint or verify an approval.
+///
+/// The profile name is the approval store file stem both binaries open.
+/// The CAIP-2 chain id comes from the environment-merged profile.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct AttestationBinding<'a> {
+    /// Approval store profile name.
+    pub profile_name: &'a str,
+    /// CAIP-2 chain id of the environment-merged profile.
+    pub chain_id: &'a str,
+}
+
+impl<'a> AttestationBinding<'a> {
+    /// Constructs the profile and chain binding.
+    #[must_use]
+    pub fn new(profile_name: &'a str, chain_id: &'a str) -> Self {
+        Self {
+            profile_name,
+            chain_id,
+        }
+    }
+}
+
 /// HMAC-SHA256 type alias.
 type HmacSha256 = Hmac<Sha256>;
 
@@ -43,8 +68,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Domain-separation tag for the `ToolsetFirstInvokeGate` attestation digest.
 ///
-/// ANY change to the preimage layout REQUIRES a tag-version bump so old grants
-/// fail closed rather than cross-validating against a new layout.
+/// A layout change bumps the tag; digests under the previous tag do not verify.
 ///
 /// Current version: `v1`.
 pub const TOOLSET_GATE_DOMAIN_TAG: &[u8] = b"stellar-agent-toolset-grant:v1";
@@ -186,9 +210,9 @@ pub fn compute_toolset_gate_digest(
 ///     "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 ///     "XLM", 0, 10_000_000,
 /// );
-/// let blob = compute_attestation(&key, "test-nonce", &digest, "1000");
+/// let blob = compute_attestation(&key, &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"), "test-nonce", &digest, "1000");
 /// assert!(verify_toolset_gate_attestation(
-///     &key,
+///     &key, &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
 ///     "test-nonce",
 ///     "my-toolset",
 ///     "sign-payment",
@@ -204,6 +228,7 @@ pub fn compute_toolset_gate_digest(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_toolset_gate_attestation(
     key: &[u8; 32],
+    binding: &AttestationBinding<'_>,
     approval_nonce: &str,
     toolset_name: &str,
     capability: &str,
@@ -222,7 +247,14 @@ pub fn verify_toolset_gate_attestation(
         amount_min_stroops,
         amount_max_stroops,
     );
-    verify_attestation(key, approval_nonce, &digest, process_uid, attestation_blob)
+    verify_attestation(
+        key,
+        binding,
+        approval_nonce,
+        &digest,
+        process_uid,
+        attestation_blob,
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -231,9 +263,7 @@ pub fn verify_toolset_gate_attestation(
 
 /// Domain-separation tag for the `TrustlineClawbackOptIn` attestation digest.
 ///
-/// ANY change to the preimage layout REQUIRES a tag-version bump so existing
-/// attestation blobs fail closed rather than cross-validating against a new
-/// layout.
+/// A layout change bumps the tag; digests under the previous tag do not verify.
 ///
 /// Current version: `v1`.
 pub const TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG: &[u8] =
@@ -310,11 +340,9 @@ pub fn compute_trustline_clawback_opt_in_digest(
 // RuleProposalSimulated digest
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Domain-separation tag for the `RuleProposalSimulated` attestation digest
-/// (Package D, GH issue #8).
+/// Domain-separation tag for the `RuleProposalSimulated` attestation digest.
 ///
-/// ANY change to the preimage layout REQUIRES a tag-version bump so old
-/// proposals fail closed rather than cross-validating against a new layout.
+/// A layout change bumps the tag; digests under the previous tag do not verify.
 ///
 /// Current version: `v1`.
 pub const RULE_PROPOSAL_DOMAIN_TAG: &[u8] = b"stellar-agent-rule-proposal-v1";
@@ -421,14 +449,18 @@ pub fn compute_rule_proposal_digest(
 /// # Input domain
 ///
 /// ```text
-/// mac.update(approval_nonce.len() as BE u32)
-/// mac.update(approval_nonce UTF-8)
-/// mac.update(envelope_sha256)          // 32 bytes, no length prefix (fixed)
-/// mac.update(process_uid.len() as BE u32)
-/// mac.update(process_uid UTF-8)
+/// mac.update(b"stellar-agent-approval-attestation:v2")
+/// mac.update(u32_be(len(profile_name)))   mac.update(profile_name)
+/// mac.update(u32_be(len(chain_id)))       mac.update(chain_id)
+/// mac.update(u32_be(len(approval_nonce))) mac.update(approval_nonce)
+/// mac.update(envelope_sha256)
+/// mac.update(u32_be(len(process_uid)))    mac.update(process_uid)
 /// ```
 ///
-/// Length prefixes prevent boundary collisions between variable-length fields.
+/// Lengths count UTF-8 bytes, encoded as big-endian u32 with saturation.
+/// The tag separates this HMAC from every other use of the key.
+/// Binding fields make a blob unverifiable under another profile or chain.
+/// A layout change bumps the tag; blobs under the previous tag do not verify.
 ///
 /// # Key discipline
 ///
@@ -448,12 +480,13 @@ pub fn compute_rule_proposal_digest(
 ///
 /// let key = [0x42u8; 32];
 /// let env_hash = [0x01u8; 32];
-/// let blob = compute_attestation(&key, "test-nonce", &env_hash, "1000");
+/// let blob = compute_attestation(&key, &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"), "test-nonce", &env_hash, "1000");
 /// assert_eq!(blob.len(), 32);
 /// ```
 #[must_use]
 pub fn compute_attestation(
     key: &[u8; 32],
+    binding: &AttestationBinding<'_>,
     approval_nonce: &str,
     envelope_sha256: &[u8; 32],
     process_uid: &str,
@@ -466,6 +499,14 @@ pub fn compute_attestation(
     )]
     let mut mac = HmacSha256::new_from_slice(key.as_ref())
         .expect("HmacSha256 key initialisation with 32-byte array is infallible");
+
+    mac.update(b"stellar-agent-approval-attestation:v2");
+    let profile_len = u32::try_from(binding.profile_name.len()).unwrap_or(u32::MAX);
+    mac.update(&profile_len.to_be_bytes());
+    mac.update(binding.profile_name.as_bytes());
+    let chain_len = u32::try_from(binding.chain_id.len()).unwrap_or(u32::MAX);
+    mac.update(&chain_len.to_be_bytes());
+    mac.update(binding.chain_id.as_bytes());
 
     // Length-prefix the approval_nonce.
     let nonce_len = u32::try_from(approval_nonce.len()).unwrap_or(u32::MAX);
@@ -503,21 +544,22 @@ pub fn compute_attestation(
 ///
 /// let key = [0x42u8; 32];
 /// let env_hash = [0x01u8; 32];
-/// let blob = compute_attestation(&key, "my-nonce", &env_hash, "1000");
-/// assert!(verify_attestation(&key, "my-nonce", &env_hash, "1000", &blob));
+/// let blob = compute_attestation(&key, &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"), "my-nonce", &env_hash, "1000");
+/// assert!(verify_attestation(&key, &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"), "my-nonce", &env_hash, "1000", &blob));
 /// // Wrong key returns false.
 /// let wrong_key = [0xffu8; 32];
-/// assert!(!verify_attestation(&wrong_key, "my-nonce", &env_hash, "1000", &blob));
+/// assert!(!verify_attestation(&wrong_key, &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"), "my-nonce", &env_hash, "1000", &blob));
 /// ```
 #[must_use]
 pub fn verify_attestation(
     key: &[u8; 32],
+    binding: &AttestationBinding<'_>,
     approval_nonce: &str,
     envelope_sha256: &[u8; 32],
     process_uid: &str,
     attestation_blob: &[u8; 32],
 ) -> bool {
-    let expected = compute_attestation(key, approval_nonce, envelope_sha256, process_uid);
+    let expected = compute_attestation(key, binding, approval_nonce, envelope_sha256, process_uid);
     // Constant-time comparison to prevent timing side-channels.
     expected.ct_eq(attestation_blob).into()
 }
@@ -537,46 +579,52 @@ mod tests {
 
     // ── KAT (known-answer test) ──────────────────────────────────────────────
 
-    /// Hard-coded KAT to detect accidental changes to the canonical input layout.
-    ///
-    /// The expected bytes were computed using reference Python:
-    /// ```python
-    /// import hmac, hashlib, struct
-    /// key = bytes([0x01]*32)
-    /// nonce = b"testnonce12345678901"  # 20 bytes
-    /// env_hash = bytes([0x02]*32)
-    /// uid = b"1000"
-    /// msg = (struct.pack(">I", len(nonce)) + nonce
-    ///      + env_hash
-    ///      + struct.pack(">I", len(uid)) + uid)
-    /// tag = hmac.new(key, msg, hashlib.sha256).digest()
-    /// ```
     #[test]
-    fn compute_attestation_known_answer() {
-        let key = [0x01u8; 32];
-        let env_hash = [0x02u8; 32];
-        let nonce = "testnonce12345678901"; // 20 chars
-        let uid = "1000";
+    fn compute_attestation_known_answer_v2() {
+        let result = compute_attestation(
+            &[0x42; 32],
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "test-nonce",
+            &[0x01; 32],
+            "1000",
+        );
+        let actual: String = result.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(
+            actual,
+            "eb90c7b47bafc0f5cc69786042755460f544f79b8c6b4e8874d5cc9fa87edabf"
+        );
+    }
 
-        let result = compute_attestation(&key, nonce, &env_hash, uid);
-
-        // Verify against independently computed expected bytes.
-        let mut mac =
-            HmacSha256::new_from_slice(&key).expect("32-byte key is always valid for HMAC");
-        let nonce_len = u32::try_from(nonce.len()).unwrap().to_be_bytes();
-        mac.update(&nonce_len);
-        mac.update(nonce.as_bytes());
-        mac.update(&env_hash);
-        let uid_len = u32::try_from(uid.len()).unwrap().to_be_bytes();
-        mac.update(&uid_len);
-        mac.update(uid.as_bytes());
-        let mut expected = [0u8; 32];
-        expected.copy_from_slice(mac.finalize().into_bytes().as_slice());
-
-        assert_eq!(result, expected, "KAT: compute_attestation output mismatch");
-        assert_ne!(
-            result, [0u8; 32],
-            "KAT: attestation blob must not be all-zero"
+    #[test]
+    fn compute_attestation_utf8_length_prefixes_count_bytes() {
+        let binding = AttestationBinding::new("trésor", "stellar:網");
+        let key = [0x42; 32];
+        let digest = [0x01; 32];
+        let mut preimage = b"stellar-agent-approval-attestation:v2".to_vec();
+        preimage.extend_from_slice(&7_u32.to_be_bytes());
+        preimage.extend_from_slice(binding.profile_name.as_bytes());
+        preimage.extend_from_slice(&11_u32.to_be_bytes());
+        preimage.extend_from_slice(binding.chain_id.as_bytes());
+        preimage.extend_from_slice(&10_u32.to_be_bytes());
+        preimage.extend_from_slice(b"test-nonce");
+        preimage.extend_from_slice(&digest);
+        preimage.extend_from_slice(&4_u32.to_be_bytes());
+        preimage.extend_from_slice(b"1000");
+        assert_eq!(
+            u32::from_be_bytes(preimage[37..41].try_into().unwrap()) as usize,
+            binding.profile_name.len()
+        );
+        assert_eq!(
+            u32::from_be_bytes(preimage[48..52].try_into().unwrap()) as usize,
+            binding.chain_id.len()
+        );
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+        mac.update(&preimage);
+        let expected: [u8; 32] = mac.finalize().into_bytes().into();
+        assert_eq!(
+            compute_attestation(&key, &binding, "test-nonce", &digest, "1000"),
+            expected,
+            "the HMAC must use UTF-8 byte-length prefixes"
         );
     }
 
@@ -586,9 +634,22 @@ mod tests {
     fn compute_then_verify_succeeds() {
         let key = [0x42u8; 32];
         let env_hash = [0xabu8; 32];
-        let blob = compute_attestation(&key, "my-approval-nonce", &env_hash, "500");
+        let blob = compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "my-approval-nonce",
+            &env_hash,
+            "500",
+        );
         assert!(
-            verify_attestation(&key, "my-approval-nonce", &env_hash, "500", &blob),
+            verify_attestation(
+                &key,
+                &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+                "my-approval-nonce",
+                &env_hash,
+                "500",
+                &blob
+            ),
             "round-trip verify must succeed"
         );
     }
@@ -599,9 +660,22 @@ mod tests {
     fn tamper_nonce_fails_verify() {
         let key = [0x42u8; 32];
         let env_hash = [0xabu8; 32];
-        let blob = compute_attestation(&key, "original-nonce", &env_hash, "500");
+        let blob = compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "original-nonce",
+            &env_hash,
+            "500",
+        );
         assert!(
-            !verify_attestation(&key, "tampered-nonce", &env_hash, "500", &blob),
+            !verify_attestation(
+                &key,
+                &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+                "tampered-nonce",
+                &env_hash,
+                "500",
+                &blob
+            ),
             "tampered nonce must fail verify"
         );
     }
@@ -610,11 +684,24 @@ mod tests {
     fn tamper_envelope_hash_fails_verify() {
         let key = [0x42u8; 32];
         let env_hash = [0xabu8; 32];
-        let blob = compute_attestation(&key, "nonce", &env_hash, "500");
+        let blob = compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "nonce",
+            &env_hash,
+            "500",
+        );
         let mut tampered_hash = env_hash;
         tampered_hash[0] ^= 0xff;
         assert!(
-            !verify_attestation(&key, "nonce", &tampered_hash, "500", &blob),
+            !verify_attestation(
+                &key,
+                &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+                "nonce",
+                &tampered_hash,
+                "500",
+                &blob
+            ),
             "tampered envelope hash must fail verify"
         );
     }
@@ -623,9 +710,22 @@ mod tests {
     fn tamper_user_id_fails_verify() {
         let key = [0x42u8; 32];
         let env_hash = [0xabu8; 32];
-        let blob = compute_attestation(&key, "nonce", &env_hash, "1000");
+        let blob = compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "nonce",
+            &env_hash,
+            "1000",
+        );
         assert!(
-            !verify_attestation(&key, "nonce", &env_hash, "9999", &blob),
+            !verify_attestation(
+                &key,
+                &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+                "nonce",
+                &env_hash,
+                "9999",
+                &blob
+            ),
             "tampered process_uid must fail verify"
         );
     }
@@ -634,10 +734,23 @@ mod tests {
     fn tamper_blob_byte_fails_verify() {
         let key = [0x42u8; 32];
         let env_hash = [0xabu8; 32];
-        let mut blob = compute_attestation(&key, "nonce", &env_hash, "1000");
+        let mut blob = compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "nonce",
+            &env_hash,
+            "1000",
+        );
         blob[0] ^= 0xff;
         assert!(
-            !verify_attestation(&key, "nonce", &env_hash, "1000", &blob),
+            !verify_attestation(
+                &key,
+                &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+                "nonce",
+                &env_hash,
+                "1000",
+                &blob
+            ),
             "bit-flipped blob must fail verify"
         );
     }
@@ -649,9 +762,22 @@ mod tests {
         let key1 = [0x11u8; 32];
         let key2 = [0x22u8; 32];
         let env_hash = [0xabu8; 32];
-        let blob = compute_attestation(&key1, "nonce", &env_hash, "1000");
+        let blob = compute_attestation(
+            &key1,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "nonce",
+            &env_hash,
+            "1000",
+        );
         assert!(
-            !verify_attestation(&key2, "nonce", &env_hash, "1000", &blob),
+            !verify_attestation(
+                &key2,
+                &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+                "nonce",
+                &env_hash,
+                "1000",
+                &blob
+            ),
             "different key must fail verify"
         );
     }
@@ -662,8 +788,20 @@ mod tests {
     fn no_boundary_collision_nonce_uid() {
         let key = [0x55u8; 32];
         let env_hash = [0x00u8; 32];
-        let blob1 = compute_attestation(&key, "ab", &env_hash, "cd");
-        let blob2 = compute_attestation(&key, "abc", &env_hash, "d");
+        let blob1 = compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "ab",
+            &env_hash,
+            "cd",
+        );
+        let blob2 = compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "abc",
+            &env_hash,
+            "d",
+        );
         assert_ne!(
             blob1, blob2,
             "length-prefix separators must prevent boundary collisions"
@@ -676,8 +814,20 @@ mod tests {
     fn compute_attestation_is_deterministic() {
         let key = [0x99u8; 32];
         let env_hash = [0x77u8; 32];
-        let b1 = compute_attestation(&key, "same-nonce", &env_hash, "42");
-        let b2 = compute_attestation(&key, "same-nonce", &env_hash, "42");
+        let b1 = compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "same-nonce",
+            &env_hash,
+            "42",
+        );
+        let b2 = compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "same-nonce",
+            &env_hash,
+            "42",
+        );
         assert_eq!(b1, b2, "compute_attestation must be deterministic");
     }
 
@@ -709,10 +859,30 @@ mod tests {
     fn verify_attestation_constant_time_path_reachable() {
         let key = [0x33u8; 32];
         let env_hash = [0xddu8; 32];
-        let blob = compute_attestation(&key, "n", &env_hash, "u");
-        assert!(verify_attestation(&key, "n", &env_hash, "u", &blob));
+        let blob = compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "n",
+            &env_hash,
+            "u",
+        );
+        assert!(verify_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "n",
+            &env_hash,
+            "u",
+            &blob
+        ));
         let wrong = [0u8; 32];
-        assert!(!verify_attestation(&key, "n", &env_hash, "u", &wrong));
+        assert!(!verify_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "n",
+            &env_hash,
+            "u",
+            &wrong
+        ));
     }
 
     // ── Toolset-gate digest KAT ─────────────────────────────────────────────────
@@ -806,11 +976,18 @@ mod tests {
         let key = [0x77u8; 32];
         let digest =
             compute_toolset_gate_digest("my-toolset", "sign-payment", DEST_G, "XLM", 0, 5_000_000);
-        let blob = compute_attestation(&key, "gate-nonce", &digest, "1234");
+        let blob = compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "gate-nonce",
+            &digest,
+            "1234",
+        );
 
         assert!(
             verify_toolset_gate_attestation(
                 &key,
+                &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
                 "gate-nonce",
                 "my-toolset",
                 "sign-payment",
@@ -831,11 +1008,18 @@ mod tests {
         let key = [0x77u8; 32];
         let digest =
             compute_toolset_gate_digest("my-toolset", "sign-payment", DEST_G, "XLM", 0, 5_000_000);
-        let blob = compute_attestation(&key, "gate-nonce", &digest, "1234");
+        let blob = compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "gate-nonce",
+            &digest,
+            "1234",
+        );
 
         assert!(
             !verify_toolset_gate_attestation(
                 &key,
+                &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
                 "gate-nonce",
                 "other-toolset", // tampered
                 "sign-payment",
@@ -856,11 +1040,18 @@ mod tests {
         let key = [0x77u8; 32];
         let digest =
             compute_toolset_gate_digest("my-toolset", "sign-payment", DEST_G, "XLM", 0, 5_000_000);
-        let blob = compute_attestation(&key, "gate-nonce", &digest, "1234");
+        let blob = compute_attestation(
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
+            "gate-nonce",
+            &digest,
+            "1234",
+        );
 
         assert!(
             !verify_toolset_gate_attestation(
                 &key,
+                &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
                 "gate-nonce",
                 "my-toolset",
                 "sign-payment",
@@ -968,5 +1159,64 @@ mod tests {
         let rule_digest = compute_rule_proposal_digest(b"x", b"y", b"z", 0);
         let toolset_digest = compute_toolset_gate_digest("x", "y", DEST_G, "XLM", 0, 1_000_000);
         assert_ne!(rule_digest, toolset_digest);
+    }
+
+    #[test]
+    fn attestation_differs_per_profile_name() {
+        let a = AttestationBinding::new("a", "stellar:testnet");
+        let b = AttestationBinding::new("b", "stellar:testnet");
+        let blob = compute_attestation(&[0x42; 32], &a, "nonce", &[1; 32], "1000");
+        assert_ne!(
+            blob,
+            compute_attestation(&[0x42; 32], &b, "nonce", &[1; 32], "1000")
+        );
+        assert!(!verify_attestation(
+            &[0x42; 32],
+            &b,
+            "nonce",
+            &[1; 32],
+            "1000",
+            &blob
+        ));
+    }
+
+    #[test]
+    fn attestation_differs_per_chain_id() {
+        let testnet = AttestationBinding::new("a", "stellar:testnet");
+        let mainnet = AttestationBinding::new("a", "stellar:mainnet");
+        for (mint, verify) in [(testnet, mainnet), (mainnet, testnet)] {
+            let blob = compute_attestation(&[0x42; 32], &mint, "nonce", &[1; 32], "1000");
+            assert_ne!(
+                blob,
+                compute_attestation(&[0x42; 32], &verify, "nonce", &[1; 32], "1000")
+            );
+            assert!(!verify_attestation(
+                &[0x42; 32],
+                &verify,
+                "nonce",
+                &[1; 32],
+                "1000",
+                &blob
+            ));
+        }
+    }
+
+    #[test]
+    fn v1_layout_blob_does_not_verify() {
+        let mut mac = HmacSha256::new_from_slice(&[0x42; 32]).unwrap();
+        mac.update(&10_u32.to_be_bytes());
+        mac.update(b"test-nonce");
+        mac.update(&[1; 32]);
+        mac.update(&4_u32.to_be_bytes());
+        mac.update(b"1000");
+        let blob: [u8; 32] = mac.finalize().into_bytes().into();
+        assert!(!verify_attestation(
+            &[0x42; 32],
+            &AttestationBinding::new("default", "stellar:testnet"),
+            "test-nonce",
+            &[1; 32],
+            "1000",
+            &blob
+        ));
     }
 }

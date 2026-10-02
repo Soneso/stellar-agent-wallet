@@ -120,16 +120,14 @@ pub enum ToolsetRuntimeError {
     /// Gated path: the first-invoke gate requires out-of-band approval.
     ///
     /// The gated resolver (`resolve_toolset_sign_payment_gated`) returns
-    /// `Ok(GatedResolveOutcome::FirstInvokeApprovalRequired { .. })` — NOT this
-    /// error variant — when the gate fires. This variant is produced by the
-    /// MCP/CLI consumer layer when it surfaces that gate outcome to the client as
-    /// a typed error response. It carries the same `approval_nonce`, `toolset_name`,
-    /// and `capability` from the `GatedResolveOutcome`.
+    /// `Ok(GatedResolveOutcome::FirstInvokeApprovalRequired { .. })` when the
+    /// gate fires. Production never constructs this error variant; the MCP
+    /// match arm must fail closed.
     ///
     /// # Recovery
     ///
     /// 1. The operator reviews the wallet-rendered summary.
-    /// 2. `stellar-agent approve --id <approval_nonce>` is run.
+    /// 2. `stellar-agent approve --id <approval_nonce> --profile <name>` is run.
     /// 3. The toolset re-invokes the same `sign-payment` action.
     #[error(
         "toolset.first_invoke_approval_required: first-invoke gate requires operator approval \
@@ -140,7 +138,7 @@ pub enum ToolsetRuntimeError {
         /// Nonce of the queued `ToolsetFirstInvokeGate` pending approval.
         ///
         /// The MCP response MUST surface this nonce so the agent can pass it
-        /// to `stellar-agent approve --id <nonce>`.
+        /// to `stellar-agent approve --id <nonce> --profile <name>`.
         approval_nonce: String,
 
         /// Sanitised toolset name (for the human-readable message).

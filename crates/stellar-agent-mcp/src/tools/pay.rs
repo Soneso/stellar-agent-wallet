@@ -280,7 +280,7 @@ pub struct StellarPayCommitArgs {
     /// HMAC-SHA256 attestation blob, URL-safe base64 no-pad encoded (32 bytes).
     ///
     /// Written to the pending-approvals store by `stellar-agent approve --id
-    /// <approval_nonce>` after the user confirms on their own tty.  The commit
+    /// <approval_nonce> --profile <name>` after the user confirms on their own tty.  The commit
     /// handler re-computes and constant-time-compares the HMAC against the stored
     /// attestation key before proceeding to signing.
     ///
@@ -560,6 +560,7 @@ impl WalletServer {
                        (simulate step). Supports native XLM and non-native assets. \
                        Runs SEP-29 memo-required enforcement at simulate time. \
                        Returns {envelope_xdr, nonce, expires_at_unix_ms, simulation}. \
+                       The approval response includes profile and chain_id. \
                        Pass all three to stellar_pay_commit to sign and submit. \
                        destructive_hint=false; read_only_hint=false.",
         annotations(read_only_hint = false, destructive_hint = false)
@@ -980,6 +981,8 @@ impl WalletServer {
                         let approval_nonce = entry.approval_nonce.clone();
                         Some(json!({
                             "approval_nonce": approval_nonce,
+                            "profile": &profile_name,
+                            "chain_id": self.profile.chain_id.caip2_str(),
                             "expires_at_unix_ms": approval_expires,
                             "reason": entry.reason,
                             "summary": {
@@ -1804,12 +1807,11 @@ impl WalletServer {
     /// `Allow`, this wrapper FORCES the `RequireApproval` path by:
     ///
     /// 1. Running `decode_authoritative_args` on `args.envelope_xdr`.
-    /// 2. If `args.approval_nonce` and `args.approval_attestation` are absent
-    ///    (i.e., policy returned `Allow` and no approval was queued) → synthesise
-    ///    a `PaymentSimulated` `PendingApproval` queue entry and return
-    ///    `policy.approval_required` so the operator approves via
-    ///    `stellar-agent approve --id <nonce>`.  The approval_nonce is surfaced
-    ///    in the error payload.
+    /// 2. If `args.approval_nonce` and `args.approval_attestation` are absent,
+    ///    synthesise a `PaymentSimulated` `PendingApproval` queue entry and
+    ///    return `policy.approval_required`. The operator approves via
+    ///    `stellar-agent approve --id <nonce> --profile <profile>`.
+    ///    The error payload carries the approval nonce.
     /// 3. If approval fields ARE present → delegate to the normal `stellar_pay_commit`
     ///    handler which will verify the attestation.
     ///
@@ -1836,7 +1838,7 @@ impl WalletServer {
         //
         // If they ARE present, delegate to the normal stellar_pay_commit flow
         // which will verify the attestation (the approval was cleared by
-        // `stellar-agent approve --id <nonce>`).
+        // `stellar-agent approve --id <nonce> --profile <profile>`).
         // approval_nonce + approval_attestation are expected to come from a
         // previously-queued and operator-approved PaymentSimulated pending
         // approval (synthesised by the `!has_approval` branch below on the prior
@@ -1955,7 +1957,9 @@ impl WalletServer {
 
             // Return indistinguishable approval_required (the nonce is in the
             // tracing log for operator forensics; not in the wire error).
-            return Ok(approval_required_indistinguishable());
+            return Ok(approval_required_indistinguishable(
+                &self.profile_name_for_approval(),
+            ));
         }
 
         // The forced gate carries the persisted request. Before submission the
@@ -1964,20 +1968,30 @@ impl WalletServer {
         // the rule's ttl.
         let approvals_dir = match self.resolve_approval_dir() {
             Ok(dir) => dir,
-            Err(_) => return Ok(approval_required_indistinguishable()),
+            Err(_) => {
+                return Ok(approval_required_indistinguishable(
+                    &self.profile_name_for_approval(),
+                ));
+            }
         };
         let store_path = approvals_dir.join(format!("{}.toml", self.profile_name_for_approval()));
         let store =
             match open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF) {
                 Ok(store) => store,
-                Err(_) => return Ok(approval_required_indistinguishable()),
+                Err(_) => {
+                    return Ok(approval_required_indistinguishable(
+                        &self.profile_name_for_approval(),
+                    ));
+                }
             };
         let Some(pending) = args
             .approval_nonce
             .as_deref()
             .and_then(|nonce| store.get(nonce))
         else {
-            return Ok(approval_required_indistinguishable());
+            return Ok(approval_required_indistinguishable(
+                &self.profile_name_for_approval(),
+            ));
         };
         let forced_outcome = DispatchOutcome::RequireApproval(pending.approval_request().into());
         drop(store);

@@ -42,16 +42,16 @@ const BOUND: &str = "127.0.0.1:8080";
 const HOST: &str = "127.0.0.1:8080";
 const ORIGIN: &str = "http://127.0.0.1:8080";
 
-struct Harness {
+pub(crate) struct Harness {
     _dir: TempDir,
     state: ServeState,
-    store_path: std::path::PathBuf,
+    pub(crate) store_path: std::path::PathBuf,
     bootstrap_hex: String,
     raw_key: [u8; 32],
 }
 
 impl Harness {
-    fn new(tag: &str) -> Self {
+    pub(crate) fn new(tag: &str) -> Self {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
         let store_path = dir.path().join("default.toml");
@@ -68,7 +68,13 @@ impl Harness {
             AuditWriter::open(audit_path, None).expect("audit writer"),
         ));
         let ctx = DecisionContext::new(
-            "ui-router-test".to_owned(),
+            stellar_agent_core::approval::ApprovalContext::from_profile(
+                "ui-router-test",
+                &stellar_agent_core::profile::schema::Profile::builder_testnet(
+                    "svc", "default", "nonce", "default",
+                )
+                .build(),
+            ),
             store_path.clone(),
             KeyringEntryRef::new(svc, "default"),
             audit_writer,
@@ -90,12 +96,12 @@ impl Harness {
         }
     }
 
-    fn router(&self) -> Router {
+    pub(crate) fn router(&self) -> Router {
         let bound: SocketAddr = BOUND.parse().unwrap();
         build_router(self.state.clone(), bound)
     }
 
-    fn insert(&self, entry: PendingApproval) -> String {
+    pub(crate) fn insert(&self, entry: PendingApproval) -> String {
         let nonce = entry.approval_nonce.clone();
         let mut store = PendingApprovalStore::open(self.store_path.clone()).unwrap();
         store
@@ -105,7 +111,7 @@ impl Harness {
     }
 
     /// Perform the bootstrap exchange and return the session cookie header value.
-    async fn bootstrap(&self) -> String {
+    pub(crate) async fn bootstrap(&self) -> String {
         let req = Request::builder()
             .uri(format!("/bootstrap/{}", self.bootstrap_hex))
             .header(header::HOST, HOST)
@@ -124,7 +130,7 @@ impl Harness {
     }
 
     /// The session CSRF value for `nonce` under the live session key.
-    fn csrf_for(&self, nonce: &str) -> String {
+    pub(crate) fn csrf_for(&self, nonce: &str) -> String {
         let guard = self.state.auth.lock().unwrap();
         let session = guard.session.as_ref().expect("session established");
         compute_csrf(&session.csrf_key, nonce)
@@ -312,7 +318,13 @@ async fn approve_payment_mints_verifiable_attestation() {
     let blob_b64 = json["attestation"].as_str().unwrap();
 
     let sha = decode_sha256_hex(&envelope_sha256_hex).unwrap();
-    let expected = compute_attestation(&h.raw_key, &nonce, &sha, &process_uid);
+    let expected = compute_attestation(
+        &h.raw_key,
+        &h.state.ctx.context.binding(),
+        &nonce,
+        &sha,
+        &process_uid,
+    );
     let blob: [u8; 32] = URL_SAFE_NO_PAD
         .decode(blob_b64)
         .unwrap()
@@ -321,6 +333,7 @@ async fn approve_payment_mints_verifiable_attestation() {
     assert_eq!(blob, expected);
     assert!(verify_attestation(
         &h.raw_key,
+        &h.state.ctx.context.binding(),
         &nonce,
         &sha,
         &process_uid,
@@ -582,7 +595,13 @@ fn config_for(
 ) -> ServeConfig {
     let audit_writer = Arc::new(StdMutex::new(AuditWriter::open(audit, None).unwrap()));
     let ctx = DecisionContext::new(
-        "ui-bind-test".to_owned(),
+        stellar_agent_core::approval::ApprovalContext::from_profile(
+            "ui-bind-test",
+            &stellar_agent_core::profile::schema::Profile::builder_testnet(
+                "svc", "default", "nonce", "default",
+            )
+            .build(),
+        ),
         store_path,
         KeyringEntryRef::new("stellar-agent-attestation-ui-bind", "default"),
         audit_writer,
@@ -1110,7 +1129,13 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
     ));
     // Deliberately never seed a password for this keyring entry.
     let ctx = DecisionContext::new(
-        "ui-router-unseeded".to_owned(),
+        stellar_agent_core::approval::ApprovalContext::from_profile(
+            "ui-router-unseeded",
+            &stellar_agent_core::profile::schema::Profile::builder_testnet(
+                "svc", "default", "nonce", "default",
+            )
+            .build(),
+        ),
         store_path.clone(),
         KeyringEntryRef::new("stellar-agent-attestation-ui-router-unseeded", "default"),
         audit_writer,
@@ -1269,4 +1294,48 @@ async fn get_endpoints_report_unavailable_on_corrupt_store_file() {
     let detail_resp = h.router().oneshot(detail_req).await.unwrap();
     assert_eq!(detail_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body_json(detail_resp).await["error"], "store_unavailable");
+}
+
+#[tokio::test]
+#[serial]
+async fn authenticated_detail_renders_selected_context_and_envelope_source() {
+    let mut h = Harness::new("context-source");
+    let context = &mut Arc::get_mut(&mut h.state.ctx).unwrap().context;
+    context.profile_name = "treasury-route".to_owned();
+    context.chain_id = "stellar:mainnet".to_owned();
+    context.endpoint_host = "https://route-rpc.example".to_owned();
+    context.signer_account = Some("GENROLLED".to_owned());
+    let mut entry = payment_entry(DEFAULT_TTL_MS);
+    if let stellar_agent_core::approval::ApprovalKind::PaymentSimulated {
+        envelope_xdr_b64, ..
+    } = &mut entry.kind
+    {
+        *envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=".to_owned();
+    }
+    let nonce = h.insert(entry);
+    let cookie = h.bootstrap().await;
+    let response = h
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/approval/{nonce}"))
+                .header(header::HOST, HOST)
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+    let html = std::str::from_utf8(&bytes).unwrap();
+    for value in [
+        "treasury-route",
+        "stellar:mainnet",
+        "https://route-rpc.example",
+        "GENROLLED",
+        "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA",
+    ] {
+        assert!(html.contains(value), "missing {value}: {html}");
+    }
 }

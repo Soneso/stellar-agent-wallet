@@ -283,7 +283,7 @@ async fn gated_toolset_first_invoke_and_forced_per_action_testnet() {
         .expect("approval_nonce must be present in first-invoke gate error payload");
 
     // ── Simulate approve: build grant, persist to grant store ─────────────
-    // (mirrors the operator running `stellar-agent approve --id <nonce>`.)
+    // (mirrors the operator running `stellar-agent approve --id <nonce> --profile <name>`.)
     let process_uid = process_uid_for_attestation().expect("process uid");
     let now_ms = now_unix_ms().expect("now_unix_ms");
     let grant = build_attested_grant(
@@ -297,6 +297,7 @@ async fn gated_toolset_first_invoke_and_forced_per_action_testnet() {
         now_ms,
         TOOLSET_GRANT_DEFAULT_TTL_MS,
         &attestation_key,
+        &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
     )
     .expect("build_attested_grant");
 

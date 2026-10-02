@@ -420,6 +420,10 @@ async fn commit_cli(
         state,
         approvals.as_ref(),
         approval_key.as_deref(),
+        &stellar_agent_core::approval::AttestationBinding::new(
+            profile_name,
+            profile.chain_id.caip2_str(),
+        ),
         record.authorization_id(),
         now_unix,
     ) {
@@ -446,6 +450,10 @@ async fn commit_cli(
         state,
         approvals.as_ref(),
         approval_key.as_deref(),
+        &stellar_agent_core::approval::AttestationBinding::new(
+            profile_name,
+            profile.chain_id.caip2_str(),
+        ),
         record.authorization_id(),
         now_unix,
         &profile.network_passphrase,

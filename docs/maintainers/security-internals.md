@@ -10,17 +10,24 @@ When the operator runs `approve`, the wallet records an HMAC-SHA256 attestation 
 
 ### Canonical input
 
-`compute_attestation(key, approval_nonce, envelope_sha256, process_uid)` feeds the HMAC in this order:
+`compute_attestation(key, binding, approval_nonce, envelope_sha256, process_uid)` feeds the HMAC in this order:
 
 ```text
-mac.update(u32_be(len(approval_nonce)))   // 4-byte length prefix
-mac.update(approval_nonce)                // variable-length UTF-8
-mac.update(envelope_sha256)               // 32 bytes, fixed-length, no prefix
-mac.update(u32_be(len(process_uid)))      // 4-byte length prefix
-mac.update(process_uid)                   // variable-length UTF-8
+mac.update(b"stellar-agent-approval-attestation:v2")
+mac.update(u32_be(len(profile_name)))   mac.update(profile_name)
+mac.update(u32_be(len(chain_id)))       mac.update(chain_id)
+mac.update(u32_be(len(approval_nonce))) mac.update(approval_nonce)
+mac.update(envelope_sha256)
+mac.update(u32_be(len(process_uid)))    mac.update(process_uid)
 ```
 
-The two variable-length fields carry a big-endian `u32` length prefix; the 32-byte envelope digest is fixed-width and needs none. The prefixes prevent boundary-collision attacks: without them two different `(nonce, uid)` pairs whose bytes concatenate identically would produce the same tag. A known-answer test pins the exact layout so an accidental change to the preimage is caught.
+Lengths count UTF-8 bytes, encoded as big-endian `u32` with saturation at `u32::MAX`.
+The 37-byte tag has no length prefix or NUL terminator; the digest is 32 bytes with no prefix.
+The tag separates this HMAC from every other use of the key.
+The profile name and CAIP-2 chain id make a blob unverifiable under another profile or chain.
+A layout change bumps the tag; blobs under the previous tag do not verify.
+
+All four variable-length fields carry a big-endian `u32` length prefix. The prefixes encode every field boundary, so inputs that split into different fields hash differently. A known-answer test pins the exact layout so an accidental change to the preimage is caught.
 
 ### Key custody
 
@@ -40,10 +47,13 @@ The attestation tag is keyed by the live `attestation_key_id` entry. Rotating th
 
 ### Kind-specific digests
 
-Two approval kinds bind extra fields by hashing them into the 32-byte slot that `compute_attestation` treats as `envelope_sha256`. Each uses a versioned domain-separation tag so a layout change forces old blobs to fail closed rather than cross-validate:
+Four approval kinds bind extra fields by hashing them into the 32-byte slot that `compute_attestation` treats as `envelope_sha256`. Each uses a versioned domain-separation tag. A layout change bumps the tag, and digests under the previous tag do not verify.
 
 - `ToolsetFirstInvokeGate`: `compute_toolset_gate_digest` hashes `TOOLSET_GATE_DOMAIN_TAG` (`stellar-agent-toolset-grant:v1`) followed by length-prefixed `toolset_name`, `capability`, `destination` (G-strkey), `asset`, then the fixed-width `amount_min_stroops` and `amount_max_stroops` as big-endian `i64`. `verify_toolset_gate_attestation` recomputes this digest and feeds it through `verify_attestation`.
 - `TrustlineClawbackOptIn`: `compute_trustline_clawback_opt_in_digest` hashes `TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG` (`stellar-agent-trustline-clawback-opt-in:v1`) followed by length-prefixed `network`, `code`, `issuer`.
+
+- `RuleProposalSimulated`: the shared HMAC binds the versioned proposal digest over the resolved rule installation arguments.
+- `MppChargeSimulated`: the shared HMAC binds the prepared artifact hash. The store verifier also compares the stored profile and chain with the binding.
 
 The first-invoke gate is a re-prompt suppressor only. The per-action `PaymentSimulated` approval still fires unconditionally on every toolset-routed payment and binds the actual executed envelope through `envelope_sha256`. So a forged or tampered grant can suppress at most the re-prompt. It cannot bypass the per-action approval, whose tag the keyring-only HMAC key protects.
 

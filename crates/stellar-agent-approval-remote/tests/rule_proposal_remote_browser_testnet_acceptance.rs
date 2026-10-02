@@ -493,7 +493,7 @@ async fn start_remote_serve_for_profile(
         AuditWriter::open(audit_path, None).expect("audit writer open"),
     ));
     let ctx = DecisionContext::new(
-        profile_name,
+        stellar_agent_core::approval::ApprovalContext::from_profile(&profile_name, profile),
         store_path,
         profile.attestation_key_id.clone(),
         audit_writer,
@@ -1430,10 +1430,9 @@ async fn toolset_gated_first_invoke_entry_is_consumed() {
     )
     .await;
 
-    // Record a ToolsetFirstInvokeGate pending entry (as `stellar_rule_create`'s
-    // toolset-gated resolver would when a toolset first attempts
-    // sign-rule-create for this smart account), then attest and record the
-    // grant via the SAME core path the CLI `approve --id` uses.
+    // The first sign-rule-create invocation queues a ToolsetFirstInvokeGate entry.
+    // Attest and record its grant through the core path used by
+    // `approve --id <nonce> --profile <name>`.
     let profile_name = server.profile_name_for_approval();
     let store_path = approval_dir.path().join(format!("{profile_name}.toml"));
     let mut store = PendingApprovalStore::open(store_path.clone()).expect("store re-open");
@@ -1464,6 +1463,10 @@ async fn toolset_gated_first_invoke_entry_is_consumed() {
         &mut store,
         &entry,
         &attestation_key,
+        &stellar_agent_core::approval::AttestationBinding::new(
+            &server.profile_name_for_approval(),
+            "stellar:testnet",
+        ),
         stellar_agent_core::approval::Surface::Cli,
         None,
         None,
@@ -1479,6 +1482,7 @@ async fn toolset_gated_first_invoke_entry_is_consumed() {
                 req.process_uid,
                 req.now_unix_ms,
                 key,
+                req.binding,
                 None,
             )
             .map(|_grant| ())

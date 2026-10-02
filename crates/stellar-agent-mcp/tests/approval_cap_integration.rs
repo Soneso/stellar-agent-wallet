@@ -295,6 +295,10 @@ decision = "{decision}"
     fn attest_nonce(&self, nonce: &str, envelope: &str) -> (String, String) {
         let blob = compute_attestation(
             &ATTESTATION_KEY,
+            &stellar_agent_core::approval::AttestationBinding::new(
+                &self.name,
+                self.profile.chain_id.caip2_str(),
+            ),
             nonce,
             &envelope_sha256(envelope.as_bytes()),
             &process_uid_for_attestation().unwrap(),
@@ -654,6 +658,7 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
         now,
         TOOLSET_GRANT_DEFAULT_TTL_MS,
         &ATTESTATION_KEY,
+        &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
     )
     .unwrap();
     ToolsetGrantStore::open(grant_path.clone(), now)
@@ -890,6 +895,8 @@ async fn rule_approval_shape_reaches_pending_and_response() {
             assert_eq!(approval["expires_at_unix_ms"], pending.expires_at_unix_ms);
             assert_eq!(pending.reason.as_deref(), Some("Treasury review"));
             assert_eq!(approval["reason"], "Treasury review");
+            assert_eq!(approval["profile"], h.name);
+            assert_eq!(approval["chain_id"], h.profile.chain_id.caip2_str());
             let request = pending.approval_request();
             assert_eq!(request.nonce, nonce);
             assert_eq!(u64::from(request.ttl_seconds) * 1_000, ttl);
@@ -958,6 +965,7 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
         now,
         TOOLSET_GRANT_DEFAULT_TTL_MS,
         &ATTESTATION_KEY,
+        &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
     )
     .unwrap();
     ToolsetGrantStore::open(grant_path.clone(), now)

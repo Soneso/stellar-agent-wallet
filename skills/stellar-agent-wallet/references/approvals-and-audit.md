@@ -11,9 +11,9 @@ Every tool/command invocation is evaluated by the active policy engine before
 any RPC call or signature. The engine returns Allow, Deny, or RequireApproval.
 A RequireApproval action does not execute on the agent's say-so: it is held in a
 per-profile pending-approval store and returns an `approval_nonce`. The wallet
-owner runs `stellar-agent approve --id <nonce>` out-of-band in a trusted
+owner runs `stellar-agent approve --id <nonce> --profile <name>` out-of-band in a trusted
 context, reads a wallet-controlled summary, and consents. The command records an
-HMAC attestation bound to the exact transaction envelope, the nonce, and the
+HMAC attestation bound to the profile name, CAIP-2 chain id, exact envelope, nonce, and
 local user, and returns `approval_attestation`. The agent presents that blob to
 the matching `*_commit` tool, which constant-time-verifies it before executing.
 Every invocation and lifecycle event is appended to a hash-chained audit log
@@ -104,7 +104,7 @@ tools, with the operator's `approve` step in between:
 ```
 1. agent  -> *_build / *_simulate tool
               returns { ..., approval_nonce } and records a pending entry
-2. operator: stellar-agent approve --id <approval_nonce>
+2. operator: stellar-agent approve --id <approval_nonce> --profile <name>
               reads wallet-controlled summary, consents,
               returns { ..., approval_attestation }
    (operator relays approval_attestation to the agent over a trusted channel)
@@ -117,7 +117,7 @@ blob as the `approval_attestation` argument of the matching `*_commit` tool.
 The attestation binds the specific envelope, so it authorises exactly one
 transaction.
 
-### What `approve --id <nonce>` returns
+### What `approve --id <nonce> --profile <name>` returns
 
 For a payment-style approval the response includes `approval_attestation`, the
 HMAC blob (URL-safe base64, no padding) the agent must present to `*_commit`.
@@ -150,13 +150,12 @@ of pending entries:
 
 Entry kinds: `PaymentSimulated`, `ClaimSimulated`, `SignWithPasskey`,
 `RegisterPasskey`, `ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`,
-`RuleProposalSimulated`. An eighth kind, `Rejected`, is not a fresh entry an
-agent's build/simulate step creates. It is the short-TTL tombstone the
-store writes in place of an entry after the operator rejects it.
+`RuleProposalSimulated` and `MppChargeSimulated`.
+`Rejected` and `Consumed` record resolved requests and cannot be approved.
 
 ### What `approve` does
 
-`stellar-agent approve --id <nonce>` loads the store and renders a
+`stellar-agent approve --id <nonce> --profile <name>` loads the store and renders a
 wallet-controlled summary of the pending action. The summary is produced by the
 command from the stored, validated entry fields, never from anything the agent
 supplied, so the agent cannot influence what the operator sees (it cannot inject
@@ -175,6 +174,14 @@ Per kind:
 | `TrustlineClawbackOptIn` | Computes a domain-separated HMAC over `(network, code, issuer)` and stores it; the trustline gate recomputes and verifies it. No `approval_attestation` returned. |
 | `ToolsetFirstInvokeGate` | Builds and persists a time-boxed toolset grant, then consumes (removes) the pending entry. Does not set an attestation blob on the entry. No `approval_attestation` returned. |
 | `RuleProposalSimulated` | Computes the HMAC attestation over `proposal_sha256` (the domain-separated digest of the FULL resolved rule definition), not an envelope hash; persists it and returns `approval_attestation`. A DEDICATED gate verifies it at commit. The shared `PaymentSimulated`/`ClaimSimulated` gate rejects this kind outright. |
+| `MppChargeSimulated` | Attests the prepared artifact hash under the profile and chain binding; returns `approval_attestation`. |
+| `Consumed` | Already resolved; cannot be attested again. |
+
+The CLI summary and both inbox detail pages show the profile name, CAIP-2 chain id, endpoint authority, and enrolled signer.
+An enrollment placeholder appears as `(not enrolled)`.
+Payment and claim rows show the envelope's effective source; an operation source overrides the transaction source.
+An undecodable envelope appears as `(undecodable envelope)`.
+A claim whose stored summary source differs also shows `Source (stored summary)`.
 
 ### The attestation
 
@@ -183,11 +190,19 @@ The attestation is an HMAC-SHA256 tag, keyed by the profile's attestation key
 input:
 
 ```text
-HMAC-SHA256(attestation_key,
-    len(approval_nonce) || approval_nonce
-    || envelope_sha256            (32 bytes)
-    || len(process_uid) || process_uid)
+mac.update(b"stellar-agent-approval-attestation:v2")
+mac.update(u32_be(len(profile_name)))   mac.update(profile_name)
+mac.update(u32_be(len(chain_id)))       mac.update(chain_id)
+mac.update(u32_be(len(approval_nonce))) mac.update(approval_nonce)
+mac.update(envelope_sha256)
+mac.update(u32_be(len(process_uid)))    mac.update(process_uid)
 ```
+
+Lengths count UTF-8 bytes, encoded as big-endian `u32` with saturation at `u32::MAX`.
+The 37-byte tag has no length prefix or NUL terminator; the digest is 32 bytes with no prefix.
+The tag separates this HMAC from every other use of the key.
+The profile name and CAIP-2 chain id make a blob unverifiable under another profile or chain.
+A layout change bumps the tag; blobs under the previous tag do not verify.
 
 The length prefixes prevent boundary-collision attacks. The `envelope_sha256`
 slot binds the tag to the exact transaction envelope that will be signed. The
@@ -209,7 +224,7 @@ pending approvals.
 
 ### `approve` command reference
 
-`stellar-agent approve --id <NONCE>`: state-changing (records an attestation or
+`stellar-agent approve --id <NONCE> --profile <name>`: state-changing (records an attestation or
 a grant in the on-disk store).
 
 | Flag | Required | Default / resolution | Meaning |
@@ -225,7 +240,7 @@ attested, created by a different local user, denied at the prompt, or on I/O
 error.
 
 ```bash
-stellar-agent approve --id ABCxyzNonce
+stellar-agent approve --id ABCxyzNonce --profile <name>
 stellar-agent approve --id ABCxyzNonce --profile myprofile --yes
 ```
 
@@ -251,12 +266,12 @@ the `approval_nonce` from the simulate/build response, wait for the operator
 to produce an `approval_attestation`, then call the matching `*_commit` tool
 with it. Three surfaces exist for the operator side of that handshake:
 
-- **CLI, one at a time**: `stellar-agent approve --id <NONCE>` (above), or
+- **CLI, one at a time**: `stellar-agent approve --id <NONCE> --profile <name>` (see the command reference), or
   `stellar-agent approve list` to enumerate every pending entry first
   (read-only; `--include-expired` also shows expired ones).
 - **Loopback web inbox**: `stellar-agent approve serve` binds a local HTTP
   server and opens a browser to the pending-approval queue, so the operator
-  clicks Approve/Reject per entry instead of running `approve --id` per nonce.
+  clicks Approve/Reject per entry without running `approve --id <nonce> --profile <name>` per nonce.
 - **Remote approval**: `stellar-agent approve serve --remote
   --confirm-remote-exposure` binds a TLS-protected listener reachable from a
   device other than the wallet host, authenticated by a registered WebAuthn passkey. Use it when the agent runs on a headless machine. Every approve or
@@ -483,10 +498,10 @@ running MCP server must be stopped first; with one running it refuses
 1. The agent surface evaluates an action against the policy engine. An action
    needing operator consent records a pending approval and returns its nonce
    instead of executing.
-2. The wallet owner runs `approve --id <nonce>` in a trusted context, reads the
+2. The wallet owner runs `approve --id <nonce> --profile <name>` in a trusted context, reads the
    wallet-controlled summary, and consents. The command writes an HMAC
-   attestation (or a toolset grant) bound to the nonce, the executed envelope's
-   hash, and the local user.
+   attestation (or a toolset grant) bound to the profile name, chain id, nonce,
+   envelope digest, and local user.
 3. The agent surface verifies the attestation and executes. Every invocation and
    lifecycle event is appended to the hash-chained audit log.
 4. The operator periodically runs `audit verify` with `--profile` to confirm the

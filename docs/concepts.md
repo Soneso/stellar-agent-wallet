@@ -100,7 +100,7 @@ The tool registry is also fail-closed at startup: a duplicate tool registration,
 
 ## The approval spine
 
-When the policy engine returns RequireApproval, the action does not proceed on the agent's say-so. It is held in the approval spine until the operator approves it out-of-band — interactively with `approve --id`, or through the loopback approval inbox started by `approve serve`, which lists pending entries (`approve list` does the same in the terminal), notifies the operator, and drives the identical attestation path. The spine is a per-profile pending-approval store plus a cryptographic attestation minted at approve time. Both approval surfaces record an audit event; an inbox rejection replaces the entry with a short-lived rejection marker so the agent's commit is refused with `policy.approval_rejected` rather than the generic pending code.
+When the policy engine returns RequireApproval, the approval spine holds the action until the operator consents. The operator can run `approve --id <nonce> --profile <name>` or use the loopback inbox started by `approve serve`. The inbox lists pending entries, notifies the operator, and drives the same attestation path. `approve list` shows pending entries in the terminal. The spine consists of a pending-approval store for each profile and a cryptographic attestation minted at approve time. Both approval surfaces record an audit event. An inbox rejection replaces the entry with a short-lived rejection marker, and the agent's commit returns `policy.approval_rejected`.
 
 ### The pending-approval store
 
@@ -114,18 +114,26 @@ Entries are kinded. The kinds are `PaymentSimulated`, `ClaimSimulated`, `SignWit
 
 ### What `approve` does
 
-`stellar-agent approve --id <nonce>` loads the store and renders a wallet-controlled summary of the pending action. The destination G-strkey and asset are validated when the entry is deserialized, so a hostile entry cannot inject terminal-rendering content into that summary. The operator confirms at the terminal, and the command then computes and records the attestation. Recording is one-shot: a nonce that is expired, of the wrong kind, or already attested is rejected.
+`stellar-agent approve --id <nonce> --profile <name>` loads the store and renders a wallet-controlled summary of the pending action. The destination G-strkey and asset are validated when the entry is deserialized, so a hostile entry cannot inject terminal-rendering content into that summary. The operator confirms at the terminal, and the command then computes and records the attestation. Recording is one-shot: a nonce that is expired, of the wrong kind, or already attested is rejected.
 
 ### The attestation
 
-The attestation is an HMAC-SHA256 tag, keyed by the profile's attestation key (which lives only in the keyring), over a length-prefixed canonical input. The input binds three things:
+The attestation is an HMAC-SHA256 tag, keyed by the profile's attestation key (which lives only in the keyring), over a length-prefixed canonical input. The input binds the selected profile and chain along with the request:
 
 ```text
-HMAC-SHA256(attestation_key,
-    len(approval_nonce) || approval_nonce
-    || envelope_sha256            (32 bytes)
-    || len(process_uid) || process_uid)
+mac.update(b"stellar-agent-approval-attestation:v2")
+mac.update(u32_be(len(profile_name)))   mac.update(profile_name)
+mac.update(u32_be(len(chain_id)))       mac.update(chain_id)
+mac.update(u32_be(len(approval_nonce))) mac.update(approval_nonce)
+mac.update(envelope_sha256)
+mac.update(u32_be(len(process_uid)))    mac.update(process_uid)
 ```
+
+Lengths count UTF-8 bytes, encoded as big-endian `u32` with saturation at `u32::MAX`.
+The 37-byte tag has no length prefix or NUL terminator; the digest is 32 bytes with no prefix.
+The tag separates this HMAC from every other use of the key.
+The profile name and CAIP-2 chain id make a blob unverifiable under another profile or chain.
+A layout change bumps the tag; blobs under the previous tag do not verify.
 
 The length prefixes on the variable fields prevent boundary-collision attacks (two different nonce/uid pairs cannot collide into the same input). The `envelope_sha256` slot binds the attestation to the exact transaction envelope that will be signed. The `process_uid` (numeric OS uid on Unix) gives cross-account-on-host non-replay: a tag minted by one local user cannot be replayed by another.
 
@@ -137,7 +145,12 @@ What an attacker who can write to the store file can and cannot do: deleting a p
 
 ### Agent-proposed context rules
 
-`RuleProposalSimulated` (Package D, GH issue #8) is the one entry kind that does NOT use the shared attestation described above. `stellar_rule_create` resolves and parks the FULL rule definition — every signer as resolved bytes, every policy typed, context, expiry, and `auth_rule_ids` — and mints a domain-separated `proposal_sha256` digest over it, computed the same way regardless of policy outcome. `stellar_rule_create_commit` verifies the operator's attestation through a DEDICATED gate (`PendingApprovalStore::verify_rule_proposal_gate`) that binds `proposal_sha256` in place of `envelope_sha256`, then UNCONDITIONALLY recomputes the digest from the stored snapshot and refuses with `simulation.divergence` on any mismatch — a store-self-consistency check independent of whether the policy required approval at all. Every approval surface (CLI `approve`, the loopback inbox, the remote inbox) renders the entire resolved definition — including a prominent callout when the context is `Default` (account-wide authority) and a warning line for either override flag — so operator consent binds to exactly what will be installed.
+`RuleProposalSimulated` uses the shared attestation with `proposal_sha256` in the digest slot.
+`stellar_rule_create` resolves and stores every signer, policy, context, expiry and `auth_rule_ids` in the pending proposal.
+The commit gate verifies the operator's attestation and compares the stored chain with the binding.
+The commit also compares that chain with the presented `args.chain_id`.
+It recomputes the proposal digest from the stored definition and refuses `simulation.divergence` on a mismatch.
+The CLI and both inboxes render the resolved definition, including account-wide authority and override warnings.
 
 ## First-invoke gate vs. per-action payment approval
 
@@ -203,7 +216,7 @@ states. See [Agent payments with MPP](agent-payments.md).
 | Policy engine | Evaluates each tool/command to Allow, Deny, or RequireApproval. Noop and V1 are the two engines. |
 | Criterion | One typed check inside a V1 policy rule (per-tx cap, per-period cap, rate limit, counterparty allowlist, minimum-reserve, session-active, and others). |
 | Approval spine | The storage and cryptographic substrate recording out-of-band operator approvals: a per-profile pending-approval store plus an HMAC attestation minted at approve time. |
-| Attestation | An HMAC-SHA256 tag, keyed by the profile attestation key, over a length-prefixed input binding the approval nonce, the envelope SHA-256, and the process uid; proves the keyring holder ran `approve`. Constant-time verified. |
+| Attestation | An HMAC-SHA256 tag, keyed by the profile attestation key, over a length-prefixed input binding the profile name, chain id, approval nonce, envelope SHA-256, and process uid. Proves the keyring holder ran `approve`. Constant-time verified. |
 | Audit log | A per-profile append-only hash-chained JSONL record of every tool invocation and lifecycle event; argument values are never logged. Verified with `audit verify`. |
 | Context rule | An on-chain OpenZeppelin smart-account authorization rule, identified by a `u32` rule id; governs which signers may authorize which actions. |
 | Auth digest | `sha256(signature_payload || context_rule_ids_xdr)`; the value a smart-account signer signs, binding the rule ids to close a downgrade attack. |

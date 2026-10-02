@@ -47,6 +47,28 @@
 
 use crate::profile::schema::Profile;
 
+/// Derives the approval store name from the owner key, falling back to default.
+#[must_use]
+pub fn profile_name_for_approval(profile: &Profile) -> String {
+    derive_profile_name_from_owner_key(profile)
+        .unwrap_or("default")
+        .to_owned()
+}
+
+/// Quotes one argument for a POSIX shell.
+#[must_use]
+pub fn shell_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_./:@-".contains(&b))
+    {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
 /// Where a resolved profile name came from.
 ///
 /// Returned as part of [`ResolvedProfileName`]. `Flag` and `Env` both mean the
@@ -1149,5 +1171,20 @@ mod tests {
         let mut profile = named_profile("acme");
         profile.policy_owner_key_id = coord;
         assert_eq!(derive_profile_name_from_owner_key(&profile), Some("acme"));
+    }
+
+    #[test]
+    fn shell_word_quotes_one_argument() {
+        for (input, expected) in [
+            ("alpha_1./:@-", "alpha_1./:@-"),
+            ("", "''"),
+            ("two words", "'two words'"),
+            ("owner's", r"'owner'\''s'"),
+            ("a;b", "'a;b'"),
+            ("$name", "'$name'"),
+            ("`id`", "'`id`'"),
+        ] {
+            assert_eq!(shell_word(input), expected);
+        }
     }
 }

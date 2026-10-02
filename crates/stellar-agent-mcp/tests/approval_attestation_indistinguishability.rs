@@ -96,7 +96,7 @@ const POLICY_APPROVAL_REQUIRED_CODE: &str = "policy.approval_required";
 /// Using `assert_eq!` against this constant (rather than `assert!(contains(...))`)
 /// pins the exact wire body and catches any drift in the message text.
 const POLICY_APPROVAL_REQUIRED_MSG: &str = "approval attestation absent, invalid, or expired; \
-     run `stellar-agent approve --id <nonce>` then re-submit with attestation";
+     run `stellar-agent approve --id <nonce> --profile acct` then re-submit with attestation";
 
 fn capture_subscriber(writer: CaptureWriter) -> impl tracing::Subscriber + Send + Sync {
     tracing_subscriber::fmt()
@@ -731,8 +731,8 @@ async fn property4c_expired_approval_entry_returns_approval_required() {
 // Accept branch — a valid attestation passes the gate
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A valid attestation — exactly what `stellar-agent approve --id` surfaces as
-/// `approval_attestation` — passes the attestation gate.
+/// A valid attestation from `stellar-agent approve --id <nonce> --profile <name>`
+/// passes the gate when presented as `approval_attestation`.
 ///
 /// The three failure-mode tests above pin the rejection envelope; none exercises
 /// the gate's accept path. This seeds the attestation key, inserts a live
@@ -814,6 +814,7 @@ async fn valid_attestation_passes_gate() {
     let sha = stellar_agent_core::approval::envelope_sha256(envelope_xdr.as_bytes());
     let blob = stellar_agent_core::approval::compute_attestation(
         &attestation_key,
+        &stellar_agent_core::approval::AttestationBinding::new("acct", "stellar:testnet"),
         &approval_nonce_id,
         &sha,
         &uid,

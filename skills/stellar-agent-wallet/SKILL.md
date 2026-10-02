@@ -171,12 +171,12 @@ On success `data` carries `tx_hash` and `ledger`.
 
 If the policy engine returns `RequireApproval` (a V1 policy rule, the high-value
 cross-check, or any toolset-routed payment), the build call returns an `approval`
-block with an `approval_nonce` and the commit is held. The handshake:
+block with `approval_nonce`, `profile`, and `chain_id`; the commit is held. The handshake:
 
-1. The operator consents out-of-band — `stellar-agent approve --id
-   <approval_nonce>` at a terminal, `approve list` / `approve serve` (a local
+1. The operator consents out-of-band with `stellar-agent approve --id
+   <approval_nonce> --profile <name>` at a terminal, `approve list` / `approve serve` (a local
    web inbox), or `approve serve --remote` (a TLS-protected, passkey-authenticated
-   inbox for a device other than the wallet host) — and reviews the
+   inbox for a device other than the wallet host). The operator reviews the
    wallet-rendered summary before consenting. See
    `references/approvals-and-audit.md` for all three surfaces.
 2. That step returns an `approval_attestation` — an HMAC blob bound to that

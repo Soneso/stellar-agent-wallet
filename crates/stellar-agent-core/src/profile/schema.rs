@@ -105,7 +105,16 @@ pub struct KeyringEntryRef {
     pub account: String,
 }
 
+/// Account value used before signer enrollment.
+pub const SIGNER_PLACEHOLDER_ACCOUNT: &str = "default";
+
 impl KeyringEntryRef {
+    /// Returns whether this reference still names the enrollment placeholder.
+    #[must_use]
+    pub fn is_signer_placeholder(&self) -> bool {
+        self.account == SIGNER_PLACEHOLDER_ACCOUNT
+    }
+
     /// Constructs a new keyring entry reference.
     ///
     /// # Examples
@@ -144,7 +153,10 @@ impl KeyringEntryRef {
     /// ```
     #[must_use]
     pub fn default_signer(profile_name: &str) -> Self {
-        Self::new(format!("stellar-agent-signer-{profile_name}"), "default")
+        Self::new(
+            format!("stellar-agent-signer-{profile_name}"),
+            SIGNER_PLACEHOLDER_ACCOUNT,
+        )
     }
 
     /// Constructs the default HMAC nonce-key keyring entry reference for a
@@ -688,10 +700,10 @@ pub struct Profile {
 
     /// Keyring entry for the wallet-owned approval spine attestation key.
     ///
-    /// A per-profile 32-byte HMAC key used to sign
-    /// `HMAC-SHA256(key, approval_nonce || envelope_hash || process_uid)`
-    /// at `stellar-agent approve` time.  Pending approvals are invalidated
-    /// when the key is rotated.
+    /// A per-profile 32-byte key for the versioned approval HMAC.
+    /// The input binds the profile name, CAIP-2 chain id, nonce, digest, and UID.
+    /// See [`crate::approval::compute_attestation`] for the canonical byte layout.
+    /// Rotating the key invalidates existing attestation blobs.
     ///
     /// Lazy-mint semantics: populated at migration time with
     /// `stellar-agent-attestation-<profile>`; key material minted by

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `AttestationBinding` and `ApprovalContext` name the profile and the chain an approval is bound to and rendered under.
+- `envelope_source_account` returns the effective source of a single-operation envelope; `approve list` reports it as `source` on payments and `envelope_source` on claims.
+- `approve` prints the profile, the network, the endpoint host, the enrolled signer, and the envelope source before the approval prompt; the loopback and remote inbox pages show the same rows.
+- The approve hints name the profile; the simulate responses name the profile and the chain id.
+- `shell_word` quotes a word for a POSIX shell.
 - `Caip2::from_passphrase` maps a network passphrase to its chain id.
 - `stellar_agent_core::redact` holds the URL redaction helpers; the network crate re-exports them.
 - `Profile::redacted` returns a `RedactedProfile`, the serialized view with URL fields reduced to scheme, host, and port.
@@ -123,6 +128,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The approval attestation binds the profile name and the chain id under a versioned domain tag. The commit refuses an approval attested on an earlier build; the inbox shows it as resolved until it expires, and the agent simulates and approves again. The CLI and the MCP server must run the same build.
+- Pending entries without an attestation can be approved under the new layout. The store needs no migration. Earlier blobs receive the existing payment, claim, MPP, or clawback refusal and expire normally.
+- Toolset grants recorded on an earlier build keep suppressing the first-invoke prompt; each action still needs its own approval.
+- `compute_attestation`, `verify_attestation`, `verify_toolset_gate_attestation`, `attest_and_persist`, `record_first_invoke_grant`, `build_attested_grant`, and `ToolsetGrant::verify_attestation` take the attestation binding. The three `PendingApprovalStore` verifiers, `commit_authorization`, and `verify_pending_approval` also take it. `DecisionContext::new` takes the approval context; `ToolsetGrantRequest` carries the binding.
+- `approval_required_indistinguishable` names the profile in its hint.
 - `Profile`'s debug output redacts `oracle_provider_url`.
 - `profile show`, `profile init` and the MCP profile resource report URL fields as scheme, host, and port only.
 - The `rpc_url` parse error names the parse failure and omits the URL text.

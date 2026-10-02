@@ -27,7 +27,7 @@
 //!    `proposal_sha256_hex`.
 //! 5. Recompute the operator attestation exactly as `stellar-agent approve`
 //!    does for a `RuleProposalSimulated` entry
-//!    (`compute_attestation(key, nonce, proposal_sha256, process_uid)`,
+//!    (`compute_attestation(key, binding, nonce, proposal_sha256, process_uid)`,
 //!    verified by `PendingApprovalStore::verify_rule_proposal_gate` — the
 //!    dedicated rule-proposal gate, not the shared pay/claim attestation
 //!    gate).
@@ -283,6 +283,11 @@ async fn t1_rule_create_commit_happy_path() {
         "propose envelope must be ok: {propose_json}"
     );
 
+    assert_eq!(
+        propose_json["data"]["profile"],
+        server.profile_name_for_approval()
+    );
+    assert_eq!(propose_json["data"]["chain_id"], TESTNET_CHAIN_ID);
     let approval_nonce = propose_json["data"]["approval_nonce"]
         .as_str()
         .expect("propose must surface approval_nonce")
@@ -298,7 +303,16 @@ async fn t1_rule_create_commit_happy_path() {
         .try_into()
         .expect("proposal_sha256_hex must decode to exactly 32 bytes");
     let uid = process_uid_for_attestation().expect("process uid");
-    let blob = compute_attestation(&attestation_key, &approval_nonce, &proposal_sha256, &uid);
+    let blob = compute_attestation(
+        &attestation_key,
+        &stellar_agent_core::approval::AttestationBinding::new(
+            &server.profile_name_for_approval(),
+            "stellar:testnet",
+        ),
+        &approval_nonce,
+        &proposal_sha256,
+        &uid,
+    );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
 
     // ── 6. Commit: gate verifies the attestation, install_rule signs+submits ──

@@ -90,6 +90,11 @@ pub const INBOX_STYLE: &str = r"
 /// Public for the same reason as [`INBOX_STYLE`]: both approval surfaces
 /// render the same decision card.
 pub const DETAIL_STYLE: &str = r"
+.approval-context {
+  background: var(--field);
+  border-bottom: 1px solid var(--field-border);
+  padding: 12px 16px;
+}
 .decision {
   background: #ffffff;
   border: 2px solid var(--field-border);
@@ -273,12 +278,14 @@ pub(crate) fn render_not_found_page(nonce: &str, identity: &PageIdentity) -> Str
 #[must_use]
 pub(crate) fn render_detail_page(
     view: &PendingApprovalView,
+    context: &stellar_agent_core::approval::ApprovalContext,
     csrf_hex: &str,
     attestation_blob: Option<&str>,
     identity: &PageIdentity,
 ) -> String {
     let approvable = kind_is_approvable(&view.summary) && !view.expired && !view.attested;
     let summary_html = render_summary_html(view);
+    let context_html = render_context_header_html(context);
     // The full rule definition (context callout, signer table, policy table,
     // override warnings) is not dt/dd-shaped, so it renders as its own block
     // AFTER the `<dl>` closes rather than inside `summary_html`.
@@ -407,6 +414,7 @@ pub(crate) fn render_detail_page(
         <span class="d-origin">requested by your wallet agent</span>
       </div>
       {status_notice}
+{context_html}
 {summary_html}
       {rule_proposal_extra_html}
       {expiry_line}
@@ -474,14 +482,39 @@ pub fn approve_button_label(summary: &ApprovalSummaryView) -> &'static str {
     }
 }
 
-/// Renders the amount headline, the untruncated primary address, and the
-/// remaining summary fields for an entry.
-///
-/// The amount is shown in both denominations — the human one for reading, the
-/// stroop count for matching against the CLI and the audit record — and the
-/// primary address is never truncated, so what the operator verifies is the
-/// whole value rather than a prefix of it. The nonce leads the field grid on
-/// every kind: it is the handle the CLI prints and the audit record keys on.
+/// Renders the serving profile context above an approval summary.
+/// Every value is escaped as HTML text.
+#[must_use]
+pub fn render_context_header_html(
+    context: &stellar_agent_core::approval::ApprovalContext,
+) -> String {
+    let mut html = String::from("<dl class=\"facts approval-context\">\n");
+    for (label, value) in [
+        ("Profile", context.profile_name.as_str()),
+        ("Network", context.chain_id.as_str()),
+        ("Endpoint", context.endpoint_host.as_str()),
+        (
+            "Signer",
+            context
+                .signer_account
+                .as_deref()
+                .unwrap_or("(not enrolled)"),
+        ),
+    ] {
+        html.push_str(&format!(
+            "<dt>{}</dt><dd>{}</dd>\n",
+            label,
+            html_escape(value)
+        ));
+    }
+    html.push_str("</dl>\n");
+    html
+}
+
+/// Renders the amount headline, the untruncated primary address, and the summary
+/// rows of an entry, every value HTML-escaped. The amount shows both denominations
+/// so the operator can match the stroop count against the CLI and the audit record.
+/// The nonce leads the grid because it is the handle the CLI prints.
 pub fn render_summary_html(view: &PendingApprovalView) -> String {
     fn row(label: &str, value: &str) -> String {
         format!(
@@ -522,6 +555,7 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
 
     match &view.summary {
         ApprovalSummaryView::Payment {
+            source,
             to,
             amount_stroops,
             asset,
@@ -531,6 +565,10 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
         } => {
             let mut rows = String::new();
             rows.push_str(&row("Asset", asset));
+            rows.push_str(&row(
+                "Source",
+                source.as_deref().unwrap_or("(undecodable envelope)"),
+            ));
             rows.push_str(&row("Memo", memo.as_deref().unwrap_or("(none)")));
             rows.push_str(&row("Simulated fee (stroops)", &fee_stroops.to_string()));
             rows.push_str(&row("Simulated seq num", &seq_num.to_string()));
@@ -542,6 +580,7 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             )
         }
         ApprovalSummaryView::Claim {
+            envelope_source,
             balance_id_strkey,
             asset,
             amount_stroops,
@@ -551,7 +590,15 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
         } => {
             let mut rows = String::new();
             rows.push_str(&row("Asset", asset));
-            rows.push_str(&row("Source", source));
+            rows.push_str(&row(
+                "Source",
+                envelope_source
+                    .as_deref()
+                    .unwrap_or("(undecodable envelope)"),
+            ));
+            if envelope_source.as_ref() != Some(source) {
+                rows.push_str(&row("Source (stored summary)", source));
+            }
             rows.push_str(&row("Simulated fee (stroops)", &fee_stroops.to_string()));
             rows.push_str(&row("Simulated seq num", &seq_num.to_string()));
             format!(
@@ -873,6 +920,14 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    fn test_context() -> stellar_agent_core::approval::ApprovalContext {
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "default", "nonce", "default",
+        )
+        .build();
+        stellar_agent_core::approval::ApprovalContext::from_profile("render-test", &profile)
+    }
+
     const NOW_MS: u64 = 1_700_000_000_000;
 
     /// The identity a deployment that configured nothing serves.
@@ -973,7 +1028,7 @@ mod tests {
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
-        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
         assert!(
             !html.contains('\u{202E}'),
             "no raw right-to-left override may reach the page"
@@ -1001,7 +1056,7 @@ mod tests {
     fn detail_page_escapes_summary_and_offers_approve() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
         assert!(html.contains("Approve"));
         assert!(html.contains("Reject"));
         // The raw `<script>` memo must be escaped, never literal.
@@ -1017,7 +1072,7 @@ mod tests {
         // the real creation clock stamped by `new_payment_pending`.
         let view = payment_view(&dir, false, u64::MAX);
         assert!(view.expired);
-        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
         assert!(html.contains("expired"));
         assert!(!html.contains("id=\"approve-btn\""));
     }
@@ -1027,7 +1082,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, true, NOW_MS);
         assert!(view.attested);
-        let html = render_detail_page(&view, &"c".repeat(64), Some("BLOB123"), &neutral());
+        let html = render_detail_page(
+            &view,
+            &test_context(),
+            &"c".repeat(64),
+            Some("BLOB123"),
+            &neutral(),
+        );
         assert!(html.contains("BLOB123"));
         assert!(!html.contains("id=\"approve-btn\""));
     }
@@ -1272,7 +1333,7 @@ mod tests {
     fn a_spent_approval_shows_its_state_and_offers_no_action() {
         let dir = TempDir::new().unwrap();
         let view = consumed_view(&dir);
-        let html = render_detail_page(&view, "aa", None, &PageIdentity::default());
+        let html = render_detail_page(&view, &test_context(), "aa", None, &PageIdentity::default());
 
         assert!(
             html.contains("already spent on a submission"),
@@ -1535,7 +1596,7 @@ mod tests {
         assert!(!view.expired);
         assert!(!view.attested);
         assert!(!kind_is_approvable(&view.summary));
-        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
         assert!(html.contains(r#"id="reject-btn""#));
         assert!(!html.contains(r#"id="approve-btn""#));
     }
@@ -1546,7 +1607,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let view = rejected_view(&dir);
         assert!(matches!(view.summary, ApprovalSummaryView::Rejected { .. }));
-        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
         assert!(!html.contains(r#"id="approve-btn""#));
         assert!(!html.contains(r#"id="reject-btn""#));
     }
@@ -1562,13 +1623,19 @@ mod tests {
 
     // ── Design surface and per-deployment identity ───────────────────────
 
-    fn every_page(dir: &TempDir, identity: &PageIdentity) -> Vec<String> {
+    fn every_page(dir: &TempDir, identity: &PageIdentity) -> Vec<(&'static str, String)> {
         let view = payment_view(dir, false, NOW_MS);
         vec![
-            render_inbox_page(std::slice::from_ref(&view), 0, false, identity),
-            render_inbox_page(&[], 0, false, identity),
-            render_detail_page(&view, &"c".repeat(64), None, identity),
-            render_not_found_page("nonce", identity),
+            (
+                "inbox",
+                render_inbox_page(std::slice::from_ref(&view), 0, false, identity),
+            ),
+            ("empty inbox", render_inbox_page(&[], 0, false, identity)),
+            (
+                "detail",
+                render_detail_page(&view, &test_context(), &"c".repeat(64), None, identity),
+            ),
+            ("not found", render_not_found_page("nonce", identity)),
         ]
     }
 
@@ -1579,7 +1646,7 @@ mod tests {
     fn every_page_embeds_the_brand_style_exactly_once() {
         let dir = TempDir::new().unwrap();
         for identity in [neutral(), named(), marked()] {
-            for html in every_page(&dir, &identity) {
+            for (_, html) in every_page(&dir, &identity) {
                 assert_eq!(
                     html.matches(BRAND_STYLE).count(),
                     1,
@@ -1595,7 +1662,7 @@ mod tests {
     #[test]
     fn an_unconfigured_deployment_serves_no_mark_and_no_wordmark() {
         let dir = TempDir::new().unwrap();
-        for html in every_page(&dir, &neutral()) {
+        for (_, html) in every_page(&dir, &neutral()) {
             assert!(
                 !html.contains(MARK_PATH_DATA),
                 "the project mark must be absent from an unconfigured page: {html}"
@@ -1615,7 +1682,7 @@ mod tests {
     #[test]
     fn a_configured_display_name_renders_on_every_page() {
         let dir = TempDir::new().unwrap();
-        for html in every_page(&dir, &named()) {
+        for (_, html) in every_page(&dir, &named()) {
             assert!(
                 html.contains("Acme Ops"),
                 "the configured display name must render: {html}"
@@ -1632,7 +1699,7 @@ mod tests {
     fn an_injection_payload_in_the_display_name_renders_inert() {
         let dir = TempDir::new().unwrap();
         let hostile = PageIdentity::new(Some(r#"</title><script>alert(1)</script>"#), false);
-        for html in every_page(&dir, &hostile) {
+        for (_, html) in every_page(&dir, &hostile) {
             assert!(
                 !html.contains("<script>alert(1)</script>"),
                 "the payload must not reach the page as markup: {html}"
@@ -1648,7 +1715,7 @@ mod tests {
     #[test]
     fn the_project_mark_renders_when_enabled() {
         let dir = TempDir::new().unwrap();
-        for html in every_page(&dir, &marked()) {
+        for (_, html) in every_page(&dir, &marked()) {
             assert!(
                 html.contains(MARK_PATH_DATA),
                 "the project mark must render when enabled: {html}"
@@ -1670,7 +1737,14 @@ mod tests {
         let blocks: Vec<String> = [neutral(), named(), marked()]
             .iter()
             .map(|identity| {
-                decision_block(&render_detail_page(&view, &csrf, None, identity)).to_owned()
+                decision_block(&render_detail_page(
+                    &view,
+                    &test_context(),
+                    &csrf,
+                    None,
+                    identity,
+                ))
+                .to_owned()
             })
             .collect();
 
@@ -1708,7 +1782,18 @@ mod tests {
     fn every_page_references_no_external_origin() {
         let dir = TempDir::new().unwrap();
         for identity in [neutral(), named(), marked()] {
-            for html in every_page(&dir, &identity) {
+            for (label, html) in every_page(&dir, &identity) {
+                // The endpoint authority is inert text in one exact header row.
+                let endpoint_row = format!(
+                    "<dt>Endpoint</dt><dd>{}</dd>",
+                    html_escape(&test_context().endpoint_host)
+                );
+                assert_eq!(
+                    html.matches(&endpoint_row).count(),
+                    usize::from(label == "detail"),
+                    "only the detail page has exactly one endpoint row (page {label})"
+                );
+                let html = html.replacen(&endpoint_row, "", 1);
                 assert!(!html.contains("http://"));
                 assert!(!html.contains("https://"));
             }
@@ -1724,7 +1809,7 @@ mod tests {
     fn detail_page_renders_payment_amount_in_both_denominations_and_the_full_destination() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
 
         // The fixture is 2_500_000 stroops of XLM.
         assert!(
@@ -1764,7 +1849,7 @@ mod tests {
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
-        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
         assert!(html.contains("900719925.4740993 XLM"), "{html}");
         assert!(html.contains("9007199254740993 stroops"), "{html}");
     }
@@ -1792,7 +1877,7 @@ mod tests {
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
-        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
         assert!(html.contains("1.2500000 USDC"), "{html}");
         assert!(
             html.contains(&format!("USDC:{issuer}")),
@@ -1807,6 +1892,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let html = render_detail_page(
             &payment_view(&dir, false, NOW_MS),
+            &test_context(),
             &"c".repeat(64),
             None,
             &neutral(),
@@ -1826,7 +1912,7 @@ mod tests {
         // A store file holds one entry per fixture, so each fixture gets its
         // own directory rather than reading back the first entry written.
         type Fixture = fn(&TempDir) -> PendingApprovalView;
-        let fixtures: [(Fixture, &str, bool); 8] = [
+        let fixtures: [(Fixture, &str, bool); 9] = [
             (claim_view, "CLAIM", false),
             (mpp_charge_view, "CHARGE", false),
             (sign_with_passkey_view, "PASSKEY", true),
@@ -1835,10 +1921,12 @@ mod tests {
             (trustline_clawback_opt_in_view, "CLAWBACK OPT-IN", false),
             (rule_proposal_view, "RULE PROPOSAL", false),
             (rejected_view, "REJECTED", false),
+            (consumed_view, "SPENT (UNKNOWN)", false),
         ];
         for (build, expected, warn) in fixtures {
             let dir = TempDir::new().unwrap();
             let view = build(&dir);
+            assert_context_header(&view);
             let (label, is_warn) = kind_pill(&view);
             assert_eq!(label, expected, "kind pill for {}", view.kind_name);
             assert_eq!(is_warn, warn, "warn variant for {}", view.kind_name);
@@ -1846,6 +1934,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let payment = payment_view(&dir, false, NOW_MS);
+        assert_context_header(&payment);
         assert_eq!(kind_pill(&payment), ("PAYMENT".to_owned(), false));
     }
 
@@ -1858,6 +1947,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let live = render_detail_page(
             &payment_view(&dir, false, NOW_MS),
+            &test_context(),
             &"c".repeat(64),
             None,
             &neutral(),
@@ -1868,6 +1958,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let expired = render_detail_page(
             &payment_view(&dir, false, u64::MAX),
+            &test_context(),
             &"c".repeat(64),
             None,
             &neutral(),
@@ -1884,6 +1975,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let attested = render_detail_page(
             &payment_view(&dir, true, NOW_MS),
+            &test_context(),
             &"c".repeat(64),
             Some("BLOB123"),
             &neutral(),
@@ -1898,7 +1990,13 @@ mod tests {
         );
 
         let dir = TempDir::new().unwrap();
-        let rejected = render_detail_page(&rejected_view(&dir), &"c".repeat(64), None, &neutral());
+        let rejected = render_detail_page(
+            &rejected_view(&dir),
+            &test_context(),
+            &"c".repeat(64),
+            None,
+            &neutral(),
+        );
         assert!(
             rejected.contains(r#"data-expiry-form="absolute""#),
             "{rejected}"
@@ -1915,7 +2013,7 @@ mod tests {
     fn detail_page_renders_the_nonce_as_a_visible_field() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
         assert!(
             html.contains(&format!(
                 "<dt>Nonce</dt><dd>{}</dd>",
@@ -1931,7 +2029,7 @@ mod tests {
     fn detail_page_carries_absolute_timestamps_in_data_attributes() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
-        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
         assert!(
             html.contains(&format!(
                 r#"data-created-ms="{}" data-expires-ms="{}""#,
@@ -1949,7 +2047,7 @@ mod tests {
     fn detail_page_expired_states_the_reason_as_a_warning() {
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, u64::MAX);
-        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
         assert!(html.contains(r#"<div class="notice warn">"#), "{html}");
         assert!(html.contains("This request has expired"), "{html}");
         assert!(!html.contains(r#"id="approve-btn""#), "{html}");
@@ -1962,7 +2060,7 @@ mod tests {
     fn detail_page_mpp_charge_keeps_the_amount_in_base_units() {
         let dir = TempDir::new().unwrap();
         let view = mpp_charge_view(&dir);
-        let html = render_detail_page(&view, &"c".repeat(64), None, &neutral());
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
         assert!(
             html.contains("1000000 <small>base units of the token contract</small>"),
             "the charge must stay in the token's own base units: {html}"
@@ -2029,5 +2127,51 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"<div id="inbox"></div>"#), "{html}");
+    }
+
+    fn assert_context_header(view: &PendingApprovalView) {
+        let mut context = test_context();
+        context.profile_name = "treasury <&\"".to_owned();
+        context.chain_id = "stellar:mainnet".to_owned();
+        context.endpoint_host = "https://context-rpc.example".to_owned();
+        context.signer_account = Some("GSIGNER".to_owned());
+        let html = render_detail_page(view, &context, &"c".repeat(64), None, &neutral());
+        for row in [
+            "<dt>Profile</dt><dd>treasury &lt;&amp;&quot;</dd>",
+            "<dt>Network</dt><dd>stellar:mainnet</dd>",
+            "<dt>Endpoint</dt><dd>https://context-rpc.example</dd>",
+            "<dt>Signer</dt><dd>GSIGNER</dd>",
+        ] {
+            assert!(
+                html.contains(row),
+                "{} missing {row}: {html}",
+                view.kind_name
+            );
+        }
+        context.signer_account = None;
+        let html = render_detail_page(view, &context, "csrf", None, &neutral());
+        assert!(html.contains("<dt>Signer</dt><dd>(not enrolled)</dd>"));
+    }
+
+    #[test]
+    fn detail_page_renders_decoded_source_and_stored_claim_disagreement() {
+        let dir = TempDir::new().unwrap();
+        let mut view = claim_view(&dir);
+        if let ApprovalSummaryView::Claim {
+            envelope_source,
+            source,
+            ..
+        } = &mut view.summary
+        {
+            *envelope_source = Some("GENVELOPE".to_owned());
+            *source = "GSTORED".to_owned();
+        }
+        let html = render_detail_page(&view, &test_context(), "csrf", None, &neutral());
+        assert!(html.contains("<dt>Source</dt><dd>GENVELOPE</dd>"));
+        assert!(html.contains("<dt>Source (stored summary)</dt><dd>GSTORED</dd>"));
+        let dir = TempDir::new().unwrap();
+        let view = payment_view(&dir, false, NOW_MS);
+        let html = render_detail_page(&view, &test_context(), "csrf", None, &neutral());
+        assert!(html.contains("<dt>Source</dt><dd>(undecodable envelope)</dd>"));
     }
 }

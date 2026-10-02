@@ -460,6 +460,10 @@ where
                             .map(|store| {
                                 store.verify_attested_trustline_clawback_opt_in(
                                     &attestation_key,
+                                    &stellar_agent_core::approval::AttestationBinding::new(
+                                        &profile_name,
+                                        profile.chain_id.caip2_str(),
+                                    ),
                                     network_key,
                                     &resolved.code,
                                     &resolved.issuer,
@@ -493,7 +497,7 @@ where
     //
     // RefuseWithWarning: `auth_clawback_enabled = true` and no VERIFIED opt-in.
     // Mint a `TrustlineClawbackOptIn` pending entry and tell the operator to run
-    // `stellar-agent approve --id <nonce>`.  On the next trustline invocation the
+    // `stellar-agent approve --id <nonce> --profile <name>`.  On the next trustline invocation the
     // HMAC-verified opt-in clears the gate.
     match &preview.gate_decision {
         GateDecisionView::Proceed => {

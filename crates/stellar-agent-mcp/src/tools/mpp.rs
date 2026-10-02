@@ -307,6 +307,10 @@ impl WalletServer {
             &state,
             approval_store.as_ref(),
             approval_key.as_ref(),
+            &stellar_agent_core::approval::AttestationBinding::new(
+                &self.profile_name_for_approval(),
+                self.profile.chain_id.caip2_str(),
+            ),
             &args.authorization_id,
             i64::try_from(now_ms / 1_000).unwrap_or(i64::MAX),
         ) {
@@ -343,6 +347,10 @@ impl WalletServer {
             &state,
             approval_store.as_ref(),
             approval_key.as_ref(),
+            &stellar_agent_core::approval::AttestationBinding::new(
+                &self.profile_name_for_approval(),
+                self.profile.chain_id.caip2_str(),
+            ),
             &args.authorization_id,
             i64::try_from(now_ms / 1_000).unwrap_or(i64::MAX),
             &self.profile.network_passphrase,

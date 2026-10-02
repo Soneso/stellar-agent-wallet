@@ -128,7 +128,7 @@ toolset-routed payment) routes through the operator. The handshake:
 
 1. The build/simulate call returns an `approval` block carrying an
    `approval_nonce` instead of executing.
-2. The operator runs `stellar-agent approve --id <approval_nonce>` in a trusted
+2. The operator runs `stellar-agent approve --id <approval_nonce> --profile <name>` in a trusted
    context, reviews the wallet-rendered summary, and consents. The command
    returns an `approval_attestation`, an HMAC blob bound to that exact envelope.
 3. The operator relays the `approval_attestation` to the agent over a trusted

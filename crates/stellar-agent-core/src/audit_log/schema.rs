@@ -2524,8 +2524,8 @@ pub enum EventKind {
     /// after the entry's HMAC attestation (`PaymentSimulated` /
     /// `ClaimSimulated` / `TrustlineClawbackOptIn`) or recorded consent
     /// (`ToolsetFirstInvokeGate`) is durably persisted to the pending-approval
-    /// store — both the `stellar-agent approve --id <nonce>` CLI path and any
-    /// future server-driven approve surface emit this same event. Emission is
+    /// store. The `stellar-agent approve --id <nonce> --profile <name>` CLI path and
+    /// server-driven approval surfaces emit this same event. Emission is
     /// non-fatal: a failure to write this row never unwinds a successful
     /// attestation.
     ///

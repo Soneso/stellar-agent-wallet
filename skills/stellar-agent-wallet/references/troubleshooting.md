@@ -51,8 +51,8 @@ engine is first-match, default-deny over signed, typed criteria.
 |---|---|---|
 | `policy.deny.<reason>` | A V1 criterion denied the call (`<reason>` is the typed reason: `per_tx_cap_exceeded`, `per_period_cap_exceeded`, `rate_limit_exceeded`, `counterparty_denied`, `minimum_reserve_breached`, `no_matching_rule`). The payload carries the redacted reason. | Do not retry as-is; the policy forbids this operation. Report the reason to the operator. Only the operator can change policy. |
 | `policy.deny.unsizable_value_effect` | A value rule matched a tool whose value cannot be sized, including the raw signing tools. | Size the call through a supported verb, or ask the operator to set `allow_opaque_signing = true` on the matched rule if raw signing is intended. |
-| `trustline.clawback_opt_in_required` | Trusting a clawback-enabled issuer requires a recorded operator opt-in. | Ask the operator to run the printed `stellar-agent approve --id <nonce>` opt-in, then re-invoke. |
-| `policy.approval_required` | A two-phase signing verb reached its commit step without a valid operator approval, or the attestation was absent, invalid, or expired. This single code intentionally covers every approval-path failure mode (missing, expired, wrong-kind, hash mismatch, HMAC mismatch) so callers cannot probe which. | Ask the operator to run `stellar-agent approve --id <nonce>`, then re-submit the commit with the returned `approval_nonce` and `approval_attestation`. The nonce came from the simulate step. |
+| `trustline.clawback_opt_in_required` | Trusting a clawback-enabled issuer requires a recorded operator opt-in. | Ask the operator to run the printed `stellar-agent approve --id <nonce> --profile <name>` opt-in, then re-invoke. |
+| `policy.approval_required` | A two-phase signing verb reached its commit step without a valid operator approval, or the attestation was absent, invalid, or expired. This single code intentionally covers every approval-path failure mode (missing, expired, wrong-kind, hash mismatch, HMAC mismatch) so callers cannot probe which. | Ask the operator to run `stellar-agent approve --id <nonce> --profile <name>`, then re-submit the commit with the returned `approval_nonce` and `approval_attestation`. The nonce came from the simulate step. |
 | `policy.approval_required_unsupported` | The policy returned RequireApproval for a single-shot sign tool (no simulate/commit split: SEP-43 sign verbs, `stellar_sep43_sign_and_submit_transaction`, SEP-53 `sign_message`, x402 `create_payment` / `authenticated_payment`). The wallet refuses fail-closed rather than sign without approval. | Cannot proceed via the agent. Ask the operator to either adjust policy so this operation does not require approval, or perform it through a two-phase tool (`stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim`, `stellar_rule_create` and their `*_commit`). |
 | `policy.engine_required` | The active engine cannot decide the call. Fires for the Noop engine on a destructive tool on `stellar:mainnet`, and for V1 engine errors such as a missing or unverifiable policy document. | Do not retry on mainnet (writes are structurally refused in this alpha; use `stellar:testnet`). Otherwise the profile needs a valid V1 policy installed by the operator. |
 | `policy.unexpected_decision` | Forward-compatibility catch-all for an engine decision the gate does not recognize. Fail-closed. | Treat as a hard refusal. Report to the operator; do not retry. |
@@ -164,7 +164,7 @@ applies.
 
 | Code | Meaning | Agent action |
 |---|---|---|
-| `toolset.first_invoke_approval_required` | The first time a toolset uses a signing-adjacent capability with no matching grant, a one-time gate fires and queues an approval. | Ask the operator to approve the queued entry with `stellar-agent approve --id <nonce>`. Once approved, a time-boxed grant suppresses only this re-prompt; the per-action payment approval still fires on every payment. |
+| `toolset.first_invoke_approval_required` | The first time a toolset uses a signing-adjacent capability with no matching grant, a one-time gate fires and queues an approval. | Ask the operator to approve the queued entry with `stellar-agent approve --id <nonce> --profile <name>`. Once approved, a time-boxed grant suppresses only this re-prompt; the per-action payment approval still fires on every payment. |
 | `toolset.unknown_action` | The action is not in the toolset's capability-to-tool matrix. | Call `stellar_toolset_list` to see the toolset's invocable actions; use one of those. |
 | `toolset.capability_not_declared` | The toolset's manifest does not declare the capability needed to grant this action. | The toolset cannot perform this action. Report to the operator; do not retry. |
 | `toolset.tool_not_allowed` | The resolved tool is excluded by the toolset's `allowed_tools` narrowing. | The toolset is configured not to use that tool. Report to the operator. |
@@ -288,7 +288,7 @@ or reconciliation ambiguity, do not retry commit or create another payment;
 query authorization status and reconcile any known server transaction.
 
 - Approval needed (`policy.approval_required`, `toolset.first_invoke_approval_required`):
-  ask the operator to run `stellar-agent approve --id <nonce>`, then re-submit
+  ask the operator to run `stellar-agent approve --id <nonce> --profile <name>`, then re-submit
   the commit with `approval_nonce` and `approval_attestation`.
 - Approval not honorable on this tool (`policy.approval_required_unsupported`):
   operator must change policy or use a two-phase tool.

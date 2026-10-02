@@ -233,7 +233,7 @@ pub struct StellarTrustlineCommitArgs {
 
     /// HMAC-SHA256 attestation blob (URL-safe base64 no-pad, 32 bytes).
     ///
-    /// Written by `stellar-agent approve --id <approval_nonce>` after the
+    /// Written by `stellar-agent approve --id <approval_nonce> --profile <name>` after the
     /// operator confirms.  Required alongside `approval_nonce` when policy
     /// requires approval.
     #[serde(default)]
@@ -389,6 +389,7 @@ impl WalletServer {
                        (simulate step). Resolves the denomination, fetches live issuer flags, \
                        runs the clawback gate, and returns \
                        {envelope_xdr, nonce, expires_at_unix_ms, preview}. \
+                       The approval response includes profile and chain_id. \
                        Pass all three to stellar_trustline_commit to sign and submit. \
                        USDT is refused unconditionally. \
                        destructive_hint=false; read_only_hint=false.",
@@ -567,7 +568,7 @@ impl WalletServer {
         // writer of the profile store file to set a forged blob and bypass the
         // gate.  The `verify_attested_trustline_clawback_opt_in` method recomputes
         // `compute_trustline_clawback_opt_in_digest` and calls
-        // `verify_attestation(key, nonce, &digest, process_uid, &blob)`
+        // `verify_attestation(key, binding, nonce, &digest, process_uid, &blob)`
         // (constant-time HMAC-SHA256) — matching the `ToolsetGrant::verify_attestation`
         // sibling pattern and the `verify_attestation_gate` keyring-load pattern.
         //
@@ -583,7 +584,7 @@ impl WalletServer {
         let opt_in_present = {
             // Load the attestation key for HMAC verification.  Fail-closed on
             // any keyring error — the gate then fires RefuseWithWarning for
-            // clawback-enabled issuers, and the operator runs `approve --id`.
+            // clawback-enabled issuers, and the operator runs `approve --id <nonce> --profile <name>`.
             let key_result = crate::tools::common::load_attestation_key(&self.profile);
             match key_result {
                 Ok(key_bytes) => {
@@ -601,6 +602,10 @@ impl WalletServer {
                             .map(|store| {
                                 store.verify_attested_trustline_clawback_opt_in(
                                     &attestation_key,
+                                    &stellar_agent_core::approval::AttestationBinding::new(
+                                        &self.profile_name_for_approval(),
+                                        self.profile.chain_id.caip2_str(),
+                                    ),
                                     network_key,
                                     &resolved.code,
                                     &resolved.issuer,
@@ -634,11 +639,11 @@ impl WalletServer {
         //
         // RefuseWithWarning means `auth_clawback_enabled = true` and no VERIFIED
         // opt-in exists.  This is NOT a terminal refusal —
-        // the operator MUST be able to provide the opt-in via `approve --id`.
+        // the operator MUST be able to provide the opt-in via `approve --id <nonce> --profile <name>`.
         // Mint a `TrustlineClawbackOptIn` pending entry and return a
         // RequireApproval response so the operator can run:
         //
-        //   stellar-agent approve --id <opt_in_nonce>
+        //   stellar-agent approve --id <opt_in_nonce> --profile <name>
         //
         // On the NEXT simulate call the HMAC-verified opt-in clears the gate.
         // Two approvals are needed: first the opt-in, then the per-action commit.
@@ -650,7 +655,7 @@ impl WalletServer {
             }
             GateDecisionView::RefuseWithWarning { warning } => {
                 // Clawback gate: mint a TrustlineClawbackOptIn pending entry.
-                // The operator must `approve --id <opt_in_nonce>` to record the
+                // The operator must `approve --id <opt_in_nonce> --profile <name>` to record the
                 // HMAC-attested opt-in, then re-invoke stellar_trustline.
                 tracing::info!(
                     tool = "stellar_trustline",
@@ -727,7 +732,7 @@ impl WalletServer {
 
                 // Return a structured RequireApproval response carrying the opt-in nonce.
                 // The agent presents this to the operator, who runs:
-                //   stellar-agent approve --id <opt_in_nonce>
+                //   stellar-agent approve --id <opt_in_nonce> --profile <name>
                 // On the next stellar_trustline call the verified opt-in clears the gate.
                 // Pre-flight refusal: nothing was submitted, so this is a
                 // business error (`is_error = true`, `ok: false`), not a success
@@ -737,10 +742,11 @@ impl WalletServer {
                 // message so the flow stays completable (the operator can also
                 // find it via `stellar-agent approve list`).
                 let message = format!(
-                    "{warning} Run `stellar-agent approve --id {opt_in_nonce}` to record the \
+                    "{warning} Run `{hint}` to record the \
                      clawback opt-in for asset {code} (issuer {issuer}; opt-in expires at \
                      {opt_in_expires} unix ms), then re-invoke stellar_trustline. Review pending \
                      approvals with `stellar-agent approve list`.",
+                    hint = stellar_agent_core::approval::approve_hint(&opt_in_nonce, &profile_name),
                     code = resolved.code,
                     issuer = redact_strkey_first5_last5(&resolved.issuer),
                 );
@@ -887,6 +893,8 @@ impl WalletServer {
                         let approval_nonce = entry.approval_nonce.clone();
                         Some(json!({
                             "approval_nonce": approval_nonce,
+                            "profile": &profile_name,
+                            "chain_id": self.profile.chain_id.caip2_str(),
                             "expires_at_unix_ms": approval_expires,
                             "reason": entry.reason,
                             "summary": {

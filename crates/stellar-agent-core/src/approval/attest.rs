@@ -1,13 +1,11 @@
 //! Shared attest path for a pending approval.
 //!
-//! The `stellar-agent approve --id <nonce>` CLI command and any future
-//! server-driven approve surface call this single canonical path so both
-//! render the identical wallet-controlled attestation semantics: the same
-//! nonce/expiry/already-attested/process-uid validation
-//! ([`load_and_validate_entry`]), and the same per-kind HMAC-attest-and-persist
-//! dispatch ([`attest_and_persist`]).  The CLI's tty prompt, exit-code
-//! mapping, and JSON rendering stay in the CLI crate — this module has no
-//! concept of a terminal or a process exit code.
+//! The `stellar-agent approve --id <nonce> --profile <name>` CLI command and
+//! server-driven approval surfaces share this canonical path.
+//! [`load_and_validate_entry`] checks the nonce, expiry, attestation state, and
+//! process UID. [`attest_and_persist`] dispatches each kind to its HMAC and
+//! persistence path. The CLI crate owns the tty prompt, exit-code mapping,
+//! and JSON rendering.
 //!
 //! # Layering note: the `ToolsetFirstInvokeGate` grant step
 //!
@@ -50,7 +48,7 @@ use super::user_id::ApproverIdentity;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Surface {
-    /// The `stellar-agent approve --id <nonce>` CLI command.
+    /// The `stellar-agent approve --id <nonce> --profile <name>` CLI command.
     Cli,
     /// A resident, server-driven approve surface bound to loopback.
     Serve,
@@ -81,12 +79,14 @@ impl Surface {
 /// Parameters for the caller-supplied `persist_toolset_grant` closure passed
 /// to [`attest_and_persist`].
 ///
-/// The caller is expected to forward these fields, `process_uid`,
+/// The caller forwards all fields, including `binding`, `process_uid`,
 /// `now_unix_ms`, and the attestation key into
 /// `stellar_agent_toolsets_runtime::record_first_invoke_grant`.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ToolsetGrantRequest<'a> {
+    /// Profile and chain binding forwarded to the grant attester.
+    pub binding: &'a super::AttestationBinding<'a>,
     /// Name of the toolset requesting signing-adjacent capability access.
     pub toolset_name: &'a str,
     /// The signing-adjacent capability token being requested.
@@ -312,15 +312,33 @@ pub fn load_attestation_key(
 /// `persist_toolset_grant` failure, or when `entry.kind` is not one of the
 /// attestable kinds. `ApprovalKind::Rejected` and `ApprovalKind::Consumed`
 /// are tombstones and can never be attested.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every attester passes the store, the entry, the key, the binding and the surface explicitly"
+)]
 pub fn attest_and_persist(
     store: &mut PendingApprovalStore,
     entry: &PendingApproval,
     key_bytes: &[u8],
+    binding: &super::AttestationBinding<'_>,
     surface: Surface,
     mut audit: Option<&mut AuditWriter>,
     operator_credential_id_b64url: Option<&str>,
     persist_toolset_grant: impl FnOnce(&ToolsetGrantRequest<'_>, &[u8; 32]) -> Result<(), String>,
 ) -> Result<Option<String>, WalletError> {
+    let binding_matches = match &entry.kind {
+        ApprovalKind::RuleProposalSimulated { chain_id, .. } => chain_id == binding.chain_id,
+        ApprovalKind::MppChargeSimulated {
+            profile, chain_id, ..
+        } => profile == binding.profile_name && chain_id == binding.chain_id,
+        _ => true,
+    };
+    if !binding_matches {
+        return Err(WalletError::Internal(InternalError::UnexpectedState {
+            detail: "approval.binding_mismatch: this request belongs to another profile or network"
+                .to_owned(),
+        }));
+    }
     let key_arr: [u8; 32] = key_bytes.try_into().map_err(|_| {
         WalletError::Internal(InternalError::UnexpectedState {
             detail: format!(
@@ -341,6 +359,7 @@ pub fn attest_and_persist(
             let presented_sha256 = decode_sha256_hex(envelope_sha256_hex)?;
             let attestation_blob = compute_attestation(
                 &key_arr,
+                binding,
                 &entry.approval_nonce,
                 &presented_sha256,
                 &entry.process_uid,
@@ -368,6 +387,7 @@ pub fn attest_and_persist(
             let presented_sha256 = decode_sha256_hex(envelope_sha256_hex)?;
             let attestation_blob = compute_attestation(
                 &key_arr,
+                binding,
                 &entry.approval_nonce,
                 &presented_sha256,
                 &entry.process_uid,
@@ -408,6 +428,7 @@ pub fn attest_and_persist(
             let now_ms = timefmt::now_unix_ms().map_err(|e| map_clock_error(&e))?;
 
             let request = ToolsetGrantRequest {
+                binding,
                 toolset_name,
                 capability,
                 destination,
@@ -467,8 +488,13 @@ pub fn attest_and_persist(
             // clears only when `verify_attested_trustline_clawback_opt_in`
             // recomputes the digest and verifies this blob against the keyring key.
             let digest = compute_trustline_clawback_opt_in_digest(network, code, issuer);
-            let attestation_blob =
-                compute_attestation(&key_arr, &entry.approval_nonce, &digest, &entry.process_uid);
+            let attestation_blob = compute_attestation(
+                &key_arr,
+                binding,
+                &entry.approval_nonce,
+                &digest,
+                &entry.process_uid,
+            );
 
             store
                 .record_trustline_clawback_opt_in_attestation(
@@ -524,6 +550,7 @@ pub fn attest_and_persist(
             // surfaced to `stellar_rule_create_commit`.
             let attestation_blob = compute_attestation(
                 &key_arr,
+                binding,
                 &entry.approval_nonce,
                 proposal_sha256,
                 &entry.process_uid,
@@ -577,6 +604,7 @@ pub fn attest_and_persist(
         } => {
             let attestation_blob = compute_attestation(
                 &key_arr,
+                binding,
                 &entry.approval_nonce,
                 prepared_artifact_hash,
                 &entry.process_uid,
@@ -930,6 +958,23 @@ mod tests {
         );
     }
 
+    fn assert_cross_bindings_refused(
+        key: &[u8; 32],
+        nonce: &str,
+        digest: &[u8; 32],
+        uid: &str,
+        blob: &[u8; 32],
+    ) {
+        for binding in [
+            crate::approval::AttestationBinding::new("b", "stellar:testnet"),
+            crate::approval::AttestationBinding::new("a", "stellar:mainnet"),
+        ] {
+            assert!(!crate::approval::verify_attestation(
+                key, &binding, nonce, digest, uid, blob
+            ));
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn attest_and_persist_payment_records_hmac_and_surfaces_blob() {
@@ -962,6 +1007,7 @@ mod tests {
             &mut store,
             &entry,
             &raw_key,
+            &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
             Surface::Cli,
             None,
             None,
@@ -975,13 +1021,26 @@ mod tests {
         assert_eq!(surfaced_blob, *blob_b64);
 
         let sha256_bytes = decode_sha256_hex(&envelope_sha256_hex).unwrap();
-        let expected = compute_attestation(&raw_key, &nonce, &sha256_bytes, &process_uid);
+        let expected = compute_attestation(
+            &raw_key,
+            &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
+            &nonce,
+            &sha256_bytes,
+            &process_uid,
+        );
         let persisted_bytes: [u8; 32] = URL_SAFE_NO_PAD
             .decode(blob_b64)
             .unwrap()
             .try_into()
             .unwrap();
         assert_eq!(persisted_bytes, expected);
+        assert_cross_bindings_refused(
+            &raw_key,
+            &nonce,
+            &sha256_bytes,
+            &process_uid,
+            &persisted_bytes,
+        );
     }
 
     #[test]
@@ -1004,6 +1063,7 @@ mod tests {
             &mut store,
             &rejected_entry,
             &raw_key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             Surface::Cli,
             None,
             None,
@@ -1045,6 +1105,7 @@ mod tests {
             &mut store,
             &entry,
             &raw_key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             Surface::Cli,
             None,
             None,
@@ -1093,6 +1154,7 @@ mod tests {
             &mut store,
             &entry,
             &raw_key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             Surface::Cli,
             None,
             None,
@@ -1168,6 +1230,7 @@ mod tests {
             &mut store,
             &entry,
             &raw_key,
+            &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
             Surface::Cli,
             None,
             None,
@@ -1181,13 +1244,26 @@ mod tests {
         let blob_b64 = final_entry.attestation_blob_b64.as_ref().unwrap();
         assert_eq!(surfaced_blob, *blob_b64);
 
-        let expected = compute_attestation(&raw_key, &nonce, &proposal_sha256, &process_uid);
+        let expected = compute_attestation(
+            &raw_key,
+            &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
+            &nonce,
+            &proposal_sha256,
+            &process_uid,
+        );
         let persisted_bytes: [u8; 32] = URL_SAFE_NO_PAD
             .decode(blob_b64)
             .unwrap()
             .try_into()
             .unwrap();
         assert_eq!(persisted_bytes, expected);
+        assert_cross_bindings_refused(
+            &raw_key,
+            &nonce,
+            &proposal_sha256,
+            &process_uid,
+            &persisted_bytes,
+        );
     }
 
     #[test]
@@ -1210,6 +1286,7 @@ mod tests {
             &mut store,
             &rejected_entry,
             &raw_key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             Surface::Cli,
             None,
             None,
@@ -1220,5 +1297,86 @@ mod tests {
             err.to_string().contains("approval.rejected"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn attest_rule_refuses_stored_chain_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("a.toml")).unwrap();
+        let entry = make_rule_proposal_entry(DEFAULT_TTL_MS);
+        store
+            .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+            .unwrap();
+        let error = attest_and_persist(
+            &mut store,
+            &entry,
+            &[0x42; 32],
+            &crate::approval::AttestationBinding::new("a", "stellar:mainnet"),
+            Surface::Cli,
+            None,
+            None,
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("approval.binding_mismatch"));
+        assert!(
+            store
+                .get(&entry.approval_nonce)
+                .unwrap()
+                .attestation_blob_b64
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn attest_mpp_refuses_stored_profile_and_chain_mismatch() {
+        for mismatch_profile in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let mut store = PendingApprovalStore::open(dir.path().join("a.toml")).unwrap();
+            let now = timefmt::now_unix_ms().unwrap();
+            let mut entry = PendingApproval::new_mpp_charge_pending(
+                [0x11; 32],
+                [0x22; 32],
+                if mismatch_profile { "other" } else { "a" }.to_owned(),
+                "stellar:testnet".to_owned(),
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                "mcp".to_owned(),
+                "merchant".to_owned(),
+                "tools/charge".to_owned(),
+                "1000000".to_owned(),
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                now / 1_000 + 3_600,
+                1_100,
+                "1000".to_owned(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap();
+            store.insert(entry.clone(), now).unwrap();
+            if !mismatch_profile
+                && let ApprovalKind::MppChargeSimulated { chain_id, .. } = &mut entry.kind
+            {
+                *chain_id = "stellar:mainnet".to_owned();
+            }
+            let error = attest_and_persist(
+                &mut store,
+                &entry,
+                &[0x42; 32],
+                &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
+                Surface::Cli,
+                None,
+                None,
+                |_, _| Ok(()),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("approval.binding_mismatch"));
+            assert!(
+                store
+                    .get(&entry.approval_nonce)
+                    .unwrap()
+                    .attestation_blob_b64
+                    .is_none()
+            );
+        }
     }
 }

@@ -156,9 +156,8 @@ mod platform {
 /// - **Windows:** current process token user's SID string.
 /// - **Other non-Unix:** stable stub `"non-unix-stub"`.
 ///
-/// The returned string is an input to
-/// `HMAC-SHA256(attestation_key, approval_nonce || envelope_sha256 || process_uid)`
-/// and is therefore bound into the attestation blob.  An attestation blob
+/// The returned string is bound by the versioned approval HMAC, alongside
+/// the profile name, chain id, nonce, and digest. An attestation blob
 /// produced under one UID cannot be replayed by a different local user.
 ///
 /// # Errors

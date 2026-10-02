@@ -399,7 +399,7 @@ var stellarAgentApproval = (function () {
     result.textContent = "";
     result.className = "result";
     var line = document.createElement("p");
-    line.textContent = "Status: " + (data.status || "unknown");
+    line.textContent = data.message || "Status: " + (data.status || "unknown");
     result.appendChild(line);
 
     var blob = data.attestation;
