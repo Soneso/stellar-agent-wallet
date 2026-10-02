@@ -72,10 +72,8 @@ use stellar_agent_smart_account::managers::rules::{
 };
 use tracing::{info, warn};
 
-use crate::commands::smart_account::common::{
-    network_to_chain_id, open_profile_audit_writer_read_only,
-};
-use crate::common::network::TargetNetwork;
+use crate::commands::smart_account::common::open_profile_audit_writer_read_only;
+use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::profile_access::{
     ProfileAccessError, load_profile_reconciled_by_requested_name, profile_access_envelope,
 };
@@ -83,9 +81,6 @@ use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
-
-/// Default Soroban RPC endpoint for Stellar testnet.
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
 /// Default submission-equivalent timeout (simulate only) in seconds.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
@@ -388,7 +383,7 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
         );
     }
     let timeout = Duration::from_secs(args.timeout_seconds);
-    let chain_id = network_to_chain_id(args.network).to_owned();
+    let chain_id = args.network.caip2().caip2_str().to_owned();
 
     let config = ContextRuleManagerConfig::new(
         args.rpc_url.clone(),

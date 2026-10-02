@@ -5,11 +5,10 @@ use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_network::{FeeStatsView, StellarRpcClient, fetch_fee_stats, validate_rpc_url};
 
+use crate::common::network::TESTNET_RPC_URL;
 use crate::common::profile_access::load_profile_reconciled_by_requested_name;
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::render::table::render_fee_stats_table;
-
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
 /// Arguments for `stellar-agent fees stats`.
 #[derive(Debug, Args)]

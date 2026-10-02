@@ -39,8 +39,9 @@ use serde_json::Value;
 const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
 /// Runs `stellar-agent profile init --profile=<name>` against an isolated home
-/// and returns `(exit_code, parsed_stdout_json)`.
-fn run_init(home: &Path, profile: &str) -> (i32, Value) {
+/// and returns `(exit_code, parsed_stdout_json, stdout)`.
+/// Extra arguments are appended after `--profile`.
+fn run_init(home: &Path, profile: &str, extra: &[&str]) -> (i32, Value, String) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
     let output = Command::new(bin_path)
         .args([
@@ -50,6 +51,7 @@ fn run_init(home: &Path, profile: &str) -> (i32, Value) {
             "noop",
             &format!("--profile={profile}"),
         ])
+        .args(extra)
         .env("STELLAR_AGENT_HOME", home)
         // An ambient value in the developer's shell must not select the profile.
         .env_remove("STELLAR_AGENT_PROFILE")
@@ -62,13 +64,13 @@ fn run_init(home: &Path, profile: &str) -> (i32, Value) {
     let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
     let json: Value =
         serde_json::from_str(stdout.trim()).expect("stdout must be a single JSON envelope");
-    (code, json)
+    (code, json, stdout)
 }
 
 /// Asserts `init` refused `profile` as an invalid name and wrote nothing.
 fn assert_refused(profile: &str, expected_reason: &str) {
     let home = tempfile::tempdir().expect("temp home");
-    let (code, json) = run_init(home.path(), profile);
+    let (code, json, _) = run_init(home.path(), profile, &[]);
 
     assert_eq!(code, 1, "an unusable profile name must exit 1: {json}");
     assert_eq!(
@@ -146,7 +148,7 @@ fn a_name_that_only_resembles_a_device_is_still_created() {
     // device, and a dash away from the first character is not a flag.
     let home = tempfile::tempdir().expect("temp home");
     for profile in ["COM0", "smoke-fp2"] {
-        let (code, json) = run_init(home.path(), profile);
+        let (code, json, _) = run_init(home.path(), profile, &[]);
         assert_eq!(code, 0, "'{profile}' must remain a usable name: {json}");
         assert_eq!(json["data"]["profile"], profile, "{json}");
         assert!(
@@ -157,4 +159,24 @@ fn a_name_that_only_resembles_a_device_is_still_created() {
             "'{profile}' must have been written to <profiles>/{profile}.toml"
         );
     }
+}
+
+#[test]
+fn profile_init_redacts_rpc_url_and_preserves_saved_url() {
+    let home = tempfile::tempdir().expect("temp home");
+    let url = "https://user:SENTINEL@mainnet.example/v1/SENTINEL-PATH";
+    let (code, json, stdout) = run_init(
+        home.path(),
+        "x",
+        &["--network", "mainnet", "--rpc-url", url],
+    );
+    assert_eq!(code, 0, "{json}");
+    assert_eq!(json["data"]["rpc_url"], "https://mainnet.example");
+    assert!(!stdout.contains("SENTINEL"), "{stdout}");
+    let saved =
+        std::fs::read_to_string(home.path().join("profiles/x.toml")).expect("profile saved");
+    assert!(
+        saved.contains(url),
+        "the saved profile must retain the full URL"
+    );
 }

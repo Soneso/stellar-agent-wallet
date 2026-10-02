@@ -84,10 +84,10 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    SignerSourceFlags, construct_signers_manager_from_fields, network_to_chain_id,
-    open_profile_audit_writer, resolve_signer, wrap_sa_error,
+    SignerSourceFlags, construct_signers_manager_from_fields, open_profile_audit_writer,
+    resolve_signer, wrap_sa_error,
 };
-use crate::common::network::TargetNetwork;
+use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::resolve_profile_name;
 use crate::common::signer_ceremony::{
@@ -100,9 +100,6 @@ use crate::common::signer_ceremony::{
 
 /// Default submission timeout in seconds.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
-
-/// Default Stellar testnet Soroban RPC endpoint.
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ExecuteArgs
@@ -414,7 +411,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let signers_manager = match construct_signers_manager_from_fields(
         &profile_name,
         network_passphrase,
-        network_to_chain_id(args.network),
+        args.network.caip2().caip2_str(),
         &args.rpc_url,
         args.secondary_rpc_url.as_deref().unwrap_or(&args.rpc_url),
         Duration::from_secs(args.timeout_seconds),
@@ -481,7 +478,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
             }
         };
 
-    let chain_id = network_to_chain_id(args.network);
+    let chain_id = args.network.caip2().caip2_str();
     let auth_rule_ids_display: Vec<u32> = args.auth_rule_id.clone();
     let auth_rule_ids: Vec<ContextRuleId> = args
         .auth_rule_id

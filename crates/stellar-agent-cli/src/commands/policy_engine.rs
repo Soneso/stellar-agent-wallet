@@ -311,25 +311,13 @@ fn owner_pubkey_b64(profile_name: &str, verb: &str) -> Result<String, String> {
         })
 }
 
-/// Maps a CLI [`TargetNetwork`] selector to its CAIP-2 chain-id string.
+/// Returns the policy gate's chain identifier for the CLI network flag.
 ///
-/// `pay`, `claim`, and `accounts create` select their target network via
-/// `--network` rather than a loaded profile's `chain_id` (unlike `trade` /
-/// `lend` / `vault` / `trustline`, which trust `profile.chain_id`
-/// exclusively). The policy gate's `ToolDescriptor::chain_id` must reflect the
-/// network the transaction actually targets, so it is derived here instead of
-/// from the (possibly synthesized, possibly mismatched) profile object.
+/// `pay`, `claim` and `accounts create` take their network from `--network`,
+/// so the policy gate's chain identifier is derived from that flag.
 #[must_use]
 pub(crate) fn caip2_chain_id_for_network(network: TargetNetwork) -> &'static str {
-    // Binding: these are the CAIP-2 chain identifiers and MUST stay
-    // byte-identical to `Caip2::caip2_str` (profile/caip2.rs:108), the
-    // authoritative source `profile.chain_id` resolves through. A drift here
-    // would silently stop chain-scoped policy rules from matching the value the
-    // MCP twin evaluates against.
-    match network {
-        TargetNetwork::Testnet => "stellar:testnet",
-        TargetNetwork::Mainnet => "stellar:mainnet",
-    }
+    network.caip2().caip2_str()
 }
 
 /// Builds the `stellar_pay` policy args the dispatch gate derives the value

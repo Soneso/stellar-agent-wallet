@@ -89,10 +89,10 @@ use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     CommonArgsView, CommonHandlerContext, SignerSourceFlags, construct_signers_manager_from_fields,
-    network_to_chain_id, open_profile_audit_writer_read_only,
+    open_profile_audit_writer_read_only,
 };
 use crate::commands::smart_account::list_rules as sa_list_rules;
-use crate::common::network::TargetNetwork;
+use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::render::render_json;
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
@@ -102,9 +102,6 @@ use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 /// Default submission timeout in seconds.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
-
-/// Default Stellar testnet Soroban RPC endpoint.
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cap-enforcement helpers
@@ -2888,7 +2885,7 @@ async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
             Ok(triple) => triple,
             Err(e) => return emit_error(&e, args.common.output, &request_id),
         };
-    let chain_id = network_to_chain_id(args.common.network);
+    let chain_id = args.common.network.caip2().caip2_str();
     let manager = match construct_signers_manager_from_fields(
         &profile_name,
         args.common.network.passphrase(),
@@ -3426,10 +3423,7 @@ fn build_readonly_manager(
     rpc_url: &str,
     timeout_seconds: u64,
 ) -> Result<ContextRuleManager, WalletError> {
-    let chain_id = match network {
-        TargetNetwork::Testnet => "stellar:testnet",
-        TargetNetwork::Mainnet => "stellar:mainnet",
-    };
+    let chain_id = network.caip2().caip2_str();
     ContextRuleManager::new(ContextRuleManagerConfig::new(
         rpc_url.to_owned(),
         network.passphrase().to_owned(),

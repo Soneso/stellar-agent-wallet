@@ -19,7 +19,10 @@ use stellar_agent_core::{
     observability::RedactedStrkey,
     policy::v1::ValueClass,
     policy::{Decision, McpToolRegistration, PolicyEngine, ToolDescriptor, ToolValueKind},
-    profile::{caip2::TESTNET_PASSPHRASE, schema::default_approval_dir},
+    profile::{
+        caip2::{Caip2, TESTNET_PASSPHRASE},
+        schema::default_approval_dir,
+    },
 };
 use stellar_agent_mpp::{
     ApprovalDisposition, ChallengeInput, MppAuthorizationStore, MppError, MppErrorCode,
@@ -461,7 +464,7 @@ async fn commit_cli(
         |authorized| {
             let entry = AuditEntry::new_mpp_charge_authorized(
                 "stellar_mpp_charge_commit",
-                "stellar:testnet",
+                Caip2::Testnet.caip2_str(),
                 hex::encode(Sha256::digest(
                     authorized.record.authorization_id().as_bytes(),
                 )),
@@ -675,7 +678,7 @@ fn prune(args: &MppPruneArgs) -> i32 {
     let reason_sha256 = hex::encode(Sha256::digest(&reason));
     let mut audit = NewToolInvocation::new(
         "stellar_mpp_state_prune",
-        "stellar:testnet",
+        Caip2::Testnet.caip2_str(),
         vec!["profile".to_owned(), "reason_sha256".to_owned()],
         PolicyDecision::Allow,
         uuid::Uuid::new_v4().to_string(),
@@ -747,7 +750,7 @@ fn policy_descriptor(tool_name: &'static str) -> ToolDescriptor {
         value_kind: ToolValueKind::MovesValue,
     };
     let mut descriptor = ToolDescriptor::from_registration(&registration);
-    descriptor.chain_id = "stellar:testnet".to_owned();
+    descriptor.chain_id = Caip2::Testnet.caip2_str().to_owned();
     descriptor
 }
 

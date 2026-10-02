@@ -1,34 +1,7 @@
-//! [`TargetNetwork`] enum — shared network selector for all write subcommands.
+//! [`TargetNetwork`] is the clap network selector for CLI commands.
 //!
-//! Unifies the network selector across `pay`, `accounts create`, and
-//! `profile init`.
-//! Implements `FromStr` + `Display` so clap can use it with
-//! `default_value = "testnet"`.
-//!
-//! # Passphrase constants
-//!
-//! `TESTNET_PASSPHRASE` and `MAINNET_PASSPHRASE` are co-located here as the
-//! **canonical CLI-layer source** and exposed on `TargetNetwork::passphrase()`.
-//!
-//! Design decision — passphrase location:
-//!
-//! `stellar-agent-network::friendbot` already carries its own `const
-//! MAINNET_PASSPHRASE` for the network-layer structural rejection check. That
-//! constant is `pub(crate)` and lives at the network layer where it is used as
-//! a runtime guard (not as a user-facing string). We do NOT pull the CLI crate
-//! into the network crate — that would invert the dependency direction. Instead:
-//!
-//! - The canonical wire-format constants live here (CLI layer, co-located with
-//!   `TargetNetwork::passphrase()`).
-//! - The network-layer constant in `friendbot.rs` remains independent for the
-//!   guard comparison; it is a private `const` not exposed to external callers.
-//!   The values are identical and stable (protocol-level strings); they are NOT
-//!   shared at the source level to avoid making the network crate depend on the
-//!   CLI crate.
-//!
-//! Callers that need the passphrase for submission call
-//! `args.network.passphrase()`. This collapses the per-command
-//! `network_passphrase(network)` helper to a single method call.
+//! It parses network names case-insensitively and converts to [`Caip2`] for
+//! the chain identifier and network passphrase.
 //!
 //! # Two-layer mainnet defence
 //!
@@ -40,20 +13,8 @@
 use std::fmt;
 use std::str::FromStr;
 
-/// Stellar testnet network passphrase.
-///
-/// Used by `TargetNetwork::Testnet` in [`TargetNetwork::passphrase`] and as
-/// the default passphrase for testnet write commands.
-pub const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
-
-/// Stellar mainnet network passphrase.
-///
-/// Exposed publicly so the embed example and any future external consumers can
-/// reference the canonical constant without hard-coding the string.
-/// For the CLI write commands, mainnet is **structurally rejected before this
-/// passphrase is ever used** — it is present for completeness and for the
-/// network-layer passphrase comparison guard in `submit_transaction_and_wait`.
-pub const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
+use stellar_agent_core::profile::caip2::Caip2;
+pub(crate) use stellar_agent_core::profile::caip2::TESTNET_RPC_URL;
 
 /// Shared network selector for all write subcommands (`pay`, `accounts create`).
 ///
@@ -79,7 +40,22 @@ pub enum TargetNetwork {
     Mainnet,
 }
 
+impl From<TargetNetwork> for Caip2 {
+    fn from(network: TargetNetwork) -> Self {
+        match network {
+            TargetNetwork::Testnet => Self::Testnet,
+            TargetNetwork::Mainnet => Self::Mainnet,
+        }
+    }
+}
+
 impl TargetNetwork {
+    /// Returns the CAIP-2 chain identifier for this CLI selector.
+    #[must_use]
+    pub fn caip2(self) -> Caip2 {
+        self.into()
+    }
+
     /// Returns the network passphrase string for this network.
     ///
     /// Callers pass this to `submit_transaction_and_wait` and
@@ -93,13 +69,7 @@ impl TargetNetwork {
     /// ```
     #[must_use]
     pub fn passphrase(&self) -> &'static str {
-        match self {
-            Self::Testnet => TESTNET_PASSPHRASE,
-            // Mainnet is structurally rejected before this is reached for
-            // write commands, but the value is correct so a passphrase
-            // comparison in the network layer still fires correctly.
-            Self::Mainnet => MAINNET_PASSPHRASE,
-        }
+        self.caip2().network_passphrase()
     }
 }
 
@@ -198,8 +168,12 @@ mod tests {
     }
 
     #[test]
-    fn target_network_passphrase_matches_exported_constants() {
-        assert_eq!(TargetNetwork::Testnet.passphrase(), TESTNET_PASSPHRASE);
-        assert_eq!(TargetNetwork::Mainnet.passphrase(), MAINNET_PASSPHRASE);
+    fn target_network_caip2_maps_both_variants() {
+        assert_eq!(TargetNetwork::Testnet.caip2(), Caip2::Testnet);
+        assert_eq!(TargetNetwork::Mainnet.caip2(), Caip2::Mainnet);
+        assert_eq!(
+            crate::commands::policy_engine::caip2_chain_id_for_network(TargetNetwork::Mainnet),
+            "stellar:mainnet"
+        );
     }
 }

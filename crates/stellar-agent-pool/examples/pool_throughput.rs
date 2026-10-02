@@ -111,6 +111,7 @@ async fn run_benchmark() {
     use rand_core::OsRng;
     use stellar_agent_core::StellarAmount;
     use stellar_agent_core::observability::redact_strkey_first5_last5;
+    use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
     use stellar_agent_network::builder::Asset;
     use stellar_agent_network::{
         ClassicOpBuilder, SoftwareSigningKey, StellarRpcClient, fetch_account, fund_with_friendbot,
@@ -169,7 +170,6 @@ async fn run_benchmark() {
     );
 
     const TESTNET_RPC: &str = "https://soroban-testnet.stellar.org";
-    const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
     const FRIENDBOT_URL: &str = "https://friendbot.stellar.org";
     const FEE: u32 = 1000;
     const TIMEOUT: Duration = Duration::from_secs(90);

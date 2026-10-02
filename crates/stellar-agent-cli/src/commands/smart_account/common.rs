@@ -131,7 +131,7 @@ impl CommonHandlerContext {
             .unwrap_or(args.rpc_url())
             .to_owned();
         let timeout = Duration::from_secs(args.timeout_seconds());
-        let chain_id = network_to_chain_id(args.network()).to_owned();
+        let chain_id = args.network().caip2().caip2_str().to_owned();
 
         let (_audit_profile, audit_writer, audit_log_path) = open_profile_audit_writer(&resolved)?;
         record_mlock_degradation(
@@ -288,14 +288,6 @@ pub(crate) async fn resolve_signer(
         mlock_degradation,
     } = resolve_software_signer_from_env(var_name, "smart-account-write", profile_name).await?;
     Ok((Box::new(signer), mlock_degradation))
-}
-
-/// Maps a [`TargetNetwork`] to its CAIP-2 chain-ID string.
-pub(crate) fn network_to_chain_id(network: TargetNetwork) -> &'static str {
-    match network {
-        TargetNetwork::Testnet => "stellar:testnet",
-        TargetNetwork::Mainnet => "stellar:mainnet",
-    }
 }
 
 /// Constructs a [`SignersManager`] from pre-resolved fields and an already-opened

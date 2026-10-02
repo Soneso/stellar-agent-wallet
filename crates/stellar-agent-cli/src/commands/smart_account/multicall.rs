@@ -66,9 +66,9 @@ use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     SignerSourceFlags, construct_signers_manager_from_fields, emit_multicall_registry_error,
-    emit_sa_error, network_to_chain_id, open_profile_audit_writer,
+    emit_sa_error, open_profile_audit_writer,
 };
-use crate::common::network::TargetNetwork;
+use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::profile_access::{
     ProfileAccessError, load_profile_reconciled, profile_access_envelope,
 };
@@ -87,9 +87,6 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 
 /// Default per-op base fee in stroops.
 const DEFAULT_FEE_STROOPS: u32 = 100;
-
-/// Default Stellar testnet Soroban RPC endpoint.
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI Args
@@ -286,7 +283,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     };
 
     let network_passphrase = args.network.passphrase().to_owned();
-    let chain_id = network_to_chain_id(args.network).to_owned();
+    let chain_id = args.network.caip2().caip2_str().to_owned();
 
     // Load the multicall registry.
     let networks_toml_path = match default_networks_toml_path() {
@@ -309,8 +306,8 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         }
     };
 
-    // Resolve secondary_rpc_url:
-    // Priority: profile.secondary_rpc_url → --secondary-rpc-url flag → typed error.
+    // Resolve the secondary RPC from the flag, else the profile's
+    // `secondary_rpc_url`, else a typed error.
     let secondary_rpc_url = {
         // Try loading the profile to get secondary_rpc_url from it.
         // Distinguish NotFound (first-run or no profile — acceptable fall-through) from

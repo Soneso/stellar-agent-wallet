@@ -56,10 +56,7 @@ use crate::signing::verify_binding::{reject_v0_envelope, verify_signature_networ
 use crate::submission_record::{SubmissionIntent, SubmissionOutcome, SubmissionRecorder};
 use crate::transaction_record::TransactionRecord;
 
-// Mainnet network passphrase (canonical; same constant used by friendbot.rs).
-// `pub(crate)` so every in-crate write path (idempotent_submit's retention
-// poll) shares the same guard constant instead of duplicating it.
-pub(crate) const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
+pub(crate) use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Poll interval

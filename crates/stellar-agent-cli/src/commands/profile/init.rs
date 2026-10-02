@@ -112,6 +112,7 @@ use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 use stellar_agent_core::profile::caip2::MAINNET_RPC_URL;
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, PolicyEngineKind, Profile};
+use stellar_agent_core::redact::redact_url_authority;
 
 use crate::common::network::TargetNetwork;
 use crate::common::render;
@@ -154,7 +155,7 @@ struct InitData {
     path: String,
     /// CAIP-2 chain id (`"stellar:testnet"` or `"stellar:mainnet"`).
     chain_id: String,
-    /// Resolved Soroban RPC endpoint.
+    /// Resolved Soroban RPC endpoint as scheme, host, and port only.
     rpc_url: String,
     /// Selected policy engine (`"v1"` or `"noop"`).
     engine: String,
@@ -229,7 +230,8 @@ fn init_refusal(args: &InitArgs, profile_name: &str, profile_dir: &Path) -> Opti
                 return Some(WalletError::Validation(ValidationError::ConfigInvalid {
                     component: "rpc_url",
                     reason: format!(
-                        "a mainnet profile requires an https:// RPC endpoint; got '{url}'"
+                        "a mainnet profile requires an https:// RPC endpoint; got '{}'",
+                        redact_url_authority(url)
                     ),
                 }));
             }
@@ -387,7 +389,7 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
         profile: profile_name.clone(),
         path: written_path.display().to_string(),
         chain_id: profile.chain_id.caip2_str().to_owned(),
-        rpc_url: profile.rpc_url.clone(),
+        rpc_url: redact_url_authority(&profile.rpc_url),
         engine: profile.policy.engine.to_string(),
         next_steps,
     }));
@@ -603,6 +605,19 @@ mod tests {
         a.rpc_url = Some("http://mainnet.example.com/rpc".to_owned());
         let err = init_refusal(&a, resolved_name(&a).as_str(), dir.path()).expect("must refuse");
         assert_eq!(err.code(), "validation.config_invalid");
+    }
+
+    #[test]
+    fn refusal_mainnet_plaintext_rpc_url_redacts_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = args("redact-plaintext");
+        a.network = TargetNetwork::Mainnet;
+        a.rpc_url = Some("http://user:SENTINEL@mainnet.example.com/SENTINEL-PATH".to_owned());
+        let err = init_refusal(&a, resolved_name(&a).as_str(), dir.path()).expect("must refuse");
+        assert_eq!(err.code(), "validation.config_invalid");
+        let message = err.to_string();
+        assert!(message.contains("http://mainnet.example.com"), "{message}");
+        assert!(!message.contains("SENTINEL"), "{message}");
     }
 
     /// An existing destination refuses with its exact wire code.

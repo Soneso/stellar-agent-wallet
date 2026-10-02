@@ -205,7 +205,7 @@ actual keys (see [Migration and key rotation](#migration-and-key-rotation)).
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `oracle_provider_url` | string (URL) | no | unset (cross-check off) | Independent RPC endpoint used to re-simulate high-value transactions. When unset, the high-value cross-check is skipped. Set this before enabling V1 for mainnet high-value flows. |
+| `oracle_provider_url` | string (URL) | no | unset (cross-check off) | Independent RPC endpoint for re-simulating high-value transactions. When unset, the high-value cross-check is skipped. Set this before enabling V1 for mainnet high-value flows. Redacted in debug output. |
 | `mcp_disabled` | bool | no | `false` | When `true`, the `stellar-agent-mcp` server refuses to start with error `mcp.disabled_per_profile`. |
 | `audit_log_path` | string (path) | no | OS-conventional | Path to the per-profile audit log. |
 | `secondary_rpc_url` | string (URL) | no | unset | Independent secondary RPC for the multicall cross-RPC trust-anchor check. Must point to a node operated independently of `rpc_url`. Required when a multicall router is registered for the profile's network; loading otherwise fails. Redacted in debug output. |
@@ -278,9 +278,10 @@ Consequences:
 
 - The profile TOML is safe to back up and to copy between hosts. The keyring
   backend is the actual defence for secret material.
-- `rpc_url` and `secondary_rpc_url` are redacted in the wallet's debug output
-  because a URL may embed RPC credentials. They are still written verbatim to the
-  TOML, so avoid embedding credentials in those URLs if the file is shared.
+- `rpc_url`, `secondary_rpc_url` and `oracle_provider_url` are redacted in debug
+  output because URLs may embed credentials. `profile show` prints them as
+  scheme, host, and port. The TOML retains the full URLs, so avoid embedding
+  credentials if the file is shared.
 - `stellar-agent profile show <name>` prints the resolved configuration as a JSON
   envelope; keyring references appear as opaque `{service, account}` objects,
   never the secret.

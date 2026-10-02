@@ -120,7 +120,7 @@ use crate::commands::policy_engine::{
     build_v1_policy_engine, caip2_chain_id_for_network, evaluate_opaque_signing_policy,
     evaluate_value_moving_policy, pay_policy_args,
 };
-use crate::common::network::TargetNetwork;
+use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::profile_access::{
     ProfileOrigin, injected_profile_load, load_profile_or_synthesize_testnet_with,
 };
@@ -151,9 +151,6 @@ dependency \u{2014} re-run without --use-oz-relayer.";
 
 /// Default submission timeout in seconds.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
-
-/// Stellar testnet RPC endpoint (SDF operated).
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PayResult — the structured success payload

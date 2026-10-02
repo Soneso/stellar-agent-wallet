@@ -46,11 +46,9 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{emit_sa_error, open_profile_audit_writer_read_only};
-use crate::common::network::TargetNetwork;
+use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
-
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
 /// Arguments for `smart-account timelock list-pending`.
 #[derive(Debug, Args)]

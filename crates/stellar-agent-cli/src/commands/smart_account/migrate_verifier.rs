@@ -67,9 +67,9 @@ use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     CommonArgsView, CommonHandlerContext, SignerSourceFlags, construct_signers_manager_from_fields,
-    network_to_chain_id, open_profile_audit_writer_read_only, wrap_sa_error,
+    open_profile_audit_writer_read_only, wrap_sa_error,
 };
-use crate::common::network::TargetNetwork;
+use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 
@@ -79,9 +79,6 @@ use crate::common::resolve_profile_name;
 
 /// Default submission timeout in seconds.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
-
-/// Default Stellar testnet Soroban RPC endpoint.
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI Args
@@ -322,7 +319,7 @@ fn dry_run_signers_manager(
 ) -> Result<(SignersManager, String), WalletError> {
     let resolved_profile = resolve_profile_name(args.profile.as_deref());
     let profile_name = resolved_profile.name.clone();
-    let chain_id = network_to_chain_id(args.network).to_owned();
+    let chain_id = args.network.caip2().caip2_str().to_owned();
     let timeout = Duration::from_secs(args.timeout_seconds);
     let secondary_rpc_url = args
         .secondary_rpc_url

@@ -29,6 +29,7 @@
 //! time, never a hardcoded pin attribute.
 
 use serde::{Deserialize, Serialize};
+use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // NetworkId
@@ -72,8 +73,8 @@ impl NetworkId {
     #[must_use]
     pub fn from_passphrase(passphrase: &str) -> Option<Self> {
         match passphrase {
-            "Public Global Stellar Network ; September 2015" => Some(Self::Mainnet),
-            "Test SDF Network ; September 2015" => Some(Self::Testnet),
+            MAINNET_PASSPHRASE => Some(Self::Mainnet),
+            TESTNET_PASSPHRASE => Some(Self::Testnet),
             _ => None,
         }
     }

@@ -92,10 +92,10 @@ const UNREACHABLE_RPC: &str = "http://127.0.0.1:9";
 ///
 /// The audit-log path is pinned inside `home` as well, so a child process can
 /// never append to a host audit log.
-fn write_profile(home: &Path, name: &str, rpc_url: &str) {
+fn write_profile(home: &Path, name: &str, rpc_url: &str, secondary_rpc_url: Option<&str>) {
     let signer = KeyringEntryRef::default_signer(name);
     let nonce = KeyringEntryRef::default_nonce(name);
-    let profile = Profile::builder_testnet_named(
+    let mut profile = Profile::builder_testnet_named(
         name,
         &signer.service,
         &signer.account,
@@ -106,6 +106,8 @@ fn write_profile(home: &Path, name: &str, rpc_url: &str) {
     .audit_log_path(home.join("audit").join(format!("{name}.jsonl")))
     .with_noop_engine()
     .build();
+
+    profile.secondary_rpc_url = secondary_rpc_url.map(str::to_owned);
 
     save_new_to_dir(name, &profile, &home.join("profiles")).expect("fixture profile must persist");
 }
@@ -158,9 +160,9 @@ fn run_cli(home: &Path, env_profile: Option<&str>, args: &[&str]) -> Run {
 /// fixtures.
 fn home_with_all_fixtures() -> tempfile::TempDir {
     let home = tempfile::tempdir().expect("temp home");
-    write_profile(home.path(), "default", DEFAULT_PROFILE_RPC);
-    write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC);
-    write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC);
+    write_profile(home.path(), "default", DEFAULT_PROFILE_RPC, None);
+    write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
+    write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC, None);
     home
 }
 
@@ -175,7 +177,7 @@ fn home_with_all_fixtures() -> tempfile::TempDir {
 #[test]
 fn the_child_process_reads_the_redirected_data_root() {
     let home = tempfile::tempdir().expect("temp home");
-    write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC);
+    write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
 
     let run = run_cli(
         home.path(),
@@ -189,8 +191,33 @@ fn the_child_process_reads_the_redirected_data_root() {
     );
     assert_eq!(
         run.json()["data"]["rpc_url"],
-        ENV_PROFILE_RPC,
+        "http://127.0.0.1:9",
         "the loaded profile must be the fixture, not a host profile of the same name"
+    );
+}
+
+#[test]
+fn profile_show_redacts_every_url_component_with_credentials() {
+    let home = tempfile::tempdir().expect("temp home");
+    write_profile(
+        home.path(),
+        "redacted",
+        "http://user:SENTINEL-CRED@127.0.0.1:9/SENTINEL-PATH?k=SENTINEL-QUERY",
+        Some(
+            "http://user:SENTINEL-SECONDARY@127.0.0.1:19/SENTINEL-SECONDARY-PATH?k=SENTINEL-SECONDARY-QUERY",
+        ),
+    );
+    let run = run_cli(
+        home.path(),
+        None,
+        &["profile", "show", "--profile", "redacted"],
+    );
+    assert_eq!(run.code, 0, "{} {}", run.stdout, run.stderr);
+    assert!(!run.stdout.contains("SENTINEL"), "{}", run.stdout);
+    assert_eq!(run.json()["data"]["rpc_url"], "http://127.0.0.1:9");
+    assert_eq!(
+        run.json()["data"]["secondary_rpc_url"],
+        "http://127.0.0.1:19"
     );
 }
 
@@ -311,7 +338,7 @@ fn pool_list_uses_the_profile_named_by_the_environment_variable() {
     // Only the env-named profile exists: a run that resolved `"default"` would
     // refuse with `validation.profile_not_found` instead of reaching the
     // pool-not-initialised refusal, which is what distinguishes the two.
-    write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC);
+    write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
 
     let run = run_cli(home.path(), Some(ENV_PROFILE), &["pool", "list"]);
     let json = run.json();
@@ -335,7 +362,7 @@ fn pool_list_profile_flag_beats_the_environment_variable() {
     let home = tempfile::tempdir().expect("temp home");
     // Only the flag-named profile exists, so a run that honoured the variable
     // over the flag would refuse with `validation.profile_not_found`.
-    write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC);
+    write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC, None);
 
     let run = run_cli(
         home.path(),
@@ -445,7 +472,7 @@ fn write_unreadable_audit_log(home: &Path, profile: &str) {
 #[test]
 fn startup_advisory_scans_the_audit_log_of_the_environment_variable_profile() {
     let home = tempfile::tempdir().expect("temp home");
-    write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC);
+    write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
     write_unreadable_audit_log(home.path(), ENV_PROFILE);
     write_unreadable_audit_log(home.path(), "default");
 
@@ -469,7 +496,7 @@ fn startup_advisory_scans_the_audit_log_of_the_environment_variable_profile() {
 #[test]
 fn startup_advisory_profile_flag_beats_the_environment_variable() {
     let home = tempfile::tempdir().expect("temp home");
-    write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC);
+    write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC, None);
     write_unreadable_audit_log(home.path(), FLAG_PROFILE);
     write_unreadable_audit_log(home.path(), ENV_PROFILE);
 
@@ -576,8 +603,8 @@ fn assert_reached_only_the_unreachable_endpoint(run: &Run, verb: &str) {
 fn the_moved_verbs_audit_under_the_profile_named_by_the_environment_variable() {
     for (verb, argv) in MOVED_VERB_ARGS {
         let home = tempfile::tempdir().expect("temp home");
-        write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC);
-        write_profile(home.path(), "default", DEFAULT_PROFILE_RPC);
+        write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
+        write_profile(home.path(), "default", DEFAULT_PROFILE_RPC, None);
         write_unreadable_audit_log(home.path(), ENV_PROFILE);
         write_unreadable_audit_log(home.path(), "default");
 
@@ -602,8 +629,8 @@ fn the_moved_verbs_audit_under_the_profile_named_by_the_environment_variable() {
 fn the_moved_verbs_let_the_profile_flag_beat_the_environment_variable() {
     for (verb, argv) in MOVED_VERB_ARGS {
         let home = tempfile::tempdir().expect("temp home");
-        write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC);
-        write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC);
+        write_profile(home.path(), ENV_PROFILE, ENV_PROFILE_RPC, None);
+        write_profile(home.path(), FLAG_PROFILE, FLAG_PROFILE_RPC, None);
         write_unreadable_audit_log(home.path(), ENV_PROFILE);
         write_unreadable_audit_log(home.path(), FLAG_PROFILE);
 

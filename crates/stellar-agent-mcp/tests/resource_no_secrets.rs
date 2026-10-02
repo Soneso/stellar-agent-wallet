@@ -1,12 +1,7 @@
 //! Runtime resource-content secret-scan gate.
 //!
 //! Calls every registered MCP-resource generator function and asserts that the
-//! output contains no secret-shaped bytes.  Runs the same detection patterns as
-//! `.github/scripts/check-mcp-resources-no-secrets.sh` so that even dynamically
-//! generated resource content is covered.
-//!
-//! Coverage policy: both static `mcp-resources/` files (CI script) and runtime
-//! generator output (this test) must pass the scan.
+//! output contains no secret-shaped bytes.
 
 #![allow(
     clippy::expect_used,

@@ -82,7 +82,7 @@ use uuid::Uuid;
 use crate::commands::smart_account::common::{
     CommonArgsView, CommonHandlerContext, SignerSourceFlags, wrap_sa_error,
 };
-use crate::common::network::TargetNetwork;
+use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
 use crate::common::render::render_json;
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
@@ -92,9 +92,6 @@ use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 /// Default submission timeout in seconds.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
-
-/// Default Stellar testnet Soroban RPC endpoint.
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cap-enforcement helper

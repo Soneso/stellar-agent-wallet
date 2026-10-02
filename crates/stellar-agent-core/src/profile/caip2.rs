@@ -8,8 +8,8 @@
 //!
 //! - Default RPC URLs are compile-time constants.  They can be overridden by an
 //!   explicit `rpc_url` field in the profile TOML.
-//! - Network passphrases are never overridden from profile config — they are
-//!   protocol constants derived from the chain ID.
+//! - Network passphrases are protocol constants derived from the chain ID.
+//!   Profile config cannot override them.
 //!
 //! # Examples
 //!
@@ -40,22 +40,12 @@ pub const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
 /// resolution and CLI help text rely on a stable fallback URL.
 pub const MAINNET_RPC_URL: &str = "https://mainnet.stellar.validationcloud.io/v1/stellar";
 
-/// Stellar testnet network passphrase.
-///
-/// Canonical wire-format constant per the Stellar protocol specification.
-/// The CLI layer also exposes this value at
-/// `stellar_agent_cli::common::network::TESTNET_PASSPHRASE`; both are kept
-/// as independent `pub const` definitions to avoid a dep-direction inversion
-/// between core and cli.
+/// Canonical wire-format passphrase for Stellar testnet.
+/// This is the workspace definition.
 pub const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 
-/// Stellar mainnet network passphrase.
-///
-/// Canonical wire-format constant per the Stellar protocol specification.
-/// The CLI layer also exposes this value at
-/// `stellar_agent_cli::common::network::MAINNET_PASSPHRASE`; both are kept
-/// as independent `pub const` definitions to avoid a dep-direction inversion
-/// between core and cli.
+/// Canonical wire-format passphrase for Stellar mainnet.
+/// This is the workspace definition.
 pub const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
 
 /// CAIP-2 chain identifier for the Stellar blockchain networks.
@@ -86,6 +76,26 @@ pub enum Caip2 {
 }
 
 impl Caip2 {
+    /// Returns the chain whose canonical passphrase matches the input exactly.
+    /// Returns `None` for any other byte sequence.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::profile::caip2::{Caip2, TESTNET_PASSPHRASE};
+    ///
+    /// assert_eq!(Caip2::from_passphrase(TESTNET_PASSPHRASE), Some(Caip2::Testnet));
+    /// assert_eq!(Caip2::from_passphrase("unknown"), None);
+    /// ```
+    #[must_use]
+    pub fn from_passphrase(passphrase: &str) -> Option<Self> {
+        match passphrase {
+            TESTNET_PASSPHRASE => Some(Self::Testnet),
+            MAINNET_PASSPHRASE => Some(Self::Mainnet),
+            _ => None,
+        }
+    }
+
     /// Returns `true` when this chain ID refers to mainnet.
     ///
     /// Used by the `NoopPolicyEngine` to gate destructive MCP tools.
@@ -276,6 +286,35 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn from_passphrase_maps_both_constants() {
+        assert_eq!(
+            Caip2::from_passphrase(TESTNET_PASSPHRASE),
+            Some(Caip2::Testnet)
+        );
+        assert_eq!(
+            Caip2::from_passphrase(MAINNET_PASSPHRASE),
+            Some(Caip2::Mainnet)
+        );
+    }
+
+    #[test]
+    fn from_passphrase_rejects_prefix() {
+        assert_eq!(Caip2::from_passphrase("Test SDF Network"), None);
+    }
+
+    #[test]
+    fn from_passphrase_rejects_trailing_space() {
+        for passphrase in [TESTNET_PASSPHRASE, MAINNET_PASSPHRASE] {
+            assert_eq!(Caip2::from_passphrase(&format!("{passphrase} ")), None);
+        }
+    }
+
+    #[test]
+    fn from_passphrase_rejects_empty_string() {
+        assert_eq!(Caip2::from_passphrase(""), None);
+    }
 
     #[test]
     fn from_str_testnet() {
