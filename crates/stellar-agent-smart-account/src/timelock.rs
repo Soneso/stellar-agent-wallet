@@ -85,6 +85,7 @@ use crate::managers::credentials::AuditWriterPoisonContext;
 use crate::managers::rules::{
     BASE_FEE_STROOPS, augment_with_oz_error_name, parse_c_strkey_to_smart_account,
 };
+use crate::submit::refuse_mainnet_sa;
 
 // ── OZ Timelock error codes ───────────────────────────────────────────────────
 // Referenced as `OzTimelockError::Variant as u32`.
@@ -448,6 +449,83 @@ fn classify_execute_error(sim_error: &str) -> TimelockExecuteFailureReason {
             TimelockExecuteFailureReason::SimulationFailed
         }
         _ => TimelockExecuteFailureReason::Other,
+    }
+}
+
+// ── Submission error mappers ─────────────────────────────────────────────────
+
+/// Maps a failure of the `schedule` submission into the schedule error surface.
+///
+/// [`SaError::MainnetWriteForbidden`] passes through unchanged and keeps the
+/// canonical code. Every other error becomes
+/// [`SaError::TimelockScheduleFailed`], classified from its text.
+fn schedule_submit_error(e: SaError, request_id: &str) -> SaError {
+    if matches!(e, SaError::MainnetWriteForbidden) {
+        return e;
+    }
+
+    let reason = format!("{e}");
+    let classified = classify_schedule_error(&reason);
+    SaError::TimelockScheduleFailed {
+        failure_reason: classified,
+        redacted_reason: augment_with_oz_error_name(&reason),
+        request_id: request_id.to_owned(),
+    }
+}
+
+/// Maps a failure of the `cancel` submission into the cancel error surface.
+///
+/// [`SaError::MainnetWriteForbidden`] passes through unchanged and keeps the
+/// canonical code. Every other error becomes [`SaError::TimelockCancelFailed`],
+/// classified from its text.
+fn cancel_submit_error(
+    e: SaError,
+    operation_id: &TimelockOperationId,
+    request_id: &str,
+) -> SaError {
+    if matches!(e, SaError::MainnetWriteForbidden) {
+        return e;
+    }
+
+    let reason = format!("{e}");
+    let classified = classify_cancel_error(&reason);
+    // OZ `cancel_operation` fires `InvalidOperationState` (4002) for any
+    // non-pending op (including never-scheduled ones). Code 4006
+    // (`OperationNotScheduled`) is unreachable from the canonical OZ
+    // storage.rs:376-378 (SHA a9c4216); all cancel failures route through
+    // `classify_cancel_error` which extracts the OZ code internally.
+    SaError::TimelockCancelFailed {
+        failure_reason: classified,
+        redacted_reason: augment_with_oz_error_name(&reason),
+        operation_id_redacted: operation_id.redacted(),
+        request_id: request_id.to_owned(),
+    }
+}
+
+/// Maps a failure of the `execute` submission into the execute error surface.
+///
+/// [`SaError::SubmissionUnresolved`] and [`SaError::MainnetWriteForbidden`]
+/// pass through unchanged and keep their codes. Every other error becomes
+/// [`SaError::TimelockExecuteFailed`], classified from its text.
+fn execute_submit_error(
+    e: SaError,
+    operation_id: &TimelockOperationId,
+    request_id: &str,
+) -> SaError {
+    if matches!(
+        e,
+        SaError::SubmissionUnresolved { .. } | SaError::MainnetWriteForbidden
+    ) {
+        return e;
+    }
+
+    let reason = format!("{e}");
+    let classified = classify_execute_error(&reason);
+    SaError::TimelockExecuteFailed {
+        failure_reason: classified,
+        redacted_reason: augment_with_oz_error_name(&reason),
+        operation_id_redacted: operation_id.redacted(),
+        request_id: request_id.to_owned(),
     }
 }
 
@@ -1435,13 +1513,23 @@ const FN_EXECUTE: &str = "execute";
 /// transaction's contract events is verified on both primary and secondary RPCs concurrently
 /// via `cross_confirm_event`.
 ///
+/// # Mainnet refusal
+///
+/// A mainnet `network_passphrase` or a mainnet-pattern `primary_rpc_url` is
+/// refused with [`SaError::MainnetWriteForbidden`] before any signing call and
+/// any request.
+///
 /// # Errors
 ///
+/// - [`SaError::MainnetWriteForbidden`]: the mainnet refusal above, or a
+///   submit-layer refusal of an endpoint that reports mainnet.
 /// - [`SaError::TimelockScheduleFailed`] — authorisation, delay, or submission
 ///   failure; typed `failure_reason` from the OZ error code.
 pub async fn schedule_upgrade(
     args: TimelockScheduleArgs<'_>,
 ) -> Result<ScheduledTimelockOperation, SaError> {
+    refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
+
     let TimelockScheduleArgs {
         timelock_contract_strkey,
         target_strkey,
@@ -1626,15 +1714,7 @@ pub async fn schedule_upgrade(
         },
     )
     .await
-    .map_err(|e| {
-        let reason = format!("{e}");
-        let classified = classify_schedule_error(&reason);
-        SaError::TimelockScheduleFailed {
-            failure_reason: classified,
-            redacted_reason: augment_with_oz_error_name(&reason),
-            request_id: request_id.to_owned(),
-        }
-    })?;
+    .map_err(|e| schedule_submit_error(e, request_id))?;
 
     // Extract the returned BytesN<32> operation_id from the ScVal return.
     let operation_id_bytes: [u8; 32] = match &result.return_val {
@@ -1733,6 +1813,12 @@ pub async fn schedule_upgrade(
 /// transaction's contract events is verified. If absent, returns
 /// [`SaError::TimelockCancelFailed`] with reason `EventConfirmationMissing`.
 ///
+/// # Mainnet refusal
+///
+/// A mainnet `network_passphrase` or a mainnet-pattern `primary_rpc_url` is
+/// refused with [`SaError::MainnetWriteForbidden`] before any signing call and
+/// any request.
+///
 /// # Errors
 ///
 /// - [`SaError::TimelockCancelFailed`] — authorisation, invalid state, or
@@ -1743,7 +1829,11 @@ pub async fn schedule_upgrade(
 ///   state — including when it was never scheduled. Code 4006
 ///   (`OperationNotScheduled`) is not reachable from the canonical cancel
 ///   path.
+/// - [`SaError::MainnetWriteForbidden`]: the mainnet refusal above, or a
+///   submit-layer refusal of an endpoint that reports mainnet.
 pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
+    refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
+
     let TimelockCancelArgs {
         timelock_contract_strkey,
         operation_id,
@@ -1856,21 +1946,7 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
         },
     )
     .await
-    .map_err(|e| {
-        let reason = format!("{e}");
-        let classified = classify_cancel_error(&reason);
-        // OZ `cancel_operation` fires `InvalidOperationState` (4002) for any
-        // non-pending op (including never-scheduled ones). Code 4006
-        // (`OperationNotScheduled`) is unreachable from the canonical OZ
-        // storage.rs:376-378 (SHA a9c4216); all cancel failures route through
-        // `classify_cancel_error` which extracts the OZ code internally.
-        SaError::TimelockCancelFailed {
-            failure_reason: classified,
-            redacted_reason: augment_with_oz_error_name(&reason),
-            operation_id_redacted: operation_id.redacted(),
-            request_id: request_id.to_owned(),
-        }
-    })?;
+    .map_err(|e| cancel_submit_error(e, operation_id, request_id))?;
 
     // Cross-confirm OperationCancelled event on BOTH primary and secondary RPCs.
     cross_confirm_event(
@@ -1943,6 +2019,13 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
 /// authoritative id, the two are validated; a mismatch returns
 /// [`SaError::TimelockExecuteFailed`] with reason `OperationIdMismatch`.
 ///
+/// # Mainnet refusal
+///
+/// A mainnet `network_passphrase` or a mainnet-pattern `primary_rpc_url` is
+/// refused with [`SaError::MainnetWriteForbidden`] before any signing call and
+/// any request. The refusal also precedes the RPC client construction of the
+/// pre-check.
+///
 /// # Pre-check ordering
 ///
 /// 1. Build RPC clients.
@@ -1965,7 +2048,11 @@ pub async fn cancel(args: TimelockCancelArgs<'_>) -> Result<(), SaError> {
 ///   operation-id mismatch, or submission failure.
 /// - [`SaError::NetworkRpcDivergence`] — primary and secondary RPCs disagree
 ///   on the operation state during pre-check.
+/// - [`SaError::MainnetWriteForbidden`]: the mainnet refusal above, or a
+///   submit-layer refusal of an endpoint that reports mainnet.
 pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
+    refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
+
     let TimelockExecuteArgs {
         timelock_contract_strkey,
         target_strkey,
@@ -2317,20 +2404,7 @@ pub async fn execute(args: TimelockExecuteArgs<'_>) -> Result<String, SaError> {
         },
     )
     .await
-    .map_err(|e| {
-        if matches!(e, SaError::SubmissionUnresolved { .. }) {
-            return e;
-        }
-
-        let reason = format!("{e}");
-        let classified = classify_execute_error(&reason);
-        SaError::TimelockExecuteFailed {
-            failure_reason: classified,
-            redacted_reason: augment_with_oz_error_name(&reason),
-            operation_id_redacted: operation_id.redacted(),
-            request_id: request_id.to_owned(),
-        }
-    })?;
+    .map_err(|e| execute_submit_error(e, &operation_id, request_id))?;
 
     // Cross-confirm OperationExecuted event on BOTH primary and secondary RPCs.
     cross_confirm_event(
@@ -3338,5 +3412,194 @@ mod tests {
                 panic!("an undecodable event is a typed error, not a divergence")
             }
         }
+    }
+
+    // ── Mainnet refusal before the signer and the endpoint ──────────────────
+
+    /// A signer whose every method panics, so any use of it fails the test
+    /// that holds it.
+    struct PanickingSigner;
+
+    #[async_trait::async_trait]
+    impl Signer for PanickingSigner {
+        async fn sign_tx_payload(
+            &self,
+            _: &[u8; 32],
+        ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+            panic!("a refused mainnet timelock call must not reach sign_tx_payload")
+        }
+        async fn sign_auth_digest(
+            &self,
+            _: &[u8; 32],
+        ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+            panic!("a refused mainnet timelock call must not reach sign_auth_digest")
+        }
+        async fn sign_soroban_address_auth_payload(
+            &self,
+            _: &[u8; 32],
+        ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+            panic!(
+                "a refused mainnet timelock call must not reach sign_soroban_address_auth_payload"
+            )
+        }
+        async fn sign_webauthn_assertion(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+        ) -> Result<stellar_agent_network::WebAuthnAssertion, stellar_agent_core::WalletError>
+        {
+            panic!("a refused mainnet timelock call must not reach sign_webauthn_assertion")
+        }
+        async fn public_key(
+            &self,
+        ) -> Result<stellar_strkey::ed25519::PublicKey, stellar_agent_core::WalletError> {
+            panic!("a refused mainnet timelock call must not reach public_key")
+        }
+    }
+
+    const ZERO_CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+    fn audit_writer(dir: &tempfile::TempDir) -> Arc<Mutex<AuditWriter>> {
+        Arc::new(Mutex::new(
+            AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
+        ))
+    }
+
+    async fn assert_no_requests(mock: &wiremock::MockServer) {
+        assert!(
+            mock.received_requests().await.unwrap().is_empty(),
+            "a refused mainnet timelock call must send no request"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_upgrade_refuses_mainnet_before_signer_and_request() {
+        let mock = wiremock::MockServer::start().await;
+        let uri = mock.uri();
+        let dir = tempfile::tempdir().unwrap();
+        let writer = audit_writer(&dir);
+        let args = TimelockScheduleArgs::builder()
+            .timelock_contract_strkey(ZERO_CONTRACT)
+            .target_strkey(ZERO_CONTRACT)
+            .function("upgrade")
+            .delay_ledgers(10)
+            .signer(&PanickingSigner)
+            .primary_rpc_url(&uri)
+            .secondary_rpc_url(&uri)
+            .network_passphrase(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE)
+            .audit_writer(&writer)
+            .request_id("req-mainnet-schedule")
+            .build();
+        let err = schedule_upgrade(args).await.err().unwrap();
+        assert!(
+            matches!(err, SaError::MainnetWriteForbidden),
+            "expected the mainnet refusal, got {err:?}"
+        );
+        assert_eq!(err.wire_code(), "network.mainnet_write_forbidden");
+        assert_no_requests(&mock).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_refuses_mainnet_before_signer_and_request() {
+        let mock = wiremock::MockServer::start().await;
+        let uri = mock.uri();
+        let dir = tempfile::tempdir().unwrap();
+        let writer = audit_writer(&dir);
+        let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
+        let args = TimelockCancelArgs::builder()
+            .timelock_contract_strkey(ZERO_CONTRACT)
+            .operation_id(&operation_id)
+            .signer(&PanickingSigner)
+            .primary_rpc_url(&uri)
+            .secondary_rpc_url(&uri)
+            .network_passphrase(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE)
+            .audit_writer(&writer)
+            .request_id("req-mainnet-cancel")
+            .build();
+        let err = cancel(args).await.unwrap_err();
+        assert!(
+            matches!(err, SaError::MainnetWriteForbidden),
+            "expected the mainnet refusal, got {err:?}"
+        );
+        assert_eq!(err.wire_code(), "network.mainnet_write_forbidden");
+        assert_no_requests(&mock).await;
+    }
+
+    #[tokio::test]
+    async fn execute_refuses_mainnet_before_signer_and_request() {
+        let mock = wiremock::MockServer::start().await;
+        let uri = mock.uri();
+        let dir = tempfile::tempdir().unwrap();
+        let writer = audit_writer(&dir);
+        let args = TimelockExecuteArgs::builder()
+            .timelock_contract_strkey(ZERO_CONTRACT)
+            .target_strkey(ZERO_CONTRACT)
+            .function("upgrade")
+            .salt([5u8; 32])
+            .signer(&PanickingSigner)
+            .primary_rpc_url(&uri)
+            .secondary_rpc_url(&uri)
+            .network_passphrase(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE)
+            .audit_writer(&writer)
+            .request_id("req-mainnet-execute")
+            .build();
+        let err = execute(args).await.unwrap_err();
+        assert!(
+            matches!(err, SaError::MainnetWriteForbidden),
+            "expected the mainnet refusal, got {err:?}"
+        );
+        assert_eq!(err.wire_code(), "network.mainnet_write_forbidden");
+        assert_no_requests(&mock).await;
+    }
+
+    fn other_submit_error() -> SaError {
+        SaError::DeploymentFailed {
+            phase: "submit",
+            redacted_reason: "endpoint refused the bytes".to_owned(),
+        }
+    }
+
+    #[test]
+    fn schedule_submit_error_passes_the_mainnet_refusal_through() {
+        let mapped = schedule_submit_error(SaError::MainnetWriteForbidden, "req-1");
+        assert!(
+            matches!(mapped, SaError::MainnetWriteForbidden),
+            "the mainnet refusal must keep its variant, got {mapped:?}"
+        );
+        let wrapped = schedule_submit_error(other_submit_error(), "req-1");
+        assert!(
+            matches!(wrapped, SaError::TimelockScheduleFailed { ref request_id, .. } if request_id == "req-1"),
+            "another error must still be wrapped, got {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn cancel_submit_error_passes_the_mainnet_refusal_through() {
+        let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
+        let mapped = cancel_submit_error(SaError::MainnetWriteForbidden, &operation_id, "req-2");
+        assert!(
+            matches!(mapped, SaError::MainnetWriteForbidden),
+            "the mainnet refusal must keep its variant, got {mapped:?}"
+        );
+        let wrapped = cancel_submit_error(other_submit_error(), &operation_id, "req-2");
+        assert!(
+            matches!(wrapped, SaError::TimelockCancelFailed { ref request_id, .. } if request_id == "req-2"),
+            "another error must still be wrapped, got {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn execute_submit_error_passes_the_mainnet_refusal_through() {
+        let operation_id = TimelockOperationId::from_bytes([3u8; 32]);
+        let mapped = execute_submit_error(SaError::MainnetWriteForbidden, &operation_id, "req-3");
+        assert!(
+            matches!(mapped, SaError::MainnetWriteForbidden),
+            "the mainnet refusal must keep its variant, got {mapped:?}"
+        );
+        let wrapped = execute_submit_error(other_submit_error(), &operation_id, "req-3");
+        assert!(
+            matches!(wrapped, SaError::TimelockExecuteFailed { ref request_id, .. } if request_id == "req-3"),
+            "another error must still be wrapped, got {wrapped:?}"
+        );
     }
 }

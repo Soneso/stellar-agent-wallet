@@ -5449,6 +5449,9 @@ pub(crate) fn sa_error_to_invocation_result(
         SaError::InstallStateMismatch { .. } => SaInvocationResult::PostSubmitVerificationFailed,
         // PolicyDenied: the wallet's own refusal, decided before the send.
         SaError::PolicyDenied { .. } => SaInvocationResult::PreSubmissionRefused,
+        // MainnetWriteForbidden: refused before signing or before the send;
+        // nothing reached the network as a transaction.
+        SaError::MainnetWriteForbidden => SaInvocationResult::PreSubmissionRefused,
         // MulticallSha256Drift: fires at registry-lookup time, before any I/O.
         SaError::MulticallSha256Drift { .. } => SaInvocationResult::PreSubmissionRefused,
         // MulticallRegistryEntryNotFound: fires at registry-lookup time, before any I/O.
@@ -6773,6 +6776,16 @@ mod tests {
                 SaInvocationResult::PreSubmissionRefused
             ));
         }
+    }
+
+    #[test]
+    fn sa_error_to_invocation_result_mainnet_refusal_is_pre_submission() {
+        use stellar_agent_core::audit_log::schema::SaInvocationResult;
+
+        assert!(matches!(
+            sa_error_to_invocation_result(&SaError::MainnetWriteForbidden),
+            SaInvocationResult::PreSubmissionRefused
+        ));
     }
 
     #[test]

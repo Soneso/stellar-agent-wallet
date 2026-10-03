@@ -103,9 +103,10 @@ fi
 The zero-config profile uses testnet. Friendbot funding is limited to testnet-class networks.
 
 On a mainnet profile, `pay`, `claim`, account creation, account deployment, and smart-account deployment refuse before signer access.
-The same structural refusal covers all signer verbs, rule writes, policy writes, `execute`, migration submit, timelock writes, and `multicall`.
-It reports `network.mainnet_write_forbidden`; Friendbot funding reports `network.friendbot_mainnet_forbidden`.
-Read-only inspection remains available. Profile-driven `trade`, `vault`, `trustline`, `pool`, and `tx` use the submit layer's refusal, so they can contact the endpoint and load their signer before it.
+The same structural refusal covers all signer verbs, rule writes, policy writes, `rules verify-pins` (it loads a signer), `execute`, migration submit, timelock writes, and `multicall`.
+It also covers `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init`, before signer access and any RPC call.
+It reports `network.mainnet_write_forbidden`; Friendbot funding reports `network.friendbot_mainnet_forbidden`, and `mpp` reports `mpp.network_forbidden`.
+Read-only inspection remains available. `tx` signs nothing, and `pool init` is the only `pool` command that signs.
 `--network` is checked against the profile before a structural refusal, so `--network mainnet` on the zero-config testnet profile reports `profile.network_flag_mismatch`.
 
 The submit layer applies the same refusal in a fixed order. A declared mainnet network passphrase is refused first, then an `--rpc-url` matching a known mainnet host; both cost zero RPC calls. The envelope is then decoded locally, so a malformed or legacy V0 envelope is refused without a round trip.

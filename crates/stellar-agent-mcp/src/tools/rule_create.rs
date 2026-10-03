@@ -1204,6 +1204,13 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use crate::tools::common::approval_required_indistinguishable;
 
+        // Structural mainnet refusal, keyed on the server's profile context:
+        // before the argument check below, the policy gate, any key access,
+        // and any RPC request, on the tool route and the toolset route alike.
+        if self.context.chain_id.is_mainnet() {
+            return Ok(crate::tools::common::mainnet_write_forbidden_result());
+        }
+
         // ── Mainnet write defence (defense in depth) ──────────────────────────
         // Does NOT rely solely on stellar_rule_create's propose-time refusal:
         // this commit call's chain_id is caller-supplied and independent of

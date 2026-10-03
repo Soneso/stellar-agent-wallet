@@ -114,8 +114,9 @@ Two structural rules apply across all surfaces:
 
 1. The default network is `stellar:testnet`.
 2. Every write or signing command structurally refuses `stellar:mainnet` before
-   any RPC call or signing, with wire code `network.mainnet_write_forbidden`.
-   `stellar:mainnet` stays accepted for read-only commands.
+   any RPC call or signing, with wire code `network.mainnet_write_forbidden`,
+   except MPP, which refuses with `mpp.network_forbidden`. `stellar:mainnet`
+   stays accepted for read-only commands.
 
 The policy engine selected per profile in `[policy]` enforces the gate. When no
 full engine is configured, the Noop engine is the binding gate, with fixed

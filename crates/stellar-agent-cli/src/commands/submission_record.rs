@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use stellar_agent_core::audit_log::schema::ValueLegRecord;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{SubmissionError, WalletError};
+use stellar_agent_core::error::{NetworkError, SubmissionError, WalletError};
 use stellar_agent_core::policy::v1::{ValueClass, ValueEffects};
 use stellar_agent_core::policy::{McpToolRegistration, ToolDescriptor, ToolValueKind};
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
@@ -449,9 +449,10 @@ pub(crate) fn unresolved_from_defi(
 
 /// Renders a DeFi submit failure and returns the process exit code.
 ///
-/// A policy denial renders as this binary's gate denials do, under `verb`. An
-/// unresolved submission keeps its `submission.*` code and its `details`;
-/// everything else is reported under `fallback_code`.
+/// A policy denial renders as this binary's gate denials do, under `verb`. A
+/// mainnet refusal reports `network.mainnet_write_forbidden`. An unresolved
+/// submission keeps its `submission.*` code and its `details`; everything else
+/// is reported under `fallback_code`.
 pub(crate) fn render_defi_submit_error(
     error: &stellar_agent_defi::adapter::DefiAdapterError,
     verb: &str,
@@ -463,9 +464,10 @@ pub(crate) fn render_defi_submit_error(
 
 /// The refusal envelope a DeFi submit failure is reported in.
 ///
-/// A policy denial reads as this binary's gate denials read, under `verb`. An
-/// unresolved submission keeps its `submission.*` code and its `details`;
-/// everything else is reported under `fallback_code`.
+/// A policy denial reads as this binary's gate denials read, under `verb`. A
+/// mainnet refusal reports `network.mainnet_write_forbidden`. An unresolved
+/// submission keeps its `submission.*` code and its `details`; everything else
+/// is reported under `fallback_code`.
 fn defi_submit_error_envelope(
     error: &stellar_agent_defi::adapter::DefiAdapterError,
     verb: &str,
@@ -476,6 +478,12 @@ fn defi_submit_error_envelope(
             reason.wire_code(),
             format!("{verb} operation denied by operator policy"),
         );
+    }
+    if matches!(
+        error,
+        stellar_agent_defi::adapter::DefiAdapterError::MainnetWriteForbidden
+    ) {
+        return Envelope::<()>::err(&WalletError::Network(NetworkError::MainnetWriteForbidden));
     }
     match unresolved_from_defi(error) {
         Some(unresolved) => unresolved.envelope(),
@@ -812,6 +820,25 @@ mod tests {
             "trade operation denied by operator policy"
         );
         assert!(rendered.details.is_none());
+    }
+
+    /// A DeFi mainnet refusal reports the canonical code, not the verb's
+    /// submit-failure code.
+    #[test]
+    fn a_defi_mainnet_refusal_reports_the_canonical_code() {
+        let error = stellar_agent_defi::adapter::DefiAdapterError::MainnetWriteForbidden;
+        for (verb, fallback) in [
+            ("trade", "dex.submit_failed"),
+            ("vault deposit", "vault.submit_failed"),
+        ] {
+            let envelope = defi_submit_error_envelope(&error, verb, fallback);
+            let rendered = envelope.error.as_ref().unwrap();
+            assert_eq!(
+                rendered.code, "network.mainnet_write_forbidden",
+                "verb {verb}"
+            );
+            assert!(rendered.details.is_none());
+        }
     }
 
     /// Every other DeFi failure still reports under the verb's own code.

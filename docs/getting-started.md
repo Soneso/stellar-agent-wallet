@@ -20,10 +20,10 @@ reads secret keys from a named environment variable, not from the command line.
 - `stellar:mainnet` is accepted for read-only commands. Select it with a
   mainnet profile (`--profile <NAME>`), or with `--rpc-url` for `balances`
   (which has no `--network` flag). `--network` asserts the profile's chain
-  and never selects one. On a mainnet profile, `pay` and the other guarded
-  transaction and smart-account write commands refuse before any RPC call or
-  signer access. The remaining write commands refuse at submission (see
-  [Mainnet is refused for writes](#mainnet-is-refused-for-writes)).
+  and never selects one. On a mainnet profile, every command that signs a
+  ledger transaction refuses before any RPC call or signer access (see
+  [Mainnet is refused for writes](#mainnet-is-refused-for-writes)). `tx` signs
+  nothing, and `pool init` is the only `pool` command that signs.
 - CLI commands print a JSON envelope on stdout by default. Exit code is `0` on
   success and `1` on any error; the envelope's `error.code` carries the
   diagnostic.
@@ -467,12 +467,12 @@ stellar-agent pay GDEST...WXYZ "10 XLM" \
 
 `--network mainnet` on a testnet profile refuses with
 `profile.network_flag_mismatch`, because the flag asserts the profile's chain.
-The other write commands (`trustline`, `trade`, `vault`, `pool`, and `tx`)
-refuse a mainnet profile at submission, in the submit layer. They can contact
-the endpoint and load their signer before that refusal. A mainnet network
-passphrase and a known mainnet RPC URL each cost zero RPC calls; beyond those
-two the wallet asks the endpoint which network it serves and refuses when the
-answer is mainnet. That
+`trustline`, `trade`, `vault deposit`, `vault withdraw`, and `pool init` refuse
+a mainnet profile the same way, before any RPC call or signer access. `tx`
+signs nothing, and `pool init` is the only `pool` command that signs. The
+submit layer refuses mainnet too. A mainnet network passphrase and a known
+mainnet RPC URL each cost zero RPC calls; beyond those two the wallet asks the
+endpoint which network it serves and refuses when the answer is mainnet. That
 same answer, not the network you declared, is what the wallet checks the
 envelope's signatures against, so an envelope signed for one network cannot be
 submitted under another network's passphrase.

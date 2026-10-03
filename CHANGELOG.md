@@ -138,6 +138,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a transaction whose outcome is unknown. On a rule with remaining
   source signers the line names the re-run of `migrate-verifier` for them
   after the refresh or the wait, and before the add.
+- `stellar_agent_network::refuse_mainnet_write` refuses a mainnet passphrase
+  or a mainnet-pattern RPC URL with `NetworkError::MainnetWriteForbidden`. It
+  performs no I/O.
+- `SaError::MainnetWriteForbidden` reports `network.mainnet_write_forbidden`
+  from the smart-account crate.
+- `DefiAdapterError::MainnetWriteForbidden` carries the same refusal through
+  the DeFi adapters.
+- `stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL` is the refusal
+  detail of every sign-only mainnet refusal, and it carries the canonical
+  code.
 
 ### Changed
 
@@ -425,6 +435,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sa.audit_log`, `network.rpc_divergence`, the threshold identification
   and read refusals, and `sa.auth_entry_construction_failed` at the lock
   and signer-set stages.
+- On a mainnet profile, the DeFi, sign-and-submit, commit, and rule-commit
+  MCP tools answer a `network.mainnet_write_forbidden` business envelope at
+  entry, before the policy gate and any RPC request. The toolset route
+  refuses its signing actions the same way and queues no approval.
+- CLI `vault deposit`, `vault withdraw`, `trade`, `trustline`, `pool init`,
+  and `smart-account rules verify-pins` report
+  `network.mainnet_write_forbidden` on a mainnet profile, before signer access
+  and any request.
+- A submit-layer mainnet refusal inside the smart-account crate reports
+  `network.mainnet_write_forbidden`. `MigrationPlan::submit` and
+  `submit_multicall_bundle` return it unwrapped, and the DeFi adapters
+  return `DefiAdapterError::MainnetWriteForbidden`.
+- `submit_signed_invoke`, `timelock::schedule_upgrade`, `timelock::cancel`,
+  and `timelock::execute` refuse a mainnet passphrase or a mainnet-pattern
+  primary RPC URL before any signing call and any request.
+- `stellar_agent_x402::exact::create_payment` and
+  `submit_fee_bump_idempotent` refuse mainnet inputs before any signing call
+  and any request. `submit_fee_bump_idempotent` serves no cached receipt on
+  mainnet.
 
 ### Removed
 
@@ -458,6 +487,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SorobanAuthorizationEntry`. They describe it as the base64 `HashIdPreimage`
   of the entry, which is what the tool signs, and the result as the raw
   signature the requester assembles into the entry.
+
+### Security
+
+- In `0.1.0-alpha.1` through `0.1.0-alpha.9`, the DeFindex vault deposit and
+  withdraw commands and MCP tools could sign Soroban authorization entries on
+  a mainnet profile. This required the V1 policy engine and an operator-signed
+  rule allowing the operation. The wallet sent the signed entries to the RPC
+  endpoint in a simulation request before its mainnet refusal, so the
+  endpoint operator could submit them on mainnet. A profile on the Noop engine
+  refused them with `policy.engine_required` before signing. Library callers
+  of the public `submit_signed_invoke` that passed mainnet inputs sent signed
+  entries the same way. So did callers of the public functions built on it:
+  `DefindexVaultAdapter::submit`, the smart-account manager writes,
+  `MigrationPlan::submit`, and `submit_multicall_bundle`.
+  `submit_multicall_bundle` did so with a multicall router registered for
+  mainnet and a caller-supplied policy engine allowing the bundle. Callers of
+  the timelock functions and `create_payment` sent them as well, and
+  `create_payment` also returned a signed mainnet payment. These commands,
+  tools, and functions refuse mainnet with `network.mainnet_write_forbidden`
+  before any signing call. All but the functions built on
+  `submit_signed_invoke`, which may read state first, also refuse before any
+  request.
 
 ## [0.1.0-alpha.9] - 2026-09-30
 

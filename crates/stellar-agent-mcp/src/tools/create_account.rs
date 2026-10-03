@@ -755,6 +755,12 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<StellarCreateAccountCommitArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Structural mainnet refusal, keyed on the server's profile context:
+        // before the policy gate, any key access, and any RPC request.
+        if self.context.chain_id.is_mainnet() {
+            return Ok(crate::tools::common::mainnet_write_forbidden_result());
+        }
+
         // ── Re-derive authoritative args from HMAC-bound envelope_xdr ────────
         //
         // The policy engine MUST evaluate nonce-bound fields. Caller-supplied

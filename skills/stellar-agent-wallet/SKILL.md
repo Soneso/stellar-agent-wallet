@@ -253,11 +253,14 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
 
 ## 9. Safety model
 
-- On `stellar:mainnet` the default policy engine allows read-only tools and
-  refuses every fund-moving tool with `policy.engine_required`, before any RPC
-  call. Below the policy layer, the network layer structurally refuses every
-  mainnet write with `network.mainnet_write_forbidden` regardless of engine or
-  keys — no configuration unlocks mainnet writes in this alpha.
+- On `stellar:mainnet` read-only tools work. The DeFi, sign-and-submit, commit,
+  and rule-commit tools refuse a mainnet profile at handler entry with
+  `network.mainnet_write_forbidden`, before the policy gate and any RPC call. A
+  profile on the Noop engine refuses the other destructive tools on mainnet with
+  `policy.engine_required`. Below the policy layer, the network layer
+  structurally refuses every mainnet write with `network.mainnet_write_forbidden`
+  regardless of engine or keys. No configuration unlocks mainnet writes in this
+  alpha.
 - The submit layer does not trust the declared network. It asks the RPC endpoint
   which network it serves and binds the submission to that answer, then verifies
   every signature on the envelope against it. Five codes carry those refusals:
@@ -266,11 +269,17 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   not be established in time), `network.envelope_signed_for_mainnet`,
   `network.envelope_signature_unverifiable`, and `network.envelope_unsigned`.
   See references/troubleshooting.md.
-- The sign-only tools (the SEP-43 sign verbs, SEP-53 `sign_message`, and the two
-  x402 payment tools), plus every MPP tool, refuse `stellar:mainnet`
-  structurally with
-  `network.mainnet_write_forbidden` at handler entry, before the policy gate and
-  regardless of engine. Branch on BOTH codes when handling a mainnet refusal.
+- These tools refuse `stellar:mainnet` structurally at handler entry with
+  `network.mainnet_write_forbidden`, before the policy gate and regardless of
+  engine:
+  - the sign-only tools: the SEP-43 sign verbs, SEP-53 `sign_message`, and the
+    two x402 payment tools;
+  - `stellar_sep43_sign_and_submit_transaction` and the DeFi tools;
+  - the commit tools, `stellar_rule_create_commit`, and the toolset signing
+    actions.
+- Every MPP tool refuses `stellar:mainnet` at handler entry with
+  `mpp.network_forbidden`. Branch on all three codes when handling a mainnet
+  refusal.
 - Argument values are never written to the audit log — only key names. The
   operator verifies the chain with `stellar-agent audit verify`.
 
@@ -323,14 +332,14 @@ reconcile the transaction. Keep credential and receipt values out of logs.
 must approve and relay the `approval_attestation`. Retrying the commit unchanged
 will keep failing.
 
-**Mainnet writes are refused in this alpha.** Expect `policy.engine_required` for
-any fund-moving tool on `stellar:mainnet` under the default Noop engine, and
-`network.mainnet_write_forbidden` from the network layer, which refuses every
-mainnet write regardless of engine or keys — no configuration unlocks mainnet
-writes. The sign-only tools (SEP-43 sign verbs, SEP-53 `sign_message`, x402
-payment tools) refuse mainnet at handler entry with
-`network.mainnet_write_forbidden`, before the policy gate — branch on both codes
-for mainnet refusals.
+**Mainnet writes are refused in this alpha.** Expect
+`network.mainnet_write_forbidden` at handler entry from the DeFi,
+sign-and-submit, commit, rule-commit, and sign-only tools, before the policy
+gate. The network layer refuses every mainnet write with the same code,
+regardless of engine or keys. No configuration unlocks mainnet writes. MPP tools
+refuse with `mpp.network_forbidden`. A profile on the Noop engine refuses the
+other destructive tools on mainnet with `policy.engine_required`. Branch on all
+three codes for mainnet refusals.
 
 **The endpoint decides which network you are on, not `chain_id`.** The submit
 layer asks the RPC endpoint which network it serves and binds the submission to

@@ -32,6 +32,16 @@
 //!    `amount_max_stroops` re-prompts the first-invoke gate.
 //! 10. **gated_tool_only_via_both_gates** — `stellar_pay_commit` is unreachable
 //!     via the ungated `resolve_action` path (structural invariant).
+//! 11. **mainnet_sign_payment_refuses_before_any_approval_is_queued**: on a
+//!     mainnet context the sign-payment action answers
+//!     `network.mainnet_write_forbidden`, queues no approval, writes no grant,
+//!     and sends no request. It runs on the Noop engine, an allow-all engine,
+//!     and a denying engine. The denying engine pins that the refusal precedes
+//!     the toolset's own dispatch gate.
+//! 12. **mainnet_rule_create_refuses_before_any_approval_is_queued**: the same
+//!     for the rule-create action over a pending rule proposal.
+//! 13. **mainnet_read_only_toolset_action_still_succeeds**: a read-only action
+//!     stays allowed on mainnet.
 //!
 //! # `#[serial]` requirement
 //!
@@ -1078,4 +1088,322 @@ async fn adversarial_muxed_destination_reprompts() {
         msg.contains("first_invoke_approval_required") || msg.contains("invalid_destination"),
         "expected first-invoke gate or invalid-destination refusal for M-address; got: {msg}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests 11 to 13: mainnet refusal ahead of the toolset gates
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Writes a minimal `ToolsetPinRecord` declaring `capabilities`.
+fn write_pin_with_capabilities(
+    toolsets_root: &std::path::Path,
+    toolset_name: &str,
+    capabilities: &[&str],
+) {
+    let toolset_dir = toolsets_root.join(toolset_name);
+    std::fs::create_dir_all(&toolset_dir).expect("create toolset dir");
+    let pin_json = serde_json::json!({
+        "package": toolset_name,
+        "version": "1.0.0",
+        "shasum": "c".repeat(64),
+        "publisher": SOURCE_G,
+        "installed_at": "2026-06-02T00:00:00Z",
+        "capabilities": capabilities,
+        "allowed_tools": []
+    });
+    let pin_path = toolset_dir.join(PIN_FILE_NAME);
+    std::fs::write(&pin_path, serde_json::to_string_pretty(&pin_json).unwrap()).expect("write pin");
+}
+
+/// The policy engine a mainnet toolset case runs on.
+#[derive(Clone, Copy, Debug)]
+enum CaseEngine {
+    /// The profile's Noop engine.
+    Noop,
+    /// An engine that allows every call.
+    AllowAll,
+    /// An engine that denies every call, including the toolset's own dispatch
+    /// gate, so only a refusal ahead of that gate answers the canonical code.
+    DenyAll,
+}
+
+/// Builds a mainnet `WalletServer` on `engine` whose endpoint is the mock at
+/// `rpc_url`.
+///
+/// No keyring mock is installed here: the refusal under test precedes every
+/// key access.
+fn build_mainnet_server(
+    rpc_url: &str,
+    approval_dir: &std::path::Path,
+    grant_store_path: &std::path::Path,
+    toolsets_root: &std::path::Path,
+    engine: CaseEngine,
+) -> WalletServer {
+    let profile = Profile::builder_mainnet(rpc_url, "svc", "acct", "n-svc", "n-acct")
+        .with_noop_engine()
+        .build();
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    match engine {
+        CaseEngine::Noop => {}
+        CaseEngine::AllowAll => server
+            .set_policy_engine_for_test(Arc::new(common::policy_mock::MockPolicyEngine::allow())),
+        CaseEngine::DenyAll => server.set_policy_engine_for_test(Arc::new(
+            common::policy_mock::MockPolicyEngine::deny_explicit_rule(),
+        )),
+    }
+    server.set_approval_dir_for_test(approval_dir.to_path_buf());
+    server.set_grant_store_path_for_test(grant_store_path.to_path_buf());
+    server.set_toolsets_root_for_test(toolsets_root.to_path_buf());
+    server
+}
+
+/// Asserts the canonical mainnet refusal envelope.
+fn assert_mainnet_write_forbidden(result: &rmcp::model::CallToolResult) {
+    let (code, _message, _text) = common::assert_business_envelope(result);
+    assert_eq!(
+        code, "network.mainnet_write_forbidden",
+        "a mainnet signing action must answer the canonical refusal code"
+    );
+}
+
+/// Asserts the mock endpoint received no request.
+async fn assert_no_requests(rpc: &wiremock::MockServer) {
+    let received = rpc
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    assert!(
+        received.is_empty(),
+        "a refused mainnet action must send no request; got {}",
+        received.len()
+    );
+}
+
+/// The sign-payment action on a mainnet context, with no grant installed,
+/// answers `network.mainnet_write_forbidden` before the first-invoke gate. No
+/// first-invoke approval and no payment approval is queued, no grant is
+/// written, and no request is sent. The verdict of the policy engine does not
+/// matter, so the case runs on the Noop engine, an allow-all engine, and a
+/// denying engine.
+#[tokio::test]
+#[serial]
+async fn mainnet_sign_payment_refuses_before_any_approval_is_queued() {
+    mainnet_sign_payment_case(CaseEngine::Noop).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn mainnet_sign_payment_refuses_before_any_approval_is_queued_under_allow_all_engine() {
+    mainnet_sign_payment_case(CaseEngine::AllowAll).await;
+}
+
+/// The denying engine refuses the toolset's own dispatch gate, so this case
+/// answers the canonical code only while the refusal precedes that gate.
+#[tokio::test]
+#[serial]
+async fn mainnet_sign_payment_refuses_before_any_approval_is_queued_under_denying_engine() {
+    mainnet_sign_payment_case(CaseEngine::DenyAll).await;
+}
+
+async fn mainnet_sign_payment_case(engine: CaseEngine) {
+    let _data_root = common::isolated_data_root();
+    let rpc = wiremock::MockServer::start().await;
+    let toolsets_dir = TempDir::new().unwrap();
+    let approval_dir = TempDir::new().unwrap();
+    let grant_dir = TempDir::new().unwrap();
+    let grant_file = grant_dir.path().join("grants.toml");
+
+    write_pin_with_sign_payment(toolsets_dir.path(), TOOLSET_NAME);
+
+    let server = build_mainnet_server(
+        &rpc.uri(),
+        approval_dir.path(),
+        &grant_file,
+        toolsets_dir.path(),
+        engine,
+    );
+    let envelope_xdr = payment_envelope_xdr(SOURCE_G, DEST_G, 10_000_000);
+    let args = StellarToolsetInvokeArgs {
+        toolset: TOOLSET_NAME.to_owned(),
+        action: "stellar_pay_commit".to_owned(),
+        chain_id: Some("stellar:mainnet".to_owned()),
+        args: serde_json::json!({
+            "envelope_xdr": envelope_xdr,
+            "source": SOURCE_G,
+            "destination": DEST_G,
+            "nonce": "fake-nonce",
+            "expires_at_unix_ms": 9_999_999_999_u64,
+            "asset": "native",
+            "amount": "1 XLM",
+            "chain_id": "stellar:mainnet"
+        }),
+    };
+
+    let result = server
+        .call_stellar_toolset_invoke(args)
+        .await
+        .expect("the mainnet refusal is a business envelope");
+    assert_mainnet_write_forbidden(&result);
+    assert_eq!(
+        count_pending_approvals(approval_dir.path(), &server.profile_name_for_approval()),
+        0,
+        "no first-invoke approval and no payment approval may be queued \
+             (engine = {engine:?})"
+    );
+    assert!(
+        !grant_file.exists(),
+        "no grant may be written (engine = {engine:?})"
+    );
+    assert_no_requests(&rpc).await;
+}
+
+/// The rule-create action on a mainnet context, with a pending rule proposal
+/// and no grant, answers `network.mainnet_write_forbidden` before the
+/// first-invoke gate: the approval store keeps exactly the proposal, and no
+/// request is sent. The case runs on the Noop engine, an allow-all engine,
+/// and a denying engine.
+#[tokio::test]
+#[serial]
+async fn mainnet_rule_create_refuses_before_any_approval_is_queued() {
+    mainnet_rule_create_case(CaseEngine::Noop).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn mainnet_rule_create_refuses_before_any_approval_is_queued_under_allow_all_engine() {
+    mainnet_rule_create_case(CaseEngine::AllowAll).await;
+}
+
+/// The denying engine refuses the toolset's own dispatch gate, so this case
+/// answers the canonical code only while the refusal precedes that gate.
+#[tokio::test]
+#[serial]
+async fn mainnet_rule_create_refuses_before_any_approval_is_queued_under_denying_engine() {
+    mainnet_rule_create_case(CaseEngine::DenyAll).await;
+}
+
+async fn mainnet_rule_create_case(engine: CaseEngine) {
+    use stellar_agent_core::approval::PendingApproval;
+    use stellar_agent_core::approval::rule_proposal::{
+        ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
+    };
+    use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+
+    const SMART_ACCOUNT: &str = "CC53XO53XO53XO53XO53XO53XO53XO53XO53XO53XO53XO53XO53WQD5";
+
+    let _data_root = common::isolated_data_root();
+    let rpc = wiremock::MockServer::start().await;
+    let toolsets_dir = TempDir::new().unwrap();
+    let approval_dir = TempDir::new().unwrap();
+    let grant_dir = TempDir::new().unwrap();
+    let grant_file = grant_dir.path().join("grants.toml");
+
+    write_pin_with_capabilities(toolsets_dir.path(), TOOLSET_NAME, &["sign-rule-create"]);
+
+    let server = build_mainnet_server(
+        &rpc.uri(),
+        approval_dir.path(),
+        &grant_file,
+        toolsets_dir.path(),
+        engine,
+    );
+
+    // A pending proposal, so the gated resolver reaches the first-invoke
+    // gate unless the refusal answers first.
+    let profile_name = server.profile_name_for_approval();
+    let store_path = approval_dir.path().join(format!("{profile_name}.toml"));
+    let proposal = PendingApproval::new_rule_proposal_pending(
+        SMART_ACCOUNT.to_owned(),
+        MAINNET_PASSPHRASE.to_owned(),
+        "stellar:mainnet".to_owned(),
+        ContextRuleProposalSnapshot::new(
+            RuleProposalContextType::Default,
+            "spend-daily".to_owned(),
+            None,
+            vec![RuleProposalSigner::delegated(SOURCE_G.to_owned(), true)],
+            vec![],
+            vec![0],
+            false,
+            false,
+        ),
+        [0u8; 32],
+        "Default rule \"spend-daily\"".to_owned(),
+        process_uid_for_attestation().expect("process uid"),
+        TOOLSET_GRANT_DEFAULT_TTL_MS,
+    )
+    .expect("rule proposal");
+    let approval_nonce = proposal.approval_nonce.clone();
+    PendingApprovalStore::open(store_path.clone())
+        .expect("open approval store")
+        .insert(proposal, now_unix_ms().expect("now_unix_ms"))
+        .expect("insert proposal");
+    let store_before = std::fs::read(&store_path).expect("read approval store");
+
+    let args = StellarToolsetInvokeArgs {
+        toolset: TOOLSET_NAME.to_owned(),
+        action: "stellar_rule_create_commit".to_owned(),
+        chain_id: Some("stellar:mainnet".to_owned()),
+        args: serde_json::json!({
+            "approval_nonce": approval_nonce,
+            "chain_id": "stellar:mainnet"
+        }),
+    };
+
+    let result = server
+        .call_stellar_toolset_invoke(args)
+        .await
+        .expect("the mainnet refusal is a business envelope");
+    assert_mainnet_write_forbidden(&result);
+    assert_eq!(
+        std::fs::read(&store_path).expect("read approval store"),
+        store_before,
+        "the approval store must hold exactly the proposal (engine = {engine:?})"
+    );
+    assert!(
+        !grant_file.exists(),
+        "no grant may be written (engine = {engine:?})"
+    );
+    assert_no_requests(&rpc).await;
+}
+
+/// A read-only toolset action stays allowed on a mainnet context.
+#[tokio::test]
+#[serial]
+async fn mainnet_read_only_toolset_action_still_succeeds() {
+    let _data_root = common::isolated_data_root();
+    let rpc = wiremock::MockServer::start().await;
+    let toolsets_dir = TempDir::new().unwrap();
+    let approval_dir = TempDir::new().unwrap();
+    let grant_dir = TempDir::new().unwrap();
+    let grant_file = grant_dir.path().join("grants.toml");
+
+    write_pin_with_capabilities(toolsets_dir.path(), TOOLSET_NAME, &["suggest-destination"]);
+
+    let server = build_mainnet_server(
+        &rpc.uri(),
+        approval_dir.path(),
+        &grant_file,
+        toolsets_dir.path(),
+        CaseEngine::Noop,
+    );
+    let args = StellarToolsetInvokeArgs {
+        toolset: TOOLSET_NAME.to_owned(),
+        action: "stellar_sep7_parse_uri".to_owned(),
+        chain_id: Some("stellar:mainnet".to_owned()),
+        args: serde_json::json!({
+            "uri": format!("web+stellar:pay?destination={DEST_G}&amount=1"),
+            "verify_origin": false
+        }),
+    };
+
+    let result = server
+        .call_stellar_toolset_invoke(args)
+        .await
+        .expect("a read-only action on mainnet succeeds");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a read-only action on mainnet must not be refused: {result:?}"
+    );
+    assert_no_requests(&rpc).await;
 }

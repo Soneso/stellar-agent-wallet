@@ -1,9 +1,11 @@
 //! Offline validation tests for `create_payment`.
 //!
 //! These exercise the request validation that `create_payment` performs before
-//! any RPC contact: scheme, network, asset, fee-sponsorship, and amount checks
-//! all reject malformed input before the RPC client is constructed. They run
-//! under the default `cargo test` with no network access and no feature flag.
+//! any RPC contact: scheme, network, mainnet refusal, asset, fee-sponsorship,
+//! and amount checks all reject their input before the RPC client is
+//! constructed. They run under the default `cargo test` with no network access
+//! and no feature flag; the mainnet cases count connections on a loopback
+//! listener.
 
 #![allow(
     clippy::unwrap_used,
@@ -165,5 +167,67 @@ async fn non_integer_amount_rejected() {
     assert!(
         matches!(r, Err(X402Error::AmountConversion { .. })),
         "expected AmountConversion for non-integer amount, got {r:?}"
+    );
+}
+
+// ── Mainnet refusal ──────────────────────────────────────────────────────────
+//
+// The endpoint is a loopback listener that counts and closes every
+// connection, so a call that passed the refusal would connect at once and
+// fail with another variant.
+
+const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
+
+/// `stellar:pubnet` requirements under the mainnet profile passphrase are
+/// refused with `MainnetSigningForbidden` before any signing call and any
+/// connection.
+#[tokio::test]
+async fn pubnet_requirements_refused_before_signing_and_any_connection() {
+    let counter = stellar_agent_test_support::ConnectionCounter::start().unwrap();
+    let req = requirements_with(
+        "exact",
+        stellar_agent_x402::constants::X402_STELLAR_PUBNET,
+        AMOUNT,
+        true.into(),
+    );
+    let r = create_payment(
+        &req,
+        &dummy_signer(),
+        &counter.https_uri(),
+        MAINNET_PASSPHRASE,
+    )
+    .await;
+    assert!(
+        matches!(&r, Err(X402Error::MainnetSigningForbidden { detail })
+            if detail.contains("network.mainnet_write_forbidden")),
+        "expected MainnetSigningForbidden carrying the canonical code, got {r:?}"
+    );
+    assert_eq!(
+        r.unwrap_err().wire_code(),
+        "network.mainnet_write_forbidden"
+    );
+    assert_eq!(
+        counter.accepted().unwrap(),
+        0,
+        "a refused mainnet payment must open no connection"
+    );
+}
+
+/// Testnet requirements under the testnet passphrase, with a mainnet-pattern
+/// RPC URL on the same listener, are refused the same way.
+#[tokio::test]
+async fn mainnet_pattern_rpc_url_refused_before_signing_and_any_connection() {
+    let counter = stellar_agent_test_support::ConnectionCounter::start().unwrap();
+    let req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
+    let rpc_url = format!("{}/pubnet", counter.https_uri());
+    let r = create_payment(&req, &dummy_signer(), &rpc_url, TESTNET_PASSPHRASE).await;
+    assert!(
+        matches!(r, Err(X402Error::MainnetSigningForbidden { .. })),
+        "expected MainnetSigningForbidden, got {r:?}"
+    );
+    assert_eq!(
+        counter.accepted().unwrap(),
+        0,
+        "a refused mainnet payment must open no connection"
     );
 }

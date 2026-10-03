@@ -557,14 +557,17 @@ impl MigrationPlan {
     ///   verifiers, so no verifier finding is returned.
     /// - [`SaError::SubmissionUnresolved`]: a step was sent and its outcome
     ///   is unknown.
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase or
+    ///   primary endpoint is mainnet, or the endpoint reports mainnet; no
+    ///   transaction is sent.
+    /// - [`SaError::AuthEntryConstructionFailed`]: the signer public-key
+    ///   fetch failed, the rule lock was not acquired within its budget, or
+    ///   a step's auth entry could not be built.
     /// - [`SaError::VerifierMigrationFailed`]: at phase `plan_build` the
     ///   pair's plan does not match the rule. At `submit_simulate` a
     ///   simulation failed or returned another shape, or a host function did
     ///   not decode or invokes another entrypoint than its step. At
-    ///   `submit_send` any other step failed.
-    /// - [`SaError::AuthEntryConstructionFailed`]: the signer public-key
-    ///   fetch failed, the rule lock was not acquired within its budget, or
-    ///   a step's auth entry could not be built.
+    ///   `submit_send` any other step failed, except the kept errors above.
     pub async fn submit(
         &self,
         signer: &(dyn Signer + Send + Sync),

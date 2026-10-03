@@ -44,15 +44,17 @@ Each invocation is evaluated before it does anything. Three decisions:
 | RequireApproval | The call is held pending an out-of-band operator approval. |
 
 The engine that runs is selected per profile in `[policy]`. Two structural rules
-apply on every surface: the default network is `stellar:testnet`. Every
-write or signing command structurally refuses `stellar:mainnet`
-(`network.mainnet_write_forbidden`). This covers `--network` commands before any RPC call
-or signature. At the submit layer it covers both a declared mainnet passphrase and a
-known mainnet RPC URL, each with no RPC call at all. Meanwhile `stellar:mainnet`
-stays accepted for read-only commands. The submit layer additionally asks the
-endpoint which network it serves and binds the submission to that answer rather
-than to the declared network, verifying every signature on the envelope against
-it; see references/troubleshooting.md for those wire codes.
+apply on every surface: the default network is `stellar:testnet`. Every write or
+signing command structurally refuses `stellar:mainnet`
+(`network.mainnet_write_forbidden`), except MPP, which refuses with
+`mpp.network_forbidden`. This covers `--network` commands and the profile-driven
+write commands before any RPC call or signature. At the submit layer it covers
+both a declared mainnet passphrase and a known mainnet RPC URL, each with no RPC
+call at all. Meanwhile `stellar:mainnet` stays accepted for read-only commands.
+The submit layer additionally asks the endpoint which network it serves and
+binds the submission to that answer rather than to the declared network,
+verifying every signature on the envelope against it; see
+references/troubleshooting.md for those wire codes.
 
 ### Noop engine
 

@@ -47,9 +47,10 @@
 //!
 //! # Mainnet write defence
 //!
-//! Write subcommands structurally refuse mainnet
+//! Write subcommands and `verify-pins` structurally refuse mainnet
 //! (`network.mainnet_write_forbidden`) before any RPC or signing call.
-//! Read subcommands accept mainnet (read-only, no write risk).
+//! `verify-pins` loads a signer to derive its simulation source account.
+//! The other read subcommands accept mainnet (read-only, no write risk).
 //!
 //! # Inverse-bypass discipline
 //!
@@ -101,7 +102,8 @@ use crate::commands::smart_account::common::{
 };
 use crate::commands::smart_account::list_rules as sa_list_rules;
 use crate::common::network::{
-    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, mainnet_write_refusal,
+    network_context_for_command,
 };
 use crate::common::profile_access::ProfileOrigin;
 use crate::common::render::render_json;
@@ -330,7 +332,8 @@ pub enum RulesSubcommand {
     /// `"unavailable"`, `"no_pin"`, or `"no_contracts"`. The
     /// `pinned_*_first8` fields carry the stored pin from the audit log;
     /// `observed_*_first8` carry the live values fetched via two-RPC
-    /// consultation.
+    /// consultation. A mainnet profile is refused with
+    /// `network.mainnet_write_forbidden` before the signer loads.
     VerifyPins(Box<VerifyPinsArgs>),
 
     /// Add a policy contract to an existing context rule (OZ `add_policy`).
@@ -1666,8 +1669,9 @@ async fn delete_run(args: &DeleteArgs) -> i32 {
 
 /// Arguments for `smart-account rules verify-pins`.
 ///
-/// Read-only — no signing, no submission. Requires a signer-source to derive
-/// the source-account G-strkey for the `getLedgerEntries` simulation envelope.
+/// Read-only: no signing, no submission. Requires a signer-source to derive
+/// the source-account G-strkey for the `getLedgerEntries` simulation envelope,
+/// so a mainnet profile is refused before the signer loads.
 #[non_exhaustive]
 #[derive(Debug, Args)]
 pub struct VerifyPinsArgs {
@@ -1855,6 +1859,9 @@ async fn verify_pins_run(args: &VerifyPinsArgs) -> i32 {
         Ok(context) => context,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
+    if let Some(err) = mainnet_write_refusal(context.chain_id) {
+        return emit_error(&err, args.output, &request_id);
+    }
     let account_redacted = redact_strkey_first5_last5(&args.account);
 
     let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {

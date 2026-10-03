@@ -88,7 +88,7 @@ use crate::idempotent_submit::{
 };
 use crate::signing::Signer;
 // Reuse the canonical bytes_to_hex and redact_tx_hash helpers from submit.
-use crate::submit::{SubmissionResult, bytes_to_hex, redact_tx_hash};
+use crate::submit::{SubmissionResult, bytes_to_hex, redact_tx_hash, refuse_mainnet_write};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -124,6 +124,15 @@ const FEEBUMP_INNER_PREFIX: &str = "feebump-inner:";
 /// RPC's retention floor while the transaction is still `NOT_FOUND`, so a zero
 /// anchor turns the first not-found poll into an ambiguous result.
 ///
+/// # Mainnet refusal
+///
+/// A mainnet `network_passphrase` or a mainnet-pattern client URL is refused
+/// with [`stellar_agent_core::error::NetworkError::MainnetWriteForbidden`]
+/// before any signing call and any request. The refusal also precedes every
+/// receipt-store read and write, so a cached success receipt is not served on
+/// mainnet. This matches the first step of
+/// [`crate::idempotent_submit::submit_transaction_idempotent`].
+///
 /// # Idempotency key
 ///
 /// `"feebump-inner:" ‖ hex(SHA-256(network_id ‖ ENVELOPE_TYPE_TX ‖ inner-tx-body))`
@@ -142,6 +151,10 @@ const FEEBUMP_INNER_PREFIX: &str = "feebump-inner:";
 ///
 /// # Errors
 ///
+/// - [`WalletError::Network`] wrapping
+///   [`stellar_agent_core::error::NetworkError::MainnetWriteForbidden`]
+///   if `network_passphrase` is the mainnet passphrase or the client URL
+///   matches a mainnet host pattern.
 /// - [`WalletError`] wrapping [`crate::fee_bump::FeeBumpError`] if the inner envelope is invalid
 ///   or the fee is outside the allowed range.
 /// - Any error from `submit_with_retention_poll` on the submission path.
@@ -208,6 +221,12 @@ pub async fn submit_fee_bump_idempotent(
     recorded_at_ledger: u32,
     timeout: Duration,
 ) -> Result<SubmissionResult, WalletError> {
+    // ── Step 0: structural mainnet refusal ───────────────────────────────────
+    //
+    // Ahead of the decode, the receipt fast path, `try_begin`, and the signer:
+    // a mainnet submission reads no receipt, writes none, and signs nothing.
+    refuse_mainnet_write(network_passphrase, &client.url).map_err(WalletError::Network)?;
+
     // ── Step 1: decode inner, compute inner tx hash and inner_key ─────────────
     //
     // decode_inner_v1 extracts the TransactionV1Envelope from the already-signed

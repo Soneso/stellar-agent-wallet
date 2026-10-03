@@ -541,6 +541,16 @@ pub enum DefiAdapterError {
         /// The typed denial, as the governing criterion produced it.
         reason: Box<stellar_agent_core::policy::DenyReason>,
     },
+    /// A write declared for mainnet, aimed at a mainnet-pattern endpoint, or
+    /// sent to an endpoint that reports the mainnet passphrase was refused. No
+    /// transaction was sent. The first two are refused before any signing call;
+    /// the adapter may read state first.
+    ///
+    /// Distinct from [`Self::Network`]: the refusal is structural, not a
+    /// failure. The surface reports `network.mainnet_write_forbidden`, the one
+    /// code every mainnet refusal carries.
+    #[error("mainnet writes are structurally refused in this alpha")]
+    MainnetWriteForbidden,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

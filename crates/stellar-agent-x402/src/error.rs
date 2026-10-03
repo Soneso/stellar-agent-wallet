@@ -72,15 +72,16 @@ pub enum X402Error {
         profile_passphrase: String,
     },
 
-    /// A payment-signing request targeted a mainnet profile.
+    /// A payment-signing request targeted mainnet.
     ///
-    /// The x402 payment tools return a signed payment authorization the MCP host
-    /// broadcasts externally; the submit-layer mainnet gate never fires because
-    /// the wallet does not submit. Signing is therefore refused structurally on a
-    /// mainnet profile before any key access, so no valid mainnet payment
-    /// signature is ever produced. The `detail` carries the canonical
-    /// `network.mainnet_write_forbidden` wire code so this refusal correlates
-    /// with the CLI, submit-layer, and SEP-43 signing guards.
+    /// A signed payment authorization is submitted by another party, not by the
+    /// wallet, so no submit-layer mainnet gate stands between it and mainnet.
+    /// [`crate::exact::create_payment`] raises this variant for a mainnet
+    /// passphrase or a mainnet-pattern RPC URL, before any key access and any
+    /// request. The MCP payment tools also refuse a mainnet profile at entry.
+    /// The `detail` carries the canonical `network.mainnet_write_forbidden`
+    /// wire code, so this refusal correlates with the CLI, submit-layer, and
+    /// SEP-43 signing guards.
     #[error("mainnet signing forbidden: {detail}")]
     MainnetSigningForbidden {
         /// Non-secret description of the refusal, carrying the canonical

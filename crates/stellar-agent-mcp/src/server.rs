@@ -879,6 +879,10 @@ impl WalletServer {
     /// On a mainnet context a supplied value is refused with
     /// `profile.non_overlayable_field`; a value with credentials is refused on
     /// every chain. An absent value yields the context's secondary endpoint.
+    ///
+    /// The DeFi tools refuse a mainnet context with
+    /// `network.mainnet_write_forbidden` before they call this method. Its
+    /// mainnet arm guards any other caller.
     pub(crate) fn secondary_override(
         &self,
         requested: Option<&str>,

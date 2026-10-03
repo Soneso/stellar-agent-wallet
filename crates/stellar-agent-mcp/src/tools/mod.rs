@@ -84,3 +84,7 @@ pub(crate) mod rules;
 // Agent-proposed context rules — stellar_rule_create / stellar_rule_create_commit
 // (Package D, GH issue #8).
 pub(crate) mod rule_create;
+
+// The mainnet refusal at entry of the commit and sign-and-submit tools.
+#[cfg(test)]
+mod mainnet_entry_refusal_tests;

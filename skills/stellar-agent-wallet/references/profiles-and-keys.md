@@ -267,6 +267,8 @@ That layer binds each submission to the network the RPC endpoint reports it
 serves, not to the profile's declared `network_passphrase`, so a profile whose
 `rpc_url` and network do not name the same chain is refused before anything is
 sent (`network.endpoint_network_mismatch`).
+MPP refuses mainnet with `mpp.network_forbidden` instead of
+`network.mainnet_write_forbidden`.
 
 ### Migrate first
 

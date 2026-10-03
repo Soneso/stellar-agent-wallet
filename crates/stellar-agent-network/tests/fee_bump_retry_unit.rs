@@ -1,8 +1,9 @@
 //! Unit tests for `fee_bump_retry` helper paths.
 //!
-//! Tests that do NOT require a mock RPC server: `fee_bump_receipt_to_result`
-//! terminal-status mapping, `wait_for_winner_fee_bump` loser-poll timeout,
-//! `redact_inner_key` behaviour, and `submit_fee_bump_idempotent` guard paths.
+//! Tests of `fee_bump_receipt_to_result` terminal-status mapping,
+//! `wait_for_winner_fee_bump` loser-poll timeout, `redact_inner_key`
+//! behaviour, and `submit_fee_bump_idempotent` guard paths. Only the mainnet
+//! refusal test starts a mock RPC server, to count the requests it receives.
 //!
 //! # Coverage
 //!
@@ -10,8 +11,8 @@
 //!     terminal receipts — correct WalletError variant and message content.
 //! (b) `submit_fee_bump_idempotent` with an invalid inner envelope (non-V1
 //!     TxFeeBump wrapper) is rejected before any signing.
-//! (c) `submit_fee_bump_idempotent` with mainnet passphrase is rejected
-//!     immediately (inner hash computation gets past, but build_and_sign rejects).
+//! (c) `submit_fee_bump_idempotent` with the mainnet passphrase is refused
+//!     before any receipt, any fee-payer signer call, and any request.
 //! (d) `submit_fee_bump_idempotent` with invalid fee_source strkey returns
 //!     ValidationError(AddressInvalid) on the outer hash computation step.
 //! (e) `redact_inner_key` preserves the prefix and redacts only the hash part.
@@ -423,6 +424,93 @@ async fn inner_envelope_is_non_v1_fee_bump_rejected_before_signing() {
             WalletError::Internal(InternalError::UnexpectedState { .. })
         ),
         "non-V1 rejection must not be UnexpectedState; got: {err:?}"
+    );
+    drop(dir);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (c) Mainnet passphrase refused before the receipt store and the signer
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A fee-payer signer whose every method panics, so any use of it fails the
+/// test that holds it.
+struct PanickingSigner;
+
+#[async_trait::async_trait]
+impl stellar_agent_network::Signer for PanickingSigner {
+    async fn sign_tx_payload(&self, _payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        panic!("a refused mainnet fee-bump must not reach sign_tx_payload")
+    }
+
+    async fn sign_auth_digest(&self, _digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        panic!("a refused mainnet fee-bump must not reach sign_auth_digest")
+    }
+
+    async fn sign_soroban_address_auth_payload(
+        &self,
+        _payload: &[u8; 32],
+    ) -> Result<[u8; 64], WalletError> {
+        panic!("a refused mainnet fee-bump must not reach sign_soroban_address_auth_payload")
+    }
+
+    async fn sign_webauthn_assertion(
+        &self,
+        _auth_digest: &[u8; 32],
+        _credential_id: &[u8],
+    ) -> Result<stellar_agent_network::WebAuthnAssertion, WalletError> {
+        panic!("a refused mainnet fee-bump must not reach sign_webauthn_assertion")
+    }
+
+    async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+        panic!("a refused mainnet fee-bump must not reach public_key")
+    }
+}
+
+/// The mainnet passphrase is refused with `MainnetWriteForbidden` before the
+/// receipt store, the fee-payer signer, and the endpoint. The client points at
+/// a mock server, so any request is recorded.
+#[tokio::test]
+async fn mainnet_passphrase_refused_before_receipt_signer_and_request() {
+    use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+
+    let (inner_xdr, fp_g, _fp_signer) = build_signed_inner(650).await;
+    let (dir, store) = open_temp_store();
+    let mock_server = wiremock::MockServer::start().await;
+    let client = StellarRpcClient::new(&mock_server.uri()).unwrap();
+
+    let result = submit_fee_bump_idempotent(
+        &client,
+        &inner_xdr,
+        &fp_g,
+        500,
+        10_000,
+        MAINNET_PASSPHRASE,
+        &PanickingSigner,
+        &store,
+        100,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(WalletError::Network(NetworkError::MainnetWriteForbidden))
+        ),
+        "the mainnet passphrase must be refused with MainnetWriteForbidden; got: {result:?}"
+    );
+    assert!(
+        store.all().unwrap().is_empty(),
+        "a refused mainnet fee-bump must leave no receipt"
+    );
+    let received = mock_server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    assert!(
+        received.is_empty(),
+        "a refused mainnet fee-bump must send no request; got {}",
+        received.len()
     );
     drop(dir);
 }

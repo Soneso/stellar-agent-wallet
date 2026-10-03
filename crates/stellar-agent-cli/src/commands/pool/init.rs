@@ -44,6 +44,7 @@ use stellar_agent_sep5::Sep5Wallet;
 use zeroize::Zeroizing;
 
 use crate::commands::submission_record::{SubmitRecord, build_recorder, write_settled_row};
+use crate::common::network::mainnet_write_refusal;
 use crate::common::profile_access::load_profile_reconciled;
 use crate::common::{render::render_json, resolve_profile_name};
 
@@ -273,7 +274,24 @@ fn pending_data(name: &str, pending: &PoolInitialization) -> serde_json::Value {
 /// Runs pool initialization or recovery. Errors leave the durable checkpoint
 /// available to the completion command. Returns zero when the request succeeds.
 pub async fn run(args: &PoolInitArgs) -> i32 {
-    match execute(args).await {
+    run_with_dependencies(
+        args,
+        stellar_agent_network::keyring::init_platform_keyring_store,
+    )
+    .await
+}
+
+/// Testable core of [`run`] with the platform-keyring initialiser injected.
+///
+/// Production callers use [`run`], which supplies
+/// [`stellar_agent_network::keyring::init_platform_keyring_store`]. Tests
+/// substitute an initialiser that panics, so a refusal ahead of it is shown to
+/// leave the keyring untouched.
+async fn run_with_dependencies<InitKeyring>(args: &PoolInitArgs, init_keyring: InitKeyring) -> i32
+where
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
+    match execute(args, init_keyring).await {
         Ok(value) => {
             render_json(&Envelope::ok(value));
             0
@@ -285,7 +303,13 @@ pub async fn run(args: &PoolInitArgs) -> i32 {
     }
 }
 
-async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> {
+async fn execute<InitKeyring>(
+    args: &PoolInitArgs,
+    init_keyring: InitKeyring,
+) -> Result<serde_json::Value, WalletError>
+where
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
     if let Some(size) = args.size
         && !(1..=stellar_agent_pool::ChannelPool::MAX_SIZE).contains(&size)
     {
@@ -300,6 +324,12 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
     let profile = load_profile_reconciled(&resolved)
         .map_err(|error| error.to_wallet_error(&resolved.name))?;
     let context = NetworkContext::from_profile(&profile);
+    // Structural mainnet refusal: ahead of the pending-initialization branch,
+    // the keyring store, the seed, the signer, and any RPC request, on both the
+    // fresh and the resume path.
+    if let Some(error) = mainnet_write_refusal(context.chain_id) {
+        return Err(error);
+    }
     let name = &resolved.name;
     if profile.pool_initialization.is_some() && !args.resume {
         return Err(unavailable(format!(
@@ -314,7 +344,7 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
             None => Err(unavailable("there is no pool initialization to resume")),
         };
     }
-    stellar_agent_network::keyring::init_platform_keyring_store()?;
+    init_keyring()?;
     let audit = crate::commands::value_audit::require_value_audit_writer(&profile, name)?;
     let master = profile
         .pool_master_key_id
@@ -876,6 +906,92 @@ mod tests {
                 && write.message().contains("re-run with --resume"),
             "write guidance lost: {}",
             write.message()
+        );
+    }
+
+    /// Persists a mainnet profile named `pool-mainnet` whose endpoint is
+    /// `rpc_url`, with `pending` as its pool initialization, under a temporary
+    /// home with `STELLAR_AGENT_PROFILE` cleared.
+    fn mainnet_pool_fixture(
+        rpc_url: &str,
+        pending: Option<PoolInitialization>,
+    ) -> (
+        tempfile::TempDir,
+        stellar_agent_test_support::StellarAgentHomeGuard,
+        stellar_agent_test_support::ProfileEnvVarGuard,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let mut profile =
+            Profile::builder_mainnet_named("pool-mainnet", rpc_url, "s", "default", "n", "a")
+                .audit_log_path(dir.path().join("audit.jsonl"))
+                .with_noop_engine()
+                .build();
+        profile.pool_initialization = pending;
+        loader::save_new_to_dir("pool-mainnet", &profile, &dir.path().join("profiles")).unwrap();
+        (dir, home, env)
+    }
+
+    fn pool_init_args(size: Option<usize>, resume: bool) -> PoolInitArgs {
+        PoolInitArgs {
+            size,
+            profile: Some("pool-mainnet".to_owned()),
+            force: false,
+            resume,
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            output: OutputFormat::Json,
+        }
+    }
+
+    /// A fresh `pool init` on a mainnet profile exits 1 before the keyring
+    /// initialiser, which panics if called, and before any connection to the
+    /// profile's endpoint.
+    #[tokio::test]
+    #[serial]
+    async fn fresh_pool_init_refuses_mainnet_before_keyring_and_any_connection() {
+        let counter = stellar_agent_test_support::ConnectionCounter::start().unwrap();
+        let _fixture = mainnet_pool_fixture(&counter.https_uri(), None);
+        let code = run_with_dependencies(&pool_init_args(Some(1), false), || {
+            panic!("a mainnet pool init must not initialise the keyring")
+        })
+        .await;
+        assert_eq!(code, 1, "a mainnet pool init must exit with code 1");
+        assert_eq!(
+            counter.accepted().unwrap(),
+            0,
+            "a mainnet pool init must open no connection"
+        );
+    }
+
+    /// `pool init --resume` over a pending initialization on a mainnet profile
+    /// exits 1 before the keyring initialiser, the seed, the endpoint probe,
+    /// and the signer.
+    #[tokio::test]
+    #[serial]
+    async fn resumed_pool_init_refuses_mainnet_before_keyring_and_any_connection() {
+        let counter = stellar_agent_test_support::ConnectionCounter::start().unwrap();
+        let funder = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        let pending = PoolInitialization {
+            id: "pool-init-mainnet".to_owned(),
+            network_passphrase: stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE.to_owned(),
+            funder: funder.to_owned(),
+            channels: vec![PoolChannelRecord::new(1, funder)],
+            seed_ready: true,
+            attempt: 0,
+            submission: None,
+            completion_ledger: None,
+        };
+        let _fixture = mainnet_pool_fixture(&counter.https_uri(), Some(pending));
+        let code = run_with_dependencies(&pool_init_args(None, true), || {
+            panic!("a mainnet pool init must not initialise the keyring")
+        })
+        .await;
+        assert_eq!(code, 1, "a resumed mainnet pool init must exit with code 1");
+        assert_eq!(
+            counter.accepted().unwrap(),
+            0,
+            "a resumed mainnet pool init must open no connection"
         );
     }
 

@@ -90,6 +90,7 @@ use stellar_agent_stablecoin::{
     resolve::{DenominationInput, resolve_denomination},
 };
 
+use crate::common::network::mainnet_write_refusal;
 use crate::common::profile_access::{
     ProfileAccessError, injected_profile_load, reconcile_loaded_profile,
 };
@@ -237,6 +238,13 @@ where
     };
 
     let context = NetworkContext::from_profile(&profile);
+
+    // ── Structural mainnet refusal ────────────────────────────────────────────
+    // Before the keyring store, the signer, and any RPC request.
+    if let Some(err) = mainnet_write_refusal(context.chain_id) {
+        render_json(&Envelope::<()>::err(&err));
+        return 1;
+    }
 
     // ── Initialise platform keyring store ─────────────────────────────────────
     // The keyring signer loaded before signing requires the process-global
@@ -1023,6 +1031,39 @@ mod tests {
                 stellar_agent_stablecoin::resolve::ResolveError::UnpinnedBareCode { .. }
             ),
             "bare unknown code must be refused as unpinned"
+        );
+    }
+
+    // ── mainnet refusal ahead of the keyring and the endpoint ────────────────
+
+    /// A mainnet profile is refused with exit 1 before the keyring
+    /// initialiser, which panics if called, and before any request reaches
+    /// the profile's endpoint.
+    #[tokio::test]
+    async fn run_refuses_mainnet_before_keyring_and_any_request() {
+        let rpc = wiremock::MockServer::start().await;
+        let args = TrustlineArgs {
+            profile: Some("trustline-mainnet".to_owned()),
+            from: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN".to_owned(),
+            asset: "USDC".to_owned(),
+            limit_stroops: None,
+            classic_base: None,
+        };
+        let code = run_with_dependencies(
+            &args,
+            |name| {
+                Ok(
+                    Profile::builder_mainnet_named(name, rpc.uri(), "s", "default", "n", "a")
+                        .build(),
+                )
+            },
+            || panic!("a mainnet profile must not initialise the keyring"),
+        )
+        .await;
+        assert_eq!(code, 1, "a mainnet trustline must exit with code 1");
+        assert!(
+            rpc.received_requests().await.unwrap().is_empty(),
+            "a mainnet trustline must send no request"
         );
     }
 

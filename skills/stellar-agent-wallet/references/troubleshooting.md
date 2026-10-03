@@ -58,8 +58,8 @@ engine is first-match, default-deny over signed, typed criteria.
 | `policy.unexpected_decision` | Forward-compatibility catch-all for an engine decision the gate does not recognize. Fail-closed. | Treat as a hard refusal. Report to the operator; do not retry. |
 
 Separately, every write or signing command refuses `stellar:mainnet` before any
-RPC call or signing with `network.mainnet_write_forbidden`. Read-only commands
-accept mainnet. Action: run write and signing operations on `stellar:testnet` in
+RPC call or signing with `network.mainnet_write_forbidden`, except MPP, which
+refuses with `mpp.network_forbidden`. Read-only commands accept mainnet. Action: run write and signing operations on `stellar:testnet` in
 this alpha.
 
 ## Network-binding codes (submit layer)

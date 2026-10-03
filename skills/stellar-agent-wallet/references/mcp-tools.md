@@ -77,20 +77,32 @@ policy engine returns one verdict:
 - `Deny` — refused with wire code `policy.deny.<reason>`.
 - `RequireApproval` — an out-of-band operator approval is required.
 
-Separately, on `stellar:mainnet` the Noop engine fails closed for any
-destructive tool, returning `policy.engine_required` before any RPC call or
+These tools refuse `stellar:mainnet` structurally at handler entry with
+`network.mainnet_write_forbidden`, before any policy evaluation and regardless
+of engine:
+
+- the six sign-only tools: `stellar_sep43_sign_transaction`,
+  `stellar_sep43_sign_auth_entry`, `stellar_sep43_sign_message`,
+  `stellar_sep53_sign_message`, `stellar_x402_create_payment`, and
+  `stellar_x402_authenticated_payment`;
+- `stellar_sep43_sign_and_submit_transaction`;
+- the DeFi tools `stellar_defindex_vault_deposit`,
+  `stellar_defindex_vault_withdraw`, and `stellar_dex_trade`;
+- the commit tools `stellar_pay_commit`, `stellar_claim_commit`,
+  `stellar_trustline_commit`, `stellar_create_account_commit`, and
+  `stellar_rule_create_commit`;
+- the signing actions of `stellar_toolset_invoke`, which queue no approval on
+  mainnet.
+
+The refusal crosses the wire as the standard business-error envelope on every
+one of these tools, including the SEP-43 family. The MPP tools refuse at handler
+entry with `mpp.network_forbidden`.
+
+Separately, on `stellar:mainnet` the Noop engine fails closed for the other
+destructive tools, returning `policy.engine_required` before any RPC call or
 signing. The two engines are Noop (testnet allow-all; mainnet read-only allow,
 mainnet destructive refused) and V1 (signature-verified typed criteria,
 first-match default-deny).
-
-The six sign-only tools — `stellar_sep43_sign_transaction`,
-`stellar_sep43_sign_auth_entry`, `stellar_sep43_sign_message`,
-`stellar_sep53_sign_message`, `stellar_x402_create_payment`, and
-`stellar_x402_authenticated_payment` — refuse `stellar:mainnet` structurally at
-handler entry with `network.mainnet_write_forbidden`, before any policy
-evaluation and regardless of engine. This crosses the wire as the standard
-business-error envelope on every one of these tools, including the SEP-43
-family.
 
 Below both layers, the submit layer binds each submission to the network the RPC
 endpoint reports it serves rather than to the declared `chain_id`, and verifies
@@ -462,7 +474,7 @@ whose verifier its pin record does not pin. The operator runs
 | `amounts_min` | array (i128 decimal strings) | yes | Same length; zero = no slippage protection (not defaulted). A raw JSON number is rejected. |
 | `invest` | bool | no | Auto-invest after deposit; default `false`. |
 | `override_upgradable` | bool | no | Proceed on an upgradable vault; WASM-pin refusal stays non-overridable. |
-| `secondary_rpc_url` | string | no | Testnet override; absent uses the profile secondary. Mainnet refuses input presence. Credentials are refused. |
+| `secondary_rpc_url` | string | no | Testnet override; absent uses the profile secondary. Credentials are refused. A mainnet profile refuses the call at entry with `network.mainnet_write_forbidden`. |
 
 ### stellar_defindex_vault_withdraw arguments
 
@@ -474,7 +486,7 @@ whose verifier its pin record does not pin. The operator runs
 | `withdraw_shares` | i128 decimal string | yes | Vault shares to redeem. A raw JSON number is rejected. |
 | `min_amounts_out` | array (i128 decimal strings) | yes | One per asset in `total_managed_funds` order; zero = no slippage protection (not defaulted). A raw JSON number is rejected. |
 | `override_upgradable` | bool | no | |
-| `secondary_rpc_url` | string | no | Testnet override; absent uses the profile secondary. Mainnet refuses input presence. Credentials are refused. |
+| `secondary_rpc_url` | string | no | Testnet override; absent uses the profile secondary. Credentials are refused. A mainnet profile refuses the call at entry with `network.mainnet_write_forbidden`. |
 
 ### stellar_dex_trade arguments
 
@@ -486,7 +498,7 @@ whose verifier its pin record does not pin. The operator runs
 | `qty_out_min` | i128 decimal string | yes | Absolute minimum output (non-negative integer, not a percent). A raw JSON number is rejected. |
 | `path` | array (string) | yes | First element input token, last output token; each a C-strkey, `"native"`, or `"CODE:ISSUER"`. |
 | `deadline` | integer (u64) | no | Unix seconds; defaults to `now + 300s`. |
-| `secondary_rpc_url` | string | no | Testnet override; absent uses the profile secondary. Mainnet refuses input presence. Credentials are refused. |
+| `secondary_rpc_url` | string | no | Testnet override; absent uses the profile secondary. Credentials are refused. A mainnet profile refuses the call at entry with `network.mainnet_write_forbidden`. |
 
 ### stellar_dex_quote arguments
 

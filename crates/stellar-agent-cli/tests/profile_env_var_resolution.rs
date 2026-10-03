@@ -1133,13 +1133,15 @@ const HEX_64: &str = "0101010101010101010101010101010101010101010101010101010101
 /// The code the structural refusal emits on the transaction verbs.
 const MAINNET_WRITE_FORBIDDEN: &str = "network.mainnet_write_forbidden";
 
-/// One guarded verb: the name a failing row reports, its argv with the
-/// required arguments and no profile, network, or endpoint flag, and the code
-/// its structural refusal emits on a mainnet profile.
+/// One guarded verb. It holds the name a failing row reports and its argv,
+/// which carries the required arguments and no profile, network, or endpoint
+/// flag. It also holds the code its structural refusal emits on a mainnet
+/// profile, and whether the command takes `--network` and `--rpc-url`.
 struct GuardedVerb {
     name: &'static str,
     argv: Vec<String>,
     mainnet_code: &'static str,
+    takes_network_flags: bool,
 }
 
 fn guarded(name: &'static str, argv: &[&str]) -> GuardedVerb {
@@ -1147,6 +1149,16 @@ fn guarded(name: &'static str, argv: &[&str]) -> GuardedVerb {
         name,
         argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
         mainnet_code: MAINNET_WRITE_FORBIDDEN,
+        takes_network_flags: true,
+    }
+}
+
+/// A guarded verb that reads its network from the profile alone and takes
+/// neither `--network` nor `--rpc-url`.
+fn guarded_profile_only(name: &'static str, argv: &[&str]) -> GuardedVerb {
+    GuardedVerb {
+        takes_network_flags: false,
+        ..guarded(name, argv)
     }
 }
 
@@ -1247,9 +1259,10 @@ fn guarded_verbs(endpoint: &str) -> Vec<GuardedVerb> {
                 .map(|arg| (*arg).to_owned())
                 .collect(),
             mainnet_code: MAINNET_WRITE_FORBIDDEN,
+            takes_network_flags: true,
         });
     }
-    let rule_verbs: [(&'static str, &[&str]); 15] = [
+    let rule_verbs: [(&'static str, &[&str]); 16] = [
         ("signers list", &["signers", "list", "--rule-id", "0"]),
         ("signers refresh", &["signers", "refresh", "--rule-id", "0"]),
         (
@@ -1324,6 +1337,10 @@ fn guarded_verbs(endpoint: &str) -> Vec<GuardedVerb> {
         ),
         ("rules delete", &["rules", "delete", "--rule-id", "0"]),
         (
+            "rules verify-pins",
+            &["rules", "verify-pins", "--rule-id", "0"],
+        ),
+        (
             "rules add-policy",
             &["rules", "add-policy", "--rule-id", "0"],
         ),
@@ -1362,6 +1379,7 @@ fn guarded_verbs(endpoint: &str) -> Vec<GuardedVerb> {
             name,
             argv,
             mainnet_code: MAINNET_WRITE_FORBIDDEN,
+            takes_network_flags: true,
         });
     }
     verbs.extend([
@@ -1458,14 +1476,66 @@ fn guarded_verbs(endpoint: &str) -> Vec<GuardedVerb> {
                 .map(|arg| (*arg).to_owned())
                 .collect(),
             mainnet_code: MAINNET_WRITE_FORBIDDEN,
+            takes_network_flags: true,
         },
+        guarded_profile_only(
+            "vault deposit",
+            &[
+                "vault",
+                "deposit",
+                "--vault",
+                ACCOUNT_C,
+                "--from",
+                ACCOUNT_C,
+                "--amounts-desired",
+                "1",
+                "--amounts-min",
+                "0",
+            ],
+        ),
+        guarded_profile_only(
+            "vault withdraw",
+            &[
+                "vault",
+                "withdraw",
+                "--vault",
+                ACCOUNT_C,
+                "--from",
+                ACCOUNT_C,
+                "--shares",
+                "1",
+                "--min-amounts-out",
+                "0",
+            ],
+        ),
+        guarded_profile_only(
+            "trade",
+            &[
+                "trade",
+                "--from",
+                ACCOUNT_C,
+                "--amount-in",
+                "1",
+                "--amount-out-min",
+                "0",
+                "--path",
+                "native",
+                "--path",
+                "native",
+            ],
+        ),
+        guarded_profile_only(
+            "trustline",
+            &["trustline", "--from", SOURCE_G, "--asset", "USDC"],
+        ),
+        guarded_profile_only("pool init", &["pool", "init", "--size", "1"]),
     ]);
     verbs
 }
 
 /// Runs every guarded verb with `extra` appended and collects each row whose
 /// exit code, envelope code, or endpoint contact differs from the
-/// expectation.
+/// expectation. A row for which `expected_code` answers `None` is not run.
 ///
 /// Contact is observed at the TCP level: a mainnet profile file carries an
 /// `https://` endpoint, and a plaintext HTTP mock records no request for a TLS
@@ -1474,12 +1544,15 @@ fn guarded_table_failures(
     home: &Path,
     endpoint: &ConnectionCounter,
     extra: &[String],
-    expected_code: impl Fn(&GuardedVerb) -> &'static str,
+    expected_code: impl Fn(&GuardedVerb) -> Option<&'static str>,
 ) -> Vec<String> {
     let mut failures = Vec::new();
     let verbs = guarded_verbs(&endpoint.https_uri());
-    assert_eq!(verbs.len(), 30, "the table covers every guarded path");
+    assert_eq!(verbs.len(), 36, "the table covers every guarded path");
     for verb in &verbs {
+        let Some(expected) = expected_code(verb) else {
+            continue;
+        };
         let mut args = verb.argv.clone();
         args.extend(extra.iter().cloned());
         let before = endpoint.accepted().expect("connection count");
@@ -1489,7 +1562,6 @@ fn guarded_table_failures(
         let code = serde_json::from_str::<Value>(run.stdout.trim())
             .ok()
             .and_then(|json| json["error"]["code"].as_str().map(str::to_owned));
-        let expected = expected_code(verb);
         if run.code != 1 || code.as_deref() != Some(expected) || requests != 0 {
             failures.push(format!(
                 "`{}`: exit {}, code {code:?} (expected {expected}), {requests} connection(s); \
@@ -1516,15 +1588,16 @@ fn every_guarded_path_refuses_a_mainnet_profile_before_endpoint_contact() {
         home.path(),
         &endpoint,
         &["--profile".to_owned(), "mainnet".to_owned()],
-        |verb| verb.mainnet_code,
+        |verb| Some(verb.mainnet_code),
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Every guarded path refuses `--network mainnet` on the zero-config testnet
-/// profile with `profile.network_flag_mismatch`. `--rpc-url` names the
-/// counter, so the zero-connection assertion observes the endpoint the
-/// command is given.
+/// Every guarded path that takes `--network` and `--rpc-url` refuses
+/// `--network mainnet` on the zero-config testnet profile with
+/// `profile.network_flag_mismatch`. `--rpc-url` names the counter, so the
+/// zero-connection assertion observes the endpoint the command is given. The
+/// rows marked `takes_network_flags: false` accept neither flag.
 #[test]
 fn every_guarded_path_refuses_a_mainnet_flag_without_a_profile() {
     let endpoint = connection_counter();
@@ -1538,7 +1611,10 @@ fn every_guarded_path_refuses_a_mainnet_flag_without_a_profile() {
             "--rpc-url".to_owned(),
             endpoint.https_uri(),
         ],
-        |_| "profile.network_flag_mismatch",
+        |verb| {
+            verb.takes_network_flags
+                .then_some("profile.network_flag_mismatch")
+        },
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

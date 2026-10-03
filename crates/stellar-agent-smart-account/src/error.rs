@@ -1103,6 +1103,20 @@ pub enum SaError {
         reason: Box<stellar_agent_core::policy::DenyReason>,
     },
 
+    /// A write declared for mainnet, aimed at a mainnet-pattern endpoint, or
+    /// sent to an endpoint that reports the mainnet passphrase was refused. No
+    /// transaction was sent. The first two are refused before any signing call
+    /// and any request.
+    ///
+    /// The variant reports the canonical cross-surface code
+    /// `network.mainnet_write_forbidden`, outside the `sa.*` namespace as
+    /// [`Self::NetworkRpcDivergence`], [`Self::SubmissionUnresolved`], and
+    /// [`Self::PolicyDenied`] are, so every mainnet refusal carries one code.
+    /// The serde tag carries the same code.
+    #[error("mainnet writes are structurally refused in this alpha")]
+    #[serde(rename = "network.mainnet_write_forbidden")]
+    MainnetWriteForbidden,
+
     /// Local `ScAddress` XDR encoding failed while building an injective cache key.
     ///
     /// This is a local encoding failure, not a deployment or simulation failure.
@@ -3023,6 +3037,7 @@ impl SaError {
             Self::DeploymentFailed { .. } => "sa.deployment_failed",
             Self::SubmissionUnresolved { kind, .. } => kind.wire_code(),
             Self::PolicyDenied { reason } => reason.wire_code(),
+            Self::MainnetWriteForbidden => "network.mainnet_write_forbidden",
             Self::ScAddressEncodingFailed { .. } => "sa.scaddress_encoding_failed",
             Self::AuthEntryConstructionFailed { .. } => "sa.auth_entry_construction_failed",
             Self::WebAuthnVerifierProvenanceMismatch { .. } => {
@@ -3779,6 +3794,11 @@ mod tests {
                     reason: AuthMismatchReason::EntryMutated,
                 },
             ),
+            // Canonical mainnet refusal.
+            (
+                "network.mainnet_write_forbidden",
+                SaError::MainnetWriteForbidden,
+            ),
         ];
 
         for (expected_code, err) in cases {
@@ -3788,6 +3808,26 @@ mod tests {
                 "wire_code mismatch for variant: {err:?}"
             );
         }
+    }
+
+    /// The unit variant serialises as its tag alone, with the canonical code
+    /// and no `context` field.
+    #[test]
+    fn mainnet_write_forbidden_serialises_as_canonical_tag() {
+        assert_eq!(
+            serde_json::to_value(SaError::MainnetWriteForbidden).unwrap(),
+            serde_json::json!({"wire_code": "network.mainnet_write_forbidden"})
+        );
+    }
+
+    /// The variant's Display text is the network error's, so the two surfaces
+    /// of one refusal read alike.
+    #[test]
+    fn mainnet_write_forbidden_display_matches_network_error() {
+        assert_eq!(
+            SaError::MainnetWriteForbidden.to_string(),
+            stellar_agent_core::error::NetworkError::MainnetWriteForbidden.to_string()
+        );
     }
 
     /// Verifies the `serde::Serialize` adjacently-tagged envelope shape for each variant.
@@ -5311,6 +5351,8 @@ mod tests {
             SaError::AuthMismatch {
                 reason: AuthMismatchReason::EntryMutated,
             },
+            // Canonical mainnet refusal.
+            SaError::MainnetWriteForbidden,
         ];
 
         // Verify each variant's wire_code matches the exhaustive closed set.
@@ -5401,6 +5443,8 @@ mod tests {
             "sa.timelock_list_pending_failed",
             // Simulation-audit mismatch.
             "sa.auth_mismatch",
+            // Canonical mainnet refusal.
+            "network.mainnet_write_forbidden",
         ];
 
         assert_eq!(
@@ -5422,7 +5466,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 79, "closed set must have exactly 79 wire codes");
+        assert_eq!(seen.len(), 80, "closed set must have exactly 80 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.

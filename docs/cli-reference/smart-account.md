@@ -11,13 +11,14 @@ The `smart-account` command group (also available under the shorter alias `sa`) 
 The following commands refuse a mainnet profile with `network.mainnet_write_forbidden` before any RPC call or signer access:
 
 - Rule writes, policy writes, and all signer verbs, including `list` and `refresh`.
+- `rules verify-pins`, which loads a signer to derive its simulation source account.
 - `execute`, `multicall`, and `migrate-verifier` submit mode.
 - Timelock `schedule`, `cancel`, and `execute`, and all four deployment commands.
 
 The following operations have no structural refusal:
 
 - `smart-account register-multicall` / `smart-account unregister-multicall` accept `mainnet` as a local-registry key.
-- The read-only verbs (`smart-account rules get`, `smart-account rules get-spending-limit`, `smart-account rules verify-pins`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account timelock list-pending`) allow mainnet inspection. `rules verify-pins` still checks its resolved signer against the enrolled identity.
+- The read-only verbs (`smart-account rules get`, `smart-account rules get-spending-limit`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account timelock list-pending`) allow mainnet inspection.
 
 For the terms used here — [profile](../profiles.md), policy engine, approval spine, audit log, [context rule](../concepts.md), auth digest — see [concepts](../concepts.md). The shared flags (`--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`, and the signer-source group) are defined once on the [CLI reference index](index.md#global-conventions); this page names each flag a command takes and only describes the flags specific to that command.
 
@@ -199,7 +200,7 @@ stellar-agent smart-account rules delete \
 
 ### `smart-account rules verify-pins`
 
-Verifies a rule's pinned verifier and policy WASM hashes against the live on-chain contracts (drift detection). Read-only; no signing, no submission. `mainnet` is accepted. Exit code is `1` when either pin status is `drift`, otherwise `0`; the JSON envelope is well-formed in both cases.
+Verifies a rule's pinned verifier and policy WASM hashes against the live on-chain contracts (drift detection). Read-only; no signing, no submission. A mainnet profile is refused with `network.mainnet_write_forbidden` before the signer loads. Exit code is `1` when either pin status is `drift`, otherwise `0`; the JSON envelope is well-formed in both cases.
 
 Each `*_pin_status` is one of `match`, `drift`, `unavailable`, `no_pin`, or `no_contracts`. `drift` also covers a pinned policy with no policy on chain: the pin record holds policy pins while the rule has none, and `policy_pin_status` is `drift` with an empty observed list. It covers a live verifier the record does not pin too: the rule holds an `External` signer while the record pins no verifier, and `verifier_pin_status` is `drift` with an empty observed list; `signers refresh` repairs it. The signer-source flags are used only to derive a source account for the simulation; no transaction is signed.
 
