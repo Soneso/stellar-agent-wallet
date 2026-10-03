@@ -101,7 +101,7 @@ struct MppAuthorizeArgs {
     #[arg(long, value_name = "PATH", conflicts_with_all = ["input_stdin", "approval_id"])]
     input_file: Option<PathBuf>,
     /// Resume only the exact stored authorization attached to this approval.
-    #[arg(long, value_name = "ID", conflicts_with_all = ["input_stdin", "input_file"])]
+    #[arg(long, value_name = "ID", allow_hyphen_values = true, conflicts_with_all = ["input_stdin", "input_file"])]
     approval_id: Option<String>,
 }
 
@@ -795,7 +795,7 @@ enum MppProfileError {
 fn load_testnet_profile(
     resolved: &ResolvedProfileName,
 ) -> Result<(Profile, NetworkContext), MppProfileError> {
-    let profile = load_profile_reconciled(resolved, None).map_err(MppProfileError::Access)?;
+    let profile = load_profile_reconciled(resolved).map_err(MppProfileError::Access)?;
     let context = testnet_context(&profile)?;
     Ok((profile, context))
 }
@@ -1091,6 +1091,34 @@ mod tests {
     struct Harness {
         #[command(flatten)]
         mpp: MppArgs,
+    }
+
+    #[test]
+    fn parses_hyphen_prefixed_approval_id() {
+        let nonce = "-AbCdEfGhIjKlMnOpQrStU";
+        let parsed =
+            Harness::try_parse_from(["mpp", "charge", "authorize", "--approval-id", nonce])
+                .expect("hyphen-prefixed approval id parses");
+        let MppCommand::Charge(charge) = parsed.mpp.command else {
+            unreachable!("expected charge");
+        };
+        let MppChargeCommand::Authorize(args) = charge.command;
+        assert_eq!(args.approval_id.as_deref(), Some(nonce));
+
+        let parsed = Harness::try_parse_from([
+            "mpp",
+            "charge",
+            "authorize",
+            "--approval-id",
+            "--input-stdin",
+        ])
+        .expect("the next token is the approval id");
+        let MppCommand::Charge(charge) = parsed.mpp.command else {
+            unreachable!("expected charge");
+        };
+        let MppChargeCommand::Authorize(args) = charge.command;
+        assert_eq!(args.approval_id.as_deref(), Some("--input-stdin"));
+        assert!(!args.input_stdin);
     }
 
     #[test]

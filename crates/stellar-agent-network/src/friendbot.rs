@@ -449,7 +449,8 @@ pub async fn fund_with_friendbot(
 
     tracing::debug!(
         account_id = %crate::account::redact_account_id(account_id),
-        "fund_with_friendbot: GET {friendbot_url}",
+        friendbot_url = %redact_url_authority(friendbot_url),
+        "fund_with_friendbot: GET",
     );
 
     let transport_error = |e: reqwest::Error| {
@@ -611,6 +612,53 @@ mod tests {
             1,
             "the funding request must carry the deadline constant"
         );
+    }
+
+    #[tokio::test]
+    async fn funding_debug_log_redacts_friendbot_url() {
+        use stellar_agent_test_support::CaptureWriter;
+        use wiremock::{Mock, ResponseTemplate, matchers::any};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let authority = server.uri();
+        let friendbot_url = format!(
+            "http://SENTINEL-USER:SENTINEL-PASS@{}/SENTINEL-PATH?k=SENTINEL-QUERY",
+            server.address()
+        );
+        let writer = CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_ansi(false)
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+
+        let error = fund_with_friendbot(
+            &friendbot_url,
+            "private-account",
+            "Test SDF Network ; September 2015",
+            "http://127.0.0.1:1",
+        )
+        .await
+        .expect_err("the mock returns HTTP 404");
+        drop(guard);
+        assert_eq!(error.code(), "network.rpc_unreachable");
+        let WalletError::Network(NetworkError::RpcUnreachable { url, reason }) = error else {
+            unreachable!("expected an HTTP failure");
+        };
+        assert_eq!(url, authority);
+        assert_eq!(reason, "Friendbot returned HTTP 404");
+
+        let logs = writer.captured_str();
+        assert!(!logs.contains("SENTINEL-"), "friendbot URL leaked: {logs}");
+        assert!(logs.contains(&authority), "missing URL authority: {logs}");
     }
 
     #[tokio::test]

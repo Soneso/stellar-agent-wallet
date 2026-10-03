@@ -72,7 +72,7 @@ pub async fn run(args: &FeesStatsArgs) -> i32 {
 
 fn resolve_rpc_url(args: &FeesStatsArgs) -> Result<String, WalletError> {
     if let Some(name) = &args.profile {
-        let profile = load_profile_reconciled(&ResolvedProfileName::from_flag(name), None)
+        let profile = load_profile_reconciled(&ResolvedProfileName::from_flag(name))
             .map_err(|e| e.to_wallet_error(name))?;
         let context = crate::common::network::network_context_for_command(
             &profile,

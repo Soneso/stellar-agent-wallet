@@ -142,10 +142,9 @@ struct RotatePolicyStateKeyData {
 pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
     // ── Step 0: load the profile FIRST so a nonexistent profile never
     // reaches the keyring init.
-    let profile = match load_profile_reconciled(
-        &ResolvedProfileName::from_flag(args.profile_name()),
-        None,
-    ) {
+    let profile = match load_profile_reconciled(&ResolvedProfileName::from_flag(
+        args.profile_name(),
+    )) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(profile = %args.profile_name(), error = %e, "profile access refused");

@@ -367,7 +367,7 @@ fn resolve_profile_inputs_with_profile(
 /// refusal.
 fn load_profile_for_verify(resolved: &ResolvedProfileName) -> Result<Profile, WalletError> {
     let profile_name = &resolved.name;
-    load_profile_reconciled(resolved, None).map_err(|e| {
+    load_profile_reconciled(resolved).map_err(|e| {
         tracing::debug!(
             profile = %profile_name,
             error = %e,

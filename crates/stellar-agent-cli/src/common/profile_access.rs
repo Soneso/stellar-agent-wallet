@@ -56,7 +56,7 @@
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::observability::redact_path_in_message;
-use stellar_agent_core::profile::loader::{self as profile_loader, MulticallRegistryHook};
+use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::name::{
     ProfileNameMismatch, ProfileStateLayout, ResolvedProfileName, check_mainnet_selection,
     profile_name_mismatch_refusal,
@@ -191,9 +191,6 @@ impl std::fmt::Display for ProfileAccessError {
 ///
 /// The resolved name retains the input that selected the profile.
 ///
-/// `multicall_hook` passes an optional registry check to the loader.
-/// Command call sites pass `None` and validate their effective secondary endpoint.
-///
 /// # Errors
 ///
 /// [`ProfileAccessError::Load`] for any loader failure — including a
@@ -202,10 +199,8 @@ impl std::fmt::Display for ProfileAccessError {
 /// profile.
 pub(crate) fn load_profile_reconciled(
     resolved: &ResolvedProfileName,
-    multicall_hook: Option<&dyn MulticallRegistryHook>,
 ) -> Result<Profile, ProfileAccessError> {
-    let profile =
-        profile_loader::load(&resolved.name, multicall_hook).map_err(ProfileAccessError::Load)?;
+    let profile = profile_loader::load(&resolved.name, None).map_err(ProfileAccessError::Load)?;
     reconcile(profile, resolved)
 }
 
@@ -472,7 +467,7 @@ mod tests {
         profile_loader::save_to_dir("mainnet", &profile, &home.path().join("profiles"))
             .expect("valid test fixture");
         for result in [
-            load_profile_reconciled(&resolved, None),
+            load_profile_reconciled(&resolved),
             reconcile_loaded_profile(Ok(profile.clone()), &resolved),
             load_profile_or_synthesize_testnet_with(&resolved, |_| Ok(profile.clone()))
                 .map(|(p, _)| p),
@@ -492,7 +487,7 @@ mod tests {
         profile_loader::save_to_dir("mainnet", &profile, &home.path().join("profiles"))
             .expect("valid test fixture");
         for result in [
-            load_profile_reconciled(&resolved, None),
+            load_profile_reconciled(&resolved),
             reconcile_loaded_profile(Ok(profile.clone()), &resolved),
             load_profile_or_synthesize_testnet_with(&resolved, |_| Ok(profile.clone()))
                 .map(|(p, _)| p),
