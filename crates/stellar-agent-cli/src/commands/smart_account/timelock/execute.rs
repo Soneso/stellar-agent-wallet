@@ -43,9 +43,8 @@
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{NetworkError, WalletError};
+use stellar_agent_core::error::WalletError;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
-use stellar_agent_core::profile::caip2::Caip2;
 use tracing::info;
 use url::Url;
 use uuid::Uuid;
@@ -55,7 +54,8 @@ use crate::commands::smart_account::common::{
     resolve_signer,
 };
 use crate::common::network::{
-    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, mainnet_write_refusal,
+    network_context_for_command,
 };
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
@@ -152,19 +152,6 @@ fn decode_hex32(s: &str) -> Option<[u8; 32]> {
     stellar_agent_core::hex::decode_hex32(s).ok()
 }
 
-/// Returns the structural mainnet-write-forbidden error if `network` is mainnet,
-/// or `None` if the network is testnet.
-///
-/// Extracted so tests can assert the exact `wire_code` without going through
-/// stdout. The read-only `list_pending` verb is exempt from this guard.
-pub(crate) fn mainnet_forbidden_error(network: Caip2) -> Option<WalletError> {
-    if network.is_mainnet() {
-        Some(WalletError::Network(NetworkError::MainnetWriteForbidden))
-    } else {
-        None
-    }
-}
-
 /// Runs `smart-account timelock execute`.
 ///
 /// Returns exit code `0` on success, `1` on any error.
@@ -207,7 +194,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     // The downstream submit_transaction_and_wait passphrase check also
     // blocks mainnet writes, but rejecting here avoids key access for a
     // doomed submission and makes the refusal explicit at the CLI layer.
-    if let Some(err) = mainnet_forbidden_error(context.chain_id) {
+    if let Some(err) = mainnet_write_refusal(context.chain_id) {
         let envelope: Envelope<()> = Envelope::err(&err);
         render_json(&envelope);
         return 1;
@@ -439,28 +426,6 @@ mod tests {
     use super::*;
 
     // ── Mainnet structural pre-reject ──────────────────────────────────────────
-
-    /// Mainnet pre-reject emits `network.mainnet_write_forbidden` before any
-    /// signer key access.
-    ///
-    /// Tests the guard function directly to assert the exact wire code rather
-    /// than just `exit_code == 1`.
-    #[test]
-    fn execute_mainnet_guard_emits_correct_wire_code() {
-        use crate::common::network::TargetNetwork;
-        let err = mainnet_forbidden_error(TargetNetwork::Mainnet.caip2())
-            .expect("mainnet must yield Some(WalletError)");
-        assert_eq!(
-            err.code(),
-            "network.mainnet_write_forbidden",
-            "mainnet pre-reject must emit network.mainnet_write_forbidden; got: {}",
-            err.code()
-        );
-        assert!(
-            mainnet_forbidden_error(TargetNetwork::Testnet.caip2()).is_none(),
-            "testnet must not trigger the mainnet guard"
-        );
-    }
 
     /// A mainnet profile exits 1 before any request reaches its endpoint.
     /// The binary tests in `tests/profile_env_var_resolution.rs` pin the

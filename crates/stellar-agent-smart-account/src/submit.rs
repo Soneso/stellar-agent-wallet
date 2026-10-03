@@ -43,7 +43,7 @@ use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_las
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
-use stellar_agent_network::{StellarRpcClient, submit_transaction_and_wait};
+use stellar_agent_network::{StellarRpcClient, refuse_mainnet_write, submit_transaction_and_wait};
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::TransactionBehavior;
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
@@ -719,11 +719,16 @@ pub struct SubmitInvokeArgs<'a> {
 /// `SignersManager::submit_signed_invoke` (signers.rs). The two instance methods
 /// become thin delegating wrappers that call this free function.
 ///
+/// A mainnet `network_passphrase` or a mainnet-pattern `primary_rpc_url` is
+/// refused with [`SaError::MainnetWriteForbidden`] before any signing call and
+/// any request.
+///
 /// # Step ordering
 ///
-/// 1. **Pre-flight**: argument guards, then, for every distinct non-zero rule
-///    in `auth_rule_ids` in ascending order and under one pre-submit
-///    deadline (see [`PinCheck`]):
+/// 1. **Pre-flight**: argument guards, the mainnet refusal of
+///    [`stellar_agent_network::refuse_mainnet_write`], then, for every
+///    distinct non-zero rule in `auth_rule_ids` in ascending order and under
+///    one pre-submit deadline (see [`PinCheck`]):
 ///    1. the rule locks: acquired here when the caller holds none, or found
 ///       in the held-lock context a signers-manager verb supplies;
 ///    2. the signer-set baseline read, with no RPC;
@@ -761,6 +766,9 @@ pub struct SubmitInvokeArgs<'a> {
 ///
 /// # Errors
 ///
+/// - [`SaError::MainnetWriteForbidden`]: `network_passphrase` is the mainnet
+///   passphrase or `primary_rpc_url` matches a mainnet host pattern, or the
+///   submit layer refused the endpoint as serving mainnet.
 /// - [`SaError::SignerSetMissingBaseline`]: a checked rule has no signer-set
 ///   state row.
 /// - [`SaError::SignerSetDiverged`] / [`SaError::NetworkRpcDivergence`]: a
@@ -841,6 +849,11 @@ pub async fn submit_signed_invoke(
     for &required in args.required_checks {
         check_required(&args, required, hf_kind)?;
     }
+
+    // ── Mainnet refusal: before the first signer call and the first request ──
+    // A mainnet passphrase or a mainnet-pattern primary URL never reaches the
+    // signer, the simulation, or the signed re-simulation.
+    refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
 
     // ── Derive source-account pubkey from the signer (four-axis migration #3) ──
     // Computed inline; signers.rs callers no longer pre-compute.
@@ -1641,20 +1654,31 @@ pub async fn submit_signed_invoke(
     })
 }
 
+/// Refuses a write declared for mainnet or aimed at a mainnet-pattern endpoint
+/// with [`SaError::MainnetWriteForbidden`].
+///
+/// The smart-account form of [`refuse_mainnet_write`]: the same two local
+/// checks, and no I/O. `submit_signed_invoke` and the three public timelock
+/// functions call it before any signing call and any request.
+pub(crate) fn refuse_mainnet_sa(network_passphrase: &str, rpc_url: &str) -> Result<(), SaError> {
+    refuse_mainnet_write(network_passphrase, rpc_url).map_err(|_| SaError::MainnetWriteForbidden)
+}
+
 /// Maps a submit-layer failure into the smart-account error surface.
 ///
 /// A submission whose outcome is unknown, and one refused because it could not
 /// be recorded, keep their own wire code and their identifiers: the caller's
 /// next step is to reconcile a transaction hash, and a generic deployment
 /// failure would send it to rebuild and re-submit instead. A policy denial
-/// keeps the criterion's own code for the same reason. Every other failure is
+/// keeps the criterion's own code for the same reason. A mainnet refusal keeps
+/// the canonical `network.mainnet_write_forbidden` code. Every other failure is
 /// a deployment failure at the submit phase.
 pub(crate) fn map_submit_error(
     error: &stellar_agent_core::error::WalletError,
     op_label: &'static str,
     signed_xdr: &str,
 ) -> SaError {
-    use stellar_agent_core::error::{SubmissionError, WalletError};
+    use stellar_agent_core::error::{NetworkError, SubmissionError, WalletError};
 
     // A refusal the wallet's own policy decided keeps the criterion's code:
     // nothing was sent, and an agent told the deployment failed would rebuild
@@ -1663,6 +1687,15 @@ pub(crate) fn map_submit_error(
         return SaError::PolicyDenied {
             reason: reason.clone(),
         };
+    }
+
+    // A submit-layer mainnet refusal, such as an endpoint that reports the
+    // mainnet passphrase, sent nothing and carries the one cross-surface code.
+    if matches!(
+        error,
+        WalletError::Network(NetworkError::MainnetWriteForbidden)
+    ) {
+        return SaError::MainnetWriteForbidden;
     }
 
     let unresolved = match error {
@@ -2179,6 +2212,20 @@ mod tests {
         );
     }
 
+    /// A submit-layer mainnet refusal, such as an endpoint that reports the
+    /// mainnet passphrase, keeps the canonical code.
+    #[test]
+    fn a_submit_layer_mainnet_refusal_keeps_the_canonical_code() {
+        let err =
+            WalletError::Network(stellar_agent_core::error::NetworkError::MainnetWriteForbidden);
+        let mapped = map_submit_error(&err, "multicall", "AAAAAgAAAAA=");
+        assert!(
+            matches!(mapped, SaError::MainnetWriteForbidden),
+            "expected the mainnet refusal, got {mapped:?}"
+        );
+        assert_eq!(mapped.wire_code(), "network.mainnet_write_forbidden");
+    }
+
     // ── host_function_kind_str closed-set ──────────────────────────────────────
 
     /// `host_function_kind_str` returns `"InvokeContract"` for the
@@ -2587,6 +2634,75 @@ mod tests {
 
         let err = submit_signed_invoke(args).await.unwrap_err();
         assert_eq!(err.wire_code(), "sa.auth_entry_construction_failed");
+    }
+
+    // ── Mainnet refusal before the signer and the endpoint ──────────────────
+
+    /// `SubmitInvokeArgs` over [`StubSigner`], whose every method panics, for
+    /// `network_passphrase` and `primary_rpc_url`.
+    fn mainnet_refusal_args<'a>(
+        network_passphrase: &'a str,
+        primary_rpc_url: &'a str,
+    ) -> SubmitInvokeArgs<'a> {
+        SubmitInvokeArgs::builder()
+            .target_contract("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
+            .auth_rule_ids(&[])
+            .host_function(HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                function_name: ScSymbol::try_from("fn").unwrap(),
+                args: VecM::default(),
+            }))
+            .signer(&STUB_SIGNER)
+            .primary_rpc_url(primary_rpc_url)
+            .network_passphrase(network_passphrase)
+            .chain_id("stellar:mainnet")
+            .timeout(std::time::Duration::from_secs(10))
+            .op_label("test_op")
+            .build()
+    }
+
+    /// The mainnet passphrase is refused with the canonical code before the
+    /// signer, which panics on any call, and before any request to the mock
+    /// primary endpoint.
+    #[tokio::test]
+    async fn submit_signed_invoke_refuses_mainnet_passphrase_before_signer_and_request() {
+        let mock = wiremock::MockServer::start().await;
+        let primary = mock.uri();
+        let args = mainnet_refusal_args(
+            stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            &primary,
+        );
+        let err = submit_signed_invoke(args).await.unwrap_err();
+        assert!(
+            matches!(err, SaError::MainnetWriteForbidden),
+            "expected the mainnet refusal, got {err:?}"
+        );
+        assert_eq!(err.wire_code(), "network.mainnet_write_forbidden");
+        assert!(
+            mock.received_requests().await.unwrap().is_empty(),
+            "a refused mainnet submission must send no request"
+        );
+    }
+
+    /// A testnet passphrase with a dialable mainnet-pattern primary URL is
+    /// refused the same way.
+    #[tokio::test]
+    async fn submit_signed_invoke_refuses_mainnet_pattern_url_before_signer_and_request() {
+        let mock = wiremock::MockServer::start().await;
+        let primary = format!("{}/pubnet", mock.uri());
+        let args = mainnet_refusal_args(
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            &primary,
+        );
+        let err = submit_signed_invoke(args).await.unwrap_err();
+        assert!(
+            matches!(err, SaError::MainnetWriteForbidden),
+            "expected the mainnet refusal, got {err:?}"
+        );
+        assert!(
+            mock.received_requests().await.unwrap().is_empty(),
+            "a refused mainnet submission must send no request"
+        );
     }
 
     // ── Ed25519RuleSigner: single-signer routing composition ────────────────

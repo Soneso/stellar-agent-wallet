@@ -56,7 +56,9 @@ use stellar_agent_network::{
 use crate::commands::policy_engine::{
     build_v1_policy_engine, evaluate_value_moving_policy_with_value,
 };
-use crate::common::network::{EndpointFlags, EndpointUrlFlag, network_context_for_command};
+use crate::common::network::{
+    EndpointFlags, EndpointUrlFlag, mainnet_write_refusal, network_context_for_command,
+};
 use crate::common::profile_access::{injected_profile_load, reconcile_loaded_profile};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
@@ -187,6 +189,14 @@ where
             return 1;
         }
     };
+
+    // ── Structural mainnet refusal ────────────────────────────────────────────
+    // Before the keyring store, the signer, and any RPC request, and ahead of
+    // the router lookup, so mainnet answers the canonical code.
+    if let Some(err) = mainnet_write_refusal(context.chain_id) {
+        render_json(&Envelope::<()>::err(&err));
+        return 1;
+    }
 
     // ── Initialise platform keyring store ─────────────────────────────────────
     // The keyring signer loaded before signing requires the process-global
@@ -477,6 +487,41 @@ mod tests {
     use stellar_agent_core::error::AuthError;
 
     use super::*;
+
+    // ── mainnet refusal ahead of the keyring and the endpoint ────────────────
+
+    /// A mainnet profile is refused with exit 1 before the keyring
+    /// initialiser, which panics if called, and before any request reaches
+    /// the profile's endpoint.
+    #[tokio::test]
+    async fn run_refuses_mainnet_before_keyring_and_any_request() {
+        let rpc = wiremock::MockServer::start().await;
+        let args = TradeArgs {
+            profile: Some("trade-mainnet".to_owned()),
+            from: "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD".to_owned(),
+            amount_in: 1,
+            amount_out_min: 0,
+            path: vec!["native".to_owned(), "native".to_owned()],
+            deadline: None,
+            secondary_rpc_url: None,
+        };
+        let code = run_with_dependencies(
+            &args,
+            |name| {
+                Ok(
+                    Profile::builder_mainnet_named(name, rpc.uri(), "s", "default", "n", "a")
+                        .build(),
+                )
+            },
+            || panic!("a mainnet profile must not initialise the keyring"),
+        )
+        .await;
+        assert_eq!(code, 1, "a mainnet trade must exit with code 1");
+        assert!(
+            rpc.received_requests().await.unwrap().is_empty(),
+            "a mainnet trade must send no request"
+        );
+    }
 
     // ── keyring store initialisation ordering ─────────────────────────────────
 

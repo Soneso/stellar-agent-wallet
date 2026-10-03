@@ -357,15 +357,22 @@ pub(crate) fn unresolved_from_defi(
 
 /// Renders a DeFi submit failure as a tool result.
 ///
-/// A policy denial renders as the dispatch gate renders one. An unresolved
-/// submission keeps its `submission.*` code and its `details`; everything else
-/// is reported under `fallback_code`.
+/// A policy denial renders as the dispatch gate renders one. A mainnet refusal
+/// reports `network.mainnet_write_forbidden`. An unresolved submission keeps
+/// its `submission.*` code and its `details`; everything else is reported under
+/// `fallback_code`.
 pub(crate) fn defi_submit_error_result(
     error: &stellar_agent_defi::adapter::DefiAdapterError,
     fallback_code: &str,
 ) -> CallToolResult {
     if let stellar_agent_defi::adapter::DefiAdapterError::PolicyDenied { reason } = error {
         return crate::tools::common::policy_denial_error_result(reason);
+    }
+    if matches!(
+        error,
+        stellar_agent_defi::adapter::DefiAdapterError::MainnetWriteForbidden
+    ) {
+        return crate::tools::common::mainnet_write_forbidden_result();
     }
     match unresolved_from_defi(error) {
         Some(unresolved) => unresolved_result(&unresolved),
@@ -515,6 +522,22 @@ mod tests {
         assert_eq!(json["error"]["details"]["envelope_hash"], "cd".repeat(32));
         assert_eq!(json["error"]["details"]["outcome"], "unknown");
         assert_eq!(json["error"]["details"]["reconcile_with"], RECONCILE_TOOL);
+    }
+
+    /// A DeFi mainnet refusal reports the canonical code under every surface
+    /// fallback.
+    #[test]
+    fn a_defi_mainnet_refusal_reports_the_canonical_code() {
+        let error = stellar_agent_defi::adapter::DefiAdapterError::MainnetWriteForbidden;
+
+        for fallback in ["vault.submit_failed", "dex.submit_failed"] {
+            let result = defi_submit_error_result(&error, fallback);
+            let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(
+                code, "network.mainnet_write_forbidden",
+                "fallback {fallback}"
+            );
+        }
     }
 
     /// Every other DeFi failure reports under the surface's own code.

@@ -11,15 +11,16 @@ Every command emits a JSON envelope on stdout by default and returns exit code `
 `vault deposit`, `vault withdraw`, and `trade` are all signing commands. Each one, before it signs anything:
 
 1. Loads the named profile (`--profile`, else `STELLAR_AGENT_PROFILE`, else `default`) and resolves the CAIP-2 chain id, RPC endpoint, and network passphrase from it.
-2. Pins the target contract by WASM hash (a two-RPC cross-check when `--secondary-rpc-url` is supplied) so the address you name actually runs the code the wallet expects.
-3. Evaluates the operator policy engine for the corresponding tool descriptor. A `Deny` decision refuses with `policy.deny.<code>`. A `RequireApproval` decision refuses with `policy.approval_required` and a message directing you to the MCP server for two-phase approval. The CLI has no interactive approval path for these verbs. A policy engine that is configured but cannot be built refuses with `policy.engine_unavailable` (fail closed: the value-moving operation does not run permissively).
-4. Loads the signing key from the OS keyring entry named by the profile, then signs and submits through the venue adapter.
+2. Refuses a mainnet profile with `network.mainnet_write_forbidden`, before the keyring, the signer, and any RPC call.
+3. Pins the target contract by WASM hash (a two-RPC cross-check when `--secondary-rpc-url` is supplied) so the address you name actually runs the code the wallet expects.
+4. Evaluates the operator policy engine for the corresponding tool descriptor. A `Deny` decision refuses with `policy.deny.<code>`. A `RequireApproval` decision refuses with `policy.approval_required` and a message directing you to the MCP server for two-phase approval. The CLI has no interactive approval path for these verbs. A policy engine that is configured but cannot be built refuses with `policy.engine_unavailable` (fail closed: the value-moving operation does not run permissively).
+5. Loads the signing key from the OS keyring entry named by the profile, then signs and submits through the venue adapter.
 
 These commands do not accept `--output`; they always emit JSON. Only the `pool` subcommands offer `--output`.
 
 ### Network constraint
 
-The default network is testnet (`stellar:testnet`). These DeFi commands and the `pool` commands carry no command-level mainnet refusal. They are constrained instead by per-network contract pins. Soroswap resolves a different pinned router per network. The DeFindex vault WASM hash is identical on testnet and mainnet. `trade` rejects a network it has no pinned router for with `dex.unrecognised_network`. Friendbot funding remains testnet-only. For the contract-pinning and venue model, see [Protocols and venues](../protocols.md).
+The default network is testnet (`stellar:testnet`). `vault deposit`, `vault withdraw`, `trade`, and `pool init` refuse a mainnet profile with `network.mainnet_write_forbidden` before signer access and any RPC call. Of the `pool` commands, only `pool init` signs. Per-network contract pins constrain the DeFi commands as well. Soroswap resolves a different pinned router per network. The DeFindex vault WASM hash is identical on testnet and mainnet. `trade` rejects a network it has no pinned router for with `dex.unrecognised_network`. Friendbot funding remains testnet-only. For the contract-pinning and venue model, see [Protocols and venues](../protocols.md).
 
 ## `stellar-agent vault deposit`
 

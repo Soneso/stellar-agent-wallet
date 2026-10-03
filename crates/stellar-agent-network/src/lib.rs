@@ -112,7 +112,7 @@ pub use submission_record::{
 };
 pub use submit::{
     SubmissionResult, SubmissionSignerKind, envelope_hash_hex, redact_tx_hash,
-    submit_transaction_and_wait,
+    refuse_mainnet_write, submit_transaction_and_wait,
 };
 pub use transaction_record::TransactionRecord;
 pub use wasm_hash::{

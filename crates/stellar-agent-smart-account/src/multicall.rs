@@ -1208,8 +1208,17 @@ pub fn build_exec_invocations(bundle: &[MulticallInvocation]) -> Result<Vec<ScVa
 ///    `SaMulticallInnerExecuted` rows. On failure, emit `SaMulticallBundleDenied`
 ///    with the appropriate `refusal_phase`.
 ///
+/// A mainnet `network_passphrase` or a mainnet-pattern `primary_rpc_url` is
+/// refused by `submit_signed_invoke` with [`SaError::MainnetWriteForbidden`]
+/// before any signing call and any request. The bundle validation, the policy
+/// gate, and the registry lookup run first.
+///
 /// # Errors
 ///
+/// - `SaError::MainnetWriteForbidden`: the bundle was declared for mainnet,
+///   aimed at a mainnet-pattern endpoint, or sent to an endpoint that reports
+///   the mainnet passphrase. No transaction was sent. It is returned unwrapped
+///   after a denied row at phase `policy_gate`.
 /// - `SaError::MulticallFailed { phase: "build", .. }` — bundle shape invalid.
 /// - `SaError::MulticallFailed { phase: "policy_gate", .. }` — policy denied.
 /// - `SaError::MulticallFailed { phase: "rpc_divergence", .. }` — cross-RPC check failed.
@@ -1556,31 +1565,20 @@ pub async fn submit_multicall_bundle(
     // ── Step 4: audit ─────────────────────────────────────────────────────────
 
     match submit_result {
-        Err(sa_err @ SaError::SubmissionUnresolved { .. }) => Err(sa_err),
-        // A reservation the window refuses is a policy denial: it carries the
-        // gate's own code, the recorder's closing row records it, and nothing
-        // was sent, so it passes through unwrapped and writes no second row.
-        Err(sa_err @ SaError::PolicyDenied { .. }) => Err(sa_err),
-        Err(ref sa_err) => {
-            // Map SaError to a MulticallFailed phase.
-            let phase = map_sa_error_to_multicall_phase(sa_err);
-            let deny_wire_code = format!("multicall.{}", sa_err.wire_code());
-
-            let _ = emit_denied(
-                &args.audit_writer,
-                None,
-                None,
-                None,
-                deny_wire_code,
-                phase,
-                inner_count,
-            );
-
-            Err(SaError::MulticallFailed {
-                phase,
-                redacted_reason: format!("submit error: {}", sa_err.wire_code()),
-                post_submit_kind: None,
-            })
+        Err(sa_err) => {
+            let (denied_row, returned) = classify_submit_failure(sa_err);
+            if let Some(row) = denied_row {
+                let _ = emit_denied(
+                    &args.audit_writer,
+                    None,
+                    None,
+                    None,
+                    row.deny_wire_code,
+                    row.refusal_phase,
+                    inner_count,
+                );
+            }
+            Err(returned)
         }
         Ok(submit_ok) => {
             // Redact the real transaction hash to first-8-last-8 before logging or emitting.
@@ -1929,6 +1927,58 @@ const RULE_CHECK_STAGES: &[&str] = &[
     "baseline_read",
     "signer_set_compare",
 ];
+
+/// The denied audit row [`submit_multicall_bundle`] writes for a failed
+/// submission.
+#[derive(Debug, PartialEq, Eq)]
+struct SubmitDeniedRow {
+    /// `deny_wire_code` of the `SaMulticallBundleDenied` row.
+    deny_wire_code: String,
+    /// `refusal_phase` of the `SaMulticallBundleDenied` row.
+    refusal_phase: &'static str,
+}
+
+/// Classifies a failed `submit_signed_invoke` result of a bundle into the
+/// denied row to write, if any, and the error to return.
+///
+/// - [`SaError::SubmissionUnresolved`] and [`SaError::PolicyDenied`] pass
+///   through unwrapped with no row. The recorder's closing row records them.
+/// - [`SaError::MainnetWriteForbidden`] passes through unwrapped and keeps the
+///   canonical code. Its row has phase `policy_gate` and deny code
+///   `multicall.network.mainnet_write_forbidden`: the wallet refused it, and
+///   no transaction was sent.
+/// - Every other error writes a row at the phase of
+///   `map_sa_error_to_multicall_phase` and becomes [`SaError::MulticallFailed`]
+///   in that phase.
+fn classify_submit_failure(sa_err: SaError) -> (Option<SubmitDeniedRow>, SaError) {
+    match sa_err {
+        SaError::SubmissionUnresolved { .. } => (None, sa_err),
+        // A reservation the window refuses is a policy denial. It carries the
+        // gate's own code, the recorder's closing row records it, and nothing
+        // was sent, so it passes through unwrapped and writes no second row.
+        SaError::PolicyDenied { .. } => (None, sa_err),
+        SaError::MainnetWriteForbidden => (
+            Some(SubmitDeniedRow {
+                deny_wire_code: format!("multicall.{}", sa_err.wire_code()),
+                refusal_phase: "policy_gate",
+            }),
+            sa_err,
+        ),
+        other => {
+            let phase = map_sa_error_to_multicall_phase(&other);
+            let row = SubmitDeniedRow {
+                deny_wire_code: format!("multicall.{}", other.wire_code()),
+                refusal_phase: phase,
+            };
+            let wrapped = SaError::MulticallFailed {
+                phase,
+                redacted_reason: format!("submit error: {}", other.wire_code()),
+                post_submit_kind: None,
+            };
+            (Some(row), wrapped)
+        }
+    }
+}
 
 /// Maps a `SaError` wire-code to the closest `MulticallFailed` phase string.
 ///
@@ -3183,6 +3233,61 @@ wasm_sha256 = "{drifted_sha}"
             host_function_kind: "InvokeContract",
         };
         assert_eq!(map_sa_error_to_multicall_phase(&err), "build");
+    }
+
+    /// A mainnet refusal returns unwrapped, after a denied row at phase
+    /// `policy_gate` with the canonical code under the `multicall.` prefix.
+    #[test]
+    fn classify_submit_failure_returns_the_mainnet_refusal_unwrapped_with_a_denied_row() {
+        let (row, returned) = classify_submit_failure(SaError::MainnetWriteForbidden);
+        assert_eq!(
+            row,
+            Some(SubmitDeniedRow {
+                deny_wire_code: "multicall.network.mainnet_write_forbidden".to_owned(),
+                refusal_phase: "policy_gate",
+            })
+        );
+        assert!(
+            matches!(returned, SaError::MainnetWriteForbidden),
+            "the mainnet refusal must return unwrapped, got {returned:?}"
+        );
+    }
+
+    /// Another submit failure still writes a row at its mapped phase and
+    /// returns wrapped in `MulticallFailed`.
+    #[test]
+    fn classify_submit_failure_still_wraps_another_failure() {
+        let (row, returned) = classify_submit_failure(SaError::DeploymentFailed {
+            phase: "submit",
+            redacted_reason: "endpoint refused the bytes".to_owned(),
+        });
+        assert_eq!(
+            row,
+            Some(SubmitDeniedRow {
+                deny_wire_code: "multicall.sa.deployment_failed".to_owned(),
+                refusal_phase: "submit",
+            })
+        );
+        assert!(
+            matches!(
+                returned,
+                SaError::MulticallFailed {
+                    phase: "submit",
+                    ..
+                }
+            ),
+            "another failure must return wrapped, got {returned:?}"
+        );
+    }
+
+    /// A policy denial passes through with no second row.
+    #[test]
+    fn classify_submit_failure_passes_a_policy_denial_through_without_a_row() {
+        let (row, returned) = classify_submit_failure(SaError::PolicyDenied {
+            reason: Box::new(stellar_agent_core::policy::DenyReason::NoMatchingRule),
+        });
+        assert_eq!(row, None);
+        assert!(matches!(returned, SaError::PolicyDenied { .. }));
     }
 
     /// `HorizonExceeded` maps to `"policy_gate"`.

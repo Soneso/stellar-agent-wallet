@@ -204,6 +204,12 @@ impl WalletServer {
 
         use crate::tools::value_audit::emit_value_audit_row_with_writer;
 
+        // Structural mainnet refusal, keyed on the server's profile context:
+        // before the policy gate, any key access, and any RPC request.
+        if self.context.chain_id.is_mainnet() {
+            return Ok(crate::tools::common::mainnet_signing_forbidden_result());
+        }
+
         // ── Telemetry preamble ────────────────────────────────────────────────
         // Redact account IDs to first-5-last-5; tx XDR length only (no content).
         let args_value = json!({
@@ -502,19 +508,10 @@ impl WalletServer {
             Err(stellar_agent_core::WalletError::Network(
                 stellar_agent_core::error::NetworkError::MainnetWriteForbidden,
             )) => {
-                // Mainnet-write guard — surface under the SAME canonical
-                // `network.mainnet_write_forbidden` code the sign-only tools use
-                // for the structural mainnet refusal (mirrors
-                // `mainnet_signing_forbidden_result`), rather than a SEP-43
-                // RpcError code. Same refusal class, one code across the sep43
-                // family.
-                Ok(crate::tools::common::business_error_result(
-                    stellar_agent_core::error::NetworkError::MainnetWriteForbidden.code(),
-                    stellar_agent_sep43::Sep43Error::MainnetSigningForbidden {
-                        detail: crate::tools::common::mainnet_signing_refusal_detail(),
-                    }
-                    .to_string(),
-                ))
+                // A submit-layer mainnet refusal returns the SEP-43 family's
+                // structural refusal, so the entry and the submit layer report
+                // one envelope with the canonical code.
+                Ok(crate::tools::common::mainnet_signing_forbidden_result())
             }
 
             Err(stellar_agent_core::WalletError::Network(
@@ -938,6 +935,13 @@ mod tests {
             .unwrap();
         let mut server = crate::server::WalletServer::new(profile).unwrap();
         server.policy_engine = std::sync::Arc::new(EnrolledAllowEngine);
+        // A testnet context over the mainnet profile passes the entry refusal,
+        // which keys on the context, and reaches the enrolled-signer check,
+        // which keys on the profile. The mapping it pins stays reachable.
+        server.context = stellar_agent_network::NetworkContext::new(
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
+            "https://rpc.example.invalid".into(),
+        );
         let result = server
             .call_stellar_sep43_sign_and_submit_transaction(Sep43SignAndSubmitTransactionArgs {
                 chain_id: "stellar:mainnet".into(),

@@ -145,13 +145,15 @@ and never as a transient error to retry blindly.
 
 ## Mainnet is read-only in this alpha
 
-On `stellar:mainnet`, read-only tools work; every write is refused. Two
-independent layers enforce this. The policy layer refuses fund-moving tools
-under the default Noop engine with `policy.engine_required`, before any RPC
-call or signing. Below it, the network layer structurally refuses every
-mainnet write with `network.mainnet_write_forbidden`, regardless of the
-configured policy engine or enrolled keys. No profile configuration unlocks
-mainnet writes in this alpha. A V1 engine with enrolled keys (see
+On `stellar:mainnet`, read-only tools work; every write is refused. The DeFi,
+sign-and-submit, commit, rule-commit, and sign-only tools refuse a mainnet
+profile at handler entry with `network.mainnet_write_forbidden`, before the
+policy gate and any RPC call or signing. The MPP tools refuse at entry with
+`mpp.network_forbidden`. A profile on the Noop engine refuses the other
+destructive tools with `policy.engine_required`. Below these, the network layer
+structurally refuses every mainnet write with `network.mainnet_write_forbidden`,
+regardless of the configured policy engine or enrolled keys. No profile
+configuration unlocks mainnet writes in this alpha. A V1 engine with enrolled keys (see
 [profiles.md](profiles.md)) is the intended foundation for a future explicit
 mainnet opt-in, not a current unlock. Design the agent to treat every mainnet
 write refusal as structural: do not retry, and do not try configuration

@@ -230,6 +230,11 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<VaultDepositMcpArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Structural mainnet refusal, keyed on the server's profile context:
+        // before the policy gate, any key access, and any RPC request.
+        if self.context.chain_id.is_mainnet() {
+            return Ok(crate::tools::common::mainnet_write_forbidden_result());
+        }
         let secondary_rpc_url = self.secondary_override(args.secondary_rpc_url.as_deref())?;
         // ── Parse decimal-string amount fields (single decode; feeds BOTH the
         // value-carrying policy gate below and `VaultDepositArgs` handed to
@@ -715,6 +720,11 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<VaultWithdrawMcpArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Structural mainnet refusal, keyed on the server's profile context:
+        // before the policy gate, any key access, and any RPC request.
+        if self.context.chain_id.is_mainnet() {
+            return Ok(crate::tools::common::mainnet_write_forbidden_result());
+        }
         let secondary_rpc_url = self.secondary_override(args.secondary_rpc_url.as_deref())?;
         // ── Parse decimal-string amount fields (single decode; feeds BOTH the
         // value-carrying policy gate below and `VaultWithdrawArgs` handed to
@@ -1356,6 +1366,9 @@ mod secondary_rule_tests {
     use super::*;
     use stellar_agent_core::profile::{Profile, caip2::Caip2};
 
+    /// A server on a mainnet or testnet profile whose context is forced to
+    /// mainnet. Both context endpoints are the mock, so every request a
+    /// handler makes is counted.
     fn server(mainnet: bool, rpc: &str) -> WalletServer {
         let profile = if mainnet {
             Profile::builder_mainnet_named("secondary", rpc, "s", "default", "n", "a")
@@ -1366,69 +1379,140 @@ mod secondary_rule_tests {
         .build();
         let mut server = WalletServer::new(profile).unwrap();
         server.context = stellar_agent_network::NetworkContext::new(Caip2::Mainnet, rpc.into())
-            .with_secondary(Some("https://file-secondary.example".into()));
+            .with_secondary(Some(rpc.into()));
         server
     }
 
+    /// A testnet server whose context comes from its profile.
+    fn testnet_server(rpc: &str) -> WalletServer {
+        let profile = Profile::builder_testnet_named("secondary", "s", "default", "n", "a")
+            .rpc_url(rpc)
+            .with_noop_engine()
+            .build();
+        WalletServer::new(profile).unwrap()
+    }
+
+    /// A credentialed secondary endpoint that dials the mock server.
+    fn credentialed(rpc: &wiremock::MockServer) -> String {
+        format!("http://agent:secret@{}", rpc.address())
+    }
+
+    fn deposit_args(chain_id: &str, secondary: Option<&str>) -> VaultDepositMcpArgs {
+        serde_json::from_value(serde_json::json!({
+            "chain_id": chain_id, "secondary_rpc_url": secondary, "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN", "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD", "amounts_desired": ["1"], "amounts_min": ["0"]
+        }))
+        .unwrap()
+    }
+
+    fn withdraw_args(chain_id: &str, secondary: Option<&str>) -> VaultWithdrawMcpArgs {
+        serde_json::from_value(serde_json::json!({
+            "chain_id": chain_id, "secondary_rpc_url": secondary, "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN", "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD", "withdraw_shares": "1", "min_amounts_out": ["0"]
+        }))
+        .unwrap()
+    }
+
+    /// A testnet profile under a mainnet context refuses with the canonical
+    /// code: the refusal keys on the context, not on the profile or the
+    /// argument.
     #[tokio::test]
-    async fn defindex_vault_deposit_secondary_refuses_at_entry_divergent_context() {
+    async fn defindex_vault_deposit_refuses_mainnet_at_entry_divergent_context() {
         let rpc = wiremock::MockServer::start().await;
         let server = server(false, &rpc.uri());
-        let args: VaultDepositMcpArgs = serde_json::from_value(serde_json::json!({
-            "chain_id": "stellar:testnet", "secondary_rpc_url": rpc.uri(), "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN", "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD", "amounts_desired": ["1"], "amounts_min": ["0"]
-        })).unwrap();
+        let args = deposit_args("stellar:testnet", Some(rpc.uri().as_str()));
         let result = server.call_stellar_defindex_vault_deposit(args).await;
-        let err = result.expect_err("endpoint override refuses before any lookup or RPC");
-        assert!(
-            err.message.contains("profile.non_overlayable_field"),
-            "{err:?}"
-        );
+        let result = result.expect("the mainnet refusal is a business envelope");
+        crate::tools::common::assert_mainnet_write_forbidden(&result);
         assert!(rpc.received_requests().await.unwrap().is_empty());
     }
 
+    /// A mainnet profile on the Noop engine refuses with the canonical code
+    /// ahead of the secondary-endpoint refusal.
     #[tokio::test]
-    async fn defindex_vault_deposit_secondary_refuses_at_entry_mainnet_profile() {
+    async fn defindex_vault_deposit_refuses_mainnet_at_entry_mainnet_profile() {
         let rpc = wiremock::MockServer::start().await;
         let server = server(true, &rpc.uri());
-        let args: VaultDepositMcpArgs = serde_json::from_value(serde_json::json!({
-            "chain_id": "stellar:mainnet", "secondary_rpc_url": rpc.uri(), "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN", "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD", "amounts_desired": ["1"], "amounts_min": ["0"]
-        })).unwrap();
+        let args = deposit_args("stellar:mainnet", Some(rpc.uri().as_str()));
         let result = server.call_stellar_defindex_vault_deposit(args).await;
-        let err = result.expect_err("endpoint override refuses before any lookup or RPC");
+        let result = result.expect("the mainnet refusal is a business envelope");
+        crate::tools::common::assert_mainnet_write_forbidden(&result);
+        assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    /// The refusal precedes the policy gate: an engine that allows every call
+    /// changes nothing.
+    #[tokio::test]
+    async fn defindex_vault_deposit_refuses_mainnet_under_allow_all_engine() {
+        let rpc = wiremock::MockServer::start().await;
+        let mut server = server(true, &rpc.uri());
+        server.policy_engine = std::sync::Arc::new(crate::tools::common::AllowAllPolicyEngine);
+        let args = deposit_args("stellar:mainnet", None);
+        let result = server.call_stellar_defindex_vault_deposit(args).await;
+        let result = result.expect("the mainnet refusal is a business envelope");
+        crate::tools::common::assert_mainnet_write_forbidden(&result);
+        assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    /// On testnet the handler still resolves the caller's secondary endpoint:
+    /// a credentialed URL is refused before any lookup or RPC.
+    #[tokio::test]
+    async fn defindex_vault_deposit_refuses_credentialed_secondary_on_testnet() {
+        let rpc = wiremock::MockServer::start().await;
+        let server = testnet_server(&rpc.uri());
+        let args = deposit_args("stellar:testnet", Some(credentialed(&rpc).as_str()));
+        let result = server.call_stellar_defindex_vault_deposit(args).await;
+        let err = result.expect_err("a credentialed secondary endpoint is refused");
         assert!(
-            err.message.contains("profile.non_overlayable_field"),
+            err.message
+                .contains(stellar_agent_core::redact::CREDENTIALED_URL_INPUT_REFUSAL),
             "{err:?}"
         );
         assert!(rpc.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn defindex_vault_withdraw_secondary_refuses_at_entry_divergent_context() {
+    async fn defindex_vault_withdraw_refuses_mainnet_at_entry_divergent_context() {
         let rpc = wiremock::MockServer::start().await;
         let server = server(false, &rpc.uri());
-        let args: VaultWithdrawMcpArgs = serde_json::from_value(serde_json::json!({
-            "chain_id": "stellar:testnet", "secondary_rpc_url": rpc.uri(), "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN", "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD", "withdraw_shares": "1", "min_amounts_out": ["0"]
-        })).unwrap();
+        let args = withdraw_args("stellar:testnet", Some(rpc.uri().as_str()));
         let result = server.call_stellar_defindex_vault_withdraw(args).await;
-        let err = result.expect_err("endpoint override refuses before any lookup or RPC");
-        assert!(
-            err.message.contains("profile.non_overlayable_field"),
-            "{err:?}"
-        );
+        let result = result.expect("the mainnet refusal is a business envelope");
+        crate::tools::common::assert_mainnet_write_forbidden(&result);
         assert!(rpc.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn defindex_vault_withdraw_secondary_refuses_at_entry_mainnet_profile() {
+    async fn defindex_vault_withdraw_refuses_mainnet_at_entry_mainnet_profile() {
         let rpc = wiremock::MockServer::start().await;
         let server = server(true, &rpc.uri());
-        let args: VaultWithdrawMcpArgs = serde_json::from_value(serde_json::json!({
-            "chain_id": "stellar:mainnet", "secondary_rpc_url": rpc.uri(), "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN", "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD", "withdraw_shares": "1", "min_amounts_out": ["0"]
-        })).unwrap();
+        let args = withdraw_args("stellar:mainnet", Some(rpc.uri().as_str()));
         let result = server.call_stellar_defindex_vault_withdraw(args).await;
-        let err = result.expect_err("endpoint override refuses before any lookup or RPC");
+        let result = result.expect("the mainnet refusal is a business envelope");
+        crate::tools::common::assert_mainnet_write_forbidden(&result);
+        assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn defindex_vault_withdraw_refuses_mainnet_under_allow_all_engine() {
+        let rpc = wiremock::MockServer::start().await;
+        let mut server = server(true, &rpc.uri());
+        server.policy_engine = std::sync::Arc::new(crate::tools::common::AllowAllPolicyEngine);
+        let args = withdraw_args("stellar:mainnet", None);
+        let result = server.call_stellar_defindex_vault_withdraw(args).await;
+        let result = result.expect("the mainnet refusal is a business envelope");
+        crate::tools::common::assert_mainnet_write_forbidden(&result);
+        assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn defindex_vault_withdraw_refuses_credentialed_secondary_on_testnet() {
+        let rpc = wiremock::MockServer::start().await;
+        let server = testnet_server(&rpc.uri());
+        let args = withdraw_args("stellar:testnet", Some(credentialed(&rpc).as_str()));
+        let result = server.call_stellar_defindex_vault_withdraw(args).await;
+        let err = result.expect_err("a credentialed secondary endpoint is refused");
         assert!(
-            err.message.contains("profile.non_overlayable_field"),
+            err.message
+                .contains(stellar_agent_core::redact::CREDENTIALED_URL_INPUT_REFUSAL),
             "{err:?}"
         );
         assert!(rpc.received_requests().await.unwrap().is_empty());

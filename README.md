@@ -36,12 +36,15 @@ Public alpha, under active development.
 - mainnet (`stellar:mainnet`) is accepted for read-only commands, through a
   mainnet profile selected with `--profile <name>`, or through `--rpc-url` for
   `balances`. Every write or signing command refuses mainnet in this alpha
-  (wire code `network.mainnet_write_forbidden`). The transaction and
-  smart-account write commands refuse a mainnet profile before any RPC call or
-  signer access. At the submit layer a declared mainnet
-  passphrase and a known mainnet RPC URL are each refused with no RPC call at
-  all; beyond those two, the layer asks the endpoint which network it serves
-  and refuses when the answer is mainnet.
+  with wire code `network.mainnet_write_forbidden`, except MPP, which refuses
+  with `mpp.network_forbidden`. The transaction and smart-account write
+  commands refuse a mainnet profile before any RPC call or signer access. So
+  do `vault deposit`, `vault withdraw`, `trade`, `trustline`, `pool init`, and
+  `smart-account rules verify-pins`, which loads a signer. The MCP signing,
+  DeFi, and commit tools refuse it at entry. At the submit layer a declared
+  mainnet passphrase and a known mainnet RPC URL are each refused with no RPC
+  call at all. Beyond those two, the layer asks the endpoint which network it
+  serves and refuses when the answer is mainnet.
 - The submit layer does not take the caller's word for the network. It treats
   the endpoint's own answer as authoritative, refuses when that answer
   disagrees with the declared network or cannot be established, and verifies

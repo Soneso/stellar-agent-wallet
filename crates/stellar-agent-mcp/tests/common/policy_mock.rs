@@ -70,29 +70,28 @@ impl PolicyEngine for MockPolicyEngine {
     }
 }
 
-/// Returns a mainnet `WalletServer` with the given engine injected.
+/// Returns a testnet `WalletServer` with the given engine injected AND
+/// `rpc_url` set to a caller-supplied endpoint (typically a local wiremock
+/// server).
 ///
-/// Returns a mainnet `WalletServer` with the given engine injected AND
-/// `rpc_url` overridden to a caller-supplied endpoint (typically a local
-/// wiremock server).
-///
-/// Commit-phase policy gates now fetch the source `account_view` BEFORE
-/// evaluating policy (feeds `minimum_reserve`), so a test that reaches the
-/// commit gate performs a real RPC round-trip even when the injected
-/// `PolicyEngine` ignores its `account_view` argument entirely (as
-/// `MockPolicyEngine` does). Pointing `rpc_url` at a local mock keeps that
-/// round-trip fast and deterministic instead of depending on the default
-/// mainnet RPC endpoint's live reachability.
+/// The commit tools refuse a mainnet profile before their policy gate, so the
+/// engine verdicts these tests pin are reached on testnet. Commit-phase policy
+/// gates fetch the source `account_view` BEFORE evaluating policy (feeds
+/// `minimum_reserve`). A test that reaches the commit gate therefore performs
+/// a real RPC round-trip, even when the injected `PolicyEngine` ignores its
+/// `account_view` argument entirely (as `MockPolicyEngine` does). Pointing
+/// `rpc_url` at a local mock keeps that round-trip fast and deterministic.
 #[allow(
     dead_code,
-    reason = "shared integration-test helper; not every consumer needs an rpc_url override"
+    reason = "shared integration-test helper; most test binaries that include `common` do not call it"
 )]
-pub fn mainnet_server_with_engine_and_rpc(
+pub fn testnet_server_with_engine_and_rpc(
     engine: impl PolicyEngine + 'static,
     rpc_url: &str,
 ) -> WalletServer {
     keyring_mock::install().expect("mock keyring install");
-    let profile = Profile::builder_mainnet(rpc_url, "svc", "acct", "n-svc", "n-acct")
+    let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .rpc_url(rpc_url)
         .with_noop_engine()
         .build();
     let mut server = WalletServer::new(profile).expect("WalletServer::new");

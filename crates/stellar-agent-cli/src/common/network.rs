@@ -5,14 +5,18 @@
 //!
 //! # Two-layer mainnet defence
 //!
-//! Structural refusals inspect the context's chain before signer access on pay,
-//! claim, account creation and deployment, smart-account deployment, signers,
-//! rules writes, execute, migration submit, timelock writes, and multicall.
-//! The submit layer also checks the endpoint and passphrase.
+//! Structural refusals inspect the context's chain before signer access and
+//! any RPC request. They cover pay, claim, account creation and deployment,
+//! smart-account deployment, signers, rules writes, `rules verify-pins`,
+//! execute, migration submit, timelock writes, and multicall. They also cover
+//! `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init`.
+//! Each answers `network.mainnet_write_forbidden` with exit code 1. The submit
+//! layer also checks the endpoint and passphrase.
 
 use std::fmt;
 use std::str::FromStr;
 
+use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
 pub(crate) use stellar_agent_core::profile::caip2::TESTNET_RPC_URL;
 
@@ -119,6 +123,21 @@ pub(crate) fn network_context_for_command(
     ))
 }
 
+/// The structural mainnet-write refusal for `chain`: `Some` on mainnet, `None`
+/// otherwise.
+///
+/// The timelock writes, `vault`, `trade`, `trustline`, `pool init`, and
+/// `rules verify-pins` call this once their network context is built. The
+/// call precedes their keyring initialiser or signer resolution, so a mainnet
+/// profile is refused before signer access and any RPC request.
+pub(crate) fn mainnet_write_refusal(chain: Caip2) -> Option<WalletError> {
+    if chain.is_mainnet() {
+        Some(WalletError::Network(NetworkError::MainnetWriteForbidden))
+    } else {
+        None
+    }
+}
+
 /// Parses an RPC URL flag without echoing credentials in errors.
 #[derive(Clone)]
 pub(crate) struct EndpointUrlFlag;
@@ -216,6 +235,24 @@ mod tests {
         assert_eq!(
             TargetNetwork::Mainnet.caip2().caip2_str(),
             "stellar:mainnet"
+        );
+    }
+
+    /// Mainnet yields the canonical refusal; testnet yields none.
+    #[test]
+    fn mainnet_write_refusal_refuses_mainnet_only() {
+        let err = mainnet_write_refusal(Caip2::Mainnet).expect("mainnet must refuse");
+        assert!(
+            matches!(
+                err,
+                WalletError::Network(NetworkError::MainnetWriteForbidden)
+            ),
+            "mainnet must yield MainnetWriteForbidden; got: {err:?}"
+        );
+        assert_eq!(err.code(), "network.mainnet_write_forbidden");
+        assert!(
+            mainnet_write_refusal(Caip2::Testnet).is_none(),
+            "testnet must not refuse"
         );
     }
 }

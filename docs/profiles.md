@@ -316,6 +316,7 @@ security-key reference names but mints no key material; the rotation commands
 below mint the actual keys. Note that the engine choice governs the policy
 layer only: every mainnet write is additionally refused at the network layer
 (`network.mainnet_write_forbidden`) in this alpha, on `noop` and `v1` alike.
+MPP refuses mainnet with `mpp.network_forbidden` instead.
 
 ### Migrate first
 

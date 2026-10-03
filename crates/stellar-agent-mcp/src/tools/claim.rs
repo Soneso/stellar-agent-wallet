@@ -646,6 +646,12 @@ impl WalletServer {
         &self,
         args: StellarClaimCommitArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Structural mainnet refusal, keyed on the server's profile context:
+        // before the policy gate, any key access, and any RPC request.
+        if self.context.chain_id.is_mainnet() {
+            return Ok(super::common::mainnet_write_forbidden_result());
+        }
+
         // ── Re-derive authoritative args from the HMAC-bound envelope_xdr ─────
         let mut authoritative_args =
             match decode_authoritative_args(&args.envelope_xdr, "stellar_claim_commit") {

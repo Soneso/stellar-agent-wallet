@@ -202,6 +202,9 @@ impl WalletServer {
     ///
     /// # Errors
     ///
+    /// - `network.mainnet_write_forbidden`: a signing action (sign-payment or
+    ///   rule-create) on a mainnet profile, answered as a business envelope
+    ///   before any gate, approval, key access, or RPC request.
     /// - `toolset.not_installed` — toolset is not installed.
     /// - `toolset.unknown_action` — action not in the capability→tool matrix.
     /// - `toolset.capability_not_declared` — granting capability not declared.
@@ -232,6 +235,18 @@ impl WalletServer {
 
         let toolset_name = stellar_agent_toolsets::sanitise_display(&args.toolset, 64);
         let action = stellar_agent_toolsets::sanitise_display(&args.action, 128);
+
+        // Structural mainnet refusal for the signing actions (sign-payment and
+        // rule-create), keyed on the server's profile context. It precedes the
+        // toolset's own dispatch gate and the gated resolvers, so a mainnet
+        // profile queues neither a first-invoke approval nor a per-payment
+        // approval. Read-only actions stay allowed on mainnet.
+        let is_signing_action = matrix::GATED_MATRIX_ENTRIES
+            .iter()
+            .any(|(_, tools)| tools.contains(&action.as_str()));
+        if is_signing_action && self.context.chain_id.is_mainnet() {
+            return Ok(crate::tools::common::mainnet_write_forbidden_result());
+        }
 
         let args_value = json!({
             "toolset": &toolset_name,
@@ -291,10 +306,7 @@ impl WalletServer {
                 .route_to_gated_resolver_rule_create(&toolset_name, &action, &args, &toolsets_root)
                 .await;
         }
-        if matrix::GATED_MATRIX_ENTRIES
-            .iter()
-            .any(|(_, tools)| tools.contains(&action.as_str()))
-        {
+        if is_signing_action {
             return self
                 .route_to_gated_resolver(&toolset_name, &action, &args, &toolsets_root)
                 .await;

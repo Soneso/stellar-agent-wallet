@@ -25,7 +25,7 @@
 //!
 //! ## Commit step (`stellar_pay_commit`)
 //!
-//! 12. Mainnet profile rejects commit (`destructive_hint = true`).
+//! 12. Mainnet profile rejects commit with `network.mainnet_write_forbidden`.
 //! 13. Replayed nonce returns `nonce.replayed`.
 //! 14. Expired/malformed nonce returns `nonce.expired`.
 //! 15. Envelope divergence returns `simulation.divergence`.
@@ -50,7 +50,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use common::policy_mock::{MockPolicyEngine, mainnet_server_with_engine_and_rpc};
+use common::policy_mock::{MockPolicyEngine, testnet_server_with_engine_and_rpc};
 use serial_test::serial;
 use stellar_agent_core::policy::DenyReason;
 use stellar_agent_core::profile::schema::Profile;
@@ -230,23 +230,19 @@ fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
     p
 }
 
-/// Builds a mainnet profile with `engine = Noop` for Property A tests.
+/// Builds a mainnet profile with `engine = Noop`.
 ///
-/// Property A tests the mainnet gate: `NoopPolicyEngine` refuses mainnet
-/// destructive tools.  Because `PolicyEngineKind::default()` is `V1`, we must
-/// set `Noop` explicitly so `WalletServer::new` succeeds without a signed
-/// policy file on disk.
+/// Used by the mainnet simulate test and by Property A. Because
+/// `PolicyEngineKind::default()` is `V1`, `Noop` is set explicitly so
+/// `WalletServer::new` succeeds without a signed policy file on disk.
 fn mainnet_profile() -> Profile {
     mainnet_profile_with_rpc("https://rpc.example.invalid")
 }
 
 /// `mainnet_profile` with a caller-supplied `rpc_url`.
 ///
-/// The commit-phase policy gate fetches the source `account_view` before
-/// evaluating policy, so Property-A's `NoopPolicyEngine` refusal — which does
-/// not itself depend on account state — still incurs a real RPC round-trip
-/// ahead of it. Pointing `rpc_url` at a local wiremock server keeps that
-/// round-trip fast and off the network.
+/// Property A points `rpc_url` at a local wiremock server and asserts that the
+/// commit refusal sends it no request.
 fn mainnet_profile_with_rpc(rpc_url: &str) -> Profile {
     Profile::builder_mainnet(rpc_url, "svc", "acct", "n-svc", "n-acct")
         .with_noop_engine()
@@ -1035,23 +1031,25 @@ async fn simulate_fee_explicit_above_profile_cap_fails() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Commit step: policy gate on mainnet (four-property suite)
+// Commit step: mainnet refusal and policy gate (four-property suite)
 //
-// Property A: Noop engine refuses mainnet destructive tools with
-//   policy.engine_required.
+// Property A: a mainnet profile is refused at entry with
+//   network.mainnet_write_forbidden, before the policy gate and any request.
 // Property B: V1 engine + matching allow rule → commit proceeds past the gate.
 // Property C: V1 engine + no matching rule → policy.deny.no_matching_rule.
 // Property D: V1 engine + explicit deny rule → policy.deny.explicit_rule_deny.
+// Properties B, C, and D run on testnet, where the commit reaches the gate.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Property A: when `policy.engine = "noop"`, the commit step for a destructive
-/// mainnet tool returns `policy.engine_required`.
+/// Property A: on a mainnet profile with the Noop engine, the commit step
+/// answers `network.mainnet_write_forbidden` and sends no request.
 ///
-/// `NoopPolicyEngine` returns `Err(NotImplemented)` for destructive tools on
-/// mainnet, preserving the Noop engine behaviour for migrated profiles.
+/// The Noop engine's own mainnet verdict (`policy.engine_required`) stays
+/// pinned in core and through the friendbot tool; the commit refusal precedes
+/// it.
 #[tokio::test]
 #[serial]
-async fn policy_noop_engine_refuses_mainnet_destructive() {
+async fn mainnet_profile_commit_refuses_with_mainnet_write_forbidden() {
     let _data_root = common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     let mock_server = MockServer::start().await;
@@ -1079,8 +1077,8 @@ async fn policy_noop_engine_refuses_mainnet_destructive() {
         memo_return_hex: None,
         nonce: "dGVzdA".to_owned(),
         expires_at_unix_ms: u64::MAX,
-        // Supply valid Payment XDR so the re-derivation step succeeds
-        // and the call reaches the policy gate (which rejects mainnet).
+        // Valid Payment XDR, so nothing but the mainnet refusal stops the
+        // call before the policy gate.
         envelope_xdr: valid_payment_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
@@ -1091,8 +1089,17 @@ async fn policy_noop_engine_refuses_mainnet_destructive() {
         .expect("mainnet commit must return Ok(is_error) envelope");
     let (code, _message, _text) = common::assert_business_envelope(&result);
     assert_eq!(
-        code, "policy.engine_required",
-        "error must be policy.engine_required, got: {code}"
+        code, "network.mainnet_write_forbidden",
+        "error must be network.mainnet_write_forbidden, got: {code}"
+    );
+    let received = mock_server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    assert!(
+        received.is_empty(),
+        "a refused mainnet commit must send no request; got {}",
+        received.len()
     );
 }
 
@@ -1118,10 +1125,10 @@ async fn policy_v1_engine_allow_rule_passes_gate() {
         ))
         .mount(&mock_server)
         .await;
-    let server = mainnet_server_with_engine_and_rpc(MockPolicyEngine::allow(), &mock_server.uri());
+    let server = testnet_server_with_engine_and_rpc(MockPolicyEngine::allow(), &mock_server.uri());
 
     let args = StellarPayCommitArgs {
-        chain_id: "stellar:mainnet".to_owned(),
+        chain_id: "stellar:testnet".to_owned(),
         source: SOURCE_G.to_owned(),
         destination: DEST_G.to_owned(),
         amount: Some(serde_json::from_str(r#""10 XLM""#).unwrap()),
@@ -1168,13 +1175,13 @@ async fn policy_v1_engine_no_matching_rule_emits_wire_code() {
         ))
         .mount(&mock_server)
         .await;
-    let server = mainnet_server_with_engine_and_rpc(
+    let server = testnet_server_with_engine_and_rpc(
         MockPolicyEngine::deny_no_matching_rule(),
         &mock_server.uri(),
     );
 
     let args = StellarPayCommitArgs {
-        chain_id: "stellar:mainnet".to_owned(),
+        chain_id: "stellar:testnet".to_owned(),
         source: SOURCE_G.to_owned(),
         destination: DEST_G.to_owned(),
         amount: Some(serde_json::from_str(r#""10 XLM""#).unwrap()),
@@ -1218,13 +1225,13 @@ async fn policy_v1_engine_explicit_deny_emits_wire_code() {
         ))
         .mount(&mock_server)
         .await;
-    let server = mainnet_server_with_engine_and_rpc(
+    let server = testnet_server_with_engine_and_rpc(
         MockPolicyEngine::deny_explicit_rule(),
         &mock_server.uri(),
     );
 
     let args = StellarPayCommitArgs {
-        chain_id: "stellar:mainnet".to_owned(),
+        chain_id: "stellar:testnet".to_owned(),
         source: SOURCE_G.to_owned(),
         destination: DEST_G.to_owned(),
         amount: Some(serde_json::from_str(r#""10 XLM""#).unwrap()),

@@ -32,6 +32,8 @@ use stellar_xdr::{
     ScVec, SorobanAuthorizationEntry, SorobanCredentials, StringM, VecM, WriteXdr,
 };
 
+use stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL;
+use stellar_agent_network::refuse_mainnet_write;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_sep43::signing::sign_soroban_auth_entry;
 
@@ -79,10 +81,14 @@ const PLACEHOLDER_SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 /// Implements the eight-step flow, wire-compatible with the @x402/stellar
 /// reference implementation.
 ///
+/// A mainnet network passphrase or a mainnet-pattern `rpc_url` is refused with
+/// [`X402Error::MainnetSigningForbidden`] before any signing call and any
+/// request.
+///
 /// # Steps
 ///
-/// 1. Validate `requirements` (scheme, network, asset, `areFeesSponsored`,
-///    amount > 0).
+/// 1. Validate `requirements` (scheme, network, the mainnet refusal, asset,
+///    `areFeesSponsored`, amount > 0).
 /// 2. Build a SAC `transfer` `InvokeHostFunction`.
 /// 3. `simulateTransaction` to populate the auth-entry nonce and
 ///    `latest_ledger`.
@@ -113,6 +119,9 @@ const PLACEHOLDER_SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 /// - [`X402Error::UnsupportedScheme`] — scheme is not `"exact"`.
 /// - [`X402Error::UnsupportedNetwork`] — network not in `{stellar:pubnet, stellar:testnet}`.
 /// - [`X402Error::NetworkPassphraseMismatch`] — network passphrase mismatch.
+/// - [`X402Error::MainnetSigningForbidden`]: the network is mainnet
+///   (`stellar:pubnet` with the mainnet profile passphrase), or `rpc_url`
+///   matches a mainnet host pattern.
 /// - [`X402Error::InvalidAssetAddress`] — `asset` is not a valid C-strkey.
 /// - [`X402Error::FeesNotSponsored`] — `extra.areFeesSponsored != true`.
 /// - [`X402Error::AmountConversion`] — `amount` parse failure.
@@ -157,6 +166,14 @@ pub async fn create_payment(
             profile_passphrase: profile_passphrase.to_owned(),
         });
     }
+
+    // Mainnet refusal: a mainnet passphrase or a mainnet-pattern endpoint
+    // never reaches the signer or the endpoint.
+    refuse_mainnet_write(network_passphrase, rpc_url).map_err(|_| {
+        X402Error::MainnetSigningForbidden {
+            detail: MAINNET_SIGNING_REFUSAL_DETAIL.to_owned(),
+        }
+    })?;
 
     // Validate asset is a C-strkey.
     validate_c_strkey(&requirements.asset)?;

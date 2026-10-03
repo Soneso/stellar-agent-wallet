@@ -1366,6 +1366,9 @@ impl SignersManager {
     ///   `rule_lock_missing` and `migrating_rule_mismatch`.
     /// - [`SaError::SubmissionUnresolved`]: the transaction was sent and its
     ///   outcome is unknown; it keeps its transaction and envelope hashes.
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase or
+    ///   primary endpoint is mainnet, or the endpoint reports mainnet; it keeps
+    ///   the canonical `network.mainnet_write_forbidden` code.
     ///
     /// Folded into [`SaError::VerifierMigrationFailed`], whose `detail`
     /// carries the folded error's Display:
@@ -1394,8 +1397,6 @@ impl SignersManager {
         rule_locks: &BorrowedRuleLocks<'_>,
         expected_return: Option<ExpectedReturn>,
     ) -> Result<crate::submit::SubmitInvokeResult, SaError> {
-        use crate::error::MIGRATION_PHASES;
-
         let auth_rule_ids = vec![ContextRuleId::from(rule_id)];
 
         self.submit_signed_invoke(
@@ -1421,40 +1422,54 @@ impl SignersManager {
             expected_return,
         )
         .await
-        .map_err(|e| {
-            // The drift check's findings, every argument and lock stage, and
-            // an unknown submission outcome keep their own identity. The
-            // operator's next step is to inspect the contract, the audit log
-            // or the transaction hash, not the migration. The step signs under
-            // the migrating rule alone, whose verifier check is skipped, so no
-            // verifier finding reaches it.
-            if matches!(
-                e,
-                SaError::PolicyHashDrift { .. }
-                    | SaError::PinnedPolicyAbsent { .. }
-                    | SaError::PinCheckUnavailable { .. }
-                    | SaError::AuthEntryConstructionFailed { .. }
-                    | SaError::SubmissionUnresolved { .. }
-            ) {
-                return e;
+        .map_err(|e| Self::migration_step_error(e, entrypoint, smart_account_redacted, request_id))
+    }
+
+    /// Maps a failure of one migration step into the migration error surface.
+    ///
+    /// The errors [`Self::submit_migration_step`] returns as themselves pass
+    /// through unchanged; every other error becomes
+    /// [`SaError::VerifierMigrationFailed`] at phase `submit_simulate` or
+    /// `submit_send`.
+    fn migration_step_error(
+        e: SaError,
+        entrypoint: &str,
+        smart_account_redacted: &str,
+        request_id: &str,
+    ) -> SaError {
+        use crate::error::MIGRATION_PHASES;
+
+        // The drift check's findings, every argument and lock stage, an
+        // unknown submission outcome, and a mainnet refusal keep their own
+        // identity. The operator's next step is to inspect the contract, the
+        // audit log, the transaction hash, or the profile's network, not the
+        // migration. The step signs under the migrating rule alone, whose
+        // verifier check is skipped, so no verifier finding reaches it.
+        if matches!(
+            e,
+            SaError::PolicyHashDrift { .. }
+                | SaError::PinnedPolicyAbsent { .. }
+                | SaError::PinCheckUnavailable { .. }
+                | SaError::AuthEntryConstructionFailed { .. }
+                | SaError::SubmissionUnresolved { .. }
+                | SaError::MainnetWriteForbidden
+        ) {
+            return e;
+        }
+        // `submit_signed_invoke` reports both phases as
+        // `SaError::DeploymentFailed`; the migration names the phase.
+        let phase = match &e {
+            SaError::DeploymentFailed { phase, .. } if *phase == "simulate" => {
+                MIGRATION_PHASES[3] // "submit_simulate"
             }
-            // `submit_signed_invoke` reports both phases as
-            // `SaError::DeploymentFailed`; the migration names the phase.
-            let phase = match &e {
-                SaError::DeploymentFailed { phase, .. } if *phase == "simulate" => {
-                    MIGRATION_PHASES[3] // "submit_simulate"
-                }
-                _ => MIGRATION_PHASES[4], // "submit_send"
-            };
-            SaError::VerifierMigrationFailed {
-                phase,
-                smart_account_redacted: RedactedStrkey::from_already_redacted(
-                    smart_account_redacted,
-                ),
-                detail: format!("{entrypoint} migration step failed: {e}"),
-                request_id: request_id.to_owned(),
-            }
-        })
+            _ => MIGRATION_PHASES[4], // "submit_send"
+        };
+        SaError::VerifierMigrationFailed {
+            phase,
+            smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
+            detail: format!("{entrypoint} migration step failed: {e}"),
+            request_id: request_id.to_owned(),
+        }
     }
 
     /// Returns the verifier and policy `ScAddress`es registered in the on-chain
@@ -9620,6 +9635,44 @@ pub(crate) mod tests {
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 
     use super::*;
+
+    /// A migration step keeps a mainnet refusal as itself, so
+    /// `MigrationPlan::submit` reports the canonical code; another failure is
+    /// still folded into `VerifierMigrationFailed`.
+    #[test]
+    fn migration_step_error_passes_the_mainnet_refusal_through() {
+        let kept = SignersManager::migration_step_error(
+            SaError::MainnetWriteForbidden,
+            "remove_signer",
+            "CAAAA...D2KM",
+            "req-migrate",
+        );
+        assert!(
+            matches!(kept, SaError::MainnetWriteForbidden),
+            "the mainnet refusal must keep its variant, got {kept:?}"
+        );
+        assert_eq!(kept.wire_code(), "network.mainnet_write_forbidden");
+
+        let folded = SignersManager::migration_step_error(
+            SaError::DeploymentFailed {
+                phase: "simulate",
+                redacted_reason: "simulation failed".to_owned(),
+            },
+            "remove_signer",
+            "CAAAA...D2KM",
+            "req-migrate",
+        );
+        assert!(
+            matches!(
+                folded,
+                SaError::VerifierMigrationFailed {
+                    phase: "submit_simulate",
+                    ..
+                }
+            ),
+            "another failure must still be folded, got {folded:?}"
+        );
+    }
 
     /// A policy pin accepts every policy Wasm the wallet vendors without the
     /// unknown-hash override, and nothing else.

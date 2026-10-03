@@ -1444,6 +1444,23 @@ impl NetworkError {
     }
 }
 
+/// The refusal detail every sign-only mainnet refusal carries.
+///
+/// The text embeds the code of [`NetworkError::MainnetWriteForbidden`], so a
+/// signing refusal correlates with the write refusals of the CLI, the MCP
+/// server, and the submit layer. The x402 payment refusal and the SEP-43 and
+/// SEP-53 tool refusals use this one constant.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::error::{MAINNET_SIGNING_REFUSAL_DETAIL, NetworkError};
+///
+/// assert!(MAINNET_SIGNING_REFUSAL_DETAIL.contains(NetworkError::MainnetWriteForbidden.code()));
+/// ```
+pub const MAINNET_SIGNING_REFUSAL_DETAIL: &str =
+    "signing is structurally refused on mainnet (network.mainnet_write_forbidden)";
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Auth errors
 // ──────────────────────────────────────────────────────────────────────────────
@@ -3637,6 +3654,16 @@ mod tests {
             destination: "GABC".to_owned(),
         });
         assert_eq!(err.message(), err.to_string());
+    }
+
+    // ── Sign-only mainnet refusal detail ─────────────────────────────────────
+
+    #[test]
+    fn mainnet_signing_refusal_detail_carries_the_write_refusal_code() {
+        assert!(
+            MAINNET_SIGNING_REFUSAL_DETAIL.contains(NetworkError::MainnetWriteForbidden.code()),
+            "the detail must embed the canonical code: {MAINNET_SIGNING_REFUSAL_DETAIL}"
+        );
     }
 
     // ── Non-exhaustive note ───────────────────────────────────────────────────

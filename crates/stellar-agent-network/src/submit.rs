@@ -185,18 +185,10 @@ pub async fn submit_transaction_and_wait(
     signer_kind: Option<SubmissionSignerKind>,
     recorder: Option<&dyn SubmissionRecorder>,
 ) -> Result<SubmissionResult, WalletError> {
-    // Mainnet write is structurally forbidden at the submit layer.
-    //
-    // Primary check: passphrase comparison (catches third-party providers
-    // that do not use SDF hostnames).
-    if network_passphrase == MAINNET_PASSPHRASE {
-        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
-    }
-    // Defence-in-depth: URL heuristic (catches slip-of-the-fingers RPC URL
-    // overrides that still target SDF mainnet endpoints).
-    if is_mainnet_url(&client.url) {
-        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
-    }
+    // Mainnet write is structurally forbidden at the submit layer: the
+    // passphrase comparison is the primary check and the URL heuristic the
+    // defence-in-depth layer, both before any decode or RPC call.
+    refuse_mainnet_write(network_passphrase, &client.url).map_err(WalletError::Network)?;
 
     // Decode the base64 XDR envelope. The envelope is caller-supplied and
     // untrusted; bounded limits prevent a deeply nested auth-invocation tree
@@ -738,15 +730,61 @@ fn tx_hash_bytes(hex: &str) -> Result<[u8; 32], WalletError> {
 ///
 /// Best-effort heuristic for the second-layer mainnet guard. Catches
 /// programmatic callers that supply a mainnet RPC URL regardless of how
-/// the network passphrase is configured. `pub(crate)` so every in-crate
-/// write path (idempotent_submit's retention poll) carries the same
-/// defence-in-depth layer.
-pub(crate) fn is_mainnet_url(url: &str) -> bool {
+/// the network passphrase is configured.
+fn is_mainnet_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     // Known SDF mainnet RPC hostnames.
     lower.contains("mainnet.stellar")
         || lower.contains("horizon.stellar.org")
         || lower.contains("pubnet")
+}
+
+/// Refuses a ledger write declared for mainnet or aimed at a mainnet-pattern
+/// endpoint.
+///
+/// Two local checks run, and either one refuses:
+///
+/// - `network_passphrase` equals the mainnet passphrase. This is the primary
+///   check, and it holds for any provider whatever its hostname.
+/// - `rpc_url` matches a known mainnet host pattern (`mainnet.stellar`,
+///   `horizon.stellar.org`, or `pubnet`, compared case-insensitively). This
+///   heuristic complements the passphrase check for a mainnet endpoint paired
+///   with another network's passphrase.
+///
+/// Neither check establishes which network an endpoint serves. The endpoint
+/// probe in the submit path of [`submit_transaction_and_wait`] remains the
+/// check that an endpoint is what it claims. The function performs no I/O.
+///
+/// # Errors
+///
+/// [`NetworkError::MainnetWriteForbidden`] if either check holds.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::error::NetworkError;
+/// use stellar_agent_network::refuse_mainnet_write;
+///
+/// let testnet = "Test SDF Network ; September 2015";
+/// let mainnet = "Public Global Stellar Network ; September 2015";
+/// assert!(refuse_mainnet_write(testnet, "https://soroban-testnet.stellar.org").is_ok());
+/// assert!(matches!(
+///     refuse_mainnet_write(mainnet, "https://soroban-testnet.stellar.org"),
+///     Err(NetworkError::MainnetWriteForbidden)
+/// ));
+/// assert!(matches!(
+///     refuse_mainnet_write(testnet, "https://rpc.pubnet.example.org"),
+///     Err(NetworkError::MainnetWriteForbidden)
+/// ));
+/// ```
+pub fn refuse_mainnet_write(network_passphrase: &str, rpc_url: &str) -> Result<(), NetworkError> {
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(NetworkError::MainnetWriteForbidden);
+    }
+    if is_mainnet_url(rpc_url) {
+        return Err(NetworkError::MainnetWriteForbidden);
+    }
+    Ok(())
 }
 
 /// Redacts a transaction hash to first-8-last-8 format for log emission.
@@ -1048,6 +1086,37 @@ mod tests {
         assert!(!is_mainnet_url("https://soroban-testnet.stellar.org"));
         assert!(!is_mainnet_url("http://localhost:8000"));
         assert!(!is_mainnet_url("https://horizon-testnet.stellar.org"));
+    }
+
+    #[test]
+    fn refuse_mainnet_write_refuses_mainnet_passphrase_with_testnet_url() {
+        let result =
+            refuse_mainnet_write(MAINNET_PASSPHRASE, "https://soroban-testnet.stellar.org");
+        assert!(
+            matches!(result, Err(NetworkError::MainnetWriteForbidden)),
+            "the mainnet passphrase must refuse: {result:?}"
+        );
+    }
+
+    #[test]
+    fn refuse_mainnet_write_refuses_testnet_passphrase_with_mainnet_url() {
+        let result = refuse_mainnet_write(
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            "https://rpc.pubnet.example.org",
+        );
+        assert!(
+            matches!(result, Err(NetworkError::MainnetWriteForbidden)),
+            "a mainnet-pattern URL must refuse: {result:?}"
+        );
+    }
+
+    #[test]
+    fn refuse_mainnet_write_passes_testnet_passphrase_with_testnet_url() {
+        let result = refuse_mainnet_write(
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            "https://soroban-testnet.stellar.org",
+        );
+        assert!(result.is_ok(), "testnet inputs must pass: {result:?}");
     }
 
     #[test]

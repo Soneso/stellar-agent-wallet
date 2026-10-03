@@ -692,9 +692,14 @@ fn build_invoke_contract_args(
 /// identifiers, so the caller reconciles a transaction hash instead of
 /// rebuilding and re-submitting. A policy refusal keeps the criterion's own
 /// code, so the caller reads a refused cap rather than an endpoint failure.
-/// Every other failure is reported as a network failure, which moved nothing.
+/// A mainnet refusal keeps the canonical `network.mainnet_write_forbidden`
+/// code. Every other failure is reported as a network failure, which moved
+/// nothing.
 fn map_submit_invoke_error(error: &stellar_agent_smart_account::SaError) -> DefiAdapterError {
     match error {
+        stellar_agent_smart_account::SaError::MainnetWriteForbidden => {
+            DefiAdapterError::MainnetWriteForbidden
+        }
         stellar_agent_smart_account::SaError::PolicyDenied { reason } => {
             DefiAdapterError::PolicyDenied {
                 reason: reason.clone(),
@@ -769,6 +774,17 @@ mod tests {
                 DefiAdapterError::Network { .. }
             ),
             "a failure that moved nothing is a network failure"
+        );
+    }
+
+    /// A mainnet refusal keeps its own variant through the adapter mapping.
+    #[test]
+    fn a_mainnet_refusal_keeps_its_variant_through_the_adapter_mapping() {
+        let error = stellar_agent_smart_account::SaError::MainnetWriteForbidden;
+        let mapped = map_submit_invoke_error(&error);
+        assert!(
+            matches!(mapped, DefiAdapterError::MainnetWriteForbidden),
+            "a mainnet refusal must not read as a network failure; got {mapped:?}"
         );
     }
 

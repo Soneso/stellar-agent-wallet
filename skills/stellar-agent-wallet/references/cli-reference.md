@@ -67,7 +67,7 @@ stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ --secret-env WALLET
 
 ### Mainnet-write refusal
 
-This is a testnet-first alpha. `mainnet` is accepted for read-only commands but every write or signing command structurally refuses `mainnet`, surfacing `network.mainnet_write_forbidden` (the `friendbot` command and `accounts create --fund-with-friendbot` use `network.friendbot_mainnet_forbidden`). Commands that take `--network` refuse before any RPC call and before any signing key is touched. At the submit layer, which every write goes through including the profile-driven ones, a declared mainnet passphrase and a known mainnet RPC URL are each refused with no RPC call at all.
+This is a testnet-first alpha. `mainnet` is accepted for read-only commands but every write or signing command structurally refuses `mainnet`, surfacing `network.mainnet_write_forbidden`. The `friendbot` command and `accounts create --fund-with-friendbot` use `network.friendbot_mainnet_forbidden`, and `mpp` uses `mpp.network_forbidden`. Commands that take `--network` refuse before any RPC call and before any signing key is touched. The profile-driven `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init` refuse a mainnet profile before signer access and any RPC call. At the submit layer, which every write goes through including the profile-driven ones, a declared mainnet passphrase and a known mainnet RPC URL are each refused with no RPC call at all.
 
 ### Submit-layer network binding
 
@@ -370,7 +370,7 @@ Flags for every verb: see [`smart-accounts.md`](smart-accounts.md).
 
 ## DeFi: lend, vault, trade
 
-`lend`, `vault deposit`, `vault withdraw`, and `trade` are signing commands. Before signing each loads the profile, pins the target contract by WASM hash (two-RPC cross-check when `--secondary-rpc-url` is set), evaluates the operator policy engine, then signs and submits. A `Deny` refuses `policy.deny.<code>`; a `RequireApproval` refuses `policy.approval_required` (use the MCP server for two-phase approval — the CLI has no interactive approval path for these verbs); an unbuildable engine refuses `policy.engine_unavailable` (fail-closed). These commands do not accept `--output`; they always emit JSON. There is no command-level mainnet refusal — they are constrained by per-network contract pins. DeFi amounts are raw integer base units (no decimal/unit string).
+`vault deposit`, `vault withdraw`, and `trade` are signing commands. Before signing, each loads the profile and refuses a mainnet profile with `network.mainnet_write_forbidden` before signer access and any RPC call. It then pins the target contract by WASM hash (two-RPC cross-check when `--secondary-rpc-url` is set), evaluates the operator policy engine, and signs and submits. A `Deny` refuses `policy.deny.<code>`; a `RequireApproval` refuses `policy.approval_required` (use the MCP server for two-phase approval; the CLI has no interactive approval path for these verbs); an unbuildable engine refuses `policy.engine_unavailable` (fail closed). These commands do not accept `--output`; they always emit JSON. Per-network contract pins constrain them as well. DeFi amounts are raw integer base units (no decimal/unit string).
 
 Every venue's flags, trust gate, refusal codes, and examples live in [`defi.md`](defi.md). Per-verb index:
 

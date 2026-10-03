@@ -214,13 +214,16 @@ runs. The gate looks up the tool's registry descriptor and calls
 - `Deny` — the call is refused with wire code `policy.deny.<reason>`.
 - `RequireApproval` — an out-of-band operator approval is required.
 
-Separately, on `stellar:mainnet` the Noop engine fails closed for any
-destructive tool by returning the engine error `policy.engine_required` before
-producing a verdict, so every write is refused before any RPC call or signing.
-Below the policy layer, the network layer structurally refuses every mainnet
-write with `network.mainnet_write_forbidden` regardless of the configured
-engine or enrolled keys — no profile configuration unlocks mainnet writes in
-this alpha. A profile whose network passphrase is the mainnet passphrase, and
+Separately, the DeFi, sign-and-submit, commit, rule-commit, and sign-only tools
+and the toolset signing actions refuse a mainnet profile before this gate runs.
+Each answers a `network.mainnet_write_forbidden` business envelope before any
+RPC call or signing. The MPP tools refuse at entry with `mpp.network_forbidden`.
+On `stellar:mainnet` the Noop engine fails closed for the other destructive
+tools by returning the engine error `policy.engine_required` before producing a
+verdict. Below the policy layer, the network layer structurally refuses every
+mainnet write with `network.mainnet_write_forbidden` regardless of the
+configured engine or enrolled keys. No profile configuration unlocks mainnet
+writes in this alpha. A profile whose network passphrase is the mainnet passphrase, and
 one whose `rpc_url` names a known mainnet host, are each refused there with no
 RPC call at all.
 
@@ -436,7 +439,7 @@ terms.
 | `stellar_dex_quote` | On-chain Soroswap `router_get_amounts_out` quote for a token path. | Read-only. |
 
 The three DeFi signing tools accept an optional `secondary_rpc_url`. On testnet, it overrides the profile secondary; absent input uses that secondary.
-Mainnet refuses this input before lookups or gates, including equal values. Credentialed input URLs are refused.
+Credentialed input URLs are refused. On a mainnet profile the three tools refuse at entry with `network.mainnet_write_forbidden`, before this input, the lookups, and the gates.
 
 ### SEP-43 (wallet interface)
 

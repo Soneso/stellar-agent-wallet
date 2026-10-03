@@ -35,27 +35,32 @@ Before signing, each one:
 1. Loads the named profile (`--profile`, else `STELLAR_AGENT_PROFILE`, else
    `default`) and resolves the CAIP-2 chain id, RPC endpoint, and network
    passphrase from it.
-2. Pins the target contract by WASM hash (a two-RPC cross-check when
+2. Refuses a mainnet profile with `network.mainnet_write_forbidden`, before the
+   keyring, the signer, and any RPC call.
+3. Pins the target contract by WASM hash (a two-RPC cross-check when
    `--secondary-rpc-url` is supplied) so the named address actually runs the code
    the wallet expects.
-3. Evaluates the operator policy engine for the tool descriptor. A `Deny`
+4. Evaluates the operator policy engine for the tool descriptor. A `Deny`
    refuses with `policy.deny.<code>`. A `RequireApproval` refuses with
    `policy.approval_required` and directs you to the MCP server for two-phase
    approval. The CLI has no interactive approval path for these verbs. A policy
    engine configured but unbuildable refuses with `policy.engine_unavailable`
-   (fail-closed).
-4. Loads the signing key from the OS keyring entry named by the profile, then
+   (fail closed).
+5. Loads the signing key from the OS keyring entry named by the profile, then
    signs and submits through the venue adapter.
 
 These commands do not accept `--output`; they always emit JSON. Only the `pool`
 subcommands offer `--output`.
 
-Shared guardrails: no raw-vector or opaque-calldata signing; a venue/WASM pin is
-verified before any signing; predicted post-op figures are display-only and never
-gate signing. `trade` rejects a network with no pinned router via
-`dex.unrecognised_network`. The DeFindex vault WASM hash is identical on testnet
-and mainnet; Soroswap resolves different pinned addresses
-per network.
+Shared guardrails: a mainnet profile is refused before signer access and any RPC
+call; no raw-vector or opaque-calldata signing; a venue/WASM pin is verified
+before any signing. Predicted post-op figures are display-only and never gate
+signing. `pool init` refuses a mainnet profile the same way. `trade` rejects a
+network with no pinned router via `dex.unrecognised_network`. The DeFindex vault
+WASM hash is identical on testnet and mainnet; Soroswap resolves different
+pinned addresses per network. The MCP DeFi tools refuse a mainnet profile at
+entry with `network.mainnet_write_forbidden`, before the policy gate and any RPC
+request.
 
 ## Command and tool map
 

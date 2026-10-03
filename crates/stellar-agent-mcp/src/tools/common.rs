@@ -490,6 +490,41 @@ pub(crate) fn assert_business_envelope(
     (code, message, text)
 }
 
+/// Test-only: a policy engine that allows every call.
+///
+/// A refusal placed ahead of the policy gate holds whatever the engine
+/// decides, so the mainnet-refusal tests run on the Noop engine and on this
+/// one.
+#[cfg(test)]
+pub(crate) struct AllowAllPolicyEngine;
+
+#[cfg(test)]
+impl stellar_agent_core::policy::PolicyEngine for AllowAllPolicyEngine {
+    fn evaluate(
+        &self,
+        _tool: &stellar_agent_core::policy::ToolDescriptor,
+        _args: &serde_json::Value,
+        _profile: &stellar_agent_core::profile::schema::Profile,
+        _account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+        _identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+        _counterparty_cache: Option<&dyn stellar_agent_core::policy::v1::CounterpartyCacheView>,
+        _sep10_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep10SessionView>,
+        _sep45_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep45SessionView>,
+    ) -> Result<stellar_agent_core::policy::Decision, stellar_agent_core::policy::PolicyError> {
+        Ok(stellar_agent_core::policy::Decision::Allow)
+    }
+}
+
+/// Test-only: asserts the structural mainnet-write refusal envelope.
+#[cfg(test)]
+pub(crate) fn assert_mainnet_write_forbidden(result: &rmcp::model::CallToolResult) {
+    let (code, _, _) = assert_business_envelope(result);
+    assert_eq!(
+        code, "network.mainnet_write_forbidden",
+        "a mainnet context must answer the canonical refusal code"
+    );
+}
+
 /// Wraps a [`stellar_agent_core::WalletError`] in an envelope after applying
 /// MCP wire redaction for sibling error variants whose `Display` includes
 /// public account identifiers.
@@ -943,34 +978,37 @@ pub(crate) fn single_shot_require_approval_error() -> rmcp::model::CallToolResul
 /// Returns the shared refusal `detail` string for the structural mainnet-signing
 /// guard, carrying the canonical `network.mainnet_write_forbidden` wire code.
 ///
-/// Single-sourced so every sign-only surface (SEP-43 and x402) embeds the
-/// identical canonical code, keeping cross-surface audit correlation exact.
+/// Single-sourced in [`stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL`],
+/// so every SEP-43, SEP-53, and x402 surface embeds the identical canonical
+/// code, keeping cross-surface audit correlation exact. The SEP-43 surfaces
+/// include both refusals of `stellar_sep43_sign_and_submit_transaction`, at
+/// entry and at the submit layer. The x402 surfaces include the library's
+/// `create_payment`, which reads the constant directly.
 pub(crate) fn mainnet_signing_refusal_detail() -> String {
-    format!(
-        "signing is structurally refused on mainnet ({})",
-        stellar_agent_core::error::NetworkError::MainnetWriteForbidden.code()
-    )
+    stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL.to_owned()
 }
 
-/// Returns the structural mainnet-signing refusal for sign-only SEP-43 tools.
+/// Returns the structural mainnet-signing refusal for the SEP-43 tools.
 ///
-/// Sign-only tools (`signTransaction`, `signAuthEntry`) return a signature the
-/// caller can broadcast externally, so the submit-layer mainnet gate never
-/// fires. On a mainnet profile these tools MUST refuse structurally, before any
-/// key access, so no valid mainnet signature is ever produced. The refusal is
-/// surfaced as the documented business-error envelope (`ok:false`, `is_error = true`) carrying the canonical
-/// `network.mainnet_write_forbidden` wire code so it correlates with the CLI and
-/// submit-layer guards.
+/// The sign-only tools (`signTransaction`, `signAuthEntry`, `signMessage`)
+/// return a signature the caller uses outside the wallet, so the submit-layer
+/// mainnet gate never fires. On a mainnet profile these tools MUST refuse
+/// structurally, before any key access, so no valid mainnet signature is ever
+/// produced. `stellar_sep43_sign_and_submit_transaction` returns it at entry on
+/// a mainnet context, before the policy gate, any key access, and any RPC
+/// request. It also returns it for a submit-layer mainnet refusal. The refusal
+/// is the documented business-error envelope (`ok:false`, `is_error = true`)
+/// carrying the canonical `network.mainnet_write_forbidden` wire code, so it
+/// correlates with the CLI and submit-layer guards.
 ///
 /// # Security
 ///
 /// This is the sign-only counterpart to the submit-layer
-/// [`stellar_agent_core::error::NetworkError::MainnetWriteForbidden`] guard.
-/// Without it a mainnet-configured profile would emit valid mainnet signatures
-/// over arbitrary caller-supplied XDR — the exact defect this refusal closes.
-/// The `NoopPolicyEngine` mainnet write gate keys on `destructive_hint`, which
-/// is `false` for these sign-only tools, so the policy engine alone does not
-/// stop them.
+/// [`stellar_agent_core::error::NetworkError::MainnetWriteForbidden`] guard,
+/// which a signature returned to the caller never reaches. The
+/// `NoopPolicyEngine` mainnet write gate keys on `destructive_hint`, which is
+/// `false` for the sign-only tools, so the policy engine alone does not stop
+/// them.
 pub(crate) fn mainnet_signing_forbidden_result() -> rmcp::model::CallToolResult {
     let err = stellar_agent_sep43::Sep43Error::MainnetSigningForbidden {
         detail: mainnet_signing_refusal_detail(),
@@ -1017,6 +1055,25 @@ pub(crate) fn sep53_mainnet_signing_forbidden_result() -> rmcp::model::CallToolR
         stellar_agent_core::error::NetworkError::MainnetWriteForbidden.code(),
         err.to_string(),
     )
+}
+
+/// Returns the structural mainnet-write refusal for the tools that load a
+/// ledger signing key to sign and submit.
+///
+/// The DeFi, commit, and rule-commit tools and the toolset signing route
+/// return it first on a mainnet context, before the policy gate, any key
+/// access, and any RPC request. The DeFi submit-error renderer
+/// `defi_submit_error_result` returns it for
+/// `DefiAdapterError::MainnetWriteForbidden`. It is the business-error envelope
+/// (`is_error = true`) of
+/// [`stellar_agent_core::error::NetworkError::MainnetWriteForbidden`], with the
+/// code `network.mainnet_write_forbidden` that the CLI and the submit layer
+/// report for the same refusal.
+pub(crate) fn mainnet_write_forbidden_result() -> rmcp::model::CallToolResult {
+    let err = stellar_agent_core::error::WalletError::Network(
+        stellar_agent_core::error::NetworkError::MainnetWriteForbidden,
+    );
+    business_error_result(err.code(), err.message())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

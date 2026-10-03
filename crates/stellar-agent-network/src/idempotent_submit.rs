@@ -190,12 +190,8 @@ pub async fn submit_transaction_idempotent(
     // before the decode, the receipt-store read, and `try_begin` keeps a
     // refused mainnet submission from writing a Pending receipt or issuing
     // any RPC read; the inner write paths repeat the guards defence-in-depth.
-    if network_passphrase == crate::submit::MAINNET_PASSPHRASE {
-        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
-    }
-    if crate::submit::is_mainnet_url(&client.url) {
-        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
-    }
+    crate::submit::refuse_mainnet_write(network_passphrase, &client.url)
+        .map_err(WalletError::Network)?;
 
     // ── Step 1: decode XDR and compute idempotency key ─────────────────────
     let (envelope, envelope_hash) = decode_and_hash_envelope(envelope_xdr)?;
@@ -871,12 +867,8 @@ async fn pre_send_checks(
     // passphrase comparison is the primary check; the URL heuristic is the
     // defence-in-depth layer. Every write path carries both, before the
     // envelope decode and before any RPC call.
-    if network_passphrase == crate::submit::MAINNET_PASSPHRASE {
-        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
-    }
-    if crate::submit::is_mainnet_url(&client.url) {
-        return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
-    }
+    crate::submit::refuse_mainnet_write(network_passphrase, &client.url)
+        .map_err(WalletError::Network)?;
 
     // The envelope is caller-supplied and untrusted; bounded limits prevent a
     // deeply nested auth-invocation tree from exhausting the stack.
