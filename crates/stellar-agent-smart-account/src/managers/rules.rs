@@ -10150,12 +10150,7 @@ mod tests {
             }
         }
     }
-}
 
-#[cfg(test)]
-mod config_redaction_tests {
-    #![allow(clippy::unwrap_used, reason = "test assertions")]
-    use super::*;
     #[test]
     fn config_debug_redacts_urls_and_writer_paths() {
         let dir = tempfile::tempdir().unwrap();

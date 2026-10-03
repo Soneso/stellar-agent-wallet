@@ -12902,12 +12902,7 @@ pub(crate) mod tests {
             other => panic!("expected SaError::BatchSignerAddRefused, got {other:?}"),
         }
     }
-}
 
-#[cfg(test)]
-mod config_redaction_tests {
-    #![allow(clippy::unwrap_used, reason = "test assertions")]
-    use super::*;
     #[test]
     fn config_debug_redacts_urls_and_writer_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -12937,6 +12932,7 @@ mod config_redaction_tests {
         assert!(debug.contains("https://primary.example"));
         assert!(debug.contains("https://secondary.example"));
     }
+
     #[test]
     fn construction_error_redacts_credentialed_url() {
         let dir = tempfile::tempdir().unwrap();
