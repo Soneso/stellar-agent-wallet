@@ -131,7 +131,7 @@ pub async fn run(args: ServeArgs) -> i32 {
     // Reconciled: the attestation-key reference and the approval-store path
     // below both come from this file, so a file that names another profile is
     // refused here rather than used to serve approvals under this name.
-    let profile = match load_profile_reconciled(&resolved_profile, None) {
+    let profile = match load_profile_reconciled(&resolved_profile) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(profile = %profile_name, error = %e, "profile access refused");

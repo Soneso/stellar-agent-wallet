@@ -92,7 +92,7 @@ pub async fn run(args: &PoolListArgs) -> i32 {
     let profile_name = resolved_profile.name.clone();
     // Reconciled: a profile file whose owner-key coordinate names a different
     // profile is refused rather than used under this name.
-    let profile = match load_profile_reconciled(&resolved_profile, None) {
+    let profile = match load_profile_reconciled(&resolved_profile) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(profile = %profile_name, error = %e, "profile access refused");

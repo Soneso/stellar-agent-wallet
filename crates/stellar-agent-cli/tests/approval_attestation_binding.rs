@@ -107,7 +107,7 @@ fn approve_binary_case(mainnet: bool) {
     .to_xdr_base64(Limits::none())
     .unwrap();
     let uid = process_uid_for_attestation().unwrap();
-    let entry = PendingApproval::new_payment_pending(
+    let mut entry = PendingApproval::new_payment_pending(
         envelope.clone(),
         envelope.as_bytes(),
         destination_strkey.to_string(),
@@ -120,6 +120,7 @@ fn approve_binary_case(mainnet: bool) {
         DEFAULT_TTL_MS,
     )
     .unwrap();
+    entry.approval_nonce = format!("-{}", &entry.approval_nonce[1..]);
     let nonce = entry.approval_nonce.clone();
     let mut approvals =
         PendingApprovalStore::open(home.join("approvals").join(format!("{name}.toml"))).unwrap();

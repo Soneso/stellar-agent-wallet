@@ -295,10 +295,9 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
     }
     let resolved = resolve_profile_name(args.profile.as_deref());
     // Validate the name and existing profile before constructing the sidecar path.
-    load_profile_reconciled(&resolved, None)
-        .map_err(|error| error.to_wallet_error(&resolved.name))?;
+    load_profile_reconciled(&resolved).map_err(|error| error.to_wallet_error(&resolved.name))?;
     let _lock = lifecycle_lock(&resolved.name)?;
-    let profile = load_profile_reconciled(&resolved, None)
+    let profile = load_profile_reconciled(&resolved)
         .map_err(|error| error.to_wallet_error(&resolved.name))?;
     let context = NetworkContext::from_profile(&profile);
     let name = &resolved.name;

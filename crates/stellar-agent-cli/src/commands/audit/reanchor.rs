@@ -191,7 +191,7 @@ where
 /// Loads the named profile, reconciled, mapping the failure into the CLI
 /// envelope model.
 fn load_profile(profile_name: &str) -> Result<Profile, WalletError> {
-    load_profile_reconciled(&ResolvedProfileName::from_flag(profile_name), None).map_err(|e| {
+    load_profile_reconciled(&ResolvedProfileName::from_flag(profile_name)).map_err(|e| {
         tracing::debug!(
             profile = %profile_name,
             error = %e,

@@ -437,6 +437,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `approve --id`, `mpp charge authorize --approval-id`, and `approve operator enroll --credential-id` accept a value that starts with `-` in the space-separated form.
+- The friendbot funding debug log records the URL authority only.
 - The baseline emitter gate rejects macro variant arguments, constructions
   after test modules, and constructions with a brace on a later line.
 - The cross-RPC consumer audit scans production code after individual

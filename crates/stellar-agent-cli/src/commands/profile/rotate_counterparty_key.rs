@@ -117,10 +117,9 @@ struct RotateCounterpartyKeyData {
 pub async fn run(args: &RotateCounterpartyKeyArgs) -> i32 {
     // ── Step 1: load the profile FIRST so a nonexistent profile never reaches
     // the keyring init.  Eliminates the process-global keyring-store race.
-    let profile = match load_profile_reconciled(
-        &ResolvedProfileName::from_flag(args.profile_name()),
-        None,
-    ) {
+    let profile = match load_profile_reconciled(&ResolvedProfileName::from_flag(
+        args.profile_name(),
+    )) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(profile = %args.profile_name(), error = %e, "profile access refused");

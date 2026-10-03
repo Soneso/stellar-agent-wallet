@@ -107,7 +107,7 @@ pub async fn run(args: &RefreshArgs) -> i32 {
     // ── Step 1: load profile (fails fast on nonexistent profile).
     // Reconciled: a profile file whose owner-key coordinate names a
     // different profile is refused rather than used under this name.
-    let _profile = match load_profile_reconciled(&resolved_profile, None) {
+    let _profile = match load_profile_reconciled(&resolved_profile) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(profile = %profile_name, error = %e, "profile access refused");

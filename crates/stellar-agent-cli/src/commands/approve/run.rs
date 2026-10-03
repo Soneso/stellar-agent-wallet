@@ -94,7 +94,7 @@ use crate::common::{render, resolve_profile_name};
 #[non_exhaustive]
 pub struct RunArgs {
     /// Approval nonce as printed in the MCP simulate response.
-    #[arg(long = "id", value_name = "NONCE")]
+    #[arg(long = "id", value_name = "NONCE", allow_hyphen_values = true)]
     pub id: Option<String>,
 
     /// Profile name (default: `"default"` or `STELLAR_AGENT_PROFILE` env var).
@@ -177,7 +177,7 @@ pub async fn run(args: RunArgs) -> i32 {
     // Reconciled: the attestation and approval-store coordinates below come
     // from this file, so a file that names another profile is refused here
     // rather than used to attest under a name it does not own.
-    let profile = match load_profile_reconciled(&resolved_profile, None) {
+    let profile = match load_profile_reconciled(&resolved_profile) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
@@ -812,6 +812,7 @@ mod tests {
 
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use clap::Parser;
     use keyring_core::Entry as KeyringEntry;
     use serial_test::serial;
     use stellar_agent_core::approval::{
@@ -822,6 +823,27 @@ mod tests {
     use stellar_agent_core::profile::schema::KeyringEntryRef;
     use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
     use tempfile::TempDir;
+
+    #[derive(Parser)]
+    struct Harness {
+        #[command(flatten)]
+        approve: crate::commands::approve::ApproveArgs,
+    }
+
+    #[test]
+    fn parses_hyphen_prefixed_approval_nonce() {
+        let nonce = "-AbCdEfGhIjKlMnOpQrStU";
+        let parsed = Harness::try_parse_from(["approve", "--id", nonce, "--profile", "p"])
+            .expect("hyphen-prefixed nonce parses");
+        assert_eq!(parsed.approve.run.id.as_deref(), Some(nonce));
+        assert_eq!(parsed.approve.run.profile.as_deref(), Some("p"));
+        assert!(parsed.approve.subcommand.is_none());
+
+        let parsed = Harness::try_parse_from(["approve", "--id", "--yes"])
+            .expect("the next token is the nonce");
+        assert_eq!(parsed.approve.run.id.as_deref(), Some("--yes"));
+        assert!(!parsed.approve.run.yes);
+    }
 
     fn test_context() -> stellar_agent_core::approval::ApprovalContext {
         let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
@@ -1193,6 +1215,22 @@ mod tests {
         let validated =
             load_and_validate_entry(&store, &nonce, &ApproverIdentity::OsUid(uid), &[]).unwrap();
         assert_eq!(validated.approval_nonce, nonce);
+    }
+
+    #[test]
+    fn load_and_validate_entry_not_found_fails() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store_at(&dir, "__stellar_agent_approve_test_not_found");
+        assert!(matches!(
+            load_and_validate_entry(
+                &store,
+                "--yes",
+                &ApproverIdentity::OsUid("test".to_owned()),
+                &[],
+            ),
+            Err(WalletError::Internal(InternalError::UnexpectedState { detail }))
+                if detail == "approval.not_found: no pending approval with that nonce"
+        ));
     }
 
     #[test]

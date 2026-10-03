@@ -351,7 +351,7 @@ fn run_profile_startup_advisory(
     scan: impl FnOnce(&std::path::Path) -> advisory::AdvisoryResult,
 ) -> advisory::AdvisoryResult {
     let resolved = resolve_profile_name(profile_flag);
-    match common::profile_access::load_profile_reconciled(&resolved, None) {
+    match common::profile_access::load_profile_reconciled(&resolved) {
         Ok(profile) => scan(&profile.audit_log_path),
         Err(error) => {
             tracing::debug!(

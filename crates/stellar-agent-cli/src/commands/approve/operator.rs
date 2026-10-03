@@ -139,6 +139,7 @@ pub struct EnrollArgs {
     #[arg(
         long = "credential-id",
         value_name = "B64URL",
+        allow_hyphen_values = true,
         requires_all = ["public_key_sec1_b64", "rp_id", "label"]
     )]
     pub credential_id_b64url: Option<String>,
@@ -341,7 +342,7 @@ async fn run_enroll_interactive(resolved: ResolvedProfileName, args: EnrollArgs)
 
     // A protected refusal or a name mismatch blocks the ceremony.
     // Any other load failure yields the neutral identity.
-    let page_identity = match page_identity_from_profile(load_profile_reconciled(&resolved, None)) {
+    let page_identity = match page_identity_from_profile(load_profile_reconciled(&resolved)) {
         Ok(identity) => identity,
         Err(error) => {
             render_json(&Envelope::<()>::err(&error.to_wallet_error(&profile_name)));
@@ -550,6 +551,40 @@ mod tests {
     struct Wrap {
         #[command(flatten)]
         args: EnrollArgs,
+    }
+
+    #[test]
+    fn parses_hyphen_prefixed_credential_id() {
+        let credential_id = "-AbCdEfGhIjKlMnOpQrStU";
+        let parsed = Wrap::try_parse_from([
+            "prog",
+            "--credential-id",
+            credential_id,
+            "--public-key",
+            "BBBBBBBB",
+            "--rp-id",
+            "wallet.internal",
+            "--label",
+            "laptop",
+        ])
+        .expect("hyphen-prefixed credential id parses");
+        assert_eq!(
+            parsed.args.credential_id_b64url.as_deref(),
+            Some(credential_id)
+        );
+
+        let error = Wrap::try_parse_from([
+            "prog",
+            "--credential-id",
+            "--public-key",
+            "BBBBBBBB",
+            "--rp-id",
+            "wallet.internal",
+            "--label",
+            "laptop",
+        ])
+        .expect_err("a consumed public-key flag leaves an unexpected value");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

@@ -160,14 +160,13 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     // Protected refusals are not tolerated. Other load failures yield the
     // neutral identity for registration with an unconfigured profile, and
     // the audit-writer open below also tolerates those failures.
-    let loaded_profile =
-        match optional_registration_profile(load_profile_reconciled(&resolved, None)) {
-            Ok(loaded) => loaded,
-            Err(e) => {
-                render_json(&profile_access_envelope(&e, &profile));
-                return 1;
-            }
-        };
+    let loaded_profile = match optional_registration_profile(load_profile_reconciled(&resolved)) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            render_json(&profile_access_envelope(&e, &profile));
+            return 1;
+        }
+    };
 
     // ── Open the approval store ONCE; wrap in Arc<Mutex<>> ───────────────────
     // This single Arc is shared between the bridge and the manager.
@@ -450,7 +449,7 @@ async fn open_profile_audit_writer_non_fatal(
     resolved: &ResolvedProfileName,
 ) -> Option<Arc<StdMutex<AuditWriter>>> {
     let profile_name = &resolved.name;
-    let profile = match load_profile_reconciled(resolved, None) {
+    let profile = match load_profile_reconciled(resolved) {
         Ok(p) => p,
         Err(e) => {
             warn!(
