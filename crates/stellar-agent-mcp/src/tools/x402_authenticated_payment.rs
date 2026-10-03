@@ -872,9 +872,15 @@ mod tests {
 
     fn make_mainnet_server() -> crate::server::WalletServer {
         crate::server::WalletServer::new(
-            Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
-                .with_noop_engine()
-                .build(),
+            Profile::builder_mainnet(
+                "https://rpc.example.invalid",
+                "svc",
+                "acct",
+                "n-svc",
+                "n-acct",
+            )
+            .with_noop_engine()
+            .build(),
         )
         .expect("WalletServer::new must not fail in tests")
     }

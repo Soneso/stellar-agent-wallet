@@ -21,7 +21,7 @@ The loader still refuses protected overlays on that read.
 | `auth.enrolled_signer_mismatch` | The derived key differs from the enrolled identity. Use the enrolled seed, Ledger account, or keyring entry. |
 | `profile.mainnet_requires_explicit_profile` | A mainnet profile was selected by the environment or the default source. Supply `--profile <name>`. |
 
-Unset `STELLAR_AGENT_CHAIN_ID` on every chain. On mainnet, also unset `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, and `STELLAR_AGENT_MCP_SIGNER_DEFAULT`. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
+Unset `STELLAR_AGENT_CHAIN_ID` on every chain. On mainnet, also unset `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, `STELLAR_AGENT_ORACLE_PROVIDER_URL`, and `STELLAR_AGENT_MCP_SIGNER_DEFAULT`. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
 
 ## `profile`
 
@@ -33,7 +33,7 @@ Every `profile` subcommand accepts a `--profile <NAME>` flag. For `init`, `enrol
 
 The name itself becomes a path component and is validated before any path is built — charset, length, no leading `-`, and no Windows reserved device name. The rules and the recovery path for a file that already carries a refused name are in [Profile names](../profiles.md#profile-names).
 
-Every subcommand except `init`, `list`, `migrate`, and `show` also reconciles the selected name against the one the loaded file carries, refusing with `profile.name_mismatch` when the two disagree (see the [index](index.md#profile)). The key-writing commands are not exempt: `sign-policy` writes `<policy_dir>/<derived>.toml` and `enroll-owner-key` writes the `stellar-agent-owner-<derived>` keyring entry, so running either against a copied profile file would replace a DIFFERENT profile's root of trust. Neither is needed to repair a mismatch — the refusal names the recovery path, and `profile show <name>` still displays the file so the offending field can be read. `init` and `list` load no profile at all, and `migrate` rewrites the raw TOML document without constructing a `Profile` or deriving any per-profile path from its contents.
+Every subcommand except `init`, `list`, `migrate`, and `show` also reconciles the selected name against the one the loaded file carries, refusing with `profile.name_mismatch` when the two disagree (see the [index](index.md#profile)). The key-writing commands are not exempt: `sign-policy` writes `<policy_dir>/<derived>.toml` and `enroll-owner-key` writes the `stellar-agent-owner-<derived>` keyring entry, so running either against a copied profile file would replace a DIFFERENT profile's root of trust. Neither is needed to repair a mismatch: the refusal names the recovery path, and `profile show <name>` still displays the file so the offending field can be read. `init` and `list` load no profile at all. `migrate` builds the v2 profile from the v1 file and the requested name, deriving the security-substrate key references from the name, not from the file's contents.
 
 ### `profile init`
 
@@ -45,7 +45,7 @@ State-changing (writes the profile file; no network, no keyring). Creates and pe
 
 - `--profile <NAME>`: profile name to create (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
 - `--network <testnet|mainnet>` — target network (default `testnet`).
-- `--rpc-url <URL>`: optional on testnet; required with `--network mainnet`, where HTTPS is required. Credentials are refused by the flag parser.
+- `--rpc-url <URL>`: optional on testnet, where an omitted value takes the testnet endpoint; required with `--network mainnet`, which has no default endpoint. The URL must use `http` or `https`, and `https` on mainnet. The flag parser refuses credentials.
 - `--engine <v1|noop>` — policy engine (default `v1`). `v1` is the default for newly-minted profiles (see the `[policy]` block in [profiles.md](../profiles.md)). A v1 profile refuses MCP-server startup and policy-gated dispatch until the V1 ceremony completes. The normative ceremony, in order, is: `profile enroll-owner-key`, `profile rotate-attestation-key`, then `profile sign-policy` (on top of `rotate-audit-key`, required on every engine — see below) — `next_steps` in the success payload mirrors it. `--engine noop` is the zero-ceremony testnet opt-out: the profile works immediately under the Noop engine (testnet allow, mainnet read-only), once the audit key is minted.
 
 The signer and nonce keyring coordinates are named `stellar-agent-signer-<name>` / `stellar-agent-nonce-<name>`, each seeded with the placeholder account `"default"` — the signer's eventual G-strkey is not known until a seed is enrolled (see `profile enroll-signer` below). The five security-substrate references (`audit_log_hash_chain_key_id`, `policy_owner_key_id`, `attestation_key_id`, `counterparty_cache_key_id`, `policy_window_state_key_id`) are derived from the profile name the same way `profile migrate` derives them.
@@ -58,7 +58,14 @@ The signer and nonce keyring coordinates are named `stellar-agent-signer-<name>`
 {"ok":true,"data":{"profile":"default","path":"/home/user/.local/share/stellar-agent/profiles/default.toml","chain_id":"stellar:testnet","rpc_url":"https://soroban-testnet.stellar.org","engine":"v1","next_steps":["Run `stellar-agent profile enroll-signer --profile default --secret-env <VAR>` to register the MCP signer seed.","Run `stellar-agent profile rotate-audit-key default` to mint the audit-log hash-chain key (required before any signing verb will proceed).","Run `stellar-agent profile enroll-owner-key --profile default --secret-env <VAR>` to enroll the policy-file owner key.","Run `stellar-agent profile rotate-attestation-key default` to mint the approval-attestation key.","Run `stellar-agent profile sign-policy --profile default --secret-env <VAR>` to sign the V1 policy file."]},"request_id":"..."}
 ```
 
-Exits `1` with `validation.config_invalid` if `--profile` is not a safe path component (see [Profile names](../profiles.md#profile-names)), if a mainnet `--rpc-url` is not `https://`, or if the resolved `rpc_url` fails URL validation; `validation.mainnet_rpc_url_required` if `--network mainnet` is selected without `--rpc-url`; `validation.profile_already_exists` if the named profile already exists; or an internal error if the write itself fails (I/O error, unwritable directory).
+The flag parser exits `2` for a malformed `--rpc-url` or one that carries credentials, before the command runs. After the arguments parse, the refusals apply in this order:
+
+1. `validation.config_invalid` if `--profile` is not a safe path component (see [Profile names](../profiles.md#profile-names)).
+2. `validation.mainnet_rpc_url_required` if `--network mainnet` is selected without `--rpc-url`.
+3. `validation.profile_already_exists` if the named profile already exists.
+4. `validation.config_invalid` if the resolved `rpc_url` breaks the endpoint rule: it must use `http` or `https`, and on mainnet `https` with no username or password (see [Loader source order](../profiles.md#loader-source-order)).
+
+Each exits `1` and writes nothing. A failed write (I/O error, unwritable directory) exits `1` with an internal error.
 
 ### `profile list`
 
@@ -84,7 +91,7 @@ Read-only. Loads the named profile (applying any environment-variable overlays) 
 
 - `<NAME>` (positional) or `--profile <NAME>` — the profile to display. Supply exactly one; supplying both, or neither, is a usage error.
 
-Exits `1` with `ProfileNotFound` when the profile does not exist, or with an unsupported-version error when the on-disk schema version is one this build does not support.
+Exits `1` with `validation.profile_not_found` when the profile does not exist. A mainnet file without `rpc_url` exits with `validation.mainnet_rpc_url_required`. An endpoint URL that breaks the endpoint rule (see [Loader source order](../profiles.md#loader-source-order)), an unsupported schema version, or another unreadable file exits with `validation.config_invalid`.
 
 ### `profile migrate <NAME>`
 
@@ -105,6 +112,12 @@ On a no-op it reports `status` `no_op` and the current version; on a migration i
 ```json
 {"ok":true,"data":{"status":"migrated","from_version":1,"to_version":2,"path":"..."},"request_id":"..."}
 ```
+
+A refused migration exits `1`, writes nothing, and leaves the v1 file unchanged:
+
+- `validation.profile_not_found` if the profile file does not exist.
+- `validation.mainnet_rpc_url_required` for a v1 mainnet file without `rpc_url`, because mainnet has no default endpoint. Add `rpc_url` to the v1 file and run the command again.
+- `validation.config_invalid` for an endpoint URL that breaks the endpoint rule (see [Loader source order](../profiles.md#loader-source-order)), or for a file that cannot be read.
 
 ### `profile enroll-signer`
 

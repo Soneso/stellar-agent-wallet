@@ -1480,8 +1480,12 @@ mod tests {
     #[serial_test::serial]
     async fn friendbot_mainnet_profile_reaches_no_endpoint() {
         let guard_rpc = wiremock::MockServer::start().await;
+        let counter =
+            stellar_agent_test_support::ConnectionCounter::start().expect("connection counter");
         let (_guard_dir, _guard_home, _guard_env) =
-            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&guard_rpc.uri());
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(
+                &counter.https_uri(),
+            );
         let args = CreateArgs {
             profile: Some("guard-mainnet".into()),
             new_account: Some(
@@ -1506,8 +1510,7 @@ mod tests {
             &args,
             |name| {
                 Ok(
-                    Profile::builder_mainnet_named(name, "s", "default", "n", "a")
-                        .rpc_url(guard_rpc.uri())
+                    Profile::builder_mainnet_named(name, guard_rpc.uri(), "s", "default", "n", "a")
                         .build(),
                 )
             },
@@ -1521,6 +1524,11 @@ mod tests {
                 .await
                 .expect("requests")
                 .is_empty()
+        );
+        assert_eq!(
+            counter.accepted().expect("connection count"),
+            0,
+            "no connection may reach the persisted profile's endpoint"
         );
     }
 
@@ -1580,8 +1588,12 @@ mod tests {
     #[serial_test::serial]
     async fn sponsored_mainnet_rejected_before_rpc_call() {
         let guard_rpc = wiremock::MockServer::start().await;
+        let counter =
+            stellar_agent_test_support::ConnectionCounter::start().expect("connection counter");
         let (_guard_dir, _guard_home, _guard_env) =
-            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&guard_rpc.uri());
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(
+                &counter.https_uri(),
+            );
         let args = CreateArgs {
             profile: Some("guard-mainnet".into()),
             new_account: Some(
@@ -1605,8 +1617,7 @@ mod tests {
             &args,
             |name| {
                 Ok(
-                    Profile::builder_mainnet_named(name, "s", "default", "n", "a")
-                        .rpc_url(guard_rpc.uri())
+                    Profile::builder_mainnet_named(name, guard_rpc.uri(), "s", "default", "n", "a")
                         .build(),
                 )
             },
@@ -1620,6 +1631,11 @@ mod tests {
                 .await
                 .expect("requests")
                 .is_empty()
+        );
+        assert_eq!(
+            counter.accepted().expect("connection count"),
+            0,
+            "no connection may reach the persisted profile's endpoint"
         );
     }
 

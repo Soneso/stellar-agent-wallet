@@ -380,7 +380,14 @@ fn policy_engine_allows_stellar_balances_read_only() {
         "stellar_balances must be allowed on testnet"
     );
 
-    let mainnet = Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct").build();
+    let mainnet = Profile::builder_mainnet(
+        "https://rpc.example.invalid",
+        "svc",
+        "acct",
+        "n-svc",
+        "n-acct",
+    )
+    .build();
     let result = engine.evaluate(&descriptor, &args, &mainnet, None, None, None, None, None);
     assert_eq!(
         result.unwrap(),

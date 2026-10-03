@@ -2921,10 +2921,10 @@ mod tests {
         use stellar_agent_test_support::CaptureWriter;
         use tracing::instrument::WithSubscriber as _;
 
-        let mut profile = Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
-            .with_noop_engine()
-            .build();
-        profile.rpc_url = "https://rpc.example.com".to_owned();
+        let mut profile =
+            Profile::builder_mainnet("https://rpc.example.com", "svc", "acct", "n-svc", "n-acct")
+                .with_noop_engine()
+                .build();
         profile.oracle_provider_url = Some(url::Url::parse("https://RPC.example.com/").unwrap());
 
         let capture = CaptureWriter::new();
@@ -2970,10 +2970,15 @@ mod tests {
         use stellar_agent_test_support::CaptureWriter;
         use tracing::instrument::WithSubscriber as _;
 
-        let mut profile = Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
-            .with_noop_engine()
-            .build();
-        profile.rpc_url = "https://primary.example.com".to_owned();
+        let mut profile = Profile::builder_mainnet(
+            "https://primary.example.com",
+            "svc",
+            "acct",
+            "n-svc",
+            "n-acct",
+        )
+        .with_noop_engine()
+        .build();
         profile.oracle_provider_url = Some(url::Url::parse("https://oracle.example.com").unwrap());
 
         let primary_xdr = transaction_envelope_xdr_with_sequence(100);
@@ -3044,10 +3049,15 @@ mod tests {
     /// window absorbs transient rebuild failures.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn high_value_cross_check_recovers_within_the_rebuild_retry_window() {
-        let mut profile = Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
-            .with_noop_engine()
-            .build();
-        profile.rpc_url = "https://primary.example.com".to_owned();
+        let mut profile = Profile::builder_mainnet(
+            "https://primary.example.com",
+            "svc",
+            "acct",
+            "n-svc",
+            "n-acct",
+        )
+        .with_noop_engine()
+        .build();
         profile.oracle_provider_url = Some(url::Url::parse("https://oracle.example.com").unwrap());
 
         let calls = Arc::new(AtomicU32::new(0));
@@ -3094,10 +3104,15 @@ mod tests {
     /// converts a persistent rebuild failure into a pass.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn high_value_cross_check_fails_after_exhausting_the_rebuild_retry_window() {
-        let mut profile = Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
-            .with_noop_engine()
-            .build();
-        profile.rpc_url = "https://primary.example.com".to_owned();
+        let mut profile = Profile::builder_mainnet(
+            "https://primary.example.com",
+            "svc",
+            "acct",
+            "n-svc",
+            "n-acct",
+        )
+        .with_noop_engine()
+        .build();
         profile.oracle_provider_url = Some(url::Url::parse("https://oracle.example.com").unwrap());
 
         let calls = Arc::new(AtomicU32::new(0));
@@ -3417,12 +3432,12 @@ mod tests {
         // file) so this test cannot race on the process-global mock keyring
         // store against a test using a different `serial_test` group.
         let profile = Profile::builder_mainnet(
+            "https://mainnet-gate.example",
             "cross-check-svc",
             "cross-check-acct",
             "cross-check-n-svc",
             "cross-check-n-acct",
         )
-        .rpc_url("https://mainnet-gate.example".to_owned())
         .with_noop_engine()
         .build();
 
@@ -3527,12 +3542,12 @@ mod tests {
         // file) so this test cannot race on the process-global mock keyring
         // store against a test using a different `serial_test` group.
         let profile = Profile::builder_mainnet(
+            "https://mainnet-gate.example",
             "cross-check-svc",
             "cross-check-acct",
             "cross-check-n-svc",
             "cross-check-n-acct",
         )
-        .rpc_url("https://mainnet-gate.example".to_owned())
         .with_noop_engine()
         .build();
 

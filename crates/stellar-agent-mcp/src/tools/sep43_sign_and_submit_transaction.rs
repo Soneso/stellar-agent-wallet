@@ -912,11 +912,17 @@ mod tests {
             .to_string()
         };
         let pin = key([1; 32]);
-        let profile =
-            Profile::builder_mainnet_named("sep43-enrolled", "sep43-enrolled", &pin, "n", "a")
-                .audit_log_path(dir.path().join("audit.jsonl"))
-                .with_noop_engine()
-                .build();
+        let profile = Profile::builder_mainnet_named(
+            "sep43-enrolled",
+            "https://rpc.example.invalid",
+            "sep43-enrolled",
+            &pin,
+            "n",
+            "a",
+        )
+        .audit_log_path(dir.path().join("audit.jsonl"))
+        .with_noop_engine()
+        .build();
         stellar_agent_network::keyring::rotate_keyring_secret_32(
             &profile.audit_log_hash_chain_key_id.service,
             &profile.audit_log_hash_chain_key_id.account,

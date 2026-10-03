@@ -252,6 +252,48 @@ fn a_path_bearing_load_failure_is_redacted_identically_on_both_surfaces() {
     );
 }
 
+/// A mainnet profile file without `rpc_url` reports
+/// `validation.mainnet_rpc_url_required` on both surfaces: mainnet has no
+/// default endpoint, and the refusal keeps its own code.
+#[test]
+fn a_mainnet_profile_without_rpc_url_has_its_own_code_on_both_surfaces() {
+    let home = tempfile::tempdir().expect("temp home");
+    let name = "mainnet-no-endpoint";
+    let profile = Profile::builder_mainnet_named(
+        name,
+        "https://rpc.example.invalid",
+        &KeyringEntryRef::default_signer(name).service,
+        "default",
+        &KeyringEntryRef::default_nonce(name).service,
+        "default",
+    )
+    .audit_log_path(home.path().join("audit").join(format!("{name}.jsonl")))
+    .with_noop_engine()
+    .build();
+    let dir = home.path().join("profiles");
+    save_new_to_dir(name, &profile, &dir).expect("fixture profile writes");
+    let toml_path = dir.join(format!("{name}.toml"));
+    let toml = std::fs::read_to_string(&toml_path).expect("fixture reads");
+    let stripped: Vec<&str> = toml
+        .lines()
+        .filter(|line| !line.starts_with("rpc_url"))
+        .collect();
+    assert_ne!(stripped.len(), toml.lines().count(), "rpc_url line removed");
+    std::fs::write(&toml_path, stripped.join("\n")).expect("fixture rewrites");
+
+    let show = run_cli(home.path(), &["profile", "show", name]);
+    let choke = run_cli(home.path(), &["counterparty", "list", "--profile", name]);
+
+    assert_eq!(show.code, 1, "show exits 1: {}", show.stdout);
+    assert_eq!(
+        show.error_code(),
+        "validation.mainnet_rpc_url_required",
+        "{}",
+        show.stdout
+    );
+    assert_eq!(show.error_code(), choke.error_code(), "surfaces must agree");
+}
+
 #[test]
 fn protected_overlay_has_its_own_code_on_both_surfaces() {
     let home = tempfile::tempdir().unwrap();

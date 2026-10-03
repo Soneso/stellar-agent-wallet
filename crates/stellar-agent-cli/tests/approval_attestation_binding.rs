@@ -37,9 +37,11 @@ fn approve_binary_case(mainnet: bool) {
     };
     let signer = KeyringEntryRef::default_signer(name);
     let nonce_ref = KeyringEntryRef::default_nonce(name);
+    let rpc_url = "https://approval-rpc.example:8443/private";
     let builder = if mainnet {
         Profile::builder_mainnet_named(
             name,
+            rpc_url,
             &signer.service,
             SIGNER,
             &nonce_ref.service,
@@ -53,9 +55,9 @@ fn approve_binary_case(mainnet: bool) {
             &nonce_ref.service,
             &nonce_ref.account,
         )
+        .rpc_url(rpc_url)
     };
     let mut profile = builder
-        .rpc_url("https://approval-rpc.example:8443/private".to_owned())
         .audit_log_path(home.join("audit").join("approval.jsonl"))
         .with_noop_engine()
         .build();

@@ -1,13 +1,15 @@
 //! CAIP-2 chain-ID enum and network-resolution helpers.
 //!
 //! [`Caip2`] is the canonical network selector for MCP tools and profile-config
-//! fields.  It maps a CAIP-2 string (`stellar:testnet`, `stellar:mainnet`) to a
-//! `(rpc_url, network_passphrase)` pair at profile-load time.
+//! fields.  It maps a CAIP-2 string (`stellar:testnet`, `stellar:mainnet`) to
+//! the network passphrase and, for testnet, a default RPC URL at profile-load
+//! time.
 //!
 //! # Invariants
 //!
-//! - Default RPC URLs are compile-time constants.  They can be overridden by an
-//!   explicit `rpc_url` field in the profile TOML.
+//! - Testnet has a compile-time default RPC URL, which an explicit `rpc_url`
+//!   field in the profile TOML overrides.  Mainnet has no default: a mainnet
+//!   profile names its endpoint in `rpc_url`.
 //! - Network passphrases are protocol constants derived from the chain ID.
 //!   Profile config cannot override them.
 //!
@@ -30,15 +32,6 @@ use crate::profile::schema::Profile;
 
 /// Default RPC URL for Stellar testnet (Soroban/RPC endpoint).
 pub const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
-
-/// Default RPC URL for Stellar mainnet (Soroban/RPC endpoint).
-///
-/// This intentionally points at Stellar Validation Cloud's public mainnet RPC
-/// endpoint. It is a third-party default, not a protocol constant; operators
-/// can and should override it in profile config or CLI flags when they require
-/// a different provider. Do not change this default casually because profile
-/// resolution and CLI help text rely on a stable fallback URL.
-pub const MAINNET_RPC_URL: &str = "https://mainnet.stellar.validationcloud.io/v1/stellar";
 
 /// Canonical wire-format passphrase for Stellar testnet.
 /// This is the workspace definition.
@@ -145,24 +138,25 @@ impl Caip2 {
         }
     }
 
-    /// Returns the default Soroban RPC URL for this chain.
+    /// Returns the default Soroban RPC URL for this chain, if it has one.
     ///
-    /// The returned value can be overridden by an explicit `rpc_url` field in
-    /// the profile TOML.  When the profile omits `rpc_url`, this default is
-    /// used.
+    /// Testnet returns [`TESTNET_RPC_URL`], which a testnet profile uses when
+    /// it omits `rpc_url`.  Mainnet returns `None`: no provider is implied for
+    /// mainnet, so a mainnet profile names its endpoint explicitly.
     ///
     /// # Examples
     ///
     /// ```
     /// use stellar_agent_core::profile::caip2::{Caip2, TESTNET_RPC_URL};
     ///
-    /// assert_eq!(Caip2::Testnet.default_rpc_url(), TESTNET_RPC_URL);
+    /// assert_eq!(Caip2::Testnet.default_rpc_url(), Some(TESTNET_RPC_URL));
+    /// assert_eq!(Caip2::Mainnet.default_rpc_url(), None);
     /// ```
     #[must_use]
-    pub fn default_rpc_url(self) -> &'static str {
+    pub fn default_rpc_url(self) -> Option<&'static str> {
         match self {
-            Self::Testnet => TESTNET_RPC_URL,
-            Self::Mainnet => MAINNET_RPC_URL,
+            Self::Testnet => Some(TESTNET_RPC_URL),
+            Self::Mainnet => None,
         }
     }
 }
@@ -385,7 +379,14 @@ mod tests {
     }
 
     fn mainnet_profile() -> Profile {
-        Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct").build()
+        Profile::builder_mainnet(
+            "https://rpc.example.invalid",
+            "svc",
+            "acct",
+            "n-svc",
+            "n-acct",
+        )
+        .build()
     }
 
     #[test]

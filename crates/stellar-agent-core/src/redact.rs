@@ -77,9 +77,10 @@ pub fn redact_url_userinfo(url: &str) -> String {
 /// password. Each caller prefixes the name of its input.
 ///
 /// The text quotes no part of the refused value, so the credentials never
-/// reach an error message. A credentialed endpoint belongs in the profile file.
+/// reach an error message. Only a testnet profile file accepts an endpoint URL
+/// with userinfo; a mainnet profile refuses one at load.
 pub const CREDENTIALED_URL_INPUT_REFUSAL: &str =
-    "never carries credentials; configure a credentialed endpoint in the profile";
+    "never carries credentials; only a testnet profile file may hold a credentialed endpoint";
 
 #[cfg(test)]
 mod tests {

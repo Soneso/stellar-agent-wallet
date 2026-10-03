@@ -187,8 +187,8 @@ and placeholder signer/nonce keyring coordinates. The full setup flow is:
 
 Pass `--profile <NAME>` for a non-default profile, `--rpc-url <URL>` to
 override the testnet default. Pass `--network mainnet --rpc-url <URL>` for a
-mainnet profile. Mainnet requires an explicit `https://` `--rpc-url`. The
-built-in default requires an API key and answers HTTP 401 unauthenticated, so persisting it would mint a broken configuration. Pass `--engine noop` to
+mainnet profile. Mainnet has no default endpoint, so it requires an explicit
+`https://` `--rpc-url` with no username or password. Pass `--engine noop` to
 skip the V1 owner-key ceremony for now. See [`profile
 init`](cli-reference/profile-and-governance.md#profile-init) for the full
 flag reference.

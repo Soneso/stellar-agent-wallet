@@ -38,12 +38,17 @@
 //!
 //! # Errors
 //!
-//! Returns exit code `1` on any migration failure.
+//! Returns exit code `1` on any migration failure. A profile that cannot be
+//! loaded for migration reports the loader's validation code. A missing file
+//! reports `validation.profile_not_found`, and a mainnet file without
+//! `rpc_url` reports `validation.mainnet_rpc_url_required`. An endpoint URL
+//! that breaks the endpoint rule, or any other unreadable file, reports
+//! `validation.config_invalid`. Nothing is written on a refusal.
 
 use clap::{ArgGroup, Args};
 use serde::Serialize;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
+use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_core::profile::loader::default_profile_dir;
 use stellar_agent_core::profile::migrate::{MigrateError, MigrateOutcome, migrate};
 
@@ -151,23 +156,11 @@ pub async fn run(args: &MigrateArgs) -> i32 {
             render::render_json(&Envelope::ok(MigrateResult::NoOp { version: 1 }));
             0
         }
+        // A load refusal is the operator's to repair, never a wallet defect:
+        // it renders under the validation code the loader assigns it.
         Err(MigrateError::Load { ref source, .. }) => {
-            // Check if it was a profile-not-found error (source is Box<ProfileLoadError>).
-            let wallet_err = if matches!(
-                source.as_ref(),
-                stellar_agent_core::profile::loader::ProfileLoadError::NotFound { .. }
-            ) {
-                WalletError::Validation(ValidationError::ProfileNotFound {
-                    name: args.profile_name().to_owned(),
-                })
-            } else {
-                WalletError::Internal(InternalError::UnexpectedState {
-                    detail: format!(
-                        "migration load failed for '{}': {source}",
-                        args.profile_name()
-                    ),
-                })
-            };
+            let wallet_err =
+                WalletError::Validation(source.to_validation_error(args.profile_name()));
             render::render_json(&Envelope::err(&wallet_err));
             1
         }

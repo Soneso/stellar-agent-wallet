@@ -71,12 +71,13 @@ mod tests {
     use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
 
     fn profile(chain: Caip2) -> Profile {
+        let primary = "https://primary.example";
         let builder = if chain.is_mainnet() {
-            Profile::builder_mainnet_named("context", "s", "a", "n", "a")
+            Profile::builder_mainnet_named("context", primary, "s", "a", "n", "a")
         } else {
-            Profile::builder_testnet_named("context", "s", "a", "n", "a")
+            Profile::builder_testnet_named("context", "s", "a", "n", "a").rpc_url(primary)
         };
-        let mut profile = builder.rpc_url("https://primary.example").build();
+        let mut profile = builder.build();
         profile.secondary_rpc_url = Some("https://profile-secondary.example".to_owned());
         profile
     }

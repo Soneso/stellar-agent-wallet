@@ -1880,8 +1880,12 @@ mod tests {
     #[serial_test::serial]
     async fn mainnet_rejected_at_run_boundary() {
         let guard_rpc = wiremock::MockServer::start().await;
+        let counter =
+            stellar_agent_test_support::ConnectionCounter::start().expect("connection counter");
         let (_guard_dir, _guard_home, _guard_env) =
-            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&guard_rpc.uri());
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(
+                &counter.https_uri(),
+            );
         let args = PayArgs {
             profile: Some("guard-mainnet".into()),
             destination: "GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGH".to_owned(),
@@ -1909,8 +1913,7 @@ mod tests {
             &args,
             |name| {
                 Ok(
-                    Profile::builder_mainnet_named(name, "s", "default", "n", "a")
-                        .rpc_url(guard_rpc.uri())
+                    Profile::builder_mainnet_named(name, guard_rpc.uri(), "s", "default", "n", "a")
                         .build(),
                 )
             },
@@ -1924,6 +1927,11 @@ mod tests {
                 .await
                 .expect("requests")
                 .is_empty()
+        );
+        assert_eq!(
+            counter.accepted().expect("connection count"),
+            0,
+            "no connection may reach the persisted profile's endpoint"
         );
     }
 

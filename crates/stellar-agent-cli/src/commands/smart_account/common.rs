@@ -444,8 +444,11 @@ pub(crate) fn open_audit_writer(
 /// Maps a profile-access failure onto the typed error the audit-writer helpers
 /// return.
 ///
-/// `profile.name_mismatch`, `profile.non_overlayable_field`, and
-/// `profile.mainnet_requires_explicit_profile` keep their own wire codes.
+/// `profile.name_mismatch`, `profile.non_overlayable_field`,
+/// `profile.mainnet_requires_explicit_profile`,
+/// `validation.mainnet_rpc_url_required` (a mainnet profile without
+/// `rpc_url`), and `validation.config_invalid` for an endpoint URL that
+/// breaks the endpoint rule keep their own wire codes.
 /// Other load failures map to an audit-writer I/O error.
 pub(crate) fn map_access_error(
     err: &crate::common::profile_access::ProfileAccessError,
@@ -457,7 +460,9 @@ pub(crate) fn map_access_error(
         ProfileAccessError::NameMismatch(_)
         | ProfileAccessError::Load(
             ProfileLoadError::NonOverlayableField { .. }
-            | ProfileLoadError::MainnetRequiresExplicitProfile { .. },
+            | ProfileLoadError::MainnetRequiresExplicitProfile { .. }
+            | ProfileLoadError::MainnetRpcUrlRequired { .. }
+            | ProfileLoadError::InvalidEndpointUrl { .. },
         ) => err.to_wallet_error(profile_name),
         ProfileAccessError::Load(_) => wallet_io_error(
             IoSource::AuditWriterSetup,

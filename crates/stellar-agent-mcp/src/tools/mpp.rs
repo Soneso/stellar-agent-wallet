@@ -859,9 +859,15 @@ mod tests {
     #[tokio::test]
     async fn every_mpp_tool_refuses_mainnet_before_state_or_keyring_access() {
         let server = WalletServer::new(
-            Profile::builder_mainnet("svc", "acct", "nonce-svc", "nonce-acct")
-                .with_noop_engine()
-                .build(),
+            Profile::builder_mainnet(
+                "https://rpc.example.invalid",
+                "svc",
+                "acct",
+                "nonce-svc",
+                "nonce-acct",
+            )
+            .with_noop_engine()
+            .build(),
         )
         .expect("server");
         let context = stellar_agent_mpp::McpRequestContext::from_params(

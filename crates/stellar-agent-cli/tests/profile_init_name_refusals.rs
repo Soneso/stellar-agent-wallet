@@ -207,3 +207,34 @@ fn profile_init_refuses_credentialed_rpc_before_creating_file() {
     );
     assert!(!home.path().join("profiles/credentials.toml").exists());
 }
+
+/// An existing destination refuses before the endpoint rule. A mainnet
+/// `--rpc-url` the flag parser accepts but the rule refuses still reports
+/// `validation.profile_already_exists`, and the existing file is untouched.
+#[test]
+fn existing_destination_refuses_before_the_endpoint_rule() {
+    let home = tempfile::tempdir().expect("temp home");
+    let profiles = home.path().join("profiles");
+    std::fs::create_dir_all(&profiles).expect("profiles dir");
+    let path = profiles.join("pin-order.toml");
+    let bytes: &[u8] = b"version = 2\n# written by the refusal-order test\n";
+    std::fs::write(&path, bytes).expect("existing profile writes");
+
+    let (code, json, _) = run_init(
+        home.path(),
+        "pin-order",
+        &[
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "http://mainnet.example.com/rpc",
+        ],
+    );
+
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(
+        json["error"]["code"], "validation.profile_already_exists",
+        "{json}"
+    );
+    assert_eq!(std::fs::read(&path).expect("profile reads"), bytes);
+}

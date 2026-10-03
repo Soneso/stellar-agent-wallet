@@ -57,6 +57,7 @@ use std::process::Command;
 use serde_json::Value;
 use stellar_agent_core::profile::loader::save_new_to_dir;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
+use stellar_agent_test_support::ConnectionCounter;
 
 /// Profile named only by `STELLAR_AGENT_PROFILE` in every test below.
 const ENV_PROFILE: &str = "i113-env-profile";
@@ -85,6 +86,10 @@ const SOURCE_G: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
 /// An unreachable loopback endpoint. This suite runs in the offline gate, so
 /// no child may reach a live endpoint.
 const UNREACHABLE_RPC: &str = "http://127.0.0.1:9";
+
+/// The unreachable loopback endpoint for a mainnet profile file, which the
+/// loader accepts only as `https://`.
+const UNREACHABLE_HTTPS_RPC: &str = "https://127.0.0.1:9";
 
 /// Writes a `noop`-engine testnet profile fixture into `<home>/profiles`.
 ///
@@ -159,6 +164,7 @@ fn run_cli_with_env(
         .env_remove("STELLAR_AGENT_CHAIN_ID")
         .env_remove("STELLAR_AGENT_RPC_URL")
         .env_remove("STELLAR_AGENT_SECONDARY_RPC_URL")
+        .env_remove("STELLAR_AGENT_ORACLE_PROVIDER_URL")
         .env_remove("STELLAR_AGENT_MCP_SIGNER_DEFAULT")
         .env_remove("FLAG_RULES_UNSET_SEED");
     for (name, value) in overlay {
@@ -664,13 +670,50 @@ fn the_moved_verbs_let_the_profile_flag_beat_the_environment_variable() {
     }
 }
 
+/// Writes a `noop`-engine mainnet profile fixture whose `rpc_url` is `rpc_url`.
+///
+/// A caller that expects the profile to load passes an `https://` URL, because
+/// the loader refuses a plaintext mainnet endpoint. A caller that asserts no
+/// endpoint contact passes a
+/// [`ConnectionCounter`]'s URL and checks its count: a plaintext HTTP mock
+/// records no request for a TLS attempt.
 fn write_mainnet_profile(home: &Path, name: &str, rpc_url: &str) {
-    let profile = Profile::builder_mainnet_named(name, "s", "a", "n", "a")
-        .rpc_url(rpc_url)
+    let profile = Profile::builder_mainnet_named(name, rpc_url, "s", "a", "n", "a")
         .audit_log_path(home.join("audit").join(format!("{name}.jsonl")))
         .with_noop_engine()
         .build();
     save_new_to_dir(name, &profile, &home.join("profiles")).unwrap();
+}
+
+/// Starts a [`ConnectionCounter`] for an endpoint no child may contact.
+fn connection_counter() -> ConnectionCounter {
+    ConnectionCounter::start().expect("loopback connection counter")
+}
+
+/// Asserts that no child connected to `counter`.
+fn assert_no_contact(counter: &ConnectionCounter) {
+    assert_eq!(
+        counter.accepted().expect("connection count"),
+        0,
+        "no connection may reach the profile's endpoint"
+    );
+}
+
+/// Removes the `rpc_url` line from a written profile file, as an operator who
+/// never set one would leave it.
+fn remove_rpc_url(home: &Path, name: &str) {
+    let path = home.join("profiles").join(format!("{name}.toml"));
+    let toml = std::fs::read_to_string(&path).unwrap();
+    let stripped: Vec<&str> = toml
+        .lines()
+        .filter(|line| !line.starts_with("rpc_url"))
+        .collect();
+    assert_ne!(
+        stripped.len(),
+        toml.lines().count(),
+        "the fixture must carry an rpc_url line to remove"
+    );
+    std::fs::write(&path, stripped.join("\n")).unwrap();
 }
 
 #[test]
@@ -690,7 +733,7 @@ fn chain_id_environment_overlay_refuses_testnet_profile() {
 #[test]
 fn rpc_environment_overlay_refuses_mainnet_profile() {
     let home = tempfile::tempdir().unwrap();
-    write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_RPC);
+    write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_HTTPS_RPC);
     let run = run_cli_with_env(
         home.path(),
         None,
@@ -701,55 +744,65 @@ fn rpc_environment_overlay_refuses_mainnet_profile() {
     assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
 }
 
-#[tokio::test]
-async fn trustline_mainnet_rpc_overlay_refuses_before_endpoint_contact() {
+#[test]
+fn trustline_mainnet_rpc_overlay_refuses_before_endpoint_contact() {
     let home = tempfile::tempdir().unwrap();
-    let endpoint = wiremock::MockServer::start().await;
-    let overlay_url = endpoint.uri();
+    let endpoint = connection_counter();
+    let overlay_url = endpoint.https_uri();
     write_mainnet_profile(home.path(), "mainnet", &overlay_url);
-    let run = tokio::task::spawn_blocking(move || {
-        run_cli_with_env(
-            home.path(),
-            None,
-            &[
-                "trustline",
-                "--from",
-                SOURCE_G,
-                "--asset",
-                "USDC",
-                "--profile",
-                "mainnet",
-            ],
-            &[("STELLAR_AGENT_RPC_URL", &overlay_url)],
-        )
-    })
-    .await
-    .unwrap();
+    let run = run_cli_with_env(
+        home.path(),
+        None,
+        &[
+            "trustline",
+            "--from",
+            SOURCE_G,
+            "--asset",
+            "USDC",
+            "--profile",
+            "mainnet",
+        ],
+        &[("STELLAR_AGENT_RPC_URL", &overlay_url)],
+    );
     assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
     assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
-    assert!(endpoint.received_requests().await.unwrap().is_empty());
+    assert_no_contact(&endpoint);
 }
 
-#[tokio::test]
-async fn trustline_mainnet_environment_refuses_before_endpoint_contact() {
+#[test]
+fn trustline_mainnet_environment_refuses_before_endpoint_contact() {
     let home = tempfile::tempdir().unwrap();
-    let endpoint = wiremock::MockServer::start().await;
-    write_mainnet_profile(home.path(), "mainnet", &endpoint.uri());
-    let run = tokio::task::spawn_blocking(move || run_trustline(home.path(), Some("mainnet"), &[]))
-        .await
-        .unwrap();
+    let endpoint = connection_counter();
+    write_mainnet_profile(home.path(), "mainnet", &endpoint.https_uri());
+    let run = run_trustline(home.path(), Some("mainnet"), &[]);
     assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
     assert_eq!(
         run.json()["error"]["code"],
         "profile.mainnet_requires_explicit_profile"
     );
-    assert!(endpoint.received_requests().await.unwrap().is_empty());
+    assert_no_contact(&endpoint);
+}
+
+/// A mainnet profile file without `rpc_url` refuses with the typed code on
+/// `trustline`, whose other load failures report
+/// `trustline.profile_load_failed`.
+#[test]
+fn trustline_mainnet_profile_without_rpc_url_reports_the_typed_code() {
+    let home = tempfile::tempdir().unwrap();
+    write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_HTTPS_RPC);
+    remove_rpc_url(home.path(), "mainnet");
+    let run = run_trustline(home.path(), None, &["--profile", "mainnet"]);
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    assert_eq!(
+        run.json()["error"]["code"],
+        "validation.mainnet_rpc_url_required"
+    );
 }
 
 #[test]
 fn trustline_mainnet_flag_passes_selection() {
     let home = tempfile::tempdir().unwrap();
-    write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_RPC);
+    write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_HTTPS_RPC);
     let run = run_trustline(home.path(), Some("mainnet"), &["--profile", "mainnet"]);
     assert_ne!(
         run.json()["error"]["code"],
@@ -761,7 +814,7 @@ fn trustline_mainnet_flag_passes_selection() {
 
 fn assert_registration_environment_refuses(verb: &str, extra: &[&str]) {
     let home = tempfile::tempdir().unwrap();
-    write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_RPC);
+    write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_HTTPS_RPC);
     let registry = home.path().join("networks.toml");
     let mut args = vec!["smart-account", verb];
     args.extend_from_slice(extra);
@@ -810,7 +863,7 @@ fn protected_secondary_and_signer_environment_overlays_refuse_mainnet() {
         ("STELLAR_AGENT_MCP_SIGNER_DEFAULT", "x"),
     ] {
         let home = tempfile::tempdir().unwrap();
-        write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_RPC);
+        write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_HTTPS_RPC);
         let run = run_cli_with_env(
             home.path(),
             None,
@@ -820,6 +873,52 @@ fn protected_secondary_and_signer_environment_overlays_refuse_mainnet() {
         assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
         assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
     }
+}
+
+/// `STELLAR_AGENT_ORACLE_PROVIDER_URL` is refused on a mainnet profile, for a
+/// value different from the file's and for an equal one.
+#[test]
+fn oracle_environment_overlay_refuses_mainnet_profile() {
+    let file_oracle = "https://oracle.example.invalid/";
+    for overlay in ["https://overlay.example.invalid/", file_oracle] {
+        let home = tempfile::tempdir().unwrap();
+        let mut profile =
+            Profile::builder_mainnet_named("mainnet", UNREACHABLE_HTTPS_RPC, "s", "a", "n", "a")
+                .audit_log_path(home.path().join("audit").join("mainnet.jsonl"))
+                .with_noop_engine()
+                .build();
+        profile.oracle_provider_url = Some(file_oracle.parse().unwrap());
+        save_new_to_dir("mainnet", &profile, &home.path().join("profiles")).unwrap();
+        let run = run_cli_with_env(
+            home.path(),
+            None,
+            &["profile", "show", "--profile", "mainnet"],
+            &[("STELLAR_AGENT_ORACLE_PROVIDER_URL", overlay)],
+        );
+        assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+        assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
+    }
+}
+
+/// The testnet control: the same variable applies to a testnet profile.
+#[test]
+fn oracle_environment_overlay_applies_to_testnet_profile() {
+    let home = tempfile::tempdir().unwrap();
+    write_profile(home.path(), "testnet", UNREACHABLE_RPC, None);
+    let run = run_cli_with_env(
+        home.path(),
+        None,
+        &["profile", "show", "--profile", "testnet"],
+        &[(
+            "STELLAR_AGENT_ORACLE_PROVIDER_URL",
+            "https://overlay.example.invalid/",
+        )],
+    );
+    assert_eq!(run.code, 0, "{} {}", run.stdout, run.stderr);
+    assert_eq!(
+        run.json()["data"]["oracle_provider_url"],
+        "https://overlay.example.invalid"
+    );
 }
 
 fn pay_base() -> Vec<&'static str> {
@@ -833,14 +932,38 @@ fn pay_base() -> Vec<&'static str> {
     ]
 }
 
-#[tokio::test]
-async fn mainnet_profile_flags_refuse_before_endpoint_contact() {
-    let rpc = wiremock::MockServer::start().await;
+/// A mainnet profile file whose `rpc_url` is plaintext refuses to load:
+/// `profile show` and a raw-code value verb both report
+/// `validation.config_invalid`, and nothing contacts the endpoint.
+#[test]
+fn plaintext_mainnet_endpoint_refuses_on_show_and_on_a_value_verb() {
+    let counter = connection_counter();
+    let plaintext = counter.https_uri().replacen("https://", "http://", 1);
     let home = tempfile::tempdir().unwrap();
-    write_mainnet_profile(home.path(), "mainnet", &rpc.uri());
+    write_mainnet_profile(home.path(), "mainnet", &plaintext);
+    let mut pay = pay_base();
+    pay.extend(["--profile", "mainnet"]);
+    for args in [vec!["profile", "show", "--profile", "mainnet"], pay] {
+        let run = run_cli(home.path(), None, &args);
+        assert_eq!(run.code, 1, "{args:?}: {} {}", run.stdout, run.stderr);
+        assert_eq!(
+            run.json()["error"]["code"],
+            "validation.config_invalid",
+            "{args:?}: {}",
+            run.stdout
+        );
+    }
+    assert_no_contact(&counter);
+}
+
+#[test]
+fn mainnet_profile_flags_refuse_before_endpoint_contact() {
+    let rpc = connection_counter();
+    let home = tempfile::tempdir().unwrap();
+    write_mainnet_profile(home.path(), "mainnet", &rpc.https_uri());
     for (flags, code) in [
         (
-            vec!["--rpc-url".to_owned(), rpc.uri()],
+            vec!["--rpc-url".to_owned(), rpc.https_uri()],
             "profile.non_overlayable_field",
         ),
         (
@@ -856,7 +979,7 @@ async fn mainnet_profile_flags_refuse_before_endpoint_contact() {
         assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
         assert_eq!(run.json()["error"]["code"], code);
     }
-    assert!(rpc.received_requests().await.unwrap().is_empty());
+    assert_no_contact(&rpc);
 }
 
 #[tokio::test]
@@ -872,11 +995,11 @@ async fn mainnet_flag_on_zero_config_refuses_before_endpoint_contact() {
     assert!(rpc.received_requests().await.unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn mainnet_signers_list_rpc_flag_refuses_before_endpoint_contact() {
-    let rpc = wiremock::MockServer::start().await;
+#[test]
+fn mainnet_signers_list_rpc_flag_refuses_before_endpoint_contact() {
+    let rpc = connection_counter();
     let home = tempfile::tempdir().unwrap();
-    write_mainnet_profile(home.path(), "mainnet", &rpc.uri());
+    write_mainnet_profile(home.path(), "mainnet", &rpc.https_uri());
     let run = run_cli(
         home.path(),
         None,
@@ -891,12 +1014,12 @@ async fn mainnet_signers_list_rpc_flag_refuses_before_endpoint_contact() {
             "--profile",
             "mainnet",
             "--rpc-url",
-            &rpc.uri(),
+            &rpc.https_uri(),
         ],
     );
     assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
     assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
-    assert!(rpc.received_requests().await.unwrap().is_empty());
+    assert_no_contact(&rpc);
 }
 
 #[test]
@@ -923,7 +1046,7 @@ fn fees_stats_mainnet_equal_rpc_flag_refuses() {
 #[test]
 fn credentialed_rpc_flag_exits_two_without_echoing_credentials() {
     let home = tempfile::tempdir().unwrap();
-    write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_RPC);
+    write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_HTTPS_RPC);
     let mut args = pay_base();
     args.extend([
         "--profile",
@@ -1027,8 +1150,9 @@ fn guarded(name: &'static str, argv: &[&str]) -> GuardedVerb {
     }
 }
 
-/// Every path with a structural mainnet refusal. `endpoint` is the mock the
-/// table observes; the friendbot arm takes it as its faucet URL as well.
+/// Every path with a structural mainnet refusal. `endpoint` is the URL of the
+/// counter the table observes; the friendbot arm takes it as its faucet URL as
+/// well.
 ///
 /// The friendbot row passes a malformed new account. The network layer
 /// refuses mainnet with the same code as the CLI, and the CLI refusal precedes
@@ -1340,35 +1464,35 @@ fn guarded_verbs(endpoint: &str) -> Vec<GuardedVerb> {
 }
 
 /// Runs every guarded verb with `extra` appended and collects each row whose
-/// exit code, envelope code, or endpoint traffic differs from the expectation.
-async fn guarded_table_failures(
+/// exit code, envelope code, or endpoint contact differs from the
+/// expectation.
+///
+/// Contact is observed at the TCP level: a mainnet profile file carries an
+/// `https://` endpoint, and a plaintext HTTP mock records no request for a TLS
+/// attempt.
+fn guarded_table_failures(
     home: &Path,
-    endpoint: &wiremock::MockServer,
+    endpoint: &ConnectionCounter,
     extra: &[String],
     expected_code: impl Fn(&GuardedVerb) -> &'static str,
 ) -> Vec<String> {
     let mut failures = Vec::new();
-    let verbs = guarded_verbs(&endpoint.uri());
+    let verbs = guarded_verbs(&endpoint.https_uri());
     assert_eq!(verbs.len(), 30, "the table covers every guarded path");
     for verb in &verbs {
         let mut args = verb.argv.clone();
         args.extend(extra.iter().cloned());
-        let before = endpoint.received_requests().await.unwrap().len();
-        let home = home.to_path_buf();
-        let run = tokio::task::spawn_blocking(move || {
-            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-            run_cli(&home, None, &argv)
-        })
-        .await
-        .unwrap();
-        let requests = endpoint.received_requests().await.unwrap().len() - before;
+        let before = endpoint.accepted().expect("connection count");
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = run_cli(home, None, &argv);
+        let requests = endpoint.accepted().expect("connection count") - before;
         let code = serde_json::from_str::<Value>(run.stdout.trim())
             .ok()
             .and_then(|json| json["error"]["code"].as_str().map(str::to_owned));
         let expected = expected_code(verb);
         if run.code != 1 || code.as_deref() != Some(expected) || requests != 0 {
             failures.push(format!(
-                "`{}`: exit {}, code {code:?} (expected {expected}), {requests} request(s); \
+                "`{}`: exit {}, code {code:?} (expected {expected}), {requests} connection(s); \
                  stdout={} stderr={}",
                 verb.name,
                 run.code,
@@ -1381,29 +1505,29 @@ async fn guarded_table_failures(
 }
 
 /// Every guarded path refuses a persisted mainnet profile with its structural
-/// code, and no request reaches the profile's endpoint. No seed variable is
-/// set, and every later stage on these paths reports a different code.
-#[tokio::test]
-async fn every_guarded_path_refuses_a_mainnet_profile_before_endpoint_contact() {
-    let endpoint = wiremock::MockServer::start().await;
+/// code, and no connection reaches the profile's endpoint. No seed variable
+/// is set, and every later stage on these paths reports a different code.
+#[test]
+fn every_guarded_path_refuses_a_mainnet_profile_before_endpoint_contact() {
+    let endpoint = connection_counter();
     let home = tempfile::tempdir().unwrap();
-    write_mainnet_profile(home.path(), "mainnet", &endpoint.uri());
+    write_mainnet_profile(home.path(), "mainnet", &endpoint.https_uri());
     let failures = guarded_table_failures(
         home.path(),
         &endpoint,
         &["--profile".to_owned(), "mainnet".to_owned()],
         |verb| verb.mainnet_code,
-    )
-    .await;
+    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Every guarded path refuses `--network mainnet` on the zero-config testnet
-/// profile with `profile.network_flag_mismatch`. `--rpc-url` names the mock,
-/// so the zero-request assertion observes the endpoint the command is given.
-#[tokio::test]
-async fn every_guarded_path_refuses_a_mainnet_flag_without_a_profile() {
-    let endpoint = wiremock::MockServer::start().await;
+/// profile with `profile.network_flag_mismatch`. `--rpc-url` names the
+/// counter, so the zero-connection assertion observes the endpoint the
+/// command is given.
+#[test]
+fn every_guarded_path_refuses_a_mainnet_flag_without_a_profile() {
+    let endpoint = connection_counter();
     let home = tempfile::tempdir().unwrap();
     let failures = guarded_table_failures(
         home.path(),
@@ -1412,37 +1536,32 @@ async fn every_guarded_path_refuses_a_mainnet_flag_without_a_profile() {
             "--network".to_owned(),
             "mainnet".to_owned(),
             "--rpc-url".to_owned(),
-            endpoint.uri(),
+            endpoint.https_uri(),
         ],
         |_| "profile.network_flag_mismatch",
-    )
-    .await;
+    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// `smart-account list-rules` has no structural refusal; a mainnet profile
 /// named only by the environment variable is refused at selection, before
-/// any request reaches the profile's endpoint.
-#[tokio::test]
-async fn list_rules_refuses_a_mainnet_profile_named_by_the_environment() {
-    let endpoint = wiremock::MockServer::start().await;
+/// any connection reaches the profile's endpoint.
+#[test]
+fn list_rules_refuses_a_mainnet_profile_named_by_the_environment() {
+    let endpoint = connection_counter();
     let home = tempfile::tempdir().unwrap();
-    write_mainnet_profile(home.path(), "mainnet", &endpoint.uri());
-    let run = tokio::task::spawn_blocking(move || {
-        run_cli(
-            home.path(),
-            Some("mainnet"),
-            &["smart-account", "list-rules", "--account", ACCOUNT_C],
-        )
-    })
-    .await
-    .unwrap();
+    write_mainnet_profile(home.path(), "mainnet", &endpoint.https_uri());
+    let run = run_cli(
+        home.path(),
+        Some("mainnet"),
+        &["smart-account", "list-rules", "--account", ACCOUNT_C],
+    );
     assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
     assert_eq!(
         run.json()["error"]["code"],
         "profile.mainnet_requires_explicit_profile"
     );
-    assert!(endpoint.received_requests().await.unwrap().is_empty());
+    assert_no_contact(&endpoint);
 }
 
 #[tokio::test]

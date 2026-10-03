@@ -115,7 +115,8 @@ fn load_v1_from_path(name: &str, path: &Path) -> Result<PartialV1Profile, Profil
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum MigrateError {
-    /// The profile could not be loaded before migration.
+    /// The profile could not be loaded, or the migrated profile breaks a load
+    /// rule.
     #[error("migration failed to load profile '{name}': {source}")]
     Load {
         /// Profile name supplied by the caller.
@@ -193,13 +194,31 @@ const CURRENT_VERSION: u32 = 2;
 ///
 /// # Errors
 ///
-/// - [`MigrateError::Load`] — the profile file could not be loaded.
+/// - [`MigrateError::Load`] if the profile file does not exist
+///   ([`ProfileLoadError::NotFound`]), cannot be read, names no `rpc_url` on
+///   mainnet ([`ProfileLoadError::MainnetRpcUrlRequired`]), or carries an
+///   endpoint URL that breaks
+///   [`check_endpoint_url`](super::schema::check_endpoint_url)
+///   ([`ProfileLoadError::InvalidEndpointUrl`]).  Nothing is written, and the
+///   file stays as it was.
 /// - [`MigrateError::Save`] — the migrated profile could not be saved.
 /// - [`MigrateError::UnknownVersion`] — no migration path exists from the
 ///   profile's current version (can only happen when the profile is at a
 ///   version the wallet does not know how to migrate from).
 pub fn migrate(name: &str, profile_dir: &Path) -> Result<MigrateOutcome, MigrateError> {
     let path = profile_dir.join(format!("{name}.toml"));
+
+    // The version peek reads through figment, which yields no data for an
+    // absent path, so a missing file is detected here first.
+    if !path.exists() {
+        return Err(load_refusal(
+            name,
+            ProfileLoadError::NotFound {
+                name: name.to_owned(),
+                path,
+            },
+        ));
+    }
 
     // Peek at the version field without requiring v2-specific fields.
     let raw_version = peek_version(name, &path)?;
@@ -231,6 +250,14 @@ pub fn migrate(name: &str, profile_dir: &Path) -> Result<MigrateOutcome, Migrate
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Wraps a load refusal of the profile `name` as [`MigrateError::Load`].
+fn load_refusal(name: &str, source: ProfileLoadError) -> MigrateError {
+    MigrateError::Load {
+        name: name.to_owned(),
+        source: Box::new(source),
+    }
+}
+
 /// Reads only the `version` field from the TOML at `path` without requiring
 /// any other fields to be present.
 fn peek_version(name: &str, path: &Path) -> Result<u32, MigrateError> {
@@ -248,12 +275,14 @@ fn peek_version(name: &str, path: &Path) -> Result<u32, MigrateError> {
         .merge(Toml::file(path))
         .extract::<VersionOnly>()
         .map(|v| v.version)
-        .map_err(|e| MigrateError::Load {
-            name: name.to_owned(),
-            source: Box::new(ProfileLoadError::Figment {
-                name: name.to_owned(),
-                source: Box::new(e),
-            }),
+        .map_err(|e| {
+            load_refusal(
+                name,
+                ProfileLoadError::Figment {
+                    name: name.to_owned(),
+                    source: Box::new(e),
+                },
+            )
         })
 }
 
@@ -262,11 +291,8 @@ fn peek_version(name: &str, path: &Path) -> Result<u32, MigrateError> {
 fn apply_migrations(name: &str, path: &Path, from_version: u32) -> Result<Profile, MigrateError> {
     match from_version {
         1 => {
-            let v1 = load_v1_from_path(name, path).map_err(|e| MigrateError::Load {
-                name: name.to_owned(),
-                source: Box::new(e),
-            })?;
-            Ok(migrate_v1_to_v2(name, v1))
+            let v1 = load_v1_from_path(name, path).map_err(|e| load_refusal(name, e))?;
+            migrate_v1_to_v2(name, v1)
         }
         _ => Err(MigrateError::UnknownVersion {
             name: name.to_owned(),
@@ -299,13 +325,23 @@ fn apply_migrations(name: &str, path: &Path, from_version: u32) -> Result<Profil
 /// | `classic_fee_per_op_stroops` | `None` | operator action |
 /// | `classic_max_fee_per_op_stroops` | `None` | operator action |
 ///
+/// # Endpoint
+///
+/// An explicit v1 `rpc_url` is carried verbatim; a testnet file without one
+/// receives the testnet default.  Mainnet has no default, so a mainnet file
+/// without `rpc_url` refuses with [`ProfileLoadError::MainnetRpcUrlRequired`].
+/// The migrated profile must pass [`Profile::validate_endpoint_urls`]; a URL
+/// that breaks the endpoint rule refuses with
+/// [`ProfileLoadError::InvalidEndpointUrl`].  Both refusals happen before
+/// anything is written.
+///
 /// # Idempotency
 ///
 /// The public [`migrate`] function guards on `from_version == CURRENT_VERSION`
 /// before calling into [`apply_migrations`], so re-running on a v2 profile
 /// returns `MigrateOutcome::NoOp` without ever reaching this function.
 ///
-fn migrate_v1_to_v2(profile_name: &str, v1: PartialV1Profile) -> Profile {
+fn migrate_v1_to_v2(profile_name: &str, v1: PartialV1Profile) -> Result<Profile, MigrateError> {
     use super::schema::default_audit_log_path_for;
 
     // Unset v1 audit_log_path migrates to the PER-PROFILE v2 location the
@@ -315,12 +351,21 @@ fn migrate_v1_to_v2(profile_name: &str, v1: PartialV1Profile) -> Profile {
         .unwrap_or_else(|| default_audit_log_path_for(profile_name));
 
     let chain_id = v1.chain_id;
-    let rpc_url = v1
-        .rpc_url
-        .unwrap_or_else(|| chain_id.default_rpc_url().to_owned());
+    let rpc_url = match (v1.rpc_url, chain_id.default_rpc_url()) {
+        (Some(explicit), _) => explicit,
+        (None, Some(default)) => default.to_owned(),
+        (None, None) => {
+            return Err(load_refusal(
+                profile_name,
+                ProfileLoadError::MainnetRpcUrlRequired {
+                    name: profile_name.to_owned(),
+                },
+            ));
+        }
+    };
     let network_passphrase = chain_id.network_passphrase().to_owned();
 
-    Profile {
+    let profile = Profile {
         version: 2,
         chain_id,
         rpc_url,
@@ -355,7 +400,18 @@ fn migrate_v1_to_v2(profile_name: &str, v1: PartialV1Profile) -> Profile {
         remote_approval: None,
         // Served pages stay neutral for migrated profiles.
         served_pages: None,
-    }
+    };
+
+    profile.validate_endpoint_urls().map_err(|source| {
+        load_refusal(
+            profile_name,
+            ProfileLoadError::InvalidEndpointUrl {
+                name: profile_name.to_owned(),
+                source,
+            },
+        )
+    })?;
+    Ok(profile)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -367,6 +423,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
 
@@ -599,9 +656,126 @@ account = "{name}"
         let dir = tempfile::tempdir().unwrap();
         let err = migrate("nonexistent", dir.path()).unwrap_err();
         assert!(
-            matches!(err, MigrateError::Load { .. }),
-            "expected Load error, got {err:?}"
+            matches!(
+                &err,
+                MigrateError::Load { source, .. }
+                    if matches!(source.as_ref(), ProfileLoadError::NotFound { name, .. } if name == "nonexistent")
+            ),
+            "expected a NotFound load error, got {err:?}"
         );
+    }
+
+    // ── Endpoint rule ────────────────────────────────────────────────────────
+
+    /// Writes a v1 TOML on `chain_id` with an optional `rpc_url` and returns
+    /// its path.
+    fn write_v1_endpoint_toml(
+        dir: &Path,
+        name: &str,
+        chain_id: &str,
+        rpc_url: Option<&str>,
+    ) -> PathBuf {
+        let rpc_line = rpc_url.map_or_else(String::new, |url| format!("rpc_url = \"{url}\"\n"));
+        let toml = format!(
+            r#"version = 1
+chain_id = "{chain_id}"
+{rpc_line}
+[mcp_signer_default]
+service = "stellar-agent-signer"
+account = "{name}"
+
+[mcp_nonce_key_alias]
+service = "stellar-agent-nonce"
+account = "{name}"
+"#
+        );
+        let path = dir.join(format!("{name}.toml"));
+        std::fs::write(&path, toml).unwrap();
+        path
+    }
+
+    /// A v1 mainnet file that names no endpoint, a plaintext one, or one with
+    /// userinfo refuses with the typed load error, and the file stays
+    /// byte-identical. The error names no part of the URL.
+    #[test]
+    fn migrate_v1_mainnet_endpoint_refusals_leave_the_file_unchanged() {
+        use crate::profile::schema::sentinel::{self, assert_no_sentinel};
+        use crate::profile::schema::{EndpointUrlError, EndpointUrlRejection};
+
+        // `None` expects the missing-endpoint refusal; `Some` the endpoint
+        // rule's refusal of `rpc_url` for that reason.
+        let cases = [
+            (None, None),
+            (
+                Some(sentinel::HTTP),
+                Some(EndpointUrlRejection::MainnetRequiresHttps),
+            ),
+            (
+                Some(sentinel::HTTPS),
+                Some(EndpointUrlRejection::MainnetCredentialInUrl),
+            ),
+        ];
+        for (rpc_url, endpoint_reason) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_v1_endpoint_toml(dir.path(), "mainnet-v1", "stellar:mainnet", rpc_url);
+            let before = std::fs::read(&path).unwrap();
+
+            let err = migrate("mainnet-v1", dir.path()).unwrap_err();
+            let MigrateError::Load { source, .. } = &err else {
+                panic!("{rpc_url:?}: expected a load refusal, got {err:?}");
+            };
+            match (source.as_ref(), endpoint_reason) {
+                (ProfileLoadError::MainnetRpcUrlRequired { name }, None) => {
+                    assert_eq!(name, "mainnet-v1");
+                }
+                (ProfileLoadError::InvalidEndpointUrl { source, .. }, Some(reason)) => {
+                    assert_eq!(
+                        source,
+                        &EndpointUrlError {
+                            field: "rpc_url",
+                            reason,
+                        }
+                    );
+                }
+                (other, _) => panic!("{rpc_url:?}: unexpected {other:?}"),
+            }
+            assert_no_sentinel(&format!("{err} {err:?}"));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "{rpc_url:?}: a refused migration must leave the v1 file byte-identical"
+            );
+        }
+    }
+
+    /// A v1 testnet file without `rpc_url` migrates to the testnet default.
+    #[test]
+    fn migrate_v1_testnet_without_rpc_url_takes_the_testnet_default() {
+        let dir = tempfile::tempdir().unwrap();
+        write_v1_endpoint_toml(dir.path(), "testnet-v1", "stellar:testnet", None);
+
+        migrate("testnet-v1", dir.path()).unwrap();
+
+        let loaded = load_from_dir("testnet-v1", dir.path(), None).unwrap();
+        assert_eq!(loaded.rpc_url, crate::profile::caip2::TESTNET_RPC_URL);
+    }
+
+    /// A v1 mainnet file with an HTTPS endpoint migrates and keeps it.
+    #[test]
+    fn migrate_v1_mainnet_with_https_rpc_url_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        write_v1_endpoint_toml(
+            dir.path(),
+            "mainnet-v1-ok",
+            "stellar:mainnet",
+            Some("https://rpc.example.invalid"),
+        );
+
+        migrate("mainnet-v1-ok", dir.path()).unwrap();
+
+        let loaded = load_from_dir("mainnet-v1-ok", dir.path(), None).unwrap();
+        assert_eq!(loaded.chain_id, crate::profile::caip2::Caip2::Mainnet);
+        assert_eq!(loaded.rpc_url, "https://rpc.example.invalid");
     }
 
     // ── migrate_v1_to_v2_produces_noop_engine ────────────────────────────────

@@ -1304,10 +1304,16 @@ mod tests {
 
     #[test]
     fn server_context_copies_mainnet_profile() {
-        let profile = Profile::builder_mainnet_named("context", "s", "a", "n", "a")
-            .rpc_url("https://mainnet.example")
-            .with_noop_engine()
-            .build();
+        let profile = Profile::builder_mainnet_named(
+            "context",
+            "https://mainnet.example",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .with_noop_engine()
+        .build();
         let server = WalletServer::new(profile).unwrap();
         assert_eq!(server.context.chain_id, server.profile.chain_id);
         assert_eq!(server.context.rpc_url, server.profile.rpc_url);

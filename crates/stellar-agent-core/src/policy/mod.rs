@@ -1516,7 +1516,7 @@ pub struct Evaluation {
 /// assert_eq!(engine.evaluate(&tool, &args, &profile, None, None, None, None, None).unwrap(), Decision::Allow);
 ///
 /// // Mainnet: read-only tool is allowed.
-/// let profile_mainnet = Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
+/// let profile_mainnet = Profile::builder_mainnet("https://rpc.example", "svc", "acct", "n-svc", "n-acct")
 ///     .with_noop_engine()
 ///     .build();
 /// let read_tool = ToolDescriptor::from_registration(&McpToolRegistration {
@@ -1584,9 +1584,15 @@ mod tests {
     }
 
     fn mainnet_profile() -> Profile {
-        Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
-            .with_noop_engine()
-            .build()
+        Profile::builder_mainnet(
+            "https://rpc.example.invalid",
+            "svc",
+            "acct",
+            "n-svc",
+            "n-acct",
+        )
+        .with_noop_engine()
+        .build()
     }
 
     fn destructive_tool() -> ToolDescriptor {

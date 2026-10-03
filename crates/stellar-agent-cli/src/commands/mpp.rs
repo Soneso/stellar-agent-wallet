@@ -1041,9 +1041,16 @@ mod tests {
 
     #[test]
     fn testnet_context_refuses_mainnet_with_network_error() {
-        let profile = Profile::builder_mainnet_named("context", "s", "a", "n", "a")
-            .with_noop_engine()
-            .build();
+        let profile = Profile::builder_mainnet_named(
+            "context",
+            "https://rpc.example.invalid",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .with_noop_engine()
+        .build();
         assert!(matches!(
             testnet_context(&profile),
             Err(MppProfileError::Network(error)) if error.code() == network_error().code()

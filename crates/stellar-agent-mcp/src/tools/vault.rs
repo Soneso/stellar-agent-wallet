@@ -1358,11 +1358,10 @@ mod secondary_rule_tests {
 
     fn server(mainnet: bool, rpc: &str) -> WalletServer {
         let profile = if mainnet {
-            Profile::builder_mainnet_named("secondary", "s", "default", "n", "a")
+            Profile::builder_mainnet_named("secondary", rpc, "s", "default", "n", "a")
         } else {
-            Profile::builder_testnet_named("secondary", "s", "default", "n", "a")
+            Profile::builder_testnet_named("secondary", "s", "default", "n", "a").rpc_url(rpc)
         }
-        .rpc_url(rpc)
         .with_noop_engine()
         .build();
         let mut server = WalletServer::new(profile).unwrap();

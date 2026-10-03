@@ -10,9 +10,9 @@
 //! | Flag | Required | Description |
 //! |------|----------|-------------|
 //! | `--timelock <C_STRKEY>` | yes | Timelock contract C-strkey. |
-//! | `--rpc-url <URL>` | no | Primary Soroban RPC (default: testnet). |
-//! | `--secondary-rpc-url <URL>` | no | Secondary RPC for cross-RPC validation. |
-//! | `--network {testnet\|mainnet}` | no | Target network (default: `testnet`). |
+//! | `--rpc-url <URL>` | no | Primary Soroban RPC; the profile endpoint when absent; refused on mainnet. |
+//! | `--secondary-rpc-url <URL>` | no | Secondary RPC for cross-RPC validation; the profile value when absent; refused on mainnet. |
+//! | `--network {testnet\|mainnet}` | no | Must equal the profile's chain when given. |
 //! | `--profile <NAME>` | no | Profile name for audit-log lookup. |
 //!
 //! # JSON envelope
@@ -41,15 +41,20 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_core::profile::loader::ProfileLoadError;
+use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_smart_account::timelock::{PendingTimelockOperation, TimelockOperationStateView};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    emit_sa_error, load_command_profile, map_access_error, open_audit_writer_read_only,
+    emit_sa_error, map_access_error, open_audit_writer_read_only,
 };
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+};
+use crate::common::profile_access::{
+    injected_profile_load, load_profile_or_synthesize_testnet_with,
 };
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
@@ -179,16 +184,36 @@ fn pending_op_to_entry(op: PendingTimelockOperation) -> PendingOperationEntry {
 ///
 /// Never panics.
 pub async fn run(args: &ListPendingArgs) -> i32 {
+    run_with_dependencies(args, injected_profile_load).await
+}
+
+/// Testable core of [`run`] with the profile load step injected.
+///
+/// Production callers use [`run`], which supplies the real profile loader.
+/// Tests substitute an in-memory profile, so a mainnet profile can point at a
+/// plaintext mock endpoint that the loader would refuse to read from a file.
+///
+/// The injected closure loads only. The synthesis decision and the
+/// reconciliation run in [`load_profile_or_synthesize_testnet_with`], outside
+/// the closure, on the injected path exactly as in production.
+async fn run_with_dependencies<LoadProfile>(
+    args: &ListPendingArgs,
+    load_profile: LoadProfile,
+) -> i32
+where
+    LoadProfile: FnOnce(&str) -> Result<Profile, ProfileLoadError>,
+{
     let resolved_profile = resolve_profile_name(args.profile.as_deref());
-    let (profile, _origin) = match load_command_profile(&resolved_profile) {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            let e = map_access_error(&error, &resolved_profile.name);
-            let envelope: Envelope<()> = Envelope::err(&e);
-            render_json(&envelope);
-            return 1;
-        }
-    };
+    let (profile, _origin) =
+        match load_profile_or_synthesize_testnet_with(&resolved_profile, load_profile) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let e = map_access_error(&error, &resolved_profile.name);
+                let envelope: Envelope<()> = Envelope::err(&e);
+                render_json(&envelope);
+                return 1;
+            }
+        };
     let context = match network_context_for_command(
         &profile,
         &resolved_profile.name,
@@ -336,12 +361,17 @@ mod tests {
     ///
     /// Prevents copy-paste of the `schedule`/`cancel`/`execute` pre-reject
     /// pattern into `list_pending`.
+    ///
+    /// The mainnet profile is injected in memory: the mock serves plaintext
+    /// HTTP, which the loader refuses for a mainnet profile file.
     #[tokio::test]
     #[serial_test::serial]
     async fn list_pending_mainnet_profile_reaches_inspection_rpc() {
         let rpc = wiremock::MockServer::start().await;
-        let (_dir, _home, _env) =
-            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&rpc.uri());
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let audit_log_path = home.path().join("audit.jsonl");
         let args = ListPendingArgs {
             timelock: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".into(),
             rpc_url: None,
@@ -349,7 +379,15 @@ mod tests {
             network: None,
             profile: Some("guard-mainnet".into()),
         };
-        let _ = run(&args).await;
+        let _ = run_with_dependencies(&args, |name| {
+            Ok(
+                Profile::builder_mainnet_named(name, rpc.uri(), "s", "default", "n", "a")
+                    .audit_log_path(audit_log_path)
+                    .with_noop_engine()
+                    .build(),
+            )
+        })
+        .await;
         assert!(
             !rpc.received_requests().await.expect("requests").is_empty(),
             "mainnet inspection must reach the endpoint without a signer"

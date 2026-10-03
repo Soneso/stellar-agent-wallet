@@ -237,23 +237,20 @@ fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
 /// set `Noop` explicitly so `WalletServer::new` succeeds without a signed
 /// policy file on disk.
 fn mainnet_profile() -> Profile {
-    Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
-        .with_noop_engine()
-        .build()
+    mainnet_profile_with_rpc("https://rpc.example.invalid")
 }
 
-/// `mainnet_profile` with `rpc_url` overridden to a caller-supplied endpoint.
+/// `mainnet_profile` with a caller-supplied `rpc_url`.
 ///
-/// The commit-phase policy gate now fetches the source `account_view` before
+/// The commit-phase policy gate fetches the source `account_view` before
 /// evaluating policy, so Property-A's `NoopPolicyEngine` refusal — which does
 /// not itself depend on account state — still incurs a real RPC round-trip
 /// ahead of it. Pointing `rpc_url` at a local wiremock server keeps that
-/// round-trip fast and independent of the default mainnet endpoint's live
-/// reachability.
+/// round-trip fast and off the network.
 fn mainnet_profile_with_rpc(rpc_url: &str) -> Profile {
-    let mut p = mainnet_profile();
-    p.rpc_url = rpc_url.to_owned();
-    p
+    Profile::builder_mainnet(rpc_url, "svc", "acct", "n-svc", "n-acct")
+        .with_noop_engine()
+        .build()
 }
 
 /// Builds a minimal but structurally valid `TransactionV1Envelope` base64 string

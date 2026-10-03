@@ -396,8 +396,15 @@ pub fn arb_profile() -> impl Strategy<Value = (Profile, String)> {
         let profile_name = name.to_owned();
         if mainnet {
             (
-                Profile::builder_mainnet_named(&profile_name, "svc", "acct", "n-svc", "n-acct")
-                    .build(),
+                Profile::builder_mainnet_named(
+                    &profile_name,
+                    "https://rpc.example.invalid",
+                    "svc",
+                    "acct",
+                    "n-svc",
+                    "n-acct",
+                )
+                .build(),
                 profile_name,
             )
         } else {

@@ -14,9 +14,9 @@
 //! | `--function <NAME>` | yes | Function name (must match scheduled). |
 //! | `--operation-id <HEX>` | yes | 64-char hex operation identifier. |
 //! | `--salt <HEX>` | yes | 64-char hex salt used when scheduling. |
-//! | `--rpc-url <URL>` | no | Primary Soroban RPC (default: testnet). |
-//! | `--secondary-rpc-url <URL>` | no | Secondary RPC for cross-RPC validation. |
-//! | `--network {testnet\|mainnet}` | no | Target network (default: `testnet`). |
+//! | `--rpc-url <URL>` | no | Primary Soroban RPC; the profile endpoint when absent; refused on mainnet. |
+//! | `--secondary-rpc-url <URL>` | no | Secondary RPC for cross-RPC validation; the profile value when absent; refused on mainnet. |
+//! | `--network {testnet\|mainnet}` | no | Must equal the profile's chain when given. |
 //! | `--signer-secret-env <VAR>` | no | Env var holding the executor S-strkey. |
 //! | `--profile <NAME>` | no | Profile name. |
 //!
@@ -468,9 +468,12 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn execute_mainnet_profile_reaches_no_endpoint() {
-        let guard_rpc = wiremock::MockServer::start().await;
+        let guard_rpc =
+            stellar_agent_test_support::ConnectionCounter::start().expect("connection counter");
         let (_guard_dir, _guard_home, _guard_env) =
-            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&guard_rpc.uri());
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(
+                &guard_rpc.https_uri(),
+            );
         use crate::common::network::TargetNetwork;
         let args = ExecuteArgs {
             timelock: "CTESTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACN7ALK".to_owned(),
@@ -490,12 +493,10 @@ mod tests {
         };
         let exit_code = run(&args).await;
         assert_eq!(exit_code, 1, "a mainnet execute must exit 1");
-        assert!(
-            guard_rpc
-                .received_requests()
-                .await
-                .expect("requests")
-                .is_empty()
+        assert_eq!(
+            guard_rpc.accepted().expect("connection count"),
+            0,
+            "no connection may reach the profile's endpoint"
         );
     }
 

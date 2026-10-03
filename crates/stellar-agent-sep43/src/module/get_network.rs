@@ -86,7 +86,14 @@ mod tests {
     fn dispatch_mainnet_returns_correct_network_fields() {
         use stellar_agent_core::profile::schema::Profile;
 
-        let profile = Profile::builder_mainnet("svc", "acct", "nonce-svc", "nonce-acct").build();
+        let profile = Profile::builder_mainnet(
+            "https://rpc.example.invalid",
+            "svc",
+            "acct",
+            "nonce-svc",
+            "nonce-acct",
+        )
+        .build();
         let result = dispatch(&profile).unwrap();
         assert_eq!(result["network"], "PUBLIC");
         let passphrase = result["networkPassphrase"].as_str().unwrap();
