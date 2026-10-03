@@ -75,10 +75,10 @@ use crate::commands::policy_engine::{
 };
 
 use stellar_agent_network::{
-    AccountView, Asset, ClassicOpBuilder, StellarRpcClient, SubmissionSignerKind, fetch_account,
-    init_platform_keyring_store, parse_classic_fee_choice,
+    AccountView, Asset, ClassicOpBuilder, StellarRpcClient, SubmissionSignerKind,
+    enrolled_keyring_signer, fetch_account, init_platform_keyring_store, parse_classic_fee_choice,
     policy_view::AccountViewAdapter,
-    resolve_classic_fee_selection, signer_from_keyring,
+    resolve_classic_fee_selection,
     signing::envelope_signing::attach_signature,
     submit::{SubmissionResult, submit_transaction_and_wait},
 };
@@ -147,12 +147,6 @@ pub struct TrustlineArgs {
     /// Profile name to load (default: `STELLAR_AGENT_PROFILE` env var, then `"default"`).
     #[arg(long = "profile", value_name = "NAME")]
     pub profile: Option<String>,
-
-    /// CAIP-2 chain identifier (e.g. `stellar:testnet`).
-    ///
-    /// When absent, the value from the loaded profile is used.
-    #[arg(long)]
-    pub chain_id: Option<String>,
 
     /// G-strkey of the account that will hold the trustline.
     #[arg(long)]
@@ -239,6 +233,8 @@ where
         }
     };
 
+    let context = NetworkContext::from_profile(&profile);
+
     // ── Initialise platform keyring store ─────────────────────────────────────
     // The keyring signer loaded before signing requires the process-global
     // default store.  Ordered after the profile load so a missing profile never
@@ -248,14 +244,9 @@ where
         return 1;
     }
 
-    let context = NetworkContext::from_profile(&profile);
     let rpc_url = context.rpc_url.as_str();
     let network_passphrase = context.network_passphrase();
-    let chain_id: String = args
-        .chain_id
-        .clone()
-        .unwrap_or_else(|| context.chain_id.caip2_str().to_owned());
-    let chain_id = chain_id.as_str();
+    let chain_id = context.chain_id.caip2_str();
 
     // ── Validate G-strkey ─────────────────────────────────────────────────────
     if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.from) {
@@ -708,13 +699,11 @@ where
     // ── Load signer from keyring ──────────────────────────────────────────────
     let signer_entry_ref = &profile.mcp_signer_default;
     let expected_g = signer_entry_ref.account.as_str();
-    let signer_handle = match signer_from_keyring(signer_entry_ref, expected_g).await {
+    let signer_handle = match enrolled_keyring_signer(&profile_name, &profile, expected_g).await {
         Ok(s) => s,
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.signer_load_failed",
-                e.to_string(),
-            ));
+            let (code, message) = signer_load_failure_parts(&e);
+            render_json(&Envelope::<()>::err_raw(code, message));
             return 1;
         }
     };
@@ -880,6 +869,16 @@ fn load_attestation_key_for_verify(
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(arr)
+}
+
+fn signer_load_failure_parts(e: &WalletError) -> (&'static str, String) {
+    match e {
+        WalletError::Auth(
+            stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
+            | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. },
+        ) => (e.code(), e.to_string()),
+        _ => ("trustline.signer_load_failed", e.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -1049,7 +1048,6 @@ mod tests {
 
         let args = TrustlineArgs {
             profile: Some("keyring-order-test".to_owned()),
-            chain_id: None,
             from: String::new(),
             asset: String::new(),
             limit_stroops: None,
@@ -1093,4 +1091,38 @@ mod tests {
     }
 
     // ── Audit pre-flight (fail-closed) ───────────────────────────────────────
+}
+
+#[cfg(test)]
+mod enrolled_failure_tests {
+    use super::*;
+    use stellar_agent_core::error::AuthError;
+
+    #[test]
+    fn enrolled_signer_load_failure_codes_pass_through() {
+        for error in [
+            AuthError::EnrolledSignerUnpinned {
+                profile: "mainnet".into(),
+                reason: "placeholder",
+            },
+            AuthError::EnrolledSignerMismatch {
+                profile: "mainnet".into(),
+                enrolled: "A".into(),
+                derived: "B".into(),
+            },
+        ] {
+            let error = WalletError::Auth(error);
+            assert_eq!(
+                signer_load_failure_parts(&error),
+                (error.code(), error.to_string())
+            );
+        }
+        let error = WalletError::Auth(AuthError::KeyringNotFound {
+            name: "missing".into(),
+        });
+        assert_eq!(
+            signer_load_failure_parts(&error),
+            ("trustline.signer_load_failed", error.to_string())
+        );
+    }
 }

@@ -60,9 +60,10 @@ use stellar_agent_smart_account::verifiers::default_networks_toml_path;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    emit_multicall_registry_error, emit_sa_error, open_profile_audit_writer,
+    emit_multicall_registry_error, emit_sa_error, load_command_profile, open_audit_writer,
 };
-use crate::common::network::TargetNetwork;
+use crate::common::network::{EndpointFlags, TargetNetwork, network_context_for_command};
+use crate::common::profile_access::profile_access_envelope;
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 
@@ -78,9 +79,10 @@ use crate::common::resolve_profile_name;
 #[derive(Debug, Args)]
 #[command(name = "unregister-multicall")]
 pub struct UnregisterMulticallArgs {
-    /// Stellar network to unregister (e.g. `testnet`, `mainnet`).
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
     /// Corruption-recovery mode: bypasses strkey/hex validation.
     ///
@@ -139,28 +141,35 @@ pub struct UnregisterMulticallArgs {
 /// Never panics.
 pub async fn run(args: &UnregisterMulticallArgs) -> i32 {
     let resolved_profile = resolve_profile_name(args.profile.as_deref());
-    let network_passphrase = args.network.passphrase().to_owned();
+    let (profile, origin) = match load_command_profile(&resolved_profile) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            render_json(&profile_access_envelope(&e, &resolved_profile.name));
+            return 1;
+        }
+    };
+    let context = match network_context_for_command(
+        &profile,
+        &resolved_profile.name,
+        EndpointFlags {
+            network: args.network,
+            rpc_url: None,
+            secondary_rpc_url: None,
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => {
+            render_json(&Envelope::<()>::err(&e));
+            return 1;
+        }
+    };
+    let network_passphrase = context.network_passphrase().to_owned();
     let network_safename = network_safename_from_passphrase(&network_passphrase);
     let request_id = Uuid::new_v4().to_string();
     let chain_id: Option<String> = None;
 
     // Open audit writer (non-fatal: log warning and continue on failure).
-    let audit_writer = match open_profile_audit_writer(&resolved_profile) {
-        Ok((_, writer, path)) => Some((writer, path)),
-        Err(error)
-            if matches!(
-                error,
-                WalletError::Validation(
-                    ValidationError::ProfileNonOverlayableField { .. }
-                        | ValidationError::MainnetRequiresExplicitProfile { .. }
-                )
-            ) =>
-        {
-            render_json(&Envelope::<()>::err(&error));
-            return 1;
-        }
-        Err(_) => None,
-    };
+    let audit_writer = open_audit_writer(&profile, origin, &resolved_profile.name).ok();
 
     // Load the registry.
     let networks_toml_path = match default_networks_toml_path() {
@@ -470,7 +479,7 @@ mod tests {
         // We simulate non-TTY by checking the code path directly.
         // In tests, stdin is a pipe (non-TTY); the flag is absent.
         let args = UnregisterMulticallArgs {
-            network: TargetNetwork::Testnet,
+            network: Some(TargetNetwork::Testnet),
             force: true,
             yes_i_have_verified_the_prior_values: false,
             profile: None,
@@ -485,7 +494,7 @@ mod tests {
     #[test]
     fn force_allowed_on_non_tty_with_yes_flag() {
         let args = UnregisterMulticallArgs {
-            network: TargetNetwork::Testnet,
+            network: Some(TargetNetwork::Testnet),
             force: true,
             yes_i_have_verified_the_prior_values: true,
             profile: None,

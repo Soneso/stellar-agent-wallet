@@ -6,11 +6,14 @@
 
 A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE` never selects one, and a mainnet `default.toml` needs `--profile default`. Keep the filename: its identity is bound to its keyring entries.
 
-Unset `STELLAR_AGENT_CHAIN_ID` and, for a mainnet profile, `STELLAR_AGENT_RPC_URL` first. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
+Unset `STELLAR_AGENT_CHAIN_ID` on every chain. On mainnet, also unset `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, and `STELLAR_AGENT_MCP_SIGNER_DEFAULT`. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
 
 | Wire code | Meaning |
 |---|---|
-| `profile.non_overlayable_field` | An environment or programmatic overlay names `chain_id`, or names `rpc_url` on a mainnet profile. Equal values are refused too. |
+| `profile.non_overlayable_field` | A protected field was supplied outside the file, including an equal value. Remove that environment value, overlay, or flag. |
+| `profile.network_flag_mismatch` | `--network` differs from the loaded chain. Remove the flag or select a profile on that chain. |
+| `auth.enrolled_signer_unpinned` | Mainnet enrollment is a placeholder or malformed. Correct a malformed `mcp_signer_default.account`, then run `stellar-agent profile enroll-signer --profile <name>`. |
+| `auth.enrolled_signer_mismatch` | The derived key differs from the enrolled identity. Use the enrolled seed, Ledger account, or keyring entry. |
 | `profile.mainnet_requires_explicit_profile` | A mainnet profile was selected by the environment or the default source. Supply `--profile <name>`. |
 
 ## Invocation and global model
@@ -42,10 +45,10 @@ These recur with the same meaning across groups:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--profile <NAME>` | Selects the per-environment TOML profile (binds CAIP-2 chain, RPC, keyring entry references, thresholds, policy engine). Holds no secrets. | resolves `--profile` → `STELLAR_AGENT_PROFILE` → `"default"` on every command that loads a profile (`accounts deploy-c` and `fees stats` default to no profile) |
-| `--network <NETWORK>` | `testnet` (default) or `mainnet`, case-insensitive | `testnet` |
-| `--rpc-url <URL>` | Primary Soroban RPC endpoint. `fees stats` validates the URL against an allowlist; other commands accept any URL that parses. | `https://soroban-testnet.stellar.org` |
-| `--secondary-rpc-url <URL>` | Second RPC for two-RPC cross-checks (WASM-hash divergence) | per command |
+| `--profile <NAME>` | Selects the per-environment TOML profile (binds CAIP-2 chain, RPC, keyring entry references, thresholds, policy engine). Holds no secrets. | resolves `--profile` → `STELLAR_AGENT_PROFILE` → `"default"` on every command that loads a profile (`fees stats` loads only with `--profile`; `accounts deploy-c` opens its writer only with that flag) |
+| `--network <NETWORK>` | Optional assertion; must match the profile chain | profile chain |
+| `--rpc-url <URL>` | Testnet override; refused on mainnet; credentials refused | profile endpoint |
+| `--secondary-rpc-url <URL>` | Testnet override; refused on mainnet; credentials refused | profile secondary |
 | `--timeout-seconds <SECONDS>` | Bounds submission and simulation | `60` |
 | `--output <FORMAT>` | `json` (default) or `table`; not accepted on every command | `json` |
 
@@ -230,7 +233,6 @@ stellar-agent balances --account GABC...WXYZ \
 | `--asset <ASSET>` (required) | `USDC` (bare, pin table), `CODE:ISSUER`, or a `C...` SAC address (deferred, typed error) | — |
 | `--limit-stroops <I64>` | Explicit limit; `0` removes the trustline | unlimited (`i64::MAX`) |
 | `--profile <NAME>` | Profile to load | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--chain-id <CAIP2>` | CAIP-2 chain id, e.g. `stellar:testnet` | profile value |
 | `--fee` | shared | profile `classic_fee_per_op_stroops` |
 
 ```bash
@@ -252,7 +254,7 @@ stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default
 | `--sign-with-ledger` / `--account-index <INDEX>` | Ledger signer / BIP index | `false` / `0` |
 | `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` | Stage selection (at most one) | — |
 | `--profile <NAME>` | Profile whose policy engine, keys, and audit writer to use | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--network` | `testnet` or `mainnet` (`mainnet` structurally refused for writes) | `testnet` |
+| `--network <NETWORK>` | Optional assertion; must match the profile chain (a mainnet profile is structurally refused for writes) | profile chain |
 | `--timeout-seconds` / `--rpc-url` / `--output` | shared | as above |
 
 Under `policy.engine = "v1"` `claim` evaluates operator policy before signing. The staged `--sign-only` / `--submit-only` stages gate too: they decode the supplied envelope and match rules under the `stellar_claim_commit` tool name, and deny `policy.deny.unsizable_value_effect` on an envelope the decoder cannot size unless the matched rule sets `allow_opaque_signing = true`.
@@ -273,7 +275,7 @@ stellar-agent claim BAAD...WXYZ --source GSRC...WXYZ --secret-env WALLET_SK
 | Flag | Meaning | Default |
 |---|---|---|
 | `--account <G_STRKEY>` (required) | Account to fund | — |
-| `--network <NETWORK>` | `testnet`/`futurenet`/`mainnet` (mainnet refused) | `testnet` |
+| `--network <NETWORK>` | `testnet`, `futurenet`, or `mainnet` (mainnet refused at dispatch); reads no profile | `testnet` |
 | `--friendbot-url <URL>` | Endpoint override; otherwise resolves to the SDF testnet URL regardless of `--network`, so `futurenet` needs an explicit override | `https://friendbot.stellar.org` |
 | `--friendbot-url-unchecked` | Bypass URL allow-list (dev/test escape hatch) | `false` |
 | `--output` | shared | `json` |
@@ -290,12 +292,12 @@ Fee-statistics group. Subcommand: `stats`.
 
 ### `fees stats [flags]`
 
-Fetches RPC fee statistics for classic fee selection. Read-only; no mainnet gate. RPC resolves `--rpc-url` → profile `rpc_url` → testnet default.
+Fetches RPC fee statistics for classic fee selection. Read-only; no mainnet gate. With `--profile`, the profile loads first and mainnet refuses `--rpc-url`. Without it, use `--rpc-url`, else the testnet endpoint.
 
 | Flag | Meaning | Default |
 |---|---|---|
 | `--profile <NAME>` | Profile whose RPC URL to use | none |
-| `--rpc-url <URL>` | Allow-listed RPC override | `https://soroban-testnet.stellar.org` |
+| `--rpc-url <URL>` | Allowlisted testnet override; refused with a mainnet profile | profile endpoint, or testnet without `--profile` |
 | `--output` | shared | `json` |
 
 ```bash

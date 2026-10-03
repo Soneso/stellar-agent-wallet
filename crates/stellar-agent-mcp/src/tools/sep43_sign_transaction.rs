@@ -8,7 +8,7 @@
 //! # Signing path
 //!
 //! Loads the signer from `profile.mcp_signer_default` via
-//! `stellar_agent_network::keyring::signer_from_keyring`, then dispatches to
+//! `stellar_agent_network::keyring::enrolled_keyring_signer`, then dispatches to
 //! `stellar_agent_sep43::StellarAgentModule::sign_transaction`.
 
 use rmcp::{
@@ -173,26 +173,44 @@ impl WalletServer {
         };
 
         use std::sync::Arc;
-        use stellar_agent_network::keyring::signer_from_keyring;
+        use stellar_agent_network::keyring::enrolled_keyring_signer;
         use stellar_agent_sep43::StellarAgentModule;
         use stellar_agent_sep43::module::ModuleAdapter;
 
         let account = self.profile.mcp_signer_default.account.as_str();
 
         // Load the signer from the keyring.
-        let signer_handle =
-            match signer_from_keyring(&self.profile.mcp_signer_default, account).await {
-                Ok(h) => h,
-                Err(err) => {
-                    let sep43_err = stellar_agent_sep43::Sep43Error::WalletUnlockFailed {
-                        detail: format!("keyring load failed: {err}"),
-                    };
+        let signer_handle = match enrolled_keyring_signer(
+            &self.profile_name_for_approval(),
+            &self.profile,
+            account,
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(err) => {
+                if matches!(
+                    &err,
+                    stellar_agent_core::error::WalletError::Auth(
+                        stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                    )
+                ) {
                     return Ok(crate::tools::common::business_error_result(
-                        sep43_err.wire_code(),
-                        sep43_err.to_string(),
+                        err.code(),
+                        err.to_string(),
                     ));
                 }
-            };
+
+                let sep43_err = stellar_agent_sep43::Sep43Error::WalletUnlockFailed {
+                    detail: format!("keyring load failed: {err}"),
+                };
+                return Ok(crate::tools::common::business_error_result(
+                    sep43_err.wire_code(),
+                    sep43_err.to_string(),
+                ));
+            }
+        };
 
         let signer_g = signer_handle.public_key().to_string();
         let profile = Arc::clone(&self.profile);

@@ -8,17 +8,16 @@ This file is self-contained. For the MCP tool surface and result-envelope shape 
 
 - Envelope: `{ ok, data | error, request_id }`. On success `ok: true` with a `data` object; on error `ok: false` with an `error` object carrying a wire code (for example `network.mainnet_write_forbidden`, `validation.rule_name_too_long`, `sa.threshold_policy_identification_failed`).
 - Amounts are always decimal strings with a unit, for example `"10 XLM"`, never JSON numbers. Assets are `native` / `XLM` or `CODE:GISSUER`. (These verbs are governance-only; no amounts are taken except per-op fees in stroops.)
-- MCP tools take `chain_id`, the CAIP-2 id of the target network, and it is required by most tools. The CLI uses `--network <testnet|mainnet>` instead.
+- MCP tools take `chain_id`, the CAIP-2 id of the target network, and most tools require it. The CLI reads the network from the profile; `--network <testnet|mainnet>` only asserts the profile's chain.
 
 ## Mainnet write refusal
 
-Every signing verb that mutates context-rule, signer, or timelock state refuses `mainnet` before any RPC call or signing-key access (`network.mainnet_write_forbidden`). This covers `rules` writes, all `signers` verbs including `list` and `refresh`, and `execute`. `list` and `refresh` are included because they emit audit rows. It also covers `migrate-verifier` submissions and timelock writes (`schedule`, `cancel`, and `execute`). The four deploy verbs are `deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`, and `deploy-policy`. A mainnet `migrate-verifier` dry-run remains read-only and allowed.
+Every signing verb that mutates context-rule, signer, or timelock state refuses a mainnet profile before any RPC call or signing-key access (`network.mainnet_write_forbidden`). This covers `rules` writes, all `signers` verbs including `list` and `refresh`, and `execute`. `list` and `refresh` are included because they emit audit rows. It also covers `multicall`, `migrate-verifier` submissions, and timelock writes (`schedule`, `cancel`, and `execute`). The four deploy verbs are `deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`, and `deploy-policy`. A mainnet `migrate-verifier` dry-run remains read-only and allowed.
 
 Exceptions:
 
 | Verb | Mainnet behavior |
 |------|------------------|
-| `smart-account multicall` | `mainnet` accepted at the flag level but requires a router registered for mainnet. |
 | `smart-account register-multicall` / `unregister-multicall` | Accept `mainnet` as a local-registry key. |
 | Read-only verbs | `smart-account rules get`, `smart-account rules get-spending-limit`, `smart-account rules verify-pins`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account timelock list-pending` accept `mainnet` unconditionally. |
 
@@ -149,12 +148,19 @@ Pinned-hash drift check (step 3): the wallet compares the rule's live verifiers 
 
 ## Smart-account infrastructure
 
+The chain and endpoints come from the resolved profile. Optional `--network` must equal the profile's chain.
+Optional RPC flags override testnet endpoints; a mainnet profile refuses either RPC flag, including equal values.
+Without a secondary flag, the profile's `secondary_rpc_url` applies. RPC flags refuse URLs containing credentials.
+
+`rules get`, `rules get-spending-limit`, and all four deployment verbs accept `--profile`. Explicitly named missing profiles refuse.
+Mainnet seed, Ledger, and keyring signers must match the enrolled account. `rules verify-pins` reads both endpoints from the profile.
+
 ### Verifier deploy and migration
 
 `smart-account deploy-webauthn-verifier` deploys the OZ WebAuthn-verifier WASM and records its address in the verifier registry (`<canonical_data_root>/networks.toml`). Idempotent — if the registry already holds a same-WASM-hash entry for the network it returns `status: "already_deployed"` with no RPC traffic. Testnet only.
 
 - Deployer source (exactly one): `--deployer-secret-env <VAR>` or `--sign-with-ledger`; `--account-index <INDEX>` default `0`.
-- `--rpc-url` default `https://soroban-testnet.stellar.org`. `--fee <STROOPS|auto[:pNN]>` (`auto` = p95; also `auto:p50`/`auto:p75`/`auto:p95`/`auto:p99`; absent uses the profile default 100-stroop base plus simulated Soroban resource fees). `--timeout-seconds` default `60`.
+- `--profile` selects the chain and endpoints. `--rpc-url` overrides testnet only and defaults to the profile endpoint. `--fee <STROOPS|auto[:pNN]>` (`auto` = p95; also `auto:p50`/`auto:p75`/`auto:p95`/`auto:p99`; absent uses the profile default 100-stroop base plus simulated Soroban resource fees). `--timeout-seconds` default `60`.
 - `--dry-run` derives the verifier address with no network access or signing; returns `status: "dry_run"`.
 
 ```bash
@@ -194,21 +200,23 @@ stellar-agent smart-account migrate-verifier \
 
 `smart-account list-rules` (alias backing `smart-account rules list`) scans the on-chain `[0, max_scan_id)` rule-id space and returns each active rule in `rule_id` order. Read-only, mainnet OK. Each rule's `baseline` reports its signer-set baseline in the profile's audit log: `none`, `v1`, `v2`, `unreadable` (an audit-log integrity error) or `unknown` (the log was not read). A rule reporting `none` refuses every signature under it with `sa.signer_set_missing_baseline` until one `signers list --rule-id N` records the baseline.
 
-- `--account <C>` (req), `--source-account <G>` (optional on testnet, where it defaults to a well-known funded account; required on mainnet, where any funded account works and is not debited), `--rpc-url` (default testnet RPC), `--secondary-rpc-url` (defaults to `--rpc-url`), `--network` (default `testnet`), `--profile`, `--max-scan-id <N>` (range `1..=10000`, rejected at parse otherwise; default from profile else `50`), `--timeout-seconds` (default `60`), `--output`.
+- `--account <C>` is required. `--source-account <G>` defaults to a funded account on testnet; on mainnet, supply a funded account for simulation.
+- `--rpc-url` and `--secondary-rpc-url` use the profile endpoints. Optional `--network` must match the profile chain; `--profile` selects the profile.
+- `--max-scan-id <N>` accepts `1..=10000`, using the profile bound or `50` when absent. `--timeout-seconds` defaults to `60`; `--output` selects the output format.
 
 ### Multicall router registry
 
 `smart-account register-multicall` records a deployed multicall-router address and its WASM hash in `<canonical_data_root>/networks.toml` (local file plus audit row, idempotent). Refuses if `--wasm-sha256` does not equal the binary's compiled-in router WASM hash.
 
-- `--network` (default `testnet`), `--address <C>` (req), `--wasm-sha256 <HEX>` (req, 64-char lowercase hex), `--profile`.
+- `--network` (optional assertion against the profile chain), `--address <C>` (req), `--wasm-sha256 <HEX>` (req, 64-char lowercase hex), `--profile`.
 
 `smart-account unregister-multicall` removes the entry. The normal path validates and removes. `--force` is for registry-file corruption recovery (bypasses strkey/hex validation, locates by network name) and needs interactive `[y/N]` confirmation on a TTY or `--yes-i-have-verified-the-prior-values` for non-TTY; the audit row is written before the file is mutated.
 
-- `--network` (default `testnet`), `--force`, `--yes-i-have-verified-the-prior-values`, `--profile`.
+- `--network` (optional assertion against the profile chain), `--force`, `--yes-i-have-verified-the-prior-values`, `--profile`.
 
 ## Multicall submission
 
-`smart-account multicall` submits an atomic multicall bundle (1–50 invocations) through the registered router for the target network. Signs and submits. The router address is resolved from the local registry; `mainnet` is accepted at the flag level but requires a router registered for mainnet. Signer source required.
+`smart-account multicall` submits an atomic multicall bundle (1 to 50 invocations) through the registered router for the target network. Signs and submits. The router address is resolved from the local registry. On a mainnet profile the command refuses with `network.mainnet_write_forbidden` before any registry, writer, or signer access. Signer source required.
 
 Each `--invocation` is `<target>:<fn>:<json-args>` where `<target>` is the C-strkey of the contract to call, `<fn>` is the function name, and `<json-args>` is a JSON array of **scalar** arguments encoded directly: a JSON number becomes an `i128`, a JSON string becomes a Soroban `String` (raw UTF-8), and `null` becomes `Void`. Booleans, objects, and nested arrays are rejected. There is no automatic typed encoding — a string is not turned into an `Address`, so functions that take addresses or other non-scalar types cannot be driven through this JSON form.
 
@@ -231,7 +239,7 @@ stellar-agent smart-account multicall \
 
 ## Upgrade timelock (`smart-account timelock`)
 
-Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelock contract. The signer must hold the appropriate role for each write verb. All four share `--timelock <C>` (req), `--rpc-url`, `--secondary-rpc-url`, `--network`, `--profile`; the write verbs add the signer-source group. Write verbs (`schedule`, `cancel`, `execute`) refuse `mainnet`; `list-pending` is read-only and accepts `mainnet`. When `--secondary-rpc-url` is omitted it defaults to `--rpc-url`; supplying an independent endpoint restores cross-RPC divergence detection.
+Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelock contract. The signer must hold the appropriate role for each write verb. All four share `--timelock <C>` (req), `--rpc-url`, `--secondary-rpc-url`, `--network`, `--profile`; the write verbs add the signer-source group. Write verbs (`schedule`, `cancel`, `execute`) refuse `mainnet`; `list-pending` is read-only and accepts `mainnet`. Without the secondary flag, the profile secondary applies. Timelock uses the primary if no secondary is configured.
 
 | Verb | Role | Extra flags | Notes |
 |------|------|-------------|-------|

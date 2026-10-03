@@ -90,11 +90,8 @@ pub(crate) const CLI_STATE_LAYOUT: ProfileStateLayout =
 
 /// Why a profile could not be made available to a command.
 ///
-/// The two arms are distinguished because their dispositions differ at several
-/// call sites: `smart-account multicall` tolerates a `NotFound` load while it
-/// must refuse a mismatch, and the signer ceremony keeps its documented
-/// warn-fallback for a load failure while failing closed on a mismatch. A
-/// single flattened error would make either disposition impossible to write.
+/// Load failures retain their typed cause. Name mismatches retain the selected
+/// and derived identities so each command can render the required recovery.
 #[derive(Debug)]
 pub(crate) enum ProfileAccessError {
     /// The loader refused: the file is absent, malformed, carries an
@@ -176,17 +173,6 @@ impl ProfileAccessError {
                 )
         )
     }
-
-    /// `true` when the profile file simply does not exist.
-    ///
-    /// The one disposition that may treat an error as "no profile configured"
-    /// rather than as a refusal; a mismatch never satisfies it.
-    pub(crate) fn is_not_found(&self) -> bool {
-        matches!(
-            self,
-            Self::Load(profile_loader::ProfileLoadError::NotFound { .. })
-        )
-    }
 }
 
 impl std::fmt::Display for ProfileAccessError {
@@ -205,9 +191,8 @@ impl std::fmt::Display for ProfileAccessError {
 ///
 /// The resolved name retains the input that selected the profile.
 ///
-/// `multicall_hook` is threaded to the loader for the one command that needs
-/// the multicall registry available while the profile is parsed
-/// (`smart-account multicall`); pass `None` everywhere else.
+/// `multicall_hook` passes an optional registry check to the loader.
+/// Command call sites pass `None` and validate their effective secondary endpoint.
 ///
 /// # Errors
 ///
@@ -315,12 +300,13 @@ pub(crate) fn profile_access_envelope(
 /// Origin of a profile resolved by [`load_profile_or_synthesize_testnet`].
 ///
 /// Two origin-aware behaviors key off this distinction, neither engine-aware:
-/// - Platform keyring store initialisation (e.g. `pay::resolve_profile_and_keyring`,
-///   the analogous helper in `claim`, and the inline attempt in `accounts
-///   create`'s sponsored path) logs a `tracing::warn!` and continues past a
-///   failed attempt for a [`Self::Synthesized`] profile, so a host with no
-///   platform keyring store (e.g. a container without a Secret Service) never
-///   blocks the zero-config quickstart's signing.
+/// - Platform keyring store initialisation logs a `tracing::warn!` and
+///   continues past a failed attempt for a [`Self::Synthesized`] profile. A
+///   host with no platform keyring store, such as a container without a
+///   Secret Service, therefore never blocks the zero-config quickstart's
+///   signing. The sites are `pay::init_keyring_for_origin`, the analogous
+///   helper in `claim`, and the inline attempt in `accounts create`'s
+///   sponsored path.
 /// - The audit pre-flight (see
 ///   [`crate::commands::value_audit::require_value_audit_writer_for_origin`])
 ///   stays fail-open (warn-only) for a [`Self::Synthesized`] profile when the
@@ -337,6 +323,7 @@ pub(crate) enum ProfileOrigin {
     /// No profile was named and no profile file exists; an in-memory
     /// `Noop`-engine testnet profile was synthesized so `pay` / `claim` /
     /// `accounts create` keep working without an authored profile.
+    /// The wallet uses `MlockRequired::Warn` and the default unlock TTL.
     Synthesized,
 }
 
@@ -415,6 +402,12 @@ where
                 name,
             )
             .policy_engine(PolicyEngineKind::Noop)
+            .wallet({
+                let mut wallet = stellar_agent_core::profile::schema::WalletConfig::default();
+                wallet.mlock_required = stellar_agent_core::wallet::MlockRequired::Warn;
+                wallet.unlock_ttl_seconds = stellar_agent_core::wallet::DEFAULT_TTL_SECONDS;
+                wallet
+            })
             .build();
             Ok((profile, ProfileOrigin::Synthesized))
         }
@@ -960,5 +953,67 @@ mod tests {
         let rendered = envelope.error.as_ref().expect("error envelope");
         assert_eq!(rendered.code, "profile.name_mismatch");
         assert_eq!(rendered.code, err.code());
+    }
+}
+
+#[cfg(test)]
+mod synthesis_posture_tests {
+    #![allow(clippy::expect_used, reason = "test fixture assertions")]
+    #[test]
+    fn synthesized_profile_uses_warn_posture() {
+        use super::*;
+        let resolved = ResolvedProfileName {
+            name: "default".into(),
+            source: stellar_agent_core::profile::ProfileNameSource::Default,
+        };
+        let result = load_profile_or_synthesize_testnet_with(&resolved, |_| {
+            Err(profile_loader::ProfileLoadError::NotFound {
+                name: "default".into(),
+                path: std::path::PathBuf::from("absent"),
+            })
+        });
+        let (profile, origin) = result.expect("synthesis");
+        assert_eq!(origin, ProfileOrigin::Synthesized);
+        assert_eq!(
+            profile.wallet.mlock_required,
+            stellar_agent_core::wallet::MlockRequired::Warn
+        );
+        assert_eq!(
+            profile.wallet.unlock_ttl_seconds,
+            stellar_agent_core::wallet::DEFAULT_TTL_SECONDS
+        );
+    }
+}
+
+/// Profile fixtures shared by the command test modules.
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    #![allow(clippy::expect_used, reason = "test fixture setup")]
+
+    use super::{Profile, profile_loader};
+
+    /// Persists a mainnet profile named `guard-mainnet` whose `rpc_url` is
+    /// `rpc_url` under a temporary home, and clears `STELLAR_AGENT_PROFILE`.
+    ///
+    /// The returned guards keep the home redirect and the cleared variable in
+    /// force; the caller holds them for the test's duration under `#[serial]`.
+    pub(crate) fn mainnet_guard_fixture(
+        rpc_url: &str,
+    ) -> (
+        tempfile::TempDir,
+        stellar_agent_test_support::StellarAgentHomeGuard,
+        stellar_agent_test_support::ProfileEnvVarGuard,
+    ) {
+        let dir = tempfile::tempdir().expect("guard home");
+        let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let profile = Profile::builder_mainnet_named("guard-mainnet", "s", "default", "n", "a")
+            .rpc_url(rpc_url)
+            .audit_log_path(dir.path().join("audit.jsonl"))
+            .with_noop_engine()
+            .build();
+        profile_loader::save_new_to_dir("guard-mainnet", &profile, &dir.path().join("profiles"))
+            .expect("persist mainnet fixture");
+        (dir, home, env)
     }
 }

@@ -114,12 +114,16 @@ use stellar_agent_network::{FriendbotResult, fund_with_friendbot};
 use crate::commands::policy_engine::{
     build_v1_policy_engine, create_policy_args, evaluate_value_moving_policy,
 };
-use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
+use crate::common::network::{
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+};
 use crate::common::profile_access::{
     ProfileOrigin, injected_profile_load, load_profile_or_synthesize_testnet_with,
 };
 use crate::common::render::{render_json, sanitize_for_table};
-use crate::common::signer_ceremony::{SignerCeremonyOutcome, resolve_software_signer_from_env};
+use crate::common::signer_ceremony::{
+    SignerCeremonyOutcome, require_enrolled_signer, resolve_software_signer_from_env,
+};
 use crate::common::{ResolvedProfileName, resolve_profile_name};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -344,11 +348,10 @@ pub struct CreateArgs {
     #[arg(long, group = "mode_group")]
     pub fund_with_friendbot: bool,
 
-    /// Network to target. `mainnet` parses but is structurally refused before
-    /// any RPC call or signing (sponsored mode: `network.mainnet_write_forbidden`;
-    /// Friendbot mode: `network.friendbot_mainnet_forbidden`).
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
     /// Friendbot endpoint URL.
     #[arg(
@@ -370,13 +373,12 @@ pub struct CreateArgs {
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
     pub timeout_seconds: u64,
 
-    /// Override the Stellar RPC endpoint URL (sponsored mode).
-    #[arg(
-        long,
-        default_value = TESTNET_RPC_URL,
-        value_name = "URL"
-    )]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -408,18 +410,19 @@ pub async fn run(args: &CreateArgs) -> i32 {
 /// [`init_platform_keyring_store`]. Tests substitute an in-memory profile and
 /// a spy initialiser to assert the keyring store is registered before the V1
 /// policy gate's owner-key read (see `run_sponsored`) without touching the OS
-/// keychain. Only the sponsored path receives the injected pair — Friendbot
-/// mode is not gated (see the module-level doc comment) and touches no
-/// keyring.
+/// keychain. Both arms receive the loaded profile; only the sponsored arm
+/// receives the keyring initialiser, because Friendbot mode is not gated (see
+/// the module-level doc comment) and touches no keyring.
 ///
 /// # The injected closure LOADS ONLY
 ///
 /// `load_profile` performs the load and nothing else. Whether a `NotFound`
 /// may be replaced by the synthesized zero-config profile is decided by
-/// [`load_profile_or_synthesize_testnet_with`], which `run_sponsored` calls
-/// with the resolved name — so the refusal for a named-but-missing profile
-/// runs on the injected path exactly as it does in production. A check placed
-/// inside the closure would be bypassed by every test that supplies its own.
+/// [`load_profile_or_synthesize_testnet_with`], which this function calls once,
+/// at entry, with the resolved name. The refusal for a named-but-missing
+/// profile therefore runs on the injected path exactly as it does in
+/// production. A check placed inside the closure would be bypassed by every
+/// test that supplies its own.
 async fn run_with_dependencies<LoadProfile, InitKeyring>(
     args: &CreateArgs,
     load_profile: LoadProfile,
@@ -429,22 +432,37 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone());
+    let resolved = resolve_profile_name(args.profile.as_deref());
+    let (profile, origin) = match load_profile_or_synthesize_testnet_with(&resolved, load_profile) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            print_error(
+                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
+                args.output,
+            );
+            return 1;
+        }
+    };
+    let context = match network_context_for_command(
+        &profile,
+        &resolved.name,
+        EndpointFlags {
+            network: args.network,
+            rpc_url: args.rpc_url.as_deref(),
+            secondary_rpc_url: None,
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
+    };
+    tracing::debug!(profile = %resolved.name, profile_source = resolved.source.as_str(), "accounts create: profile resolved");
     if args.fund_with_friendbot {
         run_friendbot(&context, args).await
     } else {
-        let resolved = resolve_profile_name(args.profile.as_deref());
-        // The resolved name and the input that supplied it are logged
-        // together: a report of a run signing against the wrong profile is
-        // diagnosable only if the log says which name was used and where it
-        // came from. Mirrors the MCP server's startup line. Friendbot mode
-        // resolves no profile, so the line belongs on this arm only.
-        tracing::debug!(
-            profile = %resolved.name,
-            profile_source = resolved.source.as_str(),
-            "accounts create: profile resolved"
-        );
-        run_sponsored(&context, args, &resolved, load_profile, init_keyring).await
+        run_sponsored(&context, args, &resolved, &profile, origin, init_keyring).await
     }
 }
 
@@ -609,11 +627,11 @@ fn build_friendbot_result(new_account: &NewAccount, fb: &FriendbotResult) -> Cre
 /// engine); returns `Err(exit_code)` — with the refusal envelope already
 /// rendered — when the operation must be refused.
 ///
-/// `profile` is the already-resolved profile from `run_sponsored`'s
-/// top-of-gated-path load; this function does not re-resolve it, so the
-/// platform keyring store `run_sponsored` unconditionally initialised (ahead
-/// of its origin-aware audit pre-flight) remains registered for the
-/// `build_v1_policy_engine` owner-key read below.
+/// `profile` is the profile `run_with_dependencies` loaded at entry. This
+/// function does not re-resolve it. The platform keyring store that
+/// `run_sponsored` initialised ahead of its origin-aware audit pre-flight
+/// therefore stays registered for the `build_v1_policy_engine` owner-key read
+/// below.
 fn evaluate_create_policy(
     args: &CreateArgs,
     profile: &Profile,
@@ -671,15 +689,15 @@ fn evaluate_create_policy(
 // Sponsored mode
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn run_sponsored<LoadProfile, InitKeyring>(
+async fn run_sponsored<InitKeyring>(
     context: &NetworkContext,
     args: &CreateArgs,
     resolved: &ResolvedProfileName,
-    load_profile: LoadProfile,
+    profile: &Profile,
+    origin: ProfileOrigin,
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     // Sponsored mode — mainnet write forbidden.
@@ -761,16 +779,6 @@ where
     // profile, so a host with no platform keyring store (e.g. a container
     // without a Secret Service) never blocks the documented no-setup
     // quickstart.
-    let (profile, origin) = match load_profile_or_synthesize_testnet_with(resolved, load_profile) {
-        Ok(p) => p,
-        Err(e) => {
-            print_error(
-                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
-                args.output,
-            );
-            return 1;
-        }
-    };
     if let Err(e) = init_keyring() {
         match origin {
             ProfileOrigin::Persisted => {
@@ -827,7 +835,7 @@ where
         }
     };
     crate::commands::submission_record::reconcile_open_reservations(
-        &profile,
+        profile,
         &resolved.name,
         &client,
         now_ms,
@@ -839,7 +847,7 @@ where
     let starting_balance_stroops = starting_balance.as_stroops();
     let create_effects = match evaluate_create_policy(
         args,
-        &profile,
+        profile,
         &resolved.name,
         starting_balance_stroops,
         &new_account.g_strkey,
@@ -859,7 +867,7 @@ where
     // Where `Some`, the writer is reused (not re-acquired) for the
     // post-confirm `value_action_submitted` row.
     let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
-        &profile,
+        profile,
         &resolved.name,
         origin,
     ) {
@@ -877,7 +885,7 @@ where
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
             policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
-            profile: &profile,
+            profile,
             profile_name: resolved.name.clone(),
             verb: "accounts create",
             tool: "stellar_create_account",
@@ -900,6 +908,8 @@ where
     match sponsored_create(
         context,
         args,
+        profile,
+        &resolved.name,
         &sponsor,
         &new_account.g_strkey,
         starting_balance,
@@ -937,6 +947,48 @@ where
     }
 }
 
+async fn sign_envelope(
+    context: &NetworkContext,
+    args: &CreateArgs,
+    unsigned_xdr: &str,
+    sponsor: &str,
+    profile: &Profile,
+    profile_name: &str,
+) -> Result<String, WalletError> {
+    let passphrase = context.network_passphrase();
+
+    let signer: Box<dyn Signer + Send + Sync> =
+        match (args.sign_with_ledger, args.secret_env.as_deref()) {
+            (true, _) => Box::new(signer_from_ledger(args.account_index, sponsor).await?),
+            (false, Some(var_name)) => {
+                let SignerCeremonyOutcome {
+                    signer,
+                    mlock_degradation: _,
+                } = resolve_software_signer_from_env(var_name, "create-account-commit", profile)
+                    .await?;
+                let derived = signer.public_key().await?.to_string().to_string();
+                if derived != sponsor {
+                    return Err(AuthError::SignerKeyMismatch {
+                        expected: sponsor.to_owned(),
+                        got: derived,
+                    }
+                    .into());
+                }
+                Box::new(signer)
+            }
+            (false, None) => {
+                return Err(ValidationError::SignerSourceRequired {
+                    detail:
+                        "no signer flag specified; pass --secret-env <VAR> or --sign-with-ledger"
+                            .to_owned(),
+                }
+                .into());
+            }
+        };
+    require_enrolled_signer(profile_name, profile, signer.as_ref()).await?;
+    attach_signature(unsigned_xdr, signer.as_ref(), passphrase).await
+}
+
 /// Builds, signs, and submits the `CreateAccount` transaction.
 ///
 /// # Signing path
@@ -951,9 +1003,15 @@ where
 /// # Errors
 ///
 /// Propagates errors from account fetch, signing, or submission.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "loaded profile identity accompanies the transaction and recorder"
+)]
 async fn sponsored_create(
     context: &NetworkContext,
     args: &CreateArgs,
+    profile: &Profile,
+    profile_name: &str,
     sponsor: &str,
     new_account: &str,
     starting_balance: StellarAmount,
@@ -963,53 +1021,16 @@ async fn sponsored_create(
         build_sponsored_unsigned_envelope(context, args, sponsor, new_account, starting_balance)
             .await?;
 
+    let signed_xdr = sign_envelope(
+        context,
+        args,
+        &built.envelope_xdr,
+        sponsor,
+        profile,
+        profile_name,
+    )
+    .await?;
     let passphrase = context.network_passphrase();
-
-    let signed_xdr = if args.sign_with_ledger {
-        // Hardware path: seed never enters process memory.
-        let signer = signer_from_ledger(args.account_index, sponsor).await?;
-        attach_signature(&built.envelope_xdr, &signer, passphrase).await?
-    } else if let Some(ref var_name) = args.secret_env {
-        // mlock-protected signing window (shared ceremony):
-        //
-        // 1. Derive the SoftwareSigningKey via
-        //    `resolve_software_signer_from_env` (env -> Zeroizing<String> ->
-        //    seed Zeroizing<[u8; 32]> -> zeroize PrivateKey.0 residue ->
-        //    Wallet::unlock -> signer_from_wallet -> wallet.dispose()).
-        // 2. Verify the derived public key matches --sponsor before signing.
-        // 3. attach_signature exactly once.
-        // 4. Drop SoftwareSigningKey -> SecretBox zeroised.
-        //
-        // A degraded mlock unlock is a separate, orthogonal concern from the
-        // audit pre-flight `run_sponsored` already ran before this function:
-        // it is surfaced only via `Wallet::unlock`'s own `tracing::warn!`,
-        // not via the audit writer.
-        let SignerCeremonyOutcome {
-            signer,
-            mlock_degradation: _,
-        } = resolve_software_signer_from_env(var_name, "create-account-commit", None).await?;
-
-        // Public-key verification before signing.
-        let signer_pk = signer.public_key().await?;
-        let signer_gstrkey = signer_pk.to_string().to_string();
-        if signer_gstrkey != sponsor {
-            return Err(WalletError::Auth(AuthError::SignerKeyMismatch {
-                expected: sponsor.to_owned(),
-                got: signer_gstrkey,
-            }));
-        }
-
-        let signed = attach_signature(&built.envelope_xdr, &signer, passphrase).await?;
-        drop(signer);
-        signed
-    } else {
-        return Err(WalletError::Validation(
-            ValidationError::SignerSourceRequired {
-                detail: "no signer flag specified; pass --secret-env <VAR> or --sign-with-ledger"
-                    .to_owned(),
-            },
-        ));
-    };
 
     // Submit and wait for confirmation.
     let client = StellarRpcClient::new(&context.rpc_url)?;
@@ -1140,6 +1161,7 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic, reason = "test spies reject keyring access")]
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -1151,6 +1173,10 @@ mod tests {
     use stellar_agent_core::profile::schema::PolicyEngineKind;
 
     use super::*;
+    use crate::common::signer_ceremony::test_fixtures::{
+        EnrolledPin, assert_enrolled_outcome, enrolled_mainnet_profile, enrolled_test_g,
+        enrolled_test_secret,
+    };
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
 
     const SOURCE_G: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
@@ -1447,12 +1473,67 @@ mod tests {
 
     // ── Network / mainnet rejection tests ────────────────────────────────────
 
+    /// The friendbot arm on a mainnet profile exits 1 before any request
+    /// reaches the profile's endpoint. The binary tests in
+    /// `tests/profile_env_var_resolution.rs` pin the refusal's wire code.
     #[tokio::test]
-    async fn friendbot_mainnet_rejected_before_http_call() {
+    #[serial_test::serial]
+    async fn friendbot_mainnet_profile_reaches_no_endpoint() {
+        let guard_rpc = wiremock::MockServer::start().await;
+        let (_guard_dir, _guard_home, _guard_env) =
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&guard_rpc.uri());
         let args = CreateArgs {
-            // Zero-config group: `None` is "no profile named", the path that
-            // still synthesizes. `Some("default")` would be an explicitly
-            // named profile and would refuse instead.
+            profile: Some("guard-mainnet".into()),
+            new_account: Some(
+                "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
+            ),
+            generate: false,
+            starting_balance: None,
+            sponsor: None,
+            secret_env: None,
+            sign_with_ledger: false,
+            account_index: 0,
+            fund_with_friendbot: true,
+            network: Some(TargetNetwork::Mainnet),
+            // Non-routable, so no request leaves the host.
+            friendbot_url: "http://127.0.0.1:1".to_owned(),
+            output: OutputFormat::Json,
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            rpc_url: None,
+            fee: None,
+        };
+        let exit = run_with_dependencies(
+            &args,
+            |name| {
+                Ok(
+                    Profile::builder_mainnet_named(name, "s", "default", "n", "a")
+                        .rpc_url(guard_rpc.uri())
+                        .build(),
+                )
+            },
+            || panic!("mainnet must not initialize the keyring"),
+        )
+        .await;
+        assert_eq!(exit, 1, "mainnet friendbot must exit with code 1");
+        assert!(
+            guard_rpc
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
+    }
+
+    /// `--network mainnet` with no profile exits 1 on the friendbot arm before
+    /// any request reaches the endpoint `--rpc-url` names.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn friendbot_mainnet_flag_without_profile_reaches_no_endpoint() {
+        let guard_rpc = wiremock::MockServer::start().await;
+        let guard_home = tempfile::tempdir().expect("home");
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let args = CreateArgs {
             profile: None,
             new_account: Some(
                 "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
@@ -1464,25 +1545,92 @@ mod tests {
             sign_with_ledger: false,
             account_index: 0,
             fund_with_friendbot: true,
-            network: TargetNetwork::Mainnet,
-            // Non-routable: if any HTTP call were made it would fail with a
-            // connection error, making an accidentally-passing test impossible.
+            network: Some(TargetNetwork::Mainnet),
+            // Non-routable, so no request leaves the host.
             friendbot_url: "http://127.0.0.1:1".to_owned(),
             output: OutputFormat::Json,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            rpc_url: "http://127.0.0.1:1".to_owned(),
+            rpc_url: Some(guard_rpc.uri()),
             fee: None,
         };
-        let exit = run(&args).await;
+        let exit = run_with_dependencies(
+            &args,
+            |name| {
+                Err(
+                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
+                        name: name.into(),
+                        path: std::path::PathBuf::from("absent"),
+                    },
+                )
+            },
+            || panic!("network mismatch must not initialize the keyring"),
+        )
+        .await;
         assert_eq!(exit, 1, "mainnet friendbot must exit with code 1");
+        assert!(
+            guard_rpc
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn sponsored_mainnet_rejected_before_rpc_call() {
+        let guard_rpc = wiremock::MockServer::start().await;
+        let (_guard_dir, _guard_home, _guard_env) =
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&guard_rpc.uri());
         let args = CreateArgs {
-            // Zero-config group: `None` is "no profile named", the path that
-            // still synthesizes. `Some("default")` would be an explicitly
-            // named profile and would refuse instead.
+            profile: Some("guard-mainnet".into()),
+            new_account: Some(
+                "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
+            ),
+            generate: false,
+            starting_balance: Some("5 XLM".to_owned()),
+            sponsor: Some("GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned()),
+            secret_env: Some("SPONSOR_SECRET".to_owned()),
+            sign_with_ledger: false,
+            account_index: 0,
+            fund_with_friendbot: false,
+            network: Some(TargetNetwork::Mainnet),
+            friendbot_url: "http://127.0.0.1:1".to_owned(),
+            output: OutputFormat::Json,
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            rpc_url: None,
+            fee: None,
+        };
+        let exit = run_with_dependencies(
+            &args,
+            |name| {
+                Ok(
+                    Profile::builder_mainnet_named(name, "s", "default", "n", "a")
+                        .rpc_url(guard_rpc.uri())
+                        .build(),
+                )
+            },
+            || panic!("mainnet must not initialize the keyring"),
+        )
+        .await;
+        assert_eq!(exit, 1, "mainnet sponsored must exit with code 1");
+        assert!(
+            guard_rpc
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sponsored_mainnet_rejected_before_rpc_call_network_flag_without_profile_refuses() {
+        let guard_rpc = wiremock::MockServer::start().await;
+        let guard_home = tempfile::tempdir().expect("home");
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let args = CreateArgs {
             profile: None,
             new_account: Some(
                 "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
@@ -1494,15 +1642,34 @@ mod tests {
             sign_with_ledger: false,
             account_index: 0,
             fund_with_friendbot: false,
-            network: TargetNetwork::Mainnet,
+            network: Some(TargetNetwork::Mainnet),
             friendbot_url: "http://127.0.0.1:1".to_owned(),
             output: OutputFormat::Json,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            rpc_url: "http://127.0.0.1:1".to_owned(),
+            rpc_url: Some(guard_rpc.uri()),
             fee: None,
         };
-        let exit = run(&args).await;
+        let exit = run_with_dependencies(
+            &args,
+            |name| {
+                Err(
+                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
+                        name: name.into(),
+                        path: std::path::PathBuf::from("absent"),
+                    },
+                )
+            },
+            || panic!("network mismatch must not initialize the keyring"),
+        )
+        .await;
         assert_eq!(exit, 1, "mainnet sponsored must exit with code 1");
+        assert!(
+            guard_rpc
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1510,12 +1677,12 @@ mod tests {
         let server = mount_create_build_rpc("333").await;
         let mut args = minimal_sponsored_args();
         args.fee = Some("250".to_owned());
-        args.rpc_url = server.uri();
+        args.rpc_url = Some(server.uri());
         let starting_balance =
             StellarAmount::parse_with_unit("1 XLM").expect("test amount with unit must parse");
 
         let built = build_sponsored_unsigned_envelope(
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+            &flag_context(&args),
             &args,
             SOURCE_G,
             DEST_G,
@@ -1571,12 +1738,12 @@ mod tests {
     async fn accounts_create_cli_default_fee_surfaces_profile_default() {
         let server = mount_create_build_rpc("333").await;
         let mut args = minimal_sponsored_args();
-        args.rpc_url = server.uri();
+        args.rpc_url = Some(server.uri());
         let starting_balance =
             StellarAmount::parse_with_unit("1 XLM").expect("test amount with unit must parse");
 
         let built = build_sponsored_unsigned_envelope(
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+            &flag_context(&args),
             &args,
             SOURCE_G,
             DEST_G,
@@ -1596,12 +1763,12 @@ mod tests {
         let server = mount_create_build_rpc("333").await;
         let mut args = minimal_sponsored_args();
         args.fee = Some("auto".to_owned());
-        args.rpc_url = server.uri();
+        args.rpc_url = Some(server.uri());
         let starting_balance =
             StellarAmount::parse_with_unit("1 XLM").expect("test amount with unit must parse");
 
         let built = build_sponsored_unsigned_envelope(
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+            &flag_context(&args),
             &args,
             SOURCE_G,
             DEST_G,
@@ -1662,11 +1829,11 @@ mod tests {
             sign_with_ledger: false,
             account_index: 0,
             fund_with_friendbot: true,
-            network: TargetNetwork::Testnet,
+            network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            rpc_url: TESTNET_RPC_URL.to_owned(),
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
         };
         let acc = resolve_new_account(&args).expect("generate must succeed");
@@ -1708,11 +1875,11 @@ mod tests {
             sign_with_ledger: false,
             account_index: 0,
             fund_with_friendbot: true,
-            network: TargetNetwork::Testnet,
+            network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            rpc_url: TESTNET_RPC_URL.to_owned(),
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
         };
         let result = resolve_new_account(&args);
@@ -1746,11 +1913,11 @@ mod tests {
             sign_with_ledger: false,
             account_index: 0,
             fund_with_friendbot: true,
-            network: TargetNetwork::Testnet,
+            network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            rpc_url: TESTNET_RPC_URL.to_owned(),
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
         };
         let acc = resolve_new_account(&args).expect("positional G-strkey must resolve");
@@ -1780,11 +1947,11 @@ mod tests {
             sign_with_ledger: false,
             account_index: 0,
             fund_with_friendbot: true,
-            network: TargetNetwork::Testnet,
+            network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            rpc_url: TESTNET_RPC_URL.to_owned(),
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
         };
         let acc = resolve_new_account(&args).expect("--generate must succeed");
@@ -1856,13 +2023,23 @@ mod tests {
             sign_with_ledger: false,
             account_index: 0,
             fund_with_friendbot: false,
-            network: TargetNetwork::Testnet,
+            network: Some(TargetNetwork::Testnet),
             friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
             output: OutputFormat::Json,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            rpc_url: TESTNET_RPC_URL.to_owned(),
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
         }
+    }
+
+    /// The context a testnet profile yields for the endpoint flags of `args`.
+    fn flag_context(args: &CreateArgs) -> NetworkContext {
+        NetworkContext::new(
+            args.network.unwrap_or(TargetNetwork::Testnet).caip2(),
+            args.rpc_url
+                .clone()
+                .unwrap_or_else(|| crate::common::network::TESTNET_RPC_URL.to_owned()),
+        )
     }
 
     // ── keyring store initialisation ordering (issue #41) ────────────────────
@@ -2016,7 +2193,7 @@ mod tests {
 
         let server = mount_create_build_rpc("333").await;
         let mut args = minimal_sponsored_args();
-        args.rpc_url = server.uri();
+        args.rpc_url = Some(server.uri());
 
         // The loader reports the profile file is absent; `minimal_sponsored_args`
         // names no profile, so the choke point synthesizes (zero-config group).
@@ -2052,5 +2229,70 @@ mod tests {
             "execution must reach the sponsor-account RPC fetch, proving the synthesized \
              profile's keyring-init failure was tolerated rather than treated as fatal"
         );
+    }
+
+    #[allow(unsafe_code, reason = "serialized test seed variable")]
+    async fn enrolled_signing_case(pin: EnrolledPin) {
+        let g = enrolled_test_g();
+        let var = "ENROLLED_ACCOUNTS_CREATE_TEST_SEED";
+        unsafe {
+            std::env::set_var(var, enrolled_test_secret());
+        }
+        let mut profile = enrolled_mainnet_profile(pin);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(CreateBuildRpcResponder::new(
+                account_ledger_key_xdr(&g),
+                account_entry_xdr_with_balance(&g, 100_000_000_000),
+                fee_stats_result("100", "100"),
+            ))
+            .mount(&server)
+            .await;
+        profile.rpc_url = server.uri();
+        let context = NetworkContext::from_profile(&profile);
+        let mut args = minimal_sponsored_args();
+        args.sponsor = Some(g.clone());
+        args.secret_env = Some(var.into());
+        args.fee = Some("100".into());
+        let built = build_sponsored_unsigned_envelope(
+            &context,
+            &args,
+            &g,
+            DEST_G,
+            StellarAmount::parse_with_unit("1 XLM").expect("amount"),
+        )
+        .await
+        .expect("build against mock");
+        let result = sign_envelope(
+            &context,
+            &args,
+            &built.envelope_xdr,
+            &g,
+            &profile,
+            "enrolled",
+        )
+        .await;
+        unsafe {
+            std::env::remove_var(var);
+        }
+        assert_enrolled_outcome(pin, result);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_signing_equal() {
+        enrolled_signing_case(EnrolledPin::Derived).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_signing_placeholder() {
+        enrolled_signing_case(EnrolledPin::Placeholder).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_signing_mismatch() {
+        enrolled_signing_case(EnrolledPin::Other).await;
     }
 }

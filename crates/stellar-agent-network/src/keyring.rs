@@ -954,6 +954,38 @@ pub async fn signer_from_keyring(
     })
 }
 
+/// The profile's enrolled keyring signer; on mainnet the pin must be valid and the stored key must derive to it.
+///
+/// # Errors
+/// Refuses invalid enrollment, a different stored key, or a keyring load failure.
+pub async fn enrolled_keyring_signer(
+    profile_name: &str,
+    profile: &stellar_agent_core::profile::Profile,
+    expected_source_g: &str,
+) -> Result<KeyringSignHandle, WalletError> {
+    use stellar_agent_core::profile::enrolled_signer_pin;
+    let pin = enrolled_signer_pin(profile_name, profile)?;
+    let result = signer_from_keyring(&profile.mcp_signer_default, expected_source_g).await;
+    if let Some(enrolled) = pin {
+        let derived = match &result {
+            Ok(handle) => Some(handle.public_key().to_string().to_string()),
+            Err(WalletError::Auth(AuthError::SignerKeyMismatch { got, .. })) => Some(got.clone()),
+            _ => None,
+        };
+        if let Some(derived) = derived
+            && derived != enrolled
+        {
+            return Err(AuthError::EnrolledSignerMismatch {
+                profile: profile_name.to_owned(),
+                enrolled,
+                derived,
+            }
+            .into());
+        }
+    }
+    result
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1144,6 +1176,158 @@ mod tests {
     fn store_sstrkey(entry_ref: &KeyringEntryRef, sstrkey: &str) {
         let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).unwrap();
         entry.set_password(sstrkey).unwrap();
+    }
+
+    fn enrolled_profile(mainnet: bool, pin: &str) -> stellar_agent_core::profile::Profile {
+        if mainnet {
+            stellar_agent_core::profile::Profile::builder_mainnet_named(
+                "enrolled",
+                "identity-test",
+                pin,
+                "n",
+                "a",
+            )
+            .build()
+        } else {
+            stellar_agent_core::profile::Profile::builder_testnet_named(
+                "enrolled",
+                "identity-test",
+                pin,
+                "n",
+                "a",
+            )
+            .build()
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_mainnet_placeholder_refuses_before_store_read() {
+        keyring_mock::install().unwrap();
+        let profile = enrolled_profile(true, "default");
+        let entry = &profile.mcp_signer_default;
+        store_sstrkey(entry, &sstrkey_for_seed([1; 32]));
+        keyring_mock::inject_error(&entry.service, &entry.account, keyring_core::Error::NoEntry)
+            .unwrap();
+        let error = enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32]))
+            .await
+            .err()
+            .expect("refusal");
+        assert_eq!(error.code(), "auth.enrolled_signer_unpinned");
+        let stored = KeyringEntry::new(&entry.service, &entry.account).unwrap();
+        assert!(
+            matches!(stored.get_password(), Err(keyring_core::Error::NoEntry)),
+            "the injected store error must remain unread"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_mainnet_malformed_refuses_before_store_read() {
+        keyring_mock::install().unwrap();
+        let profile = enrolled_profile(true, "malformed");
+        let entry = &profile.mcp_signer_default;
+        store_sstrkey(entry, &sstrkey_for_seed([1; 32]));
+        keyring_mock::inject_error(&entry.service, &entry.account, keyring_core::Error::NoEntry)
+            .unwrap();
+        let error = enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32]))
+            .await
+            .err()
+            .expect("refusal");
+        assert_eq!(error.code(), "auth.enrolled_signer_unpinned");
+        let stored = KeyringEntry::new(&entry.service, &entry.account).unwrap();
+        assert!(
+            matches!(stored.get_password(), Err(keyring_core::Error::NoEntry)),
+            "the injected store error must remain unread"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_stored_b_expected_a() {
+        keyring_mock::install().unwrap();
+        let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
+        store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([2; 32]));
+        let result =
+            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32])).await;
+        assert_eq!(
+            result.err().expect("refusal").code(),
+            "auth.enrolled_signer_mismatch"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_stored_b_expected_b() {
+        keyring_mock::install().unwrap();
+        let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
+        store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([2; 32]));
+        let result =
+            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([2; 32])).await;
+        assert_eq!(
+            result.err().expect("refusal").code(),
+            "auth.enrolled_signer_mismatch"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_stored_a_expected_b() {
+        keyring_mock::install().unwrap();
+        let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
+        store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([1; 32]));
+        let result =
+            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([2; 32])).await;
+        assert_eq!(
+            result.err().expect("refusal").code(),
+            "auth.signer_key_mismatch"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_stored_a_expected_a() {
+        keyring_mock::install().unwrap();
+        let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
+        store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([1; 32]));
+        let result =
+            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32])).await;
+        assert_eq!(
+            result.expect("handle").public_key().to_string().to_string(),
+            gstrkey_for_seed([1; 32])
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_testnet_stored_a_expected_a() {
+        keyring_mock::install().unwrap();
+        let profile = enrolled_profile(false, &gstrkey_for_seed([1; 32]));
+        store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([1; 32]));
+        let result =
+            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32])).await;
+        assert_eq!(
+            result.expect("handle").public_key().to_string().to_string(),
+            gstrkey_for_seed([1; 32])
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_testnet_placeholder_preserves_keyring_errors() {
+        keyring_mock::install().unwrap();
+        let profile = enrolled_profile(false, "default");
+        let result = enrolled_keyring_signer("enrolled", &profile, "default").await;
+        assert_eq!(
+            result.err().expect("absent key").code(),
+            "auth.keyring_not_found"
+        );
+        store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([1; 32]));
+        let result = enrolled_keyring_signer("enrolled", &profile, "default").await;
+        assert_eq!(
+            result.err().expect("source mismatch").code(),
+            "auth.signer_key_mismatch"
+        );
     }
 
     fn json_capture_subscriber(

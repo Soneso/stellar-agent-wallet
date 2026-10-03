@@ -402,11 +402,11 @@ impl SmartAccountArgs {
             SmartAccountSubcommand::RegisterMulticall(a) => a.profile.as_deref(),
             SmartAccountSubcommand::UnregisterMulticall(a) => a.profile.as_deref(),
             SmartAccountSubcommand::Execute(a) => a.profile.as_deref(),
-            SmartAccountSubcommand::DeployWebAuthnVerifier(_)
-            | SmartAccountSubcommand::DeployEd25519Verifier(_)
-            | SmartAccountSubcommand::DeploySpendingLimitPolicy(_)
-            | SmartAccountSubcommand::DeployPolicy(_)
-            | SmartAccountSubcommand::ListVerifiers(_) => None,
+            SmartAccountSubcommand::DeployWebAuthnVerifier(a) => a.profile.as_deref(),
+            SmartAccountSubcommand::DeployEd25519Verifier(a) => a.profile.as_deref(),
+            SmartAccountSubcommand::DeploySpendingLimitPolicy(a) => a.profile.as_deref(),
+            SmartAccountSubcommand::DeployPolicy(a) => a.profile.as_deref(),
+            SmartAccountSubcommand::ListVerifiers(_) => None,
         }
     }
 }

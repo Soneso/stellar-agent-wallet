@@ -41,20 +41,22 @@ use std::time::Duration;
 
 use clap::{ArgGroup, Args};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
-use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
-use stellar_agent_network::NetworkContext;
+use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_network::{
     StellarRpcClient, parse_classic_fee_choice, resolve_classic_fee_selection,
 };
 use stellar_agent_smart_account::deployment::{
-    DeployerKeypair, PolicyDeployArgs, PolicyDeployKind, PolicyDeployResult, ResolvedFeePerOp,
-    deploy_policy,
+    PolicyDeployArgs, PolicyDeployKind, PolicyDeployResult, ResolvedFeePerOp, deploy_policy,
 };
 use tracing::info;
 
-use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
+use crate::common::network::{
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+};
+use crate::common::profile_access::load_profile_or_synthesize_testnet;
 use crate::common::render::{render_json, sanitize_for_table};
-use crate::common::signer_ceremony::{SignerCeremonyOutcome, resolve_software_signer_from_env};
+use crate::common::resolve_profile_name;
+use crate::common::signer_ceremony::resolve_deployer_keypair;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -113,6 +115,9 @@ impl From<PolicyKindArg> for PolicyDeployKind {
     ),
 )]
 pub struct DeployPolicyArgs {
+    /// Profile name; falls back to the environment, then the default profile.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
     /// Which policy contract to deploy.
     #[arg(
         long,
@@ -137,16 +142,17 @@ pub struct DeployPolicyArgs {
     #[arg(long, default_value_t = 0_u32, value_name = "INDEX")]
     pub account_index: u32,
 
-    /// Network to target.
-    ///
-    /// `mainnet` parses but deployment structurally refuses it
-    /// (`network.mainnet_write_forbidden`). Default: `testnet`.
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
-    /// Soroban RPC endpoint URL.
-    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
     /// Base fee per operation in stroops, or `auto` / `auto:pNN` for `getFeeStats`
     /// automatic selection.
@@ -182,7 +188,32 @@ pub struct DeployPolicyArgs {
 ///
 /// Never panics.
 pub async fn run(args: &DeployPolicyArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone());
+    let resolved = resolve_profile_name(args.profile.as_deref());
+    let (profile, _origin) = match load_profile_or_synthesize_testnet(&resolved) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            print_error(
+                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
+                args.output,
+            );
+            return 1;
+        }
+    };
+    let context = match network_context_for_command(
+        &profile,
+        &resolved.name,
+        EndpointFlags {
+            network: args.network,
+            rpc_url: args.rpc_url.as_deref(),
+            secondary_rpc_url: None,
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
+    };
     if context.chain_id.is_mainnet() {
         let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
         let envelope = Envelope::<()>::err(&err);
@@ -190,7 +221,18 @@ pub async fn run(args: &DeployPolicyArgs) -> i32 {
         return 1;
     }
 
-    let deployer = match resolve_deployer(args).await {
+    // These verbs open no audit writer, so an `mlock` degradation is reported
+    // only through the warning `Wallet::unlock` emits.
+    let (deployer, _mlock_degradation) = match resolve_deployer_keypair(
+        args.deployer_secret_env.as_deref(),
+        args.sign_with_ledger,
+        args.account_index,
+        "deploy-policy",
+        &profile,
+        &resolved.name,
+    )
+    .await
+    {
         Ok(d) => d,
         Err(e) => {
             let envelope = Envelope::<()>::err(&e);
@@ -276,58 +318,6 @@ pub async fn run(args: &DeployPolicyArgs) -> i32 {
             1
         }
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Deployer resolution
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Resolves the deployer keypair from the CLI flags.
-///
-/// # Errors
-///
-/// - [`WalletError::Validation`] when no signer-source flag is supplied
-///   (`validation.signer_source_required`), the deployer secret-env variable
-///   is not set (`validation.secret_env_not_set`), or its value is not a valid
-///   S-strkey (`validation.secret_env_invalid`).
-/// - [`WalletError::WalletState`] when the Ledger device is unavailable
-///   (`wallet_state.hardware_not_found`, or the timeout / wrong-app variant).
-async fn resolve_deployer(args: &DeployPolicyArgs) -> Result<DeployerKeypair, WalletError> {
-    if args.sign_with_ledger {
-        use stellar_agent_network::signing::hardware::HardwareSigningKey;
-        let hw_key = HardwareSigningKey::native()?.with_account_index(args.account_index);
-
-        let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(hw_key);
-        return Ok(DeployerKeypair::Ledger {
-            account_index: args.account_index,
-            signer,
-        });
-    }
-
-    let var_name = args.deployer_secret_env.as_deref().ok_or_else(|| {
-        WalletError::Validation(ValidationError::SignerSourceRequired {
-            detail: "no deployer signer flag specified; pass --deployer-secret-env <VAR> \
-                     or --sign-with-ledger"
-                .to_owned(),
-        })
-    })?;
-
-    // Shared mlock-protected secret-env ceremony: no `--profile` flag exists
-    // on this verb, so the `[wallet]` posture falls back to
-    // `MlockRequired::Warn` and the default unlock TTL.
-    // `--profile` has no effect on the `[wallet]` posture here: no
-    // audit-writer infrastructure exists on this verb, so a degraded
-    // unlock is surfaced only via `Wallet::unlock`'s own `tracing::warn!`.
-    let SignerCeremonyOutcome {
-        signer,
-        mlock_degradation: _,
-    } = resolve_software_signer_from_env(var_name, "deploy-policy", None).await?;
-    let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(signer);
-
-    Ok(DeployerKeypair::SecretEnv {
-        var_name: var_name.to_owned(),
-        signer,
-    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -451,12 +441,13 @@ mod tests {
 
     fn dry_run_args(kind: PolicyKindArg) -> DeployPolicyArgs {
         DeployPolicyArgs {
+            profile: None,
             kind,
             deployer_secret_env: Some(TEST_DEPLOYER_ENV_VAR.to_owned()),
             sign_with_ledger: false,
             account_index: 0,
-            network: TargetNetwork::Testnet,
-            rpc_url: TESTNET_RPC_URL.to_owned(),
+            network: Some(TargetNetwork::Testnet),
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             fee: None,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             output: OutputFormat::Json,
@@ -464,13 +455,51 @@ mod tests {
         }
     }
 
-    /// The CLI structurally refuses mainnet before any key access or RPC call.
+    /// A mainnet profile exits 1 before any request reaches its endpoint.
+    /// The binary tests in `tests/profile_env_var_resolution.rs` pin the
+    /// refusal's wire code.
     #[tokio::test]
-    async fn mainnet_is_structurally_refused() {
+    #[serial_test::serial]
+    async fn mainnet_profile_reaches_no_endpoint() {
+        let guard_rpc = wiremock::MockServer::start().await;
+        let (_guard_dir, _guard_home, _guard_env) =
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&guard_rpc.uri());
         let mut args = dry_run_args(PolicyKindArg::SimpleThreshold);
-        args.network = TargetNetwork::Mainnet;
+        args.network = Some(TargetNetwork::Mainnet);
+        args.profile = Some("guard-mainnet".into());
+        args.rpc_url = None;
         let code = run(&args).await;
-        assert_eq!(code, 1, "mainnet deploy must be refused with exit code 1");
+        assert_eq!(code, 1, "a mainnet deploy must exit 1");
+        assert!(
+            guard_rpc
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
+    }
+
+    /// `--network mainnet` with no profile exits 1 before any request reaches
+    /// the endpoint `--rpc-url` names. The binary tests pin the wire code.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mainnet_flag_without_profile_reaches_no_endpoint() {
+        let guard_rpc = wiremock::MockServer::start().await;
+        let guard_home = tempfile::tempdir().expect("home");
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let mut args = dry_run_args(PolicyKindArg::SimpleThreshold);
+        args.network = Some(TargetNetwork::Mainnet);
+        args.rpc_url = Some(guard_rpc.uri());
+        let code = run(&args).await;
+        assert_eq!(code, 1, "a mainnet deploy must exit 1");
+        assert!(
+            guard_rpc
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
     }
 
     /// The dry-run path derives the policy address offline (no RPC, no

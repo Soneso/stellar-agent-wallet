@@ -188,19 +188,37 @@ impl WalletServer {
         };
 
         use std::sync::Arc;
-        use stellar_agent_network::keyring::signer_from_keyring;
+        use stellar_agent_network::keyring::enrolled_keyring_signer;
 
         let account = self.profile.mcp_signer_default.account.as_str();
-        let signer_handle =
-            match signer_from_keyring(&self.profile.mcp_signer_default, account).await {
-                Ok(h) => h,
-                Err(err) => {
+        let signer_handle = match enrolled_keyring_signer(
+            &self.profile_name_for_approval(),
+            &self.profile,
+            account,
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(err) => {
+                if matches!(
+                    &err,
+                    stellar_agent_core::error::WalletError::Auth(
+                        stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                    )
+                ) {
                     return Ok(crate::tools::common::business_error_result(
-                        "sep53.keyring_load_failed",
-                        format!("keyring load failed: {err}"),
+                        err.code(),
+                        err.to_string(),
                     ));
                 }
-            };
+
+                return Ok(crate::tools::common::business_error_result(
+                    "sep53.keyring_load_failed",
+                    format!("keyring load failed: {err}"),
+                ));
+            }
+        };
 
         let signer: Arc<dyn stellar_agent_network::signing::Signer + Send + Sync> =
             Arc::new(signer_handle);

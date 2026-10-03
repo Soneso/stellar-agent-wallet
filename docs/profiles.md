@@ -115,8 +115,8 @@ one.
 ## Loader source order
 
 The profile file is the record the operator audits. Its `chain_id` is
-non-overlayable on every chain. On mainnet, `rpc_url` is also protected.
-An environment or programmatic overlay naming either protected field is
+non-overlayable on every chain. On mainnet, `rpc_url`, `secondary_rpc_url`, and `mcp_signer_default` are also protected.
+An environment or programmatic overlay naming any protected field is
 refused with `profile.non_overlayable_field`, even when its value equals the file.
 An equal overlay can hide a later edit to the audited record.
 
@@ -126,12 +126,11 @@ The remaining fields merge in increasing priority:
 2. **Environment overlay:** variables prefixed `STELLAR_AGENT_`.
 3. **Programmatic overlay:** key/value pairs supplied by a command.
 
-A testnet `rpc_url` remains overlayable. `secondary_rpc_url` remains overlayable
-on both chains.
+Testnet endpoint and signer fields remain overlayable. Mainnet uses these fields from the profile file only.
 
 A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE` never selects one, and a mainnet `default.toml` needs `--profile default`. Keep the filename: its identity is bound to its keyring entries.
 
-Unset `STELLAR_AGENT_CHAIN_ID` and, for a mainnet profile, `STELLAR_AGENT_RPC_URL` first. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
+Unset `STELLAR_AGENT_CHAIN_ID` on every chain. On mainnet, also unset `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, and `STELLAR_AGENT_MCP_SIGNER_DEFAULT`. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
 
 After merging, the loader resolves derived fields and validates:
 
@@ -177,7 +176,7 @@ secret.
 |-------|------|----------|---------|-------------|
 | `version` | integer | yes | — | Schema version. Must be `2`. |
 | `chain_id` | string (CAIP-2) | yes | — | `stellar:testnet` or `stellar:mainnet`. Drives passphrase resolution and the mainnet-write gate. |
-| `rpc_url` | string (URL) | no | chain default | Soroban RPC endpoint. Testnet default `https://soroban-testnet.stellar.org`. Validated as a URL at load. |
+| `rpc_url` | string (URL) | no | chain default | Profile endpoint used by transaction commands. Omitted testnet values use `https://soroban-testnet.stellar.org`. Mainnet endpoint flags and overlays are refused. |
 | `network_passphrase` | string | resolved | from `chain_id` | The Stellar network passphrase. Resolved from `chain_id`; **not overridable** from the TOML or overlays. Surfaced for callers. |
 
 ### Signer and nonce references
@@ -218,11 +217,13 @@ actual keys (see [Migration and key rotation](#migration-and-key-rotation)).
 | `oracle_provider_url` | string (URL) | no | unset (cross-check off) | Independent RPC endpoint for re-simulating high-value transactions. When unset, the high-value cross-check is skipped. Set this before enabling V1 for mainnet high-value flows. Redacted in debug output. |
 | `mcp_disabled` | bool | no | `false` | When `true`, the `stellar-agent-mcp` server refuses to start with error `mcp.disabled_per_profile`. |
 | `audit_log_path` | string (path) | no | OS-conventional | Path to the per-profile audit log. |
-| `secondary_rpc_url` | string (URL) | no | unset | Independent secondary RPC for the multicall cross-RPC trust-anchor check. Must point to a node operated independently of `rpc_url`. Required when a multicall router is registered for the profile's network; loading otherwise fails. Redacted in debug output. |
+| `secondary_rpc_url` | string (URL) | no | unset | Secondary endpoint for cross-RPC checks. `smart-account multicall` requires an effective secondary from the profile or a testnet flag. Mainnet reads this field from the file only. Debug output is redacted. |
 | `smart_account_max_context_rule_scan_id` | integer | no | engine default | Override for the maximum rule-id scan bound. Rejected at load when above `10000`. |
 | `session_rule_max_horizon_ledgers` | integer | no | engine default | Override for the maximum session-rule lookahead window, in ledgers. Rejected at load when above `10000`. |
 
 ### `[wallet]` block
+
+These controls apply to every CLI seed read, including `pay`, `claim`, and `accounts create`. The zero-config testnet profile uses the `"warn"` posture and a 30-second TTL.
 
 Controls the [unlock window](concepts.md) — the short, TTL-bounded period during
 which the 32-byte signing seed is resident in pinned, zeroize-on-drop memory.

@@ -1,8 +1,13 @@
 //! Shared setup for `stellar-agent smart-account` write/read handlers.
 //!
-//! The signers and rules command groups both need the same pre-handler
-//! plumbing: resolve signer, parse smart-account, resolve profile, open the
-//! audit writer, and build manager configs from the same RPC/network inputs.
+//! Every handler runs the same entry order. It resolves the profile name and
+//! loads the profile once ([`load_command_profile`]). It builds the network
+//! context from the loaded profile and the flags. The write verbs then apply
+//! the structural mainnet refusal. Last, the handler opens the audit writer
+//! ([`open_audit_writer`]) and resolves the signer ([`resolve_signer`]).
+//!
+//! [`CommonHandlerContext::new`] runs those last two steps, parses the smart
+//! account, and builds manager configs from the context's endpoints.
 //!
 //! Also provides [`emit_sa_error`] — the canonical `SaError → WalletError::SmartAccount`
 //! bridge used by all multicall CLI subcommands.
@@ -29,13 +34,16 @@ use stellar_agent_smart_account::managers::rules::{
 use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
 use uuid::Uuid;
 
-use crate::common::network::TargetNetwork;
-use crate::common::profile_access::{ProfileAccessError, load_profile_reconciled};
+use crate::common::ResolvedProfileName;
+use crate::common::network::{EndpointFlags, TargetNetwork};
+use crate::common::profile_access::{
+    ProfileAccessError, ProfileOrigin, load_profile_or_synthesize_testnet,
+};
 use crate::common::render::render_json;
 use crate::common::signer_ceremony::{
-    SignerCeremonyOutcome, record_mlock_degradation, resolve_software_signer_from_env,
+    SignerCeremonyOutcome, record_mlock_degradation, require_enrolled_signer,
+    resolve_software_signer_from_env,
 };
-use crate::common::{ResolvedProfileName, resolve_profile_name};
 
 /// Mutually-exclusive signer source flags shared by wallet write/read handlers.
 #[derive(Debug, Args)]
@@ -65,7 +73,7 @@ impl SignerSourceFlags {
 }
 
 /// View over the common wallet handler arguments.
-pub trait CommonArgsView {
+pub(crate) trait CommonArgsView {
     /// Smart-account contract C-strkey.
     fn account(&self) -> &str;
     /// Optional profile override.
@@ -73,11 +81,19 @@ pub trait CommonArgsView {
     /// Shared signer-source flags.
     fn signer_source(&self) -> &SignerSourceFlags;
     /// Target network.
-    fn network(&self) -> TargetNetwork;
+    fn network(&self) -> Option<TargetNetwork>;
     /// Primary RPC URL.
-    fn rpc_url(&self) -> &str;
+    fn rpc_url(&self) -> Option<&str>;
     /// Secondary RPC URL, if supplied.
     fn secondary_rpc_url(&self) -> Option<&str>;
+    /// Endpoint flags asserted against the loaded profile.
+    fn endpoint_flags(&self) -> EndpointFlags<'_> {
+        EndpointFlags {
+            network: self.network(),
+            rpc_url: self.rpc_url(),
+            secondary_rpc_url: self.secondary_rpc_url(),
+        }
+    }
     /// Submission timeout in seconds.
     fn timeout_seconds(&self) -> u64;
 }
@@ -90,8 +106,8 @@ pub struct CommonHandlerContext {
     pub smart_account: SmartAccountAddress,
     /// Resolved profile name.
     pub profile_name: String,
-    /// Profile name and selection source used for reconciled loads.
-    resolved_profile: ResolvedProfileName,
+    /// The loaded profile governing this command.
+    pub profile: Profile,
     /// Shared audit writer handle.
     pub audit_writer: Arc<Mutex<AuditWriter>>,
     /// Audit log path backing `audit_writer`.
@@ -111,12 +127,20 @@ impl CommonHandlerContext {
     /// audit-log opening, or path setup fails.
     pub async fn new(
         args: &impl CommonArgsView,
+        resolved: ResolvedProfileName,
+        profile: Profile,
+        origin: ProfileOrigin,
         context: &NetworkContext,
     ) -> Result<Self, WalletError> {
-        let resolved = resolve_profile_name(args.profile());
         let profile_name = resolved.name.clone();
-        let (signer, mlock_degradation) =
-            resolve_signer(args.signer_source(), Some(&resolved)).await?;
+        let (audit_writer, audit_log_path) = open_audit_writer(&profile, origin, &profile_name)?;
+        let (signer, mlock_degradation) = resolve_signer(
+            args.signer_source(),
+            &profile,
+            &profile_name,
+            "smart-account-write",
+        )
+        .await?;
         let smart_account = parse_c_strkey_to_smart_account(args.account()).map_err(|e| {
             WalletError::Validation(ValidationError::AddressInvalid {
                 input: format!("--account: {e}"),
@@ -124,7 +148,6 @@ impl CommonHandlerContext {
         })?;
         let timeout = Duration::from_secs(args.timeout_seconds());
 
-        let (_audit_profile, audit_writer, audit_log_path) = open_profile_audit_writer(&resolved)?;
         record_mlock_degradation(
             &audit_writer,
             mlock_degradation.as_ref(),
@@ -136,7 +159,7 @@ impl CommonHandlerContext {
             signer,
             smart_account,
             profile_name,
-            resolved_profile: resolved,
+            profile,
             audit_writer,
             audit_log_path,
             context: context.clone(),
@@ -165,21 +188,10 @@ impl CommonHandlerContext {
     /// Builds a `ContextRuleManager` with the same audit writer and signers
     /// manager used by this context.
     ///
-    /// Resolves `session_rule_max_horizon_ledgers` from the profile at
-    /// construction time and threads it into the config via
-    /// [`ContextRuleManagerConfig::with_session_rule_max_horizon_ledgers`].
-    ///
-    /// A profile that does not load leaves the cap at
-    /// `DEFAULT_SESSION_RULE_HORIZON_LEDGERS` (1000 ledgers ≈ 80 min), so the
-    /// command stays usable with no authored profile. A profile whose owner-key
-    /// coordinate names ANOTHER profile is refused instead: reading a foreign
-    /// profile's in-flight-envelope horizon is not a degraded default, it is a
-    /// control taken from a profile the operator did not select.
+    /// Uses the loaded profile's session horizon and the context's endpoints.
     ///
     /// # Errors
-    ///
-    /// Returns a wallet validation error if manager construction fails, and
-    /// `profile.name_mismatch` when the loaded profile names another profile.
+    /// Returns a wallet error if manager construction fails.
     pub fn context_rule_manager(&self) -> Result<ContextRuleManager, WalletError> {
         let signers_manager = self.signers_manager().map_err(|e| {
             WalletError::Validation(ValidationError::ConfigInvalid {
@@ -187,13 +199,6 @@ impl CommonHandlerContext {
                 reason: format!("construction for divergence check: {e}"),
             })
         })?;
-
-        // Resolve the effective horizon cap from the profile's
-        // `session_rule_max_horizon_ledgers`.
-        let horizon_override = horizon_override_from_profile(
-            load_profile_reconciled(&self.resolved_profile, None),
-            &self.profile_name,
-        )?;
 
         let mut config = ContextRuleManagerConfig::new(
             self.context.rpc_url.clone(),
@@ -204,7 +209,10 @@ impl CommonHandlerContext {
         .with_signers_manager(Arc::new(signers_manager))
         .with_audit_writer(Arc::clone(&self.audit_writer));
 
-        if let Some(ledgers) = horizon_override {
+        if let Some(url) = self.context.secondary_rpc_url.clone() {
+            config = config.with_secondary_rpc_url(url);
+        }
+        if let Some(ledgers) = self.profile.session_rule_max_horizon_ledgers {
             config = config.with_session_rule_max_horizon_ledgers(ledgers);
         }
 
@@ -217,51 +225,36 @@ impl CommonHandlerContext {
     }
 }
 
-/// Resolves a signing key from the supplied [`SignerSourceFlags`].
-///
-/// Used by write commands that need a `Signer` without requiring the full
-/// [`CommonHandlerContext`] (e.g. timelock CLI verbs which take `--timelock`
-/// instead of `--account`).
-///
-/// `profile_name` supplies the `[wallet]` posture and TTL for the
-/// `--signer-secret-env` path via [`resolve_software_signer_from_env`]; pass
-/// `None` when no profile is available at the call site.
-///
-/// Returns any `mlock` degradation the secret-env ceremony reported
-/// alongside the signer (`None` for the Ledger path); the caller records it
-/// via [`record_mlock_degradation`] once its audit writer is open.
-///
-/// # Errors
-///
-/// Returns a [`WalletError`] when no signer-source flag is supplied
-/// (`validation.signer_source_required`), the Ledger device is unavailable
-/// (`wallet_state.hardware_not_found` family), or the env-var S-strkey is
-/// missing or invalid (`validation.secret_env_not_set` /
-/// `validation.secret_env_invalid`).
+/// Resolves a signer using the loaded profile's wallet controls and identity.
 pub(crate) async fn resolve_signer(
     signer_source: &SignerSourceFlags,
-    profile_name: Option<&ResolvedProfileName>,
+    profile: &Profile,
+    profile_name: &str,
+    wallet_label: &str,
 ) -> Result<(Box<dyn Signer + Send + Sync>, Option<MlockDegradation>), WalletError> {
-    if signer_source.sign_with_ledger {
-        use stellar_agent_network::signing::hardware::HardwareSigningKey;
-        let hw_key = HardwareSigningKey::native()?
-            .with_account_index(signer_source.account_index_or_default());
-        return Ok((Box::new(hw_key), None));
-    }
-
-    let var_name = signer_source.signer_secret_env.as_deref().ok_or_else(|| {
-        WalletError::Validation(ValidationError::SignerSourceRequired {
-            detail: "no signer-source flag specified; pass --signer-secret-env <VAR> \
-                     or --sign-with-ledger (or --dry-run on subcommands that support \
-                     read-only operation)"
-                .to_owned(),
-        })
-    })?;
-    let SignerCeremonyOutcome {
-        signer,
-        mlock_degradation,
-    } = resolve_software_signer_from_env(var_name, "smart-account-write", profile_name).await?;
-    Ok((Box::new(signer), mlock_degradation))
+    let (signer, degradation): (Box<dyn Signer + Send + Sync>, _) =
+        if signer_source.sign_with_ledger {
+            use stellar_agent_network::signing::hardware::HardwareSigningKey;
+            let signer = HardwareSigningKey::native()?
+                .with_account_index(signer_source.account_index_or_default());
+            (Box::new(signer), None)
+        } else {
+            let var = signer_source.signer_secret_env.as_deref().ok_or_else(|| {
+                WalletError::Validation(ValidationError::SignerSourceRequired {
+                    detail: "no signer-source flag specified; pass --signer-secret-env <VAR> or \
+                             --sign-with-ledger (or --dry-run on subcommands that support \
+                             read-only operation)"
+                        .to_owned(),
+                })
+            })?;
+            let SignerCeremonyOutcome {
+                signer,
+                mlock_degradation,
+            } = resolve_software_signer_from_env(var, wallet_label, profile).await?;
+            (Box::new(signer), mlock_degradation)
+        };
+    require_enrolled_signer(profile_name, profile, signer.as_ref()).await?;
+    Ok((signer, degradation))
 }
 
 /// Constructs a [`SignersManager`] from pre-resolved fields and an already-opened
@@ -269,7 +262,7 @@ pub(crate) async fn resolve_signer(
 ///
 /// This is the single `SignersManager::new(SignersManagerConfig::new(...))` call
 /// site in the CLI crate.  Callers obtain `audit_writer` and `audit_log_path`
-/// from [`open_profile_audit_writer`] and pass them here; no I/O is performed inside
+/// from [`open_audit_writer`] and pass them here; no I/O is performed inside
 /// this function.
 ///
 /// The argument count (8) mirrors [`SignersManagerConfig::new`] exactly; a
@@ -415,42 +408,20 @@ pub(crate) fn emit_multicall_registry_error(e: &SaError, source: IoSource) -> i3
     }
 }
 
-/// Resolves the profile for `resolved` (or synthesizes the zero-config
-/// testnet fallback when NO profile was named and no profile file exists) and
-/// opens the audit-log writer under the profile's configured `audit_log_path`
-/// and audit chain-root HMAC key.
-///
-/// Takes the whole [`ResolvedProfileName`], not the bare name, because
-/// [`load_profile_or_synthesize_testnet`](crate::common::profile_access::load_profile_or_synthesize_testnet)
-/// keys the synthesis fallback on the name's provenance: a profile the
-/// operator named through `--profile` or `STELLAR_AGENT_PROFILE` but never
-/// authored refuses instead of resolving to the permissive fallback.
-///
-/// Origin-aware, mirroring the value-verb discipline:
-///
-/// - A PERSISTED profile fails closed
-///   (`crate::commands::value_audit::require_value_audit_writer`): the
-///   operator minted a trust root, so a manager must not run with an
-///   unverifiable or divergent writer. `AuditWriterRegistry` pins one
-///   `(path, hmac_key)` pair per profile name for the process lifetime;
-///   registering anything but the keyed pair here would brick later opens
-///   (`PathMismatch`/`HmacKeyMismatch`) and leave rows outside
-///   `stellar-agent audit verify` coverage.
-/// - A SYNTHESIZED profile keeps the zero-config quickstart working:
-///   keyed when the derived key loads, otherwise an unkeyed writer at the
-///   same per-profile path
-///   (`crate::commands::value_audit::acquire_best_effort_audit_writer`).
-///
-/// Returns the resolved profile alongside the writer so callers stop
-/// re-deriving paths from the bare name.
-pub(crate) fn open_profile_audit_writer(
+/// Loads the selected profile, synthesizing testnet only for an unnamed missing file.
+pub(crate) fn load_command_profile(
     resolved: &ResolvedProfileName,
-) -> Result<(Profile, Arc<Mutex<AuditWriter>>, PathBuf), WalletError> {
-    use crate::common::profile_access::{ProfileOrigin, load_profile_or_synthesize_testnet};
+) -> Result<(Profile, ProfileOrigin), ProfileAccessError> {
+    load_profile_or_synthesize_testnet(resolved)
+}
 
-    let profile_name = resolved.name.as_str();
-    let (profile, origin) = load_profile_or_synthesize_testnet(resolved)
-        .map_err(|e| map_access_error(&e, profile_name))?;
+/// Opens the writer for a profile already loaded by the command.
+/// Persisted profiles require their audit key; synthesized profiles use best-effort acquisition.
+pub(crate) fn open_audit_writer(
+    profile: &Profile,
+    origin: ProfileOrigin,
+    profile_name: &str,
+) -> Result<(Arc<Mutex<AuditWriter>>, PathBuf), WalletError> {
     let log_path = profile.audit_log_path.clone();
 
     if let Some(parent) = log_path.parent() {
@@ -461,13 +432,13 @@ pub(crate) fn open_profile_audit_writer(
 
     let writer = match origin {
         ProfileOrigin::Persisted => {
-            crate::commands::value_audit::require_value_audit_writer(&profile, profile_name)?
+            crate::commands::value_audit::require_value_audit_writer(profile, profile_name)?
         }
         ProfileOrigin::Synthesized => {
-            crate::commands::value_audit::acquire_best_effort_audit_writer(&profile, profile_name)?
+            crate::commands::value_audit::acquire_best_effort_audit_writer(profile, profile_name)?
         }
     };
-    Ok((profile, writer, log_path))
+    Ok((writer, log_path))
 }
 
 /// Maps a profile-access failure onto the typed error the audit-writer helpers
@@ -476,7 +447,7 @@ pub(crate) fn open_profile_audit_writer(
 /// `profile.name_mismatch`, `profile.non_overlayable_field`, and
 /// `profile.mainnet_requires_explicit_profile` keep their own wire codes.
 /// Other load failures map to an audit-writer I/O error.
-fn map_access_error(
+pub(crate) fn map_access_error(
     err: &crate::common::profile_access::ProfileAccessError,
     profile_name: &str,
 ) -> WalletError {
@@ -495,7 +466,7 @@ fn map_access_error(
     }
 }
 
-/// Best-effort sibling of [`open_profile_audit_writer`] for READ-ONLY
+/// Best-effort sibling of [`open_audit_writer`] for READ-ONLY
 /// commands (list/inspect surfaces and dry-run simulation): they neither
 /// sign nor submit, so the fail-closed pre-flight does not apply to them,
 /// but manager construction still requires a writer object.
@@ -508,16 +479,12 @@ fn map_access_error(
 ///
 /// # Errors
 ///
-/// Returns [`WalletError`] on profile-resolution failure or when even the
-/// unkeyed open fails (I/O).
-pub(crate) fn open_profile_audit_writer_read_only(
-    resolved: &ResolvedProfileName,
-) -> Result<(Profile, Arc<Mutex<AuditWriter>>, PathBuf), WalletError> {
-    use crate::common::profile_access::load_profile_or_synthesize_testnet;
-
-    let profile_name = resolved.name.as_str();
-    let (profile, _origin) = load_profile_or_synthesize_testnet(resolved)
-        .map_err(|e| map_access_error(&e, profile_name))?;
+/// Returns [`WalletError`] when the audit-log directory cannot be created or
+/// when even the unkeyed open fails (I/O).
+pub(crate) fn open_audit_writer_read_only(
+    profile: &Profile,
+    profile_name: &str,
+) -> Result<(Arc<Mutex<AuditWriter>>, PathBuf), WalletError> {
     let log_path = profile.audit_log_path.clone();
 
     if let Some(parent) = log_path.parent() {
@@ -527,26 +494,8 @@ pub(crate) fn open_profile_audit_writer_read_only(
     }
 
     let writer =
-        crate::commands::value_audit::acquire_best_effort_audit_writer(&profile, profile_name)?;
-    Ok((profile, writer, log_path))
-}
-
-fn horizon_override_from_profile(
-    loaded: Result<stellar_agent_core::profile::schema::Profile, ProfileAccessError>,
-    profile_name: &str,
-) -> Result<Option<u32>, WalletError> {
-    match loaded {
-        Ok(profile) => Ok(profile.session_rule_max_horizon_ledgers),
-        Err(error) if error.requires_refusal() => Err(error.to_wallet_error(profile_name)),
-        Err(error) => {
-            tracing::debug!(
-                profile = profile_name,
-                error = %error,
-                "session-rule horizon profile unavailable; using the default"
-            );
-            Ok(None)
-        }
-    }
+        crate::commands::value_audit::acquire_best_effort_audit_writer(profile, profile_name)?;
+    Ok((writer, log_path))
 }
 
 #[cfg(test)]
@@ -556,25 +505,15 @@ mod tests {
     use stellar_agent_core::profile::name::ProfileNameSource;
 
     use super::*;
+    use crate::common::signer_ceremony::test_fixtures::{
+        EnrolledPin, assert_enrolled_outcome, enrolled_mainnet_profile,
+    };
 
     #[test]
     fn audit_writer_mapping_preserves_protected_refusals() {
         for error in crate::common::profile_access::protected_load_errors_for_test() {
             let expected = error.code();
             let result = Err::<(), _>(map_access_error(&error, "mainnet"));
-            let error = match result {
-                Err(error) => error,
-                Ok(_) => panic!("protected refusal was swallowed"),
-            };
-            assert_eq!(error.code(), expected);
-        }
-    }
-
-    #[test]
-    fn horizon_override_preserves_protected_refusals() {
-        for error in crate::common::profile_access::protected_load_errors_for_test() {
-            let expected = error.code();
-            let result = horizon_override_from_profile(Err(error), "mainnet");
             let error = match result {
                 Err(error) => error,
                 Ok(_) => panic!("protected refusal was swallowed"),
@@ -637,7 +576,7 @@ mod tests {
     /// minted it opens the writer at the profile's configured path.
     #[test]
     #[serial_test::serial]
-    fn open_profile_audit_writer_is_origin_aware() {
+    fn open_audit_writer_is_origin_aware() {
         use stellar_agent_core::profile::loader as profile_loader;
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -650,7 +589,8 @@ mod tests {
         profile_loader::save_to_dir("gate-test", &profile, &dir.path().join("profiles"))
             .expect("persist profile");
 
-        let err = open_profile_audit_writer(&named("gate-test"))
+        let (loaded, origin) = load_command_profile(&named("gate-test")).expect("load");
+        let err = open_audit_writer(&loaded, origin, "gate-test")
             .expect_err("a persisted profile without a minted audit key must refuse");
         assert_eq!(err.code(), "audit.chain_key_unavailable");
 
@@ -659,7 +599,7 @@ mod tests {
             &profile.audit_log_hash_chain_key_id.account,
         )
         .expect("mint audit key");
-        let (loaded, _writer, path) = open_profile_audit_writer(&named("gate-test"))
+        let (_writer, path) = open_audit_writer(&loaded, origin, "gate-test")
             .expect("minted key must open the writer");
         assert_eq!(path, loaded.audit_log_path);
     }
@@ -669,13 +609,13 @@ mod tests {
     /// permissive fallback for a name the operator chose.
     #[test]
     #[serial_test::serial]
-    fn open_profile_audit_writer_refuses_a_named_absent_profile() {
+    fn open_audit_writer_refuses_a_named_absent_profile() {
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
         let dir = tempfile::TempDir::new().expect("tempdir");
         let _home = StellarAgentHomeGuard::new(dir.path());
         keyring_mock::install().expect("mock store");
 
-        let err = open_profile_audit_writer(&named("gate-absent"))
+        let err = load_command_profile(&named("gate-absent"))
             .expect_err("a named profile with no file must refuse, not synthesize");
         assert!(
             err.to_string().contains("gate-absent"),
@@ -688,7 +628,7 @@ mod tests {
     /// invariant that keeps the smart-account quickstart working.
     #[test]
     #[serial_test::serial]
-    fn open_profile_audit_writer_synthesizes_when_no_profile_was_named() {
+    fn open_audit_writer_synthesizes_when_no_profile_was_named() {
         use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
         let dir = tempfile::TempDir::new().expect("tempdir");
         let _home = StellarAgentHomeGuard::new(dir.path());
@@ -698,7 +638,8 @@ mod tests {
             name: "default".to_owned(),
             source: ProfileNameSource::Default,
         };
-        let (_synth, _writer, _path) = open_profile_audit_writer(&unnamed)
+        let (synth, origin) = load_command_profile(&unnamed).expect("synthesis");
+        let (_writer, _path) = open_audit_writer(&synth, origin, &unnamed.name)
             .expect("the synthesized zero-config path must still yield a writer");
     }
 
@@ -734,9 +675,14 @@ mod tests {
             sign_with_ledger: false,
             account_index: None,
         };
-        let (signer, mlock_degradation) = resolve_signer(&flags, None)
-            .await
-            .expect("resolve must succeed");
+        let (signer, mlock_degradation) = resolve_signer(
+            &flags,
+            &Profile::builder_testnet_named("test", "s", "a", "n", "a").build(),
+            "test",
+            "smart-account-write",
+        )
+        .await
+        .expect("resolve must succeed");
         assert!(
             mlock_degradation.is_none(),
             "a real mlock success/opt-out must not report degradation"
@@ -757,7 +703,14 @@ mod tests {
             sign_with_ledger: false,
             account_index: None,
         };
-        let err = match resolve_signer(&flags, None).await {
+        let err = match resolve_signer(
+            &flags,
+            &Profile::builder_testnet_named("test", "s", "a", "n", "a").build(),
+            "test",
+            "smart-account-write",
+        )
+        .await
+        {
             Ok(_) => panic!("unset env var must refuse"),
             Err(e) => e,
         };
@@ -788,7 +741,14 @@ mod tests {
             sign_with_ledger: false,
             account_index: None,
         };
-        let err = match resolve_signer(&flags, None).await {
+        let err = match resolve_signer(
+            &flags,
+            &Profile::builder_testnet_named("test", "s", "a", "n", "a").build(),
+            "test",
+            "smart-account-write",
+        )
+        .await
+        {
             Ok(_) => panic!("malformed S-strkey must refuse"),
             Err(e) => e,
         };
@@ -818,7 +778,14 @@ mod tests {
             sign_with_ledger: true,
             account_index: Some(0),
         };
-        let err = match resolve_signer(&flags, None).await {
+        let err = match resolve_signer(
+            &flags,
+            &Profile::builder_testnet_named("test", "s", "a", "n", "a").build(),
+            "test",
+            "smart-account-write",
+        )
+        .await
+        {
             // A live device resolved a signer; the no-keyring-lookup invariant
             // still holds.
             Ok(_) => return,
@@ -845,7 +812,14 @@ mod tests {
             sign_with_ledger: false,
             account_index: None,
         };
-        let err = match resolve_signer(&flags, None).await {
+        let err = match resolve_signer(
+            &flags,
+            &Profile::builder_testnet_named("test", "s", "a", "n", "a").build(),
+            "test",
+            "smart-account-write",
+        )
+        .await
+        {
             Ok(_) => panic!("a missing signer-source flag must be refused"),
             Err(e) => e,
         };
@@ -903,5 +877,63 @@ mod tests {
             }
             other => panic!("expected WalletError::SmartAccount, got {other:?}"),
         }
+    }
+
+    /// Resolves the test seed's signer against `profile` through
+    /// [`resolve_signer`].
+    #[allow(unsafe_code, reason = "serialized test seed variable")]
+    async fn resolve_test_seed_signer(profile: &Profile) -> Result<(), WalletError> {
+        use crate::common::signer_ceremony::test_fixtures::enrolled_test_secret;
+
+        let var = "ENROLLED_COMMON_TEST_SEED";
+        unsafe {
+            std::env::set_var(var, enrolled_test_secret());
+        }
+        let flags = SignerSourceFlags {
+            signer_secret_env: Some(var.into()),
+            sign_with_ledger: false,
+            account_index: None,
+        };
+        let result = resolve_signer(&flags, profile, "enrolled", "identity-test")
+            .await
+            .map(|_| ());
+        unsafe {
+            std::env::remove_var(var);
+        }
+        result
+    }
+
+    async fn enrolled_resolver_case(pin: EnrolledPin) {
+        let result = resolve_test_seed_signer(&enrolled_mainnet_profile(pin)).await;
+        assert_enrolled_outcome(pin, result);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_resolver_equal() {
+        enrolled_resolver_case(EnrolledPin::Derived).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_resolver_placeholder() {
+        enrolled_resolver_case(EnrolledPin::Placeholder).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_resolver_mismatch() {
+        enrolled_resolver_case(EnrolledPin::Other).await;
+    }
+
+    /// A testnet profile admits a signer that is not its pinned account.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_resolver_testnet() {
+        let mut profile = enrolled_mainnet_profile(EnrolledPin::Other);
+        profile.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
+        resolve_test_seed_signer(&profile)
+            .await
+            .expect("a testnet profile admits an unrelated signer");
     }
 }

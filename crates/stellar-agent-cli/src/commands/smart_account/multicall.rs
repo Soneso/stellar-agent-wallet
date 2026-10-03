@@ -58,6 +58,7 @@
 //! "ledger": N, "inner_results": [...], "audit_degraded": false }`. On error: typed
 //! wire-code envelope.
 //!
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,8 +67,6 @@ use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{IoSource, ValidationError, WalletError};
 use stellar_agent_core::policy::v1::PolicyEngineV1;
-use stellar_agent_core::profile::ResolvedProfileName;
-use stellar_agent_core::wallet::MlockDegradation;
 use stellar_agent_network::NetworkContext;
 use stellar_agent_network::{ClassicFeeChoice, parse_classic_fee_choice};
 use stellar_agent_smart_account::ResolvedFeePerOp;
@@ -81,17 +80,14 @@ use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     SignerSourceFlags, construct_signers_manager_from_fields, emit_multicall_registry_error,
-    emit_sa_error, open_profile_audit_writer,
+    emit_sa_error, load_command_profile, map_access_error, open_audit_writer, resolve_signer,
 };
-use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
-use crate::common::profile_access::{
-    ProfileAccessError, load_profile_reconciled, profile_access_envelope,
+use crate::common::network::{
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
 };
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
-use crate::common::signer_ceremony::{
-    SignerCeremonyOutcome, record_mlock_degradation, resolve_software_signer_from_env,
-};
+use crate::common::signer_ceremony::record_mlock_degradation;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -147,23 +143,24 @@ pub struct MulticallArgs {
     )]
     pub invocation: Vec<String>,
 
-    /// Secondary Soroban RPC URL for 4-way trust-anchor cross-verification.
-    ///
-    /// Resolution priority: `profile.secondary_rpc_url` (from profile TOML) →
-    /// this flag (overrides profile) → typed error when neither is set.
-    #[arg(long, value_name = "URL")]
+    /// The secondary endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub secondary_rpc_url: Option<String>,
 
-    /// Network to target. Only `testnet` is currently operational for multicall.
-    ///
-    /// Mainnet is accepted at the flag level but requires a deployed and registered
-    /// multicall router on mainnet and a matching `MULTICALL_WASM_SHA256` binary const.
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
-    /// Primary Soroban RPC endpoint URL.
-    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
     /// Submission timeout in seconds (default 60).
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
@@ -266,36 +263,44 @@ pub async fn run(args: &MulticallArgs) -> i32 {
 
     let resolved_profile = resolve_profile_name(args.profile.as_deref());
     let profile_name = resolved_profile.name.clone();
-
-    // ── Audit pre-flight: prove the writer is acquirable BEFORE any signing ──
-    // key is touched or the bundle is submitted. A persisted profile whose
-    // audit chain key is unminted refuses here (audit.chain_key_unavailable);
-    // the SAME writer is reused for the post-confirm rows.
-    let (profile_audit_writer, audit_log_path) = match open_profile_audit_writer(&resolved_profile)
-    {
-        Ok((_profile, writer, path)) => (writer, path),
+    let (profile, origin) = match load_command_profile(&resolved_profile) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            render_json(&Envelope::<()>::err(&map_access_error(
+                &error,
+                &profile_name,
+            )));
+            return 1;
+        }
+    };
+    let context = match network_context_for_command(
+        &profile,
+        &profile_name,
+        EndpointFlags {
+            network: args.network,
+            rpc_url: args.rpc_url.as_deref(),
+            secondary_rpc_url: args.secondary_rpc_url.as_deref(),
+        },
+    ) {
+        Ok(context) => context,
         Err(e) => {
             render_json(&Envelope::<()>::err(&e));
             return 1;
         }
     };
-    let audit_writer = Some(Arc::clone(&profile_audit_writer));
-
-    // Resolve signer.
-    let (signer, mlock_degradation) = {
-        let signer_flags = SignerSourceFlags {
-            signer_secret_env: args.signer_secret_env.clone(),
-            sign_with_ledger: args.sign_with_ledger,
-            account_index: Some(args.account_index),
-        };
-        match resolve_signer(&signer_flags, Some(&resolved_profile)).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                render_json(&Envelope::<()>::err(&e));
-                return 1;
-            }
-        }
-    };
+    if context.chain_id.is_mainnet() {
+        let e =
+            WalletError::Network(stellar_agent_core::error::NetworkError::MainnetWriteForbidden);
+        render_json(&Envelope::<()>::err(&e));
+        return 1;
+    }
+    if context.secondary_rpc_url.is_none() {
+        let e = WalletError::Validation(ValidationError::AddressInvalid {
+            input: "secondary_rpc_url is required for multicall: set it in the profile TOML (secondary_rpc_url = \"https://...\") or pass --secondary-rpc-url".to_owned(),
+        });
+        render_json(&Envelope::<()>::err(&e));
+        return 1;
+    }
 
     // Load the multicall registry.
     let networks_toml_path = match default_networks_toml_path() {
@@ -318,57 +323,6 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         }
     };
 
-    // Resolve the secondary RPC from the flag, else the profile's
-    // `secondary_rpc_url`, else a typed error.
-    let secondary_rpc_url = {
-        // Try loading the profile to get secondary_rpc_url from it.
-        // Distinguish NotFound (first-run or no profile — acceptable fall-through) from
-        // other variants (e.g. VersionUnsupported, MissingPolicySection — warn but still
-        // fall through to the flag, since multicall does not hard-require the profile).
-        // Non-NotFound ProfileLoadError is not silently swallowed; it is logged.
-        //
-        // A name mismatch is the one failure this tolerance does not extend to:
-        // the file exists and is readable, it simply belongs to a different
-        // profile, and taking a submission endpoint from it would route this
-        // run through a profile the operator did not select.
-        let from_profile = match load_profile_reconciled(&resolved_profile, Some(&registry)) {
-            Ok(p) => p.secondary_rpc_url,
-            Err(ref e @ ProfileAccessError::NameMismatch(_)) => {
-                render_json(&profile_access_envelope(e, &profile_name));
-                return 1;
-            }
-            Err(e) if e.is_not_found() => None,
-            Err(e) => {
-                warn!(
-                    profile_name = %profile_name,
-                    error = %e,
-                    "smart-account multicall: non-fatal profile load error (secondary_rpc_url not \
-                     available from profile; use --secondary-rpc-url flag to supply it)"
-                );
-                None
-            }
-        };
-
-        match (from_profile, args.secondary_rpc_url.as_deref()) {
-            // Flag overrides profile.
-            (_, Some(flag_url)) => flag_url.to_owned(),
-            // Profile provides the URL.
-            (Some(profile_url), None) => profile_url,
-            // Neither set.
-            (None, None) => {
-                let err = WalletError::Validation(ValidationError::AddressInvalid {
-                    input: "secondary_rpc_url is required for multicall: set it in the profile \
-                            TOML (secondary_rpc_url = \"https://...\") or pass \
-                            --secondary-rpc-url"
-                        .to_owned(),
-                });
-                render_json(&Envelope::<()>::err(&err));
-                return 1;
-            }
-        }
-    };
-    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone())
-        .with_secondary(Some(secondary_rpc_url));
     let network_passphrase = context.network_passphrase().to_owned();
     let chain_id = context.chain_id.caip2_str().to_owned();
 
@@ -395,8 +349,38 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         }
     };
 
+    // ── Audit pre-flight: prove the writer is acquirable BEFORE any signing ──
+    // key is touched or the bundle is submitted. A persisted profile whose
+    // audit chain key is unminted refuses here (audit.chain_key_unavailable);
+    // the SAME writer is reused for the post-confirm rows.
+    let (profile_audit_writer, audit_log_path) =
+        match open_audit_writer(&profile, origin, &profile_name) {
+            Ok((writer, path)) => (writer, path),
+            Err(e) => {
+                render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        };
+    let audit_writer = Some(Arc::clone(&profile_audit_writer));
+
+    // Resolve signer.
+    let (signer, mlock_degradation) = {
+        let signer_flags = SignerSourceFlags {
+            signer_secret_env: args.signer_secret_env.clone(),
+            sign_with_ledger: args.sign_with_ledger,
+            account_index: Some(args.account_index),
+        };
+        match resolve_signer(&signer_flags, &profile, &profile_name, "multicall-cli").await {
+            Ok(pair) => pair,
+            Err(e) => {
+                render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        }
+    };
+
     // Build a minimal profile for policy evaluation.
-    let profile = build_minimal_profile(&context);
+    let evaluation_profile = build_minimal_profile(&context);
 
     // Every non-zero authorizing rule reads its baseline and pin record from
     // this profile's audit log. The signer-set comparison and executable pin
@@ -444,7 +428,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     // reservation an earlier verb left behind would count there unreconciled.
     if let Ok(reconcile_client) = stellar_agent_network::StellarRpcClient::new(&context.rpc_url) {
         crate::commands::submission_record::reconcile_open_reservations(
-            &profile,
+            &evaluation_profile,
             &profile_name,
             &reconcile_client,
             now_ms,
@@ -464,7 +448,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
             .unwrap_or(&context.rpc_url),
         network_passphrase: &network_passphrase,
         policy_engine,
-        profile: &profile,
+        profile: &evaluation_profile,
         audit_writer: audit_writer.as_ref().map(Arc::clone),
         timeout: Duration::from_secs(args.timeout_seconds),
         fee,
@@ -634,45 +618,6 @@ fn build_minimal_profile(context: &NetworkContext) -> stellar_agent_core::profil
     profile.rpc_url = context.rpc_url.clone();
     profile.secondary_rpc_url = context.secondary_rpc_url.clone();
     profile
-}
-
-/// Resolves the signer from the two mutually-exclusive flag modes.
-///
-/// The `--signer-secret-env` path routes through the shared mlock-protected
-/// [`resolve_software_signer_from_env`] ceremony, applying `profile_name`'s
-/// `[wallet]` posture and TTL exactly like every other secret-env signer
-/// resolution in the CLI. Returns any `mlock` degradation alongside the
-/// signer (`None` for the Ledger path); the caller records it via
-/// [`record_mlock_degradation`] once its audit writer is open.
-async fn resolve_signer(
-    flags: &SignerSourceFlags,
-    profile_name: Option<&ResolvedProfileName>,
-) -> Result<
-    (
-        Box<dyn stellar_agent_network::Signer + Send + Sync>,
-        Option<MlockDegradation>,
-    ),
-    WalletError,
-> {
-    if flags.sign_with_ledger {
-        use stellar_agent_network::signing::hardware::HardwareSigningKey;
-        let hw_key =
-            HardwareSigningKey::native()?.with_account_index(flags.account_index.unwrap_or(0));
-        return Ok((Box::new(hw_key), None));
-    }
-
-    let var_name = flags.signer_secret_env.as_deref().ok_or_else(|| {
-        WalletError::Validation(ValidationError::SignerSourceRequired {
-            detail: "no signer-source flag specified for smart-account multicall; \
-                     pass --signer-secret-env <VAR> or --sign-with-ledger"
-                .to_owned(),
-        })
-    })?;
-    let SignerCeremonyOutcome {
-        signer,
-        mlock_degradation,
-    } = resolve_software_signer_from_env(var_name, "multicall-cli", profile_name).await?;
-    Ok((Box::new(signer), mlock_degradation))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

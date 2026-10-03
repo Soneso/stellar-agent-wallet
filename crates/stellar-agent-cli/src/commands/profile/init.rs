@@ -114,9 +114,8 @@ use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, PolicyEngineKind, Profile};
 use stellar_agent_core::redact::redact_url_authority;
 
-use crate::common::network::TargetNetwork;
-use crate::common::render;
-use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
+use crate::common::network::{EndpointUrlFlag, TargetNetwork};
+use crate::common::{render, resolve_profile_name, validate_path_component_ascii_safe};
 
 /// Arguments for `stellar-agent profile init`.
 #[derive(Debug, Args)]
@@ -138,7 +137,7 @@ pub(crate) struct InitArgs {
     /// REQUIRED, and required to be `https://`, for `--network mainnet`: the
     /// built-in mainnet default requires an API key and answers HTTP 401
     /// unauthenticated, so persisting it would mint a broken configuration.
-    #[arg(long, value_name = "URL")]
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub(crate) rpc_url: Option<String>,
 
     /// Policy engine for the new profile.

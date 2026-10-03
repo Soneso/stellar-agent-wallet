@@ -117,14 +117,17 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    SignerSourceFlags, construct_signers_manager_from_fields, open_profile_audit_writer,
-    resolve_signer, wrap_sa_error,
+    SignerSourceFlags, construct_signers_manager_from_fields, load_command_profile,
+    map_access_error, open_audit_writer, resolve_signer, wrap_sa_error,
 };
-use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
+use crate::common::network::{
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+};
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::resolve_profile_name;
 use crate::common::signer_ceremony::{
-    SignerCeremonyOutcome, record_mlock_degradation, resolve_software_signer_from_env,
+    SignerCeremonyOutcome, record_mlock_degradation, require_enrolled_signer,
+    resolve_software_signer_from_env,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -213,16 +216,23 @@ pub struct ExecuteArgs {
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
-    /// Network to target (testnet / mainnet).
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
-    /// Soroban RPC endpoint URL.
-    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
-    /// Secondary RPC URL for two-RPC consultation.
-    #[arg(long, value_name = "URL")]
+    /// The secondary endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub secondary_rpc_url: Option<String>,
 
     /// Submission timeout in seconds.
@@ -284,7 +294,7 @@ struct ExecutePlan {
 ///
 /// # Errors
 ///
-/// - [`NetworkError::MainnetWriteForbidden`] — `--network mainnet` is
+/// - [`NetworkError::MainnetWriteForbidden`]: a mainnet context is
 ///   structurally refused (smart-account write convention).
 /// - [`ValidationError::AddressInvalid`] — empty or non-symbol `--function`,
 ///   malformed C-strkeys, an unresolvable verifier (no `--verifier` and no
@@ -407,9 +417,29 @@ fn validate_execute_inputs(
 ///
 /// Never panics.
 pub async fn run(args: &ExecuteArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone())
-        .with_secondary(args.secondary_rpc_url.clone());
     let request_id = new_request_id();
+    let resolved_profile = resolve_profile_name(args.profile.as_deref());
+    let (profile, origin) = match load_command_profile(&resolved_profile) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved_profile.name);
+            return emit_error(&e, args.output, &request_id);
+        }
+    };
+    let context = match network_context_for_command(
+        &profile,
+        &resolved_profile.name,
+        EndpointFlags {
+            network: args.network,
+            rpc_url: args.rpc_url.as_deref(),
+            secondary_rpc_url: args.secondary_rpc_url.as_deref(),
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => {
+            return emit_error(&e, args.output, &request_id);
+        }
+    };
     let account_redacted = redact_strkey_first5_last5(&args.account);
 
     // Client-side validation: mainnet refusal, function/arg well-formedness,
@@ -427,20 +457,19 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         arg_count,
     } = plan;
     let network_passphrase = context.network_passphrase();
-    let resolved_profile = resolve_profile_name(args.profile.as_deref());
     let profile_name = resolved_profile.name.clone();
 
     // ── Audit pre-flight: prove the writer is acquirable BEFORE any signing ──
     // key is touched or anything is submitted. A persisted profile whose
     // audit chain key is unminted refuses here (audit.chain_key_unavailable);
     // the SAME writer is reused for every post-confirm row below.
-    let (profile, audit_writer, audit_log_path) = match open_profile_audit_writer(&resolved_profile)
-    {
-        Ok((profile, writer, path)) => (profile, writer, path),
-        Err(e) => {
-            return emit_error(&e, args.output, &request_id);
-        }
-    };
+    let (audit_writer, audit_log_path) =
+        match open_audit_writer(&profile, origin, &resolved_profile.name) {
+            Ok((writer, path)) => (writer, path),
+            Err(e) => {
+                return emit_error(&e, args.output, &request_id);
+            }
+        };
 
     // Every non-zero authorizing rule reads its baseline and pin record from
     // this profile's audit log. The signer-set comparison and executable pin
@@ -466,7 +495,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     } = match resolve_software_signer_from_env(
         &args.rule_signer_ed25519_secret_env,
         "smart-account-execute",
-        Some(&resolved_profile),
+        &profile,
     )
     .await
     {
@@ -487,6 +516,11 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
         .unwrap_or(&rule_pubkey_hex)
         .to_owned();
 
+    // On a mainnet profile the rule signer must be the enrolled identity.
+    if let Err(e) = require_enrolled_signer(&profile_name, &profile, &rule_signer).await {
+        drop(rule_signer);
+        return emit_error(&e, args.output, &request_id);
+    }
     // Fail closed BEFORE signing if --expect-rule-signer is set and differs.
     if let Some(expected_hex) = &args.expect_rule_signer
         && expected_hex.to_lowercase() != rule_pubkey_hex
@@ -503,14 +537,20 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     }
 
     // ── Fee-payer signer ────────────────────────────────────────────────────
-    let (fee_payer_signer, fee_payer_mlock_degradation) =
-        match resolve_signer(&args.signer_source, Some(&resolved_profile)).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                drop(rule_signer);
-                return emit_error(&e, args.output, &request_id);
-            }
-        };
+    let (fee_payer_signer, fee_payer_mlock_degradation) = match resolve_signer(
+        &args.signer_source,
+        &profile,
+        &resolved_profile.name,
+        "smart-account-write",
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            drop(rule_signer);
+            return emit_error(&e, args.output, &request_id);
+        }
+    };
 
     let chain_id = context.chain_id.caip2_str();
     let auth_rule_ids_display: Vec<u32> = args.auth_rule_id.clone();
@@ -1077,24 +1117,70 @@ mod tests {
                 account_index: Some(0),
             },
             profile: None,
-            network: TargetNetwork::Testnet,
-            rpc_url: TESTNET_RPC_URL.to_owned(),
+            network: Some(TargetNetwork::Testnet),
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             secondary_rpc_url: None,
             timeout_seconds: 1,
             output: OutputFormat::Json,
         }
     }
 
-    /// Mainnet is refused before any RPC call — non-routable RPC URL ensures
-    /// an accidental call would fail with a connection error, not silently
-    /// succeed.
+    /// The context a testnet profile yields for the endpoint flags of `args`.
+    fn flag_context(args: &ExecuteArgs) -> NetworkContext {
+        NetworkContext::new(
+            args.network.unwrap_or(TargetNetwork::Testnet).caip2(),
+            args.rpc_url
+                .clone()
+                .unwrap_or_else(|| crate::common::network::TESTNET_RPC_URL.to_owned()),
+        )
+    }
+
+    /// A mainnet profile exits 1 before any request reaches its endpoint.
+    /// The binary tests in `tests/profile_env_var_resolution.rs` pin the
+    /// refusal's wire code; `validate_inputs_mainnet_yields_mainnet_write_forbidden`
+    /// pins the refusal inside `validate_execute_inputs`.
     #[tokio::test]
-    async fn mainnet_refused_before_any_network_call() {
+    #[serial_test::serial]
+    async fn mainnet_profile_reaches_no_endpoint() {
+        let guard_rpc = wiremock::MockServer::start().await;
+        let (_guard_dir, _guard_home, _guard_env) =
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&guard_rpc.uri());
         let mut args = minimal_args();
-        args.network = TargetNetwork::Mainnet;
-        args.rpc_url = "http://127.0.0.1:1".to_owned();
+        args.network = Some(TargetNetwork::Mainnet);
+        args.profile = Some("guard-mainnet".into());
+        args.rpc_url = None;
         let code = run(&args).await;
         assert_eq!(code, 1, "mainnet must exit with code 1");
+        assert!(
+            guard_rpc
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
+    }
+
+    /// `--network mainnet` with no profile exits 1 before any request reaches
+    /// the endpoint `--rpc-url` names. The binary tests pin the wire code.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mainnet_flag_without_profile_reaches_no_endpoint() {
+        let guard_rpc = wiremock::MockServer::start().await;
+        let guard_home = tempfile::tempdir().expect("home");
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let mut args = minimal_args();
+        args.network = Some(TargetNetwork::Mainnet);
+        args.rpc_url = Some(guard_rpc.uri());
+        let code = run(&args).await;
+        assert_eq!(code, 1, "mainnet must exit with code 1");
+        assert!(
+            guard_rpc
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
     }
 
     /// An empty `--function` is refused client-side.
@@ -1102,7 +1188,7 @@ mod tests {
     async fn empty_function_refused_client_side() {
         let mut args = minimal_args();
         args.function = String::new();
-        args.rpc_url = "http://127.0.0.1:1".to_owned();
+        args.rpc_url = Some("http://127.0.0.1:1".to_owned());
         let code = run(&args).await;
         assert_eq!(code, 1, "empty function name must be refused");
     }
@@ -1112,7 +1198,7 @@ mod tests {
     async fn malformed_arg_refused_with_index() {
         let mut args = minimal_args();
         args.arg = vec![VOID_ARG_B64.to_owned(), "not-valid-base64!!".to_owned()];
-        args.rpc_url = "http://127.0.0.1:1".to_owned();
+        args.rpc_url = Some("http://127.0.0.1:1".to_owned());
         let code = run(&args).await;
         assert_eq!(code, 1, "malformed --arg must be refused");
     }
@@ -1126,12 +1212,9 @@ mod tests {
     #[test]
     fn validate_inputs_mainnet_yields_mainnet_write_forbidden() {
         let mut args = minimal_args();
-        args.network = TargetNetwork::Mainnet;
-        let err = validate_execute_inputs(
-            &args,
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-        )
-        .expect_err("mainnet must refuse");
+        args.network = Some(TargetNetwork::Mainnet);
+        let err =
+            validate_execute_inputs(&args, &flag_context(&args)).expect_err("mainnet must refuse");
         assert_eq!(err.code(), "network.mainnet_write_forbidden");
     }
 
@@ -1141,11 +1224,8 @@ mod tests {
     fn validate_inputs_empty_function_names_the_flag() {
         let mut args = minimal_args();
         args.function = String::new();
-        let err = validate_execute_inputs(
-            &args,
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-        )
-        .expect_err("empty function must refuse");
+        let err = validate_execute_inputs(&args, &flag_context(&args))
+            .expect_err("empty function must refuse");
         assert_eq!(err.code(), "validation.address_invalid");
         assert!(
             err.to_string().contains("--function"),
@@ -1160,11 +1240,8 @@ mod tests {
     fn validate_inputs_malformed_arg_names_failing_index() {
         let mut args = minimal_args();
         args.arg = vec![VOID_ARG_B64.to_owned(), "not-valid-base64!!".to_owned()];
-        let err = validate_execute_inputs(
-            &args,
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-        )
-        .expect_err("malformed arg must refuse");
+        let err = validate_execute_inputs(&args, &flag_context(&args))
+            .expect_err("malformed arg must refuse");
         assert_eq!(err.code(), "validation.xdr_argument_malformed");
         assert!(
             err.to_string().contains("--arg[1]"),
@@ -1181,11 +1258,8 @@ mod tests {
         let _home = StellarAgentHomeGuard::new(dir.path());
         let mut args = minimal_args();
         args.verifier = None;
-        let err = validate_execute_inputs(
-            &args,
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-        )
-        .expect_err("missing verifier must refuse");
+        let err = validate_execute_inputs(&args, &flag_context(&args))
+            .expect_err("missing verifier must refuse");
         assert_eq!(err.code(), "validation.address_invalid");
         assert!(
             err.to_string().contains("deploy-ed25519-verifier"),
@@ -1205,11 +1279,8 @@ mod tests {
         args.contract = VALID_C.to_owned();
         args.verifier = Some(VALID_C.to_owned());
         args.arg = vec![VOID_ARG_B64.to_owned()];
-        let plan = validate_execute_inputs(
-            &args,
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-        )
-        .expect("valid inputs must produce a plan");
+        let plan = validate_execute_inputs(&args, &flag_context(&args))
+            .expect("valid inputs must produce a plan");
         assert_eq!(plan.arg_count, 1);
         assert_eq!(plan.verifier_c_strkey, VALID_C);
         assert!(matches!(
@@ -1227,7 +1298,7 @@ mod tests {
         let _guard = StellarAgentHomeGuard::new(dir.path());
 
         let mut args = minimal_args();
-        args.rpc_url = "http://127.0.0.1:1".to_owned();
+        args.rpc_url = Some("http://127.0.0.1:1".to_owned());
         let code = run(&args).await;
         assert_eq!(
             code, 1,

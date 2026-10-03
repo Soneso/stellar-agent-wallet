@@ -681,7 +681,7 @@ fn protected_environment_overlay_reports_wire_code() {
     let stderr = assert_refused_with(&run_with_initialize(command), 1);
     assert!(stderr.contains("profile.non_overlayable_field"), "{stderr}");
     assert!(
-        stderr.contains("remove it from the environment or the overlay"),
+        stderr.contains("remove it from the environment, the overlay, or the command line"),
         "{stderr}"
     );
 }

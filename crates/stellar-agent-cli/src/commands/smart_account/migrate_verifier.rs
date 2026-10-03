@@ -92,9 +92,11 @@ use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     CommonArgsView, CommonHandlerContext, SignerSourceFlags, construct_signers_manager_from_fields,
-    open_profile_audit_writer_read_only, wrap_sa_error,
+    load_command_profile, map_access_error, open_audit_writer_read_only, wrap_sa_error,
 };
-use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
+use crate::common::network::{
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 
@@ -165,22 +167,23 @@ pub struct MigrateVerifierArgs {
     #[command(flatten)]
     pub signer_source: SignerSourceFlags,
 
-    /// Target network (`testnet` or `mainnet`).
-    ///
-    /// Mainnet dry-run is allowed (read-only).  Mainnet submit is structurally
-    /// refused (`network.mainnet_write_forbidden`).
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
-    /// Primary Soroban RPC URL.
-    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
-    /// Secondary Soroban RPC URL for two-RPC consultation.
-    ///
-    /// Defaults to `--rpc-url` (degrades to single-RPC consultation where
-    /// primary and secondary trivially agree).
-    #[arg(long, value_name = "URL")]
+    /// The secondary endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub secondary_rpc_url: Option<String>,
 
     /// Submission timeout in seconds.
@@ -210,12 +213,12 @@ impl CommonArgsView for MigrateVerifierArgs {
         &self.signer_source
     }
 
-    fn network(&self) -> TargetNetwork {
+    fn network(&self) -> Option<TargetNetwork> {
         self.network
     }
 
-    fn rpc_url(&self) -> &str {
-        &self.rpc_url
+    fn rpc_url(&self) -> Option<&str> {
+        self.rpc_url.as_deref()
     }
 
     fn secondary_rpc_url(&self) -> Option<&str> {
@@ -373,25 +376,26 @@ pub struct MigrateVerifierResult {
 
 /// Builds a read-only [`SignersManager`] for the dry-run path.
 ///
-/// Opens the audit writer via [`open_profile_audit_writer_read_only`] then constructs the manager
+/// Opens the audit writer via [`open_audit_writer_read_only`] then constructs the manager
 /// via [`construct_signers_manager_from_fields`].  Does not resolve a signer source.
 ///
 /// # Errors
 ///
 /// - Audit-log directory creation or [`stellar_agent_core::audit_log::writer::AuditWriter::open`]
-///   fails → propagated from [`open_profile_audit_writer_read_only`].
+///   fails → propagated from [`open_audit_writer_read_only`].
 /// - [`stellar_agent_smart_account::managers::signers::SignersManager::new`] fails →
 ///   propagated from [`construct_signers_manager_from_fields`].
 fn dry_run_signers_manager(
     context: &NetworkContext,
     args: &MigrateVerifierArgs,
+    profile: &stellar_agent_core::profile::Profile,
+    resolved_profile: &crate::common::ResolvedProfileName,
 ) -> Result<(SignersManager, String), WalletError> {
-    let resolved_profile = resolve_profile_name(args.profile.as_deref());
     let profile_name = resolved_profile.name.clone();
     let chain_id = context.chain_id.caip2_str().to_owned();
     let timeout = Duration::from_secs(args.timeout_seconds);
-    let (_audit_profile, audit_writer, audit_log_path) =
-        open_profile_audit_writer_read_only(&resolved_profile)?;
+    let (audit_writer, audit_log_path) =
+        open_audit_writer_read_only(profile, &resolved_profile.name)?;
     let manager = construct_signers_manager_from_fields(
         &profile_name,
         context,
@@ -414,12 +418,32 @@ fn dry_run_signers_manager(
 ///
 /// Never panics.
 pub async fn run(args: &MigrateVerifierArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone())
-        .with_secondary(args.secondary_rpc_url.clone());
     let request_id = Uuid::new_v4().to_string();
+    let resolved_profile = resolve_profile_name(args.profile.as_deref());
+    let (profile, origin) = match load_command_profile(&resolved_profile) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved_profile.name);
+            return emit_error(&e, &request_id);
+        }
+    };
+    let context = match network_context_for_command(
+        &profile,
+        &resolved_profile.name,
+        EndpointFlags {
+            network: args.network,
+            rpc_url: args.rpc_url.as_deref(),
+            secondary_rpc_url: args.secondary_rpc_url.as_deref(),
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => {
+            return emit_error(&e, &request_id);
+        }
+    };
 
-    // Structural mainnet refusal — first gate, before flag-value validation,
-    // key access, or any RPC call.  Dry-run on mainnet stays allowed
+    // The context has passed the flag rules. Submit refuses mainnet before
+    // signer access or RPC. Dry-run on mainnet stays allowed
     // (read-only).
     if let Some(err) = mainnet_submit_refusal(context.chain_id, args.dry_run) {
         return emit_error(&err, &request_id);
@@ -464,10 +488,11 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
     };
 
     if args.dry_run {
-        let (manager, chain_id) = match dry_run_signers_manager(&context, args) {
-            Ok(ctx) => ctx,
-            Err(e) => return emit_error(&e, &request_id),
-        };
+        let (manager, chain_id) =
+            match dry_run_signers_manager(&context, args, &profile, &resolved_profile) {
+                Ok(ctx) => ctx,
+                Err(e) => return emit_error(&e, &request_id),
+            };
 
         info!(
             account = %redact_strkey_first5_last5(&args.account),
@@ -503,10 +528,11 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
     }
 
     // Build handler context: resolves signer, opens audit writer, constructs RPC handles.
-    let ctx = match CommonHandlerContext::new(args, &context).await {
-        Ok(ctx) => ctx,
-        Err(e) => return emit_error(&e, &request_id),
-    };
+    let ctx =
+        match CommonHandlerContext::new(args, resolved_profile, profile, origin, &context).await {
+            Ok(ctx) => ctx,
+            Err(e) => return emit_error(&e, &request_id),
+        };
 
     // Build the SignersManager — needed by MigrationPlanner for RPC access.
     let manager = match ctx.signers_manager() {
@@ -1079,6 +1105,7 @@ fn emit_error_sa(err: &SaError, request_id: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, reason = "test fixture assertions")]
     use super::*;
     use stellar_agent_smart_account::managers::migration::{
         RuleMigration, SignerStepSubmitOutcome,
@@ -1100,10 +1127,20 @@ mod tests {
         args.to_verifier = DESTINATION.to_owned();
         args.signer_source.signer_secret_env = Some("MIGRATE_SEED".to_owned());
         args.profile = Some("ops".to_owned());
-        args.rpc_url = "https://user:secret@rpc.example".to_owned();
+        args.rpc_url = Some("https://user:secret@rpc.example".to_owned());
         args.secondary_rpc_url = Some("https://user:secret@rpc2.example".to_owned());
         args.timeout_seconds = 90;
         args
+    }
+
+    /// The context a testnet profile yields for the endpoint flags of `args`.
+    fn flag_context(args: &MigrateVerifierArgs) -> NetworkContext {
+        NetworkContext::new(
+            args.network.unwrap_or(TargetNetwork::Testnet).caip2(),
+            args.rpc_url
+                .clone()
+                .unwrap_or_else(|| crate::common::network::TESTNET_RPC_URL.to_owned()),
+        )
     }
 
     /// The pending add of signer 7 of rule 1 on [`DESTINATION`].
@@ -1185,7 +1222,7 @@ mod tests {
             1,
         );
         migration_plan_to_result_submitted(
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+            &flag_context(args),
             &plan_with(later_steps),
             &submitted,
             args,
@@ -1281,11 +1318,7 @@ mod tests {
 
         // (a) The removal confirmed and was recorded; the add failed.
         let pending = pending_step(true, None);
-        let command = recovery_command(
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-            &args,
-            &pending,
-        );
+        let command = recovery_command(&flag_context(&args), &args, &pending);
         let error = SaError::VerifierMigrationFailed {
             phase: "submit_simulate",
             smart_account_redacted: redacted(),
@@ -1294,13 +1327,7 @@ mod tests {
         };
         let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 0);
         assert_eq!(
-            partial_failure_recovery_line(
-                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-                &args,
-                &result,
-                &error
-            )
-            .as_deref(),
+            partial_failure_recovery_line(&flag_context(&args), &args, &result, &error).as_deref(),
             Some(format!("run: {command}").as_str())
         );
         let value = partial_envelope(result, &error);
@@ -1324,13 +1351,7 @@ mod tests {
         // A later step on the rule: the re-run precedes the add.
         let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 1);
         assert_eq!(
-            partial_failure_recovery_line(
-                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-                &args,
-                &result,
-                &error
-            )
-            .as_deref(),
+            partial_failure_recovery_line(&flag_context(&args), &args, &result, &error).as_deref(),
             Some(format!("{remaining}, then: {command}").as_str())
         );
 
@@ -1338,13 +1359,7 @@ mod tests {
         let error = baseline_write_failed();
         let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 0);
         assert_eq!(
-            partial_failure_recovery_line(
-                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-                &args,
-                &result,
-                &error
-            )
-            .as_deref(),
+            partial_failure_recovery_line(&flag_context(&args), &args, &result, &error).as_deref(),
             Some(format!("run: {refresh}, then: {command}").as_str())
         );
         let value = partial_envelope(result, &error);
@@ -1353,13 +1368,7 @@ mod tests {
         // (b) with a later step on the rule: refresh, the re-run, the add.
         let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 1);
         assert_eq!(
-            partial_failure_recovery_line(
-                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-                &args,
-                &result,
-                &error
-            )
-            .as_deref(),
+            partial_failure_recovery_line(&flag_context(&args), &args, &result, &error).as_deref(),
             Some(format!("run: {refresh}, then {remaining}, then: {command}").as_str())
         );
 
@@ -1370,13 +1379,8 @@ mod tests {
             let error = diverged(tx_hash.clone());
             let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 0);
             assert_eq!(
-                partial_failure_recovery_line(
-                    &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-                    &args,
-                    &result,
-                    &error
-                )
-                .as_deref(),
+                partial_failure_recovery_line(&flag_context(&args), &args, &result, &error)
+                    .as_deref(),
                 Some(format!("run: {refresh}, then: {command}").as_str()),
                 "{tx_hash:?}"
             );
@@ -1389,12 +1393,7 @@ mod tests {
         let error = baseline_write_failed();
         let result = partial_result(&args, None, None, 0);
         assert_eq!(
-            partial_failure_recovery_line(
-                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-                &args,
-                &result,
-                &error
-            ),
+            partial_failure_recovery_line(&flag_context(&args), &args, &result, &error),
             None
         );
         let value = partial_envelope(result, &error);
@@ -1407,13 +1406,7 @@ mod tests {
         let error = unresolved("a".repeat(64));
         let result = partial_result(&args, Some(pending.clone()), None, 1);
         assert_eq!(
-            partial_failure_recovery_line(
-                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-                &args,
-                &result,
-                &error
-            )
-            .as_deref(),
+            partial_failure_recovery_line(&flag_context(&args), &args, &result, &error).as_deref(),
             Some(
                 format!(
                     "the remove transaction {} has an unknown outcome. Once it is confirmed, \
@@ -1443,13 +1436,7 @@ mod tests {
         let error = unresolved("b".repeat(64));
         let result = partial_result(&args, Some(pending.clone()), confirmed_hash.clone(), 0);
         assert_eq!(
-            partial_failure_recovery_line(
-                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-                &args,
-                &result,
-                &error
-            )
-            .as_deref(),
+            partial_failure_recovery_line(&flag_context(&args), &args, &result, &error).as_deref(),
             Some(
                 format!(
                     "the add transaction {} has an unknown outcome. Once it is confirmed, \
@@ -1465,13 +1452,7 @@ mod tests {
         // (c) The add's outcome is unknown with a later step on the rule.
         let result = partial_result(&args, Some(pending), confirmed_hash, 1);
         assert_eq!(
-            partial_failure_recovery_line(
-                &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-                &args,
-                &result,
-                &error
-            )
-            .as_deref(),
+            partial_failure_recovery_line(&flag_context(&args), &args, &result, &error).as_deref(),
             Some(
                 format!(
                     "the add transaction {} has an unknown outcome. Once it is confirmed, \
@@ -1505,7 +1486,7 @@ mod tests {
             2,
         );
         let result = migration_plan_to_result_submitted(
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
+            &flag_context(&args),
             &plan_with(1),
             &submitted,
             &args,
@@ -1540,11 +1521,7 @@ mod tests {
     #[test]
     fn recovery_command_renders_the_signers_add_of_the_pending_step() {
         let args = recovery_args();
-        let command = recovery_command(
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-            &args,
-            &pending_step(true, None),
-        );
+        let command = recovery_command(&flag_context(&args), &args, &pending_step(true, None));
         assert_eq!(
             command,
             format!(
@@ -1562,11 +1539,7 @@ mod tests {
         ledger.signer_source.sign_with_ledger = true;
         ledger.signer_source.account_index = Some(3);
         ledger.profile = Some("ops team's".to_owned());
-        let command = recovery_command(
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-            &ledger,
-            &pending_step(true, None),
-        );
+        let command = recovery_command(&flag_context(&args), &ledger, &pending_step(true, None));
         assert!(
             command.ends_with(
                 " --sign-with-ledger --account-index 3 --profile 'ops team'\\''s' \
@@ -1591,8 +1564,8 @@ mod tests {
                 sign_with_ledger: false,
                 account_index: Some(0),
             },
-            network: TargetNetwork::Testnet,
-            rpc_url: "http://127.0.0.1:1".to_owned(),
+            network: Some(TargetNetwork::Testnet),
+            rpc_url: Some("http://127.0.0.1:1".to_owned()),
             secondary_rpc_url: None,
             timeout_seconds: 1,
             dry_run: false,
@@ -1651,19 +1624,16 @@ mod tests {
         }
     }
 
-    /// run()-level: the wired gate refuses a mainnet submit with no RPC
-    /// attempt (the mock server records zero requests) and exit code 1.
-    ///
-    /// The fixture supplies a valid signer source and valid strkeys, so every
-    /// earlier refusal path is out of play: if the gate were unwired from
-    /// `run()`, execution would reach plan building, hit the mock server, and
-    /// fail the zero-request assertion.
+    /// A mainnet profile's submit exits 1 before any request reaches the
+    /// profile's endpoint. The binary tests in
+    /// `tests/profile_env_var_resolution.rs` pin the refusal's wire code.
     #[tokio::test]
     #[serial_test::serial]
-    async fn run_mainnet_submit_refused_before_any_network_call() {
+    async fn run_mainnet_profile_submit_reaches_no_endpoint() {
+        let guard_rpc = wiremock::MockServer::start().await;
+        let (_guard_dir, _guard_home, _guard_env) =
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&guard_rpc.uri());
         const SIGNER_ENV: &str = "MIGRATE_VERIFIER_MAINNET_GATE_TEST_SEED";
-
-        let server = wiremock::MockServer::start().await;
         let seed = stellar_strkey::ed25519::PrivateKey([7u8; 32])
             .as_unredacted()
             .to_string()
@@ -1671,23 +1641,55 @@ mod tests {
         let _guard = TestEnvVarGuard::set(SIGNER_ENV, std::ffi::OsStr::new(&seed));
 
         let mut args = minimal_args();
-        args.network = TargetNetwork::Mainnet;
-        args.rpc_url = server.uri();
-        args.secondary_rpc_url = Some(server.uri());
+        args.network = Some(TargetNetwork::Mainnet);
+        args.profile = Some("guard-mainnet".into());
+        args.rpc_url = None;
         args.signer_source.signer_secret_env = Some(SIGNER_ENV.to_owned());
-
         let code = run(&args).await;
-        assert_eq!(code, 1, "mainnet submit must exit with code 1");
-
-        let request_count = server
-            .received_requests()
-            .await
-            .map(|reqs| reqs.len())
-            .unwrap_or_default();
-        assert_eq!(
-            request_count, 0,
-            "mainnet submit must be refused before any RPC request"
+        assert_eq!(code, 1, "a mainnet submit must exit 1");
+        assert!(
+            guard_rpc
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
         );
+    }
+
+    /// `--network mainnet` with no profile exits 1 before any request reaches
+    /// the primary or the secondary endpoint the flags name. The binary tests
+    /// pin the wire code.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_mainnet_flag_without_profile_reaches_no_endpoint() {
+        let primary = wiremock::MockServer::start().await;
+        let secondary = wiremock::MockServer::start().await;
+        let guard_home = tempfile::tempdir().expect("home");
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        const SIGNER_ENV: &str = "MIGRATE_VERIFIER_MAINNET_GATE_TEST_SEED";
+        let seed = stellar_strkey::ed25519::PrivateKey([7u8; 32])
+            .as_unredacted()
+            .to_string()
+            .to_string();
+        let _guard = TestEnvVarGuard::set(SIGNER_ENV, std::ffi::OsStr::new(&seed));
+
+        let mut args = minimal_args();
+        args.network = Some(TargetNetwork::Mainnet);
+        args.rpc_url = Some(primary.uri());
+        args.secondary_rpc_url = Some(secondary.uri());
+        args.signer_source.signer_secret_env = Some(SIGNER_ENV.to_owned());
+        let code = run(&args).await;
+        assert_eq!(code, 1, "a mainnet submit must exit 1");
+        for endpoint in [&primary, &secondary] {
+            assert!(
+                endpoint
+                    .received_requests()
+                    .await
+                    .expect("requests")
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

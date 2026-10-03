@@ -21,7 +21,7 @@ use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::WalletError;
 use stellar_agent_network::{AccountView, Asset, StellarRpcClient, fetch_account};
 
-use crate::common::network::TESTNET_RPC_URL;
+use crate::common::network::{EndpointUrlFlag, TESTNET_RPC_URL};
 use crate::render::table::render_balances_table;
 
 /// Arguments for the `balances` subcommand.
@@ -46,7 +46,8 @@ pub struct BalancesArgs {
     #[arg(
         long,
         default_value = TESTNET_RPC_URL,
-        value_name = "URL"
+        value_name = "URL",
+        value_parser = EndpointUrlFlag
     )]
     pub rpc_url: String,
 

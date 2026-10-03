@@ -41,11 +41,6 @@ use stellar_agent_core::error::WalletError;
 use stellar_agent_core::policy::v1::{ValueClass, ValueEffects};
 use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::schema::Profile;
-use stellar_agent_network::NetworkContext;
-
-use crate::commands::policy_engine::{
-    build_v1_policy_engine, evaluate_value_moving_policy_with_value,
-};
 
 use stellar_agent_defi::adapter::{DefiAdapter, DefiAdapterCtx};
 use stellar_agent_defi::dispatch::{GateOutcome, dispatch_gate, require_approval_error};
@@ -54,8 +49,14 @@ use stellar_agent_dex::{
     abi::TradeArgs as DexTradeArgs, adapter::DexSwapAdapter, pins::pinned_router_for_network,
     sac::canonicalise_path, value::dex_trade_value_leg,
 };
-use stellar_agent_network::{StellarRpcClient, init_platform_keyring_store, signer_from_keyring};
+use stellar_agent_network::{
+    StellarRpcClient, enrolled_keyring_signer, init_platform_keyring_store,
+};
 
+use crate::commands::policy_engine::{
+    build_v1_policy_engine, evaluate_value_moving_policy_with_value,
+};
+use crate::common::network::{EndpointFlags, EndpointUrlFlag, network_context_for_command};
 use crate::common::profile_access::{injected_profile_load, reconcile_loaded_profile};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
@@ -117,8 +118,11 @@ pub struct TradeArgs {
     #[arg(long)]
     pub deadline: Option<u64>,
 
-    /// Secondary RPC URL for the two-RPC router WASM-hash cross-check.
-    #[arg(long)]
+    /// The secondary endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_parser = EndpointUrlFlag)]
     pub secondary_rpc_url: Option<String>,
 }
 
@@ -165,6 +169,25 @@ where
         }
     };
 
+    // ── Network context ───────────────────────────────────────────────────────
+    // Built from the loaded profile before the keyring store is registered, so
+    // a refused endpoint input never initialises it.
+    let context = match network_context_for_command(
+        &profile,
+        &profile_name,
+        EndpointFlags {
+            network: None,
+            rpc_url: None,
+            secondary_rpc_url: args.secondary_rpc_url.as_deref(),
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => {
+            render_json(&Envelope::<()>::err(&e));
+            return 1;
+        }
+    };
+
     // ── Initialise platform keyring store ─────────────────────────────────────
     // The keyring signer loaded before signing requires the process-global
     // default store.  Ordered after the profile load so a missing profile never
@@ -175,8 +198,6 @@ where
     }
 
     // ── Resolve network settings ──────────────────────────────────────────────
-    let context =
-        NetworkContext::from_profile(&profile).with_secondary(args.secondary_rpc_url.clone());
     let rpc_url = context.rpc_url.as_str();
     let network_passphrase = context.network_passphrase();
     let chain_id = context.chain_id.caip2_str();
@@ -334,7 +355,7 @@ where
     // ── Load signer ───────────────────────────────────────────────────────────
     let signer_entry_ref = &profile.mcp_signer_default;
     let expected_g = signer_entry_ref.account.as_str();
-    let signer_handle = match signer_from_keyring(signer_entry_ref, expected_g).await {
+    let signer_handle = match enrolled_keyring_signer(&profile_name, &profile, expected_g).await {
         Ok(s) => s,
         Err(e) => {
             render_json(&Envelope::<()>::err(&e));

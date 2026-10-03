@@ -33,7 +33,7 @@ use stellar_agent_core::profile::{
 use stellar_agent_network::NetworkContext;
 use stellar_agent_network::{
     SoftwareSigningKey, StellarRpcClient, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
-    WalletSubmissionRecorder, fetch_account, keyring::signer_from_keyring,
+    WalletSubmissionRecorder, fetch_account, keyring::enrolled_keyring_signer,
 };
 use stellar_agent_pool::{
     PoolError,
@@ -333,11 +333,9 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
                 }
                 _ => {}
             }
-            let signer = signer_from_keyring(
-                &profile.mcp_signer_default,
-                &profile.mcp_signer_default.account,
-            )
-            .await?;
+            let signer =
+                enrolled_keyring_signer(name, &profile, &profile.mcp_signer_default.account)
+                    .await?;
             let seed = fresh_seed();
             let size = args
                 .size
@@ -473,11 +471,8 @@ async fn execute(args: &PoolInitArgs) -> Result<serde_json::Value, WalletError> 
         pending.submission = None;
         persist(name, &master, &pending)?;
     }
-    let signer = signer_from_keyring(
-        &profile.mcp_signer_default,
-        &profile.mcp_signer_default.account,
-    )
-    .await?;
+    let signer =
+        enrolled_keyring_signer(name, &profile, &profile.mcp_signer_default.account).await?;
     if signer.public_key().to_string().as_str() != pending.funder {
         return Err(unavailable(
             "the profile signer is not the recorded pool funder",

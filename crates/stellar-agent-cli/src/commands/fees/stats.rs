@@ -6,7 +6,7 @@ use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_network::{FeeStatsView, StellarRpcClient, fetch_fee_stats, validate_rpc_url};
 
-use crate::common::network::TESTNET_RPC_URL;
+use crate::common::network::{EndpointUrlFlag, TESTNET_RPC_URL};
 use crate::common::profile_access::load_profile_reconciled;
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::render::table::render_fee_stats_table;
@@ -19,7 +19,7 @@ pub struct FeesStatsArgs {
     pub profile: Option<String>,
 
     /// Allow-listed Stellar RPC endpoint override.
-    #[arg(long, value_name = "URL")]
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub rpc_url: Option<String>,
 
     /// Output format: `json` (default) or `table`.
@@ -71,20 +71,24 @@ pub async fn run(args: &FeesStatsArgs) -> i32 {
 }
 
 fn resolve_rpc_url(args: &FeesStatsArgs) -> Result<String, WalletError> {
-    if let Some(url) = &args.rpc_url {
-        return Ok(url.clone());
+    if let Some(name) = &args.profile {
+        let profile = load_profile_reconciled(&ResolvedProfileName::from_flag(name), None)
+            .map_err(|e| e.to_wallet_error(name))?;
+        let context = crate::common::network::network_context_for_command(
+            &profile,
+            name,
+            crate::common::network::EndpointFlags {
+                network: None,
+                rpc_url: args.rpc_url.as_deref(),
+                secondary_rpc_url: None,
+            },
+        )?;
+        return Ok(context.rpc_url);
     }
-    if let Some(profile_name) = &args.profile {
-        // `--profile` here is always explicit: `None` means "use the testnet
-        // default endpoint", never "use the default profile", so the name is
-        // not routed through the resolver. It is still reconciled — an endpoint
-        // taken from a file that names another profile would send the query to
-        // a network the operator did not select.
-        return load_profile_reconciled(&ResolvedProfileName::from_flag(profile_name), None)
-            .map(|profile| profile.rpc_url)
-            .map_err(|e| e.to_wallet_error(profile_name));
-    }
-    Ok(TESTNET_RPC_URL.to_owned())
+    Ok(args
+        .rpc_url
+        .clone()
+        .unwrap_or_else(|| TESTNET_RPC_URL.to_owned()))
 }
 
 fn validate_rpc_url_for_cli(url: &str) -> Result<(), WalletError> {

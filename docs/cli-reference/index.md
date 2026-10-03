@@ -48,19 +48,22 @@ The selected name must also be the name the profile file carries. Every command 
 
 ### Network
 
-`--network <NETWORK>` accepts `testnet` (the default) or `mainnet`, case-insensitive; no other value is accepted. The CAIP-2 chain id (`stellar:testnet` or `stellar:mainnet`) drives passphrase resolution and the mainnet-write gate. Not every command exposes `--network`: the read-only `balances` command selects its network through `--rpc-url` instead.
+Transaction commands read the chain from the resolved profile. An unnamed, missing profile uses the zero-config testnet profile.
+`--network <NETWORK>` optionally asserts `testnet` or `mainnet`, case-insensitive. A value differing from the profile refuses with `profile.network_flag_mismatch` before the command's structural mainnet refusal.
 
-`testnet` is the default everywhere. `mainnet` is accepted for read-only commands, selected via `--network` where the command exposes it or via `--rpc-url` for `balances`. Every write or signing command structurally refuses `mainnet` in this alpha — see [Mainnet-write refusal](#mainnet-write-refusal).
-
-A few commands derive their network from the loaded profile rather than from a `--network` flag (for example `trustline`, which takes `--chain-id <CAIP2>`). This is noted on the relevant page.
+`balances` keeps its endpoint-based selection, standalone `friendbot` keeps its testnet-class network selector, and `profile init --network` selects the chain for a new file.
+`trustline` reads its chain from the profile.
 
 ### RPC endpoints
 
-- `--rpc-url <URL>`: the primary Soroban RPC endpoint. On most commands the default is `https://soroban-testnet.stellar.org`. `fees stats` validates the URL against an allowlist; the other commands accept any URL that parses.
-- `--secondary-rpc-url <URL>` — a second RPC endpoint for two-RPC cross-checks (for example, divergence detection on WASM-hash pins). Optional; its absence resolves per command:
-  - On `lend`, `vault`, `trade`, and `smart-account rules` the dual-RPC cross-check is disabled and verification proceeds against the primary endpoint only.
-  - On the `smart-account timelock` commands it falls back to the primary `--rpc-url` and warns that the divergence defence is then off.
-  - `smart-account multicall` requires it (set on the flag or as `secondary_rpc_url` in the profile) and errors when it is absent.
+`--rpc-url <URL>` and `--secondary-rpc-url <URL>` are optional. Without a flag, each endpoint comes from the profile.
+On testnet, a flag replaces its profile field. On mainnet, either flag refuses with `profile.non_overlayable_field`, including an equal value.
+RPC URL flags refuse credentials. Configure credentialed endpoints in the profile.
+
+Smart-account rule commands use the effective secondary for cross-RPC checks. `smart-account multicall` requires a secondary endpoint.
+The signers manager and timelock commands use the primary when no secondary is configured.
+`balances` keeps its testnet endpoint default. Standalone `friendbot` derives its endpoint from its network selector.
+`fees stats --profile` applies the endpoint rules above and keeps its flag allowlist. Without `--profile`, it uses `--rpc-url`, else the testnet endpoint.
 
 ### Timeout
 
@@ -97,9 +100,13 @@ fi
 
 ## Mainnet-write refusal
 
-This is a testnet-first alpha. `testnet` is the default network and Friendbot funding is testnet-only.
+The zero-config profile uses testnet. Friendbot funding is limited to testnet-class networks.
 
-`mainnet` is accepted for read-only commands (for example reading a context rule or listing rules). Every write or signing command structurally refuses `mainnet` with the wire code `network.mainnet_write_forbidden` (the `friendbot` command uses `network.friendbot_mainnet_forbidden`). A command that names `--network mainnet` is refused ahead of network and key access, so it cannot reach the chain or unlock a seed.
+On a mainnet profile, `pay`, `claim`, account creation, account deployment, and smart-account deployment refuse before signer access.
+The same structural refusal covers all signer verbs, rule writes, policy writes, `execute`, migration submit, timelock writes, and `multicall`.
+It reports `network.mainnet_write_forbidden`; Friendbot funding reports `network.friendbot_mainnet_forbidden`.
+Read-only inspection remains available. Profile-driven `trade`, `vault`, `trustline`, `pool`, and `tx` use the submit layer's refusal, so they can contact the endpoint and load their signer before it.
+`--network` is checked against the profile before a structural refusal, so `--network mainnet` on the zero-config testnet profile reports `profile.network_flag_mismatch`.
 
 The submit layer applies the same refusal in a fixed order. A declared mainnet network passphrase is refused first, then an `--rpc-url` matching a known mainnet host; both cost zero RPC calls. The envelope is then decoded locally, so a malformed or legacy V0 envelope is refused without a round trip.
 

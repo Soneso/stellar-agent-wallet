@@ -73,6 +73,14 @@ pub fn redact_url_userinfo(url: &str) -> String {
         .unwrap_or_else(|| url.to_string())
 }
 
+/// The refusal text for an RPC URL input that carries a username or a
+/// password. Each caller prefixes the name of its input.
+///
+/// The text quotes no part of the refused value, so the credentials never
+/// reach an error message. A credentialed endpoint belongs in the profile file.
+pub const CREDENTIALED_URL_INPUT_REFUSAL: &str =
+    "never carries credentials; configure a credentialed endpoint in the profile";
+
 #[cfg(test)]
 mod tests {
     use super::{redact_url_authority, redact_url_userinfo};

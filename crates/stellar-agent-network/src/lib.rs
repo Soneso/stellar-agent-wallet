@@ -91,7 +91,9 @@ pub use friendbot::{
     fund_with_friendbot, redact_url_userinfo, validate_friendbot_url,
 };
 pub use idempotent_submit::{reconcile_receipt, submit_transaction_idempotent};
-pub use keyring::{KeyringSignHandle, init_platform_keyring_store, signer_from_keyring};
+pub use keyring::{
+    KeyringSignHandle, enrolled_keyring_signer, init_platform_keyring_store, signer_from_keyring,
+};
 pub use retry::RetryPolicy;
 pub use sequence_floor::{
     CATCHUP_MAX_POLLS, CATCHUP_POLL_INTERVAL, SequenceFloorHook,

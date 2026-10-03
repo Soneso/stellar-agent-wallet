@@ -307,7 +307,7 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use std::sync::Arc;
 
-        use stellar_agent_network::keyring::signer_from_keyring;
+        use stellar_agent_network::keyring::enrolled_keyring_signer;
         use stellar_agent_x402::exact::create_payment;
         use stellar_agent_x402::wire::encode_payment_signature;
 
@@ -461,20 +461,38 @@ impl WalletServer {
         }
 
         // ── Step 3: Load signer from keyring ─────────────────────────────────
-        let signer_handle =
-            match signer_from_keyring(&self.profile.mcp_signer_default, account).await {
-                Ok(h) => h,
-                Err(_) => {
-                    // Static message aligned with the DeFi signer-load surfaces
-                    // (dex / vault) for cross-surface uniformity; the
-                    // wire code stays `x402.keyring_load_failed`, consistent with
-                    // `stellar_x402_create_payment`.
+        let signer_handle = match enrolled_keyring_signer(
+            &self.profile_name_for_approval(),
+            &self.profile,
+            account,
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(err) => {
+                if matches!(
+                    &err,
+                    stellar_agent_core::error::WalletError::Auth(
+                        stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                    )
+                ) {
                     return Ok(crate::tools::common::business_error_result(
-                        "x402.keyring_load_failed",
-                        "could not load signer from keyring",
+                        err.code(),
+                        err.to_string(),
                     ));
                 }
-            };
+
+                // Static message aligned with the DeFi signer-load surfaces
+                // (dex / vault) for cross-surface uniformity; the
+                // wire code stays `x402.keyring_load_failed`, consistent with
+                // `stellar_x402_create_payment`.
+                return Ok(crate::tools::common::business_error_result(
+                    "x402.keyring_load_failed",
+                    "could not load signer from keyring",
+                ));
+            }
+        };
 
         // ── Step 4: Resolve RPC URL from active profile (NEVER from input) ───
         let rpc_url = self.context.rpc_url.as_str();

@@ -53,6 +53,8 @@ pub mod migrate;
 pub mod name;
 pub mod receipt;
 pub mod schema;
+pub mod signer_identity;
+pub use signer_identity::{check_enrolled_signer, enrolled_signer_pin};
 
 pub use caip2::{ChainIdValidationError, validate_chain_id_matches_profile};
 pub use name::{

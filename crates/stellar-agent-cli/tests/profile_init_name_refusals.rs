@@ -164,7 +164,7 @@ fn a_name_that_only_resembles_a_device_is_still_created() {
 #[test]
 fn profile_init_redacts_rpc_url_and_preserves_saved_url() {
     let home = tempfile::tempdir().expect("temp home");
-    let url = "https://user:SENTINEL@mainnet.example/v1/SENTINEL-PATH";
+    let url = "https://mainnet.example/v1/SENTINEL-PATH?token=SENTINEL-QUERY";
     let (code, json, stdout) = run_init(
         home.path(),
         "x",
@@ -179,4 +179,31 @@ fn profile_init_redacts_rpc_url_and_preserves_saved_url() {
         saved.contains(url),
         "the saved profile must retain the full URL"
     );
+}
+
+#[test]
+fn profile_init_refuses_credentialed_rpc_before_creating_file() {
+    let home = tempfile::tempdir().expect("temp home");
+    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
+        .args([
+            "profile",
+            "init",
+            "--profile",
+            "credentials",
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "https://user:SENTINEL@mainnet.example",
+        ])
+        .env("STELLAR_AGENT_HOME", home.path())
+        .env_remove("STELLAR_AGENT_PROFILE")
+        .output()
+        .expect("binary runs");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(
+        !stderr.contains("user") && !stderr.contains("SENTINEL"),
+        "{stderr}"
+    );
+    assert!(!home.path().join("profiles/credentials.toml").exists());
 }

@@ -138,25 +138,43 @@ impl WalletServer {
         }
 
         use std::sync::Arc;
-        use stellar_agent_network::keyring::signer_from_keyring;
+        use stellar_agent_network::keyring::enrolled_keyring_signer;
         use stellar_agent_sep43::StellarAgentModule;
         use stellar_agent_sep43::module::ModuleAdapter;
 
         let account = self.profile.mcp_signer_default.account.as_str();
 
-        let signer_handle =
-            match signer_from_keyring(&self.profile.mcp_signer_default, account).await {
-                Ok(h) => h,
-                Err(err) => {
-                    let sep43_err = stellar_agent_sep43::Sep43Error::WalletUnlockFailed {
-                        detail: format!("keyring load failed: {err}"),
-                    };
+        let signer_handle = match enrolled_keyring_signer(
+            &self.profile_name_for_approval(),
+            &self.profile,
+            account,
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(err) => {
+                if matches!(
+                    &err,
+                    stellar_agent_core::error::WalletError::Auth(
+                        stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                    )
+                ) {
                     return Ok(crate::tools::common::business_error_result(
-                        sep43_err.wire_code(),
-                        sep43_err.to_string(),
+                        err.code(),
+                        err.to_string(),
                     ));
                 }
-            };
+
+                let sep43_err = stellar_agent_sep43::Sep43Error::WalletUnlockFailed {
+                    detail: format!("keyring load failed: {err}"),
+                };
+                return Ok(crate::tools::common::business_error_result(
+                    sep43_err.wire_code(),
+                    sep43_err.to_string(),
+                ));
+            }
+        };
 
         let profile = Arc::clone(&self.profile);
         let signer: Arc<dyn stellar_agent_network::signing::Signer + Send + Sync> =
@@ -329,7 +347,7 @@ mod tests {
             .with_noop_engine()
             .build();
         let mut server = crate::server::WalletServer::new(profile).unwrap();
-        server.context = stellar_agent_network::NetworkContext::from_flags(
+        server.context = stellar_agent_network::NetworkContext::new(
             stellar_agent_core::profile::caip2::Caip2::Mainnet,
             server.profile.rpc_url.clone(),
         );

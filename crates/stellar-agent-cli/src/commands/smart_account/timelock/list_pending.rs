@@ -41,13 +41,16 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
-use stellar_agent_network::NetworkContext;
 use stellar_agent_smart_account::timelock::{PendingTimelockOperation, TimelockOperationStateView};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::commands::smart_account::common::{emit_sa_error, open_profile_audit_writer_read_only};
-use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
+use crate::commands::smart_account::common::{
+    emit_sa_error, load_command_profile, map_access_error, open_audit_writer_read_only,
+};
+use crate::common::network::{
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 
@@ -65,19 +68,24 @@ pub struct ListPendingArgs {
     #[arg(long, value_name = "C_STRKEY", required = true)]
     pub timelock: String,
 
-    /// Primary Soroban RPC endpoint (default: testnet).
-    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
-    /// Secondary RPC for cross-RPC state validation.
-    ///
-    /// Defaults to `--rpc-url` (degrades to single-RPC).
-    #[arg(long, value_name = "URL")]
+    /// The secondary endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub secondary_rpc_url: Option<String>,
 
-    /// Target network: `testnet` (default) or `mainnet`.
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
     /// Profile name for audit-log lookup.
     ///
@@ -171,14 +179,37 @@ fn pending_op_to_entry(op: PendingTimelockOperation) -> PendingOperationEntry {
 ///
 /// Never panics.
 pub async fn run(args: &ListPendingArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone())
-        .with_secondary(args.secondary_rpc_url.clone());
     let resolved_profile = resolve_profile_name(args.profile.as_deref());
+    let (profile, _origin) = match load_command_profile(&resolved_profile) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved_profile.name);
+            let envelope: Envelope<()> = Envelope::err(&e);
+            render_json(&envelope);
+            return 1;
+        }
+    };
+    let context = match network_context_for_command(
+        &profile,
+        &resolved_profile.name,
+        EndpointFlags {
+            network: args.network,
+            rpc_url: args.rpc_url.as_deref(),
+            secondary_rpc_url: args.secondary_rpc_url.as_deref(),
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => {
+            let envelope: Envelope<()> = Envelope::err(&e);
+            render_json(&envelope);
+            return 1;
+        }
+    };
     let request_id = Uuid::new_v4().to_string();
 
-    let (_audit_profile, audit_writer, _audit_log_path) =
-        match open_profile_audit_writer_read_only(&resolved_profile) {
-            Ok(triple) => triple,
+    let (audit_writer, _audit_log_path) =
+        match open_audit_writer_read_only(&profile, &resolved_profile.name) {
+            Ok(opened) => opened,
             Err(e) => {
                 let envelope: Envelope<()> = Envelope::err(&e);
                 render_json(&envelope);
@@ -240,6 +271,7 @@ pub async fn run(args: &ListPendingArgs) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, reason = "test fixture assertions")]
     #![allow(clippy::unwrap_used, reason = "test-only")]
 
     use super::*;
@@ -304,25 +336,23 @@ mod tests {
     ///
     /// Prevents copy-paste of the `schedule`/`cancel`/`execute` pre-reject
     /// pattern into `list_pending`.
-    #[test]
-    fn list_pending_does_not_have_mainnet_guard() {
-        use crate::commands::smart_account::timelock::schedule::mainnet_forbidden_error;
-
-        // list_pending does not import or call mainnet_forbidden_error; verify
-        // that the schedule/cancel/execute guard does return the forbidden error
-        // so we know it exists — but list_pending.rs itself has no such call.
-        // The invariant is that no guard function exists in THIS module.
-        //
-        // Verify the network::Mainnet value itself resolves correctly (guard
-        // function is fine at Testnet).
-        let mainnet = TargetNetwork::Mainnet;
-        let _ = mainnet; // list_pending accepts any network without blocking.
-
-        // And that schedule's guard DOES fire — proving the guard function
-        // exists in sibling modules but is intentionally absent here.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_pending_mainnet_profile_reaches_inspection_rpc() {
+        let rpc = wiremock::MockServer::start().await;
+        let (_dir, _home, _env) =
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&rpc.uri());
+        let args = ListPendingArgs {
+            timelock: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".into(),
+            rpc_url: None,
+            secondary_rpc_url: None,
+            network: None,
+            profile: Some("guard-mainnet".into()),
+        };
+        let _ = run(&args).await;
         assert!(
-            mainnet_forbidden_error(TargetNetwork::Mainnet.caip2()).is_some(),
-            "schedule/cancel/execute guard must fire on mainnet; list_pending is the exception"
+            !rpc.received_requests().await.expect("requests").is_empty(),
+            "mainnet inspection must reach the endpoint without a signer"
         );
     }
 }

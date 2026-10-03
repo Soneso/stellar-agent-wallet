@@ -486,7 +486,7 @@ pub(crate) type LockedSubmitFuture<'l> = std::pin::Pin<
 ///
 /// Atomic signer-threshold update: all signer add/remove and threshold changes
 /// are submitted as a single transaction, preventing partial-update states.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct SignersManagerConfig {
     /// Primary Soroban RPC URL.
@@ -518,6 +518,37 @@ pub struct SignersManagerConfig {
 
     /// CAIP-2 chain ID for audit-log entries (e.g. `"stellar:testnet"`).
     pub chain_id: String,
+}
+
+impl std::fmt::Debug for SignersManagerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            primary_rpc_url,
+            secondary_rpc_url,
+            audit_writer: _,
+            audit_log_path: _,
+            network_passphrase,
+            profile_name,
+            timeout,
+            chain_id,
+        } = self;
+        f.debug_struct("SignersManagerConfig")
+            .field(
+                "primary_rpc_url",
+                &stellar_agent_core::redact::redact_url_authority(primary_rpc_url),
+            )
+            .field(
+                "secondary_rpc_url",
+                &stellar_agent_core::redact::redact_url_authority(secondary_rpc_url),
+            )
+            .field("audit_writer", &"[redacted]")
+            .field("audit_log_path", &"[redacted]")
+            .field("network_passphrase", network_passphrase)
+            .field("profile_name", profile_name)
+            .field("timeout", timeout)
+            .field("chain_id", chain_id)
+            .finish()
+    }
 }
 
 impl SignersManagerConfig {
@@ -650,7 +681,10 @@ impl SignersManager {
     pub fn new(config: SignersManagerConfig) -> Result<Self, SaError> {
         let mk_err = |url: &str, e: &dyn std::fmt::Display| SaError::AuthEntryConstructionFailed {
             stage: "auth_payload",
-            redacted_reason: format!("StellarRpcClient construction failed for {url}: {e}"),
+            redacted_reason: format!(
+                "StellarRpcClient construction failed for {}: {e}",
+                stellar_agent_core::redact::redact_url_authority(url)
+            ),
         };
         let primary_rpc_client = StellarRpcClient::new(&config.primary_rpc_url)
             .map_err(|e| mk_err(&config.primary_rpc_url, &e))?;
@@ -12867,5 +12901,61 @@ pub(crate) mod tests {
             }
             other => panic!("expected SaError::BatchSignerAddRefused, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod config_redaction_tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
+    use super::*;
+    #[test]
+    fn config_debug_redacts_urls_and_writer_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("SENTINEL-WRITER");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("SENTINEL-AUDIT.jsonl");
+        let writer = Arc::new(Mutex::new(
+            stellar_agent_core::audit_log::writer::AuditWriter::open(path.clone(), None).unwrap(),
+        ));
+        let primary = "https://SENTINEL-USER-A:SENTINEL-PASS-A@primary.example/SENTINEL-PATH-A?k=SENTINEL-QUERY-A";
+        let secondary = "https://SENTINEL-USER-B:SENTINEL-PASS-B@secondary.example/SENTINEL-PATH-B?k=SENTINEL-QUERY-B";
+        let config = SignersManagerConfig::new(
+            primary.into(),
+            secondary.into(),
+            writer,
+            path,
+            "network".into(),
+            "profile".into(),
+            Duration::from_secs(1),
+            "stellar:testnet".into(),
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("SENTINEL"),
+            "Debug leaked a sentinel: {debug}"
+        );
+        assert!(debug.contains("https://primary.example"));
+        assert!(debug.contains("https://secondary.example"));
+    }
+    #[test]
+    fn construction_error_redacts_credentialed_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let writer = Arc::new(Mutex::new(AuditWriter::open(path.clone(), None).unwrap()));
+        let config = SignersManagerConfig::new(
+            "ftp://SENTINEL-USER:SENTINEL-PASS@rpc.example/SENTINEL-PATH?k=SENTINEL-QUERY".into(),
+            "https://secondary.example".into(),
+            writer,
+            path,
+            "network".into(),
+            "profile".into(),
+            Duration::from_secs(1),
+            "stellar:testnet".into(),
+        );
+        let error = SignersManager::new(config).unwrap_err().to_string();
+        assert!(
+            !error.contains("SENTINEL"),
+            "construction error leaked: {error}"
+        );
     }
 }

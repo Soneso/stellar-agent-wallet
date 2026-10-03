@@ -861,9 +861,22 @@ pub enum ValidationError {
         path: String,
     },
 
+    /// The network flag must assert the loaded profile's chain.
+    #[error(
+        "`--network {flag}` does not match profile `{profile}` on `{chain}`. Remove the flag, or select a profile on that chain with `--profile <name>`."
+    )]
+    NetworkFlagMismatch {
+        /// The supplied network flag.
+        flag: String,
+        /// The selected profile name.
+        profile: String,
+        /// The loaded profile's chain.
+        chain: String,
+    },
+
     /// An overlay names a field whose value belongs to the profile file.
     #[error(
-        "profile field `{field}` is read from the profile file only; remove it from the environment or the overlay"
+        "profile field `{field}` is read from the profile file only; remove it from the environment, the overlay, or the command line"
     )]
     ProfileNonOverlayableField {
         /// The protected field named by the overlay.
@@ -1168,6 +1181,7 @@ impl ValidationError {
             // names the subsystem (profile.*) while the category stays
             // Validation, as `AuditLogNotFound` does for audit.*.
             Self::ProfileNameMismatch { .. } => "profile.name_mismatch",
+            Self::NetworkFlagMismatch { .. } => "profile.network_flag_mismatch",
             Self::ProfileNonOverlayableField { .. } => "profile.non_overlayable_field",
             Self::MainnetRequiresExplicitProfile { .. } => {
                 "profile.mainnet_requires_explicit_profile"
@@ -1514,6 +1528,30 @@ pub enum AuthError {
     #[error("the user refused the signing request on the hardware device")]
     HardwareUserRefused,
 
+    /// The mainnet profile has no valid enrolled signer pin.
+    #[error("{}", if *reason == "malformed" {
+        format!("profile `{profile}` has a malformed `mcp_signer_default.account`; correct the profile file, then run `stellar-agent profile enroll-signer --profile {profile}`")
+    } else {
+        format!("profile `{profile}` has no enrolled signer identity; run `stellar-agent profile enroll-signer --profile {profile}` first")
+    })]
+    EnrolledSignerUnpinned {
+        /// The selected profile name.
+        profile: String,
+        /// The invalid pin class: placeholder or malformed.
+        reason: &'static str,
+    },
+
+    /// The resolved signer differs from the mainnet profile's enrolled key.
+    #[error("signer `{derived}` is not the enrolled signer `{enrolled}` of profile `{profile}`")]
+    EnrolledSignerMismatch {
+        /// The selected profile name.
+        profile: String,
+        /// The enrolled public key.
+        enrolled: String,
+        /// The resolved public key.
+        derived: String,
+    },
+
     /// The signing key's derived public key does not match `--source`.
     ///
     /// `expected` holds the `--source` G-strkey supplied by the caller.
@@ -1560,6 +1598,8 @@ impl AuthError {
             Self::KeyringInteractiveSessionRequired => "auth.keyring_interactive_session_required",
             Self::KeyringNotFound { .. } => "auth.keyring_not_found",
             Self::HardwareUserRefused => "auth.hardware_user_refused",
+            Self::EnrolledSignerUnpinned { .. } => "auth.enrolled_signer_unpinned",
+            Self::EnrolledSignerMismatch { .. } => "auth.enrolled_signer_mismatch",
             Self::SignerKeyMismatch { .. } => "auth.signer_key_mismatch",
             Self::SignerKindMismatch { .. } => "auth.signer_kind_mismatch",
         }
@@ -2296,6 +2336,14 @@ mod tests {
         // Construct every variant; ensure the match is exhaustive.
         let cases: &[(ValidationError, &'static str)] = &[
             (
+                ValidationError::NetworkFlagMismatch {
+                    flag: "testnet".into(),
+                    profile: "mainnet".into(),
+                    chain: "stellar:mainnet".into(),
+                },
+                "profile.network_flag_mismatch",
+            ),
+            (
                 ValidationError::AmountUnitsRequired,
                 "validation.amount_units_required",
             ),
@@ -2643,6 +2691,15 @@ mod tests {
                         path: path.clone(),
                     }
                 }
+                ValidationError::NetworkFlagMismatch {
+                    flag,
+                    profile,
+                    chain,
+                } => ValidationError::NetworkFlagMismatch {
+                    flag: flag.clone(),
+                    profile: profile.clone(),
+                    chain: chain.clone(),
+                },
                 ValidationError::ProfileNonOverlayableField { field } => {
                     ValidationError::ProfileNonOverlayableField { field }
                 }
@@ -2787,6 +2844,21 @@ mod tests {
     #[test]
     fn auth_code_round_trip() {
         let cases: &[(AuthError, &'static str)] = &[
+            (
+                AuthError::EnrolledSignerUnpinned {
+                    profile: "mainnet".into(),
+                    reason: "placeholder",
+                },
+                "auth.enrolled_signer_unpinned",
+            ),
+            (
+                AuthError::EnrolledSignerMismatch {
+                    profile: "mainnet".into(),
+                    enrolled: "A".into(),
+                    derived: "B".into(),
+                },
+                "auth.enrolled_signer_mismatch",
+            ),
             (AuthError::KeyringLocked, "auth.keyring_locked"),
             (
                 AuthError::KeyringPlatformError,

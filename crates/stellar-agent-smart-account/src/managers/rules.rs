@@ -82,7 +82,7 @@ use crate::submit::ExpectedReturn;
 /// Constructed once per CLI / MCP invocation; carries network identity and
 /// timeout policy. The manager itself is cheap to clone and holds an RPC
 /// client for the `submit_transaction_and_wait` primitive.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ContextRuleManagerConfig {
     /// Primary Soroban RPC URL.
@@ -145,6 +145,42 @@ pub struct ContextRuleManagerConfig {
     /// and refuses with [`SaError::HorizonExceeded`] BEFORE any signing
     /// bytes are produced (maps to `SaInvocationResult::PreSubmissionRefused`).
     pub session_rule_max_horizon_ledgers: Option<u32>,
+}
+
+impl std::fmt::Debug for ContextRuleManagerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            primary_rpc_url,
+            secondary_rpc_url,
+            network_passphrase,
+            timeout,
+            chain_id,
+            signers_manager,
+            audit_writer: _,
+            session_rule_max_horizon_ledgers,
+        } = self;
+        f.debug_struct("ContextRuleManagerConfig")
+            .field(
+                "primary_rpc_url",
+                &stellar_agent_core::redact::redact_url_authority(primary_rpc_url),
+            )
+            .field(
+                "secondary_rpc_url",
+                &secondary_rpc_url
+                    .as_deref()
+                    .map(stellar_agent_core::redact::redact_url_authority),
+            )
+            .field("network_passphrase", network_passphrase)
+            .field("timeout", timeout)
+            .field("chain_id", chain_id)
+            .field("signers_manager", signers_manager)
+            .field("audit_writer", &"[redacted]")
+            .field(
+                "session_rule_max_horizon_ledgers",
+                session_rule_max_horizon_ledgers,
+            )
+            .finish()
+    }
 }
 
 impl ContextRuleManagerConfig {
@@ -10113,5 +10149,38 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod config_redaction_tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
+    use super::*;
+    #[test]
+    fn config_debug_redacts_urls_and_writer_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("SENTINEL-WRITER");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("SENTINEL-AUDIT.jsonl");
+        let writer = Arc::new(Mutex::new(
+            stellar_agent_core::audit_log::writer::AuditWriter::open(path.clone(), None).unwrap(),
+        ));
+        let primary = "https://SENTINEL-USER-A:SENTINEL-PASS-A@primary.example/SENTINEL-PATH-A?k=SENTINEL-QUERY-A";
+        let secondary = "https://SENTINEL-USER-B:SENTINEL-PASS-B@secondary.example/SENTINEL-PATH-B?k=SENTINEL-QUERY-B";
+        let config = ContextRuleManagerConfig::new(
+            primary.into(),
+            "network".into(),
+            Duration::from_secs(1),
+            "stellar:testnet".into(),
+        )
+        .with_secondary_rpc_url(secondary.into())
+        .with_audit_writer(writer);
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("SENTINEL"),
+            "Debug leaked a sentinel: {debug}"
+        );
+        assert!(debug.contains("https://primary.example"));
+        assert!(debug.contains("https://secondary.example"));
     }
 }

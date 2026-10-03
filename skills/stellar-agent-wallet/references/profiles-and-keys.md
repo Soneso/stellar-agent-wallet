@@ -102,6 +102,8 @@ Every profile carries a top-level `version` field. The loader dispatches on it:
 - `version > 2` — refused. A profile written by a newer wallet is rejected so an
   older wallet never silently applies stale defaults.
 
+`chain_id` is read from the file on every chain. Mainnet also protects `rpc_url`, `secondary_rpc_url`, and `mcp_signer_default` against environment and programmatic overlays.
+
 ## Field reference
 
 Fields are written at the top level of the TOML unless a `[section]` header is
@@ -115,7 +117,7 @@ secret.
 |-------|------|----------|---------|-------------|
 | `version` | integer | yes | — | Schema version. Must be `2`. |
 | `chain_id` | string (CAIP-2) | yes | — | `stellar:testnet` or `stellar:mainnet`. Drives passphrase resolution and the mainnet-write gate. |
-| `rpc_url` | string (URL) | no | chain default | Soroban RPC endpoint. Testnet default `https://soroban-testnet.stellar.org`. Validated as a URL at load. |
+| `rpc_url` | string (URL) | no | chain default | Profile endpoint used by transaction commands. Omitted testnet values use `https://soroban-testnet.stellar.org`. Mainnet endpoint flags and overlays are refused. |
 | `network_passphrase` | string | resolved | from `chain_id` | The Stellar network passphrase. Resolved from `chain_id`; not overridable from the TOML or overlays. Surfaced for callers. |
 
 ### Signer and nonce references
@@ -155,11 +157,13 @@ but mints no key material; the rotation commands mint the actual keys (see
 | `oracle_provider_url` | string (URL) | no | unset (cross-check off) | Independent RPC endpoint for re-simulating high-value transactions. When unset, the high-value cross-check is skipped. Set this before enabling V1 for mainnet high-value flows. Redacted in debug output. |
 | `mcp_disabled` | bool | no | `false` | When `true`, the `stellar-agent-mcp` server refuses to start with error `mcp.disabled_per_profile`. |
 | `audit_log_path` | string (path) | no | OS-conventional | Path to the per-profile audit log. |
-| `secondary_rpc_url` | string (URL) | no | unset | Independent secondary RPC for the multicall cross-RPC trust-anchor check. Must point to a node operated independently of `rpc_url`. Required when a multicall router is registered for the profile's network; loading otherwise fails. Redacted in debug output. |
+| `secondary_rpc_url` | string (URL) | no | unset | Secondary endpoint for cross-RPC checks. `smart-account multicall` requires an effective secondary from the profile or a testnet flag. Mainnet reads this field from the file only. Debug output is redacted. |
 | `smart_account_max_context_rule_scan_id` | integer | no | engine default | Override for the maximum rule-id scan bound. Rejected at load when above `10000`. |
 | `session_rule_max_horizon_ledgers` | integer | no | engine default | Override for the maximum session-rule lookahead window, in ledgers. Rejected at load when above `10000`. |
 
 ### `[wallet]` block
+
+These controls apply to every CLI seed read, including `pay`, `claim`, and `accounts create`. The zero-config testnet profile uses the `"warn"` posture and a 30-second TTL.
 
 Controls the unlock window — the short, TTL-bounded period during which the
 32-byte signing seed is resident in pinned, zeroize-on-drop memory.

@@ -269,25 +269,22 @@ where
     // ── Derive the public address from the env S-strkey ───────────────────────
     // Reuses the shared mlock-protected env-seed ceremony; the seed never leaves
     // the ceremony's Zeroizing wrappers.
-    let derived_g = match resolve_software_signer_from_env(
-        &args.secret_env,
-        "profile-enroll-signer",
-        Some(&resolved),
-    )
-    .await
-    {
-        Ok(outcome) => match outcome.signer.public_key().await {
-            Ok(pk) => pk.to_string().to_string(),
+    let derived_g =
+        match resolve_software_signer_from_env(&args.secret_env, "profile-enroll-signer", &profile)
+            .await
+        {
+            Ok(outcome) => match outcome.signer.public_key().await {
+                Ok(pk) => pk.to_string().to_string(),
+                Err(e) => {
+                    render::render_json(&Envelope::<()>::err(&e));
+                    return 1;
+                }
+            },
             Err(e) => {
                 render::render_json(&Envelope::<()>::err(&e));
                 return 1;
             }
-        },
-        Err(e) => {
-            render::render_json(&Envelope::<()>::err(&e));
-            return 1;
-        }
-    };
+        };
 
     // ── Optional --expected-address guard (no write on mismatch) ──────────────
     if let Some(expected) = args.expected_address.as_deref() {
