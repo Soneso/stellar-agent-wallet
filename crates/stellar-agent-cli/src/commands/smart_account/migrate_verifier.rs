@@ -1630,9 +1630,12 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_mainnet_profile_submit_reaches_no_endpoint() {
-        let guard_rpc = wiremock::MockServer::start().await;
+        let guard_rpc =
+            stellar_agent_test_support::ConnectionCounter::start().expect("connection counter");
         let (_guard_dir, _guard_home, _guard_env) =
-            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&guard_rpc.uri());
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(
+                &guard_rpc.https_uri(),
+            );
         const SIGNER_ENV: &str = "MIGRATE_VERIFIER_MAINNET_GATE_TEST_SEED";
         let seed = stellar_strkey::ed25519::PrivateKey([7u8; 32])
             .as_unredacted()
@@ -1647,12 +1650,10 @@ mod tests {
         args.signer_source.signer_secret_env = Some(SIGNER_ENV.to_owned());
         let code = run(&args).await;
         assert_eq!(code, 1, "a mainnet submit must exit 1");
-        assert!(
-            guard_rpc
-                .received_requests()
-                .await
-                .expect("requests")
-                .is_empty()
+        assert_eq!(
+            guard_rpc.accepted().expect("connection count"),
+            0,
+            "no connection may reach the profile's endpoint"
         );
     }
 

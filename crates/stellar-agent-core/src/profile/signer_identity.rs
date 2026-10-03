@@ -57,7 +57,15 @@ mod tests {
     use super::*;
 
     fn profile(account: &str) -> Profile {
-        Profile::builder_mainnet_named("identity", "s", account, "n", "a").build()
+        Profile::builder_mainnet_named(
+            "identity",
+            "https://rpc.example.invalid",
+            "s",
+            account,
+            "n",
+            "a",
+        )
+        .build()
     }
 
     fn key(byte: u8) -> String {

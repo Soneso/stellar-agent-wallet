@@ -11,9 +11,9 @@
 //! | Flag | Required | Description |
 //! |------|----------|-------------|
 //! | `--account <C_STRKEY>` | yes | Smart-account contract address. |
-//! | `--rpc-url <URL>` | no | Soroban RPC endpoint (default: testnet). |
-//! | `--secondary-rpc-url <URL>` | no | Secondary RPC for two-RPC consultation. |
-//! | `--network {testnet\|mainnet}` | no | Target network (default: `testnet`). |
+//! | `--rpc-url <URL>` | no | Primary Soroban RPC; the profile endpoint when absent; refused on mainnet. |
+//! | `--secondary-rpc-url <URL>` | no | Not consulted; the primary RPC is the only data source. The profile value when absent; refused on mainnet. |
+//! | `--network {testnet\|mainnet}` | no | Must equal the profile's chain when given. |
 //! | `--profile <NAME>` | no | Profile name for config lookup. |
 //! | `--max-scan-id <N>` | no | Override the upper scan bound (`1..=10_000`). |
 //! | `--output {json\|table}` | no | Output format (default: `json`). Table mode deferred. |

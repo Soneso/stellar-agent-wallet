@@ -1182,6 +1182,7 @@ mod tests {
         if mainnet {
             stellar_agent_core::profile::Profile::builder_mainnet_named(
                 "enrolled",
+                "https://rpc.example.invalid",
                 "identity-test",
                 pin,
                 "n",

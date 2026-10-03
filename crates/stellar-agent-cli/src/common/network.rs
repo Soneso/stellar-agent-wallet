@@ -230,12 +230,12 @@ mod flag_rules_tests {
     };
 
     fn profile(mainnet: bool) -> Profile {
+        let primary = "https://primary.example";
         let mut p = if mainnet {
-            Profile::builder_mainnet_named("flags", "s", "a", "n", "a")
+            Profile::builder_mainnet_named("flags", primary, "s", "a", "n", "a")
         } else {
-            Profile::builder_testnet_named("flags", "s", "a", "n", "a")
+            Profile::builder_testnet_named("flags", "s", "a", "n", "a").rpc_url(primary)
         }
-        .rpc_url("https://primary.example")
         .build();
         p.secondary_rpc_url = Some("https://secondary.example".into());
         p

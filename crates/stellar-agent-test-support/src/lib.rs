@@ -27,6 +27,9 @@
 //! - [`env_guard::ProfileEnvVarGuard`] — RAII guard clearing
 //!   `STELLAR_AGENT_PROFILE` for in-process tests that exercise the
 //!   "no profile was named" branch; callers serialise with `#[serial]`.
+//! - [`connection_counter::ConnectionCounter`] counts the connections a
+//!   loopback TCP listener accepts, for tests that assert no contact with an
+//!   `https://` endpoint.
 //!
 //! This crate is consumed only as a `[dev-dependencies]` entry
 //! (`publish = false`); it is never a runtime dependency, so its `pub` helpers
@@ -39,6 +42,7 @@
 //! - `verifier-registry` — WebAuthn-verifier WASM registry.
 //! - `wiremock-helpers` — HTTP test doubles.
 
+pub mod connection_counter;
 #[cfg(feature = "wiremock-helpers")]
 pub mod echo_id_responder;
 pub mod env_guard;
@@ -58,6 +62,7 @@ pub mod xdr_fixtures;
 
 mod bip39_english;
 
+pub use connection_counter::ConnectionCounter;
 #[cfg(feature = "test-helpers")]
 pub use echo_id_responder::SubmissionEchoResponder;
 #[cfg(feature = "wiremock-helpers")]

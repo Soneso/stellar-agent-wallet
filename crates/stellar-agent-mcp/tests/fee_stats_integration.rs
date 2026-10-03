@@ -63,11 +63,9 @@ fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
 /// gate allows read-only tools unconditionally, but `build_policy_engine` must
 /// still be able to construct the engine from the profile.
 fn mainnet_profile_with_rpc(rpc_url: &str) -> Profile {
-    let mut profile = Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
+    Profile::builder_mainnet(rpc_url, "svc", "acct", "n-svc", "n-acct")
         .with_noop_engine()
-        .build();
-    profile.rpc_url = rpc_url.to_owned();
-    profile
+        .build()
 }
 
 fn call_result_text(result: &rmcp::model::CallToolResult) -> &str {

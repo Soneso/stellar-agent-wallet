@@ -812,30 +812,24 @@ pub enum ValidationError {
         path: String,
     },
 
-    /// `stellar-agent profile init` selected mainnet without an explicit
-    /// `--rpc-url`.
+    /// A mainnet profile names no RPC endpoint.
     ///
-    /// The built-in mainnet default endpoint
-    /// ([`crate::profile::caip2::MAINNET_RPC_URL`]) requires an API key and
-    /// answers HTTP 401 unauthenticated; a command that mints a mainnet
-    /// profile MUST NOT silently persist it as the effective endpoint, since
-    /// the resulting configuration would be broken. The operator must pass
-    /// `--rpc-url <URL>` naming a trusted provider.
-    ///
-    /// `default_rpc_url` is informational only — the built-in default that was
-    /// NOT used; the command never contacts it.
+    /// Mainnet has no default endpoint, because no provider is implied. The
+    /// profile loader, `profile migrate`, and `profile init` raise this
+    /// refusal: the first two for a mainnet profile file without `rpc_url`,
+    /// and `init` for `--network mainnet` without `--rpc-url`.
     ///
     /// # Wire code
     ///
     /// `"validation.mainnet_rpc_url_required"`.
     #[error(
-        "mainnet requires an explicit --rpc-url; the built-in default \
-         ({default_rpc_url}) requires an API key and answers HTTP 401 \
-         unauthenticated, so persisting it would mint a broken configuration"
+        "the mainnet profile `{name}` requires an explicit RPC endpoint; set `rpc_url` in \
+         the profile file, or pass `--rpc-url` to `profile init`; no public mainnet default \
+         exists"
     )]
     MainnetRpcUrlRequired {
-        /// The built-in mainnet default RPC URL that was not used.
-        default_rpc_url: &'static str,
+        /// The mainnet profile that names no RPC endpoint.
+        name: String,
     },
 
     /// A profile-creation command refused to overwrite an existing profile
@@ -2492,7 +2486,7 @@ mod tests {
             ),
             (
                 ValidationError::MainnetRpcUrlRequired {
-                    default_rpc_url: "https://mainnet.stellar.validationcloud.io/v1/stellar",
+                    name: "mainnet".to_owned(),
                 },
                 "validation.mainnet_rpc_url_required",
             ),
@@ -2682,8 +2676,8 @@ mod tests {
                 ValidationError::AuditLogNotFound { path } => {
                     ValidationError::AuditLogNotFound { path: path.clone() }
                 }
-                ValidationError::MainnetRpcUrlRequired { default_rpc_url } => {
-                    ValidationError::MainnetRpcUrlRequired { default_rpc_url }
+                ValidationError::MainnetRpcUrlRequired { name } => {
+                    ValidationError::MainnetRpcUrlRequired { name: name.clone() }
                 }
                 ValidationError::ProfileAlreadyExists { name, path } => {
                     ValidationError::ProfileAlreadyExists {

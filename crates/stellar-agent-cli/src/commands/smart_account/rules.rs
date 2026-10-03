@@ -6169,15 +6169,20 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn set_spending_limit_mainnet_profile_reaches_no_endpoint() {
-        let rpc = wiremock::MockServer::start().await;
+        let rpc =
+            stellar_agent_test_support::ConnectionCounter::start().expect("connection counter");
         let (_dir, _home, _env) =
-            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&rpc.uri());
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&rpc.https_uri());
         let mut args = set_spending_limit_args(10_000_000);
         args.profile = Some("guard-mainnet".to_owned());
         args.network = None;
         args.rpc_url = None;
         assert_eq!(set_spending_limit_run(&args).await, 1);
-        assert!(rpc.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            rpc.accepted().expect("connection count"),
+            0,
+            "no connection may reach the profile's endpoint"
+        );
     }
 
     /// `--network mainnet` with no profile exits 1 before any request reaches

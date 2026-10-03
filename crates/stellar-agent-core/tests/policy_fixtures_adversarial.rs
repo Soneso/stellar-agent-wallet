@@ -251,9 +251,15 @@ fn tool_descriptor_from_meta(meta: &ToolMeta) -> ToolDescriptor {
 /// Constructs a `Profile` from the case `profile_name` and `chain_id`.
 fn profile_from_case(profile_name: &str, chain_id: &str) -> Profile {
     if chain_id.contains("mainnet") {
-        Profile::builder_mainnet("svc", "acct", "nonce-svc", "nonce-acct")
-            .with_profile_name(profile_name)
-            .build()
+        Profile::builder_mainnet(
+            "https://rpc.example.invalid",
+            "svc",
+            "acct",
+            "nonce-svc",
+            "nonce-acct",
+        )
+        .with_profile_name(profile_name)
+        .build()
     } else {
         Profile::builder_testnet("svc", "acct", "nonce-svc", "nonce-acct")
             .with_profile_name(profile_name)

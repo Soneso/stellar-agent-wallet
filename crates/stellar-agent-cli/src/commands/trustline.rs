@@ -215,9 +215,12 @@ where
     // Reconciled in the CALLER of the injected loader: a check placed inside
     // the closure would be bypassed by every test that supplies its own.
     //
-    // The load failure keeps this verb's own `trustline.profile_load_failed`
-    // code; a name mismatch reports the shared `profile.name_mismatch`, which
-    // is the same code every other CLI surface emits for it.
+    // A load failure keeps this verb's own `trustline.profile_load_failed`
+    // code. The protected refusals keep their typed codes: a protected
+    // overlay, an implicit mainnet selection, a mainnet profile without
+    // `rpc_url`, and an endpoint URL that breaks the endpoint rule.
+    // A name mismatch reports the shared `profile.name_mismatch`, the same
+    // code every other CLI surface emits for it.
     let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
         Ok(p) => p,
         Err(e @ ProfileAccessError::Load(_)) if !e.requires_refusal() => {

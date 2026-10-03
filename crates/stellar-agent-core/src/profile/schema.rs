@@ -590,12 +590,14 @@ pub struct Profile {
 
     /// Soroban RPC endpoint URL.
     ///
-    /// If omitted in the profile TOML, defaults to
-    /// [`Caip2::default_rpc_url`] for the resolved `chain_id`.
+    /// A testnet profile that omits `rpc_url` in the TOML uses
+    /// [`Caip2::default_rpc_url`].  Mainnet has no default: a mainnet profile
+    /// file without `rpc_url` refuses to load with
+    /// [`ProfileLoadError::MainnetRpcUrlRequired`](crate::profile::loader::ProfileLoadError::MainnetRpcUrlRequired).
     ///
-    /// Validated as a well-formed URL at load time via
-    /// [`url::Url::parse`].  A syntactically invalid URL returns
-    /// `ProfileLoadError::InvalidRpcUrl`.
+    /// The loader checks the value with [`check_endpoint_url`] and refuses a
+    /// value that breaks the endpoint rule with
+    /// [`ProfileLoadError::InvalidEndpointUrl`](crate::profile::loader::ProfileLoadError::InvalidEndpointUrl).
     pub rpc_url: String,
 
     /// Stellar network passphrase.
@@ -735,6 +737,10 @@ pub struct Profile {
     ///
     /// Default: `None` (cross-check disabled).  In TOML, omit the field when
     /// unset; when configured, use `oracle_provider_url = "https://example.org"`.
+    ///
+    /// The loader checks a configured value with [`check_endpoint_url`].  On
+    /// mainnet the value is read from the profile file only: an environment
+    /// or programmatic overlay naming this field is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle_provider_url: Option<Url>,
 
@@ -804,6 +810,9 @@ pub struct Profile {
     /// This URL is used for the cross-RPC 4-way equality check.  It MUST point
     /// to an independent Soroban RPC node — not the same node as `rpc_url` —
     /// so that a compromised primary RPC cannot forge the trust-anchor equality.
+    ///
+    /// The loader checks a configured value with [`check_endpoint_url`].  On
+    /// mainnet the value is read from the profile file only.
     ///
     /// # Debug redaction
     ///
@@ -1429,17 +1438,41 @@ impl Profile {
         self.cross_check_threshold_stroops.max(MINIMUM_FLOOR)
     }
 
-    /// Validates the `rpc_url` field as a well-formed URL.
+    /// Checks the three endpoint fields against the endpoint rule of
+    /// [`check_endpoint_url`] for this profile's chain: `rpc_url`, then
+    /// `secondary_rpc_url` and `oracle_provider_url` when present.
     ///
-    /// Called by the loader after deserialisation.  Returns
-    /// `Ok(Url)` on success; callers may discard the parsed URL if they only
-    /// need validation.
+    /// `profile init` and `profile migrate` apply this check before they write
+    /// a profile; the loader applies the same rule to the raw file values.
+    /// The builders and direct deserialization do not, so a `Profile` value
+    /// carries no guarantee that it passes.
     ///
     /// # Errors
     ///
-    /// Returns [`RpcUrlParseError`] if `rpc_url` is not a valid URL.
-    pub fn validate_rpc_url(&self) -> Result<Url, RpcUrlParseError> {
-        Url::parse(&self.rpc_url).map_err(|source| RpcUrlParseError { source })
+    /// Returns the [`EndpointUrlError`] of the first field, in the order
+    /// above, that breaks the rule.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::profile::schema::Profile;
+    ///
+    /// let mut p = Profile::builder_mainnet("https://rpc.example", "s", "a", "n", "a").build();
+    /// assert!(p.validate_endpoint_urls().is_ok());
+    ///
+    /// p.secondary_rpc_url = Some("http://secondary.example".to_owned());
+    /// let err = p.validate_endpoint_urls().unwrap_err();
+    /// assert_eq!(err.field, "secondary_rpc_url");
+    /// ```
+    pub fn validate_endpoint_urls(&self) -> Result<(), EndpointUrlError> {
+        check_endpoint_url("rpc_url", &self.rpc_url, self.chain_id)?;
+        if let Some(secondary) = self.secondary_rpc_url.as_deref() {
+            check_endpoint_url("secondary_rpc_url", secondary, self.chain_id)?;
+        }
+        if let Some(oracle) = &self.oracle_provider_url {
+            check_endpoint_url("oracle_provider_url", oracle.as_str(), self.chain_id)?;
+        }
+        Ok(())
     }
 
     /// Convenience builder for testnet profiles.
@@ -1528,21 +1561,41 @@ impl Profile {
     /// Convenience builder for mainnet profiles.
     ///
     /// Returns a [`ProfileBuilder`] pre-configured for `stellar:mainnet` with
-    /// the default mainnet RPC URL.  See [`Profile::builder_testnet`] for the
-    /// v2 key-derivation note.
+    /// the supplied RPC URL: mainnet has no default endpoint, so the caller
+    /// names one.  The builder does not check the URL;
+    /// [`Profile::validate_endpoint_urls`] applies the endpoint rule.  See
+    /// [`Profile::builder_testnet`] for the v2 key-derivation note.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::profile::schema::Profile;
+    ///
+    /// let p = Profile::builder_mainnet(
+    ///     "https://rpc.example",
+    ///     "stellar-agent-signer",
+    ///     "my-profile",
+    ///     "stellar-agent-nonce",
+    ///     "my-profile",
+    /// )
+    /// .build();
+    /// assert_eq!(p.chain_id.caip2_str(), "stellar:mainnet");
+    /// assert_eq!(p.rpc_url, "https://rpc.example");
+    /// ```
     pub fn builder_mainnet(
+        rpc_url: impl Into<String>,
         signer_service: impl Into<String>,
         signer_account: impl Into<String>,
         nonce_service: impl Into<String>,
         nonce_account: impl Into<String>,
     ) -> ProfileBuilder {
-        use super::caip2::{MAINNET_PASSPHRASE, MAINNET_RPC_URL};
+        use super::caip2::MAINNET_PASSPHRASE;
         let signer_account = signer_account.into();
         let derived_name = signer_account.clone();
         ProfileBuilder {
             version: 2,
             chain_id: Caip2::Mainnet,
-            rpc_url: MAINNET_RPC_URL.to_owned(),
+            rpc_url: rpc_url.into(),
             network_passphrase: MAINNET_PASSPHRASE.to_owned(),
             mcp_signer_default: KeyringEntryRef::new(signer_service, signer_account),
             mcp_nonce_key_alias: KeyringEntryRef::new(nonce_service, nonce_account),
@@ -1569,26 +1622,129 @@ impl Profile {
         }
     }
 
-    /// Mainnet equivalent of [`Profile::builder_testnet_named`].
+    /// Mainnet equivalent of [`Profile::builder_testnet_named`], taking the RPC
+    /// URL [`Profile::builder_mainnet`] requires.
     pub fn builder_mainnet_named(
         profile_name: &str,
+        rpc_url: impl Into<String>,
         signer_service: &str,
         signer_account: &str,
         nonce_service: &str,
         nonce_account: &str,
     ) -> ProfileBuilder {
-        Self::builder_mainnet(signer_service, signer_account, nonce_service, nonce_account)
-            .with_profile_name(profile_name)
+        Self::builder_mainnet(
+            rpc_url,
+            signer_service,
+            signer_account,
+            nonce_service,
+            nonce_account,
+        )
+        .with_profile_name(profile_name)
     }
 }
 
-/// Error returned when the `rpc_url` field fails URL validation.
-#[derive(Debug, thiserror::Error)]
-#[error("invalid rpc_url: {source}")]
-pub struct RpcUrlParseError {
-    /// The underlying parse error from the `url` crate.
-    #[source]
-    pub source: url::ParseError,
+// ─────────────────────────────────────────────────────────────────────────────
+// Endpoint URL rule
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Checks one profile endpoint URL against the endpoint rule and returns the
+/// parsed URL.
+///
+/// The rule applies to `rpc_url`, `secondary_rpc_url`, and
+/// `oracle_provider_url`, with these checks in order:
+///
+/// 1. the value parses as an absolute URL
+///    ([`EndpointUrlRejection::Unparseable`]);
+/// 2. the scheme is `http` or `https`
+///    ([`EndpointUrlRejection::UnsupportedScheme`]);
+/// 3. on mainnet, the scheme is `https`
+///    ([`EndpointUrlRejection::MainnetRequiresHttps`]);
+/// 4. on mainnet, the URL carries no username and no password
+///    ([`EndpointUrlRejection::MainnetCredentialInUrl`]).
+///
+/// No separate host check exists: the `url` crate refuses an `http` or
+/// `https` URL with an empty host at parse time, so every URL that passes the
+/// first two checks has a host.  Mainnet has no plaintext exception, loopback
+/// included; a local development endpoint belongs on a testnet profile.  A
+/// testnet endpoint may use `http` and may carry userinfo.
+///
+/// `field` names the profile field in the error.  The error never carries the
+/// URL or any part of it, because the URL may hold a credential.
+///
+/// # Errors
+///
+/// Returns an [`EndpointUrlError`] naming `field` and the first check the URL
+/// fails.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::profile::caip2::Caip2;
+/// use stellar_agent_core::profile::schema::{EndpointUrlRejection, check_endpoint_url};
+///
+/// assert!(check_endpoint_url("rpc_url", "http://127.0.0.1:8000", Caip2::Testnet).is_ok());
+///
+/// let err = check_endpoint_url("rpc_url", "http://127.0.0.1:8000", Caip2::Mainnet).unwrap_err();
+/// assert_eq!(err.field, "rpc_url");
+/// assert_eq!(err.reason, EndpointUrlRejection::MainnetRequiresHttps);
+/// ```
+pub fn check_endpoint_url(
+    field: &'static str,
+    raw: &str,
+    chain: Caip2,
+) -> Result<Url, EndpointUrlError> {
+    let reject = |reason| EndpointUrlError { field, reason };
+    let url = Url::parse(raw).map_err(|error| reject(EndpointUrlRejection::Unparseable(error)))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(reject(EndpointUrlRejection::UnsupportedScheme));
+    }
+    if chain.is_mainnet() {
+        if url.scheme() != "https" {
+            return Err(reject(EndpointUrlRejection::MainnetRequiresHttps));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(reject(EndpointUrlRejection::MainnetCredentialInUrl));
+        }
+    }
+    Ok(url)
+}
+
+/// A profile endpoint field that breaks the endpoint rule of
+/// [`check_endpoint_url`].
+///
+/// Names the field and the check it failed.  Neither `Display` nor `Debug`
+/// echoes the URL or any part of it: the URL may carry a credential.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("profile field `{field}` {reason}")]
+pub struct EndpointUrlError {
+    /// The profile field that holds the refused URL.
+    pub field: &'static str,
+    /// The check the URL failed.
+    pub reason: EndpointUrlRejection,
+}
+
+/// The check an endpoint URL failed; see [`check_endpoint_url`].
+///
+/// No variant holds any part of the refused URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum EndpointUrlRejection {
+    /// The value does not parse as an absolute URL.  The parse error names
+    /// the syntax problem and holds no part of the input.
+    #[error("is not a valid URL ({0})")]
+    Unparseable(url::ParseError),
+    /// The scheme is neither `http` nor `https`.
+    #[error("must be an http or https URL")]
+    UnsupportedScheme,
+    /// A mainnet endpoint uses a scheme other than `https`.
+    #[error("must be an https URL on a mainnet profile")]
+    MainnetRequiresHttps,
+    /// A mainnet endpoint carries a username or a password.
+    #[error(
+        "carries a username or password, which a mainnet profile does not accept; \
+         remove the userinfo from the URL in the profile file"
+    )]
+    MainnetCredentialInUrl,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2258,6 +2414,35 @@ const _: () = {
     );
 };
 
+/// Sentinel URLs for the endpoint-rule tests of the profile modules.
+///
+/// No component of any of them may reach an error's `Display`, its `Debug`,
+/// or a rendered envelope.
+#[cfg(test)]
+pub(crate) mod sentinel {
+    /// An unparseable URL whose every component is a sentinel.
+    pub(crate) const UNPARSEABLE: &str =
+        "https://SENTINEL-USER:SENTINEL-PASS@[sentinel/SENTINEL-PATH?k=SENTINEL-QUERY";
+    /// A parseable URL with an unsupported scheme.
+    pub(crate) const FTP: &str =
+        "ftp://SENTINEL-USER:SENTINEL-PASS@sentinel-host.invalid/SENTINEL-PATH?k=SENTINEL-QUERY";
+    /// A plaintext URL with userinfo.
+    pub(crate) const HTTP: &str =
+        "http://SENTINEL-USER:SENTINEL-PASS@sentinel-host.invalid/SENTINEL-PATH?k=SENTINEL-QUERY";
+    /// An HTTPS URL with userinfo.
+    pub(crate) const HTTPS: &str =
+        "https://SENTINEL-USER:SENTINEL-PASS@sentinel-host.invalid/SENTINEL-PATH?k=SENTINEL-QUERY";
+
+    /// Asserts that no sentinel component reaches `text`. The comparison is
+    /// case-insensitive because the `url` crate lowercases the host.
+    pub(crate) fn assert_no_sentinel(text: &str) {
+        assert!(
+            !text.to_ascii_lowercase().contains("sentinel"),
+            "a sentinel URL component leaked: {text}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -2266,8 +2451,12 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
+    use super::sentinel::assert_no_sentinel;
     use super::*;
     use crate::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
+
+    /// An in-memory mainnet endpoint for fixtures that never reach a network.
+    const MAINNET_FIXTURE_RPC: &str = "https://rpc.example.invalid";
 
     fn make_testnet_profile() -> Profile {
         Profile::builder_testnet(
@@ -2294,8 +2483,9 @@ mod tests {
 
     #[test]
     fn mainnet_builder_passphrase_derived_from_chain_id() {
-        let p = Profile::builder_mainnet("s", "a", "n", "a").build();
+        let p = Profile::builder_mainnet(MAINNET_FIXTURE_RPC, "s", "a", "n", "a").build();
         assert_eq!(p.network_passphrase, MAINNET_PASSPHRASE);
+        assert_eq!(p.rpc_url, MAINNET_FIXTURE_RPC);
     }
 
     #[test]
@@ -2329,6 +2519,7 @@ mod tests {
     fn builder_mainnet_named_derives_v2_keys_from_explicit_name() {
         let p = Profile::builder_mainnet_named(
             "bob",
+            MAINNET_FIXTURE_RPC,
             "stellar-agent-signer",
             "bob-signer",
             "stellar-agent-nonce",
@@ -2337,6 +2528,7 @@ mod tests {
         .build();
 
         assert_eq!(p.chain_id, crate::profile::caip2::Caip2::Mainnet);
+        assert_eq!(p.rpc_url, MAINNET_FIXTURE_RPC);
         assert_eq!(
             p.audit_log_hash_chain_key_id.service,
             "stellar-agent-audit-bob"
@@ -2420,16 +2612,89 @@ mod tests {
     }
 
     #[test]
-    fn validate_rpc_url_valid() {
+    fn validate_endpoint_urls_valid() {
         let p = make_testnet_profile();
-        assert!(p.validate_rpc_url().is_ok());
+        assert_eq!(p.validate_endpoint_urls(), Ok(()));
     }
 
     #[test]
-    fn validate_rpc_url_invalid() {
+    fn validate_endpoint_urls_invalid() {
         let mut p = make_testnet_profile();
         p.rpc_url = "not-a-url".to_owned();
-        assert!(p.validate_rpc_url().is_err());
+        assert_eq!(
+            p.validate_endpoint_urls(),
+            Err(EndpointUrlError {
+                field: "rpc_url",
+                reason: EndpointUrlRejection::Unparseable(url::ParseError::RelativeUrlWithoutBase),
+            })
+        );
+    }
+
+    /// `validate_endpoint_urls` reaches the two optional fields as well as
+    /// `rpc_url`: `profile init` and `profile migrate` rely on it for all three.
+    #[test]
+    fn validate_endpoint_urls_checks_the_optional_fields() {
+        let base = Profile::builder_mainnet(MAINNET_FIXTURE_RPC, "s", "a", "n", "a").build();
+        assert_eq!(base.validate_endpoint_urls(), Ok(()));
+
+        let mut secondary = base.clone();
+        secondary.secondary_rpc_url = Some("http://secondary.example.invalid".to_owned());
+        assert_eq!(
+            secondary.validate_endpoint_urls(),
+            Err(EndpointUrlError {
+                field: "secondary_rpc_url",
+                reason: EndpointUrlRejection::MainnetRequiresHttps,
+            })
+        );
+
+        let mut oracle = base;
+        oracle.oracle_provider_url =
+            Some(Url::parse("https://user:pass@oracle.example.invalid").unwrap());
+        assert_eq!(
+            oracle.validate_endpoint_urls(),
+            Err(EndpointUrlError {
+                field: "oracle_provider_url",
+                reason: EndpointUrlRejection::MainnetCredentialInUrl,
+            })
+        );
+
+        // With every field broken, the first in field order is reported.
+        let mut all_broken = oracle;
+        all_broken.rpc_url = "http://rpc.example.invalid".to_owned();
+        all_broken.secondary_rpc_url = Some("http://secondary.example.invalid".to_owned());
+        assert_eq!(
+            all_broken.validate_endpoint_urls().map_err(|e| e.field),
+            Err("rpc_url")
+        );
+        all_broken.rpc_url = MAINNET_FIXTURE_RPC.to_owned();
+        assert_eq!(
+            all_broken.validate_endpoint_urls().map_err(|e| e.field),
+            Err("secondary_rpc_url")
+        );
+    }
+
+    /// The endpoint rule has no host check of its own because the pinned
+    /// `url` crate refuses an empty `http` or `https` host at parse time. Each
+    /// input either fails to parse or yields a non-empty host.
+    #[test]
+    fn url_crate_refuses_an_empty_http_host() {
+        for raw in ["http://", "https://", "http:///path"] {
+            match Url::parse(raw) {
+                Err(_) => {}
+                Ok(url) => assert!(
+                    url.host_str().is_some_and(|host| !host.is_empty()),
+                    "`{raw}` parsed without a host"
+                ),
+            }
+            for chain in [Caip2::Testnet, Caip2::Mainnet] {
+                if let Ok(url) = check_endpoint_url("rpc_url", raw, chain) {
+                    assert!(
+                        url.host_str().is_some_and(|host| !host.is_empty()),
+                        "`{raw}` passed the endpoint rule without a host"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2644,7 +2909,7 @@ mod tests {
     /// Both testnet and mainnet builder-produced profiles default to `V1`.
     #[test]
     fn policy_engine_default_v1_for_new_mainnet_profiles() {
-        let p = Profile::builder_mainnet("s", "a", "n", "a").build();
+        let p = Profile::builder_mainnet(MAINNET_FIXTURE_RPC, "s", "a", "n", "a").build();
         assert_eq!(
             p.policy.engine,
             PolicyEngineKind::V1,
@@ -2663,7 +2928,7 @@ mod tests {
 
     #[test]
     fn policy_engine_builder_sets_v1_for_mainnet_profile() {
-        let p = Profile::builder_mainnet("s", "a", "n", "b")
+        let p = Profile::builder_mainnet(MAINNET_FIXTURE_RPC, "s", "a", "n", "b")
             .policy_engine(PolicyEngineKind::V1)
             .build();
 
@@ -3004,17 +3269,28 @@ mod tests {
         );
     }
 
-    // ── RpcUrlParseError display ──────────────────────────────────────────────
+    // ── EndpointUrlError display ──────────────────────────────────────────────
 
+    /// Neither `Display` nor `Debug` of an endpoint refusal echoes any part of
+    /// the URL, for an unparseable value and for each mainnet refusal.
     #[test]
-    fn rpc_url_parse_error_display_omits_the_url() {
-        let mut p = make_testnet_profile();
-        p.rpc_url = "https://user:SENTINEL@[bad".to_owned();
-        let err = p.validate_rpc_url().unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.starts_with("invalid rpc_url: "), "{msg}");
-        assert!(!msg.contains("SENTINEL"), "{msg}");
-        assert!(!format!("{err:?}").contains("SENTINEL"));
+    fn endpoint_url_error_display_and_debug_omit_the_url() {
+        let cases = [
+            (sentinel::UNPARSEABLE, Caip2::Testnet),
+            (sentinel::FTP, Caip2::Testnet),
+            (sentinel::HTTP, Caip2::Mainnet),
+            (sentinel::HTTPS, Caip2::Mainnet),
+        ];
+        for (raw, chain) in cases {
+            let mut p = make_testnet_profile();
+            p.chain_id = chain;
+            p.rpc_url = raw.to_owned();
+            let err = p.validate_endpoint_urls().unwrap_err();
+            let message = err.to_string();
+            assert!(message.starts_with("profile field `rpc_url` "), "{message}");
+            assert_no_sentinel(&message);
+            assert_no_sentinel(&format!("{err:?}"));
+        }
     }
 
     // ── ProfileBuilder setters not yet tested ─────────────────────────────────

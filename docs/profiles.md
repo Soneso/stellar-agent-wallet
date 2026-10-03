@@ -115,7 +115,7 @@ one.
 ## Loader source order
 
 The profile file is the record the operator audits. Its `chain_id` is
-non-overlayable on every chain. On mainnet, `rpc_url`, `secondary_rpc_url`, and `mcp_signer_default` are also protected.
+non-overlayable on every chain. On mainnet, `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, and `mcp_signer_default` are also protected.
 An environment or programmatic overlay naming any protected field is
 refused with `profile.non_overlayable_field`, even when its value equals the file.
 An equal overlay can hide a later edit to the audited record.
@@ -130,14 +130,23 @@ Testnet endpoint and signer fields remain overlayable. Mainnet uses these fields
 
 A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE` never selects one, and a mainnet `default.toml` needs `--profile default`. Keep the filename: its identity is bound to its keyring entries.
 
-Unset `STELLAR_AGENT_CHAIN_ID` on every chain. On mainnet, also unset `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, and `STELLAR_AGENT_MCP_SIGNER_DEFAULT`. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
+Unset `STELLAR_AGENT_CHAIN_ID` on every chain. On mainnet, also unset `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, `STELLAR_AGENT_ORACLE_PROVIDER_URL`, and `STELLAR_AGENT_MCP_SIGNER_DEFAULT`. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
 
 After merging, the loader resolves derived fields and validates:
 
 - `network_passphrase` is always derived from `chain_id`; it is never read from
   the TOML or any overlay.
-- `rpc_url` defaults to the chain's built-in endpoint when omitted, then is
-  validated as a well-formed URL. A malformed URL fails the load.
+- `rpc_url` defaults to the testnet endpoint when a testnet file omits it.
+  Mainnet has no default endpoint, because no provider is implied: a mainnet
+  file without `rpc_url` fails the load with
+  `validation.mainnet_rpc_url_required`.
+- `rpc_url`, `secondary_rpc_url`, and `oracle_provider_url` follow one
+  endpoint rule. Each must be an `http` or `https` URL. On mainnet, each must
+  be an `https` URL with no username or password; there is no plaintext
+  exception for a loopback address. A value that breaks the rule fails the
+  load with `validation.config_invalid`, and the message names the field, not
+  the URL. A local development endpoint over plain HTTP belongs on a testnet
+  profile.
 - `audit_log_path` defaults to the OS-conventional PER-PROFILE location
   (`<data root>/audit/<name>.jsonl`) when omitted; profiles never share an
   audit file unless one is configured explicitly.
@@ -176,7 +185,7 @@ secret.
 |-------|------|----------|---------|-------------|
 | `version` | integer | yes | — | Schema version. Must be `2`. |
 | `chain_id` | string (CAIP-2) | yes | — | `stellar:testnet` or `stellar:mainnet`. Drives passphrase resolution and the mainnet-write gate. |
-| `rpc_url` | string (URL) | no | chain default | Profile endpoint used by transaction commands. Omitted testnet values use `https://soroban-testnet.stellar.org`. Mainnet endpoint flags and overlays are refused. |
+| `rpc_url` | string (URL) | on mainnet | testnet endpoint | Profile endpoint used by transaction commands. Omitted testnet values use `https://soroban-testnet.stellar.org`. Mainnet has no default endpoint, so a mainnet profile must set this field. Follows the endpoint rule in [Loader source order](#loader-source-order): `http` or `https`, and on mainnet `https` with no username or password. Mainnet endpoint flags and overlays are refused. |
 | `network_passphrase` | string | resolved | from `chain_id` | The Stellar network passphrase. Resolved from `chain_id`; **not overridable** from the TOML or overlays. Surfaced for callers. |
 
 ### Signer and nonce references
@@ -214,10 +223,10 @@ actual keys (see [Migration and key rotation](#migration-and-key-rotation)).
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `oracle_provider_url` | string (URL) | no | unset (cross-check off) | Independent RPC endpoint for re-simulating high-value transactions. When unset, the high-value cross-check is skipped. Set this before enabling V1 for mainnet high-value flows. Redacted in debug output. |
+| `oracle_provider_url` | string (URL) | no | unset (cross-check off) | Independent RPC endpoint for re-simulating high-value transactions. When unset, the high-value cross-check is skipped. Set this before enabling V1 for mainnet high-value flows. Follows the endpoint rule in [Loader source order](#loader-source-order). Mainnet reads this field from the file only. Redacted in debug output. |
 | `mcp_disabled` | bool | no | `false` | When `true`, the `stellar-agent-mcp` server refuses to start with error `mcp.disabled_per_profile`. |
 | `audit_log_path` | string (path) | no | OS-conventional | Path to the per-profile audit log. |
-| `secondary_rpc_url` | string (URL) | no | unset | Secondary endpoint for cross-RPC checks. `smart-account multicall` requires an effective secondary from the profile or a testnet flag. Mainnet reads this field from the file only. Debug output is redacted. |
+| `secondary_rpc_url` | string (URL) | no | unset | Secondary endpoint for cross-RPC checks. `smart-account multicall` requires an effective secondary from the profile or a testnet flag. Follows the endpoint rule in [Loader source order](#loader-source-order). Mainnet reads this field from the file only. Debug output is redacted. |
 | `smart_account_max_context_rule_scan_id` | integer | no | engine default | Override for the maximum rule-id scan bound. Rejected at load when above `10000`. |
 | `session_rule_max_horizon_ledgers` | integer | no | engine default | Override for the maximum session-rule lookahead window, in ledgers. Rejected at load when above `10000`. |
 
@@ -289,10 +298,12 @@ Consequences:
 
 - The profile TOML is safe to back up and to copy between hosts. The keyring
   backend is the actual defence for secret material.
-- `rpc_url`, `secondary_rpc_url` and `oracle_provider_url` are redacted in debug
-  output because URLs may embed credentials. `profile show` prints them as
-  scheme, host, and port. The TOML retains the full URLs, so avoid embedding
-  credentials if the file is shared.
+- `rpc_url`, `secondary_rpc_url`, and `oracle_provider_url` are redacted in
+  debug output because URLs may embed credentials. `profile show` prints them
+  as scheme, host, and port. A mainnet profile whose endpoint URL carries a
+  username or password refuses to load; remove the userinfo from the file. A
+  testnet file may hold such a URL, and the TOML retains the full URL, so
+  avoid embedding credentials if the file is shared.
 - `stellar-agent profile show <name>` prints the resolved configuration as a JSON
   envelope; keyring references appear as opaque `{service, account}` objects,
   never the secret.

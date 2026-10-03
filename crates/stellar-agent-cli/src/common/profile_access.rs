@@ -108,9 +108,14 @@ pub(crate) enum ProfileAccessError {
 impl ProfileAccessError {
     /// The wire code for this failure on the surfaces that render a raw code.
     ///
-    /// Protected overlays and implicit mainnet selections preserve their typed codes.
+    /// Protected overlays, implicit mainnet selections, a mainnet profile
+    /// without `rpc_url`, and an endpoint URL that breaks the endpoint rule
+    /// keep the codes [`ProfileLoadError::to_validation_error`] assigns them,
+    /// so the raw and typed routes agree.
     /// Other load failures keep `profile.load_failed`.
     /// A name mismatch reports `profile.name_mismatch`.
+    ///
+    /// [`ProfileLoadError::to_validation_error`]: profile_loader::ProfileLoadError::to_validation_error
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::Load(profile_loader::ProfileLoadError::NonOverlayableField { .. }) => {
@@ -119,6 +124,12 @@ impl ProfileAccessError {
             Self::Load(profile_loader::ProfileLoadError::MainnetRequiresExplicitProfile {
                 ..
             }) => "profile.mainnet_requires_explicit_profile",
+            Self::Load(profile_loader::ProfileLoadError::MainnetRpcUrlRequired { .. }) => {
+                "validation.mainnet_rpc_url_required"
+            }
+            Self::Load(profile_loader::ProfileLoadError::InvalidEndpointUrl { .. }) => {
+                "validation.config_invalid"
+            }
             Self::Load(_) => "profile.load_failed",
             Self::NameMismatch(_) => PROFILE_NAME_MISMATCH_CODE,
         }
@@ -163,6 +174,11 @@ impl ProfileAccessError {
     }
 
     /// Whether an optional profile read must preserve this refusal.
+    ///
+    /// These refusals reach the caller of an optional read, so a profile whose
+    /// selection, overlay, or endpoint configuration is wrong never reads as
+    /// absent or neutral. They include a mainnet profile without `rpc_url` and
+    /// an endpoint URL that breaks the endpoint rule.
     pub(crate) fn requires_refusal(&self) -> bool {
         matches!(
             self,
@@ -170,6 +186,8 @@ impl ProfileAccessError {
                 | Self::Load(
                     profile_loader::ProfileLoadError::NonOverlayableField { .. }
                         | profile_loader::ProfileLoadError::MainnetRequiresExplicitProfile { .. }
+                        | profile_loader::ProfileLoadError::MainnetRpcUrlRequired { .. }
+                        | profile_loader::ProfileLoadError::InvalidEndpointUrl { .. }
                 )
         )
     }
@@ -278,13 +296,15 @@ fn reconcile(
 /// - a name mismatch gets [`PROFILE_NAME_MISMATCH_CODE`], because its recovery
 ///   is unrelated to either of the above.
 ///
-/// The verbs that render a raw code instead — `pay`, `claim`,
-/// `accounts create`, `lend`, `trade`, `vault`, `trustline` — do NOT share the
-/// Load half: they collapse every loader failure to `profile.load_failed`
-/// (`trustline` to `trustline.profile_load_failed`), which is the code their
-/// documentation and the packaged skill already pin. Only the mismatch code is
-/// uniform across both paths, which is the property this change needed.
-/// Unifying the Load codes would be a wire-behaviour change for those verbs.
+/// Some verbs render a raw code instead: `pay`, `claim`, `accounts create`,
+/// `accounts deploy-c`, `trade`, `vault`, `trustline`, and the four
+/// `smart-account deploy-*` commands. They share the Load half only for the
+/// refusals [`ProfileAccessError::code`] keeps typed: a protected overlay, an
+/// implicit mainnet selection, a mainnet profile without `rpc_url`, and an
+/// endpoint URL that breaks the endpoint rule. Every other loader failure
+/// collapses to `profile.load_failed` (`trustline` to
+/// `trustline.profile_load_failed`). The mismatch code is uniform across both
+/// paths.
 pub(crate) fn profile_access_envelope(
     err: &ProfileAccessError,
     requested_name: &str,
@@ -410,8 +430,12 @@ where
     }
 }
 
+/// One value per load refusal that keeps its typed code and that an optional
+/// profile read must preserve.
 #[cfg(test)]
 pub(crate) fn protected_load_errors_for_test() -> Vec<ProfileAccessError> {
+    use stellar_agent_core::profile::schema::{EndpointUrlError, EndpointUrlRejection};
+
     vec![
         ProfileAccessError::Load(profile_loader::ProfileLoadError::NonOverlayableField {
             field: "chain_id",
@@ -422,6 +446,16 @@ pub(crate) fn protected_load_errors_for_test() -> Vec<ProfileAccessError> {
                 named_by: stellar_agent_core::profile::ProfileNameSource::Env,
             },
         ),
+        ProfileAccessError::Load(profile_loader::ProfileLoadError::MainnetRpcUrlRequired {
+            name: "mainnet".to_owned(),
+        }),
+        ProfileAccessError::Load(profile_loader::ProfileLoadError::InvalidEndpointUrl {
+            name: "mainnet".to_owned(),
+            source: EndpointUrlError {
+                field: "rpc_url",
+                reason: EndpointUrlRejection::MainnetRequiresHttps,
+            },
+        }),
     ]
 }
 
@@ -438,7 +472,7 @@ mod tests {
     use super::*;
 
     fn mainnet_fixture(name: &str) -> Profile {
-        Profile::builder_mainnet_named(name, "s", "a", "n", "a")
+        Profile::builder_mainnet_named(name, "https://rpc.example.invalid", "s", "a", "n", "a")
             .with_noop_engine()
             .build()
     }
@@ -455,6 +489,50 @@ mod tests {
                 .expect("valid test fixture");
             assert_eq!(value["error"]["code"], error.code());
         }
+    }
+
+    /// Every protected refusal survives an optional profile read, the two
+    /// endpoint refusals among them; an ordinary load failure does not.
+    #[test]
+    fn protected_load_errors_require_refusal() {
+        let protected = protected_load_errors_for_test();
+        for (label, present) in [
+            (
+                "MainnetRpcUrlRequired",
+                protected.iter().any(|error| {
+                    matches!(
+                        error,
+                        ProfileAccessError::Load(
+                            profile_loader::ProfileLoadError::MainnetRpcUrlRequired { .. }
+                        )
+                    )
+                }),
+            ),
+            (
+                "InvalidEndpointUrl",
+                protected.iter().any(|error| {
+                    matches!(
+                        error,
+                        ProfileAccessError::Load(
+                            profile_loader::ProfileLoadError::InvalidEndpointUrl { .. }
+                        )
+                    )
+                }),
+            ),
+        ] {
+            assert!(present, "the protected fixture list must carry {label}");
+        }
+        for error in &protected {
+            assert!(
+                error.requires_refusal(),
+                "{error:?} must survive an optional read"
+            );
+        }
+        let not_found = ProfileAccessError::Load(profile_loader::ProfileLoadError::NotFound {
+            name: "absent".to_owned(),
+            path: std::path::PathBuf::from("/nonexistent"),
+        });
+        assert!(!not_found.requires_refusal());
     }
 
     #[test]
@@ -990,6 +1068,11 @@ pub(crate) mod test_fixtures {
     /// Persists a mainnet profile named `guard-mainnet` whose `rpc_url` is
     /// `rpc_url` under a temporary home, and clears `STELLAR_AGENT_PROFILE`.
     ///
+    /// The loader refuses a plaintext mainnet endpoint, so a caller that
+    /// asserts a later guard passes an `https://` URL; one that asserts no
+    /// endpoint contact passes a `ConnectionCounter`'s URL and checks its
+    /// count.
+    ///
     /// The returned guards keep the home redirect and the cleared variable in
     /// force; the caller holds them for the test's duration under `#[serial]`.
     pub(crate) fn mainnet_guard_fixture(
@@ -1002,11 +1085,11 @@ pub(crate) mod test_fixtures {
         let dir = tempfile::tempdir().expect("guard home");
         let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
-        let profile = Profile::builder_mainnet_named("guard-mainnet", "s", "default", "n", "a")
-            .rpc_url(rpc_url)
-            .audit_log_path(dir.path().join("audit.jsonl"))
-            .with_noop_engine()
-            .build();
+        let profile =
+            Profile::builder_mainnet_named("guard-mainnet", rpc_url, "s", "default", "n", "a")
+                .audit_log_path(dir.path().join("audit.jsonl"))
+                .with_noop_engine()
+                .build();
         profile_loader::save_new_to_dir("guard-mainnet", &profile, &dir.path().join("profiles"))
             .expect("persist mainnet fixture");
         (dir, home, env)

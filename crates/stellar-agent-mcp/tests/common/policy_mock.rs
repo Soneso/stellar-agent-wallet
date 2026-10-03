@@ -92,10 +92,9 @@ pub fn mainnet_server_with_engine_and_rpc(
     rpc_url: &str,
 ) -> WalletServer {
     keyring_mock::install().expect("mock keyring install");
-    let mut profile = Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
+    let profile = Profile::builder_mainnet(rpc_url, "svc", "acct", "n-svc", "n-acct")
         .with_noop_engine()
         .build();
-    profile.rpc_url = rpc_url.to_owned();
     let mut server = WalletServer::new(profile).expect("WalletServer::new");
     server.set_policy_engine_for_test(Arc::new(engine));
     server

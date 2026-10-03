@@ -49,16 +49,25 @@
 //! immediately (once the audit key is minted), with the Noop engine's
 //! testnet-allow / mainnet-read-only posture.
 //!
-//! # Mainnet requires an explicit HTTPS `--rpc-url`
+//! # Endpoint rule
 //!
-//! The built-in mainnet default endpoint
-//! ([`stellar_agent_core::profile::caip2::MAINNET_RPC_URL`]) requires an API
-//! key and answers HTTP 401 unauthenticated, so persisting it silently would
-//! mint a broken configuration. `init` refuses `--network mainnet` without an
-//! explicit `--rpc-url`, and refuses a plaintext (non-`https://`) mainnet
-//! endpoint — the requirement exists for endpoint trust. Testnet has no such
-//! requirement: `--rpc-url` is optional and defaults to the built-in testnet
-//! endpoint.
+//! Mainnet has no default endpoint, so `init` refuses `--network mainnet`
+//! without `--rpc-url`. Testnet does not require the flag: an omitted
+//! `--rpc-url` takes the built-in testnet endpoint.
+//!
+//! The resolved `rpc_url` must pass the endpoint rule the profile loader
+//! applies ([`stellar_agent_core::profile::schema::check_endpoint_url`]): an
+//! `http` or `https` URL on every chain, and on mainnet an `https` URL with no
+//! username or password. `init` therefore never writes a file the loader
+//! would refuse.
+//!
+//! # Refusal order
+//!
+//! The flag parser refuses a malformed `--rpc-url`, and one that carries
+//! userinfo, with exit code `2` before the command runs. After the arguments
+//! parse, `init` refuses in this order: an unsafe profile name, mainnet
+//! without `--rpc-url`, an existing destination file, and an endpoint that
+//! breaks the endpoint rule.
 //!
 //! # Overwrite refusal
 //!
@@ -96,11 +105,18 @@
 //!
 //! # Errors
 //!
-//! Returns exit code `1` when: the profile name is not a safe path
-//! component; `--network mainnet` is selected without `--rpc-url`, or with a
-//! non-`https://` one; a profile named `--profile <NAME>` already exists; the
-//! resolved `rpc_url` fails URL validation; or the write itself fails (I/O
-//! error, unwritable directory).
+//! Returns exit code `1`, with these refusals in this order:
+//!
+//! - `validation.config_invalid` when the profile name is not a safe path
+//!   component.
+//! - `validation.mainnet_rpc_url_required` when `--network mainnet` is
+//!   selected without `--rpc-url`.
+//! - `validation.profile_already_exists` when a profile named
+//!   `--profile <NAME>` already exists.
+//! - `validation.config_invalid` when the resolved `rpc_url` breaks the
+//!   endpoint rule.
+//! - An internal error when the write itself fails (I/O error, unwritable
+//!   directory).
 
 use std::path::Path;
 
@@ -109,7 +125,6 @@ use serde::Serialize;
 
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
-use stellar_agent_core::profile::caip2::MAINNET_RPC_URL;
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, PolicyEngineKind, Profile};
 use stellar_agent_core::redact::redact_url_authority;
@@ -134,9 +149,9 @@ pub(crate) struct InitArgs {
     /// Soroban RPC endpoint for the new profile.
     ///
     /// Optional for testnet (defaults to the built-in testnet endpoint).
-    /// REQUIRED, and required to be `https://`, for `--network mainnet`: the
-    /// built-in mainnet default requires an API key and answers HTTP 401
-    /// unauthenticated, so persisting it would mint a broken configuration.
+    /// Required for `--network mainnet`, which has no default endpoint, and
+    /// required there to be an `https://` URL. Every chain accepts only
+    /// `http` and `https` URLs. URL credentials are refused.
     #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub(crate) rpc_url: Option<String>,
 
@@ -194,13 +209,12 @@ pub async fn run(args: &InitArgs) -> i32 {
 
 /// First-stage typed refusals, evaluated before any build or write work.
 ///
-/// Pinned by unit tests via the wire codes:
-/// `validation.config_invalid` (unsafe profile name, and mainnet with a
-/// non-HTTPS `--rpc-url` — the whole point of requiring an explicit endpoint
-/// is endpoint trust, so a plaintext scheme is refused),
+/// Pinned by unit tests via the wire codes, in this order:
+/// `validation.config_invalid` (unsafe profile name),
 /// `validation.mainnet_rpc_url_required` (mainnet without `--rpc-url`), and
 /// `validation.profile_already_exists` (destination file present; the
-/// no-clobber persist repeats this refusal atomically at write time).
+/// no-clobber persist repeats this refusal atomically at write time). The
+/// endpoint rule runs after these, in [`build_profile`].
 fn init_refusal(args: &InitArgs, profile_name: &str, profile_dir: &Path) -> Option<WalletError> {
     // The name becomes a path component (`<profile_dir>/<name>.toml`);
     // reject path traversal / control characters before any filesystem access.
@@ -216,26 +230,12 @@ fn init_refusal(args: &InitArgs, profile_name: &str, profile_dir: &Path) -> Opti
         }));
     }
 
-    if args.network == TargetNetwork::Mainnet {
-        match args.rpc_url.as_deref() {
-            None => {
-                return Some(WalletError::Validation(
-                    ValidationError::MainnetRpcUrlRequired {
-                        default_rpc_url: MAINNET_RPC_URL,
-                    },
-                ));
-            }
-            Some(url) if !url.trim().to_ascii_lowercase().starts_with("https://") => {
-                return Some(WalletError::Validation(ValidationError::ConfigInvalid {
-                    component: "rpc_url",
-                    reason: format!(
-                        "a mainnet profile requires an https:// RPC endpoint; got '{}'",
-                        redact_url_authority(url)
-                    ),
-                }));
-            }
-            Some(_) => {}
-        }
+    if args.network == TargetNetwork::Mainnet && args.rpc_url.is_none() {
+        return Some(WalletError::Validation(
+            ValidationError::MainnetRpcUrlRequired {
+                name: profile_name.to_owned(),
+            },
+        ));
     }
 
     let dest = profile_dir.join(format!("{profile_name}.toml"));
@@ -248,6 +248,72 @@ fn init_refusal(args: &InitArgs, profile_name: &str, profile_dir: &Path) -> Opti
         ));
     }
     None
+}
+
+/// Builds the profile `init` writes and checks its endpoints against the
+/// endpoint rule the loader applies.
+///
+/// Signer and nonce references come from the shared
+/// [`KeyringEntryRef::default_signer`] / [`KeyringEntryRef::default_nonce`]
+/// derivations. These are the helpers the loader's synthesised first-run
+/// fallback uses, with the placeholder `"default"` account; the named builders
+/// derive the five security-substrate references from `profile_name`.
+///
+/// # Errors
+///
+/// - `validation.mainnet_rpc_url_required` for `--network mainnet` without
+///   `--rpc-url`. [`init_refusal`] reports this first on the command path.
+/// - `validation.config_invalid` for the `rpc_url` component when the URL
+///   breaks the endpoint rule. The message names the field and the rule,
+///   never the URL.
+fn build_profile(args: &InitArgs, profile_name: &str) -> Result<Profile, WalletError> {
+    let signer = KeyringEntryRef::default_signer(profile_name);
+    let nonce = KeyringEntryRef::default_nonce(profile_name);
+
+    let mut builder = match args.network {
+        TargetNetwork::Testnet => {
+            let builder = Profile::builder_testnet_named(
+                profile_name,
+                &signer.service,
+                &signer.account,
+                &nonce.service,
+                &nonce.account,
+            );
+            match &args.rpc_url {
+                Some(url) => builder.rpc_url(url.clone()),
+                None => builder,
+            }
+        }
+        TargetNetwork::Mainnet => {
+            let rpc_url = args.rpc_url.clone().ok_or_else(|| {
+                WalletError::Validation(ValidationError::MainnetRpcUrlRequired {
+                    name: profile_name.to_owned(),
+                })
+            })?;
+            Profile::builder_mainnet_named(
+                profile_name,
+                rpc_url,
+                &signer.service,
+                &signer.account,
+                &nonce.service,
+                &nonce.account,
+            )
+        }
+    };
+    if args.engine == PolicyEngineKind::Noop {
+        builder = builder.with_noop_engine();
+    }
+    let profile = builder.build();
+
+    // The same rule the loader applies at load time, so `init` never persists
+    // a file the loader would then refuse.
+    profile.validate_endpoint_urls().map_err(|e| {
+        WalletError::Validation(ValidationError::ConfigInvalid {
+            component: "rpc_url",
+            reason: e.to_string(),
+        })
+    })?;
+    Ok(profile)
 }
 
 /// Testable core of [`run`] with the profile directory injected.
@@ -265,51 +331,14 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
         return 1;
     }
 
-    // ── Build the profile ───────────────────────────────────────────────────
-    // Signer/nonce references come from the shared
-    // `KeyringEntryRef::default_signer` / `default_nonce` derivations — the
-    // same helpers the loader's synthesised first-run fallback uses — with the
-    // placeholder "default" account; `with_profile_name` derives the five
-    // security-substrate references.
-    let signer = KeyringEntryRef::default_signer(&profile_name);
-    let nonce = KeyringEntryRef::default_nonce(&profile_name);
-
-    let mut builder = match args.network {
-        TargetNetwork::Testnet => Profile::builder_testnet_named(
-            &profile_name,
-            &signer.service,
-            &signer.account,
-            &nonce.service,
-            &nonce.account,
-        ),
-        TargetNetwork::Mainnet => Profile::builder_mainnet_named(
-            &profile_name,
-            &signer.service,
-            &signer.account,
-            &nonce.service,
-            &nonce.account,
-        ),
+    // ── Build the profile and apply the endpoint rule ────────────────────────
+    let profile = match build_profile(args, &profile_name) {
+        Ok(profile) => profile,
+        Err(err) => {
+            render::render_json(&Envelope::<()>::err(&err));
+            return 1;
+        }
     };
-    if let Some(url) = &args.rpc_url {
-        builder = builder.rpc_url(url.clone());
-    }
-    if args.engine == PolicyEngineKind::Noop {
-        builder = builder.with_noop_engine();
-    }
-    let profile = builder.build();
-
-    // ── Validate the resolved rpc_url before ever writing the file ─────────
-    // Catches a malformed `--rpc-url` (testnet override or the now-mandatory
-    // mainnet value) with the same check the loader applies at load time, so
-    // `init` never persists a file the loader would then refuse.
-    if let Err(e) = profile.validate_rpc_url() {
-        let err = WalletError::Validation(ValidationError::ConfigInvalid {
-            component: "rpc_url",
-            reason: e.to_string(),
-        });
-        render::render_json(&Envelope::<()>::err(&err));
-        return 1;
-    }
 
     // ── Persist (no-clobber: atomic refusal if a file appeared meanwhile) ────
     let written_path = match loader::save_new_to_dir(&profile_name, &profile, profile_dir) {
@@ -424,6 +453,28 @@ mod tests {
     /// explicit one, since `args` always sets it.
     fn resolved_name(args: &InitArgs) -> String {
         resolve_profile_name(args.profile.as_deref()).name
+    }
+
+    /// Sentinel URLs whose every component must stay out of a refusal.
+    const SENTINEL_HTTP: &str =
+        "http://SENTINEL-USER:SENTINEL-PASS@sentinel-host.invalid/SENTINEL-PATH?k=SENTINEL-QUERY";
+    const SENTINEL_HTTPS: &str =
+        "https://SENTINEL-USER:SENTINEL-PASS@sentinel-host.invalid/SENTINEL-PATH?k=SENTINEL-QUERY";
+
+    /// Asserts that no sentinel component reaches `text`. Case-insensitive,
+    /// because the `url` crate lowercases the host.
+    fn assert_no_sentinel(text: &str) {
+        assert!(
+            !text.to_ascii_lowercase().contains("sentinel"),
+            "a sentinel URL component leaked: {text}"
+        );
+    }
+
+    /// Asserts `err` and its rendered envelope carry no sentinel component.
+    fn assert_refusal_omits_the_url(err: &WalletError) {
+        assert_no_sentinel(&err.to_string());
+        assert_no_sentinel(&format!("{err:?}"));
+        assert_no_sentinel(&serde_json::to_string(&Envelope::<()>::err(err)).unwrap());
     }
 
     /// RAII env-var guard; `#[serial]` on every test using it prevents
@@ -578,7 +629,7 @@ mod tests {
         );
     }
 
-    // ── Typed refusal pins (init_refusal) ────────────────────────────────────
+    // ── Typed refusal pins (init_refusal and build_profile) ──────────────────
     // The run()-level tests above prove the exit code end to end; these pin
     // the SPECIFIC typed refusal so a guard swap cannot pass unnoticed behind
     // an unrelated exit-1 path.
@@ -594,29 +645,121 @@ mod tests {
         assert_eq!(err.code(), "validation.mainnet_rpc_url_required");
     }
 
-    /// A plaintext mainnet endpoint refuses with the config-invalid code:
-    /// the explicit-endpoint requirement exists for endpoint trust.
+    /// A plaintext mainnet endpoint breaks the endpoint rule and refuses with
+    /// the config-invalid code.
     #[test]
-    fn refusal_mainnet_plaintext_rpc_url_yields_typed_code() {
-        let dir = tempfile::tempdir().unwrap();
+    #[serial_test::serial]
+    fn build_mainnet_plaintext_rpc_url_yields_typed_code() {
         let mut a = args("pin-plaintext");
         a.network = TargetNetwork::Mainnet;
         a.rpc_url = Some("http://mainnet.example.com/rpc".to_owned());
-        let err = init_refusal(&a, resolved_name(&a).as_str(), dir.path()).expect("must refuse");
+        let err = build_profile(&a, &resolved_name(&a)).expect_err("must refuse");
         assert_eq!(err.code(), "validation.config_invalid");
+        assert!(
+            err.to_string()
+                .contains("must be an https URL on a mainnet profile"),
+            "{err}"
+        );
     }
 
+    /// The plaintext refusal names no part of the URL, so a credential in it
+    /// never reaches the envelope.
     #[test]
-    fn refusal_mainnet_plaintext_rpc_url_redacts_credentials() {
-        let dir = tempfile::tempdir().unwrap();
+    #[serial_test::serial]
+    fn build_mainnet_plaintext_rpc_url_omits_the_url() {
         let mut a = args("redact-plaintext");
         a.network = TargetNetwork::Mainnet;
-        a.rpc_url = Some("http://user:SENTINEL@mainnet.example.com/SENTINEL-PATH".to_owned());
-        let err = init_refusal(&a, resolved_name(&a).as_str(), dir.path()).expect("must refuse");
+        a.rpc_url = Some(SENTINEL_HTTP.to_owned());
+        let err = build_profile(&a, &resolved_name(&a)).expect_err("must refuse");
         assert_eq!(err.code(), "validation.config_invalid");
-        let message = err.to_string();
-        assert!(message.contains("http://mainnet.example.com"), "{message}");
-        assert!(!message.contains("SENTINEL"), "{message}");
+        assert_refusal_omits_the_url(&err);
+    }
+
+    /// The flag parser accepts an `ftp://` URL; the endpoint rule refuses it
+    /// on every chain.
+    #[test]
+    #[serial_test::serial]
+    fn build_unsupported_scheme_yields_typed_code() {
+        for network in [TargetNetwork::Testnet, TargetNetwork::Mainnet] {
+            let mut a = args("pin-ftp");
+            a.network = network;
+            a.rpc_url = Some("ftp://mainnet.example.com".to_owned());
+            let err = build_profile(&a, &resolved_name(&a)).expect_err("must refuse");
+            assert_eq!(err.code(), "validation.config_invalid", "{network}");
+            assert!(
+                err.to_string().contains("must be an http or https URL"),
+                "{network}: {err}"
+            );
+        }
+    }
+
+    /// Userinfo in a mainnet URL breaks the endpoint rule. The flag parser
+    /// refuses such a URL before the command runs; this pins the rule itself
+    /// for a URL that reaches `build_profile`.
+    #[test]
+    #[serial_test::serial]
+    fn build_mainnet_rpc_url_with_userinfo_yields_typed_code() {
+        let mut a = args("pin-userinfo");
+        a.network = TargetNetwork::Mainnet;
+        a.rpc_url = Some(SENTINEL_HTTPS.to_owned());
+        let err = build_profile(&a, &resolved_name(&a)).expect_err("must refuse");
+        assert_eq!(err.code(), "validation.config_invalid");
+        assert!(err.to_string().contains("username or password"), "{err}");
+        assert_refusal_omits_the_url(&err);
+    }
+
+    /// `build_profile` refuses mainnet without a URL on its own, with the
+    /// same code `init_refusal` reports first on the command path.
+    #[test]
+    #[serial_test::serial]
+    fn build_mainnet_without_rpc_url_yields_typed_code() {
+        let mut a = args("pin-build-mainnet");
+        a.network = TargetNetwork::Mainnet;
+        a.rpc_url = None;
+        let err = build_profile(&a, &resolved_name(&a)).expect_err("must refuse");
+        assert_eq!(err.code(), "validation.mainnet_rpc_url_required");
+    }
+
+    /// Each endpoint-rule refusal on the command path exits 1 and writes no
+    /// file.
+    #[test]
+    #[serial_test::serial]
+    fn init_endpoint_rule_refusals_write_no_file() {
+        for (network, url) in [
+            (TargetNetwork::Testnet, "ftp://mainnet.example.com"),
+            (TargetNetwork::Mainnet, "ftp://mainnet.example.com"),
+            (TargetNetwork::Mainnet, "http://mainnet.example.com/rpc"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = args("endpoint-refused");
+            a.network = network;
+            a.rpc_url = Some(url.to_owned());
+            let code = run_with_dependencies(&a, dir.path());
+            assert_eq!(code, 1, "{network} `{url}` must be refused");
+            assert!(
+                !dir.path().join("endpoint-refused.toml").exists(),
+                "{network} `{url}`: a refused init must not write a file"
+            );
+        }
+    }
+
+    /// An existing destination refuses before the endpoint rule runs: a
+    /// parser-accepted `http://` mainnet URL still reports
+    /// `validation.profile_already_exists`, and the file is untouched.
+    #[test]
+    fn init_refusal_reports_an_existing_destination_before_the_endpoint_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pin-order.toml");
+        std::fs::write(&path, "version = 2\n").unwrap();
+        let mut a = args("pin-order");
+        a.network = TargetNetwork::Mainnet;
+        a.rpc_url = Some("http://mainnet.example.com/rpc".to_owned());
+
+        let err = init_refusal(&a, resolved_name(&a).as_str(), dir.path()).expect("must refuse");
+        assert_eq!(err.code(), "validation.profile_already_exists");
+
+        assert_eq!(run_with_dependencies(&a, dir.path()), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "version = 2\n");
     }
 
     /// An existing destination refuses with its exact wire code.
@@ -736,6 +879,22 @@ mod tests {
 
         let loaded = load_from_dir("testnet-explicit-rpc", dir.path(), None).unwrap();
         assert_eq!(loaded.rpc_url, "https://custom-testnet-rpc.example.com");
+    }
+
+    /// Testnet accepts a plaintext endpoint: the HTTPS requirement is
+    /// mainnet-only.
+    #[test]
+    #[serial_test::serial]
+    fn init_testnet_plaintext_rpc_url_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = args("testnet-plaintext-rpc");
+        a.rpc_url = Some("http://127.0.0.1:8000".to_owned());
+
+        let code = run_with_dependencies(&a, dir.path());
+        assert_eq!(code, 0);
+
+        let loaded = load_from_dir("testnet-plaintext-rpc", dir.path(), None).unwrap();
+        assert_eq!(loaded.rpc_url, "http://127.0.0.1:8000");
     }
 
     #[test]

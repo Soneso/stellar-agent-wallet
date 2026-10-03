@@ -118,9 +118,15 @@ fn mainnet_profile() -> Profile {
     // test suite and prevents future tests that call `WalletServer::new(mainnet_profile())`
     // from crashing with `OwnerKeyAbsent` (the V1 engine requires an owner-key
     // keyring entry; test environments do not provision one for mainnet profiles).
-    Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
-        .with_noop_engine()
-        .build()
+    Profile::builder_mainnet(
+        "https://rpc.example.invalid",
+        "svc",
+        "acct",
+        "n-svc",
+        "n-acct",
+    )
+    .with_noop_engine()
+    .build()
 }
 
 async fn assert_friendbot_account_id_invalid_params(account_id: String) {

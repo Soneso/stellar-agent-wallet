@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core `check_enrolled_signer` and network `enrolled_keyring_signer` enforce the enrolled identity on mainnet.
 - `--profile` selects profiles for `smart-account rules get`, `rules get-spending-limit`, `deploy-policy`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`, and `deploy-webauthn-verifier`.
 - Core `redact::CREDENTIALED_URL_INPUT_REFUSAL` is the refusal text for an RPC URL input that carries credentials.
+- Core `check_endpoint_url` and `Profile::validate_endpoint_urls` apply the endpoint rule to a profile's three endpoint fields. A refusal is an `EndpointUrlError` naming the field and an `EndpointUrlRejection`, never the URL. The loader reports one as `ProfileLoadError::InvalidEndpointUrl`, and a mainnet file without `rpc_url` as `ProfileLoadError::MainnetRpcUrlRequired`.
 - `stellar_agent_network::NetworkContext` carries the chain identity and RPC endpoints for a command, with a canonical passphrase and redacted `Debug` output.
 - Core profile APIs `check_mainnet_selection` and `ResolvedProfileName::from_flag` preserve explicit profile selection. `ProfileLoadError::to_validation_error` maps loader refusals to validation errors.
 - Wire codes `profile.non_overlayable_field` and `profile.mainnet_requires_explicit_profile` identify protected overlays and implicit mainnet selection.
@@ -144,11 +145,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--network` is optional and must match the profile's chain.
 - `--rpc-url` and `--secondary-rpc-url` are optional testnet overrides. Mainnet profiles refuse either flag, including equal values.
 - An absent `--secondary-rpc-url` uses the profile's secondary endpoint. Smart-account rule commands perform their cross-RPC check when a secondary endpoint is configured.
-- Mainnet profiles read `rpc_url`, `secondary_rpc_url`, and `mcp_signer_default` from the file only. Environment and programmatic overlays naming these fields are refused.
+- Mainnet profiles read `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, and `mcp_signer_default` from the file only. Environment and programmatic overlays naming these fields are refused, `STELLAR_AGENT_ORACLE_PROVIDER_URL` included.
+- A mainnet profile names its RPC endpoint; mainnet has no default endpoint. A mainnet profile file without `rpc_url` refuses to load, and `profile migrate` refuses such a v1 file, both with `validation.mainnet_rpc_url_required`.
+- `rpc_url`, `secondary_rpc_url`, and `oracle_provider_url` must be HTTP or HTTPS URLs on every chain, and HTTPS URLs with no userinfo on mainnet. The profile loader, `profile init`, and `profile migrate` refuse a URL that breaks the rule with `validation.config_invalid`. The message names the field, not the URL.
+- `profile migrate` reports load refusals with validation codes: `validation.profile_not_found` for a missing file, and `validation.config_invalid` for a file it cannot read. A refused migration writes nothing.
+- `pay`, `claim`, `accounts create`, `accounts deploy-c`, `trade`, `vault`, `trustline`, and the four `smart-account deploy-*` commands keep two load refusals typed. A named profile's endpoint URL that breaks the endpoint rule reports `validation.config_invalid`, and a mainnet profile without `rpc_url` reports `validation.mainnet_rpc_url_required`. Their other load failures keep `profile.load_failed` (`trustline.profile_load_failed` on `trustline`).
+- `approve operator enroll` and `credentials add-passkey` refuse a mainnet profile without `rpc_url` and a profile whose endpoint URL breaks the endpoint rule.
+- `Profile::builder_mainnet` and `Profile::builder_mainnet_named` take the RPC URL. `Caip2::default_rpc_url` returns an `Option`, `None` for mainnet. `ValidationError::MainnetRpcUrlRequired` carries the profile name.
 - The `secondary_rpc_url` inputs of `stellar_dex_trade`, `stellar_defindex_vault_deposit`, and `stellar_defindex_vault_withdraw` default to the profile's secondary endpoint. Mainnet profiles refuse these inputs before other handler work.
 - Mainnet seed, Ledger, and keyring signers must match the enrolled signer. Missing or malformed enrollment pins are refused.
 - `smart-account multicall` refuses a mainnet profile before registry, writer, or signer access.
-- RPC URL flags, including `profile init --rpc-url`, and MCP `secondary_rpc_url` inputs refuse URLs containing credentials.
+- RPC URL flags, including `profile init --rpc-url`, and MCP `secondary_rpc_url` inputs refuse URLs containing credentials; the refusal states that only a testnet profile file may hold a credentialed endpoint.
 - `pay`, `claim`, and `accounts create` apply the profile's `[wallet]` unlock controls to the signing seed.
 - `accounts create --fund-with-friendbot`, `accounts deploy-c`, and `fees stats --profile` read their network from the resolved profile. `accounts deploy-c` opens an audit writer only with `--profile`.
 - `accounts deploy-c`, the four smart-account deployment commands, `rules get`, `rules get-spending-limit`, `register-multicall`, and `unregister-multicall` refuse an explicitly named missing profile.
@@ -427,7 +434,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MigrationSubmitResult::new_for_test_with_failed_remove_tx_hash`; use
   `MigrationSubmitResult::new_for_test` under `test-helpers`.
 
-- `RpcUrlParseError::raw`; the error carries the parse failure only.
+- `MAINNET_RPC_URL`, `Profile::validate_rpc_url`, `RpcUrlParseError`, and `ProfileLoadError::InvalidRpcUrl`; use `Profile::validate_endpoint_urls`, `EndpointUrlError`, and `ProfileLoadError::InvalidEndpointUrl`.
 - `SignersManager::identify_threshold_policy`; the signer-set observation
   identifies the simple-threshold policy through both endpoints.
 - The install-time pin-check skip of a rule manager without a signers

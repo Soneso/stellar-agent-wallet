@@ -2,8 +2,9 @@
 //!
 //! The profile file is the record the operator audits. `chain_id` comes only
 //! from that file. On mainnet, overlays also cannot name `rpc_url`,
-//! `secondary_rpc_url`, or `mcp_signer_default`. Naming a protected field is refused, including an equal value,
-//! because an overlay can hide a later edit to that record.
+//! `secondary_rpc_url`, `oracle_provider_url`, or `mcp_signer_default`. Naming
+//! a protected field is refused, including an equal value, because an overlay
+//! can hide a later edit to that record.
 //!
 //! Loads the remaining fields from three sources in priority order:
 //!
@@ -56,7 +57,9 @@ use figment::{
 };
 
 use super::name::validate_path_component_ascii_safe;
-use super::schema::{MAX_SERVED_PAGE_DISPLAY_NAME_CHARS, Profile, default_audit_log_path_for};
+use super::schema::{
+    MAX_SERVED_PAGE_DISPLAY_NAME_CHARS, Profile, check_endpoint_url, default_audit_log_path_for,
+};
 pub use super::schema::{default_approval_dir, default_policy_dir, default_profile_dir};
 use crate::profile::caip2::Caip2;
 
@@ -228,14 +231,35 @@ pub enum ProfileLoadError {
         supported: u32,
     },
 
-    /// The `rpc_url` field is not a valid URL.
-    #[error("profile '{name}': {source}")]
-    InvalidRpcUrl {
+    /// A mainnet profile file names no `rpc_url`.
+    ///
+    /// Mainnet has no default endpoint, so the file must name one.
+    ///
+    /// # Fix
+    ///
+    /// Set `rpc_url` in the profile file to the HTTPS endpoint of a trusted
+    /// mainnet RPC provider.
+    #[error(
+        "mainnet profile '{name}' names no RPC endpoint; set `rpc_url` in the profile file, \
+         because mainnet has no default endpoint"
+    )]
+    MainnetRpcUrlRequired {
         /// The profile name as supplied by the caller.
         name: String,
-        /// The inner URL-parse error.
+    },
+
+    /// An endpoint field (`rpc_url`, `secondary_rpc_url`, or
+    /// `oracle_provider_url`) breaks the endpoint rule of
+    /// [`super::schema::check_endpoint_url`].
+    ///
+    /// The message names the field and the rule, never the URL.
+    #[error("profile '{name}': {source}")]
+    InvalidEndpointUrl {
+        /// The profile name as supplied by the caller.
+        name: String,
+        /// The field and the check it failed.
         #[source]
-        source: super::schema::RpcUrlParseError,
+        source: super::schema::EndpointUrlError,
     },
 
     /// A v2 profile omitted the required `[policy]` TOML section.
@@ -402,6 +426,9 @@ impl ProfileLoadError {
                 }
             }
             Self::NotFound { name, .. } => ValidationError::ProfileNotFound { name: name.clone() },
+            Self::MainnetRpcUrlRequired { name } => {
+                ValidationError::MainnetRpcUrlRequired { name: name.clone() }
+            }
             _ => ValidationError::ConfigInvalid {
                 component: "profile",
                 reason: crate::observability::redact_path_in_message(&format!(
@@ -432,7 +459,8 @@ impl ProfileLoadError {
             | Self::MainnetRequiresExplicitProfile { .. }
             | Self::InvalidName { .. }
             | Self::VersionUnsupported { .. }
-            | Self::InvalidRpcUrl { .. }
+            | Self::MainnetRpcUrlRequired { .. }
+            | Self::InvalidEndpointUrl { .. }
             | Self::MissingPolicySection { .. }
             | Self::SignerRefUnreadable { .. }
             | Self::Figment { .. }
@@ -488,11 +516,15 @@ fn guard_name_for_save(name: &str) -> Result<(), ProfileSaveError> {
 /// 2. Fail fast if the file does not exist.
 /// 3. Merge sources: TOML file → env-var overlay (priority: env wins).
 /// 4. Reject `version != 2` with [`ProfileLoadError::VersionUnsupported`].
-/// 5. Resolve `rpc_url` default from `chain_id` if the TOML omitted it.
+/// 5. Resolve the testnet `rpc_url` default if the TOML omitted it; a mainnet
+///    file without `rpc_url` refuses with
+///    [`ProfileLoadError::MainnetRpcUrlRequired`].
 /// 6. Resolve `network_passphrase` from `chain_id` (always derived; not
 ///    overridable from profile config).
 /// 7. Resolve `audit_log_path` default if the TOML omitted it.
-/// 8. Validate `rpc_url` is a well-formed URL.
+/// 8. Check `rpc_url`, `secondary_rpc_url`, and `oracle_provider_url` against
+///    the endpoint rule of [`super::schema::check_endpoint_url`], refusing
+///    with [`ProfileLoadError::InvalidEndpointUrl`].
 ///
 /// # Multicall guard
 ///
@@ -567,7 +599,8 @@ pub fn load_from_path(
 
 /// Reads identity from the file before applying permitted overlays.
 /// The file is the operator's audited record. Naming `chain_id`, or a mainnet
-/// `rpc_url`, `secondary_rpc_url`, or `mcp_signer_default`, in an overlay is refused.
+/// `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, or
+/// `mcp_signer_default`, in an overlay is refused.
 fn load_from_path_with_overlays(
     name: &str,
     path: &Path,
@@ -614,7 +647,12 @@ fn load_from_path_with_overlays(
         return Err(ProfileLoadError::NonOverlayableField { field: "chain_id" });
     }
     if on_disk.chain_id.is_mainnet() {
-        for field in ["rpc_url", "secondary_rpc_url", "mcp_signer_default"] {
+        for field in [
+            "rpc_url",
+            "secondary_rpc_url",
+            "oracle_provider_url",
+            "mcp_signer_default",
+        ] {
             if overlay_data.values().any(|dict| dict.contains_key(field)) {
                 return Err(ProfileLoadError::NonOverlayableField { field });
             }
@@ -630,11 +668,18 @@ fn load_from_path_with_overlays(
         })?;
     let policy = require_policy_section(partial.policy, path)?;
 
-    // ── Step 3: resolve derived fields.
+    // ── Step 3: resolve derived fields.  Only testnet has a default endpoint;
+    // a mainnet file that names none is refused.
     let chain_id = on_disk.chain_id;
-    let rpc_url = partial
-        .rpc_url
-        .unwrap_or_else(|| chain_id.default_rpc_url().to_owned());
+    let rpc_url = match (partial.rpc_url, chain_id.default_rpc_url()) {
+        (Some(explicit), _) => explicit,
+        (None, Some(default)) => default.to_owned(),
+        (None, None) => {
+            return Err(ProfileLoadError::MainnetRpcUrlRequired {
+                name: name.to_owned(),
+            });
+        }
+    };
     let network_passphrase = chain_id.network_passphrase().to_owned();
     // Unset audit_log_path resolves to the PER-PROFILE location the field's
     // contract documents (`<root>/audit/<name>.jsonl`), never a host-global
@@ -690,6 +735,24 @@ fn load_from_path_with_overlays(
         }
     }
 
+    // ── Step 5: check the three endpoint fields against the endpoint rule.
+    // The raw strings are checked, so the endpoint rule also reports a
+    // malformed `oracle_provider_url`.
+    let invalid_endpoint = |source| ProfileLoadError::InvalidEndpointUrl {
+        name: name.to_owned(),
+        source,
+    };
+    check_endpoint_url("rpc_url", &rpc_url, chain_id).map_err(invalid_endpoint)?;
+    if let Some(secondary) = partial.secondary_rpc_url.as_deref() {
+        check_endpoint_url("secondary_rpc_url", secondary, chain_id).map_err(invalid_endpoint)?;
+    }
+    let oracle_provider_url = partial
+        .oracle_provider_url
+        .as_deref()
+        .map(|oracle| check_endpoint_url("oracle_provider_url", oracle, chain_id))
+        .transpose()
+        .map_err(invalid_endpoint)?;
+
     let profile = Profile {
         version: partial.version,
         chain_id,
@@ -707,7 +770,7 @@ fn load_from_path_with_overlays(
         policy_owner_key_id: partial.policy_owner_key_id,
         attestation_key_id: partial.attestation_key_id,
         counterparty_cache_key_id: partial.counterparty_cache_key_id,
-        oracle_provider_url: partial.oracle_provider_url,
+        oracle_provider_url,
         policy,
         wallet: partial.wallet,
         smart_account_max_context_rule_scan_id: partial.smart_account_max_context_rule_scan_id,
@@ -720,14 +783,6 @@ fn load_from_path_with_overlays(
         served_pages: partial.served_pages,
         policy_window_state_key_id,
     };
-
-    // ── Step 5: validate rpc_url.
-    profile
-        .validate_rpc_url()
-        .map_err(|e| ProfileLoadError::InvalidRpcUrl {
-            name: name.to_owned(),
-            source: e,
-        })?;
 
     // ── Step 6: multicall guard.  When the caller wires in a
     // `MulticallRegistryHook` and the registry has an entry for the profile's
@@ -1312,7 +1367,7 @@ pub fn load_with_overlay_from_dir(
 ///
 /// The fallback profile uses the following defaults:
 /// - `chain_id = Caip2::Testnet`
-/// - `rpc_url = Caip2::Testnet.default_rpc_url()`
+/// - `rpc_url` = [`crate::profile::caip2::TESTNET_RPC_URL`]
 /// - `network_passphrase = Caip2::Testnet.network_passphrase()`
 /// - All optional fields at their schema defaults.
 ///
@@ -1383,14 +1438,16 @@ struct OnDiskChainId {
 
 /// Partial profile with optional fields that have derived defaults.
 ///
-/// `rpc_url` and `audit_log_path` are optional in the TOML; they are resolved
-/// from `chain_id` / OS-conventions at load time.  `network_passphrase` is
-/// NOT present in the TOML — it is always derived from `chain_id`.
+/// `audit_log_path` is optional in the TOML and resolves from OS conventions
+/// at load time.  `rpc_url` is optional on testnet, which resolves the chain's
+/// default endpoint; a mainnet file must set it.  `network_passphrase` is NOT
+/// present in the TOML: it is always derived from `chain_id`.
 ///
 /// The v2 fields (`audit_log_hash_chain_key_id`, `policy_owner_key_id`,
 /// `attestation_key_id`, `counterparty_cache_key_id`) are required in v2
 /// profiles; they are populated by `migrate_v1_to_v2` with default-derived
-/// names.  `oracle_provider_url` defaults to `None`.
+/// names.  `oracle_provider_url` defaults to `None` and is read as a string,
+/// so the endpoint rule reports a malformed value.
 /// `policy` defaults to `PolicyConfig::default()` (engine `V1`).
 /// `classic_fee_per_op_stroops`, `classic_max_fee_per_op_stroops`, and
 /// `submit_timeout_seconds` default to `None` for pre-existing v2 profiles
@@ -1417,7 +1474,7 @@ struct PartialProfile {
     attestation_key_id: super::schema::KeyringEntryRef,
     counterparty_cache_key_id: super::schema::KeyringEntryRef,
     #[serde(default)]
-    oracle_provider_url: Option<url::Url>,
+    oracle_provider_url: Option<String>,
     policy: Option<super::schema::PolicyConfig>,
     #[serde(default)]
     wallet: super::schema::WalletConfig,
@@ -1481,7 +1538,8 @@ mod tests {
     )]
 
     use super::*;
-    use crate::profile::schema::MINIMUM_FLOOR;
+    use crate::profile::schema::sentinel::{self, assert_no_sentinel};
+    use crate::profile::schema::{EndpointUrlError, EndpointUrlRejection, MINIMUM_FLOOR};
 
     /// One constructed value per [`ProfileLoadError`] variant.
     ///
@@ -1505,10 +1563,16 @@ mod tests {
                 reason: "must not contain '..'",
             },
             ProfileLoadError::NoStateDir(crate::profile::schema::StateDirError),
-            ProfileLoadError::InvalidRpcUrl {
+            ProfileLoadError::MainnetRpcUrlRequired {
                 name: "p".to_owned(),
-                source: crate::profile::schema::RpcUrlParseError {
-                    source: url::ParseError::RelativeUrlWithoutBase,
+            },
+            ProfileLoadError::InvalidEndpointUrl {
+                name: "p".to_owned(),
+                source: crate::profile::schema::EndpointUrlError {
+                    field: "rpc_url",
+                    reason: EndpointUrlRejection::Unparseable(
+                        url::ParseError::RelativeUrlWithoutBase,
+                    ),
                 },
             },
             ProfileLoadError::Figment {
@@ -1812,6 +1876,64 @@ mod tests {
         assert_eq!(profile.rpc_url, "https://overlay.example");
     }
 
+    /// The file of [`mainnet_toml`] with an oracle endpoint.
+    fn mainnet_oracle_toml() -> String {
+        mainnet_toml().replace(
+            "version = 2",
+            "version = 2\noracle_provider_url = \"https://oracle.example/\"",
+        )
+    }
+
+    #[test]
+    fn protected_oracle_provider_url_overlay_refuses_different_value() {
+        let result = provider_load(
+            &mainnet_oracle_toml(),
+            "oracle_provider_url",
+            serde_json::json!("https://overlay.example/"),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ProfileLoadError::NonOverlayableField {
+                    field: "oracle_provider_url"
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn protected_oracle_provider_url_overlay_refuses_equal_value() {
+        let result = provider_load(
+            &mainnet_oracle_toml(),
+            "oracle_provider_url",
+            serde_json::json!("https://oracle.example/"),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ProfileLoadError::NonOverlayableField {
+                    field: "oracle_provider_url"
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn testnet_oracle_provider_url_overlay_loads() {
+        let profile = provider_load(
+            minimal_toml(),
+            "oracle_provider_url",
+            serde_json::json!("https://overlay.example/"),
+        )
+        .unwrap();
+        assert_eq!(
+            profile.oracle_provider_url.as_ref().map(url::Url::as_str),
+            Some("https://overlay.example/")
+        );
+    }
+
     #[test]
     fn mainnet_unprotected_overlay_loads() {
         let profile =
@@ -1846,6 +1968,9 @@ mod tests {
                     "profile.mainnet_requires_explicit_profile"
                 }
                 ProfileLoadError::NotFound { .. } => "validation.profile_not_found",
+                ProfileLoadError::MainnetRpcUrlRequired { .. } => {
+                    "validation.mainnet_rpc_url_required"
+                }
                 _ => "validation.config_invalid",
             };
             assert_eq!(validation.code(), expected, "{err:?}");
@@ -2012,6 +2137,216 @@ account = "default"
         assert_eq!(p.rpc_url, TESTNET_RPC_URL);
     }
 
+    /// A mainnet file without `rpc_url` refuses: mainnet has no default
+    /// endpoint, so the file must name one.
+    #[test]
+    fn mainnet_file_without_rpc_url_refuses() {
+        let toml = minimal_toml().replace("stellar:testnet", "stellar:mainnet");
+        let (dir, name) = write_profile(&toml);
+        let err = load_from_dir(&name, dir.path(), None).unwrap_err();
+        assert!(
+            matches!(&err, ProfileLoadError::MainnetRpcUrlRequired { name: refused } if refused == &name),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            err.to_validation_error(&name).code(),
+            "validation.mainnet_rpc_url_required"
+        );
+    }
+
+    // ── Endpoint rule ────────────────────────────────────────────────────────
+
+    /// A valid mainnet primary endpoint for rows that vary another field.
+    const RULE_MAINNET_RPC: &str = "https://rpc.example.invalid";
+
+    /// The endpoint fields of one rule-table row.
+    #[derive(Clone, Copy)]
+    struct Endpoints<'a> {
+        rpc_url: Option<&'a str>,
+        secondary_rpc_url: Option<&'a str>,
+        oracle_provider_url: Option<&'a str>,
+    }
+
+    impl<'a> Endpoints<'a> {
+        /// The endpoints with `field` set to `value` over the base `rpc_url`.
+        fn with(rpc_url: Option<&'a str>, field: &str, value: &'a str) -> Self {
+            let mut endpoints = Self {
+                rpc_url,
+                secondary_rpc_url: None,
+                oracle_provider_url: None,
+            };
+            match field {
+                "rpc_url" => endpoints.rpc_url = Some(value),
+                "secondary_rpc_url" => endpoints.secondary_rpc_url = Some(value),
+                "oracle_provider_url" => endpoints.oracle_provider_url = Some(value),
+                other => panic!("no endpoint field `{other}`"),
+            }
+            endpoints
+        }
+    }
+
+    /// A profile TOML on `chain_id` carrying the given endpoint fields.
+    fn endpoint_toml(chain_id: &str, endpoints: Endpoints<'_>) -> String {
+        let mut lines = vec!["version = 2".to_owned()];
+        for (field, value) in [
+            ("rpc_url", endpoints.rpc_url),
+            ("secondary_rpc_url", endpoints.secondary_rpc_url),
+            ("oracle_provider_url", endpoints.oracle_provider_url),
+        ] {
+            if let Some(value) = value {
+                lines.push(format!("{field} = \"{value}\""));
+            }
+        }
+        minimal_toml()
+            .replace("stellar:testnet", chain_id)
+            .replace("version = 2", &lines.join("\n"))
+    }
+
+    /// The exact parse failure `url` reports for `raw`.
+    fn parse_failure(raw: &str) -> EndpointUrlRejection {
+        EndpointUrlRejection::Unparseable(url::Url::parse(raw).unwrap_err())
+    }
+
+    /// Every refusal of the endpoint rule, on both chains and all three
+    /// fields, with the exact field and reason, and no sentinel component in
+    /// the error's `Display`, its `Debug`, or the rendered envelope.
+    #[test]
+    fn endpoint_rule_refuses_each_field_with_its_exact_reason() {
+        let mut rows: Vec<(&str, Endpoints<'_>, &str, EndpointUrlRejection)> = Vec::new();
+        for field in ["rpc_url", "secondary_rpc_url", "oracle_provider_url"] {
+            let base = (field != "rpc_url").then_some(RULE_MAINNET_RPC);
+            for (value, reason) in [
+                (sentinel::UNPARSEABLE, parse_failure(sentinel::UNPARSEABLE)),
+                (sentinel::FTP, EndpointUrlRejection::UnsupportedScheme),
+                (sentinel::HTTP, EndpointUrlRejection::MainnetRequiresHttps),
+                (
+                    "http://127.0.0.1:8000",
+                    EndpointUrlRejection::MainnetRequiresHttps,
+                ),
+                (
+                    "http://localhost:8000",
+                    EndpointUrlRejection::MainnetRequiresHttps,
+                ),
+                (
+                    sentinel::HTTPS,
+                    EndpointUrlRejection::MainnetCredentialInUrl,
+                ),
+            ] {
+                rows.push((
+                    "stellar:mainnet",
+                    Endpoints::with(base, field, value),
+                    field,
+                    reason,
+                ));
+            }
+            for (value, reason) in [
+                (sentinel::UNPARSEABLE, parse_failure(sentinel::UNPARSEABLE)),
+                (sentinel::FTP, EndpointUrlRejection::UnsupportedScheme),
+                (
+                    "ftp://host.invalid/",
+                    EndpointUrlRejection::UnsupportedScheme,
+                ),
+            ] {
+                rows.push((
+                    "stellar:testnet",
+                    Endpoints::with(None, field, value),
+                    field,
+                    reason,
+                ));
+            }
+        }
+
+        for (chain_id, endpoints, field, reason) in rows {
+            let (dir, name) = write_profile(&endpoint_toml(chain_id, endpoints));
+            let err = load_from_dir(&name, dir.path(), None).unwrap_err();
+            match &err {
+                ProfileLoadError::InvalidEndpointUrl { source, .. } => assert_eq!(
+                    source,
+                    &EndpointUrlError { field, reason },
+                    "{chain_id} `{field}`"
+                ),
+                other => panic!("{chain_id} `{field}` ({reason:?}): unexpected {other:?}"),
+            }
+            assert_no_sentinel(&err.to_string());
+            assert_no_sentinel(&format!("{err:?}"));
+            let validation = err.to_validation_error(&name);
+            assert_eq!(validation.code(), "validation.config_invalid");
+            let envelope = crate::envelope::Envelope::<()>::err(
+                &crate::error::WalletError::Validation(validation),
+            );
+            assert_no_sentinel(&serde_json::to_string(&envelope).unwrap());
+        }
+    }
+
+    /// Testnet accepts a plaintext loopback endpoint and a URL with userinfo
+    /// in all three fields, so the mainnet-only checks stay mainnet-only.
+    #[test]
+    fn endpoint_rule_accepts_testnet_plaintext_and_userinfo() {
+        for value in [
+            "http://127.0.0.1:8000",
+            "https://user:pass@rpc.example.invalid/",
+        ] {
+            let endpoints = Endpoints {
+                rpc_url: Some(value),
+                secondary_rpc_url: Some(value),
+                oracle_provider_url: Some(value),
+            };
+            let (dir, name) = write_profile(&endpoint_toml("stellar:testnet", endpoints));
+            let profile = load_from_dir(&name, dir.path(), None).unwrap();
+            assert_eq!(profile.rpc_url, value);
+            assert_eq!(profile.secondary_rpc_url.as_deref(), Some(value));
+            assert_eq!(
+                profile.oracle_provider_url,
+                Some(url::Url::parse(value).unwrap())
+            );
+        }
+    }
+
+    /// The loader reports the first broken field in the order `rpc_url`,
+    /// `secondary_rpc_url`, `oracle_provider_url`.
+    #[test]
+    fn endpoint_rule_reports_the_first_broken_field() {
+        for (rpc_url, expected) in [
+            ("http://rpc.example.invalid", "rpc_url"),
+            (RULE_MAINNET_RPC, "secondary_rpc_url"),
+        ] {
+            let endpoints = Endpoints {
+                rpc_url: Some(rpc_url),
+                secondary_rpc_url: Some("http://secondary.example.invalid"),
+                oracle_provider_url: Some("https://user:pass@oracle.example.invalid/"),
+            };
+            let (dir, name) = write_profile(&endpoint_toml("stellar:mainnet", endpoints));
+            match load_from_dir(&name, dir.path(), None) {
+                Err(ProfileLoadError::InvalidEndpointUrl { source, .. }) => {
+                    assert_eq!(source.field, expected, "rpc_url `{rpc_url}`");
+                }
+                other => panic!("rpc_url `{rpc_url}`: unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// A mainnet file whose three endpoints pass the rule loads them as
+    /// written, including an HTTPS loopback endpoint.
+    #[test]
+    fn endpoint_rule_accepts_mainnet_https_endpoints() {
+        let endpoints = Endpoints {
+            rpc_url: Some("https://127.0.0.1:8443"),
+            secondary_rpc_url: Some("https://secondary.example.invalid"),
+            oracle_provider_url: Some("https://oracle.example.invalid/"),
+        };
+        let (dir, name) = write_profile(&endpoint_toml("stellar:mainnet", endpoints));
+        let profile = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(profile.rpc_url, "https://127.0.0.1:8443");
+        assert_eq!(
+            profile.secondary_rpc_url.as_deref(),
+            Some("https://secondary.example.invalid")
+        );
+        assert_eq!(
+            profile.oracle_provider_url.as_ref().map(url::Url::as_str),
+            Some("https://oracle.example.invalid/")
+        );
+    }
+
     #[test]
     fn load_explicit_rpc_url_overrides_default() {
         let toml = r#"
@@ -2162,7 +2497,16 @@ account = "default"
         let (dir, name) = write_profile(toml);
         let err = load_from_dir(&name, dir.path(), None).unwrap_err();
         assert!(
-            matches!(err, ProfileLoadError::InvalidRpcUrl { .. }),
+            matches!(
+                err,
+                ProfileLoadError::InvalidEndpointUrl {
+                    source: EndpointUrlError {
+                        field: "rpc_url",
+                        reason: EndpointUrlRejection::Unparseable(_),
+                    },
+                    ..
+                }
+            ),
             "unexpected error: {err}"
         );
     }
@@ -3293,15 +3637,22 @@ account = "a"
     fn mainnet_profile_round_trip() {
         use crate::profile::caip2::{Caip2, MAINNET_PASSPHRASE};
         let dir = tempfile::tempdir().unwrap();
-        let profile = Profile::builder_mainnet("svc", "acct", "n-svc", "n-acct")
-            .with_profile_name("mainnet-profile")
-            .audit_log_path(dir.path().join("mainnet-audit.log"))
-            .build();
+        let profile = Profile::builder_mainnet(
+            "https://rpc.example.invalid",
+            "svc",
+            "acct",
+            "n-svc",
+            "n-acct",
+        )
+        .with_profile_name("mainnet-profile")
+        .audit_log_path(dir.path().join("mainnet-audit.log"))
+        .build();
 
         save_to_dir("mainnet-profile", &profile, dir.path()).unwrap();
         let loaded = load_from_dir("mainnet-profile", dir.path(), None).unwrap();
         assert_eq!(loaded.chain_id, Caip2::Mainnet);
         assert_eq!(loaded.network_passphrase, MAINNET_PASSPHRASE);
+        assert_eq!(loaded.rpc_url, "https://rpc.example.invalid");
     }
 
     // ── MulticallRequiresSecondaryRpc error message content ───────────────────

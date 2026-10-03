@@ -1092,12 +1092,12 @@ mod tests {
 
         let profile = stellar_agent_core::profile::schema::Profile::builder_mainnet_named(
             "mainnet-store",
+            "https://mainnet-store.example",
             "svc",
             "default",
             "nonce",
             "default",
         )
-        .rpc_url("https://mainnet-store.example".to_owned())
         .build();
         let context =
             stellar_agent_core::approval::ApprovalContext::from_profile("mainnet-store", &profile);

@@ -291,8 +291,15 @@ pub(crate) mod test_fixtures {
     /// A mainnet profile named `enrolled` whose pin follows `pin`. The
     /// `[wallet]` posture skips mlock so the ceremony runs on any host.
     pub(crate) fn enrolled_mainnet_profile(pin: EnrolledPin) -> Profile {
-        let mut profile =
-            Profile::builder_mainnet_named("enrolled", "s", &pin.account(), "n", "a").build();
+        let mut profile = Profile::builder_mainnet_named(
+            "enrolled",
+            "https://rpc.example.invalid",
+            "s",
+            &pin.account(),
+            "n",
+            "a",
+        )
+        .build();
         profile.wallet.mlock_required = stellar_agent_core::wallet::MlockRequired::False;
         profile
     }
@@ -708,7 +715,15 @@ mod tests {
         let pin = stellar_strkey::ed25519::PublicKey([0x66u8; 32])
             .to_string()
             .to_string();
-        Profile::builder_mainnet_named("enrolled", "s", &pin, "n", "a").build()
+        Profile::builder_mainnet_named(
+            "enrolled",
+            "https://rpc.example.invalid",
+            "s",
+            &pin,
+            "n",
+            "a",
+        )
+        .build()
     }
 
     #[tokio::test]
