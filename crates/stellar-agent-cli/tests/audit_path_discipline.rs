@@ -110,7 +110,7 @@ fn signing_verbs_acquire_the_writer_before_submit() {
         let source = std::fs::read_to_string(src.join(file)).expect("read source");
         let production = production_half(&source);
         let acquire = production
-            .find("open_profile_audit_writer(")
+            .find("open_audit_writer(")
             .unwrap_or_else(|| panic!("{file}: missing the audit pre-flight"));
         let signer = production
             .find(signer_load)
@@ -184,7 +184,7 @@ fn value_verbs_evaluate_policy_before_the_audit_preflight() {
             "commands/trustline.rs",
             &["evaluate_value_moving_policy("][..],
             &["value_audit::require_value_audit_writer("][..],
-            &["signer_from_keyring("][..],
+            &["enrolled_keyring_signer("][..],
         ),
         (
             "commands/accounts/create.rs",
@@ -247,4 +247,19 @@ fn the_tx_verbs_acquire_the_audit_writer_by_profile_origin() {
             "{file}: the profile must be resolved the way the value verbs resolve it"
         );
     }
+}
+
+#[test]
+fn deploy_c_acquires_writer_before_deployer() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/accounts/deploy_c.rs");
+    let source = std::fs::read_to_string(path).expect("source");
+    let production = production_half(&source);
+    assert!(
+        production.find("resolve_audit_writer(").expect("writer")
+            < production
+                .find("resolve_deployer_keypair(")
+                .expect("signer"),
+        "deploy-c writer must precede the deployer"
+    );
 }

@@ -76,7 +76,7 @@ const ALLOW_SET: &[AllowEntry] = &[];
 /// visibility class (say every `pub(crate)` field) would still clear a loose
 /// floor and report a clean tree. Adding or removing a profile-selecting
 /// subcommand is expected to move this number — update it in the same commit.
-const PROFILE_FIELDS: usize = 71;
+const PROFILE_FIELDS: usize = 76;
 
 /// Call-site shapes that substitute the literal `"default"` for an absent
 /// profile name, discarding the environment variable the flag left `None` for.
@@ -131,7 +131,7 @@ fn no_clap_profile_field_carries_a_default_value() {
         let production = strip_test_modules(&clean_source(&source));
         let rel = relative_path(path, &src_root);
 
-        for field in clap_profile_fields(&production, &raw_lines) {
+        for field in clap_fields(&production, &raw_lines, is_profile_selector) {
             seen.push(format!("{rel}:{}", field.line));
             if field.attrs.contains("default_value") {
                 defaulted.push((rel.clone(), field.line));
@@ -216,7 +216,7 @@ fn no_clap_profile_field_carries_a_default_value() {
     );
 }
 
-/// One clap-attributed profile-selector field declaration.
+/// One clap-attributed field declaration admitted by a scan.
 struct ClapField {
     /// 1-based line number of the field declaration.
     line: usize,
@@ -226,18 +226,22 @@ struct ClapField {
     attrs: String,
 }
 
-/// Collects every clap profile selector: a field carrying an `#[arg(...)]` /
-/// `#[clap(...)]` attribute that is either NAMED `profile` or declares
-/// `long = "profile"`.
+/// Collects every field carrying an `#[arg(...)]` / `#[clap(...)]` attribute
+/// that `admit` accepts.
 ///
 /// The clap attribute requirement is what keeps struct-literal initialisers
 /// (`profile: Some("x".to_owned()),`) and function parameters out of the scan:
 /// only a field declaration can be preceded by `#[arg(...)]`.
 ///
-/// `raw_lines` is the UNCLEANED source, indexed identically; the flag-name
-/// half of the admission rule reads a string literal, which the cleaning pass
-/// blanks.
-fn clap_profile_fields(production: &str, raw_lines: &[&str]) -> Vec<ClapField> {
+/// `admit` receives the trimmed field line and the attribute block taken from
+/// `raw_lines`, the UNCLEANED source indexed identically. A rule that reads a
+/// string literal, such as `long = "profile"`, needs the raw text because the
+/// cleaning pass blanks literals.
+fn clap_fields(
+    production: &str,
+    raw_lines: &[&str],
+    admit: impl Fn(&str, &str) -> bool,
+) -> Vec<ClapField> {
     let mut out = Vec::new();
     let mut attrs = String::new();
     let mut attr_start: Option<usize> = None;
@@ -274,7 +278,7 @@ fn clap_profile_fields(production: &str, raw_lines: &[&str]) -> Vec<ClapField> {
             let raw_attrs = attr_start
                 .map(|start| raw_lines[start..=idx].join(" "))
                 .unwrap_or_default();
-            if is_field_declaration(trimmed, "profile") || declares_profile_flag(&raw_attrs) {
+            if admit(trimmed, &raw_attrs) {
                 out.push(ClapField {
                     line: idx + 1,
                     attrs: std::mem::take(&mut attrs),
@@ -286,6 +290,17 @@ fn clap_profile_fields(production: &str, raw_lines: &[&str]) -> Vec<ClapField> {
     }
 
     out
+}
+
+/// A clap profile selector: a field NAMED `profile`, or one whose attributes
+/// declare `long = "profile"`.
+fn is_profile_selector(field: &str, raw_attrs: &str) -> bool {
+    is_field_declaration(field, "profile") || declares_profile_flag(raw_attrs)
+}
+
+/// An endpoint URL flag: a field named `rpc_url` or `secondary_rpc_url`.
+fn is_endpoint_url_flag(field: &str, _raw_attrs: &str) -> bool {
+    is_field_declaration(field, "rpc_url") || is_field_declaration(field, "secondary_rpc_url")
 }
 
 /// True when a clap attribute block declares the long flag `--profile`,
@@ -684,4 +699,125 @@ fn from_flag_is_confined_to_explicit_argument_boundaries() {
         );
     }
     assert_eq!(seen.len(), allowed.len());
+}
+
+#[test]
+fn every_endpoint_flag_uses_the_credential_free_parser() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs_files(&root, &mut files);
+    let mut count = 0;
+    for path in files {
+        let source = std::fs::read_to_string(&path).expect("source");
+        let raw: Vec<_> = source.lines().collect();
+        let production = strip_test_modules(&clean_source(&source));
+        for field in clap_fields(&production, &raw, is_endpoint_url_flag) {
+            count += 1;
+            let dense: String = field.attrs.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                dense.contains("value_parser=EndpointUrlFlag"),
+                "{}:{}: endpoint flag lacks EndpointUrlFlag",
+                relative_path(&path, &root),
+                field.line
+            );
+        }
+    }
+    assert_eq!(count, 58, "exact endpoint flag inventory");
+}
+
+fn identifier_call(line: &str, needle: &str) -> bool {
+    line.match_indices(needle).any(|(i, _)| {
+        i == 0 || !line.as_bytes()[i - 1].is_ascii_alphanumeric() && line.as_bytes()[i - 1] != b'_'
+    })
+}
+
+#[test]
+fn every_seed_and_ledger_resolver_checks_enrollment() {
+    use std::collections::BTreeSet;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs_files(&root, &mut files);
+    let mut resolvers = BTreeSet::new();
+    let mut checks = BTreeSet::new();
+    for path in files {
+        let relative = relative_path(&path, &root);
+        if [
+            "commands/profile/enroll_signer.rs",
+            "commands/profile/enroll_owner_key.rs",
+        ]
+        .contains(&relative.as_str())
+        {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("source");
+        let production = strip_test_modules(&clean_source(&source));
+        let mut function = "";
+        for line in production.lines() {
+            if let Some((_, rest)) = line.split_once("fn ") {
+                function = rest.split(['(', '<', ' ']).next().expect("function name");
+                continue;
+            }
+            let key = (relative.clone(), function.to_owned());
+            if [
+                "resolve_software_signer_from_env(",
+                "signer_from_ledger(",
+                "HardwareSigningKey::native(",
+            ]
+            .iter()
+            .any(|needle| identifier_call(line, needle))
+            {
+                resolvers.insert(key.clone());
+            }
+            if identifier_call(line, "require_enrolled_signer(") {
+                checks.insert(key);
+            }
+        }
+    }
+    assert_eq!(
+        resolvers, checks,
+        "each seed and Ledger resolver must check enrollment once after selecting the signer"
+    );
+    assert_eq!(resolvers.len(), 6, "exact resolver inventory");
+}
+
+#[test]
+fn eager_keyring_signers_use_the_enrollment_helper() {
+    use std::collections::BTreeMap;
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates");
+    let mut eager = BTreeMap::new();
+    let mut lazy = BTreeMap::new();
+    for name in ["stellar-agent-cli", "stellar-agent-mcp"] {
+        let root = workspace.join(name).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&root, &mut files);
+        for path in files {
+            let source = std::fs::read_to_string(&path).expect("source");
+            let production = strip_test_modules(&clean_source(&source));
+            for line in production.lines() {
+                let key = format!("{name}/{}", relative_path(&path, &root));
+                if identifier_call(line, "signer_from_keyring(") {
+                    *eager.entry(key.clone()).or_insert(0) += 1;
+                }
+                if identifier_call(line, "lazy_signer_from_keyring(") {
+                    *lazy.entry(key).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        eager,
+        BTreeMap::from([(
+            "stellar-agent-cli/commands/profile/enroll_signer.rs".to_owned(),
+            1
+        )])
+    );
+    assert_eq!(
+        lazy,
+        BTreeMap::from([
+            ("stellar-agent-cli/commands/mpp.rs".to_owned(), 1),
+            ("stellar-agent-mcp/tools/mpp.rs".to_owned(), 1)
+        ])
+    );
 }

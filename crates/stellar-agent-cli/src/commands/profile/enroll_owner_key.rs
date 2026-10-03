@@ -196,7 +196,7 @@ where
     let owner_pubkey = match resolve_software_signer_from_env(
         &args.secret_env,
         "profile-enroll-owner-key",
-        Some(&resolved),
+        &profile,
     )
     .await
     {

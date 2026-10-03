@@ -185,7 +185,7 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use std::sync::Arc;
 
-        use stellar_agent_network::keyring::signer_from_keyring;
+        use stellar_agent_network::keyring::enrolled_keyring_signer;
         use stellar_agent_x402::exact::create_payment;
         use stellar_agent_x402::wire::encode_payment_signature;
 
@@ -299,19 +299,37 @@ impl WalletServer {
         }
 
         // ── Load signer from keyring ──────────────────────────────────────────
-        let signer_handle =
-            match signer_from_keyring(&self.profile.mcp_signer_default, account).await {
-                Ok(h) => h,
-                Err(err) => {
-                    // Static detail, matching the signer-load refusal wording on
-                    // the other signing tools; the keyring error is traced only.
-                    tracing::debug!(error = %err, "x402 create-payment: signer load failed");
-                    let x402_err = stellar_agent_x402::X402Error::KeyringLoadFailed {
-                        detail: "could not load signer from keyring".to_owned(),
-                    };
-                    return Ok(x402_error_to_tool_result(&x402_err));
+        let signer_handle = match enrolled_keyring_signer(
+            &self.profile_name_for_approval(),
+            &self.profile,
+            account,
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(err) => {
+                if matches!(
+                    &err,
+                    stellar_agent_core::error::WalletError::Auth(
+                        stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                    )
+                ) {
+                    return Ok(crate::tools::common::business_error_result(
+                        err.code(),
+                        err.to_string(),
+                    ));
                 }
-            };
+
+                // Static detail, matching the signer-load refusal wording on
+                // the other signing tools; the keyring error is traced only.
+                tracing::debug!(error = %err, "x402 create-payment: signer load failed");
+                let x402_err = stellar_agent_x402::X402Error::KeyringLoadFailed {
+                    detail: "could not load signer from keyring".to_owned(),
+                };
+                return Ok(x402_error_to_tool_result(&x402_err));
+            }
+        };
 
         // ── Resolve RPC URL from active profile (NEVER from input) ────────────
         // RPC URL is operator-controlled, not facilitator-supplied.

@@ -26,9 +26,9 @@
 //! - The startup advisory (pre-dispatch, in `main.rs`) resolves an audit-log
 //!   path per profile; an unreadable log at that path makes it name the path
 //!   in a `warn!` on stderr.
-//! - `pay`, `claim`, and `accounts create` take their endpoint from
-//!   `--rpc-url` and never read `profile.rpc_url`, so the endpoint
-//!   discriminator is void for them. They are pinned on the per-profile
+//! - `pay`, `claim`, and `accounts create` receive one unreachable
+//!   `--rpc-url` in every run, so the endpoint does not discriminate the
+//!   profile for them. They are pinned on the per-profile
 //!   audit-log path the startup advisory opens. That is the advisory's
 //!   resolution of the verb's own parsed `--profile` value
 //!   (`main.rs`'s `profile_flag`), not the verb's own load, so it observes
@@ -82,10 +82,8 @@ const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 /// endpoint is unreachable.
 const SOURCE_G: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
-/// Endpoint for the verbs that take it from `--rpc-url` rather than the
-/// profile. Unreachable on purpose: this suite runs in the offline gate, and
-/// `pay` / `claim` / `accounts create` default `--rpc-url` to the live testnet
-/// endpoint, so omitting it would put real outbound calls in an offline job.
+/// An unreachable loopback endpoint. This suite runs in the offline gate, so
+/// no child may reach a live endpoint.
 const UNREACHABLE_RPC: &str = "http://127.0.0.1:9";
 
 /// Writes a `noop`-engine testnet profile fixture into `<home>/profiles`.
@@ -159,7 +157,10 @@ fn run_cli_with_env(
 
     command
         .env_remove("STELLAR_AGENT_CHAIN_ID")
-        .env_remove("STELLAR_AGENT_RPC_URL");
+        .env_remove("STELLAR_AGENT_RPC_URL")
+        .env_remove("STELLAR_AGENT_SECONDARY_RPC_URL")
+        .env_remove("STELLAR_AGENT_MCP_SIGNER_DEFAULT")
+        .env_remove("FLAG_RULES_UNSET_SEED");
     for (name, value) in overlay {
         command.env(name, value);
     }
@@ -538,8 +539,8 @@ fn startup_advisory_profile_flag_beats_the_environment_variable() {
 // pay / claim / accounts create — the audit-log path is the observation
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// These three take their endpoint from `--rpc-url` and never read
-// `profile.rpc_url`, so the endpoint discriminator used above is void for them.
+// Every run of these three receives the same unreachable `--rpc-url`, so the
+// endpoint discriminator used above does not apply to them.
 // Their audit surface is keyed on the resolved profile name
 // (`commands/value_audit.rs`), and the startup advisory opens that same
 // per-profile audit-log path by running the verb's own parsed `--profile`
@@ -595,12 +596,7 @@ const MOVED_VERB_ARGS: &[(&str, &[&str])] = &[
 ];
 
 /// Asserts the child failed on the loopback endpoint it was given, which is
-/// also the proof that it issued no call to the live testnet default.
-///
-/// `pay`, `claim`, and `accounts create` default `--rpc-url` to the SDF
-/// testnet endpoint, so a future edit that drops `--rpc-url` from
-/// [`MOVED_VERB_ARGS`] would silently put real outbound calls in the offline
-/// gate. This assertion fails instead.
+/// also the proof that it reached no live endpoint.
 fn assert_reached_only_the_unreachable_endpoint(run: &Run, verb: &str) {
     let json = run.json();
     let message = json["error"]["message"].as_str().unwrap_or_default();
@@ -802,4 +798,708 @@ fn register_multicall_mainnet_environment_refuses_without_registry_write() {
 #[test]
 fn unregister_multicall_mainnet_environment_refuses_without_registry_write() {
     assert_registration_environment_refuses("unregister-multicall", &[]);
+}
+
+#[test]
+fn protected_secondary_and_signer_environment_overlays_refuse_mainnet() {
+    for (variable, value) in [
+        (
+            "STELLAR_AGENT_SECONDARY_RPC_URL",
+            "https://secondary.example",
+        ),
+        ("STELLAR_AGENT_MCP_SIGNER_DEFAULT", "x"),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_RPC);
+        let run = run_cli_with_env(
+            home.path(),
+            None,
+            &["profile", "show", "--profile", "mainnet"],
+            &[(variable, value)],
+        );
+        assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+        assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
+    }
+}
+
+fn pay_base() -> Vec<&'static str> {
+    vec![
+        "pay",
+        SOURCE_G,
+        "1 XLM",
+        "--source",
+        SOURCE_G,
+        "--build-only",
+    ]
+}
+
+#[tokio::test]
+async fn mainnet_profile_flags_refuse_before_endpoint_contact() {
+    let rpc = wiremock::MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    write_mainnet_profile(home.path(), "mainnet", &rpc.uri());
+    for (flags, code) in [
+        (
+            vec!["--rpc-url".to_owned(), rpc.uri()],
+            "profile.non_overlayable_field",
+        ),
+        (
+            vec!["--network".to_owned(), "testnet".to_owned()],
+            "profile.network_flag_mismatch",
+        ),
+        (vec![], "network.mainnet_write_forbidden"),
+    ] {
+        let mut args = pay_base();
+        args.extend(["--profile", "mainnet"]);
+        args.extend(flags.iter().map(String::as_str));
+        let run = run_cli(home.path(), None, &args);
+        assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+        assert_eq!(run.json()["error"]["code"], code);
+    }
+    assert!(rpc.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn mainnet_flag_on_zero_config_refuses_before_endpoint_contact() {
+    let rpc = wiremock::MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let endpoint = rpc.uri();
+    let mut args = pay_base();
+    args.extend(["--network", "mainnet", "--rpc-url", &endpoint]);
+    let run = run_cli(home.path(), None, &args);
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    assert_eq!(run.json()["error"]["code"], "profile.network_flag_mismatch");
+    assert!(rpc.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn mainnet_signers_list_rpc_flag_refuses_before_endpoint_contact() {
+    let rpc = wiremock::MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    write_mainnet_profile(home.path(), "mainnet", &rpc.uri());
+    let run = run_cli(
+        home.path(),
+        None,
+        &[
+            "smart-account",
+            "signers",
+            "list",
+            "--rule-id",
+            "0",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--profile",
+            "mainnet",
+            "--rpc-url",
+            &rpc.uri(),
+        ],
+    );
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
+    assert!(rpc.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn fees_stats_mainnet_equal_rpc_flag_refuses() {
+    let home = tempfile::tempdir().unwrap();
+    let endpoint = "https://mainnet.sorobanrpc.com";
+    write_mainnet_profile(home.path(), "mainnet", endpoint);
+    let run = run_cli(
+        home.path(),
+        None,
+        &[
+            "fees",
+            "stats",
+            "--profile",
+            "mainnet",
+            "--rpc-url",
+            endpoint,
+        ],
+    );
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
+}
+
+#[test]
+fn credentialed_rpc_flag_exits_two_without_echoing_credentials() {
+    let home = tempfile::tempdir().unwrap();
+    write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_RPC);
+    let mut args = pay_base();
+    args.extend([
+        "--profile",
+        "mainnet",
+        "--rpc-url",
+        "https://user:SENTINEL@rpc.example",
+    ]);
+    let run = run_cli(home.path(), None, &args);
+    assert_eq!(run.code, 2, "{} {}", run.stdout, run.stderr);
+    assert!(!run.stderr.contains("SENTINEL"));
+    assert!(!run.stderr.contains("user"));
+}
+
+#[test]
+fn registration_profile_load_failures_leave_the_registry_absent() {
+    for verb in ["register-multicall", "unregister-multicall"] {
+        for malformed in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let registry = home.path().join("networks.toml");
+            if malformed {
+                std::fs::create_dir_all(home.path().join("profiles")).unwrap();
+                std::fs::write(home.path().join("profiles/broken.toml"), "not = [toml").unwrap();
+            }
+            let mut args = vec!["smart-account", verb, "--profile", "broken"];
+            if verb == "register-multicall" {
+                args.extend([
+                    "--address",
+                    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                    "--wasm-sha256",
+                    stellar_agent_smart_account::multicall::MULTICALL_WASM_SHA256,
+                ]);
+            }
+            let run = run_cli_with_env(
+                home.path(),
+                None,
+                &args,
+                &[(
+                    stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+                    registry.to_str().unwrap(),
+                )],
+            );
+            assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+            assert_eq!(
+                run.json()["error"]["code"],
+                if malformed {
+                    "validation.config_invalid"
+                } else {
+                    "validation.profile_not_found"
+                }
+            );
+            assert!(!registry.exists());
+        }
+    }
+}
+
+fn multicall_base() -> Vec<&'static str> {
+    vec![
+        "smart-account",
+        "multicall",
+        "--smart-account",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "--rule-id",
+        "0",
+        "--signer-secret-env",
+        "FLAG_RULES_UNSET_SEED",
+        "--invocation",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM:noop:[]",
+    ]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Structural mainnet refusal on every guarded path
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A smart-account C-strkey every guarded verb accepts as an argument.
+const ACCOUNT_C: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+/// A seed variable the harness removes from every child.
+const UNSET_SEED: &str = "FLAG_RULES_UNSET_SEED";
+
+/// A 64-character hex value for hash, operation id, and salt arguments.
+const HEX_64: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+
+/// The code the structural refusal emits on the transaction verbs.
+const MAINNET_WRITE_FORBIDDEN: &str = "network.mainnet_write_forbidden";
+
+/// One guarded verb: the name a failing row reports, its argv with the
+/// required arguments and no profile, network, or endpoint flag, and the code
+/// its structural refusal emits on a mainnet profile.
+struct GuardedVerb {
+    name: &'static str,
+    argv: Vec<String>,
+    mainnet_code: &'static str,
+}
+
+fn guarded(name: &'static str, argv: &[&str]) -> GuardedVerb {
+    GuardedVerb {
+        name,
+        argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
+        mainnet_code: MAINNET_WRITE_FORBIDDEN,
+    }
+}
+
+/// Every path with a structural mainnet refusal. `endpoint` is the mock the
+/// table observes; the friendbot arm takes it as its faucet URL as well.
+///
+/// The friendbot row passes a malformed new account. The network layer
+/// refuses mainnet with the same code as the CLI, and the CLI refusal precedes
+/// the account validation, so the expected code identifies the CLI refusal.
+fn guarded_verbs(endpoint: &str) -> Vec<GuardedVerb> {
+    let seed = UNSET_SEED;
+    let friendbot_url = format!("{endpoint}/friendbot");
+    let mut verbs = vec![
+        guarded(
+            "pay",
+            &[
+                "pay",
+                SOURCE_G,
+                "1 XLM",
+                "--source",
+                SOURCE_G,
+                "--secret-env",
+                seed,
+            ],
+        ),
+        guarded(
+            "claim",
+            &[
+                "claim",
+                "000000000000000000000000000000000000000000000000000000000000000000000000",
+                "--source",
+                SOURCE_G,
+                "--secret-env",
+                seed,
+            ],
+        ),
+        guarded(
+            "accounts create (sponsored)",
+            &[
+                "accounts",
+                "create",
+                "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+                "--sponsor",
+                SOURCE_G,
+                "--starting-balance",
+                "1 XLM",
+                "--secret-env",
+                seed,
+            ],
+        ),
+        GuardedVerb {
+            mainnet_code: "network.friendbot_mainnet_forbidden",
+            ..guarded(
+                "accounts create --fund-with-friendbot",
+                &[
+                    "accounts",
+                    "create",
+                    "not-a-g-strkey",
+                    "--fund-with-friendbot",
+                    "--friendbot-url",
+                    friendbot_url.as_str(),
+                ],
+            )
+        },
+        guarded(
+            "accounts deploy-c",
+            &[
+                "accounts",
+                "deploy-c",
+                "--deployer-secret-env",
+                seed,
+                "--initial-signer",
+                SOURCE_G,
+            ],
+        ),
+        guarded(
+            "smart-account deploy-policy",
+            &[
+                "smart-account",
+                "deploy-policy",
+                "--kind",
+                "simple-threshold",
+                "--deployer-secret-env",
+                seed,
+            ],
+        ),
+    ];
+    for verb in [
+        "deploy-ed25519-verifier",
+        "deploy-spending-limit-policy",
+        "deploy-webauthn-verifier",
+    ] {
+        verbs.push(GuardedVerb {
+            name: verb,
+            argv: ["smart-account", verb, "--deployer-secret-env", seed]
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect(),
+            mainnet_code: MAINNET_WRITE_FORBIDDEN,
+        });
+    }
+    let rule_verbs: [(&'static str, &[&str]); 15] = [
+        ("signers list", &["signers", "list", "--rule-id", "0"]),
+        ("signers refresh", &["signers", "refresh", "--rule-id", "0"]),
+        (
+            "signers add",
+            &[
+                "signers",
+                "add",
+                "--rule-id",
+                "0",
+                "--signer-delegated",
+                SOURCE_G,
+            ],
+        ),
+        (
+            "signers remove",
+            &["signers", "remove", "--rule-id", "0", "--signer-id", "0"],
+        ),
+        (
+            "signers set-threshold",
+            &[
+                "signers",
+                "set-threshold",
+                "--rule-id",
+                "0",
+                "--new-threshold",
+                "1",
+            ],
+        ),
+        (
+            "signers set-weighted-threshold",
+            &[
+                "signers",
+                "set-weighted-threshold",
+                "--rule-id",
+                "0",
+                "--new-threshold",
+                "1",
+            ],
+        ),
+        (
+            "signers set-signer-weight",
+            &[
+                "signers",
+                "set-signer-weight",
+                "--rule-id",
+                "0",
+                "--new-weight",
+                "1",
+                "--signer-delegated",
+                SOURCE_G,
+            ],
+        ),
+        (
+            "signers batch-add",
+            &["signers", "batch-add", "--rule-id", "0"],
+        ),
+        ("rules create", &["rules", "create", "--name", "guarded"]),
+        (
+            "rules set-name",
+            &["rules", "set-name", "--rule-id", "0", "--name", "guarded"],
+        ),
+        (
+            "rules set-valid-until",
+            &[
+                "rules",
+                "set-valid-until",
+                "--rule-id",
+                "0",
+                "--valid-until",
+                "none",
+            ],
+        ),
+        ("rules delete", &["rules", "delete", "--rule-id", "0"]),
+        (
+            "rules add-policy",
+            &["rules", "add-policy", "--rule-id", "0"],
+        ),
+        (
+            "rules remove-policy",
+            &[
+                "rules",
+                "remove-policy",
+                "--rule-id",
+                "0",
+                "--policy-id",
+                "0",
+            ],
+        ),
+        (
+            "rules set-spending-limit",
+            &[
+                "rules",
+                "set-spending-limit",
+                "--rule-id",
+                "0",
+                "--limit",
+                "1",
+            ],
+        ),
+    ];
+    for (name, tail) in rule_verbs {
+        let mut argv = vec!["smart-account".to_owned()];
+        argv.extend(tail.iter().map(|arg| (*arg).to_owned()));
+        argv.extend(
+            ["--account", ACCOUNT_C, "--signer-secret-env", seed]
+                .iter()
+                .map(|arg| (*arg).to_owned()),
+        );
+        verbs.push(GuardedVerb {
+            name,
+            argv,
+            mainnet_code: MAINNET_WRITE_FORBIDDEN,
+        });
+    }
+    verbs.extend([
+        guarded(
+            "smart-account execute",
+            &[
+                "smart-account",
+                "execute",
+                "--account",
+                ACCOUNT_C,
+                "--contract",
+                ACCOUNT_C,
+                "--function",
+                "noop",
+                "--auth-rule-id",
+                "0",
+                "--rule-signer-ed25519-secret-env",
+                seed,
+                "--signer-secret-env",
+                seed,
+            ],
+        ),
+        guarded(
+            "smart-account migrate-verifier",
+            &[
+                "smart-account",
+                "migrate-verifier",
+                "--account",
+                ACCOUNT_C,
+                "--from",
+                HEX_64,
+                "--to",
+                ACCOUNT_C,
+                "--signer-secret-env",
+                seed,
+            ],
+        ),
+        guarded(
+            "smart-account timelock schedule",
+            &[
+                "smart-account",
+                "timelock",
+                "schedule",
+                "--timelock",
+                ACCOUNT_C,
+                "--target",
+                ACCOUNT_C,
+                "--function",
+                "upgrade",
+                "--delay-ledgers",
+                "1",
+                "--signer-secret-env",
+                seed,
+            ],
+        ),
+        guarded(
+            "smart-account timelock cancel",
+            &[
+                "smart-account",
+                "timelock",
+                "cancel",
+                "--timelock",
+                ACCOUNT_C,
+                "--operation-id",
+                HEX_64,
+                "--signer-secret-env",
+                seed,
+            ],
+        ),
+        guarded(
+            "smart-account timelock execute",
+            &[
+                "smart-account",
+                "timelock",
+                "execute",
+                "--timelock",
+                ACCOUNT_C,
+                "--target",
+                ACCOUNT_C,
+                "--function",
+                "upgrade",
+                "--operation-id",
+                HEX_64,
+                "--salt",
+                HEX_64,
+                "--signer-secret-env",
+                seed,
+            ],
+        ),
+        GuardedVerb {
+            name: "smart-account multicall",
+            argv: multicall_base()
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect(),
+            mainnet_code: MAINNET_WRITE_FORBIDDEN,
+        },
+    ]);
+    verbs
+}
+
+/// Runs every guarded verb with `extra` appended and collects each row whose
+/// exit code, envelope code, or endpoint traffic differs from the expectation.
+async fn guarded_table_failures(
+    home: &Path,
+    endpoint: &wiremock::MockServer,
+    extra: &[String],
+    expected_code: impl Fn(&GuardedVerb) -> &'static str,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let verbs = guarded_verbs(&endpoint.uri());
+    assert_eq!(verbs.len(), 30, "the table covers every guarded path");
+    for verb in &verbs {
+        let mut args = verb.argv.clone();
+        args.extend(extra.iter().cloned());
+        let before = endpoint.received_requests().await.unwrap().len();
+        let home = home.to_path_buf();
+        let run = tokio::task::spawn_blocking(move || {
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_cli(&home, None, &argv)
+        })
+        .await
+        .unwrap();
+        let requests = endpoint.received_requests().await.unwrap().len() - before;
+        let code = serde_json::from_str::<Value>(run.stdout.trim())
+            .ok()
+            .and_then(|json| json["error"]["code"].as_str().map(str::to_owned));
+        let expected = expected_code(verb);
+        if run.code != 1 || code.as_deref() != Some(expected) || requests != 0 {
+            failures.push(format!(
+                "`{}`: exit {}, code {code:?} (expected {expected}), {requests} request(s); \
+                 stdout={} stderr={}",
+                verb.name,
+                run.code,
+                run.stdout.trim(),
+                run.stderr.lines().last().unwrap_or_default()
+            ));
+        }
+    }
+    failures
+}
+
+/// Every guarded path refuses a persisted mainnet profile with its structural
+/// code, and no request reaches the profile's endpoint. No seed variable is
+/// set, and every later stage on these paths reports a different code.
+#[tokio::test]
+async fn every_guarded_path_refuses_a_mainnet_profile_before_endpoint_contact() {
+    let endpoint = wiremock::MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    write_mainnet_profile(home.path(), "mainnet", &endpoint.uri());
+    let failures = guarded_table_failures(
+        home.path(),
+        &endpoint,
+        &["--profile".to_owned(), "mainnet".to_owned()],
+        |verb| verb.mainnet_code,
+    )
+    .await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Every guarded path refuses `--network mainnet` on the zero-config testnet
+/// profile with `profile.network_flag_mismatch`. `--rpc-url` names the mock,
+/// so the zero-request assertion observes the endpoint the command is given.
+#[tokio::test]
+async fn every_guarded_path_refuses_a_mainnet_flag_without_a_profile() {
+    let endpoint = wiremock::MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let failures = guarded_table_failures(
+        home.path(),
+        &endpoint,
+        &[
+            "--network".to_owned(),
+            "mainnet".to_owned(),
+            "--rpc-url".to_owned(),
+            endpoint.uri(),
+        ],
+        |_| "profile.network_flag_mismatch",
+    )
+    .await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `smart-account list-rules` has no structural refusal; a mainnet profile
+/// named only by the environment variable is refused at selection, before
+/// any request reaches the profile's endpoint.
+#[tokio::test]
+async fn list_rules_refuses_a_mainnet_profile_named_by_the_environment() {
+    let endpoint = wiremock::MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    write_mainnet_profile(home.path(), "mainnet", &endpoint.uri());
+    let run = tokio::task::spawn_blocking(move || {
+        run_cli(
+            home.path(),
+            Some("mainnet"),
+            &["smart-account", "list-rules", "--account", ACCOUNT_C],
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    assert_eq!(
+        run.json()["error"]["code"],
+        "profile.mainnet_requires_explicit_profile"
+    );
+    assert!(endpoint.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn multicall_secondary_flag_reaches_writer_without_rpc_contact() {
+    let rpc = wiremock::MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    write_profile(home.path(), "testnet", &rpc.uri(), None);
+    let registry = home.path().join("networks.toml");
+    std::fs::write(&registry, format!("[multicall.testnet]\nnetwork_passphrase = \"Test SDF Network ; September 2015\"\naddress = \"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM\"\nwasm_sha256 = \"{}\"\n", stellar_agent_smart_account::multicall::MULTICALL_WASM_SHA256)).unwrap();
+    let endpoint = rpc.uri();
+    let mut args = multicall_base();
+    args.extend(["--profile", "testnet", "--secondary-rpc-url", &endpoint]);
+    let run = run_cli_with_env(
+        home.path(),
+        None,
+        &args,
+        &[(
+            stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            registry.to_str().unwrap(),
+        )],
+    );
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    let json = run.json();
+    let code = json["error"]["code"].as_str().unwrap();
+    assert!(
+        [
+            "audit.chain_key_unavailable",
+            "validation.secret_env_not_set"
+        ]
+        .contains(&code),
+        "{json}"
+    );
+    assert!(rpc.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn multicall_registry_error_precedes_writer_and_signer() {
+    let home = tempfile::tempdir().unwrap();
+    write_profile(
+        home.path(),
+        "testnet",
+        UNREACHABLE_RPC,
+        Some("https://secondary.example"),
+    );
+    let registry = home.path().join("unreadable-registry");
+    std::fs::create_dir(&registry).unwrap();
+    let mut args = multicall_base();
+    args.extend(["--profile", "testnet"]);
+    let run = run_cli_with_env(
+        home.path(),
+        None,
+        &args,
+        &[(
+            stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
+            registry.to_str().unwrap(),
+        )],
+    );
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    assert_eq!(run.json()["error"]["code"], "io.multicall_registry_load");
 }

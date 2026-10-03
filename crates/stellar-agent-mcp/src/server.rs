@@ -874,6 +874,43 @@ impl WalletServer {
         stellar_agent_core::profile::name::profile_name_for_approval(&self.profile)
     }
 
+    /// Resolves an agent's secondary endpoint against the command context.
+    ///
+    /// On a mainnet context a supplied value is refused with
+    /// `profile.non_overlayable_field`; a value with credentials is refused on
+    /// every chain. An absent value yields the context's secondary endpoint.
+    pub(crate) fn secondary_override(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<Option<String>, rmcp::ErrorData> {
+        if self.context.chain_id.is_mainnet() && requested.is_some() {
+            let refusal = stellar_agent_core::error::ValidationError::ProfileNonOverlayableField {
+                field: "secondary_rpc_url",
+            };
+            return Err(rmcp::ErrorData::invalid_params(
+                format!("{}: {refusal}", refusal.code()),
+                None,
+            ));
+        }
+        if let Some(value) = requested {
+            let url = url::Url::parse(value).map_err(|error| {
+                rmcp::ErrorData::invalid_params(format!("secondary_rpc_url: {error}"), None)
+            })?;
+            if !url.username().is_empty() || url.password().is_some() {
+                return Err(rmcp::ErrorData::invalid_params(
+                    format!(
+                        "the `secondary_rpc_url` input {}",
+                        stellar_agent_core::redact::CREDENTIALED_URL_INPUT_REFUSAL
+                    ),
+                    None,
+                ));
+            }
+        }
+        Ok(requested
+            .map(str::to_owned)
+            .or_else(|| self.context.secondary_rpc_url.clone()))
+    }
+
     /// Resolves the pending-approval store directory, honoring the test-only
     /// override so integration tests never write into the operator's real
     /// approval directory.

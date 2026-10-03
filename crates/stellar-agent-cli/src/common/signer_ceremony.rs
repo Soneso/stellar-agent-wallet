@@ -23,78 +23,34 @@
 //!
 //! When `Wallet::unlock` degrades under `MlockRequired::Warn` (mlock
 //! unavailable), [`resolve_software_signer_from_env`] returns the details in
-//! [`SignerCeremonyOutcome::mlock_degradation`]. [`record_mlock_degradation`]
-//! writes the corresponding `WalletMlockFailed` audit-log entry at call
-//! sites that have an audit writer open; call sites with no audit-writer
-//! infrastructure rely on the `tracing::warn!` `Wallet::unlock` already
-//! emits (see each call site's own comment for which case applies).
+//! [`SignerCeremonyOutcome::mlock_degradation`]. A caller that holds an open
+//! audit writer when it resolves the signer writes the `WalletMlockFailed`
+//! entry through [`record_mlock_degradation`]: the smart-account handler
+//! context, `execute`, `multicall`, the timelock verbs, and `accounts
+//! deploy-c` with `--profile`. Every other caller relies on the
+//! `tracing::warn!` that `Wallet::unlock` emits.
+//!
+//! # Enrolled signer identity
+//!
+//! Every function that resolves a seed or Ledger signer calls
+//! [`require_enrolled_signer`] once on the resolved signer, so on a mainnet
+//! profile the signer must be the profile's enrolled identity. The enrollment
+//! ceremonies are exempt because they establish that identity.
 
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::error::{ValidationError, WalletError, WalletStateError};
-use stellar_agent_core::profile::ResolvedProfileName;
-use stellar_agent_core::wallet::{DEFAULT_TTL_SECONDS, MlockDegradation, MlockRequired, Wallet};
-use stellar_agent_network::SoftwareSigningKey;
+use stellar_agent_core::profile::Profile;
+#[cfg(test)]
+use stellar_agent_core::wallet::{DEFAULT_TTL_SECONDS, MlockRequired};
+use stellar_agent_core::wallet::{MlockDegradation, Wallet};
+use stellar_agent_network::signing::hardware::HardwareSigningKey;
 use stellar_agent_network::signing::wallet::signer_from_wallet;
+use stellar_agent_network::{Signer, SoftwareSigningKey};
+use stellar_agent_smart_account::deployment::DeployerKeypair;
 use zeroize::Zeroizing;
-
-use crate::common::profile_access::{ProfileAccessError, load_profile_reconciled};
-
-/// Resolves the effective `mlock_required` posture and unlock TTL from
-/// `profile_name`'s `[wallet]` profile section.
-///
-/// Two failures, two dispositions, and the distinction is the point:
-///
-/// - **No profile name, or the named profile does not LOAD** — falls back to
-///   `(MlockRequired::Warn, DEFAULT_TTL_SECONDS)`. There is no posture to read,
-///   and refusing here would make every signing verb require an authored
-///   profile file. This is the documented degradation other optional
-///   profile-derived controls share.
-/// - **The profile loads but names ANOTHER profile** — refuses. The posture is
-///   readable, it just belongs to a profile the operator did not select, and
-///   `mlock_required` is a security control on the signing path: silently
-///   taking `false` from a foreign profile would unpin the seed page for a
-///   profile that asked for it to be pinned. A control read from the wrong
-///   profile is worse than no control read at all, because the caller cannot
-///   tell the difference.
-///
-/// # Errors
-///
-/// Returns [`WalletError::Validation`] with `profile.name_mismatch`,
-/// `profile.non_overlayable_field`, or `profile.mainnet_requires_explicit_profile`
-/// for a protected refusal.
-fn resolve_wallet_unlock_controls(
-    profile_name: Option<&ResolvedProfileName>,
-) -> Result<(MlockRequired, u32), WalletError> {
-    let Some(name) = profile_name else {
-        return Ok((MlockRequired::Warn, DEFAULT_TTL_SECONDS));
-    };
-    wallet_unlock_controls_from_profile(load_profile_reconciled(name, None), &name.name)
-}
-
-fn wallet_unlock_controls_from_profile(
-    loaded: Result<stellar_agent_core::profile::schema::Profile, ProfileAccessError>,
-    name: &str,
-) -> Result<(MlockRequired, u32), WalletError> {
-    match loaded {
-        Ok(profile) => Ok((
-            profile.wallet.mlock_required,
-            profile.wallet.unlock_ttl_seconds,
-        )),
-        Err(e) if e.requires_refusal() => Err(e.to_wallet_error(name)),
-        Err(e) => {
-            tracing::debug!(
-                profile = name,
-                error = %e,
-                "resolve_software_signer_from_env: profile load failed; \
-                 falling back to MlockRequired::Warn and the default unlock TTL"
-            );
-            Ok((MlockRequired::Warn, DEFAULT_TTL_SECONDS))
-        }
-    }
-}
 
 /// Outcome of [`resolve_software_signer_from_env`]: the derived signer plus
 /// whether the mlock-protected unlock window degraded to unprotected memory.
@@ -110,37 +66,17 @@ pub(crate) struct SignerCeremonyOutcome {
     pub(crate) mlock_degradation: Option<MlockDegradation>,
 }
 
-/// Derives a `SoftwareSigningKey` from the S-strkey stored in the
-/// environment variable named `var_name`, through the mlock-protected
-/// unlock ceremony described at module level.
-///
-/// `wallet_label` is the `Wallet::unlock` tracing label identifying the call
-/// site (e.g. `"pay-commit"`). `profile_name` is the already-resolved
-/// profile whose `[wallet]` section supplies the `mlock_required` posture
-/// and `unlock_ttl_seconds` TTL; pass `None` when no profile is available at
-/// the call site.
+/// Derives a software signer using the loaded profile's wallet controls.
 ///
 /// # Errors
-///
-/// - [`WalletError::Validation`] wrapping [`ValidationError::SecretEnvNotSet`]
-///   when `var_name` is not set in the environment, or
-///   [`ValidationError::SecretEnvInvalid`] when its value is not a valid
-///   `S...` ed25519 strkey. Both name only the variable, never its value.
-/// - [`WalletError::Validation`] carrying `profile.name_mismatch` when
-///   `profile_name`'s file names a different profile. The `[wallet]` posture
-///   that governs this unlock would otherwise be taken from a profile the
-///   operator did not select.
-/// - [`WalletError::WalletState`] wrapping [`WalletStateError::UnlockFailed`]
-///   when `Wallet::unlock` fails — including a profile `unlock_ttl_seconds`
-///   outside `Wallet::unlock`'s `(0, MAX_TTL_SECONDS]` range, which is refused
-///   rather than clamped, and mlock refusal under `MlockRequired::True`.
-/// - Propagates any error `signer_from_wallet` returns.
+/// Refuses an absent or invalid seed, an invalid TTL, or an unsuccessful unlock.
 pub(crate) async fn resolve_software_signer_from_env(
     var_name: &str,
     wallet_label: &str,
-    profile_name: Option<&ResolvedProfileName>,
+    profile: &Profile,
 ) -> Result<SignerCeremonyOutcome, WalletError> {
-    let (mlock_required, ttl_seconds) = resolve_wallet_unlock_controls(profile_name)?;
+    let mlock_required = profile.wallet.mlock_required;
+    let ttl_seconds = profile.wallet.unlock_ttl_seconds;
 
     let s_strkey: Zeroizing<String> = Zeroizing::new(std::env::var(var_name).map_err(|_| {
         WalletError::Validation(ValidationError::SecretEnvNotSet {
@@ -181,6 +117,87 @@ pub(crate) async fn resolve_software_signer_from_env(
     })
 }
 
+/// Checks the resolved signer's identity on a mainnet profile.
+///
+/// On a testnet profile it returns `Ok` without touching the signer, so a
+/// Ledger signer makes no device round trip. On a mainnet profile it fetches
+/// the signer's public key and compares it with the profile's enrolled pin.
+///
+/// # Errors
+///
+/// - The signer's own error when its public key cannot be fetched.
+/// - `auth.enrolled_signer_unpinned` when the profile's
+///   `mcp_signer_default.account` is the placeholder or malformed.
+/// - `auth.enrolled_signer_mismatch` when the signer is not the enrolled
+///   identity.
+pub(crate) async fn require_enrolled_signer(
+    profile_name: &str,
+    profile: &Profile,
+    signer: &dyn Signer,
+) -> Result<(), WalletError> {
+    if !profile.chain_id.is_mainnet() {
+        return Ok(());
+    }
+    let derived = signer.public_key().await?.to_string().to_string();
+    stellar_agent_core::profile::check_enrolled_signer(profile_name, profile, &derived)?;
+    Ok(())
+}
+
+/// Resolves a deployer from `--deployer-secret-env` or `--sign-with-ledger`
+/// and holds it to the profile's enrolled identity.
+///
+/// Returns the deployer with any `mlock` degradation the seed ceremony
+/// reported. The Ledger arm reports none.
+///
+/// # Errors
+///
+/// - `validation.signer_source_required` when neither flag is supplied.
+/// - `validation.secret_env_not_set` or `validation.secret_env_invalid` for an
+///   absent or invalid seed, and `wallet_state.unlock_failed` when the unlock
+///   fails.
+/// - The Ledger device errors (`wallet_state.hardware_not_found`, or the
+///   timeout and wrong-app variants).
+/// - The enrolled-signer refusals of [`require_enrolled_signer`].
+pub(crate) async fn resolve_deployer_keypair(
+    deployer_secret_env: Option<&str>,
+    sign_with_ledger: bool,
+    account_index: u32,
+    wallet_label: &str,
+    profile: &Profile,
+    profile_name: &str,
+) -> Result<(DeployerKeypair, Option<MlockDegradation>), WalletError> {
+    let (signer, var_name, degradation): (Box<dyn Signer + Send + Sync>, _, _) = if sign_with_ledger
+    {
+        let signer = HardwareSigningKey::native()?.with_account_index(account_index);
+        (Box::new(signer), None, None)
+    } else {
+        let var_name = deployer_secret_env.ok_or_else(|| {
+            WalletError::Validation(ValidationError::SignerSourceRequired {
+                detail: "no deployer signer flag specified; pass --deployer-secret-env <VAR> \
+                             or --sign-with-ledger"
+                    .to_owned(),
+            })
+        })?;
+        let SignerCeremonyOutcome {
+            signer,
+            mlock_degradation,
+        } = resolve_software_signer_from_env(var_name, wallet_label, profile).await?;
+        (Box::new(signer), Some(var_name), mlock_degradation)
+    };
+    require_enrolled_signer(profile_name, profile, signer.as_ref()).await?;
+    let deployer = match var_name {
+        Some(var_name) => DeployerKeypair::SecretEnv {
+            var_name: var_name.to_owned(),
+            signer,
+        },
+        None => DeployerKeypair::Ledger {
+            account_index,
+            signer,
+        },
+    };
+    Ok((deployer, degradation))
+}
+
 /// Records a `WalletMlockFailed` audit-log entry when `degradation` is
 /// `Some`, using the caller's already-open audit writer.
 ///
@@ -209,6 +226,97 @@ pub(crate) fn record_mlock_degradation(
     let _ = writer.write_entry(entry);
 }
 
+/// Enrolled-identity fixtures shared by the signing tests of the CLI verbs.
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    #![allow(clippy::expect_used, reason = "test fixture assertions")]
+
+    use stellar_agent_core::error::WalletError;
+    use stellar_agent_core::profile::Profile;
+
+    /// The seed every enrolled-identity test signs with.
+    const ENROLLED_TEST_SEED: [u8; 32] = [42; 32];
+
+    /// How a mainnet profile's enrolled pin relates to the key the test seed
+    /// derives.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum EnrolledPin {
+        /// The pin is the derived key.
+        Derived,
+        /// The pin is the placeholder.
+        Placeholder,
+        /// The pin is another valid key.
+        Other,
+    }
+
+    impl EnrolledPin {
+        /// The refusal code a signer derived from the test seed meets, or
+        /// `None` when it passes.
+        fn expected_refusal(self) -> Option<&'static str> {
+            match self {
+                Self::Derived => None,
+                Self::Placeholder => Some("auth.enrolled_signer_unpinned"),
+                Self::Other => Some("auth.enrolled_signer_mismatch"),
+            }
+        }
+
+        fn account(self) -> String {
+            match self {
+                Self::Derived => enrolled_test_g(),
+                Self::Placeholder => "default".to_owned(),
+                Self::Other => stellar_strkey::ed25519::PublicKey([7; 32])
+                    .to_string()
+                    .to_string(),
+            }
+        }
+    }
+
+    /// The G-strkey the test seed derives.
+    pub(crate) fn enrolled_test_g() -> String {
+        let verifying_key =
+            ed25519_dalek::SigningKey::from_bytes(&ENROLLED_TEST_SEED).verifying_key();
+        stellar_strkey::ed25519::PublicKey(verifying_key.to_bytes())
+            .to_string()
+            .to_string()
+    }
+
+    /// The S-strkey of the test seed.
+    pub(crate) fn enrolled_test_secret() -> String {
+        stellar_strkey::ed25519::PrivateKey(ENROLLED_TEST_SEED)
+            .as_unredacted()
+            .to_string()
+            .to_string()
+    }
+
+    /// A mainnet profile named `enrolled` whose pin follows `pin`. The
+    /// `[wallet]` posture skips mlock so the ceremony runs on any host.
+    pub(crate) fn enrolled_mainnet_profile(pin: EnrolledPin) -> Profile {
+        let mut profile =
+            Profile::builder_mainnet_named("enrolled", "s", &pin.account(), "n", "a").build();
+        profile.wallet.mlock_required = stellar_agent_core::wallet::MlockRequired::False;
+        profile
+    }
+
+    /// Asserts the outcome `pin` predicts for a signer derived from the test
+    /// seed.
+    pub(crate) fn assert_enrolled_outcome<T: std::fmt::Debug>(
+        pin: EnrolledPin,
+        result: Result<T, WalletError>,
+    ) {
+        match pin.expected_refusal() {
+            None => {
+                result.expect("the enrolled signer must pass");
+            }
+            Some(code) => assert_eq!(
+                result
+                    .expect_err("a signer that is not enrolled must be refused")
+                    .code(),
+                code
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -218,9 +326,18 @@ mod tests {
         reason = "test-only assertions"
     )]
 
-    use stellar_agent_network::Signer as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use stellar_agent_core::error::AuthError;
+    use stellar_agent_network::WebAuthnAssertion;
 
     use super::*;
+
+    fn test_profile() -> Profile {
+        let mut profile = Profile::builder_testnet_named("ceremony", "s", "a", "n", "a").build();
+        profile.wallet.mlock_required = MlockRequired::Warn;
+        profile
+    }
 
     fn unique_var(tag: &str) -> String {
         format!("SIGNER_CEREMONY_TEST_{tag}_{}", std::process::id())
@@ -232,7 +349,7 @@ mod tests {
         unsafe_code,
         reason = "test-only process environment mutation; the variable name is unique to this test"
     )]
-    async fn derives_the_expected_public_key_with_no_profile() {
+    async fn derives_the_expected_public_key_with_testnet_profile() {
         let seed = [0x11u8; 32];
         let s_strkey = stellar_strkey::ed25519::PrivateKey(seed)
             .as_unredacted()
@@ -248,7 +365,7 @@ mod tests {
         unsafe {
             std::env::set_var(&var, &s_strkey);
         }
-        let outcome = resolve_software_signer_from_env(&var, "unit-test", None)
+        let outcome = resolve_software_signer_from_env(&var, "unit-test", &test_profile())
             .await
             .expect("resolve must succeed");
         assert!(
@@ -269,7 +386,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn unset_env_var_is_refused() {
         let var = unique_var("UNSET");
-        let err = match resolve_software_signer_from_env(&var, "unit-test", None).await {
+        let err = match resolve_software_signer_from_env(&var, "unit-test", &test_profile()).await {
             Ok(_) => panic!("unset env var must refuse"),
             Err(e) => e,
         };
@@ -288,7 +405,7 @@ mod tests {
         unsafe {
             std::env::set_var(&var, "not-an-s-strkey");
         }
-        let err = match resolve_software_signer_from_env(&var, "unit-test", None).await {
+        let err = match resolve_software_signer_from_env(&var, "unit-test", &test_profile()).await {
             Ok(_) => panic!("invalid S-strkey must refuse"),
             Err(e) => e,
         };
@@ -308,14 +425,9 @@ mod tests {
 
     /// An out-of-range profile `unlock_ttl_seconds` is refused by
     /// `Wallet::unlock` inside the ceremony and surfaces as
-    /// `wallet_state.unlock_failed` — not a keyring error. Profile LOAD does
-    /// not range-check the TTL (enforcement lives in `Wallet::unlock`), so this
-    /// drives the full path: a persisted profile carrying an over-maximum TTL,
-    /// a valid S-strkey env var, and the ceremony resolving that profile by
-    /// name through the `STELLAR_AGENT_HOME` redirect.
-    ///
-    /// `#[serial]`: `STELLAR_AGENT_HOME` is a process-global env var whose
-    /// shared name cannot use this file's unique-var-name pattern.
+    /// `wallet_state.unlock_failed`, not a keyring error. Profile load does
+    /// not range-check the TTL (enforcement lives in `Wallet::unlock`), so the
+    /// ceremony is the boundary that refuses it.
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
     #[allow(
@@ -323,37 +435,12 @@ mod tests {
         reason = "test-only process environment mutation; the S-strkey variable name is unique to this test"
     )]
     async fn over_max_ttl_profile_surfaces_unlock_failed() {
-        use stellar_agent_core::profile::schema::Profile;
         use stellar_agent_core::wallet::MAX_TTL_SECONDS;
-        use stellar_agent_test_support::StellarAgentHomeGuard;
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _home = StellarAgentHomeGuard::new(dir.path());
-        let profiles_dir = dir.path().join("profiles");
-        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
-
-        let profile_name = "signer-ceremony-over-max-ttl";
-        // Named so the file reconciles against the name the ceremony resolves
-        // it by; this test drives the TTL refusal, not the name refusal.
-        let mut profile = Profile::builder_testnet(
-            "signer-ceremony-svc",
-            "signer-ceremony-acct",
-            "signer-ceremony-nonce-svc",
-            "signer-ceremony-nonce-acct",
-        )
-        .with_profile_name(profile_name)
-        .audit_log_path(dir.path().join("audit.log"))
-        .build();
-        profile.wallet.mlock_required = MlockRequired::Warn;
+        let mut profile = test_profile();
         // Above the permitted (0, MAX_TTL_SECONDS] range; refused at unlock, not
         // clamped, and not range-checked at profile load.
         profile.wallet.unlock_ttl_seconds = MAX_TTL_SECONDS + 1;
-        let toml_bytes = toml::to_string_pretty(&profile).expect("serialize profile");
-        std::fs::write(
-            profiles_dir.join(format!("{profile_name}.toml")),
-            toml_bytes,
-        )
-        .expect("write profile");
 
         let seed = [0x55u8; 32];
         let s_strkey = stellar_strkey::ed25519::PrivateKey(seed)
@@ -365,13 +452,7 @@ mod tests {
             std::env::set_var(&var, &s_strkey);
         }
 
-        let err = match resolve_software_signer_from_env(
-            &var,
-            "unit-test",
-            Some(&ResolvedProfileName::from_flag(profile_name)),
-        )
-        .await
-        {
+        let err = match resolve_software_signer_from_env(&var, "unit-test", &profile).await {
             Ok(_) => panic!("an over-maximum TTL must be refused at unlock"),
             Err(e) => e,
         };
@@ -383,9 +464,8 @@ mod tests {
     }
 
     /// A persisted profile with `mlock_required = false` and a non-default
-    /// TTL is picked up by [`resolve_wallet_unlock_controls`] and used to
-    /// derive successfully end to end through
-    /// [`resolve_software_signer_from_env`].
+    /// TTL loads with those `[wallet]` values, and the ceremony derives the
+    /// expected key under them through [`resolve_software_signer_from_env`].
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
     #[allow(
@@ -433,34 +513,10 @@ mod tests {
             std::env::set_var(&var, &s_strkey);
         }
 
-        // Load the profile the same way the helper does, using the loader's
-        // default directory would require a real HOME; exercise
-        // `resolve_wallet_unlock_controls` at the unit level against a
-        // profile loaded from the fixture directory to pin the field wiring,
-        // then drive the full ceremony with those controls directly.
-        let (mlock_required, ttl_seconds) = (
-            loaded.wallet.mlock_required,
-            loaded.wallet.unlock_ttl_seconds,
-        );
-        assert_eq!(mlock_required, MlockRequired::False);
-        let signer = {
-            let s_strkey: Zeroizing<String> = Zeroizing::new(s_strkey.clone());
-            let mut private_key =
-                stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).expect("valid strkey");
-            let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(private_key.0);
-            zeroize::Zeroize::zeroize(&mut private_key.0);
-            let mut wallet = Wallet::unlock(
-                "unit-test-mlock-false".to_owned(),
-                seed_bytes,
-                ttl_seconds,
-                mlock_required,
-            )
+        let outcome = resolve_software_signer_from_env(&var, "unit-test-mlock-false", &loaded)
             .await
-            .expect("unlock must succeed under MlockRequired::False");
-            let signer = signer_from_wallet(&wallet).expect("derive must succeed");
-            wallet.dispose();
-            signer
-        };
+            .expect("ceremony");
+        let signer = outcome.signer;
         let derived = signer.public_key().await.expect("public key must derive");
         assert_eq!(derived.to_string().to_string(), expected_g);
         unsafe {
@@ -517,19 +573,6 @@ mod tests {
         // The accessor is a snapshot taken at construction time: it remains
         // queryable (and still None) after dispose.
         assert!(wallet.mlock_degradation().is_none());
-    }
-
-    #[test]
-    fn wallet_unlock_controls_preserve_protected_refusals() {
-        for error in crate::common::profile_access::protected_load_errors_for_test() {
-            let expected = error.code();
-            let result = wallet_unlock_controls_from_profile(Err(error), "mainnet");
-            let error = match result {
-                Err(error) => error,
-                Ok(_) => panic!("protected refusal was swallowed"),
-            };
-            assert_eq!(error.code(), expected);
-        }
     }
 
     /// `record_mlock_degradation` writes a `WalletMlockFailed` audit-log
@@ -591,124 +634,106 @@ mod tests {
         );
     }
 
-    // ── The profile-name reconciliation on the signing path ──────────────────
+    // ── resolve_deployer_keypair ────────────────────────────────────────────
 
-    /// A profile whose owner-key coordinate names ANOTHER profile makes the
-    /// ceremony refuse, instead of taking that profile's `[wallet]` posture.
-    ///
-    /// `mlock_required` decides whether the seed page is pinned for the
-    /// duration of the unlock window. Reading it from a profile the operator
-    /// did not select would silently apply a different security posture on the
-    /// signing path, and the caller could not tell that had happened.
-    ///
-    /// `#[serial]`: `STELLAR_AGENT_HOME` is process-global.
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial_test::serial]
-    #[allow(
-        unsafe_code,
-        reason = "test-only process environment mutation; the S-strkey variable name is unique to this test"
-    )]
-    async fn a_mismatched_profile_refuses_instead_of_taking_its_posture() {
-        use stellar_agent_test_support::StellarAgentHomeGuard;
-        use stellar_agent_test_support::profile_fixtures::noop_profile_toml;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _home = StellarAgentHomeGuard::new(dir.path());
-        let profiles_dir = dir.path().join("profiles");
-        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
-
-        // `i107-ceremony.toml` whose coordinates name `i107-other`: what
-        // copying another profile's file produces.
-        let requested = "i107-ceremony";
-        std::fs::write(
-            profiles_dir.join(format!("{requested}.toml")),
-            noop_profile_toml("i107-other", "stellar:testnet", "http://127.0.0.1:29/i107"),
-        )
-        .expect("write mismatched profile");
-
-        let seed = [0x77u8; 32];
-        let s_strkey = stellar_strkey::ed25519::PrivateKey(seed)
-            .as_unredacted()
-            .to_string()
-            .to_string();
-        let var = unique_var("MISMATCHED_PROFILE");
-        unsafe {
-            std::env::set_var(&var, &s_strkey);
-        }
-
-        let err = match resolve_software_signer_from_env(
-            &var,
+    /// With neither `--deployer-secret-env` nor `--sign-with-ledger`, the
+    /// resolver refuses with `validation.signer_source_required` before any
+    /// key access.
+    #[tokio::test]
+    async fn resolve_deployer_keypair_without_a_source_flag_refuses() {
+        let error = match resolve_deployer_keypair(
+            None,
+            false,
+            0,
             "unit-test",
-            Some(&ResolvedProfileName::from_flag(requested)),
+            &test_profile(),
+            "ceremony",
         )
         .await
         {
-            Ok(_) => panic!("a mismatched profile must not supply the unlock posture"),
-            Err(e) => e,
+            Ok(_) => panic!("a missing signer-source flag must be refused"),
+            Err(error) => error,
         };
-        assert_eq!(err.code(), "profile.name_mismatch");
-        assert!(
-            err.to_string().contains("stellar-agent-owner-i107-other"),
-            "the refusal must quote the offending field: {err}"
-        );
+        assert_eq!(error.code(), "validation.signer_source_required");
+    }
 
-        unsafe {
-            std::env::remove_var(&var);
+    // ── require_enrolled_signer ─────────────────────────────────────────────
+
+    /// A signer whose key fetch counts its calls and fails, standing in for a
+    /// Ledger device whose key fetch is a round trip.
+    #[derive(Default)]
+    struct CountingKeyFetchSigner {
+        key_fetches: AtomicUsize,
+    }
+
+    fn counting_signer_error() -> WalletError {
+        WalletError::Auth(AuthError::KeyringNotFound {
+            name: "counting-key-fetch-sentinel".to_owned(),
+        })
+    }
+
+    #[async_trait::async_trait]
+    impl Signer for CountingKeyFetchSigner {
+        async fn sign_tx_payload(&self, _payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+            Err(counting_signer_error())
+        }
+
+        async fn sign_auth_digest(&self, _digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+            Err(counting_signer_error())
+        }
+
+        async fn sign_soroban_address_auth_payload(
+            &self,
+            _payload: &[u8; 32],
+        ) -> Result<[u8; 64], WalletError> {
+            Err(counting_signer_error())
+        }
+
+        async fn sign_webauthn_assertion(
+            &self,
+            _auth_digest: &[u8; 32],
+            _credential_id: &[u8],
+        ) -> Result<WebAuthnAssertion, WalletError> {
+            Err(counting_signer_error())
+        }
+
+        async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+            self.key_fetches.fetch_add(1, Ordering::SeqCst);
+            Err(counting_signer_error())
         }
     }
 
-    /// A profile that is simply ABSENT keeps the documented warn-fallback: the
-    /// ceremony proceeds on `(MlockRequired::Warn, DEFAULT_TTL_SECONDS)`.
-    ///
-    /// The control that keeps the refusal above from becoming "any profile
-    /// problem blocks signing", which would make every signing verb require an
-    /// authored profile file.
-    ///
-    /// `#[serial]`: `STELLAR_AGENT_HOME` is process-global.
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial_test::serial]
-    #[allow(
-        unsafe_code,
-        reason = "test-only process environment mutation; the S-strkey variable name is unique to this test"
-    )]
-    async fn an_absent_profile_keeps_the_documented_warn_fallback() {
-        use stellar_agent_test_support::StellarAgentHomeGuard;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _home = StellarAgentHomeGuard::new(dir.path());
-
-        let seed = [0x78u8; 32];
-        let s_strkey = stellar_strkey::ed25519::PrivateKey(seed)
-            .as_unredacted()
+    /// A pinned mainnet profile: the enrolled account is a valid G-strkey.
+    fn pinned_mainnet_profile() -> Profile {
+        let pin = stellar_strkey::ed25519::PublicKey([0x66u8; 32])
             .to_string()
             .to_string();
-        let var = unique_var("ABSENT_PROFILE");
-        unsafe {
-            std::env::set_var(&var, &s_strkey);
-        }
+        Profile::builder_mainnet_named("enrolled", "s", &pin, "n", "a").build()
+    }
 
-        let outcome = resolve_software_signer_from_env(
-            &var,
-            "unit-test",
-            Some(&ResolvedProfileName::from_flag("i107-never-authored")),
-        )
-        .await
-        .expect("an absent profile must degrade, not refuse");
-        let expected_g = {
-            let vk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
-            stellar_strkey::ed25519::PublicKey(vk.to_bytes())
-                .to_string()
-                .to_string()
-        };
-        let derived = outcome
-            .signer
-            .public_key()
+    #[tokio::test]
+    async fn require_enrolled_signer_leaves_the_signer_untouched_on_testnet() {
+        let signer = CountingKeyFetchSigner::default();
+        let result = require_enrolled_signer("ceremony", &test_profile(), &signer).await;
+        assert_eq!(
+            signer.key_fetches.load(Ordering::SeqCst),
+            0,
+            "a testnet profile must not fetch the signer's key"
+        );
+        result.expect("a testnet profile admits any signer");
+    }
+
+    #[tokio::test]
+    async fn require_enrolled_signer_fetches_the_key_once_on_mainnet() {
+        let signer = CountingKeyFetchSigner::default();
+        let error = require_enrolled_signer("enrolled", &pinned_mainnet_profile(), &signer)
             .await
-            .expect("public key must derive");
-        assert_eq!(derived.to_string().to_string(), expected_g);
-
-        unsafe {
-            std::env::remove_var(&var);
-        }
+            .expect_err("the failing key fetch must surface on mainnet");
+        assert_eq!(error.code(), counting_signer_error().code());
+        assert!(
+            error.message().contains("counting-key-fetch-sentinel"),
+            "the signer's own error must surface: {error}"
+        );
+        assert_eq!(signer.key_fetches.load(Ordering::SeqCst), 1);
     }
 }

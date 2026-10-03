@@ -18,8 +18,8 @@
 //!
 //! Deployment on mainnet is structurally refused at two layers:
 //!
-//! 1. CLI enum: `TargetNetwork::Mainnet` returns `MainnetWriteForbidden` before
-//!    any RPC or signing call.
+//! 1. The resolved profile's chain: a mainnet profile returns
+//!    `MainnetWriteForbidden` before any key access, RPC, or signing call.
 //! 2. Network passphrase: `submit_transaction_and_wait` will reject mainnet
 //!    passphrases at the ledger level.
 //!
@@ -45,16 +45,14 @@ use rand_core::{OsRng, RngCore};
 use stellar_agent_core::audit_log::writer::{AuditWriter, AuditWriterRegistry};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{InternalError, NetworkError, ValidationError, WalletError};
-use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::profile::schema::Profile;
-use stellar_agent_core::wallet::MlockDegradation;
 use stellar_agent_network::NetworkContext;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 use stellar_agent_network::{
     StellarRpcClient, parse_classic_fee_choice, resolve_classic_fee_selection,
 };
 use stellar_agent_smart_account::deployment::{
-    DeployerKeypair, DeploymentArgs, DeploymentResult, ResolvedFeePerOp, deploy_smart_account,
+    DeploymentArgs, DeploymentResult, ResolvedFeePerOp, deploy_smart_account,
 };
 use stellar_agent_smart_account::managers::credentials::CredentialsManager;
 use stellar_agent_smart_account::managers::rules::parse_c_strkey_to_smart_account;
@@ -63,12 +61,14 @@ use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
-use crate::common::profile_access::{injected_profile_load, reconcile_loaded_profile};
-use crate::common::render::{render_json, sanitize_for_table};
-use crate::common::signer_ceremony::{
-    SignerCeremonyOutcome, record_mlock_degradation, resolve_software_signer_from_env,
+use crate::common::network::{
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
 };
+use crate::common::profile_access::{
+    injected_profile_load, load_profile_or_synthesize_testnet_with,
+};
+use crate::common::render::{render_json, sanitize_for_table};
+use crate::common::signer_ceremony::{record_mlock_degradation, resolve_deployer_keypair};
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -218,21 +218,8 @@ pub struct DeployCArgs {
     #[arg(long, value_name = "HEX64", group = "salt_group")]
     pub salt_hex: Option<String>,
 
-    /// Profile whose audit-log writer should receive deployment entries.
-    ///
-    /// This flag is read two different ways, and the split is deliberate:
-    ///
-    /// - **Audit writer** (`resolve_audit_writer`): absence means "no audit
-    ///   writer". The command deploys without emitting deploy-c audit entries
-    ///   from the CLI handler, and neither `STELLAR_AGENT_PROFILE` nor the
-    ///   `"default"` fallback substitutes a profile — opting out of audit
-    ///   emission must stay an explicit, local decision.
-    /// - **Every other consumer** (the `mlock`-degradation row, the passkey
-    ///   registry lookup behind `--signer-webauthn`, and the signer ceremony's
-    ///   profile context) resolves the name through `resolve_profile_name`:
-    ///   this flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. Those
-    ///   consumers need a name for a path or a log field, and have no
-    ///   "no profile" mode.
+    /// Profile supplying the network, endpoints, and wallet controls.
+    /// The audit writer opens only when this flag is supplied.
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
@@ -243,18 +230,17 @@ pub struct DeployCArgs {
     #[arg(long, group = "salt_group")]
     pub salt_random: bool,
 
-    /// Network to target.
-    ///
-    /// `mainnet` parses but deployment structurally refuses it
-    /// (`network.mainnet_write_forbidden`). Default: `testnet`.
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
-    /// Soroban RPC endpoint URL.
-    ///
-    /// Default: `https://soroban-testnet.stellar.org`.
-    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
     /// Base fee per operation in stroops, or `auto` / `auto:pNN` for `getFeeStats`
     /// automatic selection.
@@ -323,8 +309,33 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone());
     let resolved = resolve_profile_name(args.profile.as_deref());
+    let (profile, _origin) = match load_profile_or_synthesize_testnet_with(&resolved, load_profile)
+    {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            print_error(
+                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
+                args.output,
+            );
+            return 1;
+        }
+    };
+    let context = match network_context_for_command(
+        &profile,
+        &resolved.name,
+        EndpointFlags {
+            network: args.network,
+            rpc_url: args.rpc_url.as_deref(),
+            secondary_rpc_url: None,
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
+    };
     // First layer: structural mainnet rejection before any key access.
     if context.chain_id.is_mainnet() {
         let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
@@ -358,7 +369,7 @@ where
     // `signer_external` is non-None, enforced by the `genesis_signer_source`
     // ArgGroup at parse time.
     let (initial_signer_display, genesis_signer_scval_override) =
-        match resolve_genesis_signer_source(args, &context).await {
+        match resolve_genesis_signer_source(args, &context, &resolved.name).await {
             Ok(pair) => pair,
             Err(e) => {
                 let envelope = Envelope::<()>::err(&e);
@@ -377,8 +388,30 @@ where
         }
     };
 
-    // Resolve the deployer keypair.
-    let (deployer, deployer_mlock_degradation) = match resolve_deployer(args, &resolved).await {
+    let audit_writer_arc = match resolve_audit_writer(
+        args.profile.as_ref().map(|_| &profile),
+        &resolved.name,
+        init_keyring,
+    ) {
+        Ok(writer) => writer,
+        Err(e) => {
+            let envelope = Envelope::<()>::err(&e);
+            print_error(&envelope, args.output);
+            return 1;
+        }
+    };
+
+    // Resolve the deployer keypair under the enrolled-signer rule.
+    let (deployer, deployer_mlock_degradation) = match resolve_deployer_keypair(
+        args.deployer_secret_env.as_deref(),
+        args.sign_with_ledger,
+        args.account_index,
+        "deploy-c",
+        &profile,
+        &resolved.name,
+    )
+    .await
+    {
         Ok(d) => d,
         Err(e) => {
             let envelope = Envelope::<()>::err(&e);
@@ -441,19 +474,6 @@ where
         fee: resolved_fee,
         dry_run: args.dry_run,
         genesis_signer_scval_override,
-    };
-
-    let audit_writer_arc = match resolve_audit_writer(
-        args.profile.as_ref().map(|_| &resolved),
-        load_profile,
-        init_keyring,
-    ) {
-        Ok(writer) => writer,
-        Err(e) => {
-            let envelope = Envelope::<()>::err(&e);
-            print_error(&envelope, args.output);
-            return 1;
-        }
     };
 
     // Record any `mlock` degradation from the deployer ceremony now, before
@@ -524,41 +544,28 @@ where
 ///
 /// The smart-account deployment substrate emits `SaRawInvocation` on non-dry-run
 /// success and failure, and `SmartAccountDeployed` on non-dry-run success. The
-/// CLI supplies a writer only when `--profile <name>` is provided, preserving
-/// profile-agnostic deploy-c behavior for callers that do not opt into profile
-/// resolution.
+/// CLI supplies a writer only when `--profile <name>` is provided.
+/// The network and signer controls always use the resolved profile.
 ///
 /// Delegates to [`AuditWriterRegistry::get_or_open_keyed`] so the same
 /// `Arc<Mutex<AuditWriter>>` is returned for every call with the same
 /// `profile_name` within the process, preventing multiple writers from racing
 /// to open the same file (single-writer invariant).
-fn resolve_audit_writer<LoadProfile, InitKeyring>(
-    resolved: Option<&ResolvedProfileName>,
-    load_profile: LoadProfile,
+fn resolve_audit_writer<InitKeyring>(
+    profile: Option<&Profile>,
+    profile_name: &str,
     init_keyring: InitKeyring,
 ) -> Result<Option<Arc<Mutex<AuditWriter>>>, WalletError>
 where
-    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let Some(resolved) = resolved else {
+    let Some(profile) = profile else {
         return Ok(None);
     };
-
-    let profile_name = &resolved.name;
-    // Reconciled in the CALLER of the injected loader. A check inside the
-    // closure would be bypassed by every test that supplies its own, which is
-    // the placement `crate::common::profile_access`'s module docs call out.
-    let profile = reconcile_loaded_profile(load_profile(profile_name), resolved).map_err(|e| {
-        tracing::debug!(
-            profile = %profile_name,
-            error = %e,
-            "profile access refused for deploy-c"
-        );
-        e.to_wallet_error(profile_name)
-    })?;
+    // `profile` is `Some` only with `--profile`, and an explicitly named
+    // profile is never synthesized, so it is always a persisted file.
     init_keyring()?;
-    open_profile_audit_writer_via_registry(profile_name, &profile).map(Some)
+    open_profile_audit_writer_via_registry(profile_name, profile).map(Some)
 }
 
 /// Opens or retrieves the cached audit writer for `profile_name` via the
@@ -610,6 +617,7 @@ fn open_profile_audit_writer_via_registry(
 async fn resolve_genesis_signer_source(
     args: &DeployCArgs,
     context: &NetworkContext,
+    profile_name: &str,
 ) -> Result<(String, Option<stellar_xdr::ScVal>), WalletError> {
     if let Some(g_strkey) = &args.initial_signer {
         if let Err(e) = stellar_strkey::ed25519::PublicKey::from_string(g_strkey) {
@@ -648,14 +656,14 @@ async fn resolve_genesis_signer_source(
                 }
             })?;
 
-        let profile = resolve_profile_name(args.profile.as_deref()).name;
-        validate_path_component_ascii_safe(&profile).map_err(|reason| {
+        let profile = profile_name;
+        validate_path_component_ascii_safe(profile).map_err(|reason| {
             WalletError::Validation(ValidationError::AddressInvalid {
                 input: format!("invalid profile name '{profile}': {reason}"),
             })
         })?;
         let creds_mgr =
-            CredentialsManager::from_defaults_readonly(&profile, "localhost").map_err(|e| {
+            CredentialsManager::from_defaults_readonly(profile, "localhost").map_err(|e| {
                 WalletError::Validation(ValidationError::AddressInvalid {
                     input: format!("could not open passkeys registry: {e}"),
                 })
@@ -839,82 +847,6 @@ fn resolve_salt(args: &DeployCArgs) -> Result<[u8; 32], WalletError> {
 /// Returns `Err(())` for backwards compatibility with `resolve_salt`'s error mapping.
 fn decode_hex32(hex: &str) -> Result<[u8; 32], ()> {
     stellar_agent_core::hex::decode_hex32(hex).map_err(|_| ())
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Deployer resolution
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Resolves the deployer keypair from the CLI flags.
-///
-/// Returns the keypair alongside any `mlock` degradation the secret-env
-/// ceremony reported (`None` for the Ledger path, which never touches
-/// `Wallet::unlock`); the caller records it once its audit writer is open.
-///
-/// # Errors
-///
-/// - [`WalletError::Validation`] when no signer-source flag is supplied
-///   (`validation.signer_source_required`), the deployer secret-env variable
-///   is not set (`validation.secret_env_not_set`), or its value is not a valid
-///   S-strkey (`validation.secret_env_invalid`).
-/// - [`WalletError::WalletState`] when the Ledger device is unavailable
-///   (`wallet_state.hardware_not_found`, or the timeout / wrong-app variant).
-/// - [`WalletError::Auth`] wrapping
-///   [`stellar_agent_core::error::AuthError::SignerKeyMismatch`] for Ledger
-///   public-key mismatch.
-async fn resolve_deployer(
-    args: &DeployCArgs,
-    resolved: &ResolvedProfileName,
-) -> Result<(DeployerKeypair, Option<MlockDegradation>), WalletError> {
-    if args.sign_with_ledger {
-        // Ledger mode: we don't yet know the expected G-strkey before fetching it from
-        // the device. The `signer_from_ledger` key-match check requires the expected
-        // G-strkey; for deployer-from-Ledger we defer the key-match check — the
-        // deployer IS the Ledger-derived G-strkey. We fetch the public key first via a
-        // no-check path. Use a temporary HardwareSigningKey and derive the G-strkey
-        // from it, then wrap it in DeployerKeypair::Ledger without a source-account
-        // comparison. The deployment flow will fail at submission if the Ledger key
-        // doesn't match the fetched account-sequence (fee-account must match signer).
-        use stellar_agent_network::signing::hardware::HardwareSigningKey;
-        let hw_key = HardwareSigningKey::native()?.with_account_index(args.account_index);
-
-        let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(hw_key);
-        return Ok((
-            DeployerKeypair::Ledger {
-                account_index: args.account_index,
-                signer,
-            },
-            None,
-        ));
-    }
-
-    // SecretEnv mode.
-    let var_name = args.deployer_secret_env.as_deref().ok_or_else(|| {
-        WalletError::Validation(ValidationError::SignerSourceRequired {
-            detail: "no deployer signer flag specified; pass --deployer-secret-env <VAR> \
-                     or --sign-with-ledger"
-                .to_owned(),
-        })
-    })?;
-
-    // We need the G-strkey to pass to signer_from_env for the key-match check.
-    // At deploy-c time, the deployer G-strkey is derived from the env-var S-strkey.
-    // Unlike `create` (which has an explicit `--sponsor` G-strkey), `deploy-c` derives
-    // the deployer G-strkey from the secret. We construct the signer first without
-    // the mismatch check, then wrap in DeployerKeypair::SecretEnv.
-    let SignerCeremonyOutcome {
-        signer,
-        mlock_degradation,
-    } = resolve_software_signer_from_env(var_name, "deploy-c", Some(resolved)).await?;
-    let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(signer);
-
-    Ok((
-        DeployerKeypair::SecretEnv {
-            var_name: var_name.to_owned(),
-            signer,
-        },
-        mlock_degradation,
-    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1149,8 +1081,8 @@ mod tests {
             salt_hex: Some("11".repeat(32)),
             profile,
             salt_random: false,
-            network: TargetNetwork::Testnet,
-            rpc_url: "http://127.0.0.1:9".to_owned(),
+            network: Some(TargetNetwork::Testnet),
+            rpc_url: Some("http://127.0.0.1:9".to_owned()),
             fee: Some("100".to_owned()),
             timeout_seconds: 1,
             output: OutputFormat::DEFAULT,
@@ -1179,7 +1111,12 @@ mod tests {
         args.signer_ed25519 = Some("11".repeat(32));
         args.accept_no_delegated_fallback = false;
 
-        let code = run_with_dependencies(&args, |_| unreachable!(), || Ok(())).await;
+        let code = run_with_dependencies(
+            &args,
+            |_| Ok(Profile::builder_testnet("signer", "default", "nonce", "default").build()),
+            || Ok(()),
+        )
+        .await;
         assert_eq!(
             code, 1,
             "External-only genesis without the ack flag must be refused"
@@ -1334,5 +1271,31 @@ mod tests {
                 .is_some_and(|wire_code| wire_code.starts_with("sa.")),
             "wire_code should preserve the smart-account error namespace"
         );
+    }
+    #[tokio::test]
+    #[serial]
+    async fn deploy_c_loads_once_with_and_without_profile() {
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        for selected in [None, Some("load-once".to_owned())] {
+            let name = selected.as_deref().unwrap_or("default");
+            let profile = profile_with_audit_path(name, dir.path().join(format!("{name}.jsonl")));
+            install_audit_key(&profile);
+            let calls = std::cell::Cell::new(0);
+            let (args, _seed) = deploy_args(selected, true);
+            let code = run_with_dependencies(
+                &args,
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(profile.clone())
+                },
+                || Ok(()),
+            )
+            .await;
+            assert_eq!(calls.get(), 1, "the command loads its profile exactly once");
+            assert_eq!(code, 0);
+        }
     }
 }

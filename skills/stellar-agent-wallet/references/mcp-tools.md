@@ -462,7 +462,7 @@ whose verifier its pin record does not pin. The operator runs
 | `amounts_min` | array (i128 decimal strings) | yes | Same length; zero = no slippage protection (not defaulted). A raw JSON number is rejected. |
 | `invest` | bool | no | Auto-invest after deposit; default `false`. |
 | `override_upgradable` | bool | no | Proceed on an upgradable vault; WASM-pin refusal stays non-overridable. |
-| `secondary_rpc_url` | string | no | Two-RPC WASM-hash cross-check. |
+| `secondary_rpc_url` | string | no | Testnet override; absent uses the profile secondary. Mainnet refuses input presence. Credentials are refused. |
 
 ### stellar_defindex_vault_withdraw arguments
 
@@ -474,7 +474,7 @@ whose verifier its pin record does not pin. The operator runs
 | `withdraw_shares` | i128 decimal string | yes | Vault shares to redeem. A raw JSON number is rejected. |
 | `min_amounts_out` | array (i128 decimal strings) | yes | One per asset in `total_managed_funds` order; zero = no slippage protection (not defaulted). A raw JSON number is rejected. |
 | `override_upgradable` | bool | no | |
-| `secondary_rpc_url` | string | no | |
+| `secondary_rpc_url` | string | no | Testnet override; absent uses the profile secondary. Mainnet refuses input presence. Credentials are refused. |
 
 ### stellar_dex_trade arguments
 
@@ -486,7 +486,7 @@ whose verifier its pin record does not pin. The operator runs
 | `qty_out_min` | i128 decimal string | yes | Absolute minimum output (non-negative integer, not a percent). A raw JSON number is rejected. |
 | `path` | array (string) | yes | First element input token, last output token; each a C-strkey, `"native"`, or `"CODE:ISSUER"`. |
 | `deadline` | integer (u64) | no | Unix seconds; defaults to `now + 300s`. |
-| `secondary_rpc_url` | string | no | Two-RPC WASM-hash cross-check. |
+| `secondary_rpc_url` | string | no | Testnet override; absent uses the profile secondary. Mainnet refuses input presence. Credentials are refused. |
 
 ### stellar_dex_quote arguments
 

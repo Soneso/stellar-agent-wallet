@@ -20,8 +20,8 @@
 //! # Mainnet rejection
 //!
 //! Deployment on mainnet is structurally refused at the CLI layer before any RPC
-//! or signing call. The `TargetNetwork::Mainnet` path returns
-//! `MainnetWriteForbidden` immediately.
+//! or signing call. A mainnet profile returns `MainnetWriteForbidden` as soon
+//! as its network context is built.
 //!
 //! # Dry-run mode (`--dry-run`)
 //!
@@ -41,20 +41,23 @@ use std::time::Duration;
 
 use clap::{ArgGroup, Args};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
-use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
-use stellar_agent_network::NetworkContext;
+use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_network::{
     StellarRpcClient, parse_classic_fee_choice, resolve_classic_fee_selection,
 };
 use stellar_agent_smart_account::deployment::{
-    DeployerKeypair, ResolvedFeePerOp, WebAuthnVerifierDeployArgs, WebAuthnVerifierDeployResult,
+    ResolvedFeePerOp, WebAuthnVerifierDeployArgs, WebAuthnVerifierDeployResult,
     deploy_webauthn_verifier,
 };
 use tracing::info;
 
-use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
+use crate::common::network::{
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+};
+use crate::common::profile_access::load_profile_or_synthesize_testnet;
 use crate::common::render::{render_json, sanitize_for_table};
-use crate::common::signer_ceremony::{SignerCeremonyOutcome, resolve_software_signer_from_env};
+use crate::common::resolve_profile_name;
+use crate::common::signer_ceremony::resolve_deployer_keypair;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -94,6 +97,9 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
     ),
 )]
 pub struct DeployWebAuthnVerifierArgs {
+    /// Profile name; falls back to the environment, then the default profile.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
     /// Name of the environment variable holding the deployer S-strkey.
     ///
     /// Mutually exclusive with `--sign-with-ledger`.
@@ -113,18 +119,17 @@ pub struct DeployWebAuthnVerifierArgs {
     #[arg(long, default_value_t = 0_u32, value_name = "INDEX")]
     pub account_index: u32,
 
-    /// Network to target.
-    ///
-    /// `mainnet` parses but deployment structurally refuses it
-    /// (`network.mainnet_write_forbidden`). Default: `testnet`.
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
-    /// Soroban RPC endpoint URL.
-    ///
-    /// Default: `https://soroban-testnet.stellar.org`.
-    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
     /// Base fee per operation in stroops, or `auto` / `auto:pNN` for `getFeeStats`
     /// automatic selection.
@@ -174,7 +179,32 @@ pub struct DeployWebAuthnVerifierArgs {
 ///
 /// Never panics.
 pub async fn run(args: &DeployWebAuthnVerifierArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone());
+    let resolved = resolve_profile_name(args.profile.as_deref());
+    let (profile, _origin) = match load_profile_or_synthesize_testnet(&resolved) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            print_error(
+                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
+                args.output,
+            );
+            return 1;
+        }
+    };
+    let context = match network_context_for_command(
+        &profile,
+        &resolved.name,
+        EndpointFlags {
+            network: args.network,
+            rpc_url: args.rpc_url.as_deref(),
+            secondary_rpc_url: None,
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
+    };
     // First layer: structural mainnet rejection before any key access.
     if context.chain_id.is_mainnet() {
         let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
@@ -184,7 +214,18 @@ pub async fn run(args: &DeployWebAuthnVerifierArgs) -> i32 {
     }
 
     // Resolve the deployer keypair.
-    let deployer = match resolve_deployer(args).await {
+    // These verbs open no audit writer, so an `mlock` degradation is reported
+    // only through the warning `Wallet::unlock` emits.
+    let (deployer, _mlock_degradation) = match resolve_deployer_keypair(
+        args.deployer_secret_env.as_deref(),
+        args.sign_with_ledger,
+        args.account_index,
+        "deploy-webauthn-verifier",
+        &profile,
+        &resolved.name,
+    )
+    .await
+    {
         Ok(d) => d,
         Err(e) => {
             let envelope = Envelope::<()>::err(&e);
@@ -270,61 +311,6 @@ pub async fn run(args: &DeployWebAuthnVerifierArgs) -> i32 {
             1
         }
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Deployer resolution
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Resolves the deployer keypair from the CLI flags.
-///
-/// # Errors
-///
-/// - [`WalletError::Validation`] when no signer-source flag is supplied
-///   (`validation.signer_source_required`), the deployer secret-env variable
-///   is not set (`validation.secret_env_not_set`), or its value is not a valid
-///   S-strkey (`validation.secret_env_invalid`).
-/// - [`WalletError::WalletState`] when the Ledger device is unavailable
-///   (`wallet_state.hardware_not_found`, or the timeout / wrong-app variant).
-async fn resolve_deployer(
-    args: &DeployWebAuthnVerifierArgs,
-) -> Result<DeployerKeypair, WalletError> {
-    if args.sign_with_ledger {
-        use stellar_agent_network::signing::hardware::HardwareSigningKey;
-        let hw_key = HardwareSigningKey::native()?.with_account_index(args.account_index);
-
-        let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(hw_key);
-        return Ok(DeployerKeypair::Ledger {
-            account_index: args.account_index,
-            signer,
-        });
-    }
-
-    // SecretEnv mode.
-    let var_name = args.deployer_secret_env.as_deref().ok_or_else(|| {
-        WalletError::Validation(ValidationError::SignerSourceRequired {
-            detail: "no deployer signer flag specified; pass --deployer-secret-env <VAR> \
-                     or --sign-with-ledger"
-                .to_owned(),
-        })
-    })?;
-
-    // Shared mlock-protected secret-env ceremony: no `--profile` flag exists
-    // on this verb, so the `[wallet]` posture falls back to
-    // `MlockRequired::Warn` and the default unlock TTL.
-    // `--profile` has no effect on the `[wallet]` posture here: no
-    // audit-writer infrastructure exists on this verb, so a degraded
-    // unlock is surfaced only via `Wallet::unlock`'s own `tracing::warn!`.
-    let SignerCeremonyOutcome {
-        signer,
-        mlock_degradation: _,
-    } = resolve_software_signer_from_env(var_name, "deploy-webauthn-verifier", None).await?;
-    let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> = Box::new(signer);
-
-    Ok(DeployerKeypair::SecretEnv {
-        var_name: var_name.to_owned(),
-        signer,
-    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

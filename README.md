@@ -31,12 +31,14 @@ first session with Claude Code looks.
 
 Public alpha, under active development.
 
-- testnet (`stellar:testnet`) is the default network.
-- mainnet (`stellar:mainnet`) is accepted for read-only commands, selected
-  via `--network` where the command exposes it or via `--rpc-url` for
-  `balances` (which has no `--network` flag). Every write or signing command
-  structurally refuses mainnet in this alpha (wire code
-  `network.mainnet_write_forbidden`). At the submit layer a declared mainnet
+- testnet (`stellar:testnet`) is the default network: a command with no
+  named profile and no `default.toml` runs on the zero-config testnet profile.
+- mainnet (`stellar:mainnet`) is accepted for read-only commands, through a
+  mainnet profile selected with `--profile <name>`, or through `--rpc-url` for
+  `balances`. Every write or signing command refuses mainnet in this alpha
+  (wire code `network.mainnet_write_forbidden`). The transaction and
+  smart-account write commands refuse a mainnet profile before any RPC call or
+  signer access. At the submit layer a declared mainnet
   passphrase and a known mainnet RPC URL are each refused with no RPC call at
   all; beyond those two, the layer asks the endpoint which network it serves
   and refuses when the answer is mainnet.

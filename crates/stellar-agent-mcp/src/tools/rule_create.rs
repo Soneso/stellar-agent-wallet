@@ -74,17 +74,17 @@ use stellar_agent_core::approval::{
 use stellar_agent_core::audit_log::ExecutableRefPin;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::timefmt::now_unix_ms;
-use stellar_agent_network::keyring::signer_from_keyring;
+use stellar_agent_network::keyring::enrolled_keyring_signer;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::credentials::CredentialsManager;
 use stellar_agent_smart_account::managers::rules::{
-    ContextRuleDefinition, ContextRuleManager, ContextRuleManagerConfig, ContextRulePolicy,
-    ContextRuleSignerInput, DELEGATED_SIGNER_ADDRESS_REASON, OZ_MAX_EXTERNAL_KEY_SIZE,
-    OZ_MAX_NAME_SIZE, OZ_MAX_POLICIES, OZ_MAX_SIGNERS, RuleContext,
-    compute_context_rule_proposal_sha256, context_rule_definition_from_snapshot,
-    parse_c_strkey_to_smart_account, parse_delegated_signer_address,
+    ContextRuleDefinition, ContextRuleManager, ContextRulePolicy, ContextRuleSignerInput,
+    DELEGATED_SIGNER_ADDRESS_REASON, OZ_MAX_EXTERNAL_KEY_SIZE, OZ_MAX_NAME_SIZE, OZ_MAX_POLICIES,
+    OZ_MAX_SIGNERS, RuleContext, compute_context_rule_proposal_sha256,
+    context_rule_definition_from_snapshot, parse_c_strkey_to_smart_account,
+    parse_delegated_signer_address,
 };
-use stellar_agent_smart_account::managers::signers::{SignersManager, SignersManagerConfig};
+use stellar_agent_smart_account::managers::signers::SignersManager;
 use stellar_agent_smart_account::spending_limit_policy::{
     build_spending_limit_install_param, ensure_call_contract_context_for_spending_limit,
     ensure_valid_spending_limit_params,
@@ -94,6 +94,7 @@ use stellar_xdr::{Limits, ReadXdr as _, ScVal, WriteXdr as _};
 
 use crate::server::WalletServer;
 use crate::tools::common::{DispatchOutcome, approval_rejected_error, load_attestation_key};
+use crate::tools::rules::{context_rule_manager_config, signers_manager_config};
 
 /// Default submission-equivalent timeout (simulate + submit) in seconds.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
@@ -754,30 +755,18 @@ fn open_rule_create_audit_writer(
 )]
 fn build_write_context_rule_manager(server: &WalletServer) -> Result<ContextRuleManager, SaError> {
     let audit_writer = open_rule_create_audit_writer(server)?;
-    let rpc_url = server.context.rpc_url.as_str();
-    let network_passphrase = server.context.network_passphrase();
-    let chain_id = server.context.chain_id.caip2_str();
-
-    let log_path = server.profile.audit_log_path.clone();
-    let signers_manager = SignersManager::new(SignersManagerConfig::new(
-        rpc_url.to_owned(),
-        rpc_url.to_owned(),
+    let timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECONDS);
+    let signers_manager = SignersManager::new(signers_manager_config(
+        &server.context,
         Arc::clone(&audit_writer),
-        log_path,
-        network_passphrase.to_owned(),
+        server.profile.audit_log_path.clone(),
         server.profile_name_for_approval(),
-        Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
-        chain_id.to_owned(),
+        timeout,
     ))?;
 
-    let config = ContextRuleManagerConfig::new(
-        rpc_url.to_owned(),
-        network_passphrase.to_owned(),
-        Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
-        chain_id.to_owned(),
-    )
-    .with_signers_manager(Arc::new(signers_manager))
-    .with_audit_writer(audit_writer);
+    let config = context_rule_manager_config(&server.context, timeout)
+        .with_signers_manager(Arc::new(signers_manager))
+        .with_audit_writer(audit_writer);
 
     ContextRuleManager::new(config)
 }
@@ -1470,7 +1459,13 @@ impl WalletServer {
 
         // ── Load signer + build the write-capable manager ─────────────────────
         let source_g = self.profile.mcp_signer_default.account.clone();
-        let handle = match signer_from_keyring(&self.profile.mcp_signer_default, &source_g).await {
+        let handle = match enrolled_keyring_signer(
+            &self.profile_name_for_approval(),
+            &self.profile,
+            &source_g,
+        )
+        .await
+        {
             Ok(h) => h,
             Err(err) => {
                 let envelope = stellar_agent_core::envelope::Envelope::<()>::err(&err);

@@ -12,9 +12,9 @@ For the concepts referenced below (profiles, the policy engine, the approval spi
 
 Several flags recur across the commands on this page with the same meaning. Their full description lives in the [global conventions](index.md#global-conventions) section of the index:
 
-- `--profile <NAME>`: selects the [profile](../concepts.md). Every command on this page that loads a profile resolves it in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `accounts create`, `pay`, and `claim` a profile that resolves to no file is synthesised only when no name was given. For these commands, a name you supplied through the flag or the variable is refused if its file does not exist. `accounts deploy-c` and `fees stats` default to no profile at all. Each command's table states its own default.
-- `--network <NETWORK>`: `testnet` (default) or `mainnet`, case-insensitive. Write and signing commands structurally refuse `mainnet`; see [Mainnet-write refusal](index.md#mainnet-write-refusal).
-- `--rpc-url <URL>`: the Soroban RPC endpoint. Default `https://soroban-testnet.stellar.org` where applicable.
+- `--profile <NAME>`: selects the [profile](../concepts.md). Every command on this page that loads a profile resolves it in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `accounts create`, `pay`, and `claim` a profile that resolves to no file is synthesised only when no name was given. For these commands, a name you supplied through the flag or the variable is refused if its file does not exist. `accounts deploy-c` resolves its network from the profile and opens its writer only with `--profile`. `fees stats` loads a profile only with `--profile`. Each command's table states its own default.
+- `--network <NETWORK>`: optional assertion of the loaded profile's chain; a mismatch refuses before signing.
+- `--rpc-url <URL>`: optional testnet endpoint override; mainnet profiles refuse its presence. Without it, the profile endpoint applies. Credentials are refused.
 - `--output <FORMAT>`: `json` (default) or `table`.
 - `--timeout-seconds <SECONDS>`: bounds submission. Default `60`.
 - Signer source: `--secret-env <VAR>` / `--deployer-secret-env <VAR>` (an env-var name, never the secret) or `--sign-with-ledger`, with `--account-index <INDEX>` for the Ledger derivation path (default `0`).
@@ -46,7 +46,7 @@ Argument groups (enforced by the parser):
 |---|---|---|---|
 | `<NEW_G_STRKEY>` (positional) | G-strkey of the account to create | one of the account group | none |
 | `--generate` | Generate a fresh ed25519 keypair in-process; returns the G- and S-strkey in JSON | one of the account group | `false` |
-| `--profile <NAME>` | Profile to evaluate operator policy against (sponsored mode only) | optional | `STELLAR_AGENT_PROFILE`, else `default` |
+| `--profile <NAME>` | Profile supplying the chain and endpoints for either funding mode | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--sponsor <G_STRKEY>` | Sponsor/source account for the `CreateAccount` op | one of the mode group | none |
 | `--starting-balance <AMOUNT>` | Starting balance with explicit units, e.g. `"5 XLM"` (bare numbers rejected) | sponsored mode | none |
 | `--secret-env <VAR>` | Env-var name holding the sponsor S-strkey | signer group (sponsored) | none |
@@ -54,10 +54,10 @@ Argument groups (enforced by the parser):
 | `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
 | `--fund-with-friendbot` | Fund the account via Friendbot (testnet only) | one of the mode group | `false` |
 | `--friendbot-url <URL>` | Friendbot endpoint URL (Friendbot mode) | optional | `https://friendbot.stellar.org` |
-| `--network <NETWORK>` | Target network; `testnet` or `mainnet` (`mainnet` parses but is structurally refused for writes) | optional | `testnet` |
+| `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee (sponsored mode) | optional | profile default (100) |
 | `--timeout-seconds <SECONDS>` | Submission timeout (sponsored mode) | optional | `60` |
-| `--rpc-url <URL>` | Soroban RPC endpoint (sponsored mode) | optional | `https://soroban-testnet.stellar.org` |
+| `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
 The sponsor's public key must match the public key derived from the signer; a mismatch fails before submission.
@@ -103,9 +103,9 @@ Argument groups (enforced by the parser):
 | `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
 | `--salt-hex <HEX64>` | 32-byte salt as 64-char lowercase hex (re-deploy at a known C-strkey) | one of the salt group | none |
 | `--salt-random` | Generate a fresh random 32-byte salt | one of the salt group | random when `--salt-hex` absent |
-| `--profile <NAME>` | Profile whose audit writer receives deploy entries | optional | none |
-| `--network <NETWORK>` | Target network; `testnet` or `mainnet` (`mainnet` parses but is structurally refused for writes) | optional | `testnet` |
-| `--rpc-url <URL>` | Soroban RPC endpoint | optional | `https://soroban-testnet.stellar.org` |
+| `--profile <NAME>` | Profile supplying the chain and endpoints; the explicit flag also opens the audit writer | optional | `STELLAR_AGENT_PROFILE`, else `default` |
+| `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
+| `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee; see [Shared flags](#shared-flags) | optional | profile default (100) |
 | `--timeout-seconds <SECONDS>` | Submission timeout | optional | `60` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
@@ -170,9 +170,9 @@ Argument groups (enforced by the parser):
 | `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | none |
 | `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | none |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile default (100) |
-| `--network <NETWORK>` | Target network; `testnet` or `mainnet` (`mainnet` parses but is structurally refused for writes) | optional | `testnet` |
+| `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
 | `--timeout-seconds <SECONDS>` | Submission timeout | optional | `60` |
-| `--rpc-url <URL>` | Soroban RPC endpoint | optional | `https://soroban-testnet.stellar.org` |
+| `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 | `--use-oz-relayer` | Opt into the OZ Relayer path (not implemented; declines) | optional | `false` |
 
@@ -256,9 +256,9 @@ The respective refusals are `claim.not_claimant`, `claim.predicate_not_satisfied
 | `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | none |
 | `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | none |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile default (100) |
-| `--network <NETWORK>` | Target network; `testnet` or `mainnet` (`mainnet` parses but is structurally refused for writes) | optional | `testnet` |
+| `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
 | `--timeout-seconds <SECONDS>` | Submission timeout | optional | `60` |
-| `--rpc-url <URL>` | Soroban RPC endpoint | optional | `https://soroban-testnet.stellar.org` |
+| `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
 Example: claim a balance received from a payment sender:
@@ -299,7 +299,7 @@ stellar-agent balances \
 Creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust gate: operator policy evaluation, denomination resolution (USDT hard-refusal plus a known-lookalike denylist and pinned-issuer checks), a live issuer-flag fetch that fail-closes on error, a clawback gate, and a typed preview, before the envelope is built, signed, and submitted.
 
 - **Signing.** Signs via the profile's keyring signer; builds, signs, submits, and waits atomically. There is no staged pipeline.
-- **Network.** Derived from the loaded profile (`rpc_url`, `network_passphrase`, `chain_id`). `--chain-id` overrides the CAIP-2 value. There is no `--network` flag: the network comes from the profile configuration. The command goes through the same submit layer as every other verb, so it gets the same binding. A mainnet passphrase or a known mainnet RPC URL is refused with `network.mainnet_write_forbidden` and no RPC call. The endpoint is then asked which network it serves and that answer is authoritative. The envelope's signatures are verified against it. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
+- **Network.** Derived from the loaded profile (`rpc_url`, `network_passphrase`, `chain_id`). The profile file supplies the chain identity. There is no `--network` flag: the network comes from the profile configuration. The command goes through the same submit layer as every other verb, so it gets the same binding. A mainnet passphrase or a known mainnet RPC URL is refused with `network.mainnet_write_forbidden` and no RPC call. The endpoint is then asked which network it serves and that answer is authoritative. The envelope's signatures are verified against it. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
 - **USDT is hard-refused.** The denomination resolver rejects USDT outright; the command cannot create a USDT trustline.
 - **Limit.** `--limit-stroops 0` removes the trustline. When absent the Stellar default (`i64::MAX`, unlimited) applies.
 - **Asset grammar.** A bare code such as `USDC` resolves through the pin table; `CODE:ISSUER` names an explicit issuer; a 56-char `C...` SAC address is deferred and returns a typed error.
@@ -310,7 +310,6 @@ Creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust g
 | `--asset <ASSET>` | `USDC` (bare, pin table), `CODE:ISSUER`, or a `C...` SAC address (deferred) | yes | none |
 | `--limit-stroops <I64>` | Explicit trustline limit; `0` removes the trustline | optional | unlimited (`i64::MAX`) |
 | `--profile <NAME>` | Profile to load | optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--chain-id <CAIP2>` | CAIP-2 chain id, e.g. `stellar:testnet` | optional | profile value |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile `classic_fee_per_op_stroops` |
 
 Example: establish a USDC trustline:
@@ -354,12 +353,12 @@ Fee-statistics group. Subcommand: `stats`.
 Fetches Stellar RPC fee statistics, the helper behind classic fee selection.
 
 - **Signing.** Read-only; no signing or key access.
-- **Network.** No mainnet gate. The RPC endpoint resolves in order: `--rpc-url`, then the profile's `rpc_url` (via `--profile`), then the testnet default. When `--rpc-url` is given it is validated against the allow-list.
+- **Network.** With `--profile`, load the profile and apply the shared endpoint rules. Without it, use `--rpc-url`, else the testnet endpoint. A given URL must pass the allowlist.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
 | `--profile <NAME>` | Profile whose RPC URL to use | optional | none (falls back to testnet default) |
-| `--rpc-url <URL>` | Allow-listed RPC endpoint override | optional | `https://soroban-testnet.stellar.org` |
+| `--rpc-url <URL>` | Allowlisted testnet override; refused with a mainnet profile | optional | profile endpoint, or testnet without `--profile` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
 Example: print fee stats as a table:

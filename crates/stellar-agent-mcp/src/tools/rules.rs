@@ -23,12 +23,14 @@ use rmcp::{
     schemars, serde, tool, tool_router,
 };
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use stellar_agent_mcp_macros::mcp_tool_router;
 
 use stellar_agent_core::audit_log::writer::{AuditWriter, AuditWriterRegistry};
 use stellar_agent_core::profile::schema::default_audit_log_path_for;
+use stellar_agent_network::NetworkContext;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleManager, ContextRuleManagerConfig, DEFAULT_MAX_SCAN_ID,
@@ -80,8 +82,55 @@ const RULES_OBSERVABILITY_PROFILE: &str = "mcp-rules-observability";
 // Manager construction helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Builds a read-only [`ContextRuleManager`] for the given RPC URL / network,
-/// reading `audit_writer`'s log when one is given.
+/// The signers-manager configuration for `context`.
+///
+/// The primary endpoint is the context's primary. The secondary is the
+/// context's secondary, or the primary again when the context has none, which
+/// is the manager's degraded single-endpoint mode. Every signers manager the
+/// MCP server builds takes its configuration from this function.
+pub(super) fn signers_manager_config(
+    context: &NetworkContext,
+    audit_writer: Arc<Mutex<AuditWriter>>,
+    audit_log_path: PathBuf,
+    profile_name: String,
+    timeout: Duration,
+) -> SignersManagerConfig {
+    SignersManagerConfig::new(
+        context.rpc_url.clone(),
+        context
+            .secondary_rpc_url
+            .clone()
+            .unwrap_or_else(|| context.rpc_url.clone()),
+        audit_writer,
+        audit_log_path,
+        context.network_passphrase().to_owned(),
+        profile_name,
+        timeout,
+        context.chain_id.caip2_str().to_owned(),
+    )
+}
+
+/// The context-rule-manager configuration for `context`, carrying the
+/// context's secondary endpoint when it has one. Every rule manager the MCP
+/// server builds takes its configuration from this function.
+pub(super) fn context_rule_manager_config(
+    context: &NetworkContext,
+    timeout: Duration,
+) -> ContextRuleManagerConfig {
+    let config = ContextRuleManagerConfig::new(
+        context.rpc_url.clone(),
+        context.network_passphrase().to_owned(),
+        timeout,
+        context.chain_id.caip2_str().to_owned(),
+    );
+    match context.secondary_rpc_url.clone() {
+        Some(url) => config.with_secondary_rpc_url(url),
+        None => config,
+    }
+}
+
+/// Builds a read-only [`ContextRuleManager`] for `context`, reading
+/// `audit_writer`'s log when one is given.
 #[allow(
     clippy::result_large_err,
     reason = "SaError::SignerSetDiverged carries full diagnostic state by design \
@@ -89,24 +138,17 @@ const RULES_OBSERVABILITY_PROFILE: &str = "mcp-rules-observability";
               propagates it"
 )]
 fn build_context_rule_manager(
-    rpc_url: &str,
-    network_passphrase: &str,
-    chain_id: &str,
+    context: &NetworkContext,
     audit_writer: Option<Arc<Mutex<AuditWriter>>>,
 ) -> Result<ContextRuleManager, SaError> {
-    let config = ContextRuleManagerConfig::new(
-        rpc_url.to_owned(),
-        network_passphrase.to_owned(),
-        Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
-        chain_id.to_owned(),
-    );
+    let config = context_rule_manager_config(context, Duration::from_secs(DEFAULT_TIMEOUT_SECONDS));
     ContextRuleManager::new(match audit_writer {
         Some(writer) => config.with_audit_writer(writer),
         None => config,
     })
 }
 
-/// Builds a [`SignersManager`] for the given RPC URL / network.
+/// Builds a [`SignersManager`] for `context`.
 ///
 /// Opens (or reuses, via [`AuditWriterRegistry::get_or_open`]'s per-profile
 /// cache) the audit-log writer for [`RULES_OBSERVABILITY_PROFILE`].  Neither
@@ -118,11 +160,7 @@ fn build_context_rule_manager(
               (see stellar-agent-smart-account's crate-level allow); this fn simply \
               propagates it"
 )]
-fn build_signers_manager(
-    rpc_url: &str,
-    network_passphrase: &str,
-    chain_id: &str,
-) -> Result<SignersManager, SaError> {
+fn build_signers_manager(context: &NetworkContext) -> Result<SignersManager, SaError> {
     let log_path = default_audit_log_path_for(RULES_OBSERVABILITY_PROFILE);
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| SaError::AuditWriterIo {
@@ -138,17 +176,13 @@ fn build_signers_manager(
             },
         )?;
 
-    let config = SignersManagerConfig::new(
-        rpc_url.to_owned(),
-        rpc_url.to_owned(),
+    SignersManager::new(signers_manager_config(
+        context,
         writer,
         log_path,
-        network_passphrase.to_owned(),
         RULES_OBSERVABILITY_PROFILE.to_owned(),
         Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
-        chain_id.to_owned(),
-    );
-    SignersManager::new(config)
+    ))
 }
 
 /// The profile's audit writer, for the `baseline` the rule tools report, or
@@ -297,11 +331,8 @@ impl WalletServer {
             }
         };
 
-        let rpc_url = self.context.rpc_url.as_str();
         let manager = match build_context_rule_manager(
-            rpc_url,
-            self.context.network_passphrase(),
-            self.context.chain_id.caip2_str(),
+            &self.context,
             profile_audit_writer(self, "stellar_rules_list"),
         ) {
             Ok(m) => m,
@@ -312,11 +343,7 @@ impl WalletServer {
                 ));
             }
         };
-        let signers_manager = match build_signers_manager(
-            rpc_url,
-            self.context.network_passphrase(),
-            self.context.chain_id.caip2_str(),
-        ) {
+        let signers_manager = match build_signers_manager(&self.context) {
             Ok(m) => m,
             Err(err) => {
                 return Err(rmcp::ErrorData::internal_error(
@@ -508,11 +535,8 @@ impl WalletServer {
             }
         };
 
-        let rpc_url = self.context.rpc_url.as_str();
         let manager = match build_context_rule_manager(
-            rpc_url,
-            self.context.network_passphrase(),
-            self.context.chain_id.caip2_str(),
+            &self.context,
             profile_audit_writer(self, "stellar_rules_get"),
         ) {
             Ok(m) => m,
@@ -523,11 +547,7 @@ impl WalletServer {
                 ));
             }
         };
-        let signers_manager = match build_signers_manager(
-            rpc_url,
-            self.context.network_passphrase(),
-            self.context.chain_id.caip2_str(),
-        ) {
+        let signers_manager = match build_signers_manager(&self.context) {
             Ok(m) => m,
             Err(err) => {
                 return Err(rmcp::ErrorData::internal_error(
@@ -764,6 +784,71 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
     use super::*;
+
+    // ── Manager configuration from the server's context ──────────────────────
+
+    const PRIMARY: &str = "https://primary.example";
+    const SECONDARY: &str = "https://secondary.example";
+
+    /// A testnet server whose context carries `secondary` as its secondary
+    /// endpoint.
+    fn server_with_secondary(secondary: Option<&str>) -> WalletServer {
+        let profile = stellar_agent_core::profile::Profile::builder_testnet_named(
+            "manager-config",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .rpc_url(PRIMARY)
+        .with_noop_engine()
+        .build();
+        let mut server = WalletServer::new(profile).expect("server");
+        server.context = NetworkContext::new(
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
+            PRIMARY.to_owned(),
+        )
+        .with_secondary(secondary.map(str::to_owned));
+        server
+    }
+
+    /// The two manager configurations built from `server`'s context.
+    fn manager_configs(server: &WalletServer) -> (SignersManagerConfig, ContextRuleManagerConfig) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let writer = Arc::new(Mutex::new(
+            AuditWriter::open(path.clone(), None).expect("writer"),
+        ));
+        let timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECONDS);
+        (
+            signers_manager_config(
+                &server.context,
+                writer,
+                path,
+                "manager-config".to_owned(),
+                timeout,
+            ),
+            context_rule_manager_config(&server.context, timeout),
+        )
+    }
+
+    #[test]
+    fn manager_configs_carry_a_distinct_context_secondary() {
+        let server = server_with_secondary(Some(SECONDARY));
+        let (signers, rules) = manager_configs(&server);
+        assert_eq!(signers.primary_rpc_url, PRIMARY);
+        assert_eq!(signers.secondary_rpc_url, SECONDARY);
+        assert_eq!(rules.primary_rpc_url, PRIMARY);
+        assert_eq!(rules.secondary_rpc_url.as_deref(), Some(SECONDARY));
+    }
+
+    #[test]
+    fn manager_configs_without_a_secondary_fall_back_to_the_primary() {
+        let server = server_with_secondary(None);
+        let (signers, rules) = manager_configs(&server);
+        assert_eq!(signers.secondary_rpc_url, PRIMARY);
+        assert_eq!(rules.secondary_rpc_url, None);
+    }
 
     // ── Arg schema round-trips ────────────────────────────────────────────────
 

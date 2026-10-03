@@ -38,7 +38,7 @@ use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
-use crate::commands::smart_account::common::open_profile_audit_writer;
+use crate::commands::smart_account::common::open_audit_writer;
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
@@ -158,14 +158,17 @@ pub async fn run(args: ServeArgs) -> i32 {
         return 1;
     }
 
-    let (_audit_profile, audit_writer, _audit_path) =
-        match open_profile_audit_writer(&resolved_profile) {
-            Ok(triple) => triple,
-            Err(e) => {
-                render_json(&Envelope::<()>::err(&e));
-                return 1;
-            }
-        };
+    let (audit_writer, _audit_path) = match open_audit_writer(
+        &profile,
+        crate::common::profile_access::ProfileOrigin::Persisted,
+        &resolved_profile.name,
+    ) {
+        Ok(opened) => opened,
+        Err(e) => {
+            render_json(&Envelope::<()>::err(&e));
+            return 1;
+        }
+    };
 
     let context = DecisionContext::new(
         stellar_agent_core::approval::ApprovalContext::from_profile(&profile_name, &profile),

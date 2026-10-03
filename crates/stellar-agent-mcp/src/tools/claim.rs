@@ -38,7 +38,7 @@ use stellar_agent_core::envelope_decode::decode_authoritative_args;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::{
     BASE_RESERVE_STROOPS, BalanceView, ClassicOpBuilder, StellarRpcClient,
-    keyring::signer_from_keyring,
+    keyring::enrolled_keyring_signer,
     parse_classic_fee_choice, resolve_classic_fee_selection,
     signing::envelope_signing::attach_signature,
     submit::{SubmissionResult, SubmissionSignerKind, submit_transaction_and_wait},
@@ -937,7 +937,13 @@ impl WalletServer {
         }
 
         // ── Load signer handle from keyring ──────────────────────────────────
-        let handle = match signer_from_keyring(&self.profile.mcp_signer_default, &source).await {
+        let handle = match enrolled_keyring_signer(
+            &self.profile_name_for_approval(),
+            &self.profile,
+            &source,
+        )
+        .await
+        {
             Ok(h) => h,
             Err(err) => {
                 let envelope = stellar_agent_core::envelope::Envelope::<()>::err(&err);

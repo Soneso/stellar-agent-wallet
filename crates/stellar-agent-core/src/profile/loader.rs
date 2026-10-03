@@ -1,8 +1,8 @@
 //! figment-backed profile loader.
 //!
 //! The profile file is the record the operator audits. `chain_id` comes only
-//! from that file. On mainnet, overlays also cannot name `rpc_url`.
-//! Naming either protected field is refused, including an equal value,
+//! from that file. On mainnet, overlays also cannot name `rpc_url`,
+//! `secondary_rpc_url`, or `mcp_signer_default`. Naming a protected field is refused, including an equal value,
 //! because an overlay can hide a later edit to that record.
 //!
 //! Loads the remaining fields from three sources in priority order:
@@ -162,7 +162,7 @@ const ENV_PREFIX: &str = "STELLAR_AGENT_";
 pub enum ProfileLoadError {
     /// An overlay names a field whose value belongs to the profile file.
     #[error(
-        "profile field `{field}` is read from the profile file only; remove it from the environment or the overlay"
+        "profile field `{field}` is read from the profile file only; remove it from the environment, the overlay, or the command line"
     )]
     NonOverlayableField {
         /// The protected field named by the overlay.
@@ -567,7 +567,7 @@ pub fn load_from_path(
 
 /// Reads identity from the file before applying permitted overlays.
 /// The file is the operator's audited record. Naming `chain_id`, or a mainnet
-/// `rpc_url`, in an overlay can hide edits to that record and is refused.
+/// `rpc_url`, `secondary_rpc_url`, or `mcp_signer_default`, in an overlay is refused.
 fn load_from_path_with_overlays(
     name: &str,
     path: &Path,
@@ -613,12 +613,12 @@ fn load_from_path_with_overlays(
     {
         return Err(ProfileLoadError::NonOverlayableField { field: "chain_id" });
     }
-    if on_disk.chain_id.is_mainnet()
-        && overlay_data
-            .values()
-            .any(|dict| dict.contains_key("rpc_url"))
-    {
-        return Err(ProfileLoadError::NonOverlayableField { field: "rpc_url" });
+    if on_disk.chain_id.is_mainnet() {
+        for field in ["rpc_url", "secondary_rpc_url", "mcp_signer_default"] {
+            if overlay_data.values().any(|dict| dict.contains_key(field)) {
+                return Err(ProfileLoadError::NonOverlayableField { field });
+            }
+        }
     }
     let partial: PartialProfile = Figment::new()
         .merge(Toml::file(path))
@@ -1738,6 +1738,67 @@ mod tests {
             ),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn protected_secondary_rpc_url_overlay_refuses() {
+        let result = provider_load(
+            &mainnet_toml(),
+            "secondary_rpc_url",
+            serde_json::json!("https://secondary.example"),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ProfileLoadError::NonOverlayableField {
+                    field: "secondary_rpc_url"
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn testnet_secondary_rpc_url_overlay_loads() {
+        let profile = provider_load(
+            minimal_toml(),
+            "secondary_rpc_url",
+            serde_json::json!("https://secondary.example"),
+        )
+        .unwrap();
+        assert_eq!(
+            profile.secondary_rpc_url.as_deref(),
+            Some("https://secondary.example")
+        );
+    }
+
+    #[test]
+    fn protected_mcp_signer_default_overlay_refuses() {
+        let result = provider_load(
+            &mainnet_toml(),
+            "mcp_signer_default",
+            serde_json::json!({"account": "overlay-account"}),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ProfileLoadError::NonOverlayableField {
+                    field: "mcp_signer_default"
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn testnet_mcp_signer_default_overlay_loads() {
+        let profile = provider_load(
+            minimal_toml(),
+            "mcp_signer_default",
+            serde_json::json!({"account": "overlay-account"}),
+        )
+        .unwrap();
+        assert_eq!(profile.mcp_signer_default.account, "overlay-account");
     }
 
     #[test]

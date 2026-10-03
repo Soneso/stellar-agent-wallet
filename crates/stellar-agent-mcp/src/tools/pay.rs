@@ -36,7 +36,7 @@ use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_core::wallet::Wallet;
 use stellar_agent_network::{
     Asset, BASE_RESERVE_STROOPS, ClassicOpBuilder, StellarRpcClient, fetch_account,
-    keyring::signer_from_keyring,
+    keyring::enrolled_keyring_signer,
     parse_classic_fee_choice, parse_memo_fields, resolve_classic_fee_selection,
     sep29::check_memo_required,
     signing::envelope_signing::attach_signature,
@@ -1637,7 +1637,12 @@ impl WalletServer {
         }
 
         // ── Load signer handle from keyring ───────────────────────────────────
-        let handle = match signer_from_keyring(&self.profile.mcp_signer_default, &args.source).await
+        let handle = match enrolled_keyring_signer(
+            &self.profile_name_for_approval(),
+            &self.profile,
+            &args.source,
+        )
+        .await
         {
             Ok(h) => h,
             Err(err) => {

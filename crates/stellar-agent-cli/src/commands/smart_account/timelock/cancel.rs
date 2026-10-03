@@ -34,16 +34,18 @@ use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::profile::caip2::Caip2;
-use stellar_agent_network::NetworkContext;
 use stellar_agent_smart_account::timelock::TimelockOperationId;
 use tracing::info;
 use url::Url;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    SignerSourceFlags, emit_sa_error, open_profile_audit_writer, resolve_signer,
+    SignerSourceFlags, emit_sa_error, load_command_profile, map_access_error, open_audit_writer,
+    resolve_signer,
 };
-use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
+use crate::common::network::{
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 use crate::common::signer_ceremony::record_mlock_degradation;
@@ -71,22 +73,24 @@ pub struct CancelArgs {
     #[arg(long, value_name = "HEX", required = true)]
     pub operation_id: String,
 
-    /// Primary Soroban RPC endpoint (default: testnet).
-    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
-    /// Secondary RPC for cross-RPC event confirmation (dual-RPC defence).
-    ///
-    /// When omitted, defaults to `--rpc-url` and both RPCs are the same endpoint.
-    /// A warning is emitted in that case because the cross-RPC divergence defence
-    /// is degraded: a single compromised RPC can satisfy both confirmation checks.
-    /// Provide an independent RPC endpoint for production use.
-    #[arg(long, value_name = "URL")]
+    /// The secondary endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub secondary_rpc_url: Option<String>,
 
-    /// Target network: `testnet` (default) or `mainnet`.
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
     /// Profile name for audit-log lookup.
     #[arg(long, value_name = "NAME")]
@@ -141,8 +145,32 @@ pub(crate) fn mainnet_forbidden_error(network: Caip2) -> Option<WalletError> {
 ///
 /// Never panics.
 pub async fn run(args: &CancelArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone())
-        .with_secondary(args.secondary_rpc_url.clone());
+    let resolved_profile = resolve_profile_name(args.profile.as_deref());
+    let (profile, origin) = match load_command_profile(&resolved_profile) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved_profile.name);
+            let envelope: Envelope<()> = Envelope::err(&e);
+            render_json(&envelope);
+            return 1;
+        }
+    };
+    let context = match network_context_for_command(
+        &profile,
+        &resolved_profile.name,
+        EndpointFlags {
+            network: args.network,
+            rpc_url: args.rpc_url.as_deref(),
+            secondary_rpc_url: args.secondary_rpc_url.as_deref(),
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => {
+            let envelope: Envelope<()> = Envelope::err(&e);
+            render_json(&envelope);
+            return 1;
+        }
+    };
     // Structural mainnet pre-reject: refuse before loading any signer key.
     // The downstream submit_transaction_and_wait passphrase check also
     // blocks mainnet writes, but rejecting here avoids key access for a
@@ -153,7 +181,6 @@ pub async fn run(args: &CancelArgs) -> i32 {
         return 1;
     }
 
-    let resolved_profile = resolve_profile_name(args.profile.as_deref());
     let profile_name = resolved_profile.name.clone();
     let request_id = Uuid::new_v4().to_string();
 
@@ -177,9 +204,9 @@ pub async fn run(args: &CancelArgs) -> i32 {
     };
     let operation_id = TimelockOperationId::from_bytes(op_bytes);
 
-    let (signer, mlock_degradation) =
-        match resolve_signer(&args.signer_source, Some(&resolved_profile)).await {
-            Ok(pair) => pair,
+    let (audit_writer, _audit_log_path) =
+        match open_audit_writer(&profile, origin, &resolved_profile.name) {
+            Ok(opened) => opened,
             Err(e) => {
                 let envelope: Envelope<()> = Envelope::err(&e);
                 render_json(&envelope);
@@ -187,15 +214,22 @@ pub async fn run(args: &CancelArgs) -> i32 {
             }
         };
 
-    let (_audit_profile, audit_writer, _audit_log_path) =
-        match open_profile_audit_writer(&resolved_profile) {
-            Ok(triple) => triple,
-            Err(e) => {
-                let envelope: Envelope<()> = Envelope::err(&e);
-                render_json(&envelope);
-                return 1;
-            }
-        };
+    let (signer, mlock_degradation) = match resolve_signer(
+        &args.signer_source,
+        &profile,
+        &resolved_profile.name,
+        "smart-account-write",
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            let envelope: Envelope<()> = Envelope::err(&e);
+            render_json(&envelope);
+            return 1;
+        }
+    };
+
     record_mlock_degradation(
         &audit_writer,
         mlock_degradation.as_ref(),
@@ -226,7 +260,10 @@ pub async fn run(args: &CancelArgs) -> i32 {
              provide an independent secondary RPC endpoint for production use"
         );
     }
-    tracing::debug!(rpc_url = %context.rpc_url, "cancel rpc_url (full, debug-only)");
+    tracing::debug!(
+        rpc_url = %stellar_agent_core::redact::redact_url_authority(&context.rpc_url),
+        "cancel rpc_url"
+    );
 
     let timelock_redacted = redact_strkey_first5_last5(&args.timelock);
 
@@ -306,16 +343,56 @@ mod tests {
         );
     }
 
-    /// `run()` with `network = Mainnet` must return exit code 1.
+    /// A mainnet profile exits 1 before any request reaches its endpoint.
+    /// The binary tests in `tests/profile_env_var_resolution.rs` pin the
+    /// refusal's wire code.
     #[tokio::test]
-    async fn cancel_rejects_mainnet_before_signer_access() {
+    #[serial_test::serial]
+    async fn cancel_mainnet_profile_reaches_no_endpoint() {
+        let guard_rpc = wiremock::MockServer::start().await;
+        let (_guard_dir, _guard_home, _guard_env) =
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&guard_rpc.uri());
         use crate::common::network::TargetNetwork;
         let args = CancelArgs {
             timelock: "CTESTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACN7ALK".to_owned(),
             operation_id: "a".repeat(64),
-            rpc_url: "https://soroban-testnet.stellar.org".to_owned(),
+            rpc_url: None,
             secondary_rpc_url: None,
-            network: TargetNetwork::Mainnet,
+            network: Some(TargetNetwork::Mainnet),
+            profile: Some("guard-mainnet".into()),
+            signer_source: SignerSourceFlags {
+                signer_secret_env: None,
+                sign_with_ledger: false,
+                account_index: None,
+            },
+        };
+        let exit_code = run(&args).await;
+        assert_eq!(exit_code, 1, "a mainnet cancel must exit 1");
+        assert!(
+            guard_rpc
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
+    }
+
+    /// `--network mainnet` with no profile exits 1 before any request reaches
+    /// the endpoint `--rpc-url` names. The binary tests pin the wire code.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancel_mainnet_flag_without_profile_reaches_no_endpoint() {
+        let guard_rpc = wiremock::MockServer::start().await;
+        let guard_home = tempfile::tempdir().expect("home");
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        use crate::common::network::TargetNetwork;
+        let args = CancelArgs {
+            timelock: "CTESTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACN7ALK".to_owned(),
+            operation_id: "a".repeat(64),
+            rpc_url: Some(guard_rpc.uri()),
+            secondary_rpc_url: None,
+            network: Some(TargetNetwork::Mainnet),
             profile: None,
             signer_source: SignerSourceFlags {
                 signer_secret_env: None,
@@ -324,9 +401,13 @@ mod tests {
             },
         };
         let exit_code = run(&args).await;
-        assert_eq!(
-            exit_code, 1,
-            "mainnet cancel must return exit code 1 (structural pre-reject)"
+        assert_eq!(exit_code, 1, "a mainnet cancel must exit 1");
+        assert!(
+            guard_rpc
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
         );
     }
 

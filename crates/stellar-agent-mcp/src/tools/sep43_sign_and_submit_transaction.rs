@@ -28,7 +28,7 @@
 //! # Signing path
 //!
 //! 1. Loads the signer from `profile.mcp_signer_default` via
-//!    `stellar_agent_network::keyring::signer_from_keyring`.
+//!    `stellar_agent_network::keyring::enrolled_keyring_signer`.
 //! 2. Dispatches to `stellar_agent_sep43::StellarAgentModule::sign_transaction`.
 //! 3. Submits the signed envelope via
 //!    `stellar_agent_network::submit::submit_transaction_and_wait`.
@@ -197,7 +197,7 @@ impl WalletServer {
         use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
         use stellar_agent_core::policy::v1::OpaqueReason;
         use stellar_agent_network::StellarRpcClient;
-        use stellar_agent_network::keyring::signer_from_keyring;
+        use stellar_agent_network::keyring::enrolled_keyring_signer;
         use stellar_agent_network::submit::submit_transaction_and_wait;
         use stellar_agent_sep43::StellarAgentModule;
         use stellar_agent_sep43::module::ModuleAdapter;
@@ -262,19 +262,37 @@ impl WalletServer {
         let account = self.profile.mcp_signer_default.account.as_str();
 
         // ── Load signer from keyring ──────────────────────────────────────────
-        let signer_handle =
-            match signer_from_keyring(&self.profile.mcp_signer_default, account).await {
-                Ok(h) => h,
-                Err(err) => {
-                    let sep43_err = stellar_agent_sep43::Sep43Error::WalletUnlockFailed {
-                        detail: format!("keyring load failed: {err}"),
-                    };
+        let signer_handle = match enrolled_keyring_signer(
+            &self.profile_name_for_approval(),
+            &self.profile,
+            account,
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(err) => {
+                if matches!(
+                    &err,
+                    stellar_agent_core::error::WalletError::Auth(
+                        stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                    )
+                ) {
                     return Ok(crate::tools::common::business_error_result(
-                        sep43_err.wire_code(),
-                        sep43_err.to_string(),
+                        err.code(),
+                        err.to_string(),
                     ));
                 }
-            };
+
+                let sep43_err = stellar_agent_sep43::Sep43Error::WalletUnlockFailed {
+                    detail: format!("keyring load failed: {err}"),
+                };
+                return Ok(crate::tools::common::business_error_result(
+                    sep43_err.wire_code(),
+                    sep43_err.to_string(),
+                ));
+            }
+        };
 
         // ── Sign the transaction via the SEP-43 module ───────────────────────
         // Dispatches to `stellar_agent_sep43::StellarAgentModule::sign_transaction`.
@@ -702,14 +720,17 @@ mod tests {
             "sep43.rpc_error"
         );
     }
+
     use stellar_agent_core::policy::ToolDescriptor;
     use stellar_agent_core::policy::v1::{
         AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,
         Sep45SessionView,
     };
+
     use stellar_agent_core::policy::{
         ApprovalRequest, Decision, DenyReason, PolicyEngine, PolicyError,
     };
+
     use stellar_agent_core::profile::schema::Profile;
 
     #[test]
@@ -856,5 +877,70 @@ mod tests {
             !text.contains("signedTxXdr"),
             "no signature may be produced on a policy denial; got: {text}"
         );
+    }
+
+    struct EnrolledAllowEngine;
+
+    impl PolicyEngine for EnrolledAllowEngine {
+        fn evaluate(
+            &self,
+            _tool: &ToolDescriptor,
+            _args: &serde_json::Value,
+            _profile: &Profile,
+            _account_view: Option<&dyn AccountReservesView>,
+            _identity_view: Option<&dyn AccountIdentityView>,
+            _counterparty_cache: Option<&dyn CounterpartyCacheView>,
+            _sep10_sessions: Option<&dyn Sep10SessionView>,
+            _sep45_sessions: Option<&dyn Sep45SessionView>,
+        ) -> Result<Decision, PolicyError> {
+            Ok(Decision::Allow)
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn enrolled_signer_mismatch_survives_sep43_sign_and_submit_mapping() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let key = |seed: [u8; 32]| {
+            stellar_strkey::ed25519::PublicKey(
+                ed25519_dalek::SigningKey::from_bytes(&seed)
+                    .verifying_key()
+                    .to_bytes(),
+            )
+            .to_string()
+            .to_string()
+        };
+        let pin = key([1; 32]);
+        let profile =
+            Profile::builder_mainnet_named("sep43-enrolled", "sep43-enrolled", &pin, "n", "a")
+                .audit_log_path(dir.path().join("audit.jsonl"))
+                .with_noop_engine()
+                .build();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(
+            &profile.audit_log_hash_chain_key_id.service,
+            &profile.audit_log_hash_chain_key_id.account,
+        )
+        .unwrap();
+        let secret = stellar_strkey::ed25519::PrivateKey([2; 32])
+            .as_unredacted()
+            .to_string()
+            .to_string();
+        keyring_core::Entry::new(&profile.mcp_signer_default.service, &pin)
+            .unwrap()
+            .set_password(&secret)
+            .unwrap();
+        let mut server = crate::server::WalletServer::new(profile).unwrap();
+        server.policy_engine = std::sync::Arc::new(EnrolledAllowEngine);
+        let result = server
+            .call_stellar_sep43_sign_and_submit_transaction(Sep43SignAndSubmitTransactionArgs {
+                chain_id: "stellar:mainnet".into(),
+                transaction_xdr: "AAAAAQAA".into(),
+                network_passphrase: None,
+                address: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result_code(&result), "auth.enrolled_signer_mismatch");
     }
 }

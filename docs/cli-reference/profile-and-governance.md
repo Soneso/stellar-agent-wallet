@@ -15,10 +15,13 @@ The loader still refuses protected overlays on that read.
 
 | Wire code | Meaning |
 |---|---|
-| `profile.non_overlayable_field` | An environment or programmatic overlay names `chain_id`, or names `rpc_url` on a mainnet profile. Equal values are refused too. |
+| `profile.non_overlayable_field` | A protected field was supplied outside the file, including an equal value. Remove that environment value, overlay, or flag. |
+| `profile.network_flag_mismatch` | `--network` differs from the loaded chain. Remove the flag or select a profile on that chain. |
+| `auth.enrolled_signer_unpinned` | Mainnet enrollment is a placeholder or malformed. Correct a malformed `mcp_signer_default.account`, then run `stellar-agent profile enroll-signer --profile <name>`. |
+| `auth.enrolled_signer_mismatch` | The derived key differs from the enrolled identity. Use the enrolled seed, Ledger account, or keyring entry. |
 | `profile.mainnet_requires_explicit_profile` | A mainnet profile was selected by the environment or the default source. Supply `--profile <name>`. |
 
-Unset `STELLAR_AGENT_CHAIN_ID` and, for a mainnet profile, `STELLAR_AGENT_RPC_URL` first. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
+Unset `STELLAR_AGENT_CHAIN_ID` on every chain. On mainnet, also unset `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, and `STELLAR_AGENT_MCP_SIGNER_DEFAULT`. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
 
 ## `profile`
 
@@ -42,7 +45,7 @@ State-changing (writes the profile file; no network, no keyring). Creates and pe
 
 - `--profile <NAME>`: profile name to create (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
 - `--network <testnet|mainnet>` — target network (default `testnet`).
-- `--rpc-url <URL>` — Soroban RPC endpoint. Optional for testnet (defaults to the built-in testnet endpoint); **required, and required to be `https://`,** for `--network mainnet` — the built-in mainnet default requires an API key and answers HTTP 401 unauthenticated, so persisting it silently would mint a broken configuration, and the explicit-endpoint requirement exists for endpoint trust (a plaintext scheme is refused with `validation.config_invalid`). This is a configuration-time refusal, distinct from the mainnet-write gate the rest of this page's intro describes — `init` never submits a transaction on any network.
+- `--rpc-url <URL>`: optional on testnet; required with `--network mainnet`, where HTTPS is required. Credentials are refused by the flag parser.
 - `--engine <v1|noop>` — policy engine (default `v1`). `v1` is the default for newly-minted profiles (see the `[policy]` block in [profiles.md](../profiles.md)). A v1 profile refuses MCP-server startup and policy-gated dispatch until the V1 ceremony completes. The normative ceremony, in order, is: `profile enroll-owner-key`, `profile rotate-attestation-key`, then `profile sign-policy` (on top of `rotate-audit-key`, required on every engine — see below) — `next_steps` in the success payload mirrors it. `--engine noop` is the zero-ceremony testnet opt-out: the profile works immediately under the Noop engine (testnet allow, mainnet read-only), once the audit key is minted.
 
 The signer and nonce keyring coordinates are named `stellar-agent-signer-<name>` / `stellar-agent-nonce-<name>`, each seeded with the placeholder account `"default"` — the signer's eventual G-strkey is not known until a seed is enrolled (see `profile enroll-signer` below). The five security-substrate references (`audit_log_hash_chain_key_id`, `policy_owner_key_id`, `attestation_key_id`, `counterparty_cache_key_id`, `policy_window_state_key_id`) are derived from the profile name the same way `profile migrate` derives them.

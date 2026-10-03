@@ -21,17 +21,16 @@ pub struct NetworkContext {
 }
 
 impl NetworkContext {
-    /// Copies the chain identity and primary endpoint from the profile.
-    /// The secondary endpoint starts unset.
+    /// Copies the chain identity and both endpoints from the profile.
     #[must_use]
     pub fn from_profile(profile: &Profile) -> Self {
-        Self::from_flags(profile.chain_id, profile.rpc_url.clone())
+        Self::new(profile.chain_id, profile.rpc_url.clone())
+            .with_secondary(profile.secondary_rpc_url.clone())
     }
 
-    /// Takes the chain identity and primary endpoint from command flags.
-    /// The secondary endpoint starts unset.
+    /// A context from its chain identity and primary endpoint; the secondary endpoint starts unset.
     #[must_use]
-    pub fn from_flags(chain_id: Caip2, rpc_url: String) -> Self {
+    pub fn new(chain_id: Caip2, rpc_url: String) -> Self {
         Self {
             chain_id,
             rpc_url,
@@ -83,20 +82,24 @@ mod tests {
     }
 
     #[test]
-    fn from_profile_copies_identity_without_secondary() {
+    fn from_profile_copies_identity_and_secondary() {
         for chain in [Caip2::Testnet, Caip2::Mainnet] {
-            let profile = profile(chain);
+            let mut profile = profile(chain);
             let context = NetworkContext::from_profile(&profile);
             assert_eq!(context.chain_id, chain);
             assert_eq!(context.rpc_url, profile.rpc_url);
-            assert_eq!(context.secondary_rpc_url, None);
+            assert_eq!(context.secondary_rpc_url, profile.secondary_rpc_url);
+            profile.secondary_rpc_url = None;
+            assert_eq!(
+                NetworkContext::from_profile(&profile).secondary_rpc_url,
+                None
+            );
         }
     }
 
     #[test]
-    fn from_flags_copies_identity_without_secondary() {
-        let context =
-            NetworkContext::from_flags(Caip2::Mainnet, "https://flags.example".to_owned());
+    fn new_copies_identity_without_secondary() {
+        let context = NetworkContext::new(Caip2::Mainnet, "https://flags.example".to_owned());
         assert_eq!(context.chain_id, Caip2::Mainnet);
         assert_eq!(context.rpc_url, "https://flags.example");
         assert_eq!(context.secondary_rpc_url, None);
@@ -133,7 +136,7 @@ mod tests {
 
     #[test]
     fn debug_redacts_both_urls() {
-        let context = NetworkContext::from_flags(Caip2::Testnet,
+        let context = NetworkContext::new(Caip2::Testnet,
             "https://PRIMARY-USER:PRIMARY-PASS@primary.example/PRIMARY-PATH?key=PRIMARY-QUERY".to_owned())
             .with_secondary(Some("https://SECONDARY-USER:SECONDARY-PASS@secondary.example/SECONDARY-PATH?key=SECONDARY-QUERY".to_owned()));
         let debug = format!("{context:?}");

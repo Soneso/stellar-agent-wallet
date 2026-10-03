@@ -80,7 +80,7 @@ use stellar_agent_defindex::{
     value::{vault_deposit_value_legs, vault_withdraw_value_leg},
 };
 use stellar_agent_network::{
-    StellarRpcClient, WasmHashFetch, fetch_contract_wasm_hash, signer_from_keyring,
+    StellarRpcClient, WasmHashFetch, enrolled_keyring_signer, fetch_contract_wasm_hash,
 };
 
 use crate::server::WalletServer;
@@ -124,7 +124,9 @@ pub struct VaultDepositMcpArgs {
     /// unconditionally.  The WASM-pin refusal is NON-overridable.
     #[serde(default)]
     pub override_upgradable: bool,
-    /// Optional secondary RPC URL for the two-RPC WASM-hash cross-check.
+    /// On testnet, overrides the profile secondary endpoint; absence uses that endpoint.
+    /// Mainnet refuses an input value, including an equal value.
+    /// URL credentials are refused.
     #[serde(default)]
     pub secondary_rpc_url: Option<String>,
 }
@@ -160,7 +162,9 @@ pub struct VaultWithdrawMcpArgs {
     /// Override the upgradable-vault refusal.
     #[serde(default)]
     pub override_upgradable: bool,
-    /// Optional secondary RPC URL for the two-RPC WASM-hash cross-check.
+    /// On testnet, overrides the profile secondary endpoint; absence uses that endpoint.
+    /// Mainnet refuses an input value, including an equal value.
+    /// URL credentials are refused.
     #[serde(default)]
     pub secondary_rpc_url: Option<String>,
 }
@@ -226,6 +230,7 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<VaultDepositMcpArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let secondary_rpc_url = self.secondary_override(args.secondary_rpc_url.as_deref())?;
         // ── Parse decimal-string amount fields (single decode; feeds BOTH the
         // value-carrying policy gate below and `VaultDepositArgs` handed to
         // the adapter further down) ───────────────────────────────────────────
@@ -254,8 +259,7 @@ impl WalletServer {
         let primary_rpc = StellarRpcClient::new(rpc_url).map_err(|e| {
             rmcp::ErrorData::internal_error(format!("vault.rpc_init_failed: {e}"), None)
         })?;
-        let secondary_rpc: Option<StellarRpcClient> = args
-            .secondary_rpc_url
+        let secondary_rpc: Option<StellarRpcClient> = secondary_rpc_url
             .as_deref()
             .map(|url| {
                 StellarRpcClient::new(url).map_err(|e| {
@@ -530,9 +534,28 @@ impl WalletServer {
         // ── Load signer ───────────────────────────────────────────────────────
         let signer_entry_ref = &self.profile.mcp_signer_default;
         let expected_g_strkey = signer_entry_ref.account.as_str();
-        let signer_handle = match signer_from_keyring(signer_entry_ref, expected_g_strkey).await {
+        let signer_handle = match enrolled_keyring_signer(
+            &self.profile_name_for_approval(),
+            &self.profile,
+            expected_g_strkey,
+        )
+        .await
+        {
             Ok(h) => h,
-            Err(_) => {
+            Err(err) => {
+                if matches!(
+                    &err,
+                    stellar_agent_core::error::WalletError::Auth(
+                        stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                    )
+                ) {
+                    return Ok(crate::tools::common::business_error_result(
+                        err.code(),
+                        err.to_string(),
+                    ));
+                }
+
                 return Ok(crate::tools::common::business_error_result(
                     "vault.signer_load_failed",
                     "could not load signer from keyring",
@@ -692,6 +715,7 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<VaultWithdrawMcpArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let secondary_rpc_url = self.secondary_override(args.secondary_rpc_url.as_deref())?;
         // ── Parse decimal-string amount fields (single decode; feeds BOTH the
         // value-carrying policy gate below and `VaultWithdrawArgs` handed to
         // the adapter further down) ───────────────────────────────────────────
@@ -769,8 +793,7 @@ impl WalletServer {
         let primary_rpc = StellarRpcClient::new(rpc_url).map_err(|e| {
             rmcp::ErrorData::internal_error(format!("vault.rpc_init_failed: {e}"), None)
         })?;
-        let secondary_rpc: Option<StellarRpcClient> = args
-            .secondary_rpc_url
+        let secondary_rpc: Option<StellarRpcClient> = secondary_rpc_url
             .as_deref()
             .map(|url| {
                 StellarRpcClient::new(url).map_err(|e| {
@@ -987,9 +1010,28 @@ impl WalletServer {
         // ── Load signer ───────────────────────────────────────────────────────
         let signer_entry_ref = &self.profile.mcp_signer_default;
         let expected_g_strkey = signer_entry_ref.account.as_str();
-        let signer_handle = match signer_from_keyring(signer_entry_ref, expected_g_strkey).await {
+        let signer_handle = match enrolled_keyring_signer(
+            &self.profile_name_for_approval(),
+            &self.profile,
+            expected_g_strkey,
+        )
+        .await
+        {
             Ok(h) => h,
-            Err(_) => {
+            Err(err) => {
+                if matches!(
+                    &err,
+                    stellar_agent_core::error::WalletError::Auth(
+                        stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                    )
+                ) {
+                    return Ok(crate::tools::common::business_error_result(
+                        err.code(),
+                        err.to_string(),
+                    ));
+                }
+
                 return Ok(crate::tools::common::business_error_result(
                     "vault.signer_load_failed",
                     "could not load signer from keyring",
@@ -1305,5 +1347,91 @@ mod tests {
             !redacted.contains("JK6NTOT2O4"),
             "redacted must not contain middle: {redacted}"
         );
+    }
+}
+
+#[cfg(test)]
+mod secondary_rule_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, reason = "test assertions")]
+    use super::*;
+    use stellar_agent_core::profile::{Profile, caip2::Caip2};
+
+    fn server(mainnet: bool, rpc: &str) -> WalletServer {
+        let profile = if mainnet {
+            Profile::builder_mainnet_named("secondary", "s", "default", "n", "a")
+        } else {
+            Profile::builder_testnet_named("secondary", "s", "default", "n", "a")
+        }
+        .rpc_url(rpc)
+        .with_noop_engine()
+        .build();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.context = stellar_agent_network::NetworkContext::new(Caip2::Mainnet, rpc.into())
+            .with_secondary(Some("https://file-secondary.example".into()));
+        server
+    }
+
+    #[tokio::test]
+    async fn defindex_vault_deposit_secondary_refuses_at_entry_divergent_context() {
+        let rpc = wiremock::MockServer::start().await;
+        let server = server(false, &rpc.uri());
+        let args: VaultDepositMcpArgs = serde_json::from_value(serde_json::json!({
+            "chain_id": "stellar:testnet", "secondary_rpc_url": rpc.uri(), "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN", "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD", "amounts_desired": ["1"], "amounts_min": ["0"]
+        })).unwrap();
+        let result = server.call_stellar_defindex_vault_deposit(args).await;
+        let err = result.expect_err("endpoint override refuses before any lookup or RPC");
+        assert!(
+            err.message.contains("profile.non_overlayable_field"),
+            "{err:?}"
+        );
+        assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn defindex_vault_deposit_secondary_refuses_at_entry_mainnet_profile() {
+        let rpc = wiremock::MockServer::start().await;
+        let server = server(true, &rpc.uri());
+        let args: VaultDepositMcpArgs = serde_json::from_value(serde_json::json!({
+            "chain_id": "stellar:mainnet", "secondary_rpc_url": rpc.uri(), "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN", "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD", "amounts_desired": ["1"], "amounts_min": ["0"]
+        })).unwrap();
+        let result = server.call_stellar_defindex_vault_deposit(args).await;
+        let err = result.expect_err("endpoint override refuses before any lookup or RPC");
+        assert!(
+            err.message.contains("profile.non_overlayable_field"),
+            "{err:?}"
+        );
+        assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn defindex_vault_withdraw_secondary_refuses_at_entry_divergent_context() {
+        let rpc = wiremock::MockServer::start().await;
+        let server = server(false, &rpc.uri());
+        let args: VaultWithdrawMcpArgs = serde_json::from_value(serde_json::json!({
+            "chain_id": "stellar:testnet", "secondary_rpc_url": rpc.uri(), "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN", "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD", "withdraw_shares": "1", "min_amounts_out": ["0"]
+        })).unwrap();
+        let result = server.call_stellar_defindex_vault_withdraw(args).await;
+        let err = result.expect_err("endpoint override refuses before any lookup or RPC");
+        assert!(
+            err.message.contains("profile.non_overlayable_field"),
+            "{err:?}"
+        );
+        assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn defindex_vault_withdraw_secondary_refuses_at_entry_mainnet_profile() {
+        let rpc = wiremock::MockServer::start().await;
+        let server = server(true, &rpc.uri());
+        let args: VaultWithdrawMcpArgs = serde_json::from_value(serde_json::json!({
+            "chain_id": "stellar:mainnet", "secondary_rpc_url": rpc.uri(), "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN", "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD", "withdraw_shares": "1", "min_amounts_out": ["0"]
+        })).unwrap();
+        let result = server.call_stellar_defindex_vault_withdraw(args).await;
+        let err = result.expect_err("endpoint override refuses before any lookup or RPC");
+        assert!(
+            err.message.contains("profile.non_overlayable_field"),
+            "{err:?}"
+        );
+        assert!(rpc.received_requests().await.unwrap().is_empty());
     }
 }

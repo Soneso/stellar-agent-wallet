@@ -38,7 +38,7 @@ use stellar_agent_network::{
     validate_friendbot_url,
 };
 
-use crate::common::network::TESTNET_RPC_URL;
+use crate::common::network::{EndpointUrlFlag, TESTNET_RPC_URL};
 
 /// Stellar Futurenet network passphrase.
 const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
@@ -146,7 +146,7 @@ pub struct FriendbotArgs {
     /// or Futurenet RPC endpoint) so the verification always queries the
     /// network the funding targeted. Supply an explicit URL for a private
     /// network or a non-SDF RPC provider.
-    #[arg(long, value_name = "URL")]
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub rpc_url: Option<String>,
 
     /// Output format: `json` (default) or `table`.

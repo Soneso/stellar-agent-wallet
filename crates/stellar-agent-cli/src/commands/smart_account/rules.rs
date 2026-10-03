@@ -69,7 +69,7 @@ use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::CapKind;
 use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
-use stellar_agent_core::profile::caip2::MAINNET_RPC_URL;
+use stellar_agent_core::profile::{Profile, ResolvedProfileName};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::NetworkContext;
 use stellar_agent_smart_account::error::SaError;
@@ -97,10 +97,13 @@ use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     CommonArgsView, CommonHandlerContext, SignerSourceFlags, construct_signers_manager_from_fields,
-    open_profile_audit_writer_read_only,
+    load_command_profile, map_access_error, open_audit_writer_read_only,
 };
 use crate::commands::smart_account::list_rules as sa_list_rules;
-use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
+use crate::common::network::{
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+};
+use crate::common::profile_access::ProfileOrigin;
 use crate::common::render::render_json;
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
@@ -172,16 +175,23 @@ pub struct CommonRulesWriteArgs {
     #[command(flatten)]
     pub signer_source: SignerSourceFlags,
 
-    /// Network to target.
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
-    /// Soroban RPC endpoint URL.
-    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
-    /// Secondary RPC URL for divergence checks. Defaults to `--rpc-url`.
-    #[arg(long, value_name = "URL")]
+    /// The secondary endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub secondary_rpc_url: Option<String>,
 
     /// Submission timeout in seconds.
@@ -196,17 +206,24 @@ pub struct CommonRulesWriteArgs {
 /// Arguments shared by the read subcommand (`get`).
 #[derive(Debug, Args)]
 pub struct CommonRulesReadArgs {
+    /// Profile name; falls back to the environment, then the default profile.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
     /// Smart-account C-strkey.
     #[arg(long, value_name = "C_STRKEY", required = true)]
     pub account: String,
 
-    /// Network to target.
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
-    /// Soroban RPC endpoint URL.
-    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
     /// Submission timeout in seconds.
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
@@ -232,13 +249,16 @@ pub struct CommonRulesReadArgs {
 async fn prepare_write_context<A>(
     context: &NetworkContext,
     args: &A,
+    resolved: ResolvedProfileName,
+    profile: Profile,
+    origin: ProfileOrigin,
     output: OutputFormat,
     request_id: &str,
 ) -> Result<(CommonHandlerContext, ContextRuleManager), i32>
 where
     A: CommonArgsView + Sync,
 {
-    let ctx = CommonHandlerContext::new(args, context)
+    let ctx = CommonHandlerContext::new(args, resolved, profile, origin, context)
         .await
         .map_err(|e| emit_error(&e, output, request_id))?;
     let manager = ctx
@@ -423,7 +443,7 @@ async fn list_rules_run(args: &ListArgs) -> i32 {
         account = tracing::field::display(
             stellar_agent_core::observability::redact_strkey_first5_last5(&args.account)
         ),
-        network = %args.network,
+        network = ?args.network,
         "smart-account rules list: dispatching to list-rules handler"
     );
     sa_list_rules::run(args).await
@@ -671,9 +691,20 @@ pub struct CreateResult {
 }
 
 async fn create_run(args: &CreateArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
-        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
+    let resolved = resolve_profile_name(args.profile());
+    let (profile, origin) = match load_command_profile(&resolved) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved.name);
+            return emit_error(&e, args.common.output, &request_id);
+        }
+    };
+    let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
+    {
+        Ok(context) => context,
+        Err(e) => return emit_error(&e, args.common.output, &request_id),
+    };
     let account_redacted = redact_strkey_first5_last5(&args.common.account);
 
     if context.chain_id.is_mainnet() {
@@ -835,7 +866,7 @@ async fn create_run(args: &CreateArgs) -> i32 {
 
         // Load the selected profile's passkeys registry read-only (no approval
         // store needed).
-        let profile = resolve_profile_name(args.common.profile.as_deref()).name;
+        let profile = resolved.name.clone();
         if let Err(reason) = validate_path_component_ascii_safe(&profile) {
             return emit_error(
                 &WalletError::Validation(ValidationError::AddressInvalid {
@@ -1050,7 +1081,7 @@ async fn create_run(args: &CreateArgs) -> i32 {
     // `prepare_write_context` because it has substantial pre-validation above.
     // The explicit `context_rule_manager()` call is required to wire the
     // `SignersManager` for wasm-hash pin enforcement.
-    let ctx = match CommonHandlerContext::new(args, &context).await {
+    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.common.output, &request_id),
     };
@@ -1167,9 +1198,27 @@ pub struct GetResult {
 }
 
 async fn get_run(args: &GetArgs) -> i32 {
-    let context =
-        NetworkContext::from_flags(args.common.network.caip2(), args.common.rpc_url.clone());
     let request_id = new_request_id();
+    let resolved = resolve_profile_name(args.common.profile.as_deref());
+    let (profile, _origin) = match load_command_profile(&resolved) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved.name);
+            return emit_error(&e, args.common.output, &request_id);
+        }
+    };
+    let context = match network_context_for_command(
+        &profile,
+        &resolved.name,
+        EndpointFlags {
+            network: args.common.network,
+            rpc_url: args.common.rpc_url.as_deref(),
+            secondary_rpc_url: None,
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => return emit_error(&e, args.common.output, &request_id),
+    };
     let account_redacted = redact_strkey_first5_last5(&args.common.account);
 
     let smart_account = match parse_c_strkey(&args.common.account) {
@@ -1268,9 +1317,20 @@ pub struct SetNameResult {
 }
 
 async fn set_name_run(args: &SetNameArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
-        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
+    let resolved = resolve_profile_name(args.profile());
+    let (profile, origin) = match load_command_profile(&resolved) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved.name);
+            return emit_error(&e, args.common.output, &request_id);
+        }
+    };
+    let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
+    {
+        Ok(context) => context,
+        Err(e) => return emit_error(&e, args.common.output, &request_id),
+    };
     let account_redacted = redact_strkey_first5_last5(&args.common.account);
 
     if context.chain_id.is_mainnet() {
@@ -1293,11 +1353,20 @@ async fn set_name_run(args: &SetNameArgs) -> i32 {
         );
     }
 
-    let (ctx, manager) =
-        match prepare_write_context(&context, args, args.common.output, &request_id).await {
-            Ok(pair) => pair,
-            Err(code) => return code,
-        };
+    let (ctx, manager) = match prepare_write_context(
+        &context,
+        args,
+        resolved,
+        profile,
+        origin,
+        args.common.output,
+        &request_id,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
 
     let auth_rule_ids = vec![ContextRuleId::new(
         args.auth_rule_id.unwrap_or(args.rule_id),
@@ -1370,9 +1439,20 @@ pub struct SetValidUntilResult {
 }
 
 async fn set_valid_until_run(args: &SetValidUntilArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
-        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
+    let resolved = resolve_profile_name(args.profile());
+    let (profile, origin) = match load_command_profile(&resolved) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved.name);
+            return emit_error(&e, args.common.output, &request_id);
+        }
+    };
+    let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
+    {
+        Ok(context) => context,
+        Err(e) => return emit_error(&e, args.common.output, &request_id),
+    };
     let account_redacted = redact_strkey_first5_last5(&args.common.account);
 
     if context.chain_id.is_mainnet() {
@@ -1388,11 +1468,20 @@ async fn set_valid_until_run(args: &SetValidUntilArgs) -> i32 {
         Err(e) => return emit_error(&e, args.common.output, &request_id),
     };
 
-    let (ctx, manager) =
-        match prepare_write_context(&context, args, args.common.output, &request_id).await {
-            Ok(pair) => pair,
-            Err(code) => return code,
-        };
+    let (ctx, manager) = match prepare_write_context(
+        &context,
+        args,
+        resolved,
+        profile,
+        origin,
+        args.common.output,
+        &request_id,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
 
     let auth_rule_ids = vec![ContextRuleId::new(
         args.auth_rule_id.unwrap_or(args.rule_id),
@@ -1476,12 +1565,12 @@ macro_rules! impl_common_args_view {
                 &self.common.signer_source
             }
 
-            fn network(&self) -> TargetNetwork {
+            fn network(&self) -> Option<TargetNetwork> {
                 self.common.network
             }
 
-            fn rpc_url(&self) -> &str {
-                &self.common.rpc_url
+            fn rpc_url(&self) -> Option<&str> {
+                self.common.rpc_url.as_deref()
             }
 
             fn secondary_rpc_url(&self) -> Option<&str> {
@@ -1501,9 +1590,20 @@ impl_common_args_view!(SetValidUntilArgs);
 impl_common_args_view!(DeleteArgs);
 
 async fn delete_run(args: &DeleteArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
-        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
+    let resolved = resolve_profile_name(args.profile());
+    let (profile, origin) = match load_command_profile(&resolved) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved.name);
+            return emit_error(&e, args.common.output, &request_id);
+        }
+    };
+    let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
+    {
+        Ok(context) => context,
+        Err(e) => return emit_error(&e, args.common.output, &request_id),
+    };
     let account_redacted = redact_strkey_first5_last5(&args.common.account);
 
     if context.chain_id.is_mainnet() {
@@ -1514,11 +1614,20 @@ async fn delete_run(args: &DeleteArgs) -> i32 {
         );
     }
 
-    let (ctx, manager) =
-        match prepare_write_context(&context, args, args.common.output, &request_id).await {
-            Ok(pair) => pair,
-            Err(code) => return code,
-        };
+    let (ctx, manager) = match prepare_write_context(
+        &context,
+        args,
+        resolved,
+        profile,
+        origin,
+        args.common.output,
+        &request_id,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
 
     let auth_rule_ids = vec![ContextRuleId::new(
         args.auth_rule_id.unwrap_or(args.rule_id),
@@ -1578,18 +1687,23 @@ pub struct VerifyPinsArgs {
     #[command(flatten)]
     pub signer_source: SignerSourceFlags,
 
-    /// Network to target (testnet / mainnet).
-    ///
-    /// Read-only; mainnet is allowed for verification.
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
-    /// Soroban RPC endpoint URL.
-    #[arg(long, value_name = "URL")]
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub rpc_url: Option<String>,
 
-    /// Secondary RPC URL for two-RPC consultation. Defaults to `--rpc-url`.
-    #[arg(long, value_name = "URL")]
+    /// The secondary endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub secondary_rpc_url: Option<String>,
 
     /// Request timeout in seconds.
@@ -1614,17 +1728,12 @@ impl CommonArgsView for VerifyPinsArgs {
         &self.signer_source
     }
 
-    fn network(&self) -> TargetNetwork {
+    fn network(&self) -> Option<TargetNetwork> {
         self.network
     }
 
-    fn rpc_url(&self) -> &str {
-        // verify-pins mainnet fallback intentionally uses the third-party
-        // Validation Cloud default documented on MAINNET_RPC_URL.
-        self.rpc_url.as_deref().unwrap_or(match self.network {
-            TargetNetwork::Testnet => TESTNET_RPC_URL,
-            TargetNetwork::Mainnet => MAINNET_RPC_URL,
-        })
+    fn rpc_url(&self) -> Option<&str> {
+        self.rpc_url.as_deref()
     }
 
     fn secondary_rpc_url(&self) -> Option<&str> {
@@ -1732,12 +1841,23 @@ fn verify_pins_exit_code(result: &VerifyPinsResult) -> i32 {
 }
 
 async fn verify_pins_run(args: &VerifyPinsArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url().to_owned())
-        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
+    let resolved = resolve_profile_name(args.profile());
+    let (profile, origin) = match load_command_profile(&resolved) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved.name);
+            return emit_error(&e, args.output, &request_id);
+        }
+    };
+    let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
+    {
+        Ok(context) => context,
+        Err(e) => return emit_error(&e, args.output, &request_id),
+    };
     let account_redacted = redact_strkey_first5_last5(&args.account);
 
-    let ctx = match CommonHandlerContext::new(args, &context).await {
+    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -1969,18 +2089,23 @@ pub struct AddPolicyArgs {
     #[command(flatten)]
     pub signer_source: SignerSourceFlags,
 
-    /// Network to target (testnet / mainnet).
-    ///
-    /// Mainnet is structurally refused (`network.mainnet_write_forbidden`).
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
-    /// Soroban RPC endpoint URL.
-    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
-    /// Secondary RPC URL for divergence checks. Defaults to `--rpc-url`.
-    #[arg(long, value_name = "URL")]
+    /// The secondary endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub secondary_rpc_url: Option<String>,
 
     /// Submission timeout in seconds.
@@ -2005,12 +2130,12 @@ impl CommonArgsView for AddPolicyArgs {
         &self.signer_source
     }
 
-    fn network(&self) -> TargetNetwork {
+    fn network(&self) -> Option<TargetNetwork> {
         self.network
     }
 
-    fn rpc_url(&self) -> &str {
-        &self.rpc_url
+    fn rpc_url(&self) -> Option<&str> {
+        self.rpc_url.as_deref()
     }
 
     fn secondary_rpc_url(&self) -> Option<&str> {
@@ -2036,9 +2161,20 @@ pub struct AddPolicyResult {
 }
 
 async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
-        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
+    let resolved = resolve_profile_name(args.profile());
+    let (profile, origin) = match load_command_profile(&resolved) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved.name);
+            return emit_error(&e, args.output, &request_id);
+        }
+    };
+    let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
+    {
+        Ok(context) => context,
+        Err(e) => return emit_error(&e, args.output, &request_id),
+    };
     let account_redacted = redact_strkey_first5_last5(&args.account);
 
     // Mainnet write defence — structurally refuse before any RPC call.
@@ -2453,7 +2589,7 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
                     Err(e) => return emit_error(&e, args.output, &request_id),
                 };
 
-                let profile = resolve_profile_name(args.profile.as_deref()).name;
+                let profile = resolved.name.clone();
                 if let Err(reason) = validate_path_component_ascii_safe(&profile) {
                     return emit_error(
                         &WalletError::Validation(ValidationError::AddressInvalid {
@@ -2517,7 +2653,7 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
     };
 
     // Build CommonHandlerContext (signer + manager + audit writer).
-    let ctx = match CommonHandlerContext::new(args, &context).await {
+    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -2688,18 +2824,23 @@ pub struct RemovePolicyArgs {
     #[command(flatten)]
     pub signer_source: SignerSourceFlags,
 
-    /// Network to target (testnet / mainnet).
-    ///
-    /// Mainnet is structurally refused (`network.mainnet_write_forbidden`).
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
-    /// Soroban RPC endpoint URL.
-    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
-    /// Secondary RPC URL for divergence checks. Defaults to `--rpc-url`.
-    #[arg(long, value_name = "URL")]
+    /// The secondary endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub secondary_rpc_url: Option<String>,
 
     /// Submission timeout in seconds.
@@ -2724,12 +2865,12 @@ impl CommonArgsView for RemovePolicyArgs {
         &self.signer_source
     }
 
-    fn network(&self) -> TargetNetwork {
+    fn network(&self) -> Option<TargetNetwork> {
         self.network
     }
 
-    fn rpc_url(&self) -> &str {
-        &self.rpc_url
+    fn rpc_url(&self) -> Option<&str> {
+        self.rpc_url.as_deref()
     }
 
     fn secondary_rpc_url(&self) -> Option<&str> {
@@ -2753,9 +2894,20 @@ pub struct RemovePolicyResult {
 }
 
 async fn remove_policy_run(args: &RemovePolicyArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
-        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
+    let resolved = resolve_profile_name(args.profile());
+    let (profile, origin) = match load_command_profile(&resolved) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved.name);
+            return emit_error(&e, args.output, &request_id);
+        }
+    };
+    let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
+    {
+        Ok(context) => context,
+        Err(e) => return emit_error(&e, args.output, &request_id),
+    };
     let account_redacted = redact_strkey_first5_last5(&args.account);
 
     // Mainnet write defence — structurally refuse before any RPC call.
@@ -2774,7 +2926,7 @@ async fn remove_policy_run(args: &RemovePolicyArgs) -> i32 {
     };
 
     // Build CommonHandlerContext.
-    let ctx = match CommonHandlerContext::new(args, &context).await {
+    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -2901,9 +3053,27 @@ pub struct GetSpendingLimitResult {
 }
 
 async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
-    let context =
-        NetworkContext::from_flags(args.common.network.caip2(), args.common.rpc_url.clone());
     let request_id = new_request_id();
+    let resolved = resolve_profile_name(args.common.profile.as_deref());
+    let (profile, _origin) = match load_command_profile(&resolved) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved.name);
+            return emit_error(&e, args.common.output, &request_id);
+        }
+    };
+    let context = match network_context_for_command(
+        &profile,
+        &resolved.name,
+        EndpointFlags {
+            network: args.common.network,
+            rpc_url: args.common.rpc_url.as_deref(),
+            secondary_rpc_url: None,
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => return emit_error(&e, args.common.output, &request_id),
+    };
     let account_redacted = redact_strkey_first5_last5(&args.common.account);
 
     let smart_account = match parse_c_strkey(&args.common.account) {
@@ -2921,18 +3091,13 @@ async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
         );
     }
 
-    // Read-only path: a SignersManager is still required (identify_spending_limit_policy
-    // and get_spending_limit_data are its methods), but no Signer is resolved —
-    // both methods take `source_account_strkey: Option<&str>`, not a `Signer`.
-    // `CommonRulesReadArgs` has no `--profile` flag; resolve the default profile
-    // (matches the read-only precedent set by `smart-account rules get`).
-    let resolved_profile = resolve_profile_name(None);
-    let profile_name = resolved_profile.name.clone();
-    let (_audit_profile, audit_writer, audit_log_path) =
-        match open_profile_audit_writer_read_only(&resolved_profile) {
-            Ok(triple) => triple,
-            Err(e) => return emit_error(&e, args.common.output, &request_id),
-        };
+    // Read-only inspection uses the loaded profile without resolving a signer.
+    let profile_name = resolved.name.clone();
+    let (audit_writer, audit_log_path) = match open_audit_writer_read_only(&profile, &profile_name)
+    {
+        Ok(opened) => opened,
+        Err(e) => return emit_error(&e, args.common.output, &request_id),
+    };
     let manager = match construct_signers_manager_from_fields(
         &profile_name,
         &context,
@@ -3049,16 +3214,23 @@ pub struct SetSpendingLimitArgs {
     #[command(flatten)]
     pub signer_source: SignerSourceFlags,
 
-    /// Network to target (testnet / mainnet).
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
-    /// Soroban RPC endpoint URL.
-    #[arg(long, default_value = TESTNET_RPC_URL, value_name = "URL")]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
-    /// Secondary RPC URL for two-RPC consultation.
-    #[arg(long, value_name = "URL")]
+    /// The secondary endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
     pub secondary_rpc_url: Option<String>,
 
     /// Submission timeout in seconds.
@@ -3083,12 +3255,12 @@ impl CommonArgsView for SetSpendingLimitArgs {
         &self.signer_source
     }
 
-    fn network(&self) -> TargetNetwork {
+    fn network(&self) -> Option<TargetNetwork> {
         self.network
     }
 
-    fn rpc_url(&self) -> &str {
-        &self.rpc_url
+    fn rpc_url(&self) -> Option<&str> {
+        self.rpc_url.as_deref()
     }
 
     fn secondary_rpc_url(&self) -> Option<&str> {
@@ -3115,9 +3287,20 @@ pub struct SetSpendingLimitResult {
 }
 
 async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
-    let context = NetworkContext::from_flags(args.network().caip2(), args.rpc_url().to_owned())
-        .with_secondary(args.secondary_rpc_url().map(str::to_owned));
     let request_id = new_request_id();
+    let resolved = resolve_profile_name(args.profile());
+    let (profile, origin) = match load_command_profile(&resolved) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let e = map_access_error(&error, &resolved.name);
+            return emit_error(&e, args.output, &request_id);
+        }
+    };
+    let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
+    {
+        Ok(context) => context,
+        Err(e) => return emit_error(&e, args.output, &request_id),
+    };
     let account_redacted = redact_strkey_first5_last5(&args.account);
 
     // Mainnet write defence — structurally refuse before any RPC call.
@@ -3148,7 +3331,7 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
         );
     }
 
-    let ctx = match CommonHandlerContext::new(args, &context).await {
+    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
@@ -3565,16 +3748,14 @@ impl RulesArgs {
     pub(crate) fn profile_flag(&self) -> Option<&str> {
         match &self.subcommand {
             RulesSubcommand::Create(a) => a.common.profile.as_deref(),
-            // `CommonRulesReadArgs` carries no `--profile`; these two read
-            // subcommands resolve from the environment and `"default"` alone.
-            RulesSubcommand::Get(_) => None,
+            RulesSubcommand::Get(a) => a.common.profile.as_deref(),
             RulesSubcommand::SetName(a) => a.common.profile.as_deref(),
             RulesSubcommand::SetValidUntil(a) => a.common.profile.as_deref(),
             RulesSubcommand::Delete(a) => a.common.profile.as_deref(),
             RulesSubcommand::VerifyPins(a) => a.profile.as_deref(),
             RulesSubcommand::AddPolicy(a) => a.profile.as_deref(),
             RulesSubcommand::RemovePolicy(a) => a.profile.as_deref(),
-            RulesSubcommand::GetSpendingLimit(_) => None,
+            RulesSubcommand::GetSpendingLimit(a) => a.common.profile.as_deref(),
             RulesSubcommand::SetSpendingLimit(a) => a.profile.as_deref(),
             RulesSubcommand::List(a) => a.profile.as_deref(),
         }
@@ -4290,14 +4471,32 @@ mod tests {
         assert_eq!(parsed.args.rule_id, 3);
         // VerifyPinsArgs is read-only: it carries no install-time override flags.
         assert_eq!(
-            parsed.args.network,
-            TargetNetwork::Testnet,
-            "default network is testnet"
+            parsed.args.network, None,
+            "the network comes from the loaded profile"
         );
         assert_eq!(
             parsed.args.rpc_url(),
-            TESTNET_RPC_URL,
-            "testnet default RPC URL must remain the testnet endpoint"
+            None,
+            "the endpoint comes from the loaded profile"
+        );
+        assert_eq!(parsed.args.rpc_url, None);
+        let explicit = VerifyPinsArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "3",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "https://flags.example",
+        ]);
+        assert_eq!(explicit.args.network, Some(TargetNetwork::Mainnet));
+        assert_eq!(
+            explicit.args.rpc_url.as_deref(),
+            Some("https://flags.example")
         );
     }
 
@@ -4347,27 +4546,8 @@ mod tests {
 
         assert_eq!(parsed.args.profile.as_deref(), Some("ops"));
         assert_eq!(parsed.args.rpc_url.as_deref(), Some("https://rpc.example"));
-        assert_eq!(parsed.args.rpc_url(), "https://rpc.example");
+        assert_eq!(parsed.args.rpc_url(), Some("https://rpc.example"));
         assert_eq!(parsed.args.timeout_seconds, 17);
-    }
-
-    #[test]
-    fn verify_pins_args_mainnet_defaults_to_mainnet_rpc_url() {
-        let parsed = VerifyPinsArgsHarness::parse_from([
-            "test",
-            "--account",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "--rule-id",
-            "9",
-            "--network",
-            "mainnet",
-            "--signer-secret-env",
-            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
-        ]);
-
-        assert_eq!(parsed.args.network, TargetNetwork::Mainnet);
-        assert_eq!(parsed.args.rpc_url(), MAINNET_RPC_URL);
-        assert_eq!(parsed.args.rpc_url, None);
     }
 
     #[test]
@@ -4759,13 +4939,35 @@ mod tests {
             Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
         );
         assert_eq!(
-            parsed.args.network,
-            TargetNetwork::Testnet,
-            "default network is testnet"
+            parsed.args.network, None,
+            "the network comes from the loaded profile"
         );
         assert!(
             parsed.args.auth_rule_id.is_empty(),
             "auth_rule_id defaults to empty (handler defaults to [rule_id])"
+        );
+        assert_eq!(parsed.args.rpc_url, None);
+        let explicit = AddPolicyArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "3",
+            "--policy-address",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--install-param",
+            &void_b64,
+            "--signer-secret-env",
+            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "https://flags.example",
+        ]);
+        assert_eq!(explicit.args.network, Some(TargetNetwork::Mainnet));
+        assert_eq!(
+            explicit.args.rpc_url.as_deref(),
+            Some("https://flags.example")
         );
     }
 
@@ -4904,13 +5106,33 @@ mod tests {
         assert_eq!(parsed.args.rule_id, 7);
         assert_eq!(parsed.args.policy_id, 2);
         assert_eq!(
-            parsed.args.network,
-            TargetNetwork::Testnet,
-            "default network is testnet"
+            parsed.args.network, None,
+            "the network comes from the loaded profile"
         );
         assert!(
             parsed.args.auth_rule_id.is_empty(),
             "auth_rule_id defaults to empty"
+        );
+        assert_eq!(parsed.args.rpc_url, None);
+        let explicit = RemovePolicyArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "7",
+            "--policy-id",
+            "2",
+            "--signer-secret-env",
+            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "https://flags.example",
+        ]);
+        assert_eq!(explicit.args.network, Some(TargetNetwork::Mainnet));
+        assert_eq!(
+            explicit.args.rpc_url.as_deref(),
+            Some("https://flags.example")
         );
     }
 
@@ -5424,8 +5646,8 @@ mod tests {
                 sign_with_ledger: false,
                 account_index: Some(0),
             },
-            network: TargetNetwork::Testnet,
-            rpc_url: TESTNET_RPC_URL.to_owned(),
+            network: Some(TargetNetwork::Testnet),
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             secondary_rpc_url: None,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             output: OutputFormat::Json,
@@ -5764,7 +5986,26 @@ mod tests {
         ]);
         assert_eq!(parsed.args.rule_id, 3);
         assert_eq!(parsed.args.source_account, SIMULATE_SENTINEL_G);
-        assert_eq!(parsed.args.common.network, TargetNetwork::Testnet);
+        assert_eq!(parsed.args.common.network, None);
+        assert_eq!(parsed.args.common.rpc_url, None);
+        let explicit = GetSpendingLimitArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "3",
+            "--source-account",
+            SIMULATE_SENTINEL_G,
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "https://flags.example",
+        ]);
+        assert_eq!(explicit.args.common.network, Some(TargetNetwork::Mainnet));
+        assert_eq!(
+            explicit.args.common.rpc_url.as_deref(),
+            Some("https://flags.example")
+        );
     }
 
     #[test]
@@ -5799,9 +6040,10 @@ mod tests {
     async fn get_spending_limit_run_rejects_invalid_source_account() {
         let args = GetSpendingLimitArgs {
             common: CommonRulesReadArgs {
+                profile: None,
                 account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-                network: TargetNetwork::Testnet,
-                rpc_url: TESTNET_RPC_URL.to_owned(),
+                network: Some(TargetNetwork::Testnet),
+                rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
                 timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
                 output: OutputFormat::Json,
             },
@@ -5897,8 +6139,8 @@ mod tests {
                 sign_with_ledger: false,
                 account_index: Some(0),
             },
-            network: TargetNetwork::Testnet,
-            rpc_url: TESTNET_RPC_URL.to_owned(),
+            network: Some(TargetNetwork::Testnet),
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             secondary_rpc_url: None,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             output: OutputFormat::Json,
@@ -5921,14 +6163,37 @@ mod tests {
         assert_eq!(code, 1, "negative limit must be refused");
     }
 
-    /// Mainnet is refused before the limit check (and before any signer
-    /// resolution).
+    /// A mainnet profile exits 1 before any request reaches its endpoint.
+    /// The binary tests in `tests/profile_env_var_resolution.rs` pin the
+    /// refusal's wire code.
     #[tokio::test]
-    async fn set_spending_limit_rejects_mainnet() {
+    #[serial_test::serial]
+    async fn set_spending_limit_mainnet_profile_reaches_no_endpoint() {
+        let rpc = wiremock::MockServer::start().await;
+        let (_dir, _home, _env) =
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&rpc.uri());
         let mut args = set_spending_limit_args(10_000_000);
-        args.network = TargetNetwork::Mainnet;
-        let code = set_spending_limit_run(&args).await;
-        assert_eq!(code, 1, "mainnet must be refused");
+        args.profile = Some("guard-mainnet".to_owned());
+        args.network = None;
+        args.rpc_url = None;
+        assert_eq!(set_spending_limit_run(&args).await, 1);
+        assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    /// `--network mainnet` with no profile exits 1 before any request reaches
+    /// the endpoint `--rpc-url` names. The binary tests pin the wire code.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn set_spending_limit_mainnet_flag_without_profile_reaches_no_endpoint() {
+        let rpc = wiremock::MockServer::start().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let mut args = set_spending_limit_args(10_000_000);
+        args.network = Some(TargetNetwork::Mainnet);
+        args.rpc_url = Some(rpc.uri());
+        assert_eq!(set_spending_limit_run(&args).await, 1);
+        assert!(rpc.received_requests().await.unwrap().is_empty());
     }
 
     // ── rules create --signer-delegated ──────────────────────────────────────

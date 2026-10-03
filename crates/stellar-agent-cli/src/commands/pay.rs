@@ -121,12 +121,16 @@ use crate::commands::policy_engine::{
     build_v1_policy_engine, evaluate_opaque_signing_policy, evaluate_value_moving_policy,
     pay_policy_args,
 };
-use crate::common::network::{TESTNET_RPC_URL, TargetNetwork};
+use crate::common::network::{
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+};
 use crate::common::profile_access::{
     ProfileOrigin, injected_profile_load, load_profile_or_synthesize_testnet_with,
 };
 use crate::common::render::{render_json, sanitize_for_table};
-use crate::common::signer_ceremony::{SignerCeremonyOutcome, resolve_software_signer_from_env};
+use crate::common::signer_ceremony::{
+    SignerCeremonyOutcome, require_enrolled_signer, resolve_software_signer_from_env,
+};
 use crate::common::{ResolvedProfileName, resolve_profile_name};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -319,10 +323,10 @@ pub struct PayArgs {
     #[arg(long, value_name = "BASE64_XDR", group = "stage")]
     pub submit_only: Option<String>,
 
-    /// Network to target. `mainnet` parses but is structurally refused before
-    /// any RPC call or signing (wire code `network.mainnet_write_forbidden`).
-    #[arg(long, default_value_t = TargetNetwork::Testnet, value_name = "NETWORK")]
-    pub network: TargetNetwork,
+    /// The network comes from the profile when absent.
+    /// When supplied, this flag must equal the profile's chain.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<TargetNetwork>,
 
     /// Output format: `json` (default) or `table`.
     #[arg(long, default_value_t = OutputFormat::DEFAULT, value_name = "FORMAT")]
@@ -332,13 +336,12 @@ pub struct PayArgs {
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
     pub timeout_seconds: u64,
 
-    /// Override the Stellar RPC endpoint URL.
-    #[arg(
-        long,
-        default_value = TESTNET_RPC_URL,
-        value_name = "URL"
-    )]
-    pub rpc_url: String,
+    /// The RPC endpoint comes from the profile when absent.
+    /// On testnet, this flag overrides the profile endpoint.
+    /// On mainnet, this flag is refused, including equal values.
+    /// URL credentials are refused.
+    #[arg(long, value_name = "URL", value_parser = EndpointUrlFlag)]
+    pub rpc_url: Option<String>,
 
     /// Opt in to routing submission through a self-hosted OZ Relayer Channels
     /// Plugin (AGPL-3.0); not implemented in this build — emits an AGPL-3.0
@@ -382,10 +385,11 @@ pub async fn run(args: &PayArgs) -> i32 {
 ///
 /// `load_profile` performs the load and nothing else. Whether a `NotFound`
 /// may be replaced by the synthesized zero-config profile is decided by
-/// [`load_profile_or_synthesize_testnet_with`], which every stage below calls
-/// with the resolved name — so the refusal for a named-but-missing profile
-/// runs on the injected path exactly as it does in production. A check placed
-/// inside the closure would be bypassed by every test that supplies its own.
+/// [`load_profile_or_synthesize_testnet_with`], which this function calls once,
+/// at entry, with the resolved name. Every stage receives the loaded profile.
+/// The refusal for a named-but-missing profile therefore runs on the injected
+/// path exactly as it does in production. A check placed inside the closure
+/// would be bypassed by every test that supplies its own.
 async fn run_with_dependencies<LoadProfile, InitKeyring>(
     args: &PayArgs,
     load_profile: LoadProfile,
@@ -395,8 +399,32 @@ where
     LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let context = NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone());
     let resolved = resolve_profile_name(args.profile.as_deref());
+    let (profile, origin) = match load_profile_or_synthesize_testnet_with(&resolved, load_profile) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            print_error(
+                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
+                args.output,
+            );
+            return 1;
+        }
+    };
+    let context = match network_context_for_command(
+        &profile,
+        &resolved.name,
+        EndpointFlags {
+            network: args.network,
+            rpc_url: args.rpc_url.as_deref(),
+            secondary_rpc_url: None,
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
+    };
     // The resolved name and the input that supplied it are logged together:
     // a report of a run signing against the wrong profile is diagnosable only
     // if the log says which name was used and where it came from. Mirrors the
@@ -425,19 +453,37 @@ where
         return 1;
     }
 
-    // Every gated stage reads the owner key from the keyring via
-    // `build_v1_policy_engine` when the resolved profile is V1 — including
-    // `--sign-only` / `--submit-only`, which now gate the decoded envelope
-    // before signing/broadcasting — so all four stages receive the
-    // injected profile-loader/keyring-initialiser pair.
+    // Every gated stage reads the owner key from the keyring through
+    // `build_v1_policy_engine` when the resolved profile is V1, including
+    // `--sign-only` and `--submit-only`, which gate the decoded envelope before
+    // signing or broadcasting. All four stages therefore receive the loaded
+    // profile and the keyring initialiser.
     if args.build_only {
-        run_build_only(&context, args, &resolved, load_profile, init_keyring).await
+        run_build_only(&context, args, &resolved, &profile, init_keyring).await
     } else if let Some(ref xdr) = args.sign_only {
-        run_sign_only(&context, args, &resolved, xdr, load_profile, init_keyring).await
+        run_sign_only(
+            &context,
+            args,
+            &resolved,
+            xdr,
+            &profile,
+            origin,
+            init_keyring,
+        )
+        .await
     } else if let Some(ref xdr) = args.submit_only {
-        run_submit_only(&context, args, &resolved, xdr, load_profile, init_keyring).await
+        run_submit_only(
+            &context,
+            args,
+            &resolved,
+            xdr,
+            &profile,
+            origin,
+            init_keyring,
+        )
+        .await
     } else {
-        run_full_pipeline(&context, args, &resolved, load_profile, init_keyring).await
+        run_full_pipeline(&context, args, &resolved, &profile, origin, init_keyring).await
     }
 }
 
@@ -445,18 +491,17 @@ where
 // Stage implementations
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn run_build_only<LoadProfile, InitKeyring>(
+async fn run_build_only<InitKeyring>(
     context: &NetworkContext,
     args: &PayArgs,
     resolved: &ResolvedProfileName,
-    load_profile: LoadProfile,
+    profile: &Profile,
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    // ── Resolve profile & conditionally initialise the platform keyring ──────
+    // ── Conditionally initialise the platform keyring ─────────────────────────
     // Must happen before any network build: `build_v1_policy_engine` (invoked
     // from `evaluate_pay_policy` below) reads the owner PUBLIC key from the
     // OS keyring only when `profile.policy.engine == V1`, so the platform
@@ -464,16 +509,6 @@ where
     // `--build-only` never calls the audit pre-flight (it neither signs nor
     // submits), so the Noop-engine path genuinely never touches the keyring
     // on this stage, unlike the signing/submitting stages below.
-    let (profile, _origin) = match load_profile_or_synthesize_testnet_with(resolved, load_profile) {
-        Ok(p) => p,
-        Err(e) => {
-            print_error(
-                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
-                args.output,
-            );
-            return 1;
-        }
-    };
     // `PolicyEngineKind` is `#[non_exhaustive]` (a foreign-crate enum), so this
     // cannot be a wildcard-free exhaustive match. `Noop` is the only engine that
     // reads no owner key; every other engine — `V1` and any future variant —
@@ -492,7 +527,7 @@ where
             let chain_id = context.chain_id.caip2_str();
             // Build-only: gate but do not submit, so the gate-sized effects are
             // not recorded (no confirmed on-chain action to attest).
-            if let Err(code) = evaluate_pay_policy(args, &built, chain_id, &profile, &resolved.name)
+            if let Err(code) = evaluate_pay_policy(args, &built, chain_id, profile, &resolved.name)
             {
                 return code;
             }
@@ -516,30 +551,29 @@ where
     }
 }
 
-async fn run_sign_only<LoadProfile, InitKeyring>(
+async fn run_sign_only<InitKeyring>(
     context: &NetworkContext,
     args: &PayArgs,
     resolved: &ResolvedProfileName,
     unsigned_xdr: &str,
-    load_profile: LoadProfile,
+    profile: &Profile,
+    origin: ProfileOrigin,
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let (profile, origin) =
-        match resolve_profile_and_keyring(args, resolved, load_profile, init_keyring) {
-            Ok(p) => p,
-            Err(code) => return code,
-        };
+    match init_keyring_for_origin(args, resolved, origin, init_keyring) {
+        Ok(()) => (),
+        Err(code) => return code,
+    };
     let chain_id = context.chain_id.caip2_str();
     if let Err(code) = evaluate_staged_pay_policy(
         context,
         args,
         unsigned_xdr,
         chain_id,
-        &profile,
+        profile,
         &resolved.name,
     )
     .await
@@ -554,7 +588,7 @@ where
     // (if any) is not threaded further here — its only purpose on this stage
     // is the refusal.
     if let Err(e) = crate::commands::value_audit::require_value_audit_writer_for_origin(
-        &profile,
+        profile,
         &resolved.name,
         origin,
     ) {
@@ -562,7 +596,7 @@ where
         return 1;
     }
 
-    match sign_envelope(context, args, unsigned_xdr).await {
+    match sign_envelope(context, args, unsigned_xdr, profile, &resolved.name).await {
         Ok(signed_xdr) => {
             let result = PayResult {
                 envelope_xdr: signed_xdr,
@@ -584,23 +618,22 @@ where
     }
 }
 
-async fn run_submit_only<LoadProfile, InitKeyring>(
+async fn run_submit_only<InitKeyring>(
     context: &NetworkContext,
     args: &PayArgs,
     resolved: &ResolvedProfileName,
     signed_xdr: &str,
-    load_profile: LoadProfile,
+    profile: &Profile,
+    origin: ProfileOrigin,
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let (profile, origin) =
-        match resolve_profile_and_keyring(args, resolved, load_profile, init_keyring) {
-            Ok(p) => p,
-            Err(code) => return code,
-        };
+    match init_keyring_for_origin(args, resolved, origin, init_keyring) {
+        Ok(()) => (),
+        Err(code) => return code,
+    };
     // Establish which network `--rpc-url` actually serves before anything
     // else runs. The staged gate evaluates under the chain id derived from
     // `--network`, so that flag has to describe the endpoint the envelope will
@@ -627,7 +660,7 @@ where
     };
     if let Ok(reconcile_client) = StellarRpcClient::new(&context.rpc_url) {
         crate::commands::submission_record::reconcile_open_reservations(
-            &profile,
+            profile,
             &resolved.name,
             &reconcile_client,
             now_ms,
@@ -643,7 +676,7 @@ where
         args,
         signed_xdr,
         chain_id,
-        &profile,
+        profile,
         &resolved.name,
     )
     .await
@@ -659,7 +692,7 @@ where
     // acquired. Where `Some`, the writer is reused (not re-acquired) for the
     // post-confirm emission.
     let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
-        &profile,
+        profile,
         &resolved.name,
         origin,
     ) {
@@ -673,7 +706,7 @@ where
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
             policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
-            profile: &profile,
+            profile,
             profile_name: resolved.name.clone(),
             verb: "pay",
             tool: "stellar_pay_commit",
@@ -717,8 +750,8 @@ where
     }
 }
 
-/// Resolves the profile and unconditionally attempts to initialise the
-/// platform keyring store.
+/// Attempts to initialise the platform keyring store, whatever the policy
+/// engine, and decides by the profile's origin whether a failure is fatal.
 ///
 /// Unconditional (not gated on `profile.policy.engine`): the origin-aware
 /// audit pre-flight both stages calling this helper (`--sign-only`,
@@ -738,24 +771,15 @@ where
 /// (see [`crate::commands::value_audit::require_value_audit_writer_for_origin`]),
 /// so a host with no platform keyring store (e.g. a container without a
 /// Secret Service) never blocks the documented no-setup quickstart.
-fn resolve_profile_and_keyring<LoadProfile, InitKeyring>(
+fn init_keyring_for_origin<InitKeyring>(
     args: &PayArgs,
     resolved: &ResolvedProfileName,
-    load_profile: LoadProfile,
+    origin: ProfileOrigin,
     init_keyring: InitKeyring,
-) -> Result<(Profile, ProfileOrigin), i32>
+) -> Result<(), i32>
 where
-    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    let (profile, origin) = load_profile_or_synthesize_testnet_with(resolved, load_profile)
-        .map_err(|e| {
-            print_error(
-                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
-                args.output,
-            );
-            1
-        })?;
     if let Err(e) = init_keyring() {
         match origin {
             ProfileOrigin::Persisted => {
@@ -773,7 +797,7 @@ where
             }
         }
     }
-    Ok((profile, origin))
+    Ok(())
 }
 
 /// Gates a staged (`--sign-only` / `--submit-only`) envelope before it is
@@ -931,15 +955,15 @@ fn dispatch_staged_pay_gate(
     }
 }
 
-async fn run_full_pipeline<LoadProfile, InitKeyring>(
+async fn run_full_pipeline<InitKeyring>(
     context: &NetworkContext,
     args: &PayArgs,
     resolved: &ResolvedProfileName,
-    load_profile: LoadProfile,
+    profile: &Profile,
+    origin: ProfileOrigin,
     init_keyring: InitKeyring,
 ) -> i32
 where
-    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     // Require both source and a signer for the full pipeline.
@@ -953,26 +977,14 @@ where
         return 1;
     }
 
-    // ── Resolve profile & unconditionally attempt to initialise the platform
-    // keyring ──────────────────────────────────────────────────────────────
-    // Unconditional (see `resolve_profile_and_keyring`'s rustdoc): the
-    // origin-aware audit pre-flight below reads the profile's audit
-    // chain-root HMAC key from the platform keyring regardless of the policy
-    // engine, so the store must be registered before that read even on a
-    // `Noop`-engine profile. A failed attempt is origin-aware: fatal for a
-    // persisted profile; warn-only for the synthesized zero-config profile,
-    // matching the audit pre-flight's fail-open posture for that origin (see
-    // `resolve_profile_and_keyring`'s rustdoc for the full rationale).
-    let (profile, origin) = match load_profile_or_synthesize_testnet_with(resolved, load_profile) {
-        Ok(p) => p,
-        Err(e) => {
-            print_error(
-                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
-                args.output,
-            );
-            return 1;
-        }
-    };
+    // ── Unconditionally attempt to initialise the platform keyring ────────────
+    // Unconditional (see `init_keyring_for_origin`'s rustdoc). The
+    // origin-aware audit pre-flight below reads the profile's audit chain-root
+    // HMAC key from the platform keyring whatever the policy engine. The store
+    // must therefore be registered before that read, even on a `Noop`-engine
+    // profile. A failed attempt is fatal for a persisted profile and warn-only
+    // for the synthesized zero-config profile, matching the audit pre-flight's
+    // fail-open posture for that origin.
     if let Err(e) = init_keyring() {
         match origin {
             ProfileOrigin::Persisted => {
@@ -1007,7 +1019,7 @@ where
     };
     if let Ok(reconcile_client) = StellarRpcClient::new(&context.rpc_url) {
         crate::commands::submission_record::reconcile_open_reservations(
-            &profile,
+            profile,
             &resolved.name,
             &reconcile_client,
             now_ms,
@@ -1028,7 +1040,7 @@ where
     // Runs while `built` is still owned so its fields can be moved out (not
     // cloned) once the gate allows.
     let chain_id = context.chain_id.caip2_str();
-    let pay_effects = match evaluate_pay_policy(args, &built, chain_id, &profile, &resolved.name) {
+    let pay_effects = match evaluate_pay_policy(args, &built, chain_id, profile, &resolved.name) {
         Ok(effects) => effects,
         Err(code) => return code,
     };
@@ -1042,7 +1054,7 @@ where
     // `Some`, the writer is reused (not re-acquired) for the post-confirm
     // emission.
     let audit_writer = match crate::commands::value_audit::require_value_audit_writer_for_origin(
-        &profile,
+        profile,
         &resolved.name,
         origin,
     ) {
@@ -1057,14 +1069,15 @@ where
     let fee_selection = built.fee_selection;
 
     // 2. Sign.
-    let signed_xdr = match sign_envelope(context, args, &unsigned_xdr).await {
-        Ok(xdr) => xdr,
-        Err(e) => {
-            let envelope = Envelope::<()>::err(&e);
-            print_error(&envelope, args.output);
-            return 1;
-        }
-    };
+    let signed_xdr =
+        match sign_envelope(context, args, &unsigned_xdr, profile, &resolved.name).await {
+            Ok(xdr) => xdr,
+            Err(e) => {
+                let envelope = Envelope::<()>::err(&e);
+                print_error(&envelope, args.output);
+                return 1;
+            }
+        };
 
     // 3. Record, then submit. The recorder writes the receipt, the pending
     // audit row and the spending-window reservation before the bytes leave,
@@ -1072,7 +1085,7 @@ where
     let recorder = match crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
             policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
-            profile: &profile,
+            profile,
             profile_name: resolved.name.clone(),
             verb: "pay",
             tool: "stellar_pay",
@@ -1222,12 +1235,12 @@ async fn build_unsigned_envelope(
 /// signing); returns `Some(exit_code)` — with the refusal envelope already
 /// rendered — when the operation must be refused.
 ///
-/// `profile` is the already-resolved profile from the caller's top-of-gated-
-/// path load (see `run_build_only` / `run_full_pipeline`); this function does
-/// not re-resolve it, so the platform keyring store the caller already
-/// initialised (conditionally on `run_build_only`; unconditionally on
-/// `run_full_pipeline`, ahead of its origin-aware audit pre-flight) remains
-/// registered for the `build_v1_policy_engine` owner-key read below.
+/// `profile` is the profile `run_with_dependencies` loaded at entry and passed
+/// to `run_build_only` / `run_full_pipeline`. This function does not
+/// re-resolve it. The platform keyring store the caller initialised therefore
+/// stays registered for the `build_v1_policy_engine` owner-key read below.
+/// `run_build_only` initialises the store only for a non-`Noop` engine;
+/// `run_full_pipeline` always does, ahead of its origin-aware audit pre-flight.
 fn evaluate_pay_policy(
     args: &PayArgs,
     built: &BuiltPaymentEnvelope,
@@ -1309,6 +1322,8 @@ async fn sign_envelope(
     context: &NetworkContext,
     args: &PayArgs,
     unsigned_xdr: &str,
+    profile: &Profile,
+    profile_name: &str,
 ) -> Result<String, WalletError> {
     let source = args.source.as_deref().ok_or_else(|| {
         WalletError::Validation(stellar_agent_core::error::ValidationError::AddressInvalid {
@@ -1318,53 +1333,35 @@ async fn sign_envelope(
 
     let passphrase = context.network_passphrase();
 
-    if args.sign_with_ledger {
-        // Hardware path: seed never enters process memory.
-        let signer = signer_from_ledger(args.account_index, source).await?;
-        return attach_signature(unsigned_xdr, &signer, passphrase).await;
-    }
-
-    if let Some(ref var_name) = args.secret_env {
-        // mlock-protected signing window (shared ceremony):
-        //
-        // 1. Derive the SoftwareSigningKey via
-        //    `resolve_software_signer_from_env` (env -> Zeroizing<String> ->
-        //    seed Zeroizing<[u8; 32]> -> zeroize PrivateKey.0 residue ->
-        //    Wallet::unlock -> signer_from_wallet -> wallet.dispose()).
-        // 2. Verify the derived public key matches --source before signing.
-        // 3. attach_signature exactly once.
-        // 4. Drop SoftwareSigningKey -> SecretBox zeroised.
-        // A degraded mlock unlock is a separate, orthogonal concern from the
-        // audit pre-flight the caller already ran before this function: it is
-        // surfaced only via `Wallet::unlock`'s own `tracing::warn!`, not via
-        // the audit writer.
-        let SignerCeremonyOutcome {
-            signer,
-            mlock_degradation: _,
-        } = resolve_software_signer_from_env(var_name, "pay-commit", None).await?;
-
-        // Public-key verification before signing.
-        let signer_pk = signer.public_key().await?;
-        let signer_gstrkey = signer_pk.to_string().to_string();
-        if signer_gstrkey != source {
-            return Err(WalletError::Auth(AuthError::SignerKeyMismatch {
-                expected: source.to_owned(),
-                got: signer_gstrkey,
-            }));
-        }
-
-        let signed_xdr = attach_signature(unsigned_xdr, &signer, passphrase).await?;
-        drop(signer);
-
-        return Ok(signed_xdr);
-    }
-
-    Err(WalletError::Validation(
-        ValidationError::SignerSourceRequired {
-            detail: "no signer flag specified; pass --secret-env <VAR> or --sign-with-ledger"
-                .to_owned(),
-        },
-    ))
+    let signer: Box<dyn Signer + Send + Sync> =
+        match (args.sign_with_ledger, args.secret_env.as_deref()) {
+            (true, _) => Box::new(signer_from_ledger(args.account_index, source).await?),
+            (false, Some(var_name)) => {
+                let SignerCeremonyOutcome {
+                    signer,
+                    mlock_degradation: _,
+                } = resolve_software_signer_from_env(var_name, "pay-commit", profile).await?;
+                let derived = signer.public_key().await?.to_string().to_string();
+                if derived != source {
+                    return Err(AuthError::SignerKeyMismatch {
+                        expected: source.to_owned(),
+                        got: derived,
+                    }
+                    .into());
+                }
+                Box::new(signer)
+            }
+            (false, None) => {
+                return Err(ValidationError::SignerSourceRequired {
+                    detail:
+                        "no signer flag specified; pass --secret-env <VAR> or --sign-with-ledger"
+                            .to_owned(),
+                }
+                .into());
+            }
+        };
+    require_enrolled_signer(profile_name, profile, signer.as_ref()).await?;
+    attach_signature(unsigned_xdr, signer.as_ref(), passphrase).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1529,6 +1526,7 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic, reason = "test spies reject keyring access")]
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -1538,6 +1536,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::common::signer_ceremony::test_fixtures::{
+        EnrolledPin, assert_enrolled_outcome, enrolled_mainnet_profile, enrolled_test_g,
+        enrolled_test_secret,
+    };
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
 
     const SOURCE_G: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
@@ -1872,18 +1874,69 @@ mod tests {
         );
     }
 
-    /// Mainnet is rejected at the `run` boundary before any RPC call is made,
-    /// returning exit code 1.
-    ///
-    /// The test does not start a mock server; using a non-routable address
-    /// (127.0.0.1:1) ensures any accidental RPC call would fail with a
-    /// connection error rather than silently succeeding.
+    /// Mainnet is rejected at the `run` boundary: the keyring initializer is
+    /// never invoked and no request reaches the profile's endpoint.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mainnet_rejected_at_run_boundary() {
+        let guard_rpc = wiremock::MockServer::start().await;
+        let (_guard_dir, _guard_home, _guard_env) =
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(&guard_rpc.uri());
         let args = PayArgs {
-            // Zero-config group: `None` is "no profile named", the path that
-            // still synthesizes. `Some("default")` would be an explicitly
-            // named profile and would refuse instead.
+            profile: Some("guard-mainnet".into()),
+            destination: "GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGH".to_owned(),
+            amount: "10 XLM".to_owned(),
+            asset: "native".to_owned(),
+            memo_text: None,
+            memo_id: None,
+            memo_hash_hex: None,
+            memo_return_hex: None,
+            fee: None,
+            source: Some("GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGH".to_owned()),
+            secret_env: None,
+            sign_with_ledger: false,
+            account_index: 0,
+            build_only: false,
+            sign_only: None,
+            submit_only: None,
+            network: Some(TargetNetwork::Mainnet),
+            output: OutputFormat::Json,
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            rpc_url: None,
+            use_oz_relayer: false,
+        };
+        let exit = run_with_dependencies(
+            &args,
+            |name| {
+                Ok(
+                    Profile::builder_mainnet_named(name, "s", "default", "n", "a")
+                        .rpc_url(guard_rpc.uri())
+                        .build(),
+                )
+            },
+            || panic!("mainnet must not initialize the keyring"),
+        )
+        .await;
+        assert_eq!(exit, 1, "mainnet must exit with code 1");
+        assert!(
+            guard_rpc
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
+    }
+
+    /// `--network mainnet` with no profile refuses before the keyring
+    /// initializer runs and before any request reaches `--rpc-url`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mainnet_rejected_at_run_boundary_network_flag_without_profile_refuses() {
+        let guard_rpc = wiremock::MockServer::start().await;
+        let guard_home = tempfile::tempdir().expect("home");
+        let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
+        let _guard_env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let args = PayArgs {
             profile: None,
             destination: "GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGH".to_owned(),
             amount: "10 XLM".to_owned(),
@@ -1900,16 +1953,33 @@ mod tests {
             build_only: false,
             sign_only: None,
             submit_only: None,
-            network: TargetNetwork::Mainnet,
+            network: Some(TargetNetwork::Mainnet),
             output: OutputFormat::Json,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            // Non-routable: any RPC call would result in a connection error,
-            // making an accidentally-passing test impossible.
-            rpc_url: "http://127.0.0.1:1".to_owned(),
+            rpc_url: Some(guard_rpc.uri()),
             use_oz_relayer: false,
         };
-        let exit = run(&args).await;
+        let exit = run_with_dependencies(
+            &args,
+            |name| {
+                Err(
+                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
+                        name: name.into(),
+                        path: std::path::PathBuf::from("absent"),
+                    },
+                )
+            },
+            || panic!("network mismatch must not initialize the keyring"),
+        )
+        .await;
         assert_eq!(exit, 1, "mainnet must exit with code 1");
+        assert!(
+            guard_rpc
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
     }
 
     // Note: decode_32_hex_bytes and hex_nibble are now in
@@ -1954,14 +2024,11 @@ mod tests {
         args.destination = DEST_G.to_owned();
         args.amount = "1 XLM".to_owned();
         args.fee = Some("250".to_owned());
-        args.rpc_url = server.uri();
+        args.rpc_url = Some(server.uri());
 
-        let built = build_unsigned_envelope(
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-            &args,
-        )
-        .await
-        .expect("explicit fee build succeeds");
+        let built = build_unsigned_envelope(&flag_context(&args), &args)
+            .await
+            .expect("explicit fee build succeeds");
         assert_eq!(built.fee_selection.per_op_stroops, 250);
         assert_eq!(built.fee_selection.selected_fee_percentile, "explicit");
         assert_eq!(tx_fee_from_envelope_xdr(&built.envelope_xdr), 250);
@@ -2009,14 +2076,11 @@ mod tests {
         args.source = Some(SOURCE_G.to_owned());
         args.destination = DEST_G.to_owned();
         args.amount = "1 XLM".to_owned();
-        args.rpc_url = server.uri();
+        args.rpc_url = Some(server.uri());
 
-        let built = build_unsigned_envelope(
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-            &args,
-        )
-        .await
-        .expect("default fee build succeeds");
+        let built = build_unsigned_envelope(&flag_context(&args), &args)
+            .await
+            .expect("default fee build succeeds");
         assert_eq!(built.fee_selection.per_op_stroops, DEFAULT_FEE_STROOPS);
         assert_eq!(
             built.fee_selection.selected_fee_percentile,
@@ -2032,8 +2096,13 @@ mod tests {
         args.source = Some(SOURCE_G.to_owned());
         args.destination = DEST_G.to_owned();
         args.amount = "1 XLM".to_owned();
-        args.rpc_url = ignored.uri();
-        let context = NetworkContext::from_flags(args.network.caip2(), primary.uri());
+        args.rpc_url = Some(ignored.uri());
+        let mut profile = stellar_agent_core::profile::Profile::builder_testnet(
+            "signer", "default", "nonce", "default",
+        )
+        .build();
+        profile.rpc_url = primary.uri();
+        let context = NetworkContext::from_profile(&profile);
         build_unsigned_envelope(&context, &args)
             .await
             .expect("context endpoint builds");
@@ -2059,14 +2128,11 @@ mod tests {
         args.destination = DEST_G.to_owned();
         args.amount = "1 XLM".to_owned();
         args.fee = Some("auto".to_owned());
-        args.rpc_url = server.uri();
+        args.rpc_url = Some(server.uri());
 
-        let built = build_unsigned_envelope(
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-            &args,
-        )
-        .await
-        .expect("auto fee build succeeds");
+        let built = build_unsigned_envelope(&flag_context(&args), &args)
+            .await
+            .expect("auto fee build succeeds");
         assert_eq!(built.fee_selection.per_op_stroops, 333);
         assert_eq!(built.fee_selection.selected_fee_percentile, "p95");
         assert_eq!(tx_fee_from_envelope_xdr(&built.envelope_xdr), 333);
@@ -2094,12 +2160,22 @@ mod tests {
             build_only: false,
             sign_only: None,
             submit_only: None,
-            network: TargetNetwork::Testnet,
+            network: Some(TargetNetwork::Testnet),
             output: OutputFormat::Json,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            rpc_url: TESTNET_RPC_URL.to_owned(),
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
             use_oz_relayer: false,
         }
+    }
+
+    /// The context a testnet profile yields for the endpoint flags of `args`.
+    fn flag_context(args: &PayArgs) -> NetworkContext {
+        NetworkContext::new(
+            args.network.unwrap_or(TargetNetwork::Testnet).caip2(),
+            args.rpc_url
+                .clone()
+                .unwrap_or_else(|| crate::common::network::TESTNET_RPC_URL.to_owned()),
+        )
     }
 
     // ── --use-oz-relayer opt-in gate ──────────────────────────────────────────
@@ -2191,7 +2267,7 @@ mod tests {
         args.use_oz_relayer = true;
         // Non-routable address: any accidental RPC call would produce a
         // connection error, making an accidentally-passing test impossible.
-        args.rpc_url = "http://127.0.0.1:1".to_owned();
+        args.rpc_url = Some("http://127.0.0.1:1".to_owned());
         let exit = run(&args).await;
         assert_eq!(exit, 1, "relayer opt-in must exit with code 1");
     }
@@ -2438,14 +2514,11 @@ mod tests {
         args.source = Some(source_g.clone());
         args.destination = DEST_G.to_owned();
         args.amount = "1 XLM".to_owned();
-        args.rpc_url = server.uri();
+        args.rpc_url = Some(server.uri());
 
-        let built = build_unsigned_envelope(
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-            &args,
-        )
-        .await
-        .expect("build must succeed against the mocked RPC");
+        let built = build_unsigned_envelope(&flag_context(&args), &args)
+            .await
+            .expect("build must succeed against the mocked RPC");
 
         let var = "PAY_ZERO_CONFIG_E2E_TEST_SK";
         #[allow(
@@ -2487,11 +2560,9 @@ mod tests {
     /// [`zero_config_synthesized_profile_sign_only_succeeds_with_unminted_audit_key`],
     /// but the injected `init_keyring` itself errors — modelling a host with
     /// no platform keyring store at all (e.g. a container without a Secret
-    /// Service), not merely an unminted audit key. `resolve_profile_and_keyring`
-    /// must warn and continue for a synthesized profile
-    /// rather than exit fatally: catches the regression where the keyring-init
-    /// failure was unconditionally fatal regardless of origin, which would
-    /// break this exact quickstart on any host without a platform keyring.
+    /// Service), not merely an unminted audit key. `init_keyring_for_origin`
+    /// warns and continues for a synthesized profile, so the quickstart signs
+    /// on a host without a platform keyring.
     #[tokio::test]
     #[serial_test::serial]
     async fn zero_config_synthesized_profile_sign_only_succeeds_when_keyring_init_fails() {
@@ -2511,14 +2582,11 @@ mod tests {
         args.source = Some(source_g.clone());
         args.destination = DEST_G.to_owned();
         args.amount = "1 XLM".to_owned();
-        args.rpc_url = server.uri();
+        args.rpc_url = Some(server.uri());
 
-        let built = build_unsigned_envelope(
-            &NetworkContext::from_flags(args.network.caip2(), args.rpc_url.clone()),
-            &args,
-        )
-        .await
-        .expect("build must succeed against the mocked RPC");
+        let built = build_unsigned_envelope(&flag_context(&args), &args)
+            .await
+            .expect("build must succeed against the mocked RPC");
 
         let var = "PAY_ZERO_CONFIG_KEYRING_INIT_FAIL_TEST_SK";
         #[allow(
@@ -2556,11 +2624,11 @@ mod tests {
     }
 
     /// A [`ProfileOrigin::Persisted`] profile's `--sign-only` run refuses when
-    /// the platform keyring store cannot be initialised — the counterpart of
-    /// the two zero-config tests above: an operator who authored a profile
+    /// the platform keyring store cannot be initialised. It is the counterpart
+    /// of the two zero-config tests above. An operator who authored a profile
     /// file is expected to have a working platform keyring, so
-    /// `resolve_profile_and_keyring` treats this failure as fatal regardless
-    /// of the resolved engine. `resolve_profile_and_keyring` returns before
+    /// `init_keyring_for_origin` treats this failure as fatal regardless
+    /// of the resolved engine. `init_keyring_for_origin` returns before
     /// the injected `--sign-only` XDR is ever decoded, so the dummy value
     /// below is never parsed and no RPC client is constructed.
     #[tokio::test]
@@ -2878,5 +2946,58 @@ mod tests {
             result.is_ok(),
             "Noop engine must allow an undecodable (opaque) envelope too"
         );
+    }
+
+    #[allow(unsafe_code, reason = "serialized test seed variable")]
+    async fn enrolled_signing_case(pin: EnrolledPin) {
+        let g = enrolled_test_g();
+        let var = "ENROLLED_PAY_TEST_SEED";
+        unsafe {
+            std::env::set_var(var, enrolled_test_secret());
+        }
+        let mut profile = enrolled_mainnet_profile(pin);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(PayBuildRpcResponder::new(
+                account_ledger_key_xdr(&g),
+                account_entry_xdr_with_balance(&g, 100_000_000_000),
+                fee_stats_result("100", "100"),
+            ))
+            .mount(&server)
+            .await;
+        profile.rpc_url = server.uri();
+        let context = NetworkContext::from_profile(&profile);
+        let mut args = minimal_args();
+        args.source = Some(g);
+        args.destination = DEST_G.into();
+        args.secret_env = Some(var.into());
+        args.fee = Some("100".into());
+        let built = build_unsigned_envelope(&context, &args)
+            .await
+            .expect("build against mock");
+        let result =
+            sign_envelope(&context, &args, &built.envelope_xdr, &profile, "enrolled").await;
+        unsafe {
+            std::env::remove_var(var);
+        }
+        assert_enrolled_outcome(pin, result);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_signing_equal() {
+        enrolled_signing_case(EnrolledPin::Derived).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_signing_placeholder() {
+        enrolled_signing_case(EnrolledPin::Placeholder).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enrolled_signing_mismatch() {
+        enrolled_signing_case(EnrolledPin::Other).await;
     }
 }

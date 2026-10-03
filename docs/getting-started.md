@@ -17,11 +17,13 @@ reads secret keys from a named environment variable, not from the command line.
 ## Network and safety defaults
 
 - `stellar:testnet` is the default network. Friendbot funding is testnet-only.
-- `stellar:mainnet` is accepted for read-only commands. Select it via
-  `--network` where the command exposes it, or via `--rpc-url` for `balances`
-  (which has no `--network` flag). Every write or signing command
-  structurally refuses mainnet (see [Mainnet is refused for
-  writes](#mainnet-is-refused-for-writes)).
+- `stellar:mainnet` is accepted for read-only commands. Select it with a
+  mainnet profile (`--profile <NAME>`), or with `--rpc-url` for `balances`
+  (which has no `--network` flag). `--network` asserts the profile's chain
+  and never selects one. On a mainnet profile, `pay` and the other guarded
+  transaction and smart-account write commands refuse before any RPC call or
+  signer access. The remaining write commands refuse at submission (see
+  [Mainnet is refused for writes](#mainnet-is-refused-for-writes)).
 - CLI commands print a JSON envelope on stdout by default. Exit code is `0` on
   success and `1` on any error; the envelope's `error.code` carries the
   diagnostic.
@@ -155,11 +157,11 @@ Profiles live in the OS-conventional directory, one TOML file per profile name:
 | macOS    | `~/Library/Application Support/Soneso.stellar-agent/profiles/<name>.toml` |
 | Windows  | `%LOCALAPPDATA%\Soneso\stellar-agent\data\profiles\<name>.toml` |
 
-The default profile name is `default`. The `balances` and `pay` commands below
-take an explicit `--account`/`--source` and `--rpc-url` (defaulting to the
-testnet RPC), so they work without authoring a profile file. Profile-aware
-commands synthesise an in-memory testnet profile when no profile was *named*
-and no `default.toml` exists. A profile you name (with `--profile` or `STELLAR_AGENT_PROFILE`) is never replaced by that fallback.
+The default profile name is `default`. The `balances` command takes an
+explicit `--account` and `--rpc-url` (defaulting to the testnet RPC), and
+`pay` reads its endpoint from the profile, so both work without authoring a
+profile file. Profile-aware commands synthesise an in-memory testnet profile
+when no profile was *named* and no `default.toml` exists. A profile you name (with `--profile` or `STELLAR_AGENT_PROFILE`) is never replaced by that fallback.
 If its file does not exist, the command refuses.
 
 To create a persistent profile, run `profile init`:
@@ -365,6 +367,8 @@ endpoint (not Horizon).
 stellar-agent balances --account GABC...WXYZ
 ```
 
+`balances` keeps its testnet endpoint default. Transaction commands instead read endpoints from their resolved profile.
+
 Flags:
 
 - `--account <G_STRKEY>`: the account to query (required).
@@ -417,7 +421,8 @@ Other common flags:
 - `--fee <STROOPS|auto[:pNN]>`: classic fee per operation.
 - `--timeout-seconds <SECONDS>`: submission/confirmation polling timeout;
   defaults to `60`.
-- `--rpc-url <URL>`: RPC endpoint override; defaults to the testnet RPC.
+- `--rpc-url <URL>`: overrides a testnet profile's endpoint; refused on a
+  mainnet profile. The endpoint comes from the profile when absent.
 - `--output <FORMAT>`: `json` (default) or `table`.
 
 ### The unlock window
@@ -449,19 +454,25 @@ for the full flag set.
 
 ### Mainnet is refused for writes
 
-Targeting mainnet on a `--network` write command is refused before any RPC call
-or signing:
+On a mainnet profile, `pay` and the other guarded transaction and
+smart-account write commands refuse before any RPC call or signer access.
+[Mainnet-write refusal](cli-reference/index.md#mainnet-write-refusal) lists
+them.
 
 ```bash
 stellar-agent pay GDEST...WXYZ "10 XLM" \
-  --source GABC...WXYZ --secret-env WALLET_SK --network mainnet
+  --source GABC...WXYZ --secret-env WALLET_SK --profile mainnet
 # exit code 1; error.code = network.mainnet_write_forbidden
 ```
 
-Flows that take their network from the profile rather than a flag go through the
-same submit layer and are refused there. A mainnet network passphrase and a known
-mainnet RPC URL each cost zero RPC calls; beyond those two the wallet asks the
-endpoint which network it serves and refuses when the answer is mainnet. That
+`--network mainnet` on a testnet profile refuses with
+`profile.network_flag_mismatch`, because the flag asserts the profile's chain.
+The other write commands (`trustline`, `trade`, `vault`, `pool`, and `tx`)
+refuse a mainnet profile at submission, in the submit layer. They can contact
+the endpoint and load their signer before that refusal. A mainnet network
+passphrase and a known mainnet RPC URL each cost zero RPC calls; beyond those
+two the wallet asks the endpoint which network it serves and refuses when the
+answer is mainnet. That
 same answer, not the network you declared, is what the wallet checks the
 envelope's signatures against, so an envelope signed for one network cannot be
 submitted under another network's passphrase.

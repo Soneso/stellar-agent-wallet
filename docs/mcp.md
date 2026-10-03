@@ -435,6 +435,9 @@ terms.
 | `stellar_dex_trade` | Soroswap router-direct swap, behind a venue allowlist, router WASM-hash pin, and on-chain slippage re-verify, then a smart-account submit. | Signs via the smart account and submits; policy gate. |
 | `stellar_dex_quote` | On-chain Soroswap `router_get_amounts_out` quote for a token path. | Read-only. |
 
+The three DeFi signing tools accept an optional `secondary_rpc_url`. On testnet, it overrides the profile secondary; absent input uses that secondary.
+Mainnet refuses this input before lookups or gates, including equal values. Credentialed input URLs are refused.
+
 ### SEP-43 (wallet interface)
 
 | Tool | Purpose | Gating |

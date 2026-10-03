@@ -78,7 +78,7 @@ use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
-use crate::commands::smart_account::common::open_profile_audit_writer;
+use crate::commands::smart_account::common::open_audit_writer;
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::{render, resolve_profile_name};
 
@@ -263,26 +263,22 @@ pub async fn run(args: RunArgs) -> i32 {
     };
 
     // ── 7b. Open the audit log (non-fatal: proceed without emission on failure) ──
-    // The tolerance covers writer acquisition only. A profile-name mismatch is
-    // not a writer failure: it means the file governing this attestation
-    // belongs to another profile, and continuing would attest under a name the
-    // file does not own. Step 3 already refuses it; this arm keeps the
-    // tolerance from widening to cover it.
-    let audit_writer_arc: Option<Arc<Mutex<AuditWriter>>> =
-        match open_profile_audit_writer(&resolved_profile) {
-            Ok((_profile, writer, _path)) => Some(writer),
-            Err(e @ WalletError::Validation(ValidationError::ProfileNameMismatch { .. })) => {
-                render::render_json(&Envelope::<()>::err(&e));
-                return 1;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "approve: audit writer open failed; continuing without audit emission"
-                );
-                None
-            }
-        };
+    // Step 3 loaded and reconciled the profile, so the tolerance covers writer
+    // acquisition only.
+    let audit_writer_arc: Option<Arc<Mutex<AuditWriter>>> = match open_audit_writer(
+        &profile,
+        crate::common::profile_access::ProfileOrigin::Persisted,
+        &resolved_profile.name,
+    ) {
+        Ok((writer, _path)) => Some(writer),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "approve: audit writer open failed; continuing without audit emission"
+            );
+            None
+        }
+    };
     let mut audit_guard = audit_writer_arc.as_ref().map(|arc| arc.lock());
     let audit_writer_ref: Option<&mut AuditWriter> = match audit_guard.as_mut() {
         Some(Ok(g)) => Some(&mut **g),

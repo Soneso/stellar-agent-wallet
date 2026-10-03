@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Wire codes `profile.network_flag_mismatch`, `auth.enrolled_signer_unpinned`, and `auth.enrolled_signer_mismatch` identify network assertions and signer enrollment refusals.
+- Core `check_enrolled_signer` and network `enrolled_keyring_signer` enforce the enrolled identity on mainnet.
+- `--profile` selects profiles for `smart-account rules get`, `rules get-spending-limit`, `deploy-policy`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`, and `deploy-webauthn-verifier`.
+- Core `redact::CREDENTIALED_URL_INPUT_REFUSAL` is the refusal text for an RPC URL input that carries credentials.
 - `stellar_agent_network::NetworkContext` carries the chain identity and RPC endpoints for a command, with a canonical passphrase and redacted `Debug` output.
 - Core profile APIs `check_mainnet_selection` and `ResolvedProfileName::from_flag` preserve explicit profile selection. `ProfileLoadError::to_validation_error` maps loader refusals to validation errors.
 - Wire codes `profile.non_overlayable_field` and `profile.mainnet_requires_explicit_profile` identify protected overlays and implicit mainnet selection.
@@ -136,6 +140,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CLI transaction commands read their chain and endpoints from the loaded profile. An unnamed, missing profile uses the zero-config testnet profile.
+- `--network` is optional and must match the profile's chain.
+- `--rpc-url` and `--secondary-rpc-url` are optional testnet overrides. Mainnet profiles refuse either flag, including equal values.
+- An absent `--secondary-rpc-url` uses the profile's secondary endpoint. Smart-account rule commands perform their cross-RPC check when a secondary endpoint is configured.
+- Mainnet profiles read `rpc_url`, `secondary_rpc_url`, and `mcp_signer_default` from the file only. Environment and programmatic overlays naming these fields are refused.
+- The `secondary_rpc_url` inputs of `stellar_dex_trade`, `stellar_defindex_vault_deposit`, and `stellar_defindex_vault_withdraw` default to the profile's secondary endpoint. Mainnet profiles refuse these inputs before other handler work.
+- Mainnet seed, Ledger, and keyring signers must match the enrolled signer. Missing or malformed enrollment pins are refused.
+- `smart-account multicall` refuses a mainnet profile before registry, writer, or signer access.
+- RPC URL flags, including `profile init --rpc-url`, and MCP `secondary_rpc_url` inputs refuse URLs containing credentials.
+- `pay`, `claim`, and `accounts create` apply the profile's `[wallet]` unlock controls to the signing seed.
+- `accounts create --fund-with-friendbot`, `accounts deploy-c`, and `fees stats --profile` read their network from the resolved profile. `accounts deploy-c` opens an audit writer only with `--profile`.
+- `accounts deploy-c`, the four smart-account deployment commands, `rules get`, `rules get-spending-limit`, `register-multicall`, and `unregister-multicall` refuse an explicitly named missing profile.
+- `NetworkContext::from_profile` copies `secondary_rpc_url`; `NetworkContext::from_flags` is renamed `NetworkContext::new`.
+- `SignersManagerConfig` and `ContextRuleManagerConfig` redact endpoint URLs and audit writers in `Debug`. Signers manager construction errors redact endpoint URLs too.
+- The MCP tools `stellar_rule_create`, `stellar_rule_create_commit`, `stellar_rules_list`, and `stellar_rules_get` build their smart-account managers with the profile's secondary endpoint. The rule submission's cross-RPC check uses it when one is set.
 - `chain_id` comes from the profile file only. `STELLAR_AGENT_CHAIN_ID` and programmatic overlays naming `chain_id` are refused on every profile.
 - Mainnet profiles refuse `STELLAR_AGENT_RPC_URL` and programmatic overlays naming `rpc_url`, including values equal to the file.
 - A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE` never selects one, and a mainnet `default.toml` needs `--profile default`. Keep the filename: its identity is bound to its keyring entries.
@@ -402,6 +421,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- `trustline --chain-id`; the chain comes from the profile.
+- Transaction commands' clap defaults for `--network` and `--rpc-url`.
+- The `rules verify-pins` endpoint fallback by network; endpoints come from the profile.
 - `MigrationSubmitResult::new_for_test_with_failed_remove_tx_hash`; use
   `MigrationSubmitResult::new_for_test` under `test-helpers`.
 
