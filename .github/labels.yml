@@ -34,3 +34,6 @@
 - name: stale
   color: ededed
   description: No activity for 14 days; closes after 21
+- name: hacktoberfest-accepted
+  color: ff7518
+  description: Counts for Hacktoberfest after the review

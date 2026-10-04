@@ -73,6 +73,8 @@ test tiers are in
 
 ## Review process
 
+Your first pull request or issue gets an automatic welcome comment that names the next step.
+
 A maintainer acknowledges a new pull request within one working day (Monday to
 Friday, Central European Time). The review follows within three working days for
 a change to documentation, scripts, or workflows, and within five working days

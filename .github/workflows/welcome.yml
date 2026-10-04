@@ -1,0 +1,114 @@
+name: Welcome
+
+# Welcomes an account's first contribution across issues and pull requests.
+# The repository search counts both kinds, including closed contributions.
+# Owners, members, collaborators, and bots receive no welcome.
+# Event fields enter the shell through the step environment.
+# .github/scripts/test-welcome-workflow.py exercises the script with a simulated API.
+
+on:
+  pull_request_target:
+    types: [opened]
+  issues:
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  welcome:
+    if: >-
+      (github.event.pull_request.user.type || github.event.issue.user.type) != 'Bot'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    timeout-minutes: 5
+    # One run per issue or pull request holds the comment step at a time.
+    concurrency:
+      group: welcome-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Welcome the first contribution
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          EVENT: ${{ github.event_name }}
+          LOGIN: ${{ github.event.pull_request.user.login || github.event.issue.user.login }}
+          ASSOCIATION: ${{ github.event.pull_request.author_association || github.event.issue.author_association }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$NUMBER" =~ ^[0-9]+$ ]]; then
+            printf '::error::Cannot welcome #%q: NUMBER must contain only digits.\n' "$NUMBER" >&2
+            exit 1
+          fi
+          case "$EVENT" in
+            pull_request_target | issues) ;;
+            *)
+              echo "::error::Cannot welcome #$NUMBER: unsupported event." >&2
+              exit 1
+              ;;
+          esac
+          case "$ASSOCIATION" in
+            OWNER | MEMBER | COLLABORATOR)
+              echo "no welcome on #$NUMBER: maintainer"
+              exit 0
+              ;;
+          esac
+
+          if ! search=$(gh api -X GET search/issues -f "q=repo:$GH_REPO author:$LOGIN" -f per_page=1 2>/dev/null); then
+            echo "::error::Cannot welcome #$NUMBER: search fails." >&2
+            exit 1
+          fi
+          if ! count=$(jq -er 'select(.incomplete_results == false and (.items | type == "array"))
+            | .total_count | select(. >= 0 and floor == .)' <<<"$search" 2>/dev/null); then
+            echo "::error::Cannot welcome #$NUMBER: invalid search result." >&2
+            exit 1
+          fi
+          if [[ "$count" != 1 ]]; then
+            echo "no welcome on #$NUMBER: contribution count is $count"
+            exit 0
+          fi
+          # Search can return an older contribution before it indexes the new one.
+          if ! jq -e --arg number "$NUMBER" '.items[0].number == ($number | tonumber)' <<<"$search" >/dev/null 2>&1; then
+            echo "no welcome on #$NUMBER: search names another contribution"
+            exit 0
+          fi
+
+          if ! comments=$(gh api --paginate "repos/$GH_REPO/issues/$NUMBER/comments" 2>/dev/null); then
+            echo "::error::Cannot welcome #$NUMBER: comment lookup fails." >&2
+            exit 1
+          fi
+          if ! comments=$(jq -es 'select(length > 0 and all(.[]; type == "array" and all(.[]; type == "object")))
+            | add' <<<"$comments" 2>/dev/null); then
+            echo "::error::Cannot welcome #$NUMBER: invalid comment lookup." >&2
+            exit 1
+          fi
+          if jq -e 'any(.[]; .user.login? == "github-actions[bot]" and (.body | type == "string")
+            and (.body | startswith("Thanks for the pull request, @") or startswith("Thanks for the report, @")))' <<<"$comments" >/dev/null 2>&1; then
+            echo "no welcome on #$NUMBER: welcome exists"
+            exit 0
+          fi
+
+          if [[ "$EVENT" == pull_request_target ]]; then
+            # The backticks in the template hint are literal Markdown.
+            # shellcheck disable=SC2016
+            body=$(printf 'Thanks for the pull request, @%s, and welcome. A maintainer replies within one working day. The review follows within three working days for documentation, scripts, or workflows, and within five for Rust code. CI on a first contribution starts after a maintainer approves the run, which comes with the review.
+
+          Three things that save a review round:
+
+          - Fill in the pull request template: what the change does, `Closes #N` on its own line, and the commands you ran with their exit codes.
+          - Keep one pull request per issue.
+          - Keep editor and tool directories out of the branch.
+
+          The checks CI runs are listed in CONTRIBUTING.md under "Gate suite". Nothing else is needed from you until the review.' "$LOGIN")
+          else
+            body=$(printf 'Thanks for the report, @%s, and welcome. A maintainer replies within one working day. A security vulnerability goes through SECURITY.md, never a public issue.' "$LOGIN")
+          fi
+          if ! gh api --method POST "repos/$GH_REPO/issues/$NUMBER/comments" -f "body=$body" >/dev/null 2>&1; then
+            echo "::error::Cannot welcome #$NUMBER: comment fails." >&2
+            exit 1
+          fi
+          echo "welcome comment on #$NUMBER"

@@ -30,6 +30,7 @@ LABELS = [
     ("waiting on author", "fef2c0", "The next step is the contributor's"),
     ("waiting on maintainer", "d4c5f9", "The next step is ours"),
     ("stale", "ededed", "No activity for 14 days; closes after 21"),
+    ("hacktoberfest-accepted", "ff7518", "Counts for Hacktoberfest after the review"),
 ]
 HONEST = [dict(zip(("name", "color", "description"), values)) for values in LABELS]
 SAMPLE = {"name": "example", "color": "123abc", "description": "Example label"}
