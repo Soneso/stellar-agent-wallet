@@ -1,0 +1,36 @@
+# This file routes review requests to the owner of sensitive paths.
+# It does not by itself block a merge.
+/.github/ @christian-rogobete
+/Cargo.toml @christian-rogobete
+/Cargo.lock @christian-rogobete
+/deny.toml @christian-rogobete
+/rust-toolchain.toml @christian-rogobete
+/SECURITY.md @christian-rogobete
+/crates/stellar-agent-core/ @christian-rogobete
+/crates/stellar-agent-network/ @christian-rogobete
+/crates/stellar-agent-sep5/ @christian-rogobete
+/crates/stellar-agent-soroban-auth/ @christian-rogobete
+/crates/stellar-agent-nonce/ @christian-rogobete
+/crates/stellar-agent-smart-account/ @christian-rogobete
+/crates/stellar-agent-webauthn-bridge/ @christian-rogobete
+/crates/stellar-agent-approval-ui/ @christian-rogobete
+/crates/stellar-agent-approval-remote/ @christian-rogobete
+/crates/stellar-agent-windows-identity/ @christian-rogobete
+/crates/stellar-agent-headless-keyring/ @christian-rogobete
+/crates/stellar-agent-pool/ @christian-rogobete
+/crates/stellar-agent-sep10/ @christian-rogobete
+/crates/stellar-agent-sep43/ @christian-rogobete
+/crates/stellar-agent-sep45/ @christian-rogobete
+/crates/stellar-agent-sep53/ @christian-rogobete
+/crates/stellar-agent-x402/ @christian-rogobete
+/crates/stellar-agent-x402-identity/ @christian-rogobete
+/crates/stellar-agent-mpp/ @christian-rogobete
+/crates/stellar-agent-toolsets-install/ @christian-rogobete
+/crates/stellar-agent-toolsets-runtime/ @christian-rogobete
+/crates/stellar-agent-defi/ @christian-rogobete
+/crates/stellar-agent-dex/ @christian-rogobete
+/crates/stellar-agent-defindex/ @christian-rogobete
+/crates/stellar-agent-stablecoin/ @christian-rogobete
+/crates/stellar-agent-cli/ @christian-rogobete
+/crates/stellar-agent-mcp/ @christian-rogobete
+/crates/stellar-agent-test-support/ @christian-rogobete

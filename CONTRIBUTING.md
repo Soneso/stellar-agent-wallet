@@ -98,6 +98,9 @@ author of the squash commit. This needs "Allow edits by maintainers" on the pull
 request. If you prefer to make every change yourself, say so in the pull
 request.
 
+A pull request that waits on its author for 14 days gets a reminder, and it
+closes after 21 days. You can reopen it at any time.
+
 ## Contributing with a coding agent
 
 This is a wallet built for AI agents, and contributions built with AI agents are
@@ -119,6 +122,9 @@ Good entry points are the issues labeled
 [`help wanted`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
 and
 [`good first issue`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+Issues labeled `good first issue` need no Rust toolchain beyond what the issue
+names; `help wanted` issues change Rust code and run the gate suite.
+
 Issues touching signing paths, key handling, or serialized state get the second
 review pass and are better second contributions than first ones.
 

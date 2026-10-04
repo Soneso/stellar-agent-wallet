@@ -1,0 +1,32 @@
+# Sync the declared labels on main. This workflow never deletes a label.
+name: Sync labels
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/labels.yml']
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install PyYAML
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/workflow-check"
+          "$RUNNER_TEMP/workflow-check/bin/pip" install --quiet --disable-pip-version-check \
+            --require-hashes --only-binary :all: \
+            -r .github/scripts/workflow-check-requirements.txt
+      - name: Sync labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: '"$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/sync-labels.py --repo "$GITHUB_REPOSITORY"'
