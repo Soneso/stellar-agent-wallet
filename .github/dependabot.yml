@@ -1,12 +1,13 @@
-# Dependabot opens one weekly pull request that moves the GitHub Actions pins
-# in .github/workflows to their latest releases. Cargo and npm are not listed:
-# their lockfiles change only through a reviewed pull request.
+# Dependabot checks GitHub Actions references weekly and groups available updates.
+# Cargo and npm lockfile changes require a reviewed pull request.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: "ci(deps)"
     groups:
       github-actions:
         patterns:
