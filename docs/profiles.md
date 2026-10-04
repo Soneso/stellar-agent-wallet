@@ -347,11 +347,19 @@ on error.
 ### Enroll the MCP signer
 
 The signer seed is imported, not minted: it is the operator's own account key.
-Import the `S...` secret from a named environment variable:
+Import the `S...` secret from a named environment variable, set as shown in
+[Pass a secret seed](getting-started.md#pass-a-secret-seed). Run this line on
+its own, paste the seed when prompted, and press Enter:
 
 ```bash
-export WALLET_SK=S...signer-secret...
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+Enroll the seed, then remove it from the shell:
+
+```bash
 stellar-agent profile enroll-signer --profile <name> --secret-env WALLET_SK
+unset WALLET_SK
 ```
 
 Enrollment derives the seed's public address and stores the seed in the

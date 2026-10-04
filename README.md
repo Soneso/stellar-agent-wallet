@@ -112,11 +112,20 @@ stable versions only.
 ### cargo binstall (prebuilt binaries)
 
 `cargo binstall` resolves the crate on crates.io and downloads the prebuilt
-release archive for your target from the tagged release assets:
+release archive from the tagged release assets:
 
 ```bash
-cargo binstall stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
 ```
+
+Release archives exist for the five targets that
+[Prebuilt binaries](docs/getting-started.md#prebuilt-binaries-cargo-binstall)
+lists. `cargo binstall` installs the archive for the host's target, or for a
+compatible target the host runs, such as the x86_64 Windows archive under
+emulation. With `--disable-strategies quick-install,compile`, it fails when no
+such archive exists; on other hosts, use `cargo install --locked` or build from
+source. `--locked` applies when binstall builds from source, which the strategy
+flag turns off. The strategy flag needs cargo-binstall 0.17.0 or later.
 
 The CLI and MCP binaries ship in one release archive
 (`stellar-agent-{version}-{target}.tar.xz`, or `.zip` on Windows), so both
@@ -129,33 +138,34 @@ curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.
 tar -xJf stellar-agent-0.1.0-alpha.9-aarch64-apple-darwin.tar.xz
 ```
 
-then move the two binaries onto your `PATH`. On macOS, prefer this terminal
-download over the browser: archives fetched with `curl` carry no quarantine
-attribute, while browser downloads do. The macOS binaries are ad-hoc
-signed, so Gatekeeper blocks a quarantined binary on first run. The override
-and the reasoning are documented in the
-[macOS Gatekeeper note](docs/getting-started.md#macos-gatekeeper-note).
+then move the two binaries onto your `PATH`. The release signs the macOS
+binaries with a Developer ID and notarizes them. A bare executable carries no
+stapled ticket, so Gatekeeper checks notarization online. The
+[macOS Gatekeeper note](docs/getting-started.md#macos-gatekeeper-note) shows how
+to check the signature and the notarization.
 
 ### cargo install (from crates.io)
 
 Builds the binaries from the published sources:
 
 ```bash
-cargo install stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
+cargo install --locked stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
 ```
 
+`--locked` makes cargo build with the `Cargo.lock` published in the crate.
 This installs the `stellar-agent` and `stellar-agent-mcp` executables. Building
 requires the stable Rust toolchain (edition 2024).
 
 ### Build from source
 
 ```bash
-git clone https://github.com/Soneso/stellar-agent-wallet.git
+git clone --branch v0.1.0-alpha.9 https://github.com/Soneso/stellar-agent-wallet.git
 cd stellar-agent-wallet
-cargo build --release
+cargo build --release --locked
 ```
 
-The binaries land at `target/release/stellar-agent` and
+The clone checks out the release tag, and `--locked` builds with its committed
+`Cargo.lock`. The binaries land at `target/release/stellar-agent` and
 `target/release/stellar-agent-mcp`.
 
 The CLI is also discoverable as `stellar agent ...` through the `stellar-cli`
@@ -163,8 +173,8 @@ external-binary plugin convention when `stellar-agent` is on your `PATH`.
 
 ### Verifying a release
 
-`cargo binstall` trusts the GitHub release download over TLS only. Every
-release also publishes a `SHA256SUMS` manifest, a [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)
+`cargo binstall` checks the GitHub release download over TLS only, with no
+signature. Every release also publishes a `SHA256SUMS` manifest, a [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)
 keyless signature bundle per archive, and SLSA provenance, for anyone who
 wants to verify further.
 
@@ -201,20 +211,39 @@ slsa-verifier verify-artifact stellar-agent-<version>-<target>.tar.xz \
 Generate and fund an account, check its balances, and send a payment. These
 commands take an explicit account on the flags and need no profile.
 
+Generate a fresh testnet keypair and fund it from Friendbot in one step:
+
 ```bash
-# Generate a fresh testnet keypair and fund it from Friendbot in one step.
-# The JSON output carries the new G-strkey and its secret (data.secret_key).
 stellar-agent accounts create --generate --fund-with-friendbot
-
-# Export the printed secret so the signing command below can read it.
-export WALLET_SK=S...printed-secret...
-
-# Read the new account's native and trustline balances.
-stellar-agent balances --account GABC...WXYZ
-
-# Send a payment (asset is positional and defaults to native).
-stellar-agent pay GDEST...WXYZ "10 XLM" --source GABC...WXYZ --secret-env WALLET_SK
 ```
+
+The JSON output carries the new G-strkey and its secret (`data.secret_key`).
+Save the printed secret; the payment in this quickstart reads it. The command
+output holds the seed, so do not write it to a log or a shared terminal.
+
+Read the new account's XLM and trustline balances:
+
+```bash
+stellar-agent balances --account GABC...WXYZ
+```
+
+The payment reads the seed from `WALLET_SK`. Run this line on its own, paste
+the saved secret when prompted, and press Enter:
+
+```bash
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+Send a payment (the asset is positional and defaults to `native`), then
+remove the seed from the shell:
+
+```bash
+stellar-agent pay GDEST...WXYZ "10 XLM" --source GABC...WXYZ --secret-env WALLET_SK
+unset WALLET_SK
+```
+
+[Pass a secret seed](docs/getting-started.md#pass-a-secret-seed) covers
+PowerShell and the cleanup of a seed typed into a command line.
 
 `stellar-agent profile show default` requires an existing profile file and exits
 `1` on a clean install. The synthesised in-memory testnet default is used by

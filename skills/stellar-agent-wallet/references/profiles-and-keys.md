@@ -308,9 +308,15 @@ signer every MCP fund-movement tool and every keyring-signing CLI verb
 (`trustline`, `lend`, `trade`, `vault`) resolves. On a clean install that entry
 is absent and those paths fail with `auth.keyring_not_found`.
 
+The operator sets `WALLET_SK` as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows. In the operator's terminal, run this line on its own, paste the signer seed when prompted, and press Enter. The line reads the seed from the terminal, so the operator runs it, not the agent.
+
 ```bash
-export WALLET_SK=S...signer-secret...
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+```bash
 stellar-agent profile enroll-signer --profile default --secret-env WALLET_SK
+unset WALLET_SK
 ```
 
 Flags: `--secret-env <VAR>` (required; the variable NAME, never the secret),

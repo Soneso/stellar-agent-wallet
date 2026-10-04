@@ -23,11 +23,13 @@ Exceptions:
 
 ## Signer source (write verbs)
 
-Write verbs take a signer-source group: exactly one of `--signer-secret-env <VAR>` (an env-var name holding the source-account S-strkey) or `--sign-with-ledger` (mutually exclusive; the command refuses if neither is given). `--account-index <INDEX>` selects the Ledger BIP-44 index (default `0`). Pass the variable name, never the secret:
+Write verbs take a signer-source group: exactly one of `--signer-secret-env <VAR>` (an env-var name holding the source-account S-strkey) or `--sign-with-ledger` (mutually exclusive; the command refuses if neither is given). `--account-index <INDEX>` selects the Ledger BIP-44 index (default `0`). Pass the variable name, never the secret. The examples on this page that sign with `--signer-secret-env WALLET_SK` read the source-account seed from `WALLET_SK`. Before the first of them, the operator sets it as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows. In the operator's terminal, run this line on its own, paste the seed when prompted, and press Enter. The line reads the seed from the terminal, so the operator runs it, not the agent.
 
 ```bash
-export WALLET_SK="S..."
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
 ```
+
+After the last of those examples, the operator runs `unset WALLET_SK` to remove the seed from the shell.
 
 All write signing goes through the smart-account auth-entry digest path: the signer signs the auth digest, which binds the authorizing context-rule ids.
 
@@ -163,11 +165,15 @@ Mainnet seed, Ledger, and keyring signers must match the enrolled account. `rule
 - `--profile` selects the chain and endpoints. `--rpc-url` overrides testnet only and defaults to the profile endpoint. `--fee <STROOPS|auto[:pNN]>` (`auto` = p95; also `auto:p50`/`auto:p75`/`auto:p95`/`auto:p99`; absent uses the profile default 100-stroop base plus simulated Soroban resource fees). `--timeout-seconds` default `60`.
 - `--dry-run` derives the verifier address with no network access or signing; returns `status: "dry_run"`.
 
+This example reads the deployer seed from `DEPLOYER_SK`; the operator sets it as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows and unsets it after the command.
+
 ```bash
 stellar-agent smart-account deploy-webauthn-verifier --deployer-secret-env DEPLOYER_SK
 ```
 
 `smart-account deploy-ed25519-verifier` and `smart-account deploy-spending-limit-policy` deploy the OZ Ed25519-verifier and spending-limit-policy WASMs respectively, with the same idempotency, signer modes, and flags as `deploy-webauthn-verifier` above. Both are per-network singletons — deploy once per network. The Ed25519 verifier backs `--signer-ed25519`; the spending-limit policy backs `rules add-policy --kind spending-limit`.
+
+These examples read the deployer seed from `DEPLOYER_SK`; the operator sets it as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows and unsets it after the commands.
 
 ```bash
 stellar-agent smart-account deploy-ed25519-verifier --deployer-secret-env DEPLOYER_SK
@@ -175,6 +181,8 @@ stellar-agent smart-account deploy-spending-limit-policy --deployer-secret-env D
 ```
 
 `smart-account deploy-policy --kind <simple-threshold|spending-limit|weighted-threshold>` deploys any of the three policy contracts through one verb, same flags/idempotency as above; recommended over `deploy-spending-limit-policy`. Each kind uses its own salt domain, so the three kinds deployed by the same deployer on the same network land at different addresses.
+
+This example reads the deployer seed from `DEPLOYER_SK`; the operator sets it as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows and unsets it after the command.
 
 ```bash
 stellar-agent smart-account deploy-policy --kind weighted-threshold --deployer-secret-env DEPLOYER_SK
@@ -248,7 +256,7 @@ Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelo
 | `execute` | EXECUTOR (or open-execution) | `--target <C>` (req), `--function <NAME>` (req), `--operation-id <HEX>` (req), `--salt <HEX>` (req) | Dual-RPC ready-window check, fails closed if not ready. `--target`, `--function`, `--operation-id`, `--salt` must exactly match the scheduled operation, since OZ re-derives the operation id from them. |
 | `list-pending` | — | — | Read-only, mainnet OK. Cross-references the local audit log with a dual-RPC `get_operation_state` query. |
 
-The schedule-then-execute flow centers on the returned `{operation_id, salt}`:
+The schedule-then-execute flow centers on the returned `{operation_id, salt}`. The schedule step reads the proposer seed from `PROPOSER_SK`, and the execute step reads the executor seed from `EXECUTOR_SK`. The operator sets each as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows and unsets it after its command.
 
 ```bash
 # 1. Schedule (PROPOSER). Save the "salt" and operation id from the JSON output.
@@ -269,7 +277,7 @@ stellar-agent smart-account timelock execute \
   --signer-secret-env EXECUTOR_SK
 ```
 
-To abort before the delay elapses, cancel with the operation id:
+To abort before the delay elapses, cancel with the operation id. This example reads the canceller seed from `CANCELLER_SK`; the operator sets it as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows and unsets it after the command.
 
 ```bash
 stellar-agent smart-account timelock cancel \
@@ -299,6 +307,12 @@ Success envelope: `status: "submitted"`, `contract`, `function`, `arg_count`, `a
 
 Before simulating, every `--auth-rule-id` other than `0` passes the pinned-hash drift check against the profile's audit log. A verifier or policy that differs from its pin refuses with `sa.verifier_hash_drift` / `sa.policy_hash_drift`, and a check that cannot run with `sa.pin_check_unavailable`. A rule whose record holds policy pins while the rule has no policy on chain refuses with `sa.pinned_policy_absent`. A rule holding an `External` signer while its record pins no verifier refuses with `sa.pinned_verifier_absent`. Nothing is signed or sent on a refusal.
 
+This example also reads the agent's seed from `AGENT_SK`, set as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows. In the operator's terminal, run this line on its own, paste the agent's seed when prompted, and press Enter. The line reads the seed from the terminal, so the operator runs it, not the agent.
+
+```bash
+printf 'AGENT_SK seed: ' && read -rs AGENT_SK && echo && export AGENT_SK
+```
+
 ```bash
 stellar-agent smart-account execute \
   --account CABC...WXYZ \
@@ -308,6 +322,7 @@ stellar-agent smart-account execute \
   --auth-rule-id 3 \
   --rule-signer-ed25519-secret-env AGENT_SK \
   --signer-secret-env WALLET_SK
+unset AGENT_SK
 ```
 
 ## External-contract submit convention

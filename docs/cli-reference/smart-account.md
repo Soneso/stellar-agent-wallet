@@ -28,9 +28,13 @@ Every command prints one JSON envelope on stdout and returns exit code `0` on su
 
 The write verbs use the shared signer-source group: exactly one of `--signer-secret-env <VAR>` (an env-var name holding the source-account S-strkey) or `--sign-with-ledger` (the two are mutually exclusive, and the command refuses if neither is supplied), with `--account-index <INDEX>` selecting the Ledger BIP-44 index (default `0`). See [signer source](index.md#signer-source). All signing in this group goes through the smart-account auth-entry digest path: the signer signs the [auth digest](../concepts.md), which binds the authorizing context-rule ids.
 
+The examples on this page that sign with `--signer-secret-env WALLET_SK` read the source-account seed from `WALLET_SK`. Before the first of them, run this line on its own, paste the seed when prompted, and press Enter (see [Pass a secret seed](../getting-started.md#pass-a-secret-seed)):
+
 ```bash
-export WALLET_SK="S..."   # source-account secret key; pass the var name, never the secret
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
 ```
+
+After the last of those examples, run `unset WALLET_SK` to remove the seed from the shell.
 
 ## Pre-submission checks
 
@@ -592,6 +596,12 @@ On success the envelope carries `status: "submitted"`, `contract`, `function`, `
 
 Before anything is simulated or signed, every `--auth-rule-id` other than `0` goes through the [pre-submission checks](#pre-submission-checks) against the profile's audit log. A rule without a signer-set baseline refuses with `sa.signer_set_missing_baseline`, and an audit-log integrity error with `sa.audit_log`. For a checked verifier or policy, the first eight bytes of the live code hash must equal the pinned value. An external reference must also match its pinned owner, tag, and resolved hash prefix. A mismatch refuses with `sa.verifier_hash_drift` / `sa.policy_hash_drift`, and a drift check that cannot run with `sa.pin_check_unavailable`. A rule whose record holds policy pins while the rule has no policy on chain refuses with `sa.pinned_policy_absent`. A rule holding an `External` signer while its record pins no verifier refuses with `sa.pinned_verifier_absent`. A signer set that differs from the baseline refuses with `sa.signer_set_diverged`. The checks read and fetch through the same `--rpc-url` / `--secondary-rpc-url` endpoints as the submission. Endpoint disagreement is `network.rpc_divergence`. Lock timeout is `sa.auth_entry_construction_failed` at stage `rule_lock`. A deadline that elapses during the baseline read or the comparison uses that code at `baseline_read` or `signer_set_compare`. A version 1 authorizing rule compares through its projection. Its own refusals are `sa.threshold_policy_not_installed`, `sa.threshold_policy_identification_failed`, and `sa.deployment_failed`.
 
+This example also reads the agent's seed from `AGENT_SK` (see [Pass a secret seed](../getting-started.md#pass-a-secret-seed)). Run this line on its own, paste the agent's seed when prompted, and press Enter:
+
+```bash
+printf 'AGENT_SK seed: ' && read -rs AGENT_SK && echo && export AGENT_SK
+```
+
 ```bash
 stellar-agent smart-account execute \
   --account CABC...WXYZ \
@@ -603,6 +613,7 @@ stellar-agent smart-account execute \
   --auth-rule-id 3 \
   --rule-signer-ed25519-secret-env AGENT_SK \
   --signer-secret-env WALLET_SK
+unset AGENT_SK
 ```
 
 There is currently no MCP tool for this verb; see [MCP: why there is no agent-facing execute tool](../mcp.md#why-there-is-no-agent-facing-execute-tool).
@@ -662,6 +673,8 @@ Flags:
 - `--output <FORMAT>` — `json` (default) or `table`.
 - `--dry-run` — derive the verifier address with no network access or signing; returns `status: "dry_run"`.
 
+This example reads the deployer seed from `DEPLOYER_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
+
 ```bash
 stellar-agent smart-account deploy-webauthn-verifier --deployer-secret-env DEPLOYER_SK
 ```
@@ -672,6 +685,8 @@ stellar-agent smart-account deploy-webauthn-verifier --deployer-secret-env DEPLO
 
 Deploys the OpenZeppelin Ed25519-verifier WASM and records its address in the verifier registry. Same idempotency, signer modes, and flags as `deploy-webauthn-verifier` above. This is the verifier bootstrap for first-class external Ed25519 signers (`smart-account signers add --signer-ed25519`) — see [Agent delegation](../agent-delegation.md).
 
+This example reads the deployer seed from `DEPLOYER_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
+
 ```bash
 stellar-agent smart-account deploy-ed25519-verifier --deployer-secret-env DEPLOYER_SK
 ```
@@ -681,6 +696,8 @@ stellar-agent smart-account deploy-ed25519-verifier --deployer-secret-env DEPLOY
 `--profile <NAME>` selects the profile, followed by `STELLAR_AGENT_PROFILE`, then `default`. An explicitly named missing profile refuses.
 
 Deploys the OpenZeppelin spending-limit-policy WASM and records its address in the verifier registry. Same idempotency, signer modes, and flags as `deploy-webauthn-verifier` above. The policy is a per-network singleton: one deployed instance serves every account and context rule on the network, so this only needs to run once per network. Attach the deployed policy to a rule via [`smart-account rules add-policy --kind spending-limit`](#smart-account-rules-add-policy).
+
+This example reads the deployer seed from `DEPLOYER_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
 
 ```bash
 stellar-agent smart-account deploy-spending-limit-policy --deployer-secret-env DEPLOYER_SK
@@ -698,6 +715,8 @@ Extra flag:
   - `simple-threshold` — signer-count-based threshold policy. Attach via [`rules add-policy --kind simple-threshold`](#smart-account-rules-add-policy).
   - `spending-limit` — rolling-window spending-limit policy. Attach via [`rules add-policy --kind spending-limit`](#smart-account-rules-add-policy).
   - `weighted-threshold` — weighted-signer quorum policy. Attach via [`rules add-policy --kind weighted-threshold`](#smart-account-rules-add-policy); tune via [`signers set-weighted-threshold`](#smart-account-signers-set-weighted-threshold) / [`signers set-signer-weight`](#smart-account-signers-set-signer-weight).
+
+This example reads the deployer seed from `DEPLOYER_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
 
 ```bash
 stellar-agent smart-account deploy-policy \
@@ -835,6 +854,8 @@ Schedules an operation (PROPOSER role). Signs and submits. The operation salt is
 
 Flags add: `--target <C_STRKEY>` (required) — the target contract; `--function <NAME>` (required) — the function to call on execute; `--delay-ledgers <N>` (required) — minimum delay in ledgers before execution; plus the signer-source group.
 
+This example reads the proposer seed from `PROPOSER_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
+
 ```bash
 stellar-agent smart-account timelock schedule \
   --timelock CTLCK...WXYZ \
@@ -851,6 +872,8 @@ Cancels a pending operation (CANCELLER role). Signs and submits, then cross-conf
 
 Flags add: `--operation-id <HEX>` (required) — the 64-char hex id from `schedule`; plus the signer-source group.
 
+This example reads the canceller seed from `CANCELLER_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
+
 ```bash
 stellar-agent smart-account timelock cancel \
   --timelock CTLCK...WXYZ \
@@ -863,6 +886,8 @@ stellar-agent smart-account timelock cancel \
 Executes a ready operation (EXECUTOR role, or open-execution mode). A pre-flight dual-RPC state check guards the ready-window race and fails closed if the operation is not ready. The `--target`, `--function`, `--operation-id`, and `--salt` must exactly match the scheduled operation, since OpenZeppelin re-derives the operation id from them.
 
 Flags add: `--target <C_STRKEY>` (required); `--function <NAME>` (required); `--operation-id <HEX>` (required); `--salt <HEX>` (required) — the 64-char lowercase hex `salt` field from the `schedule` command's JSON output; plus the signer-source group.
+
+This example reads the executor seed from `EXECUTOR_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
 
 ```bash
 stellar-agent smart-account timelock execute \

@@ -34,7 +34,7 @@ Creates a new Stellar account in one of two mutually exclusive modes: a sponsore
 - **Policy (sponsored mode only).** After `--starting-balance` and the new account's public key are resolved and before signing, the sponsored `CreateAccount` is evaluated against `--profile`'s policy engine. This is the same evaluation the `stellar_create_account` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized. So sponsored mode works without an authored profile file until an operator opts into `policy.engine = "v1"`. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`). A profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). Friendbot mode is not gated: it debits no wallet-held funds.
 - **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` is structurally refused before any RPC, HTTP, or key access. Sponsored mode returns `network.mainnet_write_forbidden`; Friendbot mode returns `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only.
 - **Account identity.** Provide the new account's G-strkey as the positional argument, or pass `--generate` to mint a fresh ed25519 keypair in-process. Exactly one is required.
-- **Secret-key discipline.** `--generate` returns the new S-strkey in the JSON envelope's `data.secret_key` field. It is never emitted in `--output table` and never logged. Capture it from the JSON output and store it securely; for example, redirect with a restrictive umask: `umask 077 && stellar-agent accounts create --generate ... > secret.json`.
+- **Secret-key discipline.** `--generate` returns the new S-strkey in the JSON envelope's `data.secret_key` field. It is never emitted in `--output table` and never logged. Capture it from the JSON output and store it securely. The command output holds the seed, so do not write it to a log or a shared terminal.
 
 Argument groups (enforced by the parser):
 
@@ -62,15 +62,19 @@ Argument groups (enforced by the parser):
 
 The sponsor's public key must match the public key derived from the signer; a mismatch fails before submission.
 
-Example: generate a new keypair and create it under a sponsor:
+Example: generate a new keypair and create it under a sponsor. Run this line on its own, paste the sponsor seed when prompted, and press Enter. [Pass a secret seed](../getting-started.md#pass-a-secret-seed) covers other shells.
 
 ```bash
-export SPONSOR_SK="S..."   # sponsor account secret key
+printf 'SPONSOR_SK seed: ' && read -rs SPONSOR_SK && echo && export SPONSOR_SK
+```
+
+```bash
 stellar-agent accounts create \
   --generate \
   --sponsor GABC...WXYZ \
   --secret-env SPONSOR_SK \
   --starting-balance "5 XLM"
+unset SPONSOR_SK
 ```
 
 ### `stellar-agent accounts deploy-c [flags]`
@@ -115,25 +119,33 @@ The deployer account must be funded; it pays the deployment fee.
 
 A genesis signer that is not Delegated cannot itself authorize any further rule mutation (`smart-account rules`, `smart-account signers`) on the account: `add_signer` / `batch_add_signers` / rule installs authorize only via a Delegated signer's key. Deployments using `--signer-webauthn` / `--signer-ed25519` / `--signer-external` should follow up promptly with `smart-account signers add` to attach a Delegated co-signer capable of administering the account, once a policy is attached to the target rule (see [`smart-account rules add-policy`](smart-account.md#smart-account-rules-add-policy) and [`smart-account signers add`](smart-account.md#smart-account-signers-add)).
 
-Example: deploy with a random salt, signing from an env-var secret:
+Example: deploy with a random salt, signing from an env-var secret. Run this line on its own, paste the deployer seed when prompted, and press Enter:
 
 ```bash
-export DEPLOYER_SK="S..."   # deployer account secret key
+printf 'DEPLOYER_SK seed: ' && read -rs DEPLOYER_SK && echo && export DEPLOYER_SK
+```
+
+```bash
 stellar-agent accounts deploy-c \
   --initial-signer GABC...WXYZ \
   --deployer-secret-env DEPLOYER_SK \
   --salt-random
+unset DEPLOYER_SK
 ```
 
-Example: deploy with a registered WebAuthn passkey as the sole genesis signer:
+Example: deploy with a registered WebAuthn passkey as the sole genesis signer. Run this line on its own, paste the deployer seed when prompted, and press Enter:
 
 ```bash
-export DEPLOYER_SK="S..."   # deployer account secret key
+printf 'DEPLOYER_SK seed: ' && read -rs DEPLOYER_SK && echo && export DEPLOYER_SK
+```
+
+```bash
 stellar-agent accounts deploy-c \
   --signer-webauthn my-passkey \
   --accept-no-delegated-fallback \
   --deployer-secret-env DEPLOYER_SK \
   --salt-random
+unset DEPLOYER_SK
 ```
 
 ## `stellar-agent pay <DESTINATION> <AMOUNT> [ASSET] [flags]`
@@ -176,14 +188,18 @@ Argument groups (enforced by the parser):
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 | `--use-oz-relayer` | Opt into the OZ Relayer path (not implemented; declines) | optional | `false` |
 
-Example: send 10 XLM with a text memo:
+Example: send 10 XLM with a text memo. Run this line on its own, paste the source-account seed when prompted, and press Enter:
 
 ```bash
-export WALLET_SK="S..."   # source account secret key
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+```bash
 stellar-agent pay GDEST...WXYZ "10 XLM" \
   --source GSRC...WXYZ \
   --secret-env WALLET_SK \
   --memo-text "invoice-42"
+unset WALLET_SK
 ```
 
 ## `stellar-agent claim <BALANCE_ID> [flags]`
@@ -261,13 +277,17 @@ The respective refusals are `claim.not_claimant`, `claim.predicate_not_satisfied
 | `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
-Example: claim a balance received from a payment sender:
+Example: claim a balance received from a payment sender. Run this line on its own, paste the claiming account's seed when prompted, and press Enter:
 
 ```bash
-export WALLET_SK="S..."   # claiming account secret key
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+```bash
 stellar-agent claim BAAD...R4TU \
   --source GABC...WXYZ \
   --secret-env WALLET_SK
+unset WALLET_SK
 ```
 
 ## `stellar-agent balances [flags]`

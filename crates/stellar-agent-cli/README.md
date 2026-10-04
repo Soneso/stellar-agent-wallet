@@ -7,8 +7,11 @@ Command-line binary for the stellar-agent-wallet.
 ## Install
 
 ```
-cargo install stellar-agent-cli
+cargo install --locked stellar-agent-cli@0.1.0-alpha.9
 ```
+
+`--locked` makes cargo build with the `Cargo.lock` published in the crate. The
+version is spelled out because a bare crate name matches stable versions only.
 
 ## Usage
 
