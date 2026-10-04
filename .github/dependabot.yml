@@ -1,0 +1,14 @@
+# Dependabot checks GitHub Actions references weekly and groups available updates.
+# Cargo and npm lockfile changes require a reviewed pull request.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
