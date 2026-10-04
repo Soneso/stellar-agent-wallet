@@ -181,6 +181,7 @@ expect_fail "macro variant argument construction" "FAIL (f):" \
   "at crates/stellar-agent-mcp/src/macro_baseline.rs:19"
 
 # Macro arguments may be separated by whitespace without a comma.
+# shellcheck disable=SC2016 # The sed expressions intentionally match literal Rust macro metavariables.
 sed 's/\$variant:ident, \$reason:expr/\$variant:ident \$reason:expr/; s/SaSignerSetBaselinedV2, reason/SaSignerSetBaselinedV2 reason/' \
   "$WS/crates/stellar-agent-mcp/src/macro_baseline.rs" >"$TMP/whitespace-macro.rs"
 cp "$TMP/whitespace-macro.rs" "$WS/crates/stellar-agent-mcp/src/macro_baseline.rs"
@@ -188,12 +189,14 @@ expect_fail "macro variant argument without a comma" "FAIL (f):" \
   "at crates/stellar-agent-mcp/src/macro_baseline.rs:19"
 
 # (f) Braces after a macro argument do not make it a pattern.
+# shellcheck disable=SC2016 # The sed expressions intentionally match literal Rust macro metavariables.
 sed 's/\$variant:ident \$reason:expr/\$variant:ident { .. } \$reason:expr/; s/SaSignerSetBaselinedV2 reason/SaSignerSetBaselinedV2 { .. } reason/' \
   "$TMP/whitespace-macro.rs" >"$WS/crates/stellar-agent-mcp/src/macro_baseline.rs"
 expect_fail "macro variant argument followed by braces" "FAIL (f):" \
   "at crates/stellar-agent-mcp/src/macro_baseline.rs:19"
 
 # (f) Attributes after a macro argument do not exempt the variant token.
+# shellcheck disable=SC2016 # The sed expressions intentionally match literal Rust macro metavariables.
 sed 's/\$variant:ident \$reason:expr/\$variant:ident #[$m:meta] \$reason:expr/; s/SaSignerSetBaselinedV2 reason/SaSignerSetBaselinedV2 #[doc = "x"] reason/' \
   "$TMP/whitespace-macro.rs" >"$WS/crates/stellar-agent-mcp/src/macro_baseline.rs"
 expect_fail "macro variant argument followed by an attribute" "FAIL (f):" \
