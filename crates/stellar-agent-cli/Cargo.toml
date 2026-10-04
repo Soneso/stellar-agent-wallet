@@ -16,13 +16,19 @@ path = "src/main.rs"
 
 # `cargo binstall stellar-agent-cli` support. The CLI and MCP binaries share a
 # single release archive; `{ bin }` resolves to `stellar-agent` here via the
-# `[[bin]]` declaration above. `cargo binstall` users get TLS-only trust; the
-# manual-install flow provides the full signature/provenance verification (see
-# the README "Verifying a release" section).
+# `[[bin]]` declaration above. binstall installs this repository's release
+# archive for the host's target, or for a compatible target the host runs, such
+# as the x86_64 Windows archive under emulation. `disabled-strategies`, read by
+# cargo-binstall 1.8.0 and later, turns off the third-party binary host and the
+# source build, so binstall fails when no such archive exists; `cargo install
+# --locked` or a source build applies there. binstall checks the download over
+# TLS only, with no signature; the README "Verifying a release" section covers
+# signature and provenance checks.
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/stellar-agent-{ version }-{ target }.tar.xz"
 pkg-fmt = "txz"
 bin-dir = "stellar-agent-{ version }-{ target }/{ bin }{ binary-ext }"
+disabled-strategies = ["quick-install", "compile"]
 
 [package.metadata.binstall.overrides.'cfg(target_os = "windows")']
 pkg-url = "{ repo }/releases/download/v{ version }/stellar-agent-{ version }-{ target }.zip"

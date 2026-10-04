@@ -60,16 +60,26 @@ testnet-only and structurally refuses `mainnet`; see
 [CLI reference: smart-account](cli-reference/smart-account.md) for the full
 flag reference.
 
+Each signing step reads the seed it needs into an environment variable
+without echo, as [Pass a secret seed](getting-started.md#pass-a-secret-seed)
+describes, and removes it from the shell at the end of the step.
+
 ### 1. Deploy the verifier and the policy (once per network)
 
 Both are per-network singletons: deploy once, then every rule and account on
 that network reuses the same deployed contract. Each deploy is idempotent:
 re-running it after the first success returns `status: "already_deployed"`
-with no RPC traffic.
+with no RPC traffic. Run this line on its own, paste the deployer seed when
+prompted, and press Enter:
+
+```bash
+printf 'DEPLOYER_SK seed: ' && read -rs DEPLOYER_SK && echo && export DEPLOYER_SK
+```
 
 ```bash
 stellar-agent smart-account deploy-ed25519-verifier --deployer-secret-env DEPLOYER_SK
 stellar-agent smart-account deploy-spending-limit-policy --deployer-secret-env DEPLOYER_SK
+unset DEPLOYER_SK
 ```
 
 Both addresses are recorded in the local verifier registry
@@ -81,14 +91,20 @@ there automatically.
 Generate a fresh ed25519 keypair for the agent using whatever tooling you
 already trust for key material on your platform (a keyring, an HSM, or, for
 a first testnet trial, any ed25519 keypair generator). You need the 32-byte
-public key as 64-char hex; the seed stays with the agent process and never
-touches any wallet command in this guide.
+public key as 64-char hex. The agent's seed stays with the agent: in this
+guide, only `smart-account execute` reads it, from `AGENT_SK` (see
+[Submitting an agent-signed call](#submitting-an-agent-signed-call)).
 
 ### 3. Create the scoped `CallContract` rule
 
 `rules create` needs at least one signer at creation time, so start with a
 bootstrap signer, typically your own operator key, then attach the
-agent's key in the next step:
+agent's key in the next step. Run this line on its own, paste the operator
+seed when prompted, and press Enter:
+
+```bash
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
 
 ```bash
 stellar-agent smart-account rules create \
@@ -97,6 +113,7 @@ stellar-agent smart-account rules create \
   --context call-contract:CTOK...WXYZ \
   --signer-delegated GOPS...WXYZ \
   --signer-secret-env WALLET_SK
+unset WALLET_SK
 ```
 
 `--context call-contract:<C_STRKEY>` is what scopes the rule: on-chain
@@ -105,12 +122,20 @@ contract. Record the returned `rule_id`. Every following command needs it.
 
 ### 4. Attach the agent's key to that rule
 
+Run this line on its own, paste the operator seed when prompted, and press
+Enter:
+
+```bash
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
 ```bash
 stellar-agent smart-account signers add \
   --account CABC...WXYZ \
   --rule-id <RULE_ID> \
   --signer-ed25519 <AGENT_HEX_PUBKEY_64> \
   --signer-secret-env WALLET_SK
+unset WALLET_SK
 ```
 
 `--verifier` is optional here. Omitted, it resolves the network's
@@ -126,6 +151,13 @@ boundary.
 
 ### 5. Attach the spending-limit policy
 
+Run this line on its own, paste the operator seed when prompted, and press
+Enter:
+
+```bash
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
 ```bash
 stellar-agent smart-account rules add-policy \
   --account CABC...WXYZ \
@@ -134,6 +166,7 @@ stellar-agent smart-account rules add-policy \
   --limit 50000000 \
   --period 17280 \
   --signer-secret-env WALLET_SK
+unset WALLET_SK
 ```
 
 `--limit` is in stroops (`50000000` = 5 XLM); `--period` is a rolling window
@@ -162,6 +195,17 @@ its own ed25519 seed and never touches the operator's wallet key.
 auth digest with the agent's External-Ed25519 key while a separate,
 funded key pays the transaction fee and signs the envelope.
 
+The command reads two seeds. Run each line on its own, paste the seed its
+prompt names, and press Enter:
+
+```bash
+printf 'AGENT_SK seed: ' && read -rs AGENT_SK && echo && export AGENT_SK
+```
+
+```bash
+printf 'FEE_PAYER_SK seed: ' && read -rs FEE_PAYER_SK && echo && export FEE_PAYER_SK
+```
+
 ```bash
 stellar-agent smart-account execute \
   --account CABC...WXYZ \
@@ -173,6 +217,7 @@ stellar-agent smart-account execute \
   --auth-rule-id <RULE_ID> \
   --rule-signer-ed25519-secret-env AGENT_SK \
   --signer-secret-env FEE_PAYER_SK
+unset AGENT_SK FEE_PAYER_SK
 ```
 
 - `--account` is the smart account whose rule authorizes the call;

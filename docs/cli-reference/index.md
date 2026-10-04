@@ -22,9 +22,9 @@ Run `stellar-agent --help` for the live subcommand list, or `stellar-agent <comm
 
 The wallet is a public alpha; prebuilt binaries are published on the GitHub releases page for each tagged release, and all crates are published on crates.io. While only prerelease versions are published, the version must be spelled out — a bare crate name matches stable versions only. The ways to install are:
 
-- `cargo binstall stellar-agent-cli@0.1.0-alpha.9`: downloads the prebuilt GitHub release archive for your target, resolved via crates.io. The archive is `stellar-agent-<version>-<target>.tar.xz`, or `.zip` on Windows. The `stellar-agent` CLI and the `stellar-agent-mcp` server ship in one archive.
-- `cargo install stellar-agent-cli@0.1.0-alpha.9`: builds from the published sources; the installed binary is named `stellar-agent`.
-- Building from a clone with `cargo build --release`.
+- `cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.9`: downloads the prebuilt GitHub release archive, resolved through crates.io. The archive is `stellar-agent-<version>-<target>.tar.xz`, or `.zip` on Windows. The `stellar-agent` CLI and the `stellar-agent-mcp` server ship in one archive. With the strategy flag, binstall fails on a host for which no release archive exists; see [Prebuilt binaries](../getting-started.md#prebuilt-binaries-cargo-binstall) for the release targets.
+- `cargo install --locked stellar-agent-cli@0.1.0-alpha.9`: builds from the published sources with the `Cargo.lock` published in the crate and installs the binary `stellar-agent`.
+- Building from a clone of the release tag with `cargo build --release --locked`.
 
 ## Global conventions
 
@@ -77,13 +77,19 @@ The signers manager and timelock commands use the primary when no secondary is c
 
 Signing commands take a mutually exclusive signer-source group. Exactly one source is selected:
 
-- The secret-env flag — the name of an environment variable holding the source account S-strkey. Set the variable to your secret; pass the variable name, never the secret itself. This flag is spelled `--secret-env` on `pay` and `accounts create`, `--deployer-secret-env` on `accounts deploy-c`, and `--signer-secret-env` on the `smart-account` commands; the per-group pages give the exact spelling.
-- `--sign-with-ledger` — sign with a connected Ledger hardware device.
-- `--account-index <INDEX>` — the BIP-44 account index for the Ledger derivation path. Default `0`.
+- The secret-env flag: the name of an environment variable holding the source account S-strkey. Set the variable as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows; pass the variable name, never the secret itself. Its spelling is `--secret-env` on `pay` and `accounts create`, `--deployer-secret-env` on `accounts deploy-c`, and `--signer-secret-env` on the `smart-account` commands; the per-group pages give the exact spelling.
+- `--sign-with-ledger`: sign with a connected Ledger hardware device.
+- `--account-index <INDEX>`: the BIP-44 account index for the Ledger derivation path. Default `0`.
+
+Run this line on its own, paste the source-account seed when prompted, and press Enter:
 
 ```bash
-export WALLET_SK="S..."   # your source-account secret key
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+```bash
 stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ --secret-env WALLET_SK
+unset WALLET_SK
 ```
 
 ## Output envelope and exit codes

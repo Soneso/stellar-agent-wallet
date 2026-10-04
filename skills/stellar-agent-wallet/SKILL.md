@@ -2,7 +2,7 @@
 name: stellar-agent-wallet
 description: Operate the Stellar Agent Wallet, a self-custodial Stellar wallet built for AI agents, through its stellar-agent CLI and stellar-agent-mcp MCP server. Use when an agent needs to read Stellar account state, send XLM or asset payments, create accounts, manage trustlines, or claim claimable balances. Also use for OpenZeppelin smart-account governance, DeFi lending/trading/deposits, and SEP, x402, and sponsored MPP charge flows. All operations run under a local policy engine, an operator-approval gate, and a tamper-evident audit log. Approval is satisfiable via the CLI, a local web inbox, or a TLS-protected remote-approval surface. Covers the two-phase build-then-commit signing pattern, the simulate-approve-commit handshake, chain_id and the JSON result envelope, and the mainnet write gate. Reach for it when the user mentions the stellar-agent wallet, an AI-agent wallet on Stellar, MCP-driven Stellar payments, or autonomous-agent key custody.
 license: Apache-2.0
-compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.9 public alpha; install from crates.io with a pinned version, e.g. cargo binstall stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9, or build from source). Targets Stellar testnet (default) and mainnet.
+compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.9 public alpha; install from crates.io with a pinned version, for example cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
   version: "0.4.7"
   wallet_version: "0.1.0-alpha.9"
@@ -37,14 +37,18 @@ prerelease versions are published, the version must be spelled out:
 
 ```bash
 # Prebuilt binaries (fetched from the GitHub release archive):
-cargo binstall stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
 # Or build from the published sources:
-cargo install stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
+cargo install --locked stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
 ```
 
-Building from a repository clone also works
-(`cargo build --release -p stellar-agent-cli -p stellar-agent-mcp` produces
-`target/release/stellar-agent` and `target/release/stellar-agent-mcp`).
+`--locked` builds with the `Cargo.lock` published in each crate. With the
+strategy flag, binstall installs only this repository's release archive and
+fails on a host for which none exists; use `cargo install --locked` there.
+
+Building from a clone of the release tag also works
+(`cargo build --release --locked -p stellar-agent-cli -p stellar-agent-mcp`
+produces `target/release/stellar-agent` and `target/release/stellar-agent-mcp`).
 
 Point your MCP client at the server binary:
 

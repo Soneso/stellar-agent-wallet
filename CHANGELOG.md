@@ -454,6 +454,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `submit_fee_bump_idempotent` refuse mainnet inputs before any signing call
   and any request. `submit_fee_bump_idempotent` serves no cached receipt on
   mainnet.
+- `cargo binstall` of the wallet crates fails on a host for which no release
+  archive exists, including any target outside the five release targets. Use
+  `cargo install --locked` there.
+- A CI check covers the documented install commands, the secret-seed
+  procedures, and the binstall metadata on every pull request and every push
+  to `main`, including changes that touch only Markdown.
 
 ### Removed
 
@@ -487,6 +493,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SorobanAuthorizationEntry`. They describe it as the base64 `HashIdPreimage`
   of the entry, which is what the tool signs, and the result as the raw
   signature the requester assembles into the entry.
+- The README and the getting-started guide described the macOS release
+  binaries as ad-hoc signed and gave a quarantine override. They describe the
+  Developer ID signature and the notarization, and how to check both with
+  `codesign` and `spctl`.
+- The `profile enroll-owner-key` reference said the operator keeps the owner
+  seed offline. It says that `enroll-owner-key` and `sign-policy` read the
+  owner seed from the environment of the shell that runs them, and that the
+  MCP server holds only the enrolled owner public key.
 
 ### Security
 
@@ -509,6 +523,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before any signing call. All but the functions built on
   `submit_signed_invoke`, which may read state first, also refuse before any
   request.
+- The documented `cargo install` of the wallet crates resolved current
+  dependency versions and ignored the `Cargo.lock`. This affects
+  `0.1.0-alpha.1`, `0.1.0-alpha.3`, and `0.1.0-alpha.4`, whose docs name
+  `cargo install --git` of this repository, and `0.1.0-alpha.5` through
+  `0.1.0-alpha.9`, whose docs pin the crates.io versions. For `--git`, cargo
+  asks for a package name, and the command that names one ignores the
+  repository's `Cargo.lock`. The docs of `0.1.0-alpha.2` give bare crate names,
+  which match no prerelease, so cargo installs nothing while crates.io holds
+  only prereleases. This required a malicious release within a dependency's
+  version range to be live on crates.io at install time. For example, `arrayref`
+  0.3.10 was published on 2026-08-20 with a malicious dependency whose build
+  script ran on install, and was removed about 86 minutes later
+  (RUSTSEC-2026-0260). The documented commands pass `--locked`. For any version
+  up to `0.1.0-alpha.9`, use `cargo install --locked`, whatever its docs or its
+  crates.io page say.
+- In `0.1.0-alpha.1` through `0.1.0-alpha.9`, the documented procedures had the
+  reader type secret seeds into `export` lines. This required an interactive
+  shell that saves its history to a file, the default for bash and for zsh on
+  macOS. The procedures read each seed without echo, export it only for the
+  commands that need it, and unset it afterwards. If you typed a seed into a
+  command line, follow "Remove a seed from shell history" in the getting-started
+  guide.
+- `cargo binstall` could fall back to a third-party binary host or to an
+  unlocked source build. This affects `0.1.0-alpha.3` and `0.1.0-alpha.4`, whose
+  docs name `cargo binstall --git` of this repository, and `0.1.0-alpha.5`
+  through `0.1.0-alpha.9`, whose docs pin the crates.io versions. In
+  `0.1.0-alpha.1` and `0.1.0-alpha.2`, the docs give bare crate names, which
+  match no prerelease, so binstall stops at version resolution while crates.io
+  holds only prereleases. This required that binstall could not download a
+  release archive for the host's target, including on a target outside the five
+  release targets and for a version without published archives. Both wallet
+  crates set `disabled-strategies = ["quick-install", "compile"]`, which applies
+  from the next published version and needs cargo-binstall 1.8.0 or later. For
+  any version up to `0.1.0-alpha.9`, pass
+  `--locked --disable-strategies quick-install,compile`, which needs
+  cargo-binstall 0.17.0 or later.
 
 ## [0.1.0-alpha.9] - 2026-09-30
 

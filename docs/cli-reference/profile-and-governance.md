@@ -121,9 +121,15 @@ A refused migration exits `1`, writes nothing, and leaves the v1 file unchanged:
 
 ### `profile enroll-signer`
 
+Run this line on its own, paste the signer seed when prompted, and press Enter. [Pass a secret seed](../getting-started.md#pass-a-secret-seed) covers other shells.
+
 ```bash
-export WALLET_SK=S...signer-secret...
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+```bash
 stellar-agent profile enroll-signer --profile default --secret-env WALLET_SK
+unset WALLET_SK
 ```
 
 Imports an operator-held ed25519 seed into the profile's `mcp_signer_default` keyring entry — the signer every MCP fund-movement tool and every keyring-signing CLI verb (`trustline`, `lend`, `trade`, `vault`) resolves. On a clean install that entry is absent and those paths fail with `auth.keyring_not_found`; this command is the way to populate it. State-changing (keyring; also the profile TOML the first time a profile enrolls a signer — see below), no network. The seed is read from a named environment variable through the shared mlock-protected ceremony and stored verbatim; it is never printed, logged, or returned.
@@ -143,12 +149,18 @@ Exits `1` with `ProfileNotFound` if the profile does not exist, `enroll_signer.a
 
 ### `profile enroll-owner-key`
 
+Run this line on its own, paste the owner seed when prompted, and press Enter:
+
 ```bash
-export WALLET_OWNER_SK=S...owner-secret...
-stellar-agent profile enroll-owner-key --profile default --secret-env WALLET_OWNER_SK
+printf 'WALLET_OWNER_SK seed: ' && read -rs WALLET_OWNER_SK && echo && export WALLET_OWNER_SK
 ```
 
-Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id` keyring entry — the key the V1 policy engine verifies every policy file against. The owner key is the root of trust for policy: whoever can sign a policy file can authorise any action the policy permits. The always-online agent therefore holds only the public key; the operator keeps the seed offline and signs policy files with `sign-policy`. State-changing (keyring), no network. The owner `S...` seed is read from a named environment variable through the shared mlock-protected ceremony; only the derived public key is stored, and the seed is never printed, logged, or returned.
+```bash
+stellar-agent profile enroll-owner-key --profile default --secret-env WALLET_OWNER_SK
+unset WALLET_OWNER_SK
+```
+
+Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id` keyring entry, the key the V1 policy engine verifies every policy file against. The owner key is the root of trust for policy: whoever can sign a policy file can authorize any action the policy permits. `enroll-owner-key` and `sign-policy` read the owner seed from the environment of the shell that runs them. Supply it with the read line only for those commands, as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) describes, and unset it afterwards. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment. State-changing (keyring), no network. The command passes the seed through the shared mlock-protected ceremony, stores only the derived public key, and never prints, logs, or returns the seed.
 
 - `--secret-env <VAR>` (required) — name of the environment variable holding the owner `S...` strkey. The flag takes the variable name, never the secret.
 - `--profile <NAME>`: profile whose owner coordinate is written (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
@@ -165,9 +177,15 @@ Exits `1` with `ProfileNotFound` if the profile does not exist, `enroll_owner_ke
 
 ### `profile sign-policy`
 
+Run this line on its own, paste the owner seed when prompted, and press Enter:
+
 ```bash
-export WALLET_OWNER_SK=S...owner-secret...
+printf 'WALLET_OWNER_SK seed: ' && read -rs WALLET_OWNER_SK && echo && export WALLET_OWNER_SK
+```
+
+```bash
 stellar-agent profile sign-policy --profile default --secret-env WALLET_OWNER_SK
+unset WALLET_OWNER_SK
 ```
 
 Signs a V1 policy file so the engine accepts it. The engine loads `<state_dir>/policies/<profile>.toml`, recomputes the canonical form (the `[signature]` table excluded), and verifies the signature against the enrolled owner public key. This command produces that `[signature]` table: it computes the same canonical BLAKE3 digest the loader computes, signs it with the owner seed, and writes `owner_id` (the owner G-strkey) and `sig` (hex) back into the file. State-changing (writes the policy file), no network. The owner seed is read from a named environment variable and held only in zeroizing memory; it is never printed, logged, or written to disk.

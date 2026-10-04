@@ -56,13 +56,19 @@ These recur with the same meaning across groups:
 
 Signing commands take a mutually exclusive signer-source group (exactly one):
 
-- The secret-env flag — the **name of an environment variable** holding the source-account S-strkey. Set the variable to your secret; pass the variable name, never the secret. Spelled `--secret-env` on `pay` / `accounts create`, `--deployer-secret-env` on `accounts deploy-c` and the `smart-account deploy-*` verbs (`deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`), `--signer-secret-env` on the `smart-account` commands.
-- `--sign-with-ledger` — sign with a connected Ledger hardware device.
-- `--account-index <INDEX>` — BIP-44 account index for the Ledger derivation path. Default `0`.
+- The secret-env flag: the **name of an environment variable** holding the source-account S-strkey. The operator sets the variable as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows; pass the variable name, never the secret. Spelled `--secret-env` on `pay` / `accounts create`, `--deployer-secret-env` on `accounts deploy-c` and the `smart-account deploy-*` verbs (`deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`), `--signer-secret-env` on the `smart-account` commands.
+- `--sign-with-ledger`: sign with a connected Ledger hardware device.
+- `--account-index <INDEX>`: BIP-44 account index for the Ledger derivation path. Default `0`.
+
+In the operator's terminal, run this line on its own, paste the source-account seed when prompted, and press Enter. The line reads the seed from the terminal, so the operator runs it, not the agent.
 
 ```bash
-export WALLET_SK="S..."   # source-account secret key
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+```bash
 stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ --secret-env WALLET_SK
+unset WALLET_SK
 ```
 
 ### Mainnet-write refusal
@@ -99,12 +105,18 @@ Argument groups (parser-enforced): mode (exactly one) `--sponsor` xor `--fund-wi
 | `--friendbot-url <URL>` | Friendbot endpoint (Friendbot mode) | `https://friendbot.stellar.org` |
 | `--network` / `--fee` / `--timeout-seconds` / `--rpc-url` / `--output` | shared (sponsored mode) | as above |
 
-The sponsor public key must match the public key derived from the signer.
+The sponsor public key must match the public key derived from the signer. `--generate` prints the new account's seed in `data.secret_key`; the command output holds the seed, so do not write it to a log or a shared terminal.
+
+In the operator's terminal, run this line on its own, paste the sponsor seed when prompted, and press Enter. The line reads the seed from the terminal, so the operator runs it, not the agent.
 
 ```bash
-export SPONSOR_SK="S..."
+printf 'SPONSOR_SK seed: ' && read -rs SPONSOR_SK && echo && export SPONSOR_SK
+```
+
+```bash
 stellar-agent accounts create --generate --sponsor GABC...WXYZ \
   --secret-env SPONSOR_SK --starting-balance "5 XLM"
+unset SPONSOR_SK
 ```
 
 ### `accounts deploy-c [flags]`
@@ -130,10 +142,16 @@ Argument groups: deployer (exactly one) `--deployer-secret-env` xor `--sign-with
 
 A non-Delegated genesis signer cannot itself authorize any further rule mutation (`smart-account rules`/`signers` authorize only via a Delegated signer); follow up with `smart-account signers add` to attach a Delegated co-signer once a policy is attached to the target rule.
 
+In the operator's terminal, run this line on its own, paste the deployer seed when prompted, and press Enter. The line reads the seed from the terminal, so the operator runs it, not the agent.
+
 ```bash
-export DEPLOYER_SK="S..."
+printf 'DEPLOYER_SK seed: ' && read -rs DEPLOYER_SK && echo && export DEPLOYER_SK
+```
+
+```bash
 stellar-agent accounts deploy-c --initial-signer GABC...WXYZ \
   --deployer-secret-env DEPLOYER_SK --salt-random
+unset DEPLOYER_SK
 ```
 
 ---
@@ -167,10 +185,16 @@ Under `policy.engine = "v1"` `pay` evaluates operator policy before signing. The
 
 Before the transaction is sent, `pay` records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. A submission whose confirmation does not arrive exits 1 with `submission.tx_timeout`, keeps that record, and carries the full transaction hash in `error.details`. Resolve it with `tx status <HASH>`, never by rebuilding and re-sending: a second submission for the same source account and sequence is refused with `submission.tx_already_submitted` while the first stands. The same applies to `claim`, `accounts create`, `trustline`, `trade` and `vault`.
 
+In the operator's terminal, run this line on its own, paste the source-account seed when prompted, and press Enter. The line reads the seed from the terminal, so the operator runs it, not the agent.
+
 ```bash
-export WALLET_SK="S..."
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+```bash
 stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ \
   --secret-env WALLET_SK --memo-text "invoice-42"
+unset WALLET_SK
 ```
 
 ---
@@ -261,9 +285,15 @@ Under `policy.engine = "v1"` `claim` evaluates operator policy before signing. T
 
 The build stage prints a typed preview (balance id, asset, amount, claimants, `is_claimant`, predicate verdict) to stdout before the guards run, so the operator sees the balance disclosure even when a guard subsequently refuses.
 
+In the operator's terminal, run this line on its own, paste the claiming account's seed when prompted, and press Enter. The line reads the seed from the terminal, so the operator runs it, not the agent.
+
 ```bash
-export WALLET_SK="S..."
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+```bash
 stellar-agent claim BAAD...WXYZ --source GSRC...WXYZ --secret-env WALLET_SK
+unset WALLET_SK
 ```
 
 ---
@@ -415,6 +445,8 @@ Creates, lists, shows, and migrates profiles, and rotates the keyring-backed key
 | `enroll-signer` | `profile enroll-signer --profile default --secret-env WALLET_SK` | State-changing (keyring, and the profile TOML when the account is still a placeholder). Imports the operator's `S...` ed25519 seed from the named env var and stores it verbatim at the profile's `mcp_signer_default` coordinate (the signer every MCP fund-movement tool and keyring-signing CLI verb resolves). Classification uses the raw on-disk value: the literal placeholder `"default"` is pinned to the derived G-strkey (only that key is patched); a pinned G-strkey mismatch refuses; any other value refuses as malformed (`enroll_signer.account_malformed`). `--secret-env <VAR>` (required, the variable name), `--profile <NAME>` (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default`), `--expected-address <G_STRKEY>`, `--force`. |
 | `enroll-owner-key` | `profile enroll-owner-key --profile default --secret-env WALLET_OWNER_SK` | State-changing (keyring). Derives the owner ed25519 PUBLIC key from an operator `S...` seed and stores it at `policy_owner_key_id` (the key the V1 engine verifies against). The seed is never stored. `--expected-address`, `--force`. |
 | `sign-policy` | `profile sign-policy --profile default --secret-env WALLET_OWNER_SK` | State-changing (writes the policy file, atomic). Signs `<state_dir>/policies/<profile>.toml` (or `--file`) with the owner seed and writes the `[signature]` table. Refuses if the seed does not match the enrolled owner key. |
+
+`enroll-signer` reads the signer seed, and `enroll-owner-key` and `sign-policy` read the owner seed, from the environment of the shell that runs them. The operator supplies each seed as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows, only for those commands, and unsets it afterwards. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment.
 
 ### Key-rotation subcommands
 

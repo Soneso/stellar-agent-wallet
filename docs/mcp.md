@@ -38,12 +38,12 @@ This alpha does not offer an HTTP or SSE transport. stdio is the only transport.
 ### Availability
 
 This is a public alpha. Install with
-`cargo binstall stellar-agent-mcp@0.1.0-alpha.9` (prebuilt binary from the
-tagged GitHub release, resolved via crates.io), with
-`cargo install stellar-agent-mcp@0.1.0-alpha.9` (built from the published
-sources), or build from source. While only prerelease versions are published
-on crates.io, the version must be spelled out. A bare crate name matches
-stable versions only. See
+`cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-mcp@0.1.0-alpha.9`
+(prebuilt binary from the tagged GitHub release, resolved through crates.io),
+with `cargo install --locked stellar-agent-mcp@0.1.0-alpha.9` (built from the
+published sources and their `Cargo.lock`), or build from source. While
+crates.io holds only prerelease versions, the version must be spelled out. A
+bare crate name matches stable versions only. See
 [the CLI reference](./cli-reference/) and the repository README for build
 instructions; the build that produces `stellar-agent` produces
 `stellar-agent-mcp` alongside it.

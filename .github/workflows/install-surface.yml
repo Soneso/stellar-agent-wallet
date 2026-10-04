@@ -1,0 +1,36 @@
+name: Install surface
+
+# Checks the documented install commands, the secret-seed procedures, and the
+# binstall metadata (.github/scripts/check-install-surface.py), then runs the
+# check's self-test. It has no paths filter, so a change that touches only
+# Markdown runs it too.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Supersede in-flight runs for the same ref so rapid pushes do not queue stale
+# work.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The job only reads the checked-out source.
+permissions:
+  contents: read
+
+jobs:
+  install-surface:
+    name: install surface
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: python3 .github/scripts/check-install-surface.py
+      - run: python3 .github/scripts/test-check-install-surface.py

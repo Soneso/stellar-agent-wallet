@@ -13,6 +13,7 @@ testnet account, checking a balance, and making a first payment.
 Throughout, replace placeholder identifiers (`GABC...WXYZ`, `WALLET_SK`) with
 your own values. Never paste a real secret seed into a shell history; the wallet
 reads secret keys from a named environment variable, not from the command line.
+[Pass a secret seed](#pass-a-secret-seed) shows how to set that variable.
 
 ## Network and safety defaults
 
@@ -49,13 +50,25 @@ from GitHub release archives. A single release archive carries both binaries:
 - Binaries inside: `stellar-agent` and `stellar-agent-mcp`.
 
 ```bash
-cargo binstall stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
 ```
 
 While only prerelease (alpha) versions are published on crates.io, the version
 must be spelled out. A bare crate name matches stable versions only. The
 release archives this command fetches are published with each tagged release
 on the repository's releases page.
+
+Release archives exist for five targets: `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, and
+`x86_64-pc-windows-msvc`. `cargo binstall` installs the archive for the host's
+target, or for a compatible target the host runs, such as the x86_64 Windows
+archive under emulation. With `--disable-strategies quick-install,compile`, it
+fails when no such archive exists; on other hosts, use
+[`cargo install --locked`](#cargo-install-from-cratesio) or
+[build from source](#build-from-source). `cargo binstall` checks the download
+over TLS only, with no signature. `--locked` applies when binstall builds from
+source, which the strategy flag turns off. The strategy flag needs
+cargo-binstall 0.17.0 or later.
 
 Without any Rust tooling, fetch and extract the archive directly (substitute
 your target):
@@ -71,21 +84,18 @@ build provenance. Verify a download against those before running it.
 
 #### macOS Gatekeeper note
 
-The macOS binaries are currently ad-hoc signed, not Developer-ID signed or
-notarized. Gatekeeper blocks a QUARANTINED binary on first run with "Apple
-cannot check it for malicious software", and the quarantine attribute is set
-by browser downloads, not by terminal downloads. Fetching the archive with
-`curl` (or `cargo binstall`) avoids the block entirely. For an archive that
-came through a browser, verify it against `SHA256SUMS` or its Sigstore
-bundle, then approve the binaries once with either:
+The release signs the macOS binaries with a Developer ID and notarizes them. A
+bare executable carries no stapled ticket, so Gatekeeper checks notarization
+online. To check a binary yourself:
 
 ```bash
-xattr -d com.apple.quarantine ./stellar-agent ./stellar-agent-mcp
+codesign -dvv ./stellar-agent
+spctl -a -vv -t install ./stellar-agent
 ```
 
-or right-click the binary in Finder and choose Open. Binaries built from
-source or installed via `cargo install` carry no quarantine attribute and are
-unaffected.
+`codesign` prints `Authority=Developer ID Application` with the signing team,
+and `spctl` prints `accepted` and `source=Notarized Developer ID`. Run both
+commands on `./stellar-agent-mcp` too.
 
 ### cargo install (from crates.io)
 
@@ -94,17 +104,19 @@ your `PATH`; the `stellar-agent-cli` crate installs the binary named
 `stellar-agent`:
 
 ```bash
-cargo install stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
+cargo install --locked stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
 ```
+
+`--locked` makes cargo build with the `Cargo.lock` published in the crate.
 
 ### Build from source
 
-Clone the repository and build with Cargo:
+Clone the release tag and build with its committed `Cargo.lock`:
 
 ```bash
-git clone https://github.com/Soneso/stellar-agent-wallet
+git clone --branch v0.1.0-alpha.9 https://github.com/Soneso/stellar-agent-wallet
 cd stellar-agent-wallet
-cargo build --release
+cargo build --release --locked
 ```
 
 The two binaries are produced at:
@@ -285,19 +297,77 @@ stellar-agent profile migrate default
 For the full profile schema, every field, and the key-rotation ceremony, see
 [Profiles](profiles.md).
 
+## Pass a secret seed
+
+Signing commands read a secret seed from the environment variable that
+`--secret-env` names. Read the seed without echo, export it only for the
+commands that need it, and unset it afterwards. A seed typed into a command line
+lands in the shell history file.
+
+In bash or zsh, run this line on its own, paste the seed when prompted, and
+press Enter. It prints nothing while you paste:
+
+```bash
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+Run the commands that use the seed, then remove it from the shell:
+
+```bash
+unset WALLET_SK
+```
+
+Every program the shell starts while the variable is set inherits it, so unset
+it before you start anything else from that shell, such as an MCP client.
+
+In PowerShell 7.1 and later:
+
+```powershell
+$env:WALLET_SK = Read-Host -MaskInput 'WALLET_SK seed'
+```
+
+In Windows PowerShell 5.1 and later:
+
+```powershell
+$env:WALLET_SK = [System.Net.NetworkCredential]::new('', (Read-Host -AsSecureString 'WALLET_SK seed')).Password
+```
+
+In both, remove the seed when you are done:
+
+```powershell
+Remove-Item Env:WALLET_SK
+```
+
+`cmd.exe` has no input that hides typing, so use PowerShell on Windows.
+
+### Remove a seed from shell history
+
+A seed typed into a command line earlier, for example in an `export` line, is
+in the shell history. To remove it:
+
+1. Close every shell that typed the seed, or clear its in-memory history first.
+   An open shell writes its history to the file when it exits.
+2. Delete the lines that hold the seed from `~/.bash_history` and
+   `~/.zsh_history`. On macOS, also delete them from the files in
+   `~/.zsh_sessions/` and `~/.bash_sessions/` whose names end in `.history`
+   or `.historynew`.
+3. If the account holds value, move it to a new key and enroll that key.
+
 ## Create and fund a testnet account
 
 If you do not already hold an account, generate one and fund it in a single
 step. `--generate` mints a fresh ed25519 keypair in-process and returns both the
 G-strkey and the secret in the JSON envelope (the secret in `data.secret_key`,
-never in `--output table` and never logged); `--fund-with-friendbot` funds it
-from Friendbot (testnet only). Capture the printed keys and export the secret so
-the signing commands below can read it:
+never in `--output table` and never logged). `--fund-with-friendbot` funds it
+from Friendbot (testnet only):
 
 ```bash
 stellar-agent accounts create --generate --fund-with-friendbot
-export WALLET_SK=S...printed-secret...
 ```
+
+Save the printed secret; the [enroll](#enroll-the-mcp-signer) and
+[payment](#make-a-first-payment-on-testnet) steps read it. The command output
+holds the seed, so do not write it to a log or a shared terminal.
 
 To fund an account you already hold, call Friendbot directly. Mainnet is
 structurally refused (`network.friendbot_mainnet_forbidden`) before any HTTP
@@ -330,11 +400,18 @@ refuse `audit.chain_key_unavailable`.
 
 On a profile fresh from `profile init`, `mcp_signer_default.account` is still
 the placeholder `"default"`; enrollment populates it automatically with the
-enrolled seed's derived address:
+enrolled seed's derived address. Run this line on its own, paste the seed when
+prompted, and press Enter:
 
 ```bash
-export WALLET_SK=S...your-testnet-secret...
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+Enroll the seed, then remove it from the shell:
+
+```bash
 stellar-agent profile enroll-signer --profile default --secret-env WALLET_SK
+unset WALLET_SK
 ```
 
 To pin the signer identity to a specific address in advance, refusing any
@@ -392,14 +469,21 @@ destinations before signing.
 
 Provide the secret key through an environment variable named with `--secret-env`;
 the wallet reads the variable, never the literal key on the command line. Amounts
-carry explicit units.
+carry explicit units. Run this line on its own, paste the seed when prompted,
+and press Enter:
 
 ```bash
-export WALLET_SK=S...your-testnet-secret...
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+Send the payment, then remove the seed from the shell:
+
+```bash
 stellar-agent pay GDEST...WXYZ "10 XLM" \
   --source GABC...WXYZ \
   --secret-env WALLET_SK \
   --memo-text "invoice-42"
+unset WALLET_SK
 ```
 
 Signer source (one of the following, mutually exclusive):

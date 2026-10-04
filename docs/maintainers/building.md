@@ -32,9 +32,9 @@ The workspace targets Rust edition 2024.
 The gate suite uses three auxiliary Cargo subcommands. Install them with:
 
 ```bash
-cargo install cargo-llvm-cov
-cargo install cargo-machete
-cargo install cargo-deny
+cargo install --locked cargo-llvm-cov
+cargo install --locked cargo-machete
+cargo install --locked cargo-deny
 ```
 
 `cargo-llvm-cov` also needs the `llvm-tools-preview` rustup component:
@@ -144,6 +144,18 @@ cargo deny check
 
 See [Licenses](#licenses) for the allow-list posture.
 
+### Install surface
+
+```bash
+python3 .github/scripts/check-install-surface.py
+python3 .github/scripts/test-check-install-surface.py
+```
+
+The check covers the documented install commands, version pins, and
+secret-seed procedures, and the binstall metadata of both wallet crates; its
+header defines each rule. The self-test runs the check on copies of the tree,
+with one violation injected per case. Both scripts need Python 3.11 or later.
+
 ### Windows storage regression (CI-only)
 
 CI runs a `windows-storage` job on a Windows runner covering the storage
@@ -204,6 +216,9 @@ the already-published registry copies of the current-version `core` and
 new MPP APIs. `cargo package -p stellar-agent-mpp --no-verify` may be used on the
 feature branch to inspect the source archive, but it is not a substitute for
 the post-bump verification.
+
+Release preparation also bumps the version pins in the documentation and the
+crate READMEs, which a CI check compares with the workspace version.
 
 MPP storage uses the same cross-platform locking contract as the approval and
 policy stores. Windows CI must cover MPP state lock contention, atomic replace,
