@@ -32,10 +32,13 @@ The workspace targets Rust edition 2024.
 The gate suite uses three auxiliary Cargo subcommands. Install them with:
 
 ```bash
-cargo install cargo-llvm-cov
-cargo install cargo-machete
-cargo install cargo-deny
+cargo install --locked cargo-llvm-cov --version 0.8.7
+cargo install --locked cargo-machete --version 0.9.2
+cargo install --locked cargo-deny --version 0.19.9
 ```
+
+Keep these versions aligned with the `tool:` entries in `.github/workflows/ci.yml`.
+The `machete` CI job checks the documented versions against CI before it runs.
 
 `cargo-llvm-cov` also needs the `llvm-tools-preview` rustup component:
 
