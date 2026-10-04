@@ -1,0 +1,101 @@
+{
+  "SECURITY.md": {
+    "em-dash": 7
+  },
+  "crates/stellar-agent-headless-keyring/README.md": {
+    "british-initialis": 1,
+    "em-dash": 2
+  },
+  "crates/stellar-agent-mcp/docs/usage.md": {
+    "em-dash": 17
+  },
+  "crates/stellar-agent-sep43/README.md": {
+    "british-serialis": 1
+  },
+  "crates/stellar-agent-toolsets/tests/fixtures/invalid-capability-unknown/unknown-cap/TOOLSET.md": {
+    "british-recognis": 1
+  },
+  "docs/cli-reference/defi-and-pool.md": {
+    "british-initialis": 1
+  },
+  "docs/cli-reference/index.md": {
+    "british-initialis": 1,
+    "em-dash": 7
+  },
+  "docs/cli-reference/profile-and-governance.md": {
+    "british-authoris": 1,
+    "british-initialis": 3,
+    "em-dash": 72
+  },
+  "docs/cli-reference/smart-account.md": {
+    "em-dash": 53
+  },
+  "docs/cli-reference/stellar-ops.md": {
+    "british-recognis": 1
+  },
+  "docs/concepts.md": {
+    "em-dash": 25
+  },
+  "docs/maintainers/audit-log-recovery.md": {
+    "british-recognis": 1
+  },
+  "docs/maintainers/security-internals.md": {
+    "british-authoris": 1,
+    "british-behaviour": 2,
+    "british-initialis": 3,
+    "british-recognis": 2,
+    "british-serialis": 3
+  },
+  "docs/mcp.md": {
+    "british-initialis": 1,
+    "british-recognis": 1,
+    "british-serialis": 1,
+    "em-dash": 26
+  },
+  "docs/profiles.md": {
+    "british-behaviour": 1,
+    "british-initialis": 1,
+    "em-dash": 33
+  },
+  "docs/toolsets.md": {
+    "british-recognis": 1
+  },
+  "examples/toolsets/README.md": {
+    "em-dash": 3
+  },
+  "examples/toolsets/balance-reporter/TOOLSET.md": {
+    "em-dash": 4
+  },
+  "examples/toolsets/payment-sender/TOOLSET.md": {
+    "em-dash": 4
+  },
+  "skills/stellar-agent-wallet/SKILL.md": {
+    "em-dash": 27
+  },
+  "skills/stellar-agent-wallet/references/approvals-and-audit.md": {
+    "british-authoris": 1
+  },
+  "skills/stellar-agent-wallet/references/cli-reference.md": {
+    "british-initialis": 3,
+    "em-dash": 54
+  },
+  "skills/stellar-agent-wallet/references/defi.md": {
+    "british-initialis": 1
+  },
+  "skills/stellar-agent-wallet/references/mcp-tools.md": {
+    "em-dash": 22
+  },
+  "skills/stellar-agent-wallet/references/profiles-and-keys.md": {
+    "british-behaviour": 1,
+    "em-dash": 31
+  },
+  "skills/stellar-agent-wallet/references/security.md": {
+    "british-behaviour": 2
+  },
+  "skills/stellar-agent-wallet/references/smart-accounts.md": {
+    "em-dash": 10
+  },
+  "tests/policy-fixtures/README.md": {
+    "em-dash": 2
+  }
+}

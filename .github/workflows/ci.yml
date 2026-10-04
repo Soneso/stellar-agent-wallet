@@ -1,16 +1,16 @@
 name: CI
 
-# Offline gate suite for the workspace. Every push and pull request to main runs
-# format, lint, rustdoc, the offline test tier, unused-dependency detection, and the
-# license/advisory check. The live testnet-acceptance tests are intentionally
-# out of scope here: they hit real RPC and Friendbot and run from a separate,
-# deliberately paced workflow.
+# Every pull request to main runs the offline gate suite, including docs changes.
+# Pushes to main use the paths filter below. Skill changes run the archive checks.
+# The suite covers format, lint, rustdoc, offline tests, dependencies, and licenses.
+# Live testnet tests run in a separate workflow.
 
 on:
   push:
     branches: [main]
-    # Plain documentation and the root plugin manifest cannot affect a gate.
-    # Skill changes do run CI because release-contracts verifies the archive.
+    # Documentation, the license, and the plugin manifest cannot change a gate
+    # result, so pushes skip them.
+    # Skill changes run CI because release-contracts verifies the archive.
     paths:
       - '**'
       - '!**/*.md'
@@ -19,12 +19,6 @@ on:
       - 'skills/**'
   pull_request:
     branches: [main]
-    paths:
-      - '**'
-      - '!**/*.md'
-      - '!LICENSE'
-      - '!.claude-plugin/**'
-      - 'skills/**'
 
 # Supersede in-flight runs for the same ref so rapid pushes do not queue stale
 # work.
@@ -46,6 +40,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
         with:
           toolchain: stable
@@ -58,6 +54,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
         with:
           toolchain: stable
@@ -81,6 +79,8 @@ jobs:
       RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
         with:
           toolchain: stable
@@ -99,6 +99,8 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       # The smart-account dependency closure (Arkworks, wasmi, soroban-env-host)
       # plus every compiled test binary is large; reclaim space the build does
       # not need.
@@ -136,6 +138,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: 24.5.0
@@ -148,6 +152,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: 24.5.0
@@ -160,6 +166,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - run: .github/scripts/test-publish-crates-check.sh
       - run: .github/scripts/publish-crates.sh --check
       - run: .github/scripts/package-skill.sh --check
@@ -223,6 +231,8 @@ jobs:
     # builds with the runner image's MSVC and LLVM toolchains.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
         with:
           toolchain: stable
@@ -278,6 +288,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       # cargo machete shells out to cargo metadata, so declare the toolchain
       # explicitly rather than relying on the runner image default.
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
@@ -294,6 +306,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       # cargo deny check resolves the dependency graph via cargo metadata, so
       # declare the toolchain explicitly rather than relying on the runner image
       # default.
@@ -316,6 +330,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       # The instrumented build plus every compiled test binary is large; reclaim
       # space the build does not need.
       - name: Free disk space
