@@ -183,6 +183,7 @@ jobs:
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-check-workflow-invariants.py
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-take-workflow.py
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-sync-labels.py
+          "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-triage-workflow.py
 
   windows-storage:
     name: windows-storage

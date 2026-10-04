@@ -98,6 +98,10 @@ author of the squash commit. This needs "Allow edits by maintainers" on the pull
 request. If you prefer to make every change yourself, say so in the pull
 request.
 
+A `waiting on maintainer` label means the next step is ours; `waiting on author`
+means it is yours. The labels move by themselves when either side comments,
+pushes, or reviews.
+
 A pull request that waits on its author for 14 days gets a reminder, and it
 closes after 21 days. You can reopen it at any time.
 

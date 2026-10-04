@@ -1,0 +1,135 @@
+name: Triage
+
+# Marks whose step comes next with two labels. Adds `waiting on maintainer`
+# when a non-maintainer's issue or pull request opens or reopens, when such a
+# pull request gets a push, and when a non-maintainer comments. Those pull
+# request events and comments also remove `waiting on author`. Reopens and
+# pushes use the author's role, not the actor's. A maintainer comment or
+# review on a pull request adds `waiting on author` and removes
+# `waiting on maintainer`; a maintainer comment on an issue removes
+# `waiting on maintainer`. Bots, claim comments, and other activity change
+# nothing. A label already in the wanted state is not touched.
+#
+# pull_request_target uses the base repository's token for fork pull requests.
+# This job never checks out code or runs anything from the pull request.
+# It only reads event fields and edits labels.
+# .github/scripts/test-triage-workflow.py runs the script against a simulated API.
+
+on:
+  issues:
+    types: [opened, reopened]
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+jobs:
+  triage:
+    # Skips bots, judged by the first user the event carries: comment, review,
+    # pull request, or issue.
+    if: >-
+      (github.event.comment.user.type || github.event.review.user.type
+      || github.event.pull_request.user.type || github.event.issue.user.type) != 'Bot'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    timeout-minutes: 5
+    # One run per issue or pull request at a time, so each run reads the labels
+    # the previous run wrote.
+    concurrency:
+      group: triage-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Update waiting labels
+        shell: bash
+        # Event fields reach the script only through these variables. ASSOCIATION
+        # reads the objects in the same order as the job condition.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          EVENT: ${{ format('{0}:{1}', github.event_name, github.event.action) }}
+          ASSOCIATION: ${{ github.event.comment.author_association || github.event.review.author_association || github.event.pull_request.author_association || github.event.issue.author_association }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$NUMBER" =~ ^[0-9]+$ ]]; then
+            echo '::error::NUMBER must contain only digits.' >&2
+            exit 1
+          fi
+
+          # The take workflow handles claims. jq reads the body from the environment
+          # and exits 0 only when it holds "take this" in any ASCII letter case.
+          if [[ "$EVENT" == issue_comment:created ]] &&
+            jq -en 'env.COMMENT_BODY | ascii_downcase | contains("take this")' >/dev/null; then
+            echo "no change on #$NUMBER: claim comment"
+            exit 0
+          fi
+
+          maintainer=false
+          case "$ASSOCIATION" in
+            OWNER | MEMBER | COLLABORATOR) maintainer=true ;;
+          esac
+
+          if ! issue=$(gh api "repos/$GH_REPO/issues/$NUMBER"); then
+            echo '::error::Cannot read labels.' >&2
+            exit 1
+          fi
+          if ! labels=$(jq -ce '[.labels[].name]' <<<"$issue"); then
+            echo '::error::Cannot parse labels.' >&2
+            exit 1
+          fi
+          is_pr=$(jq -r '.pull_request != null' <<<"$issue")
+
+          add=''
+          remove=''
+          if [[ "$EVENT" == issues:opened || "$EVENT" == issues:reopened ]] &&
+            [[ "$maintainer" == false ]]; then
+            add='waiting on maintainer'
+          elif [[ "$EVENT" == pull_request_target:opened || "$EVENT" == pull_request_target:reopened ||
+            "$EVENT" == pull_request_target:synchronize ]] && [[ "$maintainer" == false ]]; then
+            add='waiting on maintainer'
+            remove='waiting on author'
+          elif [[ "$EVENT" == issue_comment:created && "$maintainer" == false ]]; then
+            add='waiting on maintainer'
+            remove='waiting on author'
+          elif [[ "$EVENT" == issue_comment:created || "$EVENT" == pull_request_review:submitted ]] &&
+            [[ "$maintainer" == true && "$is_pr" == true ]]; then
+            add='waiting on author'
+            remove='waiting on maintainer'
+          # Maintainer comments on pull requests stop at the branch above, so this
+          # branch sees issue comments only.
+          elif [[ "$EVENT" == issue_comment:created && "$maintainer" == true ]]; then
+            remove='waiting on maintainer'
+          else
+            echo "no change on #$NUMBER: no matching rule"
+            exit 0
+          fi
+
+          changed=false
+          if [[ -n "$add" ]] && ! jq -e --arg label "$add" 'index($label) != null' <<<"$labels" >/dev/null; then
+            if ! gh api --method POST "repos/$GH_REPO/issues/$NUMBER/labels" -f "labels[]=$add" >/dev/null; then
+              echo '::error::Cannot add label.' >&2
+              exit 1
+            fi
+            echo "add $add on #$NUMBER"
+            changed=true
+          fi
+          if [[ -n "$remove" ]] && jq -e --arg label "$remove" 'index($label) != null' <<<"$labels" >/dev/null; then
+            encoded=${remove// /%20}
+            if ! gh api --method DELETE "repos/$GH_REPO/issues/$NUMBER/labels/$encoded" >/dev/null; then
+              echo '::error::Cannot remove label.' >&2
+              exit 1
+            fi
+            echo "remove $remove on #$NUMBER"
+            changed=true
+          fi
+          if [[ "$changed" == false ]]; then
+            echo "no change on #$NUMBER: labels already match"
+          fi
