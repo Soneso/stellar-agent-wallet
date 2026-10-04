@@ -341,15 +341,23 @@ changes, update `REFERENCE.md` in the vendor directory, the
 
 ## Review process
 
-A fixed reviewer team checks every change against the
-[review checklist](review-checklist.md) before it is committed. The team is the
-Security reviewer (security and key hygiene, dependency licensing, project
-invariants), the Code reviewer (documentation, public API and dead code, reuse and
-duplication, test quality and coverage), and the Architecture reviewer
-(reuse-versus-build and dependency choices, module architecture, production
-readiness). Review repeats on a fresh pass until every reviewer approves with no
-blocking findings. The build gates above are one dimension of that checklist; the
-other dimensions cover correctness, key hygiene, tests and coverage, documentation,
+The depth of the review follows what a change touches:
+
+- A maintainer reviews a change to documentation, scripts, or workflows from the
+  diff and the CI checks.
+- A change to Rust code gets the same review and must also pass the
+  [gate suite](#gate-suite).
+- A change to signing paths, key handling, or serialized state also gets a
+  second review pass against the full [review checklist](review-checklist.md).
+
+The second review pass keeps the three reviewer roles of the checklist. The
+security review covers security and key hygiene, dependency licensing, and
+project invariants. The code review covers documentation, public API and dead
+code, reuse and duplication, and test quality and coverage. The architecture
+review covers reuse-versus-build and dependency choices, module architecture,
+and production readiness. Review repeats until a pass ends with no blocking
+findings. The build gates above are one dimension of that checklist; the other
+dimensions cover correctness, key hygiene, tests and coverage, documentation,
 reuse and dependencies, public API and dead code, and licensing and invariants.
 
 See [../../CONTRIBUTING.md](../../CONTRIBUTING.md) for the contribution workflow.

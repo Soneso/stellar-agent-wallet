@@ -181,6 +181,7 @@ jobs:
             -r .github/scripts/workflow-check-requirements.txt
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/check-workflow-invariants.py
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-check-workflow-invariants.py
+          "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-take-workflow.py
 
   windows-storage:
     name: windows-storage
