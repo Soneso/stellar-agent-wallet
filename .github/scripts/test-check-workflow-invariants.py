@@ -19,6 +19,7 @@ SCRIPT = ROOT / ".github/scripts/check-workflow-invariants.py"
 RELEASE = ".github/workflows/release.yml"
 PUBLISH = ".github/workflows/publish.yml"
 SMOKE = ".github/workflows/notarize-smoke.yml"
+TRIAGE = ".github/workflows/triage.yml"
 ACTION = ".github/actions/macos-sign-notarize/action.yml"
 SIGN_SCRIPT = ".github/actions/macos-sign-notarize/sign-notarize.sh"
 PUBLISH_SCRIPT = ".github/scripts/publish-crates.sh"
@@ -209,6 +210,9 @@ CASES = [
     ("labels checkout that persists credentials", "checkout-credentials",
      'labels.yml:sync step 1: checkout-credentials: actions/checkout without persist-credentials: false', [
         (".github/workflows/labels.yml", "persist-credentials: false", "persist-credentials: true", 1)]),
+    ("triage workflow without top-level permissions", "workflow-permissions",
+     'triage.yml: workflow-permissions: no top-level permissions', [
+        (TRIAGE, "\npermissions: {}\n", "\n", 1)]),
     ("rust-cache in the signing job", "cred-compile",
      'release.yml:sign-macos step 2: cred-compile: uses Swatinem/rust-cache@', [before_sign_macos_tools(
         "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n\n")]),
