@@ -8,6 +8,13 @@ name: Take
 # already has an assignee, or the commenter holds another issue, one comment
 # names that assignee or that issue. A claim on an issue without either label,
 # or by the issue's own assignee, changes nothing and posts nothing.
+#
+# Two claims by one person on two issues can both pass the held-issue check.
+# After its own assignment, each run lists the commenter's open assigned
+# issues again, keeps the lowest-numbered one, and releases every other one
+# with the same "already hold" comment. Racing runs therefore end with the
+# lowest-numbered issue assigned. .github/scripts/test-take-workflow.py runs
+# this script against a simulated API.
 
 on:
   issue_comment:
@@ -49,22 +56,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Code points 8217 and 39 are the typographic and the straight apostrophe.
-          claim=$(jq -rn 'env.COMMENT_BODY | sub("\\A\\s+"; "") | sub("\\s+\\z"; "")
-            | ascii_downcase | gsub([8217] | implode; [39] | implode) | sub("\\.\\z"; "")')
-          if [ "$claim" != "i'll take this" ]; then
+          # Code points 8217 and 39 are the typographic and the straight
+          # apostrophe. jq compares the normalized body with the phrase and
+          # prints only true or false.
+          is_claim=$(jq -n '("i" + ([39] | implode) + "ll take this") as $phrase
+            | env.COMMENT_BODY | sub("\\A\\s+"; "") | sub("\\s+\\z"; "")
+            | ascii_downcase | gsub([8217] | implode; [39] | implode) | sub("\\.\\z"; "")
+            | . == $phrase')
+          if [ "$is_claim" != true ]; then
             echo "The comment is not a claim."
             exit 0
           fi
 
           # Logins compare without case, as GitHub treats them.
+          holds='def holds: any(.assignees[]; (.login | ascii_downcase) == (env.LOGIN | ascii_downcase));'
+          already_holds="Each contributor holds one open assignment at a time."
+
           issue=$(gh api "repos/$GH_REPO/issues/$NUMBER")
-          decision=$(jq -r '
+          decision=$(jq -r "$holds"'
             if .state != "open" or .pull_request != null then "not-open"
             elif (any(.labels[]; .name == "good first issue" or .name == "help wanted") | not)
               then "unlabeled"
-            elif any(.assignees[]; (.login | ascii_downcase) == (env.LOGIN | ascii_downcase))
-              then "own"
+            elif holds then "own"
             elif (.assignees | length) > 0 then "taken"
             else "free"
             end' <<<"$issue")
@@ -75,7 +88,11 @@ jobs:
               exit 0
               ;;
             taken)
-              assignees=$(jq -r '[.assignees[].login | "@" + .] | join(", ")' <<<"$issue")
+              # Two assignees join with "and"; three or more take a serial comma.
+              assignees=$(jq -r '[.assignees[].login | "@" + .]
+                | if length < 3 then join(" and ")
+                  else (.[:-1] | join(", ")) + ", and " + .[-1]
+                  end' <<<"$issue")
               gh api --method POST "repos/$GH_REPO/issues/$NUMBER/comments" \
                 -f body="@$LOGIN, this issue is already assigned to $assignees." >/dev/null
               echo "No assignment: the issue is assigned to $assignees."
@@ -88,17 +105,31 @@ jobs:
               ;;
           esac
 
-          # The assignee filter narrows the listing; the jq filter keeps only
-          # issues the commenter holds, other than this one.
-          held=$(gh api --paginate "repos/$GH_REPO/issues?state=open&assignee=$LOGIN&per_page=100" \
-            | jq -rs '[.[][]
-                | select(.pull_request == null)
-                | select(.number != (env.NUMBER | tonumber))
-                | select(any(.assignees[]; (.login | ascii_downcase) == (env.LOGIN | ascii_downcase)))
-                | .number] | first // empty')
+          # Prints the open issues, not pull requests, assigned to the commenter
+          # as a JSON array in ascending order. The API assignee filter narrows
+          # the listing, and jq checks the assignees of each entry again.
+          held_issues() {
+            gh api --paginate "repos/$GH_REPO/issues?state=open&assignee=$LOGIN&per_page=100" \
+              | jq -cs "$holds"'[.[][] | select(.pull_request == null) | select(holds) | .number] | unique'
+          }
+
+          # Removes the commenter from issue $1 and names issue $2 as the one
+          # kept. An assignment that is already gone gets no second comment.
+          release() {
+            local still
+            still=$(gh api "repos/$GH_REPO/issues/$1" | jq -r "$holds"'holds')
+            if [ "$still" = true ]; then
+              gh api --method DELETE "repos/$GH_REPO/issues/$1/assignees" -f "assignees[]=$LOGIN" >/dev/null
+              gh api --method POST "repos/$GH_REPO/issues/$1/comments" \
+                -f body="@$LOGIN, you already hold #$2. $already_holds" >/dev/null
+            fi
+          }
+
+          listed=$(held_issues)
+          held=$(jq -r 'map(select(. != (env.NUMBER | tonumber))) | first // empty' <<<"$listed")
           if [ -n "$held" ]; then
             gh api --method POST "repos/$GH_REPO/issues/$NUMBER/comments" \
-              -f body="@$LOGIN, you already hold #$held. Each contributor holds one open assignment at a time." >/dev/null
+              -f body="@$LOGIN, you already hold #$held. $already_holds" >/dev/null
             echo "No assignment: $LOGIN holds #$held."
             exit 0
           fi
@@ -106,9 +137,26 @@ jobs:
           # GitHub drops an assignee it cannot assign without an error, so the
           # response must list the commenter.
           assigned=$(gh api --method POST "repos/$GH_REPO/issues/$NUMBER/assignees" -f "assignees[]=$LOGIN" \
-            | jq -r 'any(.assignees[]; (.login | ascii_downcase) == (env.LOGIN | ascii_downcase))')
+            | jq -r "$holds"'holds')
           if [ "$assigned" != true ]; then
             echo "::error::GitHub did not assign issue #$NUMBER to $LOGIN."
             exit 1
           fi
-          echo "Assigned issue #$NUMBER to $LOGIN."
+
+          # Keep the lowest-numbered issue the commenter holds and release the
+          # others; the header comment states why.
+          listed=$(held_issues)
+          keep=$(jq -r '. + [env.NUMBER | tonumber] | min' <<<"$listed")
+          others=$(jq -r --argjson keep "$keep" \
+            '. + [env.NUMBER | tonumber] | unique | map(select(. != $keep)) | .[]' <<<"$listed")
+          while IFS= read -r other; do
+            if [ -n "$other" ]; then
+              release "$other" "$keep" </dev/null
+            fi
+          done <<<"$others"
+
+          if [ "$keep" = "$NUMBER" ]; then
+            echo "Assigned issue #$NUMBER to $LOGIN."
+          else
+            echo "No assignment: $LOGIN holds #$keep, so #$NUMBER is released."
+          fi

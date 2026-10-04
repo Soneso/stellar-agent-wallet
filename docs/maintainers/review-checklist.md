@@ -2,7 +2,7 @@
 
 Every change is reviewed for production readiness before it is committed.
 Reviewers check the change against the dimensions below, and review repeats until
-every reviewer approves with no blocking findings.
+the review approves with no blocking findings.
 
 ## Reviewers
 

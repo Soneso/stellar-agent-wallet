@@ -122,8 +122,9 @@ and
 Issues touching signing paths, key handling, or serialized state get the second
 review pass and are better second contributions than first ones.
 
-To claim an issue, comment "I'll take this" on it, and the repository assigns it
-to you at once. Hold one open assignment at a time. After 14 days with no pull
+To claim an issue that carries `good first issue` or `help wanted` and has no
+assignee, comment "I'll take this" on it, and the repository assigns it to you
+at once. Hold one open assignment at a time. After 14 days with no pull
 request and no comment, a maintainer releases the assignment and says so on the
 issue.
 
