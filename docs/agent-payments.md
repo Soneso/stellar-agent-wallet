@@ -179,7 +179,7 @@ Stable errors use the `mpp.*` namespace, including `mpp.challenge_invalid`,
 The verbs that record an audit row before they return (charge commit, record
 receipt, reconcile, prune) answer a problem with the audit LOG under its own
 `audit.*` code instead. They answer with `audit.chain_key_unavailable` when the profile's
-chain-root key is not acquirable. They answer with `audit.tip_anchor_mismatch` when the log no longer holds the chain tip its keyring-held anchor names. Those name a different
+chain-root key is not acquirable. They answer with `audit.tip_anchor_mismatch` when the log no longer holds the chain tip its keyring-held anchor names. They answer with `audit.log_binding_changed` when the profile names a log path or audit key other than its recorded audit binding. Those name a different
 thing to fix from the MPP state file, and each has its own recovery in
 [Audit-log recovery](maintainers/audit-log-recovery.md).
 
@@ -212,6 +212,10 @@ reset recovers it without discarding any record.
 With the headless keyring backend the counter is kept in a file on the same
 host. Anyone who can replace both that keyring file and the MPP state file can
 restore older history, so protect the headless keyring directory separately.
+The same file holds the audit log's tip anchor, its re-anchor counter, the
+audit binding, and the policy window state's key and generation counter.
+Anyone who can write that file can restore older entries or delete one, which
+needs no key material.
 
 A refusal whose message says the authorization state is rolled back means its
 file is missing or does not match the generation held in the keyring. The

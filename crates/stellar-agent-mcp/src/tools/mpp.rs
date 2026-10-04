@@ -143,7 +143,11 @@ impl WalletServer {
         };
 
         // Successful simulation precedes lazy MPP key creation.
-        let state = match MppAuthorizationStore::open_for_prepare(&args.profile, &self.profile) {
+        let state = match MppAuthorizationStore::open_for_prepare(
+            &args.profile,
+            &self.profile,
+            self.audit_binding,
+        ) {
             Ok(state) => state,
             Err(error) => return Ok(mpp_error_result(&error)),
         };
@@ -246,7 +250,11 @@ impl WalletServer {
             return error.into_result();
         }
         let profile_name = self.profile_name_for_approval();
-        let state = match MppAuthorizationStore::open_for_read(&profile_name, &self.profile) {
+        let state = match MppAuthorizationStore::open_for_read(
+            &profile_name,
+            &self.profile,
+            self.audit_binding,
+        ) {
             Ok(Some(state)) => state,
             // A profile that has never prepared a charge holds no
             // authorization under any identifier.
@@ -333,6 +341,7 @@ impl WalletServer {
         let audit_profile_name = profile_name.clone();
         let withheld_audit_profile = self.profile.clone();
         let withheld_audit_profile_name = profile_name.clone();
+        let audit_binding = self.audit_binding;
         // Policy and audit refusals retain their wallet code while the MPP
         // service withholds the credential at its accounting or delivery gate.
         let wallet_refusal: Arc<Mutex<Option<WalletError>>> = Arc::new(Mutex::new(None));
@@ -382,14 +391,18 @@ impl WalletServer {
                     PolicyDecision::Allow,
                     uuid::Uuid::new_v4().to_string(),
                 );
-                emit_value_audit_row_strict(&audit_profile, &audit_profile_name, entry).map_err(
-                    |error| {
-                        if let Ok(mut slot) = delivery_refusal.lock() {
-                            *slot = Some(error);
-                        }
-                        state_error()
-                    },
+                emit_value_audit_row_strict(
+                    &audit_profile,
+                    &audit_profile_name,
+                    audit_binding,
+                    entry,
                 )
+                .map_err(|error| {
+                    if let Ok(mut slot) = delivery_refusal.lock() {
+                        *slot = Some(error);
+                    }
+                    state_error()
+                })
             },
             move |withheld| {
                 let entry = AuditEntry::new_mpp_authorization_withheld(
@@ -405,6 +418,7 @@ impl WalletServer {
                 let _ = emit_value_audit_row_strict(
                     &withheld_audit_profile,
                     &withheld_audit_profile_name,
+                    audit_binding,
                     entry,
                 );
             },
@@ -449,7 +463,11 @@ impl WalletServer {
             Err(error) => return Ok(mpp_error_result(&error)),
         };
         let profile_name = self.profile_name_for_approval();
-        let state = match MppAuthorizationStore::open_for_read(&profile_name, &self.profile) {
+        let state = match MppAuthorizationStore::open_for_read(
+            &profile_name,
+            &self.profile,
+            self.audit_binding,
+        ) {
             Ok(Some(state)) => state,
             Ok(None) => return Ok(mpp_absent_state_lookup_error(&args.authorization_id)),
             Err(error) => return Ok(mpp_error_result(&error)),
@@ -473,7 +491,9 @@ impl WalletServer {
             receipt.status(),
             uuid::Uuid::new_v4().to_string(),
         );
-        if let Err(error) = emit_value_audit_row_strict(&self.profile, &profile_name, entry) {
+        if let Err(error) =
+            emit_value_audit_row_strict(&self.profile, &profile_name, self.audit_binding, entry)
+        {
             return Ok(business_error_result(error.code(), error.message()));
         }
         Ok(success(json!({
@@ -504,7 +524,11 @@ impl WalletServer {
             return Ok(result);
         }
         let profile_name = self.profile_name_for_approval();
-        let state = match MppAuthorizationStore::open_for_read(&profile_name, &self.profile) {
+        let state = match MppAuthorizationStore::open_for_read(
+            &profile_name,
+            &self.profile,
+            self.audit_binding,
+        ) {
             Ok(Some(state)) => state,
             Ok(None) => return Ok(mpp_absent_state_lookup_error(&args.authorization_id)),
             Err(error) => return Ok(mpp_error_result(&error)),
@@ -535,7 +559,9 @@ impl WalletServer {
             result.outcome.clone(),
             uuid::Uuid::new_v4().to_string(),
         );
-        if let Err(error) = emit_value_audit_row_strict(&self.profile, &profile_name, entry) {
+        if let Err(error) =
+            emit_value_audit_row_strict(&self.profile, &profile_name, self.audit_binding, entry)
+        {
             return Ok(business_error_result(error.code(), error.message()));
         }
         Ok(success(result))
@@ -561,7 +587,11 @@ impl WalletServer {
             return Ok(result);
         }
         let profile_name = self.profile_name_for_approval();
-        let state = match MppAuthorizationStore::open_for_read(&profile_name, &self.profile) {
+        let state = match MppAuthorizationStore::open_for_read(
+            &profile_name,
+            &self.profile,
+            self.audit_binding,
+        ) {
             Ok(Some(state)) => state,
             Ok(None) => return Ok(mpp_absent_state_lookup_error(&args.authorization_id)),
             Err(error) => return Ok(mpp_error_result(&error)),
@@ -1074,6 +1104,7 @@ mod tests {
         stellar_agent_mpp::MppAuthorizationStore::open_for_prepare(
             FIRST_RUN_PROFILE,
             &first_run_server().profile,
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
         )
         .expect("mint the state key and initial counter");
         let server = first_run_server();

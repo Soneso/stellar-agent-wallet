@@ -333,6 +333,24 @@ pub enum StoredTipAnchor {
 }
 
 impl StoredTipAnchor {
+    /// Classifies a raw stored anchor value read from a store.
+    ///
+    /// `None` is [`Self::Absent`]. A value that does not parse is
+    /// [`Self::Unusable`], described by its shape and never echoed.
+    #[must_use]
+    pub fn from_raw(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return Self::Absent;
+        };
+        match TipAnchor::parse(raw.trim()) {
+            Ok(anchor) => Self::Usable(anchor),
+            Err(e) => Self::Unusable {
+                shape: describe_anchor_shape(Some(raw)),
+                reason: e.to_string(),
+            },
+        }
+    }
+
     /// Renders the stored value for an operator-facing report.
     ///
     /// A usable anchor gives its `<entry count>:<end offset>` coordinates; the
@@ -360,6 +378,24 @@ fn describe_anchor_shape(raw: Option<&str>) -> String {
             raw.len()
         ),
     }
+}
+
+/// One condition an operator acknowledged in a re-anchor, in the order its
+/// `audit_tip_anchored` row is appended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReanchorAcknowledgement {
+    /// The current path's stored anchor disagreed with its log. The row has
+    /// reason `rollback_acknowledged` and names this path's superseded anchor.
+    Rollback,
+    /// The profile's audit binding changed. The row has reason
+    /// `binding_changed` and names `previous_anchor`.
+    BindingChange {
+        /// The anchor of the log path the previous binding named, as
+        /// `<entry count>:<end offset>`. `None` when nothing was anchored there
+        /// or the previous binding was unreadable.
+        previous_anchor: Option<String>,
+    },
 }
 
 /// The outcome of an operator-acknowledged re-anchor.
@@ -892,10 +928,38 @@ impl AuditWriter {
     /// - [`WriterError::Io`] / [`WriterError::Serialise`] on failure to append
     ///   the row.
     pub fn reanchor(&mut self) -> Result<ReanchorReport, WriterError> {
+        self.reanchor_acknowledging(&[ReanchorAcknowledgement::Rollback])
+    }
+
+    /// Moves the anchor to the active file's current tip and appends one
+    /// `audit_tip_anchored` row per acknowledged condition, in order.
+    ///
+    /// [`AuditWriter::reanchor`] is this method with a single
+    /// [`ReanchorAcknowledgement::Rollback`]. The whole active file is replayed
+    /// first, the current tip is anchored, and the path's re-anchor counter is
+    /// incremented once, so every row of one run carries the same count. A
+    /// rollback row names this path's superseded anchor; a binding-change row
+    /// names the anchor the caller supplies for the previous binding's path.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`AuditWriter::reanchor`]. An empty `acknowledged` list
+    /// refuses with a [`WriterError::Io`] of kind `InvalidInput` before any
+    /// write; every anchor move carries a row naming its reason.
+    pub fn reanchor_acknowledging(
+        &mut self,
+        acknowledged: &[ReanchorAcknowledgement],
+    ) -> Result<ReanchorReport, WriterError> {
         let store = self
             .tip_anchor
             .clone()
             .ok_or(WriterError::TipAnchorUnavailable)?;
+        if acknowledged.is_empty() {
+            return Err(WriterError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a re-anchor needs at least one acknowledged condition",
+            )));
+        }
         let previous = self.stored_tip_anchor()?;
 
         let scan = self.replay_active_file()?;
@@ -912,18 +976,29 @@ impl AuditWriter {
             .bump_reanchor_count()
             .map_err(WriterError::TipAnchorStore)?;
 
-        // The row itself advances the anchor past `repaired`; the report names
+        // Each row advances the anchor past the one before; the report names
         // the anchor the operator asked for, which is what the refusal was
-        // about.
-        self.write_entry(AuditEntry::new_audit_tip_anchored(
-            TipAnchorReason::RollbackAcknowledged,
-            repaired_count,
-            previous.coordinates(),
-            Some(reanchor_count),
-            uuid::Uuid::new_v4().to_string(),
-        ))?;
+        // about. Every row records the entry count of the repaired tip.
+        for acknowledgement in acknowledged {
+            let (reason, previous_anchor) = match acknowledgement {
+                ReanchorAcknowledgement::Rollback => (
+                    TipAnchorReason::RollbackAcknowledged,
+                    previous.coordinates(),
+                ),
+                ReanchorAcknowledgement::BindingChange { previous_anchor } => {
+                    (TipAnchorReason::BindingChanged, previous_anchor.clone())
+                }
+            };
+            self.write_entry(AuditEntry::new_audit_tip_anchored(
+                reason,
+                repaired_count,
+                previous_anchor,
+                Some(reanchor_count),
+                uuid::Uuid::new_v4().to_string(),
+            ))?;
+        }
 
-        // The row itself advanced the anchor past the repaired tip; report the
+        // The rows advanced the anchor past the repaired tip; report the
         // anchor as it now stands rather than the intermediate value.
         let current = store.load_anchor().map_err(WriterError::TipAnchorStore)?;
         Ok(ReanchorReport {
@@ -931,6 +1006,36 @@ impl AuditWriter {
             current,
             reanchor_count,
         })
+    }
+
+    /// Whether the stored anchor disagrees with the active file, decided under
+    /// this writer's lock.
+    ///
+    /// Applies [`super::verify::stored_anchor_disagrees_with_walk`] to the
+    /// stored value and a replay of the active file. It reads the store and the
+    /// file only: nothing is adopted, advanced, or written.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::TipAnchorUnavailable`] when no anchor store is attached.
+    /// - [`WriterError::TipAnchorStore`] when the backend is unavailable.
+    /// - [`WriterError::Io`] / [`WriterError::Serialise`] /
+    ///   [`WriterError::ChainBrokenAtOpen`] when the file cannot be replayed.
+    /// - [`WriterError::IntegrityViolation`] when the anchored entry cannot be
+    ///   read.
+    pub fn stored_anchor_disagrees(&self) -> Result<bool, WriterError> {
+        let stored = self.stored_tip_anchor()?;
+        let scan = self.replay_active_file()?;
+        let tip = super::verify::VerifiedTip {
+            entry_count: scan.entry_count,
+            tip_hash: scan.last_hash,
+            end_offset: scan.end_offset,
+        };
+        Ok(super::verify::stored_anchor_disagrees_with_walk(
+            &self.path,
+            &stored,
+            Some(&tip),
+        )?)
     }
 
     /// Returns the anchor currently held in the store, without comparing it
@@ -1391,11 +1496,15 @@ impl AuditWriter {
     /// file at the path — an attacker's byte-identical copy included — would
     /// then satisfy the anchor and be accepted, leaving a committed action with
     /// no row, no refusal and no record anywhere but a log line. Anchoring the
-    /// row that was owed puts the obligation in the one store filesystem access
-    /// cannot rewind: every file at this path is short of the anchor by exactly
+    /// row that was owed puts the obligation in the keyring, outside the log
+    /// file. Every file at this path is then short of the anchor by exactly
     /// that row, so every later open refuses until an operator runs
-    /// `audit reanchor --acknowledge-rollback`, whose report shows one more
-    /// anchored entry than the file holds and whose row records it permanently.
+    /// `audit reanchor --acknowledge-rollback`. Its report shows one more
+    /// anchored entry than the file holds, and its row records that
+    /// permanently.
+    /// Anyone who can restore the keyring's own storage together with the log
+    /// can restore an older state, and with a headless keyring backend the
+    /// anchor is kept in a file on the same host.
     ///
     /// Best-effort, like every other anchor write. If the keyring rejects it the
     /// refusal still stands for this writer and for every caller still holding
@@ -2711,7 +2820,7 @@ pub enum WriterError {
 
     /// The tip anchor could not be read from, or written to, its backing store.
     ///
-    /// The anchor lives in the platform keyring. An unreadable anchor cannot be
+    /// The anchor lives in the keyring. An unreadable anchor cannot be
     /// distinguished from a rolled-back one, so every caller that requires the
     /// anchor treats this as fail-closed.
     #[error("audit log tip anchor unavailable: {0}")]

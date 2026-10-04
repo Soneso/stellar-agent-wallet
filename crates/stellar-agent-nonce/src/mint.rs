@@ -51,10 +51,15 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+use stellar_agent_core::error::{AuthError, ValidationError, WalletError};
+use stellar_agent_core::profile::owner_key::{self, OwnerKeyContext};
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
 use stellar_agent_network::keyring::classify_keyring_error;
 
 use crate::{ReplayWindow, error::NonceError};
+
+/// The profile field a nonce-key owner refusal names.
+pub const NONCE_KEY_FIELD: &str = "mcp_nonce_key_alias";
 
 /// HMAC-SHA256 type alias.
 type HmacSha256 = Hmac<Sha256>;
@@ -383,6 +388,9 @@ fn process_boot_nonce() -> &'static [u8; 16] {
 pub struct NonceMint {
     /// Non-secret keyring reference for the HMAC nonce key.
     entry_ref: KeyringEntryRef,
+    /// The owner coordinates of the profile the mint serves. A loaded key
+    /// equal to the owner public key at any of them is refused.
+    owner: OwnerKeyContext,
     /// CAIP-2 chain identifier from the profile (non-secret).
     ///
     /// Validated at every `mint` and `verify` call: the caller-supplied
@@ -433,14 +441,15 @@ impl NonceMint {
     /// #     ).build()
     /// # }
     /// let profile = make_profile();
-    /// let mint = NonceMint::from_profile(&profile)?;
+    /// let mint = NonceMint::from_profile(&profile, "nonce-test")?;
     /// # Ok::<_, stellar_agent_nonce::NonceError>(())
     /// ```
-    pub fn from_profile(profile: &Profile) -> Result<Self, NonceError> {
+    pub fn from_profile(profile: &Profile, profile_name: &str) -> Result<Self, NonceError> {
         // Ensure the process-scoped boot_nonce is initialised.
         let _ = process_boot_nonce();
         Ok(Self {
             entry_ref: profile.mcp_nonce_key_alias.clone(),
+            owner: OwnerKeyContext::for_profile(profile_name, profile),
             chain_id: profile.chain_id.to_string(),
             max_ttl_ms: Self::MAX_TTL_MS,
         })
@@ -639,7 +648,7 @@ impl NonceMint {
     /// #     "stellar-agent-nonce",
     /// #     "alice-nonce",
     /// # ).build();
-    /// let mint = NonceMint::from_profile(&p)?;
+    /// let mint = NonceMint::from_profile(&p, "alice")?;
     /// let now = now_ms();
     /// let expiry = now + 300_000;
     /// let nonce = mint.mint(&AllTools, b"xdr", now, expiry, "stellar_balances", "stellar:testnet")?;
@@ -867,11 +876,19 @@ impl NonceMint {
     ///   (interactive-session / platform / not-found).
     /// - [`NonceError::SerialiseFailed`] if the stored value is not valid base64.
     /// - [`NonceError::KeyTooShort`] if fewer than 32 bytes decode.
+    /// - [`NonceError::KeyTooLong`] if more than 32 bytes decode.
+    /// - [`NonceError::KeyMatchesOwnerPublicKey`] if the coordinate sits in
+    ///   the owner key namespace, checked before any keyring read, or the key
+    ///   equals the profile's owner public key.
     ///
     /// # Panics
     ///
     /// Never panics.
     fn load_key(&self) -> Result<Zeroizing<[u8; 32]>, NonceError> {
+        // An owner-namespace coordinate refuses before any keyring read.
+        owner_key::refuse_owner_key_coordinate(&self.entry_ref, NONCE_KEY_FIELD)
+            .map_err(|_| NonceError::KeyMatchesOwnerPublicKey)?;
+
         // Open the keyring entry (cheap: one Arc clone). Failures classify
         // through the shared keyring mapping so environmental causes (a
         // non-interactive Windows session, a backend outage) keep their
@@ -901,10 +918,26 @@ impl NonceMint {
                 actual: decoded.len(),
             });
         }
+        // The key is exactly 32 bytes; a longer value is refused, never
+        // truncated.
+        if decoded.len() > 32 {
+            return Err(NonceError::KeyTooLong {
+                actual: decoded.len(),
+            });
+        }
 
-        // Copy first 32 bytes into a Zeroizing<[u8; 32]>.
+        owner_key::refuse_owner_public_key(&decoded, &self.owner, NONCE_KEY_FIELD).map_err(
+            |e| match e {
+                WalletError::Validation(ValidationError::KeyMatchesOwnerPublicKey { .. }) => {
+                    NonceError::KeyMatchesOwnerPublicKey
+                }
+                WalletError::Auth(auth) => NonceError::KeyringError(auth),
+                _ => NonceError::KeyringError(AuthError::KeyringPlatformError),
+            },
+        )?;
+
         let mut key = [0u8; 32];
-        key.copy_from_slice(&decoded[..32]);
+        key.copy_from_slice(&decoded);
         let key_z: Zeroizing<[u8; 32]> = Zeroizing::new(key);
 
         // Panic-injection hook — only compiled when `test-hooks` feature is enabled.
@@ -1346,7 +1379,7 @@ mod tests {
         )
         .build();
 
-        let mint = NonceMint::from_profile(&profile).expect("from_profile");
+        let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
 
         // now and expiry produce a valid TTL so the failure is definitely from
         // the envelope guard, not from a TTL guard.

@@ -2994,27 +2994,30 @@ pub enum EventKind {
     /// The audit log's keyring-held tip anchor was established for the active
     /// file.
     ///
-    /// Emitted on the two occasions the anchor is set to a tip the writer did
-    /// not itself append: adoption of a log that predates the anchor, and an
-    /// operator-acknowledged rollback repair. Ordinary per-append anchor
-    /// advances are silent — they are implied by the rows themselves.
+    /// Emitted when the anchor is set to a tip the writer did not itself
+    /// append. The occasions are the adoption of a non-empty log that has no
+    /// anchor, an operator-acknowledged rollback repair, and an
+    /// operator-acknowledged change of the profile's audit binding. Ordinary
+    /// per-append anchor advances are silent; the rows themselves imply them.
     ///
     /// The row carries no digest: the tip hash is already the chain state of
     /// the entry preceding this one, and `previous_anchor` reports the
     /// superseded anchor as `<entry count>:<end offset>` so a forensic reader
     /// can see how far the anchor moved without a hash appearing in the log
-    /// twice.
+    /// twice. For a binding change it is the anchor of the log path the
+    /// previous binding named.
     AuditTipAnchored {
         /// Why the anchor was established.
         reason: TipAnchorReason,
-        /// Number of entries in the active file at the moment the anchor was
-        /// written, before this row was appended.
+        /// Number of entries in the active file when the anchor was adopted
+        /// or repaired, before the first row of that adoption or repair.
+        /// Every row of one repair carries the same count.
         entry_count: u64,
         /// The superseded anchor as `<entry count>:<end offset>`, or `None`
-        /// when no anchor existed.
+        /// when no anchor existed or the previous binding was unreadable.
         previous_anchor: Option<String>,
-        /// Value of the path's monotonic re-anchor counter after this repair.
-        /// `None` for adoption, which does not touch the counter.
+        /// Value of the current path's monotonic re-anchor counter after this
+        /// repair. `None` for adoption, which does not touch the counter.
         reanchor_count: Option<u64>,
     },
 }
@@ -3052,6 +3055,10 @@ pub enum TipAnchorReason {
     /// An operator ran `audit reanchor --acknowledge-rollback`, moving the
     /// anchor to the current tip of a file the check had refused.
     RollbackAcknowledged,
+    /// An operator ran `audit reanchor --acknowledge-binding-change`, accepting
+    /// a profile whose audit log path or audit key differs from the binding
+    /// recorded in the keyring.
+    BindingChanged,
 }
 
 impl std::fmt::Display for TipAnchorReason {
@@ -3059,6 +3066,7 @@ impl std::fmt::Display for TipAnchorReason {
         let s = match self {
             Self::Adopted => "adopted",
             Self::RollbackAcknowledged => "rollback_acknowledged",
+            Self::BindingChanged => "binding_changed",
         };
         f.write_str(s)
     }
@@ -3070,6 +3078,44 @@ impl std::fmt::Display for TipAnchorReason {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, reason = "test-only")]
     use super::*;
+
+    // ── TipAnchorReason ──────────────────────────────────────────────────────
+
+    #[test]
+    fn tip_anchor_reason_round_trips() {
+        for reason in [
+            TipAnchorReason::Adopted,
+            TipAnchorReason::RollbackAcknowledged,
+            TipAnchorReason::BindingChanged,
+        ] {
+            let json = serde_json::to_string(&reason).unwrap();
+            assert_eq!(json, format!("\"{reason}\""));
+            let back: TipAnchorReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, reason);
+        }
+    }
+
+    /// Wire-tag fixture: the binding-change reason serializes as
+    /// `binding_changed`, inside an `audit_tip_anchored` row.
+    #[test]
+    fn tip_anchor_reason_binding_changed_wire_tag() {
+        assert_eq!(
+            serde_json::to_value(TipAnchorReason::BindingChanged).unwrap(),
+            serde_json::json!("binding_changed")
+        );
+        let kind = EventKind::AuditTipAnchored {
+            reason: TipAnchorReason::BindingChanged,
+            entry_count: 3,
+            previous_anchor: Some("7:1024".to_owned()),
+            reanchor_count: Some(2),
+        };
+        let value = serde_json::to_value(&kind).unwrap();
+        assert_eq!(value["kind"], "audit_tip_anchored");
+        assert_eq!(value["reason"], "binding_changed");
+        assert_eq!(value["previous_anchor"], "7:1024");
+        let back: EventKind = serde_json::from_value(value).unwrap();
+        assert_eq!(back, kind);
+    }
 
     #[test]
     fn policy_decision_allow_serialises() {

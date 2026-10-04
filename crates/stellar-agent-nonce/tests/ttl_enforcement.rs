@@ -24,7 +24,7 @@ fn mint_rejects_ttl_exceeded() {
     let profile = make_profile("ttl-exceeded");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
     let now = 1_000_000u64;
     // Request TTL slightly above MAX_TTL_MS (5 minutes + 1 ms).
@@ -55,7 +55,7 @@ fn mint_rejects_ttl_too_short() {
     let profile = make_profile("ttl-too-short");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
     let now = 1_000_000u64;
     // Request TTL 1 ms below the minimum floor (30 seconds - 1 ms).
@@ -86,7 +86,7 @@ fn mint_accepts_min_ttl() {
     let profile = make_profile("ttl-min");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
     let now = 1_000_000u64;
     let expiry = now + MIN_TTL_MS;
@@ -104,7 +104,7 @@ fn mint_accepts_max_ttl() {
     let profile = make_profile("ttl-max");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
     let now = 1_000_000u64;
     let expiry = now + MAX_TTL_MS;
@@ -122,7 +122,7 @@ fn mint_rejects_already_expired() {
     let profile = make_profile("ttl-already-expired");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
     let now = 1_000_000u64;
     let expiry = now - 1; // already expired

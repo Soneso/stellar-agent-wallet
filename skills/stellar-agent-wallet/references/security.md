@@ -95,6 +95,8 @@ fails:
 | `"warn"` (default Windows) | Proceed with unprotected memory; emit a warning. |
 | `false` | No lock attempted, no warning; operator accepts swap-disclosure risk. |
 
+The posture is set in the profile file and is not overlayable.
+
 On failure the wallet emits a structured warning carrying `profile`, `reason`, and
 `errno` only. No path logs the seed.
 

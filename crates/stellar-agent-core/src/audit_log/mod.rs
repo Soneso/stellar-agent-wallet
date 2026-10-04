@@ -106,6 +106,7 @@
 //! (`stellar-agent-cli::common::signer_ceremony`) when `Wallet::unlock`
 //! degrades under `MlockRequired::Warn`.
 
+pub mod binding;
 pub mod chain;
 pub mod entry;
 pub mod health;
@@ -119,6 +120,7 @@ pub mod tip_anchor;
 pub mod verify;
 pub mod writer;
 
+pub use binding::{AuditBinding, AuditBindingParseError, BindingCheck, RecordedBinding};
 pub use entry::{AuditEntry, NewToolInvocation};
 pub use health::{AuditWriterHealth, AuditWriterHealthHandle};
 pub use reader::{AuditLogIntegrityError, AuditReader, PinnedHashesRecord};
@@ -136,13 +138,14 @@ pub use signer_set::{
 };
 pub use tip_anchor::{
     KeyedAuditAccess, TipAnchor, TipAnchorParseError, TipAnchorStore, TipAnchorStoreError,
-    reanchor_count_account, tip_anchor_account,
+    log_path_sha256, reanchor_count_account, reanchor_count_account_for_digest, tip_anchor_account,
+    tip_anchor_account_for_digest,
 };
 pub use verify::{
     FileVerifyResult, PartialRotationState, VerifiedTip, VerifyError, VerifyOk, VerifyWarning,
-    verify_log,
+    check_anchor_against_walk, stored_anchor_disagrees_with_walk, verify_log,
 };
 pub use writer::{
-    AuditWriter, AuditWriterRegistry, ReanchorReport, StoredTipAnchor, WriterError,
-    audit_log_unusable_detail,
+    AuditWriter, AuditWriterRegistry, ReanchorAcknowledgement, ReanchorReport, StoredTipAnchor,
+    WriterError, audit_log_unusable_detail,
 };

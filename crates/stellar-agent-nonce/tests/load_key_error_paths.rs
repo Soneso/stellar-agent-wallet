@@ -44,7 +44,7 @@ fn load_key_returns_keyring_error_when_entry_missing() {
 
     // Intentionally do NOT seed any key.
     let profile = make_profile("load-key-missing");
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
 
     let err = mint
@@ -97,7 +97,7 @@ fn load_key_returns_keyring_error_on_get_password_no_storage_access() {
         std::io::Error::other("keyring locked in test"),
     )));
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
 
     let err = mint
@@ -145,7 +145,7 @@ fn load_key_returns_serialise_failed_on_invalid_base64() {
         .set_password("!!!not-valid-base64!!!")
         .expect("seed bad value");
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
 
     let err = mint

@@ -389,13 +389,14 @@ fn dry_run_signers_manager(
     context: &NetworkContext,
     args: &MigrateVerifierArgs,
     profile: &stellar_agent_core::profile::Profile,
+    origin: crate::common::profile_access::ProfileOrigin,
     resolved_profile: &crate::common::ResolvedProfileName,
 ) -> Result<(SignersManager, String), WalletError> {
     let profile_name = resolved_profile.name.clone();
     let chain_id = context.chain_id.caip2_str().to_owned();
     let timeout = Duration::from_secs(args.timeout_seconds);
     let (audit_writer, audit_log_path) =
-        open_audit_writer_read_only(profile, &resolved_profile.name)?;
+        open_audit_writer_read_only(profile, origin, &resolved_profile.name)?;
     let manager = construct_signers_manager_from_fields(
         &profile_name,
         context,
@@ -489,7 +490,7 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
 
     if args.dry_run {
         let (manager, chain_id) =
-            match dry_run_signers_manager(&context, args, &profile, &resolved_profile) {
+            match dry_run_signers_manager(&context, args, &profile, origin, &resolved_profile) {
                 Ok(ctx) => ctx,
                 Err(e) => return emit_error(&e, &request_id),
             };

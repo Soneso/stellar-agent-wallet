@@ -47,7 +47,7 @@ fn verify_hmac_only_happy_path_then_record() {
     let profile = make_profile("vho-happy");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_balances"]);
     let expiry = far_future_expiry();
     let now = now_before_expiry();
@@ -99,7 +99,7 @@ fn record_verified_nonce_returns_replayed_on_duplicate() {
     let profile = make_profile("vho-replay");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
     let expiry = far_future_expiry();
     let now = now_before_expiry();
@@ -146,7 +146,7 @@ fn verify_hmac_only_returns_expired_when_now_at_expiry() {
     let profile = make_profile("vho-expired");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_balances"]);
     let expiry = far_future_expiry();
     let now_at_mint = now_before_expiry();
@@ -192,7 +192,7 @@ fn verify_hmac_only_returns_expired_when_now_past_expiry() {
     let profile = make_profile("vho-expired-past");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
     let expiry = far_future_expiry();
     let now = now_before_expiry();
@@ -240,7 +240,7 @@ fn verify_hmac_only_returns_chain_mismatch() {
     let profile = make_profile("vho-chain");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_balances"]);
     let expiry = far_future_expiry();
     let now = now_before_expiry();
@@ -292,7 +292,7 @@ fn verify_hmac_only_returns_hmac_mismatch_on_tampered_envelope() {
     let profile = make_profile("vho-hmac-env");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
     let expiry = far_future_expiry();
     let now = now_before_expiry();
@@ -337,7 +337,7 @@ fn verify_hmac_only_returns_hmac_mismatch_on_tool_substitution() {
     let profile = make_profile("vho-hmac-tool");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay", "stellar_balances"]);
     let expiry = far_future_expiry();
     let now = now_before_expiry();
@@ -383,7 +383,7 @@ fn verify_hmac_only_returns_hmac_mismatch_on_corrupted_tag() {
     let profile = make_profile("vho-hmac-corrupt");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
     let expiry = far_future_expiry();
     let now = now_before_expiry();
@@ -438,7 +438,7 @@ fn verify_hmac_only_propagates_keyring_error_on_get_password_failure() {
     let profile = make_profile("vho-keyring-err");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
     let expiry = far_future_expiry();
     let now = now_before_expiry();

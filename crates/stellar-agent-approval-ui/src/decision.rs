@@ -28,6 +28,7 @@ use stellar_agent_core::approval::{
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::error::WalletError;
+use stellar_agent_core::profile::owner_key::OwnerKeyContext;
 use stellar_agent_core::profile::schema::KeyringEntryRef;
 use stellar_agent_core::timefmt;
 
@@ -94,6 +95,9 @@ pub struct DecisionContext {
     pub store_path: PathBuf,
     /// Keyring reference for the profile's attestation HMAC key.
     pub attestation_key_entry_ref: KeyringEntryRef,
+    /// The profile's owner coordinates. The attestation key load refuses a
+    /// key equal to the owner public key at any of them.
+    pub owner: OwnerKeyContext,
     /// Shared audit-log writer for the profile.
     pub audit_writer: Arc<Mutex<AuditWriter>>,
     /// Optional grant-store path override for the `ToolsetFirstInvokeGate`
@@ -104,12 +108,14 @@ pub struct DecisionContext {
 
 impl DecisionContext {
     /// Construct a decision context. Production callers pass `None` for
-    /// `grant_store_path_override`.
+    /// `grant_store_path_override`, and build `owner` with
+    /// [`OwnerKeyContext::for_profile`] from the serving profile and its name.
     #[must_use]
     pub fn new(
         context: stellar_agent_core::approval::ApprovalContext,
         store_path: PathBuf,
         attestation_key_entry_ref: KeyringEntryRef,
+        owner: OwnerKeyContext,
         audit_writer: Arc<Mutex<AuditWriter>>,
         grant_store_path_override: Option<PathBuf>,
     ) -> Self {
@@ -117,6 +123,7 @@ impl DecisionContext {
             context,
             store_path,
             attestation_key_entry_ref,
+            owner,
             audit_writer,
             grant_store_path_override,
         }
@@ -334,10 +341,14 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
     // overwritten.
     drop(store);
 
-    let key = match load_attestation_key(&ctx.attestation_key_entry_ref) {
+    let key = match load_attestation_key(&ctx.attestation_key_entry_ref, &ctx.owner) {
         Ok(k) => k,
         Err(e) => {
-            tracing::warn!(error = %e, "approve: attestation key load failed");
+            tracing::warn!(
+                code = %e.code(),
+                error = %e,
+                "approve: attestation key load failed"
+            );
             return Outcome::Unavailable;
         }
     };
@@ -564,6 +575,7 @@ mod tests {
             ),
             store_path,
             KeyringEntryRef::new(svc, "default"),
+            stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile_name("ui-test"),
             audit_writer,
             Some(grant_path),
         );
@@ -673,6 +685,48 @@ mod tests {
             &process_uid,
             &blob
         ));
+    }
+
+    /// An attestation key equal to the profile's owner public key in the
+    /// older form is refused. The decision is unavailable, nothing is
+    /// attested, and the `warn` line carries the owner code without the raw
+    /// value.
+    #[test]
+    #[serial]
+    fn approve_refuses_an_attestation_key_equal_to_the_owner_key() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("owner");
+        let owner = KeyringEntryRef::default_owner_key("ui-test");
+        let older_form = URL_SAFE_NO_PAD.encode(fx.raw_key);
+        KeyringEntry::new(&owner.service, &owner.account)
+            .unwrap()
+            .set_password(&older_form)
+            .unwrap();
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+
+        let mut outcome = None;
+        let logs = stellar_agent_test_support::with_captured_logs(|| {
+            outcome = Some(apply_decision(
+                &fx.ctx,
+                Decision::Approve {
+                    nonce: nonce.clone(),
+                },
+                &RequestIdentity::Local,
+            ));
+        });
+        assert!(
+            matches!(outcome, Some(Outcome::Unavailable)),
+            "expected Unavailable, got {outcome:?}"
+        );
+        assert!(!logs.contains(&older_form), "the raw value is never logged");
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(
+            logs.contains("validation.key_matches_owner_public_key"),
+            "{logs}"
+        );
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        let entry = store.get(&nonce).expect("the entry stays");
+        assert!(entry.attestation_blob_b64.is_none(), "nothing is attested");
     }
 
     #[test]

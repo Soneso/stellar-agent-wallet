@@ -397,7 +397,15 @@ pub fn verify_log_with_health(
 /// A file that moved FORWARD past an intact anchored entry is not an error:
 /// unkeyed writers append without touching the anchor, and the next keyed
 /// acquisition absorbs the gap.
-fn check_anchor_against_walk(
+///
+/// The function reads the log at `log_path` and never reads or writes the
+/// keyring, so it neither adopts nor advances an anchor.
+///
+/// # Errors
+///
+/// [`VerifyError::TipAnchorMismatch`] when the anchor disagrees with the walk,
+/// and [`VerifyError`] I/O variants when the anchored entry cannot be read.
+pub fn check_anchor_against_walk(
     log_path: &Path,
     anchor: &TipAnchor,
     active_tip: Option<&VerifiedTip>,
@@ -447,6 +455,37 @@ fn check_anchor_against_walk(
         return Err(mismatch("the active file's tip is not the anchored tip"));
     }
     Ok(())
+}
+
+/// Whether a stored anchor disagrees with the walked tip of the log at
+/// `log_path`.
+///
+/// An absent anchor agrees, an unusable one disagrees, and a usable one
+/// disagrees exactly when [`check_anchor_against_walk`] refuses it. A file that
+/// moved forward past an intact anchored entry agrees. Like that rule, this
+/// reads only the log.
+///
+/// # Errors
+///
+/// [`VerifyError`] when the anchored entry cannot be read for a reason other
+/// than a disagreement.
+pub fn stored_anchor_disagrees_with_walk(
+    log_path: &Path,
+    stored: &crate::audit_log::writer::StoredTipAnchor,
+    active_tip: Option<&VerifiedTip>,
+) -> Result<bool, VerifyError> {
+    use crate::audit_log::writer::StoredTipAnchor;
+    match stored {
+        StoredTipAnchor::Absent => Ok(false),
+        StoredTipAnchor::Unusable { .. } => Ok(true),
+        StoredTipAnchor::Usable(anchor) => {
+            match check_anchor_against_walk(log_path, anchor, active_tip) {
+                Ok(()) => Ok(false),
+                Err(VerifyError::TipAnchorMismatch { .. }) => Ok(true),
+                Err(e) => Err(e),
+            }
+        }
+    }
 }
 
 /// Returns `true` when the anchor names exactly the newest rotated archive's

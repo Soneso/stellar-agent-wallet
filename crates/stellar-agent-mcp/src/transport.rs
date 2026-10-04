@@ -46,6 +46,48 @@ pub use stellar_agent_core::profile::name::{
     ProfileNameMismatch, ProfileStateLayout, profile_name_mismatch_refusal,
 };
 
+/// Loads the profile the operator selected.
+///
+/// A profile named through `--profile` or `STELLAR_AGENT_PROFILE` is loaded
+/// with no fallback. The synthesized first-run profile is a **testnet**,
+/// **Noop-engine** configuration, and it never stands in for a named profile.
+/// The fallback applies only when no name was given at all, which is the
+/// first-run case it exists for.
+///
+/// The branch keys on the resolved name's source, never on the name itself:
+/// `--profile default` on a host with no `default.toml` is a named profile that
+/// must refuse, not a first run.
+///
+/// The returned origin is
+/// [`ProfileOrigin::Persisted`](stellar_agent_core::profile::loader::ProfileOrigin::Persisted)
+/// for every profile read from a file, the unnamed `default.toml` included;
+/// only the synthesized fallback is
+/// [`ProfileOrigin::Synthesized`](stellar_agent_core::profile::loader::ProfileOrigin::Synthesized).
+/// [`build_server`] takes the binding check the origin implies.
+///
+/// # Errors
+///
+/// The [`ProfileLoadError`](stellar_agent_core::profile::loader::ProfileLoadError)
+/// of the load, or the refusal of an implicitly selected mainnet profile.
+pub fn load_selected_profile(
+    resolved: &stellar_agent_core::profile::name::ResolvedProfileName,
+) -> Result<
+    (Profile, stellar_agent_core::profile::loader::ProfileOrigin),
+    stellar_agent_core::profile::loader::ProfileLoadError,
+> {
+    use stellar_agent_core::profile::loader;
+    let (profile, origin) = if resolved.source.is_explicit() {
+        (
+            loader::load(&resolved.name, None)?,
+            loader::ProfileOrigin::Persisted,
+        )
+    } else {
+        loader::load_default_or_testnet_fallback()?
+    };
+    stellar_agent_core::profile::check_mainnet_selection(&profile, resolved)?;
+    Ok((profile, origin))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Type aliases for BoundedStdioTransport internals
 // ─────────────────────────────────────────────────────────────────────────────
@@ -165,14 +207,18 @@ impl Transport<RoleServer> for BoundedStdioTransport {
 /// Starts the MCP stdio server and runs until the client disconnects.
 ///
 /// Constructs the bounded transport (max-line mitigation) and calls
-/// `rmcp::ServiceExt::serve` with the `WalletServer` handler.
+/// `rmcp::ServiceExt::serve` with the `WalletServer` handler. `binding` is
+/// passed to [`build_server`].
 ///
 /// # Errors
 ///
 /// Returns a boxed error if the rmcp service encounters a fatal error during
 /// initialisation or operation.
-pub async fn run(profile: Profile) -> Result<(), Box<dyn std::error::Error>> {
-    serve(build_server(profile)?).await
+pub async fn run(
+    profile: Profile,
+    binding: stellar_agent_core::audit_log::BindingCheck,
+) -> Result<(), Box<dyn std::error::Error>> {
+    serve(build_server(profile, binding)?).await
 }
 
 /// Constructs the [`WalletServer`] for `profile` without starting the MCP loop.
@@ -189,11 +235,17 @@ pub async fn run(profile: Profile) -> Result<(), Box<dyn std::error::Error>> {
 /// owner key, signed policy, or window state is not yet in place fails here
 /// rather than serving with a degraded engine.
 ///
+/// `binding` is the audit binding check the profile's origin implies; the
+/// server stores it and every keyed audit acquisition applies it.
+///
 /// # Errors
 ///
 /// Returns the [`BuildRegistryError`] produced by `WalletServer::new`.
-pub fn build_server(profile: Profile) -> Result<WalletServer, BuildRegistryError> {
-    WalletServer::new(profile)
+pub fn build_server(
+    profile: Profile,
+    binding: stellar_agent_core::audit_log::BindingCheck,
+) -> Result<WalletServer, BuildRegistryError> {
+    Ok(WalletServer::new(profile)?.with_audit_binding_check(binding))
 }
 
 /// Runs the MCP stdio loop for an already-constructed server until the client

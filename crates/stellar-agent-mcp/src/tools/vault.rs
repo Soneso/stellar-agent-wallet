@@ -508,6 +508,7 @@ impl WalletServer {
         let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
             &self.profile,
             &audit_profile_name,
+            self.audit_binding,
         ) {
             Ok(w) => w,
             Err(err) => {
@@ -989,6 +990,7 @@ impl WalletServer {
         let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
             &self.profile,
             &audit_profile_name,
+            self.audit_binding,
         ) {
             Ok(w) => w,
             Err(err) => {

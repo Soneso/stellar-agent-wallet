@@ -114,23 +114,40 @@ one.
 
 ## Loader source order
 
-The profile file is the record the operator audits. Its `chain_id` is
-non-overlayable on every chain. On mainnet, `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, and `mcp_signer_default` are also protected.
-An environment or programmatic overlay naming any protected field is
-refused with `profile.non_overlayable_field`, even when its value equals the file.
-An equal overlay can hide a later edit to the audited record.
+The profile file is the record the operator audits, and a profile's trust
+roots come from that file only. An environment or programmatic overlay may set
+a fixed allowlist of operational fields, in three classes:
 
-The remaining fields merge in increasing priority:
+| Class | Keys |
+| --- | --- |
+| Every chain | `submit_timeout_seconds` |
+| Testnet only | `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, `mcp_signer_default`, `cross_check_threshold_stroops` and its alias `usd_threshold`, `classic_fee_per_op_stroops`, `classic_max_fee_per_op_stroops`, `smart_account_max_context_rule_scan_id`, `session_rule_max_horizon_ledgers` |
+| Tighten only, every chain | `mcp_disabled`, and only to `true` |
+
+Every other profile key is never overlayable, on any chain: `chain_id`,
+`version`, every `*_key_id` coordinate and `mcp_nonce_key_alias`,
+`audit_log_path`, `policy`, `wallet`, `remote_approval`, `served_pages`,
+`pool_master_key_id`, `pool_config`, and `pool_initialization`. An overlay
+naming one is refused with `profile.non_overlayable_field`, even when its value
+equals the file; an equal overlay can hide a later edit to the audited record.
+An overlay that sets `mcp_disabled` to anything but `true` is refused with the
+same code. The loader checks `chain_id` first and then each key in a fixed
+order, so the refused key it names is the same on every run. A nested key is
+checked by its top-level name, so `wallet.mlock_required` is `wallet`. A
+`STELLAR_AGENT_*` variable that names no profile key, such as
+`STELLAR_AGENT_HOME`, `STELLAR_AGENT_PROFILE`, `STELLAR_AGENT_KEYRING_BACKEND`,
+`STELLAR_AGENT_HEADLESS_KEYRING_KEY`, or `STELLAR_AGENT_LOG`, is not an overlay
+and is ignored.
+
+The permitted fields merge in increasing priority:
 
 1. **TOML file:** `<profile_dir>/<name>.toml`.
 2. **Environment overlay:** variables prefixed `STELLAR_AGENT_`.
 3. **Programmatic overlay:** key/value pairs supplied by a command.
 
-Testnet endpoint and signer fields remain overlayable. Mainnet uses these fields from the profile file only.
-
 A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE` never selects one, and a mainnet `default.toml` needs `--profile default`. Keep the filename: its identity is bound to its keyring entries.
 
-Unset `STELLAR_AGENT_CHAIN_ID` on every chain. On mainnet, also unset `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, `STELLAR_AGENT_ORACLE_PROVIDER_URL`, and `STELLAR_AGENT_MCP_SIGNER_DEFAULT`. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
+To recover from the refusal, unset the `STELLAR_AGENT_*` variable for the key the message names, set the value in the profile file if it is needed, and remove the key from programmatic overlays too. On mainnet that includes `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, `STELLAR_AGENT_ORACLE_PROVIDER_URL`, and `STELLAR_AGENT_MCP_SIGNER_DEFAULT`; on every chain it includes `STELLAR_AGENT_CHAIN_ID` and `STELLAR_AGENT_AUDIT_LOG_PATH`. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
 
 After merging, the loader resolves derived fields and validates:
 
@@ -149,7 +166,15 @@ After merging, the loader resolves derived fields and validates:
   profile.
 - `audit_log_path` defaults to the OS-conventional PER-PROFILE location
   (`<data root>/audit/<name>.jsonl`) when omitted; profiles never share an
-  audit file unless one is configured explicitly.
+  audit file unless one is configured explicitly. The first keyed audit write
+  records the path's digest and the audit-key coordinate in the keyring as the
+  profile's audit binding. A later edit to either refuses with
+  `audit.log_binding_changed` until the operator runs `stellar-agent audit
+  reanchor --profile <name> --acknowledge-binding-change`. The default derives
+  from the OS data directory, which follows `$HOME` and `$XDG_DATA_HOME`. Two
+  profile files of one name in two data roots that share one keyring therefore
+  bind different digests and refuse each other. Set an explicit
+  `audit_log_path` in such a deployment.
 - A `version` 2 profile must carry an explicit `[policy]` section; a v2 file
   with no `[policy]` block is refused rather than silently inheriting a default
   engine.
@@ -239,7 +264,7 @@ which the 32-byte signing seed is resident in pinned, zeroize-on-drop memory.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `mlock_required` | bool or `"warn"` | no | platform-dependent | `mlock(2)` failure posture. `true` (default on Linux/macOS): fail closed if the seed cannot be pinned in RAM. `"warn"` (default on Windows): proceed with unprotected memory and emit a warning. `false`: do not attempt memory locking. |
+| `mlock_required` | bool or `"warn"` | no | platform-dependent | `mlock(2)` failure posture. `true` (default on Linux/macOS): fail closed if the seed cannot be pinned in RAM. `"warn"` (default on Windows): proceed with unprotected memory and emit a warning. `false`: do not attempt memory locking. The posture is set in this file and is not overlayable. |
 | `unlock_ttl_seconds` | integer | no | `30` | Unlock-window TTL in seconds, for the CLI `--secret-env` signing path. Must be in the range 1 to 600 (10 minutes); a value of 0 or above 600 is refused when the window is constructed, never clamped. |
 
 ### `[policy]` block
@@ -336,7 +361,7 @@ on error.
 
 | Command | Mints into | Notes |
 |---------|------------|-------|
-| `stellar-agent profile enroll-owner-key` | `policy_owner_key_id` | Enrols the owner ed25519 PUBLIC key from an operator seed. Sign policy files with `profile sign-policy`; re-enrolling a different key invalidates policy files signed by the previous one. |
+| `stellar-agent profile enroll-owner-key` | `policy_owner_key_id` | Enrols the owner ed25519 PUBLIC key from an operator seed, stored as its G-strkey, which no 32-byte symmetric-key loader accepts. It also rewrites every other profile's older-form owner entry. Sign policy files with `profile sign-policy`; re-enrolling a different key invalidates policy files signed by the previous one. |
 | `stellar-agent profile rotate-attestation-key <name>` | `attestation_key_id` | Fresh 32-byte HMAC key. All pending approvals are invalidated. |
 | `stellar-agent profile rotate-audit-key <name>` | `audit_log_hash_chain_key_id` | Fresh 32-byte HMAC key. Rotation re-signs every existing per-file chain-root sidecar with the new key, so the whole log verifies under it; the old key stops verifying. |
 | `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. All cached `stellar.toml` entries are invalidated and re-fetched on next use. |

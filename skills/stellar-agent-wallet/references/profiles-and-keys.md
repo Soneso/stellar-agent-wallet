@@ -72,11 +72,28 @@ CLI command and MCP tool refuses `audit.chain_key_unavailable`. See
 A profile is assembled from three layered sources. Higher-priority sources
 override lower ones field-by-field:
 
-1. TOML file — `<profile_dir>/<name>.toml` (lowest priority).
-2. Environment overlay — variables prefixed `STELLAR_AGENT_`. For example,
-   `STELLAR_AGENT_RPC_URL=https://...` overrides the `rpc_url` field.
-3. CLI overlay — programmatic key/value pairs supplied by a command at resolve
+1. TOML file: `<profile_dir>/<name>.toml` (lowest priority).
+2. Environment overlay: variables prefixed `STELLAR_AGENT_`. For example, on a
+   testnet profile `STELLAR_AGENT_RPC_URL=https://...` overrides the `rpc_url`
+   field.
+3. CLI overlay: programmatic key/value pairs supplied by a command at resolve
    time (highest priority).
+
+The two overlays may set only these fields; a profile's trust roots come from
+the file only:
+
+| Class | Keys |
+|---|---|
+| Every chain | `submit_timeout_seconds` |
+| Testnet only | `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, `mcp_signer_default`, `cross_check_threshold_stroops` and its alias `usd_threshold`, `classic_fee_per_op_stroops`, `classic_max_fee_per_op_stroops`, `smart_account_max_context_rule_scan_id`, `session_rule_max_horizon_ledgers` |
+| Tighten only, every chain | `mcp_disabled`, and only to `true` |
+
+Every other key (`chain_id`, `version`, every `*_key_id` coordinate,
+`mcp_nonce_key_alias`, `audit_log_path`, `policy`, `wallet`, `remote_approval`,
+`served_pages`, and the pool fields) is refused on every chain with
+`profile.non_overlayable_field`, even when the value equals the file. A
+`STELLAR_AGENT_*` variable that names no profile key, such as
+`STELLAR_AGENT_HOME` or `STELLAR_AGENT_KEYRING_BACKEND`, is ignored.
 
 After merging, the loader resolves derived fields and validates:
 
@@ -95,7 +112,12 @@ After merging, the loader resolves derived fields and validates:
   profile.
 - `audit_log_path` defaults to the OS-conventional PER-PROFILE location
   (`<data root>/audit/<name>.jsonl`) when omitted; profiles never share an
-  audit file unless one is configured explicitly.
+  audit file unless one is configured explicitly. The first keyed audit write
+  records the path's digest and the audit-key coordinate in the keyring as the
+  profile's audit binding. A later edit to either refuses with
+  `audit.log_binding_changed` until the operator acknowledges it. Two profile
+  files of one name in two data roots that share one keyring refuse each
+  other; set an explicit `audit_log_path` there.
 - A `version` 2 profile must carry an explicit `[policy]` section; a v2 file with
   no `[policy]` block is refused rather than silently inheriting a default
   engine.
@@ -111,7 +133,7 @@ Every profile carries a top-level `version` field. The loader dispatches on it:
 - `version > 2` — refused. A profile written by a newer wallet is rejected so an
   older wallet never silently applies stale defaults.
 
-`chain_id` is read from the file on every chain. Mainnet also protects `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, and `mcp_signer_default` against environment and programmatic overlays.
+`chain_id` and every other key outside the overlay classes above are read from the file on every chain. Mainnet also reads `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, `mcp_signer_default`, and the other testnet-only keys from the file only.
 
 ## Field reference
 
@@ -179,7 +201,7 @@ Controls the unlock window — the short, TTL-bounded period during which the
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `mlock_required` | bool or `"warn"` | no | platform-dependent | `mlock(2)` failure posture. `true` (default on Linux/macOS): fail closed if the seed cannot be pinned in RAM. `"warn"` (default on Windows): proceed with unprotected memory and emit a warning. `false`: do not attempt memory locking. |
+| `mlock_required` | bool or `"warn"` | no | platform-dependent | `mlock(2)` failure posture. `true` (default on Linux/macOS): fail closed if the seed cannot be pinned in RAM. `"warn"` (default on Windows): proceed with unprotected memory and emit a warning. `false`: do not attempt memory locking. The posture is set in this file and is not overlayable. |
 | `unlock_ttl_seconds` | integer | no | `30` | Unlock-window TTL in seconds. Hard cap `600` (10 minutes); a value above the cap is refused when the window is constructed. Operators may shorten the window. |
 
 ### `[policy]` block
@@ -288,9 +310,13 @@ on error.
 
 The policy-file owner key is not rotated here. It is an ed25519 key whose PUBLIC
 half is enrolled with `stellar-agent profile enroll-owner-key` (from an operator
-`S...` seed; only the public key is stored) and whose seed signs policy files via
-`stellar-agent profile sign-policy`. Re-enrolling a different owner key
-invalidates policy files signed by the previous one.
+`S...` seed; only the public key is stored, as its G-strkey) and whose seed signs
+policy files via `stellar-agent profile sign-policy`. Re-enrolling a different
+owner key invalidates policy files signed by the previous one. Every symmetric
+key loader refuses a coordinate in the owner namespace and a key equal to the
+owner public key, with `validation.key_matches_owner_public_key`. An owner entry
+in the older base64 form is rewritten as its G-strkey by the next V1 verb or
+`enroll-owner-key`, for every profile in the profile directory.
 
 | Command | Mints into | Notes |
 |---------|------------|-------|

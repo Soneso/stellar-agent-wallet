@@ -21,6 +21,11 @@
 use stellar_agent_core::{error::WalletError, profile::schema::KeyringEntryRef};
 use stellar_agent_network::keyring::rotate_keyring_secret_32;
 
+/// The profile field an owner refusal of `profile rotate-counterparty-key` and
+/// `counterparty rotate-hmac-key` names; both write the key at that field's
+/// coordinate.
+pub(crate) const COUNTERPARTY_KEY_FIELD: &str = "counterparty_cache_key_id";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HMAC-key path (3 rotators: attestation, audit, counterparty)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -89,6 +94,26 @@ mod tests {
     use stellar_agent_test_support::keyring_mock;
 
     use super::*;
+
+    /// Every label an owner refusal of a key-write verb names is a field of the
+    /// profile file, so the operator finds the coordinate to correct.
+    #[test]
+    fn every_owner_refusal_label_names_a_profile_field() {
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+            "labels", "s", "a", "n", "a",
+        )
+        .build();
+        let file: toml::Table = toml::from_str(&toml::to_string(&profile).unwrap()).unwrap();
+        for label in [
+            stellar_agent_network::keyring::AUDIT_KEY_FIELD,
+            stellar_agent_core::approval::attest::ATTESTATION_KEY_FIELD,
+            stellar_agent_nonce::mint::NONCE_KEY_FIELD,
+            stellar_agent_network::policy_state::POLICY_STATE_KEY_FIELD,
+            COUNTERPARTY_KEY_FIELD,
+        ] {
+            assert!(file.contains_key(label), "{label} names no profile field");
+        }
+    }
 
     /// Rotates the HMAC key for the given entry ref and returns the stored base64
     /// string.  Private to this module.

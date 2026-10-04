@@ -6,22 +6,22 @@ For the conventions shared by every command (profile and network resolution, the
 
 All four groups operate on local state — TOML files and platform-keyring entries. None of them submits a Stellar transaction, so the network flags and the mainnet-write gate do not apply here. Every command prints JSON on stdout and exits `0` on success or `1` on any error, using the standard `{ok, data, request_id}` envelope.
 
-## Profile selection and protected fields
+## Profile selection and refused overlays
 
 A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE` never selects one, and a mainnet `default.toml` needs `--profile default`. Keep the filename: its identity is bound to its keyring entries.
 
 `profile show` displays the named document without applying the selection predicate.
-The loader still refuses protected overlays on that read.
+The loader still applies the overlay classes on that read.
 
 | Wire code | Meaning |
 |---|---|
-| `profile.non_overlayable_field` | A protected field was supplied outside the file, including an equal value. Remove that environment value, overlay, or flag. |
+| `profile.non_overlayable_field` | An overlay named a key outside its class, or set `mcp_disabled` to anything but `true`, including an equal value. Overlays may set `submit_timeout_seconds` on every chain, the testnet-only endpoint, signer, fee, threshold, and scan-bound keys on testnet, and `mcp_disabled = true`; every other key comes from the file. Remove that environment value, overlay, or flag, and set the value in the profile file. |
 | `profile.network_flag_mismatch` | `--network` differs from the loaded chain. Remove the flag or select a profile on that chain. |
 | `auth.enrolled_signer_unpinned` | Mainnet enrollment is a placeholder or malformed. Correct a malformed `mcp_signer_default.account`, then run `stellar-agent profile enroll-signer --profile <name>`. |
 | `auth.enrolled_signer_mismatch` | The derived key differs from the enrolled identity. Use the enrolled seed, Ledger account, or keyring entry. |
 | `profile.mainnet_requires_explicit_profile` | A mainnet profile was selected by the environment or the default source. Supply `--profile <name>`. |
 
-Unset `STELLAR_AGENT_CHAIN_ID` on every chain. On mainnet, also unset `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, `STELLAR_AGENT_ORACLE_PROVIDER_URL`, and `STELLAR_AGENT_MCP_SIGNER_DEFAULT`. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
+Unset the `STELLAR_AGENT_*` variable the refusal names. On every chain that covers `STELLAR_AGENT_CHAIN_ID`, `STELLAR_AGENT_AUDIT_LOG_PATH`, every `*_KEY_ID` variable, and every other key outside the overlay classes. On mainnet it also covers `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, `STELLAR_AGENT_ORACLE_PROVIDER_URL`, `STELLAR_AGENT_MCP_SIGNER_DEFAULT`, and the other testnet-only keys. Remove refused keys from programmatic overlays too, and set needed values in the profile file. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
 
 ## `profile`
 
@@ -167,7 +167,7 @@ Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id
 - `--expected-address <G_STRKEY>` — refuse unless the seed derives to this address.
 - `--force` — replace an already-enrolled owner key (refused without it when one exists; replacing invalidates every policy file signed by the previous owner key).
 
-The owner coordinate's `account` is the literal `"default"` (the value the engine reads); the stored value is the URL-safe base64 (no padding) encoding of the 32-byte public key. On success the data object reports the derived `owner_address`, the `keyring_service`/`keyring_account` written, and `replaced`. The prior key's stored value is never decoded or reported: a prior entry at this coordinate may have held an owner seed in the same encoding, so rendering it could print a private key; `replaced: true` conveys that a prior entry existed.
+The owner coordinate's `account` is the literal `"default"` (the value the engine reads); the stored value is the public key's G-strkey. A G-strkey decodes as URL-safe base64 to 42 bytes, so no 32-byte symmetric-key loader accepts it. Every owner reader also accepts the older form, URL-safe base64 of the 32 key bytes. The V1 engine build rewrites an older-form entry as its G-strkey, best effort, and the first build in a process also rewrites every other profile's older-form owner entry in the profile directory. This command rewrites them too. Under `headless-dpapi` an older-form owner entry can be moved to another coordinate until it is rewritten, so run one V1 verb or this command after upgrading. On success the data object reports the derived `owner_address`, the `keyring_service`/`keyring_account` written, and `replaced`. The prior key's stored value is never decoded or reported. A prior entry at this coordinate may have held an owner seed in the older encoding, so rendering it could print a private key. `replaced: true` conveys that a prior entry existed.
 
 ```json
 {"ok":true,"data":{"profile":"default","enrolled":true,"owner_address":"G...","keyring_service":"stellar-agent-owner-default","keyring_account":"default","replaced":false},"request_id":"..."}
@@ -209,7 +209,7 @@ Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, en
 | Subcommand | Keyring entry rotated | Key kind | Effect on outstanding material |
 |---|---|---|---|
 | `rotate-attestation-key` | approval-spine attestation HMAC key (`attestation_key_id`) | 32-byte HMAC | All pending approvals are invalidated; the simulate-and-approve round trip must be re-run. |
-| `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | Rotation re-signs every existing per-file chain-root sidecar with the new key; `audit verify` passes under the new key and the old key stops verifying. Takes the audit writer's exclusive lock, so it refuses while an MCP server is running, and checks the tip anchor before touching the key. |
+| `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | Rotation re-signs every existing per-file chain-root sidecar with the new key. `audit verify` passes under the new key, and the old key stops verifying. Takes the audit writer's exclusive lock, so it refuses while an MCP server is running, and checks the tip anchor before touching the key. Checks the audit binding before it opens the writer: a changed binding refuses with `audit.log_binding_changed` and creates nothing at the path the profile names; an absent one is recorded. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
 | `rotate-policy-state-key` | policy-window-state HMAC key (`policy_window_state_key_id`) | 32-byte HMAC | The persisted window-state store is re-signed under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Rotation is refused if the store file does not verify under the current key (run `reset-window-state` instead). |
 
@@ -557,7 +557,7 @@ Read-only. Walks the log at `<LOG_PATH>`, following rotation manifests across ro
 The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is the log that profile configures. The anchor names a path, not a profile, so comparing it against a file it does not describe would report a mismatch that means nothing. Every other case reports `anchor.status` as `"not_checked"` with the reason and still verifies the chain in full. A log that moved forward past its anchor passes; a log behind it, or one whose tip is not the anchored tip, fails with `audit.tip_anchor_mismatch`.
 
 - `<LOG_PATH>` (positional, required) — path to the audit log file. By default this is `~/.local/share/stellar-agent/audit/<profile>.jsonl` on Linux, `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` on macOS, and `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` on Windows.
-- `--profile <NAME>` — the profile whose chain-root HMAC key verifies the sidecars. Optional; when omitted, only the hash chain is verified.
+- `--profile <NAME>`: the profile whose chain-root HMAC key verifies the sidecars. Optional; when omitted, only the hash chain is verified. The profile's audit binding is read and never written: a changed or unparseable binding exits `1` with `audit.log_binding_changed`.
 - `--output <FORMAT>` — output format. `json` is the default and only stable format.
 
 On Unix, the command refuses to verify a log whose parent directory is owned by a different user, since such a directory could be used to substitute log files or sidecars. It exits `0` when the chain is intact and `1` on any integrity violation (a broken chain, a rotation gap, an HMAC mismatch, a missing sidecar, an unparseable line, or a tip-anchor mismatch), a path-contract failure, or an I/O error.
@@ -572,24 +572,32 @@ stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --pr
 
 ### `audit reanchor --profile <NAME> --acknowledge-rollback`
 
-State-changing (writes the keyring anchor and appends one audit row; no network). The only way out of an `audit.tip_anchor_mismatch` refusal.
+State-changing (writes the keyring anchor and appends one or two audit rows; no network). The only way out of an `audit.tip_anchor_mismatch` or `audit.log_binding_changed` refusal. Operator-only: an agent must never run it on its own initiative.
 
-- `--profile <NAME>` (required) — the profile whose configured `audit_log_path` and audit keyring coordinate identify the anchor.
-- `--acknowledge-rollback` (required to act) — accept the log's current tip as authoritative.
+- `--profile <NAME>` (required): the profile whose configured `audit_log_path` and audit keyring coordinate identify the anchor.
+- `--acknowledge-rollback` (required to act on a rolled-back log): accept the log's current tip as authoritative.
+- `--acknowledge-binding-change` (required to act on a changed binding): accept a log path or audit key that differs from the profile's recorded audit binding.
 
-Without `--acknowledge-rollback` the command reports the anchor in force and the anchor it would write, both as `<entry count>:<byte offset>`, changes nothing, and exits `1` with `validation.acknowledgement_required`. Moving the anchor forgives whatever made the log disagree with it, and the command cannot tell a restored backup from tampering — that judgement is the operator's, and it wants to be made before the evidence moves.
+| Recorded binding | Current path's anchor | Flags required | Rows appended |
+|---|---|---|---|
+| Equal or absent | Any | `--acknowledge-rollback` | `rollback_acknowledged` |
+| Changed or unreadable | Absent, or agrees with the log | `--acknowledge-binding-change` | `binding_changed` |
+| Changed or unreadable | Disagrees with the log, or cannot be parsed | Both | `rollback_acknowledged`, then `binding_changed` |
 
-With the flag, the command replays the whole log first (a log whose own chain is broken is refused, not blessed), writes the current tip as the anchor, increments a monotonic per-path re-anchor counter held in the keyring, and appends an `audit_tip_anchored` row naming the superseded anchor. That row is permanent: the log carries its own record that a rollback was accepted and how far back it went.
+A flag the matrix does not require is ignored. The binding is checked before the repair writer opens, and the anchor's disagreement is decided again under the writer's lock. A missing flag changes nothing and exits `1` with `validation.acknowledgement_required`, naming the flag. Without `--acknowledge-rollback` on an equal or absent binding the command reports the anchor in force and the anchor it would write, both as `<entry count>:<byte offset>`, changes nothing, and exits `1` with `validation.acknowledgement_required`. Moving the anchor forgives whatever made the log disagree with it, and the command cannot tell a restored backup from tampering. That judgement is the operator's, and it wants to be made before the evidence moves.
 
-The command takes the audit writer's exclusive lock. A running MCP server holds that lock for its lifetime, so stop the server before repairing.
+With the required flags, the command replays the whole log first, so a log whose own chain is broken is refused rather than blessed. It writes the current tip as the anchor, bumps the current path's re-anchor counter held in the keyring once, and appends the rows, each carrying that count. `rollback_acknowledged` names the superseded anchor. `binding_changed` names the anchor of the log path the previous binding named, or none when the record was unreadable. The rows are permanent: the log carries its own record that a rollback or a binding change was accepted. The new binding is stored last, so a run that stops earlier leaves the refusal in place, and an absent binding is recorded after a rollback repair. The envelope lists the conditions acknowledged and how the recorded binding compared.
+
+The command takes the audit writer's exclusive lock. A running MCP server holds that lock for its lifetime, so stop the server before a rollback repair. A binding change needs no stop: a server running the edited profile refuses before it opens the new path, so it holds no lock there. A server still running the old profile refuses after the acknowledgement until it restarts.
 
 ```bash
 stellar-agent audit reanchor --profile default                          # report only, exits 1
 stellar-agent audit reanchor --profile default --acknowledge-rollback
+stellar-agent audit reanchor --profile default --acknowledge-binding-change
 ```
 
 ```json
-{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"recorded_binding":"equal","previous_binding_anchor":null},"request_id":"..."}
 ```
 
 For the causes worth ruling out before acknowledging, see [Audit-log recovery](../maintainers/audit-log-recovery.md).

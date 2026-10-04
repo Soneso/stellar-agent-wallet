@@ -873,7 +873,21 @@ pub enum ValidationError {
         "profile field `{field}` is read from the profile file only; remove it from the environment, the overlay, or the command line"
     )]
     ProfileNonOverlayableField {
-        /// The protected field named by the overlay.
+        /// The non-overlayable field named by the overlay.
+        field: &'static str,
+    },
+
+    /// An overlay sets a tighten-only field to a value other than `true`.
+    ///
+    /// # Wire code
+    ///
+    /// `"profile.non_overlayable_field"`, shared with
+    /// [`ValidationError::ProfileNonOverlayableField`].
+    #[error(
+        "profile field `{field}` may only be set to `true` outside the profile file; set it in the profile file, or remove it from the environment and the overlay"
+    )]
+    ProfileOverlayMayOnlyTighten {
+        /// The tighten-only field named by the overlay.
         field: &'static str,
     },
 
@@ -984,9 +998,12 @@ pub enum ValidationError {
     /// chain-root signature covers each file's first entry. Both verify a
     /// PREFIX, so restoring an older copy of the active log, or truncating it,
     /// leaves a log that still verifies. The anchor keeps the tip's entry count,
-    /// hash, and byte offset in the platform keyring, outside the reach of
-    /// filesystem access alone, and this refusal is what a rolled-back,
-    /// truncated, or substituted log produces.
+    /// hash, and byte offset in the keyring, outside the log file, and this
+    /// refusal is what a rolled-back, truncated, or substituted log produces.
+    /// Anyone who can restore the keyring's own storage together with the log
+    /// can restore an older state. With a headless keyring backend the anchor
+    /// is kept in a file on the same host, and anyone who can write that file
+    /// can restore an older anchor or delete one.
     ///
     /// A log that moved FORWARD past the anchor is not this: unkeyed writers
     /// append without moving the anchor, and the next keyed acquisition absorbs
@@ -1075,6 +1092,64 @@ pub enum ValidationError {
         current: String,
         /// Coordinates the anchor would move to.
         proposed: String,
+    },
+
+    /// A keyed audit writer refused because the profile's audit binding in the
+    /// keyring names another log path or audit key, or cannot be parsed.
+    ///
+    /// The binding records the log path digest and the audit-key coordinate a
+    /// persisted profile last wrote under. A profile file edited to name
+    /// another log or key has an anchor coordinate with nothing stored at it,
+    /// so the writer refuses until the operator acknowledges the change with
+    /// `stellar-agent audit reanchor --acknowledge-binding-change`. The message
+    /// names the profile and the remedy, never a path, a coordinate, or the
+    /// stored record.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.log_binding_changed"`.
+    #[error(
+        "profile '{profile}' names an audit log or audit key other than the one recorded for it in the keyring; audit writes refuse until the change is acknowledged. Confirm the change, then run `stellar-agent audit reanchor --profile {profile} --acknowledge-binding-change`"
+    )]
+    AuditLogBindingChanged {
+        /// The profile whose audit binding changed.
+        profile: String,
+    },
+
+    /// `audit reanchor` found a changed audit binding and an acknowledgement
+    /// flag the change requires is missing.
+    ///
+    /// Nothing is written. `missing` names the flag or flags to add.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.acknowledgement_required"`.
+    #[error(
+        "profile '{profile}' has a changed audit binding and the repair requires {missing}; nothing was written. Re-run `stellar-agent audit reanchor --profile {profile}` with {missing} once you have confirmed the change"
+    )]
+    AuditBindingChangeNotAcknowledged {
+        /// The profile whose audit binding changed.
+        profile: String,
+        /// The missing acknowledgement flag or flags.
+        missing: &'static str,
+    },
+
+    /// A symmetric key loader refused a key that is, or may be, the profile's
+    /// owner public key.
+    ///
+    /// The loader refuses a coordinate in the owner key namespace before any
+    /// keyring read, and a loaded key equal to the profile's own owner public
+    /// key. The message names the profile field, never key material.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.key_matches_owner_public_key"`.
+    #[error(
+        "the key for `{field}` is an owner public key or sits in the owner key namespace, so it cannot serve as a symmetric key. Point `{field}` at its own keyring coordinate and mint that key with its rotate verb"
+    )]
+    KeyMatchesOwnerPublicKey {
+        /// The profile field whose key was refused.
+        field: &'static str,
     },
 
     /// A signing verb was asked to read a secret from a named environment
@@ -1176,7 +1251,9 @@ impl ValidationError {
             // Validation, as `AuditLogNotFound` does for audit.*.
             Self::ProfileNameMismatch { .. } => "profile.name_mismatch",
             Self::NetworkFlagMismatch { .. } => "profile.network_flag_mismatch",
-            Self::ProfileNonOverlayableField { .. } => "profile.non_overlayable_field",
+            Self::ProfileNonOverlayableField { .. } | Self::ProfileOverlayMayOnlyTighten { .. } => {
+                "profile.non_overlayable_field"
+            }
             Self::MainnetRequiresExplicitProfile { .. } => {
                 "profile.mainnet_requires_explicit_profile"
             }
@@ -1194,7 +1271,14 @@ impl ValidationError {
             // variant's doc comment for why the code stays unified while the
             // remedy in the message differs.
             Self::AuditLogUnusable { .. } => "audit.chain_key_unavailable",
-            Self::AuditReanchorNotAcknowledged { .. } => "validation.acknowledgement_required",
+            Self::AuditReanchorNotAcknowledged { .. }
+            | Self::AuditBindingChangeNotAcknowledged { .. } => {
+                "validation.acknowledgement_required"
+            }
+            // Audit taxonomy code on a validation-class variant: see
+            // `AuditLogNotFound` above for the same rationale.
+            Self::AuditLogBindingChanged { .. } => "audit.log_binding_changed",
+            Self::KeyMatchesOwnerPublicKey { .. } => "validation.key_matches_owner_public_key",
             Self::SecretEnvNotSet { .. } => "validation.secret_env_not_set",
             Self::SecretEnvInvalid { .. } => "validation.secret_env_invalid",
             Self::SignerSourceRequired { .. } => "validation.signer_source_required",
@@ -2519,6 +2603,12 @@ mod tests {
                 "profile.non_overlayable_field",
             ),
             (
+                ValidationError::ProfileOverlayMayOnlyTighten {
+                    field: "mcp_disabled",
+                },
+                "profile.non_overlayable_field",
+            ),
+            (
                 ValidationError::MainnetRequiresExplicitProfile {
                     name: "p".to_owned(),
                     named_by: crate::profile::ProfileNameSource::Env,
@@ -2567,6 +2657,25 @@ mod tests {
                     proposed: "9:2600".to_owned(),
                 },
                 "validation.acknowledgement_required",
+            ),
+            (
+                ValidationError::AuditLogBindingChanged {
+                    profile: "default".to_owned(),
+                },
+                "audit.log_binding_changed",
+            ),
+            (
+                ValidationError::AuditBindingChangeNotAcknowledged {
+                    profile: "default".to_owned(),
+                    missing: "--acknowledge-binding-change",
+                },
+                "validation.acknowledgement_required",
+            ),
+            (
+                ValidationError::KeyMatchesOwnerPublicKey {
+                    field: "attestation_key_id",
+                },
+                "validation.key_matches_owner_public_key",
             ),
             (
                 ValidationError::SecretEnvNotSet {
@@ -2714,6 +2823,9 @@ mod tests {
                 ValidationError::ProfileNonOverlayableField { field } => {
                     ValidationError::ProfileNonOverlayableField { field }
                 }
+                ValidationError::ProfileOverlayMayOnlyTighten { field } => {
+                    ValidationError::ProfileOverlayMayOnlyTighten { field }
+                }
                 ValidationError::MainnetRequiresExplicitProfile { name, named_by } => {
                     ValidationError::MainnetRequiresExplicitProfile {
                         name: name.clone(),
@@ -2756,6 +2868,20 @@ mod tests {
                     current: current.clone(),
                     proposed: proposed.clone(),
                 },
+                ValidationError::AuditLogBindingChanged { profile } => {
+                    ValidationError::AuditLogBindingChanged {
+                        profile: profile.clone(),
+                    }
+                }
+                ValidationError::AuditBindingChangeNotAcknowledged { profile, missing } => {
+                    ValidationError::AuditBindingChangeNotAcknowledged {
+                        profile: profile.clone(),
+                        missing,
+                    }
+                }
+                ValidationError::KeyMatchesOwnerPublicKey { field } => {
+                    ValidationError::KeyMatchesOwnerPublicKey { field }
+                }
                 ValidationError::SecretEnvNotSet { var } => {
                     ValidationError::SecretEnvNotSet { var: var.clone() }
                 }

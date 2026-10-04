@@ -730,6 +730,41 @@ fn chain_id_environment_overlay_refuses_testnet_profile() {
     assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
 }
 
+/// Trust-root overlays are refused on a testnet profile, naming the key.
+#[test]
+fn trust_root_environment_overlays_refuse_testnet_profile() {
+    let home = tempfile::tempdir().unwrap();
+    write_profile(home.path(), "testnet", UNREACHABLE_RPC, None);
+    for (variable, value, key) in [
+        (
+            "STELLAR_AGENT_AUDIT_LOG_PATH",
+            "/tmp/overlay-audit.jsonl",
+            "audit_log_path",
+        ),
+        (
+            "STELLAR_AGENT_ATTESTATION_KEY_ID",
+            "{service=\"x\",account=\"y\"}",
+            "attestation_key_id",
+        ),
+    ] {
+        let run = run_cli_with_env(
+            home.path(),
+            None,
+            &["profile", "show", "--profile", "testnet"],
+            &[(variable, value)],
+        );
+        assert_eq!(run.code, 1, "{variable}: {} {}", run.stdout, run.stderr);
+        let json = run.json();
+        assert_eq!(json["error"]["code"], "profile.non_overlayable_field");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(key)),
+            "{variable} must name {key}: {json}"
+        );
+    }
+}
+
 #[test]
 fn rpc_environment_overlay_refuses_mainnet_profile() {
     let home = tempfile::tempdir().unwrap();

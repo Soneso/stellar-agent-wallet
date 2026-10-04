@@ -711,6 +711,7 @@ fn load_hmac_key(
     // keyring-classification allow-set; full surface-layer classification is a
     // candidate follow-up.
     let service = keyring_service_name(profile_name);
+    refuse_owner_coordinate(&service)?;
     let entry = KeyringEntry::new(&service, KEYRING_ACCOUNT).map_err(|e| {
         CounterpartyError::KeyringUnavailable {
             detail: format!("keyring entry open failed: {e}"),
@@ -743,7 +744,56 @@ fn load_hmac_key(
         }
     })?;
 
-    base64_decode_key(&raw, &service)
+    let key = base64_decode_key(&raw, &service)?;
+    refuse_owner_public_key(key.as_ref(), profile_name)?;
+    Ok(key)
+}
+
+/// The label a counterparty cache key owner refusal names.
+const COUNTERPARTY_KEY_FIELD: &str = "counterparty_cache_key";
+
+/// Refuses a cache-key coordinate in the owner key namespace, before any
+/// keyring read.
+///
+/// The service derives from the profile name under
+/// `stellar-agent-counterparty-`, so no profile name reaches the owner
+/// namespace here; the check keeps one rule for every symmetric-key loader.
+fn refuse_owner_coordinate(service: &str) -> Result<(), CounterpartyError> {
+    stellar_agent_core::profile::owner_key::refuse_owner_key_coordinate(
+        &stellar_agent_core::profile::schema::KeyringEntryRef::new(service, KEYRING_ACCOUNT),
+        COUNTERPARTY_KEY_FIELD,
+    )
+    .map_err(|_| CounterpartyError::KeyMatchesOwnerPublicKey)
+}
+
+/// Refuses a loaded cache key equal to the owner public key of
+/// `profile_name`. An owner entry that cannot be read refuses as an
+/// unavailable keyring.
+fn refuse_owner_public_key(key: &[u8], profile_name: &str) -> Result<(), CounterpartyError> {
+    use stellar_agent_core::profile::owner_key::{self, OwnerKeyContext};
+    owner_key::refuse_owner_public_key(
+        key,
+        &OwnerKeyContext::for_profile_name(profile_name),
+        COUNTERPARTY_KEY_FIELD,
+    )
+    .map_err(|e| match e {
+        stellar_agent_core::error::WalletError::Validation(
+            stellar_agent_core::error::ValidationError::KeyMatchesOwnerPublicKey { .. },
+        ) => {
+            tracing::warn!(
+                profile = %profile_name,
+                code = %e.code(),
+                "counterparty cache key refused"
+            );
+            CounterpartyError::KeyMatchesOwnerPublicKey
+        }
+        other => {
+            tracing::debug!(error = %other, "owner key read failed for the cache key check");
+            CounterpartyError::KeyringUnavailable {
+                detail: "keyring backend error reading the owner key".to_owned(),
+            }
+        }
+    })
 }
 
 /// Loads the HMAC key or mints a fresh one if the entry does not exist yet.
@@ -765,6 +815,7 @@ fn load_or_mint_hmac_key(
     // every other cause is routed to debug tracing inside
     // `CounterpartyError::KeyringUnavailable`.
     let service = keyring_service_name(profile_name);
+    refuse_owner_coordinate(&service)?;
     let entry = KeyringEntry::new(&service, KEYRING_ACCOUNT).map_err(|e| {
         CounterpartyError::KeyringUnavailable {
             detail: format!("keyring entry open failed: {e}"),
@@ -772,7 +823,12 @@ fn load_or_mint_hmac_key(
     })?;
 
     match entry.get_password() {
-        Ok(raw) => base64_decode_key(&raw, &service),
+        // The load branch compares; a freshly minted random key is not.
+        Ok(raw) => {
+            let key = base64_decode_key(&raw, &service)?;
+            refuse_owner_public_key(key.as_ref(), profile_name)?;
+            Ok(key)
+        }
         Err(keyring_core::Error::NoEntry) => {
             // Lazy-mint: generate a fresh 256-bit random key and store it.
             tracing::info!(
@@ -1671,6 +1727,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn keyring_unavailable_error_redacts_service_and_profile_name() {
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring init");
 
@@ -1692,6 +1749,139 @@ mod tests {
             !rendered.contains(&service_name),
             "operator-visible error must redact keyring service name"
         );
+    }
+
+    // ── Owner key refusals ───────────────────────────────────────────────────
+
+    const OWNER_KEY: [u8; HMAC_KEY_LEN] = [0x5c; HMAC_KEY_LEN];
+
+    fn owner_coordinate(
+        profile_name: &str,
+    ) -> stellar_agent_core::profile::schema::KeyringEntryRef {
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key(profile_name)
+    }
+
+    /// Stores the owner public key in the older form at the profile's owner
+    /// coordinate.
+    fn plant_older_form_owner(profile_name: &str) {
+        use base64::Engine as _;
+        let owner = owner_coordinate(profile_name);
+        KeyringEntry::new(&owner.service, &owner.account)
+            .unwrap()
+            .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(OWNER_KEY))
+            .unwrap();
+    }
+
+    fn set_cache_key_value(profile_name: &str, value: &str) {
+        KeyringEntry::new(&keyring_service_name(profile_name), KEYRING_ACCOUNT)
+            .unwrap()
+            .set_password(value)
+            .unwrap();
+    }
+
+    fn cache_key_value(profile_name: &str) -> Option<String> {
+        KeyringEntry::new(&keyring_service_name(profile_name), KEYRING_ACCOUNT)
+            .unwrap()
+            .get_password()
+            .ok()
+    }
+
+    /// A cache entry sealed under a cache key equal to the owner public key is
+    /// not returned by the listing or by the stale read. The control shows the
+    /// same entry is returned while no owner entry exists.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_cache_entry_sealed_under_the_owner_key_is_not_returned() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring init");
+        let profile_name = "owner-sealed";
+        set_cache_key_value(profile_name, &base64_encode_key(&OWNER_KEY));
+        let dir = TempDir::new().unwrap();
+        let home_domain = "circle.com";
+        let body = b"VERSION = \"2.0.0\"\nACCOUNTS = [\"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY\"]\n";
+        let tag = compute_hmac_v2(
+            &OWNER_KEY,
+            home_domain,
+            fetched_at_unix_s_to_i64(TEST_FETCHED_AT),
+            body,
+        )
+        .unwrap();
+        let path = cache_file_path(dir.path(), home_domain);
+        write_cache_atomic(dir.path(), &path, &tag, home_domain, TEST_FETCHED_AT, body).unwrap();
+        let resolver =
+            StellarTomlResolver::new(profile_name, dir.path(), Duration::from_secs(3600)).unwrap();
+
+        assert_eq!(
+            resolver.list_cached().await.unwrap().len(),
+            1,
+            "with no owner entry the sealed entry is returned"
+        );
+        assert!(resolver.read_stale_binding(home_domain).unwrap().is_some());
+
+        plant_older_form_owner(profile_name);
+        assert!(matches!(
+            resolver.list_cached().await,
+            Err(CounterpartyError::KeyMatchesOwnerPublicKey)
+        ));
+        assert!(matches!(
+            resolver.read_stale_binding(home_domain),
+            Err(CounterpartyError::KeyMatchesOwnerPublicKey)
+        ));
+    }
+
+    /// The load branch of the lazy-mint path refuses a cache key equal to the
+    /// owner public key and never reaches the mint arm.
+    #[test]
+    #[serial_test::serial]
+    fn load_or_mint_refuses_the_owner_key_and_mints_nothing() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring init");
+        let profile_name = "owner-mint";
+        let stored = base64_encode_key(&OWNER_KEY);
+        set_cache_key_value(profile_name, &stored);
+        plant_older_form_owner(profile_name);
+        assert!(matches!(
+            load_or_mint_hmac_key(profile_name),
+            Err(CounterpartyError::KeyMatchesOwnerPublicKey)
+        ));
+        assert!(
+            cache_key_value(profile_name).as_deref() == Some(stored.as_str()),
+            "the stored cache key is left in place"
+        );
+    }
+
+    /// A G-strkey owner value at the cache-key coordinate decodes to 42 bytes
+    /// and is refused by both loaders without minting over it.
+    #[test]
+    #[serial_test::serial]
+    fn a_g_strkey_owner_value_is_refused_by_both_loaders() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring init");
+        let profile_name = "owner-strkey";
+        let strkey = stellar_agent_core::profile::owner_key::encode_owner_public_key(&OWNER_KEY);
+        set_cache_key_value(profile_name, &strkey);
+        for result in [
+            load_hmac_key(profile_name),
+            load_or_mint_hmac_key(profile_name),
+        ] {
+            let err = result.expect_err("a G-strkey is not a 32-byte key");
+            assert!(err.to_string().contains("expected 32 bytes"), "{err}");
+        }
+        assert!(cache_key_value(profile_name).as_deref() == Some(strkey.as_str()));
+    }
+
+    /// The helper names the `counterparty_cache_key` label and carries no key
+    /// material.
+    #[test]
+    #[serial_test::serial]
+    fn the_owner_refusal_names_the_counterparty_label() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring init");
+        plant_older_form_owner("owner-label");
+        let err = refuse_owner_public_key(&OWNER_KEY, "owner-label").unwrap_err();
+        assert!(matches!(err, CounterpartyError::KeyMatchesOwnerPublicKey));
+        assert!(err.to_string().contains(COUNTERPARTY_KEY_FIELD), "{err}");
+        assert!(refuse_owner_public_key(&[0x11; HMAC_KEY_LEN], "owner-label").is_ok());
+        assert!(matches!(
+            refuse_owner_coordinate("stellar-agent-owner-b"),
+            Err(CounterpartyError::KeyMatchesOwnerPublicKey)
+        ));
     }
 
     #[test]

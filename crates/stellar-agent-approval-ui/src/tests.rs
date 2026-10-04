@@ -77,6 +77,7 @@ impl Harness {
             ),
             store_path.clone(),
             KeyringEntryRef::new(svc, "default"),
+            stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile_name("ui-test"),
             audit_writer,
             Some(grant_path),
         );
@@ -604,6 +605,7 @@ fn config_for(
         ),
         store_path,
         KeyringEntryRef::new("stellar-agent-attestation-ui-bind", "default"),
+        stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile_name("ui-test"),
         audit_writer,
         None,
     );
@@ -1138,6 +1140,7 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
         ),
         store_path.clone(),
         KeyringEntryRef::new("stellar-agent-attestation-ui-router-unseeded", "default"),
+        stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile_name("ui-test"),
         audit_writer,
         Some(dir.path().join("grants.toml")),
     );

@@ -174,6 +174,10 @@ pub async fn run(args: ServeArgs) -> i32 {
         stellar_agent_core::approval::ApprovalContext::from_profile(&profile_name, &profile),
         store_path,
         profile.attestation_key_id.clone(),
+        stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
+            &profile_name,
+            &profile,
+        ),
         audit_writer,
         None,
     );

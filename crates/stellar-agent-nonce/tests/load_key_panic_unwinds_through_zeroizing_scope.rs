@@ -50,7 +50,7 @@ fn panic_in_load_key_fires_zeroizing_drop() {
     let profile = make_profile("panic-injection-nonce");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
     let now = now_before_expiry();
     let expiry = far_future_expiry();

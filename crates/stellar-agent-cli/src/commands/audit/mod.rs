@@ -5,7 +5,7 @@
 //! - [`verify`] — walk a hash-chained audit log file and verify the chain
 //!   integrity from the oldest rotated file to the current active file.
 //! - [`reanchor`] — move the log's keyring-held tip anchor to its current tip
-//!   after an operator-acknowledged rollback.
+//!   after an operator-acknowledged rollback or audit binding change.
 //!
 //! # Dispatch
 //!
@@ -99,12 +99,16 @@ pub enum AuditSubcommand {
     /// Move the audit log's keyring-held tip anchor to the log's current tip.
     ///
     /// The way out of an `audit.tip_anchor_mismatch` refusal, which fires when
-    /// the active log no longer contains the anchored chain tip. Requires
-    /// `--acknowledge-rollback`: moving the anchor accepts the log as it now
-    /// stands, and the verb cannot tell a restored backup from tampering.
+    /// the active log no longer contains the anchored chain tip, and of an
+    /// `audit.log_binding_changed` refusal, which fires when the profile names
+    /// a log path or audit key other than its recorded binding. A rollback
+    /// needs `--acknowledge-rollback` and a binding change needs
+    /// `--acknowledge-binding-change`; a binding change over a disagreeing
+    /// anchor needs both. The verb cannot tell a restored backup or an edited
+    /// profile from tampering.
     ///
-    /// Exits 0 on success; exits 1 without the acknowledgement and on any
-    /// failure.
+    /// Exits 0 on success; exits 1 without a required acknowledgement and on
+    /// any failure.
     Reanchor(reanchor::ReanchorArgs),
 }
 

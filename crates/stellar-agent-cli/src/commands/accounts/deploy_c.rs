@@ -580,7 +580,11 @@ fn open_profile_audit_writer_via_registry(
     profile_name: &str,
     profile: &Profile,
 ) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
-    let access = stellar_agent_network::keyring::keyed_audit_access(profile)?;
+    let access = stellar_agent_network::keyring::keyed_audit_access(
+        profile,
+        profile_name,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    )?;
     AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access).map_err(
         |e| {
             tracing::debug!(
@@ -991,7 +995,12 @@ mod tests {
         )
         .unwrap();
 
-        let err = stellar_agent_network::keyring::keyed_audit_access(&profile).unwrap_err();
+        let err = stellar_agent_network::keyring::keyed_audit_access(
+            &profile,
+            "deploy-c-audit-no-logon-test",
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
+        )
+        .unwrap_err();
         assert_eq!(err.code(), "auth.keyring_interactive_session_required");
     }
 
@@ -1012,7 +1021,12 @@ mod tests {
         )
         .unwrap();
 
-        let err = stellar_agent_network::keyring::keyed_audit_access(&profile).unwrap_err();
+        let err = stellar_agent_network::keyring::keyed_audit_access(
+            &profile,
+            "deploy-c-audit-platform-err-test",
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
+        )
+        .unwrap_err();
         assert_eq!(err.code(), "auth.keyring_platform_error");
     }
 

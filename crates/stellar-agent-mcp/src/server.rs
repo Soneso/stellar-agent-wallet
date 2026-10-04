@@ -78,6 +78,7 @@ use stellar_agent_core::policy::v1::{PolicyEngineV1, PolicyStateStore};
 // one definition across both binaries.
 use stellar_agent_core::profile::name::OWNER_KEY_SERVICE_PREFIX;
 use stellar_agent_core::{
+    audit_log::BindingCheck,
     policy::{BuildRegistryError, NoopPolicyEngine, PolicyEngine, ToolDescriptor},
     profile::loader,
     profile::schema::{KeyringEntryRef, PolicyEngineKind, Profile, default_policy_dir},
@@ -314,12 +315,15 @@ pub use crate::tools::x402_parse_receipt::X402ParseReceiptArgs;
 // Policy engine construction helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Fetches the owner public key (ed25519, URL-safe base64-encoded) from the
-/// keyring entry `stellar-agent-owner-<profile_name>` / `"default"`.
+/// Fetches the owner public key (ed25519) from the keyring entry
+/// `stellar-agent-owner-<profile_name>` / `"default"`.
 ///
-/// The stored value is a URL-safe base64-encoded 32-byte ed25519 public key
-/// (same format written at policy-sign time).  The function opens the entry,
-/// reads the password, decodes the bytes, and returns the raw 32-byte array.
+/// The stored value is the key's G-strkey, or URL-safe base64 of its 32 bytes
+/// in the older form. An older-form entry is rewritten as the G-strkey, best
+/// effort: a failed rewrite logs at `warn` with the keyring code, the build
+/// continues from the value read, and the next build retries. The first build
+/// in the process also rewrites the older-form owner entry of every other
+/// profile in the profile directory.
 ///
 /// # Errors
 ///
@@ -327,10 +331,10 @@ pub use crate::tools::x402_parse_receipt::X402ParseReceiptArgs;
 ///   fails (e.g. the keyring store is not initialised).
 /// - [`BuildRegistryError::OwnerKeyAbsent`] if the entry exists but has no
 ///   stored value.
-/// - [`BuildRegistryError::OwnerKeyDecodeFailed`] if the stored value is not
-///   valid URL-safe base64.
-/// - [`BuildRegistryError::OwnerKeyLengthMismatch`] if the decoded key is not
-///   exactly 32 bytes.
+/// - [`BuildRegistryError::OwnerKeyDecodeFailed`] if the stored value is
+///   neither a G-strkey nor valid URL-safe base64.
+/// - [`BuildRegistryError::OwnerKeyLengthMismatch`] if the base64 value does
+///   not decode to exactly 32 bytes.
 fn fetch_owner_pubkey_from_keyring(
     profile_name: &str,
 ) -> Result<[u8; PUBLIC_KEY_LENGTH], BuildRegistryError> {
@@ -362,27 +366,33 @@ fn fetch_owner_pubkey_from_keyring(
         }
     })?;
 
-    // URL-safe base64, no padding — written at policy-sign time.
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(raw.trim())
-        .map_err(|e| BuildRegistryError::OwnerKeyDecodeFailed {
-            profile: profile_name.to_owned(),
-            detail: e.to_string(),
-        })?;
-
-    let actual_len = bytes.len();
-    if actual_len != PUBLIC_KEY_LENGTH {
-        return Err(BuildRegistryError::OwnerKeyLengthMismatch {
-            profile: profile_name.to_owned(),
-            actual_len,
-            expected_len: PUBLIC_KEY_LENGTH,
-        });
-    }
-
-    let mut arr = [0u8; PUBLIC_KEY_LENGTH];
-    arr.copy_from_slice(&bytes);
-    Ok(arr)
+    use stellar_agent_core::profile::owner_key;
+    let key = match owner_key::decode_owner_public_key(&raw) {
+        Some((key, form)) => {
+            if form == owner_key::OwnerKeyForm::OlderBase64 {
+                let outcome = owner_key::rewrite_owner_value_if_older(&entry_ref, &raw);
+                owner_key::log_owner_entry_rewrite(profile_name, &outcome);
+            }
+            key
+        }
+        None => {
+            // Neither form: report the base64 failure the older form implies.
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(raw.trim())
+                .map_err(|e| BuildRegistryError::OwnerKeyDecodeFailed {
+                    profile: profile_name.to_owned(),
+                    detail: e.to_string(),
+                })?;
+            return Err(BuildRegistryError::OwnerKeyLengthMismatch {
+                profile: profile_name.to_owned(),
+                actual_len: bytes.len(),
+                expected_len: PUBLIC_KEY_LENGTH,
+            });
+        }
+    };
+    owner_key::rewrite_older_form_owner_entries_once(Some(profile_name));
+    Ok(key)
 }
 
 /// Derives the profile name from `profile.policy_owner_key_id.service` by
@@ -574,6 +584,12 @@ fn build_policy_engine(
 #[derive(Clone)]
 pub struct WalletServer {
     pub(crate) profile: Arc<Profile>,
+    /// The audit binding check stored at startup from the profile's origin.
+    ///
+    /// [`BindingCheck::Enforce`] for a profile loaded from its file, and
+    /// [`BindingCheck::CheckOnly`] for the synthesized first-run profile. Every
+    /// keyed audit acquisition passes it to `keyed_audit_access`.
+    pub(crate) audit_binding: BindingCheck,
     /// Network identity shared by all transaction tools.
     pub(crate) context: stellar_agent_network::NetworkContext,
     pub(crate) policy_engine: Arc<dyn PolicyEngine>,
@@ -716,10 +732,13 @@ impl WalletServer {
         // (no reachability probe at construction time).  The `?` is for forward
         // compatibility; the only currently-possible NonceError variants at
         // construction time are none.
-        let nonce_mint =
-            NonceMint::from_profile(&profile).map_err(|e| BuildRegistryError::NonceMintInit {
-                detail: e.to_string(),
-            })?;
+        let nonce_mint = NonceMint::from_profile(
+            &profile,
+            &stellar_agent_core::profile::name::profile_name_for_approval(&profile),
+        )
+        .map_err(|e| BuildRegistryError::NonceMintInit {
+            detail: e.to_string(),
+        })?;
 
         let policy_engine: Arc<dyn PolicyEngine> =
             build_policy_engine(&profile, policy_dir_override)?;
@@ -731,6 +750,7 @@ impl WalletServer {
         Ok(Self {
             context: stellar_agent_network::NetworkContext::from_profile(&profile),
             profile: Arc::new(profile),
+            audit_binding: BindingCheck::Enforce,
             policy_engine,
             tool_registry,
             tool_catalogue,
@@ -872,6 +892,17 @@ impl WalletServer {
     /// there is no security concern with public visibility.
     pub fn profile_name_for_approval(&self) -> String {
         stellar_agent_core::profile::name::profile_name_for_approval(&self.profile)
+    }
+
+    /// Sets the audit binding check every keyed audit acquisition applies.
+    ///
+    /// [`WalletServer::new`] stores [`BindingCheck::Enforce`]. Startup passes
+    /// the check the profile's origin implies, so the synthesized first-run
+    /// profile uses [`BindingCheck::CheckOnly`].
+    #[must_use]
+    pub fn with_audit_binding_check(mut self, binding: BindingCheck) -> Self {
+        self.audit_binding = binding;
+        self
     }
 
     /// Resolves an agent's secondary endpoint against the command context.
@@ -1356,6 +1387,101 @@ mod tests {
                     if *code == "auth.keyring_interactive_session_required"
             ),
             "expected OwnerKeyringReadFailed with the interactive-session code, got {err:?}"
+        );
+    }
+
+    fn put_owner(profile_name: &str, value: &str) {
+        let coord = KeyringEntryRef::default_owner_key(profile_name);
+        keyring_core::Entry::new(&coord.service, &coord.account)
+            .unwrap()
+            .set_password(value)
+            .unwrap();
+    }
+
+    fn get_owner(profile_name: &str) -> String {
+        let coord = KeyringEntryRef::default_owner_key(profile_name);
+        keyring_core::Entry::new(&coord.service, &coord.account)
+            .unwrap()
+            .get_password()
+            .unwrap()
+    }
+
+    /// An engine build that reads the older form returns the key and rewrites
+    /// the entry as its G-strkey; a G-strkey entry reads unchanged.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn fetch_owner_pubkey_rewrites_the_older_form() {
+        use base64::Engine as _;
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let owner = [0x31_u8; 32];
+        put_owner(
+            "mcp-owner-older",
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner),
+        );
+        assert!(
+            fetch_owner_pubkey_from_keyring("mcp-owner-older").unwrap() == owner,
+            "the older form reads as the key"
+        );
+        let strkey = stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner);
+        assert!(
+            get_owner("mcp-owner-older") == strkey,
+            "rewritten as the G-strkey"
+        );
+        assert!(
+            fetch_owner_pubkey_from_keyring("mcp-owner-older").unwrap() == owner,
+            "the G-strkey reads as the same key"
+        );
+        assert!(
+            get_owner("mcp-owner-older") == strkey,
+            "a G-strkey entry is left"
+        );
+    }
+
+    /// A failed rewrite logs at `warn` with the keyring code and the build
+    /// continues from the value read.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn a_failed_owner_rewrite_warns_and_the_build_continues() {
+        use base64::Engine as _;
+        let coord = KeyringEntryRef::default_owner_key("mcp-owner-write-error");
+        let owner = [0x32_u8; 32];
+        let older = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner);
+        stellar_agent_test_support::keyring_mock::install_with_write_error(
+            &coord.service,
+            &coord.account,
+            Some(&older),
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("planted"))),
+        )
+        .unwrap();
+        let writer = stellar_agent_test_support::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let fetched = tracing::subscriber::with_default(subscriber, || {
+            fetch_owner_pubkey_from_keyring("mcp-owner-write-error")
+        });
+        assert!(
+            fetched.unwrap() == owner,
+            "the build continues from the value read"
+        );
+        assert!(
+            get_owner("mcp-owner-write-error") == older,
+            "the entry keeps its form"
+        );
+        let logs = String::from_utf8(writer.captured()).unwrap();
+        assert!(!logs.contains(&older), "the value is never logged");
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("auth.keyring_platform_error"), "{logs}");
+        assert!(logs.contains("mcp-owner-write-error"), "{logs}");
+
+        // The next build retries, and with the failure spent it rewrites.
+        fetch_owner_pubkey_from_keyring("mcp-owner-write-error").unwrap();
+        assert!(
+            get_owner("mcp-owner-write-error")
+                == stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner),
+            "the retry rewrites the entry"
         );
     }
 

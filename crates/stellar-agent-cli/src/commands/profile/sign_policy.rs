@@ -366,6 +366,8 @@ fn engine_profile_name(profile: &Profile) -> Result<String, String> {
 }
 
 /// Reads the enrolled owner public key (32 bytes) from the keyring coordinate.
+///
+/// Accepts the stored G-strkey and the older URL-safe base64 form.
 fn read_owner_pubkey(coord: &KeyringEntryRef) -> Result<[u8; 32], String> {
     let entry = KeyringEntry::new(&coord.service, &coord.account).map_err(|e| {
         format!(
@@ -393,10 +395,16 @@ fn read_owner_pubkey(coord: &KeyringEntryRef) -> Result<[u8; 32], String> {
             )
         }
     })?;
+    // The stored form is the G-strkey; the older form is URL-safe base64.
+    if let Some((key, _form)) =
+        stellar_agent_core::profile::owner_key::decode_owner_public_key(&raw)
+    {
+        return Ok(key);
+    }
     let bytes = URL_SAFE_NO_PAD.decode(raw.trim()).map_err(|e| {
         format!(
-            "the enrolled owner key at '{}:{}' is not valid base64 ({e}); re-enroll with \
-             `stellar-agent profile enroll-owner-key`",
+            "the enrolled owner key at '{}:{}' is neither a G-strkey nor valid base64 ({e}); \
+             re-enroll with `stellar-agent profile enroll-owner-key`",
             coord.service, coord.account
         )
     })?;

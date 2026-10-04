@@ -204,7 +204,7 @@ where
     LoadProfile: FnOnce(&str) -> Result<Profile, ProfileLoadError>,
 {
     let resolved_profile = resolve_profile_name(args.profile.as_deref());
-    let (profile, _origin) =
+    let (profile, origin) =
         match load_profile_or_synthesize_testnet_with(&resolved_profile, load_profile) {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -233,7 +233,7 @@ where
     let request_id = Uuid::new_v4().to_string();
 
     let (audit_writer, _audit_log_path) =
-        match open_audit_writer_read_only(&profile, &resolved_profile.name) {
+        match open_audit_writer_read_only(&profile, origin, &resolved_profile.name) {
             Ok(opened) => opened,
             Err(e) => {
                 let envelope: Envelope<()> = Envelope::err(&e);
@@ -367,6 +367,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn list_pending_mainnet_profile_reaches_inspection_rpc() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let rpc = wiremock::MockServer::start().await;
         let home = tempfile::tempdir().expect("home");
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());

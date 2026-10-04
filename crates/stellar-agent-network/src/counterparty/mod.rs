@@ -124,6 +124,7 @@ pub enum CounterpartyKindParseError {
 /// | [`CounterpartyError::KindParseError`] | `counterparty.kind_parse.unknown`, `counterparty.kind_parse.missing_field`, or `counterparty.kind_parse.invalid_value` |
 /// | [`CounterpartyError::HomeDomainInvalid`] | `counterparty.home_domain_invalid` |
 /// | [`CounterpartyError::KeyringUnavailable`] | `counterparty.keyring_unavailable` |
+/// | [`CounterpartyError::KeyMatchesOwnerPublicKey`] | `validation.key_matches_owner_public_key` |
 /// | [`CounterpartyError::Io`] | `counterparty.io` |
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -183,6 +184,14 @@ pub enum CounterpartyError {
         /// Operator-facing detail.
         detail: String,
     },
+
+    /// The cache key equals the profile's owner public key, or its
+    /// coordinate sits in the owner key namespace. No cache entry is
+    /// returned or written under it.
+    #[error(
+        "the key for `counterparty_cache_key` is an owner public key or sits in the owner key namespace"
+    )]
+    KeyMatchesOwnerPublicKey,
 
     /// Underlying I/O failure during cache read or write.
     #[error("counterparty cache I/O failed: {kind}")]

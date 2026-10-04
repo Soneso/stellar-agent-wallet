@@ -22,6 +22,8 @@ use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::policy_state::{PersistedWindowStore, RECONCILE_BUDGET};
 use stellar_agent_network::{WalletSubmissionRecorder, envelope_hash_hex};
 
+use crate::common::profile_access::ProfileOrigin;
+
 /// The verb this binary names as the way to reconcile a submission whose
 /// outcome is not known.
 pub(crate) const RECONCILE_VERB: &str = "stellar-agent tx status";
@@ -143,9 +145,13 @@ fn descriptor_for(tool: &'static str, chain_id: &str) -> ToolDescriptor {
 /// Reconciliation is not a gate of its own: a pass that cannot reach the
 /// endpoint leaves every reservation standing and the verb continues, because
 /// counting a reservation that may still apply is the safe direction.
+///
+/// The settled rows are written under the audit binding check of `origin`,
+/// so a synthesized profile records no binding.
 pub(crate) async fn reconcile_open_reservations(
     profile: &Profile,
     profile_name: &str,
+    origin: ProfileOrigin,
     client: &StellarRpcClient,
     now_ms: u64,
 ) {
@@ -183,8 +189,7 @@ pub(crate) async fn reconcile_open_reservations(
     if report.settled.is_empty() {
         return;
     }
-    let Ok(audit) = crate::commands::value_audit::require_value_audit_writer(profile, profile_name)
-    else {
+    let Some(audit) = settled_rows_writer(profile, profile_name, origin) else {
         tracing::debug!(
             profile = %profile_name,
             settled = report.settled.len(),
@@ -203,6 +208,33 @@ pub(crate) async fn reconcile_open_reservations(
             settled.ledger,
             stellar_agent_core::audit_log::PolicyDecision::Allow,
         );
+    }
+}
+
+/// The writer for the rows a reconciliation pass settled, acquired under the
+/// audit binding check of `origin`.
+///
+/// `None` when no writer is acquirable or the binding refuses; the settled
+/// rows then stay owed.
+fn settled_rows_writer(
+    profile: &Profile,
+    profile_name: &str,
+    origin: ProfileOrigin,
+) -> Option<Arc<Mutex<AuditWriter>>> {
+    match crate::commands::value_audit::require_value_audit_writer_for_origin(
+        profile,
+        profile_name,
+        origin,
+    ) {
+        Ok(writer) => writer,
+        Err(e) => {
+            tracing::debug!(
+                profile = %profile_name,
+                code = %e.code(),
+                "window reconcile: audit writer refused"
+            );
+            None
+        }
     }
 }
 
@@ -566,6 +598,68 @@ mod tests {
     use super::*;
 
     const SIGNED_XDR: &str = "AAAAAgAAAAA=";
+
+    /// The settled rows' writer applies the binding check of the origin: a
+    /// synthesized profile records no binding and refuses a changed one, and a
+    /// persisted profile records an absent one.
+    #[test]
+    #[serial_test::serial]
+    fn the_settled_rows_writer_applies_the_binding_check_of_the_origin() {
+        use stellar_agent_core::audit_log::AuditBinding;
+        use stellar_agent_network::keyring::{KeyringAuditBindingStore, rotate_keyring_secret_32};
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let keyed = |name: &str| {
+            let mut profile = Profile::builder_testnet_named(name, "s", name, "n", name).build();
+            profile.audit_log_path = dir.path().join(name).join("audit.jsonl");
+            let coord = &profile.audit_log_hash_chain_key_id;
+            rotate_keyring_secret_32(&coord.service, &coord.account).unwrap();
+            profile
+        };
+        let recorded = |name: &str| {
+            KeyringAuditBindingStore::for_profile(name)
+                .load_raw()
+                .unwrap()
+                .is_some()
+        };
+
+        let synthesized = keyed("reconcile-synthesized");
+        assert!(
+            settled_rows_writer(
+                &synthesized,
+                "reconcile-synthesized",
+                ProfileOrigin::Synthesized
+            )
+            .is_some()
+        );
+        assert!(
+            !recorded("reconcile-synthesized"),
+            "a synthesized profile records no binding"
+        );
+
+        let persisted = keyed("reconcile-persisted");
+        assert!(
+            settled_rows_writer(&persisted, "reconcile-persisted", ProfileOrigin::Persisted)
+                .is_some()
+        );
+        assert!(
+            recorded("reconcile-persisted"),
+            "a persisted profile records its binding"
+        );
+
+        let mut changed = keyed("reconcile-changed");
+        KeyringAuditBindingStore::for_profile("reconcile-changed")
+            .store(&AuditBinding::for_profile(&changed))
+            .unwrap();
+        changed.audit_log_path = dir.path().join("repointed").join("audit.jsonl");
+        assert!(
+            settled_rows_writer(&changed, "reconcile-changed", ProfileOrigin::Synthesized)
+                .is_none(),
+            "a changed binding leaves the settled rows owed"
+        );
+        assert!(!dir.path().join("repointed").exists());
+    }
 
     #[test]
     fn timeout_carries_the_full_hash_and_the_recovery_protocol() {

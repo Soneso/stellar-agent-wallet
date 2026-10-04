@@ -254,7 +254,11 @@ pub async fn run(args: RunArgs) -> i32 {
     }
 
     let entry_ref = &profile.attestation_key_id;
-    let key_bytes = match load_attestation_key(entry_ref) {
+    let owner = stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
+        &profile_name,
+        &profile,
+    );
+    let key_bytes = match load_attestation_key(entry_ref, &owner) {
         Ok(k) => k,
         Err(e) => {
             render::render_json(&Envelope::<()>::err(&e));
@@ -925,7 +929,11 @@ mod tests {
         let svc = "stellar-agent-attestation-run-test-load";
         seed_key_32(svc, "default");
         let entry_ref = KeyringEntryRef::new(svc, "default");
-        let key = load_attestation_key(&entry_ref).unwrap();
+        let key = load_attestation_key(
+            &entry_ref,
+            &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile_name("run-test"),
+        )
+        .unwrap();
         assert_eq!(key.len(), 32);
     }
 
@@ -935,7 +943,11 @@ mod tests {
         keyring_mock::install().unwrap();
         let entry_ref =
             KeyringEntryRef::new("stellar-agent-attestation-run-test-missing", "default");
-        let err = load_attestation_key(&entry_ref).unwrap_err();
+        let err = load_attestation_key(
+            &entry_ref,
+            &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile_name("run-test"),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, WalletError::Auth(AuthError::KeyringNotFound { .. })),
             "expected KeyringNotFound, got {err:?}"
@@ -1127,7 +1139,11 @@ mod tests {
 
         // Load key and compute + record attestation via the extracted helper.
         let entry_ref = KeyringEntryRef::new(svc, "default");
-        let key = load_attestation_key(&entry_ref).unwrap();
+        let key = load_attestation_key(
+            &entry_ref,
+            &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile_name("run-test"),
+        )
+        .unwrap();
 
         let mut store2 = PendingApprovalStore::open(path.clone()).unwrap();
         let entry2 = store2.get(&nonce).unwrap().clone();

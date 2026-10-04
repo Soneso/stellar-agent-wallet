@@ -415,8 +415,44 @@ pub(crate) fn load_command_profile(
     load_profile_or_synthesize_testnet(resolved)
 }
 
+/// Registers a keyring store when no store is registered, so the keyed
+/// acquisition reads the audit binding and the audit key.
+///
+/// A store already registered is kept.
+fn ensure_keyring_store() -> Result<(), WalletError> {
+    ensure_keyring_store_with(register_keyring_store)
+}
+
+/// [`ensure_keyring_store`] with the registrar injected: `register` runs only
+/// when no store is registered.
+fn ensure_keyring_store_with(
+    register: impl FnOnce() -> Result<(), WalletError>,
+) -> Result<(), WalletError> {
+    if keyring_core::get_default_store().is_none() {
+        register()?;
+    }
+    Ok(())
+}
+
+/// Registers the platform keyring store, or the headless store that
+/// `STELLAR_AGENT_KEYRING_BACKEND` names.
+#[cfg(not(test))]
+fn register_keyring_store() -> Result<(), WalletError> {
+    stellar_agent_network::keyring::init_platform_keyring_store()
+}
+
+/// Registers no store, so no unit test reaches the platform keychain. A test
+/// that needs a keyring installs the mock store first.
+#[cfg(test)]
+fn register_keyring_store() -> Result<(), WalletError> {
+    Ok(())
+}
+
 /// Opens the writer for a profile already loaded by the command.
 /// Persisted profiles require their audit key; synthesized profiles use best-effort acquisition.
+///
+/// The writer's open creates the parent directory, so a binding refusal
+/// creates nothing at the path the profile names.
 pub(crate) fn open_audit_writer(
     profile: &Profile,
     origin: ProfileOrigin,
@@ -424,18 +460,25 @@ pub(crate) fn open_audit_writer(
 ) -> Result<(Arc<Mutex<AuditWriter>>, PathBuf), WalletError> {
     let log_path = profile.audit_log_path.clone();
 
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            wallet_io_error(IoSource::AuditWriterSetup, format!("create directory: {e}"))
-        })?;
+    match (ensure_keyring_store(), origin) {
+        (Err(e), ProfileOrigin::Persisted) => return Err(e),
+        (Err(e), ProfileOrigin::Synthesized) => tracing::warn!(
+            profile = %profile_name,
+            code = %e.code(),
+            "keyring store unavailable; the audit writer opens best effort"
+        ),
+        (Ok(()), _) => {}
     }
-
     let writer = match origin {
         ProfileOrigin::Persisted => {
             crate::commands::value_audit::require_value_audit_writer(profile, profile_name)?
         }
         ProfileOrigin::Synthesized => {
-            crate::commands::value_audit::acquire_best_effort_audit_writer(profile, profile_name)?
+            crate::commands::value_audit::acquire_best_effort_audit_writer(
+                profile,
+                profile_name,
+                origin,
+            )?
         }
     };
     Ok((writer, log_path))
@@ -460,6 +503,7 @@ pub(crate) fn map_access_error(
         ProfileAccessError::NameMismatch(_)
         | ProfileAccessError::Load(
             ProfileLoadError::NonOverlayableField { .. }
+            | ProfileLoadError::OverlayMayOnlyTighten { .. }
             | ProfileLoadError::MainnetRequiresExplicitProfile { .. }
             | ProfileLoadError::MainnetRpcUrlRequired { .. }
             | ProfileLoadError::InvalidEndpointUrl { .. },
@@ -480,26 +524,33 @@ pub(crate) fn map_access_error(
 /// ([`crate::commands::value_audit::acquire_best_effort_audit_writer`]); a
 /// profile whose chain key is unminted degrades to an unkeyed writer with a
 /// warning instead of refusing, so an operator can always inspect their own
-/// state.
+/// state. A changed audit binding refuses with `audit.log_binding_changed`,
+/// and the writer's open creates the parent directory, so the refusal creates
+/// nothing at the path the profile names.
 ///
 /// # Errors
 ///
-/// Returns [`WalletError`] when the audit-log directory cannot be created or
-/// when even the unkeyed open fails (I/O).
+/// Returns [`WalletError`] for a binding refusal, or when even the unkeyed
+/// open fails (I/O).
 pub(crate) fn open_audit_writer_read_only(
     profile: &Profile,
+    origin: ProfileOrigin,
     profile_name: &str,
 ) -> Result<(Arc<Mutex<AuditWriter>>, PathBuf), WalletError> {
     let log_path = profile.audit_log_path.clone();
 
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            wallet_io_error(IoSource::AuditWriterSetup, format!("create directory: {e}"))
-        })?;
+    if let Err(e) = ensure_keyring_store() {
+        tracing::warn!(
+            profile = %profile_name,
+            code = %e.code(),
+            "keyring store unavailable; the audit writer opens best effort"
+        );
     }
-
-    let writer =
-        crate::commands::value_audit::acquire_best_effort_audit_writer(profile, profile_name)?;
+    let writer = crate::commands::value_audit::acquire_best_effort_audit_writer(
+        profile,
+        profile_name,
+        origin,
+    )?;
     Ok((writer, log_path))
 }
 
@@ -940,5 +991,89 @@ mod tests {
         resolve_test_seed_signer(&profile)
             .await
             .expect("a testnet profile admits an unrelated signer");
+    }
+
+    /// A profile whose recorded binding names `dir/audit/a.jsonl` and whose
+    /// log path moved to `dir/repointed/a.jsonl`.
+    fn repointed_profile(name: &str, dir: &std::path::Path) -> Profile {
+        let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+        profile.audit_log_path = dir.join("audit").join("a.jsonl");
+        let coord = profile.audit_log_hash_chain_key_id.clone();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .expect("seed audit key");
+        stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(name)
+            .store(&stellar_agent_core::audit_log::AuditBinding::for_profile(
+                &profile,
+            ))
+            .expect("record binding");
+        profile.audit_log_path = dir.join("repointed").join("a.jsonl");
+        profile
+    }
+
+    /// The read-only open refuses a changed binding with its own code and
+    /// creates nothing at the repointed path, the parent directory included.
+    #[test]
+    #[serial_test::serial]
+    fn read_only_open_refuses_a_changed_binding_and_creates_nothing() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = repointed_profile("read-only-binding", dir.path());
+        for origin in [ProfileOrigin::Persisted, ProfileOrigin::Synthesized] {
+            let err = open_audit_writer_read_only(&profile, origin, "read-only-binding")
+                .expect_err("a changed binding refuses");
+            assert_eq!(err.code(), "audit.log_binding_changed", "{err}");
+        }
+        assert!(
+            !dir.path().join("repointed").exists(),
+            "nothing is created at the repointed path"
+        );
+    }
+
+    /// The signing open refuses the same way and creates nothing either.
+    #[test]
+    #[serial_test::serial]
+    fn signing_open_refuses_a_changed_binding_and_creates_nothing() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = repointed_profile("signing-binding", dir.path());
+        for origin in [ProfileOrigin::Persisted, ProfileOrigin::Synthesized] {
+            let err = open_audit_writer(&profile, origin, "signing-binding")
+                .expect_err("a changed binding refuses");
+            assert_eq!(err.code(), "audit.log_binding_changed", "{err}");
+        }
+        assert!(!dir.path().join("repointed").exists());
+    }
+
+    /// A test build registers no keyring store, so no unit test reaches the
+    /// platform keychain.
+    #[test]
+    #[serial_test::serial]
+    fn a_test_build_registers_no_store() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let mock = keyring_core::get_default_store().expect("the mock store is registered");
+        register_keyring_store().expect("a test build registers nothing");
+        let after = keyring_core::get_default_store().expect("a store is registered");
+        assert!(
+            Arc::ptr_eq(&mock, &after),
+            "a test build leaves the registered store in place"
+        );
+    }
+
+    /// A store already registered is kept: the registrar does not run, so
+    /// `approve` and the tests keep the store they registered.
+    #[test]
+    #[serial_test::serial]
+    fn a_registered_store_is_kept_and_the_registrar_does_not_run() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let mock = keyring_core::get_default_store().expect("the mock store is registered");
+        let calls = std::cell::Cell::new(0_u32);
+        ensure_keyring_store_with(|| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .expect("a registered store needs no registrar");
+        assert_eq!(calls.get(), 0, "the registrar runs only without a store");
+        let after = keyring_core::get_default_store().expect("a store is registered");
+        assert!(Arc::ptr_eq(&mock, &after), "the registered store is kept");
     }
 }

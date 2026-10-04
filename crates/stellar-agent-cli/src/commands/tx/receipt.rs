@@ -68,7 +68,7 @@ use stellar_agent_network::NetworkContext;
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::policy_state::PersistedWindowStore;
 
-use crate::common::profile_access::load_profile_or_synthesize_testnet;
+use crate::common::profile_access::{ProfileOrigin, load_profile_or_synthesize_testnet};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 
@@ -432,11 +432,7 @@ async fn run_clear(args: &ClearArgs) -> i32 {
             Some(args.envelope_hash.clone()),
             &request_id,
         );
-        if let Err(e) = crate::commands::value_audit::emit_value_audit_row_strict(
-            &profile,
-            &resolved.name,
-            entry,
-        ) {
+        if let Err(e) = emit_clear_row(&profile, &resolved.name, origin, entry) {
             render_json(&Envelope::<()>::err(&e));
             return 1;
         }
@@ -457,4 +453,79 @@ async fn run_clear(args: &ClearArgs) -> i32 {
         reservation_released,
     }));
     0
+}
+
+/// Writes the clear's row under the audit binding check of the profile's
+/// origin, so a synthesized profile records no binding.
+fn emit_clear_row(
+    profile: &stellar_agent_core::profile::schema::Profile,
+    profile_name: &str,
+    origin: ProfileOrigin,
+    entry: AuditEntry,
+) -> Result<(), stellar_agent_core::error::WalletError> {
+    crate::commands::value_audit::emit_value_audit_row_strict(
+        profile,
+        profile_name,
+        origin.binding_check(),
+        entry,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, reason = "test-only assertions")]
+
+    use serial_test::serial;
+    use stellar_agent_core::profile::schema::Profile;
+    use stellar_agent_network::keyring::{KeyringAuditBindingStore, rotate_keyring_secret_32};
+    use stellar_agent_test_support::keyring_mock;
+
+    use super::*;
+
+    fn cleared_entry() -> AuditEntry {
+        AuditEntry::new_submission_receipt_cleared(
+            "tx receipt clear",
+            "stellar:testnet",
+            "2222…22bb",
+            "pending",
+            true,
+            None,
+            "req-receipt-clear",
+        )
+    }
+
+    /// The clear's row records an absent binding for a persisted profile and
+    /// records none for a synthesized one; both rows are written.
+    #[test]
+    #[serial]
+    fn the_clear_row_applies_the_binding_check_of_the_origin() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        for (name, origin, recorded) in [
+            ("receipt-synthesized", ProfileOrigin::Synthesized, false),
+            ("receipt-persisted", ProfileOrigin::Persisted, true),
+        ] {
+            let mut profile = Profile::builder_testnet_named(name, "s", name, "n", name).build();
+            profile.audit_log_path = dir.path().join(format!("{name}.jsonl"));
+            let coord = &profile.audit_log_hash_chain_key_id;
+            rotate_keyring_secret_32(&coord.service, &coord.account).expect("seed audit key");
+
+            emit_clear_row(&profile, name, origin, cleared_entry()).expect("the row is written");
+
+            assert!(
+                std::fs::read_to_string(&profile.audit_log_path)
+                    .expect("read log")
+                    .contains("submission_receipt_cleared"),
+                "{name}: the row is written"
+            );
+            assert_eq!(
+                KeyringAuditBindingStore::for_profile(name)
+                    .load_raw()
+                    .expect("read binding")
+                    .is_some(),
+                recorded,
+                "{name}: a binding is recorded for a persisted profile only"
+            );
+        }
+    }
 }

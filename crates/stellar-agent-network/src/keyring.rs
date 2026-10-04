@@ -99,12 +99,14 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use keyring_core::Entry as KeyringEntry;
 use rand_core::{OsRng, RngCore};
+use stellar_agent_core::profile::owner_key;
 use stellar_agent_core::{
+    audit_log::binding::{AuditBinding, BindingCheck, RecordedBinding},
     audit_log::tip_anchor::{
-        KeyedAuditAccess, TipAnchor, TipAnchorStore, TipAnchorStoreError, reanchor_count_account,
-        tip_anchor_account,
+        KeyedAuditAccess, TipAnchor, TipAnchorStore, TipAnchorStoreError,
+        reanchor_count_account_for_digest, tip_anchor_account_for_digest,
     },
-    error::{AuthError, InternalError, WalletError},
+    error::{AuthError, InternalError, ValidationError, WalletError},
     observability::redact_strkey_first5_last5,
     profile::schema::{KeyringEntryRef, Profile},
 };
@@ -323,9 +325,12 @@ pub fn load_hmac_key_32(entry_ref: &KeyringEntryRef) -> Result<Zeroizing<[u8; 32
 ///
 /// The caller-supplied counterpart to [`rotate_keyring_secret_32`], which only
 /// ever writes fresh random bytes. Used for the non-secret bookkeeping the
-/// wallet keeps in the keyring precisely because the keyring is outside the
-/// reach of filesystem access: the audit-log tip anchor and its re-anchor
-/// counter.
+/// wallet keeps in the keyring, outside the log file: the audit-log tip
+/// anchor, its re-anchor counter, and the audit binding. Anyone who can restore
+/// the keyring's own storage together with the log can restore an older state.
+/// With a headless keyring backend these entries are kept in a file on the
+/// same host, and anyone who can write that file can restore older entries or
+/// delete one.
 ///
 /// Do NOT route secret material through this helper. Secrets are minted by
 /// [`rotate_keyring_secret_32`] and read by [`load_hmac_key_32`], both of which
@@ -361,8 +366,8 @@ pub fn read_keyring_string(entry_ref: &KeyringEntryRef) -> Result<Option<String>
     }
 }
 
-/// Loads a profile's audit chain-root key and pairs it with the anchor store
-/// for that profile's log path.
+/// Checks the profile's audit binding, then loads its audit chain-root key and
+/// pairs it with the anchor store for that profile's log path.
 ///
 /// The single way a keyed audit writer is opened. Both halves come from the same
 /// keyring coordinate — the key from the entry itself, the anchor from an
@@ -371,13 +376,38 @@ pub fn read_keyring_string(entry_ref: &KeyringEntryRef) -> Result<Option<String>
 /// whose appends do not advance the anchor writes rows the rollback guard never
 /// covers, which is precisely the class of rows an attacker wants to remove.
 ///
+/// `profile_name` is the selected, reconciled profile name; the binding
+/// coordinate derives from it alone. The key's coordinate is refused first
+/// when it sits in the owner key namespace, so no binding records an owner
+/// coordinate. [`check_audit_binding`] then runs under `binding` before the
+/// key loads, so a changed binding refuses without a key read. The loaded key
+/// is refused when it equals the profile's owner public key.
+///
 /// # Errors
 ///
-/// - [`WalletError::Auth`] if the keyring entry is unavailable.
+/// - [`WalletError::Validation`] wrapping
+///   [`ValidationError::AuditLogBindingChanged`] when the recorded binding
+///   differs from the profile's or does not parse.
+/// - [`WalletError::Validation`] wrapping
+///   [`ValidationError::KeyMatchesOwnerPublicKey`] for an owner-namespace
+///   coordinate or a key equal to the owner public key.
+/// - [`WalletError::Auth`] if the binding cannot be read or recorded, or if
+///   the key's keyring entry is unavailable.
 /// - [`WalletError::Internal`] if the stored key is not valid base64 or not
 ///   exactly 32 bytes.
-pub fn keyed_audit_access(profile: &Profile) -> Result<KeyedAuditAccess, WalletError> {
+pub fn keyed_audit_access(
+    profile: &Profile,
+    profile_name: &str,
+    binding: BindingCheck,
+) -> Result<KeyedAuditAccess, WalletError> {
+    owner_key::refuse_owner_key_coordinate(&profile.audit_log_hash_chain_key_id, AUDIT_KEY_FIELD)?;
+    check_audit_binding(profile, profile_name, binding)?;
     let hmac_key = load_hmac_key_32(&profile.audit_log_hash_chain_key_id)?;
+    owner_key::refuse_owner_public_key(
+        hmac_key.as_ref(),
+        &owner_key::OwnerKeyContext::for_profile(profile_name, profile),
+        AUDIT_KEY_FIELD,
+    )?;
     let tip_anchor = KeyringTipAnchorStore::shared(
         &profile.audit_log_hash_chain_key_id,
         &profile.audit_log_path,
@@ -385,18 +415,119 @@ pub fn keyed_audit_access(profile: &Profile) -> Result<KeyedAuditAccess, WalletE
     Ok(KeyedAuditAccess::new(hmac_key, tip_anchor))
 }
 
+/// The profile field an audit-key owner refusal names.
+pub const AUDIT_KEY_FIELD: &str = "audit_log_hash_chain_key_id";
+
+/// Compares the profile's audit binding with the record at
+/// [`KeyringEntryRef::default_audit_binding`] for `profile_name`.
+///
+/// - An equal record continues.
+/// - An absent record is stored under [`BindingCheck::Enforce`] and left
+///   absent under [`BindingCheck::CheckOnly`].
+/// - A record that differs or does not parse refuses.
+///
+/// # Errors
+///
+/// - [`WalletError::Validation`] wrapping
+///   [`ValidationError::AuditLogBindingChanged`] for a record that differs or
+///   does not parse. The message names the profile and the remedy, never a
+///   path, a coordinate, or the record.
+/// - The keyring error when the record cannot be read, which writes nothing,
+///   or cannot be stored.
+pub fn check_audit_binding(
+    profile: &Profile,
+    profile_name: &str,
+    binding: BindingCheck,
+) -> Result<(), WalletError> {
+    let store = KeyringAuditBindingStore::for_profile(profile_name);
+    let expected = AuditBinding::for_profile(profile);
+    match store.classify(&expected)? {
+        RecordedBinding::Equal => Ok(()),
+        RecordedBinding::Absent => match binding {
+            BindingCheck::Enforce => store.store(&expected),
+            BindingCheck::CheckOnly => Ok(()),
+        },
+        RecordedBinding::Changed(_) | RecordedBinding::Unparseable => Err(WalletError::Validation(
+            ValidationError::AuditLogBindingChanged {
+                profile: profile_name.to_owned(),
+            },
+        )),
+    }
+}
+
+/// The platform-keyring store of one profile's audit binding.
+///
+/// Reads and writes the record at [`KeyringEntryRef::default_audit_binding`]
+/// through [`read_keyring_string`] and [`write_keyring_string`]. An entry the
+/// backend reports as absent reads as `None`; any other read failure is an
+/// error, so a backend that cannot answer never reads as "nothing recorded".
+#[derive(Debug, Clone)]
+pub struct KeyringAuditBindingStore {
+    entry_ref: KeyringEntryRef,
+}
+
+impl KeyringAuditBindingStore {
+    /// The store for the profile selected as `profile_name`.
+    #[must_use]
+    pub fn for_profile(profile_name: &str) -> Self {
+        Self {
+            entry_ref: KeyringEntryRef::default_audit_binding(profile_name),
+        }
+    }
+
+    /// The keyring coordinate holding the record.
+    #[must_use]
+    pub fn entry_ref(&self) -> &KeyringEntryRef {
+        &self.entry_ref
+    }
+
+    /// Reads the record without parsing it. `Ok(None)` when nothing is
+    /// recorded.
+    ///
+    /// # Errors
+    ///
+    /// The keyring error for any read failure other than an absent entry.
+    pub fn load_raw(&self) -> Result<Option<String>, WalletError> {
+        read_keyring_string(&self.entry_ref)
+    }
+
+    /// Reads the record and compares it with `expected`.
+    ///
+    /// # Errors
+    ///
+    /// The keyring error for any read failure other than an absent entry.
+    pub fn classify(&self, expected: &AuditBinding) -> Result<RecordedBinding, WalletError> {
+        let raw = self.load_raw()?;
+        Ok(RecordedBinding::classify(raw.as_deref(), expected))
+    }
+
+    /// Records `binding`, replacing any current record.
+    ///
+    /// # Errors
+    ///
+    /// The keyring error when the write fails.
+    pub fn store(&self, binding: &AuditBinding) -> Result<(), WalletError> {
+        write_keyring_string(&self.entry_ref, &binding.to_keyring_value())
+    }
+}
+
 /// The platform-keyring implementation of the audit log's tip anchor.
 ///
 /// Holds the two keyring coordinates the anchor for one log PATH occupies: the
 /// anchor value itself, and the monotonic counter of operator-acknowledged
 /// re-anchors beside it. Both are derived from the profile's audit-key
-/// coordinate plus the lexically normalized log path, so repointing a profile's
-/// `audit_log_path` starts a fresh anchor rather than carrying the old file's
-/// tip onto a new file.
+/// coordinate plus the lexically normalized log path, so a repointed
+/// `audit_log_path` has coordinates of its own and never carries the old
+/// file's tip onto a new file. The audit binding refuses the repointed path
+/// until the operator acknowledges it.
 ///
 /// Neither value is secret: the anchor is a count, a public chain hash, and a
-/// byte offset. They live in the keyring because that is the one store on the
-/// host an attacker with filesystem access alone cannot rewind.
+/// byte offset. The anchor, the re-anchor counter, and the audit binding live
+/// in the keyring, outside the log file. Anyone who can restore the keyring's
+/// own storage together with the log can restore an older state. With a
+/// headless keyring backend these entries are kept in a file on the same host.
+/// Anyone who can write that file can restore older entries or delete one,
+/// which needs no key material.
 #[derive(Debug, Clone)]
 pub struct KeyringTipAnchorStore {
     anchor_ref: KeyringEntryRef,
@@ -412,14 +543,24 @@ impl KeyringTipAnchorStore {
     /// audit key's account suffixed with the path digest.
     #[must_use]
     pub fn new(audit_key_ref: &KeyringEntryRef, log_path: &Path) -> Self {
+        Self::for_path_digest(
+            audit_key_ref,
+            &stellar_agent_core::audit_log::tip_anchor::log_path_sha256(log_path),
+        )
+    }
+
+    /// [`KeyringTipAnchorStore::new`] for a path known only by its digest, as
+    /// an [`AuditBinding`] records it.
+    #[must_use]
+    pub fn for_path_digest(audit_key_ref: &KeyringEntryRef, path_sha256: &[u8; 32]) -> Self {
         Self {
             anchor_ref: KeyringEntryRef::new(
                 audit_key_ref.service.clone(),
-                tip_anchor_account(&audit_key_ref.account, log_path),
+                tip_anchor_account_for_digest(&audit_key_ref.account, path_sha256),
             ),
             counter_ref: KeyringEntryRef::new(
                 audit_key_ref.service.clone(),
-                reanchor_count_account(&audit_key_ref.account, log_path),
+                reanchor_count_account_for_digest(&audit_key_ref.account, path_sha256),
             ),
         }
     }
@@ -1621,7 +1762,7 @@ mod tests {
         assert_eq!(
             second.load_anchor().unwrap(),
             None,
-            "repointing the log path must start a fresh anchor, which then adopts"
+            "a repointed log path has an anchor coordinate of its own"
         );
         assert_ne!(
             first.anchor_entry_ref().account,
@@ -1672,5 +1813,288 @@ mod tests {
             "a corrupted anchor must refuse, not read as never-written: \
              adopting over it would erase the rollback guard"
         );
+    }
+
+    // ── Audit binding ────────────────────────────────────────────────────────
+
+    /// A profile named `name` whose audit key is minted in the mock keyring.
+    fn bound_profile(name: &str, log_path: &str) -> Profile {
+        let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+        profile.audit_log_path = std::path::PathBuf::from(log_path);
+        let coordinate = &profile.audit_log_hash_chain_key_id;
+        rotate_keyring_secret_32(&coordinate.service, &coordinate.account).expect("mint audit key");
+        profile
+    }
+
+    fn recorded_binding(name: &str) -> Option<String> {
+        read_keyring_string(&KeyringEntryRef::default_audit_binding(name)).expect("read binding")
+    }
+
+    fn assert_binding_refusal(result: Result<KeyedAuditAccess, WalletError>, name: &str) {
+        let err = result.expect_err("a changed binding must refuse");
+        assert_eq!(err.code(), "audit.log_binding_changed", "{err}");
+        let message = err.to_string();
+        assert!(message.contains(name), "{message}");
+        assert!(
+            message.contains("--acknowledge-binding-change"),
+            "{message}"
+        );
+        assert!(!message.contains("/data/"), "no path: {message}");
+        assert!(
+            !message.contains("auditbinding"),
+            "no coordinate: {message}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_absent_binding_is_recorded_under_enforce_and_a_changed_path_then_refuses() {
+        keyring_mock::install().expect("mock keyring store");
+        let mut profile = bound_profile("bind-enforce", "/data/audit/one.jsonl");
+        assert!(
+            recorded_binding("bind-enforce").is_none(),
+            "nothing recorded yet"
+        );
+
+        keyed_audit_access(&profile, "bind-enforce", BindingCheck::Enforce)
+            .expect("an absent binding is recorded and the acquisition continues");
+        assert!(
+            recorded_binding("bind-enforce")
+                == Some(AuditBinding::for_profile(&profile).to_keyring_value()),
+            "the stored record is the profile's binding"
+        );
+        keyed_audit_access(&profile, "bind-enforce", BindingCheck::Enforce)
+            .expect("an equal binding continues");
+
+        profile.audit_log_path = std::path::PathBuf::from("/data/audit/two.jsonl");
+        assert_binding_refusal(
+            keyed_audit_access(&profile, "bind-enforce", BindingCheck::Enforce),
+            "bind-enforce",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn check_only_records_nothing_and_refuses_a_changed_record() {
+        keyring_mock::install().expect("mock keyring store");
+        let mut profile = bound_profile("bind-check", "/data/audit/one.jsonl");
+
+        keyed_audit_access(&profile, "bind-check", BindingCheck::CheckOnly)
+            .expect("an absent binding continues under CheckOnly");
+        assert!(
+            recorded_binding("bind-check").is_none(),
+            "CheckOnly never records a binding"
+        );
+
+        let recorded = AuditBinding::for_profile(&profile);
+        KeyringAuditBindingStore::for_profile("bind-check")
+            .store(&recorded)
+            .expect("record a binding");
+        keyed_audit_access(&profile, "bind-check", BindingCheck::CheckOnly)
+            .expect("an equal binding continues under CheckOnly");
+
+        profile.audit_log_path = std::path::PathBuf::from("/data/audit/two.jsonl");
+        assert_binding_refusal(
+            keyed_audit_access(&profile, "bind-check", BindingCheck::CheckOnly),
+            "bind-check",
+        );
+        assert!(
+            recorded_binding("bind-check") == Some(recorded.to_keyring_value()),
+            "a refusal leaves the record"
+        );
+    }
+
+    /// The binding refusal comes before any read of the audit key: an error
+    /// planted at the key's coordinate is still pending afterwards.
+    #[test]
+    #[serial_test::serial]
+    fn a_changed_path_refuses_before_the_hmac_key_load() {
+        keyring_mock::install().expect("mock keyring store");
+        let mut profile = bound_profile("bind-order", "/data/audit/one.jsonl");
+        keyed_audit_access(&profile, "bind-order", BindingCheck::Enforce).expect("record");
+
+        profile.audit_log_path = std::path::PathBuf::from("/data/audit/two.jsonl");
+        let key = profile.audit_log_hash_chain_key_id.clone();
+        keyring_mock::inject_error(
+            &key.service,
+            &key.account,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("planted"))),
+        )
+        .expect("inject");
+        assert_binding_refusal(
+            keyed_audit_access(&profile, "bind-order", BindingCheck::Enforce),
+            "bind-order",
+        );
+        assert!(
+            load_hmac_key_32(&key).is_err(),
+            "the planted key error is still pending, so the key was never read"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_changed_audit_key_coordinate_refuses() {
+        keyring_mock::install().expect("mock keyring store");
+        let mut profile = bound_profile("bind-key", "/data/audit/one.jsonl");
+        keyed_audit_access(&profile, "bind-key", BindingCheck::Enforce).expect("record");
+
+        profile.audit_log_hash_chain_key_id =
+            KeyringEntryRef::new("stellar-agent-audit-other", "x");
+        rotate_keyring_secret_32("stellar-agent-audit-other", "x").expect("mint other key");
+        assert_binding_refusal(
+            keyed_audit_access(&profile, "bind-key", BindingCheck::Enforce),
+            "bind-key",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_unparseable_record_refuses_under_both_checks() {
+        keyring_mock::install().expect("mock keyring store");
+        let profile = bound_profile("bind-garbage", "/data/audit/one.jsonl");
+        write_keyring_string(
+            &KeyringEntryRef::default_audit_binding("bind-garbage"),
+            "not a binding",
+        )
+        .expect("plant");
+        for check in [BindingCheck::Enforce, BindingCheck::CheckOnly] {
+            assert_binding_refusal(
+                keyed_audit_access(&profile, "bind-garbage", check),
+                "bind-garbage",
+            );
+        }
+        assert!(
+            recorded_binding("bind-garbage").as_deref() == Some("not a binding"),
+            "a refusal never overwrites the record"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_binding_write_error_fails_the_acquisition_with_the_keyring_code() {
+        let coordinate = KeyringEntryRef::default_audit_binding("bind-write");
+        keyring_mock::install_with_write_error(
+            &coordinate.service,
+            &coordinate.account,
+            None,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("planted"))),
+        )
+        .expect("mock keyring store");
+        let profile = bound_profile("bind-write", "/data/audit/one.jsonl");
+
+        let err = keyed_audit_access(&profile, "bind-write", BindingCheck::Enforce)
+            .expect_err("a failed binding write fails the acquisition");
+        assert_eq!(err.category(), ErrorCategory::Auth, "{err}");
+        assert_ne!(err.code(), "audit.log_binding_changed");
+        assert!(
+            recorded_binding("bind-write").is_none(),
+            "a failed write records nothing"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_binding_read_error_fails_closed_and_writes_nothing() {
+        keyring_mock::install().expect("mock keyring store");
+        let profile = bound_profile("bind-read", "/data/audit/one.jsonl");
+        let coordinate = KeyringEntryRef::default_audit_binding("bind-read");
+        keyring_mock::inject_error(
+            &coordinate.service,
+            &coordinate.account,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("planted"))),
+        )
+        .expect("inject");
+
+        let err = keyed_audit_access(&profile, "bind-read", BindingCheck::Enforce)
+            .expect_err("a binding read error fails closed");
+        assert_eq!(err.category(), ErrorCategory::Auth, "{err}");
+        assert!(
+            recorded_binding("bind-read").is_none(),
+            "a read error records nothing"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn keyed_audit_access_refuses_the_owner_public_key() {
+        keyring_mock::install().expect("mock keyring store");
+        let profile = bound_profile("owner-audit", "/data/audit/owner.jsonl");
+        let older_form = URL_SAFE_NO_PAD.encode([0x4d; 32]);
+        for coordinate in [
+            &KeyringEntryRef::default_owner_key("owner-audit"),
+            &profile.audit_log_hash_chain_key_id,
+        ] {
+            write_keyring_string(coordinate, &older_form).expect("plant");
+        }
+        let err = keyed_audit_access(&profile, "owner-audit", BindingCheck::Enforce)
+            .expect_err("an audit key equal to the owner key refuses");
+        assert_eq!(err.code(), "validation.key_matches_owner_public_key");
+        assert!(err.to_string().contains(AUDIT_KEY_FIELD), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn keyed_audit_access_refuses_a_g_strkey_owner_value() {
+        keyring_mock::install().expect("mock keyring store");
+        let profile = bound_profile("owner-audit-strkey", "/data/audit/strkey.jsonl");
+        write_keyring_string(
+            &profile.audit_log_hash_chain_key_id,
+            &gstrkey_for_seed([0x4e; 32]),
+        )
+        .expect("plant");
+        let err = keyed_audit_access(&profile, "owner-audit-strkey", BindingCheck::Enforce)
+            .expect_err("a G-strkey is not a 32-byte key");
+        assert!(
+            err.to_string().contains("must be 32 bytes, got 42"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn keyed_audit_access_refuses_an_owner_coordinate_without_a_read() {
+        keyring_mock::install().expect("mock keyring store");
+        let mut profile = bound_profile("owner-audit-coord", "/data/audit/coord.jsonl");
+        profile.audit_log_hash_chain_key_id =
+            KeyringEntryRef::new("stellar-agent-owner-B", "default");
+        keyring_mock::inject_error(
+            "stellar-agent-owner-B",
+            "default",
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("planted"))),
+        )
+        .expect("inject");
+        assert!(
+            recorded_binding("owner-audit-coord").is_none(),
+            "nothing recorded yet"
+        );
+        let err = keyed_audit_access(&profile, "owner-audit-coord", BindingCheck::Enforce)
+            .expect_err("an owner-namespace coordinate refuses");
+        assert_eq!(err.code(), "validation.key_matches_owner_public_key");
+        assert!(
+            recorded_binding("owner-audit-coord").is_none(),
+            "an absent binding is not recorded for an owner-namespace coordinate"
+        );
+        let pending = KeyringEntry::new("stellar-agent-owner-B", "default")
+            .and_then(|e| e.get_password())
+            .expect_err("the planted error is still pending");
+        assert!(
+            matches!(pending, keyring_core::Error::PlatformFailure(_)),
+            "no read happened: {pending:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_binding_digest_names_the_same_anchor_as_the_path() {
+        keyring_mock::install().expect("mock keyring store");
+        let path = Path::new("/data/audit/x/../one.jsonl");
+        let by_path = KeyringTipAnchorStore::new(&audit_ref(), path);
+        let by_digest = KeyringTipAnchorStore::for_path_digest(
+            &audit_ref(),
+            &stellar_agent_core::audit_log::tip_anchor::log_path_sha256(Path::new(
+                "/data/audit/one.jsonl",
+            )),
+        );
+        assert_eq!(by_path.anchor_entry_ref(), by_digest.anchor_entry_ref());
     }
 }

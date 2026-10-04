@@ -33,7 +33,7 @@
 //! # Owner PUBLIC key source (production vs. test)
 //!
 //! [`build_v1_policy_engine`] resolves the owner **PUBLIC** key through
-//! [`owner_pubkey_b64`], which reads it from the OS keyring in production. A
+//! [`owner_pubkey_raw`], which reads it from the OS keyring in production. A
 //! test-only file source, gated behind `#[cfg(any(test, feature =
 //! "test-helpers"))]` and armed only when `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE`
 //! is set, exists solely so a subprocess testnet-acceptance test can supply the
@@ -54,8 +54,22 @@ use stellar_agent_core::policy::{
 use stellar_agent_core::profile::name::{
     OWNER_KEY_SERVICE_PREFIX, derive_profile_name_from_owner_key,
 };
+use stellar_agent_core::profile::owner_key::{
+    OwnerKeyForm, decode_owner_public_key, log_owner_entry_rewrite,
+    rewrite_older_form_owner_entries_once, rewrite_owner_value_if_older,
+};
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile, default_policy_dir};
 use stellar_agent_network::policy_state::PersistedWindowStore;
+
+/// Where the V1 engine builder read the owner public key from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerKeySource {
+    /// The profile's owner entry in the keyring.
+    Keyring,
+    /// The test-only file named by `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    TestFile,
+}
 
 /// Constructs the [`PolicyEngine`] for a value-moving CLI verb from the
 /// profile's `policy.engine` kind.
@@ -151,35 +165,54 @@ pub(crate) fn build_v1_policy_engine(
                     return Err(format!(
                         "policy.engine is 'v1' but the owner-key service '{service}' does not \
                          start with the expected prefix '{OWNER_KEY_SERVICE_PREFIX}'; \
-                         {verb} refuses (fail-closed)"
+                         {verb} refuses (fail closed)"
                     ));
                 }
             };
 
-            // Resolve the owner PUBLIC key (base64 URL-safe-no-pad), either from the
-            // OS keyring (production) or from a gated test-only file source.
-            let raw_key = owner_pubkey_b64(&profile_name, verb)?;
+            // Resolve the owner PUBLIC key, a G-strkey or URL-safe base64 in the
+            // older form, from the OS keyring (production) or from a gated
+            // test-only file source.
+            let (raw_key, source) = owner_pubkey_raw(&profile_name, verb)?;
 
-            let key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw_key.trim());
-            let key_bytes = match key_bytes {
-                Ok(b) => b,
-                Err(e) => {
+            let owner_pubkey = match decode_owner_public_key(&raw_key) {
+                Some((key, form)) => {
+                    // Only a keyring entry is rewritten, never the test-only
+                    // file source.
+                    if form == OwnerKeyForm::OlderBase64 && source == OwnerKeySource::Keyring {
+                        let outcome = rewrite_owner_value_if_older(
+                            &stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key(
+                                &profile_name,
+                            ),
+                            &raw_key,
+                        );
+                        log_owner_entry_rewrite(&profile_name, &outcome);
+                    }
+                    key
+                }
+                None => {
+                    let key_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(raw_key.trim())
+                    {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return Err(format!(
+                                "policy.engine is 'v1' but the owner key for profile \
+                                 '{profile_name}' is neither a G-strkey nor valid base64 ({e}); \
+                                 {verb} refuses (fail closed)"
+                            ));
+                        }
+                    };
                     return Err(format!(
-                        "policy.engine is 'v1' but the owner key for profile '{profile_name}' \
-                         failed base64 decode ({e}); {verb} refuses (fail-closed)"
+                        "policy.engine is 'v1' but the owner key for profile '{profile_name}' has \
+                         length {} (expected {PUBLIC_KEY_LENGTH}); {verb} refuses (fail closed)",
+                        key_bytes.len()
                     ));
                 }
             };
-
-            if key_bytes.len() != PUBLIC_KEY_LENGTH {
-                return Err(format!(
-                    "policy.engine is 'v1' but the owner key for profile '{profile_name}' has \
-                     length {} (expected {PUBLIC_KEY_LENGTH}); {verb} refuses (fail-closed)",
-                    key_bytes.len()
-                ));
+            if source == OwnerKeySource::Keyring {
+                rewrite_older_form_owner_entries_once(Some(&profile_name));
             }
-            let mut owner_pubkey = [0u8; PUBLIC_KEY_LENGTH];
-            owner_pubkey.copy_from_slice(&key_bytes);
 
             // Resolve the policy directory.
             let policy_dir = match default_policy_dir() {
@@ -187,7 +220,7 @@ pub(crate) fn build_v1_policy_engine(
                 Err(e) => {
                     return Err(format!(
                         "policy.engine is 'v1' but the OS policy state directory is \
-                         unavailable ({e}); {verb} refuses (fail-closed)"
+                         unavailable ({e}); {verb} refuses (fail closed)"
                     ));
                 }
             };
@@ -199,7 +232,7 @@ pub(crate) fn build_v1_policy_engine(
                 Err(e) => {
                     return Err(format!(
                         "policy.engine is 'v1' but the policy file at {} failed to \
-                         load/verify ({e}); {verb} refuses (fail-closed)",
+                         load/verify ({e}); {verb} refuses (fail closed)",
                         policy_path.display()
                     ));
                 }
@@ -224,7 +257,7 @@ pub(crate) fn build_v1_policy_engine(
                 return Err(format!(
                     "policy.engine is 'v1' but the policy-window-state store for profile \
                      '{requested_profile_name}' failed to load ({e}); {verb} refuses \
-                     (fail-closed); run `stellar-agent profile reset-window-state \
+                     (fail closed); run `stellar-agent profile reset-window-state \
                      {requested_profile_name} --reason <reason>` to recover"
                 ));
             }
@@ -236,14 +269,14 @@ pub(crate) fn build_v1_policy_engine(
             )))
         }
         _ => Err(format!(
-            "unsupported policy engine kind {kind:?}; {verb} refuses (fail-closed)"
+            "unsupported policy engine kind {kind:?}; {verb} refuses (fail closed)"
         )),
     }
 }
 
-/// Resolves the operator's owner **PUBLIC** key (base64 URL-safe-no-pad,
-/// untrimmed) for `profile_name`, for `PolicyEngineV1`'s owner-signature
-/// verification step only.
+/// Resolves the operator's owner **PUBLIC** key, as stored, for
+/// `profile_name`, for `PolicyEngineV1`'s owner-signature verification step
+/// only.
 ///
 /// This function supplies a PUBLIC key exclusively. It is used solely to
 /// verify the operator's ed25519 signature over the policy document; there is
@@ -265,21 +298,26 @@ pub(crate) fn build_v1_policy_engine(
 /// the env var (or outside a test/`test-helpers` build), this function reads
 /// the owner public key from the OS keyring exactly as production always has.
 ///
+/// The stored value is the key's G-strkey or, in the older form, URL-safe
+/// base64 of its 32 bytes; the caller decodes either. The returned source
+/// says whether the value came from the keyring, the only source an
+/// older-form value is rewritten in.
+///
 /// # Errors
 ///
 /// Returns `Err(human-readable message)` — naming `verb` and carrying no
 /// secret material — when the file (test-only path) or keyring (production
 /// path) cannot be read.
-fn owner_pubkey_b64(profile_name: &str, verb: &str) -> Result<String, String> {
+fn owner_pubkey_raw(profile_name: &str, verb: &str) -> Result<(String, OwnerKeySource), String> {
     #[cfg(any(test, feature = "test-helpers"))]
     if let Some(path) = std::env::var_os("STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE") {
         let path = std::path::PathBuf::from(path);
         return std::fs::read_to_string(&path)
-            .map(|s| s.trim().to_owned())
+            .map(|s| (s.trim().to_owned(), OwnerKeySource::TestFile))
             .map_err(|e| {
                 format!(
                     "policy.engine is 'v1' but the test-only owner_pubkey file at {} could not \
-                     be read ({e}); {verb} refuses (fail-closed)",
+                     be read ({e}); {verb} refuses (fail closed)",
                     path.display()
                 )
             });
@@ -292,6 +330,7 @@ fn owner_pubkey_b64(profile_name: &str, verb: &str) -> Result<String, String> {
         stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key(profile_name);
     KeyringEntry::new(&entry_ref.service, &entry_ref.account)
         .and_then(|e| e.get_password())
+        .map(|raw| (raw, OwnerKeySource::Keyring))
         .map_err(|e| {
             // The outward contract is a fail-closed String error regardless of
             // cause; the classified cause is diagnostic-only (debug level).
@@ -302,7 +341,7 @@ fn owner_pubkey_b64(profile_name: &str, verb: &str) -> Result<String, String> {
             );
             format!(
                 "policy.engine is 'v1' but the owner key for profile '{profile_name}' could not \
-                 be read from the keyring ({e}); {verb} refuses (fail-closed)"
+                 be read from the keyring ({e}); {verb} refuses (fail closed)"
             )
         })
 }
@@ -748,8 +787,8 @@ mod tests {
                 "error for verb '{verb}' must mention the verb; got: {msg}"
             );
             assert!(
-                msg.contains("fail-closed"),
-                "error must say fail-closed; got: {msg}"
+                msg.contains("fail closed"),
+                "error must say fail closed; got: {msg}"
             );
         }
     }
@@ -757,9 +796,9 @@ mod tests {
     // ── Fail-closed: keyring unavailable ────────────────────────────────────
 
     /// When the service prefix is correct but the OS keyring has no entry, the
-    /// builder returns `Err` containing the verb name and "fail-closed".
+    /// builder returns `Err` containing the verb name and "fail closed".
     ///
-    /// `#[serial]`: `build_v1_policy_engine` -> `owner_pubkey_b64` reads the
+    /// `#[serial]`: `build_v1_policy_engine` -> `owner_pubkey_raw` reads the
     /// process-global `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE` env var when set;
     /// serialising avoids a race against the hazard tests below that set it.
     #[test]
@@ -783,8 +822,8 @@ mod tests {
                 "error for verb '{verb}' must mention the verb; got: {msg}"
             );
             assert!(
-                msg.contains("fail-closed"),
-                "error must say fail-closed; got: {msg}"
+                msg.contains("fail closed"),
+                "error must say fail closed; got: {msg}"
             );
         }
     }
@@ -1553,7 +1592,7 @@ mod tests {
     // active here via that crate's `test-helpers` dev-dependency feature) to
     // isolate `default_profile_dir` / `default_policy_dir` in a tempdir, and
     // the `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE` override on
-    // `owner_pubkey_b64` (active here via this crate's own `#[cfg(test)]`) to
+    // `owner_pubkey_raw` (active here via this crate's own `#[cfg(test)]`) to
     // supply the owner public key without touching the OS keyring.
 
     /// RAII guard for an arbitrary env var, mirroring
@@ -1621,6 +1660,81 @@ mod tests {
              engine = \"v1\"\n"
         );
         std::fs::write(dir.join(format!("{name}.toml")), toml).expect("write profile toml");
+    }
+
+    fn owner_entry(name: &str) -> Option<String> {
+        let coordinate =
+            stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key(name);
+        keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+            .unwrap()
+            .get_password()
+            .ok()
+    }
+
+    fn put_owner_entry(name: &str, value: &str) {
+        let coordinate =
+            stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key(name);
+        keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+            .unwrap()
+            .set_password(value)
+            .unwrap();
+    }
+
+    /// An engine build that reads an older-form keyring entry rewrites it as
+    /// the G-strkey. The build reads the key before the policy file, so the
+    /// rewrite holds even though no policy file exists here.
+    #[test]
+    #[serial_test::serial]
+    fn the_engine_builder_rewrites_an_older_form_keyring_entry() {
+        use base64::Engine as _;
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let name = "engine-rewrite";
+        write_v1_profile_toml(home.path(), name);
+        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let owner = [0x61_u8; 32];
+        put_owner_entry(
+            name,
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner),
+        );
+        let profile = stellar_agent_core::profile::loader::load(name, None).unwrap();
+        let _ = build_v1_policy_engine("pay", &profile.policy.engine, &profile, name);
+        assert!(
+            owner_entry(name)
+                == Some(stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner)),
+            "the older-form entry is rewritten as the G-strkey"
+        );
+    }
+
+    /// The test-only owner file source is read and never rewritten, and the
+    /// keyring entry is left as it is.
+    #[test]
+    #[serial_test::serial]
+    fn the_engine_builder_never_rewrites_the_test_owner_file() {
+        use base64::Engine as _;
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let name = "engine-file";
+        write_v1_profile_toml(home.path(), name);
+        let older_form = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x62_u8; 32]);
+        let pubkey_file = home.path().join("owner_pubkey.txt");
+        std::fs::write(&pubkey_file, &older_form).unwrap();
+        put_owner_entry(name, &older_form);
+        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let _pubkey_guard = TestEnvVarGuard::set(
+            "STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE",
+            pubkey_file.as_os_str(),
+        );
+        let profile = stellar_agent_core::profile::loader::load(name, None).unwrap();
+        let _ = build_v1_policy_engine("pay", &profile.policy.engine, &profile, name);
+        assert!(
+            std::fs::read_to_string(&pubkey_file).unwrap() == older_form,
+            "the test file is never rewritten"
+        );
+        assert!(
+            owner_entry(name) == Some(older_form),
+            "the keyring entry is left"
+        );
     }
 
     /// A v1 profile whose policy file carries a signature that does not

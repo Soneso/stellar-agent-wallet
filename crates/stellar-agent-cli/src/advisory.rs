@@ -435,6 +435,82 @@ mod tests {
         assert_eq!(std::fs::read(&default_path).unwrap(), default_bytes);
     }
 
+    /// The advisory writer is unkeyed, so it neither records nor checks the
+    /// audit binding. An absent binding stays absent, and a recorded binding
+    /// naming another log is left as it is while the advisory writes its row.
+    #[test]
+    #[serial_test::serial]
+    fn the_advisory_records_and_checks_no_binding() {
+        use stellar_agent_core::profile::{loader, schema::Profile};
+        use stellar_agent_network::keyring::KeyringAuditBindingStore;
+        use stellar_agent_test_support::StellarAgentHomeGuard;
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let _home = StellarAgentHomeGuard::new(dir.path());
+        let name = "advisory-binding";
+        let path = dir.path().join("advisory-audit.jsonl");
+        let profile = Profile::builder_testnet_named(name, "signer", "test", "nonce", "test")
+            .audit_log_path(&path)
+            .build();
+        loader::save(name, &profile).unwrap();
+        let allowlist = [VerifierAllowlistEntry::new_for_test(
+            [0xAB; 32],
+            VerifierAuditStatus::Revoked {
+                revoked_at: "2026-01-01",
+                reason: "test fixture",
+            },
+        )];
+        let binding = || {
+            KeyringAuditBindingStore::for_profile(name)
+                .load_raw()
+                .unwrap()
+        };
+        let run = || {
+            crate::run_profile_startup_advisory(Some(name), |selected_path| {
+                run_startup_advisory_with_allowlist(selected_path, &allowlist)
+            })
+        };
+
+        let writer = open_writer(path.clone());
+        write_context_rule_created(
+            &writer,
+            4,
+            "CDABC...12345",
+            vec!["abababababababab".to_owned()],
+        );
+        drop(writer);
+        assert_eq!(run().triggered_rule_ids, vec![4]);
+        assert!(binding().is_none(), "the advisory records no binding");
+
+        let mut elsewhere = profile.clone();
+        elsewhere.audit_log_path = dir.path().join("elsewhere.jsonl");
+        KeyringAuditBindingStore::for_profile(name)
+            .store(&stellar_agent_core::audit_log::AuditBinding::for_profile(
+                &elsewhere,
+            ))
+            .unwrap();
+        let recorded = binding();
+        let before = std::fs::read(&path).unwrap().len();
+        let writer = open_writer(path.clone());
+        write_context_rule_created(
+            &writer,
+            5,
+            "CDABC...12345",
+            vec!["abababababababab".to_owned()],
+        );
+        drop(writer);
+        assert!(
+            run().triggered_rule_ids.contains(&5),
+            "the advisory still runs"
+        );
+        assert!(std::fs::read(&path).unwrap().len() > before);
+        assert!(
+            binding() == recorded,
+            "the advisory checks and rewrites no binding"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn startup_profile_load_failures_are_nonfatal_and_do_not_scan() {

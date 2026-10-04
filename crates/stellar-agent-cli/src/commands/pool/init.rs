@@ -628,8 +628,7 @@ fn complete(
             "pool config could not be saved; resume initialization: {error}"
         ))
     })?;
-    let key =
-        stellar_agent_network::keyring::load_hmac_key_32(&profile.audit_log_hash_chain_key_id)?;
+    let key = crate::commands::profile::audit_emit::load_audit_hmac_key(profile, name)?;
     let reader = AuditReader::new(audit.clone(), Some(*key));
     let tx_hash_redacted = pending
         .submission

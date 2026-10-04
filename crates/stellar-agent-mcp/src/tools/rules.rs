@@ -194,7 +194,11 @@ fn profile_audit_writer(
     tool: &'static str,
 ) -> Option<Arc<Mutex<AuditWriter>>> {
     let profile_name = server.profile_name_for_approval();
-    match super::value_audit::require_value_audit_writer(&server.profile, &profile_name) {
+    match super::value_audit::require_value_audit_writer(
+        &server.profile,
+        &profile_name,
+        server.audit_binding,
+    ) {
         Ok(writer) => Some(writer),
         Err(err) => {
             tracing::warn!(

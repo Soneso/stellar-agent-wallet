@@ -37,6 +37,7 @@ pub(crate) fn to_counterparty_envelope(err: &CounterpartyError) -> Envelope<()> 
         }
         CounterpartyError::HomeDomainInvalid { .. } => "counterparty.home_domain_invalid",
         CounterpartyError::KeyringUnavailable { .. } => "counterparty.keyring_unavailable",
+        CounterpartyError::KeyMatchesOwnerPublicKey => "validation.key_matches_owner_public_key",
         CounterpartyError::Io { .. } => "counterparty.io",
         // Non-exhaustive match — new variants map to the generic code.
         _ => "counterparty.unknown",

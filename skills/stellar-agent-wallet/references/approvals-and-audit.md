@@ -353,9 +353,17 @@ signing the chain root with the profile's audit key.
 
 The chain and the per-file `root_hmac` sidecars verify a PREFIX of the log, so
 restoring an older copy of the active file, or truncating it, leaves a log that
-still verifies. The tip anchor closes that: for each log PATH the platform
-keyring holds the active file's entry count, last-entry hash, and byte offset,
-where filesystem access alone cannot rewind them.
+still verifies. The tip anchor closes that: for each log PATH the keyring holds
+the active file's entry count, last-entry hash, and byte offset.
+
+The anchor, the re-anchor counter, and the audit binding live in the keyring,
+outside the log file. Anyone who can restore the keyring's own storage together
+with the log can restore an older state. With a headless keyring backend these
+entries are kept in a file on the same host. Anyone who can write that file can
+restore older entries or delete one, which needs no key material. A deleted
+binding is recorded again from the profile file at the next keyed use. Under
+`headless-dpapi` an owner entry still in the older form can be moved to another
+coordinate until a V1 verb or `enroll-owner-key` rewrites it.
 
 Every value-moving verb checks the anchor before signing, on every acquisition of
 the audit writer. Five outcomes:
@@ -366,16 +374,52 @@ the audit writer. Five outcomes:
 | Exactly the anchored tip | Proceeds |
 | Ahead of the anchor, anchored entry intact | Proceeds; the tail is absorbed and the anchor advances |
 | Behind the anchor, or the anchored entry is not at the anchored offset | Refuses `audit.tip_anchor_mismatch` |
-| No anchor, chain verifies | Adopts the current tip and records `audit_tip_anchored { reason: adopted }` |
+| No anchor, file has entries, chain verifies | Adopts the current tip and records `audit_tip_anchored { reason: adopted }` |
+| No anchor, file empty | Proceeds; no anchor and no row until the first append |
 
-The ahead-of-anchor case is ordinary, not an exception: writers opened without
-the audit key (the CLI startup advisory, the zero-config best-effort path, the
-read-only smart-account verbs) append without moving the anchor. Adoption needs
+The ahead-of-anchor case is ordinary, not an exception. Writers opened without
+the audit key append without moving the anchor: the CLI startup advisory, and
+the zero-config and read-only smart-account paths of a profile whose audit key
+is not minted. Adoption needs
 no operator action and is what happens on the first run after upgrading a wallet
-whose audit log predates the anchor.
+whose audit log predates the anchor. An adoption writes its row only for a
+non-empty file.
 
-The anchor names a PATH, not a profile: repointing a profile's `audit_log_path`
-starts a fresh anchor at the new file, which then adopts.
+The anchor names a PATH, not a profile, so a changed `audit_log_path` or audit
+key has an anchor coordinate of its own. The audit binding guards that change.
+
+### The audit binding
+
+For each persisted profile the keyring records the SHA-256 of its lexically
+normalized `audit_log_path` and its audit-key coordinate, at service
+`stellar-agent-auditbinding-<profile>`, account `default`. The first keyed use
+records it from the profile file. Before the audit key loads, every keyed audit
+writer compares the profile with the record:
+
+| Record | Persisted profile | Synthesized zero-config profile |
+|---|---|---|
+| Absent | Records it and proceeds | Proceeds; records nothing |
+| Equal | Proceeds | Proceeds |
+| Different or unparseable | Refuses `audit.log_binding_changed` | Refuses `audit.log_binding_changed` |
+
+The refusal names the profile and the remedy, never a path or coordinate. It
+covers the value-moving verbs and tools, the read-only smart-account verbs,
+`approve serve`, `audit verify --profile`, and `profile rotate-audit-key`, and
+creates nothing at the path the profile names. A command whose audit row is
+best effort skips the row and continues: `approve --id <nonce>`,
+`credentials add-passkey`, `profile reset-window-state`, and the other `profile`
+enroll and rotate verbs.
+Not agent-recoverable: the operator establishes
+why the profile changed, then runs `stellar-agent audit reanchor --profile
+<NAME> --acknowledge-binding-change`. The zero-config profile has no profile
+file, and `audit reanchor` loads only a profile file: restore the `default.toml`
+that recorded the binding, or write one that names the log, then run the
+reanchor.
+
+The default `audit_log_path` derives from the OS data directory, which follows
+`$HOME` and `$XDG_DATA_HOME`. Two profile files of one name in two data roots
+that share one keyring bind different digests and refuse each other; set an
+explicit `audit_log_path` there.
 
 A rotation leaves the anchor on the outgoing file's handoff entry until the new
 file's first append, so restoring the whole audit directory to an earlier
@@ -388,8 +432,9 @@ continuous in time. Three states, differing in kind:
   the previous entry of this file. A rollback to that entry or later is
   absorbed; anything earlier is still refused. Retried on the next append.
 - **Off, nothing anchored yet**: until the first keyed append on a log path (a
-  new profile, a changed `audit_log_path`, a log written before the anchor
-  existed). Adoption takes the file as it finds it.
+  new profile, a log written before the anchor existed). Adoption takes the file
+  as it finds it. A changed `audit_log_path` is refused by the audit binding
+  until it is acknowledged.
 - **Off, freshly rotated file**: from a rotation until the first append into
   the new file is anchored. Any prefix of that file is accepted if it chains
   from the archive's handoff.
@@ -399,11 +444,12 @@ Entries already in an archive stay guarded in all three.
 What it does NOT do is detect forgery. The entry-to-entry chain hash is unkeyed,
 so an appended well-formed entry moves the tip forward and is accepted, exactly
 as an honest append is. The anchor detects rollback, truncation, and
-substitution.
+substitution, within the keyring scope stated above.
 
 Recovery from a mismatch is `stellar-agent audit reanchor --profile <NAME>
---acknowledge-rollback`. Not agent-recoverable: the operator has to establish
-why the log changed before accepting it.
+--acknowledge-rollback`. Recovery from a changed binding is the same verb with
+`--acknowledge-binding-change`. Not agent-recoverable: the operator has to
+establish why the log or the profile changed before accepting it.
 
 ### Fail-closed on an unminted audit key
 
@@ -439,7 +485,9 @@ reports `anchor.status` as `"not_checked"` with the reason and still verifies th
 chain in full. The check applies the same rule the writer applies, including
 proving the anchored entry is still at the anchored offset, so a longer
 internally consistent log that does not contain it refuses rather than passing on
-length alone.
+length alone. With `--profile` the profile's audit binding is read and never
+written: a changed or unparseable binding exits `1` with
+`audit.log_binding_changed`.
 
 | Argument | Required | Meaning |
 |---|---|---|
@@ -472,27 +520,40 @@ stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --pr
 
 ### `audit reanchor` command reference
 
-`stellar-agent audit reanchor --profile <NAME> --acknowledge-rollback`: the only
-way out of an `audit.tip_anchor_mismatch` refusal. Operator-only; an agent must
-never run it on its own initiative, because it accepts a log that may have been
-tampered with.
+`stellar-agent audit reanchor --profile <NAME>` with `--acknowledge-rollback`,
+`--acknowledge-binding-change`, or both: the only way out of an
+`audit.tip_anchor_mismatch` or `audit.log_binding_changed` refusal.
+Operator-only; an agent must never run it on its own initiative, because it
+accepts a log or a profile change that may have been tampered with.
 
 | Argument | Required | Meaning |
 |---|---|---|
 | `--profile <NAME>` | yes | Profile whose configured log path identifies the anchor. |
-| `--acknowledge-rollback` | yes, to act | Accept the log's current tip as authoritative. |
+| `--acknowledge-rollback` | per the matrix below | Accept the log's current tip as authoritative. |
+| `--acknowledge-binding-change` | per the matrix below | Accept a log path or audit key that differs from the recorded binding. |
 
-Without `--acknowledge-rollback` it reports the anchor in force and the anchor it
-would write, changes nothing, and exits `1` with
-`validation.acknowledgement_required`. With the flag it replays the whole log (a
-broken chain is refused, not blessed), writes the current tip, increments a
-monotonic per-path re-anchor counter, and appends an `audit_tip_anchored` row
-naming the superseded anchor. It takes the audit writer's exclusive lock, so a
-running MCP server must be stopped first; with one running it refuses
-`audit.writer_locked`.
+| Recorded binding | Current path's anchor | Flags required | Rows appended |
+|---|---|---|---|
+| Equal or absent | Any | `--acknowledge-rollback` | `rollback_acknowledged` |
+| Changed or unreadable | Absent, or agrees with the log | `--acknowledge-binding-change` | `binding_changed` |
+| Changed or unreadable | Disagrees with the log, or cannot be parsed | Both | `rollback_acknowledged`, then `binding_changed` |
+
+A flag the matrix does not require is ignored. A missing flag changes nothing
+and exits `1` with `validation.acknowledgement_required`, naming the flag. With
+the required flags it replays the whole log and refuses a broken chain. It then
+writes the current tip, bumps the current path's re-anchor counter once, and
+appends the rows, each carrying that count. `rollback_acknowledged`
+names the superseded anchor; `binding_changed` names the old path's anchor, or
+none when the record was unreadable. The new binding is stored last, and an
+absent binding is recorded after a rollback repair. It takes the audit writer's
+exclusive lock, so a running MCP server must be stopped before a rollback
+repair; with one running it refuses `audit.writer_locked`. A binding change needs
+no stop: a server running the edited profile refuses before it opens the new
+path, so it holds no lock there. A server still running the old profile refuses
+after the acknowledgement until it restarts.
 
 ```json
-{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"recorded_binding":"equal","previous_binding_anchor":null},"request_id":"..."}
 ```
 
 ## The governance loop end to end

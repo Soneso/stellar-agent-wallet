@@ -26,7 +26,7 @@ fn key_too_short_returns_error() {
     let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).unwrap();
     entry.set_password(&encoded).unwrap();
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_balances"]);
 
     let err = mint

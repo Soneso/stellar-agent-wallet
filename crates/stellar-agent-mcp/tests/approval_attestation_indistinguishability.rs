@@ -217,7 +217,8 @@ async fn build_scaffold(
     let now_ms: u64 = 1_893_456_000_000; // 2030-01-01 UTC test epoch
     let expiry_ms: u64 = now_ms + 60_000;
 
-    let nonce_mint = NonceMint::from_profile(&profile).expect("NonceMint::from_profile");
+    let nonce_mint =
+        NonceMint::from_profile(&profile, "nonce-test").expect("NonceMint::from_profile");
     let nonce = nonce_mint
         .mint(
             &PayCommitCatalogue,
@@ -858,4 +859,126 @@ async fn valid_attestation_passes_gate() {
             );
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Owner key: an attestation computed under the owner public key
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An attestation computed under an attestation key equal to the profile's
+/// owner public key, stored in the older form, returns the uniform
+/// `policy.approval_required` envelope. The gate logs the owner code at
+/// `warn` and never the raw value.
+#[tokio::test]
+#[serial]
+async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
+    keyring_mock::install().expect("mock keyring store init");
+    let nonce_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xABu8; 32]);
+    keyring_core::Entry::new("n-svc", "n-acct")
+        .expect("Entry::new for nonce key")
+        .set_password(&nonce_key_b64)
+        .expect("set_password for nonce key");
+
+    // The attestation key and the owner entry of profile "acct" hold the same
+    // 32 bytes, the owner entry in the older form.
+    let owner_key = [0x22u8; 32];
+    let older_form = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner_key);
+    for (service, account) in [
+        ("stellar-agent-attestation-acct", "default"),
+        ("stellar-agent-owner-acct", "default"),
+    ] {
+        keyring_core::Entry::new(service, account)
+            .expect("Entry::new")
+            .set_password(&older_form)
+            .expect("set_password");
+    }
+
+    let temp = TempDir::new().expect("TempDir::new");
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(AccountLedgerResponder {
+            account_key_xdr: account_ledger_key_xdr(SOURCE),
+            account_xdr: account_entry_xdr_with_balance(SOURCE, 1_000_000_000),
+        })
+        .mount(&mock)
+        .await;
+    let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .with_noop_engine()
+        .build();
+    profile.rpc_url = mock.uri();
+    let (server, envelope_xdr, nonce_b64, expiry_ms) =
+        build_scaffold(profile, temp.path().to_path_buf()).await;
+
+    let uid =
+        stellar_agent_core::approval::user_id::process_uid_for_attestation().expect("process uid");
+    let entry = PendingApproval::new_payment_pending(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(envelope_xdr.as_bytes()),
+        envelope_xdr.as_bytes(),
+        DEST.to_owned(),
+        100_000_000,
+        "XLM".to_owned(),
+        None,
+        100,
+        101,
+        uid.clone(),
+        60_000,
+    )
+    .expect("new_payment_pending");
+    let approval_nonce_id = entry.approval_nonce.clone();
+    {
+        let mut store =
+            PendingApprovalStore::open(temp.path().join("acct.toml")).expect("open store");
+        let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("now");
+        store.insert(entry, now_ms).expect("insert live entry");
+    }
+    let blob = stellar_agent_core::approval::compute_attestation(
+        &owner_key,
+        &stellar_agent_core::approval::AttestationBinding::new("acct", "stellar:testnet"),
+        &approval_nonce_id,
+        &stellar_agent_core::approval::envelope_sha256(envelope_xdr.as_bytes()),
+        &uid,
+    );
+
+    let logs = CaptureWriter::new();
+    let subscriber = capture_subscriber(logs.clone());
+    let result = server
+        .call_stellar_pay_commit(StellarPayCommitArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            source: SOURCE.to_owned(),
+            destination: DEST.to_owned(),
+            amount: Some(serde_json::from_str(r#""10 XLM""#).expect("parse amount")),
+            amount_in_stroops: None,
+            asset: "native".to_owned(),
+            memo_text: None,
+            memo_id: None,
+            memo_hash_hex: None,
+            memo_return_hex: None,
+            nonce: nonce_b64,
+            expires_at_unix_ms: expiry_ms,
+            envelope_xdr,
+            approval_nonce: Some(approval_nonce_id),
+            approval_attestation: Some(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob),
+            ),
+        })
+        .with_subscriber(subscriber)
+        .await
+        .expect("an owner-key refusal returns an is_error envelope");
+    let (code, message, _text) = common::assert_business_envelope(&result);
+    assert_eq!(code, POLICY_APPROVAL_REQUIRED_CODE);
+    assert_eq!(message, POLICY_APPROVAL_REQUIRED_MSG);
+    assert!(common::business_envelope_details(&result).is_none());
+
+    let captured = logs.captured_str();
+    assert!(
+        !captured.contains(&older_form),
+        "the raw owner value is never logged"
+    );
+    let warn_line = captured
+        .lines()
+        .find(|line| {
+            line.contains("WARN") && line.contains("validation.key_matches_owner_public_key")
+        })
+        .unwrap_or_else(|| panic!("expected the owner-code warn line, got: {captured}"));
+    assert!(!warn_line.is_empty());
 }

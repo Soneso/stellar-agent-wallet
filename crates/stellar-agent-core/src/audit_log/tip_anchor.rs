@@ -5,8 +5,15 @@
 //! pins the chain's TIP: restoring an older copy of the active file, or
 //! truncating it, leaves a prefix whose linkage and root signature both still
 //! verify. The tip anchor closes that gap by keeping the tip's coordinates
-//! outside the file, in the platform keyring, where an attacker holding only
-//! filesystem access cannot rewind them.
+//! outside the file, in the keyring.
+//!
+//! The anchor, the re-anchor counter, and the audit binding live in the
+//! keyring, outside the log file. Anyone who can restore the keyring's own
+//! storage together with the log can restore an older state. With a headless
+//! keyring backend these entries are kept in a file on the same host. Anyone
+//! who can write that file can restore older entries or delete one, which
+//! needs no key material. A deleted binding is recorded again from the
+//! profile file at the next keyed use.
 //!
 //! # What the anchor is
 //!
@@ -35,10 +42,12 @@
 //!   not hash to `tip_hash`: the file was rolled back, truncated, or replaced.
 //!   Refuse.
 //!
-//! An absent anchor is adopted: the chain is verified, the current tip is
-//! written as the anchor, and an `audit_tip_anchored` row records the adoption.
-//! This is what an audit log written before the anchor existed does on its first
-//! keyed use, with no operator action.
+//! An absent anchor is adopted: the chain is verified and the current tip is
+//! written as the anchor. A file with entries also gets an
+//! `audit_tip_anchored` row recording the adoption; an empty file gets neither
+//! an anchor nor a row, and its first append writes the first anchor. This is
+//! what an audit log written before the anchor existed does on its first keyed
+//! use, with no operator action.
 //!
 //! # Only a file with entries is ever anchored
 //!
@@ -65,11 +74,14 @@
 //! # Scope: one path inside one profile's keyring namespace
 //!
 //! The anchor's keyring SERVICE is the profile's own audit-key service and its
-//! ACCOUNT is derived from the lexically normalized log path, so pointing a
-//! profile's `audit_log_path` at a different file starts a fresh anchor, which
-//! then adopts that file's tip. Normalization is lexical rather than
-//! [`std::fs::canonicalize`] because the log file may not exist yet at the
-//! moment the coordinate is derived.
+//! ACCOUNT is derived from the lexically normalized log path, so a different
+//! `audit_log_path` or audit key has an anchor coordinate of its own. The
+//! audit binding of [`super::binding`] records the path digest and audit-key
+//! coordinate a persisted profile writes under. A keyed writer refuses a
+//! profile whose pair differs from the record with `audit.log_binding_changed`,
+//! until the operator runs `audit reanchor --acknowledge-binding-change`.
+//! Normalization is lexical rather than [`std::fs::canonicalize`] because the
+//! log file may not exist yet at the moment the coordinate is derived.
 //!
 //! Two profiles pointed at ONE log path therefore hold TWO anchors rather than
 //! sharing one, each advancing only on its own appends, and a rollback to the
@@ -407,7 +419,7 @@ impl KeyedAuditAccess {
 /// not-yet-created path. Lexical normalization makes `audit/./default.jsonl`
 /// and `audit/x/../default.jsonl` share an anchor with `audit/default.jsonl`;
 /// it deliberately does not resolve symlinks, so two paths that differ only
-/// through a link get separate anchors, each of which adopts.
+/// through a link get separate anchors and separate audit-binding digests.
 #[must_use]
 pub fn normalize_path_lexically(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -431,19 +443,39 @@ pub fn normalize_path_lexically(path: &Path) -> PathBuf {
     out
 }
 
-/// Derives the keyring account name that holds the anchor for `log_path`,
-/// given the profile's audit-key account as the base.
+/// SHA-256 of the lexically normalized `log_path`.
 ///
-/// The suffix is the first `PATH_DIGEST_HEX_LEN` hex characters of the
-/// SHA-256 of the lexically normalized path, so the anchor follows the FILE the
-/// profile points at: repointing `audit_log_path` starts a fresh anchor, which
-/// adopts the new file's tip.
+/// The one digest of a log path: the anchor's keyring account and the audit
+/// binding both derive from it, so the two cannot disagree about which file a
+/// profile names.
 #[must_use]
-pub fn tip_anchor_account(base_account: &str, log_path: &Path) -> String {
+pub fn log_path_sha256(log_path: &Path) -> [u8; 32] {
     let normalized = normalize_path_lexically(log_path);
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_os_str().as_encoded_bytes());
-    let digest = crate::hex::encode(&hasher.finalize());
+    hasher.finalize().into()
+}
+
+/// Derives the keyring account name that holds the anchor for `log_path`,
+/// given the profile's audit-key account as the base.
+///
+/// The suffix is the first `PATH_DIGEST_HEX_LEN` hex characters of
+/// [`log_path_sha256`], so the anchor follows the FILE the profile points at.
+/// A repointed `audit_log_path` therefore has an anchor coordinate of its own,
+/// and the audit binding refuses the repointed path until the operator
+/// acknowledges it.
+#[must_use]
+pub fn tip_anchor_account(base_account: &str, log_path: &Path) -> String {
+    tip_anchor_account_for_digest(base_account, &log_path_sha256(log_path))
+}
+
+/// [`tip_anchor_account`] for a path known only by its [`log_path_sha256`].
+///
+/// The repair verb reads the anchor of a path a profile no longer names, and
+/// the audit binding records that path only as its digest.
+#[must_use]
+pub fn tip_anchor_account_for_digest(base_account: &str, path_sha256: &[u8; 32]) -> String {
+    let digest = crate::hex::encode(path_sha256);
     let suffix = digest.get(..PATH_DIGEST_HEX_LEN).unwrap_or(digest.as_str());
     format!("{base_account}-tip-{suffix}")
 }
@@ -452,7 +484,17 @@ pub fn tip_anchor_account(base_account: &str, log_path: &Path) -> String {
 /// beside the anchor for `log_path`.
 #[must_use]
 pub fn reanchor_count_account(base_account: &str, log_path: &Path) -> String {
-    format!("{}-reanchors", tip_anchor_account(base_account, log_path))
+    reanchor_count_account_for_digest(base_account, &log_path_sha256(log_path))
+}
+
+/// [`reanchor_count_account`] for a path known only by its
+/// [`log_path_sha256`].
+#[must_use]
+pub fn reanchor_count_account_for_digest(base_account: &str, path_sha256: &[u8; 32]) -> String {
+    format!(
+        "{}-reanchors",
+        tip_anchor_account_for_digest(base_account, path_sha256)
+    )
 }
 
 // ── In-memory store for tests ────────────────────────────────────────────────

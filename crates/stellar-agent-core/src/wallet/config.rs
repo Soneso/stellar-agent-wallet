@@ -87,7 +87,7 @@ pub enum MlockRequired {
     ///
     /// Use only on platforms where memory locking is unavailable AND the
     /// operator explicitly accepts the residual T6 swap-disclosure risk.
-    /// The opt-out is recorded in the hash-chained audit log at wallet startup.
+    /// The posture is set in the profile file and is not overlayable.
     False,
 }
 

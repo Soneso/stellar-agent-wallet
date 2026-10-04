@@ -48,7 +48,7 @@ When a tool needs to sign, the 32-byte signing seed is loaded into a short Unloc
 - The window is TTL-bounded. The default is 30 seconds; the configured value (profile `[wallet] unlock_ttl_seconds`) must be in the range 1 to 600 seconds, and a value of 0 or above 600 is refused when the window is constructed rather than clamped. A background timer fires at the TTL and marks the wallet disposed.
 - On every exit path, including normal return, error propagation, and panic-unwind, the seed is zeroized and the lock released.
 
-The `mlock_required` posture in `[wallet]` controls what happens when pinning fails. The value `true` (default on Linux/macOS) fails closed and aborts the unlock; `"warn"` (default on Windows) proceeds with unprotected memory and emits a warning; `false` proceeds silently, with the operator accepting the swap-disclosure risk. No path logs the seed.
+The `mlock_required` posture in `[wallet]` controls what happens when pinning fails. The value `true` (default on Linux/macOS) fails closed and aborts the unlock; `"warn"` (default on Windows) proceeds with unprotected memory and emits a warning; `false` proceeds silently, with the operator accepting the swap-disclosure risk. The posture is set in the profile file and is not overlayable. No path logs the seed.
 
 ```toml
 [wallet]

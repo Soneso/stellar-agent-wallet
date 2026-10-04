@@ -33,7 +33,8 @@
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::audit_log::{
-    AuditEntry, AuditWriter, AuditWriterRegistry, WriterError, audit_log_unusable_detail,
+    AuditEntry, AuditWriter, AuditWriterRegistry, BindingCheck, WriterError,
+    audit_log_unusable_detail,
 };
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
@@ -76,11 +77,24 @@ use stellar_agent_network::keyring::keyed_audit_access;
 ///   acquisition, not only the first, because it caches one writer per profile
 ///   for the process lifetime and a check at open alone would miss a file
 ///   swapped underneath a live writer.
+/// - [`ValidationError::AuditLogBindingChanged`] when the profile names a log
+///   path or audit key other than the binding recorded in the keyring.
+///   `binding` is the check the server stored at startup.
 pub(crate) fn require_value_audit_writer(
     profile: &Profile,
     profile_name: &str,
+    binding: BindingCheck,
 ) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
-    let access = keyed_audit_access(profile).map_err(|e| {
+    let access = keyed_audit_access(profile, profile_name, binding).map_err(|e| {
+        // A binding refusal keeps its own code and remedy.
+        if is_binding_refusal(&e) {
+            tracing::warn!(
+                profile = %profile_name,
+                code = %e.code(),
+                "value audit: audit binding changed; refusing before signing/submit"
+            );
+            return e;
+        }
         tracing::warn!(
             profile = %profile_name,
             error = %e,
@@ -135,6 +149,14 @@ fn audit_writer_acquisition_error(profile_name: &str, e: &WriterError) -> Wallet
         "value audit: could not open audit writer; refusing before signing/submit"
     );
     audit_writer_open_failed(profile_name)
+}
+
+/// Whether `e` is the audit binding refusal.
+fn is_binding_refusal(e: &WalletError) -> bool {
+    matches!(
+        e,
+        WalletError::Validation(ValidationError::AuditLogBindingChanged { .. })
+    )
 }
 
 fn audit_chain_key_unavailable(profile_name: &str) -> WalletError {
@@ -206,9 +228,19 @@ pub(crate) fn emit_value_audit_row_with_writer(
 pub(crate) fn emit_value_audit_row_strict(
     profile: &Profile,
     profile_name: &str,
+    binding: BindingCheck,
     entry: AuditEntry,
 ) -> Result<(), WalletError> {
-    let access = keyed_audit_access(profile).map_err(|e| {
+    let access = keyed_audit_access(profile, profile_name, binding).map_err(|e| {
+        // A binding refusal keeps its own code and remedy.
+        if is_binding_refusal(&e) {
+            tracing::warn!(
+                profile = %profile_name,
+                code = %e.code(),
+                "value audit: audit binding changed; withholding the authorization"
+            );
+            return e;
+        }
         tracing::warn!(
             profile = %profile_name,
             error = %e,
@@ -351,5 +383,97 @@ mod tests {
             "message: {}",
             mapped.message()
         );
+    }
+
+    /// A profile that names `dir/repointed/audit.jsonl` over a binding
+    /// recorded for `dir/audit.jsonl`.
+    fn bound_then_repointed(name: &str, dir: &std::path::Path) -> Profile {
+        let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+        profile.audit_log_path = dir.join("audit.jsonl");
+        let coordinate = &profile.audit_log_hash_chain_key_id;
+        stellar_agent_network::keyring::rotate_keyring_secret_32(
+            &coordinate.service,
+            &coordinate.account,
+        )
+        .unwrap();
+        stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(name)
+            .store(&stellar_agent_core::audit_log::AuditBinding::for_profile(
+                &profile,
+            ))
+            .unwrap();
+        profile.audit_log_path = dir.join("repointed").join("audit.jsonl");
+        profile
+    }
+
+    fn sample_row() -> AuditEntry {
+        AuditEntry::new_value_action_submitted(
+            "stellar_pay",
+            "stellar:testnet",
+            Vec::new(),
+            "abcd1234…wxyz5678",
+            1,
+            stellar_agent_core::audit_log::PolicyDecision::Allow,
+            None,
+            None,
+            None,
+            "req-binding",
+        )
+    }
+
+    /// The pre-flight passes a binding refusal through under either check
+    /// and creates nothing at the repointed path.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn the_pre_flight_passes_a_binding_refusal_through() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let profile = bound_then_repointed("mcp-binding-preflight", dir.path());
+        for binding in [BindingCheck::Enforce, BindingCheck::CheckOnly] {
+            let err = require_value_audit_writer(&profile, "mcp-binding-preflight", binding)
+                .expect_err("a changed binding refuses");
+            assert_eq!(err.code(), "audit.log_binding_changed", "{err}");
+        }
+        assert!(!dir.path().join("repointed").exists());
+    }
+
+    /// The strict helper passes a binding refusal through and writes nothing.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn the_strict_helper_passes_a_binding_refusal_through() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let profile = bound_then_repointed("mcp-binding-strict", dir.path());
+        let err = emit_value_audit_row_strict(
+            &profile,
+            "mcp-binding-strict",
+            BindingCheck::Enforce,
+            sample_row(),
+        )
+        .expect_err("a changed binding refuses");
+        assert_eq!(err.code(), "audit.log_binding_changed", "{err}");
+        assert!(!dir.path().join("repointed").exists());
+    }
+
+    /// Every other keyed-access failure keeps `audit.chain_key_unavailable`
+    /// on both helpers.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn other_keyed_access_failures_keep_chain_key_unavailable() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile =
+            Profile::builder_testnet_named("mcp-binding-nokey", "s", "a", "n", "a").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let err = require_value_audit_writer(&profile, "mcp-binding-nokey", BindingCheck::Enforce)
+            .expect_err("an unminted key refuses");
+        assert_eq!(err.code(), "audit.chain_key_unavailable", "{err}");
+        let err = emit_value_audit_row_strict(
+            &profile,
+            "mcp-binding-nokey",
+            BindingCheck::Enforce,
+            sample_row(),
+        )
+        .expect_err("an unminted key refuses");
+        assert_eq!(err.code(), "audit.chain_key_unavailable", "{err}");
     }
 }

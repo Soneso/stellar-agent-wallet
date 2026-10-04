@@ -69,7 +69,12 @@ pub(crate) fn run(args: &ResetMppStateArgs) -> i32 {
         render::render_json(&Envelope::err(&error));
         return 1;
     }
-    match MppAuthorizationStore::reset_for_profile(profile_name, &profile, &args.reason) {
+    match MppAuthorizationStore::reset_for_profile(
+        profile_name,
+        &profile,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+        &args.reason,
+    ) {
         Ok(discarded_generation) => {
             render::render_json(&Envelope::ok(serde_json::json!({
                 "profile": profile_name,

@@ -126,6 +126,119 @@ pub fn inject_error(
     Ok(())
 }
 
+/// Installs a fresh in-memory mock store whose credential at
+/// `service`/`account` holds `initial` and fails its next WRITE with `err`.
+///
+/// [`inject_error`] fails the next operation of any kind, so a read that
+/// precedes a write consumes it. This store leaves reads, deletions, and every
+/// other coordinate as [`install`] does and fails only the first write at the
+/// named coordinate, so a test can drive a read-then-write sequence to the
+/// write. `initial`, when given, is stored before the failure is armed.
+/// [`inject_error`] does not reach the named coordinate under this store.
+///
+/// # Errors
+///
+/// Returns `Err(keyring_core::Error)` if `keyring_core::mock::Store::new()`
+/// fails or `initial` cannot be stored.
+pub fn install_with_write_error(
+    service: &str,
+    account: &str,
+    initial: Option<&str>,
+    err: keyring_core::Error,
+) -> Result<(), keyring_core::Error> {
+    use keyring_core::api::CredentialStoreApi as _;
+    let inner = keyring_core::mock::Store::new()?;
+    if let Some(initial) = initial {
+        inner.build(service, account, None)?.set_password(initial)?;
+    }
+    let store: Arc<keyring_core::CredentialStore> = Arc::new(WriteErrorStore {
+        inner,
+        target: (service.to_owned(), account.to_owned()),
+        error: Arc::new(std::sync::Mutex::new(Some(err))),
+    });
+    keyring_core::set_default_store(store);
+    Ok(())
+}
+
+/// The mock store of [`install_with_write_error`].
+struct WriteErrorStore {
+    inner: Arc<keyring_core::mock::Store>,
+    target: (String, String),
+    error: Arc<std::sync::Mutex<Option<keyring_core::Error>>>,
+}
+
+impl keyring_core::api::CredentialStoreApi for WriteErrorStore {
+    fn vendor(&self) -> String {
+        "stellar-agent-test-support write-error mock".to_owned()
+    }
+
+    fn id(&self) -> String {
+        "stellar-agent-test-support/write-error-mock".to_owned()
+    }
+
+    fn build(
+        &self,
+        service: &str,
+        user: &str,
+        modifiers: Option<&std::collections::HashMap<&str, &str>>,
+    ) -> keyring_core::Result<keyring_core::Entry> {
+        let entry = self.inner.build(service, user, modifiers)?;
+        if self.target.0 == service && self.target.1 == user {
+            return Ok(keyring_core::Entry::new_with_credential(Arc::new(
+                WriteErrorCred {
+                    inner: entry,
+                    error: Arc::clone(&self.error),
+                },
+            )));
+        }
+        Ok(entry)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// A mock credential that fails its first write with the store's error.
+struct WriteErrorCred {
+    inner: keyring_core::Entry,
+    error: Arc<std::sync::Mutex<Option<keyring_core::Error>>>,
+}
+
+impl keyring_core::api::CredentialApi for WriteErrorCred {
+    fn set_secret(&self, secret: &[u8]) -> keyring_core::Result<()> {
+        let pending = match self.error.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(err) = pending {
+            return Err(err);
+        }
+        self.inner.set_secret(secret)
+    }
+
+    fn get_secret(&self) -> keyring_core::Result<Vec<u8>> {
+        self.inner.get_secret()
+    }
+
+    fn delete_credential(&self) -> keyring_core::Result<()> {
+        self.inner.delete_credential()
+    }
+
+    fn get_credential(&self) -> keyring_core::Result<Option<Arc<keyring_core::api::Credential>>> {
+        self.inner.get_secret()?;
+        Ok(None)
+    }
+
+    fn get_specifiers(&self) -> Option<(String, String)> {
+        self.inner.get_specifiers()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Injects the Windows no-logon-session failure shape at the given
 /// coordinates: `keyring_core::Error::NoStorageAccess` wrapping
 /// [`WINDOWS_NO_LOGON_SESSION_TEXT`].

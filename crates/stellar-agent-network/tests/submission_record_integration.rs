@@ -1104,7 +1104,12 @@ async fn assert_audit_append_refusal(failure: AuditAppendFailure) {
         .unwrap()
         .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([4_u8; 32]))
         .unwrap();
-    let access = stellar_agent_network::keyring::keyed_audit_access(&fx.profile).unwrap();
+    let access = stellar_agent_network::keyring::keyed_audit_access(
+        &fx.profile,
+        &fx.profile_name,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    )
+    .unwrap();
     let mut writer = AuditWriter::open(audit_path.clone(), Some(access)).unwrap();
     writer
         .write_entry(AuditEntry::new_tool_invocation(NewToolInvocation::new(
@@ -1246,7 +1251,12 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
         .unwrap()
         .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 32]))
         .unwrap();
-    let access = stellar_agent_network::keyring::keyed_audit_access(&fx.profile).unwrap();
+    let access = stellar_agent_network::keyring::keyed_audit_access(
+        &fx.profile,
+        &fx.profile_name,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    )
+    .unwrap();
     let audit = Arc::new(Mutex::new(
         AuditWriter::open(audit_path.clone(), Some(access)).unwrap(),
     ));
