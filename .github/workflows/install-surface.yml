@@ -1,9 +1,11 @@
 name: Install surface
 
 # Checks the documented install commands, the secret-seed procedures, and the
-# binstall metadata (.github/scripts/check-install-surface.py), then runs the
-# check's self-test. It has no paths filter, so a change that touches only
-# Markdown runs it too.
+# binstall metadata (.github/scripts/check-install-surface.py). Checks the gate
+# tool versions of docs/maintainers/building.md, the other workflows, and the
+# composite actions against the ci.yml pins
+# (.github/scripts/check-gate-tool-versions.sh). Runs each check's self-test.
+# It has no paths filter, so a change that touches only Markdown runs it too.
 
 on:
   pull_request:
@@ -34,3 +36,5 @@ jobs:
           python-version: '3.13'
       - run: python3 .github/scripts/check-install-surface.py
       - run: python3 .github/scripts/test-check-install-surface.py
+      - run: bash .github/scripts/check-gate-tool-versions.sh
+      - run: bash .github/scripts/test-check-gate-tool-versions.sh
