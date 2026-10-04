@@ -29,7 +29,9 @@ first session with Claude Code looks.
 
 ## Status
 
-Public alpha, under active development.
+Public alpha, under active development. The
+[milestones](https://github.com/Soneso/stellar-agent-wallet/milestones) list
+the planned work per release.
 
 - testnet (`stellar:testnet`) is the default network: a command with no
   named profile and no `default.toml` runs on the zero-config testnet profile.
@@ -315,6 +317,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Good entry points are the issues labeled
 [`good first issue`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
 and
 [`help wanted`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22).
+[GOVERNANCE.md](GOVERNANCE.md) states who maintains the project and how it makes
+decisions.
 
 ## License
 
