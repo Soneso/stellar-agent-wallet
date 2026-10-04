@@ -10,11 +10,12 @@ name: Take
 # or by the issue's own assignee, changes nothing and posts nothing.
 #
 # Two claims by one person on two issues can both pass the held-issue check.
-# After its own assignment, each run lists the commenter's open assigned
-# issues again, keeps the lowest-numbered one, and releases every other one
-# with the same "already hold" comment. Racing runs therefore end with the
-# lowest-numbered issue assigned. .github/scripts/test-take-workflow.py runs
-# this script against a simulated API.
+# After its own assignment, each run keeps the lowest-numbered issue the
+# commenter holds and releases every other one with the "already hold"
+# comment. Before each release it reads the issue again, so an assignment
+# already released gets no second comment.
+# .github/scripts/test-take-workflow.py runs this script against a simulated
+# API.
 
 on:
   issue_comment:
