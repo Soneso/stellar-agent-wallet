@@ -43,26 +43,29 @@
 //!
 //! # Supply-chain integrity
 //!
-//! The SHA-256 of the vendored WASM is verified in the unit test
-//! `tests::weighted_threshold_policy_wasm_sha256_matches_provenance` below, on
-//! every `cargo test`. The SHA-256 value is pinned in three places (this
-//! file, `build.rs`, and
-//! `vendor/oz-weighted-threshold-policy/v0.7.2/PROVENANCE.md`), and the CI
-//! vendored-wasm gate re-hashes the in-repo WASM against PROVENANCE.md on
-//! every run.
+//! The digest of the vendored Wasm, [`WEIGHTED_THRESHOLD_POLICY_WASM_SHA256`],
+//! is pinned in this file, in [`WEIGHTED_THRESHOLD_POLICY_WASM_HASHES`], in its
+//! row of `WASM_PINS` in `build.rs`, and in
+//! `vendor/oz-weighted-threshold-policy/v0.7.2/PROVENANCE.md`. The
+//! `vendored-wasm` workflow rebuilds the file from its pinned source and fails
+//! unless the rebuilt bytes equal it; its tree check holds the file to its
+//! `WASM_PINS` row and its record. The tests in `src/vendored_wasm_tests.rs`
+//! bind [`WEIGHTED_THRESHOLD_POLICY_WASM`], the digest constant, and the
+//! allowlist to the file.
 
 /// SHA-256 of the vendored `multisig_weighted_threshold_policy_example.wasm`
 /// artefact.
 ///
-/// Pinned here, in `build.rs`, and in
-/// `vendor/oz-weighted-threshold-policy/v0.7.2/PROVENANCE.md` (same value in
-/// all places). The compile-time integrity gate is `build.rs`; the runtime
-/// `tests::weighted_threshold_policy_wasm_sha256_matches_provenance` test
-/// remains as defense in depth.
+/// Pinned here, in its row of `WASM_PINS` in `build.rs`, and in
+/// `vendor/oz-weighted-threshold-policy/v0.7.2/PROVENANCE.md`. `build.rs`
+/// fails every build unless the vendored file hashes to its row,
+/// `tests::weighted_threshold_policy_wasm_sha256_matches_provenance` compares
+/// [`WEIGHTED_THRESHOLD_POLICY_WASM`] with this constant, and the tests in
+/// `src/vendored_wasm_tests.rs` compare both with the file.
 ///
 /// Built from OZ `stellar-contracts` at SHA `a9c42169000638da937577f592ebf61a7a3c94ca`
-/// (tag `v0.7.2`) via `stellar contract build --package multisig-weighted-threshold-policy-example`
-/// (stellar-cli 25.2.0), then copying the release cdylib from
+/// (tag `v0.7.2`) via `stellar contract build --locked --package multisig-weighted-threshold-policy-example`
+/// (stellar-cli 25.2.0, rustc 1.96.0), then copying the `release/` output
 /// `target/wasm32v1-none/release/multisig_weighted_threshold_policy_example.wasm`.
 pub const WEIGHTED_THRESHOLD_POLICY_WASM_SHA256: &str =
     "e3d8cc5ab9668526d5cf2bab17ee42e84ee4b972ba7cca8d3a37b2ed8d9baee3";

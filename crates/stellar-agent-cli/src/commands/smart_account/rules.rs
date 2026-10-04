@@ -54,11 +54,10 @@
 //!
 //! # Inverse-bypass discipline
 //!
-//! All write paths invoke `Signer::sign_auth_digest` exclusively via the
-//! manager's `complete_authorization_entry` call site. A CI gate enforces this:
-//! the alternative SEP-23-payload signing primitive (the sibling of
-//! `sign_auth_digest`) MUST NOT be invoked from any source under
-//! `crates/stellar-agent-cli/src/commands/wallet/` and is repo-gate-rejected.
+//! All write paths invoke `Signer::sign_auth_digest` only through the
+//! manager's `complete_authorization_entry` call site, and no source of this
+//! module invokes the SEP-23-payload signing primitive (the sibling of
+//! `sign_auth_digest`). No check enforces this discipline; review keeps it.
 
 use std::time::Duration;
 

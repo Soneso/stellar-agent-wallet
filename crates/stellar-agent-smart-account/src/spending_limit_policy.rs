@@ -45,25 +45,28 @@
 //!
 //! # Supply-chain integrity
 //!
-//! The SHA-256 of the vendored WASM is verified in the unit test
-//! `tests::spending_limit_policy_wasm_sha256_matches_provenance` below, on every
-//! `cargo test`. The SHA-256 value is pinned in three places (this file,
-//! `build.rs`, and `vendor/oz-spending-limit-policy/v0.7.2/PROVENANCE.md`), and
-//! the CI vendored-wasm gate re-hashes the in-repo WASM against PROVENANCE.md on
-//! every run.
+//! The digest of the vendored Wasm, [`SPENDING_LIMIT_POLICY_WASM_SHA256`], is
+//! pinned in this file, in its row of `WASM_PINS` in `build.rs`, and in
+//! `vendor/oz-spending-limit-policy/v0.7.2/PROVENANCE.md`. The
+//! `vendored-wasm` workflow rebuilds the file from its pinned source and fails
+//! unless the rebuilt bytes equal it; its tree check holds the file to its
+//! `WASM_PINS` row and its record. The tests in `src/vendored_wasm_tests.rs`
+//! bind [`SPENDING_LIMIT_POLICY_WASM`] and its digest constant to the file, and
+//! the deploy refuses bytes that do not hash to the constant.
 
 /// SHA-256 of the vendored `multisig_spending_limit_policy_example.wasm`
 /// artefact.
 ///
-/// Pinned here, in `build.rs`, and in
-/// `vendor/oz-spending-limit-policy/v0.7.2/PROVENANCE.md` (same value in all
-/// places). The compile-time integrity gate is `build.rs`; the runtime
-/// `tests::spending_limit_policy_wasm_sha256_matches_provenance` test remains as
-/// defense in depth.
+/// Pinned here, in its row of `WASM_PINS` in `build.rs`, and in
+/// `vendor/oz-spending-limit-policy/v0.7.2/PROVENANCE.md`. `build.rs` fails
+/// every build unless the vendored file hashes to its row,
+/// `tests::spending_limit_policy_wasm_sha256_matches_provenance` compares
+/// [`SPENDING_LIMIT_POLICY_WASM`] with this constant, and the tests in
+/// `src/vendored_wasm_tests.rs` compare both with the file.
 ///
 /// Built from OZ `stellar-contracts` at SHA `a9c42169000638da937577f592ebf61a7a3c94ca`
-/// (tag `v0.7.2`) via `stellar contract build --package multisig-spending-limit-policy-example`
-/// (stellar-cli 25.2.0), then copying the release cdylib from
+/// (tag `v0.7.2`) via `stellar contract build --locked --package multisig-spending-limit-policy-example`
+/// (stellar-cli 25.2.0, rustc 1.96.0), then copying the `release/` output
 /// `target/wasm32v1-none/release/multisig_spending_limit_policy_example.wasm`.
 pub const SPENDING_LIMIT_POLICY_WASM_SHA256: &str =
     "0e8da0ccff5c444520085ac1973d3c8023fdd04f727ee11ae7290a49dffbbaf5";

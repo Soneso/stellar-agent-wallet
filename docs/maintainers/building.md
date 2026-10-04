@@ -330,19 +330,249 @@ smart-account crate embeds it as `cap85_beacon::CAP85_BEACON_WASM` under the
 `test-helpers` feature and in its own unit-test build, where the digest test
 runs, and pins its SHA-256 in `build.rs`.
 
-To rebuild the beacon, install stellar-cli 28.1.0 and the `wasm32v1-none`
-target, then run:
+To rebuild the beacon, install the toolchain and stellar-cli 28.1.0, built
+with host rustc 1.98.0, then run the build script:
 
 ```bash
+rustup toolchain install 1.98.0 --profile minimal --target wasm32v1-none
+RUSTUP_TOOLCHAIN=1.98.0 cargo install --locked stellar-cli --version 28.1.0
 crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/build.sh
 ```
 
-The script builds with `stellar contract build --locked`, copies the Wasm into
-the vendor directory, and prints the rustc, stellar-cli and soroban-sdk
-versions, the optimizer state and version, and the SHA-256. When the digest
-changes, update `REFERENCE.md` in the vendor directory, the
-`cap85_beacon.wasm` row of `WASM_PINS` in the crate's `build.rs`, and
-`CAP85_BEACON_WASM_SHA256` in `src/cap85_beacon.rs` together.
+The script refuses a `stellar` whose first `--version` line is not
+`stellar 28.1.0 (c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd)`. It builds a copy
+of the tracked source with `RUSTUP_TOOLCHAIN=1.98.0` and
+`stellar contract build --locked`, and copies the Wasm into the vendor
+directory. It prints the rustc, stellar-cli, and soroban-sdk versions, the
+optimizer state and version, and the SHA-256. When the digest changes, update
+`REFERENCE.md` in the vendor directory, the `cap85_beacon.wasm` row of
+`WASM_PINS` in the crate's `build.rs`, and `CAP85_BEACON_WASM_SHA256` in
+`src/cap85_beacon.rs` together.
+
+## Vendored Wasm rebuild
+
+The smart-account crate vendors the contract Wasm files that the wallet uploads
+or recognizes under `crates/stellar-agent-smart-account/vendor/`.
+Each rebuildable file has a record naming its source, toolchain, stellar-cli
+binary, build command, and digest. The multicall record documents its frozen
+exception.
+
+### What the workflow proves
+
+The `vendored-wasm` workflow (`.github/workflows/vendored-wasm.yml`) runs
+`.github/scripts/rebuild-vendored-wasm.sh`, which holds the manifest of
+rebuildable files, the one exception, and every pinned version.
+
+- The tree check runs on every pull request, every push to `main`, every tag,
+  twice a week, and on dispatch. It fails unless every tracked Wasm file is a
+  manifest file, the exception, or out of scope. Each vendored file must equal
+  its record and, where one exists, its `WASM_PINS` row in `build.rs`. Every
+  `include_bytes!` or `include_str!` in the crate's `src/` must name one string
+  literal that resolves to a vendored file. In every other crate's `src/`, each
+  include of a `.wasm` file must resolve to a vendored file too.
+- The tree check constrains source spellings in the crate's `src/` as defense
+  in depth. It refuses negated `cfg` predicates other than `unix` and `windows`,
+  `cfg!`, `include!`, `#[path]`, renamed `cfg` or `include` imports, and
+  non-ASCII code text. It also refuses `cfg_attr` applying `cfg`, `cfg_attr`,
+  or `path`, and negated `cfg_attr` applying attributes other than lint levels.
+  It refuses `macro_use`, including under `cfg_attr`, and `macro_rules!`
+  definitions outside its known list. That list pins the function-local
+  `early_err` in `managers/credentials.rs` by name, owner function, and body.
+  It refuses macro metavariables in attributes and the token sequences
+  `$name!`, `#$name`, and `#!$name`.
+  Definition files and their module-chain files cannot carry inner `cfg` or
+  `cfg_attr` attributes. Watched definitions and module declarations occur
+  exactly once, unindented, at the top level of their file, with only their
+  permitted configuration attributes.
+  Watched definitions need literal initializers. Verifier entries need literal
+  hashes and `VerifierAuditStatus::<Variant>`, with literal string fields for a
+  variant that has them.
+  The fixture occurs once under its own permitted attribute.
+  Raw identifiers count as their names. Spellings outside the self-test corpus
+  may pass; the identity tests bind values in the builds they run.
+  Glob-import shadowing inside a consumer is a spelling the lexical check
+  does not see; compiled dry runs catch it on the dry-run path of the public
+  deployment wrappers, in the builds they run.
+- When a change touches `vendor/`, `build.rs`, `contracts/`, the two scripts,
+  or the workflow, and on every tag, scheduled, or dispatched run, two macOS
+  jobs build the pinned stellar-cli binaries. The `rebuild` job then rebuilds
+  every manifest file from its pinned source with its pinned toolchain and
+  fails unless the rebuilt bytes equal the vendored file.
+- The unit tests in `src/vendored_wasm_tests.rs` and the integration target
+  `tests/vendored_wasm_release_cfg.rs` bind the table, embedded constants,
+  digest constants, and three allowlists to vendored files. The integration
+  target also binds the production audit statuses and the dry run of every
+  public deployment wrapper.
+  Both paths are relative to `crates/stellar-agent-smart-account/`.
+  The integration target links the library compiled without `cfg(test)`.
+  Its `test-helpers` and `deploy-cli` assertions run when those features are
+  enabled. Its fixture-exclusion test runs without `test-helpers`.
+  The ordinary `ci.yml` test job runs both feature selections.
+- The multicall router is the exception: its source is not in the repository,
+  so the workflow holds it at one frozen digest.
+
+The `vendored-wasm` job reads every job result and is the check to require.
+
+Run the identity and deployment gates locally with:
+
+```sh
+CARGO_BUILD_JOBS=6 cargo test -p stellar-agent-smart-account \
+  --features test-helpers,deploy-cli
+CARGO_BUILD_JOBS=6 cargo test -p stellar-agent-smart-account \
+  --test vendored_wasm_release_cfg
+CARGO_BUILD_JOBS=6 cargo test --release -p stellar-agent-smart-account \
+  --features test-helpers,deploy-cli --lib --test vendored_wasm_release_cfg -- \
+  vendored_wasm_tests deployment::deploy::tests:: \
+  vendored_table_entries embedded_wasm_constants digest_constants \
+  verifier_allowlist_ threshold_policy_hashes weighted_threshold_policy_hashes \
+  deploy_smart_account_dry_run deploy_webauthn_verifier_dry_run \
+  deploy_ed25519_verifier_dry_run deploy_spending_limit_policy_dry_run \
+  deploy_timelock_controller_dry_run deploy_policy_dry_run
+```
+
+### Run the rebuild locally
+
+Use a work directory outside any directory whose parents hold a
+`.cargo/config.toml`, since cargo reads every parent's config and the script
+refuses one. A temporary directory works. The script also refuses `RUSTFLAGS`,
+`RUSTC_WRAPPER`, `CARGO_PROFILE_*`, and the other variables that change what
+rustc compiles, and a cargo home with a config file or whitespace in its path.
+
+```bash
+W=$(mktemp -d)
+# The subshell stops at the first failing command.
+(
+set -euo pipefail
+
+# The pinned toolchains, and the host toolchains of the two stellar-cli builds.
+/bin/bash .github/scripts/rebuild-vendored-wasm.sh --list-toolchains >"$W/toolchains"
+while read -r toolchain target; do
+  rustup toolchain install "$toolchain" --profile minimal --target "$target"
+done <"$W/toolchains"
+
+# stellar-cli 25.2.0 from a git archive of its tag, built outside any git work
+# tree, so its cliver meta entry carries no revision. The tag must resolve to
+# the pinned commit before anything is archived or built.
+git init -q "$W/stellar-cli-git"
+git -C "$W/stellar-cli-git" fetch --depth 1 --no-tags \
+  https://github.com/stellar/stellar-cli.git '+refs/tags/v25.2.0:refs/tags/v25.2.0'
+commit=$(git -C "$W/stellar-cli-git" rev-parse 'v25.2.0^{commit}')
+if [ "$commit" != 28484880988199233a7e8e87c97cb12dac323cb3 ]; then
+  echo "tag v25.2.0 resolves to $commit, not 28484880988199233a7e8e87c97cb12dac323cb3" >&2
+  exit 1
+fi
+mkdir "$W/stellar-cli-export"
+git -C "$W/stellar-cli-git" archive v25.2.0 | tar -x -C "$W/stellar-cli-export"
+(cd "$W/stellar-cli-export" && GIT_CEILING_DIRECTORIES="$W" RUSTUP_TOOLCHAIN=1.94.0 \
+  CARGO_TARGET_DIR="$W/target-25" cargo install --locked --path cmd/stellar-cli --root "$W/stellar-cli-25")
+
+# stellar-cli 28.1.0 from crates.io.
+(cd "$W" && RUSTUP_TOOLCHAIN=1.98.0 CARGO_TARGET_DIR="$W/target-28" \
+  cargo install --locked stellar-cli --version 28.1.0 --root "$W/stellar-cli-28")
+rm -rf "$W/target-25" "$W/target-28"
+
+# The OpenZeppelin tags.
+git init -q "$W/oz"
+git -C "$W/oz" fetch --depth 1 --no-tags https://github.com/OpenZeppelin/stellar-contracts.git \
+  '+refs/tags/v0.7.2:refs/tags/v0.7.2' '+refs/tags/v0.7.1:refs/tags/v0.7.1'
+
+# The rebuild, with a fresh and empty cargo home.
+mkdir "$W/cargo-home"
+CARGO_HOME="$W/cargo-home" /bin/bash .github/scripts/rebuild-vendored-wasm.sh \
+  --repo-root . --oz-clone "$W/oz" \
+  --stellar-25 "$W/stellar-cli-25/bin/stellar" --stellar-28 "$W/stellar-cli-28/bin/stellar" \
+  --work "$W/work"
+)
+```
+
+The script prints one table row per vendored file and exits 0 only when every
+row matches. A row's `cmp` column reads `MISMATCH` when the rebuilt bytes
+differ; the row then also prints the vendored file's sha256 and size. The
+offline checks alone run with `--check-tree --repo-root .`.
+
+`.github/scripts/test-rebuild-vendored-wasm.sh` tests the script with stub
+builders, a stub `rustc`, and a stub `git`. It runs every git command with no
+global or system configuration and a placeholder identity, and sets
+`CARGO_HOME` to an empty scratch directory, so the host's settings never reach
+its cases.
+
+### Add or re-vendor a file
+
+Adding a vendored file takes, in one change:
+
+- its manifest row in `.github/scripts/rebuild-vendored-wasm.sh`;
+- its record and `build.sh` beside the file;
+- its `WASM_PINS` row in `build.rs` when the crate embeds it;
+- its entries in the `VENDORED` tables of `src/vendored_wasm_tests.rs` and
+  `tests/vendored_wasm_release_cfg.rs`.
+
+A constant or allowlist entry pinned to the file also takes its assertion in
+both `src/vendored_wasm_tests.rs` and `tests/vendored_wasm_release_cfg.rs`,
+plus its entry in the script's `DEFINITIONS` list. Removing the exception is
+deleting its line. A new toolchain or target needs no workflow change:
+the `rebuild` job installs every pair that `--list-toolchains` prints.
+
+Each `build.sh` re-vendors its file through the script's `--exec` mode, with the
+same refusals and environment allowlist as the workflow. When the printed digest
+differs from the committed one, update the file's record, its `WASM_PINS` row,
+and every constant and allowlist entry that pins it in the same change.
+
+### Limits and maintainer actions
+
+- The `vendored-wasm` job blocks a merge only when it is a required check, and
+  the identity tests block only when the `ci.yml` test job is required. With a
+  merge queue, the workflow needs a `merge_group` trigger.
+- A pull request that changes the script or the workflow together with the
+  bytes passes. So does one that points an embedded constant at another
+  vendored file and edits both identity-test mappings to match. Review of
+  `vendor/`, `.github/`, `src/vendored_wasm_tests.rs`, and
+  `tests/vendored_wasm_release_cfg.rs` by named owners needs a `CODEOWNERS`
+  file and a ruleset that requires code-owner review.
+- The tree check lexes the smart-account source for its attribute rules.
+  A workspace dependency can export a macro that expands in this crate.
+  The integration test checks the resulting compiled value for each mapped
+  constant and allowlist, including values produced by dependency macros.
+  The identity tests also bind the public deployment wrappers.
+  Crate-internal consumers with test-only imports remain outside those assertions.
+- Dev-dependency feature unification can enable features in the integration
+  build. Feature sets and other build settings that differ from the tested
+  builds remain a residual. Review must check those configuration changes.
+- Wasm bytes can reach the binary without a tracked Wasm file or an include
+  that the tree check sees. Such bytes can come from a byte-array or
+  encoded-string literal, from a tracked file without the Wasm magic that the
+  build decodes, or from a file that a build script writes to `OUT_DIR`. Each is
+  a visible code change.
+- For an in-tree source (`contracts/cap85-beacon/`), the rebuild proves the
+  bytes match the committed source; review of the source diff remains the
+  defense. A compromise of an upstream source at its pinned commit is outside
+  this check.
+- Two checks prove a cached stellar-cli binary: its version line and the byte
+  comparison of its output. A binary that writes the vendored bytes whatever
+  its input passes both. Every workflow of a branch shares the cache. Code that
+  runs in any job on `main` can therefore create an entry under a key that does
+  not exist yet, such as after an eviction or a recipe revision bump. An
+  existing entry never changes. Delete the stellar-cli cache entries after any
+  suspected compromise of a workflow run on `main`, and after reverting a
+  change to the workflow or the scripts.
+- A failed cache save is a warning in the stellar-cli job, and the `rebuild`
+  job then fails on the cache miss. Two concurrent cold runs on `main` can do
+  the same. A re-run clears both.
+- A tag run does not gate the release workflow.
+- Pull-request CI does not run the release-profile tests. The deploy's digest
+  check runs in every profile; review and the release-profile test run keep it
+  out of a `debug_assertions` gate. The local release gate also checks the
+  integration target against the library compiled in the release profile.
+- GitHub disables scheduled runs of a public repository after 60 days without
+  repository activity.
+- The first workflow run proves what a local run cannot: the runner image's C++
+  compiler for the optimizer that stellar-cli 28.1.0 bundles, the runner's own
+  toolchain installs, and the cold timing. A cold run builds both stellar-cli
+  binaries and takes roughly an hour.
+- Outside this check: `crates/stellar-agent-sep48/tests/fixtures/sep41_token.wasm`
+  (a test fixture), the simplewebauthn browser bundle (pinned beside it in
+  `stellar-agent-webauthn-bridge`), and the on-chain digests of third-party
+  contracts in `stellar-agent-defindex/src/pins.rs` and
+  `stellar-agent-dex/src/pins.rs`, which have no vendored bytes.
 
 ## Review process
 

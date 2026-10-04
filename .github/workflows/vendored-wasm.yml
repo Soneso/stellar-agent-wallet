@@ -1,0 +1,273 @@
+name: vendored-wasm
+
+# Invariant: every vendored contract Wasm file that the wallet uploads or
+# recognizes is rebuilt from its pinned source with pinned tools, and the
+# rebuilt bytes equal the vendored file. Each vendored file also equals its
+# record and, where one exists, its build.rs WASM_PINS row. The manifest,
+# the one exception, and the pins live in .github/scripts/rebuild-vendored-wasm.sh.
+#
+# The check job runs the tree check and the script's self-test on every event.
+# When a change can affect a rebuild, two macOS jobs provide the pinned
+# stellar-cli binaries, and the rebuild job rebuilds every manifest file and
+# compares it byte for byte. The vendored-wasm job reads every job result and
+# is the check to require; a job that if: skips reports success on its own.
+#
+# A newer push to a pull request cancels that pull request's older run. Every
+# main, tag, scheduled, and dispatched run has a concurrency group of its own.
+# A merge therefore never cancels the cold run that seeds the stellar-cli cache
+# of main, or the rebuild of a merged vendor change.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*']
+  # Twice a week, so the stellar-cli cache entries stay inside the seven-day
+  # eviction window.
+  schedule:
+    - cron: '23 5 * * 1,4'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: tree check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      rebuild: ${{ steps.decide.outputs.rebuild }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tree check
+        run: bash .github/scripts/rebuild-vendored-wasm.sh --check-tree --repo-root .
+      - name: Self-test (bash 5, GNU tools)
+        run: bash .github/scripts/test-rebuild-vendored-wasm.sh
+      - name: Decide whether the change needs a rebuild
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          event=$EVENT_NAME
+          if [ "$REF_TYPE" = tag ]; then
+            event=tag
+          fi
+          case "$event" in
+            # The checkout is the merge commit; its first parent is the base tip.
+            pull_request) base='HEAD^1'; head=HEAD ;;
+            push) base=$PUSH_BEFORE; head=$HEAD_SHA ;;
+            *) base=''; head='' ;;
+          esac
+          rebuild=$(bash .github/scripts/rebuild-vendored-wasm.sh --rebuild-needed --repo-root . \
+            --event "$event" --base "$base" --head "$head")
+          echo "rebuild=$rebuild"
+          echo "rebuild=$rebuild" >>"$GITHUB_OUTPUT"
+
+  stellar-cli-25:
+    name: stellar-cli 25.2.0
+    needs: check
+    if: needs.check.outputs.rebuild == 'true'
+    runs-on: macos-26
+    timeout-minutes: 120
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    env:
+      CLI_VERSION: 25.2.0
+      CLI_COMMIT: 28484880988199233a7e8e87c97cb12dac323cb3
+      HOST_RUSTC: 1.94.0
+      VERSION_LINE: stellar 25.2.0
+      # Bumped whenever the build steps of this job change.
+      RECIPE_REVISION: '1'
+    steps:
+      - name: Install the host toolchain
+        run: rustup toolchain install "$HOST_RUSTC" --profile minimal
+      - name: Cache key
+        id: key
+        env:
+          OS_NAME: ${{ runner.os }}
+          ARCH_NAME: ${{ runner.arch }}
+        run: echo "key=stellar-cli-$CLI_VERSION-archive-$CLI_COMMIT-rustc-$HOST_RUSTC-$OS_NAME-$ARCH_NAME-r$RECIPE_REVISION" >>"$GITHUB_OUTPUT"
+      - name: Restore the install root
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/stellar-cli-25
+          key: ${{ steps.key.outputs.key }}
+      # The export lies outside any git work tree, with the ceiling at its
+      # parent: crate-git-revision then finds no repository, so cliver reads
+      # 25.2.0# with no revision, as in the vendored files.
+      - name: Build from a git archive of the tag
+        if: steps.restore.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git init -q "$RUNNER_TEMP/stellar-cli-git"
+          git -C "$RUNNER_TEMP/stellar-cli-git" fetch --depth 1 --no-tags \
+            https://github.com/stellar/stellar-cli.git "+refs/tags/v$CLI_VERSION:refs/tags/v$CLI_VERSION"
+          commit=$(git -C "$RUNNER_TEMP/stellar-cli-git" rev-parse "v$CLI_VERSION^{commit}")
+          if [ "$commit" != "$CLI_COMMIT" ]; then
+            echo "tag v$CLI_VERSION resolves to $commit, not $CLI_COMMIT" >&2
+            exit 1
+          fi
+          mkdir "$RUNNER_TEMP/stellar-cli-export"
+          git -C "$RUNNER_TEMP/stellar-cli-git" archive "v$CLI_VERSION" | tar -x -C "$RUNNER_TEMP/stellar-cli-export"
+          cd "$RUNNER_TEMP/stellar-cli-export"
+          GIT_CEILING_DIRECTORIES="$RUNNER_TEMP" RUSTUP_TOOLCHAIN="$HOST_RUSTC" \
+            CARGO_TARGET_DIR="$RUNNER_TEMP/stellar-cli-25-target" \
+            cargo install --locked --path cmd/stellar-cli --root "$RUNNER_TEMP/stellar-cli-25"
+          rm -rf "$RUNNER_TEMP/stellar-cli-25-target"
+      - name: Assert the version line
+        run: |
+          set -euo pipefail
+          out=$("$RUNNER_TEMP/stellar-cli-25/bin/stellar" --version)
+          first=${out%%$'\n'*}
+          if [ "$first" != "$VERSION_LINE" ]; then
+            echo "the first --version line is '$first', not '$VERSION_LINE'" >&2
+            exit 1
+          fi
+      - name: Save the install root
+        if: steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/stellar-cli-25
+          key: ${{ steps.key.outputs.key }}
+
+  stellar-cli-28:
+    name: stellar-cli 28.1.0
+    needs: check
+    if: needs.check.outputs.rebuild == 'true'
+    runs-on: macos-26
+    timeout-minutes: 120
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    env:
+      CLI_VERSION: 28.1.0
+      CLI_COMMIT: c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd
+      HOST_RUSTC: 1.98.0
+      VERSION_LINE: stellar 28.1.0 (c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd)
+      # Bumped whenever the build steps of this job change.
+      RECIPE_REVISION: '1'
+    steps:
+      - name: Install the host toolchain
+        run: rustup toolchain install "$HOST_RUSTC" --profile minimal
+      - name: Cache key
+        id: key
+        env:
+          OS_NAME: ${{ runner.os }}
+          ARCH_NAME: ${{ runner.arch }}
+        run: echo "key=stellar-cli-$CLI_VERSION-crates-io-$CLI_COMMIT-rustc-$HOST_RUSTC-$OS_NAME-$ARCH_NAME-r$RECIPE_REVISION" >>"$GITHUB_OUTPUT"
+      - name: Restore the install root
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/stellar-cli-28
+          key: ${{ steps.key.outputs.key }}
+      # The crates.io package's .cargo_vcs_info.json sets the revision that the
+      # version line and the cliver meta entry carry.
+      - name: Build the crates.io package
+        if: steps.restore.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/stellar-cli-28-build"
+          cd "$RUNNER_TEMP/stellar-cli-28-build"
+          RUSTUP_TOOLCHAIN="$HOST_RUSTC" CARGO_TARGET_DIR="$RUNNER_TEMP/stellar-cli-28-target" \
+            cargo install --locked stellar-cli --version "$CLI_VERSION" --root "$RUNNER_TEMP/stellar-cli-28"
+          rm -rf "$RUNNER_TEMP/stellar-cli-28-target"
+      - name: Assert the version line
+        run: |
+          set -euo pipefail
+          out=$("$RUNNER_TEMP/stellar-cli-28/bin/stellar" --version)
+          first=${out%%$'\n'*}
+          if [ "$first" != "$VERSION_LINE" ]; then
+            echo "the first --version line is '$first', not '$VERSION_LINE'" >&2
+            exit 1
+          fi
+      - name: Save the install root
+        if: steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/stellar-cli-28
+          key: ${{ steps.key.outputs.key }}
+
+  rebuild:
+    name: rebuild
+    needs: [check, stellar-cli-25, stellar-cli-28]
+    if: needs.check.outputs.rebuild == 'true'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # /bin/bash is Bash 3.2 here; a bash placed earlier on PATH never
+      # replaces it.
+      - name: Self-test (bash 3.2, BSD tools)
+        run: /bin/bash .github/scripts/test-rebuild-vendored-wasm.sh
+      - name: Install the pinned toolchains
+        run: |
+          set -euo pipefail
+          /bin/bash .github/scripts/rebuild-vendored-wasm.sh --list-toolchains >"$RUNNER_TEMP/toolchains"
+          while read -r toolchain target; do
+            rustup toolchain install "$toolchain" --profile minimal --target "$target"
+          done <"$RUNNER_TEMP/toolchains"
+      - name: Restore stellar-cli 25.2.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/stellar-cli-25
+          key: ${{ needs.stellar-cli-25.outputs.key }}
+          fail-on-cache-miss: true
+      - name: Restore stellar-cli 28.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/stellar-cli-28
+          key: ${{ needs.stellar-cli-28.outputs.key }}
+          fail-on-cache-miss: true
+      - name: Fetch the OpenZeppelin tags
+        run: |
+          set -euo pipefail
+          git init -q "$RUNNER_TEMP/oz"
+          git -C "$RUNNER_TEMP/oz" fetch --depth 1 --no-tags https://github.com/OpenZeppelin/stellar-contracts.git \
+            '+refs/tags/v0.7.2:refs/tags/v0.7.2' '+refs/tags/v0.7.1:refs/tags/v0.7.1'
+      # CARGO_HOME is an empty directory on this step only: no cargo config
+      # and a fresh registry. rustup and its proxies stay in the image's
+      # ~/.cargo/bin.
+      - name: Rebuild and compare
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="$RUNNER_TEMP/cargo-home"
+          mkdir -p "$CARGO_HOME"
+          /bin/bash .github/scripts/rebuild-vendored-wasm.sh --repo-root . --oz-clone "$RUNNER_TEMP/oz" \
+            --stellar-25 "$RUNNER_TEMP/stellar-cli-25/bin/stellar" \
+            --stellar-28 "$RUNNER_TEMP/stellar-cli-28/bin/stellar" \
+            --work "$RUNNER_TEMP/rebuild-work"
+
+  vendored-wasm:
+    name: vendored-wasm
+    needs: [check, stellar-cli-25, stellar-cli-28, rebuild]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Gate on every job result
+        env:
+          CHECK: ${{ needs.check.result }}
+          REBUILD: ${{ needs.check.outputs.rebuild }}
+          CLI25: ${{ needs.stellar-cli-25.result }}
+          CLI28: ${{ needs.stellar-cli-28.result }}
+          REBUILD_JOB: ${{ needs.rebuild.result }}
+        run: bash .github/scripts/rebuild-vendored-wasm.sh --gate "$CHECK" "$REBUILD" "$CLI25" "$CLI28" "$REBUILD_JOB"
