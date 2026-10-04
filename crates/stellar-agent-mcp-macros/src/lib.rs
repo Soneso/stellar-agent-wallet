@@ -445,6 +445,13 @@ mod tests {
 
     /// (d) A malformed `#[mcp_tool_item]` missing a required field produces an
     /// `Err` from darling's `FromMeta` parsing.
+    ///
+    /// The sibling `#[tool(...)]` is present so the missing `chain_id_required`
+    /// field is the ONLY defect: without it the fixture would also trip the
+    /// separate missing-`#[tool]` guard, and the bare `is_err()` assertion would
+    /// pass no matter which of the two errors fired. The error message is
+    /// asserted to name the missing field so the test cannot pass on the wrong
+    /// rejection.
     #[test]
     fn malformed_mcp_tool_item_missing_field_returns_err() {
         let mut impl_block: ItemImpl = parse_quote! {
@@ -455,6 +462,7 @@ mod tests {
                     destructive_hint = true,
                     read_only_hint = false
                 )]
+                #[tool(name = "stellar_pay")]
                 fn stellar_pay(&self) {}
             }
         };
@@ -462,6 +470,41 @@ mod tests {
         assert!(
             result.is_err(),
             "expected Err when #[mcp_tool_item] is missing required field chain_id_required"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Missing field") && err_msg.contains("chain_id_required"),
+            "error message must name the missing field chain_id_required; got: {err_msg}"
+        );
+    }
+
+    /// (d2) Control for (d): the same fixture with `chain_id_required` present
+    /// expands without error, proving the missing-field rejection above comes
+    /// from that field alone and not from some other defect in the fixture.
+    #[test]
+    fn well_formed_mcp_tool_item_with_all_required_fields_expands_ok() {
+        let mut impl_block: ItemImpl = parse_quote! {
+            impl Dummy {
+                #[mcp_tool_item(
+                    name = "stellar_pay",
+                    destructive_hint = true,
+                    read_only_hint = false,
+                    chain_id_required = true
+                )]
+                #[tool(name = "stellar_pay")]
+                fn stellar_pay(&self) {}
+            }
+        };
+        let result = expand_mcp_tool_router(&mut impl_block);
+        assert!(
+            result.is_ok(),
+            "expected Ok when every required field is present; got: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            count_submit_items(&result.unwrap()),
+            1,
+            "expected exactly one inventory::submit! item for the well-formed annotation"
         );
     }
 
@@ -638,6 +681,64 @@ mod tests {
             err.to_string().contains("value_kind"),
             "error must mention value_kind: {}",
             err
+        );
+    }
+
+    /// (g4) An explicit `value_kind = "read_only"` emits `ReadOnly`, the same
+    /// variant the omitted default produces.  Pinned separately from the default
+    /// case so the `"read_only"` string is covered on its own: it shares the
+    /// `None` arm in the mapping, so nothing exercised the string itself.
+    #[test]
+    fn explicit_value_kind_read_only_emits_read_only_variant() {
+        let mut impl_block: ItemImpl = parse_quote! {
+            impl Dummy {
+                #[mcp_tool_item(
+                    name = "stellar_balances",
+                    destructive_hint = false,
+                    read_only_hint = true,
+                    chain_id_required = true,
+                    value_kind = "read_only"
+                )]
+                #[tool(name = "stellar_balances")]
+                fn stellar_balances(&self) {}
+            }
+        };
+        let expanded = expand_mcp_tool_router(&mut impl_block).expect("ok");
+        assert!(
+            expanded.to_string().contains(
+                "value_kind : :: stellar_agent_core :: policy :: ToolValueKind :: ReadOnly"
+            ),
+            "explicit value_kind = \"read_only\" must emit ReadOnly: {}",
+            expanded
+        );
+    }
+
+    /// (g5) An explicit `value_kind = "opaque_sign"` emits `OpaqueSign`.  This is
+    /// the one arm no other test reached, so it could emit any variant (even
+    /// `ReadOnly`) without failing — the policy dispatch gate would then derive
+    /// the wrong value class for a signature-only tool.
+    #[test]
+    fn explicit_value_kind_opaque_sign_emits_opaque_sign_variant() {
+        let mut impl_block: ItemImpl = parse_quote! {
+            impl Dummy {
+                #[mcp_tool_item(
+                    name = "stellar_pay",
+                    destructive_hint = true,
+                    read_only_hint = false,
+                    chain_id_required = true,
+                    value_kind = "opaque_sign"
+                )]
+                #[tool(name = "stellar_pay")]
+                fn stellar_pay(&self) {}
+            }
+        };
+        let expanded = expand_mcp_tool_router(&mut impl_block).expect("ok");
+        assert!(
+            expanded.to_string().contains(
+                "value_kind : :: stellar_agent_core :: policy :: ToolValueKind :: OpaqueSign"
+            ),
+            "explicit value_kind = \"opaque_sign\" must emit OpaqueSign: {}",
+            expanded
         );
     }
 
