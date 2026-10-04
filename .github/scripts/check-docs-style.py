@@ -8,7 +8,9 @@ FILE, scan tracked Markdown except
 CHANGELOG.md and crates/*/vendor/**. Explicit files may be untracked.
 Explicit files use the same exclusions and .md filter; other paths exit 2
 with "not a scanned path".
-Fenced code, inline code spans, autolinks, and link destinations are exempt.
+Fenced code, inline code spans, autolinks, link destinations and titles,
+and bare URLs are exempt. Link and reference labels remain subject to the
+prose rules.
 
 Rules:
 - em-dash: U+2014 fails; ASCII hyphens pass.
@@ -136,8 +138,24 @@ def mask_inline(text: str) -> str:
     return "".join(pieces)
 
 
+DEFINITION = re.compile(
+    r"^ {0,3}\[[^\]\n]+\]:[ \t]*(?P<target><[^<>\n]*>|[^\s<>]+)"
+    r"(?:[ \t]+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*\r?$",
+    re.MULTILINE,
+)
+SCHEME = re.compile(r"(?<![\w<])[a-zA-Z][a-zA-Z0-9+.-]*://")
+# Sentence punctuation after a bare URL belongs to the prose.
+URL_TAIL = ".,;:!?\"'\u201d\u2019"
+
+
+def mask_definition(match: re.Match[str]) -> str:
+    """Keep the label of a reference definition; mask its destination and title."""
+    cut = match.start("target") - match.start()
+    return match[0][:cut] + blank(match[0][cut:])
+
+
 def mask_links(text: str) -> str:
-    """Mask autolinks and balanced link destinations, preserving link labels."""
+    """Mask link targets and bare URLs, preserving labels and source offsets."""
     text = re.sub(r"<[a-zA-Z][a-zA-Z0-9+.-]*://[^<>\s]*>", lambda match: blank(match[0]), text)
     pieces = list(text)
     for opening in re.finditer(r"\]\(", text):
@@ -154,6 +172,24 @@ def mask_links(text: str) -> str:
             index += 1
         if depth == 0:
             pieces[opening.start() + 1:index] = blank(text[opening.start() + 1:index])
+    text = "".join(pieces)
+    pieces = list(text)
+    # A bare URL ends at whitespace, an angle or square bracket, or an unmatched
+    # closing parenthesis; inline destinations are already masked at this point.
+    for scheme in SCHEME.finditer(text):
+        index = scheme.end()
+        depth = 0
+        while index < len(text) and not text[index].isspace() and text[index] not in "<>[]":
+            if text[index] == "(":
+                depth += 1
+            elif text[index] == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            index += 1
+        while index > scheme.end() and text[index - 1] in URL_TAIL:
+            index -= 1
+        pieces[scheme.start():index] = blank(text[scheme.start():index])
     return "".join(pieces)
 
 
@@ -176,8 +212,10 @@ def prose(text: str) -> str:
             lines.append(blank(line))
         else:
             lines.append(line)
+    # Definition targets are recognized while their Markdown delimiters are intact.
+    text = DEFINITION.sub(mask_definition, "".join(lines))
     # Blank lines and ATX headings bound paragraphs, so code spans stop there.
-    parts = re.split(r"(\n[ \t]*\n|^ {0,3}#{1,6}[ \t]+[^\n]*\n?)", "".join(lines), flags=re.MULTILINE)
+    parts = re.split(r"(\n[ \t]*\n|^ {0,3}#{1,6}[ \t]+[^\n]*\n?)", text, flags=re.MULTILINE)
     return "".join(mask_links(mask_inline(part)) for part in parts)
 
 

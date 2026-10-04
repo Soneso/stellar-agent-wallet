@@ -136,6 +136,16 @@ def cases() -> list[Case]:
         ("link en dash destination", "Read [guide](docs/read\u2013write.md).\n"),
         ("nested link destination", "Read [guide](docs/(licence)/read\u2013write.md).\n"),
         ("escaped link destination", "Read [guide](docs/part\\)/licence).\n"),
+        ("reference definition license destination", "[terms]: docs/licence.md\n"),
+        ("indented definition with a title", "   [guide]: docs/read\u2013write.md \"read\u2013write\"\n"),
+        ("angle definition destination", "[guide]: <docs/read\u2013write.md> 'licence'\n"),
+        ("angle URL definition with a title", "[terms]: <https://e.test/a> \"a licence\"\n"),
+        ("backticks in a definition destination", "[terms]: docs/`part`/licence\n"),
+        ("bare URL en dash path", "Read https://example.com/read\u2013write now.\n"),
+        ("balanced parentheses in a plain URL", "See https://example.com/a(b)/licence today.\n"),
+        ("scheme path without angle brackets", "Read ftp://example.com/licence.\n"),
+        ("uppercase scheme path", "Read HTTPS://example.com/licence.\n"),
+        ("link destination with a URL and parentheses", "Read [guide](https://example.com/a(b)/licence).\n"),
     ]
     for name, text in accepted:
         result.append(Case(name, lambda tree, text=text: write(tree, PROBE, text)))
@@ -160,8 +170,26 @@ def cases() -> list[Case]:
         ("british-licence", "license link label", "Read [licence](https://example.com/licence).\n"),
         ("british-licence", "license prose beside autolink", "A licence applies beside <https://example.com/licence>.\n"),
         ("british-licence", "unclosed link destination", "Read [terms](licence.\n"),
+        ("british-licence", "reference definition license label", "[licence]: docs/licence.md\n"),
+        ("british-licence", "bare URL license prose", "A licence applies beside https://example.com/licence.\n"),
+        ("british-licence", "prose after an angle URL definition", "[terms]: <https://e.test/a> licence\n"),
+        ("british-licence", "prose after a code span in a definition", "[terms]: `code` licence\n"),
+        ("british-licence", "tab before a definition", "\t[terms]: docs/licence\n"),
+        ("british-licence", "four spaces before a definition", "    [terms]: docs/licence\n"),
+        ("british-licence", "opening angle inside a destination", "[terms]: docs/<licence\n"),
+        ("british-licence", "closing angle inside a destination", "[terms]: docs/licence>\n"),
+        ("british-licence", "angle pair inside a destination", "[terms]: docs/<licence>\n"),
+        ("british-licence", "nonbreaking space after a plain URL", "https://e.test/a\u00a0licence\n"),
+        ("british-licence", "definition-like prose", "[word]: this licence applies.\n"),
+        ("curly-quotes", "curly quote after a plain URL", "See https://example.com/path\u201d now.\n"),
+        ("em-dash", "unmatched parenthesis after a plain URL", "(see https://example.com/path)\u2014 now.\n"),
     ]:
         result.append(Case(name, lambda tree, text=text: write(tree, PROBE, text), 1, rule, line=1))
+    result.append(Case(
+        "prose line after a definition",
+        lambda tree: write(tree, PROBE, "[terms]: https://example.com/path\nA licence applies.\n"),
+        1, "british-licence", line=2,
+    ))
 
     for stem in ("initialis", "serialis"):
         text = "\n".join(stem + suffix for suffix in ("e", "es", "ed", "ing", "ation", "ations", "er", "ers"))
@@ -302,7 +330,31 @@ def main(argv: list[str]) -> int:
                     print(result.stdout + result.stderr)
             finally:
                 shutil.rmtree(tree)
-    print(f"docs style self-test: {len(tests) - failures} of {len(tests)} passed")
+    masks = [
+        (
+            "punctuation after a plain URL",
+            "https://e.test/licence.\u201d\n(https://e.test/licence)\n",
+            " " * len("https://e.test/licence") + ".\u201d\n("
+            + " " * len("https://e.test/licence") + ")\n",
+        ),
+        (
+            "definition and URL source offsets",
+            '[terms]: docs/licence "read\u2013write"\r\n'
+            "See https://e.test/a(b)/licence.\nA licence applies.\n",
+            "[terms]: " + " " * len('docs/licence "read\u2013write"\r') + "\n"
+            "See " + " " * len("https://e.test/a(b)/licence") + ".\nA licence applies.\n",
+        ),
+    ]
+    for name, text, expected in masks:
+        try:
+            masked = check.prose(text)
+            assert masked == expected, f"expected {expected!r}, got {masked!r}"
+            print(f"ok    {name}")
+        except AssertionError as error:
+            failures += 1
+            print(f"FAIL  {name}: {error}")
+    total = len(tests) + len(masks)
+    print(f"docs style self-test: {total - failures} of {total} passed")
     return 1 if failures else 0
 
 
