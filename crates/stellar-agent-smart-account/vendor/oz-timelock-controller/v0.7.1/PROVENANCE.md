@@ -1,43 +1,57 @@
-# OZ timelock-controller-example v0.7.1 — vendored WASM provenance
+# OZ timelock-controller-example v0.7.1: vendored Wasm provenance
 
-- **Source:** OpenZeppelin/stellar-contracts at SHA `3f81125bed3114cc93f5fca6d13240082050269a`
-  (tag `v0.7.1`, repo `https://github.com/OpenZeppelin/stellar-contracts`).
+- **Source:** `https://github.com/OpenZeppelin/stellar-contracts`, tag `v0.7.1`,
+  commit `3f81125bed3114cc93f5fca6d13240082050269a`.
 - **Package:** `timelock-controller-example`
   (`examples/timelock-controller/src/contract.rs`).
-- **Build host:** macOS (Apple Silicon, Darwin 25.3.0).
-- **Toolchain:** rustc 1.94.0 (4a4ef493e 2026-03-02) — stable channel as declared in
-  `rust-toolchain.toml` in the OpenZeppelin stellar-contracts repository; `wasm32v1-none` target.
-- **Build command:** `stellar contract build --package timelock-controller-example`
-  (stellar-cli 25.2.0) inside the OZ clone, then copy the optimised WASM from
-  `target/wasm32v1-none/release/timelock_controller_example.wasm`.
-  See `vendor/oz-timelock-controller/v0.7.1/build.sh` for the full reproducibility script.
-- **Why release/ not deps/:** the optimised `release/` output is the correct deployable
-  artefact for on-chain upload. Unlike `stellar-accounts` (a library crate), the
-  timelock-controller-example is a standalone deployable; its `release/` output retains
-  all exported functions needed for on-chain invocation. The `deps/` cdylib is NOT used
-  here because we do not use `contractimport!` against this WASM (the timelock surface
-  is invoked via raw `InvokeHostFunction` XDR construction, not soroban-sdk host bindings).
+- **Toolchain:** `rustc 1.94.0 (4a4ef493e 2026-03-02)`, selected with
+  `RUSTUP_TOOLCHAIN=1.94.0`, since the OZ `rust-toolchain.toml` names the
+  floating `stable` channel. Target `wasm32v1-none`.
+- **stellar-cli:** the first line of `stellar --version` is `stellar 25.2.0`.
+  The binary is built by `cargo install --locked --path cmd/stellar-cli` from a
+  `git archive` of stellar-cli tag `v25.2.0` (commit
+  `28484880988199233a7e8e87c97cb12dac323cb3`) with host rustc 1.94.0, outside
+  any git work tree. Its `cliver` meta entry then reads `25.2.0#`. A crates.io
+  install of 25.2.0 records its revision in `cliver`, which adds 40 bytes.
+- **Build command:** in a checkout of the source commit, with `RUSTFLAGS` unset,
+  `RUSTUP_TOOLCHAIN=1.94.0 stellar contract build --locked --package timelock-controller-example`.
+  The output is `<target dir>/wasm32v1-none/release/timelock_controller_example.wasm`.
+  `build.sh` beside this record runs this build and copies the output here.
+- **Optimizer:** none. stellar-cli 25.2.0 bundles `wasm-opt` and runs it only
+  with `--optimize`, which this build does not pass. The `release/` output
+  differs from cargo's `deps/` output only by the CLI's `contractspecv0`
+  filtering (spec shaking, which the OZ workspace enables with
+  `experimental_spec_shaking_v2`) and its meta entries.
+- **Why release/, not deps/:** the `release/` output is the deployable artifact for
+  on-chain upload. The timelock-controller-example is a standalone deployable
+  contract, so its `release/` output keeps every exported function needed for
+  on-chain invocation; `stellar-accounts` is a library crate. The wallet does not
+  `contractimport!` against this Wasm and invokes the timelock through raw
+  `InvokeHostFunction` XDR, so it needs no `deps/` spec.
+- **Build host:** macOS (Apple Silicon, Darwin 25.3.0). The bytes reproduce
+  byte for byte on macOS (Apple Silicon); a rebuild on Linux is not tested.
 - **sha256(timelock_controller_example.wasm):**
   `36299255cf77678a59d7fdfe9823d803be2bdddb9cc375be3130daed265295eb`
 - **Size:** 28357 bytes.
-- **Usage:** Uploaded to testnet in `smart_account_timelock_testnet_acceptance.rs`
-  via `HostFunction::UploadContractWasm` + `HostFunction::CreateContractV2`.
-  The contract is instantiated inline per test (not a one-time singleton).
+- **Usage:** timelocks deployed from these bytes keep their code on-chain. New
+  timelock deployments use the v0.7.2 bytes.
 - **Constructor:** `__constructor(min_delay: u32, proposers: Vec<Address>,
-  executors: Vec<Address>, admin: Option<Address>)` — sets the minimum delay,
-  grants PROPOSER + CANCELLER roles to proposers, EXECUTOR role to executors,
-  and sets the admin (defaults to the contract itself if `None`).
-- **Role semantics:** Proposers automatically get CANCELLER_ROLE at construction time
-  (contract.rs:255-258, SHA `3f81125`). If no executors are configured, anyone can
-  execute ready operations (contract.rs:296, SHA `3f81125`).
-- **Integrity:** The WASM is protected by a three-layer supply-chain gate:
-  1. **Compile-time** — `build.rs` in `stellar-agent-smart-account` verifies
-     `sha256(TIMELOCK_CONTROLLER_WASM bytes)` against the const
-     `TIMELOCK_CONTROLLER_WASM_SHA256` at build time; a mismatch is a compile error.
-  2. **Runtime** — `deploy_timelock_controller_body` re-verifies the hash before any
-     upload attempt and returns `SaError::DeploymentFailed` on mismatch (not a panic).
-  3. **Provenance** — this file is the supply-chain audit trail; the sha256 value
-     above is the canonical reference.
-  The const `TIMELOCK_CONTROLLER_WASM_SHA256` is declared `pub` in the production
-  code path (`deployment/deploy_timelock_controller.rs`) and used by both the
-  compile-time and runtime gates.
+  executors: Vec<Address>, admin: Option<Address>)`. It sets the minimum delay,
+  grants the PROPOSER and CANCELLER roles to proposers and the EXECUTOR role to
+  executors, and sets the admin (the contract itself when `None`).
+- **Role semantics:** proposers get CANCELLER_ROLE at construction time
+  (contract.rs:255-258, commit `3f81125`). With no executors configured, anyone can
+  execute ready operations (contract.rs:296, commit `3f81125`).
+- **Integrity:** the `vendored-wasm` workflow rebuilds this file from the
+  source commit with the pinned toolchain and stellar-cli, and fails unless the
+  rebuilt bytes equal this file. Its tree check fails unless the file's sha256
+  equals the digest in this record. `build.rs` carries no `WASM_PINS` row for
+  this file, since the package excludes the v0.7.1 files and `build.rs` runs
+  during `cargo package` verification. The unit test
+  `vendored_table_entries_are_the_files_at_their_paths` in
+  `src/vendored_wasm_tests.rs` fails unless the `VENDORED` entry for this path
+  holds this file's bytes. No constant or allowlist of the crate pins this
+  file's digest.
+- **Reproducibility:** Rust to Wasm builds are not bit-identical across rustc or
+  stellar-cli versions, so this record pins both. A rebuild with any other
+  version is a re-vendor that replaces the file and this record in one change.

@@ -17,9 +17,6 @@
 
 use std::time::Duration;
 
-// sha2 is only used inside the #[cfg(debug_assertions)] supply-chain integrity block below.
-// Gating the import avoids an unused-imports warning in release builds.
-#[cfg(debug_assertions)]
 use sha2::{Digest, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::SaInvocationResult;
@@ -72,20 +69,22 @@ use crate::deployment::address::derive_interop_deployer_seed;
 pub const MULTISIG_ACCOUNT_WASM: &[u8] =
     include_bytes!("../../vendor/oz-smart-account-multisig/v0.7.2/multisig_account_example.wasm");
 
-/// SHA-256 of [`MULTISIG_ACCOUNT_WASM`], pinned at build time.
+/// SHA-256 of [`MULTISIG_ACCOUNT_WASM`], as 64-char lowercase hex.
 ///
-/// Pinned here, in `build.rs`, and in
-/// `vendor/oz-smart-account-multisig/v0.7.2/PROVENANCE.md`. The compile-time
-/// integrity gate is `build.rs`; the `multisig_account_wasm_sha256_matches_provenance`
-/// test in `deployment/deploy.rs::tests` and a `debug_assert!` at the entry of
-/// `deploy_smart_account()` remain as defense in depth.
+/// Pinned here, in the `multisig_account_example.wasm` row of `WASM_PINS` in
+/// `build.rs`, and in `vendor/oz-smart-account-multisig/v0.7.2/PROVENANCE.md`.
 ///
 /// # Security
 ///
-/// A supply-chain attacker who modifies the vendored WASM without also flipping this const
-/// will be caught at the next `debug_assert!` runtime invocation. An attacker who modifies
-/// both would produce a diff detectable by reviewer attention to the binary WASM diff and
-/// the adjacent const change.
+/// - `build.rs` fails every build of the crate unless the vendored file hashes
+///   to its `WASM_PINS` row.
+/// - The `multisig_account_wasm_sha256_matches_provenance` test fails unless
+///   [`MULTISIG_ACCOUNT_WASM`] hashes to this constant, and the tests in
+///   `src/vendored_wasm_tests.rs` fail unless both equal the vendored file.
+/// - [`deploy_smart_account`] refuses, in every build profile and before any
+///   network request, unless [`MULTISIG_ACCOUNT_WASM`] hashes to this constant.
+/// - The `vendored-wasm` workflow rebuilds the vendored file from its pinned
+///   source and fails unless the rebuilt bytes equal it.
 pub const MULTISIG_ACCOUNT_WASM_SHA256: &str =
     "5bc710da20f401665f0b48ceb008c4cd313c933dbb4aeb7b54d2aacd5646e286";
 
@@ -567,16 +566,19 @@ pub(crate) fn verify_post_deploy_wasm_hash(
 ///
 /// # Flow
 ///
-/// 1. Derive the deployer G-strkey and the pre-derived C-strkey.
-/// 2. If `args.dry_run`, return immediately with the derived address (no network access).
-/// 3. Check whether the WASM is already on-chain via `getLedgerEntries`.
-/// 4. If WASM not on-chain: build + simulate + sign + submit an `UploadContractWasm`
+/// 1. Hash [`MULTISIG_ACCOUNT_WASM`] and refuse unless the hash equals
+///    [`MULTISIG_ACCOUNT_WASM_SHA256`], in every build profile and before any
+///    network request.
+/// 2. Derive the deployer G-strkey and the pre-derived C-strkey.
+/// 3. If `args.dry_run`, return immediately with the derived address (no network access).
+/// 4. Check whether the WASM is already on-chain via `getLedgerEntries`.
+/// 5. If WASM not on-chain: build + simulate + sign + submit an `UploadContractWasm`
 ///    single-op transaction; re-fetch the deployer account sequence number afterward.
-/// 5. Build + simulate + sign + submit a `CreateContractV2` single-op transaction
+/// 6. Build + simulate + sign + submit a `CreateContractV2` single-op transaction
 ///    with `__constructor` args.
-/// 6. Post-deploy WASM-hash verification via `verify_post_deploy_wasm_hash`.
-/// 7. Emit audit-log events (`SaRawInvocation` always; `SmartAccountDeployed` on success).
-/// 8. Return `DeploymentResult`.
+/// 7. Post-deploy WASM-hash verification via `verify_post_deploy_wasm_hash`.
+/// 8. Emit audit-log events (`SaRawInvocation` always; `SmartAccountDeployed` on success).
+/// 9. Return `DeploymentResult`.
 ///
 /// # Two-transaction design
 ///
@@ -610,10 +612,15 @@ pub(crate) fn verify_post_deploy_wasm_hash(
 /// the 7-value canonical set: `"build"`, `"simulate"`, `"upload"`, `"deploy"`,
 /// `"constructor"`, `"submit"`, `"post_deploy_verification"`.
 ///
+/// Returns `SaError::DeploymentFailed { phase: "build", .. }` when
+/// [`MULTISIG_ACCOUNT_WASM`] does not hash to [`MULTISIG_ACCOUNT_WASM_SHA256`],
+/// in every build profile and before any network request.
+///
 /// # Panics
 ///
-/// Never panics in release mode. `debug_assert!` fires in debug builds if the embedded
-/// WASM bytes do not match `MULTISIG_ACCOUNT_WASM_SHA256` (supply-chain integrity gate).
+/// Panics only on a broken internal invariant: a successful non-dry-run
+/// deployment always carries the deploy transaction hash and ledger that the
+/// `SmartAccountDeployed` audit entry records.
 pub async fn deploy_smart_account(
     args: DeploymentArgs,
     audit_writer: Option<&mut AuditWriter>,
@@ -640,7 +647,8 @@ pub async fn deploy_smart_account(
     };
 
     // Run the inner deployment body (no writer — audit emission is handled here).
-    let outcome = deploy_smart_account_body(args).await;
+    let outcome =
+        deploy_smart_account_body(args, MULTISIG_ACCOUNT_WASM, MULTISIG_ACCOUNT_WASM_SHA256).await;
 
     // Audit-log emission. Emits on both success and error paths.
     //
@@ -754,32 +762,32 @@ pub async fn deploy_smart_account(
 /// after this function returns, so the `audit_writer` borrow is not held during
 /// the async RPC calls. This avoids lifetime conflicts between the `&mut AuditWriter`
 /// reference and the `await` points inside the body.
-async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentResult, SaError> {
-    // Re-verify embedded WASM hash on every invocation in debug builds.
-    // This catches a tampered vendor/ file that was not also updated in tests.
-    #[cfg(debug_assertions)]
-    {
-        let mut hasher = Sha256::new();
-        hasher.update(MULTISIG_ACCOUNT_WASM);
-        let observed = to_hex(&hasher.finalize());
-        debug_assert_eq!(
-            observed, MULTISIG_ACCOUNT_WASM_SHA256,
-            "MULTISIG_ACCOUNT_WASM bytes do not match MULTISIG_ACCOUNT_WASM_SHA256 const; \
-             local supply-chain integrity is compromised. Re-build via build.sh."
-        );
+///
+/// `wasm` is the contract the deployment uploads, and `wasm_sha256` the digest
+/// it pins. Step 1 refuses unless `wasm` hashes to `wasm_sha256`, so the
+/// `CreateContractV2` executable and the post-deploy verification both name
+/// the pinned digest.
+async fn deploy_smart_account_body(
+    args: DeploymentArgs,
+    wasm: &[u8],
+    wasm_sha256: &str,
+) -> Result<DeploymentResult, SaError> {
+    // Step 1: the uploaded bytes hash to the pinned digest, in every build
+    // profile, before the first deployer call and before any RPC request.
+    // Past this check, `wasm_hash_bytes` and `wasm_hash_hex` are the digest
+    // that `wasm_sha256` names.
+    let wasm_hash_bytes: [u8; 32] = Sha256::digest(wasm).into();
+    let wasm_hash_hex = to_hex(&wasm_hash_bytes);
+    if wasm_hash_hex != wasm_sha256 {
+        return Err(SaError::DeploymentFailed {
+            phase: "build",
+            redacted_reason: format!(
+                "smart-account WASM SHA256 mismatch: expected {wasm_sha256}, got {wasm_hash_hex}"
+            ),
+        });
     }
 
-    // Parse the expected WASM hash bytes from the pinned const once.
-    let wasm_hash_bytes: [u8; 32] =
-        decode_hex32(MULTISIG_ACCOUNT_WASM_SHA256).map_err(|()| SaError::DeploymentFailed {
-            phase: "build",
-            redacted_reason: "MULTISIG_ACCOUNT_WASM_SHA256 const is not valid 64-char hex \
-                             (programmer error)"
-                .to_owned(),
-        })?;
-    let wasm_hash_hex = MULTISIG_ACCOUNT_WASM_SHA256.to_owned();
-
-    // Step 1: resolve the deployer G-strkey.
+    // Step 2: resolve the deployer G-strkey.
     let deployer_pubkey =
         args.deployer
             .deployer_pubkey()
@@ -789,7 +797,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
                 redacted_reason: format!("failed to obtain deployer pubkey: {e}"),
             })?;
 
-    // Step 2: derive the expected C-strkey (pure, no network).
+    // Step 3: derive the expected C-strkey (pure, no network).
     let derived_smart_account =
         derive_smart_account_address(&deployer_pubkey, &args.salt, &args.network_passphrase)
             .map_err(|e| SaError::DeploymentFailed {
@@ -816,7 +824,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
         });
     }
 
-    // Step 3: construct the RPC clients.
+    // Step 4: construct the RPC clients.
     // The stellar-rpc-client Client is used for simulate + getLedgerEntries.
     // The StellarRpcClient is used for fetch_account and submit_transaction_and_wait.
     let rpc_server = Client::new(&args.rpc_url).map_err(|e| SaError::DeploymentFailed {
@@ -845,7 +853,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
     // rather than each stage re-arming its own allowance.
     let deploy_budget = SequentialRpcBudget::new(args.timeout);
 
-    // Step 4: fetch the deployer's account-id sequence via the wallet substrate.
+    // Step 5: fetch the deployer's account-id sequence via the wallet substrate.
     let deployer_view = bound_stage(
         deploy_budget,
         "fetch_deployer_account",
@@ -867,7 +875,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
             },
         )?;
 
-    // Step 5: check whether the WASM is already on-chain.
+    // Step 6: check whether the WASM is already on-chain.
     let wasm_key = LedgerKey::ContractCode(LedgerKeyContractCode {
         hash: Hash(wasm_hash_bytes),
     });
@@ -905,7 +913,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
 
     let base_fee = args.fee.stroops;
 
-    // Step 6a: Upload transaction (single-op, conditional).
+    // Step 7a: Upload transaction (single-op, conditional).
     //
     // Each transaction carries exactly one `InvokeHostFunction` operation.
     // A combined `UploadContractWasm + CreateContractV2` transaction is rejected
@@ -918,8 +926,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
     } else {
         // Build the upload operation.
         let wasm_bytes: BytesM =
-            MULTISIG_ACCOUNT_WASM
-                .to_vec()
+            wasm.to_vec()
                 .try_into()
                 .map_err(|_| SaError::DeploymentFailed {
                     phase: "build",
@@ -1087,7 +1094,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
         Some(upload_submission.tx_hash)
     };
 
-    // Step 6b: Build the CreateContractV2 deploy transaction (single op).
+    // Step 7b: Build the CreateContractV2 deploy transaction (single op).
     // Build the deployer ScAddress for the contract-id preimage.
     let deployer_pk =
         stellar_strkey::ed25519::PublicKey::from_string(&deployer_pubkey).map_err(|_| {
@@ -1162,7 +1169,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
     tx_builder.add_operation(create_op);
     let tx: Transaction = tx_builder.build_for_simulation();
 
-    // Step 7: simulate + assemble the deploy transaction (panic-insulation pre-check).
+    // Step 8: simulate + assemble the deploy transaction (panic-insulation pre-check).
     let deploy_envelope_pre = tx.to_envelope().map_err(|e| SaError::DeploymentFailed {
         phase: "build",
         redacted_reason: format!("deploy to_envelope (pre-sim) failed: {e}"),
@@ -1235,7 +1242,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
         ihf.auth = deploy_sim_auth;
     }
 
-    // Step 8: sign the deploy transaction with the deployer keypair.
+    // Step 9: sign the deploy transaction with the deployer keypair.
     let signed_xdr = attach_signature(
         &prepared_tx
             .to_envelope()
@@ -1265,7 +1272,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
         "deploy_smart_account: submitting deploy transaction"
     );
 
-    // Step 9: submit + poll the deploy transaction via the existing primitive.
+    // Step 10: submit + poll the deploy transaction via the existing primitive.
     // Wrapped in the SAME collective budget as every prior stage.
     let submission = bound_stage(
         deploy_budget,
@@ -1302,7 +1309,7 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
         }
     })?;
 
-    // Step 10: post-deploy WASM-hash verification.
+    // Step 11: post-deploy WASM-hash verification.
     // Build the LedgerKey for the contract-instance entry.
     let c_strkey_decoded = ContractStrkey::from_string(&derived_smart_account).map_err(|e| {
         SaError::DeploymentFailed {
@@ -1342,9 +1349,9 @@ async fn deploy_smart_account_body(args: DeploymentArgs) -> Result<DeploymentRes
     })?;
 
     // Delegate panic-insulation + destructuring + hash-comparison to the helper.
-    verify_post_deploy_wasm_hash(entry, MULTISIG_ACCOUNT_WASM_SHA256, &derived_smart_account)?;
+    verify_post_deploy_wasm_hash(entry, wasm_sha256, &derived_smart_account)?;
 
-    // Step 11: log and return result.
+    // Step 12: log and return result.
     // Audit-log emission is handled by the public `deploy_smart_account` wrapper.
     info!(
         smart_account = %stellar_agent_core::observability::redact_strkey_first5_last5(&derived_smart_account),
@@ -1411,10 +1418,11 @@ mod tests {
         }
     }
 
-    /// Asserts that `SHA256(MULTISIG_ACCOUNT_WASM)` matches the pinned `MULTISIG_ACCOUNT_WASM_SHA256`.
+    /// Asserts that `SHA256(MULTISIG_ACCOUNT_WASM)` equals `MULTISIG_ACCOUNT_WASM_SHA256`.
     ///
-    /// This is the runtime supply-chain integrity gate equivalent to the `wasm_sha256_matches_provenance`
-    /// test in `bindings.rs`. Verifies the vendored WASM bytes match both the const and PROVENANCE.md.
+    /// The record check of `rebuild-vendored-wasm.sh --check-tree` holds the
+    /// vendored file to its `PROVENANCE.md`, and the tests in
+    /// `src/vendored_wasm_tests.rs` bind both constants to that file.
     #[test]
     fn multisig_account_wasm_sha256_matches_provenance() {
         let mut hasher = Sha256::new();
@@ -1434,6 +1442,144 @@ mod tests {
             b"\0asm",
             "MULTISIG_ACCOUNT_WASM must start with WASM magic bytes"
         );
+    }
+
+    /// A signer that records each method call and delegates to a software key,
+    /// so a test sees whether a deployment reached its deployer.
+    struct RecordingSigner {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        key: SoftwareSigningKey,
+    }
+
+    impl RecordingSigner {
+        fn record(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Signer for RecordingSigner {
+        async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+            self.record("sign_tx_payload");
+            self.key.sign_tx_payload(payload).await
+        }
+        async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+            self.record("sign_auth_digest");
+            self.key.sign_auth_digest(digest).await
+        }
+        async fn sign_soroban_address_auth_payload(
+            &self,
+            payload: &[u8; 32],
+        ) -> Result<[u8; 64], WalletError> {
+            self.record("sign_soroban_address_auth_payload");
+            self.key.sign_soroban_address_auth_payload(payload).await
+        }
+        async fn sign_webauthn_assertion(
+            &self,
+            auth_digest: &[u8; 32],
+            credential_id: &[u8],
+        ) -> Result<stellar_agent_network::WebAuthnAssertion, WalletError> {
+            self.record("sign_webauthn_assertion");
+            self.key
+                .sign_webauthn_assertion(auth_digest, credential_id)
+                .await
+        }
+        async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+            self.record("public_key");
+            self.key.public_key().await
+        }
+    }
+
+    /// Dry-run arguments whose RPC URL no test may reach.
+    fn dry_run_args(deployer: DeployerKeypair) -> DeploymentArgs {
+        DeploymentArgs {
+            deployer,
+            initial_signer: "GAAH4OT36RRCCAGKARGPN2HLHT2NOBVFHO4GUHA6CF7UKQ4MMV24WQ4N".to_owned(),
+            salt: [0x5au8; 32],
+            network_passphrase: stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
+            rpc_url: "http://127.0.0.1:9".to_owned(),
+            timeout: Duration::from_secs(1),
+            fee: ResolvedFeePerOp {
+                stroops: 100,
+                percentile_label: "profile_default".to_owned(),
+            },
+            dry_run: true,
+            genesis_signer_scval_override: None,
+        }
+    }
+
+    /// Bytes that are a valid empty Wasm module and hash to another digest
+    /// than `MULTISIG_ACCOUNT_WASM_SHA256`.
+    const MISMATCHED_WASM: &[u8] = b"\0asm\x01\0\0\0";
+
+    /// The body refuses bytes that do not hash to the pinned digest, in every
+    /// build profile, before it calls the deployer or any RPC endpoint.
+    #[tokio::test]
+    async fn body_refuses_wasm_that_differs_from_the_pinned_digest_before_the_deployer() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let signer = RecordingSigner {
+            calls: std::sync::Arc::clone(&calls),
+            key: SoftwareSigningKey::new_from_bytes([0x31u8; 32]),
+        };
+        let deployer = DeployerKeypair::from_signer("recording".to_owned(), Box::new(signer));
+
+        let result = deploy_smart_account_body(
+            dry_run_args(deployer),
+            MISMATCHED_WASM,
+            MULTISIG_ACCOUNT_WASM_SHA256,
+        )
+        .await;
+
+        let deployer_calls = calls.lock().unwrap().clone();
+        assert!(
+            matches!(
+                result,
+                Err(SaError::DeploymentFailed { phase: "build", .. })
+            ) && deployer_calls.is_empty(),
+            "expected DeploymentFailed at phase build before any deployer call; \
+             got {result:?} after deployer calls {deployer_calls:?}"
+        );
+        let observed = to_hex(&Sha256::digest(MISMATCHED_WASM));
+        assert!(
+            matches!(
+                &result,
+                Err(SaError::DeploymentFailed { redacted_reason, .. })
+                    if *redacted_reason == format!(
+                        "smart-account WASM SHA256 mismatch: expected \
+                         {MULTISIG_ACCOUNT_WASM_SHA256}, got {observed}"
+                    )
+            ),
+            "the refusal names both digests; got {result:?}"
+        );
+    }
+
+    /// The embedded Wasm passes the check, and a dry run derives the address
+    /// from the deployer and the salt.
+    #[tokio::test]
+    async fn body_accepts_the_embedded_wasm_and_derives_the_address() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let key = SoftwareSigningKey::new_from_bytes([0x31u8; 32]);
+        let deployer_pubkey = format!("{}", key.public_key().await.unwrap());
+        let signer = RecordingSigner {
+            calls: std::sync::Arc::clone(&calls),
+            key,
+        };
+        let deployer = DeployerKeypair::from_signer("recording".to_owned(), Box::new(signer));
+        let args = dry_run_args(deployer);
+        let expected_address =
+            derive_smart_account_address(&deployer_pubkey, &args.salt, &args.network_passphrase)
+                .unwrap();
+
+        let result =
+            deploy_smart_account_body(args, MULTISIG_ACCOUNT_WASM, MULTISIG_ACCOUNT_WASM_SHA256)
+                .await
+                .unwrap();
+
+        assert_eq!(result.smart_account, expected_address);
+        assert_eq!(result.deployer_pubkey, deployer_pubkey);
+        assert_eq!(result.wasm_hash, MULTISIG_ACCOUNT_WASM_SHA256);
+        assert!(result.tx_hash.is_none() && result.upload_tx_hash.is_none());
+        assert_eq!(*calls.lock().unwrap(), vec!["public_key"]);
     }
 
     /// Regression gate: a `LedgerEntryResult` with malformed `xdr` field does NOT panic the

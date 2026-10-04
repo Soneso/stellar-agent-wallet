@@ -1061,10 +1061,11 @@ impl AuditEntry {
 
     /// Constructs a `SaSignerSetBaselined` audit entry.
     ///
-    /// This constructor MUST ONLY be called from `SignersManager::list_signers`
-    /// (first-observation path) and `SignersManager::refresh_signer_baseline`
-    /// (explicit-refresh path). A repo-gate enforces the single-caller
-    /// invariant at CI time.
+    /// No production code calls this version-1 constructor:
+    /// `SignersManager::list_signers` and `SignersManager::refresh_signer_baseline`
+    /// write version-2 rows through `SignersManager::emit_baseline`. The CI
+    /// script `.github/scripts/check-no-direct-sasignersetbaselined-emit.sh`
+    /// rejects any production call of it.
     ///
     /// The `prev_chain_tip_hash` MUST be sourced from
     /// `AuditWriter::current_chain_tip()` inside the same write critical section

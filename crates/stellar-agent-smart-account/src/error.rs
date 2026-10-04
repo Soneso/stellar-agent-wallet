@@ -11,8 +11,8 @@
 //! strings (first-5-last-5 strkey form) at the call site.
 //! The type itself does NOT redact; it trusts callers to apply
 //! `stellar_agent_core::observability::redact_strkey_first5_last5` before
-//! constructing a variant. This discipline is enforced at the call site and
-//! audited by a CI gate.
+//! constructing a variant. No check enforces this discipline; each call site
+//! applies the redaction, and review keeps it there.
 
 use std::io;
 use std::path::PathBuf;
@@ -2324,9 +2324,10 @@ pub enum SaError {
     /// A multicall bundle submission failed at a specific phase.
     ///
     /// `phase` identifies where in the 8-step submit flow the failure occurred.
-    /// The closed 7-value set is enforced by a repo gate script
-    /// and the compile-time constant
-    /// `stellar_agent_smart_account::multicall::MULTICALL_FAILED_PHASES`.
+    /// The closed 7-value set is
+    /// `stellar_agent_smart_account::multicall::MULTICALL_FAILED_PHASES`, whose
+    /// length a compile-time assertion and a unit test hold and whose members a
+    /// second unit test holds. Review keeps every emit site inside the set.
     ///
     /// # Phase values (closed 7-set)
     ///

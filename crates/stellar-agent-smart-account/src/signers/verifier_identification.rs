@@ -1,7 +1,8 @@
 //! Verifier wasm-hash identification substrate.
 //!
-//! Provides `VERIFIER_WASM_FIXTURE` — the vendored WASM bytes embedded at
-//! compile time for supply-chain integrity verification and deploy-CLI upload.
+//! Provides `VERIFIER_WASM_FIXTURE`, the vendored v0.7.2 WebAuthn verifier
+//! Wasm embedded at compile time for the deploy CLI's upload and the digest
+//! tests.
 //!
 //! The compile-time allowlist of audited verifier wasm SHA-256 hashes is
 //! `crate::VERIFIER_ALLOWLIST` (`crates/stellar-agent-smart-account/src/verifier_allowlist.rs`),
@@ -14,22 +15,20 @@
 //! The allowlist's canonical entry (index 0) is the OZ
 //! `multisig-webauthn-verifier-example` v0.7.2 hash built from
 //! OpenZeppelin `stellar-contracts` at SHA
-//! `a9c42169000638da937577f592ebf61a7a3c94ca` (tag `v0.7.2`) — the hash new
+//! `a9c42169000638da937577f592ebf61a7a3c94ca` (tag `v0.7.2`): the hash new
 //! verifier deployments upload. Index 1 is the v0.7.1 hash, still recognised for
 //! verifier contracts already deployed on-chain (the ABI is unchanged).
 //!
 //! # Supply-chain integrity
 //!
-//! The SHA-256 of the vendored WASM is verified in the unit test
-//! `tests::vendored_wasm_hash_matches_allowlist_entry` below.  This test
-//! fires on every `cargo test` invocation, providing a supply-chain integrity
-//! gate.  The SHA-256 value is pinned
-//! in TWO places (the `VERIFIER_ALLOWLIST` const in `verifier_allowlist.rs` +
-//! `vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md`).  A substitution attack
-//! must update both the WASM bytes and the PROVENANCE.md to defeat the gate;
-//! the secondary defence is the per-PR CI vendored-wasm-provenance gate.
-//!
-//! Note the pinned PROVENANCE path below is the v0.7.2 artefact.
+//! The digest of `VERIFIER_WASM_FIXTURE` is `VERIFIER_ALLOWLIST[0]` and is
+//! also in `vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md` and in that
+//! file's row of `WASM_PINS` in `build.rs`. The `vendored-wasm` workflow
+//! rebuilds the file from its pinned source and fails unless the rebuilt bytes
+//! equal it; its tree check holds the file to its `WASM_PINS` row and its
+//! record. The tests in `src/vendored_wasm_tests.rs` fail unless
+//! `VERIFIER_WASM_FIXTURE` is that file and the allowlist's production entries
+//! are exactly the digests of the vendored verifier files.
 //!
 //! # Verifier identification
 //!
@@ -58,15 +57,16 @@
 ///
 /// Built from OpenZeppelin `stellar-contracts` at SHA
 /// `a9c42169000638da937577f592ebf61a7a3c94ca` (tag `v0.7.2`) via
-/// `stellar contract build --package multisig-webauthn-verifier-example`
-/// (stellar-cli 25.2.0, rustc 1.96.0 stable, wasm32v1-none target).
+/// `stellar contract build --locked --package multisig-webauthn-verifier-example`
+/// (stellar-cli 25.2.0, rustc 1.96.0), then copying the `release/` output, as
+/// `vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md` records.
 ///
-/// Supply-chain integrity: `sha2::Sha256::digest(VERIFIER_WASM_FIXTURE)`
-/// must equal `crate::VERIFIER_ALLOWLIST[0].wasm_hash` — verified by
-/// `tests::vendored_wasm_hash_matches_allowlist_entry`.
+/// `tests::vendored_wasm_hash_matches_allowlist_entry` compares the digest of
+/// `VERIFIER_WASM_FIXTURE` with `crate::VERIFIER_ALLOWLIST[0].wasm_hash`, and
+/// the tests in `src/vendored_wasm_tests.rs` bind both to the vendored file.
 ///
-// Path is relative to THIS FILE (`src/signers/verifier_identification.rs`),
-// per Rust `include_bytes!` semantics — NOT the crate root or workspace root.
+// Path is relative to this file (`src/signers/verifier_identification.rs`),
+// per Rust `include_bytes!` semantics, not the crate root or workspace root.
 // Resolves to `<crate-root>/vendor/oz-webauthn-verifier/
 // v0.7.2/multisig_webauthn_verifier_example.wasm`.
 #[cfg(any(test, feature = "deploy-cli"))]
@@ -85,16 +85,13 @@ mod tests {
     use super::*;
     use crate::VERIFIER_ALLOWLIST;
 
-    /// Asserts that `SHA256(VERIFIER_WASM_FIXTURE)` matches
+    /// Asserts that `SHA256(VERIFIER_WASM_FIXTURE)` equals
     /// `VERIFIER_ALLOWLIST[0].wasm_hash`.
     ///
-    /// This is the supply-chain integrity gate.  The check fires on every
-    /// `cargo test` invocation.
-    ///
-    /// A WASM blob substitution will fail this test AND fail the
-    /// `vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md` cross-reference (the
-    /// SHA-256 is pinned in both places, verified at CI time by the
-    /// vendored-wasm-provenance CI gate).
+    /// The record check of `rebuild-vendored-wasm.sh --check-tree` holds the
+    /// vendored file to `vendor/oz-webauthn-verifier/v0.7.2/PROVENANCE.md`, and
+    /// the tests in `src/vendored_wasm_tests.rs` bind the fixture and the
+    /// allowlist to that file.
     ///
     /// # Hard-coded OZ canonical hash
     ///

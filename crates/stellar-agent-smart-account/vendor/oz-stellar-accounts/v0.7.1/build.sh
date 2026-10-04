@@ -1,57 +1,84 @@
 #!/usr/bin/env bash
-# Reproducibility script for vendor/oz-stellar-accounts/v0.7.1/stellar_accounts.wasm.
-# Usage: ./vendor/oz-stellar-accounts/v0.7.1/build.sh
-# Pre-requisite: a local clone of the OpenZeppelin stellar-contracts repository
-#   (https://github.com/OpenZeppelin/stellar-contracts) at v0.7.1, with its path
-#   supplied via the OZ_CONTRACTS_DIR environment variable.
-# Pre-requisite: stellar-cli >= 25.2.0 installed (builds via `stellar contract build`
-#   which sets SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2).
-# Pre-requisite: rustup target add wasm32v1-none --toolchain stable
+# Re-vendors vendor/oz-stellar-accounts/v0.7.1/stellar_accounts.wasm.
+# It builds the file from its pinned source with its pinned tools and copies
+# the output here. The vendored-wasm workflow rebuilds the file with
+# .github/scripts/rebuild-vendored-wasm.sh and never runs this script.
 #
-# WASM artefact provenance note:
-# The correct artefact for contractimport! is the UNOPTIMISED cdylib from
-# target/wasm32v1-none/release/deps/ because the optimised release/ output
-# has its contractspecv0 section stripped by spec-shaking (experimental_spec_shaking_v2
-# feature in the OZ workspace Cargo.toml). The deps/ cdylib retains the full
-# 16 KB contractspecv0 section which contractimport! parses to generate
-# host-side typed bindings.
+# This Wasm is cargo's cdylib output of the v0.7.1 stellar-accounts library. It
+# keeps the full contractspecv0 section; the release/ output has that section
+# filtered away by spec shaking.
+#
+# Usage: OZ_CONTRACTS_DIR=<clone> vendor/oz-stellar-accounts/v0.7.1/build.sh
+# Prerequisites:
+#   - a clone of https://github.com/OpenZeppelin/stellar-contracts in
+#     OZ_CONTRACTS_DIR that holds commit 3f81125bed3114cc93f5fca6d13240082050269a
+#     (tag v0.7.1);
+#   - rustup toolchain install 1.94.0 --profile minimal --target wasm32v1-none;
+#   - stellar on PATH, built as PROVENANCE.md states, whose first --version
+#     line is "stellar 25.2.0";
+#   - a CARGO_HOME without a cargo config file, since the build refuses one.
+#
+# The build runs through the --exec mode of rebuild-vendored-wasm.sh, so it
+# applies the same environment refusals and allowlist as the workflow, in a
+# detached worktree and a fresh target directory that are removed on exit.
 set -euo pipefail
-CRATE_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-OZ_CLONE="${OZ_CONTRACTS_DIR:?set OZ_CONTRACTS_DIR to a local clone of OpenZeppelin/stellar-contracts v0.7.1}"
-PIN_SHA="3f81125bed3114cc93f5fca6d13240082050269a"
-ARTEFACT_DIR="${CRATE_ROOT}/vendor/oz-stellar-accounts/v0.7.1"
 
-# Restore the OZ clone's prior HEAD on exit so the operator running build.sh
-# from an unrelated working state does not silently lose their place.
-PRIOR_HEAD=$(cd "${OZ_CLONE}" && git rev-parse HEAD)
-trap "cd '${OZ_CLONE}' && git checkout --quiet '${PRIOR_HEAD}'" EXIT
+ARTIFACT_DIR=$(cd "$(dirname "$0")" && pwd -P)
+REPO_ROOT=$(cd "$ARTIFACT_DIR/../../../../.." && pwd -P)
+REBUILD="$REPO_ROOT/.github/scripts/rebuild-vendored-wasm.sh"
+OZ_CLONE="${OZ_CONTRACTS_DIR:?set OZ_CONTRACTS_DIR to a clone of https://github.com/OpenZeppelin/stellar-contracts}"
+PIN_COMMIT="3f81125bed3114cc93f5fca6d13240082050269a"
+TOOLCHAIN="1.94.0"
+STELLAR_VERSION_LINE="stellar 25.2.0"
+PACKAGE="stellar-accounts"
+OUTPUT="release/deps/stellar_accounts.wasm"
+WASM_NAME="stellar_accounts.wasm"
 
-pushd "${OZ_CLONE}" >/dev/null
-git fetch --quiet origin
-git checkout --quiet "${PIN_SHA}"
+STELLAR_BIN=$(command -v stellar) || {
+  echo "ERROR: stellar is not on PATH" >&2
+  exit 1
+}
+STELLAR_VERSION=$("$STELLAR_BIN" --version)
+STELLAR_VERSION=${STELLAR_VERSION%%$'\n'*}
+if [ "$STELLAR_VERSION" != "$STELLAR_VERSION_LINE" ]; then
+  echo "ERROR: $STELLAR_BIN prints '$STELLAR_VERSION' as its first --version line, not '$STELLAR_VERSION_LINE'" >&2
+  exit 1
+fi
+if ! git -C "$OZ_CLONE" cat-file -e "$PIN_COMMIT^{commit}" 2>/dev/null; then
+  echo "ERROR: $OZ_CLONE does not hold commit $PIN_COMMIT" >&2
+  exit 1
+fi
 
-# Use `stellar contract build` which sets SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2
-# (required by the experimental_spec_shaking_v2 soroban-sdk feature in the OZ workspace).
-stellar contract build --package stellar-accounts
+WORK=$(mktemp -d)
+cleanup() {
+  git -C "$OZ_CLONE" worktree remove --force "$WORK/src" >/dev/null 2>&1 || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+git -C "$OZ_CLONE" worktree add --detach --quiet "$WORK/src" "$PIN_COMMIT"
+mkdir "$WORK/target"
 
-popd >/dev/null
+echo "The build passes no --optimize; stellar-cli 25.2.0 runs its bundled wasm-opt only with that flag."
+# Each example build that depends on stellar-accounts rewrites its deps/
+# cdylib, so this build runs alone in its fresh target directory.
+RUSTUP_TOOLCHAIN="$TOOLCHAIN" CARGO_TARGET_DIR="$WORK/target" \
+  /bin/bash "$REBUILD" --exec --dir "$WORK/src" -- \
+  "$STELLAR_BIN" contract build --locked --package "$PACKAGE"
 
-# Copy the UNOPTIMISED cdylib from deps/ (retains full contractspecv0 section).
-# The optimised release/ output has contractspecv0 stripped to 15 bytes by spec-shaking;
-# contractimport! requires the full 16 KB spec for type generation.
-cp "${OZ_CLONE}/target/wasm32v1-none/release/deps/stellar_accounts.wasm" "${ARTEFACT_DIR}/stellar_accounts.wasm"
-SHA=$(shasum -a 256 "${ARTEFACT_DIR}/stellar_accounts.wasm" | awk '{print $1}')
-SIZE=$(wc -c < "${ARTEFACT_DIR}/stellar_accounts.wasm" | awk '{print $1}')
-RUSTC_VERSION=$(rustup run stable rustc --version)
+cp "$WORK/target/wasm32v1-none/$OUTPUT" "$ARTIFACT_DIR/$WASM_NAME"
 
-echo "sha256(stellar_accounts.wasm) = ${SHA}"
-echo "size = ${SIZE} bytes"
-echo "rustc-version = ${RUSTC_VERSION}"
+SHA=$(shasum -a 256 "$ARTIFACT_DIR/$WASM_NAME" | awk '{print $1}')
+SIZE=$(wc -c <"$ARTIFACT_DIR/$WASM_NAME" | awk '{print $1}')
+RUSTC_VERSION=$(RUSTUP_TOOLCHAIN="$TOOLCHAIN" /bin/bash "$REBUILD" --exec --dir "$WORK/src" -- rustc --version)
+
 echo ""
-echo "Update vendor/oz-stellar-accounts/v0.7.1/PROVENANCE.md with the three values above"
-echo "(sha256, size, rustc-version) and"
-echo "crates/stellar-agent-smart-account/src/bindings.rs WASM_SHA256 const with the sha256."
+echo "sha256($WASM_NAME) = $SHA"
+echo "size = $SIZE bytes"
+echo "rustc-version = $RUSTC_VERSION"
+echo "stellar-cli-version = $STELLAR_VERSION"
+echo "optimizer = none"
 echo ""
-echo "Note: soroban_sdk::contractimport! sha256 arg is NOT used (E0425 compile failure"
-echo "— contractimport! fails on this WASM). The runtime WASM_SHA256 const +"
-echo "wasm_sha256_matches_provenance test is the integrity gate."
+echo "If the sha256 differs from the committed value, update, in one change:"
+echo "  - vendor/oz-stellar-accounts/v0.7.1/PROVENANCE.md (digest, size, versions)."
+echo "The pinned commit, toolchain, and stellar-cli reproduce the committed digest on"
+echo "macOS (Apple Silicon); a different digest means an input differs."

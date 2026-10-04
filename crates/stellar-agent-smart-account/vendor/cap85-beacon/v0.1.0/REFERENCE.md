@@ -11,7 +11,7 @@
   `publish = false`), listed in the root workspace `exclude`, with its own
   committed `contracts/cap85-beacon/Cargo.lock`. It is outside this crate's
   directory, so `cargo package` of the smart-account crate ships only this
-  directory's `cap85_beacon.wasm`, `REFERENCE.md` and `build.sh`.
+  directory's `cap85_beacon.wasm`, `REFERENCE.md`, and `build.sh`.
 - **Package name:** `cap85-beacon`; the Wasm file name derives from it.
 - **Exported functions:**
   - `__constructor(admin: Address)`: records the admin that authorizes every
@@ -25,15 +25,21 @@
     `ContractExecutable::ExternalRef { executable_owner: <beacon>, tag }`,
     at the address derived from the beacon and `salt`. The host refuses an
     unpublished tag.
-- **Build host:** macOS (Apple Silicon, Darwin 25.6.0).
-- **Toolchain:** rustc 1.98.0 (88d9e12ae 2026-08-18), stable channel;
-  target `wasm32v1-none`.
+- **Build host:** macOS (Apple Silicon, Darwin 25.6.0). The bytes reproduce
+  byte for byte on macOS (Apple Silicon); a rebuild on Linux is not tested.
+- **Toolchain:** `rustc 1.98.0 (88d9e12ae 2026-08-18)`, selected with
+  `RUSTUP_TOOLCHAIN=1.98.0`, since the repository's `rust-toolchain.toml`
+  names the floating `stable` channel. Target `wasm32v1-none`.
 - **soroban-sdk version:** `=28.0.0` (Protocol 28).
-- **Build command:** `stellar contract build --locked`, run in
-  `contracts/cap85-beacon/` by `vendor/cap85-beacon/v0.1.0/build.sh`, which
-  copies `target/wasm32v1-none/release/cap85_beacon.wasm` here and prints the
-  record below.
-- **stellar-cli version:** `stellar 28.1.0 (c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd)`.
+- **stellar-cli:** the first line of `stellar --version` is
+  `stellar 28.1.0 (c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd)`. The binary is
+  built by `cargo install --locked stellar-cli --version 28.1.0` with host rustc
+  1.98.0; the crates.io package's `.cargo_vcs_info.json` sets that revision.
+- **Build command:** in a copy of the tracked files of `contracts/cap85-beacon/`,
+  with `RUSTFLAGS` unset, `RUSTUP_TOOLCHAIN=1.98.0 stellar contract build --locked`.
+  The output is `<target dir>/wasm32v1-none/release/cap85_beacon.wasm`.
+  `vendor/cap85-beacon/v0.1.0/build.sh` runs this build and copies the output
+  here.
 - **Optimizer:** enabled (the `stellar contract build` default); 2393 bytes
   before optimization, 2179 bytes after.
 - **Optimizer version:** the `wasm-opt` crate 0.116.1 bundled with
@@ -46,20 +52,27 @@
   `b3495f664a6c6a3bf52daf0089f3790670b2033d78e02a53f0fa765521e51813`
 - **Size:** 2179 bytes.
 - **Rebuild instructions:**
-  1. Install stellar-cli 28.1.0 and the `wasm32v1-none` target
-     (`rustup target add wasm32v1-none --toolchain stable`).
-  2. Run `vendor/cap85-beacon/v0.1.0/build.sh` (any working directory).
-  3. When the printed sha256 differs, update in one change: this file (digest,
+  1. Install the toolchain:
+     `rustup toolchain install 1.98.0 --profile minimal --target wasm32v1-none`.
+  2. Build stellar-cli 28.1.0 with host rustc 1.98.0:
+     `RUSTUP_TOOLCHAIN=1.98.0 cargo install --locked stellar-cli --version 28.1.0`.
+     Its first `--version` line must read as recorded here.
+  3. Run `vendor/cap85-beacon/v0.1.0/build.sh` (any working directory).
+  4. When the printed sha256 differs, update in one change: this file (digest,
      size, toolchain), the `cap85_beacon.wasm` row of `WASM_PINS` in
      `crates/stellar-agent-smart-account/build.rs`, and
      `CAP85_BEACON_WASM_SHA256` in `src/cap85_beacon.rs`.
-- **Integrity gates:** the `build.rs` `WASM_PINS` row pins the digest at
-  compile time and fails the build on a mismatch; the
-  `cap85_beacon_wasm_sha256_matches_reference` unit test re-hashes the
-  embedded bytes against `CAP85_BEACON_WASM_SHA256`. The embedded bytes are
-  `CAP85_BEACON_WASM`, compiled only with the `test-helpers` feature and in
-  the crate's own unit-test build, where the digest test runs.
-- **Reproducibility caveat:** Rust to Wasm compilation is not bit-identical
-  across rustc or stellar-cli versions. A digest that changes after a
-  toolchain change is re-attested by re-vendoring with the new record, never
-  accepted silently.
+- **Integrity:** the `vendored-wasm` workflow rebuilds this file from the
+  committed source with the pinned toolchain and stellar-cli, and fails unless
+  the rebuilt bytes equal this file. Its tree check fails unless the file's
+  sha256 equals the digest in this record and the file's `WASM_PINS` row in
+  `build.rs`. That row also fails every build of the crate on a mismatch. The
+  unit tests in `src/vendored_wasm_tests.rs` fail unless `CAP85_BEACON_WASM`
+  equals this file and `CAP85_BEACON_WASM_SHA256` equals its sha256.
+  `CAP85_BEACON_WASM` compiles only with the `test-helpers` feature and in the
+  crate's own unit-test build. Review of the source diff is what keeps the
+  committed source honest.
+- **Reproducibility:** Rust to Wasm builds are not bit-identical across rustc or
+  stellar-cli versions, so this record pins both. A rebuild with any other
+  version is a re-vendor that replaces the file, this record, and every pin of
+  its digest in one change.

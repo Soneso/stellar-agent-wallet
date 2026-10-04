@@ -80,8 +80,13 @@ pub const TIMELOCK_CONTROLLER_WASM: &[u8] =
 
 /// SHA-256 of [`TIMELOCK_CONTROLLER_WASM`], 64-char lowercase hex.
 ///
-/// Matches `ef360d61a44648176f0aae923b9884c6ac5e5a9229af5eb8ab120e81cc4cc1f4`.
-/// The `build.rs` gate in this crate asserts this at compile time.
+/// Pinned here, in the `timelock_controller_example.wasm` row of `WASM_PINS`
+/// in `build.rs`, and in
+/// `vendor/oz-timelock-controller/v0.7.2/PROVENANCE.md`. `build.rs` fails every
+/// build unless the vendored file hashes to its row, the tests in
+/// `src/vendored_wasm_tests.rs` fail unless this constant is the file's
+/// sha256, and [`deploy_timelock_controller`] refuses unless
+/// [`TIMELOCK_CONTROLLER_WASM`] hashes to it.
 pub const TIMELOCK_CONTROLLER_WASM_SHA256: &str =
     "ef360d61a44648176f0aae923b9884c6ac5e5a9229af5eb8ab120e81cc4cc1f4";
 
@@ -168,9 +173,10 @@ pub struct TimelockControllerDeployResult {
 ///
 /// # Panics
 ///
-/// Never panics. The runtime SHA gate returns `Err` on mismatch rather than
-/// panicking; the compile-time `build.rs` gate prevents mismatched WASM from
-/// reaching the binary.
+/// Never panics. The runtime SHA gate returns `Err` on mismatch. The `build.rs`
+/// gate fails the build unless the vendored file hashes to its `WASM_PINS` row,
+/// and the tests in `src/vendored_wasm_tests.rs` bind the embedded bytes and
+/// [`TIMELOCK_CONTROLLER_WASM_SHA256`] to that file.
 pub async fn deploy_timelock_controller(
     args: TimelockControllerDeployArgs,
 ) -> Result<TimelockControllerDeployResult, SaError> {

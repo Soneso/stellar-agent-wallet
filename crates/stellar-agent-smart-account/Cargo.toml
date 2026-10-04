@@ -9,9 +9,10 @@ description = "Smart-account orchestration layer for the Stellar agent wallet (O
 readme = "README.md"
 keywords = ["stellar", "soroban", "smart-account", "passkey", "wallet"]
 categories = ["cryptography::cryptocurrencies", "authentication"]
-# The v0.7.1 vendored WASM binaries and build scripts are unused by the build
-# (only their PROVENANCE.md SHA-256 anchors are cited from code); they stay in
-# the repository for auditability but are not shipped in the package.
+# The v0.7.1 vendored Wasm files and build scripts are not shipped in the
+# package. The crate's unit tests embed the v0.7.1 files to bind allowlist
+# entries to them; package verification compiles no test code, and build.rs
+# pins no v0.7.1 file.
 exclude = ["vendor/*/v0.7.1/*.wasm", "vendor/*/v0.7.1/build.sh"]
 
 [lib]

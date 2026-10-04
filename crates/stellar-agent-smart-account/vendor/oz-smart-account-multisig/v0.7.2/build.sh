@@ -1,58 +1,84 @@
 #!/usr/bin/env bash
-# Reproducibility script for vendor/oz-smart-account-multisig/v0.7.2/multisig_account_example.wasm.
-# Usage: ./vendor/oz-smart-account-multisig/v0.7.2/build.sh
-# Pre-requisite: a local clone of the OpenZeppelin stellar-contracts repository
-#   (https://github.com/OpenZeppelin/stellar-contracts) at v0.7.2, with its path
-#   supplied via the OZ_CONTRACTS_DIR environment variable.
-# Pre-requisite: stellar-cli >= 25.2.0 installed (builds via `stellar contract build`).
-# Pre-requisite: rustup target add wasm32v1-none --toolchain stable
+# Re-vendors vendor/oz-smart-account-multisig/v0.7.2/multisig_account_example.wasm.
+# It builds the file from its pinned source with its pinned tools and copies
+# the output here. The vendored-wasm workflow rebuilds the file with
+# .github/scripts/rebuild-vendored-wasm.sh and never runs this script.
 #
-# WASM artefact provenance note:
-# This WASM is the DEPLOYABLE multisig-account-example contract for on-chain
-# upload via UploadContractWasm. Unlike the stellar-accounts library WASM at
-# vendor/oz-stellar-accounts/v0.7.2/ (which is needed for contractimport!
-# type generation), this artefact is the deployable contract that exposes
+# This Wasm is the deployable multisig-account-example contract that every new
+# smart account runs. It exposes
 # __constructor(signers: Vec<Signer>, policies: Map<Address, Val>).
+#
+# Usage: OZ_CONTRACTS_DIR=<clone> vendor/oz-smart-account-multisig/v0.7.2/build.sh
+# Prerequisites:
+#   - a clone of https://github.com/OpenZeppelin/stellar-contracts in
+#     OZ_CONTRACTS_DIR that holds commit a9c42169000638da937577f592ebf61a7a3c94ca
+#     (tag v0.7.2);
+#   - rustup toolchain install 1.96.0 --profile minimal --target wasm32v1-none;
+#   - stellar on PATH, built as PROVENANCE.md states, whose first --version
+#     line is "stellar 25.2.0";
+#   - a CARGO_HOME without a cargo config file, since the build refuses one.
+#
+# The build runs through the --exec mode of rebuild-vendored-wasm.sh, so it
+# applies the same environment refusals and allowlist as the workflow, in a
+# detached worktree and a fresh target directory that are removed on exit.
 set -euo pipefail
 
-CRATE_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-OZ_CLONE="${OZ_CONTRACTS_DIR:?set OZ_CONTRACTS_DIR to a local clone of OpenZeppelin/stellar-contracts v0.7.2}"
-PIN_SHA="a9c42169000638da937577f592ebf61a7a3c94ca"
-ARTEFACT_DIR="${CRATE_ROOT}/vendor/oz-smart-account-multisig/v0.7.2"
+ARTIFACT_DIR=$(cd "$(dirname "$0")" && pwd -P)
+REPO_ROOT=$(cd "$ARTIFACT_DIR/../../../../.." && pwd -P)
+REBUILD="$REPO_ROOT/.github/scripts/rebuild-vendored-wasm.sh"
+OZ_CLONE="${OZ_CONTRACTS_DIR:?set OZ_CONTRACTS_DIR to a clone of https://github.com/OpenZeppelin/stellar-contracts}"
+PIN_COMMIT="a9c42169000638da937577f592ebf61a7a3c94ca"
+TOOLCHAIN="1.96.0"
+STELLAR_VERSION_LINE="stellar 25.2.0"
+PACKAGE="multisig-account-example"
+OUTPUT="release/multisig_account_example.wasm"
+WASM_NAME="multisig_account_example.wasm"
 
-# Restore the OZ clone's prior HEAD on exit so the operator running build.sh
-# from an unrelated working state does not silently lose their place.
-# Trap fires on normal exit, error exit, and signal-interrupted exit.
-PRIOR_HEAD=$(cd "${OZ_CLONE}" && git rev-parse HEAD)
-trap "cd '${OZ_CLONE}' && git checkout --quiet '${PRIOR_HEAD}'" EXIT
+STELLAR_BIN=$(command -v stellar) || {
+  echo "ERROR: stellar is not on PATH" >&2
+  exit 1
+}
+STELLAR_VERSION=$("$STELLAR_BIN" --version)
+STELLAR_VERSION=${STELLAR_VERSION%%$'\n'*}
+if [ "$STELLAR_VERSION" != "$STELLAR_VERSION_LINE" ]; then
+  echo "ERROR: $STELLAR_BIN prints '$STELLAR_VERSION' as its first --version line, not '$STELLAR_VERSION_LINE'" >&2
+  exit 1
+fi
+if ! git -C "$OZ_CLONE" cat-file -e "$PIN_COMMIT^{commit}" 2>/dev/null; then
+  echo "ERROR: $OZ_CLONE does not hold commit $PIN_COMMIT" >&2
+  exit 1
+fi
 
-pushd "${OZ_CLONE}" >/dev/null
-git fetch --quiet origin
-git checkout --quiet "${PIN_SHA}"
+WORK=$(mktemp -d)
+cleanup() {
+  git -C "$OZ_CLONE" worktree remove --force "$WORK/src" >/dev/null 2>&1 || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+git -C "$OZ_CLONE" worktree add --detach --quiet "$WORK/src" "$PIN_COMMIT"
+mkdir "$WORK/target"
 
-# Build the deployable multisig-account-example WASM.
-# Package name is multisig-account-example per
-# examples/multisig-smart-account/account/Cargo.toml.
-stellar contract build --package multisig-account-example
+echo "The build passes no --optimize; stellar-cli 25.2.0 runs its bundled wasm-opt only with that flag."
+RUSTUP_TOOLCHAIN="$TOOLCHAIN" CARGO_TARGET_DIR="$WORK/target" \
+  /bin/bash "$REBUILD" --exec --dir "$WORK/src" -- \
+  "$STELLAR_BIN" contract build --locked --package "$PACKAGE"
 
-popd >/dev/null
+cp "$WORK/target/wasm32v1-none/$OUTPUT" "$ARTIFACT_DIR/$WASM_NAME"
 
-# Copy the release WASM (not deps/ — this is a deployable, not a type-binding).
-cp "${OZ_CLONE}/target/wasm32v1-none/release/multisig_account_example.wasm" \
-    "${ARTEFACT_DIR}/multisig_account_example.wasm"
+SHA=$(shasum -a 256 "$ARTIFACT_DIR/$WASM_NAME" | awk '{print $1}')
+SIZE=$(wc -c <"$ARTIFACT_DIR/$WASM_NAME" | awk '{print $1}')
+RUSTC_VERSION=$(RUSTUP_TOOLCHAIN="$TOOLCHAIN" /bin/bash "$REBUILD" --exec --dir "$WORK/src" -- rustc --version)
 
-SHA=$(shasum -a 256 "${ARTEFACT_DIR}/multisig_account_example.wasm" | awk '{print $1}')
-SIZE=$(wc -c < "${ARTEFACT_DIR}/multisig_account_example.wasm" | awk '{print $1}')
-RUSTC_VERSION=$(rustup run stable rustc --version)
-STELLAR_VERSION=$(stellar --version | head -1)
-WASM_OPT_VERSION=$(wasm-opt --version 2>/dev/null || echo "not available")
-
-echo "sha256(multisig_account_example.wasm) = ${SHA}"
-echo "size = ${SIZE} bytes"
-echo "rustc-version = ${RUSTC_VERSION}"
-echo "stellar-cli = ${STELLAR_VERSION}"
-echo "wasm-opt = ${WASM_OPT_VERSION}"
 echo ""
-echo "Update vendor/oz-smart-account-multisig/v0.7.2/PROVENANCE.md with the values above and"
-echo "crates/stellar-agent-smart-account/src/deployment/deploy.rs MULTISIG_ACCOUNT_WASM_SHA256"
-echo "const with the sha256."
+echo "sha256($WASM_NAME) = $SHA"
+echo "size = $SIZE bytes"
+echo "rustc-version = $RUSTC_VERSION"
+echo "stellar-cli-version = $STELLAR_VERSION"
+echo "optimizer = none"
+echo ""
+echo "If the sha256 differs from the committed value, update, in one change:"
+echo "  - vendor/oz-smart-account-multisig/v0.7.2/PROVENANCE.md (digest, size, versions),"
+echo "  - the WASM_PINS row in build.rs,"
+echo "  - MULTISIG_ACCOUNT_WASM_SHA256 in src/deployment/deploy.rs."
+echo "The pinned commit, toolchain, and stellar-cli reproduce the committed digest on"
+echo "macOS (Apple Silicon); a different digest means an input differs."

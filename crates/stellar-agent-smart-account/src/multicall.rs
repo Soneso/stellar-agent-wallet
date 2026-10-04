@@ -50,27 +50,31 @@ use crate::submit::{MulticallCheck, ResolvedFeePerOp, SubmitInvokeArgs, submit_s
 
 /// Vendored multicall router WASM bytes.
 ///
-/// Included at compile time from `vendor/multicall/v0.1.0/multicall.wasm`.
-/// The build.rs gate (`crates/stellar-agent-smart-account/build.rs` `WASM_PINS`)
-/// verifies the SHA-256 at compile time; this `include_bytes!` binding ships
-/// the bytes into the binary for runtime deployment and runtime verification.
+/// Included at compile time from `vendor/multicall/v0.1.0/multicall.wasm`, for
+/// runtime deployment and runtime verification. `build.rs` fails every build of
+/// the crate unless that file hashes to its `WASM_PINS` row, and the tests in
+/// `src/vendored_wasm_tests.rs` fail unless this constant is that file. The
+/// source of this build is not in the repository, so no workflow rebuilds it;
+/// the tree check holds it at one frozen digest.
 ///
-/// SHA-256 provenance: `vendor/multicall/v0.1.0/REFERENCE.md`.
-/// Runtime defence-in-depth: `multicall_wasm_sha256_matches_provenance` test.
+/// Provenance: `vendor/multicall/v0.1.0/REFERENCE.md`.
 pub const MULTICALL_WASM: &[u8] = include_bytes!("../vendor/multicall/v0.1.0/multicall.wasm");
 
 /// Expected SHA-256 of [`MULTICALL_WASM`], as 64-char lowercase hex.
 ///
-/// This constant MUST equal the `expected_sha256` in
-/// `crates/stellar-agent-smart-account/build.rs` `WASM_PINS` for the
-/// `multicall.wasm` entry. A CI gate enforces byte-exact equality between
-/// the two copies.
+/// Equal to the `expected_sha256` of the `multicall.wasm` row of `WASM_PINS`
+/// in `crates/stellar-agent-smart-account/build.rs`, to the digest in
+/// `vendor/multicall/v0.1.0/REFERENCE.md`, and to the frozen digest of the
+/// exception list in `.github/scripts/rebuild-vendored-wasm.sh`.
+/// `build.rs` compares the vendored file with its `WASM_PINS` row,
+/// `multicall_wasm_sha256_matches_provenance` compares [`MULTICALL_WASM`] with
+/// this constant, and the tests in `src/vendored_wasm_tests.rs` bind both
+/// constants to the vendored file.
 ///
 /// # Trust-anchor rotation
 ///
-/// When the vendored WASM changes, BOTH this constant AND the matching
-/// `build.rs` `WASM_PINS` entry MUST be updated atomically in the same commit.
-/// The repo gate fails the build when they diverge.
+/// When the vendored WASM changes, this constant, the `WASM_PINS` row, the
+/// record, and the frozen digest change together in one reviewed change.
 pub const MULTICALL_WASM_SHA256: &str =
     "267e94a092df01fa02ad4edf8320a98bd65e4d4d6575254ac9521cb65727f3d4";
 
@@ -105,8 +109,11 @@ const _: () = assert!(
 
 /// Phase inventory for `SaError::MulticallFailed::phase`.
 ///
-/// Closed 7-value set. Every production emit site MUST use a string from this
-/// set; a CI gate enforces that the closed set is not silently extended.
+/// Closed 7-value set. A compile-time assertion below and the tests
+/// `multicall_failed_phases_closed_set_has_seven_entries` and
+/// `multicall_failed_phases_contains_canonical_names` hold its length and
+/// members. Every production emit site uses a string from this set; no check
+/// scans the emit sites, so review keeps them inside it.
 pub(crate) const MULTICALL_FAILED_PHASES: &[&str] = &[
     "build",
     "policy_gate",
@@ -2299,12 +2306,11 @@ mod tests {
 
     // ── Provenance test ───────────────────────────────────────────────────────
 
-    /// Defence-in-depth runtime check: SHA-256 of the included WASM matches
-    /// the pinned `MULTICALL_WASM_SHA256` constant.
+    /// The SHA-256 of [`MULTICALL_WASM`] equals `MULTICALL_WASM_SHA256`.
     ///
-    /// The build.rs gate already enforces this at compile time; this test
-    /// provides a runtime assertion for test configurations that might differ.
-    ///
+    /// `build.rs` compares the vendored file with its `WASM_PINS` row, never
+    /// with this constant; this test compares the constant with the embedded
+    /// bytes, and `src/vendored_wasm_tests.rs` binds both to the file.
     #[test]
     fn multicall_wasm_sha256_matches_provenance() {
         let digest = Sha256::digest(MULTICALL_WASM);
@@ -2319,8 +2325,9 @@ mod tests {
 
     /// Asserts `MULTICALL_FAILED_PHASES` has exactly 7 entries.
     ///
-    /// The phase inventory is a closed set; a CI gate enforces that no
-    /// undeclared phase string reaches production emit sites.
+    /// The phase inventory is a closed set. This test and
+    /// `multicall_failed_phases_contains_canonical_names` hold its length and
+    /// members; review keeps production emit sites inside the set.
     #[test]
     fn multicall_failed_phases_closed_set_has_seven_entries() {
         assert_eq!(

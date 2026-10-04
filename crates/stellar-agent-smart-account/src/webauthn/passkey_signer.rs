@@ -177,7 +177,7 @@ impl PasskeyCredentialRecord {
 /// of the `sign_webauthn_assertion` trait method that produces assertions.
 /// It MUST only be invoked via `complete_authorization_entry` in
 /// `crates/stellar-agent-smart-account/src/managers/auth_entry.rs`.
-/// A CI gate enforces this single-call-site constraint.
+/// No check enforces this single-call-site constraint; review keeps it.
 ///
 /// # Signing flow
 ///
@@ -361,8 +361,8 @@ impl Signer for PasskeySignHandle {
     ///
     /// This method MUST only be invoked via `complete_authorization_entry`
     /// in `crates/stellar-agent-smart-account/src/managers/auth_entry.rs`.
-    /// Direct invocation from any other site is prohibited; a CI gate enforces
-    /// this constraint.
+    /// Direct invocation from any other site is prohibited. No check enforces
+    /// this constraint; review keeps it.
     ///
     /// # Errors
     ///

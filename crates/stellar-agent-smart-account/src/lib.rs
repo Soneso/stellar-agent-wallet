@@ -51,6 +51,10 @@ pub mod timelock;
 pub(crate) mod timelock_submit;
 pub mod verifier_allowlist;
 pub mod verifiers;
+// Binds every embedded Wasm constant, pinned digest, and allowlist entry to
+// one vendored file.
+#[cfg(test)]
+mod vendored_wasm_tests;
 pub mod webauthn;
 pub mod webauthn_verifier;
 pub mod weighted_threshold_policy;

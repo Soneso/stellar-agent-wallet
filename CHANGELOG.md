@@ -560,6 +560,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused, never truncated.
 - An older binary cannot replay or verify a log holding a `binding_changed`
   row, and cannot read an owner entry stored as a G-strkey.
+- `deploy_smart_account` returns `SaError::DeploymentFailed` with phase
+  `build` when `MULTISIG_ACCOUNT_WASM` does not hash to
+  `MULTISIG_ACCOUNT_WASM_SHA256`, in every build profile.
+- The vendored Wasm records name the exact rustc and stellar-cli versions,
+  how each stellar-cli binary is built, and the command that rebuilds the
+  file. The multicall record states that its source is not in the
+  repository.
 
 ### Removed
 
@@ -731,6 +738,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the audit binding, and the policy window state live in a file on the same
   host. Anyone who can write that file can restore older entries or delete
   one.
+- In `0.1.0-alpha.1` through `0.1.0-alpha.9`, the vendored contract Wasm
+  files that the wallet deploys or recognizes were pinned only by digests
+  inside this repository. Several of their build records, and the
+  smart-account crate's documentation, described a CI check of those digests
+  that did not exist. A merged pull request could replace a Wasm file
+  together with its pins and pass every check. The vendored files are
+  unchanged since they were added, and every file except the multicall
+  router rebuilds byte for byte from its source. The `vendored-wasm`
+  workflow rebuilds every vendored Wasm file except the multicall router
+  from its pinned source with pinned tools. It fails unless the rebuilt
+  bytes equal the vendored file and the file matches its record and, where
+  one exists, its `build.rs` pin. Unit tests bind every embedded Wasm
+  constant and every pinned digest to its vendored file. The multicall
+  router Wasm is not rebuilt, since its source is not in the repository;
+  its digest remains pinned only inside the repository. In those versions,
+  release builds of `deploy_smart_account` uploaded the embedded
+  smart-account Wasm without comparing it with
+  `MULTISIG_ACCOUNT_WASM_SHA256`. This needed a build from a tree whose own
+  unit tests fail. Such a build could upload the differing bytes; the deploy
+  then failed, or created the account from the Wasm that the constant names.
+  The deploy checks the digest in every build profile, before any network
+  request.
 
 ## [0.1.0-alpha.9] - 2026-09-30
 

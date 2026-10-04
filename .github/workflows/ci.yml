@@ -124,6 +124,8 @@ jobs:
       # reaches the network. --all-features is deliberately avoided here: it
       # would enable the live tiers and attempt real RPC and Friendbot access.
       - run: cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
+      # Without test-helpers, the integration target also checks that the library excludes the revoked test fixture.
+      - run: cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg
       # stellar-agent-test-support is consumed with a different feature set by
       # each crate; every set must compile on its own.
       - run: |

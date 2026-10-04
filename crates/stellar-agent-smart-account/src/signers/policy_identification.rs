@@ -15,14 +15,15 @@
 //!
 //! # Supply-chain integrity
 //!
-//! The SHA-256 of the vendored WASM is verified in the unit test
-//! `tests::vendored_wasm_hash_matches_allowlist_entry` below.  This test
-//! fires on every `cargo test` invocation, providing the supply-chain integrity
-//! gate.  The SHA-256
-//! value is pinned in TWO places (this file + `vendor/oz-threshold-policy/
-//! v0.7.2/PROVENANCE.md`).  A substitution attack must update both the WASM
-//! bytes and the PROVENANCE.md to defeat the gate; the secondary defence is
-//! the compile-time hash const here and the per-PR CI vendored-wasm-provenance gate.
+//! Each allowlist entry is the digest of a vendored file: index 0 of
+//! `vendor/oz-threshold-policy/v0.7.2/`, index 1 of
+//! `vendor/oz-threshold-policy/v0.7.1/`. Each digest is also in that file's
+//! `PROVENANCE.md`, and the v0.7.2 digest is in its row of `WASM_PINS` in
+//! `build.rs`. The `vendored-wasm` workflow rebuilds both files from their
+//! pinned sources and fails unless the rebuilt bytes equal them; its tree check
+//! holds each file to its record and the v0.7.2 file to its `WASM_PINS` row.
+//! The tests in `src/vendored_wasm_tests.rs` fail unless `THRESHOLD_POLICY_WASM`
+//! is the v0.7.2 file and the allowlist is exactly the two files' digests.
 //!
 //! # Policy identification
 //!
@@ -41,9 +42,10 @@
 //!
 /// SHA-256 allowlist for audited threshold-policy WASM deployments.
 ///
-/// Each entry is a 32-byte raw SHA-256 digest (the same value extracted from
-/// `PROVENANCE.md` by the CI provenance gate and the same value
-/// `sha2::Sha256::digest(THRESHOLD_POLICY_WASM)` must produce).
+/// Each entry is the 32-byte raw SHA-256 digest of a vendored file. The tests
+/// in `src/vendored_wasm_tests.rs` compare each entry with the sha256 of its
+/// file, and the tree check of `rebuild-vendored-wasm.sh` holds each file to
+/// the digest in its `PROVENANCE.md`.
 ///
 /// # Allowlist (two entries)
 ///
@@ -143,16 +145,13 @@ mod tests {
 
     use super::*;
 
-    /// Asserts that `SHA256(THRESHOLD_POLICY_WASM)` matches
+    /// Asserts that `SHA256(THRESHOLD_POLICY_WASM)` equals
     /// `THRESHOLD_POLICY_WASM_HASHES[0]` (the canonical v0.7.2 deploy hash).
     ///
-    /// This is the supply-chain integrity gate.  The check fires on every
-    /// `cargo test` invocation.
-    ///
-    /// A WASM blob substitution will fail this test AND fail
-    /// `vendor/oz-threshold-policy/v0.7.2/PROVENANCE.md` cross-reference (the
-    /// sha256 is pinned in both places, verified at CI time by the
-    /// vendored-wasm-provenance CI gate).
+    /// The record check of `rebuild-vendored-wasm.sh --check-tree` holds the
+    /// vendored file to `vendor/oz-threshold-policy/v0.7.2/PROVENANCE.md`, and
+    /// the tests in `src/vendored_wasm_tests.rs` bind both constants to that
+    /// file.
     #[test]
     fn vendored_wasm_hash_matches_allowlist_entry() {
         let digest: [u8; 32] = Sha256::digest(THRESHOLD_POLICY_WASM).into();
