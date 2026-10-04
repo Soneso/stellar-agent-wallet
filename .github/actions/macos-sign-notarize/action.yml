@@ -1,0 +1,74 @@
+name: macOS sign and notarize
+description: >-
+  Signs both release binaries with the Developer ID identity, notarizes them,
+  verifies the signatures, and packs the release archive. Reads binaries only
+  from the binary-dir input and runs every tool by absolute path.
+
+inputs:
+  binary-dir:
+    description: Directory holding the validated stellar-agent and stellar-agent-mcp binaries
+    required: true
+  target:
+    description: Target triple, aarch64-apple-darwin or x86_64-apple-darwin
+    required: true
+  version:
+    description: Release version without the leading v
+    required: true
+  developer-id-p12-base64:
+    description: Base64 of the Developer ID Application certificate and key (PKCS#12)
+    required: true
+  developer-id-p12-password:
+    description: Password of the PKCS#12 file
+    required: true
+  asc-api-key-p8-base64:
+    description: Base64 of the App Store Connect API key (.p8)
+    required: true
+  asc-key-id:
+    description: App Store Connect API key ID
+    required: true
+  asc-issuer-id:
+    description: App Store Connect issuer ID
+    required: true
+
+outputs:
+  archive:
+    description: Absolute path of the signed release archive
+    value: ${{ steps.archive.outputs.archive }}
+
+# Inputs reach the scripts only through step environment variables, and the
+# scripts run from this action's directory. The secrets exist only in the
+# environment of the signing step.
+runs:
+  using: composite
+  steps:
+    - name: Sign and notarize
+      shell: /bin/bash --noprofile --norc -eo pipefail {0}
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        BINARY_DIR: ${{ inputs.binary-dir }}
+        TARGET: ${{ inputs.target }}
+        VERSION: ${{ inputs.version }}
+        P12_B64: ${{ inputs.developer-id-p12-base64 }}
+        P12_PASSWORD: ${{ inputs.developer-id-p12-password }}
+        ASC_KEY_B64: ${{ inputs.asc-api-key-p8-base64 }}
+        ASC_KEY_ID: ${{ inputs.asc-key-id }}
+        ASC_ISSUER_ID: ${{ inputs.asc-issuer-id }}
+      run: /bin/bash "$ACTION_DIR/sign-notarize.sh"
+
+    - name: Pack the release archive
+      id: archive
+      shell: /bin/bash --noprofile --norc -eo pipefail {0}
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        BINARY_DIR: ${{ inputs.binary-dir }}
+        TARGET: ${{ inputs.target }}
+        VERSION: ${{ inputs.version }}
+      run: /bin/bash "$ACTION_DIR/archive.sh"
+
+    - name: Remove the signing keychain and key files
+      if: always()
+      shell: /bin/bash --noprofile --norc -eo pipefail {0}
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        TARGET: ${{ inputs.target }}
+      run: /bin/bash "$ACTION_DIR/cleanup.sh"
