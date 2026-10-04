@@ -79,7 +79,9 @@ A maintainer acknowledges a new pull request within one working day (Monday to
 Friday, Central European Time). The review follows within three working days for
 a change to documentation, scripts, or workflows, and within five working days
 for a change to Rust code. Questions in the review thread get an answer within
-two working days. The depth of the review follows what the pull request changes:
+two working days. [GOVERNANCE.md](GOVERNANCE.md) states who merges and how a
+contributor gains the triage role. The depth of the review follows what the pull
+request changes:
 
 - A maintainer reviews a pull request that changes only documentation, scripts,
   or workflows from the diff and the repository's CI checks, with no testnet
