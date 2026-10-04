@@ -46,7 +46,7 @@ jobs:
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The smart-account dependency closure plus every compiled test binary is
       # large; reclaim space the build does not need.
       - name: Free disk space
@@ -70,10 +70,10 @@ jobs:
       # Chromium stable major-version bump. Current pin: Chrome 150 (stable as
       # of 2026-07-02).
       - name: Setup Chromium (WebAuthn suite)
-        uses: browser-actions/setup-chrome@2e1d749697dd1612b833dba4a722266286fbefcd # v2.1.2
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0
         with:
           chrome-version: 150
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # The testnet feature set builds a different dependency graph from
           # the offline jobs; keep it in its own cache.
