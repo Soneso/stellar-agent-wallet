@@ -446,12 +446,9 @@ mod tests {
     /// (d) A malformed `#[mcp_tool_item]` missing a required field produces an
     /// `Err` from darling's `FromMeta` parsing.
     ///
-    /// The sibling `#[tool(...)]` is present so the missing `chain_id_required`
-    /// field is the ONLY defect: without it the fixture would also trip the
-    /// separate missing-`#[tool]` guard, and the bare `is_err()` assertion would
-    /// pass no matter which of the two errors fired. The error message is
-    /// asserted to name the missing field so the test cannot pass on the wrong
-    /// rejection.
+    /// The fixture carries the sibling `#[tool(...)]`, so the missing
+    /// `chain_id_required` field is the fixture's single defect. The assertion
+    /// requires the error message to name that field.
     #[test]
     fn malformed_mcp_tool_item_missing_field_returns_err() {
         let mut impl_block: ItemImpl = parse_quote! {
@@ -479,8 +476,7 @@ mod tests {
     }
 
     /// (d2) Control for (d): the same fixture with `chain_id_required` present
-    /// expands without error, proving the missing-field rejection above comes
-    /// from that field alone and not from some other defect in the fixture.
+    /// expands without error, so the rejection in (d) comes from that field alone.
     #[test]
     fn well_formed_mcp_tool_item_with_all_required_fields_expands_ok() {
         let mut impl_block: ItemImpl = parse_quote! {
@@ -685,9 +681,8 @@ mod tests {
     }
 
     /// (g4) An explicit `value_kind = "read_only"` emits `ReadOnly`, the same
-    /// variant the omitted default produces.  Pinned separately from the default
-    /// case so the `"read_only"` string is covered on its own: it shares the
-    /// `None` arm in the mapping, so nothing exercised the string itself.
+    /// variant the omitted default produces. The string shares the `None` arm
+    /// of the mapping, so this test pins the string on its own.
     #[test]
     fn explicit_value_kind_read_only_emits_read_only_variant() {
         let mut impl_block: ItemImpl = parse_quote! {
@@ -713,10 +708,9 @@ mod tests {
         );
     }
 
-    /// (g5) An explicit `value_kind = "opaque_sign"` emits `OpaqueSign`.  This is
-    /// the one arm no other test reached, so it could emit any variant (even
-    /// `ReadOnly`) without failing — the policy dispatch gate would then derive
-    /// the wrong value class for a signature-only tool.
+    /// (g5) An explicit `value_kind = "opaque_sign"` emits `OpaqueSign`. The
+    /// policy dispatch gate derives the value class of a signature-only tool
+    /// from this variant.
     #[test]
     fn explicit_value_kind_opaque_sign_emits_opaque_sign_variant() {
         let mut impl_block: ItemImpl = parse_quote! {
