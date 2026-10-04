@@ -14,6 +14,7 @@ use stellar_agent_core::policy::DenyReason;
 use stellar_agent_core::policy::v1::criteria::state_store::{
     CLOCK_SKEW_TOLERANCE_MS, PolicyStateStore, StateKey, StateStoreError, WindowEntry,
 };
+use stellar_agent_core::profile::owner_key::{self, OwnerKeyContext};
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_core::profile::schema::{
     KeyringEntryRef, Profile, default_policy_window_state_path_for,
@@ -436,6 +437,7 @@ impl PersistedWindowStore {
         dest: &PolicyStateStore,
     ) -> Result<(), WindowStoreError> {
         let entry_ref = &profile.policy_window_state_key_id;
+        refuse_owner_coordinate(profile)?;
         let gen_entry = generation_entry_ref(profile);
 
         // Check file existence BEFORE loading the HMAC key: a genuinely
@@ -461,6 +463,10 @@ impl PersistedWindowStore {
             crate::keyring::load_hmac_key_32(entry_ref).map_err(|e| WindowStoreError::Keyring {
                 detail: format!("{e}"),
             })?;
+        refuse_owner_public_key(
+            key.as_ref(),
+            &OwnerKeyContext::for_profile(profile_name, profile),
+        )?;
         let wire = self.verify_with_key(&key, &bytes)?;
         let wire = select_generation(wire, load_counter(&gen_entry)?)?;
 
@@ -1283,6 +1289,7 @@ impl PersistedWindowStore {
     ///
     /// `Ok(None)` means there is nothing recorded yet for this profile.
     fn read_for_inspection(&self, profile: &Profile) -> Result<Option<WireFile>, WindowStoreError> {
+        refuse_owner_coordinate(profile)?;
         let gen_entry = generation_entry_ref(profile);
         let bytes = match fs::read(&self.path) {
             Ok(b) => b,
@@ -1300,6 +1307,7 @@ impl PersistedWindowStore {
                     detail: format!("{e}"),
                 }
             })?;
+        refuse_owner_public_key(key.as_ref(), &OwnerKeyContext::for_loaded_profile(profile))?;
         let wire = self.verify_with_key(&key, &bytes)?;
         select_generation(wire, load_counter(&gen_entry)?).map(Some)
     }
@@ -1316,13 +1324,22 @@ impl PersistedWindowStore {
         profile: &Profile,
     ) -> Result<(zeroize::Zeroizing<[u8; 32]>, MintOutcome), WindowStoreError> {
         let entry_ref = &profile.policy_window_state_key_id;
+        // An owner-namespace coordinate refuses here, so it never reaches the
+        // mint arm below.
+        refuse_owner_coordinate(profile)?;
         match crate::keyring::load_hmac_key_32(entry_ref) {
-            Ok(key) => Ok((
-                key,
-                MintOutcome {
-                    newly_minted: false,
-                },
-            )),
+            Ok(key) => {
+                refuse_owner_public_key(
+                    key.as_ref(),
+                    &OwnerKeyContext::for_loaded_profile(profile),
+                )?;
+                Ok((
+                    key,
+                    MintOutcome {
+                        newly_minted: false,
+                    },
+                ))
+            }
             Err(_) => {
                 // Load failure is treated as "not yet minted" — mint a fresh
                 // key. A genuinely different failure (backend unavailable)
@@ -1483,6 +1500,36 @@ impl PersistedWindowStore {
 fn generation_entry_ref(profile: &Profile) -> KeyringEntryRef {
     let base = &profile.policy_window_state_key_id;
     KeyringEntryRef::new(base.service.clone(), format!("{}-generation", base.account))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Owner key refusals
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The profile field a window-state key owner refusal names.
+pub const POLICY_STATE_KEY_FIELD: &str = "policy_window_state_key_id";
+
+/// Refuses a window-state key coordinate in the owner key namespace, before
+/// any keyring read.
+fn refuse_owner_coordinate(profile: &Profile) -> Result<(), WindowStoreError> {
+    owner_key::refuse_owner_key_coordinate(
+        &profile.policy_window_state_key_id,
+        POLICY_STATE_KEY_FIELD,
+    )
+    .map_err(|_| WindowStoreError::KeyMatchesOwnerPublicKey)
+}
+
+/// Refuses a loaded window-state key equal to the profile's owner public key.
+/// An owner entry that cannot be read refuses with its keyring error.
+fn refuse_owner_public_key(key: &[u8], owner: &OwnerKeyContext) -> Result<(), WindowStoreError> {
+    owner_key::refuse_owner_public_key(key, owner, POLICY_STATE_KEY_FIELD).map_err(|e| match e {
+        stellar_agent_core::error::WalletError::Validation(
+            stellar_agent_core::error::ValidationError::KeyMatchesOwnerPublicKey { .. },
+        ) => WindowStoreError::KeyMatchesOwnerPublicKey,
+        other => WindowStoreError::Keyring {
+            detail: format!("owner key read failed: {other}"),
+        },
+    })
 }
 
 /// The trusted commit binds one generation to exactly one canonical body.
@@ -3120,5 +3167,164 @@ mod tests {
             mode, 0o600,
             "the window file must be readable and writable by its owner alone; got {mode:o}"
         );
+    }
+
+    // ── owner key refusals ───────────────────────────────────────────────
+
+    const OWNER_KEY: [u8; 32] = [0x6a; 32];
+
+    fn owner_profile(dir: &Path, name: &str) -> Profile {
+        let mut p = Profile::builder_testnet_named(name, "s", "acct", "n-svc", "n-acct").build();
+        p.audit_log_path = dir.join("audit.jsonl");
+        p
+    }
+
+    fn put_raw(entry_ref: &KeyringEntryRef, value: &str) {
+        keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+            .unwrap()
+            .set_password(value)
+            .unwrap();
+    }
+
+    fn get_raw(entry_ref: &KeyringEntryRef) -> Option<String> {
+        keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+            .unwrap()
+            .get_password()
+            .ok()
+    }
+
+    /// A window file sealed under a key equal to the owner public key loads
+    /// while no owner entry exists. Once the owner entry holds that key in the
+    /// older form, `load_into`, the inspection read, and the load branch of
+    /// the lazy-mint path each refuse, and nothing is minted over the key.
+    #[test]
+    #[serial]
+    fn every_window_key_loader_refuses_the_owner_key() {
+        use base64::Engine as _;
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "owner-window";
+        let profile = owner_profile(dir.path(), name);
+        let older_form = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(OWNER_KEY);
+        put_raw(&profile.policy_window_state_key_id, &older_form);
+        let store = PersistedWindowStore::at_path(dir.path().join("owner.window"));
+        let k = key(name, "native", 86_400);
+        let now = now_ms().unwrap();
+        let outcome = store
+            .record_and_persist(&profile, &[entry(k.clone(), now, 100)])
+            .unwrap();
+        assert!(
+            !outcome.newly_minted,
+            "the planted key is loaded, not minted"
+        );
+        store
+            .load_into(name, &profile, &PolicyStateStore::new())
+            .unwrap();
+        assert_eq!(store.pending_reservations(&profile).unwrap().len(), 0);
+
+        put_raw(&KeyringEntryRef::default_owner_key(name), &older_form);
+        assert!(matches!(
+            store.load_into(name, &profile, &PolicyStateStore::new()),
+            Err(WindowStoreError::KeyMatchesOwnerPublicKey)
+        ));
+        assert!(matches!(
+            store.pending_reservations(&profile),
+            Err(WindowStoreError::KeyMatchesOwnerPublicKey)
+        ));
+        assert!(matches!(
+            store.record_and_persist(&profile, &[entry(k, now, 100)]),
+            Err(WindowStoreError::KeyMatchesOwnerPublicKey)
+        ));
+        assert!(
+            get_raw(&profile.policy_window_state_key_id).as_deref() == Some(older_form.as_str()),
+            "the refusal mints nothing over the key"
+        );
+    }
+
+    /// A G-strkey owner value at the window-key coordinate decodes to 42
+    /// bytes, so the readers refuse it as a key.
+    #[test]
+    #[serial]
+    fn a_g_strkey_owner_value_is_refused_by_the_window_readers() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "owner-window-strkey";
+        let profile = owner_profile(dir.path(), name);
+        let store = PersistedWindowStore::at_path(dir.path().join("strkey.window"));
+        store
+            .record_and_persist(
+                &profile,
+                &[entry(key(name, "native", 86_400), now_ms().unwrap(), 1)],
+            )
+            .unwrap();
+        put_raw(
+            &profile.policy_window_state_key_id,
+            &stellar_agent_core::profile::owner_key::encode_owner_public_key(&OWNER_KEY),
+        );
+        for result in [
+            store.load_into(name, &profile, &PolicyStateStore::new()),
+            store.pending_reservations(&profile).map(|_| ()),
+        ] {
+            let err = result.expect_err("a G-strkey is not a 32-byte key");
+            assert!(err.to_string().contains("got 42"), "{err}");
+        }
+    }
+
+    /// An owner-namespace window-key coordinate refuses before any keyring
+    /// read, on every loader, and mints nothing there.
+    #[test]
+    #[serial]
+    fn an_owner_namespace_window_key_coordinate_is_refused() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut profile = owner_profile(dir.path(), "owner-window-coord");
+        profile.policy_window_state_key_id =
+            KeyringEntryRef::new("stellar-agent-owner-B", "default");
+        let store = PersistedWindowStore::at_path(dir.path().join("coord.window"));
+        assert!(matches!(
+            store.record_and_persist(
+                &profile,
+                &[entry(
+                    key("owner-window-coord", "native", 86_400),
+                    now_ms().unwrap(),
+                    1
+                )]
+            ),
+            Err(WindowStoreError::KeyMatchesOwnerPublicKey)
+        ));
+        assert!(matches!(
+            store.pending_reservations(&profile),
+            Err(WindowStoreError::KeyMatchesOwnerPublicKey)
+        ));
+        assert!(matches!(
+            store.load_into("owner-window-coord", &profile, &PolicyStateStore::new()),
+            Err(WindowStoreError::KeyMatchesOwnerPublicKey)
+        ));
+        assert!(
+            get_raw(&profile.policy_window_state_key_id).is_none(),
+            "nothing is minted at the owner coordinate"
+        );
+    }
+
+    /// The helper names the `policy_window_state_key_id` label and the shared
+    /// code.
+    #[test]
+    #[serial]
+    fn the_owner_refusal_names_the_window_label() {
+        use base64::Engine as _;
+        keyring_mock::install().unwrap();
+        put_raw(
+            &KeyringEntryRef::default_owner_key("owner-window-label"),
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(OWNER_KEY),
+        );
+        let owner = OwnerKeyContext::for_profile_name("owner-window-label");
+        let err = refuse_owner_public_key(&OWNER_KEY, &owner).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains(POLICY_STATE_KEY_FIELD), "{message}");
+        assert!(
+            message.contains("validation.key_matches_owner_public_key"),
+            "{message}"
+        );
+        assert!(refuse_owner_public_key(&[0x11; 32], &owner).is_ok());
     }
 }

@@ -665,6 +665,38 @@ fn a_mainnet_default_profile_needs_the_flag() {
     assert_eq!(session.active_network_passphrase(), MAINNET_PASSPHRASE);
 }
 
+/// Trust-root overlays refuse MCP startup on a testnet profile, naming the
+/// key.
+#[test]
+fn trust_root_environment_overlays_refuse_startup_on_testnet() {
+    let home = ProfileHome::new();
+    home.write_profile(
+        "testnet",
+        &noop_profile_toml("testnet", "stellar:testnet", "http://127.0.0.1:1"),
+    );
+    for (variable, value, key) in [
+        (
+            "STELLAR_AGENT_AUDIT_LOG_PATH",
+            "/tmp/overlay-audit.jsonl",
+            "audit_log_path",
+        ),
+        (
+            "STELLAR_AGENT_ATTESTATION_KEY_ID",
+            "{service=\"x\",account=\"y\"}",
+            "attestation_key_id",
+        ),
+    ] {
+        let mut command = home.command(&["--profile", "testnet"]);
+        command.env(variable, value);
+        let stderr = assert_refused_with(&run_with_initialize(command), 1);
+        assert!(
+            stderr.contains("profile.non_overlayable_field"),
+            "{variable}: {stderr}"
+        );
+        assert!(stderr.contains(key), "{variable} must name {key}: {stderr}");
+    }
+}
+
 #[test]
 fn protected_environment_overlay_reports_wire_code() {
     let home = ProfileHome::new();

@@ -367,6 +367,7 @@ where
     crate::commands::submission_record::reconcile_open_reservations(
         &profile,
         &profile_name,
+        crate::common::profile_access::ProfileOrigin::Persisted,
         &rpc_client,
         now_ms,
     )
@@ -454,7 +455,7 @@ where
     };
     let network_key = context.chain_id.caip2_str();
     let opt_in_present: bool = {
-        match load_attestation_key_for_verify(&profile) {
+        match load_attestation_key_for_verify(&profile, &profile_name) {
             Ok(key_bytes) => {
                 let attestation_key = zeroize::Zeroizing::new(key_bytes);
                 default_approval_dir()
@@ -856,8 +857,22 @@ fn parse_denomination_input(asset: &str) -> DenominationInput {
 /// all failures as fail-closed (opt-in absent).
 fn load_attestation_key_for_verify(
     profile: &stellar_agent_core::profile::schema::Profile,
+    profile_name: &str,
 ) -> Result<[u8; 32], ()> {
+    use stellar_agent_core::approval::attest::ATTESTATION_KEY_FIELD;
+    use stellar_agent_core::profile::owner_key;
     let entry_ref = &profile.attestation_key_id;
+    // An owner refusal reads as opt-in absent, like every other failure here;
+    // its code is logged at warn because only the operator can fix it.
+    let owner_refusal = |e: &WalletError| {
+        tracing::warn!(
+            profile = %profile_name,
+            code = %e.code(),
+            "attestation key refused for trustline opt-in verify (fail closed)"
+        );
+    };
+    owner_key::refuse_owner_key_coordinate(entry_ref, ATTESTATION_KEY_FIELD)
+        .map_err(|e| owner_refusal(&e))?;
     let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
         // Fail-closed: the outward contract is a non-displayable unit error
         // (opt-in absent). The classified cause is preserved at debug for
@@ -877,6 +892,12 @@ fn load_attestation_key_for_verify(
     if bytes.len() != 32 {
         return Err(());
     }
+    owner_key::refuse_owner_public_key(
+        &bytes,
+        &owner_key::OwnerKeyContext::for_profile(profile_name, profile),
+        ATTESTATION_KEY_FIELD,
+    )
+    .map_err(|e| owner_refusal(&e))?;
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(arr)
@@ -927,7 +948,67 @@ mod tests {
             &entry_ref.account,
         )
         .unwrap();
-        assert_eq!(load_attestation_key_for_verify(&profile), Err(()));
+        assert_eq!(
+            load_attestation_key_for_verify(&profile, "trustline-attest-no-logon-test"),
+            Err(())
+        );
+    }
+
+    /// The opt-in verify reads a key equal to the owner public key in the
+    /// older form as opt-in absent and logs the code at `warn`, without the
+    /// raw value. A G-strkey owner value and an owner-namespace coordinate
+    /// read as absent too.
+    #[test]
+    #[serial_test::serial]
+    fn load_attestation_key_for_verify_refuses_owner_key_forms() {
+        use stellar_agent_core::profile::schema::KeyringEntryRef;
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let name = "trustline-attest-owner";
+        let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+        let put = |entry_ref: &KeyringEntryRef, value: &str| {
+            KeyringEntry::new(&entry_ref.service, &entry_ref.account)
+                .unwrap()
+                .set_password(value)
+                .unwrap();
+        };
+        let older_form = URL_SAFE_NO_PAD.encode([0x5e_u8; 32]);
+        put(&profile.attestation_key_id, &older_form);
+        assert!(load_attestation_key_for_verify(&profile, name).is_ok());
+
+        put(&KeyringEntryRef::default_owner_key(name), &older_form);
+        let mut result = Ok([0; 32]);
+        let logs = stellar_agent_test_support::with_captured_logs(|| {
+            result = load_attestation_key_for_verify(&profile, name);
+        });
+        assert!(result.is_err(), "the owner key reads as opt-in absent");
+        assert!(!logs.contains(&older_form), "the raw value is never logged");
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(
+            logs.contains("validation.key_matches_owner_public_key"),
+            "{logs}"
+        );
+
+        put(
+            &profile.attestation_key_id,
+            &stellar_agent_core::profile::owner_key::encode_owner_public_key(&[0x5e; 32]),
+        );
+        assert!(
+            load_attestation_key_for_verify(&profile, name).is_err(),
+            "a G-strkey reads as opt-in absent"
+        );
+
+        profile.attestation_key_id = KeyringEntryRef::new("stellar-agent-owner-B", "default");
+        let logs = stellar_agent_test_support::with_captured_logs(|| {
+            result = load_attestation_key_for_verify(&profile, name);
+        });
+        assert!(
+            result.is_err(),
+            "an owner coordinate reads as opt-in absent"
+        );
+        assert!(
+            logs.contains("validation.key_matches_owner_public_key"),
+            "{logs}"
+        );
     }
 
     // ── parse_denomination_input variants ─────────────────────────────────────

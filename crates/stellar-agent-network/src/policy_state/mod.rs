@@ -159,8 +159,8 @@ pub mod lock;
 pub mod store;
 
 pub use store::{
-    MintOutcome, PersistedWindowStore, RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS, ReconcileReport,
-    SettledSubmission, WindowReservation,
+    MintOutcome, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
+    RECONCILE_MIN_AGE_MS, ReconcileReport, SettledSubmission, WindowReservation,
 };
 
 /// Records a confirmed call's contribution into `engine`'s window state and
@@ -288,6 +288,14 @@ pub enum WindowStoreError {
         /// Operator-facing detail. MUST NOT include key material.
         detail: String,
     },
+
+    /// The HMAC key's coordinate sits in the owner key namespace, or the
+    /// loaded key equals the profile's owner public key. Nothing is minted.
+    #[error(
+        "policy window-state store key refused (validation.key_matches_owner_public_key): \
+         `policy_window_state_key_id` is an owner public key or sits in the owner key namespace"
+    )]
+    KeyMatchesOwnerPublicKey,
 
     /// A window bucket cannot admit the reservation.
     ///

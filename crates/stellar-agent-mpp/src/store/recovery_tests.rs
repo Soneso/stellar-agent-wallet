@@ -105,6 +105,7 @@ impl Fixture {
         emit_state_audit(
             &self.profile,
             &self.name,
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
             AuditEntry::new_mpp_state_adopted(
                 &self.name,
                 generation,
@@ -117,6 +118,7 @@ impl Fixture {
         MppAuthorizationStore::open_for_read_audited_at(
             self.path.clone(),
             &self.key_ref,
+            &self.name,
             |generation| self.adopt_row(generation),
         )?
         .ok_or_else(state_error)
@@ -127,6 +129,7 @@ impl Fixture {
             emit_state_audit(
                 &self.profile,
                 &self.name,
+                stellar_agent_core::audit_log::BindingCheck::Enforce,
                 AuditEntry::new_mpp_state_reset(
                     &self.name,
                     generation,
@@ -333,6 +336,7 @@ async fn reset_recovers_a_counter_gap_and_invalidates_snapshots_and_handles() {
     let clean = MppAuthorizationStore::open_for_prepare_audited_at(
         fx.path.clone(),
         &fx.key_ref,
+        &fx.name,
         |generation| fx.adopt_row(generation),
     )
     .expect("clean prepare");

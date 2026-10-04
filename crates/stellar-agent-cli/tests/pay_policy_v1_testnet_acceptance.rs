@@ -35,7 +35,7 @@
 //!    --expected-address <owner_g>` as its own subprocess (the owner seed is
 //!    set only on that subprocess's environment) — the production write path
 //!    `enroll_owner_key.rs` drives, at the exact coordinate
-//!    `commands::policy_engine::owner_pubkey_b64`'s production (non-test)
+//!    `commands::policy_engine::owner_pubkey_raw`'s production (non-test)
 //!    branch reads from at gate time. No test-only file override is used
 //!    anywhere in this suite.
 //! 5. A source and a destination account are generated and Friendbot-funded

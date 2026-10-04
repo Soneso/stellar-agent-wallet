@@ -622,7 +622,8 @@ async fn commit_with_valid_nonce_but_no_attestation_returns_indistinguishable_ap
     let now_ms: u64 = 1_893_456_000_000; // 2030-01-01 UTC (stable test epoch)
     let expiry_ms: u64 = now_ms + 60_000; // 60 s in the future
 
-    let nonce_mint = NonceMint::from_profile(&profile).expect("NonceMint::from_profile");
+    let nonce_mint =
+        NonceMint::from_profile(&profile, "nonce-test").expect("NonceMint::from_profile");
     let nonce = nonce_mint
         .mint(
             &PayCommitCatalogue,

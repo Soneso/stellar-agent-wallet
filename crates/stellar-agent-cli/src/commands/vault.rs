@@ -451,6 +451,7 @@ where
     crate::commands::submission_record::reconcile_open_reservations(
         &profile,
         &profile_name,
+        crate::common::profile_access::ProfileOrigin::Persisted,
         &primary_rpc,
         now_ms,
     )
@@ -858,6 +859,7 @@ where
     crate::commands::submission_record::reconcile_open_reservations(
         &profile,
         &profile_name,
+        crate::common::profile_access::ProfileOrigin::Persisted,
         &primary_rpc,
         now_ms,
     )

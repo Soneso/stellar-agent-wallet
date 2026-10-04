@@ -2243,7 +2243,7 @@ mod helpers {
     }
 
     pub(super) fn mint_for(profile: &Profile) -> NonceMint {
-        NonceMint::from_profile(profile).expect("NonceMint::from_profile")
+        NonceMint::from_profile(profile, "nonce-test").expect("NonceMint::from_profile")
     }
 }
 

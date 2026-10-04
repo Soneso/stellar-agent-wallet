@@ -24,6 +24,8 @@ use stellar_agent_core::error::AuthError;
 /// | `TtlTooShort` | `nonce.ttl_too_short` |
 /// | `KeyringError` | `keyring.error` |
 /// | `KeyTooShort` | `nonce.key_too_short` |
+/// | `KeyTooLong` | `nonce.key_too_long` |
+/// | `KeyMatchesOwnerPublicKey` | `validation.key_matches_owner_public_key` |
 /// | `InputTooLong` | `nonce.input_too_long` |
 /// | `SerialiseFailed` | `nonce.serialise_failed` |
 ///
@@ -128,6 +130,27 @@ pub enum NonceError {
         actual: usize,
     },
 
+    /// The keyring entry decodes to more than 32 bytes.
+    ///
+    /// The nonce key is exactly 32 bytes. A longer value is not a nonce key:
+    /// an owner public key stored as a G-strkey decodes to 42 bytes.
+    ///
+    /// Wire code: `nonce.key_too_long`.
+    #[error("nonce key too long: {actual} bytes decoded (need exactly 32)")]
+    KeyTooLong {
+        /// Number of decoded bytes actually present in the keyring entry.
+        actual: usize,
+    },
+
+    /// The nonce key's coordinate sits in the owner key namespace, or the
+    /// loaded key equals the profile's owner public key.
+    ///
+    /// Wire code: `validation.key_matches_owner_public_key`.
+    #[error(
+        "the key for `mcp_nonce_key_alias` is an owner public key or sits in the owner key namespace"
+    )]
+    KeyMatchesOwnerPublicKey,
+
     /// A variable-length HMAC domain field exceeds the u32 length-prefix bound.
     ///
     /// Variable-length fields are prefixed as big-endian u32 for boundary-collision
@@ -212,6 +235,8 @@ impl NonceError {
             NonceError::TtlTooShort { .. } => "nonce.ttl_too_short",
             NonceError::KeyringError(_) => "keyring.error",
             NonceError::KeyTooShort { .. } => "nonce.key_too_short",
+            NonceError::KeyTooLong { .. } => "nonce.key_too_long",
+            NonceError::KeyMatchesOwnerPublicKey => "validation.key_matches_owner_public_key",
             NonceError::InputTooLong { .. } => "nonce.input_too_long",
             NonceError::SerialiseFailed { .. } => "nonce.serialise_failed",
             // Forward-compat fallback: deliberately distinct from any valid wire
@@ -331,6 +356,18 @@ mod tests {
             }
             .wire_code(),
             "nonce.input_too_long"
+        );
+    }
+
+    #[test]
+    fn wire_code_key_too_long_and_owner_refusal() {
+        assert_eq!(
+            NonceError::KeyTooLong { actual: 42 }.wire_code(),
+            "nonce.key_too_long"
+        );
+        assert_eq!(
+            NonceError::KeyMatchesOwnerPublicKey.wire_code(),
+            "validation.key_matches_owner_public_key"
         );
     }
 

@@ -11,7 +11,9 @@
 use stellar_agent_network::keyring::keyed_audit_access;
 use zeroize::Zeroizing;
 
-use stellar_agent_core::audit_log::{AuditEntry, AuditWriter, AuditWriterRegistry, KeyPurpose};
+use stellar_agent_core::audit_log::{
+    AuditEntry, AuditWriter, AuditWriterRegistry, BindingCheck, KeyPurpose,
+};
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::observability::RedactedStrkey;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
@@ -37,8 +39,16 @@ pub(super) fn emit_keyring_key_written(
     public_address: Option<RedactedStrkey>,
     request_id: &str,
 ) {
-    let access = match keyed_audit_access(profile) {
+    let access = match keyed_audit_access(profile, profile_name, BindingCheck::Enforce) {
         Ok(access) => access,
+        Err(e) if crate::commands::value_audit::is_binding_refusal(&e) => {
+            tracing::warn!(
+                profile = %profile_name,
+                code = %e.code(),
+                "key write audit: audit binding changed; KeyringKeyWritten NOT emitted"
+            );
+            return;
+        }
         Err(e) => {
             tracing::warn!(
                 profile = %profile_name,
@@ -129,13 +139,34 @@ pub(super) fn emit_keyring_key_written_with_writer(
 /// `rotate-audit-key`, which reads the freshly rotated key back to re-sign the
 /// per-file chain-root sidecars.
 ///
+/// A coordinate in the owner key namespace is refused before the read, and a
+/// key equal to the owner public key of `profile` selected as `profile_name`
+/// is refused after decoding.
+///
 /// # Errors
 ///
 /// - [`WalletError::Auth`] if the keyring entry is unavailable.
 /// - [`WalletError::Internal`] if the stored value is not valid base64 or not
 ///   exactly 32 bytes.
-pub(crate) fn load_audit_hmac_key(profile: &Profile) -> Result<Zeroizing<[u8; 32]>, WalletError> {
-    stellar_agent_network::keyring::load_hmac_key_32(&profile.audit_log_hash_chain_key_id)
+/// - [`WalletError::Validation`] with `validation.key_matches_owner_public_key`
+///   when the key is or may be the owner public key.
+pub(crate) fn load_audit_hmac_key(
+    profile: &Profile,
+    profile_name: &str,
+) -> Result<Zeroizing<[u8; 32]>, WalletError> {
+    use stellar_agent_core::profile::owner_key;
+    let entry_ref = &profile.audit_log_hash_chain_key_id;
+    owner_key::refuse_owner_key_coordinate(
+        entry_ref,
+        stellar_agent_network::keyring::AUDIT_KEY_FIELD,
+    )?;
+    let key = stellar_agent_network::keyring::load_hmac_key_32(entry_ref)?;
+    owner_key::refuse_owner_public_key(
+        key.as_ref(),
+        &owner_key::OwnerKeyContext::for_profile(profile_name, profile),
+        stellar_agent_network::keyring::AUDIT_KEY_FIELD,
+    )?;
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -251,5 +282,51 @@ mod tests {
             rows[0].get("public_address").is_none(),
             "an HMAC-key rotation row carries no public address"
         );
+    }
+
+    /// The audit key loader `pool init` uses refuses a key equal to the owner
+    /// public key in the older form, a G-strkey owner value, and an
+    /// owner-namespace coordinate.
+    #[test]
+    #[serial]
+    fn load_audit_hmac_key_refuses_owner_key_forms() {
+        use base64::Engine as _;
+        keyring_mock::install().expect("mock keyring");
+        let name = "audit-emit-owner";
+        let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+        let put = |entry_ref: &KeyringEntryRef, value: &str| {
+            keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+                .unwrap()
+                .set_password(value)
+                .unwrap();
+        };
+        let older_form = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x3e_u8; 32]);
+        put(&profile.audit_log_hash_chain_key_id, &older_form);
+        assert!(load_audit_hmac_key(&profile, name).is_ok());
+        put(&KeyringEntryRef::default_owner_key(name), &older_form);
+        let Err(err) = load_audit_hmac_key(&profile, name) else {
+            panic!("the load refuses");
+        };
+        assert_eq!(err.code(), "validation.key_matches_owner_public_key");
+        assert!(
+            err.to_string().contains("audit_log_hash_chain_key_id"),
+            "{err}"
+        );
+
+        put(
+            &profile.audit_log_hash_chain_key_id,
+            &stellar_agent_core::profile::owner_key::encode_owner_public_key(&[0x3e; 32]),
+        );
+        let Err(err) = load_audit_hmac_key(&profile, name) else {
+            panic!("the load refuses");
+        };
+        assert!(err.to_string().contains("got 42"), "{err}");
+
+        profile.audit_log_hash_chain_key_id =
+            KeyringEntryRef::new("stellar-agent-owner-B", "default");
+        let Err(err) = load_audit_hmac_key(&profile, name) else {
+            panic!("the load refuses");
+        };
+        assert_eq!(err.code(), "validation.key_matches_owner_public_key");
     }
 }

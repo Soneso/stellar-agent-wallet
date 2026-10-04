@@ -37,13 +37,18 @@
 
 use clap::{ArgGroup, Args};
 use serde::Serialize;
+use stellar_agent_core::approval::attest::ATTESTATION_KEY_FIELD;
 use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::profile::ResolvedProfileName;
+use stellar_agent_core::error::WalletError;
+use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_core::profile::{ResolvedProfileName, loader, owner_key};
 use stellar_agent_network::keyring::init_platform_keyring_store;
 use uuid::Uuid;
 
-use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
+use crate::common::profile_access::{
+    injected_profile_load, profile_access_envelope, reconcile_loaded_profile,
+};
 use crate::common::render;
 
 use super::audit_emit::emit_keyring_key_written;
@@ -108,11 +113,32 @@ struct RotateAttestationKeyData {
 ///
 /// Never panics.
 pub async fn run(args: &RotateAttestationKeyArgs) -> i32 {
+    run_with_dependencies(args, injected_profile_load, init_platform_keyring_store).await
+}
+
+/// Testable core of [`run`] with the profile loader and the platform-keyring
+/// initialiser injected.
+///
+/// Production callers use [`run`], which supplies the real profile loader and
+/// [`init_platform_keyring_store`]. Tests substitute an in-memory profile and
+/// a spy initialiser over a mock keyring store.
+async fn run_with_dependencies<LoadProfile, InitKeyring>(
+    args: &RotateAttestationKeyArgs,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    LoadProfile: FnOnce(&str) -> Result<Profile, loader::ProfileLoadError>,
+    InitKeyring: FnOnce() -> Result<(), WalletError>,
+{
     // ── Step 1: load the profile FIRST so a nonexistent profile never reaches
     // the keyring init.  Eliminates the process-global keyring-store race.
-    let profile = match load_profile_reconciled(&ResolvedProfileName::from_flag(
-        args.profile_name(),
-    )) {
+    // Reconciled in the CALLER of the injected loader: a check inside the
+    // closure would be bypassed by every test that supplies its own.
+    let profile = match reconcile_loaded_profile(
+        load_profile(args.profile_name()),
+        &ResolvedProfileName::from_flag(args.profile_name()),
+    ) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(profile = %args.profile_name(), error = %e, "profile access refused");
@@ -121,13 +147,20 @@ pub async fn run(args: &RotateAttestationKeyArgs) -> i32 {
         }
     };
 
-    // ── Step 2: initialise the platform keyring store.
-    if let Err(e) = init_platform_keyring_store() {
+    // ── Step 2: a coordinate in the owner key namespace refuses before the
+    // keyring opens, so the rotation never writes over an owner entry.
+    let entry_ref = &profile.attestation_key_id;
+    if let Err(e) = owner_key::refuse_owner_key_coordinate(entry_ref, ATTESTATION_KEY_FIELD) {
         render::render_json(&Envelope::err(&e));
         return 1;
     }
 
-    let entry_ref = &profile.attestation_key_id;
+    // ── Step 3: initialise the platform keyring store.
+    if let Err(e) = init_keyring() {
+        render::render_json(&Envelope::err(&e));
+        return 1;
+    }
+
     match rotate_hmac_like_key(entry_ref, "rotate_attestation_key") {
         Ok(()) => {
             let request_id = Uuid::new_v4().to_string();
@@ -217,6 +250,52 @@ mod tests {
             profile: None,
         };
         let code = run(&args).await;
+        assert_eq!(code, 1);
+    }
+
+    /// An attestation-key coordinate in the owner key namespace refuses
+    /// before the keyring opens, and the owner entry is not overwritten.
+    #[tokio::test]
+    #[serial]
+    async fn an_owner_namespace_coordinate_refuses_the_rotation() {
+        use stellar_agent_core::profile::schema::KeyringEntryRef;
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let name = "rotate-attestation-owner";
+        let owner = KeyringEntryRef::default_owner_key(name);
+        let owner_value = owner_key::encode_owner_public_key(&[0x5b; 32]);
+        keyring_core::Entry::new(&owner.service, &owner.account)
+            .unwrap()
+            .set_password(&owner_value)
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        profile.attestation_key_id = owner.clone();
+
+        let args = RotateAttestationKeyArgs {
+            name: Some(name.to_owned()),
+            profile: None,
+        };
+        let init_calls = std::cell::Cell::new(0_u32);
+        let code = run_with_dependencies(
+            &args,
+            move |_name| Ok(profile),
+            || {
+                init_calls.set(init_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(
+            keyring_core::Entry::new(&owner.service, &owner.account)
+                .unwrap()
+                .get_password()
+                .ok()
+                == Some(owner_value),
+            "the owner entry is not overwritten"
+        );
+        assert_eq!(init_calls.get(), 0, "the refusal precedes the keyring");
         assert_eq!(code, 1);
     }
 }

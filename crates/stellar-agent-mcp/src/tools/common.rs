@@ -1086,11 +1086,16 @@ pub(crate) fn mainnet_write_forbidden_result() -> rmcp::model::CallToolResult {
 /// (as established by [`stellar_agent_core::profile::schema::KeyringEntryRef::default_attestation_key`]).
 /// The stored value is URL-safe base64 no-pad-encoded 32 bytes.
 ///
+/// A coordinate in the owner key namespace is refused before the read, and a
+/// key equal to the profile's owner public key is refused after decoding.
+/// Both refusals log `validation.key_matches_owner_public_key` at `warn`.
+///
 /// # Errors
 ///
 /// Returns `Err(ErrorData)` mapping to
-/// [`approval_required_indistinguishable`] on any keyring or decode failure,
-/// preserving the indistinguishability invariant at the call site.
+/// [`approval_required_indistinguishable`] on any keyring or decode failure
+/// and on an owner-key refusal, preserving the indistinguishability invariant
+/// at the call site.
 ///
 /// # Security
 ///
@@ -1111,6 +1116,21 @@ pub(crate) fn load_attestation_key(
     // indistinguishability rule (see `approval_required_indistinguishable`), so
     // an oracle cannot tell key-absence from an environmental keyring failure.
     // The classified cause is preserved at debug for operator forensics only.
+    // An owner-key refusal is the operator's to fix, so its code is logged at
+    // warn; the wire error stays uniform.
+    let owner_refusal = |e: &stellar_agent_core::error::WalletError| {
+        tracing::warn!(
+            profile = %profile_name,
+            code = %e.code(),
+            "attestation key refused: it is or may be the owner public key"
+        );
+        approval_required_indistinguishable(&profile_name)
+    };
+    stellar_agent_core::profile::owner_key::refuse_owner_key_coordinate(
+        entry_ref,
+        stellar_agent_core::approval::attest::ATTESTATION_KEY_FIELD,
+    )
+    .map_err(|e| owner_refusal(&e))?;
     let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
         tracing::debug!(
             error = %e,
@@ -1140,6 +1160,28 @@ pub(crate) fn load_attestation_key(
         tracing::debug!(len = bytes.len(), "attestation key length mismatch");
         return Err(approval_required_indistinguishable(&profile_name));
     }
+
+    stellar_agent_core::profile::owner_key::refuse_owner_public_key(
+        &bytes,
+        &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
+            &profile_name,
+            profile,
+        ),
+        stellar_agent_core::approval::attest::ATTESTATION_KEY_FIELD,
+    )
+    .map_err(|e| {
+        if matches!(
+            e,
+            stellar_agent_core::error::WalletError::Validation(
+                stellar_agent_core::error::ValidationError::KeyMatchesOwnerPublicKey { .. }
+            )
+        ) {
+            owner_refusal(&e)
+        } else {
+            tracing::debug!(error = %e, "owner key read failed for the attestation key check");
+            approval_required_indistinguishable(&profile_name)
+        }
+    })?;
 
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
@@ -1308,9 +1350,11 @@ impl WalletServer {
         if report.settled.is_empty() {
             return;
         }
-        let Ok(audit) =
-            crate::tools::value_audit::require_value_audit_writer(&self.profile, &profile_name)
-        else {
+        let Ok(audit) = crate::tools::value_audit::require_value_audit_writer(
+            &self.profile,
+            &profile_name,
+            self.audit_binding,
+        ) else {
             tracing::debug!(
                 profile = %profile_name,
                 settled = report.settled.len(),
@@ -2639,6 +2683,8 @@ mod tests {
                 name: "nonce-key".to_owned(),
             }),
             NonceError::KeyTooShort { actual: 16 },
+            NonceError::KeyTooLong { actual: 42 },
+            NonceError::KeyMatchesOwnerPublicKey,
             NonceError::InputTooLong {
                 field: "tool_name",
                 len: usize::MAX,
@@ -2922,6 +2968,47 @@ mod tests {
     }
 
     // ── dispatch_gate: approval_required_indistinguishable wire code ──────────
+
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn load_attestation_key_answers_owner_key_forms_uniformly() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+            "mcp-attest-forms",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .build();
+        let uniform =
+            error_envelope_parts(&approval_required_indistinguishable("mcp-attest-forms"));
+        keyring_core::Entry::new(
+            &profile.attestation_key_id.service,
+            &profile.attestation_key_id.account,
+        )
+        .unwrap()
+        .set_password(&stellar_agent_core::profile::owner_key::encode_owner_public_key(&[0x23; 32]))
+        .unwrap();
+        let strkey = load_attestation_key(&profile).expect_err("a G-strkey is no key");
+        assert_eq!(error_envelope_parts(&strkey), uniform);
+
+        profile.attestation_key_id = stellar_agent_core::profile::schema::KeyringEntryRef::new(
+            "stellar-agent-owner-B",
+            "default",
+        );
+        let mut coordinate = None;
+        let logs = stellar_agent_test_support::with_captured_logs(|| {
+            coordinate = load_attestation_key(&profile).err();
+        });
+        let coordinate = coordinate.expect("an owner coordinate refuses");
+        assert_eq!(error_envelope_parts(&coordinate), uniform);
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(
+            logs.contains("validation.key_matches_owner_public_key"),
+            "{logs}"
+        );
+    }
 
     #[test]
     fn approval_required_indistinguishable_has_expected_wire_code() {

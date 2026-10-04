@@ -57,7 +57,7 @@ Transaction commands read the chain from the resolved profile. An unnamed, missi
 ### RPC endpoints
 
 `--rpc-url <URL>` and `--secondary-rpc-url <URL>` are optional. Without a flag, each endpoint comes from the profile.
-On testnet, a flag replaces its profile field. On mainnet, either flag refuses with `profile.non_overlayable_field`, including an equal value.
+On testnet, a flag replaces its profile field. On mainnet, either flag refuses with `profile.non_overlayable_field`, including an equal value. The same code refuses environment and programmatic overlays outside their classes; see [Loader source order](../profiles.md#loader-source-order).
 RPC URL flags refuse credentials. Configure credentialed endpoints in the profile.
 
 Smart-account rule commands use the effective secondary for cross-RPC checks. `smart-account multicall` requires a secondary endpoint.
@@ -140,7 +140,7 @@ Every signature must pass, and each signature set must have at least one: on a f
 
 Every value-moving signing verb (`pay`, `claim`, `accounts create` sponsored mode, `trustline`, `trade`, `lend`, `vault`) proves the active profile's audit chain-root key is acquirable BEFORE any signing key is touched or transaction submitted. A profile fresh from `profile init` has the audit-log keyring COORDINATE but no key material — `profile rotate-audit-key <name>` mints it. Until that runs, these verbs refuse with the wire code `audit.chain_key_unavailable` rather than signing unaudited. Build-only/simulate stages are unaffected: they neither sign nor submit, so they never reach this pre-flight. On `pay --submit-only` and `claim --submit-only` the endpoint identity probe runs on the command's own client ahead of the policy gate and ahead of this pre-flight, so an `--rpc-url` pointing at a different network than `--network` is refused before either one runs. This pre-flight fails closed only for a persisted `<name>.toml` profile: `pay`, `claim`, and `accounts create` keep their zero-config posture — the in-memory profile synthesized when no profile was named and no `default.toml` exists stays fail-open on this specific check. See [Key-rotation subcommands](profile-and-governance.md#key-rotation-subcommands) and [Concepts: fail-closed on an unminted audit key](../concepts.md#fail-closed-on-an-unminted-audit-key).
 
-The same pre-flight proves the audit log still contains the chain tip its keyring-held anchor names, refusing with `audit.tip_anchor_mismatch` when the log was restored from an older copy, truncated, or substituted. A log that moved forward past its anchor is absorbed, not refused, and a log with no anchor is adopted on first use with no operator action. Recovery is [`audit reanchor`](profile-and-governance.md#audit-reanchor---profile-name---acknowledge-rollback).
+The same pre-flight proves the audit log still contains the chain tip its keyring-held anchor names, refusing with `audit.tip_anchor_mismatch` when the log was restored from an older copy, truncated, or substituted. A log that moved forward past its anchor is absorbed, not refused, and a log with no anchor is adopted on first use with no operator action. A profile whose `audit_log_path` or audit key differs from the binding recorded in the keyring refuses with `audit.log_binding_changed`. Recovery from either is [`audit reanchor`](profile-and-governance.md#audit-reanchor---profile-name---acknowledge-rollback).
 
 ## Startup advisory
 

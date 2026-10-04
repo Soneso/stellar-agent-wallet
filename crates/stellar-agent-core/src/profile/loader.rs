@@ -1,18 +1,19 @@
 //! figment-backed profile loader.
 //!
-//! The profile file is the record the operator audits. `chain_id` comes only
-//! from that file. On mainnet, overlays also cannot name `rpc_url`,
-//! `secondary_rpc_url`, `oracle_provider_url`, or `mcp_signer_default`. Naming
-//! a protected field is refused, including an equal value, because an overlay
-//! can hide a later edit to that record.
+//! The profile file is the record the operator audits, and a profile's trust
+//! roots come from that file only. An overlay may set a fixed allowlist of
+//! operational fields. `submit_timeout_seconds` is overlayable on every chain.
+//! The endpoint, signer, fee, threshold, and scan-bound fields are overlayable
+//! on testnet only. `mcp_disabled` accepts only `true`. Naming any other
+//! profile key, alias included, is refused even with an equal value, because
+//! an overlay can hide a later edit to that record.
 //!
-//! Loads the remaining fields from three sources in priority order:
+//! Loads the permitted fields from three sources in priority order:
 //!
-//! 1. **CLI overlay** — programmatically-supplied key/value pairs (highest
-//!    priority; used by `stellar-agent profile show <name>` to surface the
-//!    effective resolved config).
-//! 2. **Environment variables** — `STELLAR_AGENT_<FIELD>` prefixed variables.
-//! 3. **TOML file** — `<profile_dir>/<name>.toml` (lowest priority).
+//! 1. **Programmatic overlay**: key/value pairs a library caller passes to
+//!    [`load_with_overlay`] (highest priority).
+//! 2. **Environment variables**: `STELLAR_AGENT_<FIELD>` prefixed variables.
+//! 3. **TOML file**: `<profile_dir>/<name>.toml` (lowest priority).
 //!
 //! # Path resolution
 //!
@@ -152,8 +153,110 @@ const SUPPORTED_VERSION: u32 = 2;
 
 /// The environment-variable prefix used to override profile fields.
 ///
-/// E.g. `STELLAR_AGENT_RPC_URL=https://...` overrides `rpc_url`.
+/// On a testnet profile, `STELLAR_AGENT_RPC_URL=https://...` overrides
+/// `rpc_url`. [`OVERLAY_CLASSES`] lists the keys an overlay may set and on
+/// which chains. A variable whose suffix names no profile key, such as
+/// `STELLAR_AGENT_HOME`, is not an overlay and is ignored.
 const ENV_PREFIX: &str = "STELLAR_AGENT_";
+
+/// How an environment or programmatic overlay may set one profile key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayClass {
+    /// Any value, on every chain.
+    EveryChain,
+    /// Any value on a testnet profile; refused on every other chain.
+    TestnetOnly,
+    /// Only the boolean `true`, on every chain, so an overlay can tighten the
+    /// profile and never loosen it.
+    TightenOnly,
+    /// Refused on every chain. The value comes from the profile file only.
+    Never,
+}
+
+/// Every serde key `PartialProfile` accepts, field names and aliases alike,
+/// with its overlay class.
+///
+/// The loader checks overlay keys in this table's order, so the key a refusal
+/// names is deterministic. A key absent from this table is not a profile key,
+/// and an overlay naming it is ignored.
+const OVERLAY_CLASSES: &[(&str, OverlayClass)] = &[
+    ("version", OverlayClass::Never),
+    ("rpc_url", OverlayClass::TestnetOnly),
+    ("mcp_signer_default", OverlayClass::TestnetOnly),
+    ("mcp_nonce_key_alias", OverlayClass::Never),
+    ("cross_check_threshold_stroops", OverlayClass::TestnetOnly),
+    ("usd_threshold", OverlayClass::TestnetOnly),
+    ("classic_fee_per_op_stroops", OverlayClass::TestnetOnly),
+    ("classic_max_fee_per_op_stroops", OverlayClass::TestnetOnly),
+    ("submit_timeout_seconds", OverlayClass::EveryChain),
+    ("audit_log_path", OverlayClass::Never),
+    ("mcp_disabled", OverlayClass::TightenOnly),
+    ("audit_log_hash_chain_key_id", OverlayClass::Never),
+    ("policy_owner_key_id", OverlayClass::Never),
+    ("attestation_key_id", OverlayClass::Never),
+    ("counterparty_cache_key_id", OverlayClass::Never),
+    ("oracle_provider_url", OverlayClass::TestnetOnly),
+    ("policy", OverlayClass::Never),
+    ("wallet", OverlayClass::Never),
+    (
+        "smart_account_max_context_rule_scan_id",
+        OverlayClass::TestnetOnly,
+    ),
+    (
+        "session_rule_max_horizon_ledgers",
+        OverlayClass::TestnetOnly,
+    ),
+    ("secondary_rpc_url", OverlayClass::TestnetOnly),
+    ("pool_master_key_id", OverlayClass::Never),
+    ("pool_config", OverlayClass::Never),
+    ("pool_initialization", OverlayClass::Never),
+    ("remote_approval", OverlayClass::Never),
+    ("served_pages", OverlayClass::Never),
+    ("policy_window_state_key_id", OverlayClass::Never),
+];
+
+/// Refuses an overlay that names a key its class forbids on `chain_id`.
+///
+/// `chain_id` is checked first and on every chain, then each row of
+/// [`OVERLAY_CLASSES`] in order. A nested key reaches the check through its
+/// top-level name, so `wallet.mlock_required` is checked as `wallet`.
+fn check_overlay_keys(
+    overlay_data: &figment::value::Map<figment::Profile, figment::value::Dict>,
+    chain_id: Caip2,
+) -> Result<(), ProfileLoadError> {
+    fn named<'a>(
+        overlay_data: &'a figment::value::Map<figment::Profile, figment::value::Dict>,
+        key: &'a str,
+    ) -> impl Iterator<Item = &'a figment::value::Value> + 'a {
+        overlay_data.values().filter_map(move |dict| dict.get(key))
+    }
+    if named(overlay_data, "chain_id").next().is_some() {
+        return Err(ProfileLoadError::NonOverlayableField { field: "chain_id" });
+    }
+    for &(field, class) in OVERLAY_CLASSES {
+        let mut values = named(overlay_data, field).peekable();
+        if values.peek().is_none() {
+            continue;
+        }
+        match class {
+            OverlayClass::EveryChain => {}
+            OverlayClass::TestnetOnly => {
+                if chain_id != Caip2::Testnet {
+                    return Err(ProfileLoadError::NonOverlayableField { field });
+                }
+            }
+            OverlayClass::TightenOnly => {
+                if !values.all(|value| matches!(value, figment::value::Value::Bool(_, true))) {
+                    return Err(ProfileLoadError::OverlayMayOnlyTighten { field });
+                }
+            }
+            OverlayClass::Never => {
+                return Err(ProfileLoadError::NonOverlayableField { field });
+            }
+        }
+    }
+    Ok(())
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Errors
@@ -168,7 +271,19 @@ pub enum ProfileLoadError {
         "profile field `{field}` is read from the profile file only; remove it from the environment, the overlay, or the command line"
     )]
     NonOverlayableField {
-        /// The protected field named by the overlay.
+        /// The non-overlayable field named by the overlay.
+        field: &'static str,
+    },
+
+    /// An overlay sets a tighten-only field to a value other than `true`.
+    ///
+    /// Shares the wire code `profile.non_overlayable_field` with
+    /// [`ProfileLoadError::NonOverlayableField`].
+    #[error(
+        "profile field `{field}` may only be set to `true` outside the profile file; set it in the profile file, or remove it from the environment and the overlay"
+    )]
+    OverlayMayOnlyTighten {
+        /// The tighten-only field named by the overlay.
         field: &'static str,
     },
 
@@ -419,6 +534,9 @@ impl ProfileLoadError {
             Self::NonOverlayableField { field } => {
                 ValidationError::ProfileNonOverlayableField { field }
             }
+            Self::OverlayMayOnlyTighten { field } => {
+                ValidationError::ProfileOverlayMayOnlyTighten { field }
+            }
             Self::MainnetRequiresExplicitProfile { name, named_by } => {
                 ValidationError::MainnetRequiresExplicitProfile {
                     name: name.clone(),
@@ -456,6 +574,7 @@ impl ProfileLoadError {
             // Operator-authored input: the name, the file's syntax, its
             // version, or a field whose value is out of bounds.
             Self::NonOverlayableField { .. }
+            | Self::OverlayMayOnlyTighten { .. }
             | Self::MainnetRequiresExplicitProfile { .. }
             | Self::InvalidName { .. }
             | Self::VersionUnsupported { .. }
@@ -514,15 +633,26 @@ fn guard_name_for_save(name: &str) -> Result<(), ProfileSaveError> {
 /// Steps:
 /// 1. Resolve the profile-file path via `default_profile_dir()`.
 /// 2. Fail fast if the file does not exist.
-/// 3. Merge sources: TOML file → env-var overlay (priority: env wins).
-/// 4. Reject `version != 2` with [`ProfileLoadError::VersionUnsupported`].
-/// 5. Resolve the testnet `rpc_url` default if the TOML omitted it; a mainnet
+/// 3. Reject `version != 2` with [`ProfileLoadError::VersionUnsupported`].
+/// 4. Refuse an overlay that names `chain_id`, then check every other overlay
+///    key against its class. `submit_timeout_seconds` is overlayable on every
+///    chain. `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`,
+///    `mcp_signer_default`, `cross_check_threshold_stroops` (alias
+///    `usd_threshold`), the two classic fee fields,
+///    `smart_account_max_context_rule_scan_id`, and
+///    `session_rule_max_horizon_ledgers` are overlayable on testnet only.
+///    `mcp_disabled` accepts only `true`, refusing any other value with
+///    [`ProfileLoadError::OverlayMayOnlyTighten`]. Every other profile key
+///    refuses with [`ProfileLoadError::NonOverlayableField`]. A variable that
+///    names no profile key is ignored.
+/// 5. Merge sources: TOML file, then the permitted env-var overlay (env wins).
+/// 6. Resolve the testnet `rpc_url` default if the TOML omitted it; a mainnet
 ///    file without `rpc_url` refuses with
 ///    [`ProfileLoadError::MainnetRpcUrlRequired`].
-/// 6. Resolve `network_passphrase` from `chain_id` (always derived; not
+/// 7. Resolve `network_passphrase` from `chain_id` (always derived; not
 ///    overridable from profile config).
-/// 7. Resolve `audit_log_path` default if the TOML omitted it.
-/// 8. Check `rpc_url`, `secondary_rpc_url`, and `oracle_provider_url` against
+/// 8. Resolve `audit_log_path` default if the TOML omitted it.
+/// 9. Check `rpc_url`, `secondary_rpc_url`, and `oracle_provider_url` against
 ///    the endpoint rule of [`super::schema::check_endpoint_url`], refusing
 ///    with [`ProfileLoadError::InvalidEndpointUrl`].
 ///
@@ -598,9 +728,9 @@ pub fn load_from_path(
 }
 
 /// Reads identity from the file before applying permitted overlays.
-/// The file is the operator's audited record. Naming `chain_id`, or a mainnet
-/// `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, or
-/// `mcp_signer_default`, in an overlay is refused.
+/// The file is the operator's audited record. An overlay key is checked
+/// against `chain_id` first and then against [`OVERLAY_CLASSES`], after the
+/// version check and before any merge.
 fn load_from_path_with_overlays(
     name: &str,
     path: &Path,
@@ -628,7 +758,7 @@ fn load_from_path_with_overlays(
         });
     }
 
-    // ── Step 2: read the file identity, refuse protected overlays, and extract the profile.
+    // ── Step 2: read the file identity, refuse non-overlayable keys, and extract the profile.
     let on_disk: OnDiskChainId = Figment::new()
         .merge(Toml::file(path))
         .extract()
@@ -640,24 +770,7 @@ fn load_from_path_with_overlays(
         name: name.to_owned(),
         source: Box::new(e),
     })?;
-    if overlay_data
-        .values()
-        .any(|dict| dict.contains_key("chain_id"))
-    {
-        return Err(ProfileLoadError::NonOverlayableField { field: "chain_id" });
-    }
-    if on_disk.chain_id.is_mainnet() {
-        for field in [
-            "rpc_url",
-            "secondary_rpc_url",
-            "oracle_provider_url",
-            "mcp_signer_default",
-        ] {
-            if overlay_data.values().any(|dict| dict.contains_key(field)) {
-                return Err(ProfileLoadError::NonOverlayableField { field });
-            }
-        }
-    }
+    check_overlay_keys(&overlay_data, on_disk.chain_id)?;
     let partial: PartialProfile = Figment::new()
         .merge(Toml::file(path))
         .merge(&overlays)
@@ -1297,11 +1410,11 @@ pub enum ProfileSaveError {
 // CLI overlay support
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Loads a profile with an additional CLI-supplied overlay map (highest
+/// Loads a profile with an additional programmatic overlay map (highest
 /// priority source).
 ///
-/// Useful for `stellar-agent profile show <name>` where the caller wants to
-/// display the effective resolved config with any ad-hoc overrides applied.
+/// The overlay keys pass the same class check as the environment overlay,
+/// described in [`load`].
 ///
 /// # Multicall guard
 ///
@@ -1321,6 +1434,9 @@ pub fn load_with_overlay(
 }
 
 /// Loads a profile from an explicit directory with a CLI overlay.
+///
+/// The environment and programmatic overlays are checked together against the
+/// overlay classes described in [`load`].
 ///
 /// # Multicall guard
 ///
@@ -1371,18 +1487,63 @@ pub fn load_with_overlay_from_dir(
 /// - `network_passphrase = Caip2::Testnet.network_passphrase()`
 /// - All optional fields at their schema defaults.
 ///
+/// The returned [`ProfileOrigin`] says which arm answered: a `default.toml`
+/// that exists is [`ProfileOrigin::Persisted`], and only the synthesized
+/// fallback is [`ProfileOrigin::Synthesized`]. The audit binding check keys
+/// on it through [`ProfileOrigin::binding_check`].
+///
 /// # Errors
 ///
 /// Returns an error only if the OS-conventional state directory cannot be
-/// determined (i.e. `directories::ProjectDirs` fails — effectively never on
-/// supported platforms), or if the profile file exists but fails to load.
-pub fn load_default_or_testnet_fallback() -> Result<Profile, ProfileLoadError> {
+/// determined (`directories::ProjectDirs` fails, which supported platforms do
+/// not do), or if the profile file exists but fails to load.
+pub fn load_default_or_testnet_fallback() -> Result<(Profile, ProfileOrigin), ProfileLoadError> {
+    load_default_or_testnet_fallback_from_dir(&default_profile_dir()?)
+}
+
+/// [`load_default_or_testnet_fallback`] over an explicit profile directory.
+///
+/// # Errors
+///
+/// Returns an error if the `default.toml` in `profile_dir` exists but fails to
+/// load.
+pub fn load_default_or_testnet_fallback_from_dir(
+    profile_dir: &Path,
+) -> Result<(Profile, ProfileOrigin), ProfileLoadError> {
     // Pass `None` for the multicall hook: the testnet-fallback path is a
     // pre-multicall startup convenience; no registry is available at this point.
-    match load("default", None) {
-        Ok(profile) => Ok(profile),
-        Err(ProfileLoadError::NotFound { .. }) => Ok(synthesise_default_first_run_profile()),
+    match load_from_dir("default", profile_dir, None) {
+        Ok(profile) => Ok((profile, ProfileOrigin::Persisted)),
+        Err(ProfileLoadError::NotFound { .. }) => Ok((
+            synthesise_default_first_run_profile(),
+            ProfileOrigin::Synthesized,
+        )),
         Err(e) => Err(e),
+    }
+}
+
+/// Where a loaded profile came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileOrigin {
+    /// Loaded from a profile file.
+    Persisted,
+    /// Synthesized in memory because no profile file exists.
+    Synthesized,
+}
+
+impl ProfileOrigin {
+    /// The audit binding check a keyed writer applies to a profile of this
+    /// origin.
+    ///
+    /// A persisted profile records an absent binding; a synthesized one only
+    /// compares, so a profile held only in memory leaves the coordinate
+    /// unrecorded.
+    #[must_use]
+    pub fn binding_check(self) -> crate::audit_log::BindingCheck {
+        match self {
+            Self::Persisted => crate::audit_log::BindingCheck::Enforce,
+            Self::Synthesized => crate::audit_log::BindingCheck::CheckOnly,
+        }
     }
 }
 
@@ -1515,6 +1676,50 @@ struct PartialProfile {
     policy_window_state_key_id: Option<super::schema::KeyringEntryRef>,
 }
 
+/// Lists every field of [`PartialProfile`] once.
+///
+/// The list expands into a destructure with no rest pattern, so a field added
+/// to the struct and missing here fails to compile. The test build also gets
+/// the field names, which a test compares with the field rows of
+/// [`OVERLAY_CLASSES`].
+macro_rules! partial_profile_fields {
+    ($($field:ident),+ $(,)?) => {
+        const _: fn(PartialProfile) = |PartialProfile { $($field: _),+ }| {};
+
+        #[cfg(test)]
+        const PARTIAL_PROFILE_FIELD_NAMES: &[&str] = &[$(stringify!($field)),+];
+    };
+}
+
+partial_profile_fields!(
+    version,
+    rpc_url,
+    mcp_signer_default,
+    mcp_nonce_key_alias,
+    cross_check_threshold_stroops,
+    classic_fee_per_op_stroops,
+    classic_max_fee_per_op_stroops,
+    submit_timeout_seconds,
+    audit_log_path,
+    mcp_disabled,
+    audit_log_hash_chain_key_id,
+    policy_owner_key_id,
+    attestation_key_id,
+    counterparty_cache_key_id,
+    oracle_provider_url,
+    policy,
+    wallet,
+    smart_account_max_context_rule_scan_id,
+    session_rule_max_horizon_ledgers,
+    secondary_rpc_url,
+    pool_master_key_id,
+    pool_config,
+    pool_initialization,
+    remote_approval,
+    served_pages,
+    policy_window_state_key_id,
+);
+
 fn require_policy_section(
     policy: Option<super::schema::PolicyConfig>,
     path: &Path,
@@ -1550,6 +1755,9 @@ mod tests {
     fn one_of_every_variant() -> Vec<ProfileLoadError> {
         vec![
             ProfileLoadError::NonOverlayableField { field: "chain_id" },
+            ProfileLoadError::OverlayMayOnlyTighten {
+                field: "mcp_disabled",
+            },
             ProfileLoadError::MainnetRequiresExplicitProfile {
                 name: "p".to_owned(),
                 named_by: crate::profile::ProfileNameSource::Env,
@@ -1942,6 +2150,386 @@ mod tests {
         assert_eq!(profile.chain_id, Caip2::Mainnet);
     }
 
+    /// A well-typed overlay value for every testnet-only key, with the field
+    /// of [`Profile`] it lands in rendered for comparison.
+    fn testnet_only_overlays() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            ("rpc_url", serde_json::json!("https://overlay.example")),
+            (
+                "secondary_rpc_url",
+                serde_json::json!("https://secondary.example"),
+            ),
+            (
+                "oracle_provider_url",
+                serde_json::json!("https://oracle-overlay.example/"),
+            ),
+            (
+                "mcp_signer_default",
+                serde_json::json!({"account": "overlay-account"}),
+            ),
+            ("cross_check_threshold_stroops", serde_json::json!(123_457)),
+            ("usd_threshold", serde_json::json!(765_431)),
+            ("classic_fee_per_op_stroops", serde_json::json!(211)),
+            ("classic_max_fee_per_op_stroops", serde_json::json!(5_011)),
+            (
+                "smart_account_max_context_rule_scan_id",
+                serde_json::json!(57),
+            ),
+            ("session_rule_max_horizon_ledgers", serde_json::json!(503)),
+        ]
+    }
+
+    /// Reads the profile field a testnet-only overlay key sets.
+    fn testnet_only_field(profile: &Profile, key: &str) -> serde_json::Value {
+        match key {
+            "rpc_url" => serde_json::json!(profile.rpc_url),
+            "secondary_rpc_url" => serde_json::json!(profile.secondary_rpc_url),
+            "oracle_provider_url" => {
+                serde_json::json!(profile.oracle_provider_url.as_ref().map(url::Url::as_str))
+            }
+            "mcp_signer_default" => serde_json::json!({
+                "account": profile.mcp_signer_default.account
+            }),
+            "cross_check_threshold_stroops" | "usd_threshold" => {
+                serde_json::json!(profile.cross_check_threshold_stroops)
+            }
+            "classic_fee_per_op_stroops" => serde_json::json!(profile.classic_fee_per_op_stroops),
+            "classic_max_fee_per_op_stroops" => {
+                serde_json::json!(profile.classic_max_fee_per_op_stroops)
+            }
+            "smart_account_max_context_rule_scan_id" => {
+                serde_json::json!(profile.smart_account_max_context_rule_scan_id)
+            }
+            "session_rule_max_horizon_ledgers" => {
+                serde_json::json!(profile.session_rule_max_horizon_ledgers)
+            }
+            other => panic!("no testnet-only key {other}"),
+        }
+    }
+
+    /// A well-typed overlay value for every never-overlayable key, so a
+    /// missing refusal shows up as an accepted load rather than a type error.
+    fn never_overlays() -> Vec<(&'static str, serde_json::Value)> {
+        let coordinate = serde_json::json!({"service": "overlay-svc", "account": "overlay"});
+        vec![
+            ("version", serde_json::json!(2)),
+            ("mcp_nonce_key_alias", coordinate.clone()),
+            ("audit_log_path", serde_json::json!("/tmp/overlay.jsonl")),
+            ("audit_log_hash_chain_key_id", coordinate.clone()),
+            ("policy_owner_key_id", coordinate.clone()),
+            ("attestation_key_id", coordinate.clone()),
+            ("counterparty_cache_key_id", coordinate.clone()),
+            ("policy", serde_json::json!({"engine": "noop"})),
+            ("wallet", serde_json::json!({"mlock_required": "false"})),
+            ("pool_master_key_id", coordinate.clone()),
+            (
+                "pool_config",
+                serde_json::json!({"pool_size": 0, "channels": []}),
+            ),
+            (
+                "pool_initialization",
+                serde_json::json!({
+                    "id": "overlay",
+                    "network_passphrase": "Test SDF Network ; September 2015",
+                    "funder": "GOVERLAY",
+                    "channels": [],
+                    "seed_ready": false,
+                    "attempt": 1
+                }),
+            ),
+            (
+                "remote_approval",
+                serde_json::json!({"enabled": true, "bind": "0.0.0.0:8443"}),
+            ),
+            (
+                "served_pages",
+                serde_json::json!({"display_name": "overlay"}),
+            ),
+            ("policy_window_state_key_id", coordinate),
+        ]
+    }
+
+    #[test]
+    fn testnet_only_overlays_load_on_testnet() {
+        for (key, value) in testnet_only_overlays() {
+            let profile = provider_load(minimal_toml(), key, value.clone())
+                .unwrap_or_else(|e| panic!("testnet overlay of {key} must load: {e:?}"));
+            assert_eq!(testnet_only_field(&profile, key), value, "{key}");
+        }
+    }
+
+    #[test]
+    fn testnet_only_overlays_refuse_on_mainnet() {
+        for (key, value) in testnet_only_overlays() {
+            let result = provider_load(&mainnet_toml(), key, value);
+            assert!(
+                matches!(
+                    result,
+                    Err(ProfileLoadError::NonOverlayableField { field }) if field == key
+                ),
+                "{key}: {result:?}"
+            );
+        }
+    }
+
+    /// The alias is its own key: accepted on testnet over a file that sets
+    /// neither spelling, refused on mainnet whether the file uses the alias
+    /// or neither spelling.
+    #[test]
+    fn usd_threshold_alias_follows_the_testnet_only_class() {
+        assert!(!minimal_toml().contains("threshold"));
+        let profile = provider_load(minimal_toml(), "usd_threshold", serde_json::json!(4_242))
+            .expect("testnet alias overlay loads");
+        assert_eq!(profile.cross_check_threshold_stroops, 4_242);
+
+        let with_alias = mainnet_toml().replace("version = 2", "version = 2\nusd_threshold = 1000");
+        for file in [mainnet_toml(), with_alias] {
+            let result = provider_load(&file, "usd_threshold", serde_json::json!(4_242));
+            assert!(
+                matches!(
+                    result,
+                    Err(ProfileLoadError::NonOverlayableField {
+                        field: "usd_threshold"
+                    })
+                ),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn never_overlays_refuse_on_every_chain() {
+        for file in [minimal_toml().to_owned(), mainnet_toml()] {
+            for (key, value) in never_overlays() {
+                let result = provider_load(&file, key, value);
+                assert!(
+                    matches!(
+                        result,
+                        Err(ProfileLoadError::NonOverlayableField { field }) if field == key
+                    ),
+                    "{key}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn submit_timeout_overlay_loads_on_every_chain() {
+        for file in [minimal_toml().to_owned(), mainnet_toml()] {
+            let profile = provider_load(&file, "submit_timeout_seconds", serde_json::json!(47))
+                .expect("submit_timeout_seconds is overlayable on every chain");
+            assert_eq!(profile.submit_timeout_seconds, Some(47));
+        }
+    }
+
+    #[test]
+    fn mcp_disabled_overlay_may_only_tighten() {
+        for file in [minimal_toml().to_owned(), mainnet_toml()] {
+            let profile = provider_load(&file, "mcp_disabled", serde_json::json!(true))
+                .expect("an overlay may set mcp_disabled to true");
+            assert!(profile.mcp_disabled);
+
+            let file_disabled = file.replace("version = 2", "version = 2\nmcp_disabled = true");
+            for value in [
+                serde_json::json!(false),
+                serde_json::json!("off"),
+                serde_json::json!(0),
+            ] {
+                for toml in [file.as_str(), file_disabled.as_str()] {
+                    let result = provider_load(toml, "mcp_disabled", value.clone());
+                    assert!(
+                        matches!(
+                            result,
+                            Err(ProfileLoadError::OverlayMayOnlyTighten {
+                                field: "mcp_disabled"
+                            })
+                        ),
+                        "{value}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The keys `Env::prefixed` yields for the non-profile `STELLAR_AGENT_*`
+    /// variables name no profile key, so the class check ignores them.
+    #[test]
+    fn non_profile_overlay_keys_are_ignored() {
+        let (dir, name) = write_profile(&mainnet_toml());
+        let overlay = HashMap::from([
+            ("home", serde_json::json!("/tmp/home")),
+            ("profile", serde_json::json!("mainnet")),
+            ("keyring_backend", serde_json::json!("headless-env")),
+            ("headless_keyring_key", serde_json::json!("not-a-key")),
+            ("log", serde_json::json!("debug")),
+        ]);
+        let profile = load_from_path_with_overlays(
+            &name,
+            &dir.path().join(format!("{name}.toml")),
+            Serialized::defaults(overlay),
+            None,
+        )
+        .expect("non-profile keys are ignored");
+        assert_eq!(profile.chain_id, Caip2::Mainnet);
+    }
+
+    /// Two refused keys report the one listed first in the class table, not
+    /// the alphabetically first one.
+    #[test]
+    fn the_first_refused_key_in_table_order_is_reported() {
+        let (dir, name) = write_profile(minimal_toml());
+        let overlay = HashMap::from([
+            ("attestation_key_id", serde_json::json!({"account": "x"})),
+            ("policy_owner_key_id", serde_json::json!({"account": "y"})),
+        ]);
+        let position = |key: &str| OVERLAY_CLASSES.iter().position(|(k, _)| *k == key);
+        assert!(position("policy_owner_key_id") < position("attestation_key_id"));
+        let result = load_from_path_with_overlays(
+            &name,
+            &dir.path().join(format!("{name}.toml")),
+            Serialized::defaults(overlay),
+            None,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ProfileLoadError::NonOverlayableField {
+                    field: "policy_owner_key_id"
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// The programmatic overlay passes the same class check.
+    #[test]
+    fn programmatic_overlay_applies_the_class_table() {
+        let (dir, name) = write_profile(minimal_toml());
+        let refused = load_with_overlay_from_dir(
+            &name,
+            dir.path(),
+            HashMap::from([("audit_log_path", serde_json::json!("/tmp/x.jsonl"))]),
+            None,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(ProfileLoadError::NonOverlayableField {
+                    field: "audit_log_path"
+                })
+            ),
+            "{refused:?}"
+        );
+        let loosened = load_with_overlay_from_dir(
+            &name,
+            dir.path(),
+            HashMap::from([("mcp_disabled", serde_json::json!(false))]),
+            None,
+        );
+        assert!(
+            matches!(
+                loosened,
+                Err(ProfileLoadError::OverlayMayOnlyTighten {
+                    field: "mcp_disabled"
+                })
+            ),
+            "{loosened:?}"
+        );
+        let accepted = load_with_overlay_from_dir(
+            &name,
+            dir.path(),
+            HashMap::from([("rpc_url", serde_json::json!("https://overlay.example"))]),
+            None,
+        )
+        .expect("testnet rpc_url overlay loads");
+        assert_eq!(accepted.rpc_url, "https://overlay.example");
+    }
+
+    /// The `PartialProfile` source between its attributes and its closing
+    /// brace, with CRLF normalized.
+    fn partial_profile_source() -> String {
+        let source = include_str!("loader.rs").replace("\r\n", "\n");
+        let start = source
+            .find("struct PartialProfile {")
+            .expect("PartialProfile is declared in this file");
+        let attrs_start = source[..start].rfind("\n\n").map_or(0, |blank| blank + 2);
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, ch) in source[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(start + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        source[attrs_start..end.expect("PartialProfile closes")].to_owned()
+    }
+
+    /// Every serde alias or rename spelled in the `PartialProfile` block.
+    fn partial_profile_serde_aliases(block: &str) -> Vec<String> {
+        let mut aliases = Vec::new();
+        for marker in ["alias = \"", "rename = \"", "rename(deserialize = \""] {
+            let mut rest = block;
+            while let Some(at) = rest.find(marker) {
+                let after = &rest[at + marker.len()..];
+                let close = after.find('"').expect("the attribute string closes");
+                aliases.push(after[..close].to_owned());
+                rest = &after[close..];
+            }
+        }
+        aliases
+    }
+
+    /// The field rows of the class table are exactly `PartialProfile`'s
+    /// fields; the remaining rows are its serde aliases.
+    #[test]
+    fn class_table_field_rows_equal_the_partial_profile_fields() {
+        use std::collections::BTreeSet;
+        let aliases: BTreeSet<String> = partial_profile_serde_aliases(&partial_profile_source())
+            .into_iter()
+            .collect();
+        let field_rows: BTreeSet<&str> = OVERLAY_CLASSES
+            .iter()
+            .map(|(key, _)| *key)
+            .filter(|key| !aliases.contains(*key))
+            .collect();
+        let fields: BTreeSet<&str> = PARTIAL_PROFILE_FIELD_NAMES.iter().copied().collect();
+        assert_eq!(field_rows, fields);
+        assert_eq!(
+            OVERLAY_CLASSES.len(),
+            fields.len() + aliases.len(),
+            "every table key appears once"
+        );
+    }
+
+    /// Every alias or rename in the `PartialProfile` block has a table row,
+    /// and no attribute in the block renames or merges keys wholesale.
+    #[test]
+    fn every_partial_profile_alias_has_a_class_row() {
+        let block = partial_profile_source();
+        assert!(block.contains("struct PartialProfile {"));
+        for forbidden in ["rename_all", "flatten", "untagged"] {
+            assert!(
+                !block.contains(forbidden),
+                "PartialProfile uses `{forbidden}`, which the class table cannot list"
+            );
+        }
+        let aliases = partial_profile_serde_aliases(&block);
+        assert!(aliases.contains(&"usd_threshold".to_owned()));
+        for alias in aliases {
+            assert!(
+                OVERLAY_CLASSES.iter().any(|(key, _)| *key == alias),
+                "serde key `{alias}` has no overlay class row"
+            );
+        }
+    }
+
     #[test]
     fn version_check_precedes_identity_and_overlay_checks() {
         let result = provider_load(
@@ -1963,7 +2551,8 @@ mod tests {
         for err in one_of_every_variant() {
             let validation = err.to_validation_error("p");
             let expected = match &err {
-                ProfileLoadError::NonOverlayableField { .. } => "profile.non_overlayable_field",
+                ProfileLoadError::NonOverlayableField { .. }
+                | ProfileLoadError::OverlayMayOnlyTighten { .. } => "profile.non_overlayable_field",
                 ProfileLoadError::MainnetRequiresExplicitProfile { .. } => {
                     "profile.mainnet_requires_explicit_profile"
                 }
@@ -2613,6 +3202,36 @@ account = "a"
         assert!(
             matches!(err, ProfileLoadError::VersionUnsupported { found: 1, .. }),
             "expected VersionUnsupported for v1 profile, got {err}"
+        );
+    }
+
+    /// The fallback reports a synthesized profile as `Synthesized` and an existing
+    /// `default.toml` as `Persisted`, with the binding check each origin implies.
+    #[test]
+    fn load_default_or_testnet_fallback_reports_the_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (synthesized, origin) = load_default_or_testnet_fallback_from_dir(dir.path()).unwrap();
+        assert_eq!(origin, ProfileOrigin::Synthesized);
+        assert_eq!(
+            origin.binding_check(),
+            crate::audit_log::BindingCheck::CheckOnly
+        );
+        assert_eq!(synthesized.chain_id, Caip2::Testnet);
+
+        std::fs::write(
+            dir.path().join("default.toml"),
+            minimal_toml().replace("test-profile", "default"),
+        )
+        .unwrap();
+        let (persisted, origin) = load_default_or_testnet_fallback_from_dir(dir.path()).unwrap();
+        assert_eq!(origin, ProfileOrigin::Persisted);
+        assert_eq!(
+            origin.binding_check(),
+            crate::audit_log::BindingCheck::Enforce
+        );
+        assert_eq!(
+            persisted.audit_log_hash_chain_key_id.service,
+            "stellar-agent-audit-default"
         );
     }
 

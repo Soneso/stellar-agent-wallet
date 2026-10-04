@@ -461,8 +461,20 @@ async fn open_profile_audit_writer_non_fatal(
         }
     };
 
-    let access = match stellar_agent_network::keyring::keyed_audit_access(&profile) {
+    let access = match stellar_agent_network::keyring::keyed_audit_access(
+        &profile,
+        profile_name,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    ) {
         Ok(access) => access,
+        Err(e) if crate::commands::value_audit::is_binding_refusal(&e) => {
+            warn!(
+                profile = %profile_name,
+                code = %e.code(),
+                "credentials add-passkey: audit binding changed; audit entry will be skipped"
+            );
+            return None;
+        }
         Err(e) => {
             warn!(
                 profile = %profile_name,

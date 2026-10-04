@@ -51,6 +51,7 @@ pub mod caip2;
 pub mod loader;
 pub mod migrate;
 pub mod name;
+pub mod owner_key;
 pub mod receipt;
 pub mod schema;
 pub mod signer_identity;

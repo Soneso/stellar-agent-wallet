@@ -52,7 +52,6 @@ use stellar_agent_core::profile::name::{
     PROFILE_ENV_VAR, ProfileNameSource, ResolvedProfileName, resolve_profile_name,
     validate_path_component_ascii_safe,
 };
-use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::transport;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
@@ -282,31 +281,6 @@ fn resolve_and_validate_profile_name(requested: Option<&str>) -> ResolvedProfile
     resolved
 }
 
-/// Loads the profile the operator selected.
-///
-/// A profile named through `--profile` or `STELLAR_AGENT_PROFILE` is loaded
-/// with no fallback: the synthesised first-run profile is a **testnet**,
-/// **Noop-engine** configuration, so substituting it for a named-but-missing
-/// profile would silently answer on the wrong network and downgrade a V1
-/// profile's fail-closed governance to an unsigned-policy engine. The fallback
-/// applies only when no name was given at all, which is the first-run case it
-/// exists for.
-///
-/// The branch keys on the resolved name's [`ProfileNameSource`], never on the
-/// name itself: `--profile default` on a host with no `default.toml` is a named
-/// profile that must refuse, not a first run.
-fn load_selected_profile(
-    resolved: &ResolvedProfileName,
-) -> Result<Profile, loader::ProfileLoadError> {
-    let profile = if resolved.source.is_explicit() {
-        loader::load(&resolved.name, None)?
-    } else {
-        loader::load_default_or_testnet_fallback()?
-    };
-    stellar_agent_core::profile::check_mainnet_selection(&profile, resolved)?;
-    Ok(profile)
-}
-
 #[tokio::main]
 async fn main() {
     // ── 0. Argument parsing and profile-name resolution ──────────────────────
@@ -358,9 +332,10 @@ async fn main() {
     // ── 4. Load the selected profile ─────────────────────────────────────────
     // The profile is selected by `--profile <name>`, then
     // `STELLAR_AGENT_PROFILE`, then the name `default`. A named profile is
-    // loaded with no fallback (see `load_selected_profile`); only the unnamed
-    // case falls back to a synthesised testnet default when no profile file
-    // exists yet (the first-run case, before `stellar-agent profile init`).
+    // loaded with no fallback (see `transport::load_selected_profile`); only
+    // the unnamed case falls back to a synthesised testnet default when no
+    // profile file exists yet (the first-run case, before
+    // `stellar-agent profile init`).
     // The fallback profile is a synthesised testnet default with placeholder
     // keyring coordinates, including an audit chain-root coordinate that was
     // never minted. Any commit/submit tool that signs or moves value (e.g.
@@ -380,8 +355,8 @@ async fn main() {
     // is the intended behaviour: the fallback profile enables
     // `stellar_balances` and `stellar_create_account` (simulate step, which
     // does NOT touch the signer keyring) without requiring a prior setup step.
-    let profile = match load_selected_profile(&resolved_profile) {
-        Ok(p) => {
+    let (profile, origin) = match transport::load_selected_profile(&resolved_profile) {
+        Ok((p, origin)) => {
             // The resolved name and its source are logged together: a report of
             // a server answering from the wrong profile is diagnosable only if
             // the log says which name was used and which input supplied it.
@@ -391,7 +366,7 @@ async fn main() {
                 chain_id = %p.chain_id,
                 "stellar-agent-mcp: profile loaded"
             );
-            p
+            (p, origin)
         }
         Err(err @ loader::ProfileLoadError::MainnetRequiresExplicitProfile { .. }) => {
             tracing::error!(
@@ -470,7 +445,10 @@ async fn main() {
     // be matched: the V1 startup ceremony fails at three successive walls, and
     // naming only the first one sends the operator into a non-actionable exit
     // one step later.
-    let server = match transport::build_server(profile) {
+    // The origin fixes the audit binding check for the server's lifetime: a
+    // profile read from a file records an absent binding, and the synthesized
+    // fallback only compares.
+    let server = match transport::build_server(profile, origin.binding_check()) {
         Ok(server) => server,
         Err(err) => {
             report_build_failure(&err, &resolved_profile.name);

@@ -12,7 +12,8 @@ use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::{
-    audit_log::{AuditEntry, AuditWriterRegistry},
+    audit_log::{AuditEntry, AuditWriterRegistry, BindingCheck},
+    profile::owner_key::{self, OwnerKeyContext},
     profile::schema::{KeyringEntryRef, Profile, canonical_data_root},
 };
 use subtle::ConstantTimeEq as _;
@@ -52,6 +53,8 @@ pub struct MppAuthorizationStore {
     key: Zeroizing<[u8; 32]>,
     generation_entry: KeyringEntryRef,
     state_key_entry: Option<KeyringEntryRef>,
+    /// The owner coordinates every reload of the state key is compared with.
+    owner: Option<OwnerKeyContext>,
 }
 
 impl fmt::Debug for MppAuthorizationStore {
@@ -77,6 +80,7 @@ impl MppAuthorizationStore {
             key: Zeroizing::new(key),
             generation_entry,
             state_key_entry: None,
+            owner: None,
         }
     }
 
@@ -106,36 +110,50 @@ impl MppAuthorizationStore {
     ///
     /// Returns `mpp.state_unavailable` for inaccessible or unverifiable state,
     /// an invalid anchor, or rollback. Only a proven absent key may be minted.
-    pub fn open_for_prepare(profile_name: &str, profile: &Profile) -> Result<Self, MppError> {
+    /// `binding` is the audit binding check of the adoption row's writer.
+    pub fn open_for_prepare(
+        profile_name: &str,
+        profile: &Profile,
+        binding: BindingCheck,
+    ) -> Result<Self, MppError> {
         let placeholder = Self::for_profile(profile_name, [0; 32])?;
         let entry_ref = KeyringEntryRef::default_mpp_state_key(profile_name);
-        Self::open_for_prepare_audited_at(placeholder.path, &entry_ref, |generation| {
-            emit_state_audit(
-                profile,
-                profile_name,
-                AuditEntry::new_mpp_state_adopted(
+        Self::open_for_prepare_audited_at(
+            placeholder.path,
+            &entry_ref,
+            profile_name,
+            |generation| {
+                emit_state_audit(
+                    profile,
                     profile_name,
-                    generation,
-                    uuid::Uuid::new_v4().to_string(),
-                ),
-            )
-        })
+                    binding,
+                    AuditEntry::new_mpp_state_adopted(
+                        profile_name,
+                        generation,
+                        uuid::Uuid::new_v4().to_string(),
+                    ),
+                )
+            },
+        )
     }
 
     fn open_for_prepare_audited_at(
         path: PathBuf,
         entry_ref: &KeyringEntryRef,
+        profile_name: &str,
         adopt: impl FnOnce(u64) -> Result<(), MppError>,
     ) -> Result<Self, MppError> {
         use stellar_agent_network::keyring::{load_hmac_key_32, rotate_keyring_secret_32};
 
+        refuse_owner_coordinate(entry_ref)?;
         let mut store = Self::at_path(path, [0; 32], generation_entry_ref(entry_ref));
         let _lock = store.acquire_lock()?;
         let generation = load_generation(&store.generation_entry)?;
         if generation.is_some_and(|value| value > 0) && provably_absent(&store.path) {
             return Err(rollback_error());
         }
-        if key_is_absent(entry_ref)? {
+        let minted = key_is_absent(entry_ref)?;
+        if minted {
             if !provably_absent(&store.path) || generation.is_some_and(|value| value > 0) {
                 return Err(state_error());
             }
@@ -151,7 +169,13 @@ impl MppAuthorizationStore {
             tracing::debug!(error = %error, "mpp state key load failed");
             state_error()
         })?;
+        // A freshly minted random key is not compared.
+        let owner = OwnerKeyContext::for_profile_name(profile_name);
+        if !minted {
+            refuse_owner_public_key(store.key.as_slice(), &owner)?;
+        }
         store.state_key_entry = Some(entry_ref.clone());
+        store.owner = Some(owner);
         store.verify_or_adopt(adopt)?;
         Ok(store)
     }
@@ -163,13 +187,19 @@ impl MppAuthorizationStore {
     ///
     /// Returns `mpp.state_unavailable` for inaccessible or unverifiable state,
     /// or an invalid anchor. A missing file with an advanced anchor is rolled back.
-    pub fn open_for_read(profile_name: &str, profile: &Profile) -> Result<Option<Self>, MppError> {
+    /// `binding` is the audit binding check of the adoption row's writer.
+    pub fn open_for_read(
+        profile_name: &str,
+        profile: &Profile,
+        binding: BindingCheck,
+    ) -> Result<Option<Self>, MppError> {
         let placeholder = Self::for_profile(profile_name, [0; 32])?;
         let entry_ref = KeyringEntryRef::default_mpp_state_key(profile_name);
-        Self::open_for_read_audited_at(placeholder.path, &entry_ref, |generation| {
+        Self::open_for_read_audited_at(placeholder.path, &entry_ref, profile_name, |generation| {
             emit_state_audit(
                 profile,
                 profile_name,
+                binding,
                 AuditEntry::new_mpp_state_adopted(
                     profile_name,
                     generation,
@@ -184,10 +214,12 @@ impl MppAuthorizationStore {
     fn open_for_read_audited_at(
         path: PathBuf,
         entry_ref: &KeyringEntryRef,
+        profile_name: &str,
         adopt: impl FnOnce(u64) -> Result<(), MppError>,
     ) -> Result<Option<Self>, MppError> {
         use stellar_agent_network::keyring::load_hmac_key_32;
 
+        refuse_owner_coordinate(entry_ref)?;
         let mut store = Self::at_path(path, [0; 32], generation_entry_ref(entry_ref));
         // The lock also serializes first-read adoption and prepare/reset.
         let _lock = store.acquire_lock()?;
@@ -203,7 +235,10 @@ impl MppAuthorizationStore {
             };
         }
         store.key = load_hmac_key_32(entry_ref).map_err(|_error| state_error())?;
+        let owner = OwnerKeyContext::for_profile_name(profile_name);
+        refuse_owner_public_key(store.key.as_slice(), &owner)?;
         store.state_key_entry = Some(entry_ref.clone());
+        store.owner = Some(owner);
         store.verify_or_adopt(adopt)?;
         Ok(Some(store))
     }
@@ -213,12 +248,14 @@ impl MppAuthorizationStore {
         path: PathBuf,
         entry_ref: &KeyringEntryRef,
     ) -> Result<Option<Self>, MppError> {
-        Self::open_for_read_audited_at(path, entry_ref, |_| Err(anchor_error()))
+        Self::open_for_read_audited_at(path, entry_ref, TEST_PROFILE_NAME, |_| Err(anchor_error()))
     }
 
     #[cfg(test)]
     fn open_for_prepare_at(path: PathBuf, entry_ref: &KeyringEntryRef) -> Result<Self, MppError> {
-        Self::open_for_prepare_audited_at(path, entry_ref, |_| Err(anchor_error()))
+        Self::open_for_prepare_audited_at(path, entry_ref, TEST_PROFILE_NAME, |_| {
+            Err(anchor_error())
+        })
     }
 
     fn verify_or_adopt(
@@ -253,10 +290,12 @@ impl MppAuthorizationStore {
     /// # Errors
     ///
     /// Refuses on lock, audit, keyring access, or filesystem errors. A failed
-    /// reset can be retried with the same explicit acknowledgement.
+    /// reset can be retried with the same explicit acknowledgement. `binding`
+    /// is the audit binding check of the reset row's writer.
     pub fn reset_for_profile(
         profile_name: &str,
         profile: &Profile,
+        binding: BindingCheck,
         reason: &str,
     ) -> Result<Option<u64>, MppError> {
         let placeholder = Self::for_profile(profile_name, [0; 32])?;
@@ -265,6 +304,7 @@ impl MppAuthorizationStore {
             emit_state_audit(
                 profile,
                 profile_name,
+                binding,
                 AuditEntry::new_mpp_state_reset(
                     profile_name,
                     generation,
@@ -799,6 +839,9 @@ impl MppAuthorizationStore {
         if let Some(key_ref) = &self.state_key_entry {
             let current = stellar_agent_network::keyring::load_hmac_key_32(key_ref)
                 .map_err(|_error| state_error())?;
+            if let Some(owner) = &self.owner {
+                refuse_owner_public_key(current.as_slice(), owner)?;
+            }
             if !bool::from(self.key.as_slice().ct_eq(current.as_slice())) {
                 return Err(rollback_error());
             }
@@ -914,9 +957,13 @@ impl MppAuthorizationStore {
     }
 }
 
+/// Writes an MPP state row under the profile's keyed audit writer.
+///
+/// Every failure, a binding refusal included, is `mpp.state_unavailable`.
 fn emit_state_audit(
     profile: &Profile,
     profile_name: &str,
+    binding: BindingCheck,
     entry: AuditEntry,
 ) -> Result<(), MppError> {
     let unavailable = || {
@@ -925,8 +972,8 @@ fn emit_state_audit(
             "MPP authorization state audit is unavailable",
         )
     };
-    let access =
-        stellar_agent_network::keyring::keyed_audit_access(profile).map_err(|_| unavailable())?;
+    let access = stellar_agent_network::keyring::keyed_audit_access(profile, profile_name, binding)
+        .map_err(|_| unavailable())?;
     let writer =
         AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
             .map_err(|_| unavailable())?;
@@ -974,6 +1021,49 @@ fn key_is_absent(entry_ref: &KeyringEntryRef) -> Result<bool, MppError> {
         Err(keyring_core::Error::NoEntry) => Ok(true),
         Err(_error) => Err(state_error()),
     }
+}
+
+/// The label an MPP state-key owner refusal names.
+const MPP_STATE_KEY_FIELD: &str = "mpp_state_key";
+
+/// The profile name the path-injecting test openers compare owner keys under.
+#[cfg(test)]
+const TEST_PROFILE_NAME: &str = "mpp-store-test";
+
+const fn owner_key_error() -> MppError {
+    MppError::new(
+        MppErrorCode::StateUnavailable,
+        "MPP authorization state key is refused: it is an owner public key or sits in the owner key namespace",
+    )
+}
+
+/// Refuses a state-key coordinate in the owner key namespace, before any
+/// keyring read. The refusal's code is logged; the outward error is
+/// `mpp.state_unavailable`.
+///
+/// The production coordinate derives from the profile name through
+/// [`KeyringEntryRef::default_mpp_state_key`], so no profile name reaches the
+/// owner namespace here; the check keeps one rule for every symmetric-key
+/// loader.
+fn refuse_owner_coordinate(entry_ref: &KeyringEntryRef) -> Result<(), MppError> {
+    owner_key::refuse_owner_key_coordinate(entry_ref, MPP_STATE_KEY_FIELD).map_err(|error| {
+        tracing::warn!(code = %error.code(), "mpp state key refused");
+        owner_key_error()
+    })
+}
+
+/// Refuses a loaded state key equal to the profile's owner public key. An
+/// owner entry that cannot be read refuses as unavailable state.
+fn refuse_owner_public_key(key: &[u8], owner: &OwnerKeyContext) -> Result<(), MppError> {
+    owner_key::refuse_owner_public_key(key, owner, MPP_STATE_KEY_FIELD).map_err(|error| {
+        tracing::warn!(code = %error.code(), "mpp state key refused");
+        match error {
+            stellar_agent_core::error::WalletError::Validation(
+                stellar_agent_core::error::ValidationError::KeyMatchesOwnerPublicKey { .. },
+            ) => owner_key_error(),
+            _ => state_error(),
+        }
+    })
 }
 
 const fn rollback_error() -> MppError {
@@ -1290,6 +1380,183 @@ pub(crate) mod tests {
             absent_key.code(),
             "an environmental failure must not be distinguishable from an absent key"
         );
+    }
+
+    const OWNER_KEY: [u8; 32] = [0x7b; 32];
+
+    fn put_raw(entry_ref: &KeyringEntryRef, value: &str) {
+        keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+            .expect("entry")
+            .set_password(value)
+            .expect("plant");
+    }
+
+    fn get_raw(entry_ref: &KeyringEntryRef) -> Option<String> {
+        keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+            .expect("entry")
+            .get_password()
+            .ok()
+    }
+
+    fn older_form(key: &[u8; 32]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key)
+    }
+
+    /// A state key equal to the owner public key opens while no owner entry
+    /// exists. Once the owner entry holds that key in the older form, the
+    /// prepare opener, the read opener, and a read on an open handle each
+    /// refuse with `mpp.state_unavailable`.
+    #[test]
+    #[serial_test::serial]
+    fn every_state_key_loader_refuses_the_owner_key() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("state");
+        let entry_ref = state_key_coordinates("mpp-owner");
+        put_raw(&entry_ref, &older_form(&OWNER_KEY));
+        write_generation(&generation_entry_ref(&entry_ref), 0).expect("initial counter");
+
+        let handle = MppAuthorizationStore::open_for_prepare_at(path.clone(), &entry_ref)
+            .expect("no owner entry: the planted key opens");
+        MppAuthorizationStore::open_for_read_at(path.clone(), &entry_ref)
+            .expect("no owner entry: the read opens")
+            .expect("the key exists");
+        assert_eq!(
+            handle.load(UNKNOWN_ID).expect_err("empty store").code(),
+            NOT_FOUND_CODE
+        );
+
+        put_raw(
+            &KeyringEntryRef::default_owner_key(TEST_PROFILE_NAME),
+            &older_form(&OWNER_KEY),
+        );
+        let refused = owner_key_error().message();
+        for error in [
+            handle.load(UNKNOWN_ID).expect_err("an open handle refuses"),
+            MppAuthorizationStore::open_for_prepare_at(path.clone(), &entry_ref)
+                .expect_err("the prepare opener refuses"),
+            MppAuthorizationStore::open_for_read_at(path, &entry_ref)
+                .expect_err("the read opener refuses"),
+        ] {
+            assert_eq!(error.code(), STATE_CODE);
+            assert_eq!(error.message(), refused);
+        }
+        assert!(
+            get_raw(&entry_ref) == Some(older_form(&OWNER_KEY)),
+            "the refusal mints nothing over the key"
+        );
+    }
+
+    /// Both openers compare before the adoption path, which reads the file
+    /// without the per-read compare. A version 1 snapshot sealed under the
+    /// owner key, with no counter yet, refuses at each opener and is not
+    /// adopted.
+    #[test]
+    #[serial_test::serial]
+    fn the_openers_refuse_the_owner_key_before_adoption() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("state");
+        let entry_ref = state_key_coordinates("mpp-owner-adopt");
+        put_raw(&entry_ref, &older_form(&OWNER_KEY));
+        let body =
+            serde_json::to_vec(&serde_json::json!({"version": 1, "records": []})).expect("body");
+        let tag = compute_tag(&OWNER_KEY, &body).expect("tag");
+        fs::write(&path, [tag.as_slice(), body.as_slice()].concat()).expect("snapshot");
+        put_raw(
+            &KeyringEntryRef::default_owner_key(TEST_PROFILE_NAME),
+            &older_form(&OWNER_KEY),
+        );
+
+        for error in [
+            MppAuthorizationStore::open_for_prepare_at(path.clone(), &entry_ref)
+                .expect_err("the prepare opener refuses"),
+            MppAuthorizationStore::open_for_read_at(path, &entry_ref)
+                .expect_err("the read opener refuses"),
+        ] {
+            assert_eq!(error.code(), STATE_CODE);
+            assert_eq!(error.message(), owner_key_error().message());
+        }
+        assert_eq!(
+            load_generation(&generation_entry_ref(&entry_ref)).expect("counter"),
+            None,
+            "nothing is adopted"
+        );
+    }
+
+    /// A G-strkey owner value at the state-key coordinate decodes to 42 bytes,
+    /// so both openers refuse it and neither mints over it.
+    #[test]
+    #[serial_test::serial]
+    fn a_g_strkey_owner_value_is_refused_by_both_openers() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("state");
+        let entry_ref = state_key_coordinates("mpp-owner-strkey");
+        let strkey = stellar_agent_core::profile::owner_key::encode_owner_public_key(&OWNER_KEY);
+        put_raw(&entry_ref, &strkey);
+        write_generation(&generation_entry_ref(&entry_ref), 0).expect("initial counter");
+        assert_eq!(
+            MppAuthorizationStore::open_for_prepare_at(path.clone(), &entry_ref)
+                .expect_err("prepare refuses")
+                .code(),
+            STATE_CODE
+        );
+        assert_eq!(
+            MppAuthorizationStore::open_for_read_at(path, &entry_ref)
+                .expect_err("read refuses")
+                .code(),
+            STATE_CODE
+        );
+        assert!(
+            get_raw(&entry_ref) == Some(strkey),
+            "nothing is minted over the value"
+        );
+    }
+
+    /// An owner-namespace state-key coordinate refuses before any keyring
+    /// read: an error planted there is still pending.
+    #[test]
+    #[serial_test::serial]
+    fn an_owner_namespace_state_key_coordinate_is_refused_without_a_read() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let entry_ref = KeyringEntryRef::new("stellar-agent-owner-B", "default");
+        stellar_agent_test_support::keyring_mock::inject_error(
+            &entry_ref.service,
+            &entry_ref.account,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("planted"))),
+        )
+        .expect("inject");
+        let error = MppAuthorizationStore::open_for_read_at(directory.path().join("s"), &entry_ref)
+            .expect_err("refuses");
+        assert_eq!(error.message(), owner_key_error().message());
+        let pending = keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+            .expect("entry")
+            .get_password()
+            .expect_err("the planted error is still pending");
+        assert!(matches!(pending, keyring_core::Error::PlatformFailure(_)));
+    }
+
+    /// The core helper names the `mpp_state_key` label; the store's outward
+    /// error keeps `mpp.state_unavailable`.
+    #[test]
+    #[serial_test::serial]
+    fn the_owner_refusal_names_the_mpp_label() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        put_raw(
+            &KeyringEntryRef::default_owner_key("mpp-owner-label"),
+            &older_form(&OWNER_KEY),
+        );
+        let owner = OwnerKeyContext::for_profile_name("mpp-owner-label");
+        let core = owner_key::refuse_owner_public_key(&OWNER_KEY, &owner, MPP_STATE_KEY_FIELD)
+            .expect_err("core refusal");
+        assert_eq!(core.code(), "validation.key_matches_owner_public_key");
+        assert!(core.to_string().contains("mpp_state_key"), "{core}");
+        let outward = refuse_owner_public_key(&OWNER_KEY, &owner).expect_err("store refusal");
+        assert_eq!(outward.code(), STATE_CODE);
+        assert!(refuse_owner_public_key(&[0x11; 32], &owner).is_ok());
     }
 
     /// A minted key and initial counter with no file is the legitimate

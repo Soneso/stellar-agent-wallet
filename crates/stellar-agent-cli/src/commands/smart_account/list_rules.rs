@@ -331,7 +331,7 @@ pub struct ListRulesResult {
 /// Never panics.
 pub async fn run(args: &ListRulesArgs) -> i32 {
     let resolved_profile = resolve_profile_name(args.profile.as_deref());
-    let (profile, _origin) = match load_command_profile(&resolved_profile) {
+    let (profile, origin) = match load_command_profile(&resolved_profile) {
         Ok(loaded) => loaded,
         Err(error) => {
             let e = map_access_error(&error, &resolved_profile.name);
@@ -372,7 +372,7 @@ pub async fn run(args: &ListRulesArgs) -> i32 {
 
     // ── Open audit writer for audit-log cross-check ───────────────────────────
     let (audit_writer, _audit_log_path): (Arc<Mutex<AuditWriter>>, _) =
-        match open_audit_writer_read_only(&profile, &resolved_profile.name) {
+        match open_audit_writer_read_only(&profile, origin, &resolved_profile.name) {
             Ok(opened) => opened,
             Err(e) => return emit_error(&e),
         };

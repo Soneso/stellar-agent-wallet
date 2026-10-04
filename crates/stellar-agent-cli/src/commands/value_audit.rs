@@ -35,16 +35,20 @@
 //! the persisted case; the synthesized zero-config profile keeps the
 //! pre-existing warn-only emission path so the documented zero-config
 //! quickstart is never blocked by a fail-closed audit-key requirement the
-//! operator never opted into.
+//! operator never opted into. A changed audit binding refuses on both
+//! origins, before any signing.
 
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::audit_log::{
-    AuditEntry, AuditWriter, AuditWriterRegistry, WriterError, audit_log_unusable_detail,
+    AuditEntry, AuditWriter, AuditWriterRegistry, BindingCheck, WriterError,
+    audit_log_unusable_detail,
 };
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::keyring::keyed_audit_access;
+
+use crate::common::profile_access::ProfileOrigin;
 
 /// Requires the per-profile audit writer to be acquirable under the profile's
 /// audit chain-root HMAC key — the fail-closed pre-flight for value-moving
@@ -64,29 +68,45 @@ use stellar_agent_network::keyring::keyed_audit_access;
 ///
 /// # Errors
 ///
-/// Returns [`WalletError::Validation`] wrapping one of two variants — both
-/// carry the same wire code (`audit.chain_key_unavailable`) but distinct
-/// operator-facing remedies, since the two failure modes have different
-/// fixes:
-/// - [`ValidationError::AuditChainKeyUnavailable`] when the profile's audit
-///   chain-root HMAC key cannot be loaded from the platform keyring — an
-///   `init`-minted profile has no audit chain-root key until
+/// Returns [`WalletError::Validation`] wrapping one of these variants, each
+/// with its own operator-facing remedy:
+/// - [`ValidationError::AuditChainKeyUnavailable`], code
+///   `audit.chain_key_unavailable`, when the profile's audit chain-root HMAC
+///   key cannot be loaded from the platform keyring, or when the key or its
+///   coordinate is refused as the owner key. The `warn` line names that
+///   refusal. An `init`-minted profile has no audit chain-root key until
 ///   `stellar-agent profile rotate-audit-key <profile>` mints one.
-/// - [`ValidationError::AuditWriterOpenFailed`] when the key loaded but the
-///   audit writer could not be opened at `profile.audit_log_path` (e.g. a
-///   registry path/key mismatch against an earlier open in this process) —
-///   rotating the audit key does not fix this.
-/// - [`ValidationError::AuditTipAnchorMismatch`] when the log's chain tip is not
-///   the one its keyring-held anchor names — the log was rolled back,
-///   truncated, or replaced. The registry runs that check on EVERY keyed
-///   acquisition, not only the first, because it caches one writer per profile
-///   for the process lifetime and a check at open alone would miss a file
-///   swapped underneath a live writer.
+/// - [`ValidationError::AuditLogUnusable`], code `audit.chain_key_unavailable`,
+///   when the key loaded but the log cannot be used. The message names the
+///   condition by its `audit.*` sub-code, `audit.io_error` included.
+/// - [`ValidationError::AuditWriterOpenFailed`], code
+///   `audit.chain_key_unavailable`, when the key loaded but the registry holds
+///   a conflicting path or key registration for this profile name. Rotating
+///   the audit key does not fix this.
+/// - [`ValidationError::AuditTipAnchorMismatch`], code
+///   `audit.tip_anchor_mismatch`, when the log's chain tip is not the one its
+///   keyring-held anchor names: the log was rolled back, truncated, or
+///   replaced. The registry runs that check on every keyed acquisition,
+///   because cached writers stay live for the process lifetime and the file
+///   can be replaced while they are open.
+/// - [`ValidationError::AuditLogBindingChanged`], code
+///   `audit.log_binding_changed`, when the profile names a log path or audit
+///   key other than the binding recorded in the keyring. The profile is
+///   persisted, so an absent binding is recorded.
 pub(crate) fn require_value_audit_writer(
     profile: &Profile,
     profile_name: &str,
 ) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
-    let access = keyed_audit_access(profile).map_err(|e| {
+    let access = keyed_audit_access(profile, profile_name, BindingCheck::Enforce).map_err(|e| {
+        // A binding refusal keeps its own code and remedy.
+        if is_binding_refusal(&e) {
+            tracing::warn!(
+                profile = %profile_name,
+                code = %e.code(),
+                "value audit: audit binding changed; refusing before signing/submit"
+            );
+            return e;
+        }
         tracing::warn!(
             profile = %profile_name,
             error = %e,
@@ -117,7 +137,7 @@ fn audit_writer_acquisition_error(profile_name: &str, e: &WriterError) -> Wallet
         tracing::warn!(
             profile = %profile_name,
             error = %e,
-            "value audit: audit log tip anchor mismatch; refusing before signing/submit"
+            "value audit: audit log tip anchor mismatch"
         );
         return WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
             profile: profile_name.to_owned(),
@@ -128,7 +148,7 @@ fn audit_writer_acquisition_error(profile_name: &str, e: &WriterError) -> Wallet
         tracing::warn!(
             profile = %profile_name,
             error = %e,
-            "value audit: audit log unusable; refusing before signing/submit"
+            "value audit: audit log unusable"
         );
         return WalletError::Validation(ValidationError::AuditLogUnusable {
             profile: profile_name.to_owned(),
@@ -138,9 +158,17 @@ fn audit_writer_acquisition_error(profile_name: &str, e: &WriterError) -> Wallet
     tracing::warn!(
         profile = %profile_name,
         error = %e,
-        "value audit: could not open audit writer; refusing before signing/submit"
+        "value audit: could not open audit writer"
     );
     audit_writer_open_failed(profile_name)
+}
+
+/// Whether `e` is the audit binding refusal.
+pub(crate) fn is_binding_refusal(e: &WalletError) -> bool {
+    matches!(
+        e,
+        WalletError::Validation(ValidationError::AuditLogBindingChanged { .. })
+    )
 }
 
 fn audit_chain_key_unavailable(profile_name: &str) -> WalletError {
@@ -171,21 +199,31 @@ fn audit_writer_open_failed(profile_name: &str) -> WalletError {
 ///   could not be acquired; the caller then skips the post-confirm row rather
 ///   than treating the operation as unaudited — there was no audit guarantee
 ///   to defeat here, since the operator never persisted a profile in the
-///   first place.
+///   first place. A recorded audit binding that differs from the profile's
+///   refuses: the binding check compares without recording, and its refusal
+///   precedes any signing.
 ///
 /// # Errors
 ///
-/// Returns `Err` only for [`crate::common::profile_access::ProfileOrigin::Persisted`]; see
-/// [`require_value_audit_writer`].
+/// For [`crate::common::profile_access::ProfileOrigin::Persisted`], see
+/// [`require_value_audit_writer`]. For
+/// [`crate::common::profile_access::ProfileOrigin::Synthesized`],
+/// [`ValidationError::AuditLogBindingChanged`] only.
 pub(crate) fn require_value_audit_writer_for_origin(
     profile: &Profile,
     profile_name: &str,
-    origin: crate::common::profile_access::ProfileOrigin,
+    origin: ProfileOrigin,
 ) -> Result<Option<Arc<Mutex<AuditWriter>>>, WalletError> {
-    use crate::common::profile_access::ProfileOrigin;
     match origin {
         ProfileOrigin::Persisted => require_value_audit_writer(profile, profile_name).map(Some),
-        ProfileOrigin::Synthesized => Ok(acquire_value_audit_writer(profile, profile_name)),
+        ProfileOrigin::Synthesized => try_keyed_value_audit_writer(profile, profile_name, origin)
+            .inspect_err(|e| {
+                tracing::warn!(
+                    profile = %profile_name,
+                    code = %e.code(),
+                    "value audit: audit binding changed; refusing before signing/submit"
+                );
+            }),
     }
 }
 
@@ -201,14 +239,22 @@ pub(crate) fn require_value_audit_writer_for_origin(
 /// acquisition requires the key to load, which is exactly what failed here,
 /// and a long-lived MCP server resolves its profile once at startup.
 ///
+/// A binding refusal is returned rather than answered with the unkeyed
+/// fallback, so nothing is written to a log the binding does not name.
+///
 /// # Errors
 ///
-/// Returns [`WalletError`] only when even the unkeyed open fails (I/O).
+/// - [`ValidationError::AuditLogBindingChanged`] when the profile's audit
+///   binding changed.
+/// - [`WalletError`] when even the unkeyed open fails, mapped as the keyed
+///   acquisition's failures are: a log that cannot be read or written carries
+///   [`ValidationError::AuditLogUnusable`] with the `audit.io_error` detail.
 pub(crate) fn acquire_best_effort_audit_writer(
     profile: &Profile,
     profile_name: &str,
+    origin: ProfileOrigin,
 ) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
-    if let Some(writer) = acquire_value_audit_writer(profile, profile_name) {
+    if let Some(writer) = try_keyed_value_audit_writer(profile, profile_name, origin)? {
         return Ok(writer);
     }
     tracing::warn!(
@@ -216,55 +262,77 @@ pub(crate) fn acquire_best_effort_audit_writer(
         "value audit: keyed acquisition unavailable; \
          opening the audit writer unkeyed (rows not covered by audit verify)"
     );
+    // The unkeyed open's failure maps the way the keyed acquisition's does, so
+    // a log that cannot be opened reports its `audit.*` condition.
     AuditWriterRegistry::get_or_open_unkeyed(profile_name, &profile.audit_log_path)
-        .map_err(|e| audit_writer_open_failed_io(profile_name, &e))
-}
-
-fn audit_writer_open_failed_io(profile_name: &str, e: &impl std::fmt::Display) -> WalletError {
-    tracing::warn!(
-        profile = %profile_name,
-        error = %e,
-        "value audit: unkeyed audit writer open failed"
-    );
-    audit_writer_open_failed(profile_name)
+        .map_err(|e| audit_writer_acquisition_error(profile_name, &e))
 }
 
 /// Acquires the per-profile audit writer opened under the profile's audit
 /// chain-root HMAC key.
 ///
-/// Returns `None` (with a `tracing::warn!`) if the key cannot be loaded or the
-/// writer cannot be opened. Private: the callers are [`emit_value_audit_row`]
-/// (the one exempt, non-signing call site),
-/// [`require_value_audit_writer_for_origin`]'s
-/// [`crate::common::profile_access::ProfileOrigin::Synthesized`]
-/// arm (the zero-config quickstart's warn-only path), and
-/// [`acquire_best_effort_audit_writer`]'s keyed attempt. Every
-/// persisted-profile signing verb uses [`require_value_audit_writer`]
-/// instead, which fails closed.
+/// Returns `None` (with a `tracing::warn!`) if the binding refuses, the key
+/// cannot be loaded, or the writer cannot be opened. A binding refusal is
+/// logged with its code and the row is skipped. `origin` selects the binding
+/// check. Private: the one caller is [`emit_value_audit_row`], the exempt,
+/// non-signing call site. Every signing verb uses
+/// [`require_value_audit_writer`] or [`require_value_audit_writer_for_origin`]
+/// instead, and both refuse a changed binding.
 fn acquire_value_audit_writer(
     profile: &Profile,
     profile_name: &str,
+    origin: ProfileOrigin,
 ) -> Option<Arc<Mutex<AuditWriter>>> {
-    let access = match keyed_audit_access(profile) {
+    match try_keyed_value_audit_writer(profile, profile_name, origin) {
+        Ok(writer) => writer,
+        Err(e) => {
+            tracing::warn!(
+                profile = %profile_name,
+                code = %e.code(),
+                "value audit: audit binding changed; row skipped"
+            );
+            None
+        }
+    }
+}
+
+/// The keyed attempt behind [`acquire_value_audit_writer`],
+/// [`acquire_best_effort_audit_writer`], and the synthesized arm of
+/// [`require_value_audit_writer_for_origin`].
+///
+/// `Ok(None)`, with a `tracing::warn!`, when the key cannot be loaded or the
+/// writer cannot be opened.
+///
+/// # Errors
+///
+/// [`ValidationError::AuditLogBindingChanged`] only, so each caller decides
+/// whether a binding refusal skips its row or refuses.
+fn try_keyed_value_audit_writer(
+    profile: &Profile,
+    profile_name: &str,
+    origin: ProfileOrigin,
+) -> Result<Option<Arc<Mutex<AuditWriter>>>, WalletError> {
+    let access = match keyed_audit_access(profile, profile_name, origin.binding_check()) {
         Ok(access) => access,
+        Err(e) if is_binding_refusal(&e) => return Err(e),
         Err(e) => {
             tracing::warn!(
                 profile = %profile_name,
                 error = %e,
                 "value audit: could not load audit chain key; writer NOT acquired"
             );
-            return None;
+            return Ok(None);
         }
     };
     match AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access) {
-        Ok(arc) => Some(arc),
+        Ok(arc) => Ok(Some(arc)),
         Err(e) => {
             tracing::warn!(
                 profile = %profile_name,
                 error = %e,
                 "value audit: could not open audit writer; writer NOT acquired"
             );
-            None
+            Ok(None)
         }
     }
 }
@@ -309,7 +377,9 @@ pub(crate) fn emit_value_audit_row_with_writer(
 /// [`require_value_audit_writer`] first and then
 /// [`emit_value_audit_row_with_writer`] to reuse that acquisition.
 pub(crate) fn emit_value_audit_row(profile: &Profile, profile_name: &str, entry: AuditEntry) {
-    let Some(writer_arc) = acquire_value_audit_writer(profile, profile_name) else {
+    let Some(writer_arc) =
+        acquire_value_audit_writer(profile, profile_name, ProfileOrigin::Persisted)
+    else {
         return;
     };
     emit_value_audit_row_with_writer(&writer_arc, profile_name, entry);
@@ -324,6 +394,10 @@ pub(crate) fn emit_value_audit_row(profile: &Profile, profile_name: &str, entry:
 /// renders it to the agent and "the state is unavailable" would send an operator
 /// looking in the wrong place for a log that needs `audit reanchor`.
 ///
+/// `binding` is the audit binding check of the profile's origin: a
+/// synthesized profile passes [`BindingCheck::CheckOnly`], so the row records
+/// no binding for it.
+///
 /// # Errors
 ///
 /// [`WalletError::Validation`], with the same variants and wire codes
@@ -335,9 +409,19 @@ pub(crate) fn emit_value_audit_row(profile: &Profile, profile_name: &str, entry:
 pub(crate) fn emit_value_audit_row_strict(
     profile: &Profile,
     profile_name: &str,
+    binding: BindingCheck,
     entry: AuditEntry,
 ) -> Result<(), WalletError> {
-    let access = keyed_audit_access(profile).map_err(|e| {
+    let access = keyed_audit_access(profile, profile_name, binding).map_err(|e| {
+        // A binding refusal keeps its own code and remedy.
+        if is_binding_refusal(&e) {
+            tracing::warn!(
+                profile = %profile_name,
+                code = %e.code(),
+                "value audit: audit binding changed; withholding the authorization"
+            );
+            return e;
+        }
         tracing::warn!(
             profile = %profile_name,
             error = %e,
@@ -873,8 +957,9 @@ mod tests {
 
         // A log written before the anchor existed: rows present, no anchor.
         {
-            let key = crate::commands::profile::audit_emit::load_audit_hmac_key(&profile)
-                .expect("load key");
+            let key =
+                crate::commands::profile::audit_emit::load_audit_hmac_key(&profile, "test-profile")
+                    .expect("load key");
             let mut writer =
                 stellar_agent_core::audit_log::AuditWriter::open_keyed_unanchored_for_test(
                     profile.audit_log_path.clone(),
@@ -909,5 +994,265 @@ mod tests {
             .filter(|row| row["kind"] == "audit_tip_anchored" && row["reason"] == "adopted")
             .count();
         assert_eq!(adopted, 1, "adoption must leave exactly one row in the log");
+    }
+
+    // ── Audit binding ────────────────────────────────────────────────────────
+
+    /// A keyed profile whose binding is recorded for `dir/audit.jsonl` and
+    /// whose log path then moves to `dir/repointed/audit.jsonl`.
+    fn bound_then_repointed(name: &'static str, dir: &std::path::Path) -> Profile {
+        let mut profile = keyed_profile(name, dir);
+        stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(name)
+            .store(&stellar_agent_core::audit_log::AuditBinding::for_profile(
+                &profile,
+            ))
+            .expect("record binding");
+        profile.audit_log_path = dir.join("repointed").join("audit.jsonl");
+        profile
+    }
+
+    fn sample_row() -> AuditEntry {
+        AuditEntry::new_value_action_submitted(
+            "stellar_pay",
+            "stellar:testnet",
+            Vec::new(),
+            "abcd1234…wxyz5678",
+            1,
+            stellar_agent_core::audit_log::PolicyDecision::Allow,
+            None,
+            None,
+            None,
+            "req-binding",
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn the_pre_flight_passes_a_binding_refusal_through() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = bound_then_repointed("binding-preflight", dir.path());
+        let err = require_value_audit_writer(&profile, "binding-preflight")
+            .expect_err("a changed binding refuses");
+        assert_eq!(err.code(), "audit.log_binding_changed", "{err}");
+        assert!(!dir.path().join("repointed").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn the_strict_helper_passes_a_binding_refusal_through() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = bound_then_repointed("binding-strict", dir.path());
+        for binding in [BindingCheck::Enforce, BindingCheck::CheckOnly] {
+            let err =
+                emit_value_audit_row_strict(&profile, "binding-strict", binding, sample_row())
+                    .expect_err("a changed binding refuses");
+            assert_eq!(err.code(), "audit.log_binding_changed", "{err}");
+        }
+        assert!(!dir.path().join("repointed").exists());
+    }
+
+    /// The strict helper under `CheckOnly` writes its row and records no
+    /// binding.
+    #[test]
+    #[serial]
+    fn the_strict_helper_under_check_only_records_no_binding() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = keyed_profile("binding-strict-check-only", dir.path());
+        emit_value_audit_row_strict(
+            &profile,
+            "binding-strict-check-only",
+            BindingCheck::CheckOnly,
+            sample_row(),
+        )
+        .expect("an absent binding proceeds");
+        assert!(
+            stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(
+                "binding-strict-check-only"
+            )
+            .load_raw()
+            .expect("read binding")
+            .is_none(),
+            "CheckOnly records no binding"
+        );
+        assert!(
+            std::fs::read_to_string(&profile.audit_log_path)
+                .expect("read log")
+                .contains("value_action_submitted"),
+            "the row is written"
+        );
+    }
+
+    /// Every other keyed-access failure keeps `audit.chain_key_unavailable`
+    /// on the strict helper, as on the pre-flight.
+    #[test]
+    #[serial]
+    fn the_strict_helper_keeps_chain_key_unavailable_for_other_failures() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let mut profile = Profile::builder_testnet("binding-strict-nokey", "a", "n", "n").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let err = emit_value_audit_row_strict(
+            &profile,
+            "binding-strict-nokey",
+            BindingCheck::Enforce,
+            sample_row(),
+        )
+        .expect_err("an unminted key refuses");
+        assert_eq!(err.code(), "audit.chain_key_unavailable", "{err}");
+    }
+
+    /// The best-effort acquisition returns a binding refusal rather than
+    /// opening an unkeyed writer at the repointed path.
+    #[test]
+    #[serial]
+    fn best_effort_returns_a_binding_refusal_instead_of_an_unkeyed_writer() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = bound_then_repointed("binding-best-effort", dir.path());
+        for origin in [ProfileOrigin::Persisted, ProfileOrigin::Synthesized] {
+            let err = acquire_best_effort_audit_writer(&profile, "binding-best-effort", origin)
+                .expect_err("a changed binding refuses");
+            assert_eq!(err.code(), "audit.log_binding_changed", "{err}");
+        }
+        assert!(
+            !dir.path().join("repointed").exists(),
+            "no unkeyed fallback"
+        );
+    }
+
+    /// An unkeyed fallback whose log cannot be opened reports the log's
+    /// condition, `audit.io_error`, and no registration conflict.
+    #[test]
+    #[serial]
+    fn an_unkeyed_open_failure_reports_the_io_condition() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"a file where the audit directory goes").expect("write");
+        let mut profile = Profile::builder_testnet("unkeyed-io", "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = blocker.join("audit").join("audit.jsonl");
+        let Err(err) =
+            acquire_best_effort_audit_writer(&profile, "unkeyed-io", ProfileOrigin::Synthesized)
+        else {
+            panic!("an audit directory that cannot be created refuses");
+        };
+        assert_eq!(err.code(), "audit.chain_key_unavailable", "{err}");
+        assert!(
+            err.message().contains("audit.io_error"),
+            "{}",
+            err.message()
+        );
+        assert!(
+            !err.message()
+                .contains("conflicting audit-log path or key registration"),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// The warn-only path skips its row, logs the code, and writes nothing.
+    #[test]
+    #[serial]
+    fn the_warn_only_path_skips_its_row_and_logs_the_code() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = bound_then_repointed("binding-warn-only", dir.path());
+        let writer = stellar_agent_test_support::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            emit_value_audit_row(&profile, "binding-warn-only", sample_row());
+        });
+        let logs = String::from_utf8(writer.captured()).expect("utf8");
+        assert!(logs.contains("audit.log_binding_changed"), "{logs}");
+        assert!(!dir.path().join("repointed").exists());
+    }
+
+    /// A synthesized profile's warn-only pre-flight records no binding.
+    #[test]
+    #[serial]
+    fn a_synthesized_origin_records_no_binding() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = keyed_profile("binding-synthesized", dir.path());
+        require_value_audit_writer_for_origin(
+            &profile,
+            "binding-synthesized",
+            ProfileOrigin::Synthesized,
+        )
+        .expect("warn-only pre-flight");
+        assert!(
+            stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(
+                "binding-synthesized"
+            )
+            .load_raw()
+            .expect("read binding")
+            .is_none(),
+            "a synthesized origin records no binding"
+        );
+    }
+
+    /// A synthesized profile's pre-flight refuses a recorded binding that
+    /// differs, before any signing, and creates nothing at the path the
+    /// profile names.
+    #[test]
+    #[serial]
+    fn a_synthesized_origin_refuses_a_changed_binding() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = bound_then_repointed("binding-synthesized-changed", dir.path());
+        let Err(err) = require_value_audit_writer_for_origin(
+            &profile,
+            "binding-synthesized-changed",
+            ProfileOrigin::Synthesized,
+        ) else {
+            panic!("a changed binding refuses on a synthesized origin");
+        };
+        assert_eq!(err.code(), "audit.log_binding_changed", "{err}");
+        assert!(!dir.path().join("repointed").exists());
+    }
+
+    /// The unkeyed registry entry point reads and writes no binding, so an
+    /// unkeyed writer opens at a path the recorded binding does not name.
+    #[test]
+    #[serial]
+    fn get_or_open_unkeyed_records_and_checks_no_binding() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = bound_then_repointed("binding-unkeyed", dir.path());
+        let recorded = stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(
+            "binding-unkeyed",
+        )
+        .load_raw()
+        .expect("read binding");
+        AuditWriterRegistry::get_or_open_unkeyed("binding-unkeyed", &profile.audit_log_path)
+            .expect("an unkeyed open ignores the binding");
+        assert!(
+            stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(
+                "binding-unkeyed"
+            )
+            .load_raw()
+            .expect("read binding")
+                == recorded,
+            "an unkeyed open leaves the recorded binding"
+        );
+        let fresh = keyed_profile("binding-unkeyed-fresh", dir.path());
+        AuditWriterRegistry::get_or_open_unkeyed("binding-unkeyed-fresh", &fresh.audit_log_path)
+            .expect("open");
+        assert!(
+            stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(
+                "binding-unkeyed-fresh"
+            )
+            .load_raw()
+            .expect("read binding")
+            .is_none(),
+            "an unkeyed open records no binding"
+        );
     }
 }

@@ -30,8 +30,8 @@ fn boot_nonce_stable_within_process() {
     let profile = make_profile("boot-nonce-stable");
     seed_key(&profile, &key);
 
-    let mint1 = NonceMint::from_profile(&profile).expect("mint1");
-    let mint2 = NonceMint::from_profile(&profile).expect("mint2");
+    let mint1 = NonceMint::from_profile(&profile, "nonce-test").expect("mint1");
+    let mint2 = NonceMint::from_profile(&profile, "nonce-test").expect("mint2");
 
     // Both mints in the same process must share the same boot_nonce.
     assert_eq!(
@@ -51,7 +51,7 @@ fn boot_nonce_same_process_round_trip() {
     let profile = make_profile("boot-nonce-round-trip");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_balances"]);
     let expiry = far_future_expiry();
     let now = now_before_expiry();
@@ -69,7 +69,7 @@ fn boot_nonce_same_process_round_trip() {
         .expect("mint ok");
 
     // Construct a second NonceMint — same boot_nonce since same process.
-    let mint2 = NonceMint::from_profile(&profile).expect("mint2");
+    let mint2 = NonceMint::from_profile(&profile, "nonce-test").expect("mint2");
 
     let mut window = ReplayWindow::new();
     // Verify on the second mint instance — MUST succeed (shared boot_nonce).
@@ -98,8 +98,8 @@ fn boot_nonce_must_be_identical_across_instances() {
     let profile = make_profile("boot-nonce-identical");
     seed_key(&profile, &key);
 
-    let mint_a = NonceMint::from_profile(&profile).expect("mint_a");
-    let mint_b = NonceMint::from_profile(&profile).expect("mint_b");
+    let mint_a = NonceMint::from_profile(&profile, "nonce-test").expect("mint_a");
+    let mint_b = NonceMint::from_profile(&profile, "nonce-test").expect("mint_b");
 
     assert_eq!(
         mint_a.boot_nonce(),

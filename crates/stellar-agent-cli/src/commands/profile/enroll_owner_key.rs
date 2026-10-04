@@ -4,8 +4,12 @@
 //! The V1 policy engine verifies every policy file against the owner public key
 //! it reads from the keyring entry `stellar-agent-owner-<profile>` / `"default"`
 //! (see `fetch_owner_pubkey_from_keyring` in `stellar-agent-mcp` and
-//! `build_v1_policy_engine` in this crate).  The stored value is a URL-safe
-//! base64 (no padding) encoding of the 32-byte ed25519 public key.
+//! `build_v1_policy_engine` in this crate).  The stored value is the public
+//! key's G-strkey. A G-strkey decodes as URL-safe base64 to 42 bytes, so no
+//! 32-byte symmetric-key loader accepts it. Every owner reader also accepts
+//! the older form, URL-safe base64 of the 32 key bytes, and this command
+//! rewrites the older-form owner entry of every other profile in the profile
+//! directory, best effort.
 //!
 //! # Why the online agent holds only the public key
 //!
@@ -41,8 +45,6 @@
 //! }
 //! ```
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Args;
 use keyring_core::Entry as KeyringEntry;
 use serde::Serialize;
@@ -279,11 +281,13 @@ where
         return 1;
     }
 
-    // ── Write the base64-encoded PUBLIC key to the owner coordinate ───────────
-    // The encoding matches `fetch_owner_pubkey_from_keyring` / the V1 engine
-    // read path: URL-safe base64, no padding, over the raw 32 public-key bytes.
+    // ── Write the PUBLIC key to the owner coordinate as its G-strkey ──────────
+    // A G-strkey decodes as URL-safe base64 to 42 bytes, so no 32-byte
+    // symmetric-key loader accepts this entry. Every owner reader decodes it.
     // Wrap in Zeroizing for uniformity though the public key is non-secret.
-    let encoded: Zeroizing<String> = Zeroizing::new(URL_SAFE_NO_PAD.encode(owner_pubkey.0));
+    let encoded: Zeroizing<String> = Zeroizing::new(
+        stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_pubkey.0),
+    );
     if let Err(e) = entry.set_password(&encoded) {
         tracing::debug!(error = %e, "enroll-owner-key: set_password failed");
         // Classify the write failure: a non-interactive Windows session must
@@ -293,6 +297,21 @@ where
             &stellar_agent_network::keyring::map_keyring_error(&e, &owner_coord.service),
         ));
         return 1;
+    }
+
+    // Every other profile's older-form owner entry is rewritten as its
+    // G-strkey, best effort: a missing or unreadable entry is skipped with a
+    // warn and never fails the enrolment.
+    match stellar_agent_core::profile::schema::default_profile_dir() {
+        Ok(dir) => stellar_agent_core::profile::owner_key::rewrite_older_form_owner_entries_in_dir(
+            &dir,
+            Some(&profile_name),
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "enroll-owner-key: no profile directory; the owner key rewrite of other profiles \
+             was skipped"
+        ),
     }
 
     let request_id = Uuid::new_v4().to_string();
@@ -360,6 +379,8 @@ mod tests {
         reason = "test-only assertions"
     )]
 
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use keyring_core::Entry as KeyringEntry;
     use serial_test::serial;
     use stellar_agent_test_support::keyring_mock;
@@ -461,24 +482,80 @@ mod tests {
         .await;
         assert_eq!(code, 0, "enroll must succeed on a clean owner coordinate");
 
-        // The stored value is the base64 PUBLIC key the engine decodes.
+        // The stored value is the PUBLIC key's G-strkey, which the engine
+        // decodes and no 32-byte symmetric loader accepts.
         let entry = KeyringEntry::new(&coord.service, &coord.account).unwrap();
         let stored = entry.get_password().expect("owner key must be present");
-        let decoded = URL_SAFE_NO_PAD.decode(stored.trim()).expect("valid base64");
-        assert_eq!(decoded, pk_bytes, "stored value must be the raw public key");
-        assert_ne!(
-            decoded, [0x11u8; 32],
+        assert!(
+            stored == derived_g,
+            "the stored value is the owner G-strkey"
+        );
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(stored.trim()).map(|b| b.len()).ok(),
+            Some(42),
+            "a G-strkey decodes as URL-safe base64 to 42 bytes"
+        );
+        let (decoded, form) =
+            stellar_agent_core::profile::owner_key::decode_owner_public_key(&stored)
+                .expect("the engine decodes the stored form");
+        assert_eq!(
+            form,
+            stellar_agent_core::profile::owner_key::OwnerKeyForm::Strkey
+        );
+        assert!(decoded == pk_bytes, "stored value must be the public key");
+        assert!(
+            decoded != [0x11u8; 32],
             "stored value must be the public key, never the seed"
         );
-        // The stored public-key bytes render to the derived owner address.
-        let decoded_arr: [u8; 32] = decoded.try_into().expect("32 bytes");
-        assert_eq!(
-            stellar_strkey::ed25519::PublicKey(decoded_arr)
-                .to_string()
-                .to_string(),
-            derived_g,
-            "the stored public key must render to the derived owner address"
-        );
+    }
+
+    /// Enrolment rewrites the older-form owner entry of every other profile in
+    /// the profile directory, and leaves an entry already in the stored form.
+    #[tokio::test]
+    #[serial]
+    async fn enroll_rewrites_other_profiles_older_form_entries() {
+        keyring_mock::install().expect("mock store");
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let profile_dir =
+            stellar_agent_core::profile::schema::default_profile_dir().expect("profile dir");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let (_s_b, g_b, pk_b) = seed_material([0x51u8; 32]);
+        let (_s_c, g_c, _pk_c) = seed_material([0x52u8; 32]);
+        for (name, value) in [
+            ("enroll-other-b", URL_SAFE_NO_PAD.encode(pk_b)),
+            ("enroll-other-c", g_c.clone()),
+        ] {
+            std::fs::write(profile_dir.join(format!("{name}.toml")), "").unwrap();
+            let coord = KeyringEntryRef::default_owner_key(name);
+            KeyringEntry::new(&coord.service, &coord.account)
+                .unwrap()
+                .set_password(&value)
+                .unwrap();
+        }
+
+        let profile_name = "enroll-owner-sweep";
+        let (s_strkey, _g, _pk) = seed_material([0x53u8; 32]);
+        let var = unique_var("SWEEP");
+        let _guard = EnvGuard::set(var.clone(), &s_strkey);
+        let profile = profile_for(profile_name);
+        let code = run_with_dependencies(
+            &args(profile_name, &var, None, false),
+            move |_n| Ok(profile.clone()),
+            || Ok(()),
+        )
+        .await;
+        assert_eq!(code, 0);
+
+        let read = |name: &str| {
+            let coord = KeyringEntryRef::default_owner_key(name);
+            KeyringEntry::new(&coord.service, &coord.account)
+                .unwrap()
+                .get_password()
+                .unwrap()
+        };
+        assert!(read("enroll-other-b") == g_b, "the older form is rewritten");
+        assert!(read("enroll-other-c") == g_c, "the stored form is left");
     }
 
     #[tokio::test]
@@ -534,9 +611,8 @@ mod tests {
         assert_eq!(code, 1, "enroll must refuse to overwrite without --force");
 
         let entry = KeyringEntry::new(&coord.service, &coord.account).unwrap();
-        assert_eq!(
-            entry.get_password().unwrap(),
-            "preexisting-sentinel",
+        assert!(
+            entry.get_password().unwrap() == "preexisting-sentinel",
             "the existing entry must be left untouched"
         );
     }
@@ -569,8 +645,16 @@ mod tests {
 
         let entry = KeyringEntry::new(&coord.service, &coord.account).unwrap();
         let stored = entry.get_password().unwrap();
-        let decoded = URL_SAFE_NO_PAD.decode(stored.trim()).unwrap();
-        assert_eq!(decoded, pk_bytes, "coordinate must hold the new public key");
+        assert!(
+            stored == derived_g,
+            "coordinate must hold the new public key"
+        );
+        let (decoded, _form) =
+            stellar_agent_core::profile::owner_key::decode_owner_public_key(&stored).unwrap();
+        assert!(
+            decoded == pk_bytes,
+            "coordinate must hold the new public key"
+        );
     }
 
     #[tokio::test]

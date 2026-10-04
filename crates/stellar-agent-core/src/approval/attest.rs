@@ -237,13 +237,22 @@ pub fn decode_sha256_hex(hex: &str) -> Result<[u8; 32], WalletError> {
 /// the caller, since it is a process-wide, one-time registration rather than
 /// part of the per-approval attest path.
 ///
+/// A coordinate in the owner key namespace is refused before any keyring read,
+/// and a loaded key equal to the owner public key at a coordinate of `owner`
+/// is refused after decoding. Both refusals are
+/// [`crate::error::ValidationError::KeyMatchesOwnerPublicKey`] for
+/// `attestation_key_id`.
+///
 /// # Errors
 ///
 /// Returns a [`WalletError`] when the keyring entry is missing or contains
-/// invalid base64/wrong-length data.
+/// invalid base64/wrong-length data, when the key is or may be the owner
+/// public key, or when an owner entry cannot be read.
 pub fn load_attestation_key(
     entry_ref: &KeyringEntryRef,
+    owner: &crate::profile::owner_key::OwnerKeyContext,
 ) -> Result<Zeroizing<Vec<u8>>, WalletError> {
+    crate::profile::owner_key::refuse_owner_key_coordinate(entry_ref, ATTESTATION_KEY_FIELD)?;
     let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
         tracing::debug!(
             error = %e,
@@ -278,8 +287,12 @@ pub fn load_attestation_key(
         }));
     }
 
+    crate::profile::owner_key::refuse_owner_public_key(&key_bytes, owner, ATTESTATION_KEY_FIELD)?;
     Ok(key_bytes)
 }
+
+/// The profile field an attestation-key refusal names.
+pub const ATTESTATION_KEY_FIELD: &str = "attestation_key_id";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // attest_and_persist
@@ -737,6 +750,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
 
@@ -782,6 +796,11 @@ mod tests {
         assert!(err.to_string().contains("64"));
     }
 
+    /// The owner context of the profile these loader tests name.
+    fn test_owner() -> crate::profile::owner_key::OwnerKeyContext {
+        crate::profile::owner_key::OwnerKeyContext::for_profile_name("core-test")
+    }
+
     #[test]
     #[serial_test::serial]
     fn load_attestation_key_success() {
@@ -789,8 +808,118 @@ mod tests {
         let svc = "stellar-agent-attestation-core-test-load";
         seed_key_32(svc, "default");
         let entry_ref = KeyringEntryRef::new(svc, "default");
-        let key = load_attestation_key(&entry_ref).unwrap();
+        let key = load_attestation_key(&entry_ref, &test_owner()).unwrap();
         assert_eq!(key.len(), 32);
+    }
+
+    /// An attestation key equal to the profile's owner public key in the older
+    /// form refuses after decoding.
+    #[test]
+    #[serial_test::serial]
+    fn load_attestation_key_refuses_the_owner_public_key() {
+        use base64::Engine as _;
+        keyring_mock::install().unwrap();
+        let owner_bytes = [0x2b_u8; 32];
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner_bytes);
+        let owner = KeyringEntryRef::default_owner_key("core-test");
+        let attestation = KeyringEntryRef::new("stellar-agent-attestation-core-test", "default");
+        for coordinate in [&owner, &attestation] {
+            keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+                .unwrap()
+                .set_password(&encoded)
+                .unwrap();
+        }
+        let Err(err) = load_attestation_key(&attestation, &test_owner()) else {
+            panic!("the load refuses");
+        };
+        assert_eq!(err.code(), "validation.key_matches_owner_public_key");
+        assert!(err.to_string().contains("attestation_key_id"));
+    }
+
+    /// A G-strkey owner value at the attestation coordinate decodes to 42
+    /// bytes and is refused by the length rule.
+    #[test]
+    #[serial_test::serial]
+    fn load_attestation_key_refuses_a_g_strkey_owner_value() {
+        keyring_mock::install().unwrap();
+        let attestation = KeyringEntryRef::new("stellar-agent-attestation-core-strkey", "default");
+        keyring_core::Entry::new(&attestation.service, &attestation.account)
+            .unwrap()
+            .set_password(&crate::profile::owner_key::encode_owner_public_key(
+                &[0x2b; 32],
+            ))
+            .unwrap();
+        let Err(err) = load_attestation_key(&attestation, &test_owner()) else {
+            panic!("the load refuses");
+        };
+        assert!(
+            err.to_string()
+                .contains("attestation key must be 32 bytes, got 42"),
+            "{err}"
+        );
+    }
+
+    /// A profile whose `policy_owner_key_id.account` is not `default` still
+    /// compares against the owner entry the engine reads,
+    /// `default_owner_key(name)`.
+    #[test]
+    #[serial_test::serial]
+    fn load_attestation_key_compares_the_engine_coordinate_for_a_non_default_account() {
+        use base64::Engine as _;
+        keyring_mock::install().unwrap();
+        let mut profile = crate::profile::schema::Profile::builder_testnet_named(
+            "core-owner-acct",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .build();
+        profile.policy_owner_key_id =
+            KeyringEntryRef::new("stellar-agent-owner-core-owner-acct", "operator");
+        let owner =
+            crate::profile::owner_key::OwnerKeyContext::for_profile("core-owner-acct", &profile);
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x3c_u8; 32]);
+        let engine_coordinate = KeyringEntryRef::default_owner_key("core-owner-acct");
+        let attestation =
+            KeyringEntryRef::new("stellar-agent-attestation-core-owner-acct", "default");
+        for coordinate in [&engine_coordinate, &attestation] {
+            keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+                .unwrap()
+                .set_password(&encoded)
+                .unwrap();
+        }
+        let Err(err) = load_attestation_key(&attestation, &owner) else {
+            panic!("the load refuses");
+        };
+        assert_eq!(err.code(), "validation.key_matches_owner_public_key");
+    }
+
+    /// An attestation coordinate in another profile's owner namespace refuses
+    /// before any keyring read: an error planted there is still pending.
+    #[test]
+    #[serial_test::serial]
+    fn load_attestation_key_refuses_an_owner_coordinate_without_a_read() {
+        keyring_mock::install().unwrap();
+        let other_owner = KeyringEntryRef::new("stellar-agent-owner-B", "default");
+        keyring_mock::inject_error(
+            &other_owner.service,
+            &other_owner.account,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("planted"))),
+        )
+        .unwrap();
+        let Err(err) = load_attestation_key(&other_owner, &test_owner()) else {
+            panic!("the load refuses");
+        };
+        assert_eq!(err.code(), "validation.key_matches_owner_public_key");
+        let pending = keyring_core::Entry::new(&other_owner.service, &other_owner.account)
+            .unwrap()
+            .get_password()
+            .unwrap_err();
+        assert!(
+            matches!(pending, keyring_core::Error::PlatformFailure(_)),
+            "the planted error is still pending, so no read happened: {pending:?}"
+        );
     }
 
     /// A non-interactive Windows session (the `ERROR_NO_SUCH_LOGON_SESSION`
@@ -803,7 +932,9 @@ mod tests {
         let svc = "stellar-agent-attestation-core-test-no-logon";
         keyring_mock::inject_no_logon_session(svc, "default").unwrap();
         let entry_ref = KeyringEntryRef::new(svc, "default");
-        let err = load_attestation_key(&entry_ref).unwrap_err();
+        let Err(err) = load_attestation_key(&entry_ref, &test_owner()) else {
+            panic!("the load refuses");
+        };
         assert_eq!(err.code(), "auth.keyring_interactive_session_required");
     }
 
@@ -823,7 +954,9 @@ mod tests {
         )
         .unwrap();
         let entry_ref = KeyringEntryRef::new(svc, "default");
-        let err = load_attestation_key(&entry_ref).unwrap_err();
+        let Err(err) = load_attestation_key(&entry_ref, &test_owner()) else {
+            panic!("the load refuses");
+        };
         assert_eq!(err.code(), "auth.keyring_platform_error");
     }
 

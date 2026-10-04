@@ -259,7 +259,11 @@ async fn authorize(args: MppAuthorizeArgs) -> i32 {
     };
     let now_unix = i64::try_from(now_ms / 1_000).unwrap_or(i64::MAX);
     if let Some(approval_id) = args.approval_id.as_deref() {
-        let state = match MppAuthorizationStore::open_for_read(&profile_name, &profile) {
+        let state = match MppAuthorizationStore::open_for_read(
+            &profile_name,
+            &profile,
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
+        ) {
             Ok(Some(state)) => state,
             // A profile with no MPP state holds no authorization under any
             // approval, which is the same answer as a store that holds none.
@@ -306,7 +310,11 @@ async fn prepare_and_authorize_without_state(
         Ok(prepared) => prepared,
         Err(error) => return render_error(&error),
     };
-    let state = match MppAuthorizationStore::open_for_prepare(profile_name, &profile) {
+    let state = match MppAuthorizationStore::open_for_prepare(
+        profile_name,
+        &profile,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    ) {
         Ok(state) => state,
         Err(error) => return render_error(&error),
     };
@@ -420,7 +428,7 @@ async fn commit_cli(
             Ok(store) => Some(store),
             Err(error) => return render_error(&error),
         };
-        approval_key = match load_hmac_key_32(&profile.attestation_key_id) {
+        approval_key = match load_mpp_attestation_key(profile, profile_name) {
             Ok(key) => Some(key),
             Err(_) => return render_error(&approval_error()),
         };
@@ -497,7 +505,13 @@ async fn commit_cli(
                 PolicyDecision::Allow,
                 uuid::Uuid::new_v4().to_string(),
             );
-            emit_value_audit_row_strict(profile, profile_name, entry).map_err(|error| {
+            emit_value_audit_row_strict(
+                profile,
+                profile_name,
+                stellar_agent_core::audit_log::BindingCheck::Enforce,
+                entry,
+            )
+            .map_err(|error| {
                 if let Ok(mut slot) = delivery_refusal.lock() {
                     *slot = Some(error);
                 }
@@ -515,7 +529,12 @@ async fn commit_cli(
                 withheld.policy_budget_consumed,
                 uuid::Uuid::new_v4().to_string(),
             );
-            let _ = emit_value_audit_row_strict(profile, profile_name, entry);
+            let _ = emit_value_audit_row_strict(
+                profile,
+                profile_name,
+                stellar_agent_core::audit_log::BindingCheck::Enforce,
+                entry,
+            );
         },
     )
     .await;
@@ -544,7 +563,11 @@ fn status(args: &MppStatusArgs) -> i32 {
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
     }
-    let state = match MppAuthorizationStore::open_for_read(&profile_name, &profile) {
+    let state = match MppAuthorizationStore::open_for_read(
+        &profile_name,
+        &profile,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    ) {
         Ok(Some(state)) => state,
         // A profile that has never prepared a charge holds no authorization
         // under any identifier — the store's own answer for an unknown one.
@@ -594,7 +617,11 @@ fn record_receipt(args: &MppReceiptArgs) -> i32 {
         Ok(receipt) => receipt,
         Err(error) => return render_error(&error),
     };
-    let state = match MppAuthorizationStore::open_for_read(&profile_name, &profile) {
+    let state = match MppAuthorizationStore::open_for_read(
+        &profile_name,
+        &profile,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    ) {
         Ok(Some(state)) => state,
         Ok(None) => return render_error(&absent_state_lookup_error(&args.authorization_id)),
         Err(error) => return render_error(&error),
@@ -615,7 +642,12 @@ fn record_receipt(args: &MppReceiptArgs) -> i32 {
         receipt.status(),
         uuid::Uuid::new_v4().to_string(),
     );
-    if let Err(error) = emit_value_audit_row_strict(&profile, &profile_name, entry) {
+    if let Err(error) = emit_value_audit_row_strict(
+        &profile,
+        &profile_name,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+        entry,
+    ) {
         return render_wallet_error(&error);
     }
     print_success(json!({
@@ -646,7 +678,11 @@ async fn reconcile(args: MppReconcileArgs) -> i32 {
             },
             Err(error) => return render_error(&error),
         };
-    let state = match MppAuthorizationStore::open_for_read(&profile_name, &profile) {
+    let state = match MppAuthorizationStore::open_for_read(
+        &profile_name,
+        &profile,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    ) {
         Ok(Some(state)) => state,
         Ok(None) => return render_error(&absent_state_lookup_error(&args.authorization_id)),
         Err(error) => return render_error(&error),
@@ -669,7 +705,12 @@ async fn reconcile(args: MppReconcileArgs) -> i32 {
         result.outcome.clone(),
         uuid::Uuid::new_v4().to_string(),
     );
-    if let Err(error) = emit_value_audit_row_strict(&profile, &profile_name, entry) {
+    if let Err(error) = emit_value_audit_row_strict(
+        &profile,
+        &profile_name,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+        entry,
+    ) {
         return render_wallet_error(&error);
     }
     print_success(result);
@@ -694,7 +735,11 @@ fn prune(args: &MppPruneArgs) -> i32 {
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
     }
-    let state = match MppAuthorizationStore::open_for_read(&args.profile, &profile) {
+    let state = match MppAuthorizationStore::open_for_read(
+        &args.profile,
+        &profile,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    ) {
         Ok(state) => state,
         Err(error) => return render_error(&error),
     };
@@ -710,6 +755,7 @@ fn prune(args: &MppPruneArgs) -> i32 {
     if let Err(error) = emit_value_audit_row_strict(
         &profile,
         &args.profile,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
         AuditEntry::new_tool_invocation(audit),
     ) {
         return render_wallet_error(&error);
@@ -901,6 +947,45 @@ fn render_error(error: &MppError) -> i32 {
     1
 }
 
+/// Loads the attestation key the MPP approval check verifies against.
+///
+/// A coordinate in the owner key namespace is refused before the read, and a
+/// key equal to the owner public key of `profile` selected as `profile_name`
+/// after decoding. The caller renders every failure as the uniform approval
+/// refusal, so an owner refusal is logged here with its code.
+fn load_mpp_attestation_key(
+    profile: &stellar_agent_core::profile::schema::Profile,
+    profile_name: &str,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, WalletError> {
+    use stellar_agent_core::approval::attest::ATTESTATION_KEY_FIELD;
+    use stellar_agent_core::profile::owner_key;
+    let log_owner_refusal = |e: WalletError| {
+        if matches!(
+            e,
+            WalletError::Validation(
+                stellar_agent_core::error::ValidationError::KeyMatchesOwnerPublicKey { .. }
+            )
+        ) {
+            tracing::warn!(
+                profile = %profile_name,
+                code = %e.code(),
+                "mpp: attestation key refused: it is or may be the owner public key"
+            );
+        }
+        e
+    };
+    owner_key::refuse_owner_key_coordinate(&profile.attestation_key_id, ATTESTATION_KEY_FIELD)
+        .map_err(log_owner_refusal)?;
+    let key = load_hmac_key_32(&profile.attestation_key_id)?;
+    owner_key::refuse_owner_public_key(
+        key.as_ref(),
+        &owner_key::OwnerKeyContext::for_profile(profile_name, profile),
+        ATTESTATION_KEY_FIELD,
+    )
+    .map_err(log_owner_refusal)?;
+    Ok(key)
+}
+
 /// Renders policy and audit refusals with their wallet code and diagnostic.
 fn render_wallet_error(error: &WalletError) -> i32 {
     print_json(&crate::commands::submission_record::error_envelope(
@@ -1018,6 +1103,7 @@ impl MppArgs {
 mod tests {
     #![allow(
         clippy::expect_used,
+        clippy::panic,
         reason = "test fixtures use expect for concise setup"
     )]
 
@@ -1025,6 +1111,60 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn put_raw(entry_ref: &stellar_agent_core::profile::schema::KeyringEntryRef, value: &str) {
+        keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+            .expect("entry")
+            .set_password(value)
+            .expect("plant");
+    }
+
+    /// The attestation key loader of `mpp charge` refuses a key equal to the
+    /// owner public key in the older form and logs the code at `warn`; the
+    /// caller renders the uniform approval refusal. A G-strkey owner value and
+    /// an owner-namespace coordinate refuse too. The raw value is never
+    /// logged.
+    #[test]
+    #[serial_test::serial]
+    fn the_attestation_loader_refuses_owner_key_forms() {
+        use base64::Engine as _;
+        use stellar_agent_core::profile::schema::KeyringEntryRef;
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+        let name = "mpp-attest-owner";
+        let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+        let older_form = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x4f_u8; 32]);
+        put_raw(&profile.attestation_key_id, &older_form);
+        assert!(load_mpp_attestation_key(&profile, name).is_ok());
+
+        put_raw(&KeyringEntryRef::default_owner_key(name), &older_form);
+        let mut refused = None;
+        let logs = stellar_agent_test_support::with_captured_logs(|| {
+            refused = load_mpp_attestation_key(&profile, name).err();
+        });
+        let err = refused.expect("the owner key refuses");
+        assert_eq!(err.code(), "validation.key_matches_owner_public_key");
+        assert!(!logs.contains(&older_form), "the raw value is never logged");
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(
+            logs.contains("validation.key_matches_owner_public_key"),
+            "{logs}"
+        );
+
+        put_raw(
+            &profile.attestation_key_id,
+            &stellar_agent_core::profile::owner_key::encode_owner_public_key(&[0x4f; 32]),
+        );
+        let Err(err) = load_mpp_attestation_key(&profile, name) else {
+            panic!("a G-strkey refuses");
+        };
+        assert!(err.to_string().contains("got 42"), "{err}");
+
+        profile.attestation_key_id = KeyringEntryRef::new("stellar-agent-owner-B", "default");
+        let Err(err) = load_mpp_attestation_key(&profile, name) else {
+            panic!("an owner coordinate refuses");
+        };
+        assert_eq!(err.code(), "validation.key_matches_owner_public_key");
+    }
 
     #[test]
     fn testnet_context_derives_the_canonical_passphrase() {

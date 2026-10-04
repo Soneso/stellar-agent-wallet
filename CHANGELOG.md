@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core `check_endpoint_url` and `Profile::validate_endpoint_urls` apply the endpoint rule to a profile's three endpoint fields. A refusal is an `EndpointUrlError` naming the field and an `EndpointUrlRejection`, never the URL. The loader reports one as `ProfileLoadError::InvalidEndpointUrl`, and a mainnet file without `rpc_url` as `ProfileLoadError::MainnetRpcUrlRequired`.
 - `stellar_agent_network::NetworkContext` carries the chain identity and RPC endpoints for a command, with a canonical passphrase and redacted `Debug` output.
 - Core profile APIs `check_mainnet_selection` and `ResolvedProfileName::from_flag` preserve explicit profile selection. `ProfileLoadError::to_validation_error` maps loader refusals to validation errors.
-- Wire codes `profile.non_overlayable_field` and `profile.mainnet_requires_explicit_profile` identify protected overlays and implicit mainnet selection.
+- Wire codes `profile.non_overlayable_field` and `profile.mainnet_requires_explicit_profile` identify refused overlays and implicit mainnet selection.
 - `AttestationBinding` and `ApprovalContext` name the profile and the chain an approval is bound to and rendered under.
 - `envelope_source_account` returns the effective source of a single-operation envelope; `approve list` reports it as `source` on payments and `envelope_source` on claims.
 - `approve` prints the profile, the network, the endpoint host, the enrolled signer, and the envelope source before the approval prompt; the loopback and remote inbox pages show the same rows.
@@ -148,6 +148,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL` is the refusal
   detail of every sign-only mainnet refusal, and it carries the canonical
   code.
+- Wire code `audit.log_binding_changed` (`ValidationError::AuditLogBindingChanged`)
+  reports a profile whose audit log path or audit key differs from its
+  recorded audit binding.
+- Wire code `validation.key_matches_owner_public_key`
+  (`ValidationError::KeyMatchesOwnerPublicKey`) reports a symmetric key that
+  is, or may be, the profile's owner public key. `NonceError`,
+  `WindowStoreError`, and `CounterpartyError` gain a `KeyMatchesOwnerPublicKey`
+  variant, and `NonceError` gains `KeyTooLong` (`nonce.key_too_long`).
+- `ValidationError::AuditBindingChangeNotAcknowledged` reports the missing
+  `audit reanchor` flag under `validation.acknowledgement_required`.
+- `ProfileLoadError::OverlayMayOnlyTighten` and
+  `ValidationError::ProfileOverlayMayOnlyTighten` report an `mcp_disabled`
+  overlay other than `true` under `profile.non_overlayable_field`.
+- `TipAnchorReason::BindingChanged`, wire `binding_changed`, on the
+  `audit_tip_anchored` row an acknowledged binding change appends.
+- Core `audit_log::binding` with `AuditBinding`, `BindingCheck`,
+  `RecordedBinding`, and `AuditBindingParseError`.
+- Network `KeyringAuditBindingStore`, the keyring store of a profile's audit
+  binding, and `check_audit_binding`.
+- `KeyringEntryRef::default_audit_binding`, service
+  `stellar-agent-auditbinding-<profile>` and account `default`.
+- Core `audit_log::tip_anchor::log_path_sha256`,
+  `tip_anchor_account_for_digest`, `reanchor_count_account_for_digest`, and
+  network `KeyringTipAnchorStore::for_path_digest`.
+- Core `audit_log::verify::check_anchor_against_walk` is public, beside
+  `stored_anchor_disagrees_with_walk`. `StoredTipAnchor::from_raw`,
+  `AuditWriter::stored_anchor_disagrees`, `ReanchorAcknowledgement`, and
+  `AuditWriter::reanchor_acknowledging` back the binding acknowledgement.
+- Core `profile::owner_key` decodes both owner key forms, rewrites older-form
+  entries, and holds `OwnerKeyContext`, `refuse_owner_key_coordinate`, and
+  `refuse_owner_public_key`.
+- Core `profile::loader::ProfileOrigin` and
+  `load_default_or_testnet_fallback_from_dir`.
+- `WalletServer::with_audit_binding_check`.
+- MCP `transport::load_selected_profile` resolves the server's startup profile
+  with its origin.
+- Network `keyring::AUDIT_KEY_FIELD` and `policy_state::POLICY_STATE_KEY_FIELD`,
+  core `approval::attest::ATTESTATION_KEY_FIELD`, and nonce
+  `mint::NONCE_KEY_FIELD` name the profile fields an owner key refusal
+  reports.
+- Test support `keyring_mock::install_with_write_error` fails the next write at
+  one coordinate.
 
 ### Changed
 
@@ -155,7 +197,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--network` is optional and must match the profile's chain.
 - `--rpc-url` and `--secondary-rpc-url` are optional testnet overrides. Mainnet profiles refuse either flag, including equal values.
 - An absent `--secondary-rpc-url` uses the profile's secondary endpoint. Smart-account rule commands perform their cross-RPC check when a secondary endpoint is configured.
-- Mainnet profiles read `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, and `mcp_signer_default` from the file only. Environment and programmatic overlays naming these fields are refused, `STELLAR_AGENT_ORACLE_PROVIDER_URL` included.
+- An environment or programmatic overlay may set only operational profile fields, in three classes. `submit_timeout_seconds` is overlayable on every chain. `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, `mcp_signer_default`, `cross_check_threshold_stroops` and its alias `usd_threshold`, `classic_fee_per_op_stroops`, `classic_max_fee_per_op_stroops`, `smart_account_max_context_rule_scan_id`, and `session_rule_max_horizon_ledgers` are overlayable on testnet only. `mcp_disabled` is overlayable on every chain, and only to `true`. Every other profile key is refused on every chain with `profile.non_overlayable_field`, even when the value equals the file. That includes `chain_id`, `version`, every keyring coordinate, `audit_log_path`, `policy`, `wallet`, `remote_approval`, `served_pages`, and the pool fields. A `STELLAR_AGENT_*` variable that names no profile key is ignored.
 - A mainnet profile names its RPC endpoint; mainnet has no default endpoint. A mainnet profile file without `rpc_url` refuses to load, and `profile migrate` refuses such a v1 file, both with `validation.mainnet_rpc_url_required`.
 - `rpc_url`, `secondary_rpc_url`, and `oracle_provider_url` must be HTTP or HTTPS URLs on every chain, and HTTPS URLs with no userinfo on mainnet. The profile loader, `profile init`, and `profile migrate` refuse a URL that breaks the rule with `validation.config_invalid`. The message names the field, not the URL.
 - `profile migrate` reports load refusals with validation codes: `validation.profile_not_found` for a missing file, and `validation.config_invalid` for a file it cannot read. A refused migration writes nothing.
@@ -172,12 +214,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `NetworkContext::from_profile` copies `secondary_rpc_url`; `NetworkContext::from_flags` is renamed `NetworkContext::new`.
 - `SignersManagerConfig` and `ContextRuleManagerConfig` redact endpoint URLs and audit writers in `Debug`. Signers manager construction errors redact endpoint URLs too.
 - The MCP tools `stellar_rule_create`, `stellar_rule_create_commit`, `stellar_rules_list`, and `stellar_rules_get` build their smart-account managers with the profile's secondary endpoint. The rule submission's cross-RPC check uses it when one is set.
-- `chain_id` comes from the profile file only. `STELLAR_AGENT_CHAIN_ID` and programmatic overlays naming `chain_id` are refused on every profile.
-- Mainnet profiles refuse `STELLAR_AGENT_RPC_URL` and programmatic overlays naming `rpc_url`, including values equal to the file.
 - A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE` never selects one, and a mainnet `default.toml` needs `--profile default`. Keep the filename: its identity is bound to its keyring entries.
-- Unset `STELLAR_AGENT_CHAIN_ID` and, for a mainnet profile, `STELLAR_AGENT_RPC_URL` first. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
+- Before the first run after upgrading, move every value a refused environment variable sets into the profile file, `STELLAR_AGENT_AUDIT_LOG_PATH` for example. The first keyed use records the audit binding from the file, so the file must name the log the profile writes. Unset the refused variables, remove refused keys from programmatic overlays, then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint.
 - MCP tools and CLI transaction verbs read their network identity from one context per invocation.
-- A mainnet profile under a protected overlay reads as `profile_resource_unloadable` on MCP profile resources. Account enumeration skips profiles whose load is refused.
+- A profile under a refused overlay reads as `profile_resource_unloadable` on MCP profile resources. Account enumeration skips profiles whose load is refused.
 - The approval attestation binds the profile name and the chain id under a versioned domain tag. The commit refuses an approval attested on an earlier build; the inbox shows it as resolved until it expires, and the agent simulates and approves again. The CLI and the MCP server must run the same build.
 - Pending entries without an attestation can be approved under the new layout. The store needs no migration. Earlier blobs receive the existing payment, claim, MPP, or clawback refusal and expire normally.
 - Toolset grants recorded on an earlier build keep suppressing the first-invoke prompt; each action still needs its own approval.
@@ -470,6 +510,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   install the exact toolchain that `RELEASE_TOOLCHAIN` in `publish.yml` names.
 - The publish workflow takes a `verify_only` input that runs only the
   `verify` job.
+- `keyed_audit_access` takes the selected profile name and a `BindingCheck`,
+  and checks the audit binding before the audit key loads. The MPP store
+  openers `open_for_prepare`, `open_for_read`, and `reset_for_profile` take a
+  `BindingCheck`. MCP `build_server` and `transport::run` take the check the
+  profile's origin implies.
+- `load_default_or_testnet_fallback` returns the profile with its
+  `ProfileOrigin`: a `default.toml` that exists is persisted, and only the
+  synthesized fallback is synthesized.
+- The CLI audit helpers `open_audit_writer_read_only`,
+  `acquire_best_effort_audit_writer`, `acquire_value_audit_writer`, and
+  `reconcile_open_reservations` take the profile's origin, and
+  `emit_value_audit_row_strict` takes its binding check.
+- `load_attestation_key` and `DecisionContext::new` take the owner context,
+  an `OwnerKeyContext`. `NonceMint::from_profile` takes the profile name.
+- `AuditWriter::reanchor` is `reanchor_acknowledging` with one rollback
+  acknowledgement; `reanchor_acknowledging` takes the acknowledged conditions
+  and the previous binding's anchor, and bumps the re-anchor counter once.
+- `audit reanchor --acknowledge-binding-change` accepts a changed or
+  unreadable audit binding. With an absent or agreeing anchor it needs that
+  flag alone and appends `binding_changed`; with a disagreeing or unusable
+  anchor it needs both flags and appends `rollback_acknowledged`, then
+  `binding_changed`. On an equal or absent binding it requires
+  `--acknowledge-rollback`, appends `rollback_acknowledged`, and records an
+  absent binding. The envelope gains `acknowledged`,
+  `recorded_binding`, and `previous_binding_anchor`.
+- The read-only smart-account verbs (`rules get-spending-limit`,
+  `list-rules`, `timelock list-pending`, and the `migrate-verifier` dry run)
+  refuse a changed audit binding with `audit.log_binding_changed` and create
+  nothing at the path the profile names. `audit verify --profile` and
+  `profile rotate-audit-key` refuse it the same way.
+- On the synthesized zero-config profile, `pay`, `claim`, `accounts create`,
+  and `tx receipt clear` refuse a recorded audit binding that differs with
+  `audit.log_binding_changed` before they sign or clear anything, and record no
+  binding. The window reconciliation these verbs run records none either.
+- `profile enroll-owner-key` stores the owner public key as its G-strkey.
+  Every owner reader accepts the G-strkey and the older base64 form. The first
+  V1 engine build in a process, and `enroll-owner-key`, rewrite the older-form
+  owner entry of every profile in the profile directory, best effort.
+- Symmetric-key loaders refuse a coordinate in the owner key namespace before
+  any keyring read, and a loaded key equal to the profile's owner public key.
+  The MCP approval gate keeps answering `policy.approval_required` and logs
+  the new code. `profile rotate-attestation-key`, `rotate-audit-key`,
+  `rotate-nonce-key`, `rotate-counterparty-key`, `rotate-policy-state-key`,
+  and `counterparty rotate-hmac-key` refuse such a coordinate with
+  `validation.key_matches_owner_public_key` and write nothing, so no rotation
+  overwrites an owner entry.
+- The nonce key loader requires exactly 32 decoded bytes; a longer value is
+  refused, never truncated.
+- An older binary cannot replay or verify a log holding a `binding_changed`
+  row, and cannot read an owner entry stored as a G-strkey.
 
 ### Removed
 
@@ -511,6 +601,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seed offline. It says that `enroll-owner-key` and `sign-policy` read the
   owner seed from the environment of the shell that runs them, and that the
   MCP server holds only the enrolled owner public key.
+- The smart-account verbs registered no keyring store before opening their
+  audit writer. A persisted profile's signing verbs refused with
+  `audit.chain_key_unavailable` even with a minted audit key, and the read-only
+  verbs opened an unkeyed writer. These verbs register the platform keyring
+  store, or the headless store `STELLAR_AGENT_KEYRING_BACKEND` names, when none
+  is registered. The read-only verbs read the keyring and record an absent
+  audit binding for a persisted profile.
 
 ### Security
 
@@ -599,6 +696,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks bind tags whose commit carries them, and the publish checks bind
   dispatches from `main`. The tag ruleset, the environment settings, and the
   trusted-publisher setting in the maintainer documentation bind the rest.
+- In `0.1.0-alpha.1` through `0.1.0-alpha.9`, an environment or programmatic
+  overlay could set any profile field, trust roots included. Anyone who could
+  set the wallet process's environment could repoint `audit_log_path`, any
+  keyring coordinate, the policy engine, the `[wallet]` posture, or the
+  remote-approval settings without editing the profile file. Overlays accept
+  only the operational fields of the three overlay classes, and refuse every
+  other key with `profile.non_overlayable_field`.
+- In `0.1.0-alpha.7` through `0.1.0-alpha.9`, a profile whose
+  `audit_log_path` or audit key changed started a fresh tip anchor at the new
+  coordinate and adopted whatever file it found there. This required write
+  access to the profile file or to the wallet process's environment. A file
+  copied or rolled back before that first use became the baseline, and an
+  empty file left no row. The keyring records each persisted profile's audit
+  binding, and every keyed audit writer refuses a changed binding with
+  `audit.log_binding_changed` until the operator runs `audit reanchor
+  --acknowledge-binding-change`, which records the change in the log. Signing
+  verbs and tools refuse before signing; a command whose audit row is best
+  effort skips the row.
+- In `0.1.0-alpha.1` through `0.1.0-alpha.9`, a symmetric-key loader accepted
+  the profile's owner public key as its key, because the owner entry held the
+  key's 32 bytes in the encoding the loaders read. A coordinate overlay could
+  point the attestation key at the owner entry on every release. Under
+  `headless-dpapi` (`0.1.0-alpha.4` onward), anyone who could write the
+  headless keyring file could copy an owner entry to another coordinate, where
+  it opened. A party who knew the owner public key could then compute approval
+  attestations. Loaders refuse an owner-namespace coordinate and a key equal to
+  the owner public key, and the rotate verbs refuse to write at an
+  owner-namespace coordinate. Owner keys are stored as G-strkeys.
+  Under `headless-dpapi` an older-form owner entry stays relocatable until it
+  is rewritten: run one V1 verb, or `enroll-owner-key`, after upgrading, which
+  rewrites every profile's entry.
+- With a headless keyring backend, the audit anchor, the re-anchor counter,
+  the audit binding, and the policy window state live in a file on the same
+  host. Anyone who can write that file can restore older entries or delete
+  one.
 
 ## [0.1.0-alpha.9] - 2026-09-30
 

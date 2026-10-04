@@ -22,6 +22,13 @@
 //! nothing.  Every other case reports `anchor.status = "not_checked"` with the
 //! reason, and the hash chain is still fully verified.
 //!
+//! # Audit binding
+//!
+//! With `--profile <name>`, the profile's audit binding is read from the
+//! keyring and never written. A binding that names another log path or audit
+//! key, or that does not parse, exits 1 with `audit.log_binding_changed`. An
+//! absent or equal binding proceeds, and a keyring read error fails closed.
+//!
 //! # Output
 //!
 //! With `--output json` (the default): a JSON envelope wrapping
@@ -42,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::{
     audit_log::{
+        BindingCheck,
         health::AuditWriterHealth,
         tip_anchor::{TipAnchor, TipAnchorStore as _, normalize_path_lexically},
         verify::{FileVerifyResult, VerifyError, VerifyWarning, verify_log_with_health},
@@ -51,7 +59,7 @@ use stellar_agent_core::{
     profile::schema::Profile,
 };
 use stellar_agent_network::keyring::{
-    KeyringTipAnchorStore, init_platform_keyring_store, map_keyring_error,
+    KeyringTipAnchorStore, check_audit_binding, init_platform_keyring_store, map_keyring_error,
 };
 use zeroize::Zeroizing;
 
@@ -318,12 +326,17 @@ fn resolve_profile_inputs(
 ///
 /// Split out so the path-scope rule and the absent-anchor case are reachable
 /// without a persisted profile file.
+///
+/// The profile's audit binding is read first and never written: a record that
+/// differs or does not parse refuses with `audit.log_binding_changed`, an
+/// absent or equal one proceeds, and a read error fails closed.
 fn resolve_profile_inputs_with_profile(
     profile: &Profile,
     profile_name: &str,
     log_path: &std::path::Path,
 ) -> Result<ResolvedVerifyInputs, WalletError> {
-    let hmac_key = Some(load_audit_hmac_key(profile)?);
+    check_audit_binding(profile, profile_name, BindingCheck::CheckOnly)?;
+    let hmac_key = Some(load_audit_hmac_key(profile, profile_name)?);
 
     if normalize_path_lexically(log_path) != normalize_path_lexically(&profile.audit_log_path) {
         return Ok(ResolvedVerifyInputs {
@@ -382,8 +395,21 @@ fn load_profile_for_verify(resolved: &ResolvedProfileName) -> Result<Profile, Wa
 /// Secret residency follows the CLI key-loading pattern used by approval
 /// attestation: keyring text and decoded bytes live in `Zeroizing` wrappers,
 /// and errors report only non-secret keyring coordinates or fixed labels.
-fn load_audit_hmac_key(profile: &Profile) -> Result<Zeroizing<[u8; 32]>, WalletError> {
+///
+/// A coordinate in the owner key namespace is refused before the read, and a
+/// key equal to the owner public key of `profile` selected as `profile_name`
+/// is refused after decoding, both with
+/// `validation.key_matches_owner_public_key`.
+fn load_audit_hmac_key(
+    profile: &Profile,
+    profile_name: &str,
+) -> Result<Zeroizing<[u8; 32]>, WalletError> {
+    use stellar_agent_core::profile::owner_key;
     let entry_ref = &profile.audit_log_hash_chain_key_id;
+    owner_key::refuse_owner_key_coordinate(
+        entry_ref,
+        stellar_agent_network::keyring::AUDIT_KEY_FIELD,
+    )?;
     let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
         tracing::debug!(
             error = %e,
@@ -418,6 +444,11 @@ fn load_audit_hmac_key(profile: &Profile) -> Result<Zeroizing<[u8; 32]>, WalletE
         }));
     }
 
+    owner_key::refuse_owner_public_key(
+        decoded.as_slice(),
+        &owner_key::OwnerKeyContext::for_profile(profile_name, profile),
+        stellar_agent_network::keyring::AUDIT_KEY_FIELD,
+    )?;
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(decoded.as_slice());
     Ok(key)
@@ -740,7 +771,7 @@ mod tests {
         let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).unwrap();
         entry.set_password(&URL_SAFE_NO_PAD.encode(key)).unwrap();
 
-        let loaded = load_audit_hmac_key(&profile).unwrap();
+        let loaded = load_audit_hmac_key(&profile, "test-profile").unwrap();
         assert_eq!(loaded.as_ref(), &key);
     }
 
@@ -763,7 +794,9 @@ mod tests {
             .set_password(&URL_SAFE_NO_PAD.encode([0x42u8; 31]))
             .unwrap();
 
-        let err = load_audit_hmac_key(&profile).unwrap_err();
+        let Err(err) = load_audit_hmac_key(&profile, "test-profile") else {
+            panic!("the load refuses");
+        };
         assert!(
             matches!(
                 err,
@@ -771,6 +804,65 @@ mod tests {
             ),
             "expected UnexpectedState for wrong-length key, got {err:?}"
         );
+    }
+
+    /// An audit key equal to the owner public key in the older form refuses
+    /// with the owner code naming the field. A G-strkey owner value is refused
+    /// by the length rule, and an owner-namespace coordinate refuses before
+    /// any read.
+    #[test]
+    #[serial]
+    fn load_audit_hmac_key_refuses_owner_key_forms() {
+        use stellar_agent_core::profile::schema::KeyringEntryRef;
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let name = "audit-verify-owner";
+        let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+        let put = |entry_ref: &KeyringEntryRef, value: &str| {
+            KeyringEntry::new(&entry_ref.service, &entry_ref.account)
+                .unwrap()
+                .set_password(value)
+                .unwrap();
+        };
+        let older_form = URL_SAFE_NO_PAD.encode([0x3d_u8; 32]);
+        put(&profile.audit_log_hash_chain_key_id, &older_form);
+        assert!(load_audit_hmac_key(&profile, name).is_ok());
+        put(&KeyringEntryRef::default_owner_key(name), &older_form);
+        let Err(err) = load_audit_hmac_key(&profile, name) else {
+            panic!("the load refuses");
+        };
+        assert_eq!(err.code(), "validation.key_matches_owner_public_key");
+        assert!(
+            err.to_string().contains("audit_log_hash_chain_key_id"),
+            "{err}"
+        );
+
+        put(
+            &profile.audit_log_hash_chain_key_id,
+            &stellar_agent_core::profile::owner_key::encode_owner_public_key(&[0x3d; 32]),
+        );
+        let Err(err) = load_audit_hmac_key(&profile, name) else {
+            panic!("the load refuses");
+        };
+        assert!(err.to_string().contains("got 42"), "{err}");
+
+        profile.audit_log_hash_chain_key_id =
+            KeyringEntryRef::new("stellar-agent-owner-B", "default");
+        stellar_agent_test_support::keyring_mock::inject_error(
+            "stellar-agent-owner-B",
+            "default",
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("planted"))),
+        )
+        .unwrap();
+        let Err(err) = load_audit_hmac_key(&profile, name) else {
+            panic!("the load refuses");
+        };
+        assert_eq!(err.code(), "validation.key_matches_owner_public_key");
+        assert!(matches!(
+            KeyringEntry::new("stellar-agent-owner-B", "default")
+                .unwrap()
+                .get_password(),
+            Err(keyring_core::Error::PlatformFailure(_))
+        ));
     }
 
     /// A non-interactive Windows session (the `ERROR_NO_SUCH_LOGON_SESSION`
@@ -796,7 +888,9 @@ mod tests {
         )
         .unwrap();
 
-        let err = load_audit_hmac_key(&profile).unwrap_err();
+        let Err(err) = load_audit_hmac_key(&profile, "test-profile") else {
+            panic!("the load refuses");
+        };
         assert_eq!(err.code(), "auth.keyring_interactive_session_required");
     }
 
@@ -825,7 +919,9 @@ mod tests {
         )
         .unwrap();
 
-        let err = load_audit_hmac_key(&profile).unwrap_err();
+        let Err(err) = load_audit_hmac_key(&profile, "test-profile") else {
+            panic!("the load refuses");
+        };
         assert_eq!(err.code(), "auth.keyring_platform_error");
     }
 
@@ -1144,6 +1240,107 @@ mod tests {
                 .anchor_skip_reason
                 .expect("a skipped check must say why")
                 .contains("no tip anchor")
+        );
+    }
+
+    /// A profile whose audit key is minted and whose log holds one entry.
+    fn binding_profile(name: &str, dir: &std::path::Path) -> Profile {
+        let path = dir.join("audit.jsonl");
+        make_writer_and_entries(path.clone(), 1, None);
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = path;
+        let coord = profile.audit_log_hash_chain_key_id.clone();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .expect("seed audit key");
+        profile
+    }
+
+    fn recorded_binding(name: &str) -> Option<String> {
+        stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(name)
+            .load_raw()
+            .expect("read binding")
+    }
+
+    #[test]
+    #[serial]
+    fn verify_refuses_a_changed_binding() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = TempDir::new().unwrap();
+        let profile = binding_profile("verify-binding", dir.path());
+        let mut elsewhere = profile.clone();
+        elsewhere.audit_log_path = dir.path().join("elsewhere.jsonl");
+        let recorded = stellar_agent_core::audit_log::AuditBinding::for_profile(&elsewhere);
+        stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile("verify-binding")
+            .store(&recorded)
+            .expect("record a binding for another path");
+
+        let Err(err) = resolve_profile_inputs_with_profile(
+            &profile,
+            "verify-binding",
+            &profile.audit_log_path,
+        ) else {
+            panic!("a changed binding refuses");
+        };
+        assert_eq!(err.code(), "audit.log_binding_changed");
+        assert!(
+            recorded_binding("verify-binding") == Some(recorded.to_keyring_value()),
+            "verify never rewrites the binding"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn verify_reads_an_absent_binding_and_writes_nothing() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = TempDir::new().unwrap();
+        let profile = binding_profile("verify-absent", dir.path());
+
+        resolve_profile_inputs_with_profile(&profile, "verify-absent", &profile.audit_log_path)
+            .expect("an absent binding proceeds");
+        assert!(
+            recorded_binding("verify-absent").is_none(),
+            "verify records no binding"
+        );
+
+        let expected = stellar_agent_core::audit_log::AuditBinding::for_profile(&profile);
+        stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile("verify-absent")
+            .store(&expected)
+            .expect("record");
+        resolve_profile_inputs_with_profile(&profile, "verify-absent", &profile.audit_log_path)
+            .expect("an equal binding proceeds");
+    }
+
+    #[test]
+    #[serial]
+    fn verify_fails_closed_on_a_binding_read_error() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = TempDir::new().unwrap();
+        let profile = binding_profile("verify-read-error", dir.path());
+        let coordinate =
+            stellar_agent_core::profile::schema::KeyringEntryRef::default_audit_binding(
+                "verify-read-error",
+            );
+        keyring_mock::inject_error(
+            &coordinate.service,
+            &coordinate.account,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("planted"))),
+        )
+        .expect("inject");
+
+        let Err(err) = resolve_profile_inputs_with_profile(
+            &profile,
+            "verify-read-error",
+            &profile.audit_log_path,
+        ) else {
+            panic!("a read error fails closed");
+        };
+        assert_eq!(
+            err.category(),
+            stellar_agent_core::error::ErrorCategory::Auth
+        );
+        assert!(
+            recorded_binding("verify-read-error").is_none(),
+            "a read error records nothing"
         );
     }
 

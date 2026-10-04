@@ -70,8 +70,9 @@ use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::profile::ResolvedProfileName;
+use stellar_agent_core::profile::owner_key;
 use stellar_agent_network::keyring::{init_platform_keyring_store, load_hmac_key_32};
-use stellar_agent_network::policy_state::PersistedWindowStore;
+use stellar_agent_network::policy_state::{POLICY_STATE_KEY_FIELD, PersistedWindowStore};
 use uuid::Uuid;
 
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
@@ -165,8 +166,21 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
     // key is destroyed — closes the tamper-laundering surface (see the
     // module docs). A store file that exists under an OLD key that was
     // never minted cannot be verified against anything and is refused too.
-    match load_hmac_key_32(entry_ref) {
-        Ok(old_key) => {
+    // An owner refusal rotates nothing, so the owner entry is never
+    // overwritten.
+    let old_key = match load_old_key(&profile, args.profile_name()) {
+        Ok(old_key) => old_key,
+        Err(e) => {
+            tracing::error!(
+                code = %e.code(),
+                "policy-state key rotation refused before the old key was verified"
+            );
+            render::render_json(&Envelope::err(&e));
+            return 1;
+        }
+    };
+    match old_key {
+        Some(old_key) => {
             if let Err(e) = store.verify_tag(&old_key) {
                 tracing::error!(
                     error = ?e,
@@ -188,7 +202,7 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
                 return 1;
             }
         }
-        Err(_) if store.exists() => {
+        None if store.exists() => {
             // A store file exists but no key was ever minted for this
             // profile — it cannot have been signed legitimately.
             tracing::error!(
@@ -207,7 +221,7 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
             render::render_json(&Envelope::err(&err));
             return 1;
         }
-        Err(_) => {
+        None => {
             // No old key, no store file: genuinely the first-ever rotation
             // for this profile. Nothing to verify; proceed.
         }
@@ -273,6 +287,30 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
     0
 }
 
+/// Loads the old window-state key for the pre-rotation verify.
+///
+/// A coordinate in the owner key namespace refuses before any keyring read.
+/// An old key equal to the owner public key of `profile` selected as
+/// `profile_name` refuses after decoding. Both refusals carry
+/// `validation.key_matches_owner_public_key`. `Ok(None)` is a key that does
+/// not load, which the caller reads as never minted.
+fn load_old_key(
+    profile: &stellar_agent_core::profile::schema::Profile,
+    profile_name: &str,
+) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, WalletError> {
+    let entry_ref = &profile.policy_window_state_key_id;
+    owner_key::refuse_owner_key_coordinate(entry_ref, POLICY_STATE_KEY_FIELD)?;
+    let Ok(old_key) = load_hmac_key_32(entry_ref) else {
+        return Ok(None);
+    };
+    owner_key::refuse_owner_public_key(
+        old_key.as_ref(),
+        &owner_key::OwnerKeyContext::for_profile(profile_name, profile),
+        POLICY_STATE_KEY_FIELD,
+    )?;
+    Ok(Some(old_key))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -282,6 +320,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
 
@@ -335,5 +374,82 @@ mod tests {
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+    }
+
+    fn put_raw(entry_ref: &stellar_agent_core::profile::schema::KeyringEntryRef, value: &str) {
+        keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+            .unwrap()
+            .set_password(value)
+            .unwrap();
+    }
+
+    /// An old window-state key equal to the owner public key in the older
+    /// form refuses with its own code, so the rotation never runs; a key
+    /// that is not the owner key loads.
+    #[test]
+    #[serial]
+    fn the_old_key_load_refuses_the_owner_key() {
+        use base64::Engine as _;
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let name = "rotate-window-owner";
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+            name, "s", "a", "n", "a",
+        )
+        .build();
+        let older_form = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x2e; 32]);
+        put_raw(&profile.policy_window_state_key_id, &older_form);
+        assert!(load_old_key(&profile, name).unwrap().is_some());
+
+        put_raw(
+            &stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key(name),
+            &older_form,
+        );
+        let Err(err) = load_old_key(&profile, name) else {
+            panic!("the load refuses");
+        };
+        assert_eq!(err.code(), "validation.key_matches_owner_public_key");
+        assert!(err.to_string().contains(POLICY_STATE_KEY_FIELD), "{err}");
+    }
+
+    /// A G-strkey owner value at the window-key coordinate does not load as a
+    /// key, and an owner-namespace coordinate refuses before any read.
+    #[test]
+    #[serial]
+    fn the_old_key_load_refuses_a_g_strkey_and_an_owner_coordinate() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let name = "rotate-window-strkey";
+        let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+            name, "s", "a", "n", "a",
+        )
+        .build();
+        put_raw(
+            &profile.policy_window_state_key_id,
+            &stellar_agent_core::profile::owner_key::encode_owner_public_key(&[0x2f; 32]),
+        );
+        assert!(
+            load_old_key(&profile, name).unwrap().is_none(),
+            "a 42-byte value is no key"
+        );
+
+        profile.policy_window_state_key_id =
+            stellar_agent_core::profile::schema::KeyringEntryRef::new(
+                "stellar-agent-owner-B",
+                "default",
+            );
+        stellar_agent_test_support::keyring_mock::inject_error(
+            "stellar-agent-owner-B",
+            "default",
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("planted"))),
+        )
+        .unwrap();
+        let Err(err) = load_old_key(&profile, name) else {
+            panic!("the load refuses");
+        };
+        assert_eq!(err.code(), "validation.key_matches_owner_public_key");
+        let pending = keyring_core::Entry::new("stellar-agent-owner-B", "default")
+            .unwrap()
+            .get_password()
+            .unwrap_err();
+        assert!(matches!(pending, keyring_core::Error::PlatformFailure(_)));
     }
 }

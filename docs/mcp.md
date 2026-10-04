@@ -71,14 +71,23 @@ A mainnet profile loads only through `--profile <name>`. `STELLAR_AGENT_PROFILE`
 Implicit mainnet selection exits with `profile.mainnet_requires_explicit_profile`.
 The message names the selection source and the recovery command:
 `stellar-agent-mcp --profile <name>`.
-Protected overlays exit with `profile.non_overlayable_field` and ask the operator
-to remove the field from the environment or the overlay.
+An environment or programmatic overlay may set only operational fields.
+`submit_timeout_seconds` is overlayable on every chain. `rpc_url`,
+`secondary_rpc_url`, `oracle_provider_url`, `mcp_signer_default`,
+`cross_check_threshold_stroops` (alias `usd_threshold`), the two classic fee
+fields, `smart_account_max_context_rule_scan_id`, and
+`session_rule_max_horizon_ledgers` are overlayable on testnet only.
+`mcp_disabled` accepts only `true`. Every other profile key, `chain_id` and
+every keyring coordinate included, comes from the file only. A refused overlay
+exits with `profile.non_overlayable_field` and asks the operator to remove the
+field from the environment or the overlay. A variable that names no profile
+key, such as `STELLAR_AGENT_HOME`, is ignored.
 
-Unset `STELLAR_AGENT_CHAIN_ID` and, for a mainnet profile, `STELLAR_AGENT_RPC_URL` first. Remove protected keys from programmatic overlays too. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
+Unset the refused `STELLAR_AGENT_*` variable named in the message, remove the key from programmatic overlays too, and set the value in the profile file instead. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
 
 The server resolves one `NetworkContext` at construction for tool network reads.
-Profile resources keep their loader behavior: a mainnet profile under a protected
-overlay reads as `profile_resource_unloadable`. Account enumeration skips that profile.
+Profile resources keep their loader behavior: a profile under a refused overlay
+reads as `profile_resource_unloadable`. Account enumeration skips that profile.
 
 On startup the process, in order:
 
@@ -340,10 +349,26 @@ a refused row is anchored so the refusal survives a restart. A log that simply m
 is not a refusal — unkeyed writers append without moving it, and the next
 acquisition absorbs the gap and re-anchors. A log with no anchor at all is
 adopted on first use with no operator action, which is what happens on the first
-run after upgrading a wallet whose audit log predates the anchor. Recovery from a
+run after upgrading a wallet whose audit log predates the anchor. An adoption
+writes its `audit_tip_anchored` row only for a non-empty file. Recovery from a
 mismatch is `stellar-agent audit reanchor --profile <name>
 --acknowledge-rollback`, and it requires stopping this server first, since the
 server holds the audit writer's exclusive lock.
+
+Acquiring the writer also checks the profile's audit binding: the keyring
+records the log path digest and the audit-key coordinate the profile writes
+under. A profile loaded from its file, the unnamed `default.toml` included,
+records an absent binding; the synthesized first-run profile only compares. A
+profile that names a different log path or audit key refuses every value tool
+with `audit.log_binding_changed` before any key loads, and nothing is created at
+the new path. Recovery is `stellar-agent audit reanchor --profile <name>
+--acknowledge-binding-change`. The zero-config first-run profile has no profile
+file, and `audit reanchor` loads only a profile file: restore the `default.toml`
+that recorded the binding, or write one that names the log, then run the
+reanchor. A binding change needs no server stop: a server running the edited
+profile refuses before it opens the new path, so it holds no lock there, and
+its next acquisition finds the accepted binding. A server still running the old
+profile refuses after the acknowledgement until it restarts.
 
 ## Tool catalog
 

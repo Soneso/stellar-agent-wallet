@@ -739,11 +739,14 @@ fn open_rule_create_audit_writer(
             path: log_path.clone(),
         })?;
     }
-    super::value_audit::require_value_audit_writer(&server.profile, &profile_name).map_err(|e| {
-        SaError::AuditWriterIo {
-            detail: e.to_string(),
-            path: log_path,
-        }
+    super::value_audit::require_value_audit_writer(
+        &server.profile,
+        &profile_name,
+        server.audit_binding,
+    )
+    .map_err(|e| SaError::AuditWriterIo {
+        detail: e.to_string(),
+        path: log_path,
     })
 }
 
@@ -950,6 +953,7 @@ impl WalletServer {
         if let Err(err) = crate::tools::value_audit::require_value_audit_writer(
             &self.profile,
             &self.profile_name_for_approval(),
+            self.audit_binding,
         ) {
             return Ok(crate::tools::common::business_error_result(
                 err.code(),
@@ -1235,6 +1239,7 @@ impl WalletServer {
         if let Err(err) = crate::tools::value_audit::require_value_audit_writer(
             &self.profile,
             &self.profile_name_for_approval(),
+            self.audit_binding,
         ) {
             return Ok(crate::tools::common::business_error_result(
                 err.code(),

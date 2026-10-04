@@ -3062,7 +3062,7 @@ pub struct GetSpendingLimitResult {
 async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
     let request_id = new_request_id();
     let resolved = resolve_profile_name(args.common.profile.as_deref());
-    let (profile, _origin) = match load_command_profile(&resolved) {
+    let (profile, origin) = match load_command_profile(&resolved) {
         Ok(loaded) => loaded,
         Err(error) => {
             let e = map_access_error(&error, &resolved.name);
@@ -3100,11 +3100,11 @@ async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
 
     // Read-only inspection uses the loaded profile without resolving a signer.
     let profile_name = resolved.name.clone();
-    let (audit_writer, audit_log_path) = match open_audit_writer_read_only(&profile, &profile_name)
-    {
-        Ok(opened) => opened,
-        Err(e) => return emit_error(&e, args.common.output, &request_id),
-    };
+    let (audit_writer, audit_log_path) =
+        match open_audit_writer_read_only(&profile, origin, &profile_name) {
+            Ok(opened) => opened,
+            Err(e) => return emit_error(&e, args.common.output, &request_id),
+        };
     let manager = match construct_signers_manager_from_fields(
         &profile_name,
         &context,

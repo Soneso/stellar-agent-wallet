@@ -20,7 +20,7 @@ fn key_rotation_invalidates_old_nonce() {
     let profile = make_profile("key-rotation-invalidates");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
     let expiry = far_future_expiry();
     let now = now_before_expiry();

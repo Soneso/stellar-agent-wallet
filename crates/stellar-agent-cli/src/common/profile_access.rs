@@ -108,7 +108,7 @@ pub(crate) enum ProfileAccessError {
 impl ProfileAccessError {
     /// The wire code for this failure on the surfaces that render a raw code.
     ///
-    /// Protected overlays, implicit mainnet selections, a mainnet profile
+    /// Refused overlays, implicit mainnet selections, a mainnet profile
     /// without `rpc_url`, and an endpoint URL that breaks the endpoint rule
     /// keep the codes [`ProfileLoadError::to_validation_error`] assigns them,
     /// so the raw and typed routes agree.
@@ -118,9 +118,10 @@ impl ProfileAccessError {
     /// [`ProfileLoadError::to_validation_error`]: profile_loader::ProfileLoadError::to_validation_error
     pub(crate) fn code(&self) -> &'static str {
         match self {
-            Self::Load(profile_loader::ProfileLoadError::NonOverlayableField { .. }) => {
-                "profile.non_overlayable_field"
-            }
+            Self::Load(
+                profile_loader::ProfileLoadError::NonOverlayableField { .. }
+                | profile_loader::ProfileLoadError::OverlayMayOnlyTighten { .. },
+            ) => "profile.non_overlayable_field",
             Self::Load(profile_loader::ProfileLoadError::MainnetRequiresExplicitProfile {
                 ..
             }) => "profile.mainnet_requires_explicit_profile",
@@ -185,6 +186,7 @@ impl ProfileAccessError {
             Self::NameMismatch(_)
                 | Self::Load(
                     profile_loader::ProfileLoadError::NonOverlayableField { .. }
+                        | profile_loader::ProfileLoadError::OverlayMayOnlyTighten { .. }
                         | profile_loader::ProfileLoadError::MainnetRequiresExplicitProfile { .. }
                         | profile_loader::ProfileLoadError::MainnetRpcUrlRequired { .. }
                         | profile_loader::ProfileLoadError::InvalidEndpointUrl { .. }
@@ -299,7 +301,7 @@ fn reconcile(
 /// Some verbs render a raw code instead: `pay`, `claim`, `accounts create`,
 /// `accounts deploy-c`, `trade`, `vault`, `trustline`, and the four
 /// `smart-account deploy-*` commands. They share the Load half only for the
-/// refusals [`ProfileAccessError::code`] keeps typed: a protected overlay, an
+/// refusals [`ProfileAccessError::code`] keeps typed: a refused overlay, an
 /// implicit mainnet selection, a mainnet profile without `rpc_url`, and an
 /// endpoint URL that breaks the endpoint rule. Every other loader failure
 /// collapses to `profile.load_failed` (`trustline` to
@@ -314,33 +316,33 @@ pub(crate) fn profile_access_envelope(
 
 /// Origin of a profile resolved by [`load_profile_or_synthesize_testnet`].
 ///
-/// Two origin-aware behaviors key off this distinction, neither engine-aware:
+/// These origin-aware behaviors key off this distinction, none engine-aware:
 /// - Platform keyring store initialisation logs a `tracing::warn!` and
-///   continues past a failed attempt for a [`Self::Synthesized`] profile. A
-///   host with no platform keyring store, such as a container without a
-///   Secret Service, therefore never blocks the zero-config quickstart's
-///   signing. The sites are `pay::init_keyring_for_origin`, the analogous
-///   helper in `claim`, and the inline attempt in `accounts create`'s
-///   sponsored path.
+///   continues past a failed attempt for a `ProfileOrigin::Synthesized`
+///   profile. A host with no platform keyring store, such as a container
+///   without a Secret Service, therefore never blocks the zero-config
+///   quickstart's signing. The sites are `pay::init_keyring_for_origin`, the
+///   analogous helper in `claim`, and the inline attempt in
+///   `accounts create`'s sponsored path.
+/// - The smart-account signing opener
+///   ([`crate::commands::smart_account::common::open_audit_writer`]) returns a
+///   keyring store registration failure for a `ProfileOrigin::Persisted`
+///   profile and logs it at `warn` for a `ProfileOrigin::Synthesized` one. The
+///   read-only opener logs the failure at `warn` for either origin and
+///   continues.
 /// - The audit pre-flight (see
 ///   [`crate::commands::value_audit::require_value_audit_writer_for_origin`])
-///   stays fail-open (warn-only) for a [`Self::Synthesized`] profile when the
-///   audit chain-root key is unavailable.
+///   stays fail-open (warn-only) for a `ProfileOrigin::Synthesized` profile
+///   when the audit chain-root key is unavailable. A changed audit binding
+///   refuses on both origins.
+/// - The audit binding check, [`ProfileOrigin::binding_check`]: a persisted
+///   profile records an absent binding, and a synthesized one only compares.
 ///
-/// A [`Self::Persisted`] profile fails closed on both conditions instead: an
-/// operator who authored a profile file — under either policy engine — is
-/// expected to have a working platform keyring and to have run
-/// `stellar-agent profile rotate-audit-key <name>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProfileOrigin {
-    /// Loaded from an operator-authored `<name>.toml` file.
-    Persisted,
-    /// No profile was named and no profile file exists; an in-memory
-    /// `Noop`-engine testnet profile was synthesized so `pay` / `claim` /
-    /// `accounts create` keep working without an authored profile.
-    /// The wallet uses `MlockRequired::Warn` and the default unlock TTL.
-    Synthesized,
-}
+/// A `ProfileOrigin::Persisted` profile fails closed on the first three
+/// conditions instead. An operator who authored a profile file, under either
+/// policy engine, is expected to have a working platform keyring and to have
+/// run `stellar-agent profile rotate-audit-key <name>`.
+pub(crate) use stellar_agent_core::profile::loader::ProfileOrigin;
 
 /// Loads the resolved profile, falling back to an in-memory `Noop`-engine
 /// testnet profile only when no profile was named and no `<name>.toml` file
@@ -439,6 +441,9 @@ pub(crate) fn protected_load_errors_for_test() -> Vec<ProfileAccessError> {
     vec![
         ProfileAccessError::Load(profile_loader::ProfileLoadError::NonOverlayableField {
             field: "chain_id",
+        }),
+        ProfileAccessError::Load(profile_loader::ProfileLoadError::OverlayMayOnlyTighten {
+            field: "mcp_disabled",
         }),
         ProfileAccessError::Load(
             profile_loader::ProfileLoadError::MainnetRequiresExplicitProfile {

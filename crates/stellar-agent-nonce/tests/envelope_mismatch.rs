@@ -20,7 +20,7 @@ fn envelope_mismatch_returns_hmac_mismatch() {
     let profile = make_profile("envelope-mismatch");
     seed_key(&profile, &key);
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = StaticCatalogue(&["stellar_pay"]);
     let expiry = far_future_expiry();
     let now = now_before_expiry();

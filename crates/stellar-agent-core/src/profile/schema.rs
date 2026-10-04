@@ -337,6 +337,32 @@ impl KeyringEntryRef {
     pub fn default_mpp_state_key(profile_name: &str) -> Self {
         Self::new(format!("stellar-agent-mpp-state-{profile_name}"), "default")
     }
+
+    /// Constructs the audit-binding keyring entry reference for a profile.
+    ///
+    /// Entry name: `stellar-agent-auditbinding-<profile>` / `default`. It
+    /// holds the [`crate::audit_log::binding::AuditBinding`] the profile's
+    /// keyed audit writer last recorded. The coordinate derives from the
+    /// selected profile name only, never from a profile field. No other
+    /// `stellar-agent-<kind>-` service prefix extends it or is extended by it,
+    /// so no profile name makes it equal another profile's coordinate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::profile::schema::KeyringEntryRef;
+    ///
+    /// let r = KeyringEntryRef::default_audit_binding("alice");
+    /// assert_eq!(r.service, "stellar-agent-auditbinding-alice");
+    /// assert_eq!(r.account, "default");
+    /// ```
+    #[must_use]
+    pub fn default_audit_binding(profile_name: &str) -> Self {
+        Self::new(
+            format!("stellar-agent-auditbinding-{profile_name}"),
+            "default",
+        )
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3852,5 +3878,44 @@ mod tests {
         );
         let restored: Profile = toml::from_str(&toml_str).unwrap();
         assert_eq!(restored.smart_account_max_context_rule_scan_id, Some(200));
+    }
+
+    /// No two `default_*` coordinates are equal, across profile names chosen
+    /// to collide with the audit-binding prefix.
+    #[test]
+    fn default_coordinates_never_collide_across_profiles() {
+        type Constructor = fn(&str) -> KeyringEntryRef;
+        let constructors: [(&str, Constructor); 10] = [
+            ("signer", KeyringEntryRef::default_signer),
+            ("nonce", KeyringEntryRef::default_nonce),
+            ("audit_key", KeyringEntryRef::default_audit_key),
+            ("owner_key", KeyringEntryRef::default_owner_key),
+            ("attestation_key", KeyringEntryRef::default_attestation_key),
+            ("pool_master_key", KeyringEntryRef::default_pool_master_key),
+            (
+                "counterparty_key",
+                KeyringEntryRef::default_counterparty_key,
+            ),
+            (
+                "policy_window_state_key",
+                KeyringEntryRef::default_policy_window_state_key,
+            ),
+            ("mpp_state_key", KeyringEntryRef::default_mpp_state_key),
+            ("audit_binding", KeyringEntryRef::default_audit_binding),
+        ];
+        let names = ["x", "binding-x", "auditbinding-x", "audit-x", "default"];
+        let mut seen: Vec<(String, KeyringEntryRef)> = Vec::new();
+        for (label, constructor) in constructors {
+            for name in names {
+                let coordinate = constructor(name);
+                let collision = seen.iter().find(|(_, c)| *c == coordinate);
+                assert!(
+                    collision.is_none(),
+                    "{label}({name}) equals {collision:?}: {coordinate:?}"
+                );
+                seen.push((format!("{label}({name})"), coordinate));
+            }
+        }
+        assert_eq!(seen.len(), constructors.len() * names.len());
     }
 }

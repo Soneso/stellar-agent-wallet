@@ -560,6 +560,7 @@ where
         crate::commands::submission_record::reconcile_open_reservations(
             profile,
             &resolved.name,
+            origin,
             &reconcile_client,
             now_ms,
         )
@@ -883,6 +884,7 @@ where
         crate::commands::submission_record::reconcile_open_reservations(
             profile,
             &resolved.name,
+            origin,
             &reconcile_client,
             now_ms,
         )

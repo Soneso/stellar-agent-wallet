@@ -26,7 +26,7 @@ fn unregistered_tool_rejected_before_key_state() {
     // would return KeyringError (entry not found), NOT InvalidTool.
     let profile = make_profile("unregistered-tool");
 
-    let mint = NonceMint::from_profile(&profile).expect("from_profile");
+    let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
     let cat = RejectAllCatalogue;
 
     let err = mint

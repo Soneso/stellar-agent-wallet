@@ -30,7 +30,7 @@
 //!    `STELLAR_AGENT_HOME` pointing at a fresh directory, whose synthesized
 //!    profile opens an empty audit log -> assert
 //!    `sa.signer_set_missing_baseline`, no transaction hash and an unchanged
-//!    recipient balance. Every other step keeps the default home, whose
+//!    recipient balance. Every other step uses the test's own home, whose
 //!    audit log holds the install baseline `rules create` recorded.
 //! 7. `smart-account execute` a transfer UNDER the limit through the BINARY
 //!    -> assert submitted + on-chain recipient balance delta.
@@ -119,6 +119,10 @@ const SMART_ACCOUNT_FUND_STROOPS: i128 = 70_000_000;
 
 const RULE_SIGNER_ENV_VAR: &str = "EXEC_ACCEPTANCE_RULE_SIGNER";
 const FEE_PAYER_ENV_VAR: &str = "EXEC_ACCEPTANCE_FEE_PAYER";
+
+/// A throwaway 32-byte URL-safe base64 key for the headless keyring backend,
+/// so no child process reaches the login keychain.
+const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -359,13 +363,23 @@ fn scval_b64(val: &ScVal) -> String {
 // CLI subprocess helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Runs the `stellar-agent` release binary with `args` and the given
+/// Runs the `stellar-agent` release binary with `args`, `STELLAR_AGENT_HOME`
+/// and `HOME` under `home`, the headless keyring backend, and the given
 /// environment variables set only on the child process. Returns
 /// `(exit_success, last_stdout_line_as_json, stdout, stderr)`.
-fn run_cli(args: &[&str], envs: &[(&str, &str)]) -> (bool, serde_json::Value, String, String) {
+fn run_cli(
+    home: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (bool, serde_json::Value, String, String) {
     let bin_path = env!("CARGO_BIN_EXE_stellar-agent");
     let mut cmd = Command::new(bin_path);
-    cmd.args(args);
+    cmd.args(args)
+        .env("STELLAR_AGENT_HOME", home.join("agent"))
+        .env("HOME", home.join("home"))
+        .env_remove("STELLAR_AGENT_PROFILE")
+        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY);
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -390,6 +404,8 @@ fn run_cli(args: &[&str], envs: &[(&str, &str)]) -> (bool, serde_json::Value, St
 async fn smart_account_execute_full_flow_testnet_acceptance() {
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");
+    std::fs::create_dir_all(tmp.path().join("agent")).expect("agent home");
+    std::fs::create_dir_all(tmp.path().join("home")).expect("HOME");
 
     // ── Step 1: deploy the ed25519 verifier + spending-limit policy ─────────
     let (verifier_address, policy_address) = deploy_verifier_and_policy(&registry_path).await;
@@ -409,6 +425,7 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
     // ── Step 3: install the CallContract(XLM SAC) rule — through the BINARY ──
     let context_flag = format!("call-contract:{XLM_SAC_TESTNET}");
     let (ok, envelope, stdout, stderr) = run_cli(
+        tmp.path(),
         &[
             "smart-account",
             "rules",
@@ -446,6 +463,7 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
 
     // ── Step 4: attach the spending-limit policy — through the BINARY ──────
     let (ok, envelope, stdout, stderr) = run_cli(
+        tmp.path(),
         &[
             "smart-account",
             "rules",
@@ -521,6 +539,7 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
         .to_owned();
     let balance_before_refusal = xlm_stroops_balance(&recipient_g).await;
     let (ok, envelope, stdout, stderr) = run_cli(
+        tmp.path(),
         &[
             "smart-account",
             "execute",
@@ -577,6 +596,7 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
     // ── Step 7: execute UNDER the limit: MUST succeed ──────────────────────
     let balance_before = xlm_stroops_balance(&recipient_g).await;
     let (ok, envelope, stdout, stderr) = run_cli(
+        tmp.path(),
         &[
             "smart-account",
             "execute",
@@ -639,6 +659,7 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
     // ── Step 8: execute OVER the limit: MUST fail with SpendingLimitExceeded ──
     let second_amount_scval = ScVal::I128(i128_parts(SECOND_TRANSFER_STROOPS));
     let (ok, envelope, stdout, stderr) = run_cli(
+        tmp.path(),
         &[
             "smart-account",
             "execute",
@@ -702,6 +723,7 @@ async fn smart_account_execute_full_flow_testnet_acceptance() {
         ))),
     ];
     let (ok, envelope, stdout, stderr) = run_cli(
+        tmp.path(),
         &[
             "smart-account",
             "execute",
