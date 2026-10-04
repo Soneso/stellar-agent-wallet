@@ -20,8 +20,9 @@ checks it ran.
 
 ## Checklist
 
-Confirm each item for this description, the documentation, and the code comments in the change.
+Confirm each item for this description, the documentation, and the code comments in the change. The rules are in the [Writing style](https://github.com/Soneso/stellar-agent-wallet/blob/main/CONTRIBUTING.md#writing-style) section of the contributing guide.
 
+- [ ] "Allow edits by maintainers" is enabled, so a maintainer can push small fixes to the branch.
 - [ ] Every sentence is under 35 words.
 - [ ] No em dash.
 - [ ] No filler adjectives.

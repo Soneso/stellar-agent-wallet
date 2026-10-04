@@ -73,8 +73,11 @@ test tiers are in
 
 ## Review process
 
-A maintainer answers a new pull request within one working day. The depth of the
-review follows what the pull request changes:
+A maintainer acknowledges a new pull request within one working day (Monday to
+Friday, Central European Time). The review follows within three working days for
+a change to documentation, scripts, or workflows, and within five working days
+for a change to Rust code. Questions in the review thread get an answer within
+two working days. The depth of the review follows what the pull request changes:
 
 - A maintainer reviews a pull request that changes only documentation, scripts,
   or workflows from the diff and the repository's CI checks, with no testnet
@@ -82,12 +85,18 @@ review follows what the pull request changes:
 - Every other pull request, such as a change to Rust code, also runs the
   [gate suite](#gate-suite).
 - A pull request that changes signing paths, key handling, or serialized state
-  gets the full review.
+  also gets a second review pass.
 
-In the full review, a fresh review team (Security, Code, and Architecture
-reviewers) checks the change against the
-[review checklist](docs/maintainers/review-checklist.md) before merge. Review
-repeats on a fresh pass until every reviewer approves with no blocking findings.
+The second review pass checks the change against the full
+[review checklist](docs/maintainers/review-checklist.md) before merge, and the
+testnet acceptance suites of the crates it touches run. Expect that review to
+take longer and to ask for tests that prove the refusal paths.
+
+A maintainer pushes small fixes, such as wording, a test case, or a rebase,
+onto your branch so that the pull request can land the same day. You stay the
+author of the squash commit. This needs "Allow edits by maintainers" on the pull
+request. If you prefer to make every change yourself, say so in the pull
+request.
 
 ## Contributing with a coding agent
 
@@ -110,15 +119,37 @@ Good entry points are the issues labeled
 [`help wanted`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
 and
 [`good first issue`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
-Issues touching signing paths, key handling, or serialized state get the full
-three-reviewer pass and are better second contributions than first ones.
+Issues touching signing paths, key handling, or serialized state get the second
+review pass and are better second contributions than first ones.
 
-To claim an issue, comment "I'll take this" on it. A maintainer assigns the
-issue to you within one working day. Each contributor holds one open assignment
-at a time.
+To claim an issue, comment "I'll take this" on it, and the repository assigns it
+to you at once. Hold one open assignment at a time. After 14 days with no pull
+request and no comment, a maintainer releases the assignment and says so on the
+issue.
 
-Changes land through pull requests from a fork. CI runs on every pull request,
-and every check must be green before merge.
+If an issue is unassigned when you open a pull request for it, the first pull
+request that fills in the template is the one reviewed. A maintainer closes a
+later pull request for the same issue, with thanks and a pointer to another open
+issue.
+
+Changes land through pull requests from a fork. CI runs on every pull request.
+On your first contribution, the run starts after a maintainer approves it. Every
+required check must pass before merge.
+
+## Writing style
+
+Documentation, code comments, commit messages, and pull request descriptions
+follow these rules:
+
+- Sentences under 35 words, in present tense.
+- No em dash or en dash. Use a comma, a period, or a colon.
+- American spelling.
+- No emojis.
+- A comment states what holds and why. It does not tell the history of the code,
+  and it does not describe behavior by contrast with something the code does not
+  do.
+- No filler words that only praise or soften. Give the number or the measure,
+  or cut the word.
 
 ## Commit and pull request conventions
 

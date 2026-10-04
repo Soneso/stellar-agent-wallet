@@ -1,7 +1,6 @@
 ---
 name: Contribution task
 about: Describe a scoped task that an outside contributor can pick up.
-labels: help wanted
 ---
 
 To claim this task, comment "I'll take this". The [contributing guide](https://github.com/Soneso/stellar-agent-wallet/blob/main/CONTRIBUTING.md) describes how claiming and review work.
@@ -12,7 +11,7 @@ To claim this task, comment "I'll take this". The [contributing guide](https://g
 
 ## Where
 
-<!-- The file and line, as `path/to/file.rs:123`. -->
+<!-- The file and the function, heading, or command, with the commit, for example path/to/file.rs, fn name (at abc1234). -->
 
 ## Current behavior
 
