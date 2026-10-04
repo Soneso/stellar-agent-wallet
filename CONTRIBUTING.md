@@ -158,6 +158,8 @@ follow these rules:
 - No filler words that only praise or soften. Give the number or the measure,
   or cut the word.
 
+`python3 .github/scripts/check-docs-style.py <file>` checks the mechanical rules.
+
 ## Commit and pull request conventions
 
 - Write commit messages in conventional-commit style, for example

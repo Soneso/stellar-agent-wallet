@@ -153,15 +153,20 @@ See [Licenses](#licenses) for the allow-list posture.
 ```bash
 python3 .github/scripts/check-install-surface.py
 python3 .github/scripts/test-check-install-surface.py
+python3 .github/scripts/check-docs-style.py
+python3 .github/scripts/test-check-docs-style.py
 bash .github/scripts/check-gate-tool-versions.sh
 bash .github/scripts/test-check-gate-tool-versions.sh
+actionlint
 ```
 
 The install surface check covers the documented install commands, version
 pins, and secret-seed procedures, and the binstall metadata of both wallet
 crates; its header defines each rule. Its self-test runs the check on copies of
-the tree, with one violation injected per case. Both Python scripts need Python
-3.11 or later.
+the tree, with one violation injected per case. The docs style check applies
+the writing rules of CONTRIBUTING.md to the tracked Markdown files; its header
+defines each rule and the baseline. The Python scripts need Python 3.11 or
+later.
 
 The gate tool check compares the versions in [Gate tools](#gate-tools), in the
 other workflows, and in the composite actions with the `tool:` pins in
