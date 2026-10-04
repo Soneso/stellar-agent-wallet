@@ -32,10 +32,14 @@ The workspace targets Rust edition 2024.
 The gate suite uses three auxiliary Cargo subcommands. Install them with:
 
 ```bash
-cargo install --locked cargo-llvm-cov
-cargo install --locked cargo-machete
-cargo install --locked cargo-deny
+cargo install --locked cargo-llvm-cov --version 0.8.7
+cargo install --locked cargo-machete --version 0.9.2
+cargo install --locked cargo-deny --version 0.19.9
 ```
+
+These versions match the `tool:` pins in `.github/workflows/ci.yml`. The
+`Install surface` workflow runs `.github/scripts/check-gate-tool-versions.sh`,
+which fails when a version in this guide differs from its pin in `ci.yml`.
 
 `cargo-llvm-cov` also needs the `llvm-tools-preview` rustup component:
 
@@ -149,12 +153,20 @@ See [Licenses](#licenses) for the allow-list posture.
 ```bash
 python3 .github/scripts/check-install-surface.py
 python3 .github/scripts/test-check-install-surface.py
+bash .github/scripts/check-gate-tool-versions.sh
+bash .github/scripts/test-check-gate-tool-versions.sh
 ```
 
-The check covers the documented install commands, version pins, and
-secret-seed procedures, and the binstall metadata of both wallet crates; its
-header defines each rule. The self-test runs the check on copies of the tree,
-with one violation injected per case. Both scripts need Python 3.11 or later.
+The install surface check covers the documented install commands, version
+pins, and secret-seed procedures, and the binstall metadata of both wallet
+crates; its header defines each rule. Its self-test runs the check on copies of
+the tree, with one violation injected per case. Both Python scripts need Python
+3.11 or later.
+
+The gate tool check compares the versions in [Gate tools](#gate-tools), in the
+other workflows, and in the composite actions with the `tool:` pins in
+`ci.yml`. Its header defines the accepted line shapes, and its self-test runs
+it on fixture trees with one drift form per case.
 
 ### Windows storage regression (CI-only)
 
