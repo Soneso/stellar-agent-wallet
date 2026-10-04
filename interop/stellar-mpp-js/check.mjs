@@ -73,13 +73,20 @@ if (process.argv.includes('--emit')) {
 const fixture = JSON.parse(
   await readFile(new URL('./fixtures/sponsored-charge.json', import.meta.url), 'utf8'),
 )
-for (const field of ['challenge', 'challengeHeader', 'credential', 'receipt']) {
-  assert.deepEqual(
-    actual[field],
-    fixture[field],
-    `released SDK ${field} differs from the committed fixture`,
-  )
+const fixtureProvenance = {
+  package: '@stellar/mpp@0.7.1',
+  sourceCommit: '9f2f8254421e09906dfb7e983e2491a273120adf',
+  stellarSdk: '15.1.0',
+  mppx: '0.6.31',
+  node: '24.5.0',
+  pnpm: '10.33.0',
+  license: 'MIT/Apache-2.0 dependency set',
 }
+assert.deepEqual(
+  { ...actual, provenance: fixtureProvenance },
+  fixture,
+  'released SDK output or fixture provenance differs from expected values',
+)
 
 const parsedChallenge = Challenge.deserialize(challengeHeader, { methods: [chargeSchema] })
 assert.deepEqual(parsedChallenge, challenge)
