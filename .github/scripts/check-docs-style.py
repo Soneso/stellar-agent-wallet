@@ -137,8 +137,16 @@ def mask_inline(text: str) -> str:
 
 
 def mask_links(text: str) -> str:
-    """Mask autolinks and balanced link destinations, preserving link labels."""
+    """Mask autolinks, link destinations, definition lines, and bare URLs."""
     text = re.sub(r"<[a-zA-Z][a-zA-Z0-9+.-]*://[^<>\s]*>", lambda match: blank(match[0]), text)
+    # Bare URLs in prose (not already inside <...>)
+    text = re.sub(r"(?<![<\w])https?://[^\s)>\]]+", lambda match: blank(match[0]), text)
+    # Reference-style definition lines: [label]: destination
+    text = re.sub(
+        r"(?m)^(\s{0,3}\[[^\]]+\]:\s*)(\S.*)$",
+        lambda match: match.group(1) + blank(match.group(2)),
+        text,
+    )
     pieces = list(text)
     for opening in re.finditer(r"\]\(", text):
         depth = 1
