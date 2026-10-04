@@ -460,6 +460,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A CI check covers the documented install commands, the secret-seed
   procedures, and the binstall metadata on every pull request and every push
   to `main`, including changes that touch only Markdown.
+- The release workflow signs and notarizes the macOS binaries in a separate
+  `sign-macos` job, which runs in the `release-signing` environment. The
+  build job holds no Apple secret.
+- The notarization smoke workflow builds in one job and signs in another,
+  which runs in the `release-signing` environment.
+- The publish workflow runs a `verify` job, which builds every crate without
+  credentials, and a `publish` job, which uploads without building. Both jobs
+  install the exact toolchain that `RELEASE_TOOLCHAIN` in `publish.yml` names.
+- The publish workflow takes a `verify_only` input that runs only the
+  `verify` job.
 
 ### Removed
 
@@ -559,6 +569,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any version up to `0.1.0-alpha.9`, pass
   `--locked --disable-strategies quick-install,compile`, which needs
   cargo-binstall 0.17.0 or later.
+- In `0.1.0-alpha.6` through `0.1.0-alpha.9`, the macOS release builds ran
+  dependency build scripts in the job that held the Developer ID certificate
+  and the notarization key. This required a dependency release with a
+  malicious build script that a release then built. Signing and notarization
+  run in a separate job that compiles nothing and validates the unsigned
+  binaries it receives.
+- In `0.1.0-alpha.5` through `0.1.0-alpha.9`, the crates.io publish job ran
+  the verify build of every crate while it could mint a registry token. This
+  required a dependency release with a malicious build script. A job without
+  credentials runs the verify builds, and the upload job compiles nothing.
+- In `0.1.0-alpha.5` through `0.1.0-alpha.9`, the publish workflow
+  interpolated the tag input into a shell step of the job that could mint a
+  registry token. In `0.1.0-alpha.1` through `0.1.0-alpha.9`, the release
+  workflow interpolated the tag-derived version into a shell step. This
+  required a user who can dispatch workflows or push a tag. Both workflows
+  validate these values and read them through the environment.
+- In `0.1.0-alpha.5` through `0.1.0-alpha.9`, the publish script counted a
+  crate as published when crates.io reported its version as already
+  uploaded, without comparing bytes. This required a version of the same name
+  uploaded from other bytes, for example by an earlier run from another
+  commit. The script compares the published checksum with the checksum the
+  verify job recorded.
+- In `0.1.0-alpha.1` through `0.1.0-alpha.9`, the release workflow accepted a
+  tag on any commit. In `0.1.0-alpha.5` through `0.1.0-alpha.9`, the publish
+  workflow could check out a branch named like the tag. This required a
+  repository writer. Both workflows check that the tag's commit is on `main`,
+  and the publish workflow checks out the tag by its full ref. The release
+  checks bind tags whose commit carries them, and the publish checks bind
+  dispatches from `main`. The tag ruleset, the environment settings, and the
+  trusted-publisher setting in the maintainer documentation bind the rest.
 
 ## [0.1.0-alpha.9] - 2026-09-30
 

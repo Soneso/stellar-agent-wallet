@@ -165,6 +165,22 @@ jobs:
       - run: .github/scripts/package-skill.sh --check
       - run: bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh
       - run: bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh
+      - run: bash .github/scripts/test-check-ref-on-main.sh
+      - run: bash .github/scripts/test-publish-crates-verify.sh
+      - run: python3 .github/scripts/test-compare-crate-sums.py
+      - run: python3 .github/scripts/test-validate-unsigned-archive.py
+      # The runner image documents no PyYAML for its system Python, so the
+      # structural workflow check runs from a virtual environment with a
+      # hash-pinned PyYAML.
+      - name: Check the release workflow structure
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/workflow-check"
+          "$RUNNER_TEMP/workflow-check/bin/pip" install --quiet --disable-pip-version-check \
+            --require-hashes --only-binary :all: \
+            -r .github/scripts/workflow-check-requirements.txt
+          "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/check-workflow-invariants.py
+          "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-check-workflow-invariants.py
 
   windows-storage:
     name: windows-storage

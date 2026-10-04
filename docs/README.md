@@ -46,6 +46,8 @@ from the capability-restriction toolsets feature above.
   maturity, and mainnet posture.
 - [Building and testing](maintainers/building.md): the build, the gate suite,
   and the test tiers.
+- [Releasing](maintainers/releasing.md): cutting a release tag, the release
+  and publish checks, and the GitHub settings they rely on.
 - [Security internals](maintainers/security-internals.md): the cryptographic
   detail behind the model.
 - [MPP internals](maintainers/mpp.md): protocol pins, module ownership, durable
