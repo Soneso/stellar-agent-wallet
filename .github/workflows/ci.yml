@@ -172,7 +172,7 @@ jobs:
       # The runner image documents no PyYAML for its system Python, so the
       # structural workflow check runs from a virtual environment with a
       # hash-pinned PyYAML.
-      - name: Check the release workflow structure
+      - name: Check the workflow structure and the label sync
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/workflow-check"
@@ -182,6 +182,7 @@ jobs:
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/check-workflow-invariants.py
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-check-workflow-invariants.py
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-take-workflow.py
+          "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-sync-labels.py
 
   windows-storage:
     name: windows-storage

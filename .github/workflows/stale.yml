@@ -1,0 +1,37 @@
+# Remind the author of a pull request labeled `waiting on author` after 14 idle
+# days and close it 7 days later. Issues are never touched.
+name: Stale pull requests
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The action needs both scopes even when issues remain untouched.
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
+          only-pr-labels: 'waiting on author'
+          days-before-pr-stale: 14
+          days-before-pr-close: 7
+          stale-pr-label: stale
+          exempt-draft-pr: true
+          remove-stale-when-updated: true
+          operations-per-run: 100
+          stale-pr-message: >-
+            This pull request waits on its author and closes in 7 days without activity.
+            A push or a comment keeps it open. Thanks for your contribution.
+          close-pr-message: >-
+            This pull request is now closed after 21 days without activity.
+            You can reopen it at any time. Thanks for your contribution.

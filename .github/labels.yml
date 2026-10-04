@@ -1,0 +1,36 @@
+- name: good first issue
+  color: 7057ff
+  description: Docs, scripts, or checks; a few hours; the issue states the acceptance command
+- name: help wanted
+  color: '008672'
+  description: Rust code or tests; needs the gate suite; the issue states the design
+- name: 'area: docs'
+  color: 0075ca
+  description: Documentation and the agent skill
+- name: 'area: ci'
+  color: 0e8a16
+  description: Workflows, scripts, and checks
+- name: 'area: cli'
+  color: 1d76db
+  description: The `stellar-agent` CLI
+- name: 'area: mcp'
+  color: 5319e7
+  description: The MCP server
+- name: 'area: smart-account'
+  color: c2e0c6
+  description: Smart-account governance
+- name: 'area: mpp'
+  color: fbca04
+  description: Agent payments with MPP
+- name: security-sensitive
+  color: b60205
+  description: Signing, key handling, or serialized state; second review pass
+- name: waiting on author
+  color: fef2c0
+  description: The next step is the contributor's
+- name: waiting on maintainer
+  color: d4c5f9
+  description: The next step is ours
+- name: stale
+  color: ededed
+  description: No activity for 14 days; closes after 21

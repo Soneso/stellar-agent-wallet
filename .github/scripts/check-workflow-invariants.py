@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Structural check of the release, publish, and notarization workflows.
+"""Structural check of release, publish, notarization, and maintenance workflows.
 
 Usage: ``check-workflow-invariants.py [repository-root]``
 
-Reads ``.github/workflows/release.yml``, ``publish.yml``, and
-``notarize-smoke.yml`` and the composite action
+Reads ``.github/workflows/release.yml``, ``publish.yml``,
+``notarize-smoke.yml``, ``labels.yml``, and ``stale.yml``, plus the composite action
 ``.github/actions/macos-sign-notarize/action.yml``. Needs PyYAML.
 
 A job is credentialed when it references ``secrets.``, passes secrets to a
@@ -81,7 +81,7 @@ try:
 except ImportError:
     sys.exit("check-workflow-invariants.py needs PyYAML (pip install PyYAML)")
 
-WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml")
+WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml", "labels.yml", "stale.yml")
 COMPOSITE = pathlib.PurePosixPath(".github/actions/macos-sign-notarize")
 SIGNING_JOBS = {("release.yml", "sign-macos"), ("notarize-smoke.yml", "sign")}
 TOOLCHAIN_ALLOWED = {("publish.yml", "publish")}

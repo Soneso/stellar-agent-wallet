@@ -200,6 +200,15 @@ def publish_job_only(old, new):
 # [(file, old, new, expected occurrences)]; each edit replaces only the first
 # occurrence.
 CASES = [
+    ("labels workflow without top-level permissions", "workflow-permissions",
+     'labels.yml: workflow-permissions: no top-level permissions', [
+        (".github/workflows/labels.yml", "permissions: {}\n", "", 1)]),
+    ("stale workflow without top-level permissions", "workflow-permissions",
+     'stale.yml: workflow-permissions: no top-level permissions', [
+        (".github/workflows/stale.yml", "permissions: {}\n", "", 1)]),
+    ("labels checkout that persists credentials", "checkout-credentials",
+     'labels.yml:sync step 1: checkout-credentials: actions/checkout without persist-credentials: false', [
+        (".github/workflows/labels.yml", "persist-credentials: false", "persist-credentials: true", 1)]),
     ("rust-cache in the signing job", "cred-compile",
      'release.yml:sign-macos step 2: cred-compile: uses Swatinem/rust-cache@', [before_sign_macos_tools(
         "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n\n")]),
