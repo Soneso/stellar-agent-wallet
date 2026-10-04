@@ -181,6 +181,8 @@ jobs:
             -r .github/scripts/workflow-check-requirements.txt
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/check-workflow-invariants.py
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-check-workflow-invariants.py
+      - run: bash .github/scripts/check-gate-tool-versions.sh
+      - run: bash .github/scripts/test-check-gate-tool-versions.sh
 
   windows-storage:
     name: windows-storage
