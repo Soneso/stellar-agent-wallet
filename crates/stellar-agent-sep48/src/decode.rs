@@ -233,14 +233,15 @@ mod tests {
     fn decode_valid_invoke_contract_tx() {
         let contract_bytes = [1u8; 32];
         let amount_arg = ScVal::I128(Int128Parts { hi: 0, lo: 500 });
-        let tx_env = make_invoke_tx(contract_bytes, "transfer", vec![amount_arg]);
+        let tx_env = make_invoke_tx(contract_bytes, "transfer", vec![amount_arg.clone()]);
         let b64 = encode_tx(&tx_env);
         let result = decode_invoke_host_function(&b64).unwrap();
 
         assert_eq!(result.function_name, "transfer");
         assert_eq!(result.args.len(), 1);
         assert_eq!(result.args[0], amount_arg);
-        assert_eq!(result.contract_strkey, stellar_strkey::Contract(contract_bytes).to_string());
+        let expected_strkey = stellar_strkey::Contract(contract_bytes).to_string();
+        assert_eq!(result.contract_strkey, expected_strkey.as_str());
     }
 
     #[test]
@@ -356,7 +357,7 @@ mod tests {
     fn decode_fee_bump_invoke_contract_tx() {
         let contract_bytes = [2u8; 32];
         let amount_arg = ScVal::I128(Int128Parts { hi: 0, lo: 777 });
-        let inner_env = make_invoke_tx(contract_bytes, "mint", vec![amount_arg]);
+        let inner_env = make_invoke_tx(contract_bytes, "mint", vec![amount_arg.clone()]);
         let inner_v1 = match inner_env {
             TransactionEnvelope::Tx(v1) => v1,
             _ => panic!("expected Tx variant"),
@@ -377,7 +378,8 @@ mod tests {
         assert_eq!(result.function_name, "mint");
         assert_eq!(result.args.len(), 1);
         assert_eq!(result.args[0], amount_arg);
-        assert_eq!(result.contract_strkey, stellar_strkey::Contract(contract_bytes).to_string());
+        let expected_strkey = stellar_strkey::Contract(contract_bytes).to_string();
+        assert_eq!(result.contract_strkey, expected_strkey.as_str());
     }
 
     /// Regression: a 600-deep `SorobanAuthorizedInvocation.sub_invocations`
