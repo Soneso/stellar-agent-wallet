@@ -20,6 +20,7 @@ RELEASE = ".github/workflows/release.yml"
 PUBLISH = ".github/workflows/publish.yml"
 SMOKE = ".github/workflows/notarize-smoke.yml"
 TRIAGE = ".github/workflows/triage.yml"
+WELCOME = ".github/workflows/welcome.yml"
 ACTION = ".github/actions/macos-sign-notarize/action.yml"
 SIGN_SCRIPT = ".github/actions/macos-sign-notarize/sign-notarize.sh"
 PUBLISH_SCRIPT = ".github/scripts/publish-crates.sh"
@@ -213,6 +214,9 @@ CASES = [
     ("triage workflow without top-level permissions", "workflow-permissions",
      'triage.yml: workflow-permissions: no top-level permissions', [
         (TRIAGE, "\npermissions: {}\n", "\n", 1)]),
+    ("welcome workflow without top-level permissions", "workflow-permissions",
+     'welcome.yml: workflow-permissions: no top-level permissions', [
+        (WELCOME, "\npermissions: {}\n", "\n", 1)]),
     ("rust-cache in the signing job", "cred-compile",
      'release.yml:sign-macos step 2: cred-compile: uses Swatinem/rust-cache@', [before_sign_macos_tools(
         "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n\n")]),
