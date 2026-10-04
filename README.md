@@ -130,8 +130,8 @@ flag turns off. The strategy flag needs cargo-binstall 0.17.0 or later.
 The CLI and MCP binaries ship in one release archive
 (`stellar-agent-{version}-{target}.tar.xz`, or `.zip` on Windows), so both
 installs draw from the same download. You can also fetch and extract the
-archive directly, without any Rust tooling (substitute your target, e.g.
-`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`):
+archive directly, without any Rust tooling (substitute your target, for example
+`aarch64-apple-darwin` or `x86_64-unknown-linux-gnu`):
 
 ```bash
 curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.9/stellar-agent-0.1.0-alpha.9-aarch64-apple-darwin.tar.xz
@@ -311,7 +311,10 @@ vulnerability.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Good entry points are the issues labeled
+[`good first issue`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+and
+[`help wanted`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22).
 
 ## License
 

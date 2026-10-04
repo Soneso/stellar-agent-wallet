@@ -64,33 +64,47 @@ These gates must pass before a change is accepted:
   line-coverage floors; 90% per crate is the aspirational target, shortfalls
   below it justified in review)
 - `cargo machete` (no unused dependencies)
-- `cargo deny check` (permissive-only license allow-list and advisory check)
+- `cargo deny check` (permissive-only license allowlist and advisory check)
 
-Run them locally before requesting review. The exact commands, the gate-tool
-installation, and the test tiers are in
+Run them locally before you request review of a change outside documentation,
+scripts, and workflows. The exact commands, the gate-tool installation, and the
+test tiers are in
 [docs/maintainers/building.md](docs/maintainers/building.md).
 
 ## Review process
 
-A fresh review team (Security, Code, and Architecture reviewers) checks every change
-against the [review checklist](docs/maintainers/review-checklist.md) before it is
-committed. Review repeats on a fresh pass until every reviewer approves with no
-blocking findings.
+A maintainer answers a new pull request within one working day. The depth of the
+review follows what the pull request changes:
+
+- A maintainer reviews a pull request that changes only documentation, scripts,
+  or workflows from the diff and the repository's CI checks, with no testnet
+  run.
+- Every other pull request, such as a change to Rust code, also runs the
+  [gate suite](#gate-suite).
+- A pull request that changes signing paths, key handling, or serialized state
+  gets the full review.
+
+In the full review, a fresh review team (Security, Code, and Architecture
+reviewers) checks the change against the
+[review checklist](docs/maintainers/review-checklist.md) before merge. Review
+repeats on a fresh pass until every reviewer approves with no blocking findings.
 
 ## Contributing with a coding agent
 
 This is a wallet built for AI agents, and contributions built with AI agents are
 welcome. Two things make that work:
 
-- **You own the pull request.** The quality bar above does not move: the gate
-  suite must pass, and you — the human contributor — are expected to understand
-  the change, answer review questions, and make requested revisions. A PR whose
-  author cannot explain it will not clear review, however it was produced.
-- **Teach your agent the wallet first.** The repository ships an
+- You own the pull request. The quality bar in
+  [The bar for changes](#the-bar-for-changes) does not move, and the checks that
+  apply to the change must pass. You, the human contributor, need to understand
+  the change, answer review questions, and make requested revisions. A pull
+  request whose author cannot explain it does not clear review, whatever tool
+  wrote it.
+- Teach your agent the wallet first. The repository ships an
   [agent knowledge skill](skills/) that teaches a coding agent the CLI surface,
-  the MCP tools, the error-code families, and the security model. Installing it
-  before you start means your agent works from the project's actual conventions
-  instead of guessing; see [skills/README.md](skills/README.md) for setup.
+  the MCP tools, the error-code families, and the security model. Install it
+  before you start so your agent works from the project's conventions; see
+  [skills/README.md](skills/README.md) for setup.
 
 Good entry points are the issues labeled
 [`help wanted`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
@@ -99,8 +113,12 @@ and
 Issues touching signing paths, key handling, or serialized state get the full
 three-reviewer pass and are better second contributions than first ones.
 
-Changes land through pull requests from a fork. CI runs the offline gate suite
-on every pull request and must be green before merge.
+To claim an issue, comment "I'll take this" on it. A maintainer assigns the
+issue to you within one working day. Each contributor holds one open assignment
+at a time.
+
+Changes land through pull requests from a fork. CI runs on every pull request,
+and every check must be green before merge.
 
 ## Commit and pull request conventions
 
@@ -110,6 +128,9 @@ on every pull request and must be green before merge.
   pull requests.
 - Describe what the change does and why. State the rationale, not the history of how
   the code got there.
+- Fill in every part of the
+  [pull request template](.github/PULL_REQUEST_TEMPLATE.md), which GitHub places
+  in the description when you open a pull request.
 
 ## Reporting bugs and requesting features
 
