@@ -1124,7 +1124,10 @@ impl AuditEntry {
     /// `observed_at_ledger_seq` is the ledger sequence the observation was
     /// read at. `prev_chain_tip_hash` MUST be sourced from
     /// `AuditWriter::current_chain_tip()` inside the same write critical
-    /// section. `account_digest` is `signer_set::account_digest` of the
+    /// section. Build the row in the `build` closure of
+    /// [`AuditWriter::write_built`](super::writer::AuditWriter::write_built),
+    /// which drains the outbox and completes any rotation before the tip is
+    /// read. `account_digest` is `signer_set::account_digest` of the
     /// manager's network passphrase and the full smart-account C-strkey;
     /// `smart_account_redacted` MUST already be redacted first-5-last-5.
     #[allow(
@@ -2398,8 +2401,9 @@ impl AuditEntry {
 
     /// Constructs an `X402PaymentAuthorized` audit entry.
     ///
-    /// Emitted at the point an x402 payment authorization signature is
-    /// produced. `legs` MUST be the SAME descriptor the policy gate sized.
+    /// Written before the signed authorization first leaves the wallet, in the
+    /// RPC re-simulation. `legs` MUST be the SAME descriptor the policy gate
+    /// sized.
     /// `network` and `scheme` are non-secret settle identifiers; no signature,
     /// token, or secret is recorded. `policy_decision` carries the gate's
     /// actual decision (`Allow` on this path).
@@ -2432,6 +2436,48 @@ impl AuditEntry {
                 legs,
                 network: super::schema::bound_recorded_str(&network.into()),
                 scheme: super::schema::bound_recorded_str(&scheme.into()),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs an `X402AuthorizationWithheld` audit entry.
+    ///
+    /// Written after an `x402_payment_authorized` row when the payment then
+    /// failed. `request_id` MUST be that row's, which pairs the two.
+    /// `failure_stage` is one of `resimulation`, `response_processing`, or
+    /// `encoding`. The outer fields are those `x402_payment_authorized` writes:
+    /// empty `arg_keys` and an `Allow` policy decision, since the gate allowed
+    /// the payment and the event kind records the withholding. `network` and
+    /// `scheme` are bounded the way that constructor bounds them.
+    #[must_use]
+    pub fn new_x402_authorization_withheld(
+        tool: impl Into<String>,
+        chain_id: impl IntoOptionalChainId,
+        network: impl Into<String>,
+        scheme: impl Into<String>,
+        failure_stage: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            // network and scheme originate in the facilitator-supplied 402
+            // challenge; bound so a hostile counterparty cannot inflate
+            // hash-chained rows.
+            event_kind: EventKind::X402AuthorizationWithheld {
+                network: super::schema::bound_recorded_str(&network.into()),
+                scheme: super::schema::bound_recorded_str(&scheme.into()),
+                failure_stage: super::schema::bound_recorded_str(&failure_stage.into()),
             },
             previous_entry_hash: String::new(),
         }
@@ -7567,6 +7613,35 @@ mod tests {
         };
         assert_eq!(network.chars().count(), RECORDED_STR_MAX);
         assert_eq!(scheme.chars().count(), RECORDED_STR_MAX);
+    }
+
+    #[test]
+    fn x402_withheld_constructor_bounds_facilitator_supplied_network_and_scheme() {
+        use crate::audit_log::schema::RECORDED_STR_MAX;
+        let oversized = "n".repeat(RECORDED_STR_MAX * 8);
+        let entry = AuditEntry::new_x402_authorization_withheld(
+            "stellar_x402_create_payment",
+            Some("stellar:testnet"),
+            oversized.clone(),
+            oversized,
+            "resimulation",
+            "req-1",
+        );
+        let EventKind::X402AuthorizationWithheld {
+            network,
+            scheme,
+            failure_stage,
+        } = &entry.event_kind
+        else {
+            panic!("wrong event kind");
+        };
+        assert_eq!(network.chars().count(), RECORDED_STR_MAX);
+        assert_eq!(scheme.chars().count(), RECORDED_STR_MAX);
+        assert_eq!(failure_stage, "resimulation");
+        assert_eq!(entry.request_id, "req-1");
+        assert_eq!(entry.tool, "stellar_x402_create_payment");
+        assert_eq!(entry.policy_decision, PolicyDecision::Allow);
+        assert!(entry.arg_keys.is_empty());
     }
 
     #[test]

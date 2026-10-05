@@ -630,3 +630,176 @@ async fn a_refused_commit_leaves_its_approval_untouched() {
         "the attestation is unchanged"
     );
 }
+
+/// A consent row `stellar-agent approve` queued while this server held the
+/// audit writer is in the log before the pay commit loads its signing key.
+///
+/// The writer is cached in-process by an earlier keyed call, and the row is
+/// queued in the outbox after it, beside an attestation already persisted. A
+/// read hook at the signer's keyring coordinate records whether the row is in
+/// the log at the moment the signing key loads.
+#[tokio::test]
+#[serial]
+async fn pay_commit_logs_a_queued_consent_row_before_the_signer_loads() {
+    use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox, AuditWriterRegistry};
+
+    const ACCOUNT: &str = "acct-consent-pay";
+    let _data_root = common::isolated_data_root();
+    let log_path = Arc::new(std::sync::Mutex::new(None::<std::path::PathBuf>));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook = {
+        let log_path = Arc::clone(&log_path);
+        let seen = Arc::clone(&seen);
+        Arc::new(move || {
+            if let Some(path) = log_path.lock().unwrap().clone() {
+                seen.lock().unwrap().push(
+                    std::fs::read_to_string(path)
+                        .unwrap_or_default()
+                        .contains(r#""kind":"approval_attested""#),
+                );
+            }
+        }) as Arc<dyn Fn() + Send + Sync>
+    };
+    keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new("svc", ACCOUNT, hook)])
+        .expect("hooked mock keyring");
+
+    let seed = [0x72_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", ACCOUNT)
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+    keyring_core::Entry::new("n-svc", "n-acct")
+        .expect("Entry::new")
+        .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xC2_u8; 32]))
+        .expect("set_password");
+
+    let mock_server = MockServer::start().await;
+    let mut profile = Profile::builder_testnet("svc", ACCOUNT, "n-svc", "n-acct")
+        .with_noop_engine()
+        .build();
+    profile.rpc_url = mock_server.uri();
+    profile.submit_timeout_seconds = Some(1);
+    common::install_test_audit_key(&mut profile);
+    let _ = std::fs::remove_file(&profile.audit_log_path);
+    let attestation_key = [0xD3_u8; 32];
+    keyring_core::Entry::new(
+        &profile.attestation_key_id.service,
+        &profile.attestation_key_id.account,
+    )
+    .expect("Entry::new")
+    .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(attestation_key))
+    .expect("set_password");
+
+    let envelope_xdr = commit_envelope(&source_g, &profile.network_passphrase);
+    let approval_dir = TempDir::new().expect("approval dir");
+    let store_path = approval_dir.path().join(format!("{ACCOUNT}.toml"));
+    let process_uid = process_uid_for_attestation().expect("process uid");
+    let entry = PendingApproval::new_payment_pending(
+        envelope_xdr.clone(),
+        envelope_xdr.as_bytes(),
+        DEST.to_owned(),
+        AMOUNT_STROOPS,
+        "XLM".to_owned(),
+        None,
+        DEFAULT_CLASSIC_FEE_STROOPS,
+        SOURCE_SEQ + 1,
+        process_uid.clone(),
+        DEFAULT_TTL_MS,
+    )
+    .expect("pending approval");
+    let approval_nonce = entry.approval_nonce.clone();
+    let blob = compute_attestation(
+        &attestation_key,
+        &stellar_agent_core::approval::AttestationBinding::new(ACCOUNT, "stellar:testnet"),
+        &approval_nonce,
+        &envelope_sha256(envelope_xdr.as_bytes()),
+        &process_uid,
+    );
+    let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
+
+    // An earlier keyed call caches the writer in this process.
+    let _cached = AuditWriterRegistry::get_or_open_keyed(
+        ACCOUNT,
+        &profile.audit_log_path,
+        stellar_agent_network::keyring::keyed_audit_access(
+            &profile,
+            ACCOUNT,
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
+        )
+        .expect("audit access"),
+    )
+    .expect("writer cached");
+    // `approve --id` beside this server: the row is queued, then the
+    // attestation is persisted.
+    AuditOutbox::for_log(&profile.audit_log_path)
+        .append(&AuditEntry::new_approval_attested(
+            "PaymentSimulated",
+            "stellar_pay_commit",
+            None,
+            &approval_nonce,
+            "cli",
+            "queued-consent",
+        ))
+        .expect("queue the consent row");
+    {
+        let mut store = PendingApprovalStore::open(store_path.clone()).expect("approval store");
+        store
+            .insert(
+                entry,
+                stellar_agent_core::timefmt::now_unix_ms().expect("clock"),
+            )
+            .expect("insert");
+        store
+            .record_attestation(&approval_nonce, blob)
+            .expect("record attestation");
+    }
+
+    let responder = TimeoutRpcResponder {
+        account_key_xdr: account_ledger_key_xdr(&source_g),
+        account_xdr: account_entry_xdr_with_seq(&source_g, 100_000_000_000_000, 0, SOURCE_SEQ),
+        refuse_send: true,
+    };
+    Mock::given(method("POST"))
+        .respond_with(responder)
+        .mount(&mock_server)
+        .await;
+
+    let nonce_mint = NonceMint::from_profile(&profile, ACCOUNT).expect("NonceMint::from_profile");
+    let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("clock");
+    let expiry = now_ms + 60_000;
+    let nonce = nonce_mint
+        .mint(
+            &PayCommitCatalogue,
+            envelope_xdr.as_bytes(),
+            now_ms,
+            expiry,
+            "stellar_pay_commit",
+            "stellar:testnet",
+        )
+        .expect("mint")
+        .to_base64();
+    *log_path.lock().unwrap() = Some(profile.audit_log_path.clone());
+
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    server.set_policy_engine_for_test(Arc::new(RequireApprovalEngine));
+    server.set_approval_dir_for_test(approval_dir.path().to_path_buf());
+    server
+        .call_stellar_pay_commit(commit_args(
+            &source_g,
+            &envelope_xdr,
+            nonce,
+            expiry,
+            &approval_nonce,
+            &attestation_b64,
+        ))
+        .await
+        .expect("commit must not error at the protocol layer");
+
+    let seen = seen.lock().unwrap().clone();
+    assert!(!seen.is_empty(), "the commit loaded its signing key");
+    assert!(
+        seen.iter().all(|in_log| *in_log),
+        "the consent row must be in the log whenever the signing key loads: {seen:?}"
+    );
+}

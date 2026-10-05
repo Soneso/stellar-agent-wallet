@@ -23,13 +23,18 @@
 //!   home-directory resolution; callers serialise with `#[serial]`.
 //! - [`profile_fixtures`] — profile-TOML bytes shared by both binaries'
 //!   process-level tests, so a parity assertion compares one file rather than
-//!   two hand-copied literals.
+//!   two hand-copied literals. Its
+//!   [`unique_profile_name`](profile_fixtures::unique_profile_name) gives each
+//!   test a profile name no other test shares.
 //! - [`env_guard::ProfileEnvVarGuard`] — RAII guard clearing
 //!   `STELLAR_AGENT_PROFILE` for in-process tests that exercise the
 //!   "no profile was named" branch; callers serialise with `#[serial]`.
 //! - [`connection_counter::ConnectionCounter`] counts the connections a
 //!   loopback TCP listener accepts, for tests that assert no contact with an
 //!   `https://` endpoint.
+//! - [`source_order`] asserts that one call sits between two others inside a
+//!   production function, for tests that pin the order of a read, an
+//!   acquisition, and a signer load.
 //!
 //! This crate is consumed only as a `[dev-dependencies]` entry
 //! (`publish = false`); it is never a runtime dependency, so its `pub` helpers
@@ -52,6 +57,7 @@ pub mod profile_fixtures;
 pub mod secret_patterns;
 #[cfg(feature = "test-helpers")]
 pub mod signed_envelope;
+pub mod source_order;
 #[cfg(feature = "testnet-helpers")]
 pub mod testnet_helpers;
 pub mod testnet_strkeys;

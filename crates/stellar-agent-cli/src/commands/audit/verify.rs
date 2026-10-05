@@ -51,6 +51,7 @@ use stellar_agent_core::{
     audit_log::{
         BindingCheck,
         health::AuditWriterHealth,
+        outbox::inspect_outbox,
         tip_anchor::{TipAnchor, TipAnchorStore as _, normalize_path_lexically},
         verify::{FileVerifyResult, VerifyError, VerifyWarning, verify_log_with_health},
     },
@@ -138,6 +139,17 @@ pub struct AuditVerifyResult {
     pub audit_writer_degraded: bool,
     /// Whether the keyring-held tip anchor was checked, and if not, why.
     pub anchor: AuditAnchorStatus,
+    /// Number of consent rows queued in the audit outbox beside the log and
+    /// not yet drained into it: the newline-terminated lines of
+    /// `<log>.outbox`, read without taking the outbox lock.
+    ///
+    /// Queued rows sit outside the tip anchor until a draining writer appends
+    /// them. A torn or unparseable outbox adds a warning and leaves the chain
+    /// verdict unchanged. An outbox that cannot be read has no count: the
+    /// field is omitted, an `outbox_unreadable` warning names the condition,
+    /// and the chain verdict is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outbox_pending: Option<usize>,
 }
 
 /// Whether `audit verify` compared the log against its keyring-held tip anchor.
@@ -269,18 +281,54 @@ fn verify_to_result(args: &VerifyArgs) -> Result<AuditVerifyResult, VerifyFailur
     .map_err(|err| verify_failure(&err))?;
 
     let ok = ok_with_health.verify_ok;
+    let mut warnings = ok.warnings;
+    let outbox_pending = inspect_outbox_into(&args.log_path, &mut warnings);
     Ok(AuditVerifyResult {
         entries_verified: ok.entries_verified,
         files_walked: ok.files_walked,
         hmac_verified: ok.hmac_verified,
         per_file: ok.per_file,
-        warnings: ok.warnings,
+        warnings,
         audit_writer_degraded: ok_with_health.audit_writer_degraded,
         anchor: match anchor_skip_reason {
             Some(reason) => AuditAnchorStatus::not_checked(reason),
             None => AuditAnchorStatus::verified(),
         },
+        outbox_pending,
     })
+}
+
+/// Counts the rows queued in the audit outbox beside `log_path`, adding a
+/// warning for a torn, unparseable, or unreadable outbox.
+///
+/// Reads without the outbox lock, so the count describes the file at the
+/// moment it was read. An absent outbox counts zero; an outbox that cannot be
+/// read has no count, `None`. Nothing here changes the chain verdict.
+fn inspect_outbox_into(
+    log_path: &std::path::Path,
+    warnings: &mut Vec<VerifyWarning>,
+) -> Option<usize> {
+    match inspect_outbox(log_path) {
+        Ok(inspection) => {
+            if inspection.torn_bytes > 0 {
+                warnings.push(VerifyWarning::OutboxTornTail {
+                    torn_bytes: inspection.torn_bytes,
+                });
+            }
+            if !inspection.unparseable_lines.is_empty() {
+                warnings.push(VerifyWarning::OutboxUnparseable {
+                    lines: inspection.unparseable_lines,
+                });
+            }
+            Some(inspection.pending)
+        }
+        Err(e) => {
+            warnings.push(VerifyWarning::OutboxUnreadable {
+                error_kind: format!("{:?}", e.kind()),
+            });
+            None
+        }
+    }
 }
 
 /// What `--profile` contributed to this verification.
@@ -1370,6 +1418,150 @@ mod tests {
         assert!(
             !message.contains("sha256:"),
             "no digest in an operator-facing refusal: {message}"
+        );
+    }
+
+    // ── The audit outbox ──────────────────────────────────────────────────────
+
+    fn queue_consent(path: &std::path::Path, request_id: &str) {
+        stellar_agent_core::audit_log::AuditOutbox::for_log(path)
+            .append(
+                &stellar_agent_core::audit_log::AuditEntry::new_approval_attested(
+                    "PaymentSimulated",
+                    "stellar_pay_commit",
+                    None,
+                    "ABCDEFGHIJKLMNOPQRSTUV",
+                    "cli",
+                    request_id,
+                ),
+            )
+            .unwrap();
+    }
+
+    fn append_to_outbox(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write as _;
+        let outbox = stellar_agent_core::audit_log::AuditOutbox::for_log(path);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(outbox.path())
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    #[test]
+    fn verify_reports_outbox_pending_and_warns_on_a_torn_outbox() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        make_writer_and_entries(path.clone(), 2, None);
+        queue_consent(&path, "queued-1");
+        queue_consent(&path, "queued-2");
+        append_to_outbox(&path, b"{\"ts\":\"torn");
+
+        let result = verify_to_result(&VerifyArgs {
+            log_path: path,
+            profile: None,
+            output: OutputFormat::DEFAULT,
+        })
+        .unwrap_or_else(|_| panic!("the chain verdict is unchanged"));
+        assert_eq!(result.entries_verified, 2);
+        assert_eq!(result.outbox_pending, Some(2));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, VerifyWarning::OutboxTornTail { torn_bytes: 11 })),
+            "{:?}",
+            result.warnings
+        );
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["outbox_pending"], 2);
+    }
+
+    #[test]
+    fn verify_warns_on_an_unparseable_outbox_line_and_keeps_the_verdict() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        make_writer_and_entries(path.clone(), 1, None);
+        queue_consent(&path, "queued-1");
+        append_to_outbox(&path, b"not an audit entry\n");
+
+        let result = verify_to_result(&VerifyArgs {
+            log_path: path,
+            profile: None,
+            output: OutputFormat::DEFAULT,
+        })
+        .unwrap_or_else(|_| panic!("the chain verdict is unchanged"));
+        assert_eq!(result.outbox_pending, Some(2), "every complete line counts");
+        assert!(
+            result.warnings.iter().any(
+                |w| matches!(w, VerifyWarning::OutboxUnparseable { lines } if lines == &vec![2])
+            ),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn verify_without_an_outbox_reports_nothing_pending() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        make_writer_and_entries(path.clone(), 1, None);
+        let result = verify_to_result(&VerifyArgs {
+            log_path: path,
+            profile: None,
+            output: OutputFormat::DEFAULT,
+        })
+        .unwrap_or_else(|_| panic!("verifies"));
+        assert_eq!(
+            result.outbox_pending,
+            Some(0),
+            "an absent outbox counts zero"
+        );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["outbox_pending"], 0);
+    }
+
+    /// An outbox that cannot be read has no count: the field is omitted, the
+    /// warning names the condition, and the chain verdict is unchanged. An
+    /// empty outbox, by contrast, counts zero with no warning.
+    #[test]
+    fn verify_reports_no_count_for_an_unreadable_outbox() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        make_writer_and_entries(path.clone(), 2, None);
+        let outbox = stellar_agent_core::audit_log::AuditOutbox::for_log(&path);
+        let args = || VerifyArgs {
+            log_path: path.clone(),
+            profile: None,
+            output: OutputFormat::DEFAULT,
+        };
+
+        std::fs::write(outbox.path(), b"").unwrap();
+        let empty = verify_to_result(&args()).unwrap_or_else(|_| panic!("verifies"));
+        assert_eq!(empty.outbox_pending, Some(0), "an empty outbox counts zero");
+        assert!(empty.warnings.is_empty(), "{:?}", empty.warnings);
+
+        // A directory in the outbox's place cannot be read as a file.
+        std::fs::remove_file(outbox.path()).unwrap();
+        std::fs::create_dir(outbox.path()).unwrap();
+        let unreadable =
+            verify_to_result(&args()).unwrap_or_else(|_| panic!("the chain verdict is unchanged"));
+        assert_eq!(unreadable.entries_verified, 2);
+        assert_eq!(unreadable.outbox_pending, None, "no count is reported");
+        assert!(
+            unreadable
+                .warnings
+                .iter()
+                .any(|w| matches!(w, VerifyWarning::OutboxUnreadable { .. })),
+            "{:?}",
+            unreadable.warnings
+        );
+        let json = serde_json::to_value(&unreadable).unwrap();
+        assert!(
+            json.get("outbox_pending").is_none(),
+            "an unreadable outbox omits the count: {json}"
         );
     }
 }

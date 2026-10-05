@@ -190,6 +190,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports.
 - Test support `keyring_mock::install_with_write_error` fails the next write at
   one coordinate.
+- `x402_authorization_withheld`, an audit event kind written when an x402
+  payment fails after its `x402_payment_authorized` row. It carries the
+  network, the scheme, and a `failure_stage` of `resimulation`,
+  `response_processing`, or `encoding`, and shares the authorized row's
+  `request_id`. `AuditEntry::new_x402_authorization_withheld` constructs it.
+- The audit outbox: `<log>.outbox` queues consent rows while a draining writer
+  in another process holds the log, beside `<log>.outbox.lock` and
+  `<log>.drain.lock`. `AuditOutbox` appends to it; `drain_lock_is_held`,
+  `inspect_outbox`, and `OutboxInspection` read its state.
+- `ConsentAudit` names where `attest_and_persist` writes the consent row: an
+  `AuditWriter` or an `AuditOutbox`.
+- `stellar_agent_core::audit_log::audit_writer_refusal` maps an audit-writer
+  failure to the wallet error that names it. The consent row, the CLI audit
+  pre-flight, and the MCP audit pre-flight all refuse through it.
+- `AuditWriter::drain_outbox` appends the queued rows and empties the outbox.
+  `AuditWriter::write_built` drains, completes any rotation the append needs,
+  builds an entry from the current tip, and appends it with nothing in
+  between.
+- `audit verify` reports `outbox_pending`, the number of queued rows, and warns
+  `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` without
+  changing the chain verdict. An unreadable outbox omits `outbox_pending`. The
+  warnings are the `VerifyWarning` variants `OutboxTornTail`,
+  `OutboxUnparseable`, and `OutboxUnreadable`.
+- `stellar_agent_x402::exact::AuthorizationToTransmit` and
+  `X402Error::TransmitGateRefused`, wire code `x402.transmit_gate_refused`.
+- Detail sub-codes `audit.outbox_unusable` and `audit.outbox_busy`, under
+  `audit.chain_key_unavailable`. `audit.outbox_unusable` names the line, the
+  column, and the class of the parse failure, never the line's content.
+- `ReanchorReport::outbox_drained` and `ReanchorReport::outbox_refusal`.
+- `ApprovalKind` and `RegistrationInput` implement `PartialEq`.
 
 ### Changed
 
@@ -569,6 +599,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repository.
 - The coverage gate runs in its own Coverage workflow: weekly on main, on a
   pull request that carries the `coverage` label, and on demand.
+- `stellar_agent_x402::exact::create_payment` takes a fifth argument,
+  `before_transmit`. It is called with an `AuthorizationToTransmit`
+  immediately before the signed re-simulation, and an error from it returns at
+  once with nothing sent.
+- `stellar_x402_create_payment` and `stellar_x402_authenticated_payment` write
+  `x402_payment_authorized` in that gate. When the row cannot be written they
+  answer the `audit.*` code of the refusal and return no signature.
+- The `mpp_authorization_withheld` row of a failed sponsored commit records
+  `failure_stage` `pre_signing` with `key_access_began` `false`, `signing`, or
+  `resimulation`, naming the side of the signed re-simulation send.
+  `sign_or_resimulation` is not written. A withheld row that cannot be written
+  is logged at `error` with its code, and the primary error is returned.
+- `approve --id` writes `approval_attested` before it persists the approval.
+  Beside a running MCP server or `approve serve` that drains the outbox it
+  queues the row there. Beside a writer that does not drain it refuses with
+  `audit.writer_locked`.
+- `approve --id` refuses, persists nothing, and exits 1 on any other audit
+  failure, including a missing audit key, a rolled-back log, and
+  `audit.outbox_busy`. Its envelope carries `audit`: `"written"` or `"queued"`.
+- The approval inbox and the remote inbox write each decision's row before
+  persisting the decision. When the row cannot be written, or the writer mutex
+  is poisoned, they answer `unavailable` and leave the entry pending. A
+  poisoned mutex refuses every later decision until the inbox restarts.
+- `attest_and_persist` takes a required `ConsentAudit` sink in place of
+  `Option<&mut AuditWriter>`. It re-reads the entry under the store lock and
+  writes the consent row before persisting; a refused row persists nothing.
+- `WriterError` gains `OutboxBusy` and `OutboxUnusable`. The enum is not
+  `#[non_exhaustive]`, so an exhaustive match on it needs the two arms.
+- A writer opened with a tip-anchor store, through `AuditWriter::open` with
+  access or `AuditWriter::open_with_tip_anchor`, holds `<log>.drain.lock` and
+  drains the outbox at open, in `AuditWriter::verify_tip_anchor`, and before
+  each of its own rows. The open and `verify_tip_anchor` return the drain's
+  errors, and every registry cache hit runs `verify_tip_anchor`. When either
+  adopts the log, the adoption row is appended even if the drain refuses.
+- `stellar_mpp_charge_commit`, `mpp charge authorize`,
+  `stellar_rule_create_commit`, and CLI `trustline` acquire the audit writer
+  after reading their approval and before loading the signing key. The
+  acquisition drains the outbox, and a failure refuses with its `audit.*` code.
+- `audit reanchor` drains the outbox after its repair rows, with either
+  acknowledgement, and reports `outbox_drained`. A drain refusal leaves the
+  repair in force, omits `outbox_drained`, and is listed under `warnings`.
+- A binary that predates `x402_authorization_withheld` refuses to replay or
+  verify a log that holds one.
+- After upgrading, restart a running MCP server and `approve serve`.
+  `approve --id` refuses beside an older one, which does not drain the outbox.
 
 ### Removed
 
@@ -617,6 +692,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   store, or the headless store `STELLAR_AGENT_KEYRING_BACKEND` names, when none
   is registered. The read-only verbs read the keyring and record an absent
   audit binding for a persisted profile.
+- A file in the audit directory whose name put a multi-byte character across
+  the ninth byte of a rotated-sibling suffix panicked the writer's open, its
+  rotation, and `audit verify`. Such a name is not a rotated sibling.
+- In `0.1.0-alpha.1` through `0.1.0-alpha.9`, approving a trustline clawback
+  opt-in made the profile's approval store unloadable. The approval stored its
+  attestation on the opt-in entry, and the store refused that field for the
+  opt-in kind when it reopened. Every later approval read on the profile then
+  failed, the trustline gate included, until the entry was removed by hand.
+  An attested opt-in reloads with its attestation, and the trustline gate
+  verifies it.
 
 ### Security
 
@@ -762,6 +847,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then failed, or created the account from the Wasm that the constant names.
   The deploy checks the digest in every build profile, before any network
   request.
+- In `0.1.0-alpha.1` through `0.1.0-alpha.9`, the x402 payment tools sent
+  the signed payment authorization to the profile's RPC endpoint, in the
+  re-simulation request, before any audit row recorded it. This needed only a
+  testnet profile whose policy allowed the payment. `0.1.0-alpha.1` and
+  `0.1.0-alpha.2` wrote no row for an x402 authorization. Later releases wrote
+  `x402_payment_authorized` after the re-simulation, logged a failure to write
+  it, and returned the signature anyway. A failed re-simulation, or a failure
+  after it, left no row for an authorization the endpoint had already
+  received. The x402 tools write `x402_payment_authorized` before the signed
+  authorization leaves the wallet, and withhold it when that row cannot be
+  written.
+- In `0.1.0-alpha.1` through `0.1.0-alpha.9`, an approval took effect before
+  its audit row was written. `approve --id` persisted the attestation or the
+  grant, then wrote `approval_attested` best-effort. With the audit writer
+  unavailable it wrote no row and exited 0, which was the ordinary case beside
+  a running MCP server or `approve serve`. The approval inbox persisted
+  approvals and rejections before their rows, and skipped the row without a
+  log line when its writer mutex was poisoned. An approval or a rejection
+  takes effect only after its row is durable, in the log or in the log's
+  outbox. A queued row reaches the log before the process that consumes the
+  approval loads a signing key.
 
 ## [0.1.0-alpha.9] - 2026-09-30
 

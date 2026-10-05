@@ -41,8 +41,7 @@
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::audit_log::{
-    AuditEntry, AuditWriter, AuditWriterRegistry, BindingCheck, WriterError,
-    audit_log_unusable_detail,
+    AuditEntry, AuditWriter, AuditWriterRegistry, BindingCheck, WriterError, audit_writer_refusal,
 };
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
@@ -55,16 +54,18 @@ use crate::common::profile_access::ProfileOrigin;
 /// signing verbs.
 ///
 /// Callers invoke this BEFORE any signing key is touched and BEFORE any
-/// transaction is submitted (see the module docs). On success, the returned
-/// writer MUST be reused for the verb's post-confirm emission
-/// ([`emit_value_audit_row_with_writer`]) rather than re-acquired.
+/// transaction is submitted (see the module docs). A verb with a post-confirm
+/// row reuses the returned writer for it ([`emit_value_audit_row_with_writer`])
+/// rather than re-acquiring it. A verb whose row is written strictly before a
+/// transmission discards the handle, and the strict write acquires again.
+/// [`drain_consent_rows_before_signing`] discards it too: that acquisition
+/// exists for its drain.
 ///
 /// This is the CLI twin of `stellar_agent_mcp::tools::value_audit::require_value_audit_writer`
-/// (crate-private there, so not directly linkable): the two implementations
-/// MUST stay wire-identical — same wire code on the same underlying failure,
-/// same fail-closed semantics — so a `pay`/`claim`/`trustline`/`trade`
-/// refusal reads the same whether it came from the CLI verb or its MCP tool
-/// counterpart.
+/// (crate-private there, so not directly linkable). The two stay
+/// wire-identical: the same underlying failure gets the same wire code, and
+/// both fail closed. A refusal therefore reads the same whether it came from
+/// the CLI verb or its MCP tool counterpart.
 ///
 /// # Errors
 ///
@@ -78,7 +79,8 @@ use crate::common::profile_access::ProfileOrigin;
 ///   `stellar-agent profile rotate-audit-key <profile>` mints one.
 /// - [`ValidationError::AuditLogUnusable`], code `audit.chain_key_unavailable`,
 ///   when the key loaded but the log cannot be used. The message names the
-///   condition by its `audit.*` sub-code, `audit.io_error` included.
+///   condition by its `audit.*` sub-code, including `audit.io_error`,
+///   `audit.outbox_busy`, and `audit.outbox_unusable`.
 /// - [`ValidationError::AuditWriterOpenFailed`], code
 ///   `audit.chain_key_unavailable`, when the key loaded but the registry holds
 ///   a conflicting path or key registration for this profile name. Rotating
@@ -97,7 +99,67 @@ pub(crate) fn require_value_audit_writer(
     profile: &Profile,
     profile_name: &str,
 ) -> Result<Arc<Mutex<AuditWriter>>, WalletError> {
-    let access = keyed_audit_access(profile, profile_name, BindingCheck::Enforce).map_err(|e| {
+    acquire_keyed_audit_writer(profile, profile_name, BindingCheck::Enforce)
+        .map_err(|e| e.into_wallet_error(profile_name))
+}
+
+/// Acquires the keyed audit writer after a verb read an approval and before it
+/// loads the signing key.
+///
+/// The acquisition drains the audit outbox, at open or on the registry cache
+/// hit, so a consent row `stellar-agent approve` queued for the approval is in
+/// the log before the key is touched. The handle is not kept. This is not the
+/// verb's audit pre-flight, which precedes the approval read.
+///
+/// # Errors
+///
+/// Every error of [`require_value_audit_writer`].
+pub(crate) fn drain_consent_rows_before_signing(
+    profile: &Profile,
+    profile_name: &str,
+) -> Result<(), WalletError> {
+    require_value_audit_writer(profile, profile_name).map(|_writer| ())
+}
+
+/// Why a keyed audit-writer acquisition failed, kept typed so a caller can
+/// branch on the failure class rather than on its rendered detail.
+#[derive(Debug)]
+pub(crate) enum KeyedAcquireError {
+    /// The profile's audit chain-root key could not be loaded.
+    KeyUnavailable,
+    /// The profile differs from its recorded audit binding.
+    BindingChanged(WalletError),
+    /// The writer registry refused with this error.
+    Writer(WriterError),
+}
+
+impl KeyedAcquireError {
+    /// The wallet error [`require_value_audit_writer`] reports for this
+    /// failure.
+    pub(crate) fn into_wallet_error(self, profile_name: &str) -> WalletError {
+        match self {
+            Self::BindingChanged(e) => e,
+            Self::KeyUnavailable => audit_chain_key_unavailable(profile_name),
+            Self::Writer(e) => audit_writer_acquisition_error(profile_name, &e),
+        }
+    }
+}
+
+/// Acquires the keyed writer with the caller's binding policy and keeps
+/// failures typed. Persisted profiles use [`BindingCheck::Enforce`];
+/// synthesized profiles use [`BindingCheck::CheckOnly`].
+///
+/// # Errors
+///
+/// [`KeyedAcquireError::KeyUnavailable`] when the chain-root key cannot be
+/// loaded, [`KeyedAcquireError::BindingChanged`] when the binding differs,
+/// and [`KeyedAcquireError::Writer`] with the registry's error otherwise.
+pub(crate) fn acquire_keyed_audit_writer(
+    profile: &Profile,
+    profile_name: &str,
+    binding: BindingCheck,
+) -> Result<Arc<Mutex<AuditWriter>>, KeyedAcquireError> {
+    let access = keyed_audit_access(profile, profile_name, binding).map_err(|e| {
         // A binding refusal keeps its own code and remedy.
         if is_binding_refusal(&e) {
             tracing::warn!(
@@ -105,62 +167,30 @@ pub(crate) fn require_value_audit_writer(
                 code = %e.code(),
                 "value audit: audit binding changed; refusing before signing/submit"
             );
-            return e;
+            return KeyedAcquireError::BindingChanged(e);
         }
         tracing::warn!(
             profile = %profile_name,
             error = %e,
             "value audit: could not load audit chain key; refusing before signing/submit"
         );
-        audit_chain_key_unavailable(profile_name)
+        KeyedAcquireError::KeyUnavailable
     })?;
     AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
-        .map_err(|e| audit_writer_acquisition_error(profile_name, &e))
+        .map_err(KeyedAcquireError::Writer)
 }
 
-/// Maps a writer-acquisition failure to the wire code that names it.
-///
-/// Three outcomes, because three different things are wrong and three different
-/// things fix them:
-///
-/// - A tip-anchor mismatch carries `audit.tip_anchor_mismatch`: the log may have
-///   been rolled back, and only `audit reanchor` addresses that.
-/// - A condition about the LOG — a held writer lock, an unusable rotation
-///   bridge, a broken chain, an unreadable anchor — carries
-///   `ValidationError::AuditLogUnusable`, whose message names the condition by
-///   its `audit.*` sub-code and points at the recovery runbook. Telling the
-///   operator to rotate a key here would send them somewhere useless.
-/// - Everything left is a registry path or key registration conflict, which is
-///   what `AuditWriterOpenFailed`'s wording describes.
+/// Maps a writer-acquisition failure to the wire code that names it, through
+/// [`audit_writer_refusal`], the one mapping every audit refusal uses.
 fn audit_writer_acquisition_error(profile_name: &str, e: &WriterError) -> WalletError {
-    if let WriterError::TipAnchorMismatch { reason, .. } = e {
-        tracing::warn!(
-            profile = %profile_name,
-            error = %e,
-            "value audit: audit log tip anchor mismatch"
-        );
-        return WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
-            profile: profile_name.to_owned(),
-            reason: (*reason).to_owned(),
-        });
-    }
-    if let Some(detail) = audit_log_unusable_detail(e) {
-        tracing::warn!(
-            profile = %profile_name,
-            error = %e,
-            "value audit: audit log unusable"
-        );
-        return WalletError::Validation(ValidationError::AuditLogUnusable {
-            profile: profile_name.to_owned(),
-            detail,
-        });
-    }
+    let refusal = audit_writer_refusal(profile_name, e);
     tracing::warn!(
         profile = %profile_name,
         error = %e,
-        "value audit: could not open audit writer"
+        code = refusal.code(),
+        "value audit: audit writer unavailable; refusing before signing/submit"
     );
-    audit_writer_open_failed(profile_name)
+    refusal
 }
 
 /// Whether `e` is the audit binding refusal.
@@ -367,6 +397,36 @@ pub(crate) fn emit_value_audit_row_with_writer(
     }
 }
 
+/// Appends `entry` through `writer`, logging a poisoned writer mutex or a
+/// refused append at `error` with `event_kind`.
+///
+/// For a row whose absence does not change the command's result: the act it
+/// records already happened or was already refused. The absence is never
+/// silent.
+pub(crate) fn write_row_logged(
+    writer: &Arc<Mutex<AuditWriter>>,
+    entry: AuditEntry,
+    event_kind: &'static str,
+    request_id: &str,
+) {
+    let Ok(mut guard) = writer.lock() else {
+        tracing::error!(
+            event_kind,
+            request_id,
+            "audit writer mutex poisoned; the row was not written"
+        );
+        return;
+    };
+    if let Err(e) = guard.write_entry(entry) {
+        tracing::error!(
+            event_kind,
+            request_id,
+            error = %e,
+            "audit write failed; the row was not written"
+        );
+    }
+}
+
 /// Writes a value-audit `entry` for `profile` under its audit chain-root HMAC
 /// key, acquiring the writer internally via [`acquire_value_audit_writer`].
 ///
@@ -401,37 +461,20 @@ pub(crate) fn emit_value_audit_row(profile: &Profile, profile_name: &str, entry:
 /// # Errors
 ///
 /// [`WalletError::Validation`], with the same variants and wire codes
-/// [`require_value_audit_writer`] produces. The append runs the same
-/// tip-anchor check the acquisition does, so a refusal there carries
-/// [`ValidationError::AuditTipAnchorMismatch`] and its reason rather than a
-/// registration-conflict code; everything else carries
-/// [`ValidationError::AuditWriterOpenFailed`].
+/// [`require_value_audit_writer`] produces. The append runs the checks the
+/// acquisition does and maps a refusal the same way: a tip-anchor mismatch to
+/// [`ValidationError::AuditTipAnchorMismatch`], a condition about the log to
+/// [`ValidationError::AuditLogUnusable`], and anything else to
+/// [`ValidationError::AuditWriterOpenFailed`]. A poisoned writer mutex
+/// carries [`ValidationError::AuditWriterOpenFailed`].
 pub(crate) fn emit_value_audit_row_strict(
     profile: &Profile,
     profile_name: &str,
     binding: BindingCheck,
     entry: AuditEntry,
 ) -> Result<(), WalletError> {
-    let access = keyed_audit_access(profile, profile_name, binding).map_err(|e| {
-        // A binding refusal keeps its own code and remedy.
-        if is_binding_refusal(&e) {
-            tracing::warn!(
-                profile = %profile_name,
-                code = %e.code(),
-                "value audit: audit binding changed; withholding the authorization"
-            );
-            return e;
-        }
-        tracing::warn!(
-            profile = %profile_name,
-            error = %e,
-            "value audit: could not load audit chain key; withholding the authorization"
-        );
-        audit_chain_key_unavailable(profile_name)
-    })?;
-    let writer =
-        AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
-            .map_err(|e| audit_writer_acquisition_error(profile_name, &e))?;
+    let writer = acquire_keyed_audit_writer(profile, profile_name, binding)
+        .map_err(|e| e.into_wallet_error(profile_name))?;
     let mut guard = writer.lock().map_err(|_| {
         tracing::warn!(
             profile = %profile_name,
@@ -750,6 +793,20 @@ mod tests {
                 WriterError::FileLocked,
                 "audit.chain_key_unavailable",
                 "audit.writer_locked",
+            ),
+            (
+                WriterError::OutboxBusy,
+                "audit.chain_key_unavailable",
+                "audit.outbox_busy",
+            ),
+            (
+                WriterError::OutboxUnusable {
+                    line: 2,
+                    column: 1,
+                    reason: "invalid JSON",
+                },
+                "audit.chain_key_unavailable",
+                "audit.outbox_unusable",
             ),
             (
                 WriterError::RotationBridgeUnusable {
@@ -1254,5 +1311,61 @@ mod tests {
             .is_none(),
             "an unkeyed open records no binding"
         );
+    }
+
+    /// A row that is not written is never silent: a poisoned writer mutex and
+    /// a refused append are each logged at `error` with the row's event kind.
+    #[test]
+    fn write_row_logged_logs_a_poisoned_mutex_and_a_refused_append_at_error() {
+        use stellar_agent_core::audit_log::tip_anchor::{InMemoryTipAnchorStore, TipAnchorStore};
+        use stellar_agent_test_support::log_capture::with_captured_logs;
+
+        let row = || {
+            AuditEntry::new_approval_rejected(
+                "PaymentSimulated",
+                "AAAAAAAAAAAAAAAAAAAAAA",
+                "cli",
+                "row-request",
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let poisoned = Arc::new(Mutex::new(
+            AuditWriter::open(dir.path().join("poisoned.jsonl"), None).unwrap(),
+        ));
+        let held = Arc::clone(&poisoned);
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("poison the audit writer mutex");
+        })
+        .join();
+        let logs = with_captured_logs(|| {
+            write_row_logged(&poisoned, row(), "test_poisoned_kind", "req-poisoned");
+        });
+        assert!(logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains("test_poisoned_kind"), "{logs}");
+        assert!(logs.contains("req-poisoned"), "{logs}");
+        assert!(logs.contains("mutex poisoned"), "{logs}");
+
+        // An anchored writer over a log rolled back underneath it refuses
+        // every append.
+        let anchored_path = dir.path().join("anchored.jsonl");
+        let mut anchored = AuditWriter::open_with_tip_anchor(
+            anchored_path.clone(),
+            None,
+            Arc::new(InMemoryTipAnchorStore::new()) as Arc<dyn TipAnchorStore>,
+        )
+        .unwrap();
+        anchored.write_entry(row()).unwrap();
+        std::fs::write(&anchored_path, b"").unwrap();
+        let refusing = Arc::new(Mutex::new(anchored));
+        let logs = with_captured_logs(|| {
+            write_row_logged(&refusing, row(), "test_refused_kind", "req-refused");
+        });
+        assert!(logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains("test_refused_kind"), "{logs}");
+        assert!(logs.contains("req-refused"), "{logs}");
+        assert!(logs.contains("audit write failed"), "{logs}");
+        assert_eq!(std::fs::read(&anchored_path).unwrap(), b"", "no row lands");
     }
 }

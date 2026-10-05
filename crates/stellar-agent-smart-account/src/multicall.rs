@@ -2133,19 +2133,24 @@ fn emit_audit_event(
         return Ok(());
     };
 
-    let entry = match kind {
+    // The event kind label travels with the entry, so a row that is not
+    // written is logged with the kind it was built as.
+    let (entry, event_kind) = match kind {
         EventKind::SaMulticallBundleSubmitted {
             smart_account_redacted,
             rule_id,
             bundle_tx_hash_redacted,
             inner_count,
-        } => AuditEntry::new_sa_multicall_bundle_submitted(
-            smart_account_redacted,
-            rule_id,
-            bundle_tx_hash_redacted,
-            inner_count,
-            chain_id,
-            request_id,
+        } => (
+            AuditEntry::new_sa_multicall_bundle_submitted(
+                smart_account_redacted,
+                rule_id,
+                bundle_tx_hash_redacted,
+                inner_count,
+                chain_id,
+                request_id,
+            ),
+            "sa_multicall_bundle_submitted",
         ),
         EventKind::SaMulticallInnerExecuted {
             bundle_tx_hash_redacted,
@@ -2153,14 +2158,17 @@ fn emit_audit_event(
             target_contract_redacted,
             fn_name,
             return_scval_b64_prefix,
-        } => AuditEntry::new_sa_multicall_inner_executed(
-            bundle_tx_hash_redacted,
-            inner_index,
-            target_contract_redacted,
-            fn_name,
-            return_scval_b64_prefix,
-            chain_id,
-            request_id,
+        } => (
+            AuditEntry::new_sa_multicall_inner_executed(
+                bundle_tx_hash_redacted,
+                inner_index,
+                target_contract_redacted,
+                fn_name,
+                return_scval_b64_prefix,
+                chain_id,
+                request_id,
+            ),
+            "sa_multicall_inner_executed",
         ),
         EventKind::SaMulticallBundleDenied {
             smart_account_redacted,
@@ -2171,17 +2179,20 @@ fn emit_audit_event(
             deny_wire_code,
             refusal_phase,
             bundle_tx_hash_redacted,
-        } => AuditEntry::new_sa_multicall_bundle_denied(
-            smart_account_redacted,
-            rule_id,
-            inner_count,
-            denied_inner_index,
-            observed_inner_count,
-            deny_wire_code,
-            refusal_phase,
-            bundle_tx_hash_redacted,
-            chain_id,
-            request_id,
+        } => (
+            AuditEntry::new_sa_multicall_bundle_denied(
+                smart_account_redacted,
+                rule_id,
+                inner_count,
+                denied_inner_index,
+                observed_inner_count,
+                deny_wire_code,
+                refusal_phase,
+                bundle_tx_hash_redacted,
+                chain_id,
+                request_id,
+            ),
+            "sa_multicall_bundle_denied",
         ),
         // No other EventKind variants are emitted by submit_multicall_bundle.
         other => {
@@ -2191,8 +2202,24 @@ fn emit_audit_event(
         }
     };
 
-    let mut guard = writer.lock().map_err(|_| ())?;
-    guard.write_entry(entry).map_err(|_| ())
+    // Callers on the denied paths discard the result, so a row that is not
+    // written is logged here, at `error`, with its event kind.
+    let Ok(mut guard) = writer.lock() else {
+        tracing::error!(
+            event_kind,
+            request_id,
+            "multicall: audit writer mutex poisoned; the row was not written"
+        );
+        return Err(());
+    };
+    guard.write_entry(entry).map_err(|e| {
+        tracing::error!(
+            event_kind,
+            request_id,
+            error = %e,
+            "multicall: audit write failed; the row was not written"
+        );
+    })
 }
 
 /// Checks that two numeric estimates are within ±5% tolerance.
@@ -2303,6 +2330,45 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    // ── A denied-path row that is not written is logged ──────────────────────
+
+    /// The denied-path callers discard the emitter's result, so a row that is
+    /// not written is logged at `error` with its event kind, and the emitter
+    /// reports `Err`.
+    #[test]
+    fn a_denied_row_behind_a_poisoned_writer_is_logged_at_error_with_its_kind() {
+        let dir = TempDir::new().unwrap();
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(
+            AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
+        ));
+        let held = std::sync::Arc::clone(&writer);
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("poison the audit writer mutex");
+        })
+        .join();
+        let denied = EventKind::SaMulticallBundleDenied {
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
+            rule_id: 1,
+            inner_count: 2,
+            denied_inner_index: None,
+            observed_inner_count: None,
+            deny_wire_code: "multicall.bundle_empty".to_owned(),
+            refusal_phase: "build".to_owned(),
+            bundle_tx_hash_redacted: None,
+        };
+
+        let mut result = Ok(());
+        let logs = stellar_agent_test_support::with_captured_logs(|| {
+            result = emit_audit_event(&Some(writer), denied, "stellar:testnet", "req-denied");
+        });
+        assert_eq!(result, Err(()));
+        assert!(logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains("sa_multicall_bundle_denied"), "{logs}");
+        assert!(logs.contains("req-denied"), "{logs}");
+        assert!(logs.contains("mutex poisoned"), "{logs}");
+    }
 
     // ── Provenance test ───────────────────────────────────────────────────────
 

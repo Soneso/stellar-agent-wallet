@@ -80,6 +80,15 @@ fn approve_binary_case(mainnet: bool) {
     .unwrap()
     .set_password(&URL_SAFE_NO_PAD.encode(key))
     .unwrap();
+    // `approve --id` writes its consent row before it persists the approval,
+    // so the profile's audit key must be present.
+    keyring_core::Entry::new(
+        &profile.audit_log_hash_chain_key_id.service,
+        &profile.audit_log_hash_chain_key_id.account,
+    )
+    .unwrap()
+    .set_password(&URL_SAFE_NO_PAD.encode([0x24_u8; 32]))
+    .unwrap();
     let transaction_source = MuxedAccount::Ed25519(Uint256([2; 32]));
     let operation_source = MuxedAccount::Ed25519(Uint256([3; 32]));
     let operation_source_strkey = stellar_strkey::ed25519::PublicKey([3; 32]).to_string();
@@ -167,6 +176,18 @@ fn approve_binary_case(mainnet: bool) {
         &uid,
         &blob
     ));
+    assert_eq!(json["data"]["audit"], "written", "{stdout}");
+    let log = std::fs::read_to_string(&profile.audit_log_path).unwrap();
+    let rows: Vec<serde_json::Value> = log
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|row: &serde_json::Value| row["kind"] == "approval_attested")
+        .collect();
+    assert_eq!(rows.len(), 1, "one consent row: {log}");
+    assert_eq!(rows[0]["nonce_prefix"], nonce[..8]);
+    assert_eq!(rows[0]["origin"], "cli");
+    assert_eq!(rows[0]["approval_kind"], "PaymentSimulated");
 }
 
 #[test]

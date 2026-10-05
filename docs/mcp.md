@@ -329,12 +329,14 @@ material, so a freshly-initialized profile refuses with
 simulate/build phases of the two-phase verbs above are unaffected — they
 never sign or submit, so they never reach this pre-flight; the MCP server's
 synthesized first-run fallback profile continues to serve them.
-`stellar_mpp_charge_commit` is exempt from this specific pre-flight: it
-already fails closed on the same underlying conditions, under the same wire
-codes, through its own authorization-withholding mechanism — the audit row it
-writes before releasing a credential is acquired the same way, so the same
-refusals reach the caller and nothing is released (see
-[Agent payments with MPP](agent-payments.md)).
+`stellar_mpp_charge_commit` runs the same acquisition after it reads its
+approval and before it loads the signing key. Its delivery gate writes
+`mpp_charge_authorized` before it releases the credential, and withholds the
+credential when that row cannot be written (see
+[Agent payments with MPP](agent-payments.md)). Every keyed acquisition also
+drains the audit outbox. A consent row `stellar-agent approve` queued while this
+server held the writer enters the log there. A commit that consumes an approval
+therefore has its consent row in the log before the signing key loads.
 
 Acquiring the writer also proves the audit log still contains the chain tip its
 keyring-held anchor names, and it does so on EVERY acquisition rather than only

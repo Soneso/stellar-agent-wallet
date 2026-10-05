@@ -69,12 +69,11 @@
 //! property of the current format, not a guarantee this module has ever
 //! offered otherwise; see `one_contaminated_entry_fails_whole_multi_entry_store_load`
 //! in this module's tests for the characterisation test.  It also means every
-//! cross-kind contamination check must be conservative: incorrectly listing
-//! a field a kind legitimately carries (as `attestation_blob_b64` was, for
-//! `ClaimSimulated` and `RuleProposalSimulated`, until both shared the
-//! generic HMAC-blob attestation path with `PaymentSimulated`) takes down
-//! every OTHER pending entry in the same file the moment one entry of that
-//! kind is genuinely attested, not just the one that was already broken.
+//! cross-kind contamination check must be conservative.  Listing a field a
+//! kind legitimately carries takes down every OTHER pending entry in the same
+//! file the moment one entry of that kind is genuinely attested.  An example
+//! is `attestation_blob_b64` on an attested `ClaimSimulated`,
+//! `RuleProposalSimulated`, or `TrustlineClawbackOptIn` entry.
 //!
 //! # Single-writer invariant
 //!
@@ -261,7 +260,7 @@ fn windows_sid_is_valid(s: &str) -> bool {
 ///
 /// `#[non_exhaustive]` permits adding new kinds without breaking downstream
 /// wildcard-less `match` arms.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 #[non_exhaustive]
 pub enum ApprovalKind {
     /// A simulated payment transaction awaiting wallet-owner HMAC attestation.
@@ -1389,8 +1388,9 @@ where
 /// - `process_uid`: numeric UID on Unix, Windows SID on Windows, or
 ///   `"non-unix-stub"` on other non-Unix targets.
 ///   Validated on deserialisation to reject Unicode-direction-mark injection.
-/// - `attestation_blob_b64`: set by `record_attestation` (PaymentSimulated only).
-///   One-shot; cannot be overwritten.
+/// - `attestation_blob_b64`: set by `record_attestation` or the kind's own
+///   `record_*_attestation` method; see the field doc. One-shot; cannot be
+///   overwritten.
 /// - `passkey_assertion`: set by `record_passkey_assertion` (SignWithPasskey only).
 ///   One-shot; cannot be overwritten.
 /// - `registration_input` (embedded in `ApprovalKind::RegisterPasskey`): set by
@@ -1437,10 +1437,12 @@ pub struct PendingApproval {
     ///
     /// `None` until the operator runs `stellar-agent approve --id <nonce> --profile <name>`.
     /// Set by `record_attestation` (`PaymentSimulated` / `ClaimSimulated`,
-    /// over `envelope_sha256_hex`) or by `record_rule_proposal_attestation`
-    /// (`RuleProposalSimulated`, over `proposal_sha256`) — the generic slot
-    /// every digest-HMAC-attestable kind shares. Once set, this field cannot
-    /// be overwritten.
+    /// over `envelope_sha256_hex`), by `record_rule_proposal_attestation`
+    /// (`RuleProposalSimulated`, over `proposal_sha256`), or by
+    /// `record_trustline_clawback_opt_in_attestation`
+    /// (`TrustlineClawbackOptIn`, over the opt-in digest). It is the generic
+    /// slot every digest-HMAC-attestable kind shares. Once set, this field
+    /// cannot be overwritten.
     pub attestation_blob_b64: Option<String>,
 
     /// WebAuthn assertion bytes recorded by the bridge POST handler.
@@ -1929,8 +1931,9 @@ impl<'de> Deserialize<'de> for PendingApproval {
     ///
     /// 4. `trustline_clawback_opt_in` present → `ApprovalKind::TrustlineClawbackOptIn`.
     ///    - All `PaymentSimulated` flat fields MUST be absent.
-    ///    - `attestation_blob_b64`, `passkey_assertion`, `registration_input` MUST
-    ///      be absent.
+    ///    - `passkey_assertion` and `registration_input` MUST be absent.
+    ///    - `attestation_blob_b64` MAY be present: it holds the operator's
+    ///      HMAC once the opt-in is attested.
     ///    - All other sub-tables MUST be absent.
     ///    - Validates `TrustlineClawbackOptIn` field invariants on reload.
     ///
@@ -2196,6 +2199,13 @@ impl<'de> Deserialize<'de> for PendingApproval {
             // PaymentSimulated flat fields, passkey-related fields, or other sub-tables.
             // `sign_with_passkey`, `register_passkey`, and `toolset_first_invoke_gate`
             // are already ruled out by the if-else chain above.
+            //
+            // `attestation_blob_b64` is DELIBERATELY excluded from this list:
+            // `record_trustline_clawback_opt_in_attestation` stores the
+            // operator's HMAC there, and the trustline gate
+            // (`verify_attested_trustline_clawback_opt_in`) clears only by
+            // verifying that stored blob. An attested opt-in legitimately
+            // carries this field.
             for (field, present) in [
                 ("envelope_xdr_b64", raw.envelope_xdr_b64.is_some()),
                 ("envelope_sha256_hex", raw.envelope_sha256_hex.is_some()),
@@ -2214,7 +2224,6 @@ impl<'de> Deserialize<'de> for PendingApproval {
                     "summary_simulated_seq_num",
                     raw.summary_simulated_seq_num.is_some(),
                 ),
-                ("attestation_blob_b64", raw.attestation_blob_b64.is_some()),
                 ("passkey_assertion", raw.passkey_assertion.is_some()),
                 ("registration_input", raw.registration_input.is_some()),
                 ("claim_simulated", raw.claim_simulated.is_some()),
@@ -4410,7 +4419,17 @@ impl PendingApprovalStore {
         attestation_blob: [u8; 32],
     ) -> Result<(), ApprovalError> {
         let now_ms = approval_now_unix_ms()?;
+        self.record_attestation_at(approval_nonce, attestation_blob, now_ms)
+    }
 
+    /// [`Self::record_attestation`] with the expiry checked against `now_ms`,
+    /// so a caller that already checked expiry uses one clock read for both.
+    pub(crate) fn record_attestation_at(
+        &mut self,
+        approval_nonce: &str,
+        attestation_blob: [u8; 32],
+        now_ms: u64,
+    ) -> Result<(), ApprovalError> {
         let entry = self
             .entries
             .iter_mut()
@@ -4938,7 +4957,21 @@ impl PendingApprovalStore {
         attestation_blob: [u8; 32],
     ) -> Result<(), ApprovalError> {
         let now_ms = approval_now_unix_ms()?;
+        self.record_trustline_clawback_opt_in_attestation_at(
+            approval_nonce,
+            attestation_blob,
+            now_ms,
+        )
+    }
 
+    /// [`Self::record_trustline_clawback_opt_in_attestation`] with the expiry
+    /// checked against `now_ms`.
+    pub(crate) fn record_trustline_clawback_opt_in_attestation_at(
+        &mut self,
+        approval_nonce: &str,
+        attestation_blob: [u8; 32],
+        now_ms: u64,
+    ) -> Result<(), ApprovalError> {
         let entry = self
             .entries
             .iter_mut()
@@ -4987,7 +5020,17 @@ impl PendingApprovalStore {
         attestation_blob: [u8; 32],
     ) -> Result<(), ApprovalError> {
         let now_ms = approval_now_unix_ms()?;
+        self.record_rule_proposal_attestation_at(approval_nonce, attestation_blob, now_ms)
+    }
 
+    /// [`Self::record_rule_proposal_attestation`] with the expiry checked
+    /// against `now_ms`.
+    pub(crate) fn record_rule_proposal_attestation_at(
+        &mut self,
+        approval_nonce: &str,
+        attestation_blob: [u8; 32],
+        now_ms: u64,
+    ) -> Result<(), ApprovalError> {
         let entry = self
             .entries
             .iter_mut()
@@ -8903,6 +8946,68 @@ csrf_token = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         assert!(
             matches!(err, ApprovalError::Invalid { .. }),
             "expected Invalid for bad issuer, got {err:?}"
+        );
+    }
+
+    /// An attested opt-in persists, and the store reopens with it: the gate's
+    /// HMAC check reads the stored blob, so the reloaded entry must carry it.
+    /// A pending entry beside it reloads too, since one unloadable entry
+    /// fails the whole file.
+    #[test]
+    fn an_attested_trustline_clawback_opt_in_survives_a_reopen() {
+        use crate::approval::attestation::{
+            compute_attestation, compute_trustline_clawback_opt_in_digest,
+        };
+
+        let key: [u8; 32] = [0x11; 32];
+        let binding = crate::approval::AttestationBinding::new("clawback", "stellar:testnet");
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let (opt_in_nonce, other_nonce) = {
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            let opt_in = PendingApproval::new_trustline_clawback_opt_in_pending(
+                "stellar:testnet".to_owned(),
+                "USDC".to_owned(),
+                TESTNET_USDC_ISSUER.to_owned(),
+                "1000".to_owned(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap();
+            let other = make_payment_entry(DEFAULT_TTL_MS);
+            let opt_in_nonce = opt_in.approval_nonce.clone();
+            let other_nonce = other.approval_nonce.clone();
+            let digest = compute_trustline_clawback_opt_in_digest(
+                "stellar:testnet",
+                "USDC",
+                TESTNET_USDC_ISSUER,
+            );
+            let blob = compute_attestation(&key, &binding, &opt_in_nonce, &digest, "1000");
+            store.insert(opt_in, TEST_NOW_MS).unwrap();
+            store.insert(other, TEST_NOW_MS).unwrap();
+            store
+                .record_trustline_clawback_opt_in_attestation(&opt_in_nonce, blob)
+                .unwrap();
+            (opt_in_nonce, other_nonce)
+        };
+
+        let reopened = PendingApprovalStore::open(path).unwrap();
+        assert!(
+            reopened
+                .get(&opt_in_nonce)
+                .is_some_and(|e| e.attestation_blob_b64.is_some()),
+            "the reloaded opt-in keeps its attestation"
+        );
+        assert!(reopened.get(&other_nonce).is_some());
+        assert!(
+            reopened.verify_attested_trustline_clawback_opt_in(
+                &key,
+                &binding,
+                "stellar:testnet",
+                "USDC",
+                TESTNET_USDC_ISSUER,
+                TEST_NOW_MS,
+            ),
+            "the gate clears on the reloaded opt-in"
         );
     }
 

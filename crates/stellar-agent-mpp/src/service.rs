@@ -94,6 +94,14 @@ pub struct WithheldCharge<'a> {
     /// Durable record after the safest available terminal transition.
     pub record: &'a AuthorizationRecord,
     /// Closed, wallet-owned failure stage label.
+    ///
+    /// A failure inside the sponsored commit is `pre_signing` before the sign
+    /// call, `signing` from the sign call to just before the signed
+    /// re-simulation send, and `resimulation` at or after that send. The
+    /// other labels name the gate that refused: `policy_refusal`,
+    /// `policy_refusal_persist_failed`, `policy_accounting`, `policy_state`,
+    /// `credential_encoding`, `delivery_state`, `authorization_audit`, and
+    /// `final_state`.
     pub failure_stage: &'static str,
     /// Whether secret-key access may have begun.
     pub key_access_began: bool,
@@ -381,22 +389,32 @@ where
         return Err(error);
     }
 
-    let credential =
-        match crate::commit_sponsored(prepared, now_unix, network_passphrase, signer, rpc).await {
-            Ok(credential) => credential,
-            Err(error) => {
-                notify_withheld(
-                    state_store,
-                    authorization_id,
-                    now_unix,
-                    "sign_or_resimulation",
-                    true,
-                    true,
-                    &mut on_withheld,
-                );
-                return Err(error);
-            }
-        };
+    // The withheld row names the side of the signed re-simulation send the
+    // error came from. `pre_signing` is before the sign call, `signing` from
+    // the sign call to just before the send, and `resimulation` at or after it.
+    let credential = match crate::sponsored::commit_sponsored_staged(
+        prepared,
+        now_unix,
+        network_passphrase,
+        signer,
+        rpc,
+    )
+    .await
+    {
+        Ok(credential) => credential,
+        Err((error, stage)) => {
+            notify_withheld(
+                state_store,
+                authorization_id,
+                now_unix,
+                stage.label(),
+                stage.key_access_began(),
+                true,
+                &mut on_withheld,
+            );
+            return Err(error);
+        }
+    };
     let credential_bytes = match serde_json::to_vec(&credential) {
         Ok(bytes) => bytes,
         Err(_error) => {
@@ -636,13 +654,18 @@ mod tests {
             .expect("persist pending approval");
             let nonce = preview.approval_id.expect("approval nonce");
             let entry = approvals.get(&nonce).expect("pending entry").clone();
+            let mut audit_writer = stellar_agent_core::audit_log::AuditWriter::open(
+                directory.path().join("audit").join("audit.jsonl"),
+                None,
+            )
+            .expect("audit writer");
             attest_and_persist(
                 &mut approvals,
                 &entry,
                 &key,
                 &binding,
                 Surface::Cli,
-                None,
+                stellar_agent_core::approval::ConsentAudit::Writer(&mut audit_writer),
                 None,
                 |_, _| Err("MPP cannot persist a toolset grant".to_owned()),
             )
@@ -1282,5 +1305,204 @@ mod tests {
         assert_eq!(record.status(), AuthorizationStatus::Authorizing);
         assert!(!record.policy_accounted());
         assert!(!record.credential_constructed());
+    }
+
+    /// A signer whose public key is the payer's and whose every signing call
+    /// fails, so the error arises at the sign call itself.
+    struct SignCallFails(stellar_agent_network::signing::SoftwareSigningKey);
+
+    fn sign_refused() -> stellar_agent_core::error::WalletError {
+        stellar_agent_core::error::WalletError::Internal(
+            stellar_agent_core::error::InternalError::UnexpectedState {
+                detail: "test: the sign call fails".to_owned(),
+            },
+        )
+    }
+
+    #[async_trait::async_trait]
+    impl Signer for SignCallFails {
+        async fn sign_tx_payload(
+            &self,
+            _payload: &[u8; 32],
+        ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
+            Err(sign_refused())
+        }
+
+        async fn sign_auth_digest(
+            &self,
+            _digest: &[u8; 32],
+        ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
+            Err(sign_refused())
+        }
+
+        async fn sign_soroban_address_auth_payload(
+            &self,
+            _payload: &[u8; 32],
+        ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
+            Err(sign_refused())
+        }
+
+        async fn sign_webauthn_assertion(
+            &self,
+            _auth_digest: &[u8; 32],
+            _credential_id: &[u8],
+        ) -> Result<
+            stellar_agent_network::signing::WebAuthnAssertion,
+            stellar_agent_core::error::WalletError,
+        > {
+            Err(sign_refused())
+        }
+
+        async fn public_key(
+            &self,
+        ) -> Result<stellar_strkey::ed25519::PublicKey, stellar_agent_core::error::WalletError>
+        {
+            self.0.public_key().await
+        }
+    }
+
+    /// An RPC that answers the unsigned simulate and fails the signed
+    /// re-simulation, after the request was made.
+    struct ResimulationFails {
+        inner: crate::sponsored::tests::DeterministicRpc,
+        signed_requests: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::SponsoredRpc for ResimulationFails {
+        async fn simulate(
+            &self,
+            envelope: &stellar_xdr::TransactionEnvelope,
+        ) -> Result<stellar_rpc_client::SimulateTransactionResponse, MppError> {
+            let signed = match envelope {
+                stellar_xdr::TransactionEnvelope::Tx(transaction) => {
+                    transaction.tx.operations.iter().any(|operation| {
+                        matches!(
+                            &operation.body,
+                            stellar_xdr::OperationBody::InvokeHostFunction(host)
+                                if !host.auth.is_empty()
+                        )
+                    })
+                }
+                _ => false,
+            };
+            if signed {
+                self.signed_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(MppError::new(
+                    crate::MppErrorCode::SimulationFailed,
+                    "test: the signed re-simulation fails in transport",
+                ));
+            }
+            self.inner.simulate(envelope).await
+        }
+    }
+
+    /// Commits one prepared charge with `signer` and `rpc`, returning the
+    /// withheld events, the record status, and the error.
+    async fn commit_with(
+        label: &str,
+        signer: &(dyn Signer + Send + Sync),
+        rpc: &(dyn crate::SponsoredRpc + Send + Sync),
+        prepared: PreparedSponsoredCharge,
+    ) -> (
+        Vec<(&'static str, bool, bool)>,
+        AuthorizationStatus,
+        MppError,
+    ) {
+        let directory = TempDir::new().expect("tempdir");
+        let state = store(&directory);
+        let preview = persist_prepared_authorization(
+            label,
+            TESTNET_PASSPHRASE,
+            &prepared,
+            ApprovalDisposition::Allow,
+            "424242",
+            NOW,
+            &state,
+            None,
+        )
+        .expect("persist");
+        let mut events = Vec::new();
+        let error = commit_authorization(
+            &state,
+            None,
+            None,
+            &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
+            &preview.authorization_id,
+            NOW + 1,
+            TESTNET_PASSPHRASE,
+            signer,
+            rpc,
+            |_record, _prepared, _effects| Ok(()),
+            |_authorized| Ok(()),
+            |event| {
+                events.push((
+                    event.failure_stage,
+                    event.key_access_began,
+                    event.policy_budget_consumed,
+                ));
+            },
+        )
+        .await
+        .expect_err("the commit must fail");
+        let status = state
+            .load(&preview.authorization_id)
+            .expect("record")
+            .status();
+        (events, status, error)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_error_before_the_sign_call_is_pre_signing_with_no_key_access() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let (prepared, _payer_signer, rpc) = prepared_fixture(NOW).await;
+        // A signer for another account: the payer check refuses before the
+        // sign call, and nothing is sent.
+        let other = stellar_agent_network::signing::SoftwareSigningKey::new_from_bytes([2; 32]);
+        let (events, status, error) = commit_with("pre-signing", &other, &rpc, prepared).await;
+        assert_eq!(error.code(), "mpp.signing_failed");
+        assert_eq!(events, vec![("pre_signing", false, true)]);
+        assert_eq!(rpc.call_count(), 1, "only preparation used the RPC");
+        assert_eq!(
+            status,
+            AuthorizationStatus::Indeterminate,
+            "every stage marks the record indeterminate"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_error_at_the_sign_call_is_signing_and_sends_nothing() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let (prepared, payer_signer, rpc) = prepared_fixture(NOW).await;
+        let signer = SignCallFails(payer_signer);
+        let (events, status, error) = commit_with("signing", &signer, &rpc, prepared).await;
+        assert_eq!(error.code(), "mpp.signing_failed");
+        assert_eq!(events, vec![("signing", true, true)]);
+        assert_eq!(rpc.call_count(), 1, "the signed entry was never sent");
+        assert_eq!(status, AuthorizationStatus::Indeterminate);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_error_at_the_send_is_resimulation() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let (prepared, signer, rpc) = prepared_fixture(NOW).await;
+        let rpc = ResimulationFails {
+            inner: rpc,
+            signed_requests: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let (events, status, error) = commit_with("resimulation", &signer, &rpc, prepared).await;
+        assert_eq!(error.code(), "mpp.simulation_failed");
+        assert_eq!(events, vec![("resimulation", true, true)]);
+        assert_eq!(
+            rpc.signed_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the signed entry was sent once"
+        );
+        assert_eq!(status, AuthorizationStatus::Indeterminate);
     }
 }

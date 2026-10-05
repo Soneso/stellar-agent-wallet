@@ -668,6 +668,17 @@ pub struct WalletServer {
     /// Gated on `test-helpers` feature or `#[cfg(test)]`.
     #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) toolsets_root_override: Option<std::path::PathBuf>,
+
+    /// Test-only stand-in for the SEP-10 counterparty-identity gate of
+    /// `stellar_x402_authenticated_payment`: the JWT, the subject, and the
+    /// declared accounts of the session the gate would return.
+    ///
+    /// `None` in production, where the gate always runs. Set via
+    /// [`WalletServer::set_x402_identity_session_for_test`].
+    ///
+    /// Gated on `test-helpers` feature or `#[cfg(test)]`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) x402_identity_session_override: Option<(String, String, Vec<String>)>,
 }
 
 impl WalletServer {
@@ -768,6 +779,8 @@ impl WalletServer {
             grant_store_path_override: None,
             #[cfg(any(test, feature = "test-helpers"))]
             toolsets_root_override: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            x402_identity_session_override: None,
         })
     }
 
@@ -1026,6 +1039,22 @@ impl WalletServer {
     #[doc(hidden)]
     pub fn set_grant_store_path_for_test(&mut self, path: std::path::PathBuf) {
         self.grant_store_path_override = Some(path);
+    }
+
+    /// Replaces the SEP-10 counterparty-identity gate of
+    /// `stellar_x402_authenticated_payment` with a session carrying `jwt`,
+    /// `sub`, and `accounts`, so a test can drive the payment against a mock
+    /// RPC without a SEP-10 server.
+    ///
+    /// Gated on `test-helpers` feature or `#[cfg(test)]`.
+    #[doc(hidden)]
+    pub fn set_x402_identity_session_for_test(
+        &mut self,
+        jwt: String,
+        sub: String,
+        accounts: Vec<String>,
+    ) {
+        self.x402_identity_session_override = Some((jwt, sub, accounts));
     }
 
     /// Overrides the toolsets root directory used by `stellar_toolset_invoke`.

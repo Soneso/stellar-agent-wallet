@@ -72,8 +72,8 @@ pub mod view;
 
 pub use assertion_input::AssertionInput;
 pub use attest::{
-    Surface, ToolsetGrantRequest, attest_and_persist, decode_sha256_hex, load_and_validate_entry,
-    load_attestation_key,
+    ConsentAudit, Surface, ToolsetGrantRequest, attest_and_persist, decode_sha256_hex,
+    load_and_validate_entry, load_attestation_key,
 };
 pub use attestation::AttestationBinding;
 pub use attestation::{

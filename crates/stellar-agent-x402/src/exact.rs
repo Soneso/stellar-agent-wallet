@@ -1,7 +1,7 @@
 //! Exact Stellar scheme orchestrator — constructs a signed SAC `transfer`
 //! payment payload compatible with the x402 v2 `PAYMENT-SIGNATURE` wire format.
 //!
-//! # Eight-step flow
+//! # Flow
 //!
 //! ```text
 //! 1. Validate requirements (scheme, network, asset, areFeesSponsored, amount)
@@ -9,14 +9,18 @@
 //! 3. simulateTransaction → harvest simulated nonce + latest_ledger
 //! 4. Compute signature_expiration_ledger
 //! 5. Set expiration on auth entry; sign via sep43 (single auth-signing call site)
-//! 6. Re-simulate with signed auth (mandatory footprint refresh)
-//! 7. Build + serialize final TransactionEnvelope to base64 XDR
-//! 8. Wrap in PaymentPayload
+//! 6. Transmit gate: the caller's `before_transmit` runs; an error stops here
+//! 7. Re-simulate with signed auth (mandatory footprint refresh)
+//! 8. Build + serialize final TransactionEnvelope to base64 XDR
+//! 9. Wrap in PaymentPayload
 //! ```
 //!
 //! The flow matches the @x402/stellar reference implementation.  Auth-entry
 //! signing goes through a single call site
-//! (`stellar_agent_sep43::sign_soroban_auth_entry`).
+//! (`stellar_agent_sep43::sign_soroban_auth_entry`). The re-simulation in step 7
+//! is the first time the signed authorization leaves the wallet, to the
+//! configured RPC. The transmit gate in step 6 is the last point at which the
+//! caller can withhold it.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -73,17 +77,54 @@ const ESTIMATED_LEDGER_CLOSE_SECONDS: u32 = 5;
 const PLACEHOLDER_SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Transmit gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The signed authorization [`create_payment`] is about to transmit, as its
+/// transmit gate sees it.
+///
+/// Every field describes the payload that leaves the wallet in the signed
+/// re-simulation. A caller records it durably before returning `Ok` from the
+/// gate. The struct carries no signature bytes and no key material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AuthorizationToTransmit<'a> {
+    /// x402 wire network of the signed authorization. Always `stellar:testnet`:
+    /// step 1 refuses `stellar:pubnet` before anything is signed.
+    pub network: &'a str,
+    /// x402 scheme of the signed authorization; always `exact`.
+    pub scheme: &'a str,
+    /// Payer G-strkey whose key signed the authorization.
+    pub payer: &'a str,
+    /// Recipient address the SAC `transfer` pays.
+    pub pay_to: &'a str,
+    /// SAC contract C-strkey of the transferred asset.
+    pub asset: &'a str,
+    /// Transferred amount in the asset's atomic units.
+    pub amount: i128,
+    /// Ledger after which the signed authorization stops being valid.
+    pub signature_expiration_ledger: u32,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // create_payment
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Constructs a signed x402 v2 [`PaymentPayload`] for the Exact Stellar scheme.
 ///
-/// Implements the eight-step flow, wire-compatible with the @x402/stellar
+/// Implements the step flow below, wire-compatible with the @x402/stellar
 /// reference implementation.
 ///
 /// A mainnet network passphrase or a mainnet-pattern `rpc_url` is refused with
 /// [`X402Error::MainnetSigningForbidden`] before any signing call and any
 /// request.
+///
+/// The signed authorization first leaves the wallet in the re-simulation of
+/// step 7, sent to `rpc_url`. `before_transmit` runs once, immediately before
+/// that request, and only after the signature exists. An error from it returns
+/// at once: nothing is sent, and the error is returned unchanged. A caller that
+/// must record the authorization before it leaves the wallet does so inside
+/// `before_transmit`.
 ///
 /// # Steps
 ///
@@ -100,10 +141,12 @@ const PLACEHOLDER_SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 ///    `Address`-credentialled entries).  Set `signature_expiration_ledger` on
 ///    the payer entry and sign via `stellar_agent_sep43::sign_soroban_auth_entry`
 ///    (the single auth-signing call site).
-/// 6. Re-simulate with the signed auth entry (MANDATORY).  Without this, submit
+/// 6. Call `before_transmit` with the [`AuthorizationToTransmit`]; return its
+///    error unchanged.
+/// 7. Re-simulate with the signed auth entry (MANDATORY).  Without this, submit
 ///    traps with "trying to access contract data key outside of the footprint".
-/// 7. Build the final `TransactionEnvelope`, serialize to base64 XDR.
-/// 8. Wrap in a [`PaymentPayload`].
+/// 8. Build the final `TransactionEnvelope`, serialize to base64 XDR.
+/// 9. Wrap in a [`PaymentPayload`].
 ///
 /// # Arguments
 ///
@@ -113,6 +156,8 @@ const PLACEHOLDER_SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 ///   payment-required body).
 /// - `profile_passphrase` — the network passphrase from the operator's profile
 ///   used to cross-check the `requirements.network` field.
+/// - `before_transmit`: the transmit gate of step 6. A gate that refuses
+///   returns [`X402Error::TransmitGateRefused`] or any other variant.
 ///
 /// # Errors
 ///
@@ -132,14 +177,15 @@ const PLACEHOLDER_SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 ///   violated).
 /// - [`X402Error::AuthEntrySignFailed`] — auth-entry signing failure.
 /// - [`X402Error::TransactionBuildFailed`] — XDR envelope build failure.
+/// - Whatever `before_transmit` returns, unchanged, when the gate refuses.
 ///
 /// # Panics
 ///
 /// Never panics.
 #[allow(
     clippy::too_many_lines,
-    reason = "eight-step payment-construction flow; splitting into sub-functions \
-              would obscure the sequential validate→build→sim→sign→resim→serialize \
+    reason = "step-ordered payment-construction flow; splitting into sub-functions \
+              would obscure the sequential validate→build→sim→sign→gate→resim→serialize \
               invariant ordering"
 )]
 pub async fn create_payment(
@@ -147,6 +193,7 @@ pub async fn create_payment(
     signer: &(dyn Signer + Send + Sync),
     rpc_url: &str,
     profile_passphrase: &str,
+    before_transmit: impl FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error>,
 ) -> Result<PaymentPayload, X402Error> {
     // ── Step 1: Validate ──────────────────────────────────────────────────────
 
@@ -388,10 +435,9 @@ pub async fn create_payment(
     }
     let signed_entries = vec![auth_entry.clone()];
 
-    // ── Step 6: Re-simulate with signed auth (MANDATORY) ─────────────────────
-    // Without re-simulation, submit traps with:
-    //   "trying to access contract data key outside of the footprint"
-    // because the signed auth entry changes the storage read-set.
+    // ── Step 6: Re-simulation envelope, then the transmit gate ───────────────
+    // The envelope is built first, so every step that can still fail without
+    // sending anything runs before the gate.
 
     let invoke_args_for_resim = invoke_args.clone();
     let auth_vecm: VecM<SorobanAuthorizationEntry> =
@@ -424,6 +470,26 @@ pub async fn create_payment(
         .map_err(|e| X402Error::RpcSimulateFailed {
             detail: format!("re-simulate: to_envelope failed: {e:?}"),
         })?;
+
+    // The request below is the first one carrying the signed authorization.
+    // The gate runs immediately before it and after every step that can still
+    // fail without sending anything, so a gate that recorded the authorization
+    // and returned `Ok` is always followed by that request. A refusal returns
+    // here, and the signature never leaves the wallet.
+    before_transmit(&AuthorizationToTransmit {
+        network: &requirements.network,
+        scheme: &requirements.scheme,
+        payer: &payer_strkey,
+        pay_to: &requirements.pay_to,
+        asset: &requirements.asset,
+        amount,
+        signature_expiration_ledger,
+    })?;
+
+    // ── Step 7: Re-simulate with signed auth (MANDATORY) ─────────────────────
+    // Without re-simulation, submit traps with:
+    //   "trying to access contract data key outside of the footprint"
+    // because the signed auth entry changes the storage read-set.
     let resim_response = server
         .simulate_transaction_envelope(&resim_envelope, None)
         .await
@@ -442,7 +508,7 @@ pub async fn create_payment(
         });
     }
 
-    // ── Step 7: Build final envelope and serialize ────────────────────────────
+    // ── Step 8: Build final envelope and serialize ────────────────────────────
     // Attach the soroban transaction data (resource footprint + refundable fee)
     // from the re-simulate response.
     let auth_vecm_final: VecM<SorobanAuthorizationEntry> =
@@ -497,7 +563,7 @@ pub async fn create_payment(
                 detail: format!("envelope to_xdr_base64 failed: {e}"),
             })?;
 
-    // ── Step 8: Wrap in PaymentPayload ────────────────────────────────────────
+    // ── Step 9: Wrap in PaymentPayload ────────────────────────────────────────
     Ok(PaymentPayload {
         x402_version: 2,
         resource: None,

@@ -45,6 +45,7 @@ use uuid::Uuid;
 use crate::commands::smart_account::common::{
     emit_multicall_registry_error, emit_sa_error, load_command_profile, open_audit_writer,
 };
+use crate::commands::value_audit::write_row_logged;
 use crate::common::network::{EndpointFlags, TargetNetwork, network_context_for_command};
 use crate::common::profile_access::profile_access_envelope;
 use crate::common::render::render_json;
@@ -147,9 +148,12 @@ pub async fn run(args: &RegisterMulticallArgs) -> i32 {
                 None::<String>,
                 &request_id,
             );
-            if let Ok(mut g) = writer.lock() {
-                let _ = g.write_entry(refused);
-            }
+            write_row_logged(
+                writer,
+                refused,
+                "sa_multicall_registration_refused",
+                &request_id,
+            );
         }
         let err = WalletError::Validation(ValidationError::AddressInvalid {
             input: format!(
@@ -195,9 +199,12 @@ pub async fn run(args: &RegisterMulticallArgs) -> i32 {
                 None::<String>,
                 &request_id,
             );
-            if let Ok(mut g) = writer.lock() {
-                let _ = g.write_entry(refused);
-            }
+            write_row_logged(
+                writer,
+                refused,
+                "sa_multicall_registration_refused",
+                &request_id,
+            );
         }
         return emit_sa_error(&e);
     }

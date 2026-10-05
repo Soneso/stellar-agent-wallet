@@ -708,6 +708,18 @@ where
         "ChangeTrust envelope built (XDR at debug only)"
     );
 
+    // ── Drain the audit outbox before the signing key loads ──────────────────
+    // The clawback opt-in was read from the approval store after the audit
+    // pre-flight above. Re-acquiring the keyed writer is a cache hit, which
+    // drains the outbox, so a consent row `stellar-agent approve` queued
+    // meanwhile is in the log before the key is touched. Fail closed.
+    if let Err(e) =
+        crate::commands::value_audit::drain_consent_rows_before_signing(&profile, &profile_name)
+    {
+        render_json(&Envelope::<()>::err(&e));
+        return 1;
+    }
+
     // ── Load signer from keyring ──────────────────────────────────────────────
     let signer_entry_ref = &profile.mcp_signer_default;
     let expected_g = signer_entry_ref.account.as_str();
@@ -1248,6 +1260,156 @@ mod enrolled_failure_tests {
         assert_eq!(
             signer_load_failure_parts(&error),
             ("trustline.signer_load_failed", error.to_string())
+        );
+    }
+
+    // ── A consent row queued after the pre-flight ────────────────────────────
+
+    /// A consent row queued after the audit pre-flight, while the verb reads
+    /// the clawback opt-in, is in the log before the signing key loads.
+    ///
+    /// The writer is cached in-process by an earlier keyed call. A read hook at
+    /// the attestation key queues the row during the opt-in read; a read hook
+    /// at the signer coordinate records whether the row is in the log when the
+    /// signing key loads. No signer is seeded, so the verb refuses there.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[allow(clippy::unwrap_used, reason = "test-only fixture construction")]
+    async fn trustline_logs_a_consent_row_queued_after_its_pre_flight_before_the_signer_loads() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        use base64::Engine as _;
+        use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox, AuditWriterRegistry};
+        use stellar_agent_test_support::keyring_mock::{ReadHook, install_with_read_hooks};
+
+        const NAME: &str = "trustline-drain";
+        const FROM: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        const ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let rpc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = match body["method"].as_str().unwrap_or("") {
+                    "getLedgerEntries" => {
+                        stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[
+                            FROM, ISSUER,
+                        ])
+                    }
+                    "getNetwork" => {
+                        stellar_agent_test_support::signed_envelope::get_network_result(
+                            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                        )
+                    }
+                    "getFeeStats" => serde_json::json!({}),
+                    _ => serde_json::json!({}),
+                };
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": result,
+                }))
+            })
+            .mount(&rpc)
+            .await;
+        let mut profile =
+            Profile::builder_testnet_named(NAME, "svc-trustline-drain", FROM, "n-svc", "n-acct")
+                .with_noop_engine()
+                .build();
+        profile.rpc_url = rpc.uri();
+        profile.audit_log_path = home.path().join("audit").join(format!("{NAME}.jsonl"));
+        let log_path = profile.audit_log_path.clone();
+
+        let queued = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let queue_hook = {
+            let queued = Arc::clone(&queued);
+            let log_path = log_path.clone();
+            Arc::new(move || {
+                if queued.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                AuditOutbox::for_log(&log_path)
+                    .append(&AuditEntry::new_approval_attested(
+                        "TrustlineClawbackOptIn",
+                        "stellar_trustline_commit",
+                        None,
+                        "queued-trustline-consent",
+                        "cli",
+                        "queued-consent",
+                    ))
+                    .unwrap();
+            }) as Arc<dyn Fn() + Send + Sync>
+        };
+        let signer_hook = {
+            let seen = Arc::clone(&seen);
+            let log_path = log_path.clone();
+            Arc::new(move || {
+                seen.lock().unwrap().push(
+                    std::fs::read_to_string(&log_path)
+                        .unwrap_or_default()
+                        .contains(r#""kind":"approval_attested""#),
+                );
+            }) as Arc<dyn Fn() + Send + Sync>
+        };
+        install_with_read_hooks(vec![
+            ReadHook::new(
+                &profile.attestation_key_id.service,
+                &profile.attestation_key_id.account,
+                queue_hook,
+            ),
+            ReadHook::new(
+                &profile.mcp_signer_default.service,
+                &profile.mcp_signer_default.account,
+                signer_hook,
+            ),
+        ])
+        .unwrap();
+        for coord in [
+            &profile.audit_log_hash_chain_key_id,
+            &profile.attestation_key_id,
+        ] {
+            keyring_core::Entry::new(&coord.service, &coord.account)
+                .unwrap()
+                .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x3a; 32]))
+                .unwrap();
+        }
+
+        // An earlier keyed call caches the writer in this process.
+        let _cached = AuditWriterRegistry::get_or_open_keyed(
+            NAME,
+            &log_path,
+            stellar_agent_network::keyring::keyed_audit_access(
+                &profile,
+                NAME,
+                stellar_agent_core::audit_log::BindingCheck::Enforce,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let args = TrustlineArgs {
+            profile: Some(NAME.to_owned()),
+            from: FROM.to_owned(),
+            asset: format!("USDC:{ISSUER}"),
+            limit_stroops: None,
+            classic_base: None,
+        };
+        let loaded = profile.clone();
+        let code = run_with_dependencies(&args, move |_| Ok(loaded.clone()), || Ok(())).await;
+        assert_eq!(code, 1, "no signer is seeded");
+        assert!(
+            queued.load(Ordering::SeqCst),
+            "the opt-in read loaded the attestation key"
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "the verb reached the signer load");
+        assert!(
+            seen.iter().all(|in_log| *in_log),
+            "the consent row must be in the log when the signing key loads: {seen:?}"
         );
     }
 }

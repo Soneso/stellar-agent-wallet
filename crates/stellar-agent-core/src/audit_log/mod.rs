@@ -83,6 +83,17 @@
 //! [`crate::audit_log::verify::verify_log`]) can scan it freely while a writer is alive, on
 //! every platform.
 //!
+//! # Audit outbox
+//!
+//! A consent row that cannot take the writer because a draining writer in
+//! another process holds it is queued in `<audit_log_path>.outbox` instead
+//! ([`outbox`](crate::audit_log::outbox)). A draining writer is one opened with
+//! a tip-anchor store in `Check` mode. It holds `<audit_log_path>.drain.lock`
+//! for its life and drains the outbox at open, on every registry cache hit,
+//! and before each of its own rows. The repair writer has a tip-anchor store
+//! and does not drain at open. Delivery is at least once, and queued rows sit
+//! outside the tip anchor until drained.
+//!
 //! # Redaction discipline
 //!
 //! Argument VALUES are never logged; only key names in `arg_keys`.
@@ -111,6 +122,7 @@ pub mod chain;
 pub mod entry;
 pub mod health;
 mod lock;
+pub mod outbox;
 pub mod reader;
 pub(crate) mod redact;
 pub mod rotation;
@@ -123,6 +135,7 @@ pub mod writer;
 pub use binding::{AuditBinding, AuditBindingParseError, BindingCheck, RecordedBinding};
 pub use entry::{AuditEntry, NewToolInvocation};
 pub use health::{AuditWriterHealth, AuditWriterHealthHandle};
+pub use outbox::{AuditOutbox, OutboxInspection, drain_lock_is_held, inspect_outbox};
 pub use reader::{AuditLogIntegrityError, AuditReader, PinnedHashesRecord};
 pub use rotation::{SidecarResignError, resign_chain_root_sidecars};
 pub use schema::{
@@ -147,5 +160,5 @@ pub use verify::{
 };
 pub use writer::{
     AuditWriter, AuditWriterRegistry, ReanchorAcknowledgement, ReanchorReport, StoredTipAnchor,
-    WriterError, audit_log_unusable_detail,
+    WriterError, audit_log_unusable_detail, audit_writer_refusal,
 };

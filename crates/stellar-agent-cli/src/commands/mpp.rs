@@ -39,7 +39,8 @@ use stellar_agent_network::{
 };
 
 use crate::commands::{
-    policy_engine::build_v1_policy_engine, value_audit::emit_value_audit_row_strict,
+    policy_engine::build_v1_policy_engine,
+    value_audit::{drain_consent_rows_before_signing, emit_value_audit_row_strict},
 };
 use crate::common::profile_access::{
     ProfileAccessError, load_profile_reconciled, profile_access_envelope,
@@ -446,6 +447,13 @@ async fn commit_cli(
     ) {
         return render_error(&error);
     }
+    // The approval has been read. Acquiring the keyed writer drains the audit
+    // outbox at open, so a consent row `stellar-agent approve` queued for this
+    // charge is in the log before the signing key loads. Fail closed: no
+    // drain, no signing.
+    if let Err(error) = drain_consent_rows_before_signing(profile, profile_name) {
+        return render_wallet_error(&error);
+    }
     let signer = match lazy_signer_from_keyring(
         &profile.mcp_signer_default,
         &profile.mcp_signer_default.account,
@@ -529,12 +537,22 @@ async fn commit_cli(
                 withheld.policy_budget_consumed,
                 uuid::Uuid::new_v4().to_string(),
             );
-            let _ = emit_value_audit_row_strict(
+            // The primary error is what the caller sees; a withheld row that
+            // cannot be written is logged and does not replace it.
+            if let Err(error) = emit_value_audit_row_strict(
                 profile,
                 profile_name,
                 stellar_agent_core::audit_log::BindingCheck::Enforce,
                 entry,
-            );
+            ) {
+                tracing::error!(
+                    event_kind = "mpp_authorization_withheld",
+                    failure_stage = withheld.failure_stage,
+                    code = %error.code(),
+                    error = %error,
+                    "mpp: the withheld-authorization audit row was not written"
+                );
+            }
         },
     )
     .await;
@@ -1356,5 +1374,493 @@ mod tests {
         fs::write(&target, b"{}").expect("write fixture");
         symlink(&target, &link).expect("symlink");
         assert!(read_regular_file(&link, 2).is_err());
+    }
+
+    // ── Sponsored commit: withheld stages and the queued consent row ─────────
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use stellar_xdr::{
+        AccountId, HostFunction, Limits, OperationBody, PublicKey as XdrPublicKey, ReadXdr,
+        ScAddress, ScVal, SorobanAddressCredentials, SorobanAuthorizationEntry,
+        SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials,
+        TransactionEnvelope, Uint256, VecM, WriteXdr,
+    };
+
+    const CONTRACT: &str = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
+    const RECIPIENT: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    const TRANSACTION_DATA: &str = "AAAAAAAAAAIAAAAGAAAAAcwD/nT9D7Dc2LxRdab+2vEUF8B+XoN7mQW21oxPT8ALAAAAFAAAAAEAAAAHy8vNUZ8vyZ2ybPHW0XbSrRtP7gEWsJ6zDzcfY9P8z88AAAABAAAABgAAAAHMA/50/Q+w3Ni8UXWm/trxFBfAfl6De5kFttaMT0/ACwAAABAAAAABAAAAAgAAAA8AAAAHQ291bnRlcgAAAAASAAAAAAAAAAAg4dbAxsGAGICfBG3iT2cKGYQ6hK4sJWzZ6or1C5v6GAAAAAEAHfKyAAAFiAAAAIgAAAAAAAAAAw==";
+    const SIGNER_SERVICE: &str = "cli-mpp-stage-svc";
+
+    /// Simulate endpoint for the sponsored charge: the unsigned simulate is
+    /// answered with the payer's authorization entry, the signed one by
+    /// `on_signed` and then, unless `fail_signed`, with no entries.
+    struct Simulate {
+        payer: ScAddress,
+        fail_signed: bool,
+        on_signed: Option<Arc<dyn Fn() + Send + Sync>>,
+        signed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl wiremock::Respond for Simulate {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("JSON-RPC body");
+            let id = body["id"].clone();
+            let envelope = TransactionEnvelope::from_xdr_base64(
+                body["params"]["transaction"].as_str().expect("envelope"),
+                Limits::none(),
+            )
+            .expect("decodable envelope");
+            let TransactionEnvelope::Tx(transaction) = envelope else {
+                unreachable!("v1 envelope");
+            };
+            let OperationBody::InvokeHostFunction(host) = transaction.tx.operations[0].body.clone()
+            else {
+                unreachable!("invoke host function");
+            };
+            let HostFunction::InvokeContract(invoke) = host.host_function else {
+                unreachable!("contract invocation");
+            };
+            let auth = if host.auth.is_empty() {
+                vec![
+                    SorobanAuthorizationEntry {
+                        credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                            address: self.payer.clone(),
+                            nonce: 7,
+                            signature_expiration_ledger: 0,
+                            signature: ScVal::Void,
+                        }),
+                        root_invocation: SorobanAuthorizedInvocation {
+                            function: SorobanAuthorizedFunction::ContractFn(invoke),
+                            sub_invocations: VecM::default(),
+                        },
+                    }
+                    .to_xdr_base64(Limits::none())
+                    .expect("entry encodes"),
+                ]
+            } else {
+                self.signed
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(hook) = &self.on_signed {
+                    hook();
+                }
+                if self.fail_signed {
+                    return wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"error": "re-simulation trapped", "latestLedger": 1000},
+                    }));
+                }
+                Vec::new()
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {
+                    "transactionData": TRANSACTION_DATA,
+                    "minResourceFee": "1000",
+                    "results": [{
+                        "auth": auth,
+                        "xdr": ScVal::Void.to_xdr_base64(Limits::none()).expect("void"),
+                    }],
+                    "latestLedger": 1000,
+                },
+            }))
+        }
+    }
+
+    fn g_strkey(seed: [u8; 32]) -> String {
+        stellar_strkey::ed25519::PublicKey(
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes(),
+        )
+        .to_string()
+        .to_string()
+    }
+
+    fn payer_address(payer: &str) -> ScAddress {
+        let key = stellar_strkey::ed25519::PublicKey::from_string(payer).expect("G-strkey");
+        ScAddress::Account(AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256(
+            key.0,
+        ))))
+    }
+
+    fn sponsored_challenge(round: u8) -> ChallengeInput {
+        let request = json!({
+            "amount": "10000000",
+            "currency": CONTRACT,
+            "methodDetails": {"feePayer": true, "network": "stellar:testnet"},
+            "recipient": RECIPIENT,
+        });
+        let encoded = URL_SAFE_NO_PAD
+            .encode(stellar_agent_mpp::json::canonical_json(&request).expect("canonical request"));
+        ChallengeInput::Http {
+            www_authenticate: vec![format!(
+                "Payment id=\"cli-challenge-{round}\", realm=\"merchant.example\", \
+                 method=\"stellar\", intent=\"charge\", request={encoded}"
+            )],
+            selected_challenge_id: None,
+            context: stellar_agent_mpp::HttpRequestContext::new(
+                "https://merchant.example",
+                "POST",
+                &format!("https://merchant.example/cli/{round}"),
+                None,
+                None,
+            )
+            .expect("request context"),
+        }
+    }
+
+    /// A testnet profile for `name` with an audit key and its log in `dir`.
+    fn stage_profile(name: &str, payer: &str, dir: &Path, rpc_url: &str) -> Profile {
+        let mut profile =
+            Profile::builder_testnet_named(name, SIGNER_SERVICE, payer, "n-svc", "n-acct")
+                .with_noop_engine()
+                .build();
+        profile.rpc_url = rpc_url.to_owned();
+        profile.audit_log_path = dir.join("audit").join(format!("{name}.jsonl"));
+        let coord = &profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&coord.service, &coord.account)
+            .expect("Entry::new")
+            .set_password(&URL_SAFE_NO_PAD.encode([0x29_u8; 32]))
+            .expect("seed audit key");
+        profile
+    }
+
+    /// Prepares one sponsored charge for `profile` and returns its stored
+    /// record, with an approval pending when `approvals` is supplied.
+    async fn prepare_charge(
+        profile: &Profile,
+        name: &str,
+        round: u8,
+        approvals: Option<&mut PendingApprovalStore>,
+    ) -> (
+        MppAuthorizationStore,
+        stellar_agent_mpp::AuthorizationRecord,
+    ) {
+        let now = now_unix();
+        let selected = select_and_validate(&sponsored_challenge(round), now).expect("challenge");
+        let rpc = StellarSponsoredRpc::new(&profile.rpc_url).expect("RPC");
+        let prepared = prepare_sponsored(
+            selected,
+            &profile.mcp_signer_default.account,
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            &rpc,
+        )
+        .await
+        .expect("prepare");
+        let state = MppAuthorizationStore::open_for_prepare(
+            name,
+            profile,
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
+        )
+        .expect("state");
+        let disposition = if approvals.is_some() {
+            ApprovalDisposition::RequireApproval
+        } else {
+            ApprovalDisposition::Allow
+        };
+        let preview = persist_prepared_authorization(
+            name,
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            &prepared,
+            disposition,
+            &process_uid_for_attestation().expect("uid"),
+            now,
+            &state,
+            approvals,
+        )
+        .expect("persist");
+        let record = state.load(&preview.authorization_id).expect("record");
+        (state, record)
+    }
+
+    fn log_rows(profile: &Profile) -> Vec<serde_json::Value> {
+        fs::read_to_string(&profile.audit_log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("JSON row"))
+            .collect()
+    }
+
+    fn withheld(profile: &Profile) -> serde_json::Value {
+        let rows = log_rows(profile);
+        let withheld: Vec<_> = rows
+            .iter()
+            .filter(|row| row["kind"] == "mpp_authorization_withheld")
+            .collect();
+        assert_eq!(withheld.len(), 1, "one withheld row: {rows:?}");
+        withheld[0].clone()
+    }
+
+    struct StageCase {
+        _home: TempDir,
+        _guard: stellar_agent_test_support::StellarAgentHomeGuard,
+        _mock: wiremock::MockServer,
+        profile: Profile,
+        signed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn stage_case(
+        name: &str,
+        seed: [u8; 32],
+        seed_secret: bool,
+        configure: impl FnOnce(&mut Simulate, &Path),
+    ) -> StageCase {
+        let home = TempDir::new().expect("home");
+        let guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+        let payer = g_strkey(seed);
+        if seed_secret {
+            keyring_core::Entry::new(SIGNER_SERVICE, &payer)
+                .expect("Entry::new")
+                .set_password(
+                    stellar_strkey::ed25519::PrivateKey(seed)
+                        .as_unredacted()
+                        .to_string()
+                        .as_str(),
+                )
+                .expect("seed signer");
+        }
+        let mut simulate = Simulate {
+            payer: payer_address(&payer),
+            fail_signed: false,
+            on_signed: None,
+            signed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let log_dir = home.path().join("audit");
+        configure(&mut simulate, &log_dir.join(format!("{name}.jsonl")));
+        let signed = Arc::clone(&simulate.signed);
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(simulate)
+            .mount(&mock)
+            .await;
+        let profile = stage_profile(name, &payer, home.path(), &mock.uri());
+        StageCase {
+            _home: home,
+            _guard: guard,
+            _mock: mock,
+            profile,
+            signed,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cli_commit_failure_at_the_sign_call_records_signing() {
+        let case = stage_case("cli-stage-signing", [0x61; 32], false, |_, _| {}).await;
+        let (state, record) = prepare_charge(&case.profile, "cli-stage-signing", 1, None).await;
+        let context = testnet_context(&case.profile).ok().expect("context");
+        let code = commit_cli(
+            &context,
+            "cli-stage-signing",
+            &case.profile,
+            &state,
+            &record,
+            now_unix(),
+        )
+        .await;
+        assert_eq!(code, 1);
+        assert_eq!(case.signed.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let row = withheld(&case.profile);
+        assert_eq!(row["failure_stage"], "signing");
+        assert_eq!(row["key_access_began"], true);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cli_commit_failure_at_the_send_records_resimulation() {
+        let case = stage_case("cli-stage-resim", [0x62; 32], true, |simulate, _| {
+            simulate.fail_signed = true;
+        })
+        .await;
+        let (state, record) = prepare_charge(&case.profile, "cli-stage-resim", 2, None).await;
+        let context = testnet_context(&case.profile).ok().expect("context");
+        let code = commit_cli(
+            &context,
+            "cli-stage-resim",
+            &case.profile,
+            &state,
+            &record,
+            now_unix(),
+        )
+        .await;
+        assert_eq!(code, 1);
+        assert_eq!(case.signed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let row = withheld(&case.profile);
+        assert_eq!(row["failure_stage"], "resimulation");
+        assert_eq!(row["key_access_began"], true);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cli_commit_failure_before_the_sign_call_records_pre_signing() {
+        let case = stage_case("cli-stage-pre", [0x63; 32], true, |_, _| {}).await;
+        let (state, record) = prepare_charge(&case.profile, "cli-stage-pre", 3, None).await;
+        // The same profile with another signer: the payer check refuses before
+        // the sign call.
+        let mut other = case.profile.clone();
+        other.mcp_signer_default.account = g_strkey([0x64; 32]);
+        let context = testnet_context(&other).ok().expect("context");
+        let code = commit_cli(
+            &context,
+            "cli-stage-pre",
+            &other,
+            &state,
+            &record,
+            now_unix(),
+        )
+        .await;
+        assert_eq!(code, 1);
+        assert_eq!(case.signed.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let row = withheld(&case.profile);
+        assert_eq!(row["failure_stage"], "pre_signing");
+        assert_eq!(row["key_access_began"], false);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cli_withheld_row_write_failure_is_logged_and_the_primary_error_returned() {
+        use stellar_agent_test_support::CaptureWriter;
+
+        let case = stage_case("cli-stage-logged", [0x65; 32], true, |simulate, log| {
+            let log = log.to_path_buf();
+            simulate.fail_signed = true;
+            simulate.on_signed = Some(Arc::new(move || {
+                fs::write(&log, b"").expect("roll the audit log back");
+            }));
+        })
+        .await;
+        // A non-empty, anchored log, so the rollback is a mismatch.
+        let access = stellar_agent_network::keyring::keyed_audit_access(
+            &case.profile,
+            "cli-stage-logged",
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
+        )
+        .expect("audit access");
+        stellar_agent_core::audit_log::AuditWriterRegistry::get_or_open_keyed(
+            "cli-stage-logged",
+            &case.profile.audit_log_path,
+            access,
+        )
+        .expect("writer")
+        .lock()
+        .expect("lock")
+        .write_entry(AuditEntry::new_tool_invocation(NewToolInvocation::new(
+            "test",
+            "stellar:testnet",
+            vec![],
+            PolicyDecision::Allow,
+            "anchor-row",
+        )))
+        .expect("anchor row");
+        let (state, record) = prepare_charge(&case.profile, "cli-stage-logged", 4, None).await;
+        let context = testnet_context(&case.profile).ok().expect("context");
+
+        let capture = CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let code = commit_cli(
+            &context,
+            "cli-stage-logged",
+            &case.profile,
+            &state,
+            &record,
+            now_unix(),
+        )
+        .await;
+        drop(guard);
+
+        assert_eq!(code, 1, "the primary error is returned");
+        let logs = capture.captured_str();
+        let line = logs
+            .lines()
+            .find(|line| line.contains("mpp_authorization_withheld"))
+            .unwrap_or_else(|| unreachable!("the refused withheld row is logged: {logs}"));
+        assert!(line.contains("ERROR"), "{line}");
+        assert!(line.contains("audit.tip_anchor_mismatch"), "{line}");
+        assert!(line.contains("resimulation"), "{line}");
+    }
+
+    /// A consent row queued while this process held the writer is in the log
+    /// when the signed entry reaches the RPC.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cli_commit_drains_a_queued_consent_row_before_the_signed_resimulation() {
+        use stellar_agent_core::approval::{
+            AttestationBinding, ConsentAudit, Surface, attest_and_persist,
+        };
+        use stellar_agent_core::audit_log::{AuditOutbox, AuditWriterRegistry};
+
+        const NAME: &str = "cli-consent-drain";
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_handler = Arc::clone(&seen);
+        let case = stage_case(NAME, [0x66; 32], true, |simulate, log| {
+            let log = log.to_path_buf();
+            simulate.on_signed = Some(Arc::new(move || {
+                seen_in_handler.lock().expect("seen").push(
+                    fs::read_to_string(&log)
+                        .unwrap_or_default()
+                        .contains(r#""kind":"approval_attested""#),
+                );
+            }));
+        })
+        .await;
+        let attestation_key = [0x4b_u8; 32];
+        keyring_core::Entry::new(
+            &case.profile.attestation_key_id.service,
+            &case.profile.attestation_key_id.account,
+        )
+        .expect("Entry::new")
+        .set_password(&URL_SAFE_NO_PAD.encode(attestation_key))
+        .expect("seed attestation key");
+        let mut approvals = approval_store(NAME).expect("approval store");
+        let (state, record) = prepare_charge(&case.profile, NAME, 5, Some(&mut approvals)).await;
+        let nonce = record
+            .approval_nonce()
+            .expect("approval required")
+            .to_owned();
+
+        // An earlier keyed call caches the writer in this process.
+        let access = stellar_agent_network::keyring::keyed_audit_access(
+            &case.profile,
+            NAME,
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
+        )
+        .expect("access");
+        let _cached =
+            AuditWriterRegistry::get_or_open_keyed(NAME, &case.profile.audit_log_path, access)
+                .expect("writer cached");
+
+        // `approve --id` beside this process: queue the row, then persist.
+        let entry = approvals.get(&nonce).expect("pending entry").clone();
+        let outbox = AuditOutbox::for_log(&case.profile.audit_log_path);
+        attest_and_persist(
+            &mut approvals,
+            &entry,
+            &attestation_key,
+            &AttestationBinding::new(NAME, "stellar:testnet"),
+            Surface::Cli,
+            ConsentAudit::Outbox(&outbox),
+            None,
+            |_, _| Err("no grant".to_owned()),
+        )
+        .expect("approve");
+        drop(approvals);
+
+        let context = testnet_context(&case.profile).ok().expect("context");
+        let code = commit_cli(&context, NAME, &case.profile, &state, &record, now_unix()).await;
+        assert_eq!(code, 0, "the commit succeeds");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![true],
+            "the consent row must be in the log when the signed entry reaches the RPC"
+        );
     }
 }

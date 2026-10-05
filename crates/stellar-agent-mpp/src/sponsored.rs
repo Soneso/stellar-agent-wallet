@@ -309,30 +309,90 @@ pub async fn prepare_sponsored(
 /// re-simulation failure or mutation, final envelope invariant failure, or
 /// credential construction failure.
 pub async fn commit_sponsored(
-    mut prepared: PreparedSponsoredCharge,
+    prepared: PreparedSponsoredCharge,
     now_unix: i64,
     network_passphrase: &str,
     signer: &(dyn Signer + Send + Sync),
     rpc: &(dyn SponsoredRpc + Send + Sync),
 ) -> Result<CredentialOutput, MppError> {
-    require_testnet(network_passphrase)?;
+    commit_sponsored_staged(prepared, now_unix, network_passphrase, signer, rpc)
+        .await
+        .map_err(|(error, _stage)| error)
+}
+
+/// Which side of the signed re-simulation send a [`commit_sponsored`] error
+/// came from.
+///
+/// The sign call is the first boundary and the send is the second. The
+/// `MppError` itself keeps its static code and message; the stage travels
+/// beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitStage {
+    /// Before the sign call. The signing key was not used: the signer's
+    /// `public_key()` returns cached bytes.
+    PreSigning,
+    /// From the sign call to just before the send. The key was used and the
+    /// signed entry has not left the wallet.
+    Signing,
+    /// At or after the send, a transport error included. The signed entry
+    /// reached, or may have reached, the configured RPC.
+    Resimulation,
+}
+
+impl CommitStage {
+    /// The `failure_stage` label the withheld row records.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PreSigning => "pre_signing",
+            Self::Signing => "signing",
+            Self::Resimulation => "resimulation",
+        }
+    }
+
+    /// Whether the signing key had been used when the error arose.
+    pub(crate) fn key_access_began(self) -> bool {
+        !matches!(self, Self::PreSigning)
+    }
+}
+
+/// Tags an error with the stage it arose in.
+fn at(stage: CommitStage) -> impl FnOnce(MppError) -> (MppError, CommitStage) {
+    move |error| (error, stage)
+}
+
+/// [`commit_sponsored`], returning each error with the [`CommitStage`] it
+/// arose in.
+pub(crate) async fn commit_sponsored_staged(
+    mut prepared: PreparedSponsoredCharge,
+    now_unix: i64,
+    network_passphrase: &str,
+    signer: &(dyn Signer + Send + Sync),
+    rpc: &(dyn SponsoredRpc + Send + Sync),
+) -> Result<CredentialOutput, (MppError, CommitStage)> {
+    use CommitStage::{PreSigning, Resimulation, Signing};
+
+    // ── Before the sign call ─────────────────────────────────────────────────
+    require_testnet(network_passphrase).map_err(at(PreSigning))?;
     let remaining = prepared
         .selected
         .effective_expires_at()
         .saturating_sub(now_unix);
     if remaining < MIN_CHALLENGE_LIFETIME_SECS {
-        return Err(MppError::new(
-            MppErrorCode::ChallengeExpired,
-            "challenge is expired or too close to expiry",
+        return Err((
+            MppError::new(
+                MppErrorCode::ChallengeExpired,
+                "challenge is expired or too close to expiry",
+            ),
+            PreSigning,
         ));
     }
 
     let signer_key = signer
         .public_key()
         .await
-        .map_err(|_error| signing_error())?;
+        .map_err(|_error| (signing_error(), PreSigning))?;
     if signer_key.to_string().as_str() != prepared.payer {
-        return Err(signing_error());
+        return Err((signing_error(), PreSigning));
     }
     let expiration_ledger = compute_expiration_ledger(prepared.latest_ledger, remaining);
     let nonce = match &mut prepared.auth_entry.credentials {
@@ -342,7 +402,9 @@ pub async fn commit_sponsored(
         }
         SorobanCredentials::SourceAccount
         | SorobanCredentials::AddressV2(_)
-        | SorobanCredentials::AddressWithDelegates(_) => return Err(simulation_error()),
+        | SorobanCredentials::AddressWithDelegates(_) => {
+            return Err((simulation_error(), PreSigning));
+        }
     };
     let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
         network_id: Hash(Sha256::digest(network_passphrase.as_bytes()).into()),
@@ -352,44 +414,64 @@ pub async fn commit_sponsored(
     });
     let preimage_xdr = preimage
         .to_xdr_base64(Limits::none())
-        .map_err(|_error| signing_error())?;
+        .map_err(|_error| (signing_error(), PreSigning))?;
+
+    // ── From the sign call to just before the send ───────────────────────────
     let signature =
         sign_soroban_auth_entry(&preimage_xdr, signer, &signer_key, network_passphrase, None)
             .await
-            .map_err(|_error| signing_error())?;
+            .map_err(|_error| (signing_error(), Signing))?;
     let signature: [u8; 64] = STANDARD
         .decode(signature)
-        .map_err(|_error| signing_error())?
+        .map_err(|_error| (signing_error(), Signing))?
         .try_into()
-        .map_err(|_bytes: Vec<u8>| signing_error())?;
+        .map_err(|_bytes: Vec<u8>| (signing_error(), Signing))?;
     let payer_key = match Strkey::from_string(&prepared.payer) {
         Ok(Strkey::PublicKeyEd25519(key)) => key.0,
-        _ => return Err(signing_error()),
+        _ => return Err((signing_error(), Signing)),
     };
-    let signature_value = account_signature_scval(&payer_key, &signature)?;
+    let signature_value = account_signature_scval(&payer_key, &signature).map_err(at(Signing))?;
     let SorobanCredentials::Address(credentials) = &mut prepared.auth_entry.credentials else {
-        return Err(simulation_error());
+        return Err((simulation_error(), Signing));
     };
     credentials.signature = signature_value;
     let signed_entries = vec![prepared.auth_entry.clone()];
     let auth: VecM<SorobanAuthorizationEntry> = signed_entries
         .clone()
         .try_into()
-        .map_err(|_error| simulation_error())?;
+        .map_err(|_error| (simulation_error(), Signing))?;
     let resim_envelope = build_envelope(
         invoke_operation(prepared.invoke.clone(), auth),
         prepared.selected.effective_expires_at(),
         BASE_FEE_STROOPS,
         None,
-    )?;
+    )
+    .map_err(at(Signing))?;
     inspect_envelope(
         &resim_envelope,
         &prepared.invoke,
         &signed_entries,
         prepared.selected.effective_expires_at(),
         false,
-    )?;
-    let response = rpc.simulate(&resim_envelope).await?;
+    )
+    .map_err(at(Signing))?;
+
+    // ── At and after the send ────────────────────────────────────────────────
+    // Every error from here on, a transport error included, follows a request
+    // that carried the signed entry or may have.
+    finish_after_send(prepared, rpc, &resim_envelope, signed_entries)
+        .await
+        .map_err(at(Resimulation))
+}
+
+/// The send of the signed re-simulation and everything after it.
+async fn finish_after_send(
+    prepared: PreparedSponsoredCharge,
+    rpc: &(dyn SponsoredRpc + Send + Sync),
+    resim_envelope: &TransactionEnvelope,
+    signed_entries: Vec<SorobanAuthorizationEntry>,
+) -> Result<CredentialOutput, MppError> {
+    let response = rpc.simulate(resim_envelope).await?;
     validate_simulation_response(&response)?;
     validate_resimulation_auth(&response, &signed_entries)?;
     let resource_fee =

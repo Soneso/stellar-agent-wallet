@@ -88,7 +88,7 @@ pub(crate) const VALID_TRANSPORTS: &[&str] = &["usb", "internal", "ble", "nfc", 
 /// (e.g. `user_id`, `backup_eligible`) without breaking downstream
 /// struct-literal construction sites.
 ///
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RegistrationInput {
     /// The credential identifier returned by the authenticator.  Typically

@@ -11,9 +11,7 @@
 
 #![allow(clippy::expect_used, clippy::panic, reason = "test-only")]
 
-fn production_half(source: &str) -> &str {
-    source.split("#[cfg(test)]").next().unwrap_or(source)
-}
+use stellar_agent_test_support::source_order::production_half;
 
 fn walk(dir: &std::path::Path, needle: &str, hits: &mut Vec<(String, String)>) {
     for entry in std::fs::read_dir(dir).expect("read_dir") {

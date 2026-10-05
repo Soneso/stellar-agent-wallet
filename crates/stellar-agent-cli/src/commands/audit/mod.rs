@@ -27,10 +27,12 @@ use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 /// failure code:
 ///
 /// - A held writer lock is `audit.writer_locked`. The audit writer is
-///   process-exclusive, so a running MCP server makes every verb that needs the
-///   writer refuse; the operator stops the server and retries. The skill's
-///   troubleshooting table keys on codes, so an agent can only recognise this
-///   if the code reaches the envelope.
+///   process-exclusive, so a running MCP server makes every verb that must
+///   hold the writer itself refuse; the operator stops the server and retries.
+///   `approve --id` holds it only to write one consent row, and beside a
+///   draining server it queues that row in the audit outbox instead. The
+///   skill's troubleshooting table keys on codes, so an agent can only
+///   recognise this if the code reaches the envelope.
 /// - A tip-anchor mismatch is `audit.tip_anchor_mismatch`, the same code the
 ///   value-verb pre-flight emits, so one refusal reads the same wherever it
 ///   comes from.
@@ -62,7 +64,9 @@ pub(crate) fn audit_writer_error(
         // it through unchanged; prefixing the caller's fallback would put two
         // codes in one detail and an agent matching on the first would read the
         // wrong one.
-        WriterError::RotationBridgeUnusable { .. } => {
+        WriterError::RotationBridgeUnusable { .. }
+        | WriterError::OutboxBusy
+        | WriterError::OutboxUnusable { .. } => {
             WalletError::Internal(InternalError::UnexpectedState {
                 detail: e.to_string(),
             })

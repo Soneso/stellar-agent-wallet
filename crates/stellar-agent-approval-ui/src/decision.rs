@@ -15,13 +15,21 @@
 //! action, and lets the store drop — releasing the advisory file lock — before
 //! returning. Lock contention that survives the bounded retry surfaces as
 //! [`Outcome::Busy`] rather than an error or a panic.
+//!
+//! # Audit rows
+//!
+//! An approve or a reject takes effect only after its row is durable. The row
+//! is written through [`DecisionContext::audit_writer`] first. A refused row,
+//! or a poisoned writer mutex, answers [`Outcome::Unavailable`] with the store
+//! unchanged. A poisoned mutex keeps refusing every decision until the
+//! inbox restarts.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::{
-    ApprovalKind, ApproverIdentity, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF,
+    ApprovalKind, ApproverIdentity, ConsentAudit, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF,
     PendingApprovalStore, Surface, attest_and_persist, load_and_validate_entry,
     load_attestation_key, open_with_retry, process_uid_for_attestation,
 };
@@ -99,6 +107,11 @@ pub struct DecisionContext {
     /// key equal to the owner public key at any of them.
     pub owner: OwnerKeyContext,
     /// Shared audit-log writer for the profile.
+    ///
+    /// Every approve and reject writes its row through this writer before the
+    /// decision is persisted, and a refused row refuses the decision with
+    /// [`Outcome::Unavailable`]. A poisoned mutex is never recovered: every
+    /// later decision refuses until the inbox restarts.
     pub audit_writer: Arc<Mutex<AuditWriter>>,
     /// Optional grant-store path override for the `ToolsetFirstInvokeGate`
     /// branch. Production passes `None` (the path is resolved from the profile
@@ -358,8 +371,18 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
         Err(outcome) => return outcome,
     };
 
-    let mut audit_guard = ctx.audit_writer.lock().ok();
-    let audit_ref: Option<&mut AuditWriter> = audit_guard.as_deref_mut().map(|w| &mut *w);
+    // The consent row is written before the attestation is persisted, so a
+    // writer that cannot be used refuses the decision. A poisoned mutex may
+    // guard a writer left mid-append; it is never recovered, and every later
+    // decision refuses until the inbox restarts.
+    let Ok(mut writer) = ctx.audit_writer.lock() else {
+        tracing::error!(
+            event_kind = audit_event_kind(operator_credential_id.as_deref(), true),
+            "approve: audit writer mutex poisoned; refusing the decision until the inbox \
+             restarts"
+        );
+        return Outcome::Unavailable;
+    };
 
     let grant_override = ctx.grant_store_path_override.clone();
     let profile_name = ctx.context.profile_name.as_str();
@@ -369,7 +392,7 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
         &key,
         &ctx.context.binding(),
         surface,
-        audit_ref,
+        ConsentAudit::Writer(&mut writer),
         operator_credential_id.as_deref(),
         |req, grant_key| {
             stellar_agent_toolsets_runtime::record_first_invoke_grant(
@@ -403,19 +426,43 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
             if approval_detail_code_is(&e, "approval.wrong_kind") {
                 return Outcome::WrongKind;
             }
-            if approval_detail_code_is(&e, "approval.rejected") {
-                // A rejected tombstone is already resolved; never a panic.
+            if approval_detail_code_is(&e, "approval.not_found") {
+                return Outcome::NotFound;
+            }
+            if approval_detail_code_is(&e, "approval.expired") {
+                return Outcome::Expired;
+            }
+            if approval_detail_code_is(&e, "approval.rejected")
+                || approval_detail_code_is(&e, "approval.consumed")
+            {
+                // A rejected or spent tombstone is already resolved, and its
+                // attestation is not handed back.
                 return Outcome::AlreadyResolved { attestation: None };
             }
             if approval_detail_code_is(&e, "approval.already_attested") {
+                // Another handle attested this entry since it was validated:
+                // no row was written here, and the stored attestation is the
+                // one to re-show.
                 let attestation = store
                     .get(nonce)
                     .and_then(|e| e.attestation_blob_b64.clone());
                 return Outcome::AlreadyResolved { attestation };
             }
+            // A refused consent row lands here: nothing was persisted.
             tracing::warn!(error = %e, "approve: attest_and_persist failed");
             Outcome::Unavailable
         }
+    }
+}
+
+/// The audit event kind a decision writes, for the `error` log of a decision
+/// refused before its row.
+fn audit_event_kind(operator_credential_id: Option<&str>, approve: bool) -> &'static str {
+    match (operator_credential_id.is_some(), approve) {
+        (false, true) => "approval_attested",
+        (true, true) => "approval_attested_remote",
+        (false, false) => "approval_rejected",
+        (true, false) => "approval_rejected_remote",
     }
 }
 
@@ -483,42 +530,57 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
         }
     };
 
+    // The rejection row is written before the rejection is persisted, so a
+    // rejection never takes effect without its row. The entry was read above
+    // from this store, which holds its lock until it drops, so it is still the
+    // entry being rejected. A poisoned mutex is never recovered: every later
+    // decision refuses until the inbox restarts.
+    let event_kind = audit_event_kind(operator_credential_id.as_deref(), false);
+    let Ok(mut writer) = ctx.audit_writer.lock() else {
+        tracing::error!(
+            event_kind,
+            "reject: audit writer mutex poisoned; refusing the decision until the inbox restarts"
+        );
+        return Outcome::Unavailable;
+    };
+    let kind_name = original_kind_name.unwrap_or_else(|| "unknown".to_owned());
+    let audit_entry = match &operator_credential_id {
+        Some(cred_id) => AuditEntry::new_approval_rejected_remote(
+            kind_name,
+            nonce,
+            cred_id,
+            uuid::Uuid::new_v4().to_string(),
+        ),
+        None => AuditEntry::new_approval_rejected(
+            kind_name,
+            nonce,
+            surface.as_str(),
+            uuid::Uuid::new_v4().to_string(),
+        ),
+    };
+    if let Err(e) = writer.write_entry(audit_entry) {
+        tracing::warn!(
+            error = %e,
+            event_kind,
+            "reject: the rejection row was not written; the entry stays pending"
+        );
+        return Outcome::Unavailable;
+    }
+    drop(writer);
+
+    // A persist failure here leaves a row recording a rejection that did not
+    // take effect; the entry stays pending.
     match store.reject(nonce, now_ms, REJECT_TOMBSTONE_TTL_MS) {
-        Ok(true) => {}
+        Ok(true) => Outcome::Rejected,
         Ok(false) => {
-            // The entry vanished between the read and the reject — idempotent.
-            return Outcome::AlreadyResolved { attestation: None };
+            // The store lock keeps the validated entry present through this call.
+            Outcome::AlreadyResolved { attestation: None }
         }
         Err(e) => {
-            tracing::warn!(error = %e, "reject: store reject failed");
-            return Outcome::Unavailable;
+            tracing::warn!(error = %e, "reject: store reject failed after the rejection row");
+            Outcome::Unavailable
         }
     }
-
-    // Audit is best-effort: a rejection is already durable by this point, and
-    // an audit hiccup must never undo it.
-    let kind_name = original_kind_name.unwrap_or_else(|| "unknown".to_owned());
-    if let Ok(mut writer) = ctx.audit_writer.lock() {
-        let audit_entry = match &operator_credential_id {
-            Some(cred_id) => AuditEntry::new_approval_rejected_remote(
-                kind_name,
-                nonce,
-                cred_id,
-                uuid::Uuid::new_v4().to_string(),
-            ),
-            None => AuditEntry::new_approval_rejected(
-                kind_name,
-                nonce,
-                surface.as_str(),
-                uuid::Uuid::new_v4().to_string(),
-            ),
-        };
-        if let Err(e) = writer.write_entry(audit_entry) {
-            tracing::warn!(error = %e, "reject: audit write failed; rejection already persisted");
-        }
-    }
-
-    Outcome::Rejected
 }
 
 #[cfg(test)]
@@ -1159,5 +1221,356 @@ mod tests {
         );
         let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
         assert!(store.get(&nonce).unwrap().attestation_blob_b64.is_none());
+    }
+
+    // ── Decisions take effect only after their rows ──────────────────────────
+
+    use stellar_agent_core::audit_log::{TipAnchor, TipAnchorStore, TipAnchorStoreError};
+
+    /// An in-process anchor store, so a test writer refuses an append on a log
+    /// rolled back underneath it.
+    #[derive(Debug, Default)]
+    struct MemAnchor(Mutex<(Option<TipAnchor>, u64)>);
+
+    impl TipAnchorStore for MemAnchor {
+        fn load_anchor(&self) -> Result<Option<TipAnchor>, TipAnchorStoreError> {
+            Ok(self.0.lock().unwrap().0.clone())
+        }
+
+        fn load_raw(&self) -> Result<Option<String>, TipAnchorStoreError> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .0
+                .as_ref()
+                .map(TipAnchor::to_keyring_value))
+        }
+
+        fn store_anchor(&self, anchor: &TipAnchor) -> Result<(), TipAnchorStoreError> {
+            self.0.lock().unwrap().0 = Some(anchor.clone());
+            Ok(())
+        }
+
+        fn bump_reanchor_count(&self) -> Result<u64, TipAnchorStoreError> {
+            let mut state = self.0.lock().unwrap();
+            state.1 += 1;
+            Ok(state.1)
+        }
+
+        fn reanchor_count(&self) -> Result<Option<u64>, TipAnchorStoreError> {
+            Ok(Some(self.0.lock().unwrap().1))
+        }
+    }
+
+    fn audit_path(fx: &Fixture) -> std::path::PathBuf {
+        fx.ctx.store_path.parent().unwrap().join("audit.log")
+    }
+
+    fn rows_of_kind(path: &std::path::Path, kind: &str) -> usize {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(&format!(r#""kind":"{kind}""#)))
+            .count()
+    }
+
+    fn poison(writer: &Arc<Mutex<AuditWriter>>) {
+        let held = Arc::clone(writer);
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("poison the audit writer mutex");
+        })
+        .join();
+        assert!(writer_is_poisoned(writer));
+    }
+
+    fn writer_is_poisoned(writer: &Arc<Mutex<AuditWriter>>) -> bool {
+        writer.lock().is_err()
+    }
+
+    /// Replaces the fixture's writer with an anchored one over a log that is
+    /// then rolled back, so every append refuses.
+    fn refusing_writer(fx: &mut Fixture) {
+        let path = fx.ctx.store_path.parent().unwrap().join("anchored.log");
+        let mut writer = AuditWriter::open_with_tip_anchor(
+            path.clone(),
+            None,
+            Arc::new(MemAnchor::default()) as Arc<dyn TipAnchorStore>,
+        )
+        .unwrap();
+        writer
+            .write_entry(AuditEntry::new_approval_rejected(
+                "PaymentSimulated",
+                "AAAAAAAAAAAAAAAAAAAAAA",
+                "serve",
+                "seed-row",
+            ))
+            .unwrap();
+        std::fs::write(&path, b"").unwrap();
+        fx.ctx.audit_writer = Arc::new(Mutex::new(writer));
+    }
+
+    fn still_pending(fx: &Fixture, nonce: &str) -> bool {
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        let entry = store.get(nonce).expect("the entry stays");
+        matches!(entry.kind, ApprovalKind::PaymentSimulated { .. })
+            && entry.attestation_blob_b64.is_none()
+    }
+
+    /// Another handle attests the entry after the inbox validated it and
+    /// before it attests: the inbox answers with the stored attestation and
+    /// writes no row.
+    #[test]
+    #[serial]
+    fn approving_an_entry_attested_by_another_handle_reshows_the_stored_blob_with_no_row() {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store_path = Arc::new(Mutex::new(None::<std::path::PathBuf>));
+        let nonce_slot = Arc::new(Mutex::new(None::<String>));
+        let hook = {
+            let fired = Arc::clone(&fired);
+            let store_path = Arc::clone(&store_path);
+            let nonce_slot = Arc::clone(&nonce_slot);
+            Arc::new(move || {
+                let (Some(path), Some(nonce)) = (
+                    store_path.lock().unwrap().clone(),
+                    nonce_slot.lock().unwrap().clone(),
+                ) else {
+                    return;
+                };
+                if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let mut other = PendingApprovalStore::open(path).unwrap();
+                other.record_attestation(&nonce, [0x01; 32]).unwrap();
+            }) as Arc<dyn Fn() + Send + Sync>
+        };
+        stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
+            stellar_agent_test_support::keyring_mock::ReadHook::new(
+                "stellar-agent-attestation-ui-raced",
+                "default",
+                hook,
+            ),
+        ])
+        .unwrap();
+        let fx = fixture("raced");
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        *store_path.lock().unwrap() = Some(fx.ctx.store_path.clone());
+        *nonce_slot.lock().unwrap() = Some(nonce.clone());
+
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Approve { nonce },
+            &RequestIdentity::Local,
+        );
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the other handle attested between validation and the attest"
+        );
+        assert_eq!(
+            outcome,
+            Outcome::AlreadyResolved {
+                attestation: Some(URL_SAFE_NO_PAD.encode([0x01; 32])),
+            }
+        );
+        assert_eq!(rows_of_kind(&audit_path(&fx), "approval_attested"), 0);
+    }
+
+    /// Approves a payment entry that another handle resolves with `resolve`
+    /// after the inbox validated it and before it attests. A read hook at the
+    /// attestation key runs `resolve` once; the inbox has released the store
+    /// lock by then.
+    fn approve_an_entry_resolved_by_another_handle(
+        tag: &str,
+        resolve: fn(&mut PendingApprovalStore, &str),
+    ) -> (Fixture, Outcome) {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let target = Arc::new(Mutex::new(None::<(std::path::PathBuf, String)>));
+        let hook = {
+            let fired = Arc::clone(&fired);
+            let target = Arc::clone(&target);
+            Arc::new(move || {
+                let Some((path, nonce)) = target.lock().unwrap().clone() else {
+                    return;
+                };
+                if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let mut other = PendingApprovalStore::open(path).unwrap();
+                resolve(&mut other, &nonce);
+            }) as Arc<dyn Fn() + Send + Sync>
+        };
+        stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
+            stellar_agent_test_support::keyring_mock::ReadHook::new(
+                &format!("stellar-agent-attestation-ui-{tag}"),
+                "default",
+                hook,
+            ),
+        ])
+        .unwrap();
+        let fx = fixture(tag);
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        *target.lock().unwrap() = Some((fx.ctx.store_path.clone(), nonce.clone()));
+
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Approve { nonce },
+            &RequestIdentity::Local,
+        );
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the other handle resolved the entry between validation and the attest"
+        );
+        (fx, outcome)
+    }
+
+    /// A commit spends the entry after the inbox validated it: the decision is
+    /// already resolved, no attestation is handed back, and no row is written.
+    #[test]
+    #[serial]
+    fn approving_an_entry_consumed_since_validation_is_already_resolved_with_no_row() {
+        let (fx, outcome) =
+            approve_an_entry_resolved_by_another_handle("raced-consumed", |store, nonce| {
+                store.record_attestation(nonce, [0x01; 32]).unwrap();
+                store
+                    .consume(
+                        nonce,
+                        &"ab".repeat(32),
+                        stellar_agent_core::approval::ConsumedOutcome::Confirmed,
+                    )
+                    .unwrap();
+            });
+        assert_eq!(outcome, Outcome::AlreadyResolved { attestation: None });
+        assert_eq!(rows_of_kind(&audit_path(&fx), "approval_attested"), 0);
+    }
+
+    /// The operator rejects the entry from another surface after the inbox
+    /// validated it.
+    #[test]
+    #[serial]
+    fn approving_an_entry_rejected_since_validation_is_already_resolved_with_no_row() {
+        let (fx, outcome) =
+            approve_an_entry_resolved_by_another_handle("raced-rejected", |store, nonce| {
+                store
+                    .reject(nonce, timefmt::now_unix_ms().unwrap(), DEFAULT_TTL_MS)
+                    .unwrap();
+            });
+        assert_eq!(outcome, Outcome::AlreadyResolved { attestation: None });
+        assert_eq!(rows_of_kind(&audit_path(&fx), "approval_attested"), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn approve_with_a_poisoned_writer_mutex_is_unavailable_and_changes_no_store() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("poison-approve");
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        poison(&fx.ctx.audit_writer);
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Approve {
+                nonce: nonce.clone(),
+            },
+            &RequestIdentity::Local,
+        );
+        assert_eq!(outcome, Outcome::Unavailable);
+        assert!(still_pending(&fx, &nonce));
+        // A poisoned mutex keeps refusing until the inbox restarts.
+        let again = apply_decision(
+            &fx.ctx,
+            Decision::Approve {
+                nonce: nonce.clone(),
+            },
+            &RequestIdentity::Local,
+        );
+        assert_eq!(again, Outcome::Unavailable);
+        assert!(still_pending(&fx, &nonce));
+    }
+
+    #[test]
+    #[serial]
+    fn reject_with_a_poisoned_writer_mutex_is_unavailable_and_changes_no_store() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("poison-reject");
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        poison(&fx.ctx.audit_writer);
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Reject {
+                nonce: nonce.clone(),
+            },
+            &RequestIdentity::Local,
+        );
+        assert_eq!(outcome, Outcome::Unavailable);
+        assert!(still_pending(&fx, &nonce));
+    }
+
+    #[test]
+    #[serial]
+    fn a_reject_whose_row_cannot_be_written_leaves_the_entry_pending() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fx = fixture("reject-row-refused");
+        refusing_writer(&mut fx);
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Reject {
+                nonce: nonce.clone(),
+            },
+            &RequestIdentity::Local,
+        );
+        assert_eq!(outcome, Outcome::Unavailable);
+        assert!(
+            still_pending(&fx, &nonce),
+            "the rejection did not take effect"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn an_approve_whose_row_cannot_be_written_persists_nothing() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fx = fixture("approve-row-refused");
+        refusing_writer(&mut fx);
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Approve {
+                nonce: nonce.clone(),
+            },
+            &RequestIdentity::Local,
+        );
+        assert_eq!(outcome, Outcome::Unavailable);
+        assert!(
+            still_pending(&fx, &nonce),
+            "the approval did not take effect"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn approve_and_reject_write_their_rows() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("rows");
+        let approved = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        let rejected = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        assert!(matches!(
+            apply_decision(
+                &fx.ctx,
+                Decision::Approve { nonce: approved },
+                &RequestIdentity::Local
+            ),
+            Outcome::Attested { .. }
+        ));
+        assert_eq!(
+            apply_decision(
+                &fx.ctx,
+                Decision::Reject { nonce: rejected },
+                &RequestIdentity::Local
+            ),
+            Outcome::Rejected
+        );
+        assert_eq!(rows_of_kind(&audit_path(&fx), "approval_attested"), 1);
+        assert_eq!(rows_of_kind(&audit_path(&fx), "approval_rejected"), 1);
     }
 }

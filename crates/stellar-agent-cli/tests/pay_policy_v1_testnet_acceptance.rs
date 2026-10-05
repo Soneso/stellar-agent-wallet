@@ -12,7 +12,7 @@
 //!
 //! A fresh temp directory stands in for `STELLAR_AGENT_HOME` (only ever set on
 //! the CHILD process's environment, never the test-process environment). The
-//! profile name is unique per test run (`pay-v1-acceptance-<pid>-<unix_secs>`)
+//! profile name is unique per test run (`pay-v1-acceptance-<pid>-<unix_secs>-<n>`)
 //! so the OS keyring coordinate it drives (below) never collides with a
 //! concurrent or prior local run.
 //!
@@ -132,7 +132,8 @@ const PAY_SECRET_ENV_VAR: &str = "PAY_POLICY_V1_ACCEPTANCE_SECRET";
 /// subprocess's environment, never the test-process environment.
 const OWNER_SECRET_ENV_VAR: &str = "PAY_POLICY_V1_ACCEPTANCE_OWNER_SECRET";
 
-/// Builds a profile name unique to this test run: `pay-v1-acceptance-<pid>-<unix_secs>`.
+/// Builds a profile name unique to this test run:
+/// `pay-v1-acceptance-<pid>-<unix_secs>-<n>`.
 ///
 /// The profile TOML and policy TOML live inside the test's own fresh
 /// tempdir and so cannot collide across runs on their own, but the OS
@@ -141,11 +142,7 @@ const OWNER_SECRET_ENV_VAR: &str = "PAY_POLICY_V1_ACCEPTANCE_OWNER_SECRET";
 /// tempdir-scoped — the profile name must be unique per run so repeated
 /// local runs (or a concurrent CI matrix) never collide on that entry.
 fn unique_profile_name() -> String {
-    let unix_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock must work")
-        .as_secs();
-    format!("pay-v1-acceptance-{}-{unix_secs}", std::process::id())
+    stellar_agent_test_support::profile_fixtures::unique_profile_name("pay-v1-acceptance")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

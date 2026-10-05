@@ -199,12 +199,30 @@ withheld row records `policy_refusal_persist_failed` with the budget
 unconsumed, and the persistence error is returned.
 `BeforeSignError` distinguishes these outcomes at the accounting callback.
 
+A failure inside the sponsored commit records the side of the signed
+re-simulation send it came from, in the withheld row's `failure_stage`:
+
+| Stage | Where the error arose | `key_access_began` |
+|---|---|---|
+| `pre_signing` | before the sign call | `false` |
+| `signing` | from the sign call to just before the send | `true` |
+| `resimulation` | at or after the send, a transport error included | `true` |
+
+`resimulation` means the signed entry reached, or may have reached, the
+configured RPC. `pre_signing` means the signing key was not used: the lazy
+signer handle answers `public_key()` from cached bytes. Every stage still marks
+the record `indeterminate`, so a `pre_signing` row can sit beside an
+`indeterminate` record. The record state is conservative; the row says what
+happened.
+
 ## Audit and redaction
 
 The four typed events are `MppChargeAuthorized`,
 `MppAuthorizationWithheld`, `MppReceiptObserved`, and
 `MppSettlementReconciled`. Authorization audit append is a mandatory delivery
-gate. Withheld audit is best-effort after the primary failure. Receipt and
+gate. Withheld audit is best-effort after the primary failure: the primary
+error is returned unchanged, and a withheld row that cannot be written is
+logged at `error` with its code. Receipt and
 reconciliation events state observation provenance but never conflate it with
 settlement. Explicit pruning emits a normal tool-invocation row carrying only
 the bounded reason SHA-256.
