@@ -68,6 +68,15 @@ The skill uses progressive disclosure: only `SKILL.md` is loaded into context
 initially. Reference files are loaded by the agent only when needed, keeping token
 usage efficient.
 
+## Contributing skill
+
+The [contributing skill](contributing/SKILL.md) teaches coding agents the path
+from choosing an issue to answering pull request feedback. Use it from the
+repository checkout, following [AGENTS.md](../AGENTS.md).
+
+Copy the `skills/contributing` folder into your agent's skills directory, then
+run the agent from the checkout so it can read the repository files.
+
 ## Status
 
 This is a public alpha. The `stellar-agent` and `stellar-agent-mcp` binaries

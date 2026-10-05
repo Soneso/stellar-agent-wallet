@@ -117,6 +117,11 @@ closes after 21 days. You can reopen it at any time.
 
 ## Contributing with a coding agent
 
+Coding agents start at [AGENTS.md](AGENTS.md) and can install
+[skills/contributing](skills/README.md#contributing-skill).
+The `agent-ready` label marks issues whose Where, Acceptance, and Gates are stated
+as commands.
+
 This is a wallet built for AI agents, and contributions built with AI agents are
 welcome. Three things make that work:
 

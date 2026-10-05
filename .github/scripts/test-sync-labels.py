@@ -20,6 +20,7 @@ SCRIPT = ROOT / ".github/scripts/sync-labels.py"
 LABELS = [
     ("good first issue", "7057ff", "Docs, scripts, or checks; a few hours; the issue states the acceptance command"),
     ("help wanted", "008672", "Rust code or tests; needs the gate suite; the issue states the design"),
+    ("agent-ready", "1d76db", "Where, acceptance, and gates are stated as commands; a coding agent can take it"),
     ("area: docs", "0075ca", "Documentation and the agent skill"),
     ("area: ci", "0e8a16", "Workflows, scripts, and checks"),
     ("area: cli", "1d76db", "The `stellar-agent` CLI"),

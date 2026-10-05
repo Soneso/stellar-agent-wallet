@@ -314,6 +314,7 @@ vulnerability.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+Coding agents start at `AGENTS.md`.
 `bash .github/scripts/preflight.sh` runs the checks for the files you changed.
 Good entry points are the issues labeled
 [`good first issue`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
