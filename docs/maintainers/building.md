@@ -37,9 +37,10 @@ cargo install --locked cargo-machete --version 0.9.2
 cargo install --locked cargo-deny --version 0.19.9
 ```
 
-These versions match the `tool:` pins in `.github/workflows/ci.yml`. The
-`Install surface` workflow runs `.github/scripts/check-gate-tool-versions.sh`,
-which fails when a version in this guide differs from its pin in `ci.yml`.
+`cargo-llvm-cov` uses the reference pin in `.github/workflows/coverage.yml`.
+`cargo-machete` and `cargo-deny` use the reference pins in
+`.github/workflows/ci.yml`. The `Install surface` workflow checks this guide
+against those pins with `.github/scripts/check-gate-tool-versions.sh`.
 
 `cargo-llvm-cov` also needs the `llvm-tools-preview` rustup component:
 
@@ -132,6 +133,11 @@ is reviewed against. The measurement uses the offline feature set (deliberately 
 `--all-features`, which would compile in the live tiers and attempt real RPC
 and Friendbot access).
 
+CI runs this gate in the Coverage workflow: weekly on main, on a pull request
+that carries the `coverage` label, and on demand through `workflow_dispatch`.
+A maintainer adds the label to a pull request that changes Rust code. Run the
+gate locally before you open such a pull request.
+
 ### Unused dependencies
 
 ```bash
@@ -169,9 +175,10 @@ defines each rule and the baseline. The Python scripts need Python 3.11 or
 later.
 
 The gate tool check compares the versions in [Gate tools](#gate-tools), in the
-other workflows, and in the composite actions with the `tool:` pins in
-`ci.yml`. Its header defines the accepted line shapes, and its self-test runs
-it on fixture trees with one drift form per case.
+other workflows, and in the composite actions with each tool's reference
+workflow pin: `coverage.yml` for `cargo-llvm-cov`, `ci.yml` for
+`cargo-machete` and `cargo-deny`. Its header defines the accepted line shapes,
+and its self-test runs it on fixture trees with one drift form per case.
 
 ### Windows storage regression (CI-only)
 
@@ -207,8 +214,8 @@ declared on individual crates (and on `stellar-agent-test-support`), are:
 - `wiremock-helpers`: `wiremock`-based HTTP doubles in
   `stellar-agent-test-support`.
 
-The CI `test (offline)` and coverage jobs run the offline tier with
-`--features test-helpers,test-hooks,test-loopback,verifier-registry`.
+The CI `test (offline)` job and the Coverage workflow run the offline tier
+with `--features test-helpers,test-hooks,test-loopback,verifier-registry`.
 
 MPP development should run its focused protocol/security suite and both binary
 adapters before the full workspace gates:

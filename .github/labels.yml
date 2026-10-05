@@ -25,6 +25,9 @@
 - name: security-sensitive
   color: b60205
   description: Signing, key handling, or serialized state; second review pass
+- name: coverage
+  color: c5def5
+  description: CI runs the coverage gate on this pull request
 - name: waiting on author
   color: fef2c0
   description: The next step is the contributor's

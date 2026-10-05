@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Offline regression checks for check-gate-tool-versions.sh.
+# Offline regression checks for check-gate-tool-versions.sh. In the fixture,
+# coverage.yml holds the reference pin of cargo-llvm-cov, and ci.yml holds
+# those of cargo-machete and cargo-deny.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -23,6 +25,9 @@ jobs:
       - uses: taiki-e/install-action@pinned
         with:
           tool: cargo-deny@0.19.9
+EOF
+  cat >"$dir/.github/workflows/coverage.yml" <<'EOF'
+jobs:
   coverage:
     steps:
       - uses: taiki-e/install-action@pinned
@@ -77,6 +82,20 @@ expect_fail() {
   done
 }
 
+# Runs the check in fixture `$1` and requires exit status 1 with output equal
+# to `$2` plus a final newline, byte for byte.
+expect_exact_fail() {
+  local dir="$1" expected="$2" rc=0
+  bash "$dir/$SCRIPT_REL" >"$dir.out" 2>&1 || rc=$?
+  if [ "$rc" -ne 1 ] || ! printf '%s\n' "$expected" | cmp -s - "$dir.out"; then
+    echo "$(basename "$dir") exited ${rc}, expected 1 with exactly:" >&2
+    printf '%s\n' "$expected" >&2
+    echo "output:" >&2
+    cat "$dir.out" >&2
+    exit 1
+  fi
+}
+
 # Requires fixture file `$1` to contain the fixed string `$2`, so a fixture
 # edit that did not apply fails the self-test.
 require_text() {
@@ -96,6 +115,15 @@ sed -i.bak 's/cargo-machete --version 0.9.2/cargo-machete --version 0.9.1/' "$TM
 expect_fail "$TMP/mismatch-doc" "cargo-machete version mismatch" \
   ".github/workflows/ci.yml:6 pins 0.9.2" "docs/maintainers/building.md:2 pins 0.9.1"
 
+# A cargo-llvm-cov version bumped in building.md but not coverage.yml fails
+# with exactly one mismatch that names the coverage.yml reference pin first.
+make_fixture "$TMP/mismatch-doc-llvm-cov"
+sed -i.bak 's/cargo-llvm-cov --version 0.8.7/cargo-llvm-cov --version 0.8.6/' \
+  "$TMP/mismatch-doc-llvm-cov/docs/maintainers/building.md"
+expect_exact_fail "$TMP/mismatch-doc-llvm-cov" "error: cargo-llvm-cov version mismatch:
+  .github/workflows/coverage.yml:6 pins 0.8.7
+  docs/maintainers/building.md:1 pins 0.8.6"
+
 # A version bumped in ci.yml but not building.md fails, naming the tool.
 make_fixture "$TMP/mismatch-ci"
 sed -i.bak 's/cargo-deny@0.19.9/cargo-deny@0.19.10/' "$TMP/mismatch-ci/.github/workflows/ci.yml"
@@ -107,6 +135,15 @@ make_fixture "$TMP/mismatch-release"
 sed -i.bak 's/cargo-deny@0.19.9/cargo-deny@0.19.10/' "$TMP/mismatch-release/.github/workflows/release.yml"
 expect_fail "$TMP/mismatch-release" "cargo-deny version mismatch" \
   ".github/workflows/ci.yml:11 pins 0.19.9" ".github/workflows/release.yml:8 pins 0.19.10"
+
+# The check compares ci.yml with the coverage.yml reference pin of
+# cargo-llvm-cov and prints exactly that one mismatch.
+make_fixture "$TMP/llvm-cov-in-ci"
+printf '  coverage:\n    steps:\n      - uses: taiki-e/install-action@pinned\n        with:\n          tool: cargo-llvm-cov@0.8.6\n' \
+  >>"$TMP/llvm-cov-in-ci/.github/workflows/ci.yml"
+expect_exact_fail "$TMP/llvm-cov-in-ci" "error: cargo-llvm-cov version mismatch:
+  .github/workflows/coverage.yml:6 pins 0.8.7
+  .github/workflows/ci.yml:16 pins 0.8.6"
 
 # The check reads a workflow and an action with the .yaml extension too.
 make_fixture "$TMP/mismatch-yaml"
@@ -141,6 +178,17 @@ if grep -q "version mismatch" "$TMP/missing-ci.out"; then
   cat "$TMP/missing-ci.out" >&2
   exit 1
 fi
+
+# The cargo-llvm-cov pin removed from coverage.yml fails the same way, naming
+# coverage.yml as the reference workflow. The check still reads the other
+# files: it reports a stray line in release.yml and compares no version.
+make_fixture "$TMP/missing-coverage"
+sed -i.bak '/tool: cargo-llvm-cov/d' "$TMP/missing-coverage/.github/workflows/coverage.yml"
+printf '      - run: cargo install --locked cargo-llvm-cov --version 0.8.6\n' \
+  >>"$TMP/missing-coverage/.github/workflows/release.yml"
+expect_exact_fail "$TMP/missing-coverage" \
+  "error: no 'tool: cargo-llvm-cov@<version>' pin found in .github/workflows/coverage.yml
+error: .github/workflows/release.yml:10 names cargo-llvm-cov with a version outside the 'tool: cargo-llvm-cov@<version>' form"
 
 # A tool line removed from building.md fails the same way.
 make_fixture "$TMP/missing-doc"
@@ -195,8 +243,8 @@ expect_fail "$TMP/prose-doc" \
 make_fixture "$TMP/stray-ci"
 printf '      - run: cargo install --locked cargo-deny --version 0.19.9\n' >>"$TMP/stray-ci/.github/workflows/ci.yml"
 expect_fail "$TMP/stray-ci" \
-  ".github/workflows/ci.yml:17 names cargo-deny with a version outside the 'tool: cargo-deny@<version>' form"
-if [ "$(grep -c 'ci.yml:17 names' "$TMP/stray-ci.out")" -ne 1 ]; then
+  ".github/workflows/ci.yml:12 names cargo-deny with a version outside the 'tool: cargo-deny@<version>' form"
+if [ "$(grep -c 'ci.yml:12 names' "$TMP/stray-ci.out")" -ne 1 ]; then
   echo "stray-ci reported the line more than once:" >&2
   cat "$TMP/stray-ci.out" >&2
   exit 1

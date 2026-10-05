@@ -2,10 +2,12 @@
 """Offline regression checks for check-workflow-invariants.py.
 
 Copies the workflows, the composite action, and the scripts into a temporary
-root, then applies one violation per case. The check must fail, and one line
-of its output must name the case's rule and hold the case's message fragment.
-The unmodified copy must pass. Each replacement must match the expected
-number of times; a case whose text drifted fails.
+root. Each failing case applies its edits and must make the check exit 1. For
+each rule and message fragment the case expects, in order, a line of its
+output after the previous match must name the rule and hold the fragment. The
+unmodified copy must pass, and so must each copy that a PASSING entry edits
+into another accepted form. Each replacement must match the expected number
+of times; a case whose text drifted fails.
 """
 
 import pathlib
@@ -21,9 +23,25 @@ PUBLISH = ".github/workflows/publish.yml"
 SMOKE = ".github/workflows/notarize-smoke.yml"
 TRIAGE = ".github/workflows/triage.yml"
 WELCOME = ".github/workflows/welcome.yml"
+COVERAGE = ".github/workflows/coverage.yml"
 ACTION = ".github/actions/macos-sign-notarize/action.yml"
 SIGN_SCRIPT = ".github/actions/macos-sign-notarize/sign-notarize.sh"
 PUBLISH_SCRIPT = ".github/scripts/publish-crates.sh"
+COVERAGE_CONDITION = "github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage')"
+COVERAGE_IF_LINE = f"    if: {COVERAGE_CONDITION}\n"
+COVERAGE_IF_WRAPPED_LINE = f"    if: ${{{{ {COVERAGE_CONDITION} }}}}\n"
+COVERAGE_IF_SPACED_LINE = f'    if: "  {COVERAGE_CONDITION}  "\n'
+COVERAGE_TYPES_LINE = "    types: [opened, synchronize, reopened, labeled, unlabeled]\n"
+COVERAGE_ON_BLOCK = (
+    "on:\n"
+    "  pull_request:\n"
+    "    branches: [main]\n"
+    + COVERAGE_TYPES_LINE +
+    "  schedule:\n"
+    "    # Weekly, Monday 04:41 UTC.\n"
+    "    - cron: '41 4 * * 1'\n"
+    "  workflow_dispatch:\n"
+)
 
 SIGN_MACOS_FIRST_STEP = (
     "      - name: Check tool paths\n"
@@ -198,9 +216,18 @@ def publish_job_only(old, new):
     return [(PUBLISH, old, HELD, 2), (PUBLISH, old, new, 1), (PUBLISH, HELD, old, 1)]
 
 
+# label, [(file, old, new, expected occurrences)]; the edited copy must pass.
+PASSING = [
+    ("coverage job condition wrapped in ${{ }} passes", [
+        (COVERAGE, COVERAGE_IF_LINE, COVERAGE_IF_WRAPPED_LINE, 1)]),
+    ("coverage job condition with surrounding whitespace passes", [
+        (COVERAGE, COVERAGE_IF_LINE, COVERAGE_IF_SPACED_LINE, 1)]),
+]
+
 # label, expected rule, a fragment that one line naming the rule must hold,
 # [(file, old, new, expected occurrences)]; each edit replaces only the first
-# occurrence.
+# occurrence. A case that expects several lines gives a tuple of rules and a
+# tuple of fragments of the same length, in output order.
 CASES = [
     ("labels workflow without top-level permissions", "workflow-permissions",
      'labels.yml: workflow-permissions: no top-level permissions', [
@@ -576,6 +603,58 @@ CASES = [
     ("smoke workflow that is not valid YAML", "unreadable",
      '.github/workflows/notarize-smoke.yml: unreadable: ', [
         (SMOKE, "name: Notarization smoke\n", "name: [Notarization smoke\n", 1)]),
+    ("coverage pull_request trigger with a paths filter", "coverage-trigger", "paths filter", [
+        (COVERAGE, "    branches: [main]\n" + COVERAGE_TYPES_LINE,
+         "    branches: [main]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1)]),
+    ("coverage pull_request trigger with a paths-ignore filter", "coverage-trigger", "paths-ignore filter", [
+        (COVERAGE, "    branches: [main]\n" + COVERAGE_TYPES_LINE,
+         "    branches: [main]\n    paths-ignore: ['**.md']\n" + COVERAGE_TYPES_LINE, 1)]),
+    ("coverage pull_request trigger without unlabeled", "coverage-trigger", "lack unlabeled", [
+        (COVERAGE, "labeled, unlabeled]", "labeled]", 1)]),
+    ("coverage workflow without a pull_request trigger", "coverage-trigger", "trigger is absent", [
+        (COVERAGE, "  pull_request:\n    branches: [main]\n" + COVERAGE_TYPES_LINE, "", 1)]),
+    ("coverage job without the label condition", "coverage-condition", "label condition", [
+        (COVERAGE, COVERAGE_IF_LINE, "", 1)]),
+    ("coverage job that always measures", "coverage-condition", "label condition", [
+        (COVERAGE, COVERAGE_IF_LINE,
+         "    if: true || contains(github.event.pull_request.labels.*.name, 'coverage')\n", 1)]),
+    ("coverage job that never measures", "coverage-condition", "label condition", [
+        (COVERAGE, COVERAGE_IF_LINE,
+         "    if: false && contains(github.event.pull_request.labels.*.name, 'coverage')\n", 1)]),
+    ("coverage job without the non-pull-request bypass", "coverage-condition", "label condition", [
+        (COVERAGE, COVERAGE_IF_LINE, "    if: contains(github.event.pull_request.labels.*.name, 'coverage')\n", 1)]),
+    ("coverage workflow without its coverage job", "coverage-condition", "job coverage not found", [
+        (COVERAGE, "  coverage:\n    name: coverage\n", "  measure:\n    name: coverage\n", 1)]),
+    ("coverage pull_request trigger in the list shorthand", "coverage-trigger",
+     "coverage.yml: coverage-trigger: pull_request types are absent", [
+        (COVERAGE, COVERAGE_ON_BLOCK, "on: [pull_request, workflow_dispatch]\n", 1)]),
+    ("coverage pull_request trigger in the scalar shorthand", "coverage-trigger",
+     "coverage.yml: coverage-trigger: pull_request types are absent", [
+        (COVERAGE, COVERAGE_ON_BLOCK, "on: pull_request\n", 1)]),
+    ("coverage pull_request trigger without a configuration", "coverage-trigger",
+     "coverage.yml: coverage-trigger: pull_request types are absent", [
+        (COVERAGE, "  pull_request:\n    branches: [main]\n" + COVERAGE_TYPES_LINE, "  pull_request:\n", 1)]),
+    ("coverage pull_request types as a string", "coverage-trigger",
+     "coverage.yml: coverage-trigger: pull_request types are absent", [
+        (COVERAGE, COVERAGE_TYPES_LINE, "    types: labeled\n", 1)]),
+    ("coverage pull_request types as an empty list", ("coverage-trigger",) * 5, (
+        "coverage.yml: coverage-trigger: pull_request types lack opened",
+        "coverage.yml: coverage-trigger: pull_request types lack synchronize",
+        "coverage.yml: coverage-trigger: pull_request types lack reopened",
+        "coverage.yml: coverage-trigger: pull_request types lack labeled",
+        "coverage.yml: coverage-trigger: pull_request types lack unlabeled"), [
+        (COVERAGE, COVERAGE_TYPES_LINE, "    types: []\n", 1)]),
+    ("coverage pull_request types missing three events", ("coverage-trigger",) * 3, (
+        "coverage.yml: coverage-trigger: pull_request types lack synchronize",
+        "coverage.yml: coverage-trigger: pull_request types lack reopened",
+        "coverage.yml: coverage-trigger: pull_request types lack unlabeled"), [
+        (COVERAGE, COVERAGE_TYPES_LINE, "    types: [opened, labeled]\n", 1)]),
+    ("coverage paths filter and a missing condition", ("coverage-trigger", "coverage-condition"), (
+        "coverage.yml: coverage-trigger: pull_request trigger has a paths filter",
+        "coverage.yml: coverage-condition: coverage job runs without the label condition"), [
+        (COVERAGE, "    branches: [main]\n" + COVERAGE_TYPES_LINE,
+         "    branches: [main]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1),
+        (COVERAGE, COVERAGE_IF_LINE, "", 1)]),
 ]
 
 
@@ -589,6 +668,38 @@ def run_check(root):
     return result.returncode, result.stdout + result.stderr
 
 
+def apply_edits(root, edits):
+    """Applies each edit to the copy at root and returns one problem per edit whose text drifted."""
+    problems = []
+    for relative, old, new, expected in edits:
+        path = root / relative
+        text = path.read_text()
+        count = text.count(old)
+        if count != expected:
+            problems.append(f"{relative}: replacement text found {count} times, expected {expected}")
+            continue
+        path.write_text(text.replace(old, new, 1))
+    return problems
+
+
+def expectations(rule, fragment):
+    """Returns the (rule, fragment) pairs a case expects, in output order."""
+    if isinstance(rule, str):
+        return [(rule, fragment)]
+    return list(zip(rule, fragment, strict=True))
+
+
+def first_unmatched(output, expected):
+    """Returns the first expected pair that no line after the previous match holds, or None."""
+    position = 0
+    for line in output.splitlines():
+        if position < len(expected):
+            rule, fragment = expected[position]
+            if f": {rule}: " in line and fragment in line:
+                position += 1
+    return expected[position] if position < len(expected) else None
+
+
 def main():
     failures = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -600,25 +711,32 @@ def main():
         else:
             print("ok   unmodified tree passes")
 
+        for index, (label, edits) in enumerate(PASSING):
+            root = pathlib.Path(tmp) / f"passing{index}"
+            copy_tree(root)
+            problems = apply_edits(root, edits)
+            if not problems:
+                rc, output = run_check(root)
+                if rc != 0:
+                    problems.append(f"exit {rc}, expected 0: {output.strip()}")
+            if problems:
+                failures.append(f"{label}: {'; '.join(problems)}")
+            else:
+                print(f"ok   {label}")
+            shutil.rmtree(root)
+
         for index, (label, rule, fragment, edits) in enumerate(CASES):
             root = pathlib.Path(tmp) / f"case{index}"
             copy_tree(root)
-            problems = []
+            problems = apply_edits(root, edits)
             output = ""
-            for relative, old, new, expected in edits:
-                path = root / relative
-                text = path.read_text()
-                count = text.count(old)
-                if count != expected:
-                    problems.append(f"{relative}: replacement text found {count} times, expected {expected}")
-                    continue
-                path.write_text(text.replace(old, new, 1))
             if not problems:
                 rc, output = run_check(root)
                 if rc != 1:
                     problems.append(f"exit {rc}, expected 1")
-                if not any(f": {rule}: " in line and fragment in line for line in output.splitlines()):
-                    problems.append(f"no {rule} violation with {fragment!r} reported: {output.strip()}")
+                missing = first_unmatched(output, expectations(rule, fragment))
+                if missing is not None:
+                    problems.append(f"no {missing[0]} violation with {missing[1]!r} reported in order: {output.strip()}")
             if problems:
                 failures.append(f"{label}: {'; '.join(problems)}")
             else:
