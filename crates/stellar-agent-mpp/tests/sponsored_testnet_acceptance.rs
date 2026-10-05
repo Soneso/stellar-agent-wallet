@@ -58,6 +58,9 @@ const RPC_URL: &str = "https://soroban-testnet.stellar.org";
 const FRIENDBOT_URL: &str = "https://friendbot.stellar.org";
 const NATIVE_SAC_TESTNET: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
 const AMOUNT_STROOPS: i64 = 1_000;
+/// The released MPP server requires a challenge secret of at least 32 bytes.
+const CHALLENGE_SECRET: &str = "stellar-agent-sponsored-live-acceptance";
+const _: () = assert!(CHALLENGE_SECRET.len() >= 32);
 
 struct ServerProcess(Child);
 
@@ -136,7 +139,7 @@ fn start_server(
         .env("MPP_RECIPIENT", recipient)
         .env("MPP_CURRENCY", NATIVE_SAC_TESTNET)
         .env("MPP_RPC_URL", RPC_URL)
-        .env("MPP_CHALLENGE_SECRET", "stellar-agent-live-acceptance")
+        .env("MPP_CHALLENGE_SECRET", CHALLENGE_SECRET)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
