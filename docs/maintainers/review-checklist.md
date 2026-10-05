@@ -4,15 +4,6 @@ Every change is reviewed for production readiness before it is committed.
 Reviewers check the change against the dimensions below, and review repeats until
 the review approves with no blocking findings.
 
-## Reviewers
-
-- **Security reviewer**: security and key hygiene, dependency licensing, and the
-  project invariants.
-- **Code reviewer**: documentation, public API and dead code, reuse and
-  duplication, and test quality and coverage.
-- **Architecture reviewer**: reuse-versus-build and dependency choices, module
-  architecture, and overall production readiness.
-
 ## Dimensions
 
 ### 1. Correctness
@@ -103,6 +94,9 @@ the review approves with no blocking findings.
 
 ### 8. Build gates
 
+`bash .github/scripts/preflight.sh` runs the local CI checks that apply to the
+files your branch changes; `--full` runs every gate in its registry.
+
 All of the following pass:
 
 - `cargo fmt --all --check`
@@ -111,3 +105,34 @@ All of the following pass:
 - `cargo llvm-cov` meets the coverage bar
 - `cargo machete`
 - `cargo deny check`
+
+## Self-review before you open a pull request
+
+### Test teeth
+
+For each new test, revert the production lines it checks in a scratch copy, or
+introduce the specific defect. Run the test alone and confirm the relevant
+assertion fails. Restore the scratch copy afterward. A test that still passes
+has no teeth; fix it before the pull request. Name the tests you probed this
+way in the pull request description.
+
+### Quality criteria
+
+1. **Comments and docstrings** state what holds and why. Nothing in them is
+   stale, narrates the obvious, tells the history, or contrasts the code with
+   behavior it does not have.
+2. **Dead code.** No branch is unreachable, and no condition tests a state the
+   callers cannot produce.
+3. **Unused surface.** Every symbol, parameter, field, constant, and import
+   has a consumer, and each item's visibility matches what its callers need.
+4. **Duplication.** The change repeats no logic within itself and none that
+   the workspace already provides. Read the neighboring modules before you add
+   a helper.
+5. **Dark code.** The purpose of each item follows from its name, structure,
+   and comments. Names do not mislead, and the code prefers a plain
+   construction to a clever one.
+6. **Size and structure.** Each function has one responsibility, and every
+   abstraction earns its indirection.
+7. **House style.** The change follows the writing rules of
+   [CONTRIBUTING.md](../../CONTRIBUTING.md), the lint posture of the root
+   `Cargo.toml`, and the test naming of the crate it changes.

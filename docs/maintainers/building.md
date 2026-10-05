@@ -77,9 +77,149 @@ dependency, so nothing extra is required to build the workspace off Windows.
 
 ## Gate suite
 
-Every change is reviewed for production readiness and must pass all of the gates
-below before commit. They mirror the build-gate dimension of the
+A change to Rust code must pass all of the gates below before commit. A change
+to documentation, scripts, or workflows passes the checks of the Install
+surface workflow. They mirror the build-gate dimension of the
 [review checklist](review-checklist.md); run them locally before requesting review.
+
+### Preflight
+
+`.github/scripts/preflight.sh` runs the local CI checks that apply to the files
+a branch changes. It then prints one line per gate in the form the pull request
+template asks for.
+
+```bash
+bash .github/scripts/preflight.sh
+```
+
+- `--base <ref>` compares the branch with its merge base with `<ref>`. The
+  default is `origin/main`, or `main` when `origin/main` does not exist.
+- `--full` runs every gate in the registry, with the workspace test command.
+- `--list` prints the selected gates, one `<id><TAB><command>` line each in
+  registry order, and runs nothing.
+
+Run it from a Git checkout with bash 3.2 or later, Git, Python 3.11 or later,
+and the standard Unix utilities; new Markdown must be tracked for the style
+check to read it.
+
+The changed set is the union of the paths that differ from the merge base and
+the paths that `git status` lists. It includes untracked and deleted files.
+Every run includes the three always gates: `docs-style`, `install-surface`,
+and `gate-tool-versions`. Each path selects the gates of every scope class it
+matches:
+
+- The docs scope adds no gates beyond the three always gates. Directory scopes
+  also apply to Markdown files.
+- A workflow under `.github/workflows/`, a file under `.github/actions/`, or
+  `.github/labels.yml` selects `actionlint`.
+- A file under `.github/scripts/` selects the self-test of the script it
+  changes, and a changed shell script also selects shellcheck.
+- A file under `skills/` or `.claude-plugin/` selects the skill archive check.
+- A file under `crates/`, `tests/`, or `examples/`, or a root `Cargo.toml`,
+  `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`, `Cross.toml`, or
+  `deny.toml`, selects the Rust gates.
+- A file under `interop/` selects only the three always gates, since the
+  interop harnesses run under `--full`.
+
+The test gate runs `cargo test` for the packages that own the changed Rust
+paths, in path order, followed by their direct dependents, sorted by name. A
+dependent is a workspace member whose `[dependencies]`, `[dev-dependencies]`,
+or target-specific dependency table names an owner by `path`, directly or
+through `workspace = true`. The `--features` list holds the offline test
+features that at least one selected package declares: `test-helpers`,
+`test-hooks`, `test-loopback`, and `verifier-registry`, in that order. A
+changed Rust path outside every member, such as a root manifest, a path under
+`tests/`, or a deleted member manifest, selects the workspace command instead.
+
+Each gate lists the tools and Python modules it needs. A missing one makes the
+gate unavailable: its line names the requirement and an install hint, the later
+gates still run, and the run fails. The hints read their versions from the
+files that pin them: `actionlint` and `shellcheck` from the Install surface
+workflow, `cargo-llvm-cov` from the Coverage workflow, and the other cargo
+subcommands and Node from `ci.yml`.
+
+Each gate prints `=== <id>: <command>` before its own output and `RC=<n>` after
+it, and a failing gate does not stop the later ones. The run ends with the
+table for the pull request description and a summary line:
+
+```text
+- `python3 .github/scripts/check-docs-style.py`: exit 0
+- `python3 .github/scripts/check-install-surface.py`: exit 0
+- `bash .github/scripts/check-gate-tool-versions.sh`: exit 1
+- `actionlint`: unavailable (actionlint: brew install actionlint, or the <version> release archive)
+- `.github/scripts/test-mpp-interop.sh`: not run (--full; needs Node <version> and Corepack)
+- `.github/scripts/test-sdk-v17-interop.sh`: not run (--full; needs Node <version> and Corepack)
+preflight: 3 gates run, 1 failed, 1 unavailable
+```
+
+A gate that ran reads `exit <n>`. The two interop harnesses read `not run`
+without `--full`, and so do the coverage floors when the coverage run failed or
+was unavailable. The script exits 0 when no gate failed and none was
+unavailable, and 1 otherwise. It exits 2 for a usage error, a missing
+prerequisite, a base without a merge base, or an unreadable workspace manifest.
+
+The registry, in run order, with what selects each gate. `--full` selects every
+gate except `shellcheck-changed`, which needs a changed shell script.
+
+1. `docs-style`, `install-surface`, and `gate-tool-versions`: every run.
+2. `actionlint`: a workflow change.
+3. `workflow-invariants`: a change to `release.yml`, `publish.yml`,
+   `notarize-smoke.yml`, `labels.yml`, `stale.yml`, `triage.yml`,
+   `welcome.yml`, or `coverage.yml` under `.github/workflows/`, to
+   `.github/actions/`, or to a file under `.github/scripts/` that one of them
+   names.
+4. The self-tests, in filename order. Each runs when the file it tests or the
+   self-test itself changes:
+   - `test-check-docs-style.py`: `check-docs-style.py`
+   - `test-check-gate-tool-versions.sh`: `check-gate-tool-versions.sh`
+   - `test-check-install-surface.py`: `check-install-surface.py`
+   - `test-check-no-direct-sasignersetbaselined-emit.sh`:
+     `check-no-direct-sasignersetbaselined-emit.sh`
+   - `test-check-ref-on-main.sh`: `check-ref-on-main.sh`
+   - `test-check-workflow-invariants.py`: `check-workflow-invariants.py`
+   - `test-compare-crate-sums.py`: `compare-crate-sums.py`
+   - `test-preflight.sh`: `preflight.sh`
+   - `test-publish-crates-check.sh`: `publish-crates.sh`
+   - `test-publish-crates-verify.sh`: `publish-crates.sh`
+   - `test-rebuild-vendored-wasm.sh`: `rebuild-vendored-wasm.sh`
+   - `test-sync-labels.py`: `sync-labels.py`, `.github/labels.yml`, or
+     `.github/workflows/labels.yml`
+   - `test-take-workflow.py`: `.github/workflows/take.yml`
+   - `test-triage-workflow.py`: `.github/workflows/triage.yml`
+   - `test-validate-unsigned-archive.py`: `validate-unsigned-archive.py`
+   - `test-welcome-workflow.py`: `.github/workflows/welcome.yml`
+5. `shellcheck-preflight`: a change to `preflight.sh` or `test-preflight.sh`.
+6. `shellcheck-changed`: any other changed shell script under
+   `.github/scripts/` or `.github/actions/` that still exists, under `--full`
+   too.
+7. `package-skill`: a change under `skills/` or `.claude-plugin/`.
+8. `vendored-tree-check`: a change under `crates/stellar-agent-smart-account/`
+   or `contracts/`, or to `rebuild-vendored-wasm.sh`.
+9. `publish-check` and `baseline-gate`: `--full` only.
+10. `fmt`, `clippy`, `rustdoc`, and `test`: a Rust change.
+11. `test-vendored-release-cfg`: a Rust change whose test packages include
+    `stellar-agent-smart-account`, or that selects the workspace command.
+12. `machete`, `deny`, `coverage`, and `coverage-floors`: `--full` only.
+13. `interop:mpp` and `interop:sdk-v17`: `--full` only.
+
+`package-skill.sh`, `check-coverage.py`, `run-testnet-acceptance.sh`, and
+`release-preflight-version-check.sh` have no self-test. The preflight runs the
+workflow checks with `python3`, which needs PyYAML importable.
+
+The preflight does not carry these CI checks: the `windows-storage` job, the
+`stellar-agent-test-support` feature matrix of the `test` job, the setup steps,
+and the virtual environment of the workflow checks. Nor does it carry the
+rebuild of the `vendored-wasm` workflow: its two stellar-cli build jobs, its
+`rebuild` and `vendored-wasm` jobs, and the rebuild decision of its `check` job.
+
+Each registry entry names the workflow, job, and step of the CI step it
+mirrors, and the self-test checks those names against the workflows. Every
+step of a cited job that runs a command needs a registry entry or an entry in
+the not-carried list of `.github/scripts/test-preflight.sh`. A new, removed,
+or renamed step fails the self-test with the workflow, job, and step. The
+check reads step names, not commands, so a changed CI command needs the same
+change in the registry by hand.
+Package-scoped tests use the offline features the selected packages declare.
 
 ### Format
 
@@ -592,15 +732,8 @@ The depth of the review follows what a change touches:
 - A change to signing paths, key handling, or serialized state also gets a
   second review pass against the full [review checklist](review-checklist.md).
 
-The second review pass keeps the three reviewer roles of the checklist. The
-security review covers security and key hygiene, dependency licensing, and
-project invariants. The code review covers documentation, public API and dead
-code, reuse and duplication, and test quality and coverage. The architecture
-review covers reuse-versus-build and dependency choices, module architecture,
-and production readiness. Review repeats until a pass ends with no blocking
-findings. The build gates above are one dimension of that checklist; the other
-dimensions cover correctness, key hygiene, tests and coverage, documentation,
-reuse and dependencies, public API and dead code, and licensing and invariants.
+The second review pass checks the change against every dimension of the
+checklist. Review repeats until a pass ends with no blocking findings.
 
 See [../../CONTRIBUTING.md](../../CONTRIBUTING.md) for the contribution workflow.
 
