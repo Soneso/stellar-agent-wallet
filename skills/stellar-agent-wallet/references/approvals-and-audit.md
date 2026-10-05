@@ -126,8 +126,17 @@ HMAC blob (URL-safe base64, no padding) the agent must present to `*_commit`.
 The field is omitted for approval kinds whose gate reads the recorded consent
 from the store directly (toolset first-invoke grants, trustline clawback opt-ins).
 
+The `approval_attested` row is written before the approval is persisted. `audit`
+is `"written"` when the command wrote it to the log. It is `"queued"` when a
+running MCP server or `approve serve` inbox held the audit writer and the row
+went to the audit outbox. That process appends it to the log before any process
+loads a signing key for the approved action. The command refuses and persists nothing
+beside a process that does not drain the outbox (`audit.writer_locked`), and on
+any other audit failure. After upgrading, restart a running MCP server and
+`approve serve`: `approve --id` refuses beside an older one.
+
 ```json
-{"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v..."},"request_id":"..."}
+{"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v...","audit":"written"},"request_id":"..."}
 ```
 
 ## The approval spine
@@ -178,6 +187,12 @@ Per kind:
 | `RuleProposalSimulated` | Computes the HMAC attestation over `proposal_sha256` (the domain-separated digest of the FULL resolved rule definition), not an envelope hash; persists it and returns `approval_attestation`. A DEDICATED gate verifies it at commit. The shared `PaymentSimulated`/`ClaimSimulated` gate rejects this kind outright. |
 | `MppChargeSimulated` | Attests the prepared artifact hash under the profile and chain binding; returns `approval_attestation`. |
 | `Consumed` | Already resolved; cannot be attested again. |
+
+For every kind the consent row is written first and is fatal: when it cannot be
+written, nothing is recorded. The store entry is re-read under its lock just
+before the row. An entry another process attested, rejected, or consumed since
+validation is refused with `approval.already_attested`, `approval.rejected`, or
+`approval.consumed`, and no row is written.
 
 The CLI summary and both inbox detail pages show the profile name, CAIP-2 chain id, endpoint authority, and enrolled signer.
 An enrollment placeholder appears as `(not enrolled)`.
@@ -327,9 +342,12 @@ first-five-last-five and transaction hashes to first-eight-last-eight; the
 envelope hash is left intact (it is a SHA-256 digest carrying no user data).
 
 Beyond tool invocations, the log records `value_action_submitted` on every
-confirmed value-moving submit (carrying the gate-sized value legs),
-`keyring_key_written` on each key-writing profile command, and
-`x402_payment_authorized` on x402 authorization signing. MPP adds
+confirmed value-moving submit (carrying the gate-sized value legs) and
+`keyring_key_written` on each key-writing profile command. It records
+`x402_payment_authorized` before a signed x402 authorization leaves the wallet
+in the RPC re-simulation. When that payment then fails, it records
+`x402_authorization_withheld` with the same request id and a `failure_stage`
+of `resimulation`, `response_processing`, or `encoding`. MPP adds
 `mpp_charge_authorized`, `mpp_authorization_withheld`, `mpp_receipt_observed`,
 and `mpp_settlement_reconciled`; these carry only hashes, redacted references,
 the exact policy-sized legs, and closed status labels, never a credential,
@@ -404,9 +422,9 @@ writer compares the profile with the record:
 
 The refusal names the profile and the remedy, never a path or coordinate. It
 covers the value-moving verbs and tools, the read-only smart-account verbs,
-`approve serve`, `audit verify --profile`, and `profile rotate-audit-key`, and
+`approve --id <nonce>`, `approve serve`, `audit verify --profile`, and `profile rotate-audit-key`, and
 creates nothing at the path the profile names. A command whose audit row is
-best effort skips the row and continues: `approve --id <nonce>`,
+best effort skips the row and continues:
 `credentials add-passkey`, `profile reset-window-state`, and the other `profile`
 enroll and rotate verbs.
 Not agent-recoverable: the operator establishes
@@ -511,11 +529,13 @@ of wire codes, for example `audit.chain_broken`, `audit.rotation_gap`,
 `audit.hmac_mismatch`, `audit.tip_anchor_mismatch`, with line and file detail
 kept out of the code.
 
+`outbox_pending` counts the consent rows queued in the audit outbox beside the log (`<LOG_PATH>.outbox`) and not yet drained into it, read without taking the outbox lock. Queued rows sit outside the tip anchor until a draining writer appends them. A torn outbox adds an `outbox_torn_tail` warning and unparseable lines add `outbox_unparseable`. An unreadable outbox adds `outbox_unreadable` and omits `outbox_pending`, since no count is known. None of them changes the chain verdict.
+
 ```bash
 stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --profile default
 ```
 ```json
-{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false,"anchor":{"status":"verified","reason":null}},"request_id":"..."}
+{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false,"anchor":{"status":"verified","reason":null},"outbox_pending":0},"request_id":"..."}
 ```
 
 ### `audit reanchor` command reference
@@ -552,8 +572,10 @@ no stop: a server running the edited profile refuses before it opens the new
 path, so it holds no lock there. A server still running the old profile refuses
 after the acknowledgement until it restarts.
 
+Queued consent rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, or the condition an append refused on, such as `audit.io_error`.
+
 ```json
-{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"recorded_binding":"equal","previous_binding_anchor":null},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"recorded_binding":"equal","previous_binding_anchor":null,"outbox_drained":0},"request_id":"..."}
 ```
 
 ## The governance loop end to end

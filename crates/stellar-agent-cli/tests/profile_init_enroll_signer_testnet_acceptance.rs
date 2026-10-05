@@ -15,7 +15,7 @@
 //! A fresh temp directory stands in for `STELLAR_AGENT_HOME` (only ever set on
 //! the CHILD processes' environments, never the test-process environment).
 //! The profile name is unique per test run
-//! (`profile-init-acceptance-<pid>-<unix_secs>`) so the OS keyring coordinate
+//! (`profile-init-acceptance-<pid>-<unix_secs>-<n>`) so the OS keyring coordinate
 //! `enroll-signer` writes to (below) never collides with a concurrent or
 //! prior local run.
 //!
@@ -133,7 +133,7 @@ const SIGNER_SECRET_ENV_VAR: &str = "PROFILE_INIT_ACCEPTANCE_SIGNER_SECRET";
 const PROOF_ASSET_CODE: &str = "ACCTPROOF";
 
 /// Builds a profile name unique to this test run:
-/// `profile-init-acceptance-<pid>-<unix_secs>`.
+/// `profile-init-acceptance-<pid>-<unix_secs>-<n>`.
 ///
 /// The profile TOML lives inside the test's own fresh tempdir and so cannot
 /// collide across runs on its own, but the OS keyring coordinate
@@ -142,11 +142,7 @@ const PROOF_ASSET_CODE: &str = "ACCTPROOF";
 /// unique per run so repeated local runs (or a concurrent CI matrix) never
 /// collide on the signer-service half of that coordinate.
 fn unique_profile_name() -> String {
-    let unix_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock must work")
-        .as_secs();
-    format!("profile-init-acceptance-{}-{unix_secs}", std::process::id())
+    stellar_agent_test_support::profile_fixtures::unique_profile_name("profile-init-acceptance")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

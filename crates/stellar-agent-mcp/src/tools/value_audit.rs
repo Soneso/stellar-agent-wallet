@@ -1,11 +1,15 @@
 //! Shared audit emission for value-moving MCP tools.
 //!
-//! Value verbs (pay, create_account, claim, trustline, the DeFi adapters, the
-//! x402 authorizers, and the opaque sep43 submit) record a hash-chained,
-//! HMAC-signed row after the on-chain action is confirmed — or, for x402, at
-//! the point the authorization signature is produced. Emission is NON-FATAL
-//! post-success: the action has already committed, so a row-write failure logs
-//! a `tracing::warn!` and never changes the tool result or exit path.
+//! Value verbs (pay, create_account, claim, trustline, the DeFi adapters, and
+//! the opaque sep43 submit) record a hash-chained, HMAC-signed row after the
+//! on-chain action is confirmed. That emission is NON-FATAL post-success: the
+//! action has already committed, so a row-write failure logs a
+//! `tracing::warn!` and never changes the tool result or exit path.
+//!
+//! The x402 authorizers and the MPP commit write their authorization row
+//! through [`emit_value_audit_row_strict`] before the signed authorization
+//! leaves the wallet or the credential is released. A failure there withholds
+//! it.
 //!
 //! The legs carried in a row are the SAME `ValueEffects` the policy gate sized
 //! (single-derivation invariant); this module only serialises what the caller
@@ -24,17 +28,20 @@
 //! transaction submitted: it proves the audit writer is acquirable, refusing
 //! with `audit.chain_key_unavailable` if not. The tool then threads the
 //! returned writer into [`emit_value_audit_row_with_writer`] for the
-//! post-confirm row — no second acquisition, no re-acquisition race.
-//! `stellar_mpp_charge_commit` is exempt: it already fails closed via
-//! [`emit_value_audit_row_strict`], which refuses on the same conditions under
-//! the same wire codes and carries its own withheld-authorization telemetry, so
-//! a second gate would only re-check what the credential already hangs on.
+//! post-confirm row, with no second acquisition.
+//!
+//! Every keyed acquisition also drains the audit outbox: consent rows that
+//! `stellar-agent approve` queued while this server held the writer enter the
+//! log there. A commit that consumes an approval acquires the writer after it
+//! reads the approval and before it loads the signing key, so the consent row
+//! is in the log before the key is touched. `stellar_mpp_charge_commit` makes
+//! that acquisition after `verify_pending_approval`, and its delivery gate
+//! writes through [`emit_value_audit_row_strict`].
 
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::audit_log::{
-    AuditEntry, AuditWriter, AuditWriterRegistry, BindingCheck, WriterError,
-    audit_log_unusable_detail,
+    AuditEntry, AuditWriter, AuditWriterRegistry, BindingCheck, WriterError, audit_writer_refusal,
 };
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
@@ -45,38 +52,41 @@ use stellar_agent_network::keyring::keyed_audit_access;
 /// commit/submit MCP tools.
 ///
 /// Callers invoke this BEFORE any signing key is touched and BEFORE any
-/// transaction is submitted (see the module docs). On success, the returned
-/// writer MUST be reused for the tool's post-confirm emission
-/// ([`emit_value_audit_row_with_writer`]) rather than re-acquired.
+/// transaction is submitted (see the module docs). A tool with a post-confirm
+/// row reuses the returned writer for it
+/// ([`emit_value_audit_row_with_writer`]) rather than re-acquiring it. A tool
+/// whose row is written strictly before a transmission discards the handle,
+/// and the strict write acquires again.
 ///
 /// This is the MCP twin of the CLI's
 /// `crate::commands::value_audit::require_value_audit_writer` (in the
-/// `stellar-agent-cli` crate, so not directly linkable): the two
-/// implementations MUST stay wire-identical — same wire code on the same
-/// underlying failure, same fail-closed semantics — so a
-/// `pay`/`claim`/`trustline`/`trade` refusal reads the same whether it came
-/// from the MCP tool or its CLI verb counterpart.
+/// `stellar-agent-cli` crate, so not directly linkable). The two stay
+/// wire-identical: the same underlying failure gets the same wire code, and
+/// both fail closed. A refusal therefore reads the same whether it came from
+/// the MCP tool or its CLI verb counterpart.
 ///
 /// # Errors
 ///
-/// Returns [`WalletError::Validation`] wrapping one of two variants — both
-/// carry the same wire code (`audit.chain_key_unavailable`) but distinct
-/// operator-facing remedies, since the two failure modes have different
-/// fixes:
-/// - [`ValidationError::AuditChainKeyUnavailable`] when the profile's audit
-///   chain-root HMAC key cannot be loaded from the platform keyring — a
-///   `profile init`-minted profile has no audit chain-root key until
-///   `stellar-agent profile rotate-audit-key <profile>` mints one.
-/// - [`ValidationError::AuditWriterOpenFailed`] when the key loaded but the
-///   audit writer could not be opened at `profile.audit_log_path` (e.g. a
-///   registry path/key mismatch against an earlier open in this process) —
-///   rotating the audit key does not fix this.
-/// - [`ValidationError::AuditTipAnchorMismatch`] when the log's chain tip is not
-///   the one its keyring-held anchor names — the log was rolled back,
-///   truncated, or replaced. The registry runs that check on EVERY keyed
-///   acquisition, not only the first, because it caches one writer per profile
-///   for the process lifetime and a check at open alone would miss a file
-///   swapped underneath a live writer.
+/// Returns [`WalletError::Validation`] wrapping one of five variants, each
+/// with its own operator-facing remedy:
+/// - [`ValidationError::AuditChainKeyUnavailable`] (`audit.chain_key_unavailable`)
+///   when the profile's audit chain-root HMAC key cannot be loaded from the
+///   platform keyring. A `profile init`-minted profile has no audit chain-root
+///   key until `stellar-agent profile rotate-audit-key <profile>` mints one.
+/// - [`ValidationError::AuditTipAnchorMismatch`] (`audit.tip_anchor_mismatch`)
+///   when the log's chain tip is not the one its keyring-held anchor names: the
+///   log was rolled back, truncated, or replaced. The registry runs that check
+///   on EVERY keyed acquisition, because it caches one writer per profile for
+///   the process lifetime.
+/// - [`ValidationError::AuditLogUnusable`] (`audit.chain_key_unavailable`) when
+///   the writer refused on a condition about the log. Its detail leads with the
+///   `audit.*` sub-code: for example `audit.writer_locked`,
+///   `audit.outbox_busy`, `audit.outbox_unusable`, or `audit.chain_broken`.
+///   Rotating the audit key fixes none of them.
+/// - [`ValidationError::AuditWriterOpenFailed`] (`audit.chain_key_unavailable`)
+///   when the key loaded but the registry refused the path or key registration,
+///   a mismatch against an earlier open in this process. Rotating the audit
+///   key does not fix this.
 /// - [`ValidationError::AuditLogBindingChanged`] when the profile names a log
 ///   path or audit key other than the binding recorded in the keyring.
 ///   `binding` is the check the server stored at startup.
@@ -106,49 +116,17 @@ pub(crate) fn require_value_audit_writer(
         .map_err(|e| audit_writer_acquisition_error(profile_name, &e))
 }
 
-/// Maps a writer-acquisition failure to the wire code that names it.
-///
-/// Three outcomes, because three different things are wrong and three different
-/// things fix them:
-///
-/// - A tip-anchor mismatch carries `audit.tip_anchor_mismatch`: the log may have
-///   been rolled back, and only `audit reanchor` addresses that.
-/// - A condition about the LOG — a held writer lock, an unusable rotation
-///   bridge, a broken chain, an unreadable anchor — carries
-///   `ValidationError::AuditLogUnusable`, whose message names the condition by
-///   its `audit.*` sub-code and points at the recovery runbook. Telling the
-///   operator to rotate a key here would send them somewhere useless.
-/// - Everything left is a registry path or key registration conflict, which is
-///   what `AuditWriterOpenFailed`'s wording describes.
+/// Maps a writer-acquisition failure to the wire code that names it, through
+/// [`audit_writer_refusal`], the one mapping every audit refusal uses.
 fn audit_writer_acquisition_error(profile_name: &str, e: &WriterError) -> WalletError {
-    if let WriterError::TipAnchorMismatch { reason, .. } = e {
-        tracing::warn!(
-            profile = %profile_name,
-            error = %e,
-            "value audit: audit log tip anchor mismatch; refusing before signing/submit"
-        );
-        return WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
-            profile: profile_name.to_owned(),
-            reason: (*reason).to_owned(),
-        });
-    }
-    if let Some(detail) = audit_log_unusable_detail(e) {
-        tracing::warn!(
-            profile = %profile_name,
-            error = %e,
-            "value audit: audit log unusable; refusing before signing/submit"
-        );
-        return WalletError::Validation(ValidationError::AuditLogUnusable {
-            profile: profile_name.to_owned(),
-            detail,
-        });
-    }
+    let refusal = audit_writer_refusal(profile_name, e);
     tracing::warn!(
         profile = %profile_name,
         error = %e,
-        "value audit: could not open audit writer; refusing before signing/submit"
+        code = refusal.code(),
+        "value audit: audit writer unavailable; refusing before signing/submit"
     );
-    audit_writer_open_failed(profile_name)
+    refusal
 }
 
 /// Whether `e` is the audit binding refusal.
@@ -174,9 +152,9 @@ fn audit_writer_open_failed(profile_name: &str) -> WalletError {
 /// Writes `entry` through an audit writer the caller already acquired (via
 /// [`require_value_audit_writer`]).
 ///
-/// Non-fatal: the write has nothing left to gate — the transaction (or, for
-/// x402, the authorization signature) already committed — so a failure to
-/// take the lock or append the row logs a `tracing::warn!` and returns without
+/// Non-fatal: the write has nothing left to gate, since the transaction or the
+/// sign-only signature it records already committed. A failure to take the
+/// lock or append the row logs a `tracing::warn!` and returns without
 /// disturbing the caller. Callers construct `entry` with the gate-derived legs
 /// already in hand (e.g. [`AuditEntry::new_value_action_submitted`]).
 pub(crate) fn emit_value_audit_row_with_writer(
@@ -206,10 +184,10 @@ pub(crate) fn emit_value_audit_row_with_writer(
 /// Writes an authorization audit row and fails closed on every acquisition,
 /// locking, or persistence error.
 ///
-/// MPP calls this before releasing a credential, so unlike the post-submit
-/// helper above (which writes after an action already committed and
-/// therefore cannot withhold anything), failure here can and must withhold
-/// the artifact.
+/// MPP calls this before releasing a credential, and the x402 transmit gate
+/// calls it before the signed authorization leaves the wallet. Unlike the
+/// post-submit helper above, which writes after an action already committed,
+/// a failure here withholds the artifact.
 ///
 /// Acquiring the writer runs the anchor check, so a log rolled back, truncated,
 /// or replaced under the running server refuses HERE and nothing is released.
@@ -220,11 +198,12 @@ pub(crate) fn emit_value_audit_row_with_writer(
 /// # Errors
 ///
 /// [`WalletError::Validation`], with the same variants and wire codes
-/// [`require_value_audit_writer`] produces. The append runs the same
-/// tip-anchor check the acquisition does, so a refusal there carries
-/// [`ValidationError::AuditTipAnchorMismatch`] and its reason rather than a
-/// registration-conflict code; everything else carries
-/// [`ValidationError::AuditWriterOpenFailed`].
+/// [`require_value_audit_writer`] produces. The append runs the checks the
+/// acquisition does and maps a refusal the same way: a tip-anchor mismatch to
+/// [`ValidationError::AuditTipAnchorMismatch`], a condition about the log to
+/// [`ValidationError::AuditLogUnusable`], and anything else to
+/// [`ValidationError::AuditWriterOpenFailed`]. A poisoned writer mutex
+/// carries [`ValidationError::AuditWriterOpenFailed`].
 pub(crate) fn emit_value_audit_row_strict(
     profile: &Profile,
     profile_name: &str,
@@ -297,6 +276,20 @@ mod tests {
                 WriterError::FileLocked,
                 "audit.chain_key_unavailable",
                 "audit.writer_locked",
+            ),
+            (
+                WriterError::OutboxBusy,
+                "audit.chain_key_unavailable",
+                "audit.outbox_busy",
+            ),
+            (
+                WriterError::OutboxUnusable {
+                    line: 2,
+                    column: 1,
+                    reason: "invalid JSON",
+                },
+                "audit.chain_key_unavailable",
+                "audit.outbox_unusable",
             ),
             (
                 WriterError::RotationBridgeUnusable {

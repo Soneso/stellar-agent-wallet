@@ -61,7 +61,7 @@ use rmcp::{
     schemars, serde, tool, tool_router,
 };
 use serde_json::json;
-use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision, ValueLegRecord};
+use stellar_agent_core::audit_log::ValueLegRecord;
 use stellar_agent_core::policy::v1::ValueClass;
 use stellar_agent_mcp_macros::mcp_tool_router;
 
@@ -71,7 +71,7 @@ use crate::server::WalletServer;
 use crate::tools::common::{
     decode_payment_required_input, x402_error_to_tool_result, x402_value_leg,
 };
-use crate::tools::value_audit::emit_value_audit_row_with_writer;
+use crate::tools::x402_create_payment::{X402AuthorizationAudit, X402Failure};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // payTo-anchoring signal
@@ -388,23 +388,21 @@ impl WalletServer {
         // Runs AFTER the dispatch gate: a policy denial or approval escalation
         // authorizes no payment and needs no audit setup, so it must surface
         // its own code rather than audit.chain_key_unavailable. The pre-flight
-        // still precedes the SEP-10 identity gate, the signer load, and the
-        // payment authorization — no signature may exist unless the row
-        // recording its production can be written. Reused (not re-acquired) for
-        // the post-signature `x402_payment_authorized` row.
-        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
+        // precedes the SEP-10 identity gate and the signer load, so a log that
+        // cannot take a row refuses before any key is touched. It keeps no
+        // handle: the transmit gate writes the `x402_payment_authorized` row
+        // through its own registry acquisition, which reruns the anchor check
+        // immediately before the signed authorization is sent.
+        if let Err(err) = crate::tools::value_audit::require_value_audit_writer(
             &self.profile,
             &self.profile_name_for_approval(),
             self.audit_binding,
         ) {
-            Ok(w) => w,
-            Err(err) => {
-                return Ok(crate::tools::common::business_error_result(
-                    err.code(),
-                    err.to_string(),
-                ));
-            }
-        };
+            return Ok(crate::tools::common::business_error_result(
+                err.code(),
+                err.to_string(),
+            ));
+        }
 
         tracing::debug!(
             chain_id = %args.chain_id,
@@ -424,21 +422,23 @@ impl WalletServer {
         //
         // Any failure here aborts BEFORE create_payment is called.
         let network_passphrase = self.context.network_passphrase();
-        let session =
-            match resolve_and_verify_counterparty(&args.home_domain, network_passphrase).await {
-                Ok(s) => s,
-                Err(ref err) => {
-                    tracing::warn!(
-                        error_code = %err.wire_code(),
-                        home_domain = %args.home_domain,
-                        "x402_authenticated_payment: identity gate aborted before payment",
-                        // NEVER log err details that might contain URL paths
-                        // (IdentityError::Display is redaction-safe, but explicit
-                        // redact at the span boundary is belt-and-braces).
-                    );
-                    return Ok(identity_error_to_tool_result(err));
-                }
-            };
+        let session = match self
+            .verify_x402_counterparty(&args.home_domain, network_passphrase)
+            .await
+        {
+            Ok(s) => s,
+            Err(ref err) => {
+                tracing::warn!(
+                    error_code = %err.wire_code(),
+                    home_domain = %args.home_domain,
+                    "x402_authenticated_payment: identity gate aborted before payment",
+                    // NEVER log err details that might contain URL paths
+                    // (IdentityError::Display is redaction-safe, but explicit
+                    // redact at the span boundary is belt-and-braces).
+                );
+                return Ok(identity_error_to_tool_result(err));
+            }
+        };
 
         tracing::debug!(
             home_domain = %args.home_domain,
@@ -512,24 +512,46 @@ impl WalletServer {
             return Ok(refusal);
         }
 
-        let payment_payload =
-            match create_payment(&requirements, signer.as_ref(), rpc_url, network_passphrase).await
-            {
-                Ok(p) => p,
-                Err(source) => {
-                    tracing::warn!(
-                        "x402_authenticated_payment: create_payment failed after identity gate",
-                    );
-                    // Surface a uniform single-pipeline error envelope. The
-                    // X402Error Display is redaction-safe (authority-only, no secrets).
-                    return Ok(payment_build_error_result(&source.to_string()));
+        // The transmit gate writes `x402_payment_authorized` before the signed
+        // authorization leaves the wallet in the re-simulation. Both rows of
+        // this payment share the request id minted here.
+        let mut audit = X402AuthorizationAudit::new(
+            self,
+            "stellar_x402_authenticated_payment",
+            args.chain_id.as_str(),
+            audit_leg,
+        );
+        let created = create_payment(
+            &requirements,
+            signer.as_ref(),
+            rpc_url,
+            network_passphrase,
+            |authorization| audit.before_transmit(authorization),
+        )
+        .await;
+        let payment_payload = match created {
+            Ok(p) => p,
+            Err(source) => {
+                tracing::warn!(
+                    "x402_authenticated_payment: create_payment failed after identity gate",
+                );
+                // An audit refusal at the transmit gate answers its own
+                // `audit.*` code; it is not a payment-build failure.
+                if let Some(refusal) = audit.refusal_result() {
+                    return Ok(refusal);
                 }
-            };
+                audit.record_withheld(X402Failure::CreatePayment(&source));
+                // Surface a uniform single-pipeline error envelope. The
+                // X402Error Display is redaction-safe (authority-only, no secrets).
+                return Ok(payment_build_error_result(&source.to_string()));
+            }
+        };
 
         // ── Step 6: Encode PAYMENT-SIGNATURE ─────────────────────────────────
         let payment_signature = match encode_payment_signature(&payment_payload) {
             Ok(sig) => sig,
             Err(source) => {
+                audit.record_withheld(X402Failure::Encoding);
                 return Ok(payment_build_error_result(&source.to_string()));
             }
         };
@@ -543,25 +565,6 @@ impl WalletServer {
             home_domain = %args.home_domain,
             "x402_authenticated_payment: payment payload constructed",
             // NEVER log session.jwt.
-        );
-
-        // Non-fatal audit row at signature production. The wallet is the payer;
-        // the host settles externally, so there is no on-chain submit — the row
-        // records the authorized value, not a confirmed transaction.
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let audit_entry = AuditEntry::new_x402_payment_authorized(
-            "stellar_x402_authenticated_payment",
-            args.chain_id.as_str(),
-            vec![audit_leg],
-            requirements.network.as_str(),
-            requirements.scheme.as_str(),
-            PolicyDecision::Allow,
-            &request_id,
-        );
-        emit_value_audit_row_with_writer(
-            &audit_writer,
-            &self.profile_name_for_approval(),
-            audit_entry,
         );
 
         // ── Build response ────────────────────────────────────────────────────
@@ -593,6 +596,30 @@ impl WalletServer {
             .to_json_pretty()
             .unwrap_or_else(|_| String::from("{}"));
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
+    }
+}
+
+impl WalletServer {
+    /// Runs the SEP-10 counterparty-identity gate for `home_domain`.
+    ///
+    /// A test build may stand a fixed session in for the gate; see
+    /// `WalletServer::set_x402_identity_session_for_test`. Production always
+    /// runs the gate.
+    async fn verify_x402_counterparty(
+        &self,
+        home_domain: &str,
+        network_passphrase: &str,
+    ) -> Result<stellar_agent_x402_identity::VerifiedCounterpartySession, IdentityError> {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if let Some((jwt, sub, accounts)) = &self.x402_identity_session_override {
+            return Ok(stellar_agent_x402_identity::VerifiedCounterpartySession {
+                jwt: jwt.clone(),
+                sub: sub.clone(),
+                home_domain: home_domain.to_owned(),
+                accounts: accounts.clone(),
+            });
+        }
+        resolve_and_verify_counterparty(home_domain, network_passphrase).await
     }
 }
 

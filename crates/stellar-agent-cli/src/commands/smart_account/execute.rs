@@ -120,6 +120,7 @@ use crate::commands::smart_account::common::{
     SignerSourceFlags, construct_signers_manager_from_fields, load_command_profile,
     map_access_error, open_audit_writer, resolve_signer, wrap_sa_error,
 };
+use crate::commands::value_audit::write_row_logged;
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
 };
@@ -725,9 +726,6 @@ fn write_success_audit_rows(
     chain_id: &str,
     request_id: &str,
 ) {
-    let Ok(mut writer) = audit_writer.lock() else {
-        return;
-    };
     let raw = AuditEntry::new_sa_raw_invocation(
         account_redacted.to_owned(),
         "sa.ok".to_owned(),
@@ -737,7 +735,7 @@ fn write_success_audit_rows(
         chain_id,
         request_id.to_owned(),
     );
-    let _ = writer.write_entry(raw);
+    write_row_logged(audit_writer, raw, "sa_raw_invocation", request_id);
 
     let domain = AuditEntry::new_sa_external_execute_submitted(
         RedactedStrkey::from_already_redacted(account_redacted.to_owned()),
@@ -751,7 +749,12 @@ fn write_success_audit_rows(
         chain_id,
         request_id.to_owned(),
     );
-    let _ = writer.write_entry(domain);
+    write_row_logged(
+        audit_writer,
+        domain,
+        "sa_external_execute_submitted",
+        request_id,
+    );
 }
 
 /// Writes the `SaRawInvocation` audit row for a failed submission.
@@ -771,9 +774,6 @@ fn write_failure_audit_row(
     chain_id: &str,
     request_id: &str,
 ) {
-    let Ok(mut writer) = audit_writer.lock() else {
-        return;
-    };
     let result = classify_invocation_result(err);
     let raw = AuditEntry::new_sa_raw_invocation(
         account_redacted.to_owned(),
@@ -784,7 +784,7 @@ fn write_failure_audit_row(
         chain_id,
         request_id.to_owned(),
     );
-    let _ = writer.write_entry(raw);
+    write_row_logged(audit_writer, raw, "sa_raw_invocation", request_id);
 }
 
 /// Minimal phase-based `SaError` -> `SaInvocationResult` classifier for the

@@ -52,6 +52,7 @@ use stellar_agent_core::{
     profile::schema::Profile,
 };
 use stellar_agent_mcp::server::{WalletServer, check_duplicate_registrations};
+use stellar_agent_test_support::source_order::{assert_called_between, production_half};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: iterate all registered McpToolRegistration records
@@ -1597,6 +1598,10 @@ const MOVES_VALUE_COMMIT_HANDLER_SOURCES: &[(&str, &str)] = &[
         "stellar_x402_create_payment",
         include_str!("../src/tools/x402_create_payment.rs"),
     ),
+    (
+        "stellar_mpp_charge_commit",
+        include_str!("../src/tools/mpp.rs"),
+    ),
 ];
 
 /// `MovesValue` tools NOT covered by [`MOVES_VALUE_COMMIT_HANDLER_SOURCES`],
@@ -1605,17 +1610,12 @@ const MOVES_VALUE_COMMIT_HANDLER_SOURCES: &[(&str, &str)] = &[
 /// single authoritative statement of `MovesValue` audit-pre-flight coverage.
 ///
 /// - `stellar_pay`, `stellar_create_account`, `stellar_claim`,
-///   `stellar_trustline`, `stellar_mpp_charge_prepare` — the simulate-phase
-///   half of a two-phase verb; each mints a nonce/preview but never signs or
-///   submits, so there is nothing to gate. The `_commit` sibling that DOES
-///   sign lives in the same source file (already covered above), except
-///   `stellar_mpp_charge_prepare`, whose sibling is the next exemption.
-/// - `stellar_mpp_charge_commit` — fails closed via
-///   `emit_value_audit_row_strict` instead: MPP's own strict-mode emission
-///   already withholds the authorization credential on any acquisition,
-///   locking, or persistence failure, so a duplicate
-///   `require_value_audit_writer` call would only change the wire code of an
-///   already fail-closed path (see `value_audit.rs`'s module doc).
+///   `stellar_trustline`, `stellar_mpp_charge_prepare`: the simulate-phase
+///   half of a two-phase verb; each mints a nonce or a preview but never signs
+///   or submits, so there is nothing to gate. The `_commit` sibling that does
+///   sign is covered above; for `stellar_mpp_charge_prepare` that sibling is
+///   `stellar_mpp_charge_commit`, whose acquisition after the approval read
+///   drains the audit outbox before the signing key loads.
 ///
 /// Two related but OUT-OF-SCOPE surfaces are intentionally absent from both
 /// lists because they are not `MovesValue`-classified at all, so this test
@@ -1631,7 +1631,6 @@ const MOVES_VALUE_SIMULATE_PHASE_EXEMPT: &[&str] = &[
     "stellar_claim",
     "stellar_trustline",
     "stellar_mpp_charge_prepare",
-    "stellar_mpp_charge_commit",
 ];
 
 /// Every `MovesValue`-classified tool either has its commit/submit handler
@@ -1693,10 +1692,6 @@ fn every_moves_value_commit_handler_calls_require_value_audit_writer() {
 /// with its discipline verified.
 #[test]
 fn every_audit_writer_open_registers_the_profile_keyed_pair() {
-    fn production_half(source: &str) -> &str {
-        source.split("#[cfg(test)]").next().unwrap_or(source)
-    }
-
     fn walk(dir: &std::path::Path, hits: &mut Vec<(String, String)>) {
         for entry in std::fs::read_dir(dir).expect("read_dir") {
             let path = entry.expect("dir entry").path();
@@ -1753,8 +1748,7 @@ fn every_audit_writer_open_registers_the_profile_keyed_pair() {
 /// (PathMismatch/HmacKeyMismatch) for the remainder of the process.
 #[test]
 fn rule_create_audit_writer_routes_through_the_keyed_preflight() {
-    let source = include_str!("../src/tools/rule_create.rs");
-    let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+    let production = production_half(include_str!("../src/tools/rule_create.rs"));
     assert!(
         production.contains("require_value_audit_writer("),
         "rule_create must acquire its audit writer via require_value_audit_writer"
@@ -1763,4 +1757,62 @@ fn rule_create_audit_writer_routes_through_the_keyed_preflight() {
         !production.contains("default_audit_log_path_for("),
         "rule_create must not derive a default audit path from the profile name"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Consent rows reach the log before a consumer loads its signing key
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every MCP consumer of an approval acquires the keyed audit writer after it
+/// reads the approval and before it loads the signing key. The acquisition
+/// drains consent rows `stellar-agent approve` queued beside the server.
+#[test]
+fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the_signer() {
+    assert_called_between(
+        "mpp.rs",
+        include_str!("../src/tools/mpp.rs"),
+        "pub async fn stellar_mpp_charge_commit(",
+        "verify_pending_approval(",
+        "require_value_audit_writer(",
+        "lazy_signer_from_keyring(",
+    );
+    assert_called_between(
+        "rule_create.rs",
+        include_str!("../src/tools/rule_create.rs"),
+        "pub(crate) async fn stellar_rule_create_commit_impl(",
+        "verify_rule_proposal_gate(",
+        "require_value_audit_writer(",
+        "enrolled_keyring_signer(",
+    );
+    for (file, source, function) in [
+        (
+            "pay.rs",
+            include_str!("../src/tools/pay.rs"),
+            "pub(crate) async fn stellar_pay_commit_impl(",
+        ),
+        (
+            "claim.rs",
+            include_str!("../src/tools/claim.rs"),
+            "pub(crate) async fn stellar_claim_commit_impl(",
+        ),
+        (
+            "create_account.rs",
+            include_str!("../src/tools/create_account.rs"),
+            "async fn stellar_create_account_commit(",
+        ),
+        (
+            "trustline.rs",
+            include_str!("../src/tools/trustline.rs"),
+            "async fn stellar_trustline_commit(",
+        ),
+    ] {
+        assert_called_between(
+            file,
+            source,
+            function,
+            "verify_attestation_gate(",
+            "require_value_audit_writer(",
+            "enrolled_keyring_signer(",
+        );
+    }
 }

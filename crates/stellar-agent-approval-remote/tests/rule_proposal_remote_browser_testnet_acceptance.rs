@@ -1463,6 +1463,12 @@ async fn toolset_gated_first_invoke_entry_is_consumed() {
         .get(&gate_nonce)
         .cloned()
         .expect("gate entry must be present");
+    let consent_dir = TempDir::new().expect("consent audit dir");
+    let mut consent_writer = stellar_agent_core::audit_log::AuditWriter::open(
+        consent_dir.path().join("audit.jsonl"),
+        None,
+    )
+    .expect("consent audit writer");
     stellar_agent_core::approval::attest::attest_and_persist(
         &mut store,
         &entry,
@@ -1472,7 +1478,7 @@ async fn toolset_gated_first_invoke_entry_is_consumed() {
             "stellar:testnet",
         ),
         stellar_agent_core::approval::Surface::Cli,
-        None,
+        stellar_agent_core::approval::ConsentAudit::Writer(&mut consent_writer),
         None,
         |req, key| {
             stellar_agent_toolsets_runtime::record_first_invoke_grant(

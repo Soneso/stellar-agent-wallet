@@ -19,6 +19,7 @@ The detail page shows the profile, network, endpoint authority, and enrolled sig
 Summary rows render challenge-bound entry data. Header rows come from the serving profile and are not challenge-bound.
 A commit cannot tell whether an attestation came from the local inbox or the remote listener.
 The audit log distinguishes remote `ApprovalAttestedRemote` / `ApprovalRejectedRemote` events from loopback `ApprovalAttested` / `ApprovalRejected` events.
+Each row is written before the decision takes effect; a decision whose row cannot be written is refused and the entry stays pending.
 
 Two independent layers must both hold for a remote approve or reject to take
 effect:

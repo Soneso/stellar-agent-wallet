@@ -319,6 +319,19 @@ impl WalletServer {
         ) {
             return Ok(mpp_error_result(&error));
         }
+        // The approval has been read. Acquiring the keyed writer drains the
+        // audit outbox at open or on the cache hit, so a consent row
+        // `stellar-agent approve` queued for this charge is in the log before
+        // the signing key loads. Fail closed: no drain, no signing. It follows
+        // the profile, nonce, dispatch, and approval checks, so their codes
+        // keep precedence.
+        if let Err(error) = crate::tools::value_audit::require_value_audit_writer(
+            &self.profile,
+            &profile_name,
+            self.audit_binding,
+        ) {
+            return Ok(business_error_result(error.code(), error.to_string()));
+        }
         let signer = match lazy_signer_from_keyring(
             &self.profile.mcp_signer_default,
             &self.profile.mcp_signer_default.account,
@@ -415,12 +428,22 @@ impl WalletServer {
                     withheld.policy_budget_consumed,
                     uuid::Uuid::new_v4().to_string(),
                 );
-                let _ = emit_value_audit_row_strict(
+                // The primary error is what the caller sees; a withheld row that
+                // cannot be written is logged and does not replace it.
+                if let Err(error) = emit_value_audit_row_strict(
                     &withheld_audit_profile,
                     &withheld_audit_profile_name,
                     audit_binding,
                     entry,
-                );
+                ) {
+                    tracing::error!(
+                        event_kind = "mpp_authorization_withheld",
+                        failure_stage = withheld.failure_stage,
+                        code = %error.code(),
+                        error = %error,
+                        "mpp: the withheld-authorization audit row was not written"
+                    );
+                }
             },
         )
         .await;

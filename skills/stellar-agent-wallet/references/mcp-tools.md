@@ -134,9 +134,10 @@ moves value proves the active profile's audit chain-root key is acquirable
 BEFORE the signer is loaded or anything is submitted, refusing
 `audit.chain_key_unavailable` otherwise (see
 [Approvals and audit](approvals-and-audit.md#fail-closed-on-an-unminted-audit-key)).
-`stellar_mpp_charge_commit` is exempt — it already fails closed on the same
-conditions, under the same codes, when it writes the authorization row it
-withholds the credential on. The SEP-43 sign-only pair
+`stellar_mpp_charge_commit` runs the same acquisition after it reads its
+approval and before it loads the signing key. Each acquisition also drains
+consent rows `stellar-agent approve` queued while the server held the audit
+writer, so they are in the log before the key loads. The SEP-43 sign-only pair
 (`stellar_sep43_sign_transaction`, `stellar_sep43_sign_auth_entry`) runs the
 same pre-flight and, once the signature is produced, records an
 `opaque_payload_signed` audit row (redacted payload digest and redacted

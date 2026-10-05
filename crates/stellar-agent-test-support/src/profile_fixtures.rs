@@ -1,4 +1,5 @@
-//! Profile-TOML fixtures shared by the two binaries' process-level tests.
+//! Profile-TOML fixtures shared by the two binaries' process-level tests, and
+//! the profile names tests use.
 //!
 //! The reconciliation that refuses a profile whose owner-key coordinate names
 //! another profile is one implementation in `stellar-agent-core`, applied by
@@ -68,4 +69,43 @@ account = "default"
 engine = "noop"
 "#
     )
+}
+
+/// A profile name no other test shares: `<prefix>-<pid>-<unix_secs>-<n>`.
+///
+/// The process id and the clock second keep names apart across runs and
+/// across concurrent processes, which matters where the name reaches an
+/// OS-global keyring coordinate. The counter `n` keeps names apart inside one
+/// process, which matters where the name keys the process-wide audit-writer
+/// registry. A clock set before the Unix epoch reads as second 0.
+#[must_use]
+pub fn unique_profile_name(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    format!(
+        "{prefix}-{}-{unix_secs}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unique_profile_names_differ_within_one_process() {
+        let first = unique_profile_name("fixture");
+        let second = unique_profile_name("fixture");
+        assert_ne!(first, second);
+        let pid = std::process::id().to_string();
+        for name in [&first, &second] {
+            assert!(name.starts_with(&format!("fixture-{pid}-")), "{name}");
+        }
+    }
 }

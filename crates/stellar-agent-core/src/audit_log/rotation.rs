@@ -214,6 +214,57 @@ fn write_sidecar_atomic(sidecar: &Path, tag: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Test-only seam that lowers the rotation threshold for one log path, so a
+/// test reaches a rotation without writing 10 MiB.
+///
+/// Keyed by the active log path, so tests running in parallel threads never
+/// see one another's threshold.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_seam {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static THRESHOLDS: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
+
+    /// Restores the default threshold for its log when dropped, also when the
+    /// test holding it panics.
+    #[derive(Debug)]
+    #[must_use = "the threshold is restored when the guard is dropped"]
+    pub struct RotationThresholdGuard {
+        log_path: PathBuf,
+    }
+
+    impl Drop for RotationThresholdGuard {
+        fn drop(&mut self) {
+            if let Ok(mut thresholds) = THRESHOLDS.lock() {
+                thresholds.retain(|(path, _)| path != &self.log_path);
+            }
+        }
+    }
+
+    /// Makes the writer of the log at `log_path` rotate once the active file
+    /// reaches `bytes`, in place of
+    /// [`ROTATION_THRESHOLD_BYTES`](super::ROTATION_THRESHOLD_BYTES), until
+    /// the returned guard is dropped.
+    pub fn set_rotation_threshold(log_path: &Path, bytes: u64) -> RotationThresholdGuard {
+        if let Ok(mut thresholds) = THRESHOLDS.lock() {
+            thresholds.retain(|(path, _)| path != log_path);
+            thresholds.push((log_path.to_path_buf(), bytes));
+        }
+        RotationThresholdGuard {
+            log_path: log_path.to_path_buf(),
+        }
+    }
+
+    pub(crate) fn rotation_threshold_for(log_path: &Path) -> Option<u64> {
+        let thresholds = THRESHOLDS.lock().ok()?;
+        thresholds
+            .iter()
+            .find(|(path, _)| path == log_path)
+            .map(|(_, bytes)| *bytes)
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -66,19 +66,21 @@ use serde::Serialize;
 
 use stellar_agent_core::amount::StellarAmount;
 use stellar_agent_core::approval::{
-    ApprovalKind, ApproverIdentity, ContextRuleProposalSnapshot, DEFAULT_RETRY_ATTEMPTS,
-    DEFAULT_RETRY_BACKOFF, PendingApproval, RuleProposalContextType, RuleProposalSignerKind,
-    Surface, load_and_validate_entry, load_attestation_key, open_with_retry,
+    ApprovalKind, ApproverIdentity, ConsentAudit, ContextRuleProposalSnapshot,
+    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApproval, PendingApprovalStore,
+    RuleProposalContextType, RuleProposalSignerKind, Surface, ToolsetGrantRequest,
+    attest_and_persist, load_and_validate_entry, load_attestation_key, open_with_retry,
     process_uid_for_attestation, try_decode_spending_limit_params,
 };
-use stellar_agent_core::audit_log::writer::AuditWriter;
+use stellar_agent_core::audit_log::writer::{AuditWriter, WriterError};
+use stellar_agent_core::audit_log::{AuditOutbox, drain_lock_is_held};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
-use stellar_agent_core::profile::schema::default_approval_dir;
+use stellar_agent_core::profile::schema::{Profile, default_approval_dir};
 use stellar_agent_core::timefmt;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
-use crate::commands::smart_account::common::open_audit_writer;
+use crate::commands::value_audit::{KeyedAcquireError, acquire_keyed_audit_writer};
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::{render, resolve_profile_name};
 
@@ -142,6 +144,10 @@ struct ApproveRunData {
     /// the store directly and take no attestation argument.
     #[serde(skip_serializing_if = "Option::is_none")]
     approval_attestation: Option<String>,
+    /// Where the consent row went: `"written"` to the audit log, or `"queued"`
+    /// in the audit outbox for the draining writer of a running MCP server or
+    /// approval inbox.
+    audit: ConsentRowOutcome,
 }
 
 /// Runs `stellar-agent approve --id <nonce> --profile <name>`.
@@ -266,67 +272,18 @@ pub async fn run(args: RunArgs) -> i32 {
         }
     };
 
-    // ── 7b. Open the audit log (non-fatal: proceed without emission on failure) ──
-    // Step 3 loaded and reconciled the profile, so the tolerance covers writer
-    // acquisition only.
-    let audit_writer_arc: Option<Arc<Mutex<AuditWriter>>> = match open_audit_writer(
-        &profile,
-        crate::common::profile_access::ProfileOrigin::Persisted,
-        &resolved_profile.name,
-    ) {
-        Ok((writer, _path)) => Some(writer),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "approve: audit writer open failed; continuing without audit emission"
-            );
-            None
-        }
-    };
-    let mut audit_guard = audit_writer_arc.as_ref().map(|arc| arc.lock());
-    let audit_writer_ref: Option<&mut AuditWriter> = match audit_guard.as_mut() {
-        Some(Ok(g)) => Some(&mut **g),
-        Some(Err(_poison)) => {
-            tracing::warn!("approve: audit writer mutex poisoned; audit entry will be skipped");
-            None
-        }
-        None => None,
-    };
-
-    // ── 8. Compute and persist HMAC attestation blob ─────────────────────────
-    let approval_attestation = match stellar_agent_core::approval::attest_and_persist(
-        &mut store,
-        &entry,
-        &key_bytes,
-        &context.binding(),
-        Surface::Cli,
-        audit_writer_ref,
-        None,
-        |req, key| {
-            stellar_agent_toolsets_runtime::record_first_invoke_grant(
-                &profile_name,
-                req.toolset_name,
-                req.capability,
-                req.destination,
-                req.asset,
-                req.amount_min_stroops,
-                req.amount_max_stroops,
-                req.process_uid,
-                req.now_unix_ms,
-                key,
-                req.binding,
-                None, // No grant-store-path override in the production CLI approve path.
-            )
-            .map(|_grant| ())
-            .map_err(|e| e.to_string())
-        },
-    ) {
-        Ok(a) => a,
-        Err(e) => {
-            render::render_json(&Envelope::<()>::err(&e));
-            return 1;
-        }
-    };
+    // ── 8. Write the consent row, then persist the attestation ──────────────
+    // The row is written through this process's writer, or queued for the
+    // draining writer of another process, before anything is persisted. Any
+    // audit refusal refuses the approval with nothing persisted.
+    let (approval_attestation, audit) =
+        match approve_with_consent_row(&mut store, &entry, &key_bytes, &context, &profile) {
+            Ok(approved) => approved,
+            Err(e) => {
+                render::render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        };
 
     // key_bytes is Zeroizing; erased on drop after this point.
 
@@ -337,8 +294,154 @@ pub async fn run(args: RunArgs) -> i32 {
         process_uid: our_uid,
         expires_at_unix_ms: entry.expires_at_unix_ms,
         approval_attestation,
+        audit,
     }));
     0
+}
+
+/// Where `approve --id` wrote its consent row, reported as the success
+/// envelope's `audit` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ConsentRowOutcome {
+    /// Appended to the audit log through this process's writer.
+    Written,
+    /// Queued in the audit outbox for the draining writer of another process,
+    /// which appends it before any process loads a signing key for the
+    /// approved action.
+    Queued,
+}
+
+/// The sink `approve --id` writes its consent row through.
+enum ConsentSink {
+    /// This process holds the keyed writer.
+    Writer(Arc<Mutex<AuditWriter>>),
+    /// A draining writer in another process holds the log.
+    Outbox(AuditOutbox),
+}
+
+/// Returns `true` when an acquisition failure is contention for the writer's
+/// sidecar lock, the one failure `approve --id` retries and then resolves by
+/// probing the drain lock.
+///
+/// Classified by the typed error. Every other failure, `audit.outbox_busy`
+/// included, refuses the approval.
+fn is_sidecar_contention(error: &KeyedAcquireError) -> bool {
+    matches!(error, KeyedAcquireError::Writer(WriterError::FileLocked))
+}
+
+/// Acquires the sink for the consent row.
+///
+/// The keyed writer is acquired through the registry, which drains any queued
+/// rows at open. Sidecar contention is retried with the approval store's
+/// bounded retry, since a CLI command's startup advisory holds the lock
+/// briefly. Still locked, one `try_lock` on the drain lock, released at once,
+/// decides. Held means a draining writer owns the log, and the row is queued.
+/// Free means the holder does not drain, and the approval is refused with
+/// `audit.writer_locked`.
+///
+/// # Errors
+///
+/// The [`WalletError`] for any acquisition failure other than contention, and
+/// for contention with a holder that does not drain.
+fn acquire_consent_sink(profile: &Profile, profile_name: &str) -> Result<ConsentSink, WalletError> {
+    let mut attempt = 0_u32;
+    let contention = loop {
+        attempt += 1;
+        match acquire_keyed_audit_writer(
+            profile,
+            profile_name,
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
+        ) {
+            Ok(writer) => return Ok(ConsentSink::Writer(writer)),
+            Err(error) if is_sidecar_contention(&error) => {
+                if attempt >= DEFAULT_RETRY_ATTEMPTS {
+                    break error;
+                }
+                std::thread::sleep(DEFAULT_RETRY_BACKOFF);
+            }
+            Err(error) => return Err(error.into_wallet_error(profile_name)),
+        }
+    };
+    match drain_lock_is_held(&profile.audit_log_path) {
+        Ok(true) => Ok(ConsentSink::Outbox(AuditOutbox::for_log(
+            &profile.audit_log_path,
+        ))),
+        Ok(false) => Err(contention.into_wallet_error(profile_name)),
+        Err(error) => Err(KeyedAcquireError::Writer(error).into_wallet_error(profile_name)),
+    }
+}
+
+/// Writes the consent row and persists the approval, in that order.
+///
+/// # Errors
+///
+/// The acquisition refusal of [`acquire_consent_sink`], a poisoned writer
+/// mutex, or any error of `attest_and_persist`. Nothing is persisted when the
+/// row is refused.
+fn approve_with_consent_row(
+    store: &mut PendingApprovalStore,
+    entry: &PendingApproval,
+    key_bytes: &[u8],
+    context: &stellar_agent_core::approval::ApprovalContext,
+    profile: &Profile,
+) -> Result<(Option<String>, ConsentRowOutcome), WalletError> {
+    let profile_name = context.profile_name.as_str();
+    let persist_grant = |req: &ToolsetGrantRequest<'_>, key: &[u8; 32]| {
+        stellar_agent_toolsets_runtime::record_first_invoke_grant(
+            profile_name,
+            req.toolset_name,
+            req.capability,
+            req.destination,
+            req.asset,
+            req.amount_min_stroops,
+            req.amount_max_stroops,
+            req.process_uid,
+            req.now_unix_ms,
+            key,
+            req.binding,
+            None, // No grant-store-path override in the production CLI approve path.
+        )
+        .map(|_grant| ())
+        .map_err(|e| e.to_string())
+    };
+    match acquire_consent_sink(profile, profile_name)? {
+        ConsentSink::Writer(writer) => {
+            let mut guard = writer.lock().map_err(|_| {
+                tracing::error!(
+                    event_kind = "approval_attested",
+                    "approve: audit writer mutex poisoned; refusing the approval"
+                );
+                WalletError::Validation(ValidationError::AuditWriterOpenFailed {
+                    profile: profile_name.to_owned(),
+                })
+            })?;
+            let attestation = attest_and_persist(
+                store,
+                entry,
+                key_bytes,
+                &context.binding(),
+                Surface::Cli,
+                ConsentAudit::Writer(&mut guard),
+                None,
+                persist_grant,
+            )?;
+            Ok((attestation, ConsentRowOutcome::Written))
+        }
+        ConsentSink::Outbox(outbox) => {
+            let attestation = attest_and_persist(
+                store,
+                entry,
+                key_bytes,
+                &context.binding(),
+                Surface::Cli,
+                ConsentAudit::Outbox(&outbox),
+                None,
+                persist_grant,
+            )?;
+            Ok((attestation, ConsentRowOutcome::Queued))
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1147,13 +1250,15 @@ mod tests {
 
         let mut store2 = PendingApprovalStore::open(path.clone()).unwrap();
         let entry2 = store2.get(&nonce).unwrap().clone();
+        let mut audit_writer =
+            AuditWriter::open(dir.path().join("audit").join("audit.jsonl"), None).unwrap();
         let surfaced = stellar_agent_core::approval::attest_and_persist(
             &mut store2,
             &entry2,
             &key,
             &context.binding(),
             Surface::Cli,
-            None,
+            ConsentAudit::Writer(&mut audit_writer),
             None,
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
@@ -1695,5 +1800,357 @@ mod tests {
         assert!(text.contains(
             "  Source (stored summary): GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         ));
+    }
+
+    // ── The consent row: written, queued, or refused ─────────────────────────
+
+    use stellar_agent_core::audit_log::{AuditWriterRegistry, inspect_outbox};
+    use stellar_agent_core::profile::schema::Profile;
+
+    const TEST_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+
+    /// A testnet profile whose audit log lives in `dir`, with its audit key
+    /// seeded unless `audit_key` is false.
+    fn consent_profile(name: &str, dir: &TempDir, audit_key: bool) -> Profile {
+        let mut profile = Profile::builder_testnet_named(name, "svc", TEST_G, "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        profile.audit_log_path = dir.path().join("audit").join(format!("{name}.jsonl"));
+        if audit_key {
+            seed_key_32(
+                &profile.audit_log_hash_chain_key_id.service,
+                &profile.audit_log_hash_chain_key_id.account,
+            );
+        }
+        profile
+    }
+
+    /// A store holding one pending payment entry, and that entry.
+    fn pending_store(dir: &TempDir) -> (PendingApprovalStore, PendingApproval) {
+        let mut store = PendingApprovalStore::open(dir.path().join("approvals.toml")).unwrap();
+        let entry = make_entry(DEFAULT_TTL_MS);
+        store
+            .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+            .unwrap();
+        (store, entry)
+    }
+
+    fn consent_rows(profile: &Profile) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(&profile.audit_log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["kind"] == "approval_attested")
+            .collect()
+    }
+
+    fn assert_nothing_persisted(store: &PendingApprovalStore, nonce: &str) {
+        let entry = store.get(nonce).expect("the entry stays");
+        assert!(
+            entry.attestation_blob_b64.is_none(),
+            "a refused approval persists nothing"
+        );
+    }
+
+    fn approve_in_process(
+        name: &str,
+        profile: &Profile,
+        store: &mut PendingApprovalStore,
+        entry: &PendingApproval,
+    ) -> Result<(Option<String>, ConsentRowOutcome), WalletError> {
+        let context = stellar_agent_core::approval::ApprovalContext::from_profile(name, profile);
+        approve_with_consent_row(store, entry, &[0x42; 32], &context, profile)
+    }
+
+    /// The acquisition is classified by the typed writer error: only sidecar
+    /// contention is retried and resolved through the drain lock.
+    #[test]
+    fn only_sidecar_contention_is_resolved_through_the_drain_lock() {
+        assert!(is_sidecar_contention(&KeyedAcquireError::Writer(
+            WriterError::FileLocked
+        )));
+        for refused in [
+            KeyedAcquireError::KeyUnavailable,
+            KeyedAcquireError::BindingChanged(WalletError::Validation(
+                stellar_agent_core::error::ValidationError::AuditLogBindingChanged {
+                    profile: "p".to_owned(),
+                },
+            )),
+            KeyedAcquireError::Writer(WriterError::OutboxBusy),
+            KeyedAcquireError::Writer(WriterError::OutboxUnusable {
+                line: 1,
+                column: 1,
+                reason: "invalid JSON",
+            }),
+            KeyedAcquireError::Writer(WriterError::TipAnchorMismatch {
+                expected_count: 2,
+                expected_offset: 10,
+                actual_len: 0,
+                reason: "file is shorter than the anchor",
+            }),
+            KeyedAcquireError::Writer(WriterError::Io(std::io::Error::other("disk"))),
+            KeyedAcquireError::Writer(WriterError::TipAnchorUnavailable),
+            KeyedAcquireError::Writer(WriterError::HmacKeyMismatch {
+                profile_name: "p".to_owned(),
+            }),
+        ] {
+            assert!(!is_sidecar_contention(&refused), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn the_success_envelope_names_where_the_row_went() {
+        for (outcome, wire) in [
+            (ConsentRowOutcome::Written, "written"),
+            (ConsentRowOutcome::Queued, "queued"),
+        ] {
+            let data = ApproveRunData {
+                approval_nonce: "n".to_owned(),
+                attested: true,
+                process_uid: "501".to_owned(),
+                expires_at_unix_ms: 1,
+                approval_attestation: None,
+                audit: outcome,
+            };
+            assert_eq!(serde_json::to_value(&data).unwrap()["audit"], wire);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn with_a_free_writer_the_row_is_written_then_the_approval_persisted() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = consent_profile("approve-free", &dir, true);
+        let (mut store, entry) = pending_store(&dir);
+        let (attestation, audit) =
+            approve_in_process("approve-free", &profile, &mut store, &entry).unwrap();
+        assert_eq!(audit, ConsentRowOutcome::Written);
+        assert!(attestation.is_some());
+        assert_eq!(consent_rows(&profile).len(), 1);
+        assert!(
+            store
+                .get(&entry.approval_nonce)
+                .unwrap()
+                .attestation_blob_b64
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn beside_a_draining_writer_the_row_is_queued_and_its_next_acquisition_logs_it() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = consent_profile("approve-queued", &dir, true);
+        // Another process's draining writer: same log, its own registry entry.
+        let holder = || {
+            AuditWriterRegistry::get_or_open_keyed(
+                "approve-queued-server",
+                &profile.audit_log_path,
+                stellar_agent_network::keyring::keyed_audit_access(
+                    &profile,
+                    "approve-queued",
+                    stellar_agent_core::audit_log::BindingCheck::Enforce,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let _server = holder();
+        assert!(drain_lock_is_held(&profile.audit_log_path).unwrap());
+
+        let (mut store, entry) = pending_store(&dir);
+        let (attestation, audit) =
+            approve_in_process("approve-queued", &profile, &mut store, &entry).unwrap();
+        assert_eq!(audit, ConsentRowOutcome::Queued);
+        assert!(attestation.is_some(), "the approval is persisted");
+        assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 1);
+        assert!(consent_rows(&profile).is_empty(), "queued, not yet logged");
+        assert!(
+            drain_lock_is_held(&profile.audit_log_path).unwrap(),
+            "the draining writer still holds the drain lock"
+        );
+
+        let _again = holder();
+        assert_eq!(
+            consent_rows(&profile).len(),
+            1,
+            "the next acquisition logs it"
+        );
+        assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn beside_a_writer_that_does_not_drain_the_approval_is_refused() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = consent_profile("approve-locked", &dir, true);
+        std::fs::create_dir_all(profile.audit_log_path.parent().unwrap()).unwrap();
+        let _older = AuditWriter::open(profile.audit_log_path.clone(), None).unwrap();
+
+        let (mut store, entry) = pending_store(&dir);
+        let err = approve_in_process("approve-locked", &profile, &mut store, &entry).unwrap_err();
+        assert_eq!(err.code(), "audit.chain_key_unavailable");
+        assert!(err.to_string().contains("audit.writer_locked"), "{err}");
+        assert_nothing_persisted(&store, &entry.approval_nonce);
+        assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 0);
+        assert!(
+            !drain_lock_is_held(&profile.audit_log_path).unwrap(),
+            "the drain lock is left free: a try_lock on it succeeds"
+        );
+    }
+
+    /// A writer that holds the sidecar lock briefly, as a CLI command's startup
+    /// advisory does, is waited out within the approval store's retry bound,
+    /// and the row is written.
+    #[test]
+    #[serial]
+    fn a_sidecar_lock_held_briefly_is_waited_out_and_the_row_written() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = consent_profile("approve-brief", &dir, true);
+        std::fs::create_dir_all(profile.audit_log_path.parent().unwrap()).unwrap();
+        let (mut store, entry) = pending_store(&dir);
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let path = profile.audit_log_path.clone();
+        let holder = std::thread::spawn(move || {
+            let brief = AuditWriter::open(path, None).unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(DEFAULT_RETRY_BACKOFF);
+            drop(brief);
+        });
+        held_rx.recv().unwrap();
+        let result = approve_in_process("approve-brief", &profile, &mut store, &entry);
+        holder.join().unwrap();
+
+        let (attestation, audit) = result.unwrap();
+        assert_eq!(audit, ConsentRowOutcome::Written);
+        assert!(attestation.is_some());
+        assert_eq!(consent_rows(&profile).len(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn without_an_audit_key_the_approval_is_refused() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = consent_profile("approve-no-key", &dir, false);
+        let (mut store, entry) = pending_store(&dir);
+        let err = approve_in_process("approve-no-key", &profile, &mut store, &entry).unwrap_err();
+        assert_eq!(err.code(), "audit.chain_key_unavailable");
+        assert_nothing_persisted(&store, &entry.approval_nonce);
+        assert!(consent_rows(&profile).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn on_a_rolled_back_log_the_approval_is_refused() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = consent_profile("approve-rolled-back", &dir, true);
+        {
+            let writer = AuditWriterRegistry::get_or_open_keyed(
+                "approve-rolled-back",
+                &profile.audit_log_path,
+                stellar_agent_network::keyring::keyed_audit_access(
+                    &profile,
+                    "approve-rolled-back",
+                    stellar_agent_core::audit_log::BindingCheck::Enforce,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let mut writer = writer.lock().unwrap();
+            for id in ["one", "two"] {
+                writer
+                    .write_entry(
+                        stellar_agent_core::audit_log::AuditEntry::new_tool_invocation(
+                            stellar_agent_core::audit_log::NewToolInvocation::new(
+                                "test",
+                                "stellar:testnet",
+                                vec![],
+                                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                                id,
+                            ),
+                        ),
+                    )
+                    .unwrap();
+            }
+        }
+        std::fs::write(&profile.audit_log_path, b"").unwrap();
+
+        let (mut store, entry) = pending_store(&dir);
+        let err =
+            approve_in_process("approve-rolled-back", &profile, &mut store, &entry).unwrap_err();
+        assert_eq!(err.code(), "audit.tip_anchor_mismatch");
+        assert_nothing_persisted(&store, &entry.approval_nonce);
+    }
+
+    #[test]
+    #[serial]
+    fn on_a_changed_binding_the_approval_is_refused() {
+        use stellar_agent_core::audit_log::AuditBinding;
+        use stellar_agent_network::keyring::KeyringAuditBindingStore;
+
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "approve-binding-changed";
+        let mut profile = consent_profile(name, &dir, true);
+        let binding_store = KeyringAuditBindingStore::for_profile(name);
+        binding_store
+            .store(&AuditBinding::for_profile(&profile))
+            .unwrap();
+        let binding_before = binding_store.load_raw().unwrap();
+        let new_directory = dir.path().join("repointed");
+        profile.audit_log_path = new_directory.join("audit.jsonl");
+
+        let (mut store, entry) = pending_store(&dir);
+        let err = approve_in_process(name, &profile, &mut store, &entry).unwrap_err();
+        assert_eq!(err.code(), "audit.log_binding_changed");
+        assert_nothing_persisted(&store, &entry.approval_nonce);
+        drop(store);
+        let reread = PendingApprovalStore::open(dir.path().join("approvals.toml")).unwrap();
+        assert_nothing_persisted(&reread, &entry.approval_nonce);
+        assert!(
+            !new_directory.exists(),
+            "nothing is created at the new path"
+        );
+        assert_eq!(binding_store.load_raw().unwrap(), binding_before);
+    }
+
+    #[test]
+    #[serial]
+    fn a_failing_outbox_append_refuses_and_the_entry_stays_pending() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = consent_profile("approve-outbox-fails", &dir, true);
+        let _server = AuditWriterRegistry::get_or_open_keyed(
+            "approve-outbox-fails-server",
+            &profile.audit_log_path,
+            stellar_agent_network::keyring::keyed_audit_access(
+                &profile,
+                "approve-outbox-fails",
+                stellar_agent_core::audit_log::BindingCheck::Enforce,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (mut store, entry) = pending_store(&dir);
+        let outbox = AuditOutbox::for_log(&profile.audit_log_path);
+        stellar_agent_core::audit_log::outbox::test_seam::arm_partial_write(outbox.path(), 5);
+        let result = approve_in_process("approve-outbox-fails", &profile, &mut store, &entry);
+        stellar_agent_core::audit_log::outbox::test_seam::disarm(outbox.path());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), "audit.chain_key_unavailable", "{err}");
+        assert_nothing_persisted(&store, &entry.approval_nonce);
+        drop(store);
+        let reread = PendingApprovalStore::open(dir.path().join("approvals.toml")).unwrap();
+        assert_nothing_persisted(&reread, &entry.approval_nonce);
+        assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 0);
     }
 }

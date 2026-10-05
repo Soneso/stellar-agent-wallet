@@ -10,7 +10,10 @@
 //! This crate produces the signed x402 payment payload via
 //! [`exact::create_payment`]. A host integration (for example an MCP `x402`
 //! tool) delivers the payload over HTTP; the payee/facilitator settles it
-//! on-chain.
+//! on-chain. The signed authorization first leaves the wallet in the RPC
+//! re-simulation, and `create_payment` runs the caller's transmit gate
+//! immediately before that request, so a host can record the authorization
+//! durably or withhold it.
 //!
 //! # Non-goals
 //!

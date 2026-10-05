@@ -1,11 +1,12 @@
-//! `stellar_mpp_charge_commit` against the audit log's keyring-held tip anchor.
+//! `stellar_mpp_charge_commit` against the audit log.
 //!
-//! The MPP commit path does not run the value-verb pre-flight: it writes its
-//! authorization row through the strict emission helper and withholds the
-//! credential when that write cannot be made. The anchor check therefore has to
-//! sit where that helper acquires the writer, or a log rolled back under the
-//! running server would take the row that proves the authorization and the
-//! credential would go out anyway.
+//! The commit acquires the audit writer after it reads its approval and before
+//! it loads the signing key, which drains any consent row queued beside the
+//! running server. It then writes its authorization row through the strict
+//! emission helper and withholds the credential when that write cannot be
+//! made, so a log rolled back under the running server refuses the credential.
+//! A failure in the sponsored commit writes a withheld row naming the side of
+//! the signed re-simulation send.
 
 #![allow(
     clippy::unwrap_used,
@@ -62,6 +63,33 @@ const SIGNER_SERVICE: &str = "mpp-anchor-svc";
 /// caller's own validation rather than be waved through.
 struct SponsoredSimulateResponder {
     payer: ScAddress,
+    /// Runs when a signed re-simulation arrives, before it is answered.
+    on_signed: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Answers the signed re-simulation with an RPC error.
+    fail_signed: bool,
+    /// Number of signed re-simulations received.
+    signed_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SponsoredSimulateResponder {
+    fn new(payer: ScAddress) -> Self {
+        Self {
+            payer,
+            on_signed: None,
+            fail_signed: false,
+            signed_requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn on_signed(mut self, hook: std::sync::Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.on_signed = Some(hook);
+        self
+    }
+
+    fn failing_signed(mut self) -> Self {
+        self.fail_signed = true;
+        self
+    }
 }
 
 #[async_trait]
@@ -115,6 +143,20 @@ impl Respond for SponsoredSimulateResponder {
                     .expect("auth entry encodes"),
             ]
         } else {
+            self.signed_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(hook) = &self.on_signed {
+                hook();
+            }
+            if self.fail_signed {
+                return ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {"error": "re-simulation trapped", "latestLedger": 1000},
+                    }))
+                    .insert_header("content-type", "application/json");
+            }
             Vec::new()
         };
 
@@ -237,9 +279,7 @@ async fn cli_and_mcp_authorization_fingerprint_and_preview_match() {
     let payer = gstrkey_for_seed([0x6f; 32]);
     let rpc_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(SponsoredSimulateResponder {
-            payer: payer_sc_address(&payer),
-        })
+        .respond_with(SponsoredSimulateResponder::new(payer_sc_address(&payer)))
         .expect(2)
         .mount(&rpc_server)
         .await;
@@ -404,21 +444,33 @@ async fn mpp_charge_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_ba
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
 
-    let mock_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(SponsoredSimulateResponder {
-            payer: payer_sc_address(&payer_g),
-        })
-        .mount(&mock_server)
-        .await;
-
     let mut profile =
         Profile::builder_testnet_named(PROFILE, SIGNER_SERVICE, &payer_g, "n-svc", "n-acct")
             .with_noop_engine()
             .build();
-    profile.rpc_url = mock_server.uri();
     common::install_test_audit_key(&mut profile);
     let audit_log_path = profile.audit_log_path.clone();
+
+    // The rollback lands inside the signed re-simulation of round two: after
+    // the commit's audit acquisition passed and before its delivery gate, so
+    // the refusal has to come from the strict delivery-gate write.
+    let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rollback_armed = std::sync::Arc::clone(&armed);
+    let rollback_path = audit_log_path.clone();
+    let responder = SponsoredSimulateResponder::new(payer_sc_address(&payer_g)).on_signed(
+        std::sync::Arc::new(move || {
+            if rollback_armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                std::fs::write(&rollback_path, b"").expect("truncate the audit log");
+            }
+        }),
+    );
+    let signed_requests = std::sync::Arc::clone(&responder.signed_requests);
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(responder)
+        .mount(&mock_server)
+        .await;
+    profile.rpc_url = mock_server.uri();
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     // Round one: a commit that succeeds, leaving the anchor naming the log.
@@ -435,10 +487,22 @@ async fn mpp_charge_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_ba
         "the first commit must have written its authorization row"
     );
 
-    // Roll the log back underneath the writer the server is still holding.
-    std::fs::write(&audit_log_path, b"").expect("truncate the audit log");
+    // Roll the log back underneath the writer the server is still holding,
+    // during the signed re-simulation of the second commit.
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let signed_before = signed_requests.load(std::sync::atomic::Ordering::SeqCst);
 
     let second = prepare_and_commit(&server, PROFILE, 2).await;
+    assert!(
+        !armed.load(std::sync::atomic::Ordering::SeqCst),
+        "the rollback must have run inside the signed re-simulation"
+    );
+    assert_eq!(
+        signed_requests.load(std::sync::atomic::Ordering::SeqCst),
+        signed_before + 1,
+        "the second commit must reach its signed re-simulation, so the refusal \
+         comes from the delivery gate"
+    );
     let (code, _message, _text) = common::assert_business_envelope(&second);
     assert_eq!(
         code, "audit.tip_anchor_mismatch",
@@ -511,9 +575,7 @@ async fn mpp_accounting_cap_refusal_withholds_the_credential() {
         .unwrap();
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(SponsoredSimulateResponder {
-            payer: payer_sc_address(&payer),
-        })
+        .respond_with(SponsoredSimulateResponder::new(payer_sc_address(&payer)))
         .expect(1)
         .mount(&mock)
         .await;
@@ -594,9 +656,7 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
         .unwrap();
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(SponsoredSimulateResponder {
-            payer: payer_sc_address(&payer),
-        })
+        .respond_with(SponsoredSimulateResponder::new(payer_sc_address(&payer)))
         .mount(&mock)
         .await;
     let mut profile =
@@ -664,5 +724,395 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
             .query_window(&key, stellar_agent_core::timefmt::now_unix_ms().unwrap())
             .unwrap(),
         (10_000_000, 1)
+    );
+}
+
+// ── Withheld-row stages ───────────────────────────────────────────────────────
+
+/// One MPP server over a mock RPC: the payer, the profile, and the server.
+struct MppFixture {
+    _home: tempfile::TempDir,
+    _home_guard: StellarAgentHomeGuard,
+    _mock: MockServer,
+    profile: Profile,
+    server: WalletServer,
+    signed_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    payer: String,
+}
+
+/// Builds a server for `profile_name`. `seed_secret` decides whether the
+/// payer's secret is in the keyring; without it the lazy signer fails at the
+/// sign call.
+async fn mpp_fixture(
+    profile_name: &str,
+    seed: [u8; 32],
+    seed_secret: bool,
+    configure: impl FnOnce(SponsoredSimulateResponder, &Profile) -> SponsoredSimulateResponder,
+) -> MppFixture {
+    let home = tempfile::tempdir().expect("temp home");
+    let home_guard = StellarAgentHomeGuard::new(home.path());
+    keyring_mock::install().expect("mock keyring");
+    install_test_nonce_key(244);
+    let payer = gstrkey_for_seed(seed);
+    if seed_secret {
+        keyring_core::Entry::new(SIGNER_SERVICE, &payer)
+            .expect("Entry::new")
+            .set_password(&sstrkey_for_seed(seed))
+            .expect("set_password");
+    }
+    let mut profile =
+        Profile::builder_testnet_named(profile_name, SIGNER_SERVICE, &payer, "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+    common::install_test_audit_key(&mut profile);
+    let _ = std::fs::remove_file(&profile.audit_log_path);
+    let responder = configure(
+        SponsoredSimulateResponder::new(payer_sc_address(&payer)),
+        &profile,
+    );
+    let signed_requests = std::sync::Arc::clone(&responder.signed_requests);
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(responder)
+        .mount(&mock)
+        .await;
+    profile.rpc_url = mock.uri();
+    let server = WalletServer::new(profile.clone()).expect("WalletServer::new");
+    MppFixture {
+        _home: home,
+        _home_guard: home_guard,
+        _mock: mock,
+        profile,
+        server,
+        signed_requests,
+        payer,
+    }
+}
+
+/// The single `mpp_authorization_withheld` row in the log.
+fn withheld_row(profile: &Profile) -> serde_json::Value {
+    let rows = common::audit_rows(profile);
+    let withheld = common::rows_of_kind(&rows, "mpp_authorization_withheld");
+    assert_eq!(withheld.len(), 1, "one withheld row: {rows:?}");
+    withheld[0].clone()
+}
+
+/// A failure at the sign call records `signing`: the key was used and the
+/// signed entry never reached the RPC.
+#[tokio::test]
+#[serial]
+async fn mpp_commit_failure_at_the_sign_call_records_signing() {
+    let fixture = mpp_fixture("mpp-stage-signing", [0x71; 32], false, |r, _| r).await;
+    let result = prepare_and_commit(&fixture.server, "mpp-stage-signing", 11).await;
+    let (code, _, _) = common::assert_business_envelope(&result);
+    assert_eq!(code, "mpp.signing_failed");
+    assert_eq!(
+        fixture
+            .signed_requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing signed reached the RPC"
+    );
+    let row = withheld_row(&fixture.profile);
+    assert_eq!(row["failure_stage"], "signing");
+    assert_eq!(row["key_access_began"], true);
+}
+
+/// A failure at the send records `resimulation`: the signed entry reached, or
+/// may have reached, the RPC.
+#[tokio::test]
+#[serial]
+async fn mpp_commit_failure_at_the_send_records_resimulation() {
+    let fixture = mpp_fixture("mpp-stage-resim", [0x72; 32], true, |r, _| {
+        r.failing_signed()
+    })
+    .await;
+    let result = prepare_and_commit(&fixture.server, "mpp-stage-resim", 12).await;
+    let (code, _, _) = common::assert_business_envelope(&result);
+    assert_eq!(code, "mpp.simulation_failed");
+    assert_eq!(
+        fixture
+            .signed_requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let row = withheld_row(&fixture.profile);
+    assert_eq!(row["failure_stage"], "resimulation");
+    assert_eq!(row["key_access_began"], true);
+}
+
+/// A failure before the sign call records `pre_signing` with no key access.
+///
+/// The charge was prepared for one payer and is committed by a server whose
+/// profile names another: the payer check refuses before the sign call.
+#[tokio::test]
+#[serial]
+async fn mpp_commit_failure_before_the_sign_call_records_pre_signing() {
+    let fixture = mpp_fixture("mpp-stage-pre", [0x73; 32], true, |r, _| r).await;
+    let prepared = fixture
+        .server
+        .call_stellar_mpp_charge_prepare("mpp-stage-pre".to_owned(), challenge(13))
+        .await
+        .expect("prepare");
+    assert_ne!(prepared.is_error, Some(true), "{}", result_json(&prepared));
+    let prepared = result_json(&prepared);
+    let data = &prepared["data"];
+
+    // The same profile, the same audit log and state, another signer.
+    let mut other = fixture.profile.clone();
+    other.mcp_signer_default.account = gstrkey_for_seed([0x74; 32]);
+    assert_ne!(other.mcp_signer_default.account, fixture.payer);
+    let committing = WalletServer::new(other).expect("WalletServer::new");
+    let result = committing
+        .call_stellar_mpp_charge_commit(
+            data["authorization"]["authorization_id"]
+                .as_str()
+                .expect("authorization_id")
+                .to_owned(),
+            data["nonce"].as_str().expect("nonce").to_owned(),
+            data["nonce_expires_at_unix_ms"].as_u64().expect("expiry"),
+        )
+        .await
+        .expect("commit");
+    let (code, _, _) = common::assert_business_envelope(&result);
+    assert_eq!(code, "mpp.signing_failed");
+    assert_eq!(
+        fixture
+            .signed_requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    let row = withheld_row(&fixture.profile);
+    assert_eq!(row["failure_stage"], "pre_signing");
+    assert_eq!(row["key_access_began"], false);
+}
+
+/// A withheld row that cannot be written is logged at `error` with its code,
+/// and the commit still answers with its primary error.
+#[tokio::test]
+#[serial]
+async fn mpp_withheld_row_write_failure_is_logged_and_the_primary_error_returned() {
+    use stellar_agent_test_support::CaptureWriter;
+
+    let fixture = mpp_fixture("mpp-stage-logged", [0x75; 32], true, |r, profile| {
+        let path = profile.audit_log_path.clone();
+        r.failing_signed().on_signed(std::sync::Arc::new(move || {
+            // Roll the log back so the withheld row's strict write refuses.
+            std::fs::write(&path, b"").expect("truncate the audit log");
+        }))
+    })
+    .await;
+    // Anchor a non-empty log first, so the rollback is a mismatch.
+    let anchor_row = stellar_agent_core::audit_log::AuditEntry::new_tool_invocation(
+        stellar_agent_core::audit_log::NewToolInvocation::new(
+            "test",
+            "stellar:testnet",
+            vec![],
+            stellar_agent_core::audit_log::PolicyDecision::Allow,
+            "anchor-row",
+        ),
+    );
+    let access = stellar_agent_network::keyring::keyed_audit_access(
+        &fixture.profile,
+        "mpp-stage-logged",
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    )
+    .expect("audit access");
+    stellar_agent_core::audit_log::AuditWriterRegistry::get_or_open_keyed(
+        "mpp-stage-logged",
+        &fixture.profile.audit_log_path,
+        access,
+    )
+    .expect("writer")
+    .lock()
+    .expect("writer lock")
+    .write_entry(anchor_row)
+    .expect("anchor row");
+
+    let capture = CaptureWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+    let result = prepare_and_commit(&fixture.server, "mpp-stage-logged", 14).await;
+    drop(guard);
+
+    let (code, _, _) = common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "mpp.simulation_failed",
+        "the primary error is returned"
+    );
+    let logs = capture.captured_str();
+    let line = logs
+        .lines()
+        .find(|line| line.contains("mpp_authorization_withheld"))
+        .unwrap_or_else(|| panic!("the refused withheld row must be logged: {logs}"));
+    assert!(line.contains("ERROR"), "logged at error: {line}");
+    assert!(
+        line.contains("audit.tip_anchor_mismatch"),
+        "the log names the refusal's code: {line}"
+    );
+    assert!(line.contains("resimulation"), "and the stage: {line}");
+}
+
+/// A policy denial at the commit's dispatch gate answers its policy code even
+/// when the profile has no audit key: the audit acquisition comes after it.
+#[tokio::test]
+#[serial]
+async fn mpp_policy_denial_without_an_audit_key_answers_the_policy_code() {
+    let mut fixture = mpp_fixture("mpp-stage-deny", [0x76; 32], true, |r, _| r).await;
+    let prepared = fixture
+        .server
+        .call_stellar_mpp_charge_prepare("mpp-stage-deny".to_owned(), challenge(15))
+        .await
+        .expect("prepare");
+    assert_ne!(prepared.is_error, Some(true), "{}", result_json(&prepared));
+    let prepared = result_json(&prepared);
+    let data = &prepared["data"];
+    let coord = &fixture.profile.audit_log_hash_chain_key_id;
+    keyring_core::Entry::new(&coord.service, &coord.account)
+        .expect("Entry::new")
+        .delete_credential()
+        .expect("remove the audit key");
+    fixture
+        .server
+        .set_policy_engine_for_test(std::sync::Arc::new(
+            common::policy_mock::MockPolicyEngine::deny_no_matching_rule(),
+        ));
+    let result = fixture
+        .server
+        .call_stellar_mpp_charge_commit(
+            data["authorization"]["authorization_id"]
+                .as_str()
+                .expect("authorization_id")
+                .to_owned(),
+            data["nonce"].as_str().expect("nonce").to_owned(),
+            data["nonce_expires_at_unix_ms"].as_u64().expect("expiry"),
+        )
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => panic!("the denial is a business envelope, got {error:?}"),
+    };
+    let (code, _, _) = common::assert_business_envelope(&result);
+    assert_eq!(code, "policy.deny.no_matching_rule");
+}
+
+// ── A consent row queued beside the running server ───────────────────────────
+
+/// A consent row `stellar-agent approve` queued while this server held the
+/// writer is in the log before the signed entry leaves the wallet.
+///
+/// The writer is cached in-process by an earlier keyed call. The row is queued
+/// in the outbox and the attestation persisted after it. The commit's own
+/// acquisition, after it reads the approval, drains the row. The mock's handler
+/// for the signed re-simulation refuses unless the row is in the log.
+#[tokio::test]
+#[serial]
+async fn mpp_commit_drains_a_queued_consent_row_before_the_signed_resimulation() {
+    use stellar_agent_core::approval::{
+        AttestationBinding, ConsentAudit, PendingApprovalStore, Surface, attest_and_persist,
+    };
+    use stellar_agent_core::audit_log::{AuditOutbox, AuditWriterRegistry};
+
+    const NAME: &str = "mpp-consent-drain";
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_handler = std::sync::Arc::clone(&seen);
+    let mut fixture = mpp_fixture(NAME, [0x77; 32], true, |r, profile| {
+        let path = profile.audit_log_path.clone();
+        r.on_signed(std::sync::Arc::new(move || {
+            let log = std::fs::read_to_string(&path).unwrap_or_default();
+            seen_in_handler
+                .lock()
+                .unwrap()
+                .push(log.contains(r#""kind":"approval_attested""#));
+        }))
+    })
+    .await;
+    let approvals = tempfile::tempdir().expect("approvals dir");
+    fixture
+        .server
+        .set_approval_dir_for_test(approvals.path().to_path_buf());
+    fixture
+        .server
+        .set_policy_engine_for_test(std::sync::Arc::new(
+            common::policy_mock::MockPolicyEngine::require_approval(),
+        ));
+    let attestation_key = [0x5a_u8; 32];
+    keyring_core::Entry::new(
+        &fixture.profile.attestation_key_id.service,
+        &fixture.profile.attestation_key_id.account,
+    )
+    .expect("Entry::new")
+    .set_password(&URL_SAFE_NO_PAD.encode(attestation_key))
+    .expect("seed attestation key");
+
+    let prepared = fixture
+        .server
+        .call_stellar_mpp_charge_prepare(NAME.to_owned(), challenge(16))
+        .await
+        .expect("prepare");
+    assert_ne!(prepared.is_error, Some(true), "{}", result_json(&prepared));
+    let prepared = result_json(&prepared);
+    let data = &prepared["data"];
+    let approval_id = data["authorization"]["approval_id"]
+        .as_str()
+        .expect("the charge requires approval")
+        .to_owned();
+
+    // An earlier keyed call caches the writer in this process.
+    let access = stellar_agent_network::keyring::keyed_audit_access(
+        &fixture.profile,
+        NAME,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    )
+    .expect("access");
+    let _cached =
+        AuditWriterRegistry::get_or_open_keyed(NAME, &fixture.profile.audit_log_path, access)
+            .expect("writer cached");
+
+    // `approve --id` beside this server: queue the row, then persist.
+    let store_path = approvals.path().join(format!("{NAME}.toml"));
+    let mut store = PendingApprovalStore::open(store_path).expect("approval store");
+    let entry = store.get(&approval_id).expect("pending entry").clone();
+    let outbox = AuditOutbox::for_log(&fixture.profile.audit_log_path);
+    attest_and_persist(
+        &mut store,
+        &entry,
+        &attestation_key,
+        &AttestationBinding::new(NAME, "stellar:testnet"),
+        Surface::Cli,
+        ConsentAudit::Outbox(&outbox),
+        None,
+        |_, _| Err("no grant".to_owned()),
+    )
+    .expect("approve");
+    drop(store);
+    assert!(
+        !std::fs::read_to_string(&fixture.profile.audit_log_path)
+            .unwrap_or_default()
+            .contains(r#""kind":"approval_attested""#),
+        "the row is queued, not yet in the log"
+    );
+
+    let result = fixture
+        .server
+        .call_stellar_mpp_charge_commit(
+            data["authorization"]["authorization_id"]
+                .as_str()
+                .expect("authorization_id")
+                .to_owned(),
+            data["nonce"].as_str().expect("nonce").to_owned(),
+            data["nonce_expires_at_unix_ms"].as_u64().expect("expiry"),
+        )
+        .await
+        .expect("commit");
+    assert_ne!(result.is_error, Some(true), "{}", result_json(&result));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![true],
+        "the consent row must be in the log when the signed entry reaches the RPC"
     );
 }

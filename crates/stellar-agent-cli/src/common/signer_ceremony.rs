@@ -201,9 +201,9 @@ pub(crate) async fn resolve_deployer_keypair(
 /// Records a `WalletMlockFailed` audit-log entry when `degradation` is
 /// `Some`, using the caller's already-open audit writer.
 ///
-/// No-op when `degradation` is `None`. Best-effort: an audit-writer lock
-/// failure is swallowed rather than failing the signing operation over an
-/// audit-log write, matching the `write_success_audit_rows` /
+/// No-op when `degradation` is `None`. Best-effort: a poisoned writer mutex
+/// or a failed write does not fail the signing operation. Either is logged at
+/// `error` with the event kind, matching the `write_success_audit_rows` /
 /// `write_failure_audit_row` convention used elsewhere in the CLI.
 pub(crate) fn record_mlock_degradation(
     audit_writer: &Arc<Mutex<AuditWriter>>,
@@ -214,16 +214,18 @@ pub(crate) fn record_mlock_degradation(
     let Some(degradation) = degradation else {
         return;
     };
-    let Ok(mut writer) = audit_writer.lock() else {
-        return;
-    };
     let entry = AuditEntry::new_mlock_failed(
         profile_name.to_owned(),
         degradation.reason.clone(),
         degradation.errno,
         request_id.to_owned(),
     );
-    let _ = writer.write_entry(entry);
+    crate::commands::value_audit::write_row_logged(
+        audit_writer,
+        entry,
+        "wallet_mlock_failed",
+        request_id,
+    );
 }
 
 /// Enrolled-identity fixtures shared by the signing tests of the CLI verbs.

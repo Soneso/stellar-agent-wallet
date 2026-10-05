@@ -1334,7 +1334,10 @@ pub enum EventKind {
     ///
     /// `prev_chain_tip_hash` MUST be sourced from
     /// `AuditWriter::current_chain_tip()` inside the same write critical
-    /// section.
+    /// section. Build the row in the `build` closure of
+    /// [`AuditWriter::write_built`](crate::audit_log::writer::AuditWriter::write_built),
+    /// which drains the outbox and completes any rotation before the tip is
+    /// read.
     ///
     /// # Redaction
     ///
@@ -2808,11 +2811,15 @@ pub enum EventKind {
         reservation_released: bool,
     },
 
-    /// An x402 payment authorization was signed.
+    /// An x402 payment authorization was signed and is about to leave the
+    /// wallet.
     ///
-    /// Emitted at the point the authorization signature is produced and about
-    /// to be returned; there is no on-chain submit point — the host settles
-    /// externally. The `legs` are the SAME descriptor the policy gate sized.
+    /// Written durably before the signed authorization first leaves the wallet,
+    /// in the RPC re-simulation; a write failure withholds it. There is no
+    /// on-chain submit point, since the host settles externally. A later failure
+    /// on the same request adds an [`EventKind::X402AuthorizationWithheld`] row
+    /// with the same outer `request_id`. The `legs` are the SAME descriptor the
+    /// policy gate sized.
     /// Only non-secret settle identifiers are recorded — never the signature,
     /// token, or any secret.
     ///
@@ -2837,6 +2844,38 @@ pub enum EventKind {
         /// constant identifying how the host settles, facilitator-supplied and
         /// bounded to [`RECORDED_STR_MAX`] characters at construction.
         scheme: String,
+    },
+
+    /// An x402 payment whose `x402_payment_authorized` row was written did not
+    /// return a payment signature to the caller.
+    ///
+    /// Paired with that row by the outer `request_id`. The signed authorization
+    /// reached, or may have reached, the configured RPC in the re-simulation
+    /// whatever the stage. `failure_stage` is one of a closed set:
+    ///
+    /// - `resimulation`: the signed re-simulation request failed in transport,
+    ///   or the RPC answered it with an error or with no resource data.
+    /// - `response_processing`: the RPC answered, and the payload could not be
+    ///   built from the answer.
+    /// - `encoding`: the payload was built, and it could not be encoded as the
+    ///   `PAYMENT-SIGNATURE` header value.
+    ///
+    /// This variant intentionally has NO field named `request_id` or `tool`
+    /// (the outer [`AuditEntry`](super::entry::AuditEntry) owns those). A binary
+    /// that predates this variant cannot replay a log that holds it.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    X402AuthorizationWithheld {
+        /// x402 CAIP-2 network of the withheld authorization, bounded to
+        /// [`RECORDED_STR_MAX`] characters at construction.
+        network: String,
+        /// x402 payment scheme of the withheld authorization, bounded to
+        /// [`RECORDED_STR_MAX`] characters at construction.
+        scheme: String,
+        /// Where the payment failed after its authorization row was written.
+        failure_stage: String,
     },
 
     /// An opaque payload was signed without submission (SEP-43 sign-only).
@@ -3042,7 +3081,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 69;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 70;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5490,6 +5529,44 @@ mod tests {
             !s.contains("\"tool\""),
             "tool must NOT appear as a variant field: {s}"
         );
+    }
+
+    #[test]
+    fn event_kind_x402_authorization_withheld_round_trip() {
+        let ev = EventKind::X402AuthorizationWithheld {
+            network: "stellar:testnet".to_owned(),
+            scheme: "exact".to_owned(),
+            failure_stage: "resimulation".to_owned(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            ev, back,
+            "X402AuthorizationWithheld must round-trip cleanly"
+        );
+        assert!(
+            s.contains(r#""kind":"x402_authorization_withheld""#),
+            "wire discriminant: {s}"
+        );
+        assert!(
+            s.contains(r#""failure_stage":"resimulation""#),
+            "stage: {s}"
+        );
+        assert!(
+            !s.contains("request_id") && !s.contains(r#""tool""#),
+            "outer fields must NOT appear as variant fields: {s}"
+        );
+        // Each field is required on its own: a payload missing exactly one of
+        // them does not deserialize.
+        let full = serde_json::to_value(&ev).unwrap();
+        for field in ["network", "scheme", "failure_stage"] {
+            let mut missing = full.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<EventKind>(missing).is_err(),
+                "X402AuthorizationWithheld without `{field}` must not deserialize"
+            );
+        }
     }
 
     #[test]

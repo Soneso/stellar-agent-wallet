@@ -190,6 +190,18 @@ pub enum X402Error {
         /// Human-readable description of the violation.
         detail: String,
     },
+
+    /// The transmit gate of [`crate::exact::create_payment`] refused, so the
+    /// signed authorization was never sent.
+    ///
+    /// A host whose gate refuses for its own reason keeps that reason beside
+    /// the gate and reports it with its own code. This variant's code reaches a
+    /// caller only from a gate that keeps no such reason.
+    #[error("transmit gate refused: {detail}")]
+    TransmitGateRefused {
+        /// Non-secret description of the refusal.
+        detail: String,
+    },
 }
 
 impl X402Error {
@@ -222,6 +234,7 @@ impl X402Error {
             X402Error::TransactionBuildFailed { .. } => "x402.transaction_build_failed",
             X402Error::UnexpectedAuthEntries { .. } => "x402.unexpected_auth_entries",
             X402Error::KeyringLoadFailed { .. } => "x402.keyring_load_failed",
+            X402Error::TransmitGateRefused { .. } => "x402.transmit_gate_refused",
         }
     }
 }
@@ -418,6 +431,17 @@ mod tests {
         let d = err.to_string();
         assert!(d.contains("transaction build failed"));
         assert!(d.contains("xdr overflow"));
+    }
+
+    #[test]
+    fn transmit_gate_refused_carries_its_own_wire_code() {
+        let err = X402Error::TransmitGateRefused {
+            detail: "audit row not written".to_owned(),
+        };
+        assert_eq!(err.wire_code(), "x402.transmit_gate_refused");
+        let d = err.to_string();
+        assert!(d.contains("transmit gate refused"));
+        assert!(d.contains("audit row not written"));
     }
 
     #[test]

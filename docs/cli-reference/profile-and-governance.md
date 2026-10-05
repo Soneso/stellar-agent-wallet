@@ -389,6 +389,10 @@ State-changing (records an attestation or a grant in the on-disk pending-approva
 
 Interactively, the command prints the summary and prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. It exits `1` when the nonce is unknown, expired, already attested, created by a different local user, denied at the prompt, or on an I/O error.
 
+The `approval_attested` audit row is written before the approval is persisted. Beside a running MCP server or `approve serve` inbox, which hold the audit writer, the row is queued in the audit outbox instead. The running process appends it to the log before any process loads a signing key for the approved action. The envelope's `audit` field says which happened: `"written"` or `"queued"`. The command refuses, persists nothing, and exits `1` when the writer is held by a process that does not drain the outbox (`audit.writer_locked`). It does the same on any other audit failure. Examples are a missing audit key, a rolled-back log (`audit.tip_anchor_mismatch`), and a busy outbox (`audit.outbox_busy`).
+
+After upgrading, restart any running MCP server and `approve serve`: `approve --id` refuses beside an older one, which does not drain the outbox.
+
 For a payment-style approval the response also returns `approval_attestation`: the HMAC blob the agent surface must present as the `approval_attestation` argument to the matching `*_commit` tool. The operator relays it to the agent over a trusted channel; the attestation binds the specific envelope, so it authorises only that one transaction. The field is omitted for approval kinds whose gate reads the recorded consent from the store directly (toolset first-invoke grants, trustline clawback opt-ins).
 
 ```bash
@@ -396,7 +400,7 @@ stellar-agent approve --id ABCxyzNonce --profile <name>
 ```
 
 ```json
-{"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v..."},"request_id":"..."}
+{"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v...","audit":"written"},"request_id":"..."}
 ```
 
 ### `approve gc`
@@ -449,6 +453,13 @@ next commit attempt is refused with the distinct `policy.approval_rejected`
 code. (`approve --id <nonce> --profile <name>` answering `n` keeps its
 leave-to-expire behavior; only the inbox's Reject records an explicit
 rejection.)
+
+Each decision writes its audit row (`approval_attested` or `approval_rejected`)
+before it takes effect. A decision whose row cannot be written is refused with
+`unavailable` and the entry stays pending. A poisoned audit writer refuses
+every later decision until the inbox restarts. `approve serve` itself refuses
+to start while another process, such as a running MCP server, holds the audit
+writer (`audit.writer_locked`).
 
 The printed URL contains a single-use bootstrap token: the first visit
 exchanges it for an HttpOnly session cookie and the token dies. All state
@@ -562,17 +573,19 @@ The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is 
 
 On Unix, the command refuses to verify a log whose parent directory is owned by a different user, since such a directory could be used to substitute log files or sidecars. It exits `0` when the chain is intact and `1` on any integrity violation (a broken chain, a rotation gap, an HMAC mismatch, a missing sidecar, an unparseable line, or a tip-anchor mismatch), a path-contract failure, or an I/O error.
 
+`outbox_pending` counts the consent rows queued in the audit outbox beside the log (`<LOG_PATH>.outbox`) and not yet drained into it, read without taking the outbox lock. Queued rows sit outside the tip anchor until a draining writer appends them. A torn outbox adds an `outbox_torn_tail` warning and unparseable lines add `outbox_unparseable`. An unreadable outbox adds `outbox_unreadable` and omits `outbox_pending`, since no count is known. None of them changes the chain verdict.
+
 ```bash
 stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --profile default
 ```
 
 ```json
-{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false,"anchor":{"status":"verified","reason":null}},"request_id":"..."}
+{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false,"anchor":{"status":"verified","reason":null},"outbox_pending":0},"request_id":"..."}
 ```
 
 ### `audit reanchor --profile <NAME> --acknowledge-rollback`
 
-State-changing (writes the keyring anchor and appends one or two audit rows; no network). The only way out of an `audit.tip_anchor_mismatch` or `audit.log_binding_changed` refusal. Operator-only: an agent must never run it on its own initiative.
+State-changing (writes the keyring anchor, appends one or two audit rows, then drains the audit outbox; no network). The only way out of an `audit.tip_anchor_mismatch` or `audit.log_binding_changed` refusal. Operator-only: an agent must never run it on its own initiative.
 
 - `--profile <NAME>` (required): the profile whose configured `audit_log_path` and audit keyring coordinate identify the anchor.
 - `--acknowledge-rollback` (required to act on a rolled-back log): accept the log's current tip as authoritative.
@@ -588,6 +601,8 @@ A flag the matrix does not require is ignored. The binding is checked before the
 
 With the required flags, the command replays the whole log first, so a log whose own chain is broken is refused rather than blessed. It writes the current tip as the anchor, bumps the current path's re-anchor counter held in the keyring once, and appends the rows, each carrying that count. `rollback_acknowledged` names the superseded anchor. `binding_changed` names the anchor of the log path the previous binding named, or none when the record was unreadable. The rows are permanent: the log carries its own record that a rollback or a binding change was accepted. The new binding is stored last, so a run that stops earlier leaves the refusal in place, and an absent binding is recorded after a rollback repair. The envelope lists the conditions acknowledged and how the recorded binding compared.
 
+Queued consent rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, or the condition an append refused on, such as `audit.io_error`.
+
 The command takes the audit writer's exclusive lock. A running MCP server holds that lock for its lifetime, so stop the server before a rollback repair. A binding change needs no stop: a server running the edited profile refuses before it opens the new path, so it holds no lock there. A server still running the old profile refuses after the acknowledgement until it restarts.
 
 ```bash
@@ -597,7 +612,7 @@ stellar-agent audit reanchor --profile default --acknowledge-binding-change
 ```
 
 ```json
-{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"recorded_binding":"equal","previous_binding_anchor":null},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"recorded_binding":"equal","previous_binding_anchor":null,"outbox_drained":0},"request_id":"..."}
 ```
 
 For the causes worth ruling out before acknowledging, see [Audit-log recovery](../maintainers/audit-log-recovery.md).

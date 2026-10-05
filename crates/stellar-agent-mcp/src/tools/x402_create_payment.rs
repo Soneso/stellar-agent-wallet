@@ -59,7 +59,7 @@ use crate::server::WalletServer;
 use crate::tools::common::{
     business_error_result, decode_payment_required_input, x402_error_to_tool_result, x402_value_leg,
 };
-use crate::tools::value_audit::emit_value_audit_row_with_writer;
+use crate::tools::value_audit::emit_value_audit_row_strict;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument type
@@ -149,6 +149,10 @@ pub struct X402CreatePaymentArgs {
 /// - The keyring entry for the signer cannot be loaded.
 /// - The Soroban RPC simulate call fails.
 /// - The auth-entry signing step fails.
+///
+/// The audit refusals carry their `audit.*` code: the pre-flight before the
+/// signer load, and the `x402_payment_authorized` row the transmit gate writes
+/// before the signed authorization leaves the wallet.
 ///
 /// # Examples
 ///
@@ -265,20 +269,18 @@ impl WalletServer {
         // Runs AFTER the dispatch gate: a policy denial or approval escalation
         // authorizes no payment and needs no audit setup, so it must surface
         // its own code rather than audit.chain_key_unavailable. The pre-flight
-        // still precedes the signer load and the payment authorization — no
-        // signature may exist unless the row recording its production can be
-        // written. Reused (not re-acquired) for the post-signature
-        // `x402_payment_authorized` row.
-        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
+        // precedes the signer load, so a log that cannot take a row refuses
+        // before any key is touched. It keeps no handle: the transmit gate
+        // writes the `x402_payment_authorized` row through its own registry
+        // acquisition, which reruns the anchor check immediately before the
+        // signed authorization is sent.
+        if let Err(err) = crate::tools::value_audit::require_value_audit_writer(
             &self.profile,
             &self.profile_name_for_approval(),
             self.audit_binding,
         ) {
-            Ok(w) => w,
-            Err(err) => {
-                return Ok(business_error_result(err.code(), err.to_string()));
-            }
-        };
+            return Ok(business_error_result(err.code(), err.to_string()));
+        }
 
         tracing::debug!(
             chain_id = %args.chain_id,
@@ -352,24 +354,46 @@ impl WalletServer {
             return Ok(refusal);
         }
 
-        let payment_payload =
-            match create_payment(&requirements, signer.as_ref(), rpc_url, profile_passphrase).await
-            {
-                Ok(p) => p,
-                Err(ref err) => {
-                    // Log error class without secret bleed (X402Error::Display is redaction-safe).
-                    tracing::warn!(
-                        error_class = %classify_x402_error(err),
-                        "x402_create_payment: create_payment failed",
-                    );
-                    return Ok(x402_error_to_tool_result(err));
+        // The transmit gate writes `x402_payment_authorized` before the signed
+        // authorization leaves the wallet in the re-simulation. Both rows of
+        // this payment share the request id minted here.
+        let mut audit = X402AuthorizationAudit::new(
+            self,
+            "stellar_x402_create_payment",
+            args.chain_id.as_str(),
+            audit_leg,
+        );
+        let created = create_payment(
+            &requirements,
+            signer.as_ref(),
+            rpc_url,
+            profile_passphrase,
+            |authorization| audit.before_transmit(authorization),
+        )
+        .await;
+        let payment_payload = match created {
+            Ok(p) => p,
+            Err(ref err) => {
+                // Log error class without secret bleed (X402Error::Display is redaction-safe).
+                tracing::warn!(
+                    error_class = %classify_x402_error(err),
+                    "x402_create_payment: create_payment failed",
+                );
+                if let Some(refusal) = audit.refusal_result() {
+                    return Ok(refusal);
                 }
-            };
+                audit.record_withheld(X402Failure::CreatePayment(err));
+                return Ok(x402_error_to_tool_result(err));
+            }
+        };
 
         // ── Encode PAYMENT-SIGNATURE ──────────────────────────────────────────
         let payment_signature = match encode_payment_signature(&payment_payload) {
             Ok(sig) => sig,
-            Err(ref err) => return Ok(x402_error_to_tool_result(err)),
+            Err(ref err) => {
+                audit.record_withheld(X402Failure::Encoding);
+                return Ok(x402_error_to_tool_result(err));
+            }
         };
 
         // ── Redact payer address for telemetry ────────────────────────────────
@@ -379,25 +403,6 @@ impl WalletServer {
             payer = %redacted_payer,
             network = %requirements.network,
             "x402_create_payment: payment payload constructed",
-        );
-
-        // Non-fatal audit row at signature production. The wallet is the payer;
-        // the host settles externally, so there is no on-chain submit — the row
-        // records the authorized value, not a confirmed transaction.
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let audit_entry = AuditEntry::new_x402_payment_authorized(
-            "stellar_x402_create_payment",
-            args.chain_id.as_str(),
-            vec![audit_leg],
-            requirements.network.as_str(),
-            requirements.scheme.as_str(),
-            PolicyDecision::Allow,
-            &request_id,
-        );
-        emit_value_audit_row_with_writer(
-            &audit_writer,
-            &self.profile_name_for_approval(),
-            audit_entry,
         );
 
         // ── Build response ────────────────────────────────────────────────────
@@ -416,6 +421,163 @@ impl WalletServer {
             .to_json_pretty()
             .unwrap_or_else(|_| String::from("{}"));
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
+    }
+}
+
+/// A failure after `create_payment` was called, as the withheld-row stage
+/// helper classifies it.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum X402Failure<'a> {
+    /// `create_payment` returned this error.
+    CreatePayment(&'a stellar_agent_x402::X402Error),
+    /// The handler could not encode the payload as the `PAYMENT-SIGNATURE`
+    /// header value.
+    Encoding,
+}
+
+/// Returns the `x402_authorization_withheld` stage for `failure`, or `None`
+/// when the transmit gate never returned `Ok`.
+///
+/// Before the gate returns `Ok` the signed authorization has not left the
+/// wallet and no authorized row exists, so no withheld row is written. After
+/// it, an RPC simulate error is the re-simulation itself, every other
+/// `create_payment` error is the processing of its answer, and a failure to
+/// encode the built payload is the encoding.
+pub(super) fn x402_withheld_stage(
+    gate_passed: bool,
+    failure: X402Failure<'_>,
+) -> Option<&'static str> {
+    if !gate_passed {
+        return None;
+    }
+    Some(match failure {
+        X402Failure::CreatePayment(stellar_agent_x402::X402Error::RpcSimulateFailed { .. }) => {
+            "resimulation"
+        }
+        X402Failure::CreatePayment(_) => "response_processing",
+        X402Failure::Encoding => "encoding",
+    })
+}
+
+/// The transmit gate both x402 tools pass to `create_payment`, and what it
+/// observed.
+///
+/// The gate writes the `x402_payment_authorized` row through the strict
+/// helper, which acquires the writer through the registry and reruns the
+/// anchor check, so the row is durable before the signed authorization is
+/// sent. A write that refuses keeps its wallet error here, and the handler
+/// answers with that error's own code. The withheld row of a later failure
+/// carries the same request id as the authorized row.
+pub(super) struct X402AuthorizationAudit<'a> {
+    profile: &'a stellar_agent_core::profile::schema::Profile,
+    profile_name: String,
+    binding: stellar_agent_core::audit_log::BindingCheck,
+    tool: &'static str,
+    chain_id: &'a str,
+    leg: Option<ValueLegRecord>,
+    request_id: String,
+    network: String,
+    scheme: String,
+    gate_passed: bool,
+    refusal: Option<stellar_agent_core::error::WalletError>,
+}
+
+impl<'a> X402AuthorizationAudit<'a> {
+    /// Mints the request id both rows of this payment share.
+    pub(super) fn new(
+        server: &'a WalletServer,
+        tool: &'static str,
+        chain_id: &'a str,
+        leg: ValueLegRecord,
+    ) -> Self {
+        Self {
+            profile: &server.profile,
+            profile_name: server.profile_name_for_approval(),
+            binding: server.audit_binding,
+            tool,
+            chain_id,
+            leg: Some(leg),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            network: String::new(),
+            scheme: String::new(),
+            gate_passed: false,
+            refusal: None,
+        }
+    }
+
+    /// The transmit gate: writes the authorized row, or refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`stellar_agent_x402::X402Error::TransmitGateRefused`] when the row
+    /// cannot be written. The wallet error that refused is kept for
+    /// [`X402AuthorizationAudit::refusal_result`].
+    pub(super) fn before_transmit(
+        &mut self,
+        authorization: &stellar_agent_x402::exact::AuthorizationToTransmit<'_>,
+    ) -> Result<(), stellar_agent_x402::X402Error> {
+        self.network = authorization.network.to_owned();
+        self.scheme = authorization.scheme.to_owned();
+        let entry = AuditEntry::new_x402_payment_authorized(
+            self.tool,
+            self.chain_id,
+            self.leg.take().into_iter().collect(),
+            authorization.network,
+            authorization.scheme,
+            PolicyDecision::Allow,
+            &self.request_id,
+        );
+        match emit_value_audit_row_strict(self.profile, &self.profile_name, self.binding, entry) {
+            Ok(()) => {
+                self.gate_passed = true;
+                Ok(())
+            }
+            Err(error) => {
+                self.refusal = Some(error);
+                Err(stellar_agent_x402::X402Error::TransmitGateRefused {
+                    detail: "the x402_payment_authorized audit row was not written".to_owned(),
+                })
+            }
+        }
+    }
+
+    /// The tool result for the gate's own refusal, carrying the wallet error's
+    /// code, or `None` when the gate did not refuse.
+    pub(super) fn refusal_result(&mut self) -> Option<CallToolResult> {
+        self.refusal
+            .take()
+            .map(|error| business_error_result(error.code(), error.to_string()))
+    }
+
+    /// Writes the `x402_authorization_withheld` row for `failure` when the gate
+    /// wrote the authorized row.
+    ///
+    /// The caller returns its primary error unchanged whatever happens here; a
+    /// row that cannot be written is logged at `error` with its code.
+    pub(super) fn record_withheld(&self, failure: X402Failure<'_>) {
+        let Some(stage) = x402_withheld_stage(self.gate_passed, failure) else {
+            return;
+        };
+        let entry = AuditEntry::new_x402_authorization_withheld(
+            self.tool,
+            self.chain_id,
+            self.network.as_str(),
+            self.scheme.as_str(),
+            stage,
+            self.request_id.as_str(),
+        );
+        if let Err(error) =
+            emit_value_audit_row_strict(self.profile, &self.profile_name, self.binding, entry)
+        {
+            tracing::error!(
+                tool = self.tool,
+                event_kind = "x402_authorization_withheld",
+                failure_stage = stage,
+                code = %error.code(),
+                error = %error,
+                "x402: the withheld-authorization audit row was not written"
+            );
+        }
     }
 }
 
@@ -468,6 +630,7 @@ fn classify_x402_error(err: &stellar_agent_x402::X402Error) -> &'static str {
         X402Error::ReceiptParseFailed { .. } => "receipt_parse_failed",
         X402Error::TransactionBuildFailed { .. } => "transaction_build_failed",
         X402Error::UnexpectedAuthEntries { .. } => "unexpected_auth_entries",
+        X402Error::TransmitGateRefused { .. } => "transmit_gate_refused",
         _ => "x402_error",
     }
 }
@@ -611,6 +774,9 @@ mod tests {
             X402Error::UnexpectedAuthEntries {
                 detail: "i".to_owned(),
             },
+            X402Error::TransmitGateRefused {
+                detail: "j".to_owned(),
+            },
         ];
         for err in cases {
             let class = classify_x402_error(err);
@@ -620,6 +786,69 @@ mod tests {
                 "variant {err:?} must have a specific class"
             );
         }
+    }
+
+    // ── x402_withheld_stage: one test per arm ──────────────────────────────────
+
+    #[test]
+    fn withheld_stage_is_none_before_the_gate_returned_ok() {
+        use stellar_agent_x402::X402Error;
+        let errors = [
+            X402Error::RpcSimulateFailed {
+                detail: "first simulate".to_owned(),
+            },
+            X402Error::TransactionBuildFailed {
+                detail: "before the gate".to_owned(),
+            },
+            X402Error::TransmitGateRefused {
+                detail: "the gate refused".to_owned(),
+            },
+        ];
+        for err in &errors {
+            assert_eq!(
+                x402_withheld_stage(false, X402Failure::CreatePayment(err)),
+                None
+            );
+        }
+        assert_eq!(x402_withheld_stage(false, X402Failure::Encoding), None);
+    }
+
+    #[test]
+    fn withheld_stage_names_an_rpc_simulate_error_after_the_gate_resimulation() {
+        let err = stellar_agent_x402::X402Error::RpcSimulateFailed {
+            detail: "re-simulate returned error".to_owned(),
+        };
+        assert_eq!(
+            x402_withheld_stage(true, X402Failure::CreatePayment(&err)),
+            Some("resimulation")
+        );
+    }
+
+    #[test]
+    fn withheld_stage_names_any_other_error_after_the_gate_response_processing() {
+        use stellar_agent_x402::X402Error;
+        let errors = [
+            X402Error::TransactionBuildFailed {
+                detail: "re-simulate transaction_data decode failed".to_owned(),
+            },
+            X402Error::AmountConversion {
+                detail: "fee".to_owned(),
+            },
+        ];
+        for err in &errors {
+            assert_eq!(
+                x402_withheld_stage(true, X402Failure::CreatePayment(err)),
+                Some("response_processing")
+            );
+        }
+    }
+
+    #[test]
+    fn withheld_stage_names_a_handler_encoding_failure_encoding() {
+        assert_eq!(
+            x402_withheld_stage(true, X402Failure::Encoding),
+            Some("encoding")
+        );
     }
 
     // ── Security regression: RequireApproval is fail-closed ─────────────────────

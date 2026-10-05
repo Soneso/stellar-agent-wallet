@@ -189,7 +189,14 @@ async fn construct_sign_resimulate_happy_path() {
     let signer = signer_from_seed(&seed);
     let requirements = native_testnet_requirements(&g_strkey, TRANSFER_AMOUNT_ATOMIC);
 
-    let result = create_payment(&requirements, &signer, TESTNET_RPC_URL, TESTNET_PASSPHRASE).await;
+    let result = create_payment(
+        &requirements,
+        &signer,
+        TESTNET_RPC_URL,
+        TESTNET_PASSPHRASE,
+        |_| Ok(()),
+    )
+    .await;
 
     match result {
         Ok(payload) => {
@@ -276,11 +283,15 @@ async fn submit_to_testnet_reaches_ledger() {
     let signer = signer_from_seed(&seed);
     let requirements = native_testnet_requirements(&g_strkey, TRANSFER_AMOUNT_ATOMIC);
 
-    let payload = create_payment(&requirements, &signer, TESTNET_RPC_URL, TESTNET_PASSPHRASE)
-        .await
-        .expect(
-            "[submit/confirm FAIL] create_payment must succeed for a funded native-SAC transfer",
-        );
+    let payload = create_payment(
+        &requirements,
+        &signer,
+        TESTNET_RPC_URL,
+        TESTNET_PASSPHRASE,
+        |_| Ok(()),
+    )
+    .await
+    .expect("[submit/confirm FAIL] create_payment must succeed for a funded native-SAC transfer");
 
     let rpc = StellarRpcClient::new(TESTNET_RPC_URL).expect("RPC client construction failed");
 

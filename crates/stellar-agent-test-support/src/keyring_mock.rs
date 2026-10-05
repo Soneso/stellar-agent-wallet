@@ -84,6 +84,154 @@ pub fn install() -> Result<(), keyring_core::Error> {
     Ok(())
 }
 
+/// A callback the hooked mock store runs before a secret read at one keyring
+/// coordinate.
+///
+/// Lets a test act at the exact moment code under test reads a key, for
+/// example to observe the audit log when a signing key loads.
+#[derive(Clone)]
+pub struct ReadHook {
+    service: String,
+    account: String,
+    hook: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl ReadHook {
+    /// A hook that runs `hook` before every secret read at `service`/`account`.
+    #[must_use]
+    pub fn new(service: &str, account: &str, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            service: service.to_owned(),
+            account: account.to_owned(),
+            hook,
+        }
+    }
+}
+
+impl std::fmt::Debug for ReadHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadHook")
+            .field("service", &self.service)
+            .field("account", &self.account)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Installs a fresh in-memory mock store, as [`install`] does, whose secret
+/// reads at each hook's coordinate run that hook first.
+///
+/// Writes, deletes, and reads at every other coordinate behave exactly as the
+/// plain mock store. A hook runs on every read at its coordinate, including
+/// the reads a test performs itself.
+///
+/// # Errors
+///
+/// Returns `Err(keyring_core::Error)` if `keyring_core::mock::Store::new()`
+/// fails.
+pub fn install_with_read_hooks(hooks: Vec<ReadHook>) -> Result<(), keyring_core::Error> {
+    let store: Arc<keyring_core::CredentialStore> = Arc::new(HookedStore {
+        inner: keyring_core::mock::Store::new()?,
+        hooks,
+    });
+    keyring_core::set_default_store(store);
+    Ok(())
+}
+
+/// The mock store with read hooks; see [`install_with_read_hooks`].
+struct HookedStore {
+    inner: Arc<keyring_core::mock::Store>,
+    hooks: Vec<ReadHook>,
+}
+
+impl std::fmt::Debug for HookedStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookedStore")
+            .field("hooks", &self.hooks)
+            .finish_non_exhaustive()
+    }
+}
+
+impl keyring_core::api::CredentialStoreApi for HookedStore {
+    fn vendor(&self) -> String {
+        "stellar-agent-test-support hooked mock store".to_owned()
+    }
+
+    fn id(&self) -> String {
+        keyring_core::api::CredentialStoreApi::id(self.inner.as_ref())
+    }
+
+    fn build(
+        &self,
+        service: &str,
+        user: &str,
+        modifiers: Option<&std::collections::HashMap<&str, &str>>,
+    ) -> keyring_core::Result<keyring_core::Entry> {
+        let entry = keyring_core::api::CredentialStoreApi::build(
+            self.inner.as_ref(),
+            service,
+            user,
+            modifiers,
+        )?;
+        let hooks = self
+            .hooks
+            .iter()
+            .filter(|hook| hook.service == service && hook.account == user)
+            .map(|hook| Arc::clone(&hook.hook))
+            .collect::<Vec<_>>();
+        if hooks.is_empty() {
+            return Ok(entry);
+        }
+        Ok(keyring_core::Entry::new_with_credential(Arc::new(
+            HookedCred { entry, hooks },
+        )))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// A mock credential whose secret reads run hooks first.
+struct HookedCred {
+    entry: keyring_core::Entry,
+    hooks: Vec<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for HookedCred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookedCred").finish_non_exhaustive()
+    }
+}
+
+impl keyring_core::api::CredentialApi for HookedCred {
+    fn set_secret(&self, secret: &[u8]) -> keyring_core::Result<()> {
+        self.entry.set_secret(secret)
+    }
+
+    fn get_secret(&self) -> keyring_core::Result<Vec<u8>> {
+        for hook in &self.hooks {
+            hook();
+        }
+        self.entry.get_secret()
+    }
+
+    fn delete_credential(&self) -> keyring_core::Result<()> {
+        self.entry.delete_credential()
+    }
+
+    fn get_credential(&self) -> keyring_core::Result<Option<Arc<keyring_core::api::Credential>>> {
+        Ok(None)
+    }
+
+    fn get_specifiers(&self) -> Option<(String, String)> {
+        self.entry.get_specifiers()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Canonical `Display` text of the `windows-native-keyring-store` platform
 /// error for Win32 `ERROR_NO_SUCH_LOGON_SESSION` (1312), as rendered inside
 /// `keyring_core::Error::NoStorageAccess`.

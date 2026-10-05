@@ -96,11 +96,7 @@ const PAY_SECRET_ENV_VAR: &str = "PAY_TIMEOUT_ACCEPTANCE_SECRET";
 const OWNER_SECRET_ENV_VAR: &str = "PAY_TIMEOUT_ACCEPTANCE_OWNER_SECRET";
 
 fn unique_profile_name() -> String {
-    let unix_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock must work")
-        .as_secs();
-    format!("pay-timeout-acceptance-{}-{unix_secs}", std::process::id())
+    stellar_agent_test_support::profile_fixtures::unique_profile_name("pay-timeout-acceptance")
 }
 
 fn fresh_keypair() -> (String, Zeroizing<[u8; 32]>) {

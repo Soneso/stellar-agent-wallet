@@ -6558,8 +6558,12 @@ impl SignersManager {
             self.mark_audit_writer_degraded();
             return Err(BaselineWriteError::Poisoned);
         };
-        let entry = build(&writer);
-        writer.write_entry(entry).map_err(BaselineWriteError::Write)
+        // `write_built` drains the audit outbox and completes any rotation
+        // before `build` reads the tip, so `prev_chain_tip_hash` names the row
+        // this one directly follows.
+        writer
+            .write_built(|writer| build(writer))
+            .map_err(BaselineWriteError::Write)
     }
 
     /// Writes the state row recording a confirmed signer mutation.
@@ -9851,6 +9855,145 @@ pub(crate) mod tests {
         assert!(
             manager.audit_writer_degraded(),
             "poisoned audit-writer branch must mark manager degraded"
+        );
+    }
+
+    /// A row queued in the audit outbox drains before the baseline row, and
+    /// the baseline row's `prev_chain_tip_hash` names the row it directly
+    /// follows: the drained row, not the tip before the drain.
+    #[test]
+    fn emit_baseline_names_its_direct_predecessor_after_a_drain() {
+        let dir = tempfile::tempdir().expect("tempdir must succeed");
+        let (manager, audit_log_path) = draining_manager_with_a_queued_consent(dir.path());
+        emit_test_baseline(&manager).expect("the baseline row is written");
+
+        let rows = json_rows(&audit_log_path);
+        let request_ids: Vec<&str> = rows
+            .iter()
+            .map(|row| row["request_id"].as_str().expect("request_id"))
+            .collect();
+        assert_eq!(request_ids, vec!["queued-consent", "req-baseline"]);
+        assert_baseline_predecessors_agree(&rows[1]);
+    }
+
+    /// At the rotation boundary: the drained row fills the active file, so
+    /// the baseline's append rotates first. Both predecessor fields of the
+    /// baseline name the rotation's handoff entry.
+    #[test]
+    fn emit_baseline_names_its_direct_predecessor_across_a_rotation() {
+        use stellar_agent_core::audit_log::rotation::test_seam;
+
+        let dir = tempfile::tempdir().expect("tempdir must succeed");
+        let (manager, audit_log_path) = draining_manager_with_a_queued_consent(dir.path());
+        // The empty active file reaches the threshold once the consent lands.
+        let threshold_guard = test_seam::set_rotation_threshold(&audit_log_path, 1);
+        emit_test_baseline(&manager).expect("the baseline row is written");
+        drop(threshold_guard);
+
+        let archive = std::fs::read_dir(audit_log_path.parent().expect("audit dir"))
+            .expect("list the audit dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("audit.jsonl."))
+                    .is_some_and(|suffix| suffix.starts_with(|c: char| c.is_ascii_digit()))
+            })
+            .expect("the append rotated the log");
+        let archived_kinds: Vec<String> = json_rows(&archive)
+            .iter()
+            .map(|row| row["kind"].as_str().expect("kind").to_owned())
+            .collect();
+        assert_eq!(
+            archived_kinds,
+            vec!["approval_attested", "audit_rotation_handoff"],
+            "the drained row precedes the rotation"
+        );
+        let rows = json_rows(&audit_log_path);
+        assert_eq!(rows.len(), 1, "the baseline opens the new file: {rows:?}");
+        assert_eq!(rows[0]["request_id"], "req-baseline");
+        assert_baseline_predecessors_agree(&rows[0]);
+    }
+
+    /// A signers manager over a draining writer, with one consent row queued
+    /// in the audit outbox, and the audit log path.
+    fn draining_manager_with_a_queued_consent(
+        dir: &std::path::Path,
+    ) -> (SignersManager, std::path::PathBuf) {
+        use stellar_agent_core::audit_log::AuditOutbox;
+        use stellar_agent_core::audit_log::tip_anchor::{InMemoryTipAnchorStore, TipAnchorStore};
+
+        let audit_log_path = dir.join("audit").join("audit.jsonl");
+        let writer = AuditWriter::open_with_tip_anchor(
+            audit_log_path.clone(),
+            None,
+            Arc::new(InMemoryTipAnchorStore::new()) as Arc<dyn TipAnchorStore>,
+        )
+        .expect("a draining writer opens");
+        let manager = SignersManager::new(SignersManagerConfig::new(
+            "http://127.0.0.1:1".to_owned(),
+            "http://127.0.0.1:1".to_owned(),
+            Arc::new(Mutex::new(writer)),
+            audit_log_path.clone(),
+            "Test SDF Network ; September 2015".to_owned(),
+            "test-profile".to_owned(),
+            Duration::from_secs(1),
+            "stellar:testnet".to_owned(),
+        ))
+        .expect("manager construction must succeed");
+        AuditOutbox::for_log(&audit_log_path)
+            .append(&AuditEntry::new_approval_attested(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                "ABCDEFGHIJKLMNOPQRSTUV",
+                "cli",
+                "queued-consent",
+            ))
+            .expect("queue a consent row");
+        (manager, audit_log_path)
+    }
+
+    /// Emits the baseline row of a one-signer observation through `manager`.
+    fn emit_test_baseline(manager: &SignersManager) -> Result<(), SaError> {
+        let observation = test_observation(SignerSetSnapshotV2 {
+            signers: vec![ed25519_entry(0, 0x11)],
+            threshold: None,
+        });
+        manager.emit_baseline(
+            &observation,
+            7,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            "CDABC...12345",
+            BaselineReason::FirstObservation,
+            None,
+            "req-baseline",
+        )
+    }
+
+    /// Every row of the log file at `path`, as JSON.
+    fn json_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .expect("read the log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON row"))
+            .collect()
+    }
+
+    /// Asserts that a baseline row's two predecessor fields are present and
+    /// name one entry.
+    fn assert_baseline_predecessors_agree(baseline: &serde_json::Value) {
+        assert_eq!(
+            baseline["prev_chain_tip_hash"]
+                .as_str()
+                .expect("the baseline carries prev_chain_tip_hash"),
+            baseline["previous_entry_hash"]
+                .as_str()
+                .expect("the baseline carries previous_entry_hash")
+                .strip_prefix("sha256:")
+                .expect("previous_entry_hash carries the sha256: prefix"),
+            "prev_chain_tip_hash names the row the baseline directly follows: {baseline}"
         );
     }
 

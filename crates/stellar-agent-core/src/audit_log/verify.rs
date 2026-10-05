@@ -120,7 +120,8 @@ pub struct FileVerifyResult {
     pub hmac_verified: Option<bool>,
 }
 
-/// Informational warnings produced by [`verify_log`].
+/// Informational warnings produced by [`verify_log`] and by the audit-outbox
+/// inspection `audit verify` runs beside it.
 ///
 /// Warnings do not invalidate the hash chain and do not cause verification to
 /// fail. They are surfaced for operator investigation in deterministic CLI JSON.
@@ -140,6 +141,24 @@ pub enum VerifyWarning {
         file_index: usize,
         /// Zero-based non-empty entry index within the file.
         entry_index: usize,
+    },
+    /// The audit outbox ends in a segment with no terminating newline: an
+    /// append that never returned `Ok`. The next append or drain discards it.
+    OutboxTornTail {
+        /// Size of the torn segment in bytes.
+        torn_bytes: usize,
+    },
+    /// Complete lines of the audit outbox do not parse as audit entries. Every
+    /// drain refuses with `audit.outbox_unusable` until an operator moves the
+    /// file aside; see `docs/maintainers/audit-log-recovery.md`.
+    OutboxUnparseable {
+        /// One-based numbers of the lines that do not parse.
+        lines: Vec<usize>,
+    },
+    /// The audit outbox exists and could not be read.
+    OutboxUnreadable {
+        /// The I/O error kind.
+        error_kind: String,
     },
 }
 
@@ -957,6 +976,7 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             | EventKind::ValueActionFailed { .. }
             | EventKind::SubmissionReceiptCleared { .. }
             | EventKind::X402PaymentAuthorized { .. }
+            | EventKind::X402AuthorizationWithheld { .. }
             | EventKind::OpaquePayloadSigned { .. }
             | EventKind::MppChargeAuthorized { .. }
             | EventKind::MppAuthorizationWithheld { .. }
@@ -1581,6 +1601,7 @@ mod tests {
             EventKind::ValueActionFailed { .. } => "value_action_failed",
             EventKind::SubmissionReceiptCleared { .. } => "submission_receipt_cleared",
             EventKind::X402PaymentAuthorized { .. } => "x402_payment_authorized",
+            EventKind::X402AuthorizationWithheld { .. } => "x402_authorization_withheld",
             EventKind::OpaquePayloadSigned { .. } => "opaque_payload_signed",
             EventKind::MppChargeAuthorized { .. } => "mpp_charge_authorized",
             EventKind::MppAuthorizationWithheld { .. } => "mpp_authorization_withheld",
@@ -2066,6 +2087,11 @@ mod tests {
                 network: "stellar:testnet".to_owned(),
                 scheme: "exact".to_owned(),
             },
+            EventKind::X402AuthorizationWithheld {
+                network: "stellar:testnet".to_owned(),
+                scheme: "exact".to_owned(),
+                failure_stage: "resimulation".to_owned(),
+            },
             EventKind::OpaquePayloadSigned {
                 payload_sha256_redacted: "dfe78222...9d11baf1".to_owned(),
                 signer_redacted: crate::observability::RedactedStrkey::from_already_redacted(
@@ -2392,6 +2418,7 @@ mod tests {
                 "value_action_failed",
                 "submission_receipt_cleared",
                 "x402_payment_authorized",
+                "x402_authorization_withheld",
                 "opaque_payload_signed",
                 "mpp_charge_authorized",
                 "mpp_authorization_withheld",
@@ -4284,7 +4311,12 @@ mod tests {
             1,
             "drift of 60_001 ms must produce exactly one warning"
         );
-        let VerifyWarning::BackwardTimestampJump { drift_ms, .. } = &ok.warnings[0];
+        let VerifyWarning::BackwardTimestampJump { drift_ms, .. } = &ok.warnings[0] else {
+            panic!(
+                "expected a backward timestamp jump, got {:?}",
+                ok.warnings[0]
+            );
+        };
         assert_eq!(*drift_ms, 60_001);
     }
 

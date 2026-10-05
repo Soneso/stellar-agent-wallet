@@ -503,12 +503,14 @@ State-changing (records an HMAC attestation, or for a toolset first-invoke gate 
 
 Interactively prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. Exits `1` when the nonce is unknown, expired, already attested, created by a different local user, denied, or on I/O error. For payment-style approvals the response returns `approval_attestation` (the HMAC blob the agent must pass as the `approval_attestation` argument to the matching `*_commit` tool); omitted for kinds whose gate reads recorded consent directly (toolset first-invoke grants, trustline clawback opt-ins).
 
+The `approval_attested` row is written before the approval is persisted. `audit` is `"written"`, or `"queued"` when a running MCP server or `approve serve` inbox holds the audit writer. That process appends the queued row to the log before any process loads a signing key for the approved action. The command exits `1` and persists nothing beside a process that does not drain the outbox (`audit.writer_locked`) and on any other audit failure. After upgrading, restart a running MCP server and `approve serve`: `approve --id` refuses beside an older one.
+
 ```bash
 stellar-agent approve --id ABCxyzNonce --profile <name>
 ```
 
 ```json
-{"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v..."},"request_id":"..."}
+{"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v...","audit":"written"},"request_id":"..."}
 ```
 
 ### `approve gc`
@@ -621,17 +623,19 @@ The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is 
 
 On Unix, refuses to verify a log whose parent directory is owned by a different user. Exits `0` when the chain is intact, `1` on any integrity violation (broken chain, rotation gap, HMAC mismatch, missing sidecar, unparseable line, tip-anchor mismatch), path-contract failure, or I/O error.
 
+`outbox_pending` counts the consent rows queued in the audit outbox beside the log (`<LOG_PATH>.outbox`) and not yet drained into it, read without taking the outbox lock. Queued rows sit outside the tip anchor until a draining writer appends them. A torn outbox adds an `outbox_torn_tail` warning and unparseable lines add `outbox_unparseable`. An unreadable outbox adds `outbox_unreadable` and omits `outbox_pending`, since no count is known. None of them changes the chain verdict.
+
 ```bash
 stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --profile default
 ```
 
 ```json
-{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false,"anchor":{"status":"verified","reason":null}},"request_id":"..."}
+{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false,"anchor":{"status":"verified","reason":null},"outbox_pending":0},"request_id":"..."}
 ```
 
 ### `audit reanchor --profile <NAME> --acknowledge-rollback`
 
-State-changing (writes the keyring anchor and appends one or two audit rows; no network). The only way out of an `audit.tip_anchor_mismatch` or `audit.log_binding_changed` refusal. Operator-only: an agent must never run it on its own initiative, because it accepts a log or a profile change that may have been tampered with.
+State-changing (writes the keyring anchor, appends one or two audit rows, then drains the audit outbox; no network). The only way out of an `audit.tip_anchor_mismatch` or `audit.log_binding_changed` refusal. Operator-only: an agent must never run it on its own initiative, because it accepts a log or a profile change that may have been tampered with.
 
 | Flag / arg | Meaning |
 |---|---|
@@ -647,13 +651,15 @@ State-changing (writes the keyring anchor and appends one or two audit rows; no 
 
 A flag the matrix does not require is ignored. A missing flag changes nothing and exits `1` with `validation.acknowledgement_required`, naming the flag. With the required flags it replays the whole log, so a broken chain is refused rather than blessed. It writes the current tip, bumps the current path's re-anchor counter once, and appends the rows, each carrying that count. `binding_changed` names the old path's anchor, or none when the record was unreadable. The new binding is stored last. It takes the audit writer's exclusive lock, so a running MCP server must be stopped before a rollback repair; with one running it refuses `audit.writer_locked`. A binding change needs no stop: a server running the edited profile refuses before it opens the new path, so it holds no lock there. A server still running the old profile refuses after the acknowledgement until it restarts.
 
+Queued consent rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, or the condition an append refused on, such as `audit.io_error`.
+
 ```bash
 stellar-agent audit reanchor --profile default --acknowledge-rollback
 stellar-agent audit reanchor --profile default --acknowledge-binding-change
 ```
 
 ```json
-{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"recorded_binding":"equal","previous_binding_anchor":null},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"recorded_binding":"equal","previous_binding_anchor":null,"outbox_drained":0},"request_id":"..."}
 ```
 
 ### Governance loop

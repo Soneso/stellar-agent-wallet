@@ -2,7 +2,7 @@
 
 Rust-native x402 Exact Stellar payment scheme, payer side, for the stellar-agent-wallet.
 
-This crate constructs and signs x402 v2 `PAYMENT-SIGNATURE` payloads for the Exact Stellar scheme via a multi-step validate, build, simulate, sign, re-simulate, and finalize flow, wire-compatible with the published `@x402/stellar` package. The entry point `exact::create_payment` produces the signed payload; a host integration (for example an MCP tool) delivers it over HTTP, and the payee or facilitator settles it on-chain.
+This crate constructs and signs x402 v2 `PAYMENT-SIGNATURE` payloads for the Exact Stellar scheme via a multi-step validate, build, simulate, sign, re-simulate, and finalize flow, wire-compatible with the published `@x402/stellar` package. The entry point `exact::create_payment` produces the signed payload; a host integration (for example an MCP tool) delivers it over HTTP, and the payee or facilitator settles it on-chain. The signed authorization first leaves the wallet in the RPC re-simulation, and `create_payment` runs a caller-supplied transmit gate immediately before that request, so the host can record the authorization durably or withhold it.
 
 The crate is payer-only: it implements no payee or facilitator logic, targets Stellar Exact (not EVM, not the `upto` scheme, not x402 v3.x), and does not orchestrate the HTTP retry loop.
 

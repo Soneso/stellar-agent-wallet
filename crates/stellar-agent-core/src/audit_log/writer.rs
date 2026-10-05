@@ -188,6 +188,16 @@ const LOG_TIP_REWRITTEN_REASON: &str =
 pub struct AuditWriter {
     /// Path to the active log file.
     path: PathBuf,
+    /// The drain lock `<path>.drain.lock`, held for the writer's whole life
+    /// when the writer drains the audit outbox, and `None` otherwise.
+    ///
+    /// Taken only after the sidecar lock, so a writer that lost the sidecar
+    /// never holds it. Another process that finds the sidecar lock held reads
+    /// this lock to learn whether the holder drains. Declared before `_lock`
+    /// because fields drop in declaration order: the drain lock is released
+    /// first, so a held drain lock never outlives the sidecar lock it vouches
+    /// for.
+    _drain_lock: Option<crate::audit_log::lock::AuditWriterLock>,
     /// Exclusive advisory lock on the sidecar `<path>.lock` file.
     ///
     /// Held for the entire `AuditWriter` lifetime, including across every
@@ -197,6 +207,14 @@ pub struct AuditWriter {
     /// sections.  This field is never read; its only purpose is to hold the
     /// lock for as long as the `AuditWriter` lives.
     _lock: crate::audit_log::lock::AuditWriterLock,
+    /// `true` for a writer opened with a tip-anchor store in `Check` mode.
+    ///
+    /// A draining writer drains the outbox at open after anchor
+    /// reconciliation, in every [`AuditWriter::verify_tip_anchor`] (which
+    /// every registry cache hit runs), and at the start of every
+    /// [`AuditWriter::write_entry`] and [`AuditWriter::write_built`]. A queued
+    /// row therefore precedes the writer's own next row.
+    drains: bool,
     /// The single OS handle used for every read and write against the active
     /// log file.
     ///
@@ -255,6 +273,14 @@ pub struct AuditWriter {
     /// `sync_data` and the anchor write.
     #[cfg(test)]
     skip_tip_anchor_write: bool,
+    /// Test-only fault seam: the number of further appends allowed to succeed
+    /// before the next one fails, or `None` for no fault.
+    #[cfg(test)]
+    appends_before_fault: Option<usize>,
+    /// Test-only fault seam for a crash between a drain's appends and the
+    /// outbox truncation: the drain appends and returns without truncating.
+    #[cfg(test)]
+    skip_outbox_truncate: bool,
     /// Archive name produced by a failed mid-rotation active-lock acquisition.
     ///
     /// Once set, the writer refuses all future writes. The caller must discard
@@ -398,6 +424,16 @@ pub enum ReanchorAcknowledgement {
     },
 }
 
+/// Why an append refused before its row was written.
+#[derive(Debug)]
+enum AppendRefusal {
+    /// The log at the path stopped being the log the writer holds. The caller
+    /// anchors the row it owed, so the refusal outlives the process.
+    LogMoved(WriterError),
+    /// Every other refusal. Nothing is anchored.
+    Other(WriterError),
+}
+
 /// The outcome of an operator-acknowledged re-anchor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -409,6 +445,20 @@ pub struct ReanchorReport {
     pub current: Option<TipAnchor>,
     /// Value of the path's monotonic re-anchor counter after this repair.
     pub reanchor_count: u64,
+    /// Number of queued outbox rows the repair appended after its own rows, or
+    /// `None` when the drain refused.
+    ///
+    /// A refused drain leaves every queued row in the outbox, and the next
+    /// drain appends again the rows it appended before the refusal.
+    pub outbox_drained: Option<usize>,
+    /// Why the outbox could not be drained after a successful repair, led by
+    /// its `audit.*` sub-code, or `None` when the drain succeeded.
+    ///
+    /// The sub-code is `audit.outbox_unusable`, `audit.outbox_busy`, or the
+    /// condition an append of the drain refused on, such as `audit.io_error`.
+    /// The repair itself stands either way; the rows stay queued for the next
+    /// drain.
+    pub outbox_refusal: Option<String>,
 }
 
 impl std::fmt::Debug for AuditWriter {
@@ -463,6 +513,10 @@ impl AuditWriter {
     /// unkeyed — the chain root is not HMAC-signed (the hash chain is still
     /// intact) and no anchor is checked or advanced. There is no third shape.
     ///
+    /// A writer opened with an anchor store takes `<log>.drain.lock` and
+    /// drains the audit outbox after reconciliation. The adoption row is
+    /// appended even when the drain refuses.
+    ///
     /// # Errors
     ///
     /// - [`WriterError::PathContract`] if `path` has no parent directory
@@ -473,6 +527,8 @@ impl AuditWriter {
     /// - [`WriterError::TipAnchorMismatch`] / [`WriterError::TipAnchorStore`]
     ///   from the anchor reconciliation when `access` is supplied; see
     ///   [`AuditWriter::open_with_tip_anchor`].
+    /// - Every error of [`AuditWriter::drain_outbox`], when `access` is
+    ///   supplied.
     pub fn open(path: PathBuf, access: Option<KeyedAuditAccess>) -> Result<Self, WriterError> {
         let (hmac_key, tip_anchor) = match access {
             Some(access) => {
@@ -520,6 +576,10 @@ impl AuditWriter {
     /// [`WriterError::TipAnchorMismatch`]. From then on every
     /// [`AuditWriter::write_entry`] advances the anchor.
     ///
+    /// The writer takes `<log>.drain.lock` and drains the audit outbox after
+    /// reconciliation. The adoption row is appended even when the drain
+    /// refuses.
+    ///
     /// Supply a store only for writers whose appends should move the anchor.
     /// See [`crate::audit_log::tip_anchor`] for the full check semantics and for
     /// what the anchor does not protect.
@@ -531,6 +591,7 @@ impl AuditWriter {
     ///   anchored tip.
     /// - [`WriterError::TipAnchorStore`] when the anchor cannot be read or
     ///   written.
+    /// - Every error of [`AuditWriter::drain_outbox`].
     pub fn open_with_tip_anchor(
         path: PathBuf,
         hmac_key: Option<Zeroizing<[u8; 32]>>,
@@ -597,6 +658,18 @@ impl AuditWriter {
         let lock_path = lock_sidecar_path(&path);
         let lock = crate::audit_log::lock::AuditWriterLock::acquire(&lock_path)?;
 
+        // A draining writer takes the drain lock here, while it holds the
+        // sidecar lock. An opener that lost the sidecar never holds it, so a
+        // held drain lock always means a draining writer owns the log. The
+        // repair writer and writers without an anchor store do not drain and
+        // do not take it.
+        let drains = tip_anchor.is_some() && anchor_mode == TipAnchorOpenMode::Check;
+        let drain_lock = if drains {
+            Some(super::outbox::acquire_drain_lock(&path)?)
+        } else {
+            None
+        };
+
         // Open the data file. No lock is placed on it; see above. This is the
         // single handle used for every subsequent read and write against the
         // active log file — see the module-level "Single-handle I/O against
@@ -632,7 +705,9 @@ impl AuditWriter {
 
         let mut writer = Self {
             path,
+            _drain_lock: drain_lock,
             _lock: lock,
+            drains,
             file,
             last_hash: scan.last_hash,
             is_new_file,
@@ -647,12 +722,20 @@ impl AuditWriter {
             fail_after_entry_before_sidecar: false,
             #[cfg(test)]
             skip_tip_anchor_write: false,
+            #[cfg(test)]
+            appends_before_fault: None,
+            #[cfg(test)]
+            skip_outbox_truncate: false,
             partial_rotation_archive: None,
         };
 
         if writer.tip_anchor.is_some() && anchor_mode == TipAnchorOpenMode::Check {
             let outcome = writer.reconcile_tip_anchor()?;
-            writer.emit_adoption_row_if_needed(outcome);
+            let anchored_count = writer.entry_count;
+            // Drain point: at open, after anchor reconciliation and before any
+            // row of the writer's own, so a queued consent row enters the log
+            // before the opener can act on the approval it records.
+            writer.drain_then_record_adoption(outcome, anchored_count)?;
         }
 
         Ok(writer)
@@ -678,7 +761,9 @@ impl AuditWriter {
     /// The `prev_chain_tip_hash` field of `SaSignerSetBaselined` MUST be
     /// sourced from this method inside the same write critical section (while
     /// the `Arc<Mutex<AuditWriter>>` is held), never re-read from disk after
-    /// lock release.
+    /// lock release. Build the row in the `build` closure of
+    /// [`AuditWriter::write_built`], which drains the outbox and completes any
+    /// rotation before the tip is read.
     ///
     /// # Returns
     ///
@@ -695,7 +780,11 @@ impl AuditWriter {
 
     /// Appends `entry` to the audit log.
     ///
-    /// Steps:
+    /// A draining writer first drains the audit outbox, so every queued
+    /// consent row precedes this entry. A writer that does not drain appends
+    /// directly.
+    ///
+    /// Steps of the append itself:
     /// 1. Rotate if needed (file size exceeds [`ROTATION_THRESHOLD_BYTES`]).
     /// 2. Truncate arg_keys if needed to stay within the 4096-byte limit.
     /// 3. Set `entry.previous_entry_hash` to the writer's `last_hash`.
@@ -713,15 +802,173 @@ impl AuditWriter {
     ///
     /// # Errors
     ///
+    /// - Every error of [`AuditWriter::drain_outbox`], for a draining writer.
+    ///   The entry is then not appended.
     /// - [`WriterError::Io`] on I/O failure.
     /// - [`WriterError::Serialise`] if the entry cannot be serialised.
     /// - [`WriterError::Hash`] if the hash computation fails.
-    pub fn write_entry(&mut self, mut entry: AuditEntry) -> Result<(), WriterError> {
+    pub fn write_entry(&mut self, entry: AuditEntry) -> Result<(), WriterError> {
+        if self.drains {
+            self.drain_outbox()?;
+        }
+        self.append_checked(entry)
+    }
+
+    /// Drains the audit outbox, then builds an entry from the writer's current
+    /// state and appends it, with nothing appended in between.
+    ///
+    /// `build` reads the tip it needs from the writer, for example
+    /// [`AuditWriter::current_chain_tip`]. The drain runs first. Every check the
+    /// append makes, and any rotation it needs, runs next, so a rotation's
+    /// handoff entry is in place before `build` reads the tip. The append then
+    /// follows `build` directly, so the tip `build` reads is the predecessor of
+    /// the entry it builds. A caller that reads the tip before
+    /// [`AuditWriter::write_entry`] gets no such guarantee. That call's own drain
+    /// and rotation can land rows in between.
+    ///
+    /// A writer that does not drain builds and appends without draining.
+    ///
+    /// # Errors
+    ///
+    /// Every error of [`AuditWriter::write_entry`].
+    pub fn write_built<F>(&mut self, build: F) -> Result<(), WriterError>
+    where
+        F: FnOnce(&Self) -> AuditEntry,
+    {
+        if self.drains {
+            self.drain_outbox()?;
+        }
+        if let Err(refusal) = self.prepare_append() {
+            // When the log moved under the writer, the row this call owed is
+            // built only to anchor it.
+            return Err(match refusal {
+                AppendRefusal::LogMoved(e) => {
+                    self.anchor_owed_row(build);
+                    e
+                }
+                AppendRefusal::Other(e) => e,
+            });
+        }
+        let entry = build(self);
+        self.commit_append(entry)
+    }
+
+    /// Returns `true` when this writer drains the audit outbox.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn drains_outbox(&self) -> bool {
+        self.drains
+    }
+
+    /// Appends every row queued in the audit outbox to the log, then empties
+    /// the outbox.
+    ///
+    /// Drains whatever writer it is called on. Under the outbox lock it reads
+    /// the file, discards a final segment with no terminating newline (an
+    /// append that never returned `Ok`) with a `warn`, and parses every
+    /// complete line before appending any. Each entry keeps the consent
+    /// timestamp it was queued with. Only after every entry is appended is the
+    /// outbox truncated to zero.
+    ///
+    /// Delivery is at least once. A refusal leaves the outbox unchanged, and
+    /// the entries appended before the refusal are appended again by the next
+    /// drain, with the same `request_id`. Queued rows sit outside the tip
+    /// anchor until they are drained.
+    ///
+    /// Returns the number of rows appended.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
+    /// - [`WriterError::OutboxUnusable`] when a complete line does not parse.
+    ///   Nothing is appended and the outbox is left unchanged.
+    /// - Every error of the append, for example
+    ///   [`WriterError::TipAnchorMismatch`]. The outbox is left unchanged.
+    /// - [`WriterError::Io`] when the outbox cannot be read or truncated.
+    pub fn drain_outbox(&mut self) -> Result<usize, WriterError> {
+        let Some(mut batch) = super::outbox::OutboxBatch::take(&self.path)? else {
+            return Ok(0);
+        };
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let entries = batch.take_entries();
+        let drained = entries.len();
+        for entry in entries {
+            self.append_checked(entry)?;
+        }
+        #[cfg(test)]
+        if self.skip_outbox_truncate {
+            return Ok(drained);
+        }
+        batch.clear()?;
+        if drained > 0 {
+            tracing::debug!(
+                log = %basename_lossy_path(&self.path),
+                drained,
+                "audit outbox drained into the log"
+            );
+        }
+        Ok(drained)
+    }
+
+    /// Appends `entry` with every check an append makes, without draining.
+    ///
+    /// The divergence check, the anchor retry, rotation, the hash, the write,
+    /// the fsync, the chain-root sidecar, and the anchor advance all run here,
+    /// through [`Self::prepare_append`] and [`Self::commit_append`].
+    /// [`AuditWriter::write_entry`], [`AuditWriter::write_built`], and
+    /// [`AuditWriter::drain_outbox`] append only through these two methods.
+    fn append_checked(&mut self, entry: AuditEntry) -> Result<(), WriterError> {
+        if let Err(refusal) = self.prepare_append() {
+            return Err(match refusal {
+                AppendRefusal::LogMoved(e) => {
+                    self.anchor_owed_row(|_| entry);
+                    e
+                }
+                AppendRefusal::Other(e) => e,
+            });
+        }
+        self.commit_append(entry)
+    }
+
+    /// Anchors the row an append owed when the log moved under the writer,
+    /// once per writer. `owed` builds that row and runs only while no owed
+    /// row is anchored.
+    fn anchor_owed_row(&mut self, owed: impl FnOnce(&Self) -> AuditEntry) {
+        if !self.owed_row_anchored {
+            let mut entry = owed(self);
+            self.anchor_the_refused_row(&mut entry);
+        }
+    }
+
+    /// Runs every check an append makes before its row exists, and completes
+    /// any rotation the append needs.
+    ///
+    /// After `Ok`, the writer's tip is the predecessor of the next row
+    /// [`Self::commit_append`] writes, so a row built from that tip names its
+    /// predecessor correctly.
+    ///
+    /// # Errors
+    ///
+    /// [`AppendRefusal::LogMoved`] when the log at the path stopped being the
+    /// log this writer holds, and [`AppendRefusal::Other`] for every other
+    /// refusal, including a failed rotation.
+    fn prepare_append(&mut self) -> Result<(), AppendRefusal> {
+        #[cfg(test)]
+        if let Some(remaining) = self.appends_before_fault.as_mut() {
+            if *remaining == 0 {
+                return Err(AppendRefusal::Other(WriterError::Io(io::Error::other(
+                    "test fault: append refused",
+                ))));
+            }
+            *remaining -= 1;
+        }
         if let Some(archive_name) = &self.partial_rotation_archive {
-            return Err(WriterError::PartialRotation {
+            return Err(AppendRefusal::Other(WriterError::PartialRotation {
                 archive_name: archive_name.clone(),
                 active_locked_by: None,
-            });
+            }));
         }
 
         // The log this writer holds must still be the log at its path, and must
@@ -733,15 +980,11 @@ impl AuditWriter {
         // the rotation decision, which is the one moment the handle and the path
         // are legitimately allowed to diverge.
         //
-        // A refusal here is durable, not just in-process: the row the wallet owed
-        // is anchored in the keyring, so no file at this path satisfies the
-        // anchor again until an operator acknowledges what happened.
-        if let Err(e) = self.refuse_if_log_moved_on_append() {
-            if !self.owed_row_anchored {
-                self.anchor_the_refused_row(&mut entry);
-            }
-            return Err(e);
-        }
+        // A refusal here is durable, not just in-process: the caller anchors
+        // the row the wallet owed in the keyring. No file at this path then
+        // satisfies the anchor until an operator acknowledges what happened.
+        self.refuse_if_log_moved_on_append()
+            .map_err(AppendRefusal::LogMoved)?;
 
         // Repair an anchor left behind by an earlier failed write, before this
         // append moves the tip again. The value written names the entry most
@@ -749,11 +992,24 @@ impl AuditWriter {
         // writes were missed.
         self.retry_tip_anchor_if_behind();
 
-        // Rotate if needed before writing.
-        if self.needs_rotation()? {
-            self.rotate()?;
+        // Rotate if needed before the row is built and written, so the
+        // rotation's handoff entry is the row's predecessor.
+        if self.needs_rotation().map_err(AppendRefusal::Other)? {
+            self.rotate().map_err(AppendRefusal::Other)?;
         }
+        Ok(())
+    }
 
+    /// Writes `entry` after [`Self::prepare_append`] returned `Ok`, with
+    /// nothing appended in between: the hash, the write, the fsync, the
+    /// chain-root sidecar, and the anchor advance.
+    ///
+    /// # Errors
+    ///
+    /// [`WriterError::Io`], [`WriterError::Serialise`], or
+    /// [`WriterError::Hash`] when the row cannot be hashed, serialised, or
+    /// written.
+    fn commit_append(&mut self, mut entry: AuditEntry) -> Result<(), WriterError> {
         // Truncate arg_keys if needed.
         entry.truncate_arg_keys_if_needed()?;
 
@@ -831,6 +1087,20 @@ impl AuditWriter {
         self.skip_tip_anchor_write = enabled;
     }
 
+    /// Enables a test-only fault seam: `allowed` further appends succeed and
+    /// the next one fails with an I/O error. `None` disables it.
+    #[cfg(test)]
+    pub(crate) fn set_appends_before_fault(&mut self, allowed: Option<usize>) {
+        self.appends_before_fault = allowed;
+    }
+
+    /// Enables a test-only fault seam for a crash between a drain's appends
+    /// and the outbox truncation.
+    #[cfg(test)]
+    pub(crate) fn set_skip_outbox_truncate(&mut self, enabled: bool) {
+        self.skip_outbox_truncate = enabled;
+    }
+
     /// Forces a log rotation without waiting for the size threshold.
     ///
     /// `pub(crate)` and `#[cfg(test)]` — only for unit tests that need to
@@ -891,6 +1161,11 @@ impl AuditWriter {
     ///
     /// A writer with no anchor store returns `Ok(())` unchanged.
     ///
+    /// A draining writer then drains the audit outbox, so this is a drain point
+    /// of every registry cache hit. When reconciliation adopted the file, the
+    /// adoption row follows the drained rows, and it is appended even when the
+    /// drain refuses.
+    ///
     /// # Errors
     ///
     /// - [`WriterError::TipAnchorMismatch`] when the file no longer contains the
@@ -899,10 +1174,11 @@ impl AuditWriter {
     ///   written.
     /// - [`WriterError::Io`] / [`WriterError::Serialise`] /
     ///   [`WriterError::ChainBrokenAtOpen`] when the file cannot be replayed.
+    /// - Every error of [`AuditWriter::drain_outbox`], for a draining writer.
     pub fn verify_tip_anchor(&mut self) -> Result<(), WriterError> {
         let outcome = self.reconcile_tip_anchor()?;
-        self.emit_adoption_row_if_needed(outcome);
-        Ok(())
+        let anchored_count = self.entry_count;
+        self.drain_then_record_adoption(outcome, anchored_count)
     }
 
     /// Moves the anchor to the active file's current tip and records the
@@ -917,6 +1193,11 @@ impl AuditWriter {
     ///
     /// Open the writer with [`AuditWriter::open_for_reanchor`]: an ordinary open
     /// would refuse before reaching this method.
+    ///
+    /// After its own row, the repair drains the audit outbox, so the queued
+    /// rows follow the `audit_tip_anchored` row. A drain refusal does not undo
+    /// the repair: it is reported in [`ReanchorReport::outbox_refusal`] and the
+    /// rows stay queued.
     ///
     /// # Errors
     ///
@@ -940,6 +1221,9 @@ impl AuditWriter {
     /// incremented once, so every row of one run carries the same count. A
     /// rollback row names this path's superseded anchor; a binding-change row
     /// names the anchor the caller supplies for the previous binding's path.
+    /// Queued consent rows drain after every acknowledgement row is appended.
+    /// A drain refusal leaves the repair in force and is reported in
+    /// [`ReanchorReport::outbox_refusal`].
     ///
     /// # Errors
     ///
@@ -978,7 +1262,7 @@ impl AuditWriter {
 
         // Each row advances the anchor past the one before; the report names
         // the anchor the operator asked for, which is what the refusal was
-        // about. Every row records the entry count of the repaired tip.
+        // about. Every repair row records the entry count of the repaired tip.
         for acknowledgement in acknowledged {
             let (reason, previous_anchor) = match acknowledgement {
                 ReanchorAcknowledgement::Rollback => (
@@ -989,7 +1273,7 @@ impl AuditWriter {
                     (TipAnchorReason::BindingChanged, previous_anchor.clone())
                 }
             };
-            self.write_entry(AuditEntry::new_audit_tip_anchored(
+            self.append_checked(AuditEntry::new_audit_tip_anchored(
                 reason,
                 repaired_count,
                 previous_anchor,
@@ -998,6 +1282,21 @@ impl AuditWriter {
             ))?;
         }
 
+        // Queued rows follow the repair rows. A drain refusal leaves them
+        // queued and the repair in force.
+        let (outbox_drained, outbox_refusal) = match self.drain_outbox() {
+            Ok(drained) => (Some(drained), None),
+            Err(e) => {
+                let detail = audit_log_unusable_detail(&e).unwrap_or_else(|| e.to_string());
+                tracing::warn!(
+                    log = %basename_lossy_path(&self.path),
+                    error = %e,
+                    "audit reanchor: the repair stands, and the audit outbox could not be drained"
+                );
+                (None, Some(detail))
+            }
+        };
+
         // The rows advanced the anchor past the repaired tip; report the
         // anchor as it now stands rather than the intermediate value.
         let current = store.load_anchor().map_err(WriterError::TipAnchorStore)?;
@@ -1005,6 +1304,8 @@ impl AuditWriter {
             previous,
             current,
             reanchor_count,
+            outbox_drained,
+            outbox_refusal,
         })
     }
 
@@ -1563,23 +1864,45 @@ impl AuditWriter {
         self.store_tip_anchor_best_effort(&current);
     }
 
-    /// Appends the adoption row when reconciliation adopted a non-empty file.
+    /// Drains the outbox of a draining writer, then appends the adoption row
+    /// when reconciliation adopted a non-empty file.
+    ///
+    /// `entry_count` is the count the adoption anchored, read before the
+    /// drain. The adoption is in force in the keyring once reconciliation
+    /// returns, and the next reconciliation finds the anchor current, so this
+    /// call is the only one that can append the adoption row. When the drain
+    /// refuses, the row is still appended and the refusal is returned; the
+    /// refused rows stay queued behind it.
+    ///
+    /// # Errors
+    ///
+    /// Every error of [`AuditWriter::drain_outbox`], for a draining writer.
+    fn drain_then_record_adoption(
+        &mut self,
+        outcome: AnchorOutcome,
+        entry_count: u64,
+    ) -> Result<(), WriterError> {
+        if self.drains
+            && let Err(refusal) = self.drain_outbox()
+        {
+            self.record_adoption(outcome, entry_count);
+            return Err(refusal);
+        }
+        self.record_adoption(outcome, entry_count);
+        Ok(())
+    }
+
+    /// Appends the adoption row, with [`Self::append_checked`], when
+    /// reconciliation adopted a non-empty file.
     ///
     /// Non-fatal: the anchor is already in force, and refusing the acquisition
     /// because a forensic row could not be appended would take the log offline
     /// for a reason the anchor itself has already handled.
-    fn emit_adoption_row_if_needed(&mut self, outcome: AnchorOutcome) {
+    fn record_adoption(&mut self, outcome: AnchorOutcome, entry_count: u64) {
         if outcome != AnchorOutcome::AdoptedExisting {
             return;
         }
-        let entry_count = self.entry_count;
-        if let Err(e) = self.write_entry(AuditEntry::new_audit_tip_anchored(
-            TipAnchorReason::Adopted,
-            entry_count,
-            None,
-            None,
-            uuid::Uuid::new_v4().to_string(),
-        )) {
+        if let Err(e) = self.append_checked(adoption_row(entry_count)) {
             tracing::warn!(
                 log = %basename_lossy_path(&self.path),
                 error = %e,
@@ -1597,7 +1920,12 @@ impl AuditWriter {
     /// Returns [`WriterError::Io`] if file metadata cannot be read.
     fn needs_rotation(&self) -> Result<bool, WriterError> {
         let meta = self.file.metadata()?;
-        Ok(meta.len() >= ROTATION_THRESHOLD_BYTES)
+        #[cfg(any(test, feature = "test-helpers"))]
+        let threshold = super::rotation::test_seam::rotation_threshold_for(&self.path)
+            .unwrap_or(ROTATION_THRESHOLD_BYTES);
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        let threshold = ROTATION_THRESHOLD_BYTES;
+        Ok(meta.len() >= threshold)
     }
 
     /// Rotates the active log file.
@@ -1914,17 +2242,18 @@ pub(crate) fn is_rotated_sibling(stem: &str, name: &str) -> bool {
         15 | 18 => {}
         _ => return false,
     }
-    // First 8 chars must be decimal digits (YYYYMMDD).
-    if !base_suffix[..8].bytes().all(|b| b.is_ascii_digit()) {
+    // The checks below run on bytes, never on `str` slices: a directory entry
+    // name is attacker-placeable, and a byte index inside a multi-byte
+    // character would panic a `str` slice. Any non-ASCII byte fails the digit
+    // or `T` test, so such a name is never a sibling.
+    let bytes = base_suffix.as_bytes();
+    let (Some(date), Some(separator), Some(time)) = (bytes.get(..8), bytes.get(8), bytes.get(9..))
+    else {
         return false;
-    }
-    // Ninth char must be 'T'.
-    if base_suffix.as_bytes()[8] != b'T' {
-        return false;
-    }
-    // Remaining chars after 'T' must all be decimal digits.
-    // Length constraint guarantees either 6 or 9 digits here.
-    base_suffix[9..].bytes().all(|b| b.is_ascii_digit())
+    };
+    // First 8 bytes must be decimal digits (YYYYMMDD), the ninth `T`, and the
+    // rest decimal digits. The length constraint gives either 6 or 9 of them.
+    date.iter().all(u8::is_ascii_digit) && *separator == b'T' && time.iter().all(u8::is_ascii_digit)
 }
 
 // ── Rotation create-failure test seam ────────────────────────────────────────
@@ -1973,23 +2302,39 @@ fn create_new_active_file_after_rotation(path: &Path) -> Result<File, WriterErro
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
+/// The `audit_tip_anchored` row that records the adoption of an existing log
+/// holding `entry_count` entries.
+fn adoption_row(entry_count: u64) -> AuditEntry {
+    AuditEntry::new_audit_tip_anchored(
+        TipAnchorReason::Adopted,
+        entry_count,
+        None,
+        None,
+        uuid::Uuid::new_v4().to_string(),
+    )
+}
+
 /// Returns the `.root_hmac` sidecar path for `log_path`.
 ///
 /// For `audit.jsonl` → `audit.jsonl.root_hmac`.
 /// For `audit.jsonl.20260428T123456` → `audit.jsonl.20260428T123456.root_hmac`.
-///
-/// Uses `set_extension` via push onto the OsString so the existing extension
-/// (`.jsonl`) is preserved.
 pub(super) fn hmac_sidecar_path(log_path: &Path) -> PathBuf {
-    // `with_extension` replaces the last extension; we want to APPEND.
-    // Build the sidecar name by appending ".root_hmac" to the full filename.
+    sidecar_path(log_path, ".root_hmac")
+}
+
+/// Returns the path beside `log_path` whose file name is the log's full file
+/// name followed by `suffix`.
+///
+/// For `audit.jsonl` and `.lock` → `audit.jsonl.lock`. The log's own
+/// extension is kept: `suffix` is appended, never substituted.
+pub(super) fn sidecar_path(log_path: &Path, suffix: &str) -> PathBuf {
     let mut sidecar = log_path.to_path_buf();
     let existing = sidecar
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_owned();
-    sidecar.set_file_name(format!("{existing}.root_hmac"));
+    sidecar.set_file_name(format!("{existing}{suffix}"));
     sidecar
 }
 
@@ -2005,14 +2350,7 @@ pub(super) fn hmac_sidecar_path(log_path: &Path) -> PathBuf {
 /// `is_rotated_sibling_rejects_lock_sidecar`), so rotation's directory scan
 /// and pruning never touch it.
 pub(super) fn lock_sidecar_path(log_path: &Path) -> PathBuf {
-    let mut sidecar = log_path.to_path_buf();
-    let existing = sidecar
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_owned();
-    sidecar.set_file_name(format!("{existing}.lock"));
-    sidecar
+    sidecar_path(log_path, ".lock")
 }
 
 /// Returns `true` if the sidecar lock for `log_path` is currently held by a
@@ -2853,6 +3191,39 @@ pub enum WriterError {
         /// Stable diagnostic for which structural check failed.
         reason: &'static str,
     },
+
+    /// The audit outbox lock stayed held for the whole wait.
+    ///
+    /// Another process is appending to or draining the outbox. Distinct from
+    /// [`WriterError::FileLocked`], which names the writer's sidecar lock. See
+    /// [`crate::audit_log::outbox`].
+    #[error(
+        "audit.outbox_busy: the audit outbox lock stayed held for {} ms; another \
+         process is appending to or draining the outbox",
+        super::outbox::OUTBOX_LOCK_WAIT.as_millis()
+    )]
+    OutboxBusy,
+
+    /// A complete line of the audit outbox does not parse as an audit entry.
+    ///
+    /// The drain refused and left the outbox unchanged. The variant names the
+    /// line, the column, and the class of the parse failure, never the line's
+    /// content. Anyone who can write the audit directory can plant that
+    /// content, and this error reaches agent and CLI envelopes. Recovery is in
+    /// `docs/maintainers/audit-log-recovery.md`.
+    #[error(
+        "audit.outbox_unusable: line {line} of the audit outbox does not parse as an \
+         audit entry ({reason} at column {column}); the outbox is left unchanged"
+    )]
+    OutboxUnusable {
+        /// One-based number of the first line that does not parse.
+        line: usize,
+        /// One-based column of that line at which parsing stopped.
+        column: usize,
+        /// Class of the parse failure, from a closed set: `invalid JSON`,
+        /// `JSON that is not an audit entry`, or `truncated JSON`.
+        reason: &'static str,
+    },
 }
 
 /// Returns the condition an audit-writer acquisition failure describes, led by
@@ -2876,9 +3247,10 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
                 .to_owned(),
         ),
         // These carry their own `audit.*` code at the head of their Display.
-        WriterError::RotationBridgeUnusable { .. } | WriterError::IntegrityViolation(_) => {
-            Some(e.to_string())
-        }
+        WriterError::RotationBridgeUnusable { .. }
+        | WriterError::IntegrityViolation(_)
+        | WriterError::OutboxBusy
+        | WriterError::OutboxUnusable { .. } => Some(e.to_string()),
         WriterError::ChainBrokenAtOpen { entry_idx, .. } => Some(format!(
             "audit.chain_broken: the log's own hash chain is broken at entry {entry_idx}; \
              the file was modified outside the writer"
@@ -2910,6 +3282,45 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
     }
 }
 
+/// Maps an audit-writer failure to the [`WalletError`] that names its
+/// condition, for a caller that refuses because a required audit row cannot
+/// be written.
+///
+/// Three outcomes, because three different things are wrong and three
+/// different things fix them:
+///
+/// - A tip-anchor mismatch is [`ValidationError::AuditTipAnchorMismatch`]: the
+///   log may have been rolled back, and only `audit reanchor` addresses that.
+/// - A condition about the log, as [`audit_log_unusable_detail`] names it, is
+///   [`ValidationError::AuditLogUnusable`], led by its `audit.*` sub-code.
+/// - Everything left is a registry path or key registration conflict, which
+///   is what [`ValidationError::AuditWriterOpenFailed`] describes.
+///
+/// [`WalletError`]: crate::error::WalletError
+/// [`ValidationError::AuditTipAnchorMismatch`]: crate::error::ValidationError::AuditTipAnchorMismatch
+/// [`ValidationError::AuditLogUnusable`]: crate::error::ValidationError::AuditLogUnusable
+/// [`ValidationError::AuditWriterOpenFailed`]: crate::error::ValidationError::AuditWriterOpenFailed
+#[must_use]
+pub fn audit_writer_refusal(profile: &str, e: &WriterError) -> crate::error::WalletError {
+    use crate::error::{ValidationError, WalletError};
+
+    if let WriterError::TipAnchorMismatch { reason, .. } = e {
+        return WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
+            profile: profile.to_owned(),
+            reason: (*reason).to_owned(),
+        });
+    }
+    if let Some(detail) = audit_log_unusable_detail(e) {
+        return WalletError::Validation(ValidationError::AuditLogUnusable {
+            profile: profile.to_owned(),
+            detail,
+        });
+    }
+    WalletError::Validation(ValidationError::AuditWriterOpenFailed {
+        profile: profile.to_owned(),
+    })
+}
+
 // ── Partial-rotation detection ────────────────────────────────────────────────
 
 /// Returns the basename (file-name component) of `path` as a `String`.
@@ -2920,7 +3331,7 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
 /// programmatic recovery.
 ///
 /// Falls back to `"<non-utf8>"` when the basename contains non-UTF-8 bytes.
-fn basename_lossy_path(path: &Path) -> String {
+pub(super) fn basename_lossy_path(path: &Path) -> String {
     path.file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("<non-utf8>")
@@ -3414,11 +3825,20 @@ impl AuditWriterRegistry {
     /// the file now at the path and checks THAT file against the anchor: an
     /// older copy refuses, the same file put back is accepted.
     ///
+    /// # The outbox is drained on EVERY call
+    ///
+    /// A keyed writer drains the audit outbox. A cache miss drains at open,
+    /// after anchor reconciliation. A cache hit drains after its anchor check,
+    /// under the same writer-mutex guard. Either way, a consent row queued
+    /// before this call is in the log when the handle is returned.
+    ///
     /// # Errors
     ///
     /// Everything [`AuditWriterRegistry::get_or_open_unkeyed`] returns, plus the
     /// tip-anchor failures of [`AuditWriter::open_with_tip_anchor`] and of
-    /// [`AuditWriter::verify_tip_anchor`].
+    /// [`AuditWriter::verify_tip_anchor`], plus every error of
+    /// [`AuditWriter::drain_outbox`]: [`WriterError::OutboxBusy`],
+    /// [`WriterError::OutboxUnusable`], and the errors of the drain's appends.
     pub fn get_or_open_keyed(
         profile_name: &str,
         log_path: &Path,
@@ -3600,7 +4020,13 @@ impl AuditWriterRegistry {
     }
 }
 
-/// Runs the anchor check on a writer the registry is about to hand out.
+/// Runs the anchor check on a writer the registry is about to hand out, which
+/// for a draining writer also drains the audit outbox, under one guard.
+///
+/// The drain is a drain point of every keyed acquisition: a caller that read
+/// an approval and then acquires the writer gets it back only after any
+/// queued consent row is in the log. Holding one guard for both steps keeps
+/// another holder of the handle from appending between them.
 ///
 /// A poisoned writer mutex is surfaced as an I/O error rather than unwound, the
 /// same discipline [`AuditWriterRegistry::get_or_open_keyed`] applies to the
@@ -4393,6 +4819,42 @@ mod tests {
             "audit.jsonl",
             "audit.jsonl.20260428T1234567"
         ));
+    }
+
+    /// A 15-byte and an 18-byte suffix whose byte 8 falls inside a two-byte
+    /// character. Byte length passes the first check, so these names reach
+    /// the digit and `T` tests.
+    const MULTIBYTE_AT_BYTE_8_NAMES: [&str; 2] = [
+        "audit.jsonl.1234567\u{e9}123456",
+        "audit.jsonl.1234567\u{e9}123456789",
+    ];
+
+    #[test]
+    fn is_rotated_sibling_rejects_a_multibyte_character_at_byte_8_without_panicking() {
+        for name in MULTIBYTE_AT_BYTE_8_NAMES {
+            let suffix = name.strip_prefix("audit.jsonl.").unwrap();
+            assert!(matches!(suffix.len(), 15 | 18), "{name}");
+            assert!(!suffix.is_char_boundary(8), "{name}");
+            assert!(!is_rotated_sibling("audit.jsonl", name), "{name}");
+        }
+        assert!(!is_rotated_sibling(
+            "audit.jsonl",
+            "audit.jsonl.1234567\u{e9}123456789-1"
+        ));
+    }
+
+    #[test]
+    fn pruning_skips_a_multibyte_name_in_the_audit_directory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let writer = open_no_key(path.clone());
+        for name in MULTIBYTE_AT_BYTE_8_NAMES {
+            fs::write(dir.path().join(name), b"not an archive\n").unwrap();
+        }
+        writer.prune_rotated_files().unwrap();
+        for name in MULTIBYTE_AT_BYTE_8_NAMES {
+            assert!(dir.path().join(name).exists(), "{name} must be left alone");
+        }
     }
 
     // ── post-rotation single-writer enforcement ───────────────────────────────
@@ -5421,6 +5883,84 @@ mod tests {
         assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
     }
 
+    /// The adoption is in force in the keyring once reconciliation returns,
+    /// and the next open finds the anchor current. An open whose drain then
+    /// refuses still appends the adoption row, exactly once.
+    #[test]
+    fn an_open_whose_drain_refuses_still_records_the_adoption() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        {
+            let mut writer = open_no_key(path.clone());
+            writer.write_entry(make_entry("")).unwrap();
+        }
+        let outbox = super::super::outbox::outbox_path(&path);
+        fs::write(&outbox, b"not an audit entry\n").unwrap();
+
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let err = open_anchored(&path, &store).unwrap_err();
+        assert!(matches!(err, WriterError::OutboxUnusable { .. }), "{err:?}");
+        assert_eq!(
+            count_tip_anchored_rows(&path, "adopted"),
+            1,
+            "the refused drain leaves the adoption row"
+        );
+        assert_eq!(
+            stored_value(&store),
+            tip_of(&path).to_keyring_value(),
+            "the adoption row advanced the anchor"
+        );
+
+        fs::remove_file(&outbox).unwrap();
+        drop(open_anchored(&path, &store).expect("the outbox was moved aside"));
+        assert_eq!(
+            count_tip_anchored_rows(&path, "adopted"),
+            1,
+            "the adoption is recorded once"
+        );
+    }
+
+    /// The cache-hit twin: the anchor disappears from the keyring while a
+    /// draining writer is cached, so the next acquisition adopts the log. Its
+    /// drain refuses, and the adoption row is still appended, exactly once.
+    #[test]
+    fn a_cache_hit_whose_drain_refuses_still_records_the_adoption() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let key = Zeroizing::new([0x5a_u8; 32]);
+        let access =
+            || KeyedAuditAccess::new(key.clone(), Arc::clone(&store) as Arc<dyn TipAnchorStore>);
+        let profile = "cache-hit-adoption-drain-refused";
+
+        let handle = AuditWriterRegistry::get_or_open_keyed(profile, &path, access()).unwrap();
+        handle.lock().unwrap().write_entry(make_entry("")).unwrap();
+        store.set(None);
+        let outbox = super::super::outbox::outbox_path(&path);
+        fs::write(&outbox, b"not an audit entry\n").unwrap();
+
+        let err = AuditWriterRegistry::get_or_open_keyed(profile, &path, access()).unwrap_err();
+        assert!(matches!(err, WriterError::OutboxUnusable { .. }), "{err:?}");
+        assert_eq!(
+            count_tip_anchored_rows(&path, "adopted"),
+            1,
+            "the refused drain leaves the adoption row"
+        );
+        assert_eq!(
+            stored_value(&store),
+            tip_of(&path).to_keyring_value(),
+            "the adoption row advanced the anchor"
+        );
+
+        fs::remove_file(&outbox).unwrap();
+        drop(AuditWriterRegistry::get_or_open_keyed(profile, &path, access()).unwrap());
+        assert_eq!(
+            count_tip_anchored_rows(&path, "adopted"),
+            1,
+            "the adoption is recorded once"
+        );
+    }
+
     #[test]
     fn an_anchored_open_refuses_a_broken_chain_instead_of_adopting_it() {
         let dir = TempDir::new().unwrap();
@@ -5520,6 +6060,8 @@ mod tests {
 
         assert_eq!(report.previous, StoredTipAnchor::Usable(superseded.clone()));
         assert_eq!(report.reanchor_count, 1);
+        assert_eq!(report.outbox_drained, Some(0), "an empty outbox drains");
+        assert_eq!(report.outbox_refusal, None);
         assert_eq!(store.reanchor_count().unwrap(), Some(1));
         assert_eq!(
             count_tip_anchored_rows(&path, "rollback_acknowledged"),
@@ -5533,6 +6075,64 @@ mod tests {
         );
 
         open_anchored(&path, &store).expect("the repaired log must open cleanly");
+    }
+
+    /// A drain that refuses part way after the repair reports no count: the
+    /// rows it appended stay queued and are appended again by the next drain,
+    /// so no number of drained rows is true.
+    #[test]
+    fn a_drain_refused_part_way_after_a_repair_reports_no_drained_count() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let snapshot = {
+            let mut writer = open_anchored(&path, &store).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            let snapshot = fs::read(&path).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+            snapshot
+        };
+        fs::write(&path, &snapshot).unwrap();
+        let outbox = super::super::outbox::AuditOutbox::for_log(&path);
+        for request_id in ["queued-1", "queued-2", "queued-3"] {
+            outbox
+                .append(&AuditEntry::new_approval_attested(
+                    "PaymentSimulated",
+                    "stellar_pay_commit",
+                    None,
+                    "ABCDEFGHIJKLMNOPQRSTUV",
+                    "cli",
+                    request_id,
+                ))
+                .unwrap();
+        }
+        let queued = fs::read(outbox.path()).unwrap();
+
+        let mut writer = AuditWriter::open_for_reanchor(
+            path.clone(),
+            None,
+            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+        )
+        .unwrap();
+        // The repair row and the first queued row land; the second refuses.
+        writer.set_appends_before_fault(Some(2));
+        let report = writer.reanchor().expect("the repair stands");
+        drop(writer);
+
+        assert_eq!(report.outbox_drained, None);
+        let refusal = report.outbox_refusal.expect("the drain refused");
+        assert!(refusal.starts_with("audit.io_error"), "{refusal}");
+        assert_eq!(
+            fs::read(outbox.path()).unwrap(),
+            queued,
+            "every row stays queued"
+        );
+        let log = fs::read_to_string(&path).unwrap();
+        assert!(
+            log.contains(r#""request_id":"queued-1""#),
+            "the partial drain"
+        );
+        assert!(!log.contains(r#""request_id":"queued-2""#));
     }
 
     #[test]
@@ -6605,6 +7205,48 @@ mod tests {
             "the repair must record the anchor that named the missing row"
         );
         assert_eq!(report.reanchor_count, 1);
+    }
+
+    /// `write_built` on a log moved under the writer refuses, builds the row it
+    /// owed once, and anchors that row once.
+    #[test]
+    fn write_built_after_the_log_is_replaced_anchors_the_owed_row_once() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        let anchored_len = fs::metadata(&path).unwrap().len();
+        fs::rename(&path, dir.path().join("moved.jsonl")).unwrap();
+
+        let builds = std::cell::Cell::new(0_u32);
+        let err = writer
+            .write_built(|_| {
+                builds.set(builds.get() + 1);
+                make_entry("")
+            })
+            .expect_err("an append onto a path the writer no longer holds must refuse");
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. } if *reason == LOG_REPLACED_REASON
+            ),
+            "{err:?}"
+        );
+        assert_eq!(builds.get(), 1, "the owed row is built once");
+        let owed = store.peek().expect("the refused row must be anchored");
+        assert_eq!(owed.entry_count, 2, "the anchor names the refused row");
+        assert!(owed.end_offset > anchored_len);
+
+        let later_builds = std::cell::Cell::new(0_u32);
+        writer
+            .write_built(|_| {
+                later_builds.set(later_builds.get() + 1);
+                make_entry("")
+            })
+            .expect_err("a latched writer refuses");
+        assert_eq!(later_builds.get(), 0, "a latched writer builds no row");
+        assert_eq!(store.peek(), Some(owed), "the owed row is anchored once");
     }
 
     /// An unanchored writer is not gated on the file's identity.

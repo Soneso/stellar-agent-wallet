@@ -278,9 +278,12 @@ hash-chained to the one before it; each file carries a root-HMAC sidecar signed
 with the profile's audit key.
 
 Beyond tool invocations, the log records `value_action_submitted` on every
-confirmed value-moving submit (carrying the gate-sized value legs),
-`keyring_key_written` on each key-writing profile command, and
-`x402_payment_authorized` on x402 authorization signing.
+confirmed value-moving submit (carrying the gate-sized value legs) and
+`keyring_key_written` on each key-writing profile command. It records
+`x402_payment_authorized` before a signed x402 authorization leaves the wallet
+in the RPC re-simulation, and `x402_authorization_withheld` when that payment
+then fails. The configured RPC observes the signed x402 authorization.
+Approval and rejection rows are written before the decision takes effect.
 
 MPP credentials follow a stricter one-shot rule. Durable state is atomically
 claimed before policy accounting or signer access; value budget is recorded

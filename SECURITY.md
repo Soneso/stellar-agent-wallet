@@ -103,17 +103,22 @@ properties:
   binds the approval nonce, the envelope SHA-256, and the OS process uid.
 - Tamper-evident audit log. Every tool invocation and lifecycle event is appended to a
   per-profile hash-chained JSONL audit log. Argument values are never logged — only key
-  names. The chain is verified end-to-end with `audit verify`. Every value-moving signing
-  or submitting verb (`pay`, `claim`, `accounts create`, `trustline`, `trade`, `lend`,
-  `vault`, the x402 payment tools) proves its audit writer is acquirable BEFORE the
-  signing key is touched or a transaction is submitted, refusing
-  (`audit.chain_key_unavailable`) rather than signing unaudited if the profile's audit
-  chain-root key was never minted. This pre-flight fails closed for a persisted profile;
+  names. The chain is verified end-to-end with `audit verify`. The value-moving signing and
+  submitting verbs are `pay`, `claim`, `accounts create`, `trustline`, `trade`, `lend`,
+  `vault`, the x402 payment tools, and the MPP charge commit. Each proves its audit writer
+  is acquirable BEFORE the signing key is touched or a transaction is submitted. It refuses
+  with `audit.chain_key_unavailable` rather than signing unaudited when the profile's
+  audit chain-root key was never minted. This pre-flight fails closed for a persisted profile;
   the zero-config synthesized profile `pay`/`claim`/`accounts create` fall back to when no
   `<name>.toml` file exists stays fail-open for this specific check, matching its
   documented no-profile-required posture. The SEP-43 sign-only pair (`signTransaction`,
   `signAuthEntry`) runs the same pre-flight and records an
-  `opaque_payload_signed` audit row when the signature is produced.
+  `opaque_payload_signed` audit row when the signature is produced. The x402 tools
+  write `x402_payment_authorized` before the signed authorization leaves the wallet in
+  the RPC re-simulation, and withhold it when that row cannot be written. An approval or
+  rejection takes effect only after its audit row is durable, in the log or in the
+  log's outbox. A queued row reaches the log before the consumer of the approval loads
+  a signing key.
 
 The core library compiles under `#![forbid(unsafe_code)]`. Logging redaction is enforced
 throughout: secret material is never written to logs, and account, strkey, and

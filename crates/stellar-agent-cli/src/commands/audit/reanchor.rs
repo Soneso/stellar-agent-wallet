@@ -61,6 +61,13 @@
 //! binding is stored last, so a run that stops earlier leaves the refusal in
 //! place and a rerun appends its rows again.
 //!
+//! After the last repair row, and before the new binding is stored, it drains
+//! the audit outbox. Consent rows queued while the log was refused follow the
+//! repair rows. A drain refusal does not undo the repair: the verb succeeds
+//! and lists the refusal under `warnings`, led by its `audit.*` sub-code, and
+//! the rows stay queued. Without a required acknowledgement the log, the
+//! anchors, the binding, and the outbox are left unchanged.
+//!
 //! # Concurrency
 //!
 //! Repair takes the audit writer's exclusive sidecar lock. A running MCP server
@@ -78,8 +85,8 @@ use serde::Serialize;
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::{
     audit_log::{
-        AuditBinding, AuditWriter, ReanchorAcknowledgement, RecordedBinding, StoredTipAnchor,
-        TipAnchor, WriterError, stored_anchor_disagrees_with_walk, verify_log,
+        AuditBinding, AuditWriter, ReanchorAcknowledgement, ReanchorReport, RecordedBinding,
+        StoredTipAnchor, TipAnchor, WriterError, stored_anchor_disagrees_with_walk, verify_log,
     },
     envelope::Envelope,
     error::{InternalError, ValidationError, WalletError},
@@ -150,6 +157,17 @@ struct ReanchorData {
     /// anchored there, when the recorded binding was unreadable, or when no
     /// binding change was acknowledged.
     previous_binding_anchor: Option<String>,
+    /// Number of queued audit-outbox rows appended after the repair rows.
+    /// Omitted when the drain refused: the rows appended before the refusal
+    /// stay queued and are appended again by the next drain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outbox_drained: Option<usize>,
+    /// Conditions the repair stood despite, each led by its `audit.*`
+    /// sub-code: `audit.outbox_unusable`, `audit.outbox_busy`, or the
+    /// condition an append of the drain refused on, such as
+    /// `audit.io_error`. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// Runs the `audit reanchor` subcommand.
@@ -245,18 +263,13 @@ where
     if recorded == RecordedBinding::Absent {
         binding_store.store(&expected)?;
     }
-    Ok(ReanchorData {
-        profile: args.profile.clone(),
-        previous_anchor: report.previous.coordinates(),
-        current_anchor: report
-            .current
-            .as_ref()
-            .map_or_else(|| "none".to_owned(), TipAnchor::coordinates),
-        reanchor_count: report.reanchor_count,
-        acknowledged: vec!["rollback"],
-        recorded_binding: recorded.label(),
-        previous_binding_anchor: None,
-    })
+    Ok(reanchor_data(
+        &args.profile,
+        report,
+        vec!["rollback"],
+        recorded.label(),
+        None,
+    ))
 }
 
 /// The arm of [`reanchor`] for a binding that changed or does not parse.
@@ -315,18 +328,13 @@ fn reanchor_binding_change(
     // Stored last: a run that stops before this write leaves the refusal in
     // place, and a rerun appends its rows again.
     binding_store.store(expected)?;
-    Ok(ReanchorData {
-        profile: args.profile.clone(),
-        previous_anchor: report.previous.coordinates(),
-        current_anchor: report
-            .current
-            .as_ref()
-            .map_or_else(|| "none".to_owned(), TipAnchor::coordinates),
-        reanchor_count: report.reanchor_count,
+    Ok(reanchor_data(
+        &args.profile,
+        report,
         acknowledged,
-        recorded_binding: recorded.label(),
+        recorded.label(),
         previous_binding_anchor,
-    })
+    ))
 }
 
 /// The acknowledgement flags a changed binding still needs, or `None` when
@@ -384,6 +392,33 @@ fn tip_anchor_unavailable(e: &impl std::fmt::Display) -> WalletError {
     WalletError::Internal(InternalError::UnexpectedState {
         detail: format!("audit.tip_anchor_unavailable: {e}"),
     })
+}
+
+/// The success payload for a completed repair.
+///
+/// A drain refusal after the repair is a warning: the repair stands and the
+/// queued rows stay queued.
+fn reanchor_data(
+    profile: &str,
+    report: ReanchorReport,
+    acknowledged: Vec<&'static str>,
+    recorded_binding: &'static str,
+    previous_binding_anchor: Option<String>,
+) -> ReanchorData {
+    ReanchorData {
+        profile: profile.to_owned(),
+        previous_anchor: report.previous.coordinates(),
+        current_anchor: report
+            .current
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), TipAnchor::coordinates),
+        reanchor_count: report.reanchor_count,
+        outbox_drained: report.outbox_drained,
+        warnings: report.outbox_refusal.into_iter().collect(),
+        acknowledged,
+        recorded_binding,
+        previous_binding_anchor,
+    }
 }
 
 /// Loads the named profile, reconciled, mapping the failure into the CLI
@@ -701,6 +736,8 @@ mod tests {
         vec![
             std::fs::read(&old.audit_log_path).ok(),
             std::fs::read(&new.audit_log_path).ok(),
+            std::fs::read(AuditOutbox::for_log(&old.audit_log_path).path()).ok(),
+            std::fs::read(AuditOutbox::for_log(&new.audit_log_path).path()).ok(),
             raw_anchor(old).map(String::into_bytes),
             raw_anchor(new).map(String::into_bytes),
             raw_binding(name).map(String::into_bytes),
@@ -717,6 +754,9 @@ mod tests {
         record_binding("bind-refuse", &old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
+        AuditOutbox::for_log(&new.audit_log_path)
+            .append(&queued_consent("queued-refused"))
+            .expect("queue");
         let before = snapshot("bind-refuse", &old, &new);
 
         let err = run_reanchor(&args_with("bind-refuse", true, false), &new)
@@ -735,7 +775,7 @@ mod tests {
         assert!(err.to_string().contains("--acknowledge-binding-change"));
         assert!(
             snapshot("bind-refuse", &old, &new) == before,
-            "the log, both anchors, and the binding are byte-identical"
+            "the log, both anchors, the binding, and the outbox are byte-identical"
         );
         assert!(
             !new.audit_log_path.exists(),
@@ -799,6 +839,12 @@ mod tests {
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
 
+        for id in ["queued-1", "queued-2"] {
+            AuditOutbox::for_log(&new.audit_log_path)
+                .append(&queued_consent(id))
+                .expect("queue");
+        }
+
         let data = run_reanchor(&args_with("bind-accept", false, true), &new)
             .expect("the binding flag accepts the change");
         assert_eq!(data.acknowledged, vec!["binding_change"]);
@@ -807,6 +853,19 @@ mod tests {
             data.previous_binding_anchor.as_deref(),
             Some(old_anchor.as_str())
         );
+
+        assert_eq!(data.outbox_drained, Some(2));
+        assert!(data.warnings.is_empty(), "{:?}", data.warnings);
+        let all_rows = log_rows(&new);
+        assert_eq!(all_rows.len(), 3, "{all_rows:?}");
+        assert_eq!(all_rows[0]["reason"], "binding_changed");
+        assert_eq!(all_rows[1]["request_id"], "queued-1");
+        assert_eq!(all_rows[2]["request_id"], "queued-2");
+        assert!(outbox_file(&new).is_empty());
+        assert_eq!(inspect_outbox(&new.audit_log_path).unwrap().pending, 0);
+        let json = serde_json::to_value(&data).expect("JSON");
+        assert_eq!(json["outbox_drained"], 2);
+        assert!(json.get("warnings").is_none(), "{json}");
 
         let rows = tip_rows(&new);
         assert_eq!(rows.len(), 1, "exactly one row: {rows:?}");
@@ -873,6 +932,9 @@ mod tests {
         write_anchored(&new, 2);
         roll_back(&new);
         let superseded = anchor_coordinates(&new);
+        AuditOutbox::for_log(&new.audit_log_path)
+            .append(&queued_consent("queued-refused"))
+            .expect("queue");
         let before = snapshot("bind-both", &old, &new);
 
         let err = run_reanchor(&args_with("bind-both", false, true), &new)
@@ -904,6 +966,131 @@ mod tests {
         assert_eq!(rows[0]["reanchor_count"], 1);
         assert_eq!(rows[1]["reanchor_count"], 1);
         assert_eq!(counter(&new), Some(1));
+    }
+
+    /// A binding-change repair appends every repair row, drains the outbox,
+    /// and then stores the binding.
+    #[test]
+    #[serial]
+    fn both_flags_drain_queued_rows_after_both_repair_rows() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let old = anchored_profile("bind-both-outbox", dir.path(), 2);
+        record_binding("bind-both-outbox", &old);
+        let old_anchor = anchor_coordinates(&old);
+        let mut new = old.clone();
+        new.audit_log_path = dir.path().join("new.jsonl");
+        write_anchored(&new, 2);
+        roll_back(&new);
+        let superseded = anchor_coordinates(&new);
+        let before = log_rows(&new);
+        for id in ["queued-1", "queued-2"] {
+            AuditOutbox::for_log(&new.audit_log_path)
+                .append(&queued_consent(id))
+                .expect("queue");
+        }
+
+        let data = run_reanchor(&args_with("bind-both-outbox", true, true), &new)
+            .expect("both flags accept");
+        assert_eq!(data.outbox_drained, Some(2));
+        assert!(data.warnings.is_empty(), "{:?}", data.warnings);
+        assert_eq!(data.acknowledged, vec!["rollback", "binding_change"]);
+        assert_eq!(data.recorded_binding, "changed");
+        assert_eq!(data.previous_anchor, Some(superseded));
+        assert_eq!(
+            data.previous_binding_anchor.as_deref(),
+            Some(old_anchor.as_str())
+        );
+        let rows = log_rows(&new);
+        assert_eq!(rows.len(), before.len() + 4, "{rows:?}");
+        assert_eq!(&rows[..before.len()], before.as_slice());
+        let tail = &rows[before.len()..];
+        assert_eq!(tail[0]["reason"], "rollback_acknowledged");
+        assert_eq!(tail[1]["reason"], "binding_changed");
+        assert_eq!(tail[2]["request_id"], "queued-1");
+        assert_eq!(tail[3]["request_id"], "queued-2");
+        assert_eq!(inspect_outbox(&new.audit_log_path).unwrap().pending, 0);
+        assert!(outbox_file(&new).is_empty());
+        assert_eq!(
+            anchor_coordinates(&new),
+            data.current_anchor,
+            "the reported anchor covers the drained rows"
+        );
+        assert_eq!(counter(&new), Some(1));
+        assert_eq!(
+            raw_binding("bind-both-outbox"),
+            Some(AuditBinding::for_profile(&new).to_keyring_value())
+        );
+        let json = serde_json::to_value(&data).expect("JSON");
+        assert_eq!(json["outbox_drained"], 2);
+        assert!(json.get("warnings").is_none(), "{json}");
+    }
+
+    /// On a binding change a refused drain is a warning, and the new binding
+    /// is stored with either set of required acknowledgements.
+    #[test]
+    #[serial]
+    fn a_refused_drain_on_a_binding_change_is_a_warning_and_the_binding_is_stored() {
+        for rollback in [false, true] {
+            keyring_mock::install().expect("mock keyring store");
+            let dir = tempfile::tempdir().expect("tmp dir");
+            let old = anchored_profile("bind-outbox-unusable", dir.path(), 2);
+            record_binding("bind-outbox-unusable", &old);
+            let old_anchor = anchor_coordinates(&old);
+            let mut new = old.clone();
+            new.audit_log_path = dir.path().join("new.jsonl");
+            if rollback {
+                write_anchored(&new, 2);
+                roll_back(&new);
+            }
+            let before = log_rows(&new);
+            let outbox = AuditOutbox::for_log(&new.audit_log_path);
+            outbox.append(&queued_consent("queued-1")).expect("queue");
+            let mut bytes = std::fs::read(outbox.path()).expect("outbox");
+            bytes.extend_from_slice(b"not an audit entry\n");
+            std::fs::write(outbox.path(), &bytes).expect("corrupt the outbox");
+
+            let data = run_reanchor(&args_with("bind-outbox-unusable", rollback, true), &new)
+                .expect("the repair stands");
+            let (acknowledged, reasons) = if rollback {
+                (
+                    vec!["rollback", "binding_change"],
+                    vec!["rollback_acknowledged", "binding_changed"],
+                )
+            } else {
+                (vec!["binding_change"], vec!["binding_changed"])
+            };
+            assert_eq!(data.acknowledged, acknowledged);
+            assert_eq!(data.recorded_binding, "changed");
+            assert_eq!(
+                data.previous_binding_anchor.as_deref(),
+                Some(old_anchor.as_str())
+            );
+            assert_eq!(data.outbox_drained, None);
+            assert_eq!(data.warnings.len(), 1);
+            assert!(
+                data.warnings[0].starts_with("audit.outbox_unusable"),
+                "{:?}",
+                data.warnings
+            );
+            assert_eq!(outbox_file(&new), bytes, "the outbox is left as it was");
+            let rows = log_rows(&new);
+            assert_eq!(rows.len(), before.len() + reasons.len(), "{rows:?}");
+            assert_eq!(&rows[..before.len()], before.as_slice());
+            for (row, reason) in rows[before.len()..].iter().zip(reasons) {
+                assert_eq!(row["reason"], reason);
+            }
+            assert_eq!(anchor_coordinates(&new), data.current_anchor);
+            assert_eq!(counter(&new), Some(1));
+            assert!(
+                raw_binding("bind-outbox-unusable")
+                    == Some(AuditBinding::for_profile(&new).to_keyring_value()),
+                "the binding is stored after a refused drain"
+            );
+            let json = serde_json::to_value(&data).expect("JSON");
+            assert_eq!(json["warnings"][0], data.warnings[0]);
+            assert!(json.get("outbox_drained").is_none(), "{json}");
+        }
     }
 
     #[test]
@@ -994,6 +1181,10 @@ mod tests {
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
 
+        AuditOutbox::for_log(&new.audit_log_path)
+            .append(&queued_consent("queued-before-binding-failure"))
+            .expect("queue");
+
         let err = run_reanchor(&args_with("bind-rerun", false, true), &new)
             .expect_err("the binding write fails");
         assert_eq!(
@@ -1001,6 +1192,20 @@ mod tests {
             stellar_agent_core::error::ErrorCategory::Auth
         );
         assert_eq!(tip_rows(&new).len(), 1, "the rows were appended");
+        let rows = log_rows(&new);
+        assert_eq!(
+            rows.len(),
+            2,
+            "the queued row drained before the binding write failed"
+        );
+        assert_eq!(rows[0]["reason"], "binding_changed");
+        assert_eq!(rows[1]["request_id"], "queued-before-binding-failure");
+        assert!(outbox_file(&new).is_empty());
+        assert_eq!(inspect_outbox(&new.audit_log_path).unwrap().pending, 0);
+        assert_eq!(
+            raw_binding("bind-rerun"),
+            Some(AuditBinding::for_profile(&old).to_keyring_value())
+        );
         let refusal = stellar_agent_network::keyring::keyed_audit_access(
             &new,
             "bind-rerun",
@@ -1017,5 +1222,172 @@ mod tests {
             BindingCheck::Enforce,
         )
         .expect("the binding is accepted");
+    }
+
+    // ── Repair with queued consent rows ──────────────────────────────────────
+
+    use stellar_agent_core::audit_log::{AuditOutbox, inspect_outbox};
+
+    fn queued_consent(request_id: &str) -> AuditEntry {
+        AuditEntry::new_approval_attested(
+            "PaymentSimulated",
+            "stellar_pay_commit",
+            None,
+            "ABCDEFGHIJKLMNOPQRSTUV",
+            "cli",
+            request_id,
+        )
+    }
+
+    fn log_rows(profile: &Profile) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(&profile.audit_log_path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON row"))
+            .collect()
+    }
+
+    fn outbox_file(profile: &Profile) -> Vec<u8> {
+        std::fs::read(AuditOutbox::for_log(&profile.audit_log_path).path()).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn without_the_acknowledgement_the_log_the_anchor_and_the_outbox_are_unchanged() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = rolled_back_profile("reanchor-outbox-gate", dir.path());
+        AuditOutbox::for_log(&profile.audit_log_path)
+            .append(&queued_consent("queued-1"))
+            .expect("queue");
+        let store = TestAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        );
+        let anchor_before = store.load_raw().expect("read anchor");
+        let log_before = std::fs::read(&profile.audit_log_path).expect("read log");
+        let outbox_before = outbox_file(&profile);
+
+        let args = ReanchorArgs {
+            profile: "reanchor-outbox-gate".to_owned(),
+            acknowledge_rollback: false,
+            acknowledge_binding_change: false,
+        };
+        let cloned = profile.clone();
+        let code = run_with_dependencies(&args, move |_| Ok(cloned.clone()), || Ok(())).await;
+
+        assert_eq!(code, 1);
+        assert_eq!(store.load_raw().expect("read anchor"), anchor_before);
+        assert_eq!(
+            std::fs::read(&profile.audit_log_path).expect("read log"),
+            log_before
+        );
+        assert_eq!(
+            outbox_file(&profile),
+            outbox_before,
+            "the outbox is left as it was"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn with_the_acknowledgement_queued_rows_follow_the_repair_row() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = rolled_back_profile("reanchor-outbox-drain", dir.path());
+        let store = TestAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        );
+        let mismatching = store
+            .load_anchor()
+            .expect("read anchor")
+            .expect("anchored")
+            .coordinates();
+        for id in ["queued-1", "queued-2"] {
+            AuditOutbox::for_log(&profile.audit_log_path)
+                .append(&queued_consent(id))
+                .expect("queue");
+        }
+
+        let args = ReanchorArgs {
+            profile: "reanchor-outbox-drain".to_owned(),
+            acknowledge_rollback: true,
+            acknowledge_binding_change: false,
+        };
+        let cloned = profile.clone();
+        let code = run_with_dependencies(&args, move |_| Ok(cloned.clone()), || Ok(())).await;
+        assert_eq!(code, 0);
+
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+            .expect("read log")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("JSON row"))
+            .collect();
+        let repair_at = rows
+            .iter()
+            .position(|row| row["kind"] == "audit_tip_anchored")
+            .expect("the repair row");
+        assert_eq!(rows[repair_at]["previous_anchor"], mismatching);
+        let tail: Vec<&str> = rows[repair_at + 1..]
+            .iter()
+            .map(|row| row["request_id"].as_str().expect("request id"))
+            .collect();
+        assert_eq!(
+            tail,
+            vec!["queued-1", "queued-2"],
+            "queued rows follow the repair"
+        );
+        assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_drain_refusal_after_the_repair_is_a_warning_and_the_repair_stands() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = rolled_back_profile("reanchor-outbox-unusable", dir.path());
+        let outbox = AuditOutbox::for_log(&profile.audit_log_path);
+        outbox.append(&queued_consent("queued-1")).expect("queue");
+        let mut bytes = std::fs::read(outbox.path()).expect("outbox");
+        bytes.extend_from_slice(b"not an audit entry\n");
+        std::fs::write(outbox.path(), &bytes).expect("corrupt the outbox");
+
+        let mut writer = open_repair_writer(&profile, "reanchor-outbox-unusable").expect("open");
+        let report = writer.reanchor().expect("the repair succeeds");
+        drop(writer);
+        let refusal = report.outbox_refusal.clone().expect("the drain refused");
+        assert!(refusal.starts_with("audit.outbox_unusable"), "{refusal}");
+        assert_eq!(report.outbox_drained, None);
+        assert_eq!(outbox_file(&profile), bytes, "the outbox is left as it was");
+
+        let data = serde_json::to_value(reanchor_data(
+            "reanchor-outbox-unusable",
+            report,
+            vec!["rollback"],
+            "absent",
+            None,
+        ))
+        .expect("JSON");
+        assert_eq!(data["warnings"][0], serde_json::json!(refusal));
+        assert!(
+            data.get("outbox_drained").is_none(),
+            "a refused drain reports no count: {data}"
+        );
+
+        // The repair stands: the log opens cleanly under the ordinary path once
+        // the outbox is moved aside.
+        std::fs::remove_file(outbox.path()).expect("move the outbox aside");
+        let key = load_audit_hmac_key(&profile, "reanchor-outbox-unusable").expect("load key");
+        AuditWriter::open_with_tip_anchor(
+            profile.audit_log_path.clone(),
+            Some(key),
+            TestAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        )
+        .expect("the repaired log opens cleanly");
     }
 }

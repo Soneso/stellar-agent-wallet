@@ -5,7 +5,8 @@
 //! and amount checks all reject their input before the RPC client is
 //! constructed. They run under the default `cargo test` with no network access
 //! and no feature flag; the mainnet cases count connections on a loopback
-//! listener.
+//! listener. Every case passes a transmit gate that records a call and refuses,
+//! and asserts the gate never ran: no signature exists on these paths.
 
 #![allow(
     clippy::unwrap_used,
@@ -13,12 +14,14 @@
     reason = "test-only; unwraps acceptable in unit tests"
 )]
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use stellar_agent_network::signing::SoftwareSigningKey;
 use stellar_agent_x402::X402Error;
 use stellar_agent_x402::constants::X402_STELLAR_TESTNET;
-use stellar_agent_x402::exact::create_payment;
+use stellar_agent_x402::exact::{AuthorizationToTransmit, create_payment};
 use stellar_agent_x402::wire::PaymentRequirements;
 use zeroize::Zeroizing;
 
@@ -41,6 +44,26 @@ const AMOUNT: &str = "1000000";
 fn dummy_signer() -> SoftwareSigningKey {
     let sk = SigningKey::generate(&mut OsRng);
     SoftwareSigningKey::new_from_zeroizing(Zeroizing::new(sk.to_bytes()))
+}
+
+/// A transmit gate that records being called and refuses. Validation returns
+/// before any signature exists, so a case that sees `called` set has failed.
+fn gate_that_must_not_run(
+    called: &AtomicBool,
+) -> impl FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error> + '_ {
+    move |_| {
+        called.store(true, Ordering::SeqCst);
+        Err(X402Error::TransmitGateRefused {
+            detail: "the transmit gate must not run on a validation refusal".to_owned(),
+        })
+    }
+}
+
+fn assert_gate_never_ran(called: &AtomicBool) {
+    assert!(
+        !called.load(Ordering::SeqCst),
+        "the transmit gate ran on a path that returns before signing"
+    );
 }
 
 fn requirements_with(
@@ -66,7 +89,16 @@ fn requirements_with(
 #[tokio::test]
 async fn invalid_scheme_rejected() {
     let req = requirements_with("upto", X402_STELLAR_TESTNET, AMOUNT, true.into());
-    let r = create_payment(&req, &dummy_signer(), UNUSED_RPC_URL, TESTNET_PASSPHRASE).await;
+    let called = AtomicBool::new(false);
+    let r = create_payment(
+        &req,
+        &dummy_signer(),
+        UNUSED_RPC_URL,
+        TESTNET_PASSPHRASE,
+        gate_that_must_not_run(&called),
+    )
+    .await;
+    assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::UnsupportedScheme { .. })),
         "expected UnsupportedScheme, got {r:?}"
@@ -78,7 +110,16 @@ async fn invalid_scheme_rejected() {
 #[tokio::test]
 async fn stellar_mainnet_rejected_as_invalid_x402_network() {
     let req = requirements_with("exact", "stellar:mainnet", AMOUNT, true.into());
-    let r = create_payment(&req, &dummy_signer(), UNUSED_RPC_URL, TESTNET_PASSPHRASE).await;
+    let called = AtomicBool::new(false);
+    let r = create_payment(
+        &req,
+        &dummy_signer(),
+        UNUSED_RPC_URL,
+        TESTNET_PASSPHRASE,
+        gate_that_must_not_run(&called),
+    )
+    .await;
+    assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::UnsupportedNetwork { .. })),
         "expected UnsupportedNetwork, got {r:?}"
@@ -89,13 +130,16 @@ async fn stellar_mainnet_rejected_as_invalid_x402_network() {
 #[tokio::test]
 async fn wrong_network_passphrase_rejected() {
     let req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
+    let called = AtomicBool::new(false);
     let r = create_payment(
         &req,
         &dummy_signer(),
         UNUSED_RPC_URL,
         "Public Global Stellar Network ; September 2015", // mainnet passphrase
+        gate_that_must_not_run(&called),
     )
     .await;
+    assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::NetworkPassphraseMismatch { .. })),
         "expected NetworkPassphraseMismatch, got {r:?}"
@@ -107,7 +151,16 @@ async fn wrong_network_passphrase_rejected() {
 async fn invalid_asset_address_rejected() {
     let mut req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
     req.asset = "not-a-strkey".to_owned();
-    let r = create_payment(&req, &dummy_signer(), UNUSED_RPC_URL, TESTNET_PASSPHRASE).await;
+    let called = AtomicBool::new(false);
+    let r = create_payment(
+        &req,
+        &dummy_signer(),
+        UNUSED_RPC_URL,
+        TESTNET_PASSPHRASE,
+        gate_that_must_not_run(&called),
+    )
+    .await;
+    assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::InvalidAssetAddress { .. })),
         "expected InvalidAssetAddress, got {r:?}"
@@ -118,7 +171,16 @@ async fn invalid_asset_address_rejected() {
 #[tokio::test]
 async fn fees_not_sponsored_rejected() {
     let req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, false.into());
-    let r = create_payment(&req, &dummy_signer(), UNUSED_RPC_URL, TESTNET_PASSPHRASE).await;
+    let called = AtomicBool::new(false);
+    let r = create_payment(
+        &req,
+        &dummy_signer(),
+        UNUSED_RPC_URL,
+        TESTNET_PASSPHRASE,
+        gate_that_must_not_run(&called),
+    )
+    .await;
+    assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::FeesNotSponsored)),
         "expected FeesNotSponsored, got {r:?}"
@@ -130,7 +192,16 @@ async fn fees_not_sponsored_rejected() {
 #[tokio::test]
 async fn fees_sponsored_string_true_rejected() {
     let req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, "true".into());
-    let r = create_payment(&req, &dummy_signer(), UNUSED_RPC_URL, TESTNET_PASSPHRASE).await;
+    let called = AtomicBool::new(false);
+    let r = create_payment(
+        &req,
+        &dummy_signer(),
+        UNUSED_RPC_URL,
+        TESTNET_PASSPHRASE,
+        gate_that_must_not_run(&called),
+    )
+    .await;
+    assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::FeesNotSponsored)),
         "expected FeesNotSponsored for string \"true\", got {r:?}"
@@ -141,7 +212,16 @@ async fn fees_sponsored_string_true_rejected() {
 #[tokio::test]
 async fn amount_zero_rejected() {
     let req = requirements_with("exact", X402_STELLAR_TESTNET, "0", true.into());
-    let r = create_payment(&req, &dummy_signer(), UNUSED_RPC_URL, TESTNET_PASSPHRASE).await;
+    let called = AtomicBool::new(false);
+    let r = create_payment(
+        &req,
+        &dummy_signer(),
+        UNUSED_RPC_URL,
+        TESTNET_PASSPHRASE,
+        gate_that_must_not_run(&called),
+    )
+    .await;
+    assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::AmountConversion { .. })),
         "expected AmountConversion for amount=0, got {r:?}"
@@ -152,7 +232,16 @@ async fn amount_zero_rejected() {
 #[tokio::test]
 async fn negative_amount_rejected() {
     let req = requirements_with("exact", X402_STELLAR_TESTNET, "-1000000", true.into());
-    let r = create_payment(&req, &dummy_signer(), UNUSED_RPC_URL, TESTNET_PASSPHRASE).await;
+    let called = AtomicBool::new(false);
+    let r = create_payment(
+        &req,
+        &dummy_signer(),
+        UNUSED_RPC_URL,
+        TESTNET_PASSPHRASE,
+        gate_that_must_not_run(&called),
+    )
+    .await;
+    assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::AmountConversion { .. })),
         "expected AmountConversion for negative amount, got {r:?}"
@@ -163,7 +252,16 @@ async fn negative_amount_rejected() {
 #[tokio::test]
 async fn non_integer_amount_rejected() {
     let req = requirements_with("exact", X402_STELLAR_TESTNET, "1.5", true.into());
-    let r = create_payment(&req, &dummy_signer(), UNUSED_RPC_URL, TESTNET_PASSPHRASE).await;
+    let called = AtomicBool::new(false);
+    let r = create_payment(
+        &req,
+        &dummy_signer(),
+        UNUSED_RPC_URL,
+        TESTNET_PASSPHRASE,
+        gate_that_must_not_run(&called),
+    )
+    .await;
+    assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::AmountConversion { .. })),
         "expected AmountConversion for non-integer amount, got {r:?}"
@@ -190,13 +288,16 @@ async fn pubnet_requirements_refused_before_signing_and_any_connection() {
         AMOUNT,
         true.into(),
     );
+    let called = AtomicBool::new(false);
     let r = create_payment(
         &req,
         &dummy_signer(),
         &counter.https_uri(),
         MAINNET_PASSPHRASE,
+        gate_that_must_not_run(&called),
     )
     .await;
+    assert_gate_never_ran(&called);
     assert!(
         matches!(&r, Err(X402Error::MainnetSigningForbidden { detail })
             if detail.contains("network.mainnet_write_forbidden")),
@@ -220,7 +321,16 @@ async fn mainnet_pattern_rpc_url_refused_before_signing_and_any_connection() {
     let counter = stellar_agent_test_support::ConnectionCounter::start().unwrap();
     let req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
     let rpc_url = format!("{}/pubnet", counter.https_uri());
-    let r = create_payment(&req, &dummy_signer(), &rpc_url, TESTNET_PASSPHRASE).await;
+    let called = AtomicBool::new(false);
+    let r = create_payment(
+        &req,
+        &dummy_signer(),
+        &rpc_url,
+        TESTNET_PASSPHRASE,
+        gate_that_must_not_run(&called),
+    )
+    .await;
+    assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::MainnetSigningForbidden { .. })),
         "expected MainnetSigningForbidden, got {r:?}"

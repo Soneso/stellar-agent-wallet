@@ -3626,6 +3626,11 @@ mod tests {
 
         // Mint the attestation via the SAME core path `stellar-agent approve
         // --id <nonce> --profile <name>` calls.
+        let mut consent_writer = stellar_agent_core::audit_log::AuditWriter::open(
+            approvals_dir.path().join("audit").join("audit.jsonl"),
+            None,
+        )
+        .unwrap();
         let attestation_b64 = attest_and_persist(
             &mut store,
             &entry,
@@ -3635,7 +3640,7 @@ mod tests {
                 "stellar:mainnet",
             ),
             Surface::Cli,
-            None,
+            stellar_agent_core::approval::ConsentAudit::Writer(&mut consent_writer),
             None,
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
@@ -3736,6 +3741,11 @@ mod tests {
 
         // Mint the attestation via the SAME core path `stellar-agent approve
         // --id <nonce> --profile <name>` calls.
+        let mut consent_writer = stellar_agent_core::audit_log::AuditWriter::open(
+            approvals_dir.path().join("audit").join("audit.jsonl"),
+            None,
+        )
+        .unwrap();
         let attestation_b64 = attest_and_persist(
             &mut store,
             &entry,
@@ -3745,7 +3755,7 @@ mod tests {
                 "stellar:mainnet",
             ),
             Surface::Cli,
-            None,
+            stellar_agent_core::approval::ConsentAudit::Writer(&mut consent_writer),
             None,
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
