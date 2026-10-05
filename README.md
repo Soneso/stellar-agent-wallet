@@ -112,9 +112,9 @@ carry the file, an acceptance check, and the gate commands. Claim an unassigned
 or
 [`help wanted`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
 by commenting "I'll take this". Merged pull requests get release-note credit.
-[CONTRIBUTING.md](CONTRIBUTING.md) describes the review path, and questions and
-ideas go to
-[Discussions](https://github.com/Soneso/stellar-agent-wallet/discussions).
+[CONTRIBUTING.md](CONTRIBUTING.md#start-here-with-your-agent) has a starter
+prompt for your agent and describes the review path, and questions and ideas go
+to [Discussions](https://github.com/Soneso/stellar-agent-wallet/discussions).
 
 ## Install
 

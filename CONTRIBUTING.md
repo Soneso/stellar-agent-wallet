@@ -125,6 +125,43 @@ Coding agents start at [AGENTS.md](AGENTS.md) and can install
 The `agent-ready` label marks issues whose Where, Acceptance, and Gates are stated
 as commands.
 
+### Start here with your agent
+
+Pick an unassigned issue labeled `agent-ready`, note its number, and give your
+coding agent this prompt with the number in place of NNN:
+
+> You are contributing to https://github.com/Soneso/stellar-agent-wallet for me,
+> as an outside contributor, with my GitHub account through the `gh` CLI. The
+> issue is #NNN.
+>
+> 1. Read the issue with `gh issue view NNN --repo Soneso/stellar-agent-wallet`.
+> If nobody is assigned, ask me, then comment exactly "I'll take this" on it. A
+> workflow assigns the issue to me. Confirm the assignment before you continue.
+> If nothing assigns it within a few minutes, stop and tell me.
+> 2. Fork and clone with `gh repo fork Soneso/stellar-agent-wallet --clone`,
+> then create a branch named for the change.
+> 3. Read `AGENTS.md`, the sections "Contributing with a coding agent", "Commit
+> and pull request conventions", and "Writing style" in `CONTRIBUTING.md`, and
+> the section "Self-review before you open a pull request" in
+> `docs/maintainers/review-checklist.md`. Follow them.
+> 4. Make exactly the changes the issue describes, nothing more. A test asserts
+> the correct behavior. If a test passes only by accepting something wrong, the
+> code is wrong, not the test. If you add or change a test, revert the behavior
+> it pins and confirm the test fails, then restore it and note how you checked.
+> 5. Verify the result: every acceptance command in the issue gives the value
+> the issue states, and `bash .github/scripts/preflight.sh` passes.
+> 6. Show me the diff, the gate results, and a pull request description that
+> fills in `.github/PULL_REQUEST_TEMPLATE.md` with the preflight table and
+> "Closes #NNN". After I confirm, commit in conventional-commit style, push to
+> my fork, and open the pull request against `main` with `gh pr create`. Keep
+> "Allow edits by maintainers" enabled.
+> 7. When a review comment arrives, show it to me with your proposed answer or
+> change before you reply or push.
+
+The agent stops three times: before it claims the issue, before it opens the
+pull request, and before it answers a review comment. Read the diff before you
+confirm the pull request. You own it and answer the review questions.
+
 This is a wallet built for AI agents, and contributions built with AI agents are
 welcome. Three things make that work:
 
