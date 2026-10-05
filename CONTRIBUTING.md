@@ -162,9 +162,10 @@ request that fills in the template is the one reviewed. A maintainer closes a
 later pull request for the same issue, with thanks and a pointer to another open
 issue.
 
-Changes land through pull requests from a fork. CI runs on every pull request.
-On your first contribution, the run starts after a maintainer approves it. Every
-required check must pass before merge.
+Work on a branch named for the change, for example `docs/exit-code-2` or
+`fix/claim-refusal-codes`. Changes land through pull requests from a fork. CI
+runs on every pull request. On your first contribution, the run starts after a
+maintainer approves it. Every required check must pass before merge.
 
 ## Writing style
 
