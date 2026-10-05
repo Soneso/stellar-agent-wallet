@@ -12,8 +12,14 @@
   },
   "dependencies": {
     "@stellar/mpp": "0.7.1",
-    "@stellar/stellar-sdk": "17.2.1",
-    "mppx": "0.13.1",
+    "@stellar/stellar-sdk": "15.1.0",
+    "mppx": "0.6.31",
     "viem": "2.57.2"
+  },
+  "pnpm": {
+    "overrides": {
+      "axios": "1.20.0",
+      "toml": "4.3.0"
+    }
   }
 }
