@@ -47,7 +47,8 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
   clippy:
     name: clippy
@@ -70,7 +71,8 @@ jobs:
       # the testnet-acceptance features, without executing any test. The
       # workspace lints declared in the root Cargo.toml deny warnings; -D
       # warnings turns any remaining warning into a failure.
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   doc:
     name: rustdoc
@@ -88,7 +90,8 @@ jobs:
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo doc --no-deps --all-features
+      - name: Build the rustdoc
+        run: cargo doc --no-deps --all-features
 
   test:
     name: test (offline)
@@ -124,12 +127,15 @@ jobs:
       # features stay off and the heavy submit flows are #[ignore]d, so no test
       # reaches the network. --all-features is deliberately avoided here: it
       # would enable the live tiers and attempt real RPC and Friendbot access.
-      - run: cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
+      - name: Run the offline tests
+        run: cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
       # Without test-helpers, the integration target also checks that the library excludes the revoked test fixture.
-      - run: cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg
+      - name: Test the vendored Wasm release configuration
+        run: cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg
       # stellar-agent-test-support is consumed with a different feature set by
       # each crate; every set must compile on its own.
-      - run: |
+      - name: Check each test-support feature set
+        run: |
           cargo check -p stellar-agent-test-support --no-default-features
           for feature in test-helpers testnet-helpers verifier-registry wiremock-helpers; do
             cargo check -p stellar-agent-test-support --no-default-features --features "$feature"
@@ -146,8 +152,10 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.5.0
-      - run: corepack enable
-      - run: .github/scripts/test-mpp-interop.sh
+      - name: Enable Corepack
+        run: corepack enable
+      - name: Run the MPP interop harness
+        run: .github/scripts/test-mpp-interop.sh
 
   sdk-v17-interop:
     name: stellar-sdk v17 preimage interop
@@ -160,8 +168,10 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.5.0
-      - run: corepack enable
-      - run: .github/scripts/test-sdk-v17-interop.sh
+      - name: Enable Corepack
+        run: corepack enable
+      - name: Run the stellar-sdk v17 interop harness
+        run: .github/scripts/test-sdk-v17-interop.sh
 
   release-contracts:
     name: release contracts
@@ -171,15 +181,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: .github/scripts/test-publish-crates-check.sh
-      - run: .github/scripts/publish-crates.sh --check
-      - run: .github/scripts/package-skill.sh --check
-      - run: bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh
-      - run: bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh
-      - run: bash .github/scripts/test-check-ref-on-main.sh
-      - run: bash .github/scripts/test-publish-crates-verify.sh
-      - run: python3 .github/scripts/test-compare-crate-sums.py
-      - run: python3 .github/scripts/test-validate-unsigned-archive.py
+      - name: Self-test the publish tier check
+        run: .github/scripts/test-publish-crates-check.sh
+      - name: Check the publish tiers
+        run: .github/scripts/publish-crates.sh --check
+      - name: Check the skill archive
+        run: .github/scripts/package-skill.sh --check
+      - name: Check the signer-set baseline gate
+        run: bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh
+      - name: Self-test the signer-set baseline gate
+        run: bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh
+      - name: Self-test the ref-on-main check
+        run: bash .github/scripts/test-check-ref-on-main.sh
+      - name: Self-test the publish verification
+        run: bash .github/scripts/test-publish-crates-verify.sh
+      - name: Self-test the crate checksum comparison
+        run: python3 .github/scripts/test-compare-crate-sums.py
+      - name: Self-test the unsigned archive validation
+        run: python3 .github/scripts/test-validate-unsigned-archive.py
       # The runner image documents no PyYAML for its system Python, so the
       # structural workflow check runs from a virtual environment with a
       # hash-pinned PyYAML.
@@ -303,7 +322,8 @@ jobs:
       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
         with:
           tool: cargo-machete@0.9.2
-      - run: cargo machete
+      - name: Check for unused dependencies
+        run: cargo machete
 
   deny:
     name: licenses-advisories
@@ -327,4 +347,5 @@ jobs:
       # commit when an upstream advisory is published. The license, ban, and
       # source checks are deterministic from the committed Cargo.lock and
       # deny.toml.
-      - run: cargo deny check
+      - name: Check licenses and advisories
+        run: cargo deny check

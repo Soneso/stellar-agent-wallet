@@ -9,11 +9,9 @@ Closes #N
 ## Gates run
 
 <!--
-One line per gate with its exit code, for example:
-- `cargo test --all-features`: exit 0
-A change outside documentation, scripts, and workflows runs the gate suite in
-CONTRIBUTING.md. A change to documentation, scripts, or workflows lists the
-checks it ran.
+Paste the table that `bash .github/scripts/preflight.sh` prints. A change
+outside documentation, scripts, and workflows also lists the acceptance gates
+of CONTRIBUTING.md it ran, with their exit codes.
 -->
 
 -
@@ -30,3 +28,4 @@ Confirm each item for this description, the documentation, and the code comments
 - [ ] No contrast with imagined wrong behavior.
 - [ ] Comments state invariants.
 - [ ] I understand every line of the change and can answer questions about it.
+- [ ] Every new test fails when the behavior it pins is reverted (the self-review section of the review checklist).

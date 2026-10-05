@@ -313,7 +313,9 @@ vulnerability.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Good entry points are the issues labeled
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+`bash .github/scripts/preflight.sh` runs the checks for the files you changed.
+Good entry points are the issues labeled
 [`good first issue`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
 and
 [`help wanted`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22).

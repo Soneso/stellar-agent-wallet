@@ -66,9 +66,12 @@ These gates must pass before a change is accepted:
 - `cargo machete` (no unused dependencies)
 - `cargo deny check` (permissive-only license allowlist and advisory check)
 
-Run them locally before you request review of a change outside documentation,
-scripts, and workflows. The exact commands, the gate-tool installation, and the
-test tiers are in
+`bash .github/scripts/preflight.sh` runs the local CI checks that apply to the
+files your branch changes and prints their results for the pull request
+description. `--full` runs every gate in its registry. The gates above remain
+the acceptance bar for a change outside documentation, scripts, and workflows;
+run the ones that apply. The exact commands, the gate-tool installation, and
+the test tiers are in
 [docs/maintainers/building.md](docs/maintainers/building.md).
 
 CI runs the coverage gate on a pull request once a maintainer adds the
@@ -115,7 +118,7 @@ closes after 21 days. You can reopen it at any time.
 ## Contributing with a coding agent
 
 This is a wallet built for AI agents, and contributions built with AI agents are
-welcome. Two things make that work:
+welcome. Three things make that work:
 
 - You own the pull request. The quality bar in
   [The bar for changes](#the-bar-for-changes) does not move, and the checks that
@@ -128,6 +131,10 @@ welcome. Two things make that work:
   the MCP tools, the error-code families, and the security model. Install it
   before you start so your agent works from the project's conventions; see
   [skills/README.md](skills/README.md) for setup.
+- Before the pull request, your agent runs `bash .github/scripts/preflight.sh`
+  and the self-review section of the
+  [review checklist](docs/maintainers/review-checklist.md). The pull request
+  description carries the preflight table and names the tests it probed.
 
 Good entry points are the issues labeled
 [`help wanted`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
