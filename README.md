@@ -132,7 +132,7 @@ stable versions only.
 release archive from the tagged release assets:
 
 ```bash
-cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.10 stellar-agent-mcp@0.1.0-alpha.10
 ```
 
 Release archives exist for the five targets that
@@ -151,8 +151,8 @@ archive directly, without any Rust tooling (substitute your target, for example
 `aarch64-apple-darwin` or `x86_64-unknown-linux-gnu`):
 
 ```bash
-curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.9/stellar-agent-0.1.0-alpha.9-aarch64-apple-darwin.tar.xz
-tar -xJf stellar-agent-0.1.0-alpha.9-aarch64-apple-darwin.tar.xz
+curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.10/stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin.tar.xz
+tar -xJf stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin.tar.xz
 ```
 
 then move the two binaries onto your `PATH`. The release signs the macOS
@@ -166,7 +166,7 @@ to check the signature and the notarization.
 Builds the binaries from the published sources:
 
 ```bash
-cargo install --locked stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
+cargo install --locked stellar-agent-cli@0.1.0-alpha.10 stellar-agent-mcp@0.1.0-alpha.10
 ```
 
 `--locked` makes cargo build with the `Cargo.lock` published in the crate.
@@ -176,7 +176,7 @@ requires the stable Rust toolchain (edition 2024).
 ### Build from source
 
 ```bash
-git clone --branch v0.1.0-alpha.9 https://github.com/Soneso/stellar-agent-wallet.git
+git clone --branch v0.1.0-alpha.10 https://github.com/Soneso/stellar-agent-wallet.git
 cd stellar-agent-wallet
 cargo build --release --locked
 ```

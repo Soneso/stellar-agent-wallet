@@ -104,7 +104,7 @@ and other AI coding agents discover tools. A first session looks like this:
 1. **Build the wallet** (a Rust toolchain is the only prerequisite):
 
    ```bash
-   git clone --branch v0.1.0-alpha.9 https://github.com/Soneso/stellar-agent-wallet
+   git clone --branch v0.1.0-alpha.10 https://github.com/Soneso/stellar-agent-wallet
    cd stellar-agent-wallet && cargo build --release --locked
    ```
 

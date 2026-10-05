@@ -50,7 +50,7 @@ from GitHub release archives. A single release archive carries both binaries:
 - Binaries inside: `stellar-agent` and `stellar-agent-mcp`.
 
 ```bash
-cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.10 stellar-agent-mcp@0.1.0-alpha.10
 ```
 
 While only prerelease (alpha) versions are published on crates.io, the version
@@ -74,8 +74,8 @@ Without any Rust tooling, fetch and extract the archive directly (substitute
 your target):
 
 ```bash
-curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.9/stellar-agent-0.1.0-alpha.9-aarch64-apple-darwin.tar.xz
-tar -xJf stellar-agent-0.1.0-alpha.9-aarch64-apple-darwin.tar.xz
+curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.10/stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin.tar.xz
+tar -xJf stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin.tar.xz
 ```
 
 Every release ships supply-chain verification artifacts alongside the
@@ -104,7 +104,7 @@ your `PATH`; the `stellar-agent-cli` crate installs the binary named
 `stellar-agent`:
 
 ```bash
-cargo install --locked stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9
+cargo install --locked stellar-agent-cli@0.1.0-alpha.10 stellar-agent-mcp@0.1.0-alpha.10
 ```
 
 `--locked` makes cargo build with the `Cargo.lock` published in the crate.
@@ -114,7 +114,7 @@ cargo install --locked stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-a
 Clone the release tag and build with its committed `Cargo.lock`:
 
 ```bash
-git clone --branch v0.1.0-alpha.9 https://github.com/Soneso/stellar-agent-wallet
+git clone --branch v0.1.0-alpha.10 https://github.com/Soneso/stellar-agent-wallet
 cd stellar-agent-wallet
 cargo build --release --locked
 ```

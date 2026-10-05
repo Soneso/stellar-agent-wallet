@@ -7,7 +7,7 @@ Model Context Protocol (MCP) stdio server for the stellar-agent-wallet.
 ## Install
 
 ```
-cargo install --locked stellar-agent-mcp@0.1.0-alpha.9
+cargo install --locked stellar-agent-mcp@0.1.0-alpha.10
 ```
 
 `--locked` makes cargo build with the `Cargo.lock` published in the crate. The

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.10] - 2026-10-05
+
+First contributions from outside the maintainers: @Revan0809 (#280), @harshit3355 (#308), @thadidaniel-ctrl (#305, #306), and @abhicodes-007 (#312).
+
 ### Added
 
 - Wire codes `profile.network_flag_mismatch`, `auth.enrolled_signer_unpinned`, and `auth.enrolled_signer_mismatch` identify network assertions and signer enrollment refusals.
@@ -2639,7 +2643,8 @@ policy engine, operator-approval spine, and tamper-evident audit log.
 - An agent integration guide (`docs/agents.md`) and capability-isolation example
   toolsets under `examples/toolsets/`.
 
-[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.9...HEAD
+[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.10...HEAD
+[0.1.0-alpha.10]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.9...v0.1.0-alpha.10
 [0.1.0-alpha.9]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.8...v0.1.0-alpha.9
 [0.1.0-alpha.8]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.7...v0.1.0-alpha.8
 [0.1.0-alpha.7]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.6...v0.1.0-alpha.7
