@@ -1,6 +1,9 @@
 # Contributing
 
 Thanks for your interest in Stellar Agent Wallet. Contributions are welcome.
+Questions and ideas go to
+[Discussions](https://github.com/Soneso/stellar-agent-wallet/discussions); bugs
+and feature requests are issues.
 
 This is a public alpha under active development. Interfaces, output schemas, and
 internal structure can change between commits. Expect change, and check the current

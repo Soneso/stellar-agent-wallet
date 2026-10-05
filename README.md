@@ -8,20 +8,26 @@
   <a href="https://github.com/Soneso/stellar-agent-wallet/releases"><img src="https://img.shields.io/github/v/release/Soneso/stellar-agent-wallet?include_prereleases&style=for-the-badge&label=release" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Soneso/stellar-agent-wallet?style=for-the-badge" alt="License"></a>
   <a href="docs/getting-started.md"><img src="https://img.shields.io/badge/docs-getting_started-4cc9f0?style=for-the-badge" alt="Getting started"></a>
-  <a href="https://soneso.com"><img src="https://img.shields.io/badge/built_by-Soneso-243b5c?style=for-the-badge" alt="Built by Soneso"></a>
+  <a href="https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3Aagent-ready"><img src="https://img.shields.io/github/issues/Soneso/stellar-agent-wallet/agent-ready?style=for-the-badge&label=agent-ready%20issues" alt="Open agent-ready issues"></a>
+  <a href="https://soneso.com"><img src="https://img.shields.io/badge/maintained_by-Soneso-243b5c?style=for-the-badge" alt="Maintained by Soneso"></a>
 </p>
 
 # Stellar Agent Wallet
 
-A Stellar wallet for AI agents, built by Soneso: autonomous transactions
-inside rules you define, approvals you grant, and an audit trail you can
-verify.
+A Stellar wallet for AI agents, built by AI agents: autonomous transactions
+inside rules you define, approvals you grant, and an audit trail you can verify.
+
+Stellar Agent Wallet is a community experiment. AI agents write most of the
+code, a maintainer reviews every pull request, and anyone who works with agents
+on Stellar can contribute. Soneso maintains the project under
+[GOVERNANCE.md](GOVERNANCE.md).
 
 `stellar-agent-wallet` lets an AI agent transact on Stellar under guardrails. It
-ships two surfaces over one shared core: the `stellar-agent` CLI and the
-`stellar-agent-mcp` MCP stdio server. Both sit on a policy engine, an
-operator-approval spine, and a tamper-evident hash-chained audit log, so an
-autonomous agent can act while a human keeps control of what it is allowed to do.
+ships two surfaces over one shared core: the `stellar-agent` CLI, which also runs
+as `stellar agent` inside the Stellar CLI, and the `stellar-agent-mcp` MCP stdio
+server. Both sit on a policy engine, an operator-approval spine, and a
+tamper-evident hash-chained audit log, so an autonomous agent can act while a
+human keeps control of what it is allowed to do.
 
 New to the project? [What is the Stellar Agent Wallet?](docs/onboarding.md)
 is the non-technical tour: what it is, what an agent can do with it, and how a
@@ -63,43 +69,65 @@ each tagged release, and the workspace crates are published to
 
 ## Highlights
 
-- Payments, balances, trustlines, and claimable-balance claims on Stellar.
-- Operator approval loop with a terminal command and a loopback web inbox
-  (list, notify, approve or reject pending agent actions).
-- DeFi adapters: Soroswap swaps (CLI `trade`; MCP
-  `stellar_dex_trade` plus read-only `stellar_dex_quote`), DeFindex vaults
+- Payments and assets: payments, balances, trustlines, and claimable-balance
+  claims on Stellar.
+- DeFi: adapters for Soroswap swaps (CLI `trade`; MCP
+  `stellar_dex_trade` plus read-only `stellar_dex_quote`) and DeFindex vaults
   (`vault`). Each verb is typed, simulate-checked, and
   fail-closed; raw or opaque calldata is refused before signing.
-- SEP protocol support: SEP-6 and SEP-24 anchor flows, SEP-7 `web+stellar:` URI
-  parsing, SEP-10 web auth, SEP-43 wallet signing, SEP-45 contract-account web
-  auth, SEP-47 contract-interface discovery, SEP-48 typed-argument preview, and
-  SEP-53 prefixed message signing.
-- x402 agent payments: payer-side `PAYMENT-SIGNATURE` payloads for the x402 v2
-  Exact Stellar scheme, with an optional SEP-10 counterparty-identity gate.
-- Machine Payments Protocol (MPP) sponsored charges: strict HTTP/native-MCP
-  challenge validation, one-shot G-account authorization, host receipts, and
-  independent settlement reconciliation. This credential-only flow is
-  testnet-only; the trusted host sends the paid request and server submission.
-- OpenZeppelin smart-account governance: deployment, context rules, threshold
-  updates, and WebAuthn passkey signers, with signing bound to the on-chain
-  authorization rules. Each non-zero authorizing rule passes the signer-set
-  comparison and executable pin check before signing.
-- Signed agent toolsets with capability isolation: toolsets are installed only
-  after publisher-signature and hash verification, and a structural boundary keeps
-  a toolset from reaching a signing tool it was not granted.
-- Bounded agent delegation: scoped context rules (`CallContract` /
-  `CreateContract`), rolling-window spending limits, and a first-class
-  External-Ed25519 signer let an agent hold its own key and submit smart-account
-  `execute` calls within limits the contract enforces on-chain.
-- Interactive passkey enrollment for the operator approval surfaces: register a
-  WebAuthn credential for the loopback or remote approval inbox with a local
-  one-shot browser ceremony.
+- Smart accounts:
+  - OpenZeppelin smart-account governance: deployment, context rules, threshold
+    updates, and WebAuthn passkey signers, with signing bound to the on-chain
+    authorization rules. Each non-zero authorizing rule passes the signer-set
+    comparison and executable pin check before signing.
+  - Bounded agent delegation: scoped context rules (`CallContract` /
+    `CreateContract`) and rolling-window spending limits. A first-class
+    External-Ed25519 signer lets an agent hold its own key and submit
+    smart-account `execute` calls within limits the contract enforces on-chain.
+- Anchors and protocols over SEP: SEP-6 and SEP-24 anchor flows, SEP-7
+  `web+stellar:` URI parsing, SEP-10 web auth, SEP-43 wallet signing, and
+  SEP-45 contract-account web auth. The wallet also supports SEP-47
+  contract-interface discovery, SEP-48 typed-argument preview, and SEP-53
+  prefixed message signing.
+- Machine payments:
+  - x402 agent payments: payer-side `PAYMENT-SIGNATURE` payloads for the x402 v2
+    Exact Stellar scheme, with an optional SEP-10 counterparty-identity gate.
+  - Machine Payments Protocol (MPP) sponsored charges: strict HTTP/native-MCP
+    challenge validation, one-shot G-account authorization, host receipts, and
+    independent settlement reconciliation. This credential-only flow is
+    testnet-only; the trusted host sends the paid request and server submission.
+- Operator control:
+  - Operator approval loop with a terminal command and a loopback web inbox
+    (list, notify, approve, or reject pending agent actions).
+  - Signed agent toolsets with capability isolation: toolsets are installed
+    only after publisher-signature and hash verification. A structural boundary
+    keeps a toolset from reaching a signing tool it was not granted.
+  - Interactive passkey enrollment for the operator approval surfaces: register
+    a WebAuthn credential for the loopback or remote approval inbox with a local
+    one-shot browser ceremony.
+  - Ledger signing: `--sign-with-ledger` uses a connected Ledger hardware device
+    to sign, and `--account-index` selects the BIP-44 account index for the
+    derivation path.
 
 See [docs/concepts.md](docs/concepts.md) for the policy engine, approval spine,
 audit log, and toolset model in detail.
 
 The supported MPP flow, exact trust boundary, CLI commands, and five MCP tools
 are documented in [Agent payments with MPP](docs/agent-payments.md).
+
+## Contribute with your agent
+
+Give your coding agent [`AGENTS.md`](AGENTS.md); it tells the agent where to
+start. Issues labeled
+[`agent-ready`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3Aagent-ready)
+carry the file, an acceptance check, and the gate commands. Claim an unassigned
+[`good first issue`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+or
+[`help wanted`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
+by commenting "I'll take this". Merged pull requests get release-note credit.
+[CONTRIBUTING.md](CONTRIBUTING.md) describes the review path, and questions and
+ideas go to
+[Discussions](https://github.com/Soneso/stellar-agent-wallet/discussions).
 
 ## Install
 
@@ -310,18 +338,6 @@ the wallet enforces at runtime), demonstrated in
 
 See [SECURITY.md](SECURITY.md) for the supported versions and how to report a
 vulnerability.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-Coding agents start at `AGENTS.md`.
-`bash .github/scripts/preflight.sh` runs the checks for the files you changed.
-Good entry points are the issues labeled
-[`good first issue`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
-and
-[`help wanted`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22).
-[GOVERNANCE.md](GOVERNANCE.md) states who maintains the project and how it makes
-decisions.
 
 ## License
 
