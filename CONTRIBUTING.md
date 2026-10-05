@@ -71,6 +71,9 @@ scripts, and workflows. The exact commands, the gate-tool installation, and the
 test tiers are in
 [docs/maintainers/building.md](docs/maintainers/building.md).
 
+CI runs the coverage gate on a pull request once a maintainer adds the
+`coverage` label, and weekly on main.
+
 ## Review process
 
 Your first pull request or issue gets an automatic welcome comment that names the next step.

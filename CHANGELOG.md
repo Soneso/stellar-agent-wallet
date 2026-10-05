@@ -567,6 +567,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   how each stellar-cli binary is built, and the command that rebuilds the
   file. The multicall record states that its source is not in the
   repository.
+- The coverage gate runs in its own Coverage workflow: weekly on main, on a
+  pull request that carries the `coverage` label, and on demand.
 
 ### Removed
 

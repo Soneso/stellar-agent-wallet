@@ -3,7 +3,7 @@ name: Install surface
 # Checks the documented install commands, the secret-seed procedures, and the
 # binstall metadata (.github/scripts/check-install-surface.py). Checks the gate
 # tool versions of docs/maintainers/building.md, the other workflows, and the
-# composite actions against the ci.yml pins
+# composite actions against each tool's reference workflow pin
 # (.github/scripts/check-gate-tool-versions.sh). Checks the writing style of
 # the Markdown files (.github/scripts/check-docs-style.py) and the syntax of
 # every workflow (actionlint). Runs each check's self-test, the Python ones on

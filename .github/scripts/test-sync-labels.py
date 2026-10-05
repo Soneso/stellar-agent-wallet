@@ -27,6 +27,7 @@ LABELS = [
     ("area: smart-account", "c2e0c6", "Smart-account governance"),
     ("area: mpp", "fbca04", "Agent payments with MPP"),
     ("security-sensitive", "b60205", "Signing, key handling, or serialized state; second review pass"),
+    ("coverage", "c5def5", "CI runs the coverage gate on this pull request"),
     ("waiting on author", "fef2c0", "The next step is the contributor's"),
     ("waiting on maintainer", "d4c5f9", "The next step is ours"),
     ("stale", "ededed", "No activity for 14 days; closes after 21"),

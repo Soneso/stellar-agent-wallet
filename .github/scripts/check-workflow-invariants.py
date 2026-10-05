@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Structural check of the release, publish, notarization, and maintenance workflows.
+"""Structural check of the release, publish, notarization, maintenance, and coverage workflows.
 
 Usage: ``check-workflow-invariants.py [repository-root]``
 
 Reads ``release.yml``, ``publish.yml``, ``notarize-smoke.yml``, ``labels.yml``,
-``stale.yml``, ``triage.yml``, and ``welcome.yml`` under ``.github/workflows/``.
+``stale.yml``, ``triage.yml``, ``welcome.yml``, and ``coverage.yml`` under
+``.github/workflows/``.
 Also reads the composite action
 ``.github/actions/macos-sign-notarize/action.yml``. Needs PyYAML.
 
@@ -16,7 +17,8 @@ and comment lines skipped. The check fails when any of these holds:
 
 - ``unreadable``: a workflow or the composite action is missing or is not
   valid YAML.
-- ``missing-job``: a job that a rule below names does not exist.
+- ``missing-job``: a job that a release, publish, or notarization rule below
+  names does not exist.
 - ``workflow-permissions``: a workflow sets no top-level ``permissions``.
 - ``cred-compile``: a credentialed job uses ``Swatinem/rust-cache``,
   ``actions/cache``, or a sub-action of either, runs ``cross``, or runs a
@@ -70,6 +72,12 @@ and comment lines skipped. The check fails when any of these holds:
   that holds no shell operator. The step of that line sets ``if`` or
   ``continue-on-error``, or the job sets ``continue-on-error``. A
   ``publish.yml`` job passes the script the dispatch commit (``GITHUB_SHA``).
+- ``coverage-trigger``: ``coverage.yml`` has no ``pull_request`` trigger, a
+  ``paths`` or ``paths-ignore`` filter, no ``types`` list, or a list missing
+  an event in ``COVERAGE_EVENTS``. The rule reports every missing event.
+- ``coverage-condition``: ``coverage.yml`` has no ``coverage`` job, or that
+  job's ``if`` is not a string equal to ``COVERAGE_CONDITION`` after the check
+  strips the surrounding whitespace and one enclosing ``${{ }}``.
 """
 
 import fnmatch
@@ -82,7 +90,8 @@ try:
 except ImportError:
     sys.exit("check-workflow-invariants.py needs PyYAML (pip install PyYAML)")
 
-WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml", "labels.yml", "stale.yml", "triage.yml", "welcome.yml")
+WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml", "labels.yml", "stale.yml", "triage.yml", "welcome.yml",
+             "coverage.yml")
 COMPOSITE = pathlib.PurePosixPath(".github/actions/macos-sign-notarize")
 SIGNING_JOBS = {("release.yml", "sign-macos"), ("notarize-smoke.yml", "sign")}
 TOOLCHAIN_ALLOWED = {("publish.yml", "publish")}
@@ -95,6 +104,17 @@ REUSABLE_NEEDS_ALLOWED = {
     ("release.yml", "provenance", "provenance-name"): "needs.preflight.outputs.version",
 }
 ANCESTRY_JOBS = {("release.yml", "preflight"), ("publish.yml", "verify"), ("publish.yml", "publish")}
+# Branch protection requires the `coverage` check. GitHub leaves a required
+# check pending when a paths filter skips its workflow, so the coverage
+# workflow runs on every pull request and its job condition decides whether a
+# run measures. A run starts on every new head, and on every label change made
+# by a person or with an app token.
+COVERAGE_WORKFLOW = "coverage.yml"
+COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled", "unlabeled")
+# The coverage job measures on the schedule, on a dispatch, and on a pull
+# request whose labels include `coverage`.
+COVERAGE_CONDITION = ("github.event_name != 'pull_request' || "
+                      "contains(github.event.pull_request.labels.*.name, 'coverage')")
 # For each job: the action that receives a credential, and the text of the
 # checks that earlier steps must hold. The third entry is the text of the
 # workspace code that reads the downloaded data. A clean-checkout check must
@@ -389,6 +409,45 @@ class Checker:
                 if workflow == "publish.yml" and re.search(r"GITHUB_SHA|github\.sha", step["run"]):
                     self.report(step_where, "ancestry-check", "passes the dispatch commit, not the tag's HEAD")
 
+    def check_coverage_trigger(self, workflow, doc):
+        # PyYAML reads the key `on` as the boolean True. The shorthand forms
+        # `on: pull_request` and `on: [pull_request, ...]`, and a null
+        # `pull_request:` entry, name the event with an empty configuration.
+        triggers = doc.get("on", doc.get(True))
+        if isinstance(triggers, dict) and "pull_request" in triggers:
+            trigger = triggers["pull_request"]
+        elif triggers == "pull_request" or (isinstance(triggers, list) and "pull_request" in triggers):
+            trigger = None
+        else:
+            self.report(workflow, "coverage-trigger", "pull_request trigger is absent")
+            return
+        if not isinstance(trigger, dict):
+            trigger = {}
+        if "paths" in trigger:
+            self.report(workflow, "coverage-trigger", "pull_request trigger has a paths filter")
+        if "paths-ignore" in trigger:
+            self.report(workflow, "coverage-trigger", "pull_request trigger has a paths-ignore filter")
+        types = trigger.get("types")
+        if not isinstance(types, list):
+            self.report(workflow, "coverage-trigger", "pull_request types are absent")
+            return
+        for event in COVERAGE_EVENTS:
+            if event not in types:
+                self.report(workflow, "coverage-trigger", f"pull_request types lack {event}")
+
+    def check_coverage_condition(self, workflow, jobs):
+        if "coverage" not in jobs:
+            self.report(workflow, "coverage-condition", "job coverage not found")
+            return
+        job = jobs["coverage"]
+        condition = job.get("if") if isinstance(job, dict) else None
+        if isinstance(condition, str):
+            condition = condition.strip()
+            if condition.startswith("${{") and condition.endswith("}}"):
+                condition = condition[3:-2].strip()
+        if condition != COVERAGE_CONDITION:
+            self.report(workflow, "coverage-condition", "coverage job runs without the label condition")
+
     def check_workflow(self, workflow):
         doc = self.load(pathlib.PurePosixPath(".github/workflows") / workflow)
         if not isinstance(doc, dict):
@@ -399,6 +458,9 @@ class Checker:
         for wanted_workflow, wanted_job in ANCESTRY_JOBS | SIGNING_JOBS | set(CREDENTIAL_GUARDS):
             if wanted_workflow == workflow and wanted_job not in jobs:
                 self.report(workflow, "missing-job", f"job {wanted_job} not found")
+        if workflow == COVERAGE_WORKFLOW:
+            self.check_coverage_trigger(workflow, doc)
+            self.check_coverage_condition(workflow, jobs)
         for job_id, job in jobs.items():
             self.check_job(workflow, doc, job_id, job)
 

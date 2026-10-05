@@ -3,6 +3,7 @@ name: CI
 # Every pull request to main runs the offline gate suite, including docs changes.
 # Pushes to main use the paths filter below. Skill changes run the archive checks.
 # The suite covers format, lint, rustdoc, offline tests, dependencies, and licenses.
+# Coverage runs in coverage.yml.
 # Live testnet tests run in a separate workflow.
 
 on:
@@ -327,49 +328,3 @@ jobs:
       # source checks are deterministic from the committed Cargo.lock and
       # deny.toml.
       - run: cargo deny check
-
-  coverage:
-    name: coverage
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # The instrumented build plus every compiled test binary is large; reclaim
-      # space the build does not need.
-      - name: Free disk space
-        # The instrumented workspace build plus the vendored OpenSSL source
-        # build need more headroom than the plain test job.
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache
-          sudo rm -rf /usr/lib/jvm
-          sudo rm -rf /usr/share/swift
-          sudo rm -rf /usr/local/share/powershell
-          sudo rm -rf /usr/local/.ghcup
-          sudo rm -rf /usr/local/lib/node_modules
-          sudo docker image prune --all --force >/dev/null 2>&1 || true
-      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
-        with:
-          toolchain: stable
-          components: llvm-tools-preview
-      - name: Install libudev (Linux hidapi)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # Coverage builds are instrumented and differ from the other jobs; keep
-          # them in a separate cache so they do not evict the plain-build caches.
-          prefix-key: coverage
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
-        with:
-          tool: cargo-llvm-cov@0.8.7
-      # Offline tier only, matching the `test` job's feature set. --all-features
-      # is deliberately avoided so no live RPC / Friendbot test runs; coverage of
-      # the remaining live-network lines is out of scope for this offline gate.
-      - name: Measure offline line coverage
-        run: cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov.json
-      - name: Enforce per-crate line-coverage floors
-        run: python3 .github/scripts/check-coverage.py cov.json
