@@ -4,6 +4,7 @@ about: Describe a scoped task that an outside contributor can pick up.
 ---
 
 To claim this task, comment "I'll take this". The [contributing guide](https://github.com/Soneso/stellar-agent-wallet/blob/main/CONTRIBUTING.md) describes how claiming and review work.
+A maintainer adds the `agent-ready` label when Where, Acceptance, and Gates are stated as commands.
 
 ## Problem
 
@@ -19,9 +20,13 @@ To claim this task, comment "I'll take this". The [contributing guide](https://g
 
 ## Acceptance
 
-<!-- The checks that decide the task is done: tests to add, gates to pass, and observable behavior. -->
+<!-- Give a check whose output differs today and when done: a count or a command with both values. -->
 
 - [ ]
+
+## Gates
+
+<!-- The preflight command and any named test command. -->
 
 ## Hints
 
