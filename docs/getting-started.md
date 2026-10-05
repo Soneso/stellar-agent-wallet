@@ -538,8 +538,10 @@ for the full flag set.
 
 ### Mainnet is refused for writes
 
-On a mainnet profile, `pay` and the other guarded transaction and
-smart-account write commands refuse before any RPC call or signer access.
+On a mainnet profile, every write or signing command refuses with wire code
+`network.mainnet_write_forbidden`. MPP refuses with `mpp.network_forbidden`.
+`pay` and the other guarded transaction and smart-account write commands refuse
+before any RPC call or signer access.
 [Mainnet-write refusal](cli-reference/index.md#mainnet-write-refusal) lists
 them.
 
@@ -551,14 +553,20 @@ stellar-agent pay GDEST...WXYZ "10 XLM" \
 
 `--network mainnet` on a testnet profile refuses with
 `profile.network_flag_mismatch`, because the flag asserts the profile's chain.
-`trustline`, `trade`, `vault deposit`, `vault withdraw`, and `pool init` refuse
-a mainnet profile the same way, before any RPC call or signer access. `tx`
-signs nothing, and `pool init` is the only `pool` command that signs. The
-submit layer refuses mainnet too. A mainnet network passphrase and a known
-mainnet RPC URL each cost zero RPC calls; beyond those two the wallet asks the
-endpoint which network it serves and refuses when the answer is mainnet. That
-same answer, not the network you declared, is what the wallet checks the
-envelope's signatures against, so an envelope signed for one network cannot be
+
+`trustline`, `trade`, `vault deposit`, `vault withdraw`, `pool init`, and
+`smart-account rules verify-pins`, which loads a signer, refuse a mainnet
+profile the same way, before any RPC call or signer access. `tx` signs nothing,
+and `pool init` is the only `pool` command that signs. The MCP signing, DeFi,
+and commit tools refuse a mainnet profile at entry.
+
+The submit layer refuses mainnet too. A declared mainnet network passphrase and
+a known mainnet RPC URL are each refused with zero RPC calls. Beyond those two,
+the wallet asks the endpoint which network it serves and treats the answer as
+authoritative. It refuses when the answer is mainnet or disagrees with the
+declared network, and when the wallet cannot establish which network the
+endpoint serves. The wallet verifies every envelope signature against the
+endpoint's reported network. An envelope signed for one network cannot be
 submitted under another network's passphrase.
 
 ## Next steps

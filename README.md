@@ -41,24 +41,11 @@ the planned work per release.
 
 - testnet (`stellar:testnet`) is the default network: a command with no
   named profile and no `default.toml` runs on the zero-config testnet profile.
-- mainnet (`stellar:mainnet`) is accepted for read-only commands, through a
-  mainnet profile selected with `--profile <name>`, or through `--rpc-url` for
-  `balances`. Every write or signing command refuses mainnet in this alpha
-  with wire code `network.mainnet_write_forbidden`, except MPP, which refuses
-  with `mpp.network_forbidden`. The transaction and smart-account write
-  commands refuse a mainnet profile before any RPC call or signer access. So
-  do `vault deposit`, `vault withdraw`, `trade`, `trustline`, `pool init`, and
-  `smart-account rules verify-pins`, which loads a signer. The MCP signing,
-  DeFi, and commit tools refuse it at entry. At the submit layer a declared
-  mainnet passphrase and a known mainnet RPC URL are each refused with no RPC
-  call at all. Beyond those two, the layer asks the endpoint which network it
-  serves and refuses when the answer is mainnet.
-- The submit layer does not take the caller's word for the network. It treats
-  the endpoint's own answer as authoritative, refuses when that answer
-  disagrees with the declared network or cannot be established, and verifies
-  every signature on the envelope against the network the endpoint reported.
-  An envelope signed for one network cannot be relayed under another network's
-  passphrase.
+- mainnet (`stellar:mainnet`) is read-only in this alpha. Every write or
+  signing command refuses a mainnet profile, and the submit layer refuses a
+  mainnet endpoint after asking it which network it serves.
+  [Mainnet is refused for writes](docs/getting-started.md#mainnet-is-refused-for-writes)
+  lists the commands, the layers, and the wire codes.
 - Friendbot funding is testnet/futurenet only; mainnet is structurally refused.
 
 Release archives are published on the
