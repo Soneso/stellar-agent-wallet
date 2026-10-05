@@ -82,9 +82,9 @@ run the agent from the checkout so it can read the repository files.
 This is a public alpha. The `stellar-agent` and `stellar-agent-mcp` binaries
 install from crates.io with a pinned prerelease version. To install the
 prebuilt release archives, run
-`cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9`;
+`cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.10 stellar-agent-mcp@0.1.0-alpha.10`;
 to build from the published sources, run
-`cargo install --locked stellar-agent-cli@0.1.0-alpha.9 stellar-agent-mcp@0.1.0-alpha.9`.
+`cargo install --locked stellar-agent-cli@0.1.0-alpha.10 stellar-agent-mcp@0.1.0-alpha.10`.
 You can also build from source; the skill teaches the same surface either way.
 See the repository [README](https://github.com/Soneso/stellar-agent-wallet) for
 the full install options.
