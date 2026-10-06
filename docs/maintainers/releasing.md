@@ -11,7 +11,18 @@ dispatch.
    [Building and testing](building.md)) and adds a `## [<version>]` heading to
    `CHANGELOG.md`.
 2. Wait for CI to pass on that `main` commit.
-3. Tag that commit and push the tag:
+3. From a checkout of that commit, check the workspace members on crates.io:
+
+   ```bash
+   .github/scripts/check-crates-exist.sh
+   ```
+
+   The script exits 1 and names every publishable member missing on
+   crates.io. The publish run halts at each of them, so have the crates.io
+   token for each first upload ready, as
+   [Publish a new crate for the first time](#publish-a-new-crate-for-the-first-time)
+   describes.
+4. Tag that commit and push the tag:
 
    ```bash
    git fetch origin
@@ -20,7 +31,9 @@ dispatch.
    ```
 
 The tag push starts `.github/workflows/release.yml`. Tag only a commit on
-`main`: the preflight refuses any other commit.
+`main`: the preflight refuses any other commit. The `preflight` job runs the
+same script with `--warn`, annotates the run with one warning per missing
+member, and the release proceeds.
 
 ## What the release preflight refuses
 
@@ -162,6 +175,66 @@ dispatch runs on, which is `main` for a publish. The tier lists in
 another member set stops before any upload. Every tag up to `v0.1.0-alpha.9`
 has another member set, so none of them can be published again through this
 workflow.
+
+## Publish a new crate for the first time
+
+Trusted Publishing updates crates that exist on crates.io, and it cannot
+create a crate. The `publish` job therefore halts at every new workspace
+member, with the crates.io answer "Trusted Publishing tokens do not support
+creating new crates". A maintainer then uploads that crate once by hand:
+
+1. On Linux or macOS, clone the tagged commit with LF line endings. The `-c`
+   option sets `core.autocrlf` to `false` before the checkout:
+
+   ```bash
+   git clone -c core.autocrlf=false --branch v<version> https://github.com/Soneso/stellar-agent-wallet.git
+   cd stellar-agent-wallet
+   ```
+
+2. Package the crate with the toolchain that `publish.yml` on `main` pins as
+   `RELEASE_TOOLCHAIN`, since the publish run uses the workflow and scripts of
+   `main`:
+
+   ```bash
+   cargo +<RELEASE_TOOLCHAIN> package -p <crate> --no-verify --locked
+   ```
+
+3. Download the `verify-sums` artifact of the halted run and compare the
+   archive with its line in `SHA256SUMS`. `<run-id>` is the number at the end
+   of the run's URL:
+
+   ```bash
+   gh run download <run-id> -n verify-sums -D ../verify-sums
+   expected=$(awk '$2 == "<crate>-<version>.crate" { print $1 }' ../verify-sums/SHA256SUMS)
+   actual=$(sha256sum target/package/<crate>-<version>.crate | cut -d ' ' -f 1)
+   if [ -n "$expected" ] && [ "$actual" = "$expected" ]; then echo match; else echo MISMATCH; fi
+   ```
+
+   On a mismatch, stop. A published version is immutable, so fix the checkout
+   or the toolchain first. The artifact expires after seven days. A dispatch
+   of the same tag with `-f verify_only=true` records it again.
+4. A maintainer who owns the crates creates a crates.io API token scoped to
+   `publish-new` and the crate name. They log in with `cargo login` in a
+   terminal of their own and upload the crate from the same checkout:
+
+   ```bash
+   cargo +<RELEASE_TOOLCHAIN> publish -p <crate> --no-verify --locked
+   ```
+
+5. On crates.io, add the owners `soneso-crates` and
+   `github:soneso:crates-owners` to the crate.
+6. Add the trusted publisher: repository `Soneso/stellar-agent-wallet`,
+   workflow `publish.yml`, environment `crates-io`.
+7. Turn on "Require trusted publishing" for the crate.
+8. Revoke the token on crates.io and run `cargo logout`.
+9. Confirm the upload. The script exits 0:
+
+   ```bash
+   .github/scripts/check-crates-exist.sh <crate>
+   ```
+
+10. Dispatch the same tag again. The run resumes at that crate: every crate
+    already on crates.io passes when its checksum matches.
 
 ## Run the notarization smoke
 

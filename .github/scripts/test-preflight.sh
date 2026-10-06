@@ -75,6 +75,7 @@ install-surface	python3 .github/scripts/check-install-surface.py
 gate-tool-versions	bash .github/scripts/check-gate-tool-versions.sh
 actionlint	actionlint
 workflow-invariants	python3 .github/scripts/check-workflow-invariants.py
+self-test:test-check-crates-exist.sh	bash .github/scripts/test-check-crates-exist.sh
 self-test:test-check-docs-style.py	python3 .github/scripts/test-check-docs-style.py
 self-test:test-check-gate-tool-versions.sh	bash .github/scripts/test-check-gate-tool-versions.sh
 self-test:test-check-install-surface.py	python3 .github/scripts/test-check-install-surface.py
@@ -1015,8 +1016,8 @@ case_full() {
   start_case
   edit CONTRIBUTING.md
   read -r -a ids <<<"$(printf '%s\n' "$EXPECTED_REGISTRY" | awk -F '\t' '{ printf "%s ", $1 }')"
-  if [ "${#ids[@]}" -ne 37 ]; then
-    fail "the expected registry holds ${#ids[@]} rows, expected 37"
+  if [ "${#ids[@]}" -ne 38 ]; then
+    fail "the expected registry holds ${#ids[@]} rows, expected 38"
   fi
   expect_list --full "${ids[@]}"
 }

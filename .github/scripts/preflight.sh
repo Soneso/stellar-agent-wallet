@@ -78,6 +78,7 @@ install-surface	python3 .github/scripts/check-install-surface.py	-	install-surfa
 gate-tool-versions	bash .github/scripts/check-gate-tool-versions.sh	-	install-surface.yml	install-surface	Check the gate tool versions
 actionlint	actionlint	actionlint	install-surface.yml	install-surface	Check workflows
 workflow-invariants	python3 .github/scripts/check-workflow-invariants.py	yaml	ci.yml	release-contracts	Check the workflow structure and the label sync
+self-test:test-check-crates-exist.sh	bash .github/scripts/test-check-crates-exist.sh	jq	ci.yml	release-contracts	Self-test the crates.io existence check
 self-test:test-check-docs-style.py	python3 .github/scripts/test-check-docs-style.py	-	install-surface.yml	install-surface	Self-test Python checks on Python 3.13
 self-test:test-check-gate-tool-versions.sh	bash .github/scripts/test-check-gate-tool-versions.sh	-	install-surface.yml	install-surface	Self-test the gate tool version check
 self-test:test-check-install-surface.py	python3 .github/scripts/test-check-install-surface.py	-	install-surface.yml	install-surface	Self-test Python checks on Python 3.13
@@ -247,6 +248,7 @@ is_invariant_script() {
 # that still exists.
 select_self_tests() {
   case "$1" in
+    .github/scripts/check-crates-exist.sh) select_gate self-test:test-check-crates-exist.sh ;;
     .github/scripts/check-docs-style.py) select_gate self-test:test-check-docs-style.py ;;
     .github/scripts/check-gate-tool-versions.sh) select_gate self-test:test-check-gate-tool-versions.sh ;;
     .github/scripts/check-install-surface.py) select_gate self-test:test-check-install-surface.py ;;
