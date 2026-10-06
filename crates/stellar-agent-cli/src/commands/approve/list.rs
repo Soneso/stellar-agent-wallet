@@ -48,8 +48,7 @@ use stellar_agent_core::approval::{
     open_with_retry,
 };
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
-use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
-use stellar_agent_core::profile::schema::default_approval_dir;
+use stellar_agent_core::error::{ApprovalFailure, ValidationError, WalletError};
 use stellar_agent_core::timefmt;
 
 use crate::common::render::{render_json, sanitize_for_table};
@@ -118,13 +117,9 @@ pub async fn run(args: ListArgs) -> i32 {
         return 1;
     }
 
-    let store_path = match default_approval_dir() {
+    let store_path = match super::common::approval_store_dir() {
         Ok(dir) => dir.join(format!("{profile_name}.toml")),
-        Err(_) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: "approval.store_dir_error: could not determine approval store directory"
-                    .to_owned(),
-            });
+        Err(err) => {
             print_error(&Envelope::<()>::err(&err), args.output);
             return 1;
         }
@@ -142,8 +137,8 @@ pub async fn run(args: ListArgs) -> i32 {
     let now_ms = match timefmt::now_unix_ms() {
         Ok(n) => n,
         Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("approval.clock_error: system clock error: {e}"),
+            let err = WalletError::Approval(ApprovalFailure::ClockError {
+                detail: format!("system clock error: {e}"),
             });
             print_error(&Envelope::<()>::err(&err), args.output);
             return 1;

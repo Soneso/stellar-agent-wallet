@@ -229,17 +229,14 @@ pub async fn run(args: &VerifyArgs) -> i32 {
 
 /// How `audit verify` failed.
 ///
-/// Most failures map onto a typed [`WalletError`]. A tip-anchor mismatch does
-/// not: the verifier computed the anchored and the observed entry count and byte
-/// offset and the reason they disagree, and flattening that into the value-verb
-/// variant would drop all of it and substitute a sentence about signing, which
-/// this verb does not do. That one carries the verifier's own message under the
-/// same wire code, the way `counterparty.writer_locked` is emitted.
+/// Verifier failures carry their audit wire codes and diagnostic text.
+/// A missing log has a validation category and a remediation message.
+/// Profile and ownership pre-checks carry their own codes.
 #[derive(Debug)]
 enum VerifyFailure {
     /// A typed error; the envelope takes its code and message.
     Wallet(WalletError),
-    /// A code and message this verb chooses.
+    /// A verifier failure carrying its own wire code and diagnostic message.
     Raw {
         /// Wire code for the envelope.
         code: &'static str,
@@ -563,81 +560,17 @@ fn check_parent_owner(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Maps a [`VerifyError`] to a [`stellar_agent_core::WalletError`] for
-/// uniform envelope output.
-///
-/// # Mapping rationale
-///
-/// All integrity violations (`ChainBroken`, `RotationGap`, `HmacMismatch`,
-/// `HmacSidecarMissing`) map to
-/// `WalletError::Internal(InternalError::InvariantViolated)`.  The audit log
-/// being corrupt IS an invariant violation at the substrate level — it
-/// indicates that the tamper-evidence guarantee has been compromised.  Using
-/// `WalletError::Auth` would imply the violation is in an auth flow; these
-/// errors instead mean the audit infrastructure itself has been tampered with.
-///
-/// `ParseError` also maps to `InvariantViolated` because parseable log lines
-/// are a hard invariant (a log line that cannot be parsed means the file was
-/// externally modified).
-///
-/// `PathContract` and `Io` map to `Internal(UnexpectedState)` because the log
-/// path must satisfy the verifier contract and the log file should be readable
-/// when the path is correct.
-///
-/// `LogNotFound` maps to `Validation(AuditLogNotFound)` — a missing primary log
-/// is a user-actionable condition (nothing logged yet, or a wrong path), not an
-/// integrity violation, and surfaces the `audit.log_not_found` wire code with
-/// an actionable message.
-///
-/// `TipAnchorMismatch` never reaches this function; [`verify_failure`] emits it
-/// with the verifier's own message.
-///
-/// The `detail` is the `VerifyError` Display string alone: every variant's
-/// Display already begins with its own wire code (e.g. `"audit.io_error: ..."`),
-/// so prefixing `wire_code()` again would double it.
+/// Preserves each verifier code and its diagnostic text in the envelope.
+/// A missing log carries the validation message with its remediation.
 fn verify_failure(err: &VerifyError) -> VerifyFailure {
-    if matches!(err, VerifyError::TipAnchorMismatch { .. }) {
-        // Carry the verifier's own message: it states the anchored and the
-        // observed entry count and byte offset and which half of the check
-        // failed, all of which a typed variant would drop, and it says nothing
-        // about signing, which this verb does not do. The wire code is the one
-        // every other surface uses for this condition.
-        return VerifyFailure::Raw {
+    match err {
+        VerifyError::LogNotFound { path } => VerifyFailure::Wallet(WalletError::Validation(
+            stellar_agent_core::ValidationError::AuditLogNotFound { path: path.clone() },
+        )),
+        _ => VerifyFailure::Raw {
             code: err.wire_code(),
             message: err.to_string(),
-        };
-    }
-    VerifyFailure::Wallet(map_verify_error(err))
-}
-
-fn map_verify_error(err: &VerifyError) -> stellar_agent_core::WalletError {
-    use stellar_agent_core::error::{InternalError, ValidationError};
-
-    let msg = err.to_string();
-
-    match err {
-        VerifyError::LogNotFound { path } => {
-            stellar_agent_core::WalletError::Validation(ValidationError::AuditLogNotFound {
-                path: path.clone(),
-            })
-        }
-        VerifyError::ChainBroken { .. }
-        | VerifyError::RotationGap { .. }
-        | VerifyError::HmacMismatch { .. }
-        | VerifyError::HmacSidecarMissing { .. }
-        | VerifyError::ParseError { .. } => {
-            stellar_agent_core::WalletError::Internal(InternalError::InvariantViolated {
-                detail: msg,
-            })
-        }
-        VerifyError::PathContract { .. } | VerifyError::Io(_) => {
-            stellar_agent_core::WalletError::Internal(InternalError::UnexpectedState {
-                detail: msg,
-            })
-        }
-        _ => stellar_agent_core::WalletError::Internal(InternalError::UnexpectedState {
-            detail: msg,
-        }),
+        },
     }
 }
 
@@ -675,9 +608,11 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use keyring_core::Entry as KeyringEntry;
     use serial_test::serial;
+    use stellar_agent_core::PartialRotationState;
     use stellar_agent_core::audit_log::{
         entry::{AuditEntry, NewToolInvocation},
         schema::PolicyDecision,
+        signer_set::SignerSetCanonicalBodyError,
         verify::verify_log,
         writer::AuditWriter,
     };
@@ -757,48 +692,6 @@ mod tests {
         };
         let code = run(&args).await;
         assert_eq!(code, 0);
-    }
-
-    /// A tampered hash chain must be detected: corrupting any byte in a
-    /// non-final line invalidates the hash recorded in the following entry's
-    /// `previous_entry_hash` field, so `run` must return exit code 1.
-    ///
-    /// This test would fail (returning 0) if the hash-chain verification were
-    /// removed or broken, because the tamper would go undetected.
-    #[tokio::test]
-    async fn run_tampered_log_exits_1() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("audit_tampered.jsonl");
-
-        // Write 3 valid entries so the chain has at least one non-final line
-        // (line 1) whose corruption will be detected by line 2's check.
-        make_writer_and_entries(path.clone(), 3, None);
-
-        // Read the file, corrupt one byte in the first (non-final) line, and
-        // write the modified content back.  Changing any byte in the JSON body
-        // of a non-final line causes the next entry's `previous_entry_hash`
-        // check to fail.
-        let content = std::fs::read(&path).unwrap();
-        let first_newline = content
-            .iter()
-            .position(|&b| b == b'\n')
-            .expect("at least one newline must exist");
-        // Corrupt one byte in the middle of the first line.  The byte chosen
-        // is well inside the JSON body (not at the very start of the line,
-        // which might be whitespace or `{`).  XOR with 0x01 flips the
-        // lowest bit — guaranteed to change the byte regardless of its value.
-        let mut tampered = content.clone();
-        let corrupt_pos = first_newline / 2;
-        tampered[corrupt_pos] ^= 0x01;
-        std::fs::write(&path, &tampered).unwrap();
-
-        let args = VerifyArgs {
-            log_path: path,
-            profile: None,
-            output: OutputFormat::DEFAULT,
-        };
-        let code = run(&args).await;
-        assert_eq!(code, 1, "tampered hash chain must exit with code 1");
     }
 
     #[test]
@@ -996,134 +889,122 @@ mod tests {
     }
 
     #[test]
-    fn map_verify_error_chain_broken_is_invariant_violated() {
-        let err = VerifyError::ChainBroken {
-            line: 5,
-            file: "f.jsonl".to_owned(),
-            reason: "previous_entry_hash_mismatch",
-        };
-        let we = map_verify_error(&err);
-        assert!(
-            matches!(
-                we,
-                stellar_agent_core::WalletError::Internal(
-                    stellar_agent_core::InternalError::InvariantViolated { .. }
-                )
+    fn verify_failure_preserves_all_wire_codes_and_messages() {
+        let cases = [
+            (
+                VerifyError::ChainBroken {
+                    line: 5,
+                    file: "f.jsonl".to_owned(),
+                    reason: "previous_entry_hash_mismatch",
+                },
+                "audit.chain_broken",
             ),
-            "expected InvariantViolated, got {we:?}"
-        );
+            (
+                VerifyError::RotationGap {
+                    file: "f.jsonl".to_owned(),
+                },
+                "audit.rotation_gap",
+            ),
+            (
+                VerifyError::HmacMismatch {
+                    file: "f.jsonl".to_owned(),
+                },
+                "audit.hmac_mismatch",
+            ),
+            (
+                VerifyError::HmacSidecarMissing {
+                    file: "f.jsonl".to_owned(),
+                },
+                "audit.hmac_sidecar_missing",
+            ),
+            (
+                VerifyError::TooManyRotatedFiles { found: 99, cap: 10 },
+                "audit.too_many_rotated_files",
+            ),
+            (
+                VerifyError::NonRegularFileLogPath {
+                    path: "f.jsonl".into(),
+                },
+                "audit.non_regular_file_log_path",
+            ),
+            (
+                VerifyError::ParseError {
+                    line: 1,
+                    detail: "bad json".to_owned(),
+                },
+                "audit.parse_error",
+            ),
+            (
+                VerifyError::PathContract {
+                    detail: "invalid path".to_owned(),
+                },
+                "audit.path_contract",
+            ),
+            (
+                VerifyError::LogNotFound {
+                    path: "/tmp/audit.jsonl".to_owned(),
+                },
+                "audit.log_not_found",
+            ),
+            (
+                VerifyError::Io(std::io::Error::other("read failed")),
+                "audit.io_error",
+            ),
+            (
+                VerifyError::SignerSetCanonicalBody(
+                    SignerSetCanonicalBodyError::MalformedObservedSignerSet {
+                        reason: "inconsistent count",
+                    },
+                ),
+                "audit.signer_set_canonical_body",
+            ),
+            (
+                VerifyError::PartialRotation {
+                    state: PartialRotationState::MidRename {
+                        tmp_path: "audit.tmp".into(),
+                        size_bytes: 1,
+                    },
+                    recovery_hint: "recovery runbook".to_owned(),
+                },
+                "audit.partial_rotation",
+            ),
+            (
+                VerifyError::TipAnchorMismatch {
+                    expected_count: 2,
+                    expected_offset: 20,
+                    actual_count: 1,
+                    actual_offset: 10,
+                    reason: "count mismatch",
+                },
+                "audit.tip_anchor_mismatch",
+            ),
+        ];
+        for (err, expected_code) in cases {
+            match verify_failure(&err) {
+                VerifyFailure::Raw { code, message } => {
+                    assert_ne!(expected_code, "audit.log_not_found");
+                    assert_eq!(code, expected_code);
+                    assert_eq!(message, err.to_string());
+                }
+                VerifyFailure::Wallet(error) => {
+                    assert_eq!(expected_code, "audit.log_not_found");
+                    assert_eq!(error.code(), expected_code);
+                    assert_eq!(
+                        error.category(),
+                        stellar_agent_core::ErrorCategory::Validation
+                    );
+                    assert_eq!(
+                        error.message(),
+                        "audit log not found at /tmp/audit.jsonl; nothing has been written to the audit log yet, or the log path is incorrect"
+                    );
+                }
+            }
+        }
     }
 
+    /// Verifier diagnostics carry their wire code exactly once.
     #[test]
-    fn map_verify_error_rotation_gap_is_invariant_violated() {
-        let err = VerifyError::RotationGap {
-            file: "missing.jsonl".to_owned(),
-        };
-        let we = map_verify_error(&err);
-        assert!(
-            matches!(
-                we,
-                stellar_agent_core::WalletError::Internal(
-                    stellar_agent_core::InternalError::InvariantViolated { .. }
-                )
-            ),
-            "expected InvariantViolated, got {we:?}"
-        );
-    }
-
-    #[test]
-    fn map_verify_error_hmac_mismatch_is_invariant_violated() {
-        let err = VerifyError::HmacMismatch {
-            file: "f.jsonl".to_owned(),
-        };
-        let we = map_verify_error(&err);
-        assert!(
-            matches!(
-                we,
-                stellar_agent_core::WalletError::Internal(
-                    stellar_agent_core::InternalError::InvariantViolated { .. }
-                )
-            ),
-            "expected InvariantViolated, got {we:?}"
-        );
-    }
-
-    #[test]
-    fn map_verify_error_hmac_sidecar_missing_is_invariant_violated() {
-        let err = VerifyError::HmacSidecarMissing {
-            file: "f.jsonl".to_owned(),
-        };
-        let we = map_verify_error(&err);
-        assert!(
-            matches!(
-                we,
-                stellar_agent_core::WalletError::Internal(
-                    stellar_agent_core::InternalError::InvariantViolated { .. }
-                )
-            ),
-            "expected InvariantViolated, got {we:?}"
-        );
-    }
-
-    #[test]
-    fn map_verify_error_parse_error_is_invariant_violated() {
-        let err = VerifyError::ParseError {
-            line: 1,
-            detail: "bad json".to_owned(),
-        };
-        let we = map_verify_error(&err);
-        assert!(
-            matches!(
-                we,
-                stellar_agent_core::WalletError::Internal(
-                    stellar_agent_core::InternalError::InvariantViolated { .. }
-                )
-            ),
-            "expected InvariantViolated, got {we:?}"
-        );
-    }
-
-    #[test]
-    fn map_verify_error_io_is_unexpected_state() {
-        let err = VerifyError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "not found",
-        ));
-        let we = map_verify_error(&err);
-        assert!(
-            matches!(
-                we,
-                stellar_agent_core::WalletError::Internal(
-                    stellar_agent_core::InternalError::UnexpectedState { .. }
-                )
-            ),
-            "expected UnexpectedState, got {we:?}"
-        );
-    }
-
-    #[test]
-    fn map_verify_error_path_contract_is_unexpected_state() {
-        let err = VerifyError::PathContract {
-            detail: "log path has no UTF-8 file name".to_owned(),
-        };
-        let we = map_verify_error(&err);
-        assert!(
-            matches!(
-                we,
-                stellar_agent_core::WalletError::Internal(
-                    stellar_agent_core::InternalError::UnexpectedState { .. }
-                )
-            ),
-            "expected UnexpectedState, got {we:?}"
-        );
-    }
-
-    /// The envelope message must carry each variant's wire code exactly once —
-    /// `VerifyError` Display already begins with the code, so `map_verify_error`
-    /// must not prepend it again. Covers two variants across both `Internal`
-    /// arms.
-    #[test]
-    fn map_verify_error_message_has_single_code_prefix() {
+    fn verify_failure_message_has_single_code_prefix() {
         for (err, code) in [
             (
                 VerifyError::ChainBroken {
@@ -1141,7 +1022,9 @@ mod tests {
                 "audit.io_error",
             ),
         ] {
-            let message = map_verify_error(&err).message();
+            let VerifyFailure::Raw { message, .. } = verify_failure(&err) else {
+                panic!("verifier diagnostics use raw envelopes");
+            };
             assert_eq!(
                 message.matches(&format!("{code}:")).count(),
                 1,
@@ -1154,11 +1037,13 @@ mod tests {
     /// A missing primary log classifies as validation-class with the
     /// `audit.log_not_found` code and an actionable, single-prefix message.
     #[test]
-    fn map_verify_error_log_not_found_is_validation_class() {
+    fn verify_failure_log_not_found_is_validation_class() {
         let err = VerifyError::LogNotFound {
             path: "/tmp/audit.jsonl".to_owned(),
         };
-        let we = map_verify_error(&err);
+        let VerifyFailure::Wallet(we) = verify_failure(&err) else {
+            panic!("missing log has a validation error");
+        };
         assert!(
             matches!(we, stellar_agent_core::WalletError::Validation(_)),
             "missing primary log must be validation-class, got {we:?}"

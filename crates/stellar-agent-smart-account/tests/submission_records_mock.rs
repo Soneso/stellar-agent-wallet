@@ -289,6 +289,21 @@ impl Fixture {
         bundle: Vec<MulticallInvocation>,
         engine: Arc<PolicyEngineV1>,
     ) -> Result<stellar_agent_smart_account::multicall::MulticallResult, SaError> {
+        self.multicall_on_chain(url, bundle, engine, self.profile.chain_id.caip2_str())
+            .await
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "preserve the submission API's typed error for assertions"
+    )]
+    async fn multicall_on_chain(
+        &self,
+        url: &str,
+        bundle: Vec<MulticallInvocation>,
+        engine: Arc<PolicyEngineV1>,
+        chain_id: &str,
+    ) -> Result<stellar_agent_smart_account::multicall::MulticallResult, SaError> {
         let signer = SoftwareSigningKey::new_from_bytes(SEED);
         // The bundle signs under rule 0, which the pinned-hash drift check
         // never fetches or reads.
@@ -308,7 +323,7 @@ impl Fixture {
                 audit_writer: Some(Arc::clone(&self.audit)),
                 timeout: Duration::from_secs(2),
                 fee: ResolvedFeePerOp::default(),
-                chain_id: "stellar:testnet",
+                chain_id,
                 request_id: "multicall-record",
                 signers_manager: &signers_manager,
             },
@@ -613,4 +628,95 @@ async fn timed_out_timelock_execute_keeps_receipt_and_pending_row() {
     assert_eq!(fixture.rows("value_action_pending").len(), 1);
     assert!(fixture.rows("value_action_submitted").is_empty());
     assert_eq!(sends.load(Ordering::SeqCst), 1);
+}
+
+type TreeSnapshot = std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>;
+
+/// Records directory existence and file contents, including receipts and reservations.
+fn snapshot_tree(root: &std::path::Path) -> std::io::Result<TreeSnapshot> {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        snapshot: &mut TreeSnapshot,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(std::io::Error::other)?
+                .to_owned();
+            if entry.file_type()?.is_dir() {
+                snapshot.insert(relative, None);
+                visit(root, &path, snapshot)?;
+            } else {
+                snapshot.insert(relative, Some(std::fs::read(&path)?));
+            }
+        }
+        Ok(())
+    }
+    let mut snapshot = std::collections::BTreeMap::new();
+    visit(root, root, &mut snapshot)?;
+    Ok(snapshot)
+}
+
+fn assert_multicall_chain_mismatch(error: &SaError) {
+    assert_eq!(error.wire_code(), "sa.multicall_failed");
+    assert!(
+        matches!(error, SaError::MulticallFailed { phase: "policy_gate", redacted_reason, post_submit_kind: None }
+        if redacted_reason == "chain_id does not match the profile chain"),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn multicall_chain_mismatch_has_no_side_effects() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new();
+    let (server, _, _) = rpc("SUCCESS").await;
+    // The manager creates fixture files so the snapshot isolates the submission's effects.
+    drop(pin_check_manager::pin_check_manager(
+        &server.uri(),
+        &server.uri(),
+        PROFILE,
+        fixture._root.path(),
+    ));
+    let before = snapshot_tree(fixture._root.path())?;
+    let result = fixture
+        .multicall_on_chain(
+            &server.uri(),
+            fixture.bundle(),
+            fixture.engine(),
+            "stellar:mainnet",
+        )
+        .await;
+    let requests = server
+        .received_requests()
+        .await
+        .ok_or("request recording disabled")?;
+    assert!(requests.is_empty(), "received requests: {requests:?}");
+    assert_eq!(snapshot_tree(fixture._root.path())?, before);
+    let error = result.err().ok_or("chain mismatch must refuse")?;
+    assert_multicall_chain_mismatch(&error);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn multicall_chain_mismatch_precedes_empty_bundle_validation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new();
+    let (server, _, _) = rpc("SUCCESS").await;
+    let error = fixture
+        .multicall_on_chain(
+            &server.uri(),
+            Vec::new(),
+            fixture.engine(),
+            "stellar:mainnet",
+        )
+        .await
+        .err()
+        .ok_or("chain mismatch must refuse")?;
+    assert_multicall_chain_mismatch(&error);
+    Ok(())
 }

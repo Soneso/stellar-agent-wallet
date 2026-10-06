@@ -1166,6 +1166,7 @@ fn wallet_error_kind(err: &WalletError) -> &'static str {
         WalletError::Protocol(_) => "WalletError::Protocol",
         WalletError::Ledger(_) => "WalletError::Ledger",
         WalletError::Submission(_) => "WalletError::Submission",
+        WalletError::Approval(_) => "WalletError::Approval",
         WalletError::Internal(_) => "WalletError::Internal",
         WalletError::SmartAccount { .. } => "WalletError::SmartAccount",
         _ => "WalletError::Unknown",

@@ -291,19 +291,9 @@ fn open_store(ctx: &DecisionContext, op: &'static str) -> Result<PendingApproval
     })
 }
 
-/// Returns `true` iff `err` carries the `approval.*` detail code `code`.
-///
-/// [`load_and_validate_entry`] and [`attest_and_persist`] document their
-/// [`WalletError::Internal`] values as carrying an `approval.*` detail
-/// PREFIX (`"<code>: <message>"`) — that prefix is the stable contract those
-/// two functions commit to, even though `WalletError::code()` itself
-/// collapses every one of these paths to the coarse
-/// `"internal.unexpected_state"`. Matching is anchored on the `"<code>: "`
-/// token rather than a bare substring scan of the full human-readable
-/// message, so unrelated prose elsewhere in the message can never produce a
-/// false match.
-fn approval_detail_code_is(err: &WalletError, code: &str) -> bool {
-    err.to_string().contains(&format!("{code}: "))
+/// Compares the structured approval code independently of operator-facing text.
+fn approval_code_is(err: &WalletError, code: &str) -> bool {
+    err.code() == code
 }
 
 fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity) -> Outcome {
@@ -321,16 +311,16 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
     let entry = match load_and_validate_entry(&store, nonce, &identity, &allowed_credentials) {
         Ok(e) => e,
         Err(e) => {
-            if approval_detail_code_is(&e, "approval.user_mismatch") {
+            if approval_code_is(&e, "approval.user_mismatch") {
                 return Outcome::UserMismatch;
             }
-            if approval_detail_code_is(&e, "approval.expired") {
+            if approval_code_is(&e, "approval.expired") {
                 return Outcome::Expired;
             }
-            if approval_detail_code_is(&e, "approval.not_found") {
+            if approval_code_is(&e, "approval.not_found") {
                 return Outcome::NotFound;
             }
-            if approval_detail_code_is(&e, "approval.already_attested") {
+            if approval_code_is(&e, "approval.already_attested") {
                 // Recoverable lost-response re-show: return the already-stored
                 // blob without re-attesting.
                 let attestation = store
@@ -420,26 +410,26 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
             expires_at_unix_ms: entry.expires_at_unix_ms,
         },
         Err(e) => {
-            if approval_detail_code_is(&e, "approval.binding_mismatch") {
+            if approval_code_is(&e, "approval.binding_mismatch") {
                 return Outcome::BindingMismatch;
             }
-            if approval_detail_code_is(&e, "approval.wrong_kind") {
+            if approval_code_is(&e, "approval.wrong_kind") {
                 return Outcome::WrongKind;
             }
-            if approval_detail_code_is(&e, "approval.not_found") {
+            if approval_code_is(&e, "approval.not_found") {
                 return Outcome::NotFound;
             }
-            if approval_detail_code_is(&e, "approval.expired") {
+            if approval_code_is(&e, "approval.expired") {
                 return Outcome::Expired;
             }
-            if approval_detail_code_is(&e, "approval.rejected")
-                || approval_detail_code_is(&e, "approval.consumed")
+            if approval_code_is(&e, "approval.rejected")
+                || approval_code_is(&e, "approval.consumed")
             {
                 // A rejected or spent tombstone is already resolved, and its
                 // attestation is not handed back.
                 return Outcome::AlreadyResolved { attestation: None };
             }
-            if approval_detail_code_is(&e, "approval.already_attested") {
+            if approval_code_is(&e, "approval.already_attested") {
                 // Another handle attested this entry since it was validated:
                 // no row was written here, and the stored attestation is the
                 // one to re-show.
@@ -694,6 +684,86 @@ mod tests {
             ttl_ms,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn approval_classifications_use_wire_codes() {
+        use stellar_agent_core::ApprovalFailure;
+        let cases = [
+            (
+                ApprovalFailure::UserMismatch {
+                    detail: "plain diagnostic".to_owned(),
+                },
+                "approval.user_mismatch",
+            ),
+            (
+                ApprovalFailure::Expired {
+                    detail: "plain diagnostic".to_owned(),
+                },
+                "approval.expired",
+            ),
+            (
+                ApprovalFailure::NotFound {
+                    detail: "plain diagnostic".to_owned(),
+                },
+                "approval.not_found",
+            ),
+            (
+                ApprovalFailure::AlreadyAttested {
+                    detail: "plain diagnostic".to_owned(),
+                },
+                "approval.already_attested",
+            ),
+            (
+                ApprovalFailure::BindingMismatch {
+                    detail: "plain diagnostic".to_owned(),
+                },
+                "approval.binding_mismatch",
+            ),
+            (
+                ApprovalFailure::WrongKind {
+                    detail: "plain diagnostic".to_owned(),
+                },
+                "approval.wrong_kind",
+            ),
+            (
+                ApprovalFailure::Rejected {
+                    detail: "plain diagnostic".to_owned(),
+                },
+                "approval.rejected",
+            ),
+            (
+                ApprovalFailure::Consumed {
+                    detail: "plain diagnostic".to_owned(),
+                },
+                "approval.consumed",
+            ),
+        ];
+        for (failure, code) in cases {
+            let error = WalletError::Approval(failure);
+            assert_eq!(error.message(), "plain diagnostic");
+            assert!(approval_code_is(&error, code));
+        }
+    }
+
+    #[test]
+    fn approval_classifications_ignore_message_tokens() {
+        for code in [
+            "approval.user_mismatch",
+            "approval.expired",
+            "approval.not_found",
+            "approval.already_attested",
+            "approval.binding_mismatch",
+            "approval.wrong_kind",
+            "approval.rejected",
+            "approval.consumed",
+        ] {
+            let unrelated =
+                WalletError::Internal(stellar_agent_core::InternalError::UnexpectedState {
+                    detail: format!("unrelated diagnostic contains {code}: quoted text"),
+                });
+            assert!(!approval_code_is(&unrelated, code));
+        }
     }
 
     #[test]

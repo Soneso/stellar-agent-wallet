@@ -32,8 +32,7 @@ use stellar_agent_core::approval::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry,
 };
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
-use stellar_agent_core::profile::schema::default_approval_dir;
+use stellar_agent_core::error::{ApprovalFailure, ValidationError, WalletError};
 use stellar_agent_core::timefmt;
 
 use crate::common::{render, resolve_profile_name, validate_path_component_ascii_safe};
@@ -93,13 +92,9 @@ pub async fn run(args: GcArgs) -> i32 {
     }
 
     // ── 2. Resolve store path ─────────────────────────────────────────────────
-    let store_path = match default_approval_dir() {
+    let store_path = match super::common::approval_store_dir() {
         Ok(dir) => dir.join(format!("{profile_name}.toml")),
-        Err(_) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: "approval.store_dir_error: could not determine approval store directory"
-                    .to_owned(),
-            });
+        Err(err) => {
             render::render_json(&Envelope::<()>::err(&err));
             return 1;
         }
@@ -129,8 +124,8 @@ pub async fn run(args: GcArgs) -> i32 {
     let evicted_count = match store.gc_expired(now_ms) {
         Ok(n) => n,
         Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("approval.gc_failed: {e}"),
+            let err = WalletError::Approval(ApprovalFailure::GcFailed {
+                detail: format!("{e}"),
             });
             render::render_json(&Envelope::<()>::err(&err));
             return 1;
@@ -157,8 +152,8 @@ pub async fn run(args: GcArgs) -> i32 {
 /// Returns current Unix time in milliseconds for approval GC.
 fn approval_gc_now_unix_ms() -> Result<u64, WalletError> {
     timefmt::now_unix_ms().map_err(|e| {
-        WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!("approval.clock_error: system clock error: {e}"),
+        WalletError::Approval(ApprovalFailure::ClockError {
+            detail: format!("system clock error: {e}"),
         })
     })
 }

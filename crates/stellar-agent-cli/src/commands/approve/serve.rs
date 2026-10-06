@@ -35,7 +35,6 @@ use clap::{Args, ValueEnum};
 use stellar_agent_approval_ui::{DecisionContext, ServeConfig, ServeStartError, start_serve};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, WalletError};
-use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
 use crate::commands::smart_account::common::open_audit_writer;
@@ -140,13 +139,9 @@ pub async fn run(args: ServeArgs) -> i32 {
         }
     };
 
-    let store_path = match default_approval_dir() {
+    let store_path = match super::common::approval_store_dir() {
         Ok(dir) => dir.join(format!("{profile_name}.toml")),
-        Err(_) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: "approval.store_dir_error: could not determine approval store directory"
-                    .to_owned(),
-            });
+        Err(err) => {
             render_json(&Envelope::<()>::err(&err));
             return 1;
         }

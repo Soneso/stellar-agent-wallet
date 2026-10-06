@@ -7,9 +7,9 @@
 //!
 //! # What this crate does
 //!
-//! Provides typed amounts ([`StellarAmount`]), the nine-category error taxonomy
-//! ([`WalletError`]), the JSON envelope ([`Envelope`]), observability
-//! primitives, smart-account auth-digest / context-rule-ID helpers,
+//! Provides typed amounts ([`StellarAmount`]), the typed [`WalletError`] taxonomy,
+//! the JSON envelope ([`Envelope`]), observability primitives,
+//! smart-account auth-digest / context-rule-ID helpers,
 //! per-profile configuration ([`profile`]), and the mainnet write-tools policy
 //! gate ([`policy`]).
 //!
@@ -75,7 +75,7 @@ pub mod amount;
 /// Shared counterparty identity validators used by policy and network crates.
 pub mod counterparty;
 
-/// Nine-category [`WalletError`] taxonomy used by every CLI command, MCP tool,
+/// Typed [`WalletError`] taxonomy used by every CLI command, MCP tool,
 /// and library API in this crate.  See the module documentation for the full
 /// taxonomy overview, wire-format specification, and secret-material policy.
 pub mod error;
@@ -188,8 +188,8 @@ pub use audit_log::{
 pub use counterparty::is_valid_ldh_home_domain;
 pub use envelope::{Envelope, EnvelopeError, OutputFormat};
 pub use error::{
-    AuthError, AuthMismatchReason, ErrorCategory, InternalError, LedgerError, NetworkError,
-    ProtocolError, SubmissionError, ValidationError, WalletError, WalletStateError,
+    ApprovalFailure, AuthError, AuthMismatchReason, ErrorCategory, InternalError, LedgerError,
+    NetworkError, ProtocolError, SubmissionError, ValidationError, WalletError, WalletStateError,
 };
 pub use observability::{
     FormatChoice, InitError, RedactingJsonFormatter, SubscriberConfig, init_subscriber,

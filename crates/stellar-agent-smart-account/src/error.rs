@@ -2332,7 +2332,8 @@ pub enum SaError {
     /// # Phase values (closed 7-set)
     ///
     /// - `"build"` — bundle shape validation (Step 1).
-    /// - `"policy_gate"` — policy engine `evaluate_bundle` denial (Step 2).
+    /// - `"policy_gate"`: chain agreement check at entry, before Step 1, or
+    ///   policy engine `evaluate_bundle` denial (Step 2).
     /// - `"rpc_divergence"` — cross-RPC trust-anchor 4-way equality failure (Step 4).
     /// - `"simulate"` — Soroban RPC simulate error (Step 2 of submit sub-flow).
     /// - `"sign"` — auth-entry signing failure (Step 3 of submit sub-flow).

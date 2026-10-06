@@ -1,4 +1,5 @@
-//! The approve binary renders and attests the selected profile and network.
+//! The approve binary binds attestations to the selected profile and network
+//! and reports approval refusals without persisting consent.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -27,7 +28,14 @@ use stellar_xdr::{
 
 const SIGNER: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
 
-fn approve_binary_case(mainnet: bool) {
+#[derive(Clone, Copy)]
+enum ApprovalCase {
+    Attest,
+    UnknownNonce,
+    ClosedStdin,
+}
+
+fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let name = if mainnet {
@@ -139,8 +147,18 @@ fn approve_binary_case(mainnet: bool) {
         .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
         .unwrap();
     drop(approvals);
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(["approve", "--id", &nonce, "--profile", name, "--yes"])
+    let requested_nonce = if matches!(case, ApprovalCase::UnknownNonce) {
+        "AAAAAAAAAAAAAAAAAAAAAA"
+    } else {
+        &nonce
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+    command.args(["approve", "--id", requested_nonce, "--profile", name]);
+    if !matches!(case, ApprovalCase::ClosedStdin) {
+        command.arg("--yes");
+    }
+    let output = command
+        .stdin(std::process::Stdio::null())
         .env("STELLAR_AGENT_HOME", home)
         .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
         .env(
@@ -149,9 +167,30 @@ fn approve_binary_case(mainnet: bool) {
         )
         .env_remove("STELLAR_AGENT_PROFILE")
         .output()
-        .unwrap();
+        .expect("approve binary runs");
     let stderr = String::from_utf8(output.stderr).unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
+    let expected_code = match case {
+        ApprovalCase::UnknownNonce => Some("approval.not_found"),
+        ApprovalCase::ClosedStdin => Some("approval.denied"),
+        ApprovalCase::Attest => None,
+    };
+    if let Some(expected_code) = expected_code {
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "stdout={stdout}; stderr={stderr}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("JSON envelope");
+        assert_eq!(json["error"]["code"], expected_code, "{stdout}");
+        let approvals =
+            PendingApprovalStore::open(home.join("approvals").join(format!("{name}.toml")))
+                .expect("read pending approval");
+        let pending = approvals.get(&nonce).expect("entry remains pending");
+        assert!(pending.attestation_blob_b64.is_none());
+        assert!(!profile.audit_log_path.exists());
+        return;
+    }
     assert!(output.status.success(), "stdout={stdout}; stderr={stderr}");
     for row in [
         format!("  Profile:           {name}"),
@@ -193,11 +232,23 @@ fn approve_binary_case(mainnet: bool) {
 #[test]
 #[serial]
 fn approve_binary_testnet_binding_and_summary() {
-    approve_binary_case(false);
+    approve_binary_case(false, ApprovalCase::Attest);
 }
 
 #[test]
 #[serial]
 fn approve_binary_mainnet_binding_and_summary() {
-    approve_binary_case(true);
+    approve_binary_case(true, ApprovalCase::Attest);
+}
+
+#[test]
+#[serial]
+fn approve_binary_unknown_nonce_has_approval_code() {
+    approve_binary_case(false, ApprovalCase::UnknownNonce);
+}
+
+#[test]
+#[serial]
+fn approve_binary_closed_stdin_denies_without_attesting() {
+    approve_binary_case(false, ApprovalCase::ClosedStdin);
 }

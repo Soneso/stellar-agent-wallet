@@ -364,7 +364,23 @@ mod tests {
     #[test]
     fn writer_locked_display() {
         let err = ApprovalError::WriterLocked;
-        assert!(err.to_string().contains("writer"));
+        assert_eq!(
+            err.to_string(),
+            "approval store is locked by another writer (approval.writer_locked)"
+        );
+    }
+
+    #[test]
+    fn wrong_kind_display() {
+        let err = ApprovalError::WrongKind {
+            expected: "PaymentSimulated",
+            actual: "SignWithPasskey",
+        };
+        assert_eq!(
+            err.to_string(),
+            "approval kind mismatch: expected PaymentSimulated, actual SignWithPasskey \
+             (approval.wrong_kind)"
+        );
     }
 
     #[test]

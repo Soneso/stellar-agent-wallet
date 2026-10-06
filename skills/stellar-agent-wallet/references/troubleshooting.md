@@ -204,6 +204,45 @@ keyring code: they are folded into the uniform `policy.approval_required` so the
 approval path cannot be probed. Recovery is the same as for any
 `policy.approval_required`.
 
+## Audit verification codes
+
+`audit verify` emits the verifier's code and diagnostic text.
+A missing log has a remediation message.
+Profile and ownership pre-checks carry their own codes.
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `audit.chain_broken` | An entry hash or link fails verification. | Stop using the log as verified evidence. Report the diagnostic so the operator can investigate the chain. |
+| `audit.rotation_gap` | A file in the rotation chain is missing or its handoff is invalid. | Report the gap. Have the operator investigate the handoff and recover and verify the complete rotation set. |
+| `audit.hmac_mismatch` | A chain-root HMAC fails verification with the supplied key. | Report the mismatch. Have the operator investigate the key and log provenance. |
+| `audit.hmac_sidecar_missing` | HMAC verification requires a missing sidecar. | Report the missing sidecar. Have the operator recover it from a trusted source. |
+| `audit.parse_error` | A log entry cannot be parsed. | Report the line and diagnostic. Have the operator inspect the malformed entry before trusting the log. |
+| `audit.signer_set_canonical_body` | A signer-set audit entry violates canonical-body invariants. | Report the diagnostic. Have the operator investigate the malformed signer-set evidence. |
+| `audit.partial_rotation` | The audit files show an incomplete rotation. | Stop and report the recovery hint. Have the operator follow the audit recovery runbook. |
+| `audit.tip_anchor_mismatch` | The log does not contain the chain tip recorded in the keyring anchor. | Follow the `audit.tip_anchor_mismatch` action in the [Audit-key code table](#audit-key-code). |
+| `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`, `audit.path_contract`, `audit.log_not_found`, `audit.io_error` | Verification cannot accept or read the requested path or file set. | Report the diagnostic. Have the operator check the log path, file type, archive count, existence, and access before retrying. |
+
+## Approval codes
+
+The table covers failures from `approve`, `approve gc`, `approve list`, `approve serve`, and the shared attestation API.
+CLI envelopes carry `error.code` and a plain diagnostic message.
+Authentication, validation, and audit failures on these paths carry their own codes.
+The MCP server's direct JSON-RPC approval errors use their message form.
+`approve operator` codes are outside this list.
+
+These failures carry `approval.*` codes:
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `approval.expired` | The pending approval's lifetime has ended. | Request a fresh simulation and ask the operator to review the new approval. |
+| `approval.not_found` | The selected store has no pending entry for the nonce. | Check the profile and nonce. Request a new approval if the entry is unavailable. |
+| `approval.denied` | The operator declines the CLI prompt or closes its input. | Stop the requested action. Proceed only after fresh operator consent. |
+| `approval.user_mismatch` | The approving identity is not authorized for the pending entry. | Have the authorized operator approve through the trusted local or enrolled remote surface. |
+| `approval.already_attested` | Consent is already recorded for this entry. | Use the recorded consent for the pending action. |
+| `approval.rejected` | The operator refused this approval. | Stop the requested action. |
+| `approval.consumed` | This approval has already been used. | Request a new simulation before seeking another approval. |
+| `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.record_failed`, `approval.uid_unavailable`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`, `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed` | Approval validation, attestation, storage, or expired-entry collection refuses. | Report the code and diagnostic. Have the operator resolve the approval state, key, identity, clock, or store condition before requesting fresh consent. |
+
 ## Audit-key code
 
 | Code | Meaning | Agent action |

@@ -73,7 +73,7 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 
 | Crate | Responsibility |
 | --- | --- |
-| `stellar-agent-core` | Synchronous, runtime-free substrate: typed amounts, nine-category `WalletError`, JSON `Envelope`, profiles, observability, smart-account auth-digest helpers, the policy-engine trait and Noop/V1 implementations, the approval spine, the audit log, and the `rpc_budget` module: a shared wall-clock budget primitive (`SequentialRpcBudget` / `bound_stage`) that bounds sequential RPC flows: deployment stages, rule scans, list operations, and retry attempts. |
+| `stellar-agent-core` | Synchronous, runtime-free substrate: typed amounts, typed `WalletError`, JSON `Envelope`, profiles, observability, smart-account auth-digest helpers, the policy-engine trait and Noop/V1 implementations, the approval spine, the audit log, and the `rpc_budget` module: a shared wall-clock budget primitive (`SequentialRpcBudget` / `bound_stage`) that bounds sequential RPC flows: deployment stages, rule scans, list operations, and retry attempts. |
 | `stellar-agent-network` | Async Stellar RPC client, account-view projection, transaction assembly, SEP-29 memo enforcement, hardware-signer preparation, Friendbot funding, and the idempotent submit primitive. |
 | `stellar-agent-claimable` | Claimable-balance domain logic: balance-id normalization, predicate evaluation, entry and trustline fetch, and claim preview; drives the `claim` verb. |
 | `stellar-agent-sep5` | SEP-5 / BIP-44 HD ed25519 key derivation (`m/44'/148'/index'`, SLIP-0010 hardened) from a BIP-39 mnemonic or seed; no I/O or RNG. |
@@ -127,6 +127,16 @@ The policy engine, approval spine, and audit log all live in `stellar-agent-core
 - `audit_log`: the append-only hash-chained JSONL writer, the chain primitives, and `verify_log` for end-to-end chain verification.
 
 These primitives are synchronous and runtime-free; `core` uses Tokio only for the unlock-window TTL timer in `Wallet::unlock`. The security rationale for each is in [security-internals.md](security-internals.md).
+
+### Approval error taxonomy
+
+`WalletError::Approval(ApprovalFailure)` belongs to `ErrorCategory::Approval`.
+Each variant exposes an `approval.*` wire code and a plain diagnostic message.
+The CLI and shared attestation API map store errors in their call-site context.
+`approval::error::ApprovalError` is the store error type.
+The UI classifies failures through `WalletError::code()`.
+The shared MCP envelope carries these codes; direct JSON-RPC approval errors use their message form.
+MCP attestation validation reports missing and expired approvals as `policy.approval_required`.
 
 ## How the binaries wire the tool registry to the substrate
 
