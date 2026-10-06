@@ -488,8 +488,9 @@ jobs:
       - name: Sign archives and SHA256SUMS with cosign
         # `--bundle` writes signature, signing certificate, and the Rekor
         # transparency-log entry into one Sigstore bundle file. Verification
-        # (see README "Verifying a release") needs only the bundle plus the
-        # certificate identity and OIDC issuer — no separate certificate file.
+        # (see docs/verifying-releases.md) needs only the bundle plus the
+        # certificate identity and OIDC issuer. It needs no separate
+        # certificate file.
         run: |
           set -euo pipefail
           for file in "$RUNNER_TEMP"/artifacts/artifacts-*/*.tar.xz "$RUNNER_TEMP"/artifacts/artifacts-*/*.zip "$RUNNER_TEMP"/release-combined/SHA256SUMS; do

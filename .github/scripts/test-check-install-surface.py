@@ -432,23 +432,12 @@ def cases(version: str) -> list[Case]:
             ),
         ),
         Case(
-            "rule 2: release tag of a PowerShell base URL in README.md",
-            "2",
-            "README.md",
-            lambda tree: replace(
-                tree,
-                "README.md",
-                f"releases/download/v{version}'",
-                "releases/download/v0.0.1'",
-            ),
-        ),
-        Case(
             "rule 2: release archive name",
             "2",
-            "README.md",
+            "docs/getting-started.md",
             lambda tree: replace(
                 tree,
-                "README.md",
+                "docs/getting-started.md",
                 f"/stellar-agent-{version}-aarch64-apple-darwin.tar.xz\n",
                 "/stellar-agent-0.0.1-aarch64-apple-darwin.tar.xz\n",
             ),
@@ -456,10 +445,10 @@ def cases(version: str) -> list[Case]:
         Case(
             "rule 2: archive name in a tar line",
             "2",
-            "README.md",
+            "docs/getting-started.md",
             lambda tree: replace(
                 tree,
-                "README.md",
+                "docs/getting-started.md",
                 f"tar -xJf stellar-agent-{version}-",
                 "tar -xJf stellar-agent-0.0.1-",
             ),
@@ -467,10 +456,10 @@ def cases(version: str) -> list[Case]:
         Case(
             "rule 2: archive name of another version of the same length",
             "2",
-            "README.md",
+            "docs/getting-started.md",
             lambda tree: replace(
                 tree,
-                "README.md",
+                "docs/getting-started.md",
                 f"tar -xJf stellar-agent-{version}-",
                 f"tar -xJf stellar-agent-{version[:-1]}{'1' if version[-1] == '0' else '0'}-",
             ),

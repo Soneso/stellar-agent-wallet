@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `WalletError::Approval(ApprovalFailure)` and `ErrorCategory::Approval` classify approval-specific failures. Library callers of `load_and_validate_entry` and `attest_and_persist` receive the new variant for these failures.
+- The shortened README gives an overview, and the getting-started guide holds
+  the direct download, the Windows PowerShell steps, the macOS Gatekeeper note,
+  and the profile setup details. `docs/verifying-releases.md` shows how to check
+  a release archive against `SHA256SUMS`, its cosign signature, and its SLSA
+  provenance.
 
 ### Fixed
 
