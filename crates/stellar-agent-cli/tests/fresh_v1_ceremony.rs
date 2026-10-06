@@ -83,10 +83,13 @@ fn a_fresh_v1_profile_through_inits_order_passes_audit_verify() {
     let order = [
         "enroll-signer",
         "rotate-audit-key",
+        "rotate-nonce-key",
         "enroll-owner-key",
         "rotate-attestation-key",
+        "`policies/ceremony.toml`",
         "sign-policy",
     ];
+    assert_eq!(steps.len(), order.len(), "{steps:?}");
     for (step, verb) in steps.iter().zip(order) {
         assert!(
             step.contains(verb),
@@ -110,6 +113,7 @@ fn a_fresh_v1_profile_through_inits_order_passes_audit_verify() {
         Some((SIGNER_ENV, &signer_secret)),
     );
     cli(home, &["profile", "rotate-audit-key", PROFILE], None);
+    cli(home, &["profile", "rotate-nonce-key", PROFILE], None);
     let (owner_secret, owner_public) = keypair(0x22);
     cli(
         home,

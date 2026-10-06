@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multicall submission requires the call chain to match the profile chain at entry, before bundle validation or side effects.
 
 - CLI help names `--account` as required for balances and describes JSON profile-list output and audit sidecar re-signing. The `stellar_balances` MCP description uses `--account` in its CLI equivalent.
+- `trustline` and `claim` print one JSON envelope. The typed preview is in `data.preview` on success and in `error.details.preview` when a later step fails.
+- An argument the CLI parser refuses prints one `validation.usage_error` envelope on stdout and exits `1`, with nothing on stderr. `--help` and `--version` still print their text and exit `0`.
+- Friendbot's refusal to fund an existing account reports `network.friendbot_account_already_funded`, naming the account. The `friendbot` command, `accounts create --fund-with-friendbot`, and `stellar_friendbot` share the code.
+- `balances` requires `--account` at the argument parser, so omitting it reports `validation.usage_error`.
+- A headless keyring backend that cannot be set up reports `auth.keyring_config_invalid`. A padded or standard-alphabet `STELLAR_AGENT_HEADLESS_KEYRING_KEY` is refused with a message naming that cause.
+- `profile init` next steps include `profile rotate-nonce-key` and, for a V1 profile, creating the policy file before `profile sign-policy`.
 
 ## [0.1.0-alpha.10] - 2026-10-05
 

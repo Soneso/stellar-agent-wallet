@@ -297,7 +297,10 @@ async fn main() {
         }
     }
 
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => std::process::exit(report_parse_error(&error)),
+    };
 
     // ── Startup advisory ────────────────────────────────────────────────────
     //
@@ -337,6 +340,38 @@ async fn main() {
     };
 
     std::process::exit(exit_code);
+}
+
+/// Reports an argument-parsing outcome that ends the process and returns the
+/// exit code.
+///
+/// `--help` and `--version` print their text to stdout through clap and exit
+/// `0`. Every other parse failure prints one `validation.usage_error` error
+/// envelope on stdout and exits `1`, the code of every other error, so a
+/// script sees one envelope for every invocation and nothing on stderr.
+fn report_parse_error(error: &clap::Error) -> i32 {
+    use clap::error::ErrorKind;
+    match error.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => error.exit(),
+        _ => {
+            common::render::render_json(&usage_error_envelope(error));
+            1
+        }
+    }
+}
+
+/// The error envelope for a parse failure: code `validation.usage_error`,
+/// with clap's unstyled rendering, trimmed and without its leading `error: `,
+/// as the message.
+///
+/// A flag parser that refuses a value never echoes it in its own error text
+/// (see `EndpointUrlFlag`), so a rejected credential does not reach the
+/// message.
+fn usage_error_envelope(error: &clap::Error) -> stellar_agent_core::envelope::Envelope<()> {
+    let rendered = error.render().to_string();
+    let trimmed = rendered.trim();
+    let message = trimmed.strip_prefix("error: ").unwrap_or(trimmed);
+    stellar_agent_core::envelope::Envelope::<()>::err_raw("validation.usage_error", message)
 }
 
 /// Loads the selected profile locally before scanning its configured audit log.

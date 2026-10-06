@@ -144,6 +144,13 @@ pub use stellar_agent_core::keyring_errors::{classify_keyring_error, map_keyring
 ///
 /// # Errors
 ///
+/// Returns [`WalletError::Auth`] wrapping [`AuthError::KeyringConfigInvalid`]
+/// if `STELLAR_AGENT_KEYRING_BACKEND` selects a headless backend that cannot
+/// be set up. The causes are an unrecognized backend value, a missing or
+/// malformed `STELLAR_AGENT_HEADLESS_KEYRING_KEY`, a backend the platform does
+/// not support, and an undeterminable state directory. The detail names the
+/// variable or condition at fault.
+///
 /// Returns [`WalletError::Auth`] wrapping [`AuthError::KeyringNotFound`] if:
 /// - The platform store cannot be instantiated (store library construction
 ///   error; emitted at `tracing::debug!` level).
@@ -171,11 +178,15 @@ pub fn init_platform_keyring_store() -> Result<(), WalletError> {
     // operation and cannot surface that variant, so there is no environmental
     // cause here for the classifier to distinguish. This site is on the T6
     // keyring-classification allow-set for that reason.
+    //
+    // A headless backend that cannot be set up is a configuration fault the
+    // operator fixes in the environment, so it reports the configuration
+    // code, with the variable or condition at fault, and no keyring entry.
     if let Some(backend) = stellar_agent_headless_keyring::requested_backend() {
         return stellar_agent_headless_keyring::init_headless_store(&backend).map_err(|e| {
             tracing::debug!(error = %e, backend = %backend, "headless keyring store init failure");
-            WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!("headless keyring backend '{backend}' failed to initialise: {e}"),
+            WalletError::Auth(AuthError::KeyringConfigInvalid {
+                detail: e.to_string(),
             })
         });
     }

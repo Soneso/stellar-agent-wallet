@@ -91,8 +91,9 @@ fn init_platform_keyring_store_dispatches_to_headless_env_backend() {
     assert!(on_disk.contains("headless-env"));
 }
 
-/// An unrecognised `STELLAR_AGENT_KEYRING_BACKEND` value refuses — never
-/// silently falls back to the platform keyring.
+/// An unrecognized `STELLAR_AGENT_KEYRING_BACKEND` value refuses as a
+/// configuration fault naming the variable. It never falls back to the
+/// platform keyring.
 #[test]
 #[serial]
 fn init_platform_keyring_store_refuses_unknown_backend_without_fallback() {
@@ -103,5 +104,43 @@ fn init_platform_keyring_store_refuses_unknown_backend_without_fallback() {
 
     let err = init_platform_keyring_store().unwrap_err();
     assert_eq!(err.category(), ErrorCategory::Auth);
-    assert_eq!(err.code(), "auth.keyring_not_found");
+    assert_eq!(err.code(), "auth.keyring_config_invalid");
+    assert!(
+        err.message()
+            .contains(stellar_agent_headless_keyring::BACKEND_ENV_VAR),
+        "{err}"
+    );
+}
+
+/// A padded `headless-env` key refuses as a configuration fault that names
+/// the padding, and the message never repeats the key.
+#[test]
+#[serial]
+fn init_platform_keyring_store_refuses_a_padded_key_as_a_configuration_fault() {
+    let padded = base64::engine::general_purpose::STANDARD.encode([0x33u8; 32]);
+    assert!(padded.ends_with('='));
+    let _guard = EnvGuard::set(&[
+        (
+            stellar_agent_headless_keyring::BACKEND_ENV_VAR,
+            "headless-env",
+        ),
+        (stellar_agent_headless_keyring::ENV_KEY_VAR, padded.as_str()),
+    ]);
+
+    let err = init_platform_keyring_store().unwrap_err();
+    assert_eq!(err.code(), "auth.keyring_config_invalid");
+    let message = err.message();
+    assert!(
+        message.starts_with("headless keyring configuration is invalid: "),
+        "{message}"
+    );
+    assert!(
+        message.contains("value has base64 padding; use URL-safe base64 without padding"),
+        "{message}"
+    );
+    assert!(
+        message.contains(stellar_agent_headless_keyring::ENV_KEY_VAR),
+        "{message}"
+    );
+    assert!(!message.contains(padded.trim_end_matches('=')), "{message}");
 }

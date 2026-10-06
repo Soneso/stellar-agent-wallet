@@ -232,7 +232,7 @@ and removes only terminal markers older than 30 days.
 
 ## balances
 
-`balances [flags]` — reads native XLM balance and trustlines via RPC `getLedgerEntries`. Read-only; no mainnet gate. `--account` is required in practice (omitting it exits `1`).
+`balances [flags]` — reads native XLM balance and trustlines via RPC `getLedgerEntries`. Read-only; no mainnet gate. `--account` is required; omitting it exits `1` with `validation.usage_error`.
 
 | Flag | Meaning | Default |
 |---|---|---|
@@ -259,6 +259,8 @@ stellar-agent balances --account GABC...WXYZ \
 | `--profile <NAME>` | Profile to load | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--fee` | shared | profile `classic_fee_per_op_stroops` |
 
+One JSON envelope: once the clawback gate passes, the typed preview is in `data.preview` on success and in `error.details.preview` when a later step (fee, envelope build, signing, submission) fails.
+
 ```bash
 stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default
 ```
@@ -283,7 +285,7 @@ stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default
 
 Under `policy.engine = "v1"` `claim` evaluates operator policy before signing. The staged `--sign-only` / `--submit-only` stages gate too: they decode the supplied envelope and match rules under the `stellar_claim_commit` tool name, and deny `policy.deny.unsizable_value_effect` on an envelope the decoder cannot size unless the matched rule sets `allow_opaque_signing = true`.
 
-The build stage prints a typed preview (balance id, asset, amount, claimants, `is_claimant`, predicate verdict) to stdout before the guards run, so the operator sees the balance disclosure even when a guard subsequently refuses.
+The build stage computes a typed preview (balance id, asset, amount, claimants, `is_claimant`, predicate verdict) before the guards run. The command prints one JSON envelope: the preview is in `data.preview` on success and in `error.details.preview` when a guard or any later step refuses, so the operator sees the balance disclosure either way. `--sign-only` and `--submit-only` build no preview.
 
 In the operator's terminal, run this line on its own, paste the claiming account's seed when prompted, and press Enter. The line reads the seed from the terminal, so the operator runs it, not the agent.
 
@@ -300,7 +302,7 @@ unset WALLET_SK
 
 ## friendbot
 
-`friendbot [flags]` — funds a testnet or futurenet account via the Friendbot HTTP endpoint. No local signing. `--network` accepts `testnet`/`futurenet`/`mainnet` at the parser but `mainnet` is refused at dispatch (`network.friendbot_mainnet_forbidden`). The endpoint is allow-list validated (`friendbot.stellar.org`, `friendbot-futurenet.stellar.org`) unless `--friendbot-url-unchecked`.
+`friendbot [flags]` — funds a testnet or futurenet account via the Friendbot HTTP endpoint. No local signing. `--network` accepts `testnet`/`futurenet`/`mainnet` at the parser but `mainnet` is refused at dispatch (`network.friendbot_mainnet_forbidden`). The endpoint is allow-list validated (`friendbot.stellar.org`, `friendbot-futurenet.stellar.org`) unless `--friendbot-url-unchecked`. An account that already exists exits `1` with `network.friendbot_account_already_funded`; it is usable as it is.
 
 | Flag | Meaning | Default |
 |---|---|---|
@@ -438,7 +440,7 @@ Creates, lists, shows, and migrates profiles, and rotates the keyring-backed key
 
 | Verb | Form | Notes |
 |---|---|---|
-| `init` | `profile init --profile default --network testnet` | State-changing (writes the profile file). Creates a new profile TOML with per-profile-derived keyring refs (placeholder `"default"` signer/nonce accounts) and reports enrollment next steps. Mints no key material, emits no audit row. `--profile <NAME>` (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default`), `--network <testnet\|mainnet>` (default `testnet`), `--rpc-url <URL>` (optional for testnet; required for mainnet, which has no default endpoint), `--engine <v1\|noop>` selects the engine (default `v1`). On V1, the MCP server starts once the owner key is enrolled and the owner-signed policy loads; the rest of the [V1 setup](profiles-and-keys.md#opt-in-to-v1) gates approvals and signing. A testnet `noop` profile supports server startup and read access immediately. Run `profile rotate-nonce-key` before MCP payment simulation. Before MCP signing, mint the audit key with `profile rotate-audit-key` and enroll the signer with `profile enroll-signer`. The flag parser exits `2` for a malformed `--rpc-url` or one that carries credentials. Refusals, in order, each exit `1` and write nothing. An unsafe `--profile`: `validation.config_invalid`. Mainnet without `--rpc-url`: `validation.mainnet_rpc_url_required`. An existing profile: `validation.profile_already_exists`. An `rpc_url` that breaks the endpoint rule: `validation.config_invalid`. The rule requires `http` or `https`, and on mainnet `https` with no username or password. A failed write exits `1` with an internal error. |
+| `init` | `profile init --profile default --network testnet` | State-changing (writes the profile file). Creates a new profile TOML with per-profile-derived keyring refs (placeholder `"default"` signer/nonce accounts) and reports enrollment next steps. Mints no key material, emits no audit row. `--profile <NAME>` (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default`), `--network <testnet\|mainnet>` (default `testnet`), `--rpc-url <URL>` (optional for testnet; required for mainnet, which has no default endpoint), `--engine <v1\|noop>` selects the engine (default `v1`). On V1, the MCP server starts once the owner key is enrolled and the owner-signed policy loads; the rest of the [V1 setup](profiles-and-keys.md#opt-in-to-v1) gates approvals and signing. A testnet `noop` profile supports server startup and read access immediately. Run `profile rotate-nonce-key` before MCP payment simulation. Before MCP signing, mint the audit key with `profile rotate-audit-key` and enroll the signer with `profile enroll-signer`. The flag parser refuses a malformed `--rpc-url`, or one that carries credentials, with exit `1` and `validation.usage_error`. Refusals, in order, each exit `1` and write nothing. An unsafe `--profile`: `validation.config_invalid`. Mainnet without `--rpc-url`: `validation.mainnet_rpc_url_required`. An existing profile: `validation.profile_already_exists`. An `rpc_url` that breaks the endpoint rule: `validation.config_invalid`. The rule requires `http` or `https`, and on mainnet `https` with no username or password. A failed write exits `1` with an internal error. |
 | `list` | `profile list` | Read-only. Returns known profile names sorted as a JSON array. Takes no profile selector. |
 | `show <NAME>` | `profile show default` | Read-only. URL fields (`rpc_url`, `secondary_rpc_url`, `oracle_provider_url`) show scheme, host, and port only. Resolved config; keyring refs appear as opaque `{service, account}`, secrets never read. Exits `1` with `validation.profile_not_found` when the profile does not exist. A mainnet file without `rpc_url` exits with `validation.mainnet_rpc_url_required`. An endpoint URL that breaks the endpoint rule, an unsupported schema version, or another unreadable file exits with `validation.config_invalid`. |
 | `migrate <NAME>` | `profile migrate default` | State-changing (atomic temp+rename). No-op if already current (`status:"no_op"`); else `status:"migrated"` with `from_version`/`to_version`/`path`. A refused migration exits `1`, writes nothing, and leaves the v1 file unchanged. A missing profile file: `validation.profile_not_found`. A v1 mainnet file without `rpc_url`: `validation.mainnet_rpc_url_required`, because mainnet has no default endpoint; add `rpc_url` to the v1 file and run the command again. An endpoint URL that breaks the endpoint rule, or a file that cannot be read: `validation.config_invalid`. |

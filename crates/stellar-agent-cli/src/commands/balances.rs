@@ -14,11 +14,13 @@
 //! # Exit codes
 //!
 //! - 0 on success.
-//! - 1 on any [`WalletError`] — the envelope's `error.code` is the diagnostic.
+//! - 1 on any [`WalletError`](stellar_agent_core::error::WalletError); the
+//!   envelope's `error.code` is the diagnostic.
+//! - 1 with `validation.usage_error` when `--account` is omitted: the flag is
+//!   required by the argument parser, and no profile supplies a fallback.
 
 use clap::Args;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
-use stellar_agent_core::error::WalletError;
 use stellar_agent_network::{AccountView, Asset, StellarRpcClient, fetch_account};
 
 use crate::common::network::{EndpointUrlFlag, TESTNET_RPC_URL};
@@ -28,8 +30,8 @@ use crate::render::table::render_balances_table;
 #[derive(Debug, Args)]
 pub struct BalancesArgs {
     /// Required G-strkey account to query.
-    #[arg(long, value_name = "G_STRKEY")]
-    pub account: Option<String>,
+    #[arg(long, required = true, value_name = "G_STRKEY")]
+    pub account: String,
 
     /// Output format: `json` (default) or `table`.
     #[arg(
@@ -78,21 +80,6 @@ pub struct BalancesArgs {
 /// Only if UUID generation or `serde_json` serialisation panics
 /// (effectively never in practice).
 pub async fn run(args: &BalancesArgs) -> i32 {
-    // `--account` is required and no profile is read.
-    let account_id = match &args.account {
-        Some(id) => id.clone(),
-        None => {
-            let err = WalletError::Validation(
-                stellar_agent_core::error::ValidationError::ProfileNotFound {
-                    name: "default".to_owned(),
-                },
-            );
-            let envelope = Envelope::<()>::err(&err);
-            print_error(&envelope, args.output);
-            return 1;
-        }
-    };
-
     // Parse --asset CODE:ISSUER flags.
     // Boundary check: `Asset::parse` validates the code length and issuer
     // G-strkey; invalid inputs are rejected before the network call.
@@ -117,7 +104,7 @@ pub async fn run(args: &BalancesArgs) -> i32 {
         }
     };
 
-    match fetch_account(&client, &account_id, &trustline_assets).await {
+    match fetch_account(&client, &args.account, &trustline_assets).await {
         Ok(view) => {
             let envelope = Envelope::ok(view);
             print_success(&envelope, args.output);

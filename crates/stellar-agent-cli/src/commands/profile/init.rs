@@ -33,7 +33,8 @@
 //! <name>` mints the key — this applies to the `noop` engine exactly as it
 //! does to `v1`, since the audit pre-flight is independent of the policy
 //! engine. `next_steps` names `rotate-audit-key` in the ALWAYS list (right
-//! after `enroll-signer`) for both engines.
+//! after `enroll-signer`) for both engines, followed by `rotate-nonce-key`,
+//! which MCP payment simulation requires.
 //!
 //! # Engine default
 //!
@@ -61,10 +62,11 @@
 //! # Refusal order
 //!
 //! The flag parser refuses a malformed `--rpc-url`, and one that carries
-//! userinfo, with exit code `2` before the command runs. After the arguments
-//! parse, `init` refuses in this order: an unsafe profile name, mainnet
-//! without `--rpc-url`, an existing destination file, and an endpoint that
-//! breaks the endpoint rule.
+//! userinfo, before the command runs: exit code `1` with one
+//! `validation.usage_error` envelope on stdout, whose message never repeats
+//! the rejected value. After the arguments parse, `init` refuses in this
+//! order: an unsafe profile name, mainnet without `--rpc-url`, an existing
+//! destination file, and an endpoint that breaks the endpoint rule.
 //!
 //! # Overwrite refusal
 //!
@@ -91,8 +93,10 @@
 //!     "next_steps": [
 //!       "Run `stellar-agent profile enroll-signer --profile default --secret-env <VAR>` to register the MCP signer seed.",
 //!       "Run `stellar-agent profile rotate-audit-key default` to mint the audit-log hash-chain key (required before any signing verb will proceed).",
+//!       "Run `stellar-agent profile rotate-nonce-key default` to mint the commit-nonce key (required before MCP payment simulation).",
 //!       "Run `stellar-agent profile enroll-owner-key --profile default --secret-env <VAR>` to enroll the policy-file owner key.",
 //!       "Run `stellar-agent profile rotate-attestation-key default` to mint the approval-attestation key.",
+//!       "Create the V1 policy file `policies/default.toml` in the wallet's state directory, with `version = 1` and `scope = \"profile:default\"` (see \"Create the V1 policy file\" in the getting-started guide).",
 //!       "Run `stellar-agent profile sign-policy --profile default --secret-env <VAR>` to sign the V1 policy file."
 //!     ]
 //!   },
@@ -170,12 +174,8 @@ struct InitData {
     rpc_url: String,
     /// Selected policy engine (`"v1"` or `"noop"`).
     engine: String,
-    /// Operator-facing enrollment guidance: the follow-up commands needed
-    /// before the profile can sign, in order. Always names `enroll-signer`
-    /// and `rotate-audit-key` (every signing verb requires the audit
-    /// chain-root key to be acquirable, regardless of policy engine); for the
-    /// `v1` engine, also names `enroll-owner-key`, `rotate-attestation-key`,
-    /// and `sign-policy`.
+    /// Operator-facing enrollment guidance: the follow-up steps needed
+    /// before the profile can sign, in order. See [`next_steps`].
     next_steps: Vec<String>,
 }
 
@@ -357,49 +357,6 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
         }
     };
 
-    // ── Enrollment guidance ──────────────────────────────────────────────────
-    // Both engines list `rotate-audit-key` because signing requires the
-    // profile's audit key. `init` writes the keyring coordinate; rotation
-    // mints the key material. The V1 list names owner enrollment, attestation
-    // key rotation, and policy signing in their required order.
-    let mut next_steps = vec![
-        format!(
-            "Run `stellar-agent profile enroll-signer --profile {} --secret-env <VAR>` to \
-             register the MCP signer seed.",
-            profile_name
-        ),
-        format!(
-            "Run `stellar-agent profile rotate-audit-key {}` to mint the audit-log \
-             hash-chain key (required before any signing verb will proceed).",
-            profile_name
-        ),
-    ];
-    if args.engine == PolicyEngineKind::V1 {
-        next_steps.push(format!(
-            "Run `stellar-agent profile enroll-owner-key --profile {} --secret-env <VAR>` \
-             to enroll the policy-file owner key.",
-            profile_name
-        ));
-        next_steps.push(format!(
-            "Run `stellar-agent profile rotate-attestation-key {}` to mint the \
-             approval-attestation key.",
-            profile_name
-        ));
-        next_steps.push(format!(
-            "Run `stellar-agent profile sign-policy --profile {} --secret-env <VAR>` to \
-             sign the V1 policy file.",
-            profile_name
-        ));
-        if args.network == TargetNetwork::Mainnet {
-            next_steps.push(
-                "Set `oracle_provider_url` in the profile before relying on V1 for \
-                 mainnet high-value flows (the independent-RPC cross-check is skipped \
-                 while it is unset)."
-                    .to_owned(),
-            );
-        }
-    }
-
     tracing::info!(
         profile = %profile_name,
         chain_id = %profile.chain_id,
@@ -412,9 +369,64 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
         chain_id: profile.chain_id.caip2_str().to_owned(),
         rpc_url: redact_url_authority(&profile.rpc_url),
         engine: profile.policy.engine.to_string(),
-        next_steps,
+        next_steps: next_steps(&profile_name, args.engine, args.network),
     }));
     0
+}
+
+/// The enrollment guidance `init` prints for a new profile, in the order the
+/// steps must run.
+///
+/// Both engines list `enroll-signer`, then `rotate-audit-key`, because signing
+/// requires the profile's audit key: `init` writes the keyring coordinate and
+/// rotation mints the key material. `rotate-nonce-key` follows, because MCP
+/// payment simulation requires the commit-nonce key. The V1 list then names
+/// owner enrollment, attestation key rotation, the policy file `sign-policy`
+/// reads, and policy signing, in that order. A mainnet V1 profile adds the
+/// oracle setting.
+fn next_steps(profile_name: &str, engine: PolicyEngineKind, network: TargetNetwork) -> Vec<String> {
+    let mut steps = vec![
+        format!(
+            "Run `stellar-agent profile enroll-signer --profile {profile_name} --secret-env \
+             <VAR>` to register the MCP signer seed."
+        ),
+        format!(
+            "Run `stellar-agent profile rotate-audit-key {profile_name}` to mint the audit-log \
+             hash-chain key (required before any signing verb will proceed)."
+        ),
+        format!(
+            "Run `stellar-agent profile rotate-nonce-key {profile_name}` to mint the \
+             commit-nonce key (required before MCP payment simulation)."
+        ),
+    ];
+    if engine == PolicyEngineKind::V1 {
+        steps.push(format!(
+            "Run `stellar-agent profile enroll-owner-key --profile {profile_name} --secret-env \
+             <VAR>` to enroll the policy-file owner key."
+        ));
+        steps.push(format!(
+            "Run `stellar-agent profile rotate-attestation-key {profile_name}` to mint the \
+             approval-attestation key."
+        ));
+        steps.push(format!(
+            "Create the V1 policy file `policies/{profile_name}.toml` in the wallet's state \
+             directory, with `version = 1` and `scope = \"profile:{profile_name}\"` (see \
+             \"Create the V1 policy file\" in the getting-started guide)."
+        ));
+        steps.push(format!(
+            "Run `stellar-agent profile sign-policy --profile {profile_name} --secret-env \
+             <VAR>` to sign the V1 policy file."
+        ));
+        if network == TargetNetwork::Mainnet {
+            steps.push(
+                "Set `oracle_provider_url` in the profile before relying on V1 for \
+                 mainnet high-value flows (the independent-RPC cross-check is skipped \
+                 while it is unset)."
+                    .to_owned(),
+            );
+        }
+    }
+    steps
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -902,5 +914,62 @@ mod tests {
             !dir.path().join("malformed-rpc.toml").exists(),
             "a refused init must not write a file"
         );
+    }
+
+    /// Asserts each step names the matching marker, in order, and that no
+    /// step is left over.
+    fn assert_steps_in_order(steps: &[String], markers: &[&str]) {
+        assert_eq!(steps.len(), markers.len(), "{steps:#?}");
+        for (step, marker) in steps.iter().zip(markers) {
+            assert!(step.contains(marker), "expected `{marker}` in: {step}");
+        }
+    }
+
+    /// A `noop` profile lists the signer, the audit key, and the commit-nonce
+    /// key, in that order, and nothing of the V1 setup.
+    #[test]
+    fn next_steps_for_noop_list_signer_audit_and_nonce_keys() {
+        let steps = next_steps("alpha", PolicyEngineKind::Noop, TargetNetwork::Testnet);
+        assert_steps_in_order(
+            &steps,
+            &[
+                "profile enroll-signer --profile alpha ",
+                "profile rotate-audit-key alpha`",
+                "profile rotate-nonce-key alpha`",
+            ],
+        );
+    }
+
+    /// A V1 profile adds owner enrollment, the attestation key, the policy
+    /// file, and policy signing, with the policy file right before
+    /// `sign-policy`.
+    #[test]
+    fn next_steps_for_v1_create_the_policy_file_before_signing_it() {
+        let steps = next_steps("alpha", PolicyEngineKind::V1, TargetNetwork::Testnet);
+        assert_steps_in_order(
+            &steps,
+            &[
+                "profile enroll-signer --profile alpha ",
+                "profile rotate-audit-key alpha`",
+                "profile rotate-nonce-key alpha`",
+                "profile enroll-owner-key --profile alpha ",
+                "profile rotate-attestation-key alpha`",
+                "`policies/alpha.toml` in the wallet's state directory",
+                "profile sign-policy --profile alpha ",
+            ],
+        );
+        assert!(
+            steps[5].contains("`scope = \"profile:alpha\"`"),
+            "{}",
+            steps[5]
+        );
+    }
+
+    /// A mainnet V1 profile ends with the oracle setting.
+    #[test]
+    fn next_steps_for_mainnet_v1_end_with_the_oracle_setting() {
+        let steps = next_steps("alpha", PolicyEngineKind::V1, TargetNetwork::Mainnet);
+        assert_eq!(steps.len(), 8, "{steps:#?}");
+        assert!(steps[7].contains("`oracle_provider_url`"), "{}", steps[7]);
     }
 }

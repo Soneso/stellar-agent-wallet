@@ -1684,6 +1684,21 @@ pub enum NetworkError {
         waited_secs: u64,
     },
 
+    /// Friendbot refused to fund an account because the account already
+    /// exists and holds its starting balance.
+    ///
+    /// Friendbot funds only an account that does not exist yet, and answers
+    /// HTTP 400 with an "account already funded" detail for one that does.
+    /// The account is usable as it is; no funding transaction was sent.
+    ///
+    /// `account_id` holds the public account ID (`G…`), shown in full for
+    /// operator auditability, matching [`NetworkError::AccountNotFound`].
+    #[error("account '{account_id}' is already funded; Friendbot funds only a new account")]
+    FriendbotAccountAlreadyFunded {
+        /// The public account ID (`G…`) Friendbot refused to fund.
+        account_id: String,
+    },
+
     /// The RPC endpoint reports a network passphrase that differs from the one
     /// the caller declared, and is not mainnet.
     ///
@@ -1788,6 +1803,9 @@ impl NetworkError {
             Self::RpcResponseMalformed { .. } => "network.rpc_response_malformed",
             Self::RpcDivergence { .. } => "network.rpc_divergence",
             Self::FriendbotFundingNotConfirmed { .. } => "network.friendbot_funding_not_confirmed",
+            Self::FriendbotAccountAlreadyFunded { .. } => {
+                "network.friendbot_account_already_funded"
+            }
             Self::EndpointNetworkMismatch { .. } => "network.endpoint_network_mismatch",
             Self::EndpointIdentityUnavailable { .. } => "network.endpoint_identity_unavailable",
             Self::EnvelopeSignedForMainnet => "network.envelope_signed_for_mainnet",
@@ -1888,6 +1906,22 @@ pub enum AuthError {
         name: String,
     },
 
+    /// The headless keyring backend the environment selects cannot be set up
+    /// from its configuration.
+    ///
+    /// Covers an unrecognized `STELLAR_AGENT_KEYRING_BACKEND` value, a
+    /// missing or malformed `STELLAR_AGENT_HEADLESS_KEYRING_KEY`, a backend
+    /// the platform does not support, and an undeterminable state directory.
+    /// The operator fixes the environment; no keyring entry is involved.
+    ///
+    /// `detail` names the variable or condition at fault and never carries
+    /// the key value.
+    #[error("headless keyring configuration is invalid: {detail}")]
+    KeyringConfigInvalid {
+        /// The configuration fault, without secret material.
+        detail: String,
+    },
+
     /// The user refused the signing request on the hardware device.
     #[error("the user refused the signing request on the hardware device")]
     HardwareUserRefused,
@@ -1961,6 +1995,7 @@ impl AuthError {
             Self::KeyringPlatformError => "auth.keyring_platform_error",
             Self::KeyringInteractiveSessionRequired => "auth.keyring_interactive_session_required",
             Self::KeyringNotFound { .. } => "auth.keyring_not_found",
+            Self::KeyringConfigInvalid { .. } => "auth.keyring_config_invalid",
             Self::HardwareUserRefused => "auth.hardware_user_refused",
             Self::EnrolledSignerUnpinned { .. } => "auth.enrolled_signer_unpinned",
             Self::EnrolledSignerMismatch { .. } => "auth.enrolled_signer_mismatch",
@@ -3234,6 +3269,12 @@ mod tests {
                 "network.envelope_signature_unverifiable",
             ),
             (NetworkError::EnvelopeUnsigned, "network.envelope_unsigned"),
+            (
+                NetworkError::FriendbotAccountAlreadyFunded {
+                    account_id: "GABCDE".to_owned(),
+                },
+                "network.friendbot_account_already_funded",
+            ),
         ];
 
         assert_code_round_trips!(cases);
@@ -3279,6 +3320,12 @@ mod tests {
                     name: "main".to_owned(),
                 },
                 "auth.keyring_not_found",
+            ),
+            (
+                AuthError::KeyringConfigInvalid {
+                    detail: "unknown backend".to_owned(),
+                },
+                "auth.keyring_config_invalid",
             ),
             (AuthError::HardwareUserRefused, "auth.hardware_user_refused"),
             (
@@ -3801,12 +3848,28 @@ mod tests {
                 hint: "0a1b2c3d".to_owned(),
             }),
             WalletError::Network(NetworkError::EnvelopeUnsigned),
+            WalletError::Network(NetworkError::FriendbotAccountAlreadyFunded {
+                account_id: "GABCDEFGHIJKLMNOPQR".to_owned(),
+            }),
         ];
         for err in &cases {
             let msg = err.message();
             assert_no_compile_time_secret_markers(&msg);
             assert_no_secret_bytes(msg.as_bytes());
         }
+    }
+
+    /// The already-funded refusal names the account Friendbot refused.
+    #[test]
+    fn friendbot_account_already_funded_names_the_account() {
+        let err = WalletError::Network(NetworkError::FriendbotAccountAlreadyFunded {
+            account_id: "GABCDEFGHIJKLMNOPQR".to_owned(),
+        });
+        assert_eq!(err.code(), "network.friendbot_account_already_funded");
+        assert_eq!(
+            err.message(),
+            "account 'GABCDEFGHIJKLMNOPQR' is already funded; Friendbot funds only a new account"
+        );
     }
 
     /// A non-public network passphrase never reaches the `Display` surface of
@@ -3865,6 +3928,9 @@ mod tests {
             WalletError::Auth(AuthError::KeyringInteractiveSessionRequired),
             WalletError::Auth(AuthError::KeyringNotFound {
                 name: "main".to_owned(),
+            }),
+            WalletError::Auth(AuthError::KeyringConfigInvalid {
+                detail: "STELLAR_AGENT_HEADLESS_KEYRING_KEY: value has base64 padding".to_owned(),
             }),
             WalletError::Auth(AuthError::HardwareUserRefused),
             WalletError::Auth(AuthError::SignerKindMismatch {

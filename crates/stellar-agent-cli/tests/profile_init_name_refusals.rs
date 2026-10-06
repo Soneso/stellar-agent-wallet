@@ -14,9 +14,10 @@
 //! for the same input class. `validation.address_invalid` is reserved for
 //! Stellar account addresses.
 //!
-//! The `=` form of the flag is used throughout: clap refuses `--profile -x`
-//! with `unexpected argument '-x' found` before the command runs, so only
-//! `--profile=-x` carries such a value through to the validator.
+//! The `=` form of the flag is used throughout: the argument parser refuses
+//! `--profile -x` with `unexpected argument '-x' found` before the command
+//! runs, so only `--profile=-x` carries such a value through to the
+//! validator.
 //!
 //! Every run gets its own `STELLAR_AGENT_HOME`, so a run that did NOT refuse
 //! would leave its file inside the temp directory the test then asserts is
@@ -181,6 +182,11 @@ fn profile_init_redacts_rpc_url_and_preserves_saved_url() {
     );
 }
 
+/// A credentialed `--rpc-url` is refused by the flag parser before the
+/// command runs: exit `1` with one `validation.usage_error` envelope on
+/// stdout, nothing on stderr, and no file. The envelope message is the
+/// parser's rendering of the refusal, and neither stream carries the
+/// rejected userinfo.
 #[test]
 fn profile_init_refuses_credentialed_rpc_before_creating_file() {
     let home = tempfile::tempdir().expect("temp home");
@@ -199,12 +205,21 @@ fn profile_init_refuses_credentialed_rpc_before_creating_file() {
         .env_remove("STELLAR_AGENT_PROFILE")
         .output()
         .expect("binary runs");
-    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
-    assert!(
-        !stderr.contains("user") && !stderr.contains("SENTINEL"),
-        "{stderr}"
-    );
+    assert_eq!(output.status.code(), Some(1), "{stdout}{stderr}");
+    let json: Value = serde_json::from_str(stdout.trim()).expect("one JSON envelope on stdout");
+    assert_eq!(json["ok"], false, "{json}");
+    assert_eq!(json["error"]["code"], "validation.usage_error", "{json}");
+    let message = json["error"]["message"].as_str().expect("message");
+    assert!(message.contains("--rpc-url"), "{json}");
+    assert!(stderr.is_empty(), "{stderr}");
+    for stream in [&stdout, &stderr] {
+        assert!(
+            !stream.contains("user") && !stream.contains("SENTINEL"),
+            "{stream}"
+        );
+    }
     assert!(!home.path().join("profiles/credentials.toml").exists());
 }
 

@@ -3,7 +3,7 @@
 //! Claims a Stellar `ClaimClaimableBalance` operation for a balance the agent
 //! already holds the id of. Supports the same three execution stages as `pay`:
 //!
-//! 1. **Build** (`--build-only`) — fetch the entry, render a typed preview, run
+//! 1. **Build** (`--build-only`) — fetch the entry, build a typed preview, run
 //!    the claim guards, construct the transaction envelope, and emit unsigned
 //!    base64 XDR.
 //! 2. **Sign** (`--sign-only <base64-xdr>`) — sign a previously-built envelope
@@ -12,6 +12,16 @@
 //!    poll until confirmation.
 //!
 //! Default (no stage flag): runs all three stages atomically.
+//!
+//! # Output
+//!
+//! One JSON envelope on stdout (`--output json`, the default). The build
+//! stage's typed preview is rendered once, as a nested `preview` object. It
+//! sits in `data.preview` on success. It sits in `error.details.preview` when
+//! a later step fails: a claim guard, the fee resolution, the policy gate, the
+//! audit pre-flight, signing, or submission. `--sign-only` and `--submit-only`
+//! build no preview. `--output table` prints the preview line before the
+//! result or error line.
 //!
 //! # Claim guards
 //!
@@ -80,6 +90,7 @@
 //! it neither signs nor submits. Where a writer was acquired, it is reused
 //! (not re-acquired) for the post-confirm `value_action_submitted` row.
 
+use std::io::Write;
 use std::time::Duration;
 
 use clap::{ArgGroup, Args};
@@ -118,7 +129,9 @@ use crate::common::network::{
 use crate::common::profile_access::{
     ProfileOrigin, injected_profile_load, load_profile_or_synthesize_testnet_with,
 };
-use crate::common::render::{render_json, sanitize_for_table};
+use crate::common::render::{
+    WithPreview, exit_code_after_output, sanitize_for_table, with_preview_detail, write_envelope,
+};
 use crate::common::signer_ceremony::{
     SignerCeremonyOutcome, require_enrolled_signer, resolve_software_signer_from_env,
 };
@@ -175,6 +188,60 @@ struct BuiltClaimEnvelope {
     /// the policy gate's `account_view`, mirroring the `stellar_claim` MCP
     /// twin's `AccountViewAdapter` wiring exactly.
     account_view: stellar_agent_network::AccountView,
+    /// The typed preview the build stage computed before the guards ran.
+    preview: ClaimPreview,
+}
+
+/// A build-stage failure, with the preview when the failure followed it.
+#[derive(Debug)]
+struct ClaimBuildFailure {
+    error: ClaimError,
+    /// `Some` when a claim guard, the fee resolution, or the envelope build
+    /// refused after the preview was built. Boxed to keep the failure small.
+    preview: Option<Box<ClaimPreview>>,
+}
+
+/// What a stage reports: its result and the preview it computed, if any.
+///
+/// Rendered once, by [`render_claim_outcome`].
+struct ClaimOutcome {
+    preview: Option<ClaimPreview>,
+    result: Result<ClaimResult, Envelope<()>>,
+}
+
+impl ClaimOutcome {
+    /// A failure before any preview was computed.
+    fn failed(envelope: Envelope<()>) -> Self {
+        Self {
+            preview: None,
+            result: Err(envelope),
+        }
+    }
+
+    /// A failure after the preview was computed.
+    fn failed_after_preview(preview: ClaimPreview, envelope: Envelope<()>) -> Self {
+        Self {
+            preview: Some(preview),
+            result: Err(envelope),
+        }
+    }
+
+    /// A successful stage.
+    fn succeeded(preview: Option<ClaimPreview>, result: ClaimResult) -> Self {
+        Self {
+            preview,
+            result: Ok(result),
+        }
+    }
+
+    /// A build-stage failure, carrying the preview when the failure followed
+    /// it.
+    fn from_build_failure(failure: ClaimBuildFailure) -> Self {
+        Self {
+            preview: failure.preview.map(|preview| *preview),
+            result: Err(claim_error_envelope(&failure.error)),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -282,32 +349,58 @@ pub struct ClaimArgs {
 ///
 /// Never panics.
 pub async fn run(args: &ClaimArgs) -> i32 {
-    run_with_dependencies(args, injected_profile_load, init_platform_keyring_store).await
+    run_with_dependencies(
+        args,
+        injected_profile_load,
+        init_platform_keyring_store,
+        &mut std::io::stdout(),
+    )
+    .await
 }
 
-/// Testable core of [`run`] with the profile loader and the platform-keyring
-/// initialiser injected.
+/// Testable core of [`run`] with the profile loader, the platform-keyring
+/// initializer, and the output writer injected.
 ///
-/// Production callers use [`run`], which supplies the real profile loader and
-/// [`init_platform_keyring_store`]. Tests substitute an in-memory profile and
-/// a spy initialiser to assert the keyring store is registered before the V1
-/// policy gate's owner-key read (see `run_build_only` / `run_full_pipeline`)
-/// without touching the OS keychain.
+/// Production callers use [`run`], which supplies the real profile loader,
+/// [`init_platform_keyring_store`], and stdout. Tests substitute an in-memory
+/// profile and a spy initializer, and read what the command writes from an
+/// in-memory writer. They assert the keyring store is registered before the
+/// V1 policy gate's owner-key read (see `run_build_only` /
+/// `run_full_pipeline`) without touching the OS keychain.
+///
+/// Writes exactly one rendered outcome to `out`: [`claim_outcome`] renders
+/// nothing, and [`render_claim_outcome`] writes its result once.
 ///
 /// # The injected closure LOADS ONLY
 ///
 /// `load_profile` performs the load and nothing else. Whether a `NotFound`
 /// may be replaced by the synthesized zero-config profile is decided by
-/// [`load_profile_or_synthesize_testnet_with`], which this function calls once,
-/// at entry, with the resolved name. Every stage receives the loaded profile.
-/// The refusal for a named-but-missing profile therefore runs on the injected
-/// path exactly as it does in production. A check placed inside the closure
-/// would be bypassed by every test that supplies its own.
+/// [`load_profile_or_synthesize_testnet_with`], which [`claim_outcome`]
+/// calls once, at entry, with the resolved name. Every stage receives the
+/// loaded profile. The refusal for a named-but-missing profile therefore runs
+/// on the injected path exactly as it does in production. A check placed
+/// inside the closure would be bypassed by every test that supplies its own.
 async fn run_with_dependencies<LoadProfile, InitKeyring>(
     args: &ClaimArgs,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
+    out: &mut dyn Write,
 ) -> i32
+where
+    LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
+    let outcome = claim_outcome(args, load_profile, init_keyring).await;
+    render_claim_outcome(out, args.output, outcome)
+}
+
+/// Resolves the profile and the network context, refuses mainnet, and runs
+/// the selected stage.
+async fn claim_outcome<LoadProfile, InitKeyring>(
+    args: &ClaimArgs,
+    load_profile: LoadProfile,
+    init_keyring: InitKeyring,
+) -> ClaimOutcome
 where
     LoadProfile: Fn(&str) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError>,
     InitKeyring: Fn() -> Result<(), WalletError>,
@@ -316,11 +409,10 @@ where
     let (profile, origin) = match load_profile_or_synthesize_testnet_with(&resolved, load_profile) {
         Ok(loaded) => loaded,
         Err(e) => {
-            print_error(
-                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
-                args.output,
-            );
-            return 1;
+            return ClaimOutcome::failed(Envelope::<()>::err_raw(
+                e.code(),
+                e.message(&resolved.name),
+            ));
         }
     };
     let context = match network_context_for_command(
@@ -333,10 +425,7 @@ where
         },
     ) {
         Ok(context) => context,
-        Err(e) => {
-            print_error(&Envelope::<()>::err(&e), args.output);
-            return 1;
-        }
+        Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
     };
     // The resolved name and the input that supplied it are logged together:
     // a report of a run signing against the wrong profile is diagnosable only
@@ -351,8 +440,7 @@ where
     // ── Mainnet structural rejection (first layer) ────────────────────────────
     if context.chain_id.is_mainnet() {
         let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
-        print_error(&Envelope::<()>::err(&err), args.output);
-        return 1;
+        return ClaimOutcome::failed(Envelope::<()>::err(&err));
     }
 
     // Every gated stage reads the owner key from the keyring through
@@ -399,7 +487,7 @@ async fn run_build_only<InitKeyring>(
     resolved: &ResolvedProfileName,
     profile: &Profile,
     init_keyring: InitKeyring,
-) -> i32
+) -> ClaimOutcome
 where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
@@ -420,35 +508,29 @@ where
     if !matches!(profile.policy.engine, PolicyEngineKind::Noop)
         && let Err(e) = init_keyring()
     {
-        print_error(&Envelope::<()>::err(&e), args.output);
-        return 1;
+        return ClaimOutcome::failed(Envelope::<()>::err(&e));
     }
 
-    match build_unsigned_envelope(context, args).await {
-        Ok(built) => {
-            let chain_id = context.chain_id.caip2_str();
-            // Build-only: gate but do not submit, so the gate-sized effects are
-            // not recorded (no confirmed on-chain action to attest).
-            if let Err(code) =
-                evaluate_claim_policy(args, &built, chain_id, profile, &resolved.name)
-            {
-                return code;
-            }
-            let result = ClaimResult {
-                envelope_xdr: built.envelope_xdr,
-                tx_hash: None,
-                ledger: None,
-                stage: "build".to_owned(),
-                balance_id_hex72: Some(built.balance_id_hex72),
-            };
-            print_success(&Envelope::ok(result), args.output);
-            0
-        }
-        Err(e) => {
-            print_error(&claim_error_envelope(&e), args.output);
-            1
-        }
+    let built = match build_unsigned_envelope(context, args).await {
+        Ok(built) => built,
+        Err(failure) => return ClaimOutcome::from_build_failure(failure),
+    };
+    let chain_id = context.chain_id.caip2_str();
+    // Build-only: gate but do not submit, so the gate-sized effects are
+    // not recorded (no confirmed on-chain action to attest).
+    if let Err(envelope) = evaluate_claim_policy(&built, chain_id, profile, &resolved.name) {
+        return ClaimOutcome::failed_after_preview(built.preview, envelope);
     }
+    ClaimOutcome::succeeded(
+        Some(built.preview),
+        ClaimResult {
+            envelope_xdr: built.envelope_xdr,
+            tx_hash: None,
+            ledger: None,
+            stage: "build".to_owned(),
+            balance_id_hex72: Some(built.balance_id_hex72),
+        },
+    )
 }
 
 async fn run_sign_only<InitKeyring>(
@@ -459,26 +541,18 @@ async fn run_sign_only<InitKeyring>(
     profile: &Profile,
     origin: ProfileOrigin,
     init_keyring: InitKeyring,
-) -> i32
+) -> ClaimOutcome
 where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    match init_keyring_for_origin(args, resolved, origin, init_keyring) {
-        Ok(()) => (),
-        Err(code) => return code,
-    };
+    if let Err(envelope) = init_keyring_for_origin(resolved, origin, init_keyring) {
+        return ClaimOutcome::failed(envelope);
+    }
     let chain_id = context.chain_id.caip2_str();
-    if let Err(code) = evaluate_staged_claim_policy(
-        context,
-        args,
-        unsigned_xdr,
-        chain_id,
-        profile,
-        &resolved.name,
-    )
-    .await
+    if let Err(envelope) =
+        evaluate_staged_claim_policy(context, unsigned_xdr, chain_id, profile, &resolved.name).await
     {
-        return code;
+        return ClaimOutcome::failed(envelope);
     }
     // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
     // policy gate (a denial is a clean refusal that signs nothing and needs
@@ -492,26 +566,21 @@ where
         &resolved.name,
         origin,
     ) {
-        print_error(&Envelope::<()>::err(&e), args.output);
-        return 1;
+        return ClaimOutcome::failed(Envelope::<()>::err(&e));
     }
 
     match sign_envelope(context, args, unsigned_xdr, profile, &resolved.name).await {
-        Ok(signed_xdr) => {
-            let result = ClaimResult {
+        Ok(signed_xdr) => ClaimOutcome::succeeded(
+            None,
+            ClaimResult {
                 envelope_xdr: signed_xdr,
                 tx_hash: None,
                 ledger: None,
                 stage: "sign".to_owned(),
                 balance_id_hex72: None,
-            };
-            print_success(&Envelope::ok(result), args.output);
-            0
-        }
-        Err(e) => {
-            print_error(&Envelope::<()>::err(&e), args.output);
-            1
-        }
+            },
+        ),
+        Err(e) => ClaimOutcome::failed(Envelope::<()>::err(&e)),
     }
 }
 
@@ -523,14 +592,13 @@ async fn run_submit_only<InitKeyring>(
     profile: &Profile,
     origin: ProfileOrigin,
     init_keyring: InitKeyring,
-) -> i32
+) -> ClaimOutcome
 where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
-    match init_keyring_for_origin(args, resolved, origin, init_keyring) {
-        Ok(()) => (),
-        Err(code) => return code,
-    };
+    if let Err(envelope) = init_keyring_for_origin(resolved, origin, init_keyring) {
+        return ClaimOutcome::failed(envelope);
+    }
 
     // Establish which network `--rpc-url` actually serves before anything
     // else runs. The staged gate evaluates under the chain id derived from
@@ -538,8 +606,7 @@ where
     // reach; the probe is what makes it so, and a mismatch refuses here rather
     // than after a policy decision taken for the wrong chain.
     if let Err(e) = probe_endpoint_network(context, args).await {
-        print_error(&Envelope::<()>::err(&e), args.output);
-        return 1;
+        return ClaimOutcome::failed(Envelope::<()>::err(&e));
     }
 
     // Settle the spending-window reservations that have stood long enough to
@@ -549,11 +616,10 @@ where
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(v) => v,
         Err(e) => {
-            print_error(
-                &Envelope::<()>::err_raw("wallet.clock_error", e.to_string()),
-                args.output,
-            );
-            return 1;
+            return ClaimOutcome::failed(Envelope::<()>::err_raw(
+                "wallet.clock_error",
+                e.to_string(),
+            ));
         }
     };
     if let Ok(reconcile_client) = StellarRpcClient::new(&context.rpc_url) {
@@ -570,19 +636,13 @@ where
     let chain_id = context.chain_id.caip2_str();
     // The envelope arrives pre-signed, but broadcasting it still spends
     // funds — gate here even though signing already happened elsewhere.
-    let claim_effects = match evaluate_staged_claim_policy(
-        context,
-        args,
-        signed_xdr,
-        chain_id,
-        profile,
-        &resolved.name,
-    )
-    .await
-    {
-        Ok(effects) => effects,
-        Err(code) => return code,
-    };
+    let claim_effects =
+        match evaluate_staged_claim_policy(context, signed_xdr, chain_id, profile, &resolved.name)
+            .await
+        {
+            Ok(effects) => effects,
+            Err(envelope) => return ClaimOutcome::failed(envelope),
+        };
     // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
     // policy gate (a denial is a clean refusal that submits nothing and
     // needs no audit setup) but BEFORE the transaction below is submitted,
@@ -596,10 +656,7 @@ where
         origin,
     ) {
         Ok(w) => w,
-        Err(e) => {
-            print_error(&Envelope::<()>::err(&e), args.output);
-            return 1;
-        }
+        Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
     };
 
     let recorder = match crate::commands::submission_record::build_recorder(
@@ -617,42 +674,36 @@ where
     ) {
         Ok(r) => r,
         Err(e) => {
-            print_error(
-                &crate::commands::submission_record::error_envelope(&e, signed_xdr, "claim"),
-                args.output,
-            );
-            return 1;
+            return ClaimOutcome::failed(crate::commands::submission_record::error_envelope(
+                &e, signed_xdr, "claim",
+            ));
         }
     };
 
     match submit_envelope(context, args, signed_xdr, Some(&recorder)).await {
-        Ok((signed_xdr, sub_result)) => {
-            let result = ClaimResult {
+        Ok((signed_xdr, sub_result)) => ClaimOutcome::succeeded(
+            None,
+            ClaimResult {
                 envelope_xdr: signed_xdr,
                 tx_hash: Some(sub_result.tx_hash.clone()),
                 ledger: Some(sub_result.ledger),
                 stage: "submit".to_owned(),
                 balance_id_hex72: None,
-            };
-            print_success(&Envelope::ok(result), args.output);
-            0
-        }
-        Err(e) => {
-            print_error(&Envelope::<()>::err(&e), args.output);
-            1
-        }
+            },
+        ),
+        Err(e) => ClaimOutcome::failed(Envelope::<()>::err(&e)),
     }
 }
 
 /// Attempts to initialise the platform keyring store, whatever the policy
 /// engine, and decides by the profile's origin whether a failure is fatal.
 ///
-/// Unconditional (not gated on `profile.policy.engine`): the origin-aware
-/// audit pre-flight both stages calling this helper (`--sign-only`,
-/// `--submit-only`) run next reads the profile's audit chain-root HMAC key
-/// from the platform keyring regardless of the policy engine — a `Noop`
-/// engine reads no OWNER key, but the audit key is a separate, engine-independent
-/// requirement.
+/// The attempt is unconditional, not gated on `profile.policy.engine`. The
+/// stages calling this helper (`--sign-only`, `--submit-only`, the full
+/// pipeline) next run an origin-aware audit pre-flight. It reads the profile's
+/// audit chain-root HMAC key from the platform keyring regardless of the
+/// policy engine. A `Noop` engine reads no OWNER key, but the audit key is a
+/// separate, engine-independent requirement.
 ///
 /// The outcome of a failed initialisation attempt is origin-aware:
 /// [`ProfileOrigin::Persisted`] treats it as fatal — an operator who authored
@@ -665,21 +716,22 @@ where
 /// (see [`crate::commands::value_audit::require_value_audit_writer_for_origin`]),
 /// so a host with no platform keyring store (e.g. a container without a
 /// Secret Service) never blocks the documented no-setup quickstart.
+///
+/// # Errors
+///
+/// Returns the refusal envelope when initialization fails for a persisted
+/// profile.
 fn init_keyring_for_origin<InitKeyring>(
-    args: &ClaimArgs,
     resolved: &ResolvedProfileName,
     origin: ProfileOrigin,
     init_keyring: InitKeyring,
-) -> Result<(), i32>
+) -> Result<(), Envelope<()>>
 where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
     if let Err(e) = init_keyring() {
         match origin {
-            ProfileOrigin::Persisted => {
-                print_error(&Envelope::<()>::err(&e), args.output);
-                return Err(1);
-            }
+            ProfileOrigin::Persisted => return Err(Envelope::<()>::err(&e)),
             ProfileOrigin::Synthesized => {
                 tracing::warn!(
                     profile = %resolved.name,
@@ -703,25 +755,21 @@ where
 /// function's tests exercise directly. `claim` supplies `identity_view: None`
 /// — no destination concept, matching `evaluate_claim_policy`'s established
 /// posture.
+///
+/// # Errors
+///
+/// Returns the refusal envelope when the engine cannot be built, the source
+/// account cannot be fetched, or the gate refuses.
 async fn evaluate_staged_claim_policy(
     context: &NetworkContext,
-    args: &ClaimArgs,
     envelope_xdr: &str,
     chain_id: &str,
     profile: &Profile,
     profile_name: &str,
-) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
+) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, Envelope<()>> {
     let policy_engine =
-        match build_v1_policy_engine("claim", &profile.policy.engine, profile, profile_name) {
-            Ok(pe) => pe,
-            Err(msg) => {
-                print_error(
-                    &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
-                    args.output,
-                );
-                return Err(1);
-            }
-        };
+        build_v1_policy_engine("claim", &profile.policy.engine, profile, profile_name)
+            .map_err(|msg| Envelope::<()>::err_raw("policy.engine_unavailable", msg))?;
 
     let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
         envelope_xdr,
@@ -733,31 +781,24 @@ async fn evaluate_staged_claim_policy(
     // matching `claim`'s established posture.
     let mut source_view_holder = None;
     if let Ok(ref authoritative_args) = decode_result {
-        let client = match StellarRpcClient::new(&context.rpc_url) {
-            Ok(c) => c,
-            Err(e) => {
-                print_error(&Envelope::<()>::err(&e), args.output);
-                return Err(1);
-            }
-        };
+        let client =
+            StellarRpcClient::new(&context.rpc_url).map_err(|e| Envelope::<()>::err(&e))?;
         let source = authoritative_args
             .get("source")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
 
-        source_view_holder = match fetch_account(&client, source, &[]).await {
-            Ok(v) => Some(v),
-            Err(e) => {
-                print_error(&Envelope::<()>::err(&e), args.output);
-                return Err(1);
-            }
-        };
+        source_view_holder = Some(
+            fetch_account(&client, source, &[])
+                .await
+                .map_err(|e| Envelope::<()>::err(&e))?,
+        );
     }
     let source_adapter = source_view_holder
         .as_ref()
         .map(stellar_agent_network::policy_view::AccountViewAdapter::new);
 
-    match dispatch_staged_claim_gate(
+    dispatch_staged_claim_gate(
         policy_engine.as_ref(),
         profile,
         chain_id,
@@ -765,13 +806,7 @@ async fn evaluate_staged_claim_policy(
         source_adapter
             .as_ref()
             .map(|a| a as &dyn AccountReservesView),
-    ) {
-        Ok(effects) => Ok(effects),
-        Err(envelope) => {
-            print_error(&envelope, args.output);
-            Err(1)
-        }
-    }
+    )
 }
 
 /// Pure post-decode dispatch for the staged `claim` gate: no network or
@@ -826,7 +861,7 @@ async fn run_full_pipeline<InitKeyring>(
     profile: &Profile,
     origin: ProfileOrigin,
     init_keyring: InitKeyring,
-) -> i32
+) -> ClaimOutcome
 where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
@@ -838,32 +873,17 @@ where
     // profile. A failed attempt is fatal for a persisted profile and warn-only
     // for the synthesized zero-config profile, matching the audit pre-flight's
     // fail-open posture for that origin.
-    if let Err(e) = init_keyring() {
-        match origin {
-            ProfileOrigin::Persisted => {
-                print_error(&Envelope::<()>::err(&e), args.output);
-                return 1;
-            }
-            ProfileOrigin::Synthesized => {
-                tracing::warn!(
-                    profile = %resolved.name,
-                    error = %e,
-                    "platform keyring store unavailable for the synthesized zero-config \
-                     profile; continuing warn-only — the audit pre-flight below already \
-                     tolerates this for a synthesized profile"
-                );
-            }
-        }
+    if let Err(envelope) = init_keyring_for_origin(resolved, origin, init_keyring) {
+        return ClaimOutcome::failed(envelope);
     }
 
     // 1. Build (fetch entry, preview, guards).
     let built = match build_unsigned_envelope(context, args).await {
         Ok(built) => built,
-        Err(e) => {
-            print_error(&claim_error_envelope(&e), args.output);
-            return 1;
-        }
+        Err(failure) => return ClaimOutcome::from_build_failure(failure),
     };
+    let preview = built.preview.clone();
+    let failed = |envelope: Envelope<()>| ClaimOutcome::failed_after_preview(preview, envelope);
     let unsigned_xdr = built.envelope_xdr.clone();
 
     // Settle the spending-window reservations that have stood long enough to
@@ -873,11 +893,7 @@ where
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(v) => v,
         Err(e) => {
-            print_error(
-                &Envelope::<()>::err_raw("wallet.clock_error", e.to_string()),
-                args.output,
-            );
-            return 1;
+            return failed(Envelope::<()>::err_raw("wallet.clock_error", e.to_string()));
         }
     };
     if let Ok(reconcile_client) = StellarRpcClient::new(&context.rpc_url) {
@@ -893,10 +909,9 @@ where
 
     // ── Operator policy evaluation (before signing) ───────────────────────────
     let chain_id = context.chain_id.caip2_str();
-    let claim_effects = match evaluate_claim_policy(args, &built, chain_id, profile, &resolved.name)
-    {
+    let claim_effects = match evaluate_claim_policy(&built, chain_id, profile, &resolved.name) {
         Ok(effects) => effects,
-        Err(code) => return code,
+        Err(envelope) => return failed(envelope),
     };
 
     // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
@@ -913,20 +928,14 @@ where
         origin,
     ) {
         Ok(w) => w,
-        Err(e) => {
-            print_error(&Envelope::<()>::err(&e), args.output);
-            return 1;
-        }
+        Err(e) => return failed(Envelope::<()>::err(&e)),
     };
 
     // 2. Sign.
     let signed_xdr =
         match sign_envelope(context, args, &unsigned_xdr, profile, &resolved.name).await {
             Ok(xdr) => xdr,
-            Err(e) => {
-                print_error(&Envelope::<()>::err(&e), args.output);
-                return 1;
-            }
+            Err(e) => return failed(Envelope::<()>::err(&e)),
         };
 
     // 3. Record, then submit. The recorder writes the receipt, the pending
@@ -947,33 +956,30 @@ where
     ) {
         Ok(r) => r,
         Err(e) => {
-            print_error(
-                &crate::commands::submission_record::error_envelope(&e, &signed_xdr, "claim"),
-                args.output,
-            );
-            return 1;
+            return failed(crate::commands::submission_record::error_envelope(
+                &e,
+                &signed_xdr,
+                "claim",
+            ));
         }
     };
 
     match submit_envelope(context, args, &signed_xdr, Some(&recorder)).await {
-        Ok((xdr, sub_result)) => {
-            let result = ClaimResult {
+        Ok((xdr, sub_result)) => ClaimOutcome::succeeded(
+            Some(built.preview),
+            ClaimResult {
                 envelope_xdr: xdr,
                 tx_hash: Some(sub_result.tx_hash.clone()),
                 ledger: Some(sub_result.ledger),
                 stage: "build+sign+submit".to_owned(),
                 balance_id_hex72: Some(built.balance_id_hex72),
-            };
-            print_success(&Envelope::ok(result), args.output);
-            0
-        }
-        Err(e) => {
-            print_error(
-                &crate::commands::submission_record::error_envelope(&e, &signed_xdr, "claim"),
-                args.output,
-            );
-            1
-        }
+            },
+        ),
+        Err(e) => failed(crate::commands::submission_record::error_envelope(
+            &e,
+            &signed_xdr,
+            "claim",
+        )),
     }
 }
 
@@ -981,15 +987,59 @@ where
 // Build helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Fetches the entry, renders a typed preview, runs the claim guards, and
+/// Fetches the entry, builds the typed preview, runs the claim guards, and
 /// constructs the unsigned envelope XDR.
 ///
-/// The preview is rendered to stdout before the guards run so the operator sees
-/// the balance disclosure even when a guard subsequently refuses.
+/// The preview is built before the guards run and travels with every later
+/// outcome. It is in the built envelope on success, and in the failure when a
+/// guard, the fee resolution, or the envelope build refuses. The operator
+/// therefore sees the balance disclosure even when a guard refuses.
+///
+/// # Errors
+///
+/// Returns a [`ClaimBuildFailure`] carrying the preview when the failure
+/// followed it, and no preview when the entry fetch or the preview itself
+/// failed.
 async fn build_unsigned_envelope(
     context: &NetworkContext,
     args: &ClaimArgs,
-) -> Result<BuiltClaimEnvelope, ClaimError> {
+) -> Result<BuiltClaimEnvelope, ClaimBuildFailure> {
+    let previewed =
+        fetch_claim_preview(context, args)
+            .await
+            .map_err(|error| ClaimBuildFailure {
+                error,
+                preview: None,
+            })?;
+    match guard_and_build(context, args, &previewed).await {
+        Ok((envelope_xdr, fee_selection)) => Ok(BuiltClaimEnvelope {
+            envelope_xdr,
+            balance_id_hex72: previewed.id.to_hex72(),
+            fee_selection,
+            account_view: previewed.account_view,
+            preview: previewed.preview,
+        }),
+        Err(error) => Err(ClaimBuildFailure {
+            error,
+            preview: Some(Box::new(previewed.preview)),
+        }),
+    }
+}
+
+/// What the preview stage of the build fetched and computed.
+struct PreviewedClaim {
+    id: BalanceId,
+    client: StellarRpcClient,
+    account_view: stellar_agent_network::AccountView,
+    preview: ClaimPreview,
+}
+
+/// Parses the balance id, validates the source, fetches the entry and the
+/// source account, and builds the typed preview.
+async fn fetch_claim_preview(
+    context: &NetworkContext,
+    args: &ClaimArgs,
+) -> Result<PreviewedClaim, ClaimError> {
     let id = BalanceId::parse(&args.balance_id)?;
 
     // Validate the source G-strkey up front.
@@ -1010,17 +1060,35 @@ async fn build_unsigned_envelope(
 
     let now_secs = current_unix_secs()?;
     let preview = ClaimPreview::build(&entry, &args.source, now_secs)?;
+    Ok(PreviewedClaim {
+        id,
+        client,
+        account_view,
+        preview,
+    })
+}
 
-    // ── Render the typed preview before running the guards ────────────────────
-    render_preview(&preview, args.output);
+/// Runs the claim guards against the preview, resolves the fee, checks its
+/// affordability, and builds the unsigned envelope.
+async fn guard_and_build(
+    context: &NetworkContext,
+    args: &ClaimArgs,
+    previewed: &PreviewedClaim,
+) -> Result<(String, ClassicFeeSelection), ClaimError> {
+    let PreviewedClaim {
+        id,
+        client,
+        account_view,
+        preview,
+    } = previewed;
 
     // ── Claim guards, in order ────────────────────────────────────────────────
-    require_claimant(&preview, &args.source)?;
-    require_predicate_satisfied(&preview)?;
+    require_claimant(preview, &args.source)?;
+    require_predicate_satisfied(preview)?;
     if preview.asset_code.is_some() {
         let code = preview.asset_code.as_deref().unwrap_or_default();
         let issuer = preview.asset_issuer.as_deref().unwrap_or_default();
-        let state = fetch_trustline_state(&client, &args.source, code, issuer).await?;
+        let state = fetch_trustline_state(client, &args.source, code, issuer).await?;
         check_trustline(
             &state,
             preview.asset_code.as_deref(),
@@ -1032,7 +1100,7 @@ async fn build_unsigned_envelope(
     // ── Fee resolution + affordability ────────────────────────────────────────
     let fee_choice = parse_classic_fee_choice(args.fee.as_deref())?;
     let fee_selection =
-        resolve_classic_fee_selection(&client, DEFAULT_FEE_STROOPS, fee_choice).await?;
+        resolve_classic_fee_selection(client, DEFAULT_FEE_STROOPS, fee_choice).await?;
     let fee_per_op = fee_selection.per_op_stroops;
     // Single-operation transaction: the total fee equals the per-operation fee.
     let fee_stroops = i64::from(fee_per_op);
@@ -1070,12 +1138,7 @@ async fn build_unsigned_envelope(
     builder.claim_claimable_balance(&id.to_hex64())?;
     let envelope_xdr = builder.build()?;
 
-    Ok(BuiltClaimEnvelope {
-        envelope_xdr,
-        balance_id_hex72: id.to_hex72(),
-        fee_selection,
-        account_view,
-    })
+    Ok((envelope_xdr, fee_selection))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1086,34 +1149,29 @@ async fn build_unsigned_envelope(
 /// (and `stellar_claim` value descriptor contract) the `stellar_claim` MCP
 /// tool's dispatch gate uses.
 ///
-/// Returns `None` when the operation is allowed (the caller proceeds to
-/// signing); returns `Some(exit_code)` — with the refusal envelope already
-/// rendered — when the operation must be refused.
+/// Returns the gate-sized effects when the operation is allowed (the caller
+/// proceeds to signing).
 ///
-/// `profile` is the profile `run_with_dependencies` loaded at entry and passed
+/// `profile` is the profile `claim_outcome` loaded at entry and passed
 /// to `run_build_only` / `run_full_pipeline`. This function does not
 /// re-resolve it. The platform keyring store the caller initialised therefore
 /// stays registered for the `build_v1_policy_engine` owner-key read below.
 /// `run_build_only` initialises the store only for a non-`Noop` engine;
 /// `run_full_pipeline` always does, ahead of its origin-aware audit pre-flight.
+///
+/// # Errors
+///
+/// Returns the refusal envelope when the engine cannot be built or the
+/// operation must be refused.
 fn evaluate_claim_policy(
-    args: &ClaimArgs,
     built: &BuiltClaimEnvelope,
     chain_id: &str,
     profile: &Profile,
     profile_name: &str,
-) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
+) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, Envelope<()>> {
     let policy_engine =
-        match build_v1_policy_engine("claim", &profile.policy.engine, profile, profile_name) {
-            Ok(pe) => pe,
-            Err(msg) => {
-                print_error(
-                    &Envelope::<()>::err_raw("policy.engine_unavailable", msg),
-                    args.output,
-                );
-                return Err(1);
-            }
-        };
+        build_v1_policy_engine("claim", &profile.policy.engine, profile, profile_name)
+            .map_err(|msg| Envelope::<()>::err_raw("policy.engine_unavailable", msg))?;
     // `derive_value_class` ignores args for `stellar_claim` (a non-debit
     // Claim leg is always emitted); `balance_id` is carried for audit parity
     // with the MCP tool's dispatch args and for any future criterion that
@@ -1125,7 +1183,7 @@ fn evaluate_claim_policy(
     // has no destination concept, matching the twin.
     let source_adapter =
         stellar_agent_network::policy_view::AccountViewAdapter::new(&built.account_view);
-    match evaluate_value_moving_policy(
+    evaluate_value_moving_policy(
         policy_engine.as_ref(),
         profile,
         "stellar_claim",
@@ -1135,13 +1193,7 @@ fn evaluate_claim_policy(
         "claim",
         Some(&source_adapter),
         None,
-    ) {
-        Ok(effects) => Ok(effects),
-        Err(envelope) => {
-            print_error(&envelope, args.output);
-            Err(1)
-        }
-    }
+    )
 }
 
 /// Returns the current Unix time in seconds for predicate evaluation.
@@ -1256,10 +1308,48 @@ async fn submit_envelope(
 // Output helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Renders the typed claim preview to stdout (JSON), before the guards run.
-fn render_preview(preview: &ClaimPreview, format: OutputFormat) {
-    let envelope = Envelope::ok(serde_json::json!({
-        "stage": "preview",
+/// Builds an error envelope from a [`ClaimError`], preserving its stable
+/// `claim.*` / delegated wire code and its (secret-free) display message.
+fn claim_error_envelope(err: &ClaimError) -> Envelope<()> {
+    Envelope::<()>::err_raw(err.code(), err.to_string())
+}
+
+/// Writes `outcome` to `out` per `format` and returns the exit code.
+///
+/// JSON output is one envelope: the success data carries the preview at
+/// `data.preview`, a failure after the preview carries it at
+/// `error.details.preview`. Table output prints the preview line before the
+/// result or error line. Output that cannot be written or flushed exits `1`
+/// with the failure on stderr, whatever the outcome.
+fn render_claim_outcome(out: &mut dyn Write, format: OutputFormat, outcome: ClaimOutcome) -> i32 {
+    let ClaimOutcome { preview, result } = outcome;
+    let exit_code = if result.is_ok() { 0 } else { 1 };
+    if format == OutputFormat::Table {
+        return exit_code_after_output(
+            render_claim_table(out, preview.as_ref(), &result),
+            exit_code,
+        );
+    }
+    let preview = preview.as_ref().map(claim_preview_view);
+    match result {
+        Ok(result) => write_envelope(
+            out,
+            &Envelope::ok(WithPreview { result, preview }),
+            exit_code,
+        ),
+        Err(envelope) => {
+            let envelope = match preview {
+                Some(preview) => with_preview_detail(envelope, preview),
+                None => envelope,
+            };
+            write_envelope(out, &envelope, exit_code)
+        }
+    }
+}
+
+/// The typed preview as the nested `preview` object of the output envelope.
+fn claim_preview_view(preview: &ClaimPreview) -> serde_json::Value {
+    serde_json::json!({
         "balance_id_hex72": &preview.balance_id_hex72,
         "balance_id_strkey": &preview.balance_id_strkey,
         "asset_code": &preview.asset_code,
@@ -1271,71 +1361,60 @@ fn render_preview(preview: &ClaimPreview, format: OutputFormat) {
         "predicate_satisfied": preview.predicate_satisfied,
         "window": &preview.window,
         "clawback_enabled": preview.clawback_enabled,
-    }));
-    match format {
-        OutputFormat::Table => {
-            #[allow(clippy::print_stdout, reason = "CLI binary intentional user output")]
-            {
-                println!(
-                    "[preview] balance {}  asset {}  amount {}  is_claimant {}",
-                    preview.balance_id_strkey,
-                    preview.asset_code.as_deref().unwrap_or("XLM"),
-                    preview.amount_display,
-                    preview.is_claimant
-                );
-            }
-        }
-        _ => render_json(&envelope),
+    })
+}
+
+/// Writes the table form of `result`, after the preview line when a preview
+/// was computed, and flushes it.
+///
+/// # Errors
+///
+/// Returns the I/O error when a line cannot be written or the output cannot
+/// be flushed.
+fn render_claim_table(
+    out: &mut dyn Write,
+    preview: Option<&ClaimPreview>,
+    result: &Result<ClaimResult, Envelope<()>>,
+) -> std::io::Result<()> {
+    let mut lines = Vec::new();
+    if let Some(preview) = preview {
+        lines.push(format!(
+            "[preview] balance {}  asset {}  amount {}  is_claimant {}",
+            preview.balance_id_strkey,
+            preview.asset_code.as_deref().unwrap_or("XLM"),
+            preview.amount_display,
+            preview.is_claimant
+        ));
     }
-}
-
-/// Builds an error envelope from a [`ClaimError`], preserving its stable
-/// `claim.*` / delegated wire code and its (secret-free) display message.
-fn claim_error_envelope(err: &ClaimError) -> Envelope<()> {
-    Envelope::<()>::err_raw(err.code(), err.to_string())
-}
-
-fn print_success(envelope: &Envelope<ClaimResult>, format: OutputFormat) {
-    match format {
-        OutputFormat::Table =>
-        {
-            #[allow(clippy::print_stdout, reason = "CLI binary intentional user output")]
-            if let Some(result) = &envelope.data {
-                match (&result.tx_hash, &result.ledger) {
-                    (Some(hash), Some(ledger)) => {
-                        use stellar_agent_network::submit::redact_tx_hash;
-                        println!(
-                            "Claim submitted: tx_hash {}  ledger {}",
-                            redact_tx_hash(hash),
-                            ledger
-                        );
-                    }
-                    _ => {
-                        let prefix: String = result.envelope_xdr.chars().take(32).collect();
-                        println!(
-                            "[{}] envelope_xdr (first 32 chars): {}...",
-                            result.stage, prefix
-                        );
-                    }
-                }
+    match result {
+        Ok(result) => match (&result.tx_hash, &result.ledger) {
+            (Some(hash), Some(ledger)) => {
+                use stellar_agent_network::submit::redact_tx_hash;
+                lines.push(format!(
+                    "Claim submitted: tx_hash {}  ledger {}",
+                    redact_tx_hash(hash),
+                    ledger
+                ));
             }
-        }
-        _ => render_json(envelope),
-    }
-}
-
-fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
-    match format {
-        OutputFormat::Table =>
-        {
-            #[allow(clippy::print_stdout, reason = "CLI binary intentional user output")]
+            _ => {
+                let prefix: String = result.envelope_xdr.chars().take(32).collect();
+                lines.push(format!(
+                    "[{}] envelope_xdr (first 32 chars): {}...",
+                    result.stage, prefix
+                ));
+            }
+        },
+        Err(envelope) => {
             if let Some(err) = &envelope.error {
                 let safe_msg = sanitize_for_table(&err.message);
-                println!("Error: {} — {}", err.code, safe_msg);
+                lines.push(format!("Error: {} — {}", err.code, safe_msg));
             }
         }
-        _ => render_json(envelope),
     }
+    for line in &lines {
+        writeln!(out, "{line}")?;
+    }
+    out.flush()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1571,6 +1650,7 @@ mod tests {
                 )
             },
             || panic!("mainnet must not initialize the keyring"),
+            &mut std::io::sink(),
         )
         .await;
         assert_eq!(exit, 1, "mainnet must exit with code 1");
@@ -1611,6 +1691,7 @@ mod tests {
                 )
             },
             || panic!("network mismatch must not initialize the keyring"),
+            &mut std::io::sink(),
         )
         .await;
         assert_eq!(exit, 1, "mainnet must exit with code 1");
@@ -1677,6 +1758,7 @@ mod tests {
                     name: "keyring-order-test-sentinel".to_owned(),
                 }))
             },
+            &mut std::io::sink(),
         )
         .await;
 
@@ -1730,6 +1812,7 @@ mod tests {
                 init_writer.store(true, Ordering::SeqCst);
                 Ok(())
             },
+            &mut std::io::sink(),
         )
         .await;
 
@@ -1745,7 +1828,8 @@ mod tests {
 
     // ── init_keyring_for_origin: origin-aware keyring-init failure ────────────
     //
-    // `init_keyring_for_origin` backs `run_sign_only` / `run_submit_only`.
+    // `init_keyring_for_origin` backs `run_sign_only`, `run_submit_only`, and
+    // `run_full_pipeline`.
     // These tests call it directly (sync, no RPC or gate involved), because
     // the Synthesized/Persisted split is the whole behavior under test. A
     // direct call pins it without the RPC-mocked surface of a full
@@ -1779,7 +1863,7 @@ mod tests {
             )
         })
         .expect("profile");
-        let result = init_keyring_for_origin(&args, &resolved, origin, || {
+        let result = init_keyring_for_origin(&resolved, origin, || {
             Err(WalletError::Auth(AuthError::KeyringNotFound {
                 name: "init-keyring-for-origin-synthesized-sentinel".to_owned(),
             }))
@@ -1815,6 +1899,7 @@ mod tests {
                 init_invoked.set(true);
                 Ok(())
             },
+            &mut std::io::sink(),
         )
         .await;
         assert_eq!(code, 1, "a named-but-missing profile must refuse");
@@ -1824,11 +1909,11 @@ mod tests {
         );
     }
 
-    /// A [`ProfileOrigin::Persisted`] profile must refuse (`Err(1)`) when the
-    /// platform keyring store fails to initialise: an operator who authored a
-    /// profile file is expected to have a working platform keyring for both
-    /// the fail-closed audit pre-flight and the keyring-backed owner-key
-    /// read, so this failure stays fatal.
+    /// A [`ProfileOrigin::Persisted`] profile must refuse with the keyring
+    /// error's envelope when the platform keyring store fails to initialize.
+    /// An operator who authored a profile file is expected to have a working
+    /// platform keyring for the fail-closed audit pre-flight and the
+    /// keyring-backed owner-key read, so this failure stays fatal.
     #[test]
     #[serial_test::serial]
     fn init_keyring_for_origin_persisted_fails_on_init_failure() {
@@ -1848,15 +1933,16 @@ mod tests {
             .build())
         })
         .expect("profile");
-        let result = init_keyring_for_origin(&args, &resolved, origin, || {
+        let result = init_keyring_for_origin(&resolved, origin, || {
             Err(WalletError::Auth(AuthError::KeyringNotFound {
                 name: "init-keyring-for-origin-persisted-sentinel".to_owned(),
             }))
         });
         match result {
-            Err(code) => assert_eq!(
-                code, 1,
-                "a persisted profile must refuse with exit code 1 when the platform \
+            Err(envelope) => assert_eq!(
+                envelope.error.as_ref().map(|e| e.code.as_str()),
+                Some("auth.keyring_not_found"),
+                "a persisted profile must refuse with the keyring error when the platform \
                  keyring store cannot be initialised"
             ),
             Ok(_) => panic!(
@@ -2103,46 +2189,14 @@ mod tests {
             std::env::set_var(var, enrolled_test_secret());
         }
         let mut profile = enrolled_mainnet_profile(pin);
-        use stellar_xdr::{
-            ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceEntryExt, Claimant, ClaimantV0,
-            LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance,
-        };
-        let server = wiremock::MockServer::start().await;
-        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0xab; 32]));
-        let claim_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
-            balance_id: balance_id.clone(),
-        })
-        .to_xdr_base64(Limits::none())
-        .expect("key");
-        let entry = ClaimableBalanceEntry {
-            balance_id,
-            claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
-                destination: g_to_account_id(&g),
-                predicate: ClaimPredicate::Unconditional,
-            })]
-            .try_into()
-            .expect("claimants"),
-            asset: stellar_xdr::Asset::Native,
-            amount: 100_000_000,
-            ext: ClaimableBalanceEntryExt::V0,
-        };
-        let claim_xdr = LedgerEntryData::ClaimableBalance(entry)
-            .to_xdr_base64(Limits::none())
-            .expect("claim XDR");
-        let account_xdr = enrolled_account_xdr(&g);
-        wiremock::Mock::given(wiremock::matchers::method("POST")).respond_with(move |request: &wiremock::Request| {
-            let value: serde_json::Value = serde_json::from_slice(&request.body).expect("RPC JSON");
-            let key = value["params"]["keys"][0].as_str().expect("ledger key");
-            let xdr = if key == claim_key { &claim_xdr } else { &account_xdr };
-            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc": "2.0", "id": value["id"], "result": {"entries": [{"key": key, "xdr": xdr, "lastModifiedLedgerSeq": 1000}], "latestLedger": 1001}}))
-        }).mount(&server).await;
+        let server = mount_claim_rpc(&g).await;
         profile.rpc_url = server.uri();
         let context = NetworkContext::from_profile(&profile);
         let mut args = minimal_args();
         args.source = g;
         args.secret_env = Some(var.into());
         args.fee = Some("100".into());
-        args.balance_id = "ab".repeat(32);
+        args.balance_id = CLAIM_RPC_BALANCE_HEX64.to_owned();
         let built = build_unsigned_envelope(&context, &args)
             .await
             .expect("build against mock");
@@ -2170,6 +2224,253 @@ mod tests {
     #[serial_test::serial]
     async fn enrolled_signing_mismatch() {
         enrolled_signing_case(EnrolledPin::Other).await;
+    }
+
+    /// The 64-hex hash of the claimable balance [`mount_claim_rpc`] serves.
+    const CLAIM_RPC_BALANCE_HEX64: &str =
+        "abababababababababababababababababababababababababababababababab";
+
+    /// Starts an RPC mock whose `getLedgerEntries` serves an unconditional
+    /// 10 XLM claimable balance for `claimant` and a funded `claimant`
+    /// account. Every other method gets an empty result.
+    async fn mount_claim_rpc(claimant: &str) -> wiremock::MockServer {
+        use stellar_xdr::{
+            ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceEntryExt, Claimant, ClaimantV0,
+            LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance,
+        };
+        let server = wiremock::MockServer::start().await;
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0xab; 32]));
+        let claim_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+            balance_id: balance_id.clone(),
+        })
+        .to_xdr_base64(Limits::none())
+        .expect("key");
+        let entry = ClaimableBalanceEntry {
+            balance_id,
+            claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+                destination: g_to_account_id(claimant),
+                predicate: ClaimPredicate::Unconditional,
+            })]
+            .try_into()
+            .expect("claimants"),
+            asset: stellar_xdr::Asset::Native,
+            amount: 100_000_000,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        let claim_xdr = LedgerEntryData::ClaimableBalance(entry)
+            .to_xdr_base64(Limits::none())
+            .expect("claim XDR");
+        let account_xdr = enrolled_account_xdr(claimant);
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("RPC JSON");
+                let result = match value["params"]["keys"][0].as_str() {
+                    Some(key) if value["method"] == "getLedgerEntries" => {
+                        let xdr = if key == claim_key {
+                            &claim_xdr
+                        } else {
+                            &account_xdr
+                        };
+                        serde_json::json!({
+                            "entries": [{"key": key, "xdr": xdr, "lastModifiedLedgerSeq": 1000}],
+                            "latestLedger": 1001,
+                        })
+                    }
+                    _ => serde_json::json!({}),
+                };
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": value["id"],
+                    "result": result,
+                }))
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The JSON-RPC methods `server` received, in order.
+    async fn received_methods(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .expect("request recording")
+            .iter()
+            .filter_map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .ok()
+                    .and_then(|body| body["method"].as_str().map(str::to_owned))
+            })
+            .collect()
+    }
+
+    /// Arguments for claiming the balance [`mount_claim_rpc`] serves at
+    /// `server`, under a persisted `Noop` profile.
+    fn one_envelope_args(server: &wiremock::MockServer, fee: &str) -> ClaimArgs {
+        let mut args = minimal_args();
+        args.profile = Some("claim-one-envelope".to_owned());
+        args.balance_id = CLAIM_RPC_BALANCE_HEX64.to_owned();
+        args.fee = Some(fee.to_owned());
+        args.rpc_url = Some(server.uri());
+        args
+    }
+
+    /// Loads a persisted `Noop`-engine testnet profile under the requested
+    /// name.
+    fn noop_profile(
+        name: &str,
+    ) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError> {
+        Ok(Profile::builder_testnet_named(
+            name,
+            "stellar-agent-signer",
+            name,
+            "stellar-agent-nonce",
+            name,
+        )
+        .policy_engine(PolicyEngineKind::Noop)
+        .build())
+    }
+
+    /// A successful `--build-only` claim prints exactly one JSON document:
+    /// the result envelope, with the preview nested at `data.preview`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_built_claim_prints_one_envelope_with_the_preview_in_data() {
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let server = mount_claim_rpc(SOURCE_G).await;
+        let mut args = one_envelope_args(&server, "100");
+        args.build_only = true;
+        let mut out = Vec::new();
+        let code = run_with_dependencies(&args, noop_profile, || Ok(()), &mut out).await;
+
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+        let envelope = crate::common::render::single_json_document(&out);
+        assert_eq!(envelope["ok"], true, "{envelope}");
+        let data = &envelope["data"];
+        assert_eq!(data["stage"], "build", "{envelope}");
+        assert!(
+            data["envelope_xdr"].as_str().is_some_and(|x| !x.is_empty()),
+            "{envelope}"
+        );
+        let balance_id_hex72 = format!("00000000{CLAIM_RPC_BALANCE_HEX64}");
+        assert_eq!(data["balance_id_hex72"], balance_id_hex72, "{envelope}");
+        assert_eq!(
+            data["preview"]["balance_id_hex72"], balance_id_hex72,
+            "{envelope}"
+        );
+        assert_eq!(data["preview"]["is_claimant"], true, "{envelope}");
+        assert_eq!(data["preview"]["amount_stroops"], "100000000", "{envelope}");
+        assert!(data["preview"].get("stage").is_none(), "{envelope}");
+    }
+
+    /// A failure after the preview prints exactly one JSON document: the
+    /// error envelope, with the preview nested at `error.details.preview`.
+    ///
+    /// `--fee bogus` passes the entry fetch, the preview, and the claim
+    /// guards against the mock, then fails at the fee parse, before the
+    /// fee-statistics request, signing, or any submission.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failure_after_the_preview_prints_one_envelope_with_the_preview_in_details() {
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let server = mount_claim_rpc(SOURCE_G).await;
+        let args = one_envelope_args(&server, "bogus");
+        let mut out = Vec::new();
+        let code = run_with_dependencies(&args, noop_profile, || Ok(()), &mut out).await;
+
+        assert_eq!(code, 1, "{}", String::from_utf8_lossy(&out));
+        let envelope = crate::common::render::single_json_document(&out);
+        assert_eq!(envelope["ok"], false, "{envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "validation.amount_malformed",
+            "{envelope}"
+        );
+        let preview = &envelope["error"]["details"]["preview"];
+        assert_eq!(
+            preview["balance_id_hex72"],
+            format!("00000000{CLAIM_RPC_BALANCE_HEX64}"),
+            "{envelope}"
+        );
+        assert_eq!(preview["is_claimant"], true, "{envelope}");
+        let methods = received_methods(&server).await;
+        assert!(
+            methods.iter().all(|m| m == "getLedgerEntries"),
+            "the fee parse fails before any later request: {methods:?}"
+        );
+    }
+
+    /// A failure before the preview prints one envelope without a preview.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failure_before_the_preview_prints_one_envelope_without_a_preview() {
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let server = mount_claim_rpc(SOURCE_G).await;
+        let mut args = one_envelope_args(&server, "100");
+        args.balance_id = "not-a-balance-id".to_owned();
+        let mut out = Vec::new();
+        let code = run_with_dependencies(&args, noop_profile, || Ok(()), &mut out).await;
+
+        assert_eq!(code, 1);
+        let envelope = crate::common::render::single_json_document(&out);
+        assert_eq!(
+            envelope["error"]["code"], "claim.invalid_balance_id",
+            "{envelope}"
+        );
+        assert!(envelope["error"].get("details").is_none(), "{envelope}");
+    }
+
+    /// A successful claim whose output cannot be written or flushed exits
+    /// `1`, in JSON and in table output: the result never reached the caller.
+    #[test]
+    fn a_successful_claim_whose_output_fails_exits_one() {
+        use crate::common::render::FailingWriter;
+        let built = || {
+            ClaimOutcome::succeeded(
+                None,
+                ClaimResult {
+                    envelope_xdr: "AAAA".to_owned(),
+                    tx_hash: None,
+                    ledger: None,
+                    stage: "build".to_owned(),
+                    balance_id_hex72: None,
+                },
+            )
+        };
+        for format in [OutputFormat::Json, OutputFormat::Table] {
+            for mut writer in [FailingWriter::Write, FailingWriter::Flush] {
+                let code = render_claim_outcome(&mut writer, format, built());
+                assert_eq!(code, 1, "{format:?} {writer:?}");
+            }
+            assert_eq!(
+                render_claim_outcome(&mut Vec::new(), format, built()),
+                0,
+                "{format:?}"
+            );
+        }
+    }
+
+    /// Table output prints the preview line, then the error line, for a
+    /// failure after the preview.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn table_output_prints_the_preview_line_before_the_error_line() {
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let server = mount_claim_rpc(SOURCE_G).await;
+        let mut args = one_envelope_args(&server, "bogus");
+        args.output = OutputFormat::Table;
+        let mut out = Vec::new();
+        let code = run_with_dependencies(&args, noop_profile, || Ok(()), &mut out).await;
+
+        assert_eq!(code, 1);
+        let text = String::from_utf8(out).expect("UTF-8 table output");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].starts_with("[preview] balance B"), "{text}");
+        assert!(
+            lines[1].starts_with("Error: validation.amount_malformed"),
+            "{text}"
+        );
     }
 
     fn enrolled_account_xdr(account_id: &str) -> String {
