@@ -40,7 +40,9 @@ jobs:
   preflight:
     name: preflight
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The crates.io check paces one request per publishable member, up to 30 s
+    # each, so a hanging crates.io needs more than 15 min with the other steps.
+    timeout-minutes: 30
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -69,6 +71,9 @@ jobs:
 
       - name: Refuse a tag whose commit is not on main
         run: .github/scripts/check-ref-on-main.sh "$GITHUB_SHA"
+
+      - name: Warn when a workspace member is missing on crates.io
+        run: .github/scripts/check-crates-exist.sh --warn
 
       - name: Verify tag matches workspace version
         env:

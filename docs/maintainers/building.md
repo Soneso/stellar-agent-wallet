@@ -170,6 +170,7 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    names.
 4. The self-tests, in filename order. Each runs when the file it tests or the
    self-test itself changes:
+   - `test-check-crates-exist.sh`: `check-crates-exist.sh`
    - `test-check-docs-style.py`: `check-docs-style.py`
    - `test-check-gate-tool-versions.sh`: `check-gate-tool-versions.sh`
    - `test-check-install-surface.py`: `check-install-surface.py`

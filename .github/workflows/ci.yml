@@ -193,6 +193,8 @@ jobs:
         run: bash .github/scripts/test-check-no-direct-sasignersetbaselined-emit.sh
       - name: Self-test the ref-on-main check
         run: bash .github/scripts/test-check-ref-on-main.sh
+      - name: Self-test the crates.io existence check
+        run: bash .github/scripts/test-check-crates-exist.sh
       - name: Self-test the publish verification
         run: bash .github/scripts/test-publish-crates-verify.sh
       - name: Self-test the crate checksum comparison
