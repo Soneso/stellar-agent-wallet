@@ -108,8 +108,11 @@ Every run includes the three always gates: `docs-style`, `install-surface`,
 and `gate-tool-versions`. Each path selects the gates of every scope class it
 matches:
 
-- The docs scope adds no gates beyond the three always gates. Directory scopes
-  also apply to Markdown files.
+- A file that the install surface check reads, as its `is_scanned` function
+  decides, selects that check's self-test, which injects violations into
+  copies of those files. A deleted path counts too.
+- Any other docs file adds no gates beyond the three always gates. Directory
+  scopes also apply to Markdown files.
 - A workflow under `.github/workflows/`, a file under `.github/actions/`, or
   `.github/labels.yml` selects `actionlint`.
 - A file under `.github/scripts/` selects the self-test of the script it
@@ -118,8 +121,8 @@ matches:
 - A file under `crates/`, `tests/`, or `examples/`, or a root `Cargo.toml`,
   `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`, `Cross.toml`, or
   `deny.toml`, selects the Rust gates.
-- A file under `interop/` selects only the three always gates, since the
-  interop harnesses run under `--full`.
+- A file under `interop/` adds no gate of its own, since the interop
+  harnesses run under `--full`.
 
 The test gate runs `cargo test` for the packages that own the changed Rust
 paths, in path order, followed by their direct dependents, sorted by name. A
@@ -156,7 +159,8 @@ A gate that ran reads `exit <n>`. The two interop harnesses read `not run`
 without `--full`, and so do the coverage floors when the coverage run failed or
 was unavailable. The script exits 0 when no gate failed and none was
 unavailable, and 1 otherwise. It exits 2 for a usage error, a missing
-prerequisite, a base without a merge base, or an unreadable workspace manifest.
+prerequisite, a base without a merge base, an unreadable workspace manifest,
+or, without `--full`, an install surface check that Python cannot load.
 
 The registry, in run order, with what selects each gate. `--full` selects every
 gate except `shellcheck-changed`, which needs a changed shell script.
@@ -173,7 +177,8 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    - `test-check-crates-exist.sh`: `check-crates-exist.sh`
    - `test-check-docs-style.py`: `check-docs-style.py`
    - `test-check-gate-tool-versions.sh`: `check-gate-tool-versions.sh`
-   - `test-check-install-surface.py`: `check-install-surface.py`
+   - `test-check-install-surface.py`: `check-install-surface.py`, or a file
+     that check reads
    - `test-check-no-direct-sasignersetbaselined-emit.sh`:
      `check-no-direct-sasignersetbaselined-emit.sh`
    - `test-check-ref-on-main.sh`: `check-ref-on-main.sh`

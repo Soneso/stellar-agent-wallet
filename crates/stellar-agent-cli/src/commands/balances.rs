@@ -27,7 +27,7 @@ use crate::render::table::render_balances_table;
 /// Arguments for the `balances` subcommand.
 #[derive(Debug, Args)]
 pub struct BalancesArgs {
-    /// Override the active profile and query this G-strkey account instead.
+    /// Required G-strkey account to query.
     #[arg(long, value_name = "G_STRKEY")]
     pub account: Option<String>,
 

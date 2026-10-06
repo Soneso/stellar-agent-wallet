@@ -68,8 +68,8 @@ pub enum ProfileSubcommand {
     Init(init::InitArgs),
     /// List known profile names.
     ///
-    /// Reads the OS-conventional profile directory and prints one profile
-    /// name per line.
+    /// Reads the OS-conventional profile directory and prints a JSON envelope
+    /// containing an alphabetically sorted array of profile names.
     List(list::ListArgs),
     /// Print a profile's resolved configuration.
     ///
@@ -121,8 +121,9 @@ pub enum ProfileSubcommand {
     /// Rotate the hash-chain audit-log chain-root HMAC key for a profile.
     ///
     /// Generates 32 bytes from `OsRng` and stores them in the platform
-    /// keyring entry for `audit_log_hash_chain_key_id`.  New audit log files
-    /// opened after rotation use the new key for their chain-root signature.
+    /// keyring entry for `audit_log_hash_chain_key_id`. Re-signs every existing
+    /// per-file chain-root sidecar with the new key while holding the audit
+    /// writer's exclusive lock. New audit log files use the new key too.
     RotateAuditKey(rotate_audit_key::RotateAuditKeyArgs),
     /// Rotate the `stellar.toml` cache-integrity HMAC key for a profile.
     ///

@@ -50,7 +50,9 @@ Rule 2, version pins. In the scanned Markdown, each of these equals
 - the version of `stellar-agent-cli@<semver>` and `stellar-agent-mcp@<semver>`;
 - the tag of `git clone ... --branch v<semver>`, `--branch=v<semver>`, or
   `-b v<semver>`;
-- the tag of `releases/download/v<semver>/stellar-agent-`.
+- the tag of each `releases/download/v<semver>`, whatever follows it: an
+  archive name, `/SHA256SUMS`, or the quote that closes a base URL. The tag
+  is the longest semver after the `v`.
 A name `stellar-agent-<semver>...`, such as a release archive, starts with
 `stellar-agent-<version>` and ends there or continues with `.`, or with `-` and
 then a placeholder or the architecture of a release target. A prerelease may
@@ -152,7 +154,7 @@ CRATE_PIN = re.compile(r"(?<![\w-])stellar-agent-(?:cli|mcp)@(" + SEMVER + r")")
 CLONE_PIN = re.compile(
     r"(?<![\w-])git\s+clone\b[^\n]*?(?:--branch[=\s]+|(?<![\w-])-b\s+)v(" + SEMVER + r")"
 )
-RELEASE_TAG = re.compile(r"releases/download/v(" + SEMVER + r")/stellar-agent-")
+RELEASE_TAG = re.compile(r"releases/download/v(" + SEMVER + r")")
 VERSIONED_NAME = re.compile(r"(?<![\w-])stellar-agent-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z_.-]*)")
 # The architectures of the release targets in `.github/workflows/release.yml`.
 RELEASE_ARCHITECTURES = ("x86_64", "aarch64")
@@ -227,6 +229,22 @@ def fail_to_run(message: str) -> NoReturn:
     sys.exit(2)
 
 
+def is_scanned(path: str) -> bool:
+    """Whether the check reads PATH, relative to ROOT, when Git tracks it.
+
+    preflight.sh selects the self-test of this check when a changed path
+    passes, so the self-test runs whenever a file it injects into changes.
+    """
+    if path == "Cargo.toml" or path in WALLET_MANIFESTS:
+        return True
+    if not path.endswith(".md") or path == "CHANGELOG.md":
+        return False
+    parts = path.split("/")
+    if len(parts) > 3 and parts[0] == "crates" and parts[2] == "vendor":
+        return False
+    return not (len(parts) > 4 and parts[0] == "crates" and parts[2:4] == ["tests", "fixtures"])
+
+
 def scanned_markdown(root: pathlib.Path) -> list[str]:
     """Return the tracked Markdown paths the check reads, relative to ROOT."""
     try:
@@ -237,20 +255,8 @@ def scanned_markdown(root: pathlib.Path) -> list[str]:
         )
     except (OSError, subprocess.CalledProcessError) as error:
         fail_to_run(f"git ls-files failed in {root}: {error}")
-    paths = []
-    for raw in result.stdout.split(b"\0"):
-        if not raw:
-            continue
-        path = raw.decode("utf-8")
-        parts = path.split("/")
-        if path == "CHANGELOG.md":
-            continue
-        if len(parts) > 3 and parts[0] == "crates" and parts[2] == "vendor":
-            continue
-        if len(parts) > 4 and parts[0] == "crates" and parts[2:4] == ["tests", "fixtures"]:
-            continue
-        paths.append(path)
-    return sorted(paths)
+    paths = (raw.decode("utf-8") for raw in result.stdout.split(b"\0") if raw)
+    return sorted(path for path in paths if is_scanned(path))
 
 
 def scanned_files(root: pathlib.Path) -> list[str]:

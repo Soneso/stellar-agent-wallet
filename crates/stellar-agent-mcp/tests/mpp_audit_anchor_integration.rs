@@ -423,12 +423,9 @@ fn row_count(path: &std::path::Path) -> usize {
 /// audit log is truncated underneath the writer the running server holds, and
 /// appends nothing.
 ///
-/// The registry caches one writer per profile for the server's lifetime, so a
-/// check made only when that writer was opened would cover the first commit and
-/// nothing after it. This drives two full charges: the first succeeds and leaves
-/// the anchor naming the log, the log is then truncated on disk, and the second
-/// must withhold its credential rather than append its authorization row to a
-/// log that no longer contains the tip it anchored.
+/// The first charge leaves a cached writer and an anchor naming the log.
+/// Truncation on disk must make the second charge withhold its credential
+/// because the log no longer contains the anchored tip.
 #[tokio::test]
 #[serial]
 async fn mpp_charge_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_back() {

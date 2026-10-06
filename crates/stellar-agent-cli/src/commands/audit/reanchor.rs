@@ -70,10 +70,12 @@
 //!
 //! # Concurrency
 //!
-//! Repair takes the audit writer's exclusive sidecar lock. A running MCP server
-//! holds that lock for its lifetime, so this verb refuses with
-//! `audit.writer_locked` while the server is up. Stop the server, repair, start
-//! it again.
+//! Repair takes the audit writer's exclusive sidecar lock. While an MCP server
+//! holds that profile's writer, this verb refuses with `audit.writer_locked`.
+//! Stop that server, repair, and start it again. The server acquires its writer
+//! when needed, including for V1 reservation reconciliation during simulation.
+//! The registry normally retains it until exit. A replaced-file refusal during acquisition marks
+//! it for eviction; a later acquisition drops it once callers release it.
 //!
 //! # Exit codes
 //!

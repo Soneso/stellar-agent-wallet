@@ -574,9 +574,13 @@ impl std::fmt::Display for KeyPurpose {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EventKind {
-    /// Standard per-tool audit entry (the common case).
+    /// Generic invocation entry written by explicit emission sites.
     ///
-    /// Produced by every signing tool invocation — simulate, commit, approve.
+    /// The CLI `mpp state prune` command emits this before pruning.
+    /// Transaction submissions, signed authorizations, approvals, and lifecycle
+    /// changes use their dedicated event kinds at their emission sites.
+    /// MCP payment simulation can trigger reconciliation and settlement rows;
+    /// it produces no automatic `ToolInvocation` row.
     ToolInvocation,
 
     /// A fail-closed executable policy plugin was invoked.

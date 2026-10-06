@@ -31,13 +31,12 @@
 //!
 //! # Policy engine
 //!
-//! Uses the shared `commands::policy_engine::build_v1_policy_engine` builder,
-//! same as `lend.rs` / `vault.rs` / `trade.rs`, and gates via the shared
-//! `evaluate_value_moving_policy` args-path helper (the `Trustline` leg is
-//! derived from `policy_args` by `derive_value_class` — no typed leg builder
-//! is needed for this verb).  `policy_args` is built by
-//! `commands::policy_engine::trustline_policy_args`, matching the MCP
-//! `stellar_trustline` twin's `{from, asset}` dispatch fields.
+//! Uses `commands::policy_engine::build_v1_policy_engine`, shared with the
+//! `vault` and `trade` CLI commands. Policy evaluation uses
+//! `evaluate_value_moving_policy`; `derive_value_class` derives the `Trustline`
+//! leg from `policy_args`. `commands::policy_engine::trustline_policy_args`
+//! builds those arguments with the MCP `stellar_trustline` tool's `{from, asset}`
+//! dispatch fields.
 //! `account_view` is the fetched source account; `identity_view` is `None`
 //! (the issuer's on-chain `home_domain` is self-asserted and must not feed
 //! allowlist matching, so identity-class criteria configured on this verb

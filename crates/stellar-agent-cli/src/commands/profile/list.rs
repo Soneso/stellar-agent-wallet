@@ -1,7 +1,7 @@
 //! `stellar-agent profile list` — list known profile names.
 //!
-//! Reads the OS-conventional profile directory and prints one profile name per
-//! line in JSON envelope format.
+//! Reads the OS-conventional profile directory and prints a JSON envelope
+//! containing an alphabetically sorted array of profile names.
 //!
 //! # Output
 //!

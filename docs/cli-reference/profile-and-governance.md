@@ -29,7 +29,7 @@ The `profile` group creates, lists, shows, and migrates profiles, and rotates th
 
 The seven key-writing commands — `enroll-signer`, `enroll-owner-key`, and the five key-rotation subcommands — each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `reset-window-state` writes the same row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
 
-Every `profile` subcommand accepts a `--profile <NAME>` flag. For `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, and `reset-mpp-state` it is an alternative to the positional `<NAME>`: supply exactly one of the positional `<NAME>` or `--profile <NAME>` (supplying both, or neither, is a usage error), with no default. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
+`profile list` lists all profile names and takes no profile selector. Every other `profile` subcommand accepts `--profile <NAME>`. For `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, and `reset-mpp-state`, supply exactly one positional `<NAME>` or `--profile <NAME>`. These commands require an explicit selection. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
 
 The name itself becomes a path component and is validated before any path is built — charset, length, no leading `-`, and no Windows reserved device name. The rules and the recovery path for a file that already carries a refused name are in [Profile names](../profiles.md#profile-names).
 
@@ -46,7 +46,7 @@ State-changing (writes the profile file; no network, no keyring). Creates and pe
 - `--profile <NAME>`: profile name to create (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
 - `--network <testnet|mainnet>` — target network (default `testnet`).
 - `--rpc-url <URL>`: optional on testnet, where an omitted value takes the testnet endpoint; required with `--network mainnet`, which has no default endpoint. The URL must use `http` or `https`, and `https` on mainnet. The flag parser refuses credentials.
-- `--engine <v1|noop>` — policy engine (default `v1`). `v1` is the default for newly-minted profiles (see the `[policy]` block in [profiles.md](../profiles.md)). A v1 profile refuses MCP-server startup and policy-gated dispatch until the V1 ceremony completes. The normative ceremony, in order, is: `profile enroll-owner-key`, `profile rotate-attestation-key`, then `profile sign-policy` (on top of `rotate-audit-key`, required on every engine — see below) — `next_steps` in the success payload mirrors it. `--engine noop` is the zero-ceremony testnet opt-out: the profile works immediately under the Noop engine (testnet allow, mainnet read-only), once the audit key is minted.
+- `--engine <v1|noop>`: policy engine (default `v1`). See the `[policy]` block in [profiles.md](../profiles.md). On a V1 profile, the MCP server starts once the owner key is enrolled and the owner-signed policy loads; the rest of the [V1 setup](../profiles.md#opt-in-to-v1) gates approvals and signing. The `next_steps` commands are `profile enroll-owner-key`, `profile rotate-attestation-key`, then `profile sign-policy`. [Create the policy file](../profiles.md#create-the-v1-policy-file) before signing it. A testnet `noop` profile supports server startup and read access immediately. Run `profile rotate-nonce-key` before MCP payment simulation. Before MCP signing, mint the audit key with `profile rotate-audit-key` and enroll the signer with `profile enroll-signer`.
 
 The signer and nonce keyring coordinates are named `stellar-agent-signer-<name>` / `stellar-agent-nonce-<name>`, each seeded with the placeholder account `"default"` — the signer's eventual G-strkey is not known until a seed is enrolled (see `profile enroll-signer` below). The five security-substrate references (`audit_log_hash_chain_key_id`, `policy_owner_key_id`, `attestation_key_id`, `counterparty_cache_key_id`, `policy_window_state_key_id`) are derived from the profile name the same way `profile migrate` derives them.
 
@@ -73,7 +73,7 @@ Each exits `1` and writes nothing. A failed write (I/O error, unwritable directo
 stellar-agent profile list
 ```
 
-Read-only. Reads the OS-conventional profile directory and returns the known profile names, sorted, as a JSON array. Takes no flags.
+Read-only. Reads the OS-conventional profile directory and returns the known profile names, sorted, as a JSON array. Takes no profile selector.
 
 ```json
 {"ok":true,"data":["default","mainnet-ops"],"request_id":"..."}
@@ -132,7 +132,14 @@ stellar-agent profile enroll-signer --profile default --secret-env WALLET_SK
 unset WALLET_SK
 ```
 
-Imports an operator-held ed25519 seed into the profile's `mcp_signer_default` keyring entry — the signer every MCP fund-movement tool and every keyring-signing CLI verb (`trustline`, `lend`, `trade`, `vault`) resolves. On a clean install that entry is absent and those paths fail with `auth.keyring_not_found`; this command is the way to populate it. State-changing (keyring; also the profile TOML the first time a profile enrolls a signer — see below), no network. The seed is read from a named environment variable through the shared mlock-protected ceremony and stored verbatim; it is never printed, logged, or returned.
+Imports an operator-held ed25519 seed into the profile's `mcp_signer_default`
+keyring entry. MCP fund-movement tools and keyring-signing CLI verbs
+(`trustline`, `trade`, `vault`) resolve this signer. On a clean install that
+entry is absent, so those paths fail with `auth.keyring_not_found`.
+This command populates the entry and updates the profile TOML on first signer
+enrollment, without network access. It reads the seed from a named environment
+variable through the shared mlock-protected ceremony and stores it verbatim.
+The seed is never printed, logged, or returned.
 
 - `--secret-env <VAR>` (required) — name of the environment variable holding the signer's `S...` strkey. The flag takes the variable name, never the secret.
 - `--profile <NAME>`: profile whose `mcp_signer_default` entry is written (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
@@ -145,7 +152,14 @@ The coordinate's `account` field is the signer identity: `signer_from_keyring` v
 {"ok":true,"data":{"profile":"default","enrolled":true,"public_address":"G...","keyring_service":"stellar-agent-signer-default","keyring_account":"G...","replaced":false,"account_populated":true},"request_id":"..."}
 ```
 
-Exits `1` with `ProfileNotFound` if the profile does not exist, `enroll_signer.account_identity_mismatch` if the seed does not match a pinned signer account, `enroll_signer.account_malformed` if the stored account is neither the placeholder nor a valid G-strkey, `enroll_signer.expected_address_mismatch` if `--expected-address` does not match, `enroll_signer.entry_exists` if an entry exists without `--force`, or a keyring error if the platform keyring is unavailable.
+Exits `1` on refusal:
+
+- `validation.profile_not_found`: the profile does not exist.
+- `enroll_signer.account_identity_mismatch`: the seed does not match a pinned signer account.
+- `enroll_signer.account_malformed`: the stored account is neither the placeholder nor a valid G-strkey.
+- `enroll_signer.expected_address_mismatch`: `--expected-address` does not match.
+- `enroll_signer.entry_exists`: an entry exists without `--force`.
+- A keyring error: the platform keyring is unavailable.
 
 ### `profile enroll-owner-key`
 
@@ -160,7 +174,7 @@ stellar-agent profile enroll-owner-key --profile default --secret-env WALLET_OWN
 unset WALLET_OWNER_SK
 ```
 
-Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id` keyring entry, the key the V1 policy engine verifies every policy file against. The owner key is the root of trust for policy: whoever can sign a policy file can authorize any action the policy permits. `enroll-owner-key` and `sign-policy` read the owner seed from the environment of the shell that runs them. Supply it with the read line only for those commands, as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) describes, and unset it afterwards. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment. State-changing (keyring), no network. The command passes the seed through the shared mlock-protected ceremony, stores only the derived public key, and never prints, logs, or returns the seed.
+Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id` keyring entry, the key the V1 policy engine verifies every policy file against. The owner key is the root of trust for policy: whoever can sign a policy file can authorize any action the policy permits. `enroll-owner-key` and `sign-policy` read the owner seed from the environment of the shell that runs them. Supply it with the read line only for those commands, as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) describes, and unset it afterward. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment. State-changing (keyring), no network. The command passes the seed through the shared mlock-protected ceremony, stores only the derived public key, and never prints, logs, or returns the seed.
 
 - `--secret-env <VAR>` (required) — name of the environment variable holding the owner `S...` strkey. The flag takes the variable name, never the secret.
 - `--profile <NAME>`: profile whose owner coordinate is written (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
@@ -173,7 +187,12 @@ The owner coordinate's `account` is the literal `"default"` (the value the engin
 {"ok":true,"data":{"profile":"default","enrolled":true,"owner_address":"G...","keyring_service":"stellar-agent-owner-default","keyring_account":"default","replaced":false},"request_id":"..."}
 ```
 
-Exits `1` with `ProfileNotFound` if the profile does not exist, `enroll_owner_key.expected_address_mismatch` if `--expected-address` does not match, `enroll_owner_key.entry_exists` if an owner key is already enrolled without `--force`, or a keyring error if the platform keyring is unavailable.
+Exits `1` on refusal:
+
+- `validation.profile_not_found`: the profile does not exist.
+- `enroll_owner_key.expected_address_mismatch`: `--expected-address` does not match.
+- `enroll_owner_key.entry_exists`: an owner key exists without `--force`.
+- A keyring error: the platform keyring is unavailable.
 
 ### `profile sign-policy`
 
@@ -200,16 +219,30 @@ Before writing, the seed's derived public key is cross-checked against the enrol
 {"ok":true,"data":{"profile":"default","signed":true,"owner_address":"G...","policy_path":".../policies/default.toml","digest":"<hex>","signature":"<hex>","replaced":false},"request_id":"..."}
 ```
 
-Exits `1` with `ProfileNotFound` if the profile does not exist, `sign_policy.owner_key_unavailable` if no owner key is enrolled (run `enroll-owner-key` first), `sign_policy.owner_key_mismatch` if the seed does not match the enrolled owner key, `sign_policy.policy_file_unreadable` if the policy file is missing, `sign_policy.canonicalization_failed` if it is malformed, or a keyring error if the platform keyring is unavailable.
+Exits `1` on refusal:
+
+- `validation.profile_not_found`: the profile does not exist.
+- `sign_policy.owner_key_unavailable`: no owner key is enrolled; run `enroll-owner-key` first.
+- `sign_policy.owner_key_mismatch`: the seed does not match the enrolled owner key.
+- `sign_policy.policy_file_unreadable`: the policy file is missing.
+- `sign_policy.canonicalization_failed`: the policy file is malformed.
+- A keyring error: the platform keyring is unavailable.
 
 ### Key-rotation subcommands
+
+The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and write settlement audit rows.
+
+The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor.
+
+While held, the lock blocks rotation with `audit.writer_locked` in the error
+detail, even if the operation that acquired it later fails.
 
 Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, encodes it as URL-safe base64 (no padding), and atomically replaces one keyring entry the profile names. The raw bytes never leave the keyring, are never logged, and are never returned. Every rotation subcommand takes the profile as either a positional `<NAME>` argument or a `--profile <NAME>` flag — exactly one of the two, and supplying both, or neither, is a usage error — changes keyring state (no network), and is not reversible. Rotate deliberately, because each one invalidates material minted under the old key. (The policy-file owner ed25519 key is not rotated here; it is enrolled with `enroll-owner-key`.)
 
 | Subcommand | Keyring entry rotated | Key kind | Effect on outstanding material |
 |---|---|---|---|
 | `rotate-attestation-key` | approval-spine attestation HMAC key (`attestation_key_id`) | 32-byte HMAC | All pending approvals are invalidated; the simulate-and-approve round trip must be re-run. |
-| `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | Rotation re-signs every existing per-file chain-root sidecar with the new key. `audit verify` passes under the new key, and the old key stops verifying. Takes the audit writer's exclusive lock, so it refuses while an MCP server is running, and checks the tip anchor before touching the key. Checks the audit binding before it opens the writer: a changed binding refuses with `audit.log_binding_changed` and creates nothing at the path the profile names; an absent one is recorded. |
+| `rotate-audit-key` | audit-log chain-root HMAC key (`audit_log_hash_chain_key_id`) | 32-byte HMAC | Rotation re-signs every existing per-file chain-root sidecar with the new key. `audit verify` passes under the new key, and the old key stops verifying. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds that writer, and checks the tip anchor before touching the key. Checks the audit binding before it opens the writer: a changed binding refuses with `audit.log_binding_changed` and creates nothing at the path the profile names; an absent one is recorded. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
 | `rotate-policy-state-key` | policy-window-state HMAC key (`policy_window_state_key_id`) | 32-byte HMAC | The persisted window-state store is re-signed under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Rotation is refused if the store file does not verify under the current key (run `reset-window-state` instead). |
 
@@ -234,7 +267,7 @@ Each returns the profile name and a `rotated` flag. The attestation-key and audi
 
 A further rotation subcommand, `profile rotate-counterparty-key <NAME>`, rotates the `stellar.toml` cache-integrity HMAC key (`counterparty_cache_key_id`); it invalidates every cached counterparty binding, which the wallet re-fetches on the next counterparty-allowlist check. Its data object adds `"key_kind": "hmac_32_bytes"` and `"cache_invalidated": true` to the `profile` and `rotated` fields. This rotates the same keyring entry as `stellar-agent counterparty rotate-hmac-key` (see [core operations](stellar-ops.md)); the two verbs are interchangeable.
 
-Each rotation exits `1` with `ProfileNotFound` if the profile does not exist, or with a keyring error if the platform keyring is unavailable.
+Each rotation exits `1` with `validation.profile_not_found` if the profile does not exist, or with a keyring error if the platform keyring is unavailable.
 
 ### `reset-window-state <NAME> --reason <REASON>`
 
@@ -389,7 +422,7 @@ State-changing (records an attestation or a grant in the on-disk pending-approva
 
 Interactively, the command prints the summary and prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. It exits `1` when the nonce is unknown, expired, already attested, created by a different local user, denied at the prompt, or on an I/O error.
 
-The `approval_attested` audit row is written before the approval is persisted. Beside a running MCP server or `approve serve` inbox, which hold the audit writer, the row is queued in the audit outbox instead. The running process appends it to the log before any process loads a signing key for the approved action. The envelope's `audit` field says which happened: `"written"` or `"queued"`. The command refuses, persists nothing, and exits `1` when the writer is held by a process that does not drain the outbox (`audit.writer_locked`). It does the same on any other audit failure. Examples are a missing audit key, a rolled-back log (`audit.tip_anchor_mismatch`), and a busy outbox (`audit.outbox_busy`).
+The `approval_attested` audit row is written before the approval is persisted. When an MCP server or `approve serve` inbox holds that profile's audit writer, the row is queued in the audit outbox. The running process appends it to the log before any process loads a signing key for the approved action. The envelope's `audit` field says which happened: `"written"` or `"queued"`. The command refuses, persists nothing, and exits `1` when the writer is held by a process that does not drain the outbox (`audit.writer_locked`). It does the same on any other audit failure. Examples are a missing audit key, a rolled-back log (`audit.tip_anchor_mismatch`), and a busy outbox (`audit.outbox_busy`).
 
 After upgrading, restart any running MCP server and `approve serve`: `approve --id` refuses beside an older one, which does not drain the outbox.
 
@@ -557,7 +590,7 @@ stellar-agent approve operator enroll \
 
 ## `audit`
 
-The `audit` group verifies the per-profile audit log, an append-only, hash-chained JSONL record of every tool invocation and lifecycle event, and repairs its tip anchor. Argument values are never logged; only argument key names are recorded. The chain links each entry to the SHA-256 of the prior entry's canonical body, so any external modification breaks verification.
+The `audit` group verifies the per-profile audit log, an append-only, hash-chained JSONL record of transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events, and repairs its tip anchor. MCP balance reads and payment simulations produce no automatic invocation row. Under V1, payment simulations can reconcile overdue reservations and write settlement audit rows. Argument values are never logged; only argument key names are recorded. The chain links each entry to the SHA-256 of the prior entry's canonical body, so any external modification breaks verification.
 
 The chain and the per-file chain-root signatures verify a PREFIX of the log, so an older copy of the active file, or a truncated one, passes both. What pins the END of the chain is the tip anchor: the active file's entry count, last-entry hash, and byte offset, held in the platform keyring per log path. Every value-moving verb checks it before signing, and `audit verify --profile` checks it too.
 
@@ -603,7 +636,7 @@ With the required flags, the command replays the whole log first, so a log whose
 
 Queued consent rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, or the condition an append refused on, such as `audit.io_error`.
 
-The command takes the audit writer's exclusive lock. A running MCP server holds that lock for its lifetime, so stop the server before a rollback repair. A binding change needs no stop: a server running the edited profile refuses before it opens the new path, so it holds no lock there. A server still running the old profile refuses after the acknowledgement until it restarts.
+The command takes the audit writer's exclusive lock. Stop an MCP server that holds this profile's writer before a rollback repair. See [Key-rotation subcommands](#key-rotation-subcommands) for acquisition and replacement eviction. A binding change needs no stop: a server running the edited profile refuses before it opens the new path, so it holds no lock there. A server still running the old profile refuses after the acknowledgement until it restarts.
 
 ```bash
 stellar-agent audit reanchor --profile default                          # report only, exits 1
@@ -623,7 +656,7 @@ For the causes worth ruling out before acknowledging, see [Audit-log recovery](.
 
 1. The agent surface evaluates an action against the policy engine. An action that needs operator consent records a pending approval and returns its nonce instead of executing.
 2. The wallet owner runs `approve --id <NONCE> --profile <name>` in a trusted context, reads the wallet-controlled summary, and consents. The command writes an HMAC attestation (or a toolset grant) bound to the profile name, chain id, approval nonce, envelope digest, and local user.
-3. The agent surface verifies the attestation and executes. Every invocation and lifecycle event is appended to the hash-chained audit log.
+3. The agent surface verifies the attestation and executes. The commit writes its transaction audit events to the hash-chained audit log.
 4. The operator periodically runs `audit verify` to confirm the log has not been tampered with, supplying `--profile` to check the chain-root HMAC sidecars and the tip anchor as well as the hash chain.
 
 Key rotation backs this loop: `rotate-attestation-key` invalidates outstanding approvals, and `rotate-audit-key` re-keys the chain root and re-signs every existing per-file sidecar. See [concepts](../concepts.md) for the full model.

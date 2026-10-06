@@ -150,12 +150,48 @@ installs draw from the same download. You can also fetch and extract the
 archive directly, without any Rust tooling (substitute your target, for example
 `aarch64-apple-darwin` or `x86_64-unknown-linux-gnu`):
 
+Linux or macOS (this example selects Apple Silicon):
+
 ```bash
 curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.10/stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin.tar.xz
-tar -xJf stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin.tar.xz
+curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.10/SHA256SUMS
 ```
 
-then move the two binaries onto your `PATH`. The release signs the macOS
+On Linux, check the checksum with `sha256sum --ignore-missing --check SHA256SUMS`.
+On macOS, use `shasum -a 256 --ignore-missing --check SHA256SUMS`.
+After the checksum matches, extract the archive and add its folder to this
+shell's `PATH`:
+
+```bash
+tar -xJf stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin.tar.xz
+export PATH="$PWD/stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin:$PATH"
+```
+
+Windows PowerShell:
+
+```powershell
+$release = 'https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.10'
+$folder = 'stellar-agent-0.1.0-alpha.10-x86_64-pc-windows-msvc'
+$archive = "$folder.zip"
+curl.exe -fsSLO "$release/$archive"
+curl.exe -fsSLO "$release/SHA256SUMS"
+$line = Get-Content SHA256SUMS | Where-Object { ($_ -split '\s+')[1] -eq $archive }
+if (@($line).Count -ne 1) { throw 'Expected one archive entry in SHA256SUMS' }
+$expected = ($line -split '\s+')[0]
+$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
+if ($actual -ne $expected) { throw 'Archive checksum mismatch' }
+Expand-Archive -LiteralPath $archive -DestinationPath .
+$env:PATH = "$((Resolve-Path -LiteralPath $folder).Path);$env:PATH"
+```
+
+Use `curl.exe`: Windows PowerShell's `curl` alias runs `Invoke-WebRequest`.
+The `PATH` commands apply to the current shell. For future sessions, add the
+folder to your shell configuration or Windows user `Path` environment variable.
+Every Linux, macOS, and Windows archive extracts into
+`stellar-agent-<version>-<target>/`. Both binaries are inside that folder;
+the Windows names end in `.exe`.
+
+The release signs the macOS
 binaries with a Developer ID and notarizes them. A bare executable carries no
 stapled ticket, so Gatekeeper checks notarization online. The
 [macOS Gatekeeper note](docs/getting-started.md#macos-gatekeeper-note) shows how
@@ -195,11 +231,16 @@ signature. Every release also publishes a `SHA256SUMS` manifest, a [cosign](http
 keyless signature bundle per archive, and SLSA provenance, for anyone who
 wants to verify further.
 
-Checksum:
+Download `SHA256SUMS` from the same release as the archive. On Linux:
 
 ```bash
 sha256sum --ignore-missing --check SHA256SUMS
 ```
+
+On macOS, use `shasum -a 256 --ignore-missing --check SHA256SUMS`.
+The Windows PowerShell example under [cargo binstall](#cargo-binstall-prebuilt-binaries)
+compares `Get-FileHash -Algorithm SHA256` with the archive's entry in `SHA256SUMS`
+before calling `Expand-Archive`.
 
 Cosign signature (keyless; verifies the archive was signed by this
 repository's release workflow, not by an arbitrary identity):
@@ -268,9 +309,11 @@ PowerShell and the cleanup of a seed typed into a command line.
 only when no profile was named and no `default.toml` exists, never by
 `profile show`. Run
 `stellar-agent profile init` to create `default.toml`. It writes
-`engine = "v1"` by default, which keeps the MCP server refusing to start until
-the V1 key ceremony completes; pass `--engine noop` for a zero-ceremony testnet
-profile that works immediately.
+`engine = "v1"` by default. On a V1 profile, the MCP server starts once the
+owner key is enrolled and the owner-signed policy loads. A testnet profile created with `--engine noop` supports
+server startup and read access immediately. Run `profile rotate-nonce-key` before
+MCP payment simulation. Before MCP signing, mint the audit key with
+`profile rotate-audit-key` and enroll the signer with `profile enroll-signer`.
 
 Commands print a JSON envelope on stdout by default and exit `0` on success or
 `1` on any error. A profile holds no secrets: it binds a CAIP-2 chain

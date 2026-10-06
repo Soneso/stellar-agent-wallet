@@ -3274,14 +3274,10 @@ async fn pay_simulate_unaffected_by_missing_audit_key() {
 /// `stellar_pay_commit` refuses with `audit.tip_anchor_mismatch` when the audit
 /// log is rolled back underneath the writer the server already holds.
 ///
-/// The MCP writer registry caches one writer per profile for the process
-/// lifetime, so a check performed only at writer open would cover the FIRST
-/// acquisition and nothing after it. This drives two commits through the real
-/// tool: the first succeeds and leaves the anchor naming the log, the log is
-/// then truncated on disk, and the second must refuse before the nonce is
-/// consumed. The CLI twin of this test lives in the `stellar-agent-cli` crate;
-/// removing the anchor check from either surface alone must fail only that
-/// surface's test.
+/// The first commit leaves a cached writer and an anchor naming the log.
+/// Truncation on disk must make the second commit refuse before consuming the
+/// nonce because the log no longer contains the anchored tip. The CLI twin
+/// in `stellar-agent-cli` covers the same invariant for CLI dispatch.
 #[tokio::test]
 #[serial]
 async fn pay_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_back() {

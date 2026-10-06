@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- CLI help names `--account` as required for balances and describes JSON profile-list output and audit sidecar re-signing. The `stellar_balances` MCP description uses `--account` in its CLI equivalent.
+
 ## [0.1.0-alpha.10] - 2026-10-05
 
 First contributions from outside the maintainers: @Revan0809 (#280), @harshit3355 (#308), @thadidaniel-ctrl (#305, #306), and @abhicodes-007 (#312).

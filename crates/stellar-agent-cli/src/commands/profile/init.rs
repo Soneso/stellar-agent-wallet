@@ -37,17 +37,14 @@
 //!
 //! # Engine default
 //!
-//! `--engine` defaults to `v1` — [`PolicyEngineKind::default`] is `V1`, and
-//! newly-minted profiles are meant to carry the policy-engine infrastructure
-//! from the start (unlike a profile migrated from schema v1, which is set to
-//! `noop` explicitly). A v1 profile refuses MCP-server startup and
-//! policy-gated dispatch until the V1 ceremony completes (owner key,
-//! attestation key, signed policy, on top of the audit key every engine
-//! needs — the normative list is in the CLI reference's `profile init` entry,
-//! mirrored in `next_steps`).
-//! `--engine noop` is the zero-ceremony testnet opt-out: the profile works
-//! immediately (once the audit key is minted), with the Noop engine's
-//! testnet-allow / mainnet-read-only posture.
+//! `--engine` defaults to `v1`; [`PolicyEngineKind::default`] is `V1`.
+//! V1 setup requires an enrolled owner key, an attestation key, and an
+//! existing policy file signed with `sign-policy`. The CLI reference's
+//! `profile init` entry links the complete setup sequence.
+//! A testnet `--engine noop` profile supports server startup and read access
+//! immediately. MCP payment simulation requires `rotate-nonce-key`. MCP signing
+//! requires `rotate-audit-key` and `enroll-signer` on both engines. The Noop
+//! engine allows testnet calls and restricts mainnet to read-only calls.
 //!
 //! # Endpoint rule
 //!
@@ -361,14 +358,10 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
     };
 
     // ── Enrollment guidance ──────────────────────────────────────────────────
-    // `rotate-audit-key` is in the ALWAYS list (both engines): every signing
-    // verb requires the profile's audit chain-root key to be acquirable
-    // BEFORE it signs or submits — `init` mints the keyring COORDINATE only,
-    // no key material, so an init-minted profile signs nothing until this
-    // step runs, Noop engine included. The remaining V1 list mirrors the
-    // normative ceremony in
-    // docs/cli-reference/profile-and-governance.md#profile-init: owner key,
-    // attestation key, then the signed policy file.
+    // Both engines list `rotate-audit-key` because signing requires the
+    // profile's audit key. `init` writes the keyring coordinate; rotation
+    // mints the key material. The V1 list names owner enrollment, attestation
+    // key rotation, and policy signing in their required order.
     let mut next_steps = vec![
         format!(
             "Run `stellar-agent profile enroll-signer --profile {} --secret-env <VAR>` to \

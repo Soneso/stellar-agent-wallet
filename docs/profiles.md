@@ -63,14 +63,19 @@ for a deliberate reset. Amount caps size outbound value, so a vault withdrawal,
 which returns underlying assets and burns the wallet's shares, reserves no
 amount against them.
 
-Every `profile` subcommand accepts a `--profile <NAME>` flag to name the
-profile it operates on; the subcommands that also take a positional `<NAME>`
-(`show`, `migrate`, the `rotate-*` commands, and `reset-window-state`) accept
-exactly one of the two.
+`profile list` lists all profile names and takes no profile selector.
+Every other `profile` subcommand accepts `--profile <NAME>`.
+`show`, `migrate`, the `rotate-*` commands, `reset-window-state`, and
+`reset-mpp-state` accept exactly one positional `<NAME>` or `--profile <NAME>`.
 
 Create a new profile file with `stellar-agent profile init`; see
 [cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md#profile-init)
 for flags and defaults.
+
+Save profile edits as UTF-8; a UTF-8 BOM is accepted. In PowerShell, use
+`Set-Content -Encoding utf8`. Windows PowerShell 5.1's `Out-File` and `>` default
+to UTF-16LE, which the loader refuses. The surfaced code depends on the command:
+`profile show` reports `validation.config_invalid`; `pay` reports `profile.load_failed`.
 
 ## Profile names
 
@@ -333,6 +338,13 @@ Consequences:
   envelope; keyring references appear as opaque `{service, account}` objects,
   never the secret.
 
+For a headless file-backed keyring, set `STELLAR_AGENT_KEYRING_BACKEND=headless-env`
+and `STELLAR_AGENT_HEADLESS_KEYRING_KEY` in the process environment. The key must
+encode 32 random bytes as URL-safe base64 without padding. See
+[Generate a headless keyring key](getting-started.md#generate-a-headless-keyring-key)
+for POSIX shell and PowerShell commands. Keep the key in your secret manager and
+reuse it for every process that opens the same store.
+
 ## Migration and key rotation
 
 A profile migrated from schema v1 stays on the `noop` engine until the operator
@@ -396,21 +408,28 @@ address; a profile whose `account` already pins a G-strkey — from a prior
 enrollment, or set by hand — is left untouched, and enrollment refuses if the
 seed does not derive to that exact address (printing the address to set
 `account` to). Without an enrolled seed, the MCP tools and the
-keyring-signing CLI verbs (`trustline`, `lend`, `trade`, `vault`) fail with
+keyring-signing CLI verbs (`trustline`, `trade`, `vault`) fail with
 `auth.keyring_not_found`. See
 [cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md#profile-enroll-signer)
 for flags and the envelope shape.
 
 ### Opt in to V1
 
-On top of `profile rotate-audit-key` (required on every engine, see above),
-the V1-specific ceremony, in order, is `profile enroll-owner-key`,
-`profile rotate-attestation-key`, then `profile sign-policy` (the normative
-command list is the
-[`profile init` reference entry](cli-reference/profile-and-governance.md#profile-init)).
-An `init`-minted profile already carries `engine = "v1"` — complete the
-ceremony and it becomes operational. A profile migrated from schema v1 stays
-on `noop`; after the ceremony, set the engine in the profile TOML:
+Complete these steps for a persistent profile, using its name in place of `<name>`:
+
+1. `stellar-agent profile rotate-audit-key <name>`: mint the audit key, required
+   on every engine.
+2. `stellar-agent profile rotate-nonce-key <name>`: mint the nonce key before
+   MCP payment simulation. Without it, simulation fails with `nonce.mint_failed`.
+3. `profile enroll-owner-key`, then `profile rotate-attestation-key`: enroll
+   the policy owner and mint the approval key.
+4. [Create the V1 policy file](#create-the-v1-policy-file), then run
+   `profile sign-policy`.
+5. [Enroll the MCP signer](#enroll-the-mcp-signer) before signing transactions.
+
+An `init`-minted profile already carries `engine = "v1"`. This setup supplies
+its policy and key prerequisites. A profile migrated from schema v1 stays
+on `noop`; after completing these steps, set the engine in the profile TOML:
 
 ```toml
 [policy]
@@ -423,6 +442,64 @@ to `v1` changes the policy layer only — mainnet writes stay structurally
 refused at the network layer in this alpha. For the governance flow that V1
 enforces, see
 [cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md).
+
+### Create the V1 policy file
+
+Before `profile sign-policy`, create `policies/<name>.toml` in the wallet's
+state directory. The default paths are:
+
+| Platform | Policy file for `default` |
+|----------|---------------------------|
+| Linux | `${XDG_DATA_HOME:-$HOME/.local/share}/stellar-agent/policies/default.toml` |
+| macOS | `~/Library/Application Support/Soneso.stellar-agent/policies/default.toml` |
+| Windows | `%LOCALAPPDATA%\Soneso\stellar-agent\data\policies\default.toml` |
+
+Create the parent directory first. On Linux or macOS:
+
+```sh
+case "$(uname -s)" in
+  Linux) policy_dir="${XDG_DATA_HOME:-$HOME/.local/share}/stellar-agent/policies" ;;
+  Darwin) policy_dir="$HOME/Library/Application Support/Soneso.stellar-agent/policies" ;;
+esac
+mkdir -p "$policy_dir"
+```
+
+On Windows PowerShell:
+
+```powershell
+$policyDir = Join-Path $env:LOCALAPPDATA 'Soneso\stellar-agent\data\policies'
+New-Item -ItemType Directory -Force -Path $policyDir | Out-Null
+```
+
+Save this minimal policy as `default.toml` in that directory, using UTF-8:
+
+```toml
+version = 1
+scope = "profile:default"
+
+[[rules]]
+match = { tool = "stellar_balances", chain = "*" }
+criteria = []
+decision = "allow"
+
+[[rules]]
+match = { tool = "*", chain = "*" }
+criteria = []
+decision = "require_approval"
+```
+
+For another profile, replace `default` in the filename and `scope`.
+The first rule allows balance queries; the second requests operator approval
+for other policy-gated calls. Both use `chain = "*"` because the profile binds
+the chain. Review the rules before signing; an empty `criteria` list adds no
+spending cap. See [policy rules](concepts.md#the-policy-engine)
+for additional restrictions.
+
+Then run `stellar-agent profile sign-policy --profile default --secret-env WALLET_OWNER_SK`
+with the enrolled owner's seed in `WALLET_OWNER_SK`.
+[Pass a secret seed](getting-started.md#pass-a-secret-seed) covers setting and
+clearing that variable. The command adds the signature table; it refuses a
+missing file with `sign_policy.policy_file_unreadable`.
 
 ## Example profile
 

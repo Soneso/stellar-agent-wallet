@@ -28,7 +28,7 @@ The wallet is a public alpha; prebuilt binaries are published on the GitHub rele
 
 ## Global conventions
 
-There are no flags on the top-level command. Network selection, the profile, RPC URLs, and the signer source are declared per subcommand. The recurring flags below have the same meaning everywhere they appear; the per-group pages reference this section rather than restating them.
+The top-level command accepts `-h`/`--help` and `-V`/`--version`. Network selection, the profile, RPC URLs, and the signer source are declared per subcommand. The recurring flags below have the same meaning everywhere they appear; the per-group pages reference this section rather than restating them.
 
 ### Profile
 
@@ -138,7 +138,26 @@ Every signature must pass, and each signature set must have at least one: on a f
 
 ## Audit-key pre-flight refusal
 
-Every value-moving signing verb (`pay`, `claim`, `accounts create` sponsored mode, `trustline`, `trade`, `lend`, `vault`) proves the active profile's audit chain-root key is acquirable BEFORE any signing key is touched or transaction submitted. A profile fresh from `profile init` has the audit-log keyring COORDINATE but no key material — `profile rotate-audit-key <name>` mints it. Until that runs, these verbs refuse with the wire code `audit.chain_key_unavailable` rather than signing unaudited. Build-only/simulate stages are unaffected: they neither sign nor submit, so they never reach this pre-flight. On `pay --submit-only` and `claim --submit-only` the endpoint identity probe runs on the command's own client ahead of the policy gate and ahead of this pre-flight, so an `--rpc-url` pointing at a different network than `--network` is refused before either one runs. This pre-flight fails closed only for a persisted `<name>.toml` profile: `pay`, `claim`, and `accounts create` keep their zero-config posture — the in-memory profile synthesized when no profile was named and no `default.toml` exists stays fail-open on this specific check. See [Key-rotation subcommands](profile-and-governance.md#key-rotation-subcommands) and [Concepts: fail-closed on an unminted audit key](../concepts.md#fail-closed-on-an-unminted-audit-key).
+`pay`, `claim`, sponsored `accounts create`, `trustline`, `trade`, and `vault`
+require the active profile's audit chain-root key before accessing signing keys
+or submitting transactions. A profile from `profile init` has the audit-log
+keyring coordinate but no key material. `profile rotate-audit-key <name>` mints
+the key. Until it runs, these verbs refuse with `audit.chain_key_unavailable`.
+Build-only and simulate stages never reach this pre-flight because they neither
+sign nor submit.
+
+On `pay --submit-only` and `claim --submit-only`, the endpoint identity probe
+runs on the command's own client before the policy gate and audit pre-flight.
+An `--rpc-url` pointing at a different network than `--network` is refused before
+either check runs.
+
+This pre-flight fails closed for persisted `<name>.toml` profiles. `pay`,
+`claim`, and `accounts create` synthesize an in-memory testnet profile when no
+profile is named and no `default.toml` exists. That profile attempts keyed
+audit acquisition and tolerates an unavailable key or writer. A changed audit
+binding still refuses with `audit.log_binding_changed` before signing or submission.
+See [Key-rotation subcommands](profile-and-governance.md#key-rotation-subcommands)
+and [Concepts: fail-closed on an unminted audit key](../concepts.md#fail-closed-on-an-unminted-audit-key).
 
 The same pre-flight proves the audit log still contains the chain tip its keyring-held anchor names, refusing with `audit.tip_anchor_mismatch` when the log was restored from an older copy, truncated, or substituted. A log that moved forward past its anchor is absorbed, not refused, and a log with no anchor is adopted on first use with no operator action. A profile whose `audit_log_path` or audit key differs from the binding recorded in the keyring refuses with `audit.log_binding_changed`. Recovery from either is [`audit reanchor`](profile-and-governance.md#audit-reanchor---profile-name---acknowledge-rollback).
 
@@ -154,6 +173,7 @@ Before dispatching any command, the CLI runs a local-only startup advisory: it s
 | `accounts` | Create a Stellar account (sponsored `CreateAccount` or Friendbot) and deploy an OpenZeppelin smart-account contract. | [stellar-ops](stellar-ops.md) |
 | `pay` | Send a classic payment with SEP-29 memo enforcement; supports staged build/sign/submit. | [stellar-ops](stellar-ops.md) |
 | `claim` | Claim a claimable balance by ID behind claimant, predicate, and trustline pre-flight guards; supports staged build/sign/submit. | [stellar-ops](stellar-ops.md) |
+| `tx` | Reconcile a submitted transaction with `status`, or clear its submission record with `receipt clear`. | [stellar-ops](stellar-ops.md) |
 | `balances` | Read native XLM and trustline balances for an account (read-only). | [stellar-ops](stellar-ops.md) |
 | `trustline` | Create or remove a classic trustline (`ChangeTrust`) behind the ordered trust gate. | [stellar-ops](stellar-ops.md) |
 | `friendbot` | Fund a testnet or futurenet account via the Friendbot endpoint (read-only; mainnet refused). | [stellar-ops](stellar-ops.md) |

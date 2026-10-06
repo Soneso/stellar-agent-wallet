@@ -19,15 +19,18 @@
 #
 #   workflows  .github/workflows/*.yml, .github/actions/, .github/labels.yml
 #   scripts    .github/scripts/
+#   surface    each path that is_scanned of check-install-surface.py accepts:
+#              the Markdown files and manifests that check reads
 #   skill      skills/, .claude-plugin/
 #   rust       crates/, tests/, examples/, and the root files Cargo.toml,
 #              Cargo.lock, rust-toolchain.toml, rustfmt.toml, Cross.toml, and
 #              deny.toml
 #
-# The docs scope adds no gates beyond the three always gates. Directory
-# scopes also apply to Markdown files. A path under interop/ selects only the
-# always gates; the interop harnesses run under --full. select_for_path holds
-# the triggers. A gate that several triggers select runs once, at its
+# A docs path outside the surface scope adds no gates beyond the three always
+# gates. Directory scopes also apply to Markdown files. A path under interop/
+# adds no gate of its own; the interop harnesses run under --full.
+# select_for_path holds the triggers, and plan_surface_self_test the trigger
+# of the surface scope. A gate that several triggers select runs once, at its
 # registry position.
 #
 # A selected gate whose tool or Python module is missing is unavailable: its
@@ -36,8 +39,9 @@
 #
 # Exit codes: 0 when every selected gate ran and passed, and 1 when a gate
 # failed or was unavailable. Exit code 2 means a usage error, a missing
-# prerequisite, a base without a merge base, or an unreadable workspace
-# manifest.
+# prerequisite, a base without a merge base, an unreadable workspace
+# manifest, or, without --full, a check-install-surface.py that Python cannot
+# load.
 #
 # Needs bash 3.2 or later, git, python3 3.11 or later (for tomllib), awk,
 # grep, sed, sort, uniq, and mktemp. The Python blocks use the standard
@@ -332,6 +336,40 @@ select_for_path() {
   esac
 }
 
+# Selects the self-test of check-install-surface.py when a changed path is in
+# the surface scope. The self-test injects violations into copies of the
+# files that check reads, so a change to one of them can break it. The
+# check's own is_scanned decides, so the scope follows the check's file set.
+plan_surface_self_test() {
+  local selects
+  python3 - "$SCRATCH/changed" >"$SCRATCH/surface" <<'PY' || exit 2
+import importlib.util
+import os
+import sys
+
+# Loading the check must not leave a __pycache__ directory in the tree. Its
+# dataclasses resolve their module through sys.modules, so the block
+# registers the module there before running it.
+sys.dont_write_bytecode = True
+check = ".github/scripts/check-install-surface.py"
+try:
+    spec = importlib.util.spec_from_file_location("check_install_surface", check)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+except Exception as error:
+    print(f"preflight: cannot load {check}: {error}", file=sys.stderr)
+    raise SystemExit(2)
+with open(sys.argv[1], "rb") as stream:
+    changed = [os.fsdecode(path) for path in stream.read().split(b"\0") if path]
+print(1 if any(module.is_scanned(path) for path in changed) else 0)
+PY
+  IFS= read -r selects <"$SCRATCH/surface"
+  if [ "$selects" = 1 ]; then
+    select_gate self-test:test-check-install-surface.py
+  fi
+}
+
 # Replaces the test command with the per-package command when every changed
 # Rust path belongs to a workspace member. Selects the release configuration
 # test of the vendored crate when the packages include it or the workspace
@@ -516,8 +554,11 @@ plan() {
       fi
       position=$((position + 1))
     done
-  elif [ -s "$SCRATCH/rust" ]; then
-    plan_tests
+  else
+    plan_surface_self_test
+    if [ -s "$SCRATCH/rust" ]; then
+      plan_tests
+    fi
   fi
   if [ -s "$SCRATCH/shell" ]; then
     plan_shellcheck_changed

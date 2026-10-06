@@ -1,9 +1,13 @@
 # Getting started
 
-The Stellar Agent Wallet is a Stellar wallet built for AI agents. It lets an
-autonomous agent transact on Stellar under guardrails: a policy engine evaluates
-each action, an operator-approval spine records out-of-band approvals, and a
-tamper-evident hash-chained audit log records every invocation. It ships two
+The Stellar Agent Wallet is a Stellar wallet built for AI agents. A policy
+engine evaluates actions, and an operator-approval spine records out-of-band
+approvals. A tamper-evident hash-chained audit log records transaction
+submissions, signed authorizations, approvals, and explicit key-management and
+lifecycle events. MCP balance reads and payment simulations produce no automatic
+invocation row. Under V1, payment simulations can reconcile overdue reservations
+and write settlement audit rows.
+It ships two
 surfaces over the same core: the `stellar-agent` command-line binary and the
 `stellar-agent-mcp` MCP stdio server.
 
@@ -47,7 +51,8 @@ The declared install path is [`cargo binstall`](https://github.com/cargo-bins/ca
 from GitHub release archives. A single release archive carries both binaries:
 
 - Archive name: `stellar-agent-<version>-<target>.tar.xz` (`.zip` on Windows).
-- Binaries inside: `stellar-agent` and `stellar-agent-mcp`.
+- Top-level folder on every platform: `stellar-agent-<version>-<target>/`.
+- Binaries inside that folder: `stellar-agent` and `stellar-agent-mcp` (`.exe` on Windows).
 
 ```bash
 cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.10 stellar-agent-mcp@0.1.0-alpha.10
@@ -73,10 +78,46 @@ cargo-binstall 0.17.0 or later.
 Without any Rust tooling, fetch and extract the archive directly (substitute
 your target):
 
+Linux or macOS (this example selects Apple Silicon):
+
 ```bash
 curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.10/stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin.tar.xz
-tar -xJf stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin.tar.xz
+curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.10/SHA256SUMS
 ```
+
+On Linux, check the checksum with `sha256sum --ignore-missing --check SHA256SUMS`.
+On macOS, use `shasum -a 256 --ignore-missing --check SHA256SUMS`.
+After the checksum matches, extract the archive and add its folder to this
+shell's `PATH`:
+
+```bash
+tar -xJf stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin.tar.xz
+export PATH="$PWD/stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin:$PATH"
+```
+
+Windows PowerShell:
+
+```powershell
+$release = 'https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.10'
+$folder = 'stellar-agent-0.1.0-alpha.10-x86_64-pc-windows-msvc'
+$archive = "$folder.zip"
+curl.exe -fsSLO "$release/$archive"
+curl.exe -fsSLO "$release/SHA256SUMS"
+$line = Get-Content SHA256SUMS | Where-Object { ($_ -split '\s+')[1] -eq $archive }
+if (@($line).Count -ne 1) { throw 'Expected one archive entry in SHA256SUMS' }
+$expected = ($line -split '\s+')[0]
+$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
+if ($actual -ne $expected) { throw 'Archive checksum mismatch' }
+Expand-Archive -LiteralPath $archive -DestinationPath .
+$env:PATH = "$((Resolve-Path -LiteralPath $folder).Path);$env:PATH"
+```
+
+Use `curl.exe`: Windows PowerShell's `curl` alias runs `Invoke-WebRequest`.
+The `PATH` commands apply to the current shell. For future sessions, add the
+folder to your shell configuration or Windows user `Path` environment variable.
+Every Linux, macOS, and Windows archive extracts into
+`stellar-agent-<version>-<target>/`. Both binaries are inside that folder;
+the Windows names end in `.exe`.
 
 Every release ships supply-chain verification artifacts alongside the
 archives: a `SHA256SUMS` file, a Sigstore bundle per archive, and in-toto
@@ -86,7 +127,7 @@ build provenance. Verify a download against those before running it.
 
 The release signs the macOS binaries with a Developer ID and notarizes them. A
 bare executable carries no stapled ticket, so Gatekeeper checks notarization
-online. To check a binary yourself:
+online. From the extracted versioned folder, check a binary yourself:
 
 ```bash
 codesign -dvv ./stellar-agent
@@ -153,13 +194,41 @@ into the headless keyring store described below.
 
 **Headless deployments (Windows service/SSH/CI, Linux services): the opt-in
 file-backed keyring store.** Set `STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi`
-(Windows, DPAPI CurrentUser scope) or `STELLAR_AGENT_KEYRING_BACKEND=headless-env`
-(any platform; also requires `STELLAR_AGENT_HEADLESS_KEYRING_KEY`, a 32-byte
-URL-safe-base64 key) on the process environment before running any
+for Windows DPAPI CurrentUser protection, or `STELLAR_AGENT_KEYRING_BACKEND=headless-env`
+on any platform. The `headless-env` backend also requires
+`STELLAR_AGENT_HEADLESS_KEYRING_KEY`, a 32-byte URL-safe-base64 key without padding.
+Set these variables in the process environment before running any
 `stellar-agent` or `stellar-agent-mcp` command. The platform keyring remains
 the default when this variable is unset. See [security-internals.md's headless
 keyring section](maintainers/security-internals.md#headless-keyring-store)
 for the trust model and protection-mode details before enabling it.
+
+### Generate a headless keyring key
+
+Generate the key once and store it in your secret manager. Reuse it for every
+process that opens the same keyring store.
+
+POSIX shell:
+
+```sh
+export STELLAR_AGENT_HEADLESS_KEYRING_KEY="$(openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
+```
+
+PowerShell:
+
+```powershell
+$keyBytes = New-Object byte[] 32
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+try {
+    $rng.GetBytes($keyBytes)
+    $env:STELLAR_AGENT_HEADLESS_KEYRING_KEY = [Convert]::ToBase64String($keyBytes).Replace('+', '-').Replace('/', '_').TrimEnd('=')
+} finally {
+    $rng.Dispose()
+    [Array]::Clear($keyBytes, 0, $keyBytes.Length)
+}
+```
+
+### Profile locations
 
 Profiles live in the OS-conventional directory, one TOML file per profile name:
 
@@ -191,11 +260,11 @@ and placeholder signer/nonce keyring coordinates. The full setup flow is:
    **every** engine, `noop` included: `init` mints the audit-log keyring
    coordinate only, no key material, so every signing verb refuses
    `audit.chain_key_unavailable` until this runs.
-4. For the `v1` engine only, the rest of the ceremony: `profile
-   enroll-owner-key`, `profile rotate-attestation-key`, then `profile
-   sign-policy` (the normative list is the
-   [`profile init` reference entry](cli-reference/profile-and-governance.md#profile-init);
-   see also [Opt in to V1](profiles.md#opt-in-to-v1)).
+4. `stellar-agent profile rotate-nonce-key default`: mint the nonce key before
+   MCP payment simulation. Without it, simulation fails with `nonce.mint_failed`.
+5. For `v1`, run `profile enroll-owner-key`, then `profile rotate-attestation-key`.
+6. [Create the V1 policy file](#create-the-v1-policy-file), then run
+   `profile sign-policy`. See [Opt in to V1](profiles.md#opt-in-to-v1).
 
 Pass `--profile <NAME>` for a non-default profile, `--rpc-url <URL>` to
 override the testnet default. Pass `--network mainnet --rpc-url <URL>` for a
@@ -211,9 +280,12 @@ the environment sets the name for both when the flag is absent. A profile file
 belongs to its name: back it up freely, but restoring it under a different file
 name does not create a second profile. Run `profile init` for that.
 
-A `v1` profile does not serve MCP requests until the ceremony below is complete;
-the server refuses to start and names the step that is missing. `--engine noop`
-is the way to have a working server immediately.
+On a `v1` profile, the MCP server starts once the owner key is enrolled and
+the owner-signed policy loads; until then it refuses and names what is
+missing. An approval also requires `profile rotate-attestation-key`. A testnet
+`noop` profile supports server startup and read access immediately. MCP payment
+simulation requires `profile rotate-nonce-key`. MCP signing requires
+`profile rotate-audit-key` and `profile enroll-signer`.
 
 For reference, here is the shape a testnet profile takes after enrolling a
 signer (a minimal version-2 profile). It is shown here with `engine = "noop"` for a
@@ -297,11 +369,69 @@ stellar-agent profile migrate default
 For the full profile schema, every field, and the key-rotation ceremony, see
 [Profiles](profiles.md).
 
+### Create the V1 policy file
+
+Before `profile sign-policy`, create `policies/<name>.toml` in the wallet's
+state directory. The default paths are:
+
+| Platform | Policy file for `default` |
+|----------|---------------------------|
+| Linux | `${XDG_DATA_HOME:-$HOME/.local/share}/stellar-agent/policies/default.toml` |
+| macOS | `~/Library/Application Support/Soneso.stellar-agent/policies/default.toml` |
+| Windows | `%LOCALAPPDATA%\Soneso\stellar-agent\data\policies\default.toml` |
+
+Create the parent directory first. On Linux or macOS:
+
+```sh
+case "$(uname -s)" in
+  Linux) policy_dir="${XDG_DATA_HOME:-$HOME/.local/share}/stellar-agent/policies" ;;
+  Darwin) policy_dir="$HOME/Library/Application Support/Soneso.stellar-agent/policies" ;;
+esac
+mkdir -p "$policy_dir"
+```
+
+On Windows PowerShell:
+
+```powershell
+$policyDir = Join-Path $env:LOCALAPPDATA 'Soneso\stellar-agent\data\policies'
+New-Item -ItemType Directory -Force -Path $policyDir | Out-Null
+```
+
+Save this minimal policy as `default.toml` in that directory, using UTF-8:
+
+```toml
+version = 1
+scope = "profile:default"
+
+[[rules]]
+match = { tool = "stellar_balances", chain = "*" }
+criteria = []
+decision = "allow"
+
+[[rules]]
+match = { tool = "*", chain = "*" }
+criteria = []
+decision = "require_approval"
+```
+
+For another profile, replace `default` in the filename and `scope`.
+The first rule allows balance queries; the second requests operator approval
+for other policy-gated calls. Both use `chain = "*"` because the profile binds
+the chain. Review the rules before signing; an empty `criteria` list adds no
+spending cap. See [policy rules](concepts.md#the-policy-engine)
+for additional restrictions.
+
+Then run `stellar-agent profile sign-policy --profile default --secret-env WALLET_OWNER_SK`
+with the enrolled owner's seed in `WALLET_OWNER_SK`.
+[Pass a secret seed](#pass-a-secret-seed) covers setting and
+clearing that variable. The command adds the signature table; it refuses a
+missing file with `sign_policy.policy_file_unreadable`.
+
 ## Pass a secret seed
 
 Signing commands read a secret seed from the environment variable that
 `--secret-env` names. Read the seed without echo, export it only for the
-commands that need it, and unset it afterwards. A seed typed into a command line
+commands that need it, and unset it afterward. A seed typed into a command line
 lands in the shell history file.
 
 In bash or zsh, run this line on its own, paste the seed when prompted, and

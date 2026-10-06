@@ -405,8 +405,41 @@ def cases(version: str) -> list[Case]:
             lambda tree: replace(
                 tree,
                 "docs/getting-started.md",
-                f"releases/download/v{version}/",
-                "releases/download/v0.0.1/",
+                f"releases/download/v{version}/stellar-agent-{version}-",
+                f"releases/download/v0.0.1/stellar-agent-{version}-",
+            ),
+        ),
+        Case(
+            "rule 2: release tag of a SHA256SUMS URL",
+            "2",
+            "docs/getting-started.md",
+            lambda tree: replace(
+                tree,
+                "docs/getting-started.md",
+                f"releases/download/v{version}/SHA256SUMS",
+                "releases/download/v0.0.1/SHA256SUMS",
+            ),
+        ),
+        Case(
+            "rule 2: release tag of a PowerShell base URL",
+            "2",
+            "docs/getting-started.md",
+            lambda tree: replace(
+                tree,
+                "docs/getting-started.md",
+                f"releases/download/v{version}'",
+                "releases/download/v0.0.1'",
+            ),
+        ),
+        Case(
+            "rule 2: release tag of a PowerShell base URL in README.md",
+            "2",
+            "README.md",
+            lambda tree: replace(
+                tree,
+                "README.md",
+                f"releases/download/v{version}'",
+                "releases/download/v0.0.1'",
             ),
         ),
         Case(
@@ -766,6 +799,8 @@ def near_misses(tree: pathlib.Path) -> None:
         f"in the stellar-agent-{version} release.\n"
         f"The Linux archive is stellar-agent-{version}-x86_64-unknown-linux-gnu.tar.xz, "
         f"named after the template stellar-agent-{version}-<target>.tar.xz.\n"
+        f"The release URL releases/download/v{version}/SHA256SUMS fills the template "
+        f"releases/download/v<version>/SHA256SUMS, and its base is releases/download/v{version}.\n"
         f"Run `cargo install stellar-agent-cli@{version}\n--locked` by hand.\n"
         "Run cargo binstall --locked --disable-strategies `quick-install,compile` "
         f"stellar-agent-cli@{version}.\n\n"

@@ -16,8 +16,12 @@ context, reads a wallet-controlled summary, and consents. The command records an
 HMAC attestation bound to the profile name, CAIP-2 chain id, exact envelope, nonce, and
 local user, and returns `approval_attestation`. The agent presents that blob to
 the matching `*_commit` tool, which constant-time-verifies it before executing.
-Every invocation and lifecycle event is appended to a hash-chained audit log
-that `stellar-agent audit verify` checks for tampering.
+Transaction submissions, signed authorizations, approvals, and explicit
+key-management and lifecycle events enter a hash-chained audit log.
+MCP balance reads and payment simulations produce no automatic invocation row.
+Under V1, payment simulations can reconcile overdue reservations and write
+settlement audit rows.
+`stellar-agent audit verify` checks the log for tampering.
 
 ## Conventions used across these surfaces
 
@@ -328,8 +332,19 @@ Toolset-routed payments use two distinct controls, and only one is suppressible.
 
 ## The hash-chained audit log
 
-A per-profile, append-only JSONL file recording every tool invocation and
-lifecycle event. The writer is a per-profile singleton holding an exclusive
+The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and write settlement audit rows.
+
+The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor.
+
+A server holding that profile's writer blocks rotation or repair, even if the
+operation that acquired it later fails.
+
+A per-profile, append-only JSONL file records transaction submissions, signed
+authorizations, approvals, and explicit key-management and lifecycle events.
+MCP balance reads and payment simulations produce no automatic invocation row.
+Under V1, payment simulations can reconcile overdue reservations and write
+settlement audit rows. The writer is a per-profile singleton holding an
+exclusive
 lock, appending with an fsync per line; a second opener is rejected. Files
 rotate at a size bound with a fixed number of rotated files retained.
 
@@ -341,7 +356,7 @@ never logged; only their key names are. Strkeys in a decision reason are redacte
 first-five-last-five and transaction hashes to first-eight-last-eight; the
 envelope hash is left intact (it is a SHA-256 digest carrying no user data).
 
-Beyond tool invocations, the log records `value_action_submitted` on every
+The log records `value_action_submitted` on every
 confirmed value-moving submit (carrying the gate-sized value legs) and
 `keyring_key_written` on each key-writing profile command. It records
 `x402_payment_authorized` before a signed x402 authorization leaves the wallet
@@ -566,8 +581,8 @@ appends the rows, each carrying that count. `rollback_acknowledged`
 names the superseded anchor; `binding_changed` names the old path's anchor, or
 none when the record was unreadable. The new binding is stored last, and an
 absent binding is recorded after a rollback repair. It takes the audit writer's
-exclusive lock, so a running MCP server must be stopped before a rollback
-repair; with one running it refuses `audit.writer_locked`. A binding change needs
+exclusive lock. While an MCP server holds that profile's writer, repair
+refuses with `audit.writer_locked`. Stop that server before a rollback repair. A binding change needs
 no stop: a server running the edited profile refuses before it opens the new
 path, so it holds no lock there. A server still running the old profile refuses
 after the acknowledgement until it restarts.
@@ -587,8 +602,8 @@ Queued consent rows follow the repair rows and are counted in `outbox_drained`. 
    wallet-controlled summary, and consents. The command writes an HMAC
    attestation (or a toolset grant) bound to the profile name, chain id, nonce,
    envelope digest, and local user.
-3. The agent surface verifies the attestation and executes. Every invocation and
-   lifecycle event is appended to the hash-chained audit log.
+3. The agent surface verifies the attestation and executes. The commit writes its transaction audit events to
+   the hash-chained audit log.
 4. The operator periodically runs `audit verify` with `--profile` to confirm the
    hash chain, the chain-root HMAC sidecars, and the tip anchor are all intact.
 
@@ -606,7 +621,7 @@ The policy-file owner key is not rotated here. It is enrolled with `profile enro
 | Subcommand | Key kind | Effect on outstanding material |
 |---|---|---|
 | `profile rotate-attestation-key <NAME>` | 32-byte HMAC | All pending approvals invalidated; re-run the simulate-and-approve round trip. |
-| `profile rotate-audit-key <NAME>` | 32-byte HMAC | Re-signs every existing per-file chain-root sidecar with the new key; `audit verify --profile <p>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server is running. |
+| `profile rotate-audit-key <NAME>` | 32-byte HMAC | Re-signs every existing per-file chain-root sidecar with the new key; `audit verify --profile <p>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds the writer. |
 | `profile rotate-nonce-key <NAME>` | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
 | `profile rotate-counterparty-key <NAME>` | 32-byte HMAC | Invalidates every cached counterparty binding; the wallet re-fetches on the next counterparty-allowlist check. |
 

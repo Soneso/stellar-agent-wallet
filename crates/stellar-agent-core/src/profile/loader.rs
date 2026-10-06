@@ -1556,9 +1556,10 @@ impl ProfileOrigin {
 /// The asymmetry between this fallback and a newly-minted profile is
 /// intentional: newly-minted profiles default to `V1`, but the synthesised
 /// first-run fallback retains `Noop` because no owner-key has been minted yet.
-/// V1 becomes operational through the ceremony `enroll-owner-key` +
-/// `rotate-attestation-key` + `rotate-audit-key` + `sign-policy` (the
-/// normative list is the CLI reference's `profile init` entry).
+/// V1 setup requires an enrolled owner key, an attestation key, and an
+/// existing policy file signed with `sign-policy`. MCP payment simulation
+/// requires a nonce key. MCP signing requires an audit key and an enrolled signer.
+/// The CLI reference's `profile init` entry links the complete setup sequence.
 ///
 /// # Design note
 ///

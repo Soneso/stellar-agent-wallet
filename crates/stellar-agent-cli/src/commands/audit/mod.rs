@@ -27,8 +27,9 @@ use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 /// failure code:
 ///
 /// - A held writer lock is `audit.writer_locked`. The audit writer is
-///   process-exclusive, so a running MCP server makes every verb that must
-///   hold the writer itself refuse; the operator stops the server and retries.
+///   process-exclusive. While an MCP server holds that profile's writer,
+///   commands that need exclusive writer access refuse. The operator stops
+///   the server and retries.
 ///   `approve --id` holds it only to write one consent row, and beside a
 ///   draining server it queues that row in the audit outbox instead. The
 ///   skill's troubleshooting table keys on codes, so an agent can only
