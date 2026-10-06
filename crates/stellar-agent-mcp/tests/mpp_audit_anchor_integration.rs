@@ -1113,3 +1113,156 @@ async fn mpp_commit_drains_a_queued_consent_row_before_the_signed_resimulation()
         "the consent row must be in the log when the signed entry reaches the RPC"
     );
 }
+
+fn profile_chain_cap_engine(profile_name: &str) -> stellar_agent_core::PolicyEngineV1 {
+    use stellar_agent_core::policy::Decision;
+    use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
+    use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+    PolicyEngineV1::new(
+        PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            signature: None,
+            rules: vec![
+                PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "*".into(),
+                        chain: "stellar:testnet".into(),
+                    },
+                    criteria: vec![Box::new(PerPeriodCapCriterion::new(
+                        CONTRACT.into(),
+                        Window::parse("1d").expect("window"),
+                        15_000_000,
+                    ))],
+                    decision: Decision::Allow,
+                    allow_opaque_signing: false,
+                },
+                PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "*".into(),
+                        chain: "*".into(),
+                    },
+                    criteria: vec![],
+                    decision: Decision::Allow,
+                    allow_opaque_signing: false,
+                },
+            ],
+        },
+        profile_name.into(),
+    )
+}
+
+fn assert_profile_chain_authorization_window(profile: &Profile, name: &str) {
+    use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+    let state = PolicyStateStore::new();
+    stellar_agent_network::policy_state::PersistedWindowStore::for_profile(name)
+        .load_into(name, profile, &state)
+        .expect("persisted authorization");
+    assert_eq!(
+        state
+            .query_window(
+                &StateKey::new(
+                    name,
+                    1,
+                    &stellar_agent_core::policy::v1::value::asset_normalise(CONTRACT),
+                    86_400
+                ),
+                stellar_agent_core::timefmt::now_unix_ms().expect("clock"),
+            )
+            .expect("window"),
+        (10_000_000, 1),
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn profile_chain_mpp_accounting_persists_cap() {
+    const NAME: &str = "chain-mpp";
+    let mut fixture = mpp_fixture(NAME, [0x78; 32], true, |responder, _| responder).await;
+    fixture
+        .server
+        .set_policy_engine_for_test(std::sync::Arc::new(profile_chain_cap_engine(NAME)));
+    let prepared = fixture
+        .server
+        .call_stellar_mpp_charge_prepare(NAME.into(), challenge(2))
+        .await
+        .expect("second authorization prepare");
+    let prepared = result_json(&prepared);
+    assert_eq!(prepared["ok"], true, "{prepared}");
+    let first = prepare_and_commit(&fixture.server, NAME, 1).await;
+    let first = result_json(&first);
+    assert_eq!(first["ok"], true, "{first}");
+    assert!(!first["data"]["credential"].is_null());
+    assert_profile_chain_authorization_window(&fixture.profile, NAME);
+
+    let data = &prepared["data"];
+    let second = fixture
+        .server
+        .call_stellar_mpp_charge_commit(
+            data["authorization"]["authorization_id"]
+                .as_str()
+                .expect("authorization id")
+                .into(),
+            data["nonce"].as_str().expect("commit nonce").into(),
+            data["nonce_expires_at_unix_ms"].as_u64().expect("expiry"),
+        )
+        .await
+        .expect("second commit");
+    assert_eq!(
+        common::assert_business_envelope(&second).0,
+        "policy.deny.per_period_cap_exceeded"
+    );
+    assert_eq!(
+        fixture
+            .signed_requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_profile_chain_authorization_window(&fixture.profile, NAME);
+}
+
+#[tokio::test]
+#[serial]
+async fn profile_chain_x402_accounting_persists_cap() {
+    use stellar_agent_mcp::server::X402CreatePaymentArgs;
+    const NAME: &str = "chain-x402";
+    let mut fixture = mpp_fixture(NAME, [0x79; 32], true, |responder, _| responder).await;
+    fixture
+        .server
+        .set_policy_engine_for_test(std::sync::Arc::new(profile_chain_cap_engine(NAME)));
+    let args = || X402CreatePaymentArgs {
+        chain_id: "stellar:testnet".into(),
+        address: None,
+        payment_required: serde_json::json!({
+            "scheme": "exact", "network": "stellar:testnet", "asset": CONTRACT,
+            "amount": "10000000", "payTo": RECIPIENT, "maxTimeoutSeconds": 300,
+            "extra": { "areFeesSponsored": true }
+        })
+        .to_string(),
+    };
+    let first = fixture
+        .server
+        .call_stellar_x402_create_payment(args())
+        .await
+        .expect("authorization");
+    let first = result_json(&first);
+    assert_eq!(first["ok"], true, "{first}");
+    assert!(first["data"]["paymentSignature"].as_str().is_some());
+    assert_profile_chain_authorization_window(&fixture.profile, NAME);
+    let second = fixture
+        .server
+        .call_stellar_x402_create_payment(args())
+        .await
+        .expect("cap refusal");
+    assert_eq!(
+        common::assert_business_envelope(&second).0,
+        "policy.deny.per_period_cap_exceeded"
+    );
+    assert_eq!(
+        fixture
+            .signed_requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_profile_chain_authorization_window(&fixture.profile, NAME);
+}

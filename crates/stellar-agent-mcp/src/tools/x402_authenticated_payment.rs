@@ -357,8 +357,8 @@ impl WalletServer {
             "payment_required_len": args.payment_required.len(),
         });
 
-        // ── dispatch_gate_with_value: registry lookup + policy evaluation +
-        // chain_id, sizing the value criteria against `value_leg` ────────────
+        // The gate performs registry lookup, chain validation, and policy evaluation.
+        // Value criteria use the supplied value_leg.
         // Single-shot sign tool: RequireApproval is fail-closed. The two-phase
         // approval flow is not supported on this surface. `account_view` /
         // `identity_view` are `None`: the `minimum_reserve` / `home_domain`

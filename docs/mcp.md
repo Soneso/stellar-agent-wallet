@@ -260,6 +260,10 @@ The two [policy engines](./concepts.md) are Noop (testnet allow-all; mainnet
 read-only allow, mainnet destructive refused) and V1 (signature-verified typed
 criteria, first-match default-deny).
 
+A tool that requires `chain_id` refuses any other chain with `invalid_params`
+before policy evaluation. Policy rules match on the profile's chain for
+evaluation and accounting, including gated tools without a `chain_id` argument.
+
 How a `RequireApproval` verdict is satisfied depends on the tool shape:
 
 - Two-phase signing verbs (`stellar_pay`, `stellar_create_account`,

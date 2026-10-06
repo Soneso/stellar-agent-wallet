@@ -368,9 +368,12 @@ impl RuleMatch {
     ///     chain_id_required: true,
     ///     value_kind: stellar_agent_core::policy::ToolValueKind::ReadOnly,
     /// });
-    /// // chain_id on ToolDescriptor is populated from the tool call arg at dispatch;
-    /// // for the match test the chain_id field of ToolDescriptor is not yet set.
-    /// // The wildcard form always passes:
+    /// // Dispatch binds the descriptor to the profile's chain.
+    /// let mut bound = td.clone();
+    /// bound.chain_id = "stellar:mainnet".into();
+    /// assert!(exact.matches(&bound));
+    /// assert!(!exact.matches(&td));
+    /// // A wildcard matches every chain.
     /// let wild = RuleMatch { tool: "*".into(), chain: "*".into() };
     /// assert!(wild.matches(&td));
     /// ```

@@ -121,6 +121,8 @@ Evaluation is **first-match, default-deny**:
 
 1. Rules are walked in declaration order.
 2. The first rule whose match (tool name plus chain-id filter) applies is selected.
+   The chain filter compares the rule's `chain` with the bound profile's chain,
+   on the CLI and in the MCP server.
 3. That rule's criteria run in order; the first failing criterion produces a Deny.
 4. If all criteria pass, the rule's decision is returned.
 5. If no rule matches, the call is denied (`no_matching_rule`).

@@ -109,6 +109,8 @@ url = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+# WalletServer::call_stellar_pay for the CLI and MCP policy parity test.
+stellar-agent-mcp = { path = "../stellar-agent-mcp", features = ["test-helpers"] }
 # Build signed toolset .tar.gz fixtures in the install tests.
 flate2 = { workspace = true }
 tar = { workspace = true }

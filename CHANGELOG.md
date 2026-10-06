@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- In `0.1.0-alpha.1` through `0.1.0-alpha.10`, the MCP server and the CLI
+  `smart-account multicall` command match policy rules against an empty chain,
+  so a rule with an exact `chain` never applies there. The MCP server now
+  evaluates policy rules and records spending with the profile's chain, so an
+  exact `chain` rule applies on the MCP path as on the CLI. A wrong `chain_id`
+  argument fails with `invalid_params` before any policy decision. SEP-43
+  sign-and-submit counts toward the rate limit of its matching rule. The CLI
+  `smart-account multicall` command evaluates and records its bundle with the
+  profile's chain.
+
 ### Fixed
 
 - CLI help names `--account` as required for balances and describes JSON profile-list output and audit sidecar re-signing. The `stellar_balances` MCP description uses `--account` in its CLI equivalent.
