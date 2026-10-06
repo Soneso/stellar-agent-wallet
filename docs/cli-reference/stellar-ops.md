@@ -493,10 +493,12 @@ A submission whose ledger has fallen outside the endpoint's retention window can
 never be settled this way. The verb reports it as `ambiguous` with
 `record.reservation_open: true`, and `tx receipt clear` is the way out.
 
-Writing the settled row needs the audit writer's exclusive lock, which a running
-`stellar-agent-mcp` server holds for its lifetime. While the server is up the
-verb refuses with `audit.writer_locked`; stop the server, reconcile, start it
-again.
+Writing the settled row needs the audit writer's exclusive lock. The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and write settlement audit rows.
+
+The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor.
+
+While the server holds that profile's writer, the verb refuses with
+`audit.writer_locked`; stop the server, reconcile, and start it again.
 
 Exits 0 when the lookup completes, whatever the chain reported; exits 1 when the
 profile, the record, or the endpoint could not be reached.

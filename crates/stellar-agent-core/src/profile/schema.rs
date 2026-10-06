@@ -455,10 +455,9 @@ pub enum PolicyEngineKindParseError {
 
 /// Per-profile policy-engine configuration.
 ///
-/// Embedded as `[policy]` in the profile TOML.  The full `PolicyEngineV1`
-/// configuration (typed criteria, rules, scope) lives in a separate
-/// `~/.local/share/stellar-agent/policies/` TOML file; only the engine
-/// selector is held here.
+/// Embedded as `[policy]` in the profile TOML, this holds the engine selector.
+/// The full `PolicyEngineV1` configuration lives in a separate TOML file under
+/// [`default_policy_dir`], which honors `XDG_DATA_HOME` on Linux.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct PolicyConfig {

@@ -339,13 +339,18 @@ server held the writer enters the log there. A commit that consumes an approval
 therefore has its consent row in the log before the signing key loads.
 
 Acquiring the writer also proves the audit log still contains the chain tip its
-keyring-held anchor names, and it does so on EVERY acquisition rather than only
-at server start: the writer is cached for the server's lifetime, so a log
-replaced underneath it would otherwise go unnoticed until a restart. A log that
-was restored from an older copy, truncated, or substituted refuses with
-`audit.tip_anchor_mismatch`, whether it was overwritten in place or replaced by
-a rename: the file at the path is compared by identity against the handle the
-server holds, not only by its contents. Every row the server appends is checked
+keyring-held anchor names. This check runs on every acquisition, including
+writer open. The MCP server acquires its audit writer when an operation needs
+it, such as a commit preflight before signing. MCP balance reads do not acquire
+it. Under V1, payment simulations can reconcile overdue reservations, acquire
+the writer, and write settlement audit rows.
+
+The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor.
+
+A log restored from an older copy, truncated, or substituted refuses with
+`audit.tip_anchor_mismatch`. Both in-place overwrites and replacements by
+rename are checked. The file at the path is compared by identity against
+the handle the server holds; its tip is also checked. Every row the server appends is checked
 again, for identity and for the file still ending where the server left it, and
 a refused row is anchored so the refusal survives a restart. A log that simply moved FORWARD past its anchor
 is not a refusal — unkeyed writers append without moving it, and the next
@@ -354,8 +359,8 @@ adopted on first use with no operator action, which is what happens on the first
 run after upgrading a wallet whose audit log predates the anchor. An adoption
 writes its `audit_tip_anchored` row only for a non-empty file. Recovery from a
 mismatch is `stellar-agent audit reanchor --profile <name>
---acknowledge-rollback`, and it requires stopping this server first, since the
-server holds the audit writer's exclusive lock.
+--acknowledge-rollback`. Stop this server first if it holds that profile's
+audit writer.
 
 Acquiring the writer also checks the profile's audit binding: the keyring
 records the log path digest and the audit-key coordinate the profile writes

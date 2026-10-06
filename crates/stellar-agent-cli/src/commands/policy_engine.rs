@@ -3,9 +3,8 @@
 //! # What this module does
 //!
 //! Provides [`build_v1_policy_engine`]: a single fail-closed builder for
-//! `PolicyEngineV1` (or `NoopPolicyEngine`) shared by the `lend`, `vault`,
-//! `trade`, `bridge`, and `trustline` CLI subcommands, as well as `pay`,
-//! `claim`, and `accounts create` (sponsored mode).
+//! `PolicyEngineV1` (or `NoopPolicyEngine`) shared by the `vault`, `trade`,
+//! `trustline`, `pay`, `claim`, and sponsored `accounts create` CLI commands.
 //!
 //! Also provides [`evaluate_value_moving_policy`] for shared policy evaluation
 //! and refusal-envelope construction. The
@@ -74,9 +73,8 @@ enum OwnerKeySource {
 /// Constructs the [`PolicyEngine`] for a value-moving CLI verb from the
 /// profile's `policy.engine` kind.
 ///
-/// `verb` is the operation name (e.g. `"lend"`, `"vault"`, `"trade"`,
-/// `"bridge"`, `"trustline"`) — it appears in every error message to
-/// attribute the failure.
+/// `verb` is the operation name, such as `"vault"`, `"trade"`, or `"trustline"`.
+/// It appears in every error message to attribute the failure.
 ///
 /// `requested_profile_name` is the name the operator selected (`--profile`,
 /// `STELLAR_AGENT_PROFILE`, or the fallback), already resolved. It selects the
@@ -407,20 +405,17 @@ pub(crate) fn trustline_policy_args(from: &str, asset: &str) -> serde_json::Valu
     serde_json::json!({ "from": from, "asset": asset })
 }
 
-/// Evaluates operator policy for a value-moving classic verb (`pay`, `claim`,
-/// `accounts create`) through the same [`PolicyEngine::evaluate`] path the
-/// DeFi verbs (`trade`, `lend`, `vault`, `trustline`) already use.
+/// Evaluates operator policy for `pay`, `claim`, sponsored `accounts create`,
+/// and `trustline` through [`PolicyEngine::evaluate_full`].
 ///
-/// Constructs the [`ToolDescriptor`] from `tool_name` / `value_kind` /
-/// `chain_id`, then evaluates `policy_args` against `profile`. Returns
-/// `Ok(value_effects)` on [`Decision::Allow`] — the value descriptor the gate
-/// sized while deriving it from `policy_args` (`Some` for a value-moving allow,
-/// `None` for a read-only allow or the no-op engine) — so the caller records
-/// exactly the legs the gate evaluated (single-derivation invariant) without
-/// re-deriving. Returns `Err(envelope)` — a fully-rendered refusal envelope —
-/// for every other outcome, mirroring the `trade` / `lend` / `vault` /
-/// `trustline` refusal-message shapes verbatim so a V1-engine deny produces the
-/// identical wire code the MCP twin returns for the same rule.
+/// Constructs the [`ToolDescriptor`] from `tool_name`, `value_kind`, and
+/// `chain_id`, then evaluates `policy_args` against `profile`.
+/// On [`Decision::Allow`], returns `Ok(value_effects)` with the value descriptor
+/// derived from `policy_args`. A value-moving allow carries `Some`; a
+/// read-only allow or the Noop engine carries `None`. Callers record exactly
+/// the legs the gate evaluated. Other outcomes return `Err(envelope)` with a
+/// rendered refusal. V1 denials carry the same wire code as the corresponding
+/// MCP tool for the same rule.
 ///
 /// Callers render the envelope with their own `print_error` (JSON vs table)
 /// and exit `1`.
@@ -502,19 +497,15 @@ pub(crate) fn evaluate_value_moving_policy(
     }
 }
 
-/// Evaluates operator policy for a value-moving DeFi verb (`trade`, `lend`,
-/// `vault`) whose effect cannot be derived from pre-decode args alone —
-/// mirroring the MCP DeFi tools' `WalletServer::dispatch_gate_with_value`
-/// mechanism.
+/// Evaluates operator policy for `trade` and `vault` using a supplied value
+/// descriptor, matching the MCP DeFi tools'
+/// `WalletServer::dispatch_gate_with_value` mechanism.
 ///
 /// Constructs the same [`ToolDescriptor`] shape as
-/// [`evaluate_value_moving_policy`] (`McpToolRegistration` with
-/// `value_kind: ToolValueKind::MovesValue`, `ToolDescriptor::from_registration`,
-/// `chain_id` set), but evaluates via
-/// [`PolicyEngine::evaluate_with_value`] with the caller-supplied
-/// `value_class` — the same value descriptor the CLI verb builds from the
-/// SAME parsed requirements it signs (single-decode invariant) — instead of
-/// [`PolicyEngine::evaluate`]'s args-derived descriptor. Returns `Ok(())` on
+/// [`evaluate_value_moving_policy`], with `ToolValueKind::MovesValue` and the
+/// selected `chain_id`. Evaluates through [`PolicyEngine::evaluate_with_value_full`]
+/// using the caller-supplied `value_class`. The CLI derives this descriptor
+/// from the same parsed requirements it signs. Returns `Ok(())` on
 /// [`Decision::Allow`]; returns `Err(envelope)` for every other outcome,
 /// mirroring the `evaluate_value_moving_policy` refusal-message shapes
 /// verbatim so a V1-engine deny produces the identical wire code the MCP
@@ -1512,11 +1503,9 @@ mod tests {
 
     // ── evaluate_value_moving_policy_with_value: single-shot DeFi verb parity ──
     //
-    // These tests drive `evaluate_value_moving_policy_with_value` against a
-    // synthetic `stellar_dex_trade`-shaped rule, mirroring the pattern above
-    // but through the `evaluate_with_value` path (typed `ValueClass` supplied
-    // directly rather than derived from `args`), the mechanism the `trade` /
-    // `lend` / `vault` CLI verbs now share with their MCP twins.
+    // These tests evaluate a synthetic `stellar_dex_trade` rule with an
+    // explicit `ValueClass`. The `trade` and `vault` CLI verbs share this
+    // `evaluate_with_value_full` path with their MCP twins.
 
     use stellar_agent_core::policy::v1::{ActionKind, ValueClass, ValueLeg};
 

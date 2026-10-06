@@ -104,6 +104,14 @@ printf '%s' 'scheduled retention cleanup' | \
   stellar-agent mpp state prune --profile default --reason-stdin
 ```
 
+Select exactly one reason source: `--reason-stdin` or `--reason-file <PATH>`.
+The reason must contain 1 to 4096 bytes. A reason file must be a regular file;
+the command refuses a symlink. For a file-based reason:
+
+```bash
+stellar-agent mpp state prune --profile default --reason-file reason.txt
+```
+
 All commands return the standard JSON envelope and exit `0` only for
 `{"ok":true}`. Credential-bearing output is sensitive; do not place it in logs,
 shell history, telemetry, or an untrusted agent transcript.

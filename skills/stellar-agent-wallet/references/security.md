@@ -2,10 +2,13 @@
 
 This wallet places fixed controls between every tool call an agent makes and any
 network or signing action. The agent is not assumed to be correct or honest: a
-policy engine evaluates each call before any RPC or signature, operator approval
-is required for gated cases and is cryptographically bound to the exact
-transaction, every invocation is recorded in a tamper-evident audit log, and the
-signing seed is kept out of the agent's reach. This file describes the security
+policy engine evaluates calls and operator approval covers gated cases.
+Approval is cryptographically bound to the exact transaction. The audit log
+records transaction submissions, signed authorizations, approvals, and explicit
+key-management and lifecycle events. MCP balance reads add no audit rows. A payment
+simulation adds no invocation row; under V1 it can reconcile overdue
+reservations and write their settlement rows. The signing seed stays out of the agent's reach.
+This file describes the security
 model an operator should understand and the safe-operation rules an agent must
 follow. For the tool list and argument shapes see `./mcp-tools.md`.
 
@@ -264,8 +267,12 @@ agent-controlled surface.
 
 ## The tamper-evident audit log
 
-Every tool invocation and lifecycle event is appended to a per-profile,
-append-only, hash-chained JSONL audit log. The writer is a per-profile singleton
+The per-profile, append-only, hash-chained JSONL audit log records transaction
+submissions, signed authorizations, approvals, and explicit key-management and
+lifecycle events. MCP balance reads and payment simulations produce no automatic
+invocation row. Under V1, payment simulations can reconcile overdue reservations
+and write settlement audit rows.
+The writer is a per-profile singleton
 holding an exclusive lock and appending with an fsync per line; a second opener is
 rejected. Files rotate at a size bound with a fixed number of rotated files
 retained.
@@ -277,7 +284,7 @@ request id, the event kind, and the previous entry's hash. Each entry is
 hash-chained to the one before it; each file carries a root-HMAC sidecar signed
 with the profile's audit key.
 
-Beyond tool invocations, the log records `value_action_submitted` on every
+The log records `value_action_submitted` on every
 confirmed value-moving submit (carrying the gate-sized value legs) and
 `keyring_key_written` on each key-writing profile command. It records
 `x402_payment_authorized` before a signed x402 authorization leaves the wallet

@@ -115,7 +115,7 @@ pub struct StellarBalancesArgs {
 impl WalletServer {
     /// Fetches the native XLM balance and trustlines for a Stellar account.
     ///
-    /// Returns the same JSON envelope as `stellar-agent balances <G>`.
+    /// Returns the same JSON envelope as `stellar-agent balances --account <G>`.
     ///
     /// # Tool annotations
     ///
@@ -182,7 +182,7 @@ impl WalletServer {
         name = "stellar_balances",
         description = "Fetch the native XLM balance and trustlines for a Stellar account. \
                        Optional `assets` array specifies non-native trustlines to include. \
-                       Returns the same JSON envelope as `stellar-agent balances <G>`. \
+                       Returns the same JSON envelope as `stellar-agent balances --account <G>`. \
                        read_only_hint=true; destructive_hint=false.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]

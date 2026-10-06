@@ -29,9 +29,12 @@ The wallet answers that with a strict division of roles:
 - **You decide.** Actions held for approval land in your approval inbox. You
   see what the wallet itself decoded from the transaction, never the agent's
   description of it, and approve or reject with one click.
-- **Everything is recorded.** An append-only, hash-chained audit log captures
-  every action and decision. If anyone edits the log afterwards, verification
-  fails.
+- **Audit events reveal tampering.** An append-only, hash-chained audit log records
+  transaction submissions, signed authorizations, approvals, and explicit
+  key-management and lifecycle events. MCP balance reads and payment simulations
+  produce no automatic invocation row. Under V1, payment simulations can
+  reconcile overdue reservations and write settlement audit rows. If anyone
+  edits the log afterward, verification fails.
 
 Your secret keys never reach the agent. They live in your operating system's
 keyring (Keychain on macOS, Secret Service on Linux, Credential Manager on
@@ -92,7 +95,7 @@ Nothing is asked of you on faith. The alpha is deliberately conservative:
   rules can require your approval above a chosen amount.
 - **Approvals are unforgeable.** An approval is a cryptographic attestation
   bound to the exact transaction bytes you saw and to your OS user account.
-  If the transaction changes by one byte afterwards, the approval is void.
+  If the transaction changes by one byte afterward, the approval is void.
 - **The audit log does not lie.** Each entry is chained to the previous one
   by hash. `stellar-agent audit verify` proves the record was not touched.
 

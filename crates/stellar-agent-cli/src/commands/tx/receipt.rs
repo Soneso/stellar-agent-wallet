@@ -39,9 +39,12 @@
 //!
 //! # Concurrency
 //!
-//! Writing the audit row needs the audit writer's exclusive lock, which a
-//! running MCP server holds for its lifetime. Stop the server, clear, start it
-//! again.
+//! Writing the audit row needs the audit writer's exclusive lock. If an MCP
+//! server holds that profile's writer, stop it, clear, and start it again.
+//! The server acquires its writer when needed, including for V1 reservation
+//! reconciliation during simulation. The registry normally retains it until
+//! exit. A replaced-file refusal during acquisition marks it for eviction.
+//! A later acquisition drops it once callers release it.
 //!
 //! # Exit codes
 //!

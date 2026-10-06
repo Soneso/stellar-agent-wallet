@@ -218,8 +218,9 @@ server transaction instead. The complete testnet-only workflow is in
 - Expect `policy.deny.*`, `policy.approval_required`, and `policy.engine_required`
   as normal control flow, not failures to retry.
 - Never try to get under a limit by re-submitting a commit with altered amounts;
-  the gate matches the authoritative envelope and the audit log records every
-  attempt.
+  the gate matches the authoritative envelope. Audit rows come from explicit
+  submission, signing, approval, key-management, and lifecycle events; early
+  refusals do not automatically write a row.
 - The operator verifies the tamper-evident log with `stellar-agent audit verify`.
   Argument values are never logged; only key names are. So passing data through the
   wallet does not leak it into the audit trail.

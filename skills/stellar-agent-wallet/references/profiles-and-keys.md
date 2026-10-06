@@ -269,9 +269,10 @@ before any `stellar-agent` / `stellar-agent-mcp` command:
 
 - `STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi` — Windows only; entries are
   protected with DPAPI (CurrentUser scope).
-- `STELLAR_AGENT_KEYRING_BACKEND=headless-env` — any platform; entries are
-  encrypted with XChaCha20-Poly1305 under a 32-byte URL-safe-base64 key
-  supplied in `STELLAR_AGENT_HEADLESS_KEYRING_KEY`.
+- `STELLAR_AGENT_KEYRING_BACKEND=headless-env`: any platform; entries are
+  encrypted with XChaCha20-Poly1305. Supply 32 random bytes, encoded as URL-safe
+  base64 without padding, in `STELLAR_AGENT_HEADLESS_KEYRING_KEY`.
+  See the [POSIX shell and PowerShell generation commands](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#generate-a-headless-keyring-key).
 
 The platform keyring remains the default when the variable is unset; there is
 no silent fallback in either direction — a misconfigured backend fails closed
@@ -331,7 +332,7 @@ The signer seed is imported, not minted. `stellar-agent profile enroll-signer`
 reads the operator's `S...` ed25519 secret from a named environment variable and
 stores it verbatim at the profile's `mcp_signer_default` keyring coordinate — the
 signer every MCP fund-movement tool and every keyring-signing CLI verb
-(`trustline`, `lend`, `trade`, `vault`) resolves. On a clean install that entry
+(`trustline`, `trade`, `vault`) resolves. On a clean install that entry
 is absent and those paths fail with `auth.keyring_not_found`.
 
 The operator sets `WALLET_SK` as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows. In the operator's terminal, run this line on its own, paste the signer seed when prompted, and press Enter. The line reads the seed from the terminal, so the operator runs it, not the agent.
@@ -359,12 +360,20 @@ the seed does not derive to that exact address, printing the address to set
 
 ### Opt in to V1
 
-On top of `profile rotate-audit-key` (required on every engine, see above),
-the V1-specific ceremony, in order, is `profile enroll-owner-key`,
-`profile rotate-attestation-key`, then `profile sign-policy`. An
-`init`-minted profile already carries `engine = "v1"` — complete the ceremony
-and it becomes operational. A profile migrated from schema v1 stays on
-`noop`; after the ceremony, set the engine in the profile TOML:
+Complete these steps for a persistent profile, using its name in place of `<name>`:
+
+1. `stellar-agent profile rotate-audit-key <name>`: mint the audit key, required
+   before signing on every engine.
+2. `stellar-agent profile rotate-nonce-key <name>`: mint the nonce key before
+   MCP payment simulation. Without it, simulation fails with `nonce.mint_failed`.
+3. `profile enroll-owner-key`, then `profile rotate-attestation-key <name>`:
+   enroll the policy owner and mint the approval key.
+4. [Create the V1 policy file](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/profiles.md#create-the-v1-policy-file), then run `profile sign-policy`. A missing file refuses with `sign_policy.policy_file_unreadable`.
+5. [Enroll the MCP signer](#enroll-the-mcp-signer) before signing transactions.
+
+An `init`-minted profile already carries `engine = "v1"`. This setup supplies
+its policy and key prerequisites. A profile migrated from schema v1 stays on
+`noop`; after completing these steps, set the engine in the profile TOML:
 
 ```toml
 [policy]

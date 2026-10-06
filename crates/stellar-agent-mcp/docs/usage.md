@@ -16,7 +16,7 @@ Fetches the native XLM balance and trustlines for a Stellar account.
 
 - `assets` (array, optional): Non-native trustlines to include. Each element is `{ "code": "USDC", "issuer": "GA5Z..." }`. Returns the native XLM balance plus any trustlines listed in the optional `assets` argument. Up to 100 trustline assets may be queried per call; assets the account does not currently trust are omitted from the returned `balances` list.
 
-**Returns:** JSON envelope identical to `stellar-agent balances <account_id>`.
+**Returns:** JSON envelope identical to `stellar-agent balances --account <G>`.
 
 **Annotations:** `readOnlyHint=true`, `destructiveHint=false`.
 

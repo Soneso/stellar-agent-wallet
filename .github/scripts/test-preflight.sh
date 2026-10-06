@@ -4,9 +4,9 @@
 # Builds a scratch Git repository with one commit on main. It holds copies of
 # the root manifest, every crates/*/Cargo.toml, four crate sources, and the
 # cap85-beacon record of the smart-account crate. It also holds the .github
-# directory, CONTRIBUTING.md, the building guide, and the skill. Each case
-# copies that repository, changes it on a branch, and runs preflight.sh
-# against main.
+# directory, CHANGELOG.md, CONTRIBUTING.md, the building guide, and the skill.
+# Each case copies that repository, changes it on a branch, and runs
+# preflight.sh against main.
 #
 # Planning cases compare the whole --list output with the expected gates. The
 # package cases also compute the test packages from the fixture manifests
@@ -48,12 +48,14 @@ REAL_BASH=$(command -v bash)
 REAL_PYTHON=$(python3 -c 'import sys; print(sys.executable)')
 FIXTURE="$TMP/fixture"
 
-CASES="docs-only welcome-workflow ci-yml-only python-check-script shell-check-script skill
-one-crate two-owners target-specific-edge dev-dependency-edge root-manifest removed-member
-untracked-test-file committed-cross-scope-rename staged-rename-record spaces-and-an-apostrophe
+CASES="docs-only install-surface-doc deleted-install-surface-doc welcome-workflow ci-yml-only
+python-check-script shell-check-script skill one-crate two-owners target-specific-edge
+dev-dependency-edge root-manifest wallet-manifest removed-member untracked-test-file fixture-markdown
+committed-cross-scope-rename staged-rename-record spaces-and-an-apostrophe
 full vendored contracts action-script invariants-helper duplicate-triggers changed-self-test
 deleted-shell-script deleted-self-test unavailable-tool
-exit-aggregation table bad-base malformed-manifest the-preflight-itself registry-completeness
+exit-aggregation table bad-base malformed-manifest unloadable-install-surface-check
+the-preflight-itself registry-completeness
 drift drift-new-step drift-unnamed-step drift-removed-step drift-renamed-step
 install-hint coverage-suppression coverage-unavailable coverage-written"
 
@@ -170,7 +172,7 @@ build_fixture() {
   for file in crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/REFERENCE.md \
     crates/stellar-agent-sep7/src/lib.rs crates/stellar-agent-sep5/src/lib.rs \
     crates/stellar-agent-windows-identity/src/lib.rs crates/stellar-agent-test-support/src/lib.rs \
-    CONTRIBUTING.md docs/maintainers/building.md skills/stellar-agent-wallet/SKILL.md; do
+    CHANGELOG.md CONTRIBUTING.md docs/maintainers/building.md skills/stellar-agent-wallet/SKILL.md; do
     mkdir -p "$dir/$(dirname "$file")"
     cp "$ROOT/$file" "$dir/$file"
   done
@@ -860,10 +862,29 @@ expect_drift() {
   done
 }
 
+# CHANGELOG.md is Markdown outside the surface scope.
 case_docs_only() {
   start_case
-  edit CONTRIBUTING.md
+  edit CHANGELOG.md
   expect_list "${ALWAYS[@]}"
+}
+
+# The install-surface check reads CONTRIBUTING.md, and its self-test injects
+# into copies of the files that check reads.
+case_install_surface_doc() {
+  start_case
+  edit CONTRIBUTING.md
+  expect_list "${ALWAYS[@]}" self-test:test-check-install-surface.py
+}
+
+# A deleted path of the surface scope selects the self-test too: a case that
+# injects into the deleted file fails.
+case_deleted_install_surface_doc() {
+  start_case
+  git rm -q docs/maintainers/building.md
+  git commit -q -m "remove the building guide"
+  assert_changed docs/maintainers/building.md
+  expect_list "${ALWAYS[@]}" self-test:test-check-install-surface.py
 }
 
 case_welcome_workflow() {
@@ -894,7 +915,7 @@ case_shell_check_script() {
 case_skill() {
   start_case
   edit skills/stellar-agent-wallet/SKILL.md
-  expect_list "${ALWAYS[@]}" package-skill
+  expect_list "${ALWAYS[@]}" self-test:test-check-install-surface.py package-skill
 }
 
 # The MCP manifest inherits stellar-agent-sep7 from [workspace.dependencies].
@@ -941,7 +962,18 @@ stellar-agent-toolsets-runtime stellar-agent-x402" test-helpers,test-hooks,test-
 case_root_manifest() {
   start_case
   edit Cargo.toml
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg
+  expect_list "${ALWAYS[@]}" self-test:test-check-install-surface.py "${RUST[@]}" test \
+    test-vendored-release-cfg
+}
+
+# The install-surface check reads the binstall metadata of the wallet crate
+# manifests.
+case_wallet_manifest() {
+  start_case
+  edit crates/stellar-agent-cli/Cargo.toml
+  pin_packages stellar-agent-cli test-helpers crates/stellar-agent-cli/Cargo.toml
+  expect_list "${ALWAYS[@]}" self-test:test-check-install-surface.py "${RUST[@]}" \
+    "test=$TEST_COMMAND"
 }
 
 case_removed_member() {
@@ -960,12 +992,23 @@ case_untracked_test_file() {
   expect_list "${ALWAYS[@]}" "${RUST[@]}" "test=$TEST_COMMAND"
 }
 
+# Markdown under the test fixtures of a crate is outside the surface scope.
+case_fixture_markdown() {
+  start_case
+  mkdir -p crates/stellar-agent-sep7/tests/fixtures
+  printf '# Fixture\n' >crates/stellar-agent-sep7/tests/fixtures/notes.md
+  assert_changed crates/stellar-agent-sep7/tests/fixtures/notes.md
+  pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers \
+    crates/stellar-agent-sep7/tests/fixtures/notes.md
+  expect_list "${ALWAYS[@]}" "${RUST[@]}" "test=$TEST_COMMAND"
+}
+
 case_committed_cross_scope_rename() {
   start_case
   git mv skills/stellar-agent-wallet/SKILL.md docs/skill.md
   git commit -q -m "move the skill"
   assert_changed skills/stellar-agent-wallet/SKILL.md docs/skill.md
-  expect_list "${ALWAYS[@]}" package-skill
+  expect_list "${ALWAYS[@]}" self-test:test-check-install-surface.py package-skill
 }
 
 # The staged rename has two NUL-delimited paths outside the Rust scope.
@@ -1022,6 +1065,7 @@ case_full() {
   expect_list --full "${ids[@]}"
 }
 
+# The vendored REFERENCE.md is Markdown outside the surface scope.
 case_vendored() {
   start_case
   edit crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/REFERENCE.md
@@ -1191,6 +1235,21 @@ case_malformed_manifest() {
   if [ "$rc" -ne 2 ] || ! grep -qF crates/stellar-agent-sep5/Cargo.toml "$CASE_DIR.err" || [ -s "$CASE_DIR.out" ]; then
     cat "$CASE_DIR.out" "$CASE_DIR.err" >&2
     fail "a malformed manifest exited $rc"
+  fi
+}
+
+# A check-install-surface.py that does not load stops the planner, and the
+# message names it.
+case_unloadable_install_surface_check() {
+  local rc=0
+  start_case
+  printf 'def is_scanned(:\n' >.github/scripts/check-install-surface.py
+  assert_changed .github/scripts/check-install-surface.py
+  "$REAL_BASH" "$SCRIPT_REL" --list --base main >"$CASE_DIR.out" 2>"$CASE_DIR.err" || rc=$?
+  if [ "$rc" -ne 2 ] || [ -s "$CASE_DIR.out" ] ||
+    ! grep -qF "preflight: cannot load .github/scripts/check-install-surface.py: " "$CASE_DIR.err"; then
+    cat "$CASE_DIR.out" "$CASE_DIR.err" >&2
+    fail "an unloadable install-surface check exited $rc"
   fi
 }
 
