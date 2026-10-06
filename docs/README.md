@@ -10,6 +10,8 @@ shipping a `stellar-agent` CLI and a `stellar-agent-mcp` MCP server.
   with Claude Code looks. Start here.
 - [Getting started](getting-started.md): install, create a profile, fund a
   testnet account, and make a first payment.
+- [Verifying releases](verifying-releases.md): check a release archive against
+  its checksums, its cosign signature, and its SLSA provenance.
 - [Concepts](concepts.md): the security and governance model: profiles, key
   custody, the policy engine, the approval spine, and the audit log.
 - [CLI reference](cli-reference/index.md): the `stellar-agent` command surface.
@@ -23,8 +25,8 @@ shipping a `stellar-agent` CLI and a `stellar-agent-mcp` MCP server.
 - [Protocols and integrations](protocols.md): the supported SEPs, x402, and DeFi
   venues.
 - [Agent payments with MPP](agent-payments.md): sponsored testnet charge
-  authorization, CLI/MCP workflows, receipt and settlement semantics, and the
-  trusted-host boundary.
+  authorization, CLI/MCP workflows, the semantics of receipts and settlement,
+  and the trusted-host boundary.
 - [Agent toolsets](toolsets.md): packaging, signing, and running the wallet's
   capability-restricting toolsets.
 - [Profile configuration](profiles.md): the profile TOML reference and the
@@ -36,7 +38,8 @@ shipping a `stellar-agent` CLI and a `stellar-agent-mcp` MCP server.
 
 The downloadable [agent knowledge skill](../skills/) (`skills/`) teaches an AI
 agent how to operate the wallet without cloning the repository; it is distinct
-from the capability-restriction toolsets feature above.
+from the capability-restriction feature that [Agent toolsets](toolsets.md)
+describes.
 
 ## For maintainers
 
