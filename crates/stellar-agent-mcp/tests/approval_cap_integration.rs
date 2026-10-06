@@ -137,6 +137,7 @@ struct Harness {
     source: String,
     outcomes: Arc<Mutex<Outcome>>,
     sends: Arc<Mutex<Vec<WindowSnapshot>>>,
+    signer_reads: Arc<AtomicI64>,
     policy_dir: TempDir,
     approval_dir: TempDir,
     _rpc: MockServer,
@@ -154,8 +155,27 @@ impl Harness {
         outcome: Outcome,
         approval_fields: &str,
     ) -> Self {
+        Self::with_policy_chain(name, decision, outcome, approval_fields, "*").await
+    }
+
+    async fn with_policy_chain(
+        name: &str,
+        decision: &str,
+        outcome: Outcome,
+        approval_fields: &str,
+        chain: &str,
+    ) -> Self {
         let root = common::isolated_data_root();
-        keyring_mock::install().unwrap();
+        let signer_reads = Arc::new(AtomicI64::new(0));
+        let observed_reads = Arc::clone(&signer_reads);
+        keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+            "svc",
+            name,
+            Arc::new(move || {
+                observed_reads.fetch_add(1, Ordering::SeqCst);
+            }),
+        )])
+        .expect("hooked mock keyring");
         let signer = SigningKey::from_bytes(&[0x61; 32]);
         let source = stellar_strkey::ed25519::PublicKey(signer.verifying_key().to_bytes())
             .to_string()
@@ -192,10 +212,14 @@ match = {{ tool = "stellar_transaction_status", chain = "*" }}
 criteria = []
 decision = "allow"
 [[rules]]
-match = {{ tool = "*", chain = "*" }}
+match = {{ tool = "*", chain = "{chain}" }}
 criteria = [{{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 100000000 }}]
 decision = "{decision}"
 {approval_fields}
+[[rules]]
+match = {{ tool = "*", chain = "*" }}
+criteria = []
+decision = "allow"
 "#
         );
         let signature = hex::encode(
@@ -262,6 +286,7 @@ decision = "{decision}"
             source,
             outcomes,
             sends,
+            signer_reads,
             policy_dir,
             approval_dir,
             _rpc: rpc,
@@ -637,7 +662,14 @@ async fn approved_sponsored_account_creation_reserves_and_settles() {
 #[tokio::test]
 #[serial]
 async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
-    let mut h = Harness::new("cap-toolset-forced", "allow", Outcome::Success).await;
+    let mut h = Harness::with_policy_chain(
+        "cap-toolset-forced",
+        "allow",
+        Outcome::Success,
+        "",
+        "stellar:testnet",
+    )
+    .await;
     let tools = tempfile::tempdir().unwrap();
     let tool_dir = tools.path().join("payment-toolset");
     std::fs::create_dir(&tool_dir).unwrap();
@@ -1036,4 +1068,115 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
         common::rows_of_kind(&rows, "value_action_pending").is_empty(),
         "{rows:?}"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn profile_chain_approval_preserves_nonce_and_consumes_attestation() {
+    let h = Harness::with_policy_chain(
+        "chain-approval",
+        "require_approval",
+        Outcome::Success,
+        "",
+        "stellar:testnet",
+    )
+    .await;
+    let amount = 20_000_000;
+    let sim = h.simulate_pay(amount).await;
+    assert_eq!(sim["ok"], true, "{sim}");
+    let data = &sim["data"];
+    let approval_nonce = data["approval"]["approval_nonce"]
+        .as_str()
+        .expect("pending approval");
+    let store_path = h.approval_dir.path().join(format!("{}.toml", h.name));
+    let pending = PendingApprovalStore::open(store_path.clone()).expect("pending store");
+    assert_eq!(pending.snapshot(now_unix_ms().expect("clock")).len(), 1);
+    drop(pending);
+
+    let args = h.pay_args(data, amount, None);
+    let commit_nonce = args.nonce.clone();
+    let reads_before_commit = h.signer_reads.load(Ordering::SeqCst);
+    let refusal = h.commit_pay(args).await;
+    assert_eq!(
+        refusal["error"]["code"], "policy.approval_required",
+        "{refusal}"
+    );
+    assert!(h.sends.lock().expect("sends").is_empty());
+    assert_eq!(h.window().entries, 0);
+    assert_eq!(h.signer_reads.load(Ordering::SeqCst), reads_before_commit);
+    assert!(
+        common::rows_of_kind(&common::audit_rows(&h.profile), "value_action_submitted").is_empty()
+    );
+
+    let approval = h.attest(data);
+    let retry = h.pay_args(data, amount, Some(approval.clone()));
+    assert_eq!(retry.nonce, commit_nonce);
+    let result = h.commit_pay(retry).await;
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(h.window().amount, amount);
+    assert!(h.signer_reads.load(Ordering::SeqCst) > reads_before_commit);
+    h.assert_legs("value_action_submitted", "payment", Some(amount));
+    let rows = common::audit_rows(&h.profile);
+    let submitted = common::rows_of_kind(&rows, "value_action_submitted");
+    assert_eq!(submitted.len(), 1);
+    assert_eq!(submitted[0]["chain_id"], h.profile.chain_id.caip2_str());
+    assert_eq!(submitted[0]["policy_decision"], "require_approval");
+    assert_eq!(submitted[0]["approval_nonce"], approval_nonce);
+    assert_eq!(submitted[0]["legs"][0]["asset"], "native");
+    assert_eq!(
+        submitted[0]["legs"][0]["destination_redacted"],
+        stellar_agent_core::observability::redact_strkey_first5_last5(DEST)
+    );
+    let consumed = PendingApprovalStore::open(store_path).expect("consumed approval store");
+    assert!(matches!(
+        consumed
+            .get(approval_nonce)
+            .expect("approval tombstone")
+            .kind,
+        stellar_agent_core::approval::ApprovalKind::Consumed { .. }
+    ));
+
+    drop(consumed);
+    let second = h.simulate_pay(amount).await;
+    assert_eq!(second["ok"], true, "cap headroom: {second}");
+    let second_args = h.pay_args(&second["data"], amount, Some(approval));
+    assert_ne!(second_args.nonce, commit_nonce);
+    let refused = h.commit_pay(second_args).await;
+    assert_eq!(
+        refused["error"]["code"], "policy.approval_consumed",
+        "{refused}"
+    );
+    assert_eq!(h.sends.lock().expect("sends").len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn profile_chain_payment_accounting_persists_cap() {
+    let h = Harness::with_policy_chain(
+        "chain-payment",
+        "allow",
+        Outcome::Success,
+        "",
+        "stellar:testnet",
+    )
+    .await;
+    let sim = h.simulate_pay(AMOUNT).await;
+    assert_eq!(sim["ok"], true, "{sim}");
+    let result = h.commit_pay(h.pay_args(&sim["data"], AMOUNT, None)).await;
+    assert_eq!(result["ok"], true, "{result}");
+    h.assert_send_reserved();
+    assert_eq!(
+        h.window(),
+        WindowSnapshot {
+            amount: AMOUNT,
+            entries: 1,
+            pending: 0
+        }
+    );
+    let second = h.simulate_pay(AMOUNT).await;
+    assert_eq!(
+        second["error"]["code"], "policy.deny.per_period_cap_exceeded",
+        "{second}"
+    );
+    assert_eq!(h.sends.lock().expect("sends").len(), 1);
 }

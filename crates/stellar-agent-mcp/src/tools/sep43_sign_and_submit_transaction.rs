@@ -217,7 +217,7 @@ impl WalletServer {
             "transaction_xdr_len": args.transaction_xdr.len(),
         });
 
-        // ── dispatch_gate: registry lookup + policy evaluation + chain_id ─────
+        // The gate performs registry lookup, chain validation, and policy evaluation.
         // Single-shot sign tool: a RequireApproval verdict is fail-closed.
         // The two-phase approval flow is not supported on this path.
         let dispatch_outcome = match self
@@ -364,11 +364,9 @@ impl WalletServer {
         let timeout = crate::tools::common::submit_timeout(&self.profile);
         let network_passphrase = self.context.network_passphrase();
 
-        // Record the submission before the bytes leave. The envelope is the
-        // caller's, so the policy engine sized no value for it and no
-        // spending-window reservation is possible — but the receipt, the
-        // pending row and the duplicate suppression are, and they are what
-        // make a timeout here reconcilable and the sequence protected.
+        // The opaque submission reserves its rate-limit entries before the send.
+        // Its receipt, pending row, and duplicate suppression make a timeout
+        // reconcilable and protect the sequence.
         let profile_name = self.profile_name_for_approval();
         let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
             Ok(v) => v,
@@ -388,7 +386,7 @@ impl WalletServer {
                 chain_id: self.context.chain_id.caip2_str().to_owned(),
                 legs: Vec::new(),
                 engine: self.policy_engine.as_ref(),
-                descriptor: None,
+                registry: &self.tool_registry,
                 value_class: stellar_agent_core::policy::v1::ValueClass::Opaque(
                     OpaqueReason::RawTransactionSignature,
                 ),
@@ -749,27 +747,6 @@ mod tests {
         );
     }
 
-    struct RequireApprovalEngine;
-
-    impl PolicyEngine for RequireApprovalEngine {
-        fn evaluate(
-            &self,
-            _tool: &ToolDescriptor,
-            _args: &serde_json::Value,
-            _profile: &Profile,
-            _account_view: Option<&dyn AccountReservesView>,
-            _identity_view: Option<&dyn AccountIdentityView>,
-            _counterparty_cache: Option<&dyn CounterpartyCacheView>,
-            _sep10_sessions: Option<&dyn Sep10SessionView>,
-            _sep45_sessions: Option<&dyn Sep45SessionView>,
-        ) -> Result<Decision, PolicyError> {
-            Ok(Decision::RequireApproval(ApprovalRequest::new(
-                "test-nonce".into(),
-                120,
-            )))
-        }
-    }
-
     struct DenyEngine;
 
     impl PolicyEngine for DenyEngine {
@@ -790,6 +767,7 @@ mod tests {
 
     fn make_require_approval_server() -> crate::server::WalletServer {
         use std::sync::Arc;
+        use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
         let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
             .with_noop_engine()
             .build();
@@ -799,7 +777,37 @@ mod tests {
         // the fail-closed approval error doubles as the ordering pin.
         let mut server = crate::server::WalletServer::new(profile)
             .expect("WalletServer::new must not fail in tests");
-        server.policy_engine = Arc::new(RequireApprovalEngine);
+        server.policy_engine = Arc::new(PolicyEngineV1::new(
+            PolicyDocument {
+                version: 1,
+                scope: ScopeId::AllProfiles,
+                signature: None,
+                rules: vec![
+                    PolicyRule {
+                        r#match: RuleMatch {
+                            tool: "stellar_sep43_sign_and_submit_transaction".into(),
+                            chain: "stellar:testnet".into(),
+                        },
+                        criteria: vec![],
+                        decision: Decision::RequireApproval(ApprovalRequest::new(
+                            String::new(),
+                            120,
+                        )),
+                        allow_opaque_signing: false,
+                    },
+                    PolicyRule {
+                        r#match: RuleMatch {
+                            tool: "*".into(),
+                            chain: "*".into(),
+                        },
+                        criteria: vec![],
+                        decision: Decision::Allow,
+                        allow_opaque_signing: false,
+                    },
+                ],
+            },
+            "default".into(),
+        ));
         server
     }
 
@@ -810,6 +818,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(keyring)]
     async fn require_approval_verdict_is_fail_closed_no_signature_produced() {
+        let home = tempfile::tempdir().expect("isolated home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         stellar_agent_test_support::keyring_mock::install().ok();
         let server = make_require_approval_server();
         let args = Sep43SignAndSubmitTransactionArgs {

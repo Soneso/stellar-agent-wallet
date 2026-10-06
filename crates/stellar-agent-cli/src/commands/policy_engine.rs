@@ -922,6 +922,159 @@ mod tests {
             .as_str()
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn profile_chain_signed_cap_cli_mcp_parity() {
+        use base64::Engine as _;
+        use ed25519_dalek::SigningKey;
+        use serde_json::{Value, json};
+        use stellar_agent_mcp::server::{StellarPayArgs, WalletServer};
+        use stellar_agent_test_support::xdr_fixtures::{
+            account_entry_xdr_with_seq, account_ledger_key_xdr,
+        };
+        use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        const NAME: &str = "chain-parity";
+        const SOURCE: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
+        let home = tempfile::tempdir().expect("isolated home");
+        let _home = StellarAgentHomeGuard::new(home.path());
+        keyring_mock::install().expect("mock keyring");
+        let rpc = MockServer::start().await;
+        let entries: Vec<_> = [SOURCE, PARITY_DEST_G]
+            .iter()
+            .map(|account| {
+                (
+                    account_ledger_key_xdr(account),
+                    account_entry_xdr_with_seq(account, 500_000_000_000, 0, 42),
+                )
+            })
+            .collect();
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).expect("JSON-RPC");
+                let result = match body["method"].as_str().expect("method") {
+                    "getLedgerEntries" => {
+                        let keys = body["params"]["keys"].as_array().expect("ledger keys");
+                        let found: Vec<_> = entries
+                            .iter()
+                            .filter(|(key, _)| keys.contains(&json!(key)))
+                            .map(|(key, xdr)| {
+                                json!({
+                                    "key": key, "xdr": xdr, "lastModifiedLedgerSeq": 1000
+                                })
+                            })
+                            .collect();
+                        json!({ "entries": found, "latestLedger": 1001 })
+                    }
+                    "getFeeStats" => {
+                        let fees = json!({
+                            "max": "100", "min": "100", "mode": "100", "p10": "100", "p20": "100",
+                            "p30": "100", "p40": "100", "p50": "100", "p60": "100", "p70": "100",
+                            "p80": "100", "p90": "100", "p95": "100", "p99": "100",
+                            "transactionCount": "10", "ledgerCount": 5
+                        });
+                        json!({
+                            "inclusionFee": fees, "sorobanInclusionFee": fees, "latestLedger": 1001
+                        })
+                    }
+                    other => panic!("unexpected RPC method: {other}"),
+                };
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": body["id"], "result": result
+                }))
+            })
+            .mount(&rpc)
+            .await;
+        let mut profile =
+            Profile::builder_testnet_named(NAME, "chain-signer", SOURCE, "chain-nonce", NAME)
+                .build();
+        profile.rpc_url = rpc.uri();
+        profile.audit_log_path = home.path().join("audit.jsonl");
+        let owner = SigningKey::from_bytes(&[0x74; 32]);
+        let owner_address = stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes())
+            .to_string()
+            .to_string();
+        keyring_core::Entry::new(
+            &profile.policy_owner_key_id.service,
+            &profile.policy_owner_key_id.account,
+        )
+        .expect("owner key entry")
+        .set_password(&owner_address)
+        .expect("owner key");
+        keyring_core::Entry::new(
+            &profile.mcp_nonce_key_alias.service,
+            &profile.mcp_nonce_key_alias.account,
+        )
+        .expect("nonce entry")
+        .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9; 32]))
+        .expect("nonce key");
+        let body = format!(
+            r#"version = 1
+scope = "profile:{NAME}"
+[[rules]]
+match = {{ tool = "stellar_pay", chain = "stellar:testnet" }}
+criteria = [{{ kind = "per_tx_cap", asset = "native", max_stroops = 100000000 }}]
+decision = "allow"
+[[rules]]
+match = {{ tool = "*", chain = "*" }}
+criteria = []
+decision = "allow"
+"#
+        );
+        let canonical = stellar_agent_core::policy::v1::canonical::canonical_bytes(&body)
+            .expect("canonical policy");
+        let digest = stellar_agent_core::policy::v1::signature::digest(&canonical);
+        let signature = hex::encode(stellar_agent_core::policy::v1::signature::sign(
+            &digest, &owner,
+        ));
+        let policies = home.path().join("policies");
+        std::fs::create_dir_all(&policies).expect("policy directory");
+        std::fs::write(
+            policies.join(format!("{NAME}.toml")),
+            format!("{body}\n[signature]\nowner_id = \"{owner_address}\"\nsig = \"{signature}\"\n"),
+        )
+        .expect("signed policy");
+        let cli = build_v1_policy_engine("pay", &profile.policy.engine, &profile, NAME)
+            .expect("CLI signed policy");
+        let server = WalletServer::new_with_policy_dir_for_test(profile.clone(), &policies)
+            .expect("MCP signed policy");
+        for amount in [50_000_000, 150_000_000] {
+            let cli_result = evaluate_value_moving_policy(
+                cli.as_ref(),
+                &profile,
+                "stellar_pay",
+                ToolValueKind::MovesValue,
+                profile.chain_id.caip2_str(),
+                &pay_policy_args(amount, "native", PARITY_DEST_G),
+                "pay",
+                None,
+                None,
+            );
+            let args: StellarPayArgs = serde_json::from_value(json!({
+                "chain_id": profile.chain_id.caip2_str(),
+                "source": SOURCE, "destination": PARITY_DEST_G,
+                "amount_in_stroops": amount.to_string(), "asset": "native"
+            }))
+            .expect("payment arguments");
+            let mcp_result = server.call_stellar_pay(args).await.expect("MCP response");
+            let mcp: Value =
+                serde_json::from_str(&mcp_result.content[0].as_text().expect("text response").text)
+                    .expect("JSON response");
+            if amount < 100_000_000 {
+                assert!(cli_result.is_ok(), "{cli_result:?}");
+                assert_eq!(mcp["ok"], true, "{mcp}");
+                assert!(mcp["data"]["nonce"].as_str().is_some());
+            } else {
+                assert_eq!(
+                    envelope_code(&cli_result),
+                    "policy.deny.per_tx_cap_exceeded"
+                );
+                assert_eq!(mcp["error"]["code"], envelope_code(&cli_result), "{mcp}");
+            }
+        }
+    }
+
     #[test]
     fn pay_gate_under_cap_allows() {
         let engine = per_tx_cap_engine("stellar_pay", 1_000_000_000); // 100 XLM cap

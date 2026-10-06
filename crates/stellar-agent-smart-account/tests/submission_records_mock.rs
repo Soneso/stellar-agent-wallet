@@ -211,23 +211,38 @@ impl Fixture {
     }
 
     fn engine(&self) -> Arc<PolicyEngineV1> {
+        self.engine_for_chain("*")
+    }
+
+    fn engine_for_chain(&self, chain: &str) -> Arc<PolicyEngineV1> {
         let engine = PolicyEngineV1::new(
             PolicyDocument {
                 version: 1,
                 scope: ScopeId::AllProfiles,
-                rules: vec![PolicyRule {
-                    r#match: RuleMatch {
-                        tool: "wallet_multicall".to_owned(),
-                        chain: "*".to_owned(),
+                rules: vec![
+                    PolicyRule {
+                        r#match: RuleMatch {
+                            tool: "wallet_multicall".to_owned(),
+                            chain: chain.to_owned(),
+                        },
+                        criteria: vec![Box::new(BundlePerPeriodCapCriterion::new(
+                            contract(0x47),
+                            Window::parse("1d").expect("bundle cap window"),
+                            100,
+                        ))],
+                        decision: Decision::Allow,
+                        allow_opaque_signing: false,
                     },
-                    criteria: vec![Box::new(BundlePerPeriodCapCriterion::new(
-                        contract(0x47),
-                        Window::parse("1d").unwrap(),
-                        100,
-                    ))],
-                    decision: Decision::Allow,
-                    allow_opaque_signing: false,
-                }],
+                    PolicyRule {
+                        r#match: RuleMatch {
+                            tool: "*".to_owned(),
+                            chain: "*".to_owned(),
+                        },
+                        criteria: Vec::new(),
+                        decision: Decision::Allow,
+                        allow_opaque_signing: false,
+                    },
+                ],
                 signature: None,
             },
             PROFILE.to_owned(),
@@ -260,6 +275,20 @@ impl Fixture {
         &self,
         url: &str,
     ) -> Result<stellar_agent_smart_account::multicall::MulticallResult, SaError> {
+        self.multicall_with_policy(url, self.bundle(), self.engine())
+            .await
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "preserve the submission API's typed error for assertions"
+    )]
+    async fn multicall_with_policy(
+        &self,
+        url: &str,
+        bundle: Vec<MulticallInvocation>,
+        engine: Arc<PolicyEngineV1>,
+    ) -> Result<stellar_agent_smart_account::multicall::MulticallResult, SaError> {
         let signer = SoftwareSigningKey::new_from_bytes(SEED);
         // The bundle signs under rule 0, which the pinned-hash drift check
         // never fetches or reads.
@@ -269,12 +298,12 @@ impl Fixture {
             MulticallSubmitArgs {
                 smart_account: &contract(0x44),
                 rule_id: 0,
-                bundle: self.bundle(),
+                bundle,
                 signer: &signer,
                 primary_rpc_url: url,
                 secondary_rpc_url: url,
                 network_passphrase: PASSPHRASE,
-                policy_engine: self.engine(),
+                policy_engine: engine,
                 profile: &self.profile,
                 audit_writer: Some(Arc::clone(&self.audit)),
                 timeout: Duration::from_secs(2),
@@ -473,6 +502,60 @@ async fn confirmed_multicall_counts_each_leg_once() {
             .is_empty()
     );
     assert_eq!(fixture.rows("value_action_pending").len(), 1);
+    assert_eq!(fixture.rows("value_action_submitted").len(), 1);
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn profile_chain_multicall_cap_precedes_wildcard_and_persists_accounting() {
+    let fixture = Fixture::new();
+    let (server, sends, _) = rpc("SUCCESS").await;
+    let mut over_cap = fixture.bundle();
+    for invocation in &mut over_cap {
+        invocation.args_json[2] = json!("60");
+    }
+    let error = fixture
+        .multicall_with_policy(
+            &server.uri(),
+            over_cap,
+            fixture.engine_for_chain("stellar:testnet"),
+        )
+        .await
+        .expect_err("120 exceeds the exact-chain bundle cap of 100");
+    assert!(matches!(
+        error,
+        SaError::MulticallFailed {
+            phase: "policy_gate",
+            ..
+        }
+    ));
+    assert_eq!(error.wire_code(), "sa.multicall_failed");
+    let denied = fixture.rows("sa_multicall_bundle_denied");
+    assert_eq!(denied.len(), 1);
+    assert_eq!(
+        denied[0]["deny_wire_code"],
+        "multicall.per_period_cap_exceeded"
+    );
+    assert_eq!(denied[0]["denied_inner_index"], 1);
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.total(), (0, 0));
+
+    fixture
+        .multicall_with_policy(
+            &server.uri(),
+            fixture.bundle(),
+            fixture.engine_for_chain("stellar:testnet"),
+        )
+        .await
+        .expect("60 fits the exact-chain bundle cap of 100");
+    assert_eq!(fixture.total(), (60, 2));
+    assert!(
+        PersistedWindowStore::for_profile(PROFILE)
+            .pending_reservations(&fixture.profile)
+            .expect("persisted reservations")
+            .is_empty()
+    );
     assert_eq!(fixture.rows("value_action_submitted").len(), 1);
     assert_eq!(sends.load(Ordering::SeqCst), 1);
 }

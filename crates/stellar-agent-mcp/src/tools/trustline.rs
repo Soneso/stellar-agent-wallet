@@ -1298,9 +1298,8 @@ impl WalletServer {
         // The recorder writes the receipt, the pending audit row and the
         // spending-window reservation immediately before the bytes leave, and
         // settles all three against what the network answers. The window
-        // entries it reserves come from the SAME gate_value_effects the audit
-        // rows carry, keyed by the SAME registry descriptor the gate evaluated
-        // against.
+        // entries it reserves come from the gate_value_effects the audit rows
+        // carry. The recorder binds the descriptor the gate evaluated against.
         let value_class = gate_value_effects
             .clone()
             .map(stellar_agent_core::policy::v1::ValueClass::Value)
@@ -1315,7 +1314,7 @@ impl WalletServer {
                 chain_id: args.chain_id.to_string(),
                 legs: audit_legs,
                 engine: self.policy_engine.as_ref(),
-                descriptor: self.tool_registry.get("stellar_trustline_commit"),
+                registry: &self.tool_registry,
                 value_class,
                 audit: std::sync::Arc::clone(&audit_writer),
                 nonce_id: Some(nonce_id_prefix.to_string()),

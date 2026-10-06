@@ -1421,7 +1421,9 @@ pub async fn submit_multicall_bundle(
         // stands on its own value-moving nature.
         value_kind: stellar_agent_core::policy::ToolValueKind::MovesValue,
     };
-    let tool = ToolDescriptor::from_registration(&tool_reg);
+    // Bundle evaluation and accounting use the profile's chain.
+    let mut tool = ToolDescriptor::from_registration(&tool_reg);
+    tool.chain_id = args.profile.chain_id.caip2_str().to_owned();
     let eval_args = serde_json::json!({
         "smart_account": args.smart_account,
         "rule_id": args.rule_id,

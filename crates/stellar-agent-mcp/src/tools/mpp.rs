@@ -343,8 +343,8 @@ impl WalletServer {
             Ok(rpc) => rpc,
             Err(error) => return Ok(mpp_error_result(&error)),
         };
-        let descriptor = match self.tool_registry.get("stellar_mpp_charge_commit") {
-            Some(descriptor) => descriptor.clone(),
+        let descriptor = match self.policy_descriptor("stellar_mpp_charge_commit") {
+            Some(descriptor) => descriptor,
             None => return Ok(mpp_state_error()),
         };
         let profile = self.profile.clone();

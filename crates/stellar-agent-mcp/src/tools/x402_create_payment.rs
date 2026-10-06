@@ -238,8 +238,8 @@ impl WalletServer {
             "payment_required_len": args.payment_required.len(),
         });
 
-        // ── dispatch_gate_with_value: registry lookup + policy evaluation +
-        // chain_id, sizing the value criteria against `value_leg` ────────────
+        // The gate performs registry lookup, chain validation, and policy evaluation.
+        // Value criteria use the supplied value_leg.
         // Single-shot sign tool: RequireApproval is fail-closed. The two-phase
         // approval flow is not supported on this surface. `account_view` /
         // `identity_view` are `None`: the `minimum_reserve` / `home_domain`
@@ -593,10 +593,10 @@ pub(super) fn record_x402_authorization(
             "authorized payment accounting is unavailable",
         )
     };
-    let descriptor = server.tool_registry.get(tool).ok_or_else(unavailable)?;
+    let descriptor = server.policy_descriptor(tool).ok_or_else(unavailable)?;
     stellar_agent_network::policy_state::record_authorized_window_state(
         server.policy_engine.as_ref(),
-        descriptor,
+        &descriptor,
         &server.profile,
         &server.profile_name_for_approval(),
         value,

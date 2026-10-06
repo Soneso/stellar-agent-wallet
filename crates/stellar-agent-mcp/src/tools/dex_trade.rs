@@ -437,7 +437,7 @@ impl WalletServer {
                 chain_id: args.chain_id.to_string(),
                 legs: audit_legs.clone(),
                 engine: self.policy_engine.as_ref(),
-                descriptor: self.tool_registry.get("stellar_dex_trade"),
+                registry: &self.tool_registry,
                 value_class: ValueClass::single(value_leg_for_record),
                 audit: std::sync::Arc::clone(&audit_writer),
                 nonce_id: None,

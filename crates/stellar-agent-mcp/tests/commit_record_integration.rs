@@ -632,3 +632,119 @@ async fn a_confirmed_sep43_submission_writes_one_settled_row() {
         "reconciling a settled submission appends no second row: {rows_after:?}"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn profile_chain_sep43_accounting_persists_rate_limit() {
+    use stellar_agent_core::policy::Decision;
+    use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+    use stellar_agent_core::policy::v1::criteria::{
+        per_period_cap::Window, rate_limit::RateLimitCriterion,
+    };
+    use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+    use stellar_agent_network::policy_state::PersistedWindowStore;
+    use stellar_agent_test_support::signed_envelope::SignedTestEnvelope;
+
+    let _root = common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring");
+    install_test_nonce_key();
+    let seed = [0x73; 32];
+    let first = SignedTestEnvelope::builder(seed)
+        .sequence(SOURCE_SEQ + 1)
+        .build();
+    let second = SignedTestEnvelope::builder(seed)
+        .sequence(SOURCE_SEQ + 2)
+        .build();
+    assert_ne!(first.envelope_xdr(), second.envelope_xdr());
+    let rpc = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            common::TimeoutRpc::new(vec![(
+                account_ledger_key_xdr(first.source()),
+                account_entry_xdr_with_seq(first.source(), SOURCE_BALANCE_STROOPS, 0, SOURCE_SEQ),
+            )])
+            .confirming_in(1001),
+        )
+        .mount(&rpc)
+        .await;
+    let (profile, mut server, _) = timeout_server(&rpc.uri(), first.source(), seed);
+    let name = server.profile_name_for_approval();
+    server.set_policy_engine_for_test(std::sync::Arc::new(PolicyEngineV1::new(
+        PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            signature: None,
+            rules: vec![
+                PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "stellar_sep43_sign_and_submit_transaction".into(),
+                        chain: "stellar:testnet".into(),
+                    },
+                    criteria: vec![Box::new(RateLimitCriterion::new(
+                        Window::parse("1d").expect("window"),
+                        1,
+                    ))],
+                    decision: Decision::Allow,
+                    allow_opaque_signing: false,
+                },
+                PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "*".into(),
+                        chain: "*".into(),
+                    },
+                    criteria: vec![],
+                    decision: Decision::Allow,
+                    allow_opaque_signing: false,
+                },
+            ],
+        },
+        name.clone(),
+    )));
+    let args = |envelope: &SignedTestEnvelope| Sep43SignAndSubmitTransactionArgs {
+        chain_id: "stellar:testnet".into(),
+        transaction_xdr: envelope.envelope_xdr().into(),
+        network_passphrase: None,
+        address: None,
+    };
+    let submitted = server
+        .call_stellar_sep43_sign_and_submit_transaction(args(&first))
+        .await
+        .expect("first submission");
+    let submitted = call_result_json(&submitted);
+    assert_eq!(submitted["ok"], true, "{submitted}");
+    assert_eq!(submitted["data"]["status"], "success", "{submitted}");
+    let state = PolicyStateStore::new();
+    let disk = PersistedWindowStore::for_profile(&name);
+    disk.load_into(&name, &profile, &state)
+        .expect("persisted count");
+    assert_eq!(
+        state
+            .query_window(
+                &StateKey::new(&name, 1, "rate_limit", 86_400),
+                stellar_agent_core::timefmt::now_unix_ms().expect("clock"),
+            )
+            .expect("rate window"),
+        (1, 1)
+    );
+    assert!(
+        disk.pending_reservations(&profile)
+            .expect("reservations")
+            .is_empty()
+    );
+    let refused = server
+        .call_stellar_sep43_sign_and_submit_transaction(args(&second))
+        .await
+        .expect("second submission refusal");
+    assert_eq!(
+        common::assert_business_envelope(&refused).0,
+        "policy.deny.rate_limit_exceeded"
+    );
+    let requests = rpc.received_requests().await.expect("RPC requests");
+    assert_eq!(
+        requests.iter().filter(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("JSON-RPC")["method"] == "sendTransaction"
+        }).count(),
+        1
+    );
+}

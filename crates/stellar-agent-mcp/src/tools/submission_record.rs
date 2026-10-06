@@ -6,6 +6,7 @@
 //! lives here once, and so does the mapping that turns the three submission
 //! refusals into a response an agent can act on.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rmcp::model::{CallToolResult, Content};
@@ -21,6 +22,8 @@ use stellar_agent_network::policy_state::PersistedWindowStore;
 use stellar_agent_network::{
     ApprovalTombstone, SequenceFloorHook, WalletSubmissionRecorder, envelope_hash_hex,
 };
+
+use super::common::profile_bound_descriptor;
 
 /// The tool this server names as the way to reconcile a submission whose
 /// outcome is not known.
@@ -46,9 +49,9 @@ pub(crate) struct CommitRecord<'a> {
     pub legs: Vec<ValueLegRecord>,
     /// The policy engine that sized the action.
     pub engine: &'a dyn PolicyEngine,
-    /// The registry descriptor the gate evaluated against. `None` where the
-    /// tool is not registered, which records no window entries.
-    pub descriptor: Option<&'a ToolDescriptor>,
+    /// The tool registry used to bind the accounting descriptor to the profile.
+    /// A missing entry refuses with `submission.record_unavailable`.
+    pub registry: &'a HashMap<&'static str, ToolDescriptor>,
     /// The SAME value class the gate evaluated.
     pub value_class: ValueClass,
     /// The audit writer acquired by the value-audit pre-flight.
@@ -74,8 +77,8 @@ pub(crate) struct CommitRecord<'a> {
 /// # Errors
 ///
 /// Returns `submission.record_unavailable` when the receipt store cannot be
-/// opened or the policy engine cannot account for the action. Both refuse the
-/// submission: a send the wallet cannot record is one it cannot reconcile,
+/// opened, the tool has no registry entry, or the policy engine cannot account
+/// for the action. A send the wallet cannot record is one it cannot reconcile,
 /// cap, or audit afterwards.
 pub(crate) fn build_recorder<'a>(
     record: CommitRecord<'a>,
@@ -111,23 +114,27 @@ pub(crate) fn build_recorder<'a>(
         _ => None,
     };
 
+    let descriptor = profile_bound_descriptor(record.registry, record.profile, record.tool)
+        .ok_or_else(|| {
+            WalletError::Submission(SubmissionError::RecordUnavailable {
+                detail: format!("the submission tool {} has no registry entry", record.tool),
+            })
+        })?;
+
     let receipts = ReceiptStore::open(&record.profile_name).map_err(|e| {
         WalletError::Submission(SubmissionError::RecordUnavailable {
             detail: format!("the submission receipt store could not be opened: {e}"),
         })
     })?;
 
-    let window_entries = match record.descriptor {
-        Some(descriptor) => record
-            .engine
-            .record_confirmed(descriptor, record.profile, &record.value_class)
-            .map_err(|e| {
-                WalletError::Submission(SubmissionError::RecordUnavailable {
-                    detail: format!("the policy engine could not account for this action: {e}"),
-                })
-            })?,
-        None => Vec::new(),
-    };
+    let window_entries = record
+        .engine
+        .record_confirmed(&descriptor, record.profile, &record.value_class)
+        .map_err(|e| {
+            WalletError::Submission(SubmissionError::RecordUnavailable {
+                detail: format!("the policy engine could not account for this action: {e}"),
+            })
+        })?;
 
     Ok(WalletSubmissionRecorder::new(
         record.profile,
@@ -690,13 +697,46 @@ mod tests {
         assert_eq!(json["error"]["details"]["timeout_seconds"], 45);
     }
     #[test]
+    #[serial_test::serial(keyring)]
+    fn allowed_recorder_requires_a_registered_tool() {
+        let dir = tempfile::tempdir().expect("isolated audit directory");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let profile = Profile::builder_testnet("signer", "default", "nonce", "default").build();
+        let audit = Arc::new(Mutex::new(
+            AuditWriter::open(dir.path().join("audit.jsonl"), None).expect("audit writer"),
+        ));
+        let error = build_recorder(
+            CommitRecord {
+                profile: &profile,
+                profile_name: "missing-registry-entry".to_owned(),
+                tool: "stellar_unregistered_commit",
+                chain_id: "stellar:testnet".to_owned(),
+                policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
+                legs: Vec::new(),
+                engine: &stellar_agent_core::policy::NoopPolicyEngine,
+                registry: &HashMap::new(),
+                value_class: ValueClass::ReadOnly,
+                audit,
+                nonce_id: None,
+                approval_nonce: None,
+                approval_dir: None,
+                now_ms: 0,
+            },
+            None,
+        )
+        .expect_err("an allowed submission requires a registered tool");
+        assert_eq!(error.code(), "submission.record_unavailable");
+        assert!(error.message().contains("stellar_unregistered_commit"));
+    }
+
+    #[test]
     fn approved_recorder_requires_its_approval_store() {
         let dir = tempfile::tempdir().unwrap();
         let profile = Profile::builder_testnet("signer", "default", "nonce", "default").build();
         let audit = Arc::new(Mutex::new(
             AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
         ));
-        let result = build_recorder(
+        let error = build_recorder(
             CommitRecord {
                 profile: &profile,
                 profile_name: "missing-approval-store".to_owned(),
@@ -705,7 +745,7 @@ mod tests {
                 policy_decision: stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
                 legs: Vec::new(),
                 engine: &stellar_agent_core::policy::NoopPolicyEngine,
-                descriptor: None,
+                registry: &HashMap::new(),
                 value_class: ValueClass::ReadOnly,
                 audit,
                 nonce_id: None,
@@ -714,8 +754,8 @@ mod tests {
                 now_ms: 0,
             },
             None,
-        );
-        let error = result.expect_err("an approval binding must not be silently dropped");
+        )
+        .expect_err("an approval binding must not be silently dropped");
         assert_eq!(error.code(), "submission.record_unavailable");
         assert!(error.message().contains("approval store"));
     }
@@ -726,7 +766,7 @@ mod tests {
         let audit = Arc::new(Mutex::new(
             AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
         ));
-        let result = build_recorder(
+        let error = build_recorder(
             CommitRecord {
                 profile: &profile,
                 profile_name: "missing-approval-nonce".to_owned(),
@@ -735,7 +775,7 @@ mod tests {
                 policy_decision: stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
                 legs: Vec::new(),
                 engine: &stellar_agent_core::policy::NoopPolicyEngine,
-                descriptor: None,
+                registry: &HashMap::new(),
                 value_class: ValueClass::ReadOnly,
                 audit,
                 nonce_id: None,
@@ -744,8 +784,8 @@ mod tests {
                 now_ms: 0,
             },
             None,
-        );
-        let error = result.expect_err("an approved submission must carry its approval nonce");
+        )
+        .expect_err("an approved submission must carry its approval nonce");
         assert_eq!(error.code(), "submission.record_unavailable");
         assert!(error.message().contains("approval nonce"));
     }

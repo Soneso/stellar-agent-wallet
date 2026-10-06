@@ -4,9 +4,9 @@
 //! nonce TTL and fee constants, the `ToolCatalogueAdapter` bridge, the
 //! link-time tool-registry builder, and the two centralised dispatch helpers:
 //!
-//! - [`WalletServer::dispatch_gate`] — the 3-step preamble shared by
-//!   every MCP tool handler (registry lookup → policy_engine.evaluate →
-//!   chain_id validation).  Returns [`DispatchOutcome`] so simulate handlers
+//! - [`WalletServer::dispatch_gate`]: the gated-handler preamble performs
+//!   registry lookup, validates the call chain, and evaluates policy with the
+//!   profile-bound descriptor. Returns [`DispatchOutcome`] so simulate handlers
 //!   can observe `Decision::RequireApproval` and persist the pending-approval
 //!   entry.
 //! - [`commit_envelope_and_verify_nonce`] — the nonce HMAC verify + replay-window
@@ -1189,20 +1189,40 @@ pub(crate) fn load_attestation_key(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// dispatch_gate — centralised 3-step preamble
+// dispatch_gate: registry lookup, chain validation, policy evaluation
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Builds a tool descriptor whose policy chain is the bound profile's chain.
+pub(crate) fn profile_bound_descriptor(
+    registry: &HashMap<&'static str, ToolDescriptor>,
+    profile: &Profile,
+    tool: &str,
+) -> Option<ToolDescriptor> {
+    let mut descriptor = registry.get(tool)?.clone();
+    descriptor.chain_id = profile.chain_id.caip2_str().to_owned();
+    Some(descriptor)
+}
+
 impl WalletServer {
-    /// Centralised dispatch gate consolidating the 3-step preamble shared
-    /// by every MCP tool handler (registry lookup → policy_engine.evaluate →
-    /// chain_id validation).
+    /// Builds the call's policy context from the registry and the bound profile.
+    ///
+    /// Every gated tool matches and accounts against the profile's chain,
+    /// including tools whose arguments require no chain identifier.
+    pub(crate) fn policy_descriptor(&self, tool_name: &str) -> Option<ToolDescriptor> {
+        profile_bound_descriptor(&self.tool_registry, &self.profile, tool_name)
+    }
+
+    /// The dispatch gate resolves the tool, validates the call chain, and
+    /// evaluates policy with the profile-bound descriptor.
     ///
     /// # Steps
     ///
     /// 1. Look up `tool_name` in `self.tool_registry`. Missing → fail-closed
     ///    `internal_error("tool.registry_missing: <name> not found in registry")`.
-    /// 2. Call `self.policy_engine.evaluate_full(...)` with the registry
-    ///    descriptor, the args, the profile, the optional account/identity views,
+    /// 2. For tools requiring a chain, validate it against the profile.
+    ///    Mismatch returns `invalid_params("chain_id mismatch: <err>")`.
+    /// 3. Evaluate policy with the profile-bound descriptor, the args,
+    ///    the profile, the optional account/identity views,
     ///    and a counterparty-cache snapshot.
     ///    - `Decision::Allow` → `Ok(DispatchOutcome::Allow(value_effects))`, the
     ///      gate-sized effects (`Some` for a value-moving allow).
@@ -1218,13 +1238,11 @@ impl WalletServer {
     ///      `policy.unexpected_decision` (forward-compat catch-all).
     ///    - `Err` → `Err(ToolError::Business)` with wire code
     ///      `policy.engine_required`.
-    /// 3. Call `validate_chain_id_matches_profile(chain_id, &self.profile)`.
-    ///    Mismatch → `Err(ToolError::Protocol(invalid_params("chain_id mismatch: <err>")))`.
     ///
     /// # Errors
     ///
-    /// Returns `Err(ToolError)` for all failure modes listed in step 2 and
-    /// step 3: policy refusals as [`ToolError::Business`] (result envelope),
+    /// Returns `Err(ToolError)` for every gate failure: policy refusals as
+    /// [`ToolError::Business`] (result envelope),
     /// malformed-argument / registry / chain-id faults as
     /// [`ToolError::Protocol`] (JSON-RPC error). Fold back into a handler's
     /// return type with [`ToolError::into_result`].
@@ -1406,8 +1424,8 @@ impl WalletServer {
             ))
         })?;
 
-        // Step 1 — registry lookup.
-        let descriptor = match self.tool_registry.get(tool_name) {
+        // Resolve the profile-bound policy descriptor.
+        let descriptor = match self.policy_descriptor(tool_name) {
             Some(d) => d,
             None => {
                 return Err(ToolError::Protocol(ErrorData::internal_error(
@@ -1416,6 +1434,16 @@ impl WalletServer {
                 )));
             }
         };
+
+        // Required call chains match the profile before policy evaluation.
+        if descriptor.chain_id_required
+            && let Err(err) = validate_chain_id_matches_profile(chain_id, &self.profile)
+        {
+            return Err(ToolError::Protocol(ErrorData::invalid_params(
+                format!("chain_id mismatch: {err}"),
+                None,
+            )));
+        }
 
         let counterparty_cache =
             match stellar_agent_network::CounterpartyCacheSnapshot::from_resolver(
@@ -1434,7 +1462,7 @@ impl WalletServer {
                 }
             };
 
-        // Step 1.4 — settle the reservations that have stood long enough to be
+        // Settle the reservations that have stood long enough to be
         // settleable, before the refresh below reads them.
         //
         // The order is deliberate: this pass writes the window FILE, and the
@@ -1459,7 +1487,7 @@ impl WalletServer {
             self.reconcile_open_reservations().await;
         }
 
-        // Step 1.5 — refresh window state before evaluation.
+        // Refresh window state before evaluation.
         //
         // The MCP server is a long-lived process: `self.policy_engine` is
         // constructed once and evaluates every dispatch for the life of the
@@ -1501,7 +1529,7 @@ impl WalletServer {
             }
         }
 
-        // Step 2 — policy engine evaluation with explicit typed arms.
+        // Evaluate policy with the profile-bound descriptor.
         //
         // The value-carrying path (`value = Some`) sizes the exact effect the
         // handler decoded; the args-derived path (`value = None`) lets the engine
@@ -1514,7 +1542,7 @@ impl WalletServer {
         // the value-verb handlers record exactly what the gate evaluated.
         let evaluation = match value {
             Some(value) => self.policy_engine.evaluate_with_value_full(
-                descriptor,
+                &descriptor,
                 args_value,
                 &self.profile,
                 value,
@@ -1525,7 +1553,7 @@ impl WalletServer {
                 None,
             ),
             None => self.policy_engine.evaluate_full(
-                descriptor,
+                &descriptor,
                 args_value,
                 &self.profile,
                 account_view,
@@ -1584,21 +1612,6 @@ impl WalletServer {
                 )));
             }
         };
-
-        // Step 3 — chain_id validation.
-        //
-        // Only validate when `chain_id_required = true` (the tool must receive a
-        // valid CAIP-2 chain identifier).  Tools with `chain_id_required = false`
-        // (e.g. `stellar_toolset_invoke`, `stellar_toolset_list`, read-only tools)
-        // may be called with an empty chain_id — skip validation for them.
-        if descriptor.chain_id_required
-            && let Err(err) = validate_chain_id_matches_profile(chain_id, &self.profile)
-        {
-            return Err(ToolError::Protocol(ErrorData::invalid_params(
-                format!("chain_id mismatch: {err}"),
-                None,
-            )));
-        }
 
         Ok(outcome)
     }
@@ -2514,6 +2527,262 @@ mod tests {
         // the same crate.
         server.policy_engine = Arc::new(engine);
         server
+    }
+
+    struct RecordingPolicyEngine {
+        inner: stellar_agent_core::PolicyEngineV1,
+        evaluations: Arc<AtomicU32>,
+    }
+
+    impl PolicyEngine for RecordingPolicyEngine {
+        fn evaluate(
+            &self,
+            tool: &ToolDescriptor,
+            args: &Value,
+            profile: &Profile,
+            account_view: Option<&dyn AccountReservesView>,
+            identity_view: Option<&dyn AccountIdentityView>,
+            counterparty_cache: Option<&dyn CounterpartyCacheView>,
+            sep10_sessions: Option<&dyn Sep10SessionView>,
+            sep45_sessions: Option<&dyn Sep45SessionView>,
+        ) -> Result<Decision, PolicyError> {
+            self.evaluations.fetch_add(1, Ordering::SeqCst);
+            self.inner.evaluate(
+                tool,
+                args,
+                profile,
+                account_view,
+                identity_view,
+                counterparty_cache,
+                sep10_sessions,
+                sep45_sessions,
+            )
+        }
+    }
+
+    fn chain_engine(chain: &str, cap: Option<i128>) -> stellar_agent_core::PolicyEngineV1 {
+        use stellar_agent_core::policy::v1::criteria::per_tx_cap::PerTxCapCriterion;
+        use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+        let mut rules = vec![PolicyRule {
+            r#match: RuleMatch {
+                tool: "*".into(),
+                chain: chain.into(),
+            },
+            criteria: cap
+                .map(|max| {
+                    vec![Box::new(PerTxCapCriterion::new("native".into(), max))
+                        as Box<
+                            dyn stellar_agent_core::policy::v1::criteria::Criterion,
+                        >]
+                })
+                .unwrap_or_default(),
+            decision: Decision::Allow,
+            allow_opaque_signing: false,
+        }];
+        if cap.is_some() {
+            rules.push(PolicyRule {
+                r#match: RuleMatch {
+                    tool: "*".into(),
+                    chain: "*".into(),
+                },
+                criteria: vec![],
+                decision: Decision::Allow,
+                allow_opaque_signing: false,
+            });
+        }
+        PolicyEngineV1::new(
+            PolicyDocument {
+                version: 1,
+                scope: ScopeId::AllProfiles,
+                rules,
+                signature: None,
+            },
+            "default".into(),
+        )
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn dispatch_gate_profile_chain_validation_precedes_evaluation() {
+        let home = tempfile::tempdir().expect("isolated home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+        let evaluations = Arc::new(AtomicU32::new(0));
+        let server = make_server_with_engine(RecordingPolicyEngine {
+            inner: chain_engine("*", None),
+            evaluations: Arc::clone(&evaluations),
+        });
+        for chain in ["stellar:mainnet", "", "invalid"] {
+            for explicit_value in [false, true] {
+                let args = serde_json::json!({ "chain_id": chain });
+                let result = if explicit_value {
+                    server
+                        .dispatch_gate_with_value(
+                            "stellar_balances",
+                            &args,
+                            chain,
+                            stellar_agent_core::policy::v1::ValueClass::ReadOnly,
+                            None,
+                            None,
+                        )
+                        .await
+                } else {
+                    server.dispatch_gate("stellar_balances", &args, chain).await
+                };
+                let Err(ToolError::Protocol(error)) = result else {
+                    panic!("a mismatched chain must return a protocol error: {result:?}");
+                };
+                assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+                assert!(error.message.starts_with("chain_id mismatch:"), "{error:?}");
+                assert_eq!(evaluations.load(Ordering::SeqCst), 0);
+            }
+        }
+        assert!(
+            server
+                .dispatch_gate("stellar_balances", &star_tool_value(), "stellar:testnet")
+                .await
+                .is_ok()
+        );
+        assert_eq!(evaluations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn dispatch_gate_profile_chain_exact_allow_both_branches() {
+        use stellar_agent_core::policy::v1::value::derive_value_class;
+        let home = tempfile::tempdir().expect("isolated home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+        let server = make_server_with_engine(chain_engine("stellar:testnet", None));
+        let args = serde_json::json!({
+            "amount_stroops": "50", "asset": "native", "destination": "recipient"
+        });
+        let derived = server
+            .dispatch_gate("stellar_pay", &args, "stellar:testnet")
+            .await;
+        assert!(
+            matches!(derived, Ok(DispatchOutcome::Allow(Some(_)))),
+            "{derived:?}"
+        );
+        let supplied = server
+            .dispatch_gate_with_value(
+                "stellar_x402_create_payment",
+                &args,
+                "stellar:testnet",
+                derive_value_class("stellar_pay", &args),
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(supplied, Ok(DispatchOutcome::Allow(Some(_)))),
+            "{supplied:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn dispatch_gate_profile_chain_cap_precedes_wildcard_both_branches() {
+        use stellar_agent_core::policy::v1::value::derive_value_class;
+        let home = tempfile::tempdir().expect("isolated home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+        let server = make_server_with_engine(chain_engine("stellar:testnet", Some(100)));
+        for explicit_value in [false, true] {
+            for amount in [50, 150] {
+                let args = serde_json::json!({
+                    "amount_stroops": amount.to_string(),
+                    "asset": "native",
+                    "destination": "recipient"
+                });
+                let result = if explicit_value {
+                    server
+                        .dispatch_gate_with_value(
+                            "stellar_x402_create_payment",
+                            &args,
+                            "stellar:testnet",
+                            derive_value_class("stellar_pay", &args),
+                            None,
+                            None,
+                        )
+                        .await
+                } else {
+                    server
+                        .dispatch_gate("stellar_pay", &args, "stellar:testnet")
+                        .await
+                };
+                if amount < 100 {
+                    assert!(
+                        matches!(result, Ok(DispatchOutcome::Allow(Some(_)))),
+                        "{result:?}"
+                    );
+                } else {
+                    let error = business_tool_error(result.expect_err("cap refusal"));
+                    assert_eq!(
+                        error_envelope_parts(&error).1,
+                        "policy.deny.per_tx_cap_exceeded"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn dispatch_gate_profile_chain_mainnet_read_only_and_testnet_control() {
+        let home = tempfile::tempdir().expect("isolated home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+        let profile =
+            Profile::builder_mainnet("https://rpc.example", "svc", "acct", "n-svc", "n-acct")
+                .with_noop_engine()
+                .build();
+        let mut mainnet = WalletServer::new(profile).expect("mainnet read-only profile");
+        mainnet.policy_engine = Arc::new(chain_engine("stellar:mainnet", None));
+        let result = mainnet
+            .dispatch_gate(
+                "stellar_balances",
+                &serde_json::json!({}),
+                "stellar:mainnet",
+            )
+            .await;
+        assert!(
+            matches!(result, Ok(DispatchOutcome::Allow(_))),
+            "{result:?}"
+        );
+        let testnet = make_server_with_engine(chain_engine("stellar:mainnet", None));
+        let result = testnet
+            .dispatch_gate("stellar_balances", &star_tool_value(), "stellar:testnet")
+            .await;
+        let error = business_tool_error(result.expect_err("mainnet rule excludes testnet"));
+        assert_eq!(
+            error_envelope_parts(&error).1,
+            "policy.deny.no_matching_rule"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn dispatch_gate_profile_chain_tool_without_chain_argument() {
+        let home = tempfile::tempdir().expect("isolated home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+        let server = make_server_with_engine(chain_engine("stellar:testnet", None));
+        let result = server
+            .dispatch_gate("stellar_toolset_list", &serde_json::json!({}), "")
+            .await;
+        assert!(
+            matches!(result, Ok(DispatchOutcome::Allow(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            server
+                .tool_registry
+                .get("stellar_toolset_list")
+                .expect("registered tool")
+                .chain_id,
+            ""
+        );
     }
 
     fn star_tool_value() -> Value {
