@@ -263,11 +263,10 @@ This writes `<profile_dir>/default.toml` with `engine = "v1"` (the default)
 and placeholder signer/nonce keyring coordinates. The full setup flow is:
 
 1. `profile init`: create the profile file (this step).
-2. [`profile enroll-signer`](#enroll-the-mcp-signer): register the MCP signer seed.
-3. `profile rotate-audit-key`: mint the audit chain-root key. Required on
-   **every** engine, `noop` included: `init` mints the audit-log keyring
-   coordinate only, no key material, so every signing verb refuses
-   `audit.chain_key_unavailable` until this runs.
+2. `profile rotate-audit-key`: mint the audit chain-root key, required on every
+   engine. The key must exist before signer enrollment so its audit row is written.
+   Every signing verb refuses `audit.chain_key_unavailable` until this runs.
+3. [`profile enroll-signer`](#enroll-the-mcp-signer): register the MCP signer seed.
 4. `stellar-agent profile rotate-nonce-key default`: mint the nonce key before
    MCP payment simulation. Without it, simulation fails with `nonce.mint_failed`.
 5. For `v1`, run `profile enroll-owner-key`, then `profile rotate-attestation-key`.
@@ -292,9 +291,9 @@ On a `v1` profile, the MCP server starts once the owner key is enrolled and
 the owner-signed policy loads; until then it refuses and names what is
 missing. An approval also requires `profile rotate-attestation-key`. A testnet
 profile created with `--engine noop` supports server startup and read access at
-once. Run `profile rotate-nonce-key` before MCP payment simulation. Before MCP
-signing, mint the audit key with `profile rotate-audit-key` and enroll the
-signer with `profile enroll-signer`.
+once. Mint the audit key with `profile rotate-audit-key` before `profile enroll-signer`
+so enrollment writes its audit row. Then run `profile rotate-nonce-key` before
+MCP payment simulation.
 
 For reference, here is the shape a testnet profile takes after enrolling a
 signer (a minimal version-2 profile). It is shown here with `engine = "noop"` for a
@@ -418,16 +417,20 @@ criteria = []
 decision = "allow"
 
 [[rules]]
+match = { tool = "stellar_pay", chain = "stellar:testnet" }
+criteria = [{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 1000000000 }]
+decision = "allow"
+
+[[rules]]
 match = { tool = "*", chain = "*" }
 criteria = []
 decision = "require_approval"
 ```
 
 For another profile, replace `default` in the filename and `scope`.
-The first rule allows balance queries; the second requests operator approval
-for other policy-gated calls. Both use `chain = "*"` because the profile binds
-the chain. Review the rules before signing; an empty `criteria` list adds no
-spending cap. See [policy rules](concepts.md#the-policy-engine)
+Balance reads are allowed, and testnet payments are allowed up to 100 XLM per day.
+Everything else waits for operator approval.
+Review the rules before signing. See [policy rules](concepts.md#the-policy-engine)
 for additional restrictions.
 
 Then run `stellar-agent profile sign-policy --profile default --secret-env WALLET_OWNER_SK`
@@ -534,7 +537,7 @@ those paths fail with `auth.keyring_not_found` until you enroll a seed. Enrollme
 reads the `S...` secret from a named environment variable, derives its public
 address, and stores it in the platform keyring. The secret is never printed.
 These same three verbs also require the profile's audit chain-root key to be
-minted (`profile rotate-audit-key <name>`, step 3 of the flow in
+minted (`profile rotate-audit-key <name>`, step 2 of the flow in
 [Set up a profile](#set-up-a-profile)); before that they refuse
 `audit.chain_key_unavailable`.
 
@@ -607,7 +610,8 @@ stellar-agent balances \
 
 `pay` sends a payment. By default it builds, signs, and submits the transaction
 atomically, then polls until confirmation. It enforces SEP-29 memo-required
-destinations before signing.
+destinations before signing. The sample policy allows this payment within its
+daily cap of 100 XLM.
 
 Provide the secret key through an environment variable named with `--secret-env`;
 the wallet reads the variable, never the literal key on the command line. Amounts

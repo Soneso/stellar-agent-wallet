@@ -81,8 +81,8 @@ fn a_fresh_v1_profile_through_inits_order_passes_audit_verify() {
         .map(|step| step.as_str().unwrap().to_owned())
         .collect();
     let order = [
-        "enroll-signer",
         "rotate-audit-key",
+        "enroll-signer",
         "rotate-nonce-key",
         "enroll-owner-key",
         "rotate-attestation-key",
@@ -97,6 +97,7 @@ fn a_fresh_v1_profile_through_inits_order_passes_audit_verify() {
         );
     }
 
+    cli(home, &["profile", "rotate-audit-key", PROFILE], None);
     let (signer_secret, signer_public) = keypair(0x11);
     cli(
         home,
@@ -112,7 +113,6 @@ fn a_fresh_v1_profile_through_inits_order_passes_audit_verify() {
         ],
         Some((SIGNER_ENV, &signer_secret)),
     );
-    cli(home, &["profile", "rotate-audit-key", PROFILE], None);
     cli(home, &["profile", "rotate-nonce-key", PROFILE], None);
     let (owner_secret, owner_public) = keypair(0x22);
     cli(
@@ -156,6 +156,17 @@ fn a_fresh_v1_profile_through_inits_order_passes_audit_verify() {
     let profile =
         stellar_agent_core::profile::loader::load_from_dir(PROFILE, &home.join("profiles"), None)
             .unwrap();
+    let rows: Vec<Value> = std::fs::read_to_string(&profile.audit_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        rows.iter().any(|row| {
+            row["kind"] == "keyring_key_written" && row["key_purpose"] == "mcp_signer_seed"
+        }),
+        "the first signer enrollment writes its audit row"
+    );
     let log_path = profile.audit_log_path.display().to_string();
     let (_, verified) = cli(
         home,

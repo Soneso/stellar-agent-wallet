@@ -28,8 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a release archive against `SHA256SUMS`, its cosign signature, and its SLSA
   provenance.
 
+### Changed
+
+- The getting-started sample policy allows testnet payments up to 100 XLM per day and requests operator approval for other calls except balance reads.
+
 ### Fixed
 
+- `profile init` lists audit-key rotation before signer enrollment on both engines so the first enrollment writes its audit row.
+- `accounts create --profile` help describes the profile's chain and endpoints for either funding mode.
 - `audit verify` reports each verifier failure with its `audit.*` code and diagnostic text. A missing log has a remediation message.
 - Approval-specific failures from the CLI and shared attestation API use `approval.*` envelope codes. Their messages omit the code prefix and internal wrapper. The MCP server's direct JSON-RPC approval errors are outside this change.
 - Multicall submission requires the call chain to match the profile chain at entry, before bundle validation or side effects.

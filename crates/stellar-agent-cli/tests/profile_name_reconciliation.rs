@@ -993,3 +993,34 @@ fn a_malformed_profile_reports_a_validation_code_and_keeps_its_cause() {
         run.message_field()
     );
 }
+
+/// Both engines mint the audit key before signer enrollment, then the nonce key.
+#[test]
+fn init_next_steps_put_audit_key_before_signer_enrollment_on_both_engines() {
+    for engine in ["v1", "noop"] {
+        let home = tempfile::tempdir().unwrap();
+        let run = run_cli(
+            home.path(),
+            &[
+                "profile",
+                "init",
+                "--profile",
+                REQUESTED,
+                "--engine",
+                engine,
+            ],
+        );
+        assert_eq!(run.code, 0, "{} {}", run.stdout, run.stderr);
+        let envelope = run.json();
+        let steps = envelope["data"]["next_steps"].as_array().unwrap();
+        for (index, verb) in ["rotate-audit-key", "enroll-signer", "rotate-nonce-key"]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                steps[index].as_str().unwrap().contains(verb),
+                "{engine} requires {verb} at position {index}: {steps:?}"
+            );
+        }
+    }
+}

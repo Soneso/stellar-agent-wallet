@@ -290,8 +290,7 @@ struct SponsoredCreateResult {
     ),
 )]
 pub struct CreateArgs {
-    /// Profile name to evaluate operator policy against in sponsored mode.
-    /// Ignored in Friendbot mode.
+    /// Profile supplying the chain and endpoints for either funding mode.
     ///
     /// Resolution order: this flag, then `STELLAR_AGENT_PROFILE`, then the
     /// literal `"default"`. When NO profile was named and no `default.toml`
