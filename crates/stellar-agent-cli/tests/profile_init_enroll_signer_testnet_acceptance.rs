@@ -315,12 +315,11 @@ fn run_rotate_audit_key(home: &Path, profile: &str) -> serde_json::Value {
 
 /// Spawns `stellar-agent trustline` with NO secret-env flag — it must resolve
 /// its signer purely through the profile's (just-enrolled) keyring
-/// coordinate — and returns `(exit_code, final_stdout_json_envelope)`.
+/// coordinate — and returns `(exit_code, stdout_json_envelope)`.
 ///
-/// The trustline submit path emits TWO JSON envelopes on stdout: the
-/// clawback-gate preview envelope (`stage: "preview"`) followed by the submit
-/// result envelope (`status: "submitted"`). Every stdout line must be valid
-/// JSON; the LAST line is the submit outcome this test asserts on.
+/// The trustline command prints exactly one JSON envelope on stdout; a run
+/// that reaches the preview carries it at `data.preview` on success and at
+/// `error.details.preview` on a later failure.
 fn run_trustline(
     home: &Path,
     profile: &str,
@@ -345,22 +344,16 @@ fn run_trustline(
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
-    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut documents =
+        serde_json::Deserializer::from_str(&stdout).into_iter::<serde_json::Value>();
+    let envelope = documents
+        .next()
+        .unwrap_or_else(|| panic!("stdout must hold a JSON envelope; stderr={stderr}"))
+        .unwrap_or_else(|e| panic!("stdout must be valid JSON ({e}): {stdout}"));
     assert!(
-        !lines.is_empty(),
-        "expected at least one JSON envelope line on stdout; stderr={stderr}"
+        documents.next().is_none(),
+        "stdout must hold exactly one JSON envelope: {stdout}"
     );
-    let envelopes: Vec<serde_json::Value> = lines
-        .iter()
-        .map(|line| {
-            serde_json::from_str(line)
-                .unwrap_or_else(|e| panic!("every stdout line must be valid JSON ({e}): {line}"))
-        })
-        .collect();
-    let envelope = envelopes
-        .last()
-        .expect("non-empty by the assertion above")
-        .clone();
 
     let exit_code = output
         .status
@@ -540,6 +533,11 @@ async fn profile_init_then_enroll_signer_enables_a_real_signing_operation() {
         trustline_envelope["ok"].as_bool(),
         Some(true),
         "trustline envelope must be ok=true: {trustline_envelope}"
+    );
+    assert_eq!(
+        trustline_envelope["data"]["preview"]["issuer"].as_str(),
+        Some(issuer_g.as_str()),
+        "the result must carry the typed preview: {trustline_envelope}"
     );
     let tx_hash = trustline_envelope["data"]["tx_hash"]
         .as_str()

@@ -628,10 +628,22 @@ fn mpp_reset_requires_acknowledgement_and_audits_recovery() {
         None,
     );
     assert_eq!(
-        refused.code, 2,
-        "acknowledgement is required by the parser: {}",
-        refused.stderr
+        refused.code, 1,
+        "acknowledgement is required by the parser: {} {}",
+        refused.stdout, refused.stderr
     );
+    assert_eq!(
+        refused.json()["error"]["code"],
+        "validation.usage_error",
+        "{}",
+        refused.stdout
+    );
+    assert!(
+        refused.message_field().contains("--acknowledge"),
+        "{}",
+        refused.stdout
+    );
+    assert!(refused.stderr.is_empty(), "{}", refused.stderr);
     assert_eq!(
         std::fs::read(home.path().join("headless-keyring/store.keyring")).expect("keyring"),
         before_keyring

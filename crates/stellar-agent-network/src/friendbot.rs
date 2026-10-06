@@ -295,6 +295,47 @@ async fn friendbot_request(
         .await
 }
 
+/// Upper bound, in bytes, on how much of a Friendbot error body is read to
+/// classify the failure.
+///
+/// Friendbot's "already funded" detail sits in a short JSON problem document;
+/// 64 KiB holds it with room to spare while bounding what a misbehaving
+/// endpoint can make the wallet buffer.
+const FRIENDBOT_ERROR_BODY_LIMIT: usize = 64 * 1024;
+
+/// Reads at most [`FRIENDBOT_ERROR_BODY_LIMIT`] bytes of an error response's
+/// body as lossy UTF-8.
+///
+/// A body that misses the request deadline, or breaks off, yields what was
+/// read before the failure. The caller only classifies the failure it already
+/// has, and an unread body classifies as no detail.
+async fn read_error_body(mut response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    while body.len() < FRIENDBOT_ERROR_BODY_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = FRIENDBOT_ERROR_BODY_LIMIT - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::debug!(
+                    error = %redact_rpc_error(&e.to_string()),
+                    "fund_with_friendbot: error body read stopped"
+                );
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+/// Whether a Friendbot error body reports that the account is already
+/// funded, compared without regard to ASCII case.
+fn reports_already_funded(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("already funded")
+}
+
 /// Upper bound on the number of `fetch_account` polls after a successful
 /// Friendbot HTTP response, before [`fund_with_friendbot`] gives up and
 /// reports [`NetworkError::FriendbotFundingNotConfirmed`].
@@ -405,8 +446,13 @@ async fn verify_funding_landed_with(
 ///
 /// - [`WalletError::Network`] wrapping [`NetworkError::FriendbotMainnetForbidden`]
 ///   if `network_passphrase` matches the Stellar mainnet passphrase.
+/// - [`WalletError::Network`] wrapping
+///   [`NetworkError::FriendbotAccountAlreadyFunded`] if Friendbot answers
+///   HTTP 400 with an "already funded" detail in the first 64 KiB of the
+///   body.
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcUnreachable`] if
-///   the Friendbot HTTP endpoint is unreachable or returns an error.
+///   the Friendbot HTTP endpoint is unreachable or returns any other error
+///   status.
 /// - [`WalletError::Network`] wrapping [`NetworkError::AccountNotFound`] if
 ///   the Friendbot response cannot be parsed (unexpected Friendbot response).
 /// - [`WalletError::Network`] wrapping [`NetworkError::FriendbotFundingNotConfirmed`]
@@ -466,10 +512,18 @@ pub async fn fund_with_friendbot(
         .map_err(transport_error)?;
 
     if !response.status().is_success() {
-        let status = response.status().as_u16();
+        let status = response.status();
+        let body = read_error_body(response).await;
+        if status == reqwest::StatusCode::BAD_REQUEST && reports_already_funded(&body) {
+            return Err(WalletError::Network(
+                NetworkError::FriendbotAccountAlreadyFunded {
+                    account_id: account_id.to_owned(),
+                },
+            ));
+        }
         return Err(WalletError::Network(NetworkError::RpcUnreachable {
             url: redact_url_authority(friendbot_url),
-            reason: format!("Friendbot returned HTTP {status}"),
+            reason: format!("Friendbot returned HTTP {}", status.as_u16()),
         }));
     }
 
@@ -659,6 +713,142 @@ mod tests {
         let logs = writer.captured_str();
         assert!(!logs.contains("SENTINEL-"), "friendbot URL leaked: {logs}");
         assert!(logs.contains(&authority), "missing URL authority: {logs}");
+    }
+
+    /// The account Friendbot is asked to fund in the error-status tests.
+    const FUNDED_ACCOUNT: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+
+    /// Funds [`FUNDED_ACCOUNT`] against a Friendbot mock that answers
+    /// `status` with `body`, and returns the error.
+    async fn fund_against(status: u16, body: String) -> WalletError {
+        use wiremock::{Mock, ResponseTemplate, matchers::any};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+        fund_with_friendbot(
+            &server.uri(),
+            FUNDED_ACCOUNT,
+            "Test SDF Network ; September 2015",
+            "http://127.0.0.1:1",
+        )
+        .await
+        .expect_err("an error status must fail")
+    }
+
+    /// Friendbot's answer for an existing account: HTTP 400 with an
+    /// "account already funded" detail.
+    #[tokio::test]
+    async fn an_already_funded_account_reports_the_already_funded_code() {
+        let error = fund_against(
+            400,
+            serde_json::json!({
+                "type": "https://stellar.org/horizon-errors/bad_request",
+                "title": "Bad Request",
+                "status": 400,
+                "detail": "account already funded to starting balance",
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(error.code(), "network.friendbot_account_already_funded");
+        let WalletError::Network(NetworkError::FriendbotAccountAlreadyFunded { account_id }) =
+            &error
+        else {
+            unreachable!("expected the already-funded refusal: {error:?}");
+        };
+        assert_eq!(account_id, FUNDED_ACCOUNT);
+        assert!(error.message().contains(FUNDED_ACCOUNT), "{error}");
+    }
+
+    /// Only a 400 whose body carries the detail is the already-funded
+    /// refusal; every other error status keeps the unreachable code.
+    #[tokio::test]
+    async fn other_error_answers_stay_rpc_unreachable() {
+        for (status, body) in [
+            (400, r#"{"detail":"invalid address"}"#.to_owned()),
+            (500, r#"{"detail":"account already funded"}"#.to_owned()),
+        ] {
+            let error = fund_against(status, body).await;
+            assert_eq!(error.code(), "network.rpc_unreachable", "HTTP {status}");
+            let WalletError::Network(NetworkError::RpcUnreachable { reason, .. }) = error else {
+                unreachable!("expected an HTTP failure");
+            };
+            assert_eq!(reason, format!("Friendbot returned HTTP {status}"));
+        }
+    }
+
+    /// Accepts one request, answers with `response`, then closes the
+    /// connection, so a body shorter than its `Content-Length` breaks off.
+    async fn truncated_friendbot(response: &'static [u8]) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut chunk = [0; 1024];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0 && request.len() + count <= 4096);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            socket.write_all(response).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        url
+    }
+
+    /// A body that breaks off is classified by what arrived before the
+    /// break: the already-funded detail still yields its code, and a body cut
+    /// before the detail stays the unreachable refusal with the status.
+    #[tokio::test]
+    async fn an_interrupted_error_body_is_classified_by_what_arrived() {
+        let funded = truncated_friendbot(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 1024\r\n\r\n\
+              {\"detail\":\"account already funded to starting balance\"",
+        )
+        .await;
+        let error = fund_with_friendbot(
+            &funded,
+            FUNDED_ACCOUNT,
+            "Test SDF Network ; September 2015",
+            "http://127.0.0.1:1",
+        )
+        .await
+        .expect_err("an interrupted error answer must fail");
+        assert_eq!(error.code(), "network.friendbot_account_already_funded");
+
+        let cut = truncated_friendbot(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 1024\r\n\r\n{\"detail\":\"acc",
+        )
+        .await;
+        let error = fund_with_friendbot(
+            &cut,
+            FUNDED_ACCOUNT,
+            "Test SDF Network ; September 2015",
+            "http://127.0.0.1:1",
+        )
+        .await
+        .expect_err("an interrupted error answer must fail");
+        let WalletError::Network(NetworkError::RpcUnreachable { reason, .. }) = error else {
+            unreachable!("expected the unreachable refusal: {error:?}");
+        };
+        assert_eq!(reason, "Friendbot returned HTTP 400");
+    }
+
+    /// The classification reads only the first 64 KiB of the body: a detail
+    /// past the bound is not read.
+    #[tokio::test]
+    async fn a_detail_past_the_body_bound_is_not_read() {
+        let body = format!(
+            "{}account already funded",
+            " ".repeat(FRIENDBOT_ERROR_BODY_LIMIT)
+        );
+        let error = fund_against(400, body).await;
+        assert_eq!(error.code(), "network.rpc_unreachable");
     }
 
     #[tokio::test]

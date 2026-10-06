@@ -21,6 +21,11 @@ Tool and command results use a uniform envelope:
 - `error.code` is the stable wire code. Branch on it.
 - `request_id` correlates the call with the audit log. Quote it when asking the
   operator to investigate.
+- By default every CLI command prints exactly one envelope on stdout and exits
+  `0` on success, `1` on any error. An argument the parser refuses (an unknown flag,
+  a missing required flag, a malformed value) returns `validation.usage_error`
+  with the parser's message; correct the invocation and retry. `--help` and
+  `--version` print text, not an envelope.
 
 At the MCP boundary, account, strkey, and contract-id fields inside an error are
 redacted to first-five-last-five characters, and transaction hashes to
@@ -78,6 +83,12 @@ single-use nonce is burned, so a refusal here leaves the nonce usable.
 | `network.envelope_signature_unverifiable` | A signature verifies under neither the endpoint's network nor mainnet, or no eligible ed25519 signer accounts for it (hash-x and pre-auth-tx signers contribute no ed25519 key). | Do not retry the same envelope. Re-run the simulate step and sign with a key the source account lists as a signer. |
 | `network.envelope_unsigned` | The envelope carries no signature, or on a fee-bump the outer or the inner transaction carries none; typically a build-only envelope handed straight to a submit step. | Sign the envelope first, then submit. On a fee-bump, both the inner transaction and the fee source must sign. |
 | `network.account_not_found` | A transaction-source or operation-source account on the envelope is absent from the ledger, so its signer set cannot be read. | Nothing was sent. Confirm the account exists and is funded on the target network. |
+
+## Friendbot code
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `network.friendbot_account_already_funded` | Friendbot refused to fund the account because it already exists and is funded. `stellar-agent friendbot`, `accounts create --fund-with-friendbot`, and `stellar_friendbot` report it; the message names the account. | Do not retry. The account is usable as it is: continue with it, or fund a new account if a fresh one was intended. |
 
 ## Submission codes (unresolved outcomes)
 
@@ -191,6 +202,7 @@ agent-recoverable at runtime.
 |---|---|---|
 | `keyring.error` | A platform keyring read failed while loading the nonce key or an HMAC key on a two-phase verb. | Often the active profile names a keyring entry that holds no secret yet (the first-run testnet fallback profile uses placeholder coordinates). Only read-only tools that never touch the keyring still work: the simulate step already fails at nonce mint (`nonce.mint_failed`) when the nonce key is missing, so the flow stops there, before any commit. The operator must populate the keyring entry. Report to the operator. |
 | `auth.keyring_interactive_session_required` | Windows Credential Manager requires an interactive logon session; the process is running non-interactively (service, SSH, scheduled task). | Not retryable in-place. The operator must either run from an interactive desktop session or opt into the headless keyring store (`STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi` or `headless-env`, see profiles-and-keys.md). Report to the operator. |
+| `auth.keyring_config_invalid` | The headless keyring store cannot be set up from the environment. `STELLAR_AGENT_KEYRING_BACKEND` names an unknown backend, or `STELLAR_AGENT_HEADLESS_KEYRING_KEY` is missing or malformed: base64 padding, the standard alphabet, or not 32 bytes. The backend may also be unsupported on the platform, or the state directory undeterminable. The message names the cause, never the key. | Not agent-recoverable. Report the message; the operator fixes the environment variable, for example by encoding the key as URL-safe base64 without padding (43 characters). |
 | `io.audit_writer_setup` | A smart-account verb could not load its profile file: the file is missing, unreadable, malformed, or of an unsupported schema version. A name mismatch, a non-overlayable field, the mainnet rules, and the endpoint rule keep their own codes. | Not agent-recoverable. Report the message; the operator corrects the profile file. An audit directory that cannot be created, or a writer lock another process holds, reports `audit.chain_key_unavailable` with the `audit.io_error` or `audit.writer_locked` detail instead. |
 
 A missing or empty **signer** keyring entry on a single-shot SEP-43 sign tool

@@ -1078,8 +1078,10 @@ fn fees_stats_mainnet_equal_rpc_flag_refuses() {
     assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
 }
 
+/// A credentialed `--rpc-url` is a usage error: exit `1` with one
+/// `validation.usage_error` envelope, and neither stream echoes the userinfo.
 #[test]
-fn credentialed_rpc_flag_exits_two_without_echoing_credentials() {
+fn credentialed_rpc_flag_is_a_usage_error_without_echoing_credentials() {
     let home = tempfile::tempdir().unwrap();
     write_mainnet_profile(home.path(), "mainnet", UNREACHABLE_HTTPS_RPC);
     let mut args = pay_base();
@@ -1090,9 +1092,13 @@ fn credentialed_rpc_flag_exits_two_without_echoing_credentials() {
         "https://user:SENTINEL@rpc.example",
     ]);
     let run = run_cli(home.path(), None, &args);
-    assert_eq!(run.code, 2, "{} {}", run.stdout, run.stderr);
-    assert!(!run.stderr.contains("SENTINEL"));
-    assert!(!run.stderr.contains("user"));
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    assert_eq!(run.json()["error"]["code"], "validation.usage_error");
+    assert!(run.stderr.is_empty(), "{}", run.stderr);
+    for stream in [&run.stdout, &run.stderr] {
+        assert!(!stream.contains("SENTINEL"), "{stream}");
+        assert!(!stream.contains("user"), "{stream}");
+    }
 }
 
 #[test]

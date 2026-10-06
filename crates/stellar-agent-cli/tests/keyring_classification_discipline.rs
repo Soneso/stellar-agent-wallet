@@ -61,16 +61,18 @@ const ALLOW_SET: &[AllowEntry] = &[
         invariant: "the classifier itself maps keyring_core::Error into AuthError; \
                     KeyringNotFound is the classified OUTPUT, not a hand-roll",
     },
-    // init_platform_keyring_store hand-rolls KeyringNotFound around Store::new()
-    // (store CONSTRUCTION, not a credential op). Per the classifier's own
-    // contract, the interactive-session (1312) case cannot arise from store
-    // construction, so classification is not applicable. Store::new() is not a
-    // raw-op needle, so this is a forward guard.
+    // init_platform_keyring_store hand-rolls KeyringNotFound around the
+    // platform Store::new() (store CONSTRUCTION, not a credential op). Per the
+    // classifier's own contract, the interactive-session (1312) case cannot
+    // arise from store construction, so classification is not applicable.
+    // Store::new() is not a raw-op needle, so this is a forward guard. The
+    // headless backend's setup failure is a configuration fault and reports
+    // AuthError::KeyringConfigInvalid, which this rule does not concern.
     AllowEntry {
         file: "stellar-agent-network/src/keyring.rs",
         anchor: "init_platform_keyring_store",
-        invariant: "store construction cannot surface the interactive-session case; \
-                    see the invariant comment in init_platform_keyring_store",
+        invariant: "platform store construction cannot surface the interactive-session \
+                    case; see the invariant comment in init_platform_keyring_store",
     },
     // Non-AuthError typed errors: NoEntry is distinguished, every other cause
     // keeps the raw text inside the crate-local error and nothing is discarded.

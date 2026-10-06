@@ -96,6 +96,8 @@ unset WALLET_SK
 
 By default every command prints one JSON envelope on stdout. Exit code `0` means success; exit code `1` means any error. Scripts can branch on the exit code and parse the JSON for details.
 
+An argument the parser refuses, such as an unknown flag or a missing required one, also prints one envelope: `validation.usage_error` with the parser's message, exit code `1`, and nothing on stderr. `--help` and `--version` print their text and exit `0`.
+
 ```bash
 if stellar-agent balances --account GABC...WXYZ > out.json; then
   jq '.' out.json

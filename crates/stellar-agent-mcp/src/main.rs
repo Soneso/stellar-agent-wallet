@@ -115,8 +115,7 @@ fn harden_process() {
 /// Exit code for an unusable invocation: an argument that cannot be parsed, or
 /// a profile name that cannot be a path component.
 ///
-/// Distinct from the exit code `1` every later startup refusal uses, and the
-/// same code clap gives the `stellar-agent` CLI for a usage error.
+/// Distinct from the exit code `1` every later startup refusal uses.
 const EXIT_USAGE: i32 = 2;
 
 /// The accepted flags, printed by `--help` and repeated with every usage

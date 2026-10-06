@@ -24,7 +24,7 @@
 //!    for the post-confirm row.
 //! 6. `clawback_gate(flags, opt_in_present)` where `opt_in_present` is derived
 //!    from the wallet-controlled `PendingApprovalStore` (NOT a CLI flag).
-//! 7. `TrustlinePreview::build` — typed JSON preview rendered to stdout.
+//! 7. `TrustlinePreview::build` — the typed preview of the trustline.
 //! 8. `RefuseWithWarning` / `Refuse` gate decisions → early return (exit 1).
 //! 9. Build `ChangeTrust` envelope via `ClassicOpBuilder::change_trust`.
 //! 10. Sign via keyring → submit → wait for confirmation.
@@ -44,12 +44,22 @@
 //!
 //! # Output
 //!
-//! JSON.  Returns `0` on success, `1` on error.
+//! One JSON envelope on stdout. Returns `0` on success, `1` on error.
+//!
+//! The typed preview from step 7 is rendered once, as a nested `preview`
+//! object, after the step 8 gate decision passes. It sits in `data.preview`
+//! beside the submission result on success. It sits in
+//! `error.details.preview` when a later stage fails: fee resolution, envelope
+//! build, signing, or submission. A refusal up to and including the step 8
+//! gate decision carries no preview.
 //!
 //! # Behavior
 //!
 //! The denomination resolver pins issuers and refuses USDT. A live issuer-flag
 //! fetch feeds a named clawback gate that discloses clawback-enabled issuers.
+
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -63,6 +73,7 @@ use stellar_agent_core::approval::user_id::process_uid_for_attestation;
 use stellar_agent_core::approval::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, DEFAULT_TTL_MS, open_with_retry,
 };
+use stellar_agent_core::audit_log::AuditWriter;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
@@ -86,14 +97,14 @@ use stellar_agent_network::account::AccountFlagsView;
 use stellar_agent_network::keyring::classify_keyring_error;
 use stellar_agent_stablecoin::{
     preview::{GateDecisionView, TrustlinePreview},
-    resolve::{DenominationInput, resolve_denomination},
+    resolve::{DenominationInput, ResolvedAsset, resolve_denomination},
 };
 
 use crate::common::network::mainnet_write_refusal;
 use crate::common::profile_access::{
     ProfileAccessError, injected_profile_load, reconcile_loaded_profile,
 };
-use crate::common::render::render_json;
+use crate::common::render::{WithPreview, with_preview_detail, write_envelope};
 use crate::common::resolve_profile_name;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -125,7 +136,7 @@ fn redact_asset_for_log(asset: &str) -> String {
 ///    pinned-issuer-mismatch + unpinned-bare-code.
 /// 3. Live issuer-flag fetch.  Fetch failure fail-closes.
 /// 4. `clawback_gate` — wallet-controlled approval store opt-in lookup.
-/// 5. Preview to stdout.
+/// 5. Typed preview, reported in the one output envelope.
 /// 6. Build → sign → submit.
 ///
 /// # Asset grammar
@@ -187,20 +198,28 @@ pub struct TrustlineArgs {
 /// Returns `1` on any gate failure, denomination error, flag-fetch failure,
 /// build error, sign error, or submit error.
 pub async fn run(args: &TrustlineArgs) -> i32 {
-    run_with_dependencies(args, injected_profile_load, init_platform_keyring_store).await
+    run_with_dependencies(
+        args,
+        injected_profile_load,
+        init_platform_keyring_store,
+        &mut std::io::stdout(),
+    )
+    .await
 }
 
-/// Testable core of [`run`] with the profile loader and the platform-keyring
-/// initialiser injected.
+/// Testable core of [`run`] with the profile loader, the platform-keyring
+/// initializer, and the output writer injected.
 ///
-/// Production callers use [`run`], which supplies the real profile loader and
-/// [`init_platform_keyring_store`]. Tests substitute an in-memory profile and a
-/// spy initialiser to assert the keyring store is registered before signer
-/// resolution without touching the OS keychain.
+/// Production callers use [`run`], which supplies the real profile loader,
+/// [`init_platform_keyring_store`], and stdout. Tests substitute an in-memory
+/// profile and a spy initializer, and read the one envelope the command
+/// writes from an in-memory writer. They assert the keyring store is
+/// registered before signer resolution without touching the OS keychain.
 async fn run_with_dependencies<LoadProfile, InitKeyring>(
     args: &TrustlineArgs,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
+    out: &mut dyn Write,
 ) -> i32
 where
     LoadProfile: Fn(&str) -> Result<Profile, profile_loader::ProfileLoadError>,
@@ -224,15 +243,18 @@ where
     let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
         Ok(p) => p,
         Err(e @ ProfileAccessError::Load(_)) if !e.requires_refusal() => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.profile_load_failed",
-                e.message(&profile_name),
-            ));
-            return 1;
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("trustline.profile_load_failed", e.message(&profile_name)),
+                1,
+            );
         }
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(e.code(), e.message(&profile_name)));
-            return 1;
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw(e.code(), e.message(&profile_name)),
+                1,
+            );
         }
     };
 
@@ -241,8 +263,7 @@ where
     // ── Structural mainnet refusal ────────────────────────────────────────────
     // Before the keyring store, the signer, and any RPC request.
     if let Some(err) = mainnet_write_refusal(context.chain_id) {
-        render_json(&Envelope::<()>::err(&err));
-        return 1;
+        return write_envelope(out, &Envelope::<()>::err(&err), 1);
     }
 
     // ── Initialise platform keyring store ─────────────────────────────────────
@@ -250,8 +271,7 @@ where
     // default store.  Ordered after the profile load so a missing profile never
     // triggers the store registration.
     if let Err(e) = init_keyring() {
-        render_json(&Envelope::<()>::err(&e));
-        return 1;
+        return write_envelope(out, &Envelope::<()>::err(&e), 1);
     }
 
     let rpc_url = context.rpc_url.as_str();
@@ -260,11 +280,14 @@ where
 
     // ── Validate G-strkey ─────────────────────────────────────────────────────
     if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&args.from) {
-        render_json(&Envelope::<()>::err_raw(
-            "trustline.invalid_from",
-            format!("invalid from address (expected G-strkey): {err}"),
-        ));
-        return 1;
+        return write_envelope(
+            out,
+            &Envelope::<()>::err_raw(
+                "trustline.invalid_from",
+                format!("invalid from address (expected G-strkey): {err}"),
+            ),
+            1,
+        );
     }
 
     // ── GATE 1: resolve_denomination (D3 ordered refusal) ────────────────────
@@ -279,11 +302,11 @@ where
                 error = %e,
                 "denomination resolver refused trustline"
             );
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.denomination_refused",
-                e.to_string(),
-            ));
-            return 1;
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("trustline.denomination_refused", e.to_string()),
+                1,
+            );
         }
     };
 
@@ -291,11 +314,11 @@ where
     let rpc_client = match StellarRpcClient::new(rpc_url) {
         Ok(c) => c,
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.rpc_init_failed",
-                e.to_string(),
-            ));
-            return 1;
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("trustline.rpc_init_failed", e.to_string()),
+                1,
+            );
         }
     };
 
@@ -340,11 +363,11 @@ where
     let source_account_view = match fetch_account(&rpc_client, &args.from, &[]).await {
         Ok(v) => v,
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.source_account_fetch_failed",
-                e.to_string(),
-            ));
-            return 1;
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("trustline.source_account_fetch_failed", e.to_string()),
+                1,
+            );
         }
     };
     let source_sequence = source_account_view.sequence_number;
@@ -356,11 +379,11 @@ where
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(v) => v,
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "wallet.clock_error",
-                e.to_string(),
-            ));
-            return 1;
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("wallet.clock_error", e.to_string()),
+                1,
+            );
         }
     };
     crate::commands::submission_record::reconcile_open_reservations(
@@ -383,11 +406,11 @@ where
     ) {
         Ok(pe) => pe,
         Err(msg) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.policy_engine_unavailable",
-                msg,
-            ));
-            return 1;
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("trustline.policy_engine_unavailable", msg),
+                1,
+            );
         }
     };
     let policy_args = trustline_policy_args(&args.from, &args.asset);
@@ -409,8 +432,7 @@ where
     ) {
         Ok(effects) => effects,
         Err(envelope) => {
-            render_json(&envelope);
-            return 1;
+            return write_envelope(out, &envelope, 1);
         }
     };
 
@@ -424,8 +446,7 @@ where
         match crate::commands::value_audit::require_value_audit_writer(&profile, &profile_name) {
             Ok(w) => w,
             Err(e) => {
-                render_json(&Envelope::<()>::err(&e));
-                return 1;
+                return write_envelope(out, &Envelope::<()>::err(&e), 1);
             }
         };
 
@@ -445,11 +466,11 @@ where
     let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
         Ok(ms) => ms,
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.clock_error",
-                e.to_string(),
-            ));
-            return 1;
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("trustline.clock_error", e.to_string()),
+                1,
+            );
         }
     };
     let network_key = context.chain_id.caip2_str();
@@ -521,11 +542,11 @@ where
             let uid = match process_uid_for_attestation() {
                 Ok(u) => u,
                 Err(e) => {
-                    render_json(&Envelope::<()>::err_raw(
-                        "trustline.uid_unavailable",
-                        e.to_string(),
-                    ));
-                    return 1;
+                    return write_envelope(
+                        out,
+                        &Envelope::<()>::err_raw("trustline.uid_unavailable", e.to_string()),
+                        1,
+                    );
                 }
             };
             match default_approval_dir() {
@@ -561,18 +582,21 @@ where
                                                 "opt-in entry insert failed"
                                             );
                                         } else {
-                                            render_json(&Envelope::ok(serde_json::json!({
-                                                "outcome": "clawback_opt_in_required",
-                                                "warning": warning,
-                                                "opt_in_approval": {
-                                                    "approval_nonce": opt_in_nonce,
-                                                    "expires_at_unix_ms": opt_in_expires,
-                                                    "instructions": "Run `stellar-agent approve \
-                                                        --id <approval_nonce>` to record the \
-                                                        clawback opt-in, then re-invoke trustline.",
-                                                },
-                                            })));
-                                            return 1;
+                                            return write_envelope(
+                                                out,
+                                                &Envelope::ok(serde_json::json!({
+                                                    "outcome": "clawback_opt_in_required",
+                                                    "warning": warning,
+                                                    "opt_in_approval": {
+                                                        "approval_nonce": opt_in_nonce,
+                                                        "expires_at_unix_ms": opt_in_expires,
+                                                        "instructions": "Run `stellar-agent approve \
+                                                            --id <approval_nonce>` to record the \
+                                                            clawback opt-in, then re-invoke trustline.",
+                                                    },
+                                                })),
+                                                1,
+                                            );
                                         }
                                     }
                                     Err(e) => {
@@ -603,11 +627,11 @@ where
                 }
             }
             // Fall-through: render a plain refusal if the store mint failed.
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.clawback_gate_refused",
-                warning,
-            ));
-            return 1;
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("trustline.clawback_gate_refused", warning),
+                1,
+            );
         }
         GateDecisionView::Refuse { reason } => {
             tracing::info!(
@@ -618,35 +642,88 @@ where
                 reason = %reason,
                 "clawback gate Refuse — trustline refused (fail-closed or hard-refusal)"
             );
-            render_json(&Envelope::<()>::err_raw("trustline.gate_refused", reason));
-            return 1;
+            return write_envelope(
+                out,
+                &Envelope::<()>::err_raw("trustline.gate_refused", reason),
+                1,
+            );
         }
     }
 
-    // ── Render preview to stdout (before signing) ─────────────────────────────
-    let preview_envelope = Envelope::ok(json!({
-        "stage": "preview",
-        "code": &preview.code,
-        "issuer": &preview.issuer,
-        "issuer_redacted": redact_strkey_first5_last5(&preview.issuer),
-        "limit_stroops": preview.limit_stroops.map(|v| v.to_string()),
-        "is_pinned": preview.is_pinned,
-        "issuer_flags": &preview.issuer_flags,
-        "gate_decision": &preview.gate_decision,
-    }));
-    render_json(&preview_envelope);
+    // ── Report every later stage in one envelope carrying the preview ────────
+    let preview_view = trustline_preview_view(&preview);
+    let outcome = sign_and_submit(GatedTrustline {
+        args,
+        profile: &profile,
+        profile_name: &profile_name,
+        rpc_client: &rpc_client,
+        network_passphrase,
+        chain_id,
+        resolved: &resolved,
+        source_sequence,
+        effects: trustline_effects.as_ref(),
+        audit_writer: &audit_writer,
+        now_ms,
+    })
+    .await;
+    render_trustline_outcome(out, preview_view, outcome)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stages after the preview
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The inputs the stages after the preview take from the gates before it.
+struct GatedTrustline<'a> {
+    args: &'a TrustlineArgs,
+    profile: &'a Profile,
+    profile_name: &'a str,
+    rpc_client: &'a StellarRpcClient,
+    network_passphrase: &'a str,
+    chain_id: &'a str,
+    resolved: &'a ResolvedAsset,
+    source_sequence: i64,
+    effects: Option<&'a stellar_agent_core::policy::v1::ValueEffects>,
+    audit_writer: &'a Arc<Mutex<AuditWriter>>,
+    now_ms: u64,
+}
+
+/// The success payload of a submitted `ChangeTrust` transaction.
+#[derive(Debug, serde::Serialize)]
+struct TrustlineSubmitted {
+    status: &'static str,
+    action: &'static str,
+    code: String,
+    issuer_redacted: String,
+    limit_stroops: Option<String>,
+    is_pinned: bool,
+    tx_hash: String,
+    ledger: u32,
+}
+
+/// Resolves the fee, then builds, signs, records, and submits the
+/// `ChangeTrust` envelope.
+///
+/// Renders nothing: the caller reports the returned payload or failure
+/// envelope in the one envelope that carries the preview.
+async fn sign_and_submit(gated: GatedTrustline<'_>) -> Result<TrustlineSubmitted, Envelope<()>> {
+    let GatedTrustline {
+        args,
+        profile,
+        profile_name,
+        rpc_client,
+        network_passphrase,
+        chain_id,
+        resolved,
+        source_sequence,
+        effects,
+        audit_writer,
+        now_ms,
+    } = gated;
 
     // ── Fee resolution ────────────────────────────────────────────────────────
-    let fee_choice = match parse_classic_fee_choice(args.classic_base.as_deref()) {
-        Ok(fc) => fc,
-        Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.invalid_fee",
-                e.code().to_string(),
-            ));
-            return 1;
-        }
-    };
+    let fee_choice = parse_classic_fee_choice(args.classic_base.as_deref())
+        .map_err(|e| Envelope::<()>::err_raw("trustline.invalid_fee", e.code().to_string()))?;
     // Unwrap Option<u32> with a safe default (100 stroops = testnet safe floor).
     // The MCP path uses the common helper `resolve_classic_fee_per_op_stroops`;
     // the CLI path is equivalent: fallback to 100 when the profile has no explicit
@@ -655,50 +732,22 @@ where
     let default_fee_per_op = profile
         .classic_fee_per_op_stroops
         .unwrap_or(DEFAULT_CLASSIC_FEE_STROOPS);
-    let fee_selection =
-        match resolve_classic_fee_selection(&rpc_client, default_fee_per_op, fee_choice).await {
-            Ok(sel) => sel,
-            Err(e) => {
-                render_json(&Envelope::<()>::err_raw(
-                    "trustline.fee_resolution_failed",
-                    e.to_string(),
-                ));
-                return 1;
-            }
-        };
+    let fee_selection = resolve_classic_fee_selection(rpc_client, default_fee_per_op, fee_choice)
+        .await
+        .map_err(|e| Envelope::<()>::err_raw("trustline.fee_resolution_failed", e.to_string()))?;
     let fee_per_op = fee_selection.per_op_stroops;
 
     // ── Build unsigned ChangeTrust envelope ───────────────────────────────────
-    let asset = match Asset::from_code_and_issuer(&resolved.code, &resolved.issuer) {
-        Ok(a) => a,
-        Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.asset_build_failed",
-                e.to_string(),
-            ));
-            return 1;
-        }
-    };
-
+    let asset = Asset::from_code_and_issuer(&resolved.code, &resolved.issuer)
+        .map_err(|e| Envelope::<()>::err_raw("trustline.asset_build_failed", e.to_string()))?;
+    let envelope_build_failed =
+        |e: WalletError| Envelope::<()>::err_raw("trustline.envelope_build_failed", e.to_string());
     let mut builder =
         ClassicOpBuilder::new(&args.from, source_sequence, network_passphrase, fee_per_op);
-    if let Err(e) = builder.change_trust(&asset, args.limit_stroops) {
-        render_json(&Envelope::<()>::err_raw(
-            "trustline.envelope_build_failed",
-            e.to_string(),
-        ));
-        return 1;
-    }
-    let envelope_xdr = match builder.build() {
-        Ok(xdr) => xdr,
-        Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.envelope_build_failed",
-                e.to_string(),
-            ));
-            return 1;
-        }
-    };
+    builder
+        .change_trust(&asset, args.limit_stroops)
+        .map_err(envelope_build_failed)?;
+    let envelope_xdr = builder.build().map_err(envelope_build_failed)?;
 
     // NEVER log the envelope XDR at info.
     tracing::debug!(
@@ -709,75 +758,58 @@ where
 
     // ── Drain the audit outbox before the signing key loads ──────────────────
     // The clawback opt-in was read from the approval store after the audit
-    // pre-flight above. Re-acquiring the keyed writer is a cache hit, which
-    // drains the outbox, so a consent row `stellar-agent approve` queued
-    // meanwhile is in the log before the key is touched. Fail closed.
-    if let Err(e) =
-        crate::commands::value_audit::drain_consent_rows_before_signing(&profile, &profile_name)
-    {
-        render_json(&Envelope::<()>::err(&e));
-        return 1;
-    }
+    // pre-flight. Re-acquiring the keyed writer is a cache hit, which drains
+    // the outbox, so a consent row `stellar-agent approve` queued meanwhile is
+    // in the log before the key is touched. Fail closed.
+    crate::commands::value_audit::drain_consent_rows_before_signing(profile, profile_name)
+        .map_err(|e| Envelope::<()>::err(&e))?;
 
     // ── Load signer from keyring ──────────────────────────────────────────────
-    let signer_entry_ref = &profile.mcp_signer_default;
-    let expected_g = signer_entry_ref.account.as_str();
-    let signer_handle = match enrolled_keyring_signer(&profile_name, &profile, expected_g).await {
-        Ok(s) => s,
-        Err(e) => {
+    let expected_g = profile.mcp_signer_default.account.as_str();
+    let signer_handle = enrolled_keyring_signer(profile_name, profile, expected_g)
+        .await
+        .map_err(|e| {
             let (code, message) = signer_load_failure_parts(&e);
-            render_json(&Envelope::<()>::err_raw(code, message));
-            return 1;
-        }
-    };
+            Envelope::<()>::err_raw(code, message)
+        })?;
 
     // ── Sign envelope ─────────────────────────────────────────────────────────
-    let signed_xdr = match attach_signature(&envelope_xdr, &signer_handle, network_passphrase).await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "trustline.sign_failed",
-                e.to_string(),
-            ));
-            return 1;
-        }
-    };
+    let signed_xdr = attach_signature(&envelope_xdr, &signer_handle, network_passphrase)
+        .await
+        .map_err(|e| Envelope::<()>::err_raw("trustline.sign_failed", e.to_string()))?;
 
     // ── Record, then submit ───────────────────────────────────────────────────
     // The recorder writes the receipt, the pending audit row and the
     // spending-window reservation before the bytes leave, and settles all
     // three against what the network answers.
-    let recorder = match crate::commands::submission_record::build_recorder(
+    let submission_failure = |e: WalletError| {
+        crate::commands::submission_record::error_envelope_with_fallback(
+            &e,
+            &signed_xdr,
+            "trustline",
+            "trustline.submit_failed",
+        )
+    };
+    let recorder = crate::commands::submission_record::build_recorder(
         crate::commands::submission_record::SubmitRecord {
             policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
-            profile: &profile,
-            profile_name: profile_name.clone(),
+            profile,
+            profile_name: profile_name.to_owned(),
             verb: "trustline",
             tool: "stellar_trustline",
             chain_id,
-            effects: trustline_effects.as_ref(),
-            audit: Some(std::sync::Arc::clone(&audit_writer)),
+            effects,
+            audit: Some(Arc::clone(audit_writer)),
             now_ms,
         },
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            render_json(
-                &crate::commands::submission_record::error_envelope_with_fallback(
-                    &e,
-                    &signed_xdr,
-                    "trustline",
-                    "trustline.submit_failed",
-                ),
-            );
-            return 1;
-        }
-    };
+    )
+    .map_err(submission_failure)?;
 
     let timeout = std::time::Duration::from_secs(profile.submit_timeout_seconds.unwrap_or(90));
-    match submit_transaction_and_wait(
-        &rpc_client,
+    let SubmissionResult {
+        tx_hash, ledger, ..
+    } = submit_transaction_and_wait(
+        rpc_client,
         &signed_xdr,
         timeout,
         network_passphrase,
@@ -785,44 +817,65 @@ where
         Some(&recorder),
     )
     .await
-    {
-        Ok(SubmissionResult {
-            tx_hash, ledger, ..
-        }) => {
-            let tx_hash_redacted = stellar_agent_network::submit::redact_tx_hash(&tx_hash);
-            tracing::info!(
-                subcommand = "trustline",
-                chain = %chain_id,
-                code = %resolved.code,
-                issuer = %redact_strkey_first5_last5(&resolved.issuer),
-                tx_hash = %tx_hash_redacted,
-                ledger = ?ledger,
-                "ChangeTrust tx submitted"
-            );
+    .map_err(submission_failure)?;
 
-            render_json(&Envelope::ok(json!({
-                "status": "submitted",
-                "action": "change_trust",
-                "code": resolved.code,
-                "issuer_redacted": redact_strkey_first5_last5(&resolved.issuer),
-                "limit_stroops": args.limit_stroops.map(|v| v.to_string()),
-                "is_pinned": resolved.is_pinned,
-                "tx_hash": tx_hash,
-                "ledger": ledger,
-            })));
-            0
-        }
-        Err(e) => {
-            render_json(
-                &crate::commands::submission_record::error_envelope_with_fallback(
-                    &e,
-                    &signed_xdr,
-                    "trustline",
-                    "trustline.submit_failed",
-                ),
-            );
-            1
-        }
+    let tx_hash_redacted = stellar_agent_network::submit::redact_tx_hash(&tx_hash);
+    tracing::info!(
+        subcommand = "trustline",
+        chain = %chain_id,
+        code = %resolved.code,
+        issuer = %redact_strkey_first5_last5(&resolved.issuer),
+        tx_hash = %tx_hash_redacted,
+        ledger = ?ledger,
+        "ChangeTrust tx submitted"
+    );
+
+    Ok(TrustlineSubmitted {
+        status: "submitted",
+        action: "change_trust",
+        code: resolved.code.clone(),
+        issuer_redacted: redact_strkey_first5_last5(&resolved.issuer),
+        limit_stroops: args.limit_stroops.map(|v| v.to_string()),
+        is_pinned: resolved.is_pinned,
+        tx_hash,
+        ledger,
+    })
+}
+
+/// The typed preview as the nested `preview` object of the output envelope.
+fn trustline_preview_view(preview: &TrustlinePreview) -> serde_json::Value {
+    json!({
+        "code": &preview.code,
+        "issuer": &preview.issuer,
+        "issuer_redacted": redact_strkey_first5_last5(&preview.issuer),
+        "limit_stroops": preview.limit_stroops.map(|v| v.to_string()),
+        "is_pinned": preview.is_pinned,
+        "issuer_flags": &preview.issuer_flags,
+        "gate_decision": &preview.gate_decision,
+    })
+}
+
+/// Writes the outcome of the stages after the preview as one envelope and
+/// returns the exit code.
+///
+/// The preview sits in `data.preview` on success and in
+/// `error.details.preview` on failure. An envelope that cannot be written or
+/// flushed exits `1` with the failure on stderr, whatever the outcome.
+fn render_trustline_outcome<T: serde::Serialize>(
+    out: &mut dyn Write,
+    preview: serde_json::Value,
+    outcome: Result<T, Envelope<()>>,
+) -> i32 {
+    match outcome {
+        Ok(result) => write_envelope(
+            out,
+            &Envelope::ok(WithPreview {
+                result,
+                preview: Some(preview),
+            }),
+            0,
+        ),
+        Err(envelope) => write_envelope(out, &with_preview_detail(envelope, preview), 1),
     }
 }
 
@@ -1150,6 +1203,7 @@ mod tests {
                 )
             },
             || panic!("a mainnet profile must not initialise the keyring"),
+            &mut std::io::sink(),
         )
         .await;
         assert_eq!(code, 1, "a mainnet trustline must exit with code 1");
@@ -1213,6 +1267,7 @@ mod tests {
                     name: "keyring-order-test-sentinel".to_owned(),
                 }))
             },
+            &mut std::io::sink(),
         )
         .await;
 
@@ -1226,7 +1281,173 @@ mod tests {
         );
     }
 
-    // ── Audit pre-flight (fail-closed) ───────────────────────────────────────
+    // ── One envelope on stdout ────────────────────────────────────────────────
+
+    const ONE_ENVELOPE_FROM: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+    const ONE_ENVELOPE_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+    /// The preview a `USDC:<issuer>` trustline renders when the issuer sets
+    /// no flags.
+    fn usdc_preview() -> TrustlinePreview {
+        let resolved = resolve_denomination(
+            DenominationInput::CodeAndIssuer {
+                code: "USDC".to_owned(),
+                issuer: ONE_ENVELOPE_ISSUER.to_owned(),
+            },
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+        )
+        .unwrap();
+        TrustlinePreview::build(resolved, None, Some(&AccountFlagsView::from_raw(0)), false)
+    }
+
+    /// The success payload of a submitted `USDC` trustline.
+    fn submitted_usdc(preview: &TrustlinePreview) -> TrustlineSubmitted {
+        TrustlineSubmitted {
+            status: "submitted",
+            action: "change_trust",
+            code: "USDC".to_owned(),
+            issuer_redacted: redact_strkey_first5_last5(ONE_ENVELOPE_ISSUER),
+            limit_stroops: None,
+            is_pinned: preview.is_pinned,
+            tx_hash: "ab".repeat(32),
+            ledger: 7,
+        }
+    }
+
+    /// A submitted trustline prints exactly one JSON document: the result
+    /// envelope, with the preview nested at `data.preview`.
+    #[test]
+    fn a_submitted_trustline_prints_one_envelope_with_the_preview_in_data() {
+        let preview = usdc_preview();
+        let submitted = submitted_usdc(&preview);
+        let mut out = Vec::new();
+        let code =
+            render_trustline_outcome(&mut out, trustline_preview_view(&preview), Ok(submitted));
+        assert_eq!(code, 0);
+        let envelope = crate::common::render::single_json_document(&out);
+        assert_eq!(envelope["ok"], true, "{envelope}");
+        let data = &envelope["data"];
+        assert_eq!(data["status"], "submitted", "{envelope}");
+        assert_eq!(data["tx_hash"], "ab".repeat(32), "{envelope}");
+        assert_eq!(data["ledger"], 7, "{envelope}");
+        assert_eq!(data["preview"]["code"], "USDC", "{envelope}");
+        assert_eq!(data["preview"]["issuer"], ONE_ENVELOPE_ISSUER, "{envelope}");
+        assert_eq!(
+            data["preview"]["gate_decision"]["kind"], "proceed",
+            "{envelope}"
+        );
+        assert!(data.get("stage").is_none(), "{envelope}");
+    }
+
+    /// A submitted trustline whose envelope cannot be written or flushed
+    /// exits `1`: the result never reached the caller.
+    #[test]
+    fn a_submitted_trustline_whose_output_fails_exits_one() {
+        use crate::common::render::FailingWriter;
+        let preview = usdc_preview();
+        for mut writer in [FailingWriter::Write, FailingWriter::Flush] {
+            let code = render_trustline_outcome(
+                &mut writer,
+                trustline_preview_view(&preview),
+                Ok(submitted_usdc(&preview)),
+            );
+            assert_eq!(code, 1, "{writer:?}");
+        }
+    }
+
+    /// A failure after the preview stage prints exactly one JSON document:
+    /// the error envelope, with the preview nested at `error.details.preview`.
+    ///
+    /// `--fee bogus` passes every gate up to the preview against a mocked
+    /// endpoint and fails at the fee parse, before the fee-statistics request
+    /// or any submission.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failure_after_the_preview_prints_one_envelope_with_the_preview_in_details() {
+        const NAME: &str = "trustline-one-envelope";
+
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let rpc = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = match body["method"].as_str().unwrap_or("") {
+                    "getLedgerEntries" => {
+                        stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[
+                            ONE_ENVELOPE_FROM,
+                            ONE_ENVELOPE_ISSUER,
+                        ])
+                    }
+                    "getNetwork" => {
+                        stellar_agent_test_support::signed_envelope::get_network_result(
+                            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                        )
+                    }
+                    _ => serde_json::json!({}),
+                };
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": result,
+                }))
+            })
+            .mount(&rpc)
+            .await;
+        let mut profile =
+            Profile::builder_testnet_named(NAME, "svc-one-envelope", ONE_ENVELOPE_FROM, "n", "a")
+                .with_noop_engine()
+                .build();
+        profile.rpc_url = rpc.uri();
+        profile.audit_log_path = home.path().join("audit").join(format!("{NAME}.jsonl"));
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let audit_key = &profile.audit_log_hash_chain_key_id;
+        KeyringEntry::new(&audit_key.service, &audit_key.account)
+            .unwrap()
+            .set_password(&URL_SAFE_NO_PAD.encode([0x3a; 32]))
+            .unwrap();
+
+        let args = TrustlineArgs {
+            profile: Some(NAME.to_owned()),
+            from: ONE_ENVELOPE_FROM.to_owned(),
+            asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
+            limit_stroops: None,
+            classic_base: Some("bogus".to_owned()),
+        };
+        let mut out = Vec::new();
+        let loaded = profile.clone();
+        let code =
+            run_with_dependencies(&args, move |_| Ok(loaded.clone()), || Ok(()), &mut out).await;
+
+        assert_eq!(code, 1);
+        let envelope = crate::common::render::single_json_document(&out);
+        assert_eq!(envelope["ok"], false, "{envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "trustline.invalid_fee",
+            "{envelope}"
+        );
+        let preview = &envelope["error"]["details"]["preview"];
+        assert_eq!(preview["code"], "USDC", "{envelope}");
+        assert_eq!(preview["issuer"], ONE_ENVELOPE_ISSUER, "{envelope}");
+        assert_eq!(preview["gate_decision"]["kind"], "proceed", "{envelope}");
+        let methods: Vec<String> = rpc
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .ok()
+                    .and_then(|body| body["method"].as_str().map(str::to_owned))
+            })
+            .collect();
+        assert!(
+            !methods
+                .iter()
+                .any(|m| m == "getFeeStats" || m == "sendTransaction"),
+            "the fee parse fails before any later request: {methods:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1398,7 +1619,13 @@ mod enrolled_failure_tests {
             classic_base: None,
         };
         let loaded = profile.clone();
-        let code = run_with_dependencies(&args, move |_| Ok(loaded.clone()), || Ok(())).await;
+        let code = run_with_dependencies(
+            &args,
+            move |_| Ok(loaded.clone()),
+            || Ok(()),
+            &mut std::io::sink(),
+        )
+        .await;
         assert_eq!(code, 1, "no signer is seeded");
         assert!(
             queued.load(Ordering::SeqCst),

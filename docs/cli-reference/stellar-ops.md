@@ -32,7 +32,7 @@ Creates a new Stellar account in one of two mutually exclusive modes: a sponsore
 
 - **Signing.** Sponsored mode signs the `CreateAccount` operation with the sponsor's key. Friendbot mode performs no signing and touches no key.
 - **Policy (sponsored mode only).** After `--starting-balance` and the new account's public key are resolved and before signing, the sponsored `CreateAccount` is evaluated against `--profile`'s policy engine. This is the same evaluation the `stellar_create_account` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized. So sponsored mode works without an authored profile file until an operator opts into `policy.engine = "v1"`. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`). A profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). Friendbot mode is not gated: it debits no wallet-held funds.
-- **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` is structurally refused before any RPC, HTTP, or key access. Sponsored mode returns `network.mainnet_write_forbidden`; Friendbot mode returns `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only.
+- **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` is structurally refused before any RPC, HTTP, or key access. Sponsored mode returns `network.mainnet_write_forbidden`; Friendbot mode returns `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only. In Friendbot mode, an account that already exists exits `1` with `network.friendbot_account_already_funded`.
 - **Account identity.** Provide the new account's G-strkey as the positional argument, or pass `--generate` to mint a fresh ed25519 keypair in-process. Exactly one is required.
 - **Secret-key discipline.** `--generate` returns the new S-strkey in the JSON envelope's `data.secret_key` field. It is never emitted in `--output table` and never logged. Capture it from the JSON output and store it securely. The command output holds the seed, so do not write it to a log or a shared terminal.
 
@@ -259,6 +259,12 @@ The respective refusals are `claim.not_claimant`, `claim.predicate_not_satisfied
 - **Timing.** The predicate is evaluated against the local clock; on-chain
   validation uses the apply-ledger close time, so a claim previewed near a
   time-bound boundary can still fail on submit.
+- **Output.** The command prints one JSON envelope. The build stage's typed
+  preview is a nested `preview` object: in `data.preview` on success, and in
+  `error.details.preview` when a later step fails: a claim guard, the fee
+  resolution, the policy gate, the audit pre-flight, signing, or submission.
+  `--sign-only` and `--submit-only` build no preview. `--output table` prints
+  a preview line before the result line.
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
@@ -296,12 +302,12 @@ Reads the native XLM balance and trustlines for an account via the Stellar RPC `
 
 - **Signing.** Read-only; no signing or key access.
 - **Network.** No mainnet gate; the command queries whatever `--rpc-url` points at.
-- **Account.** `--account` is required in practice. When omitted the command exits `1` (the active-profile fallback is not wired).
+- **Account.** `--account` is required. When omitted, the command exits `1` with `validation.usage_error`.
 - **Trustlines.** Pass `--asset CODE:ISSUER` to query specific trustlines; repeat the flag for multiple assets. Assets the account does not trust are silently omitted from the output.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--account <G_STRKEY>` | Account to query | required in practice | none |
+| `--account <G_STRKEY>` | Account to query | yes | none |
 | `--asset <CODE:ISSUER>` | Trustline asset to query; repeatable | optional | none |
 | `--rpc-url <URL>` | Stellar RPC endpoint | optional | `https://soroban-testnet.stellar.org` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
@@ -323,6 +329,7 @@ Creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust g
 - **USDT is hard-refused.** The denomination resolver rejects USDT outright; the command cannot create a USDT trustline.
 - **Limit.** `--limit-stroops 0` removes the trustline. When absent the Stellar default (`i64::MAX`, unlimited) applies.
 - **Asset grammar.** A bare code such as `USDC` resolves through the pin table; `CODE:ISSUER` names an explicit issuer; a 56-char `C...` SAC address is deferred and returns a typed error.
+- **Output.** The command prints one JSON envelope. Once the clawback gate passes, the typed preview is a nested `preview` object with the code, issuer, limit, pin status, issuer flags, and gate decision. It sits in `data.preview` beside the submission result on success, and in `error.details.preview` when the fee resolution, envelope build, signing, or submission fails.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
@@ -348,6 +355,7 @@ Funds a testnet or futurenet account via the Stellar Friendbot HTTP endpoint.
 - **Signing.** No local signing or key access; Friendbot funds the account.
 - **Network.** `--network` accepts `testnet`, `futurenet`, or `mainnet` at the parser, but `mainnet` is structurally refused at dispatch with `network.friendbot_mainnet_forbidden` before any HTTP call. The endpoint URL is validated against an allow-list (`friendbot.stellar.org`, `friendbot-futurenet.stellar.org`) unless `--friendbot-url-unchecked` is set.
 - **Funding verification.** After a successful Friendbot HTTP response, the command polls `--rpc-url` until the funded account is queryable before reporting success. The JSON envelope's `data.funding_confirmed_after_ms` reports how long that took. If the account never becomes queryable, the command exits `1` with `network.friendbot_funding_not_confirmed` rather than reporting a Friendbot HTTP success that has not actually landed.
+- **Already funded.** Friendbot funds only an account that does not exist yet. For an existing account it answers HTTP 400 with an "account already funded" detail, and the command exits `1` with `network.friendbot_account_already_funded`, naming the account. The account is usable as it is. Every other Friendbot error status exits `1` with `network.rpc_unreachable`.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|

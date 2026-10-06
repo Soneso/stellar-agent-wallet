@@ -257,39 +257,27 @@ async fn t3_cli_single_shot_happy_path() {
         "stellar-agent claim must exit 0; stdout={stdout} stderr={stderr}"
     );
 
-    // In `--output json` mode the CLI emits one compact envelope per stage
-    // (the trustline verb's stream convention): a `stage: "preview"` envelope
-    // first, then the final result envelope. Every stdout line must be valid
-    // JSON, and the LAST line carries the claim result.
-    let envelopes: Vec<serde_json::Value> = stdout
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            serde_json::from_str(l)
-                .unwrap_or_else(|e| panic!("every stdout line must be valid JSON ({e}): {l}"))
-        })
-        .collect();
+    // In `--output json` mode the CLI prints exactly one envelope: the claim
+    // result, with the typed preview nested at `data.preview`.
+    let mut documents =
+        serde_json::Deserializer::from_str(&stdout).into_iter::<serde_json::Value>();
+    let envelope = documents
+        .next()
+        .expect("stdout must hold a JSON envelope")
+        .unwrap_or_else(|e| panic!("stdout must be valid JSON ({e}): {stdout}"));
     assert!(
-        envelopes.len() >= 2,
-        "expected a preview envelope and a result envelope; got {} line(s): {stdout}",
-        envelopes.len()
+        documents.next().is_none(),
+        "stdout must hold exactly one JSON envelope: {stdout}"
     );
-    let preview = &envelopes[0];
-    assert_eq!(
-        preview["data"]["stage"].as_str(),
-        Some("preview"),
-        "first envelope must be the typed preview: {preview}"
-    );
-    assert_eq!(
-        preview["data"]["is_claimant"].as_bool(),
-        Some(true),
-        "preview must confirm the source is a claimant: {preview}"
-    );
-    let envelope = envelopes.last().expect("at least one stdout envelope");
     assert_eq!(
         envelope["ok"].as_bool(),
         Some(true),
         "claim envelope must be ok: {envelope}"
+    );
+    assert_eq!(
+        envelope["data"]["preview"]["is_claimant"].as_bool(),
+        Some(true),
+        "the preview must confirm the source is a claimant: {envelope}"
     );
     let tx_hash = envelope["data"]["tx_hash"]
         .as_str()

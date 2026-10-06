@@ -197,6 +197,8 @@ file-backed keyring store.** Set `STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi`
 for Windows DPAPI CurrentUser protection, or `STELLAR_AGENT_KEYRING_BACKEND=headless-env`
 on any platform. The `headless-env` backend also requires
 `STELLAR_AGENT_HEADLESS_KEYRING_KEY`, a 32-byte URL-safe-base64 key without padding.
+A padded or standard-alphabet key is refused with `auth.keyring_config_invalid`,
+and the message names the cause.
 Set these variables in the process environment before running any
 `stellar-agent` or `stellar-agent-mcp` command. The platform keyring remains
 the default when this variable is unset. See [security-internals.md's headless

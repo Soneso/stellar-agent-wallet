@@ -276,7 +276,7 @@ before any `stellar-agent` / `stellar-agent-mcp` command:
 
 The platform keyring remains the default when the variable is unset; there is
 no silent fallback in either direction — a misconfigured backend fails closed
-rather than switching stores. In `headless-env` mode the operator-held
+with `auth.keyring_config_invalid` rather than switching stores. In `headless-env` mode the operator-held
 environment key is the custody boundary: whoever can read the process
 environment can decrypt the store, so scope it to the service user.
 

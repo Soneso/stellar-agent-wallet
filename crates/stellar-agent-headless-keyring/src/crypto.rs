@@ -200,16 +200,18 @@ fn dpapi_open(_ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
 ///
 /// # Errors
 ///
-/// Returns [`CryptoError::InvalidEnvKey`] if `raw` is not valid base64 or
-/// does not decode to exactly 32 bytes.
+/// Returns [`CryptoError::InvalidEnvKey`] if `raw` is not valid URL-safe
+/// base64 without padding, naming the cause (see [`undecodable_key_detail`]),
+/// or does not decode to exactly 32 bytes.
 pub(crate) fn parse_env_key(raw: &str) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
+    let value = raw.trim();
     let decoded = Zeroizing::new(
         URL_SAFE_NO_PAD
-            .decode(raw.trim())
-            .map_err(|_| CryptoError::InvalidEnvKey("value is not valid URL-safe base64"))?,
+            .decode(value)
+            .map_err(|_| CryptoError::InvalidEnvKey(undecodable_key_detail(value)))?,
     );
     if decoded.len() != 32 {
         return Err(CryptoError::InvalidEnvKey(
@@ -219,6 +221,23 @@ pub(crate) fn parse_env_key(raw: &str) -> Result<Zeroizing<[u8; 32]>, CryptoErro
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&decoded);
     Ok(key)
+}
+
+/// Names why `value` is not URL-safe base64 without padding.
+///
+/// Two encodings a key generator often produces instead are named with their
+/// fix, padding first. A padded value is refused with the unpadded length: the
+/// 32-byte key is 43 characters. A standard-alphabet value is refused for its
+/// `+` or `/`, which URL-safe base64 writes as `-` and `_`. The detail never
+/// repeats the value.
+fn undecodable_key_detail(value: &str) -> &'static str {
+    if value.ends_with('=') {
+        "value has base64 padding; use URL-safe base64 without padding, 43 characters"
+    } else if value.contains(['+', '/']) {
+        "value uses the standard base64 alphabet; use URL-safe base64 without padding"
+    } else {
+        "value is not valid URL-safe base64"
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -353,7 +372,57 @@ mod tests {
     fn parse_env_key_rejects_invalid_base64() {
         assert!(matches!(
             parse_env_key("not valid base64!!"),
-            Err(CryptoError::InvalidEnvKey(_))
+            Err(CryptoError::InvalidEnvKey(
+                "value is not valid URL-safe base64"
+            ))
+        ));
+    }
+
+    /// A 32-byte key in standard base64 with its `=` padding is refused with
+    /// the padding cause and the expected length.
+    #[test]
+    fn parse_env_key_names_padding() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        let padded = STANDARD.encode([0x33u8; 32]);
+        assert!(padded.ends_with('=') && !padded.contains(['+', '/']));
+        assert!(matches!(
+            parse_env_key(&padded),
+            Err(CryptoError::InvalidEnvKey(
+                "value has base64 padding; use URL-safe base64 without padding, 43 characters"
+            ))
+        ));
+    }
+
+    /// A padded key in the standard alphabet is refused with the padding
+    /// cause, which names the expected length.
+    #[test]
+    fn parse_env_key_names_padding_before_the_alphabet() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        let padded = STANDARD.encode([0xfbu8; 32]);
+        assert!(padded.ends_with('=') && padded.contains(['+', '/']));
+        assert!(matches!(
+            parse_env_key(&padded),
+            Err(CryptoError::InvalidEnvKey(
+                "value has base64 padding; use URL-safe base64 without padding, 43 characters"
+            ))
+        ));
+    }
+
+    /// A key in the standard alphabet without padding is refused with the
+    /// alphabet cause.
+    #[test]
+    fn parse_env_key_names_the_standard_alphabet() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD_NO_PAD;
+        let standard = STANDARD_NO_PAD.encode([0xfbu8; 32]);
+        assert!(standard.contains(['+', '/']) && !standard.ends_with('='));
+        assert!(matches!(
+            parse_env_key(&standard),
+            Err(CryptoError::InvalidEnvKey(
+                "value uses the standard base64 alphabet; use URL-safe base64 without padding"
+            ))
         ));
     }
 }
