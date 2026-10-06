@@ -1213,7 +1213,7 @@ pub fn build_exec_invocations(bundle: &[MulticallInvocation]) -> Result<Vec<ScVa
 ///    + simulate + cross-RPC check + sign + submit + post-submit verification.
 /// 4. **audit** — on `Ok`, emit `SaMulticallBundleSubmitted` + N
 ///    `SaMulticallInnerExecuted` rows. On failure, emit `SaMulticallBundleDenied`
-///    with the appropriate `refusal_phase`.
+///    with the appropriate `refusal_phase`. A chain disagreement returns before any audit row.
 ///
 /// A mainnet `network_passphrase` or a mainnet-pattern `primary_rpc_url` is
 /// refused by `submit_signed_invoke` with [`SaError::MainnetWriteForbidden`]
@@ -1227,7 +1227,8 @@ pub fn build_exec_invocations(bundle: &[MulticallInvocation]) -> Result<Vec<ScVa
 ///   the mainnet passphrase. No transaction was sent. It is returned unwrapped
 ///   after a denied row at phase `policy_gate`.
 /// - `SaError::MulticallFailed { phase: "build", .. }` — bundle shape invalid.
-/// - `SaError::MulticallFailed { phase: "policy_gate", .. }` — policy denied.
+/// - `SaError::MulticallFailed { phase: "policy_gate", .. }`: chain disagreement or policy denial.
+///   A chain disagreement returns before processing or emitting any audit row.
 /// - `SaError::MulticallFailed { phase: "rpc_divergence", .. }` — cross-RPC check failed.
 /// - `SaError::MulticallFailed { phase: "simulate", .. }` — RPC simulate error.
 /// - `SaError::MulticallFailed { phase: "sign", .. }` — auth-entry signing error.
@@ -1245,6 +1246,16 @@ pub async fn submit_multicall_bundle(
     args: MulticallSubmitArgs<'_>,
     registry: &MulticallRegistry,
 ) -> Result<MulticallResult, SaError> {
+    // Policy and accounting use the profile chain. Audit rows and submission
+    // identity use the call chain. Both identifiers must agree before processing begins.
+    if args.chain_id != args.profile.chain_id.caip2_str() {
+        return Err(SaError::MulticallFailed {
+            phase: "policy_gate",
+            redacted_reason: "chain_id does not match the profile chain".to_owned(),
+            post_submit_kind: None,
+        });
+    }
+
     let smart_account_redacted = redact_strkey_first5_last5(args.smart_account);
 
     // Warn when primary and secondary RPC URLs are identical. The trust-anchor

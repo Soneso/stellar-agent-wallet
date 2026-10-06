@@ -3235,8 +3235,7 @@ pub enum WriterError {
 /// minting a key nor resolving a registration, so the caller must not tell the
 /// operator to do either.
 ///
-/// The sub-codes are the ones already documented for these conditions; the
-/// detail-carried convention matches `approval.writer_locked`.
+/// Each sub-code identifies the documented recovery procedure for its condition.
 #[must_use]
 pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
     match e {

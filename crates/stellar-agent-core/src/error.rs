@@ -11,6 +11,7 @@
 //! |-------------------|---------------|--------|
 //! | [`WalletError::Validation`]   | `validation`   | User-supplied input validation |
 //! | [`WalletError::Network`]      | `network`      | RPC / Horizon connectivity |
+//! | [`WalletError::Approval`]     | `approval`     | Operator approval and attestation failures |
 //! | [`WalletError::Auth`]         | `auth`         | Keyring and signing auth |
 //! | [`WalletError::WalletState`]  | `wallet_state` | Hardware-wallet / keyring state |
 //! | [`WalletError::Protocol`]     | `protocol`     | XDR / Soroban protocol errors |
@@ -158,6 +159,10 @@ pub enum WalletError {
     #[error(transparent)]
     Network(#[from] NetworkError),
 
+    /// An operator approval or attestation operation failed.
+    #[error(transparent)]
+    Approval(#[from] ApprovalFailure),
+
     /// An authentication or keyring operation failed.
     #[error(transparent)]
     Auth(#[from] AuthError),
@@ -275,6 +280,8 @@ pub enum ErrorCategory {
     Validation,
     /// Network connectivity or RPC failure.
     Network,
+    /// Operator approval or attestation failure.
+    Approval,
     /// Keyring or signing authentication failure.
     Auth,
     /// Hardware wallet or keyring state error.
@@ -315,6 +322,7 @@ impl WalletError {
         match self {
             Self::Validation(e) => e.code(),
             Self::Network(e) => e.code(),
+            Self::Approval(e) => e.code(),
             Self::Auth(e) => e.code(),
             Self::WalletState(e) => e.code(),
             Self::Protocol(e) => e.code(),
@@ -349,6 +357,7 @@ impl WalletError {
         match self {
             Self::Validation(_) => ErrorCategory::Validation,
             Self::Network(_) => ErrorCategory::Network,
+            Self::Approval(_) => ErrorCategory::Approval,
             Self::Auth(_) => ErrorCategory::Auth,
             Self::WalletState(_) => ErrorCategory::WalletState,
             Self::Protocol(_) => ErrorCategory::Protocol,
@@ -384,6 +393,270 @@ impl WalletError {
     #[must_use]
     pub fn message(&self) -> String {
         self.to_string()
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Approval errors
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A failure to validate, authorize, or persist an operator approval.
+///
+/// Each variant carries a non-secret operator diagnostic as plain text.
+/// Store errors receive contextual mappings at each call site.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ApprovalFailure {
+    /// The pending approval does not exist.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.not_found"`.
+    #[error("{detail}")]
+    NotFound {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The pending approval has expired.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.expired"`.
+    #[error("{detail}")]
+    Expired {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The pending approval already carries an attestation.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.already_attested"`.
+    #[error("{detail}")]
+    AlreadyAttested {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The caller cannot authorize this pending approval.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.user_mismatch"`.
+    #[error("{detail}")]
+    UserMismatch {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The system clock cannot supply an approval timestamp.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.clock_error"`.
+    #[error("{detail}")]
+    ClockError {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The approval digest is not valid SHA-256 hexadecimal text.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.sha256_hex_error"`.
+    #[error("{detail}")]
+    Sha256HexError {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The attestation key is not valid base64.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.key_decode_failed"`.
+    #[error("{detail}")]
+    KeyDecodeFailed {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The attestation key has an invalid length.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.key_length_error"`.
+    #[error("{detail}")]
+    KeyLengthError {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The approval belongs to another profile or network.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.binding_mismatch"`.
+    #[error("{detail}")]
+    BindingMismatch {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The approval grant cannot be persisted.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.grant_persist"`.
+    #[error("{detail}")]
+    GrantPersist {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The pending approval kind cannot be attested on this path.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.wrong_kind"`.
+    #[error("{detail}")]
+    WrongKind {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The operator has rejected this approval.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.rejected"`.
+    #[error("{detail}")]
+    Rejected {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The approval has already been consumed.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.consumed"`.
+    #[error("{detail}")]
+    Consumed {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The attestation cannot be recorded.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.record_failed"`.
+    #[error("{detail}")]
+    RecordFailed {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The process identity cannot be derived.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.uid_unavailable"`.
+    #[error("{detail}")]
+    UidUnavailable {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The operator declines the pending approval.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.denied"`.
+    #[error("{detail}")]
+    Denied {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The approval store directory cannot be resolved.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.store_dir_error"`.
+    #[error("{detail}")]
+    StoreDirError {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The approval store permissions are invalid.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.permission_denied"`.
+    #[error("{detail}")]
+    PermissionDenied {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The approval nonce has an invalid length.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.invalid_nonce_length"`.
+    #[error("{detail}")]
+    InvalidNonceLength {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// Another writer holds the approval store lock.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.writer_locked"`.
+    #[error("{detail}")]
+    WriterLocked {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The approval store cannot be opened.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.store_open_failed"`.
+    #[error("{detail}")]
+    StoreOpenFailed {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// Expired approvals cannot be collected.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.gc_failed"`.
+    #[error("{detail}")]
+    GcFailed {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+}
+
+impl ApprovalFailure {
+    /// Returns the stable approval wire code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound { .. } => "approval.not_found",
+            Self::Expired { .. } => "approval.expired",
+            Self::AlreadyAttested { .. } => "approval.already_attested",
+            Self::UserMismatch { .. } => "approval.user_mismatch",
+            Self::ClockError { .. } => "approval.clock_error",
+            Self::Sha256HexError { .. } => "approval.sha256_hex_error",
+            Self::KeyDecodeFailed { .. } => "approval.key_decode_failed",
+            Self::KeyLengthError { .. } => "approval.key_length_error",
+            Self::BindingMismatch { .. } => "approval.binding_mismatch",
+            Self::GrantPersist { .. } => "approval.grant_persist",
+            Self::WrongKind { .. } => "approval.wrong_kind",
+            Self::Rejected { .. } => "approval.rejected",
+            Self::Consumed { .. } => "approval.consumed",
+            Self::RecordFailed { .. } => "approval.record_failed",
+            Self::UidUnavailable { .. } => "approval.uid_unavailable",
+            Self::Denied { .. } => "approval.denied",
+            Self::StoreDirError { .. } => "approval.store_dir_error",
+            Self::PermissionDenied { .. } => "approval.permission_denied",
+            Self::InvalidNonceLength { .. } => "approval.invalid_nonce_length",
+            Self::WriterLocked { .. } => "approval.writer_locked",
+            Self::StoreOpenFailed { .. } => "approval.store_open_failed",
+            Self::GcFailed { .. } => "approval.gc_failed",
+        }
     }
 }
 
@@ -794,18 +1067,16 @@ pub enum ValidationError {
 
     /// The audit log file to verify does not exist at the supplied path.
     ///
-    /// A user-actionable condition, not an integrity violation: either nothing
-    /// has been written to the audit log yet, or the `--log-path` is wrong.
-    /// Carries the `audit.log_not_found` wire code (audit taxonomy) while being
-    /// a validation-class error so callers can distinguish "no log yet" from a
-    /// tamper-evidence failure.
+    /// Nothing has been written to the audit log yet, or the log path is incorrect.
+    /// `audit verify` produces this validation-class error for its positional
+    /// `LOG_PATH`, with the `audit.log_not_found` wire code.
     ///
     /// # Wire code
     ///
     /// `"audit.log_not_found"`.
     #[error(
         "audit log not found at {path}; nothing has been written to the audit \
-         log yet, or the --log-path is incorrect"
+         log yet, or the log path is incorrect"
     )]
     AuditLogNotFound {
         /// Display path of the missing primary audit-log file.
@@ -1045,10 +1316,8 @@ pub enum ValidationError {
     /// [`ValidationError::AuditChainKeyUnavailable`]'s remedy nor
     /// [`ValidationError::AuditWriterOpenFailed`]'s applies.
     ///
-    /// `detail` leads with the `audit.*` sub-code for the specific condition —
-    /// the same detail-carried convention `approval.writer_locked` uses — so an
-    /// agent matching on the sub-code reaches the right troubleshooting row and
-    /// the right runbook section.
+    /// `detail` leads with the `audit.*` sub-code for the specific condition.
+    /// The sub-code identifies the troubleshooting row and recovery runbook section.
     ///
     /// # Wire code
     ///
@@ -3680,12 +3949,163 @@ mod tests {
         }
     }
 
+    #[test]
+    fn approval_failure_wire_codes_and_messages() {
+        let cases = [
+            (
+                ApprovalFailure::NotFound {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.not_found",
+            ),
+            (
+                ApprovalFailure::Expired {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.expired",
+            ),
+            (
+                ApprovalFailure::AlreadyAttested {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.already_attested",
+            ),
+            (
+                ApprovalFailure::UserMismatch {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.user_mismatch",
+            ),
+            (
+                ApprovalFailure::ClockError {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.clock_error",
+            ),
+            (
+                ApprovalFailure::Sha256HexError {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.sha256_hex_error",
+            ),
+            (
+                ApprovalFailure::KeyDecodeFailed {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.key_decode_failed",
+            ),
+            (
+                ApprovalFailure::KeyLengthError {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.key_length_error",
+            ),
+            (
+                ApprovalFailure::BindingMismatch {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.binding_mismatch",
+            ),
+            (
+                ApprovalFailure::GrantPersist {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.grant_persist",
+            ),
+            (
+                ApprovalFailure::WrongKind {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.wrong_kind",
+            ),
+            (
+                ApprovalFailure::Rejected {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.rejected",
+            ),
+            (
+                ApprovalFailure::Consumed {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.consumed",
+            ),
+            (
+                ApprovalFailure::RecordFailed {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.record_failed",
+            ),
+            (
+                ApprovalFailure::UidUnavailable {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.uid_unavailable",
+            ),
+            (
+                ApprovalFailure::Denied {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.denied",
+            ),
+            (
+                ApprovalFailure::StoreDirError {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.store_dir_error",
+            ),
+            (
+                ApprovalFailure::PermissionDenied {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.permission_denied",
+            ),
+            (
+                ApprovalFailure::InvalidNonceLength {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.invalid_nonce_length",
+            ),
+            (
+                ApprovalFailure::WriterLocked {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.writer_locked",
+            ),
+            (
+                ApprovalFailure::StoreOpenFailed {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.store_open_failed",
+            ),
+            (
+                ApprovalFailure::GcFailed {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.gc_failed",
+            ),
+        ];
+        for (failure, code) in cases {
+            let error = WalletError::Approval(failure);
+            assert_eq!(error.code(), code);
+            assert_eq!(error.category(), ErrorCategory::Approval);
+            assert_eq!(error.to_string(), "operator diagnostic");
+            assert_eq!(error.message(), "operator diagnostic");
+        }
+    }
+
     // ── category() consistency ────────────────────────────────────────────────
 
     /// Every WalletError variant must return the category matching its wrapper.
     #[test]
     fn category_consistency() {
         let pairs: &[(WalletError, ErrorCategory)] = &[
+            (
+                WalletError::Approval(ApprovalFailure::Denied {
+                    detail: "declined".to_owned(),
+                }),
+                ErrorCategory::Approval,
+            ),
             (
                 WalletError::Validation(ValidationError::AmountUnitsRequired),
                 ErrorCategory::Validation,

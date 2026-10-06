@@ -33,7 +33,7 @@ use zeroize::Zeroizing;
 use crate::audit_log::entry::AuditEntry;
 use crate::audit_log::outbox::AuditOutbox;
 use crate::audit_log::writer::{AuditWriter, WriterError, audit_writer_refusal};
-use crate::error::{InternalError, WalletError};
+use crate::error::{ApprovalFailure, WalletError};
 use crate::keyring_errors::map_keyring_error;
 use crate::profile::schema::KeyringEntryRef;
 use crate::timefmt;
@@ -140,8 +140,7 @@ pub struct ToolsetGrantRequest<'a> {
 ///
 /// # Errors
 ///
-/// Returns a [`WalletError`] (all `Internal(UnexpectedState)` with a
-/// `approval.*` detail prefix) when: the nonce is unknown
+/// Returns [`WalletError::Approval`] when: the nonce is unknown
 /// (`approval.not_found`); the entry has expired (`approval.expired`); the
 /// entry is already attested (`approval.already_attested`); or the
 /// caller's identity is not authorized against the entry
@@ -153,24 +152,24 @@ pub fn load_and_validate_entry(
     allowed_credentials: &[String],
 ) -> Result<PendingApproval, WalletError> {
     let entry = store.get(nonce).cloned().ok_or_else(|| {
-        // Distinguishable UX error: indistinguishability is required for the
-        // MCP commit path, not for this wallet-controlled attest path.
-        WalletError::Internal(InternalError::UnexpectedState {
-            detail: "approval.not_found: no pending approval with that nonce".to_owned(),
+        // This operator-run path names a missing entry.
+        // The MCP commit path reports missing and expired approvals as
+        // `policy.approval_required`.
+        WalletError::Approval(ApprovalFailure::NotFound {
+            detail: "no pending approval with that nonce".to_owned(),
         })
     })?;
 
     let now_ms = timefmt::now_unix_ms().map_err(|e| map_clock_error(&e))?;
     if entry.is_expired(now_ms) {
-        return Err(WalletError::Internal(InternalError::UnexpectedState {
-            detail: "approval.expired: this pending approval has expired".to_owned(),
+        return Err(WalletError::Approval(ApprovalFailure::Expired {
+            detail: "this pending approval has expired".to_owned(),
         }));
     }
 
     if entry.attestation_blob_b64.is_some() {
-        return Err(WalletError::Internal(InternalError::UnexpectedState {
-            detail: "approval.already_attested: this pending approval has already been attested"
-                .to_owned(),
+        return Err(WalletError::Approval(ApprovalFailure::AlreadyAttested {
+            detail: "this pending approval has already been attested".to_owned(),
         }));
     }
 
@@ -179,8 +178,8 @@ pub fn load_and_validate_entry(
         &entry.approval_nonce,
         allowed_credentials,
     ) {
-        return Err(WalletError::Internal(InternalError::UnexpectedState {
-            detail: "approval.user_mismatch: this pending approval was created by a different \
+        return Err(WalletError::Approval(ApprovalFailure::UserMismatch {
+            detail: "this pending approval was created by a different \
                      local user (process_uid mismatch), or the presented passkey credential is \
                      not authorized for this profile; this caller cannot attest it"
                 .to_owned(),
@@ -191,8 +190,8 @@ pub fn load_and_validate_entry(
 }
 
 fn map_clock_error(err: &crate::wallet::WalletLifecycleError) -> WalletError {
-    WalletError::Internal(InternalError::UnexpectedState {
-        detail: format!("approval.clock_error: system clock error: {err}"),
+    WalletError::Approval(ApprovalFailure::ClockError {
+        detail: format!("system clock error: {err}"),
     })
 }
 
@@ -208,24 +207,21 @@ fn map_clock_error(err: &crate::wallet::WalletLifecycleError) -> WalletError {
 /// or contains non-hex-digit bytes.
 pub fn decode_sha256_hex(hex: &str) -> Result<[u8; 32], WalletError> {
     if hex.len() != 64 {
-        return Err(WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!(
-                "approval.sha256_hex_error: expected 64 hex chars, got {}",
-                hex.len()
-            ),
+        return Err(WalletError::Approval(ApprovalFailure::Sha256HexError {
+            detail: format!("expected 64 hex chars, got {}", hex.len()),
         }));
     }
 
     let mut out = [0u8; 32];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
         let byte_str = std::str::from_utf8(chunk).map_err(|_| {
-            WalletError::Internal(InternalError::UnexpectedState {
-                detail: "approval.sha256_hex_error: non-UTF8 in hex string".to_owned(),
+            WalletError::Approval(ApprovalFailure::Sha256HexError {
+                detail: "non-UTF8 in hex string".to_owned(),
             })
         })?;
         out[i] = u8::from_str_radix(byte_str, 16).map_err(|_| {
-            WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("approval.sha256_hex_error: invalid hex byte '{byte_str}'"),
+            WalletError::Approval(ApprovalFailure::Sha256HexError {
+                detail: format!("invalid hex byte '{byte_str}'"),
             })
         })?;
     }
@@ -280,17 +276,14 @@ pub fn load_attestation_key(
 
     let key_bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {
         tracing::debug!(error = %e, "attestation key base64 decode failed");
-        WalletError::Internal(InternalError::UnexpectedState {
-            detail: "approval.key_decode_failed: attestation key is not valid base64".to_owned(),
+        WalletError::Approval(ApprovalFailure::KeyDecodeFailed {
+            detail: "attestation key is not valid base64".to_owned(),
         })
     })?);
 
     if key_bytes.len() != 32 {
-        return Err(WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!(
-                "approval.key_length_error: attestation key must be 32 bytes, got {}",
-                key_bytes.len()
-            ),
+        return Err(WalletError::Approval(ApprovalFailure::KeyLengthError {
+            detail: format!("attestation key must be 32 bytes, got {}", key_bytes.len()),
         }));
     }
 
@@ -363,8 +356,10 @@ impl ConsentAudit<'_> {
 ///
 /// Returns a [`WalletError`] in each of these cases:
 ///
-/// - Validation: a key-length mismatch, a hash-decode failure, a binding
-///   mismatch, or an `entry.kind` that is not one of the attestable kinds.
+/// - Approval: a key-length mismatch (`approval.key_length_error`), a hash-decode
+///   failure (`approval.sha256_hex_error`), a binding mismatch
+///   (`approval.binding_mismatch`), or an unattestable `entry.kind`
+///   (`approval.wrong_kind`).
 ///   `ApprovalKind::Rejected` and `ApprovalKind::Consumed` are tombstones and
 ///   can never be attested.
 /// - An entry that changed since validation: `approval.not_found`,
@@ -398,17 +393,13 @@ pub fn attest_and_persist(
         _ => true,
     };
     if !binding_matches {
-        return Err(WalletError::Internal(InternalError::UnexpectedState {
-            detail: "approval.binding_mismatch: this request belongs to another profile or network"
-                .to_owned(),
+        return Err(WalletError::Approval(ApprovalFailure::BindingMismatch {
+            detail: "this request belongs to another profile or network".to_owned(),
         }));
     }
     let key_arr: [u8; 32] = key_bytes.try_into().map_err(|_| {
-        WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!(
-                "approval.key_length_error: attestation key must be 32 bytes, got {}",
-                key_bytes.len()
-            ),
+        WalletError::Approval(ApprovalFailure::KeyLengthError {
+            detail: format!("attestation key must be 32 bytes, got {}", key_bytes.len()),
         })
     })?;
 
@@ -519,11 +510,8 @@ pub fn attest_and_persist(
                 surface,
                 operator_credential_id_b64url,
             )?;
-            persist_toolset_grant(&request, &key_arr).map_err(|e| {
-                WalletError::Internal(InternalError::UnexpectedState {
-                    detail: format!("approval.grant_persist: {e}"),
-                })
-            })?;
+            persist_toolset_grant(&request, &key_arr)
+                .map_err(|e| WalletError::Approval(ApprovalFailure::GrantPersist { detail: e }))?;
 
             // Step 3: CONSUME the pending entry so it cannot be replayed.
             // A failure to remove is best-effort (the grant is already persisted).
@@ -661,9 +649,9 @@ pub fn attest_and_persist(
             return Err(consumed_error());
         }
         other => {
-            return Err(WalletError::Internal(InternalError::UnexpectedState {
+            return Err(WalletError::Approval(ApprovalFailure::WrongKind {
                 detail: format!(
-                    "approval.wrong_kind: attest_and_persist does not support {}, \
+                    "attest_and_persist does not support {}, \
                      expected PaymentSimulated, ClaimSimulated, MppChargeSimulated, \
                      ToolsetFirstInvokeGate, TrustlineClawbackOptIn, or RuleProposalSimulated",
                     other.kind_name()
@@ -676,16 +664,16 @@ pub fn attest_and_persist(
 }
 
 fn rejected_error() -> WalletError {
-    WalletError::Internal(InternalError::UnexpectedState {
-        detail: "approval.rejected: this pending approval was rejected by the operator \
+    WalletError::Approval(ApprovalFailure::Rejected {
+        detail: "this pending approval was rejected by the operator \
                  and cannot be attested"
             .to_owned(),
     })
 }
 
 fn consumed_error() -> WalletError {
-    WalletError::Internal(InternalError::UnexpectedState {
-        detail: "approval.consumed: this pending approval was already spent on a \
+    WalletError::Approval(ApprovalFailure::Consumed {
+        detail: "this pending approval was already spent on a \
                  submission and cannot be attested"
             .to_owned(),
     })
@@ -712,8 +700,8 @@ fn refuse_unless_still_pending(
         return Err(match current.kind {
             ApprovalKind::Rejected { .. } => rejected_error(),
             ApprovalKind::Consumed { .. } => consumed_error(),
-            _ => WalletError::Internal(InternalError::UnexpectedState {
-                detail: "approval.wrong_kind: the pending approval changed between validation \
+            _ => WalletError::Approval(ApprovalFailure::WrongKind {
+                detail: "the pending approval changed between validation \
                          and the attest"
                     .to_owned(),
             }),
@@ -731,18 +719,17 @@ fn refuse_unless_still_pending(
 /// Maps a store record failure to its `approval.*` refusal.
 fn record_error(e: &ApprovalError) -> WalletError {
     match e {
-        ApprovalError::NotFound => WalletError::Internal(InternalError::UnexpectedState {
-            detail: "approval.not_found: entry disappeared between lookup and record".to_owned(),
+        ApprovalError::NotFound => WalletError::Approval(ApprovalFailure::NotFound {
+            detail: "entry disappeared between lookup and record".to_owned(),
         }),
-        ApprovalError::Expired => WalletError::Internal(InternalError::UnexpectedState {
-            detail: "approval.expired: entry expired between check and record".to_owned(),
+        ApprovalError::Expired => WalletError::Approval(ApprovalFailure::Expired {
+            detail: "entry expired between check and record".to_owned(),
         }),
-        ApprovalError::AlreadyAttested => WalletError::Internal(InternalError::UnexpectedState {
-            detail: "approval.already_attested: entry was attested by a concurrent process"
-                .to_owned(),
+        ApprovalError::AlreadyAttested => WalletError::Approval(ApprovalFailure::AlreadyAttested {
+            detail: "entry was attested by a concurrent process".to_owned(),
         }),
-        other => WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!("approval.record_failed: {other}"),
+        other => WalletError::Approval(ApprovalFailure::RecordFailed {
+            detail: other.to_string(),
         }),
     }
 }
@@ -864,7 +851,74 @@ mod tests {
     #[test]
     fn decode_sha256_hex_wrong_length_fails() {
         let err = decode_sha256_hex("abcd").unwrap_err();
+        assert_eq!(err.code(), "approval.sha256_hex_error");
         assert!(err.to_string().contains("64"));
+    }
+
+    #[test]
+    fn attest_passkey_kind_refuses_with_wrong_kind_code() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = TempDir::new()?;
+        let store_path = dir.path().join("approvals.toml");
+        let mut store = PendingApprovalStore::open(store_path.clone())?;
+        let entry = PendingApproval::new_passkey_pending(
+            [0x11; 32],
+            vec![0x22; 32],
+            "CAAAA...BBBBB".to_owned(),
+            vec![1],
+            [0x33; 32],
+            "localhost".to_owned(),
+            process_uid_for_attestation()?,
+            DEFAULT_TTL_MS,
+        )?;
+        store.insert(entry.clone(), timefmt::now_unix_ms()?)?;
+        let mut writer = test_audit_writer(&dir);
+        let mut grant_persisted = false;
+        let err = attest_and_persist(
+            &mut store,
+            &entry,
+            &[0x42; 32],
+            &binding(),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut writer),
+            None,
+            |_, _| {
+                grant_persisted = true;
+                Ok(())
+            },
+        )
+        .err()
+        .ok_or("passkey approval must refuse HMAC attestation")?;
+        assert_eq!(err.code(), "approval.wrong_kind");
+        assert!(!grant_persisted);
+        assert!(consent_rows(&dir).is_empty());
+        drop(store);
+        let reopened = PendingApprovalStore::open(store_path)?;
+        let pending = reopened
+            .get(&entry.approval_nonce)
+            .ok_or("pending entry must exist")?;
+        assert!(pending.attestation_blob_b64.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn record_attestation_persist_failure_has_record_failed_code()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let store_path = dir.path().join("approvals.toml");
+        let mut store = PendingApprovalStore::open(store_path.clone())?;
+        let entry = make_entry(DEFAULT_TTL_MS);
+        let now_ms = timefmt::now_unix_ms()?;
+        store.insert(entry.clone(), now_ms)?;
+        std::fs::remove_file(&store_path)?;
+        std::fs::create_dir(&store_path)?;
+        let err =
+            record_attestation_on_store(&mut store, &entry.approval_nonce, [0x42; 32], now_ms)
+                .err()
+                .ok_or("persisting over a directory must refuse")?;
+        assert_eq!(err.code(), "approval.record_failed");
+        assert!(store_path.is_dir());
+        Ok(())
     }
 
     /// The owner context of the profile these loader tests name.
@@ -881,6 +935,34 @@ mod tests {
         let entry_ref = KeyringEntryRef::new(svc, "default");
         let key = load_attestation_key(&entry_ref, &test_owner()).unwrap();
         assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_attestation_key_invalid_base64_has_decode_code()
+    -> Result<(), Box<dyn std::error::Error>> {
+        keyring_mock::install()?;
+        let entry_ref = KeyringEntryRef::new("stellar-agent-attestation-invalid-base64", "default");
+        KeyringEntry::new(&entry_ref.service, &entry_ref.account)?.set_password("not!base64")?;
+        let err = load_attestation_key(&entry_ref, &test_owner())
+            .err()
+            .ok_or("invalid base64 must refuse")?;
+        assert_eq!(err.code(), "approval.key_decode_failed");
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_attestation_key_31_bytes_has_length_code() -> Result<(), Box<dyn std::error::Error>> {
+        keyring_mock::install()?;
+        let entry_ref = KeyringEntryRef::new("stellar-agent-attestation-short-key", "default");
+        KeyringEntry::new(&entry_ref.service, &entry_ref.account)?
+            .set_password(&URL_SAFE_NO_PAD.encode([0xAB; 31]))?;
+        let err = load_attestation_key(&entry_ref, &test_owner())
+            .err()
+            .ok_or("a 31-byte key must refuse")?;
+        assert_eq!(err.code(), "approval.key_length_error");
+        Ok(())
     }
 
     /// An attestation key equal to the profile's owner public key in the older
@@ -1068,7 +1150,7 @@ mod tests {
             &[],
         )
         .unwrap_err();
-        assert!(err.to_string().contains("approval.user_mismatch"));
+        assert_eq!(err.code(), "approval.user_mismatch");
     }
 
     /// GATE-IS-REAL: a `PasskeyCredential` identity reaching
@@ -1098,7 +1180,7 @@ mod tests {
         let allowed = vec!["enrolled-operator-cred-id".to_owned()];
         let err = load_and_validate_entry(&store, &nonce, &identity, &allowed).unwrap_err();
         assert!(
-            err.to_string().contains("approval.user_mismatch"),
+            err.code() == "approval.user_mismatch",
             "unexpected error: {err}"
         );
     }
@@ -1157,7 +1239,7 @@ mod tests {
         let allowed = vec!["enrolled-operator-cred-id".to_owned()];
         let err = load_and_validate_entry(&store, &nonce, &identity, &allowed).unwrap_err();
         assert!(
-            err.to_string().contains("approval.user_mismatch"),
+            err.code() == "approval.user_mismatch",
             "unexpected error: {err}"
         );
     }
@@ -1276,10 +1358,7 @@ mod tests {
             |_req, _key| Err("must not be called".to_owned()),
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("approval.rejected"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(err.code(), "approval.rejected", "unexpected error: {err}");
     }
 
     #[test]
@@ -1369,7 +1448,7 @@ mod tests {
             |_req, _key| Err("grant store unavailable".to_owned()),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("approval.grant_persist"));
+        assert_eq!(err.code(), "approval.grant_persist");
         assert!(
             store.get(&nonce).is_some(),
             "entry must survive a failed grant persist"
@@ -1503,10 +1582,7 @@ mod tests {
             |_req, _key| Err("must not be called".to_owned()),
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("approval.rejected"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(err.code(), "approval.rejected", "unexpected error: {err}");
     }
 
     #[test]
@@ -1529,7 +1605,7 @@ mod tests {
             |_, _| Ok(()),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("approval.binding_mismatch"));
+        assert_eq!(error.code(), "approval.binding_mismatch");
         assert!(
             store
                 .get(&entry.approval_nonce)
@@ -1581,7 +1657,7 @@ mod tests {
                 |_, _| Ok(()),
             )
             .unwrap_err();
-            assert!(error.to_string().contains("approval.binding_mismatch"));
+            assert_eq!(error.code(), "approval.binding_mismatch");
             assert!(
                 store
                     .get(&entry.approval_nonce)
@@ -1882,10 +1958,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-            assert!(
-                err.to_string().contains(&format!("{expected_code}: ")),
-                "{kind}: {err}"
-            );
+            assert_eq!(err.code(), expected_code, "{kind}: {err}");
             assert!(consent_rows(&dir).is_empty(), "{kind}: no row is written");
             assert!(!grant_persisted, "{kind}");
         }
@@ -1937,10 +2010,7 @@ mod tests {
             assert!(!entry.is_expired(timefmt::now_unix_ms().unwrap()));
 
             let err = attest_validated_copy(&dir, &mut store, &entry);
-            assert!(
-                err.to_string().contains("approval.expired: "),
-                "{kind}: {err}"
-            );
+            assert_eq!(err.code(), "approval.expired", "{kind}: {err}");
             assert!(consent_rows(&dir).is_empty(), "{kind}: no row is written");
             drop(store);
             let reopened = PendingApprovalStore::open(store_path).unwrap();
@@ -1968,10 +2038,7 @@ mod tests {
                 .unwrap();
 
             let err = attest_validated_copy(&dir, &mut store, &entry);
-            assert!(
-                err.to_string().contains("approval.wrong_kind: "),
-                "{kind}: {err}"
-            );
+            assert_eq!(err.code(), "approval.wrong_kind", "{kind}: {err}");
             assert!(consent_rows(&dir).is_empty(), "{kind}: no row is written");
             let left = store.get(&entry.approval_nonce).unwrap();
             assert!(left.attestation_blob_b64.is_none(), "{kind}");
@@ -1994,7 +2061,7 @@ mod tests {
             )
             .unwrap();
         let err = attest_validated_copy(&dir, &mut store, &entry);
-        assert!(err.to_string().contains("approval.rejected: "), "{err}");
+        assert_eq!(err.code(), "approval.rejected", "{err}");
         assert!(consent_rows(&dir).is_empty());
     }
 
@@ -2019,7 +2086,7 @@ mod tests {
             )
             .unwrap();
         let err = attest_validated_copy(&dir, &mut store, &entry);
-        assert!(err.to_string().contains("approval.consumed: "), "{err}");
+        assert_eq!(err.code(), "approval.consumed", "{err}");
         assert!(consent_rows(&dir).is_empty());
     }
 }

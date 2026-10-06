@@ -75,8 +75,8 @@ use stellar_agent_core::approval::{
 use stellar_agent_core::audit_log::writer::{AuditWriter, WriterError};
 use stellar_agent_core::audit_log::{AuditOutbox, drain_lock_is_held};
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
-use stellar_agent_core::profile::schema::{Profile, default_approval_dir};
+use stellar_agent_core::error::{ApprovalFailure, ValidationError, WalletError};
+use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::timefmt;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
@@ -218,8 +218,8 @@ pub async fn run(args: RunArgs) -> i32 {
     let our_uid = match process_uid_for_attestation() {
         Ok(uid) => uid,
         Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("approval.uid_unavailable: process UID derivation failed: {e}"),
+            let err = WalletError::Approval(ApprovalFailure::UidUnavailable {
+                detail: format!("process UID derivation failed: {e}"),
             });
             render::render_json(&Envelope::<()>::err(&err));
             return 1;
@@ -241,8 +241,8 @@ pub async fn run(args: RunArgs) -> i32 {
     match prompt_approval(&entry, &context, args.yes) {
         Ok(true) => {}
         Ok(false) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: "approval.denied: user declined the pending approval".to_owned(),
+            let err = WalletError::Approval(ApprovalFailure::Denied {
+                detail: "user declined the pending approval".to_owned(),
             });
             render::render_json(&Envelope::<()>::err(&err));
             return 1;
@@ -450,12 +450,7 @@ fn approve_with_consent_row(
 
 /// Builds the store path for `<profile>` as `<approval_dir>/<profile>.toml`.
 fn build_store_path(profile_name: &str) -> Result<PathBuf, WalletError> {
-    let dir = default_approval_dir().map_err(|_| {
-        WalletError::Internal(InternalError::UnexpectedState {
-            detail: "approval.store_dir_error: could not determine approval store directory"
-                .to_owned(),
-        })
-    })?;
+    let dir = super::common::approval_store_dir()?;
     Ok(dir.join(format!("{profile_name}.toml")))
 }
 
@@ -960,6 +955,7 @@ mod tests {
         stellar_agent_core::approval::ApprovalContext::from_profile("render-test", &profile)
     }
     use super::*;
+    use stellar_agent_core::profile::schema::default_approval_dir;
 
     // ── Helper: seed an attestation key into the mock keyring ────────────────
 
@@ -1349,8 +1345,7 @@ mod tests {
                 &ApproverIdentity::OsUid("test".to_owned()),
                 &[],
             ),
-            Err(WalletError::Internal(InternalError::UnexpectedState { detail }))
-                if detail == "approval.not_found: no pending approval with that nonce"
+            Err(ref error) if error.code() == "approval.not_found"
         ));
     }
 
@@ -1373,8 +1368,9 @@ mod tests {
             &[],
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("approval.user_mismatch"),
+        assert_eq!(
+            err.code(),
+            "approval.user_mismatch",
             "unexpected error: {err}"
         );
     }

@@ -412,6 +412,11 @@ Payment and claim rows show the envelope's effective source; an operation source
 An undecodable envelope appears as `(undecodable envelope)`.
 A claim whose stored summary source differs also shows `Source (stored summary)`.
 
+The `approve`, `approve gc`, `approve list`, and `approve serve` commands return failures with `error.code` and a plain diagnostic message.
+These failures carry `approval.*` codes: `approval.not_found`, `approval.expired`, `approval.already_attested`, `approval.user_mismatch`, `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.rejected`, `approval.consumed`, `approval.record_failed`, `approval.uid_unavailable`, `approval.denied`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`, `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed`.
+`approval.gc_failed` reports a collection failure from `approve gc`.
+Authentication, validation, and audit failures on approval paths carry their own codes.
+
 ### `approve --id <NONCE> --profile <name>`
 
 State-changing (records an attestation or a grant in the on-disk pending-approval store).
@@ -599,6 +604,9 @@ The chain and the per-file chain-root signatures verify a PREFIX of the log, so 
 Read-only. Walks the log at `<LOG_PATH>`, following rotation manifests across rotated files, and verifies that the hash chain is intact end to end. When `--profile` is supplied, it additionally loads that profile's audit chain-root HMAC key and verifies the chain-root sidecars; without `--profile`, only the hash chain is checked and `hmac_verified` is reported as `false`.
 
 The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is the log that profile configures. The anchor names a path, not a profile, so comparing it against a file it does not describe would report a mismatch that means nothing. Every other case reports `anchor.status` as `"not_checked"` with the reason and still verifies the chain in full. A log that moved forward past its anchor passes; a log behind it, or one whose tip is not the anchored tip, fails with `audit.tip_anchor_mismatch`.
+
+Verifier failures use `audit.chain_broken`, `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`, `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`, `audit.parse_error`, `audit.path_contract`, `audit.log_not_found`, `audit.io_error`, `audit.signer_set_canonical_body`, `audit.partial_rotation`, `audit.tip_anchor_mismatch`; see [security internals](../maintainers/security-internals.md#audit-hash-chain).
+Profile and ownership pre-checks carry their own codes.
 
 - `<LOG_PATH>` (positional, required) — path to the audit log file. By default this is `~/.local/share/stellar-agent/audit/<profile>.jsonl` on Linux, `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` on macOS, and `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` on Windows.
 - `--profile <NAME>`: the profile whose chain-root HMAC key verifies the sidecars. Optional; when omitted, only the hash chain is verified. The profile's audit binding is read and never written: a changed or unparseable binding exits `1` with `audit.log_binding_changed`.

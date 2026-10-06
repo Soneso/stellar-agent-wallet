@@ -19,7 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `smart-account multicall` command evaluates and records its bundle with the
   profile's chain.
 
+### Added
+
+- `WalletError::Approval(ApprovalFailure)` and `ErrorCategory::Approval` classify approval-specific failures. Library callers of `load_and_validate_entry` and `attest_and_persist` receive the new variant for these failures.
+
 ### Fixed
+
+- `audit verify` reports each verifier failure with its `audit.*` code and diagnostic text. A missing log has a remediation message.
+- Approval-specific failures from the CLI and shared attestation API use `approval.*` envelope codes. Their messages omit the code prefix and internal wrapper. The MCP server's direct JSON-RPC approval errors are outside this change.
+- Multicall submission requires the call chain to match the profile chain at entry, before bundle validation or side effects.
 
 - CLI help names `--account` as required for balances and describes JSON profile-list output and audit sidecar re-signing. The `stellar_balances` MCP description uses `--account` in its CLI equivalent.
 
