@@ -1108,7 +1108,7 @@ pub(crate) fn load_attestation_key(
 ) -> Result<[u8; 32], rmcp::model::CallToolResult> {
     use base64::Engine as _;
     use keyring_core::Entry as KeyringEntry;
-    use stellar_agent_network::keyring::classify_keyring_error;
+    use stellar_agent_network::keyring::{KeyringOperation, classify_keyring_operation_error};
 
     let profile_name = stellar_agent_core::profile::name::profile_name_for_approval(profile);
     let entry_ref = &profile.attestation_key_id;
@@ -1133,8 +1133,7 @@ pub(crate) fn load_attestation_key(
     .map_err(|e| owner_refusal(&e))?;
     let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
         tracing::debug!(
-            error = %e,
-            cause = ?classify_keyring_error(&e, &entry_ref.service),
+            cause = ?classify_keyring_operation_error(&e, KeyringOperation::Construct, &entry_ref.service),
             "attestation key entry open failed"
         );
         approval_required_indistinguishable(&profile_name)
@@ -1142,8 +1141,7 @@ pub(crate) fn load_attestation_key(
 
     let raw = entry.get_password().map_err(|e| {
         tracing::debug!(
-            error = %e,
-            cause = ?classify_keyring_error(&e, &entry_ref.service),
+            cause = ?classify_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service),
             "attestation key read failed"
         );
         approval_required_indistinguishable(&profile_name)

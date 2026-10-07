@@ -94,7 +94,7 @@ use stellar_agent_network::{
 };
 
 use stellar_agent_network::account::AccountFlagsView;
-use stellar_agent_network::keyring::classify_keyring_error;
+use stellar_agent_network::keyring::{KeyringOperation, classify_keyring_operation_error};
 use stellar_agent_stablecoin::{
     preview::{GateDecisionView, TrustlinePreview},
     resolve::{DenominationInput, ResolvedAsset, resolve_denomination},
@@ -942,13 +942,13 @@ fn load_attestation_key_for_verify(
         // (opt-in absent). The classified cause is preserved at debug for
         // operator forensics only.
         tracing::debug!(
-            cause = ?classify_keyring_error(&e, &entry_ref.service),
+            cause = ?classify_keyring_operation_error(&e, KeyringOperation::Construct, &entry_ref.service),
             "attestation key entry open failed for trustline opt-in verify (fail-closed)"
         );
     })?;
     let raw = entry.get_password().map_err(|e| {
         tracing::debug!(
-            cause = ?classify_keyring_error(&e, &entry_ref.service),
+            cause = ?classify_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service),
             "attestation key read failed for trustline opt-in verify (fail-closed)"
         );
     })?;

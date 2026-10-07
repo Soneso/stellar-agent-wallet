@@ -22,7 +22,7 @@ use keyring_core::Entry as KeyringEntry;
 use subtle::ConstantTimeEq as _;
 
 use crate::error::{ValidationError, WalletError};
-use crate::keyring_errors::map_keyring_error;
+use crate::keyring_errors::{KeyringOperation, map_keyring_operation_error};
 use crate::profile::name::OWNER_KEY_SERVICE_PREFIX;
 use crate::profile::schema::{KeyringEntryRef, Profile};
 
@@ -95,7 +95,12 @@ pub fn rewrite_older_form_owner_entry(entry_ref: &KeyringEntryRef) -> OwnerEntry
         Ok(entry) => entry,
         Err(e) => {
             return OwnerEntryRewrite::Unreadable {
-                code: map_keyring_error(&e, &entry_ref.service).code(),
+                code: map_keyring_operation_error(
+                    &e,
+                    KeyringOperation::Construct,
+                    &entry_ref.service,
+                )
+                .code(),
             };
         }
     };
@@ -104,7 +109,8 @@ pub fn rewrite_older_form_owner_entry(entry_ref: &KeyringEntryRef) -> OwnerEntry
         Err(keyring_core::Error::NoEntry) => return OwnerEntryRewrite::Absent,
         Err(e) => {
             return OwnerEntryRewrite::Unreadable {
-                code: map_keyring_error(&e, &entry_ref.service).code(),
+                code: map_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service)
+                    .code(),
             };
         }
     };
@@ -118,7 +124,8 @@ pub fn rewrite_owner_value_if_older(entry_ref: &KeyringEntryRef, raw: &str) -> O
     match KeyringEntry::new(&entry_ref.service, &entry_ref.account) {
         Ok(entry) => rewrite_value(&entry, &entry_ref.service, raw),
         Err(e) => OwnerEntryRewrite::WriteFailed {
-            code: map_keyring_error(&e, &entry_ref.service).code(),
+            code: map_keyring_operation_error(&e, KeyringOperation::Construct, &entry_ref.service)
+                .code(),
         },
     }
 }
@@ -131,7 +138,7 @@ fn rewrite_value(entry: &KeyringEntry, service: &str, raw: &str) -> OwnerEntryRe
             match entry.set_password(&encode_owner_public_key(&key)) {
                 Ok(()) => OwnerEntryRewrite::Rewritten,
                 Err(e) => OwnerEntryRewrite::WriteFailed {
-                    code: map_keyring_error(&e, service).code(),
+                    code: map_keyring_operation_error(&e, KeyringOperation::Write, service).code(),
                 },
             }
         }
@@ -296,12 +303,19 @@ pub fn refuse_owner_public_key(
     field: &'static str,
 ) -> Result<(), WalletError> {
     for coordinate in owner.coordinates() {
-        let entry = KeyringEntry::new(&coordinate.service, &coordinate.account)
-            .map_err(|e| map_keyring_error(&e, &coordinate.service))?;
+        let entry = KeyringEntry::new(&coordinate.service, &coordinate.account).map_err(|e| {
+            map_keyring_operation_error(&e, KeyringOperation::Construct, &coordinate.service)
+        })?;
         let raw = match entry.get_password() {
             Ok(raw) => zeroize::Zeroizing::new(raw),
             Err(keyring_core::Error::NoEntry) => continue,
-            Err(e) => return Err(map_keyring_error(&e, &coordinate.service)),
+            Err(e) => {
+                return Err(map_keyring_operation_error(
+                    &e,
+                    KeyringOperation::Read,
+                    &coordinate.service,
+                ));
+            }
         };
         let Some((owner_key, _)) = decode_owner_public_key(&raw) else {
             continue;

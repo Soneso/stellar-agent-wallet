@@ -57,7 +57,7 @@ use stellar_agent_core::observability::RedactedStrkey;
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
 use stellar_agent_network::Signer as _;
-use stellar_agent_network::keyring::init_platform_keyring_store;
+use stellar_agent_network::keyring::{KeyringOperation, init_platform_keyring_store};
 use uuid::Uuid;
 
 use crate::common::profile_access::{
@@ -242,9 +242,13 @@ where
     let entry = match KeyringEntry::new(&owner_coord.service, &owner_coord.account) {
         Ok(e) => e,
         Err(e) => {
-            tracing::debug!(error = %e, "enroll-owner-key: keyring entry construction failed");
+            tracing::debug!("enroll-owner-key: keyring entry construction failed");
             render::render_json(&Envelope::<()>::err(
-                &stellar_agent_network::keyring::map_keyring_error(&e, &owner_coord.service),
+                &stellar_agent_network::keyring::map_keyring_operation_error(
+                    &e,
+                    KeyringOperation::Construct,
+                    &owner_coord.service,
+                ),
             ));
             return 1;
         }
@@ -260,9 +264,13 @@ where
         Ok(_existing) => true,
         Err(keyring_core::Error::NoEntry) => false,
         Err(e) => {
-            tracing::debug!(error = %e, "enroll-owner-key: existence probe failed");
+            tracing::debug!("enroll-owner-key: existence probe failed");
             render::render_json(&Envelope::<()>::err(
-                &stellar_agent_network::keyring::map_keyring_error(&e, &owner_coord.service),
+                &stellar_agent_network::keyring::map_keyring_operation_error(
+                    &e,
+                    KeyringOperation::Read,
+                    &owner_coord.service,
+                ),
             ));
             return 1;
         }
@@ -289,12 +297,16 @@ where
         stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_pubkey.0),
     );
     if let Err(e) = entry.set_password(&encoded) {
-        tracing::debug!(error = %e, "enroll-owner-key: set_password failed");
+        tracing::debug!("enroll-owner-key: set_password failed");
         // Classify the write failure: a non-interactive Windows session must
         // surface as auth.keyring_interactive_session_required, not "not
         // found".
         render::render_json(&Envelope::<()>::err(
-            &stellar_agent_network::keyring::map_keyring_error(&e, &owner_coord.service),
+            &stellar_agent_network::keyring::map_keyring_operation_error(
+                &e,
+                KeyringOperation::Write,
+                &owner_coord.service,
+            ),
         ));
         return 1;
     }

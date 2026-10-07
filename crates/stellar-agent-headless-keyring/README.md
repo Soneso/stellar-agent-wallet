@@ -6,8 +6,15 @@ Platform keyrings are unavailable or unusable in some deployment shapes: Windows
 
 Two protection modes, selected by `STELLAR_AGENT_KEYRING_BACKEND`:
 
-- `headless-env` — entries sealed with XChaCha20-Poly1305 under a 32-byte key supplied via `STELLAR_AGENT_HEADLESS_KEYRING_KEY` (URL-safe base64, no padding). Works on every platform; the env var is the root of trust.
-- `headless-dpapi` — Windows only; entries sealed with DPAPI in CurrentUser scope. The trust boundary is the same as Windows Credential Manager (any process running as the same user can decrypt), without the interactive-session requirement.
+- `headless-env`: entries sealed with XChaCha20-Poly1305 under a 32-byte key supplied via `STELLAR_AGENT_HEADLESS_KEYRING_KEY` (URL-safe base64, no padding). Works on every platform; the env var is the root of trust.
+- `headless-dpapi`: Windows only; entries sealed with DPAPI in CurrentUser scope. Processes running as the same user can decrypt when the session can access that user's DPAPI master key.
+
+DPAPI needs access to the current user's master key and can fail in
+key-authenticated SSH sessions. An interactive desktop logon may help.
+`headless-env` avoids that dependency and needs its configured encryption key.
+Protect failures report `auth.keyring_platform_error`, naming `CryptProtectData`
+and its numeric Windows error code when available. Unprotect failures remain
+detail-free and map to `BadDataFormat`, without a reason or code.
 
 The platform keyring remains the default. The headless store never activates implicitly and never falls back to or from the platform keyring on any initialisation failure. Tampered or corrupt entries fail closed with typed errors.
 

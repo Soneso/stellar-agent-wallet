@@ -197,7 +197,11 @@ restriction, or opt into the file-backed headless keyring store.
 **Headless deployments (Windows service/SSH/CI, Linux services): the opt-in
 file-backed keyring store.** Set `STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi`
 for Windows DPAPI CurrentUser protection, or `STELLAR_AGENT_KEYRING_BACKEND=headless-env`
-on any platform. The `headless-env` backend also requires
+on any platform. The `headless-dpapi` backend depends on access to the current
+user's DPAPI master key and can fail in key-authenticated SSH sessions.
+An interactive desktop logon may help. Such a failure reports
+`auth.keyring_platform_error` naming DPAPI and the numeric `CryptProtectData`
+error code when available. The `headless-env` backend has no such dependency and requires
 `STELLAR_AGENT_HEADLESS_KEYRING_KEY`, a 32-byte URL-safe-base64 key without padding.
 The wallet refuses a padded or standard-alphabet key with
 `auth.keyring_config_invalid`, and the message names the cause.
