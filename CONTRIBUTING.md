@@ -81,6 +81,9 @@ cleanup guidance.
 
 Only a remote Codespace moves builds off your laptop; a local container does
 not, and a coding agent must run inside that remote environment to benefit.
+The repository ships a
+[dev container definition](docs/maintainers/building.md#remote-development)
+with the gate tools for that Codespace.
 
 ## Review process
 

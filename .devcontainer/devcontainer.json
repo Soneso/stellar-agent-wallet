@@ -1,0 +1,14 @@
+{
+  "name": "stellar-agent-wallet",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "vscode",
+  "containerEnv": {
+    "CARGO_INCREMENTAL": "0"
+  },
+  "hostRequirements": {
+    "storage": "32gb"
+  },
+  "postCreateCommand": "bash .github/scripts/check-gate-tool-versions.sh"
+}
