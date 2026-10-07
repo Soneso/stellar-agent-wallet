@@ -60,7 +60,8 @@ use stellar_agent_core::{
     profile::schema::Profile,
 };
 use stellar_agent_network::keyring::{
-    KeyringTipAnchorStore, check_audit_binding, init_platform_keyring_store, map_keyring_error,
+    KeyringOperation, KeyringTipAnchorStore, check_audit_binding, init_platform_keyring_store,
+    map_keyring_operation_error,
 };
 use zeroize::Zeroizing;
 
@@ -457,20 +458,18 @@ fn load_audit_hmac_key(
     )?;
     let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
         tracing::debug!(
-            error = %e,
             service = %entry_ref.service,
             "keyring Entry::new failed for audit verify HMAC key"
         );
-        map_keyring_error(&e, &entry_ref.service)
+        map_keyring_operation_error(&e, KeyringOperation::Construct, &entry_ref.service)
     })?;
 
     let secret_b64 = Zeroizing::new(entry.get_password().map_err(|e| {
         tracing::debug!(
-            error = %e,
             service = %entry_ref.service,
             "get_password failed for audit verify HMAC key"
         );
-        map_keyring_error(&e, &entry_ref.service)
+        map_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service)
     })?);
 
     let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {

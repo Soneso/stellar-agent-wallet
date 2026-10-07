@@ -49,9 +49,8 @@
 //! name, account name, or any retrieved secret material.  The service name is
 //! used only to construct the diagnostic label in `KeyringNotFound`; the label
 //! is the service name (non-secret keyring coordinate) — never the password.
-//! Platform-store `Display` strings are never forwarded to typed error payloads;
-//! they are emitted at `tracing::debug!` level only,
-//! where the wallet's `RedactingLayer` scrubs known-secret patterns.
+//! Credential-store Display and Debug strings never enter diagnostics.
+//! Classified failures contain fixed labels and extracted numeric codes.
 //!
 //! # Platform initialisation
 //!
@@ -64,8 +63,8 @@
 //!
 //! Supported target platforms: `macos`, `linux`, `windows`.  On any other
 //! target, `init_platform_keyring_store` returns
-//! [`AuthError::KeyringNotFound`] immediately with a diagnostic naming the
-//! unsupported OS — see [`init_platform_keyring_store`] for details.
+//! [`AuthError::KeyringPlatformError`] immediately with a fixed
+//! unsupported-platform diagnostic. See [`init_platform_keyring_store`] for details.
 //!
 //! # Headless deployments
 //!
@@ -115,11 +114,47 @@ use zeroize::Zeroizing;
 use crate::signing::source::{SecretStrkeySource, signer_from_s_strkey};
 use crate::signing::{Signer, WebAuthnAssertion, software::SoftwareSigningKey};
 
-// The single keyring-failure classification point lives in
-// `stellar-agent-core` so that core-side consumers (attestation-key reads,
-// the MCP owner-key path) share one classifier. Re-exported here because every
-// existing caller reaches it through `stellar_agent_network::keyring::`.
-pub use stellar_agent_core::keyring_errors::{classify_keyring_error, map_keyring_error};
+#[allow(deprecated)]
+pub use stellar_agent_core::keyring_errors::classify_keyring_error;
+use stellar_agent_core::keyring_errors::keyring_store_label;
+pub use stellar_agent_core::keyring_errors::{KeyringOperation, classify_keyring_operation_error};
+
+/// Classifies a read failure, including typed headless DPAPI failures.
+#[must_use]
+#[deprecated(note = "use the operation-aware function")]
+pub fn map_keyring_error(e: &keyring_core::Error, service: &str) -> WalletError {
+    map_keyring_operation_error(e, KeyringOperation::Read, service)
+}
+
+/// Classifies an operation failure with safe platform diagnostics.
+///
+/// DPAPI protect errors contribute only their numeric code. Other errors use
+/// core's classifier; upstream Display and Debug never enter the detail.
+#[must_use]
+pub fn map_keyring_operation_error(
+    e: &keyring_core::Error,
+    operation: KeyringOperation,
+    service: &str,
+) -> WalletError {
+    use stellar_agent_headless_keyring::crypto::CryptoError;
+    if let keyring_core::Error::PlatformFailure(inner) = e {
+        let cause = match inner.downcast_ref::<CryptoError>() {
+            Some(CryptoError::DpapiProtectFailed { code }) => Some(format!(
+                "DPAPI CryptProtectData failed (error {code}) while writing headless-dpapi; if this session cannot access the user's DPAPI master key, try an interactive desktop logon, or configure STELLAR_AGENT_KEYRING_BACKEND=headless-env and STELLAR_AGENT_HEADLESS_KEYRING_KEY"
+            )),
+            Some(CryptoError::DpapiProtectInternalFailure) => {
+                Some("headless-dpapi could not protect the value".to_owned())
+            }
+            _ => None,
+        };
+        if let Some(cause) = cause {
+            return WalletError::Auth(AuthError::KeyringPlatformError {
+                detail: format!("{} {}: {cause}", operation.label(), keyring_store_label()),
+            });
+        }
+    }
+    WalletError::Auth(classify_keyring_operation_error(e, operation, service))
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Platform store initialisation
@@ -138,9 +173,8 @@ pub use stellar_agent_core::keyring_errors::{classify_keyring_error, map_keyring
 ///   `dbus-secret-service-keyring-store` (crypto-rust, vendored).
 /// - **Windows** — Windows Credential Manager via
 ///   `windows-native-keyring-store`.
-/// - **Other** — returns [`AuthError::KeyringNotFound`] immediately with a
-///   diagnostic naming the unsupported OS (fail-fast; does not silently
-///   continue with no store registered).
+/// - **Other**: returns [`AuthError::KeyringPlatformError`] immediately with
+///   a fixed unsupported-platform diagnostic.
 ///
 /// # Errors
 ///
@@ -151,11 +185,9 @@ pub use stellar_agent_core::keyring_errors::{classify_keyring_error, map_keyring
 /// not support, and an undeterminable state directory. The detail names the
 /// variable or condition at fault.
 ///
-/// Returns [`WalletError::Auth`] wrapping [`AuthError::KeyringNotFound`] if:
-/// - The platform store cannot be instantiated (store library construction
-///   error; emitted at `tracing::debug!` level).
-/// - The target OS is not `macos`, `linux`, or `windows` (fail-fast with OS
-///   name in the diagnostic label).
+/// Returns [`WalletError::Auth`] wrapping [`AuthError::KeyringPlatformError`]
+/// with a fixed diagnostic if the platform store cannot be initialized or
+/// the target OS is unsupported.
 ///
 /// # Panics
 ///
@@ -169,16 +201,6 @@ pub use stellar_agent_core::keyring_errors::{classify_keyring_error, map_keyring
 /// init_platform_keyring_store().expect("platform keyring unavailable");
 /// ```
 pub fn init_platform_keyring_store() -> Result<(), WalletError> {
-    // Store-construction failures below are reported as `KeyringNotFound`
-    // WITHOUT routing through `classify_keyring_error`, and this is correct:
-    // the classifier's interactive-session detection keys off the
-    // `NoStorageAccess(PlatformError("...ERROR_NO_SUCH_LOGON_SESSION"))` that
-    // `windows-native-keyring-store`'s `decode_error` produces on a CREDENTIAL
-    // OPERATION (open/get/set). A `Store::new()` failure is not a credential
-    // operation and cannot surface that variant, so there is no environmental
-    // cause here for the classifier to distinguish. This site is on the T6
-    // keyring-classification allow-set for that reason.
-    //
     // A headless backend that cannot be set up is a configuration fault the
     // operator fixes in the environment, so it reports the configuration
     // code, with the variable or condition at fault, and no keyring entry.
@@ -194,53 +216,66 @@ pub fn init_platform_keyring_store() -> Result<(), WalletError> {
     #[cfg(target_os = "macos")]
     {
         use apple_native_keyring_store::keychain::Store;
-        // Store::new() returns Result<Arc<Store>>; coerce to Arc<dyn trait>.
-        // Upstream Display strings are not forwarded to typed errors; emit at debug only.
-        let store: Arc<keyring_core::CredentialStore> = Store::new().map_err(|e| {
-            tracing::debug!(error = %e, "macOS Keychain store init failure");
-            WalletError::Auth(AuthError::KeyringNotFound {
-                name: "macOS Keychain store init failed".to_owned(),
-            })
-        })?;
-        keyring_core::set_default_store(store);
-        return Ok(());
+        return install_platform_store(
+            Store::new().map(|store| store as Arc<keyring_core::CredentialStore>),
+        );
     }
     #[cfg(target_os = "linux")]
     {
         use dbus_secret_service_keyring_store::Store;
-        // Upstream Display strings are not forwarded to typed errors; emit at debug only.
-        let store: Arc<keyring_core::CredentialStore> = Store::new().map_err(|e| {
-            tracing::debug!(error = %e, "Linux Secret Service store init failure");
-            WalletError::Auth(AuthError::KeyringNotFound {
-                name: "Linux Secret Service store init failed".to_owned(),
-            })
-        })?;
-        keyring_core::set_default_store(store);
-        return Ok(());
+        return install_platform_store(
+            Store::new().map(|store| store as Arc<keyring_core::CredentialStore>),
+        );
     }
     #[cfg(target_os = "windows")]
     {
         use windows_native_keyring_store::Store;
-        // Upstream Display strings are not forwarded to typed errors; emit at debug only.
-        let store: Arc<keyring_core::CredentialStore> = Store::new().map_err(|e| {
-            tracing::debug!(error = %e, "Windows Credential Manager store init failure");
-            WalletError::Auth(AuthError::KeyringNotFound {
-                name: "Windows Credential Manager store init failed".to_owned(),
-            })
-        })?;
-        keyring_core::set_default_store(store);
-        return Ok(());
+        return install_platform_store(
+            Store::new().map(|store| store as Arc<keyring_core::CredentialStore>),
+        );
     }
-    // Unsupported platform: fail fast with the OS name so the operator can
-    // diagnose the configuration error immediately rather than receiving a
-    // mysterious NoDefaultStore error on the first keyring lookup.
     #[allow(unreachable_code)]
-    Err(WalletError::Auth(AuthError::KeyringNotFound {
-        name: format!(
-            "platform keyring not supported on this target_os ({})",
-            std::env::consts::OS
-        ),
-    }))
+    Err(platform_store_init_failure(
+        "unsupported-platform credential store initialization failed",
+    ))
+}
+
+fn platform_store_init_failure(label: &str) -> WalletError {
+    WalletError::Auth(AuthError::KeyringPlatformError {
+        detail: label.to_owned(),
+    })
+}
+
+fn install_platform_store(
+    store: keyring_core::Result<Arc<keyring_core::CredentialStore>>,
+) -> Result<(), WalletError> {
+    let store = store.map_err(|error| {
+        let label = if cfg!(target_os = "macos") {
+            "macOS Keychain store initialization failed"
+        } else if cfg!(target_os = "linux") {
+            "Linux Secret Service store initialization failed"
+        } else if cfg!(target_os = "windows") {
+            "Windows Credential Manager store initialization failed"
+        } else {
+            "unsupported-platform credential store initialization failed"
+        };
+        let classified = classify_keyring_operation_error(&error, KeyringOperation::Construct, "");
+        let cause = match &classified {
+            AuthError::KeyringPlatformError { detail } => {
+                // Core separates its fixed operation/store labels from the safe cause.
+                detail
+                    .split_once(": ")
+                    .map_or(detail.as_str(), |(_, cause)| cause)
+            }
+            AuthError::KeyringInteractiveSessionRequired => {
+                "credential store requires an interactive logon session"
+            }
+            _ => "credential store operation failed",
+        };
+        platform_store_init_failure(&format!("{label}: {cause}"))
+    })?;
+    keyring_core::set_default_store(store);
+    Ok(())
 }
 
 /// Generates 32 fresh CSPRNG bytes, base64-URL-safe-no-pad encodes them, and
@@ -266,7 +301,7 @@ pub fn rotate_keyring_secret_32(service: &str, entry_name: &str) -> Result<(), W
     let entry = open_entry(&entry_ref)?;
     entry
         .set_password(&encoded)
-        .map_err(|e| map_keyring_error(&e, service))?;
+        .map_err(|e| map_keyring_operation_error(&e, KeyringOperation::Write, service))?;
 
     Ok(())
 }
@@ -299,11 +334,9 @@ pub fn rotate_keyring_secret_32(service: &str, entry_name: &str) -> Result<(), W
 /// Never panics.
 pub fn load_hmac_key_32(entry_ref: &KeyringEntryRef) -> Result<Zeroizing<[u8; 32]>, WalletError> {
     let entry = open_entry(entry_ref)?;
-    let secret_b64 = Zeroizing::new(
-        entry
-            .get_password()
-            .map_err(|e| map_keyring_error(&e, &entry_ref.service))?,
-    );
+    let secret_b64 = Zeroizing::new(entry.get_password().map_err(|e| {
+        map_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service)
+    })?);
 
     let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {
         // Upstream Display strings are not forwarded to typed errors; debug only.
@@ -356,7 +389,7 @@ pub fn write_keyring_string(entry_ref: &KeyringEntryRef, value: &str) -> Result<
     let entry = open_entry(entry_ref)?;
     entry
         .set_password(value)
-        .map_err(|e| map_keyring_error(&e, &entry_ref.service))
+        .map_err(|e| map_keyring_operation_error(&e, KeyringOperation::Write, &entry_ref.service))
 }
 
 /// Reads the keyring entry `entry_ref` as a plain string.
@@ -373,7 +406,11 @@ pub fn read_keyring_string(entry_ref: &KeyringEntryRef) -> Result<Option<String>
     match entry.get_password() {
         Ok(value) => Ok(Some(value)),
         Err(keyring_core::Error::NoEntry) => Ok(None),
-        Err(e) => Err(map_keyring_error(&e, &entry_ref.service)),
+        Err(e) => Err(map_keyring_operation_error(
+            &e,
+            KeyringOperation::Read,
+            &entry_ref.service,
+        )),
     }
 }
 
@@ -787,7 +824,9 @@ impl KeyringSignHandle {
     /// # Errors
     ///
     /// - [`WalletError::Auth`] wrapping [`AuthError::KeyringNotFound`] if the
-    ///   keyring entry does not exist or the platform keyring is locked.
+    ///   keyring entry does not exist.
+    /// - [`WalletError::Auth`] wrapping [`AuthError::KeyringPlatformError`] if
+    ///   the credential store operation fails.
     /// - [`WalletError::Auth`] wrapping [`AuthError::KeyringNotFound`] if the
     ///   stored value is not a valid S-strkey (the entry's content is corrupt).
     /// - [`WalletError::Auth`] wrapping [`AuthError::SignerKeyMismatch`] if the
@@ -846,11 +885,9 @@ impl KeyringSignHandle {
         // The `KeyringEntry` is constructed fresh on every call (per-call
         // handle discipline).
         let entry = open_entry(&self.entry_ref)?;
-        let s_strkey: Zeroizing<String> = Zeroizing::new(
-            entry
-                .get_password()
-                .map_err(|e| map_keyring_error(&e, &self.entry_ref.service))?,
-        );
+        let s_strkey: Zeroizing<String> = Zeroizing::new(entry.get_password().map_err(|e| {
+            map_keyring_operation_error(&e, KeyringOperation::Read, &self.entry_ref.service)
+        })?);
 
         // Delegate to the inner helper which verifies the freshly-loaded seed's
         // public key against the cached bytes before signing. The panic-injection
@@ -880,11 +917,9 @@ impl KeyringSignHandle {
         // Same zeroisation + host-swap check as sign_tx_payload. The two methods
         // diverge only at the call site (which payload class is being signed).
         let entry = open_entry(&self.entry_ref)?;
-        let s_strkey: Zeroizing<String> = Zeroizing::new(
-            entry
-                .get_password()
-                .map_err(|e| map_keyring_error(&e, &self.entry_ref.service))?,
-        );
+        let s_strkey: Zeroizing<String> = Zeroizing::new(entry.get_password().map_err(|e| {
+            map_keyring_operation_error(&e, KeyringOperation::Read, &self.entry_ref.service)
+        })?);
 
         sign_payload_verifying_pubkey(
             s_strkey,
@@ -913,11 +948,9 @@ impl KeyringSignHandle {
         payload: &[u8; 32],
     ) -> Result<[u8; 64], WalletError> {
         let entry = open_entry(&self.entry_ref)?;
-        let s_strkey: Zeroizing<String> = Zeroizing::new(
-            entry
-                .get_password()
-                .map_err(|e| map_keyring_error(&e, &self.entry_ref.service))?,
-        );
+        let s_strkey: Zeroizing<String> = Zeroizing::new(entry.get_password().map_err(|e| {
+            map_keyring_operation_error(&e, KeyringOperation::Read, &self.entry_ref.service)
+        })?);
 
         sign_payload_verifying_pubkey(
             s_strkey,
@@ -1036,8 +1069,9 @@ pub fn lazy_signer_from_keyring(
 /// # Errors
 ///
 /// - [`WalletError::Auth`] wrapping [`AuthError::KeyringNotFound`] if the
-///   entry does not exist, the platform keyring is locked, or the stored
-///   value is not a valid S-strkey.
+///   entry does not exist or the stored value is not a valid S-strkey.
+/// - [`WalletError::Auth`] wrapping [`AuthError::KeyringPlatformError`] if the
+///   credential store operation fails.
 /// - [`WalletError::Auth`] wrapping [`AuthError::SignerKeyMismatch`] if the
 ///   derived public key does not match `expected_source_g`.
 ///
@@ -1067,11 +1101,9 @@ pub async fn signer_from_keyring(
     // Load the secret into a Zeroizing<String>; dropped inside
     // signer_from_s_strkey after the seed bytes are captured.
     let entry = open_entry(entry_ref)?;
-    let s_strkey: Zeroizing<String> = Zeroizing::new(
-        entry
-            .get_password()
-            .map_err(|e| map_keyring_error(&e, &entry_ref.service))?,
-    );
+    let s_strkey: Zeroizing<String> = Zeroizing::new(entry.get_password().map_err(|e| {
+        map_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service)
+    })?);
 
     // Delegate to the canonical parse-verify-zeroise helper in signing::source.
     // It applies the full zeroisation sequence (PrivateKey residue,
@@ -1144,12 +1176,12 @@ pub async fn enrolled_keyring_signer(
 
 /// Opens a `keyring_core::Entry` for the given [`KeyringEntryRef`].
 ///
-/// Returns [`AuthError::KeyringNotFound`] if the default store has not been
-/// set (process forgot to call `init_platform_keyring_store`) or if the
-/// entry coordinates are rejected by the store.
+/// Classifies construction failures with their operation and safe cause.
+/// A missing default store or rejected coordinate is a platform failure.
 fn open_entry(entry_ref: &KeyringEntryRef) -> Result<KeyringEntry, WalletError> {
-    KeyringEntry::new(&entry_ref.service, &entry_ref.account)
-        .map_err(|e| map_keyring_error(&e, &entry_ref.service))
+    KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
+        map_keyring_operation_error(&e, KeyringOperation::Construct, &entry_ref.service)
+    })
 }
 
 fn redact_keyring_coord(value: &str) -> String {
@@ -1163,7 +1195,9 @@ fn redact_keyring_coord(value: &str) -> String {
 fn wallet_error_kind(err: &WalletError) -> &'static str {
     match err {
         WalletError::Auth(AuthError::KeyringLocked) => "AuthError::KeyringLocked",
-        WalletError::Auth(AuthError::KeyringPlatformError) => "AuthError::KeyringPlatformError",
+        WalletError::Auth(AuthError::KeyringPlatformError { .. }) => {
+            "AuthError::KeyringPlatformError"
+        }
         WalletError::Auth(AuthError::KeyringInteractiveSessionRequired) => {
             "AuthError::KeyringInteractiveSessionRequired"
         }
@@ -1312,6 +1346,21 @@ mod tests {
     use stellar_agent_core::error::ErrorCategory;
     use stellar_agent_test_support::{CaptureWriter, keyring_mock};
 
+    struct RestoreStore(Option<Arc<keyring_core::CredentialStore>>);
+    impl RestoreStore {
+        fn new() -> Self {
+            Self(keyring_core::unset_default_store())
+        }
+    }
+    impl Drop for RestoreStore {
+        fn drop(&mut self) {
+            keyring_core::unset_default_store();
+            if let Some(store) = self.0.take() {
+                keyring_core::set_default_store(store);
+            }
+        }
+    }
+
     fn gstrkey_for_seed(seed: [u8; 32]) -> String {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
         stellar_strkey::ed25519::PublicKey(signing_key.verifying_key().to_bytes())
@@ -1352,6 +1401,151 @@ mod tests {
             )
             .build()
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dpapi_typed_diagnostics_preserve_only_protect_codes() {
+        use stellar_agent_headless_keyring::crypto::{CryptoError, ProtectionMode};
+        use stellar_agent_headless_keyring::store::HeadlessStore;
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = RestoreStore::new();
+        keyring_core::set_default_store(std::sync::Arc::new(HeadlessStore::new(
+            dir.path().join("keyring.json"),
+            ProtectionMode::Dpapi,
+        )));
+        for (inner, expected) in [
+            (
+                CryptoError::DpapiProtectFailed { code: 2148073483 },
+                "DPAPI CryptProtectData failed (error 2148073483) while writing headless-dpapi; if this session cannot access the user's DPAPI master key, try an interactive desktop logon, or configure STELLAR_AGENT_KEYRING_BACKEND=headless-env and STELLAR_AGENT_HEADLESS_KEYRING_KEY",
+            ),
+            (
+                CryptoError::DpapiProtectInternalFailure,
+                "headless-dpapi could not protect the value",
+            ),
+            (CryptoError::SealFailed, "credential store operation failed"),
+        ] {
+            let error = keyring_core::Error::PlatformFailure(Box::new(inner));
+            let classified =
+                map_keyring_operation_error(&error, KeyringOperation::Write, "service-sentinel");
+            assert_eq!(classified.code(), "auth.keyring_platform_error");
+            assert_eq!(
+                classified.message(),
+                format!("keyring operation failed: write headless-dpapi: {expected}")
+            );
+            assert!(!format!("{classified:?}").contains("service-sentinel"));
+        }
+        let nested = keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+            CryptoError::DpapiProtectFailed { code: 2148073483 },
+        )));
+        assert_eq!(
+            map_keyring_operation_error(&nested, KeyringOperation::Write, "service").message(),
+            "keyring operation failed: write headless-dpapi: credential store operation failed"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn platform_store_initialization_failure_is_platform_error() {
+        let _restore = RestoreStore::new();
+        let expected = if cfg!(target_os = "macos") {
+            "keyring operation failed: macOS Keychain store initialization failed"
+        } else if cfg!(target_os = "linux") {
+            "keyring operation failed: Linux Secret Service store initialization failed"
+        } else if cfg!(target_os = "windows") {
+            "keyring operation failed: Windows Credential Manager store initialization failed"
+        } else {
+            "keyring operation failed: unsupported-platform credential store initialization failed"
+        };
+        for (error, cause) in [
+            (
+                keyring_core::Error::BadStoreFormat("secret-sentinel".to_owned()),
+                "credential store is not readable",
+            ),
+            (
+                keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::from_raw_os_error(
+                    13,
+                ))),
+                "credential store access denied (OS error 13)",
+            ),
+        ] {
+            let error = install_platform_store(Err(error)).unwrap_err();
+            assert_eq!(error.code(), "auth.keyring_platform_error");
+            assert_eq!(error.message(), format!("{expected}: {cause}"));
+            assert!(!format!("{error:?}").contains("secret-sentinel"));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(target_os = "windows")]
+    fn dpapi_protect_failure_reaches_wallet_error() {
+        use stellar_agent_headless_keyring::crypto::{
+            DpapiError, ProtectionMode, with_dpapi_protect_result,
+        };
+        use stellar_agent_headless_keyring::store::HeadlessStore;
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = RestoreStore::new();
+        keyring_core::set_default_store(std::sync::Arc::new(HeadlessStore::new(
+            dir.path().join("keyring.json"),
+            ProtectionMode::Dpapi,
+        )));
+        let entry = keyring_core::Entry::new("service-sentinel", "account-sentinel").unwrap();
+        with_dpapi_protect_result(
+            Err(DpapiError::Win32 {
+                api: "hostile-api-label",
+                code: 2148073483,
+            }),
+            || {
+                let error = entry.set_secret(b"secret-sentinel").unwrap_err();
+                let classified = super::map_keyring_operation_error(
+                    &error,
+                    super::KeyringOperation::Write,
+                    "service-sentinel",
+                );
+                assert_eq!(classified.code(), "auth.keyring_platform_error");
+                assert_eq!(
+                    classified.message(),
+                    "keyring operation failed: write headless-dpapi: DPAPI CryptProtectData failed (error 2148073483) while writing headless-dpapi; if this session cannot access the user's DPAPI master key, try an interactive desktop logon, or configure STELLAR_AGENT_KEYRING_BACKEND=headless-env and STELLAR_AGENT_HEADLESS_KEYRING_KEY"
+                );
+                for sentinel in [
+                    "service-sentinel",
+                    "account-sentinel",
+                    "secret-sentinel",
+                    "hostile-api-label",
+                ] {
+                    assert!(!format!("{classified:?}").contains(sentinel));
+                }
+            },
+        );
+        with_dpapi_protect_result(Err(DpapiError::InputTooLarge), || {
+            let error = entry.set_secret(b"secret-sentinel").unwrap_err();
+            let classified = super::map_keyring_operation_error(
+                &error,
+                super::KeyringOperation::Write,
+                "service-sentinel",
+            );
+            assert_eq!(classified.code(), "auth.keyring_platform_error");
+            assert_eq!(
+                classified.message(),
+                "keyring operation failed: write headless-dpapi: headless-dpapi could not protect the value"
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dpapi_protect_diagnostic_matches_crypto_display() {
+        use stellar_agent_headless_keyring::crypto::CryptoError;
+        let _restore = RestoreStore::new();
+        let inner = CryptoError::DpapiProtectFailed { code: 2148073483 };
+        let expected = inner.to_string();
+        let error = keyring_core::Error::PlatformFailure(Box::new(inner));
+        let classified = map_keyring_operation_error(&error, KeyringOperation::Write, "service");
+        assert_eq!(
+            classified.message(),
+            format!("keyring operation failed: write no default store: {expected}")
+        );
     }
 
     #[tokio::test]
@@ -1694,7 +1888,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn open_entry_without_store_returns_keyring_not_found() {
+    fn open_entry_without_store_returns_platform_error() {
         // `#[serial]` alongside the store-installing tests: this test unsets the
         // process-global keyring store and then asserts a lookup fails, so a
         // sibling test re-installing the default store between those two steps
@@ -1708,7 +1902,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.category(), ErrorCategory::Auth);
-        assert_eq!(err.code(), "auth.keyring_not_found");
+        assert_eq!(err.code(), "auth.keyring_platform_error");
     }
 
     #[tokio::test]
@@ -1726,7 +1920,7 @@ mod tests {
             .sign_tx_payload(&[0x11; 32])
             .await
             .expect_err("first signature call must open the missing keyring");
-        assert_eq!(error.code(), "auth.keyring_not_found");
+        assert_eq!(error.code(), "auth.keyring_platform_error");
         assert!(lazy_signer_from_keyring(&entry_ref, "not-a-g-strkey").is_err());
     }
 

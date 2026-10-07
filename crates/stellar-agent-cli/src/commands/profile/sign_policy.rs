@@ -65,7 +65,7 @@ use stellar_agent_core::policy::v1::signature::{digest, sign};
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile, default_policy_dir};
 use stellar_agent_core::wallet::{MlockRequired, Wallet};
-use stellar_agent_network::keyring::map_keyring_error;
+use stellar_agent_network::keyring::{KeyringOperation, map_keyring_operation_error};
 
 use crate::common::profile_access::{
     injected_profile_load, profile_access_envelope, reconcile_loaded_profile,
@@ -370,8 +370,10 @@ fn engine_profile_name(profile: &Profile) -> Result<String, String> {
 /// Accepts the stored G-strkey and the older URL-safe base64 form.
 fn read_owner_pubkey(coord: &KeyringEntryRef) -> Result<[u8; 32], String> {
     let entry = KeyringEntry::new(&coord.service, &coord.account).map_err(|e| {
+        let classified =
+            map_keyring_operation_error(&e, KeyringOperation::Construct, &coord.service);
         format!(
-            "owner keyring entry '{}:{}' could not be opened ({e})",
+            "owner keyring entry '{}:{}' could not be opened ({classified})",
             coord.service, coord.account
         )
     })?;
@@ -385,7 +387,8 @@ fn read_owner_pubkey(coord: &KeyringEntryRef) -> Result<[u8; 32], String> {
             coord.service, coord.account
         ),
         other => {
-            let classified = map_keyring_error(other, &coord.service);
+            let classified =
+                map_keyring_operation_error(other, KeyringOperation::Read, &coord.service);
             format!(
                 "the owner key at keyring service '{}' account '{}' could not be read ({}): {}",
                 coord.service,

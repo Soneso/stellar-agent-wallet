@@ -104,7 +104,7 @@ syn = { workspace = true, features = ["visit"] }
 proc-macro2 = { workspace = true, features = ["span-locations"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers", "test-helpers"] }
 # STELLAR_AGENT_HOME override on headless_keyring_path, for the
-# init_platform_keyring_store headless-dispatch test.
+# headless-dispatch test and scoped DPAPI protect-result injection.
 stellar-agent-headless-keyring = { path = "../stellar-agent-headless-keyring", features = ["test-helpers"] }
 wiremock = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "test-util"] }

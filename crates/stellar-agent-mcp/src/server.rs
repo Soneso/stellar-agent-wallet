@@ -84,7 +84,7 @@ use stellar_agent_core::{
     profile::schema::{KeyringEntryRef, PolicyEngineKind, Profile, default_policy_dir},
     timefmt::{Clock, default_clock},
 };
-use stellar_agent_network::keyring::map_keyring_error;
+use stellar_agent_network::keyring::{KeyringOperation, map_keyring_operation_error};
 use stellar_agent_network::policy_state::PersistedWindowStore;
 use stellar_agent_network::{CounterpartyResolver, NoopCounterpartyResolver, StellarTomlResolver};
 use stellar_agent_nonce::{NonceMint, ReplayWindow};
@@ -344,7 +344,12 @@ fn fetch_owner_pubkey_from_keyring(
     let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
         BuildRegistryError::OwnerKeyringEntryUnreadable {
             profile: profile_name.to_owned(),
-            detail: e.to_string(),
+            detail: map_keyring_operation_error(
+                &e,
+                KeyringOperation::Construct,
+                &entry_ref.service,
+            )
+            .message(),
         }
     })?;
 
@@ -354,10 +359,11 @@ fn fetch_owner_pubkey_from_keyring(
         // misreported as an absent key.
         keyring_core::Error::NoEntry => BuildRegistryError::OwnerKeyAbsent {
             profile: profile_name.to_owned(),
-            detail: e.to_string(),
+            detail: "No matching credential found".to_owned(),
         },
         other => {
-            let classified = map_keyring_error(other, &entry_ref.service);
+            let classified =
+                map_keyring_operation_error(other, KeyringOperation::Read, &entry_ref.service);
             BuildRegistryError::OwnerKeyringReadFailed {
                 profile: profile_name.to_owned(),
                 code: classified.code(),

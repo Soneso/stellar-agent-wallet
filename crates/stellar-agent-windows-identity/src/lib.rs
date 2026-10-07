@@ -11,11 +11,16 @@
 //!   replayed by another user on the same machine.
 //! - [`dpapi_protect`] / [`dpapi_unprotect`] wrap DPAPI CurrentUser-scope
 //!   protect/unprotect, consumed by `stellar-agent-headless-keyring`'s
-//!   `dpapi` protection mode. DPAPI CurrentUser scope works in the SSH /
-//!   service / Session-0 "network logon" sessions where Windows Credential
-//!   Manager fails closed (see that crate's module docs for the trust-model
-//!   writeup); both calls pass `CRYPTPROTECT_UI_FORBIDDEN` so a headless
-//!   session can never block on a UI prompt.
+//!   `dpapi` protection mode. Both calls require access to the current user's
+//!   DPAPI master key and pass `CRYPTPROTECT_UI_FORBIDDEN` to prevent UI prompts.
+//!   Key-authenticated SSH sessions can lack master-key access; an interactive
+//!   desktop logon may help. The wallet's `headless-env` backend avoids this
+//!   dependency and requires its configured encryption key.
+//!
+//! Protect failures expose typed numeric Windows codes when available. The
+//! wallet reports `auth.keyring_platform_error` naming `CryptProtectData`.
+//! The headless keyring keeps unprotect failures detail-free, exposing no
+//! decryption reason or code to the wallet.
 
 /// Errors returned by the Windows SID lookup wrapper.
 #[derive(Debug, thiserror::Error)]
@@ -104,11 +109,9 @@ pub enum DpapiError {
 /// Encrypts `plaintext` with DPAPI CurrentUser scope
 /// (`CryptProtectData`, no optional entropy, no `LOCAL_MACHINE` flag).
 ///
-/// Any process running as the same Windows user can decrypt the result with
-/// [`dpapi_unprotect`] — the SAME trust boundary as Windows Credential
-/// Manager, minus the interactive-logon-session requirement. Passes
-/// `CRYPTPROTECT_UI_FORBIDDEN` so the call can never block on a UI prompt in a
-/// headless session.
+/// Processes running as the same Windows user can decrypt with
+/// [`dpapi_unprotect`] when their session can access that user's DPAPI master
+/// key. Passes `CRYPTPROTECT_UI_FORBIDDEN` to prevent UI prompts.
 ///
 /// # Errors
 ///

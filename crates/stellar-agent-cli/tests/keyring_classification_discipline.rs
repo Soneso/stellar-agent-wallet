@@ -1,15 +1,15 @@
 //! Source-scan regression test for the keyring-failure classification
 //! discipline (issue #94).
 //!
-//! Every production keyring operation — entry construction (`Entry::new`),
-//! reads (`get_password`), and writes (`set_password`) — must route its
-//! `keyring_core::Error` through `classify_keyring_error` /
-//! `map_keyring_error` (hosted in `stellar-agent-core`, re-exported from
-//! `stellar_agent_network::keyring`). Hand-rolling
-//! `AuthError::KeyringNotFound` around a keyring operation misreports
-//! environmental causes — most notably a non-interactive Windows session,
-//! which must surface as `AuthError::KeyringInteractiveSessionRequired`, not
-//! "not found".
+//! Core classifies keyring failures with fixed labels and exports
+//! `classify_keyring_operation_error`, `KeyringOperation`, and its own
+//! `map_keyring_operation_error` for core's callers. Network re-exports the
+//! classifier and operation type. Network defines `map_keyring_operation_error`
+//! to add typed headless DPAPI protect diagnostics. Every crate outside core
+//! routes keyring errors through the network functions.
+//! Missing reads report `AuthError::KeyringNotFound`. Construction and other
+//! read failures report `AuthError::KeyringPlatformError`. Non-interactive
+//! Windows sessions report `AuthError::KeyringInteractiveSessionRequired`.
 //!
 //! This test enforces the issue's acceptance criterion — "no production call
 //! site hand-rolls `KeyringNotFound` around a keyring operation" — as a
@@ -57,22 +57,9 @@ const ALLOW_SET: &[AllowEntry] = &[
     // rather than a currently-firing occurrence.
     AllowEntry {
         file: "stellar-agent-core/src/keyring_errors.rs",
-        anchor: "classify_keyring_error",
+        anchor: "classify_keyring_operation_error",
         invariant: "the classifier itself maps keyring_core::Error into AuthError; \
                     KeyringNotFound is the classified OUTPUT, not a hand-roll",
-    },
-    // init_platform_keyring_store hand-rolls KeyringNotFound around the
-    // platform Store::new() (store CONSTRUCTION, not a credential op). Per the
-    // classifier's own contract, the interactive-session (1312) case cannot
-    // arise from store construction, so classification is not applicable.
-    // Store::new() is not a raw-op needle, so this is a forward guard. The
-    // headless backend's setup failure is a configuration fault and reports
-    // AuthError::KeyringConfigInvalid, which this rule does not concern.
-    AllowEntry {
-        file: "stellar-agent-network/src/keyring.rs",
-        anchor: "init_platform_keyring_store",
-        invariant: "platform store construction cannot surface the interactive-session \
-                    case; see the invariant comment in init_platform_keyring_store",
     },
     // Non-AuthError typed errors: NoEntry is distinguished, every other cause
     // keeps the raw text inside the crate-local error and nothing is discarded.
@@ -182,7 +169,7 @@ fn no_production_call_site_hand_rolls_keyring_not_found() {
                 violations.push(format!(
                     "{rel}:{} — a raw keyring op is followed within {WINDOW_LINES} lines by \
                      `{FORBIDDEN} ... }}`; route the failure through \
-                     `map_keyring_error(&e, &<coord>.service)` (or add an allow-set entry \
+                     `map_keyring_operation_error(&e, operation, &<coord>.service)` (or add an allow-set entry \
                      with a documented invariant if this is a legitimate exemption)",
                     idx + 1
                 ));

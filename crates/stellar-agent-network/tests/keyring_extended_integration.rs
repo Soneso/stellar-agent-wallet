@@ -4,7 +4,7 @@
 //! - `KeyringSignHandle::sign_auth_digest` and `sign_soroban_address_auth_payload`
 //! - The `Signer` trait `public_key()` impl on `KeyringSignHandle`
 //! - `Signer` trait dispatch to `sign_auth_digest` and `sign_soroban_address_auth_payload`
-//! - `map_keyring_error` for `NoStorageAccess` and catch-all variants
+//! - `map_keyring_operation_error` for `NoStorageAccess` and malformed values
 //! - `redact_keyring_coord` short-value path (≤10 characters)
 //! - `wallet_error_kind` branches via the tracing event emitted on failure
 //! - `rotate_keyring_secret_32` successive rotation replaces prior secret
@@ -274,18 +274,18 @@ async fn signer_trait_public_key() {
     assert_eq!(pk_g, expected_g, "trait public_key must match expected_g");
 }
 
-// ─── map_keyring_error coverage ──────────────────────────────────────────────
+// map_keyring_operation_error coverage: ---------------------------------------
 
-/// `map_keyring_error` with `NoStorageAccess` maps to `KeyringPlatformError`.
+/// `map_keyring_operation_error` with `NoStorageAccess` maps to `KeyringPlatformError`.
 ///
 /// This variant is produced by the platform keyring when the credential store
 /// is locked (e.g. macOS Keychain locked, GNOME Keyring locked). It is
 /// distinct from `PlatformFailure` (runtime error) and maps to the same
 /// `KeyringPlatformError` code.
 ///
-/// `map_keyring_error` is private; this test verifies the mapping by arming a
+/// This test verifies the operation-aware mapping by arming a
 /// `NoStorageAccess` error on the mock entry, calling `sign_tx_payload` to
-/// traverse the production `map_keyring_error` code path, and asserting the
+/// traverse the production `map_keyring_operation_error` code path, and asserting the
 /// resulting `WalletError::code()`.
 #[tokio::test]
 #[serial]
@@ -304,7 +304,7 @@ async fn no_storage_access_maps_to_keyring_platform_error() {
         .expect("handle construction must succeed");
 
     // Arm the NoStorageAccess error — the next get_password call during
-    // sign_tx_payload will return this error, which map_keyring_error maps
+    // sign_tx_payload will return this error, which map_keyring_operation_error maps
     // to KeyringPlatformError.
     let entry =
         keyring_core::Entry::new(&entry_ref.service, &entry_ref.account).expect("mock entry");
@@ -327,17 +327,11 @@ async fn no_storage_access_maps_to_keyring_platform_error() {
     );
 }
 
-/// `map_keyring_error` catch-all for `BadEncoding` maps to `KeyringNotFound`.
-///
-/// `BadEncoding`, `TooLong`, `Invalid`, `Ambiguous`, etc. are all catch-all
-/// variants that map to `KeyringNotFound` (the keyring entry is malformed or
-/// inaccessible, which is operationally equivalent to "not found" for signing).
-///
-/// `map_keyring_error` is private; we arm a `BadEncoding` error on the mock
-/// entry and call `sign_tx_payload` to traverse the production code path.
+/// A malformed stored password reports a platform failure with a safe cause.
+/// The armed mock error traverses the production signing read.
 #[tokio::test]
 #[serial]
-async fn bad_encoding_maps_to_keyring_not_found_via_mock() {
+async fn bad_encoding_maps_to_keyring_platform_error_via_mock() {
     use keyring_core::mock;
     keyring_mock::install().expect("mock store init");
 
@@ -360,14 +354,18 @@ async fn bad_encoding_maps_to_keyring_not_found_via_mock() {
     cred.set_error(keyring_core::Error::BadEncoding(vec![0xFFu8, 0xFEu8]));
 
     // sign_tx_payload re-loads the secret; the armed error fires.
-    // map_keyring_error's catch-all maps BadEncoding to KeyringNotFound.
+    // The classified cause describes malformed encoding without rendering bytes.
     let err = handle.sign_tx_payload(&[0u8; 32]).await.unwrap_err();
     assert_eq!(err.category(), ErrorCategory::Auth);
     assert_eq!(
         err.code(),
-        "auth.keyring_not_found",
-        "BadEncoding catch-all must map to auth.keyring_not_found; got {:?}",
+        "auth.keyring_platform_error",
+        "BadEncoding must map to auth.keyring_platform_error; got {:?}",
         err.code()
+    );
+    assert_eq!(
+        err.message(),
+        "keyring operation failed: read unknown credential store: stored password is not valid UTF-8"
     );
 }
 
@@ -464,27 +462,9 @@ async fn signer_from_keyring_with_short_service_name_logs_unredacted() {
 
 // ─── wallet_error_kind coverage ──────────────────────────────────────────────
 
-/// The `keyring.sign.failure` event includes the `error_kind` field, which is
-/// populated by the private `wallet_error_kind` function.  By triggering
-/// different failure modes we exercise branches of that function that are not
-/// reached by the existing `sign_tx_payload_emits_failure_event` test.
-///
-/// This test covers `KeyringLocked`, `HardwareUserRefused`, and
-/// `SignerKindMismatch` branches by injecting mock errors and observing the
-/// logged `error_kind` string.
-///
-/// `KeyringLocked` is armed via `mock::Cred::set_error(Error::NoStorageAccess)`,
-/// but `map_keyring_error` maps `NoStorageAccess` to `KeyringPlatformError`
-/// (not `KeyringLocked`) — so the `KeyringLocked` and `HardwareUserRefused`
-/// wallet_error_kind branches are not reachable through the keyring signing
-/// path.  They are reached only via callers that produce those variants (e.g.
-/// `HardwareSigningKey`).  Since those callers live outside keyring.rs, the
-/// `wallet_error_kind` coverage for `KeyringLocked` and `HardwareUserRefused`
-/// is acknowledged as unreachable from the keyring module and listed under
-/// suspected_issues in the coverage report.
-///
-/// What this test DOES cover: the `KeyringPlatformError` branch in
-/// `wallet_error_kind`, exercised by arming `NoStorageAccess` and signing.
+/// The signing failure event keeps its stable `error_kind` label.
+/// A mock `NoStorageAccess` error traverses the production signing read and
+/// classifies as `KeyringPlatformError` before the event is emitted.
 #[tokio::test]
 #[serial]
 async fn sign_tx_payload_platform_error_is_logged_as_keyring_platform_error() {
@@ -502,7 +482,7 @@ async fn sign_tx_payload_platform_error_is_logged_as_keyring_platform_error() {
         .expect("handle construction must succeed");
 
     // Arm a NoStorageAccess error on the next get_password call.
-    // map_keyring_error maps this to KeyringPlatformError.
+    // map_keyring_operation_error maps this to KeyringPlatformError.
     let entry =
         keyring_core::Entry::new(&entry_ref.service, &entry_ref.account).expect("mock entry");
     let cred: &mock::Cred = entry

@@ -9,11 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The two-argument `map_keyring_error` and `classify_keyring_error` functions
+  in core and network are deprecated. Use their operation-aware counterparts.
+- `AuthError::KeyringPlatformError` carries a safe `detail`. Constructors supply
+  the detail; matches use `KeyringPlatformError { .. }`. The Display changes;
+  `auth.keyring_platform_error` and the auth category stay unchanged.
+
 - The three log lines of the CLI's shared value audit writer acquisition end in
   `refusing`, which fits the callers that neither sign nor submit. Two tests pin
   the Enforce binding check at the `approve` site and at the value audit
   pre-flight. The audit log recovery guide names the `audit reanchor` repair rows
   in the plural. Thanks to @ngybnc.
+
+### Fixed
+
+- Keyring write and store failures report `auth.keyring_platform_error` with
+  their cause instead of `auth.keyring_not_found`.
+  Read failures other than a missing entry, and construction failures, now
+  report `auth.keyring_platform_error`.
+- `headless-dpapi` names a failed `CryptProtectData` operation and its numeric
+  Windows code when available, with guidance for master-key access failures.
+- `profile enroll-signer` refuses an unset secret without touching the profile.
 
 ## [0.1.0-alpha.11] - 2026-10-07
 

@@ -269,7 +269,15 @@ Windows Credential Manager requires an interactive logon session; a Windows serv
 | Mode | Env var | Primitive | Trust boundary |
 |------|---------|-----------|-----------------|
 | `headless-env` | `STELLAR_AGENT_HEADLESS_KEYRING_KEY` (32-byte URL-safe base64, no padding) | XChaCha20-Poly1305 (`chacha20poly1305` crate) | The env var is the root of trust: any reader of it can decrypt every entry. Targets Linux services and CI where a secret manager already injects env vars under trusted access control. |
-| `headless-dpapi` (Windows only) | none | `CryptProtectData` / `CryptUnprotectData`, CurrentUser scope, via `stellar-agent-windows-identity`'s `dpapi_protect` / `dpapi_unprotect` (`CRYPTPROTECT_UI_FORBIDDEN`, never blocks on a UI prompt) | The SAME trust boundary as Windows Credential Manager (any process running as the same Windows user can decrypt), minus the interactive-logon-session requirement DPAPI CurrentUser scope does not have. |
+| `headless-dpapi` (Windows only) | none | `CryptProtectData` / `CryptUnprotectData`, CurrentUser scope, via `stellar-agent-windows-identity`'s `dpapi_protect` / `dpapi_unprotect` (`CRYPTPROTECT_UI_FORBIDDEN`, never blocks on a UI prompt) | Processes running as the same Windows user can decrypt when that session can access the user's DPAPI master key. |
+
+DPAPI depends on access to the current user's master key. Key-authenticated SSH
+sessions can lack that access; an interactive desktop logon may help.
+`headless-env` has no DPAPI dependency and requires its configured encryption key.
+Protect failures report `auth.keyring_platform_error` with the operation, backend,
+and fixed `CryptProtectData` diagnostic, including the numeric Windows code when
+available. Unprotect failures keep a detail-free cryptographic error and map to
+`BadDataFormat`; their wallet diagnostic reveals no decryption reason or code.
 
 Both modes are tamper-evident and fail closed: XChaCha20-Poly1305 carries its own Poly1305 authentication tag (a tampered ciphertext fails to decrypt); DPAPI blobs are self-authenticating (`CryptUnprotectData` fails on a modified blob). The `env-key` mode additionally binds `service`||`\0`||`account` as AEAD associated data, so a ciphertext relocated to a different entry coordinate fails to open. DPAPI has no AAD concept, so this binding does not apply to `headless-dpapi` (documented scope limitation, same as Credential Manager's own lack of one). A DPAPI entry moved to another coordinate therefore opens there. Owner public keys are stored as G-strkeys, a form no 32-byte symmetric-key loader accepts, and every symmetric-key loader refuses a key equal to the profile's owner public key.
 

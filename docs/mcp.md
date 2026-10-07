@@ -129,8 +129,12 @@ every signing tool refuses at the keyring step. Launch it from an interactive
 desktop session (including Remote Desktop), run it inside a container /
 Linux VM where the platform keyring backend has no such restriction, or set
 `STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi` on the process environment to
-opt into the headless file-backed keyring store (DPAPI CurrentUser scope,
-works in exactly these non-interactive session types). See
+opt into the headless file-backed keyring store with DPAPI CurrentUser scope.
+DPAPI needs access to the current user's master key and can fail in
+key-authenticated SSH sessions. An interactive desktop logon may help.
+A protect failure reports `auth.keyring_platform_error`, naming DPAPI and its
+numeric error code when available. The `headless-env` backend avoids this DPAPI dependency
+and requires `STELLAR_AGENT_HEADLESS_KEYRING_KEY`. See
 [security-internals.md's headless keyring section](maintainers/security-internals.md#headless-keyring-store)
 for the trust model before enabling it.
 
