@@ -60,11 +60,12 @@ Create a new profile file with `stellar-agent profile init` (name resolves
 `engine = "v1"`); mainnet requires an explicit `https://` `--rpc-url`.
 See [cli-reference.md](cli-reference.md) for flags.
 
-`init` mints the `audit_log_hash_chain_key_id` keyring COORDINATE only, no key
-material. Run `stellar-agent profile enroll-signer` then
-`stellar-agent profile rotate-audit-key <name>` next — required before any
-signing verb will proceed, on **either** policy engine — or every value-moving
-CLI command and MCP tool refuses `audit.chain_key_unavailable`. See
+`init` writes the `audit_log_hash_chain_key_id` coordinate only.
+Run `stellar-agent profile rotate-audit-key <name>` before
+`stellar-agent profile enroll-signer` so the first enrollment writes its audit row.
+Then run `stellar-agent profile rotate-nonce-key <name>` before MCP payment simulation.
+Every value-moving signing command requires the audit key on either engine,
+refusing `audit.chain_key_unavailable` until it exists. See
 [Approvals and audit](approvals-and-audit.md#fail-closed-on-an-unminted-audit-key).
 
 ## Loader source order
@@ -362,14 +363,14 @@ the seed does not derive to that exact address, printing the address to set
 
 Complete these steps for a persistent profile, using its name in place of `<name>`:
 
-1. `stellar-agent profile rotate-audit-key <name>`: mint the audit key, required
-   before signing on every engine.
-2. `stellar-agent profile rotate-nonce-key <name>`: mint the nonce key before
+1. `stellar-agent profile rotate-audit-key <name>`: mint the audit key before
+   the first key-writing command so its audit row is written.
+2. [Enroll the MCP signer](#enroll-the-mcp-signer): register the signer seed.
+3. `stellar-agent profile rotate-nonce-key <name>`: mint the nonce key before
    MCP payment simulation. Without it, simulation fails with `nonce.mint_failed`.
-3. `profile enroll-owner-key`, then `profile rotate-attestation-key <name>`:
+4. `profile enroll-owner-key`, then `profile rotate-attestation-key <name>`:
    enroll the policy owner and mint the approval key.
-4. [Create the V1 policy file](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/profiles.md#create-the-v1-policy-file), then run `profile sign-policy`. A missing file refuses with `sign_policy.policy_file_unreadable`.
-5. [Enroll the MCP signer](#enroll-the-mcp-signer) before signing transactions.
+5. [Create the V1 policy file](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/profiles.md#create-the-v1-policy-file), then run `profile sign-policy`. A missing file refuses with `sign_policy.policy_file_unreadable`.
 
 An `init`-minted profile already carries `engine = "v1"`. This setup supplies
 its policy and key prerequisites. A profile migrated from schema v1 stays on

@@ -417,15 +417,15 @@ for flags and the envelope shape.
 
 Complete these steps for a persistent profile, using its name in place of `<name>`:
 
-1. `stellar-agent profile rotate-audit-key <name>`: mint the audit key, required
-   on every engine.
-2. `stellar-agent profile rotate-nonce-key <name>`: mint the nonce key before
+1. `stellar-agent profile rotate-audit-key <name>`: mint the audit key before
+   the first key-writing command so its audit row is written.
+2. [Enroll the MCP signer](#enroll-the-mcp-signer): register the signer seed.
+3. `stellar-agent profile rotate-nonce-key <name>`: mint the nonce key before
    MCP payment simulation. Without it, simulation fails with `nonce.mint_failed`.
-3. `profile enroll-owner-key`, then `profile rotate-attestation-key`: enroll
+4. `profile enroll-owner-key`, then `profile rotate-attestation-key`: enroll
    the policy owner and mint the approval key.
-4. [Create the V1 policy file](#create-the-v1-policy-file), then run
+5. [Create the V1 policy file](#create-the-v1-policy-file), then run
    `profile sign-policy`.
-5. [Enroll the MCP signer](#enroll-the-mcp-signer) before signing transactions.
 
 An `init`-minted profile already carries `engine = "v1"`. This setup supplies
 its policy and key prerequisites. A profile migrated from schema v1 stays

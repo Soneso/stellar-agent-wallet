@@ -32,9 +32,10 @@
 //! `audit.chain_key_unavailable` until `stellar-agent profile rotate-audit-key
 //! <name>` mints the key — this applies to the `noop` engine exactly as it
 //! does to `v1`, since the audit pre-flight is independent of the policy
-//! engine. `next_steps` names `rotate-audit-key` in the ALWAYS list (right
-//! after `enroll-signer`) for both engines, followed by `rotate-nonce-key`,
-//! which MCP payment simulation requires.
+//! engine. On both engines, `next_steps` lists `rotate-audit-key` first,
+//! then `enroll-signer`, then `rotate-nonce-key` for MCP payment simulation.
+//! The audit key must exist before the first key-writing command so its
+//! `keyring_key_written` audit row is written.
 //!
 //! # Engine default
 //!
@@ -91,8 +92,8 @@
 //!     "rpc_url": "https://soroban-testnet.stellar.org",
 //!     "engine": "v1",
 //!     "next_steps": [
-//!       "Run `stellar-agent profile enroll-signer --profile default --secret-env <VAR>` to register the MCP signer seed.",
 //!       "Run `stellar-agent profile rotate-audit-key default` to mint the audit-log hash-chain key (required before any signing verb will proceed).",
+//!       "Run `stellar-agent profile enroll-signer --profile default --secret-env <VAR>` to register the MCP signer seed.",
 //!       "Run `stellar-agent profile rotate-nonce-key default` to mint the commit-nonce key (required before MCP payment simulation).",
 //!       "Run `stellar-agent profile enroll-owner-key --profile default --secret-env <VAR>` to enroll the policy-file owner key.",
 //!       "Run `stellar-agent profile rotate-attestation-key default` to mint the approval-attestation key.",
@@ -377,9 +378,10 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
 /// The enrollment guidance `init` prints for a new profile, in the order the
 /// steps must run.
 ///
-/// Both engines list `enroll-signer`, then `rotate-audit-key`, because signing
-/// requires the profile's audit key: `init` writes the keyring coordinate and
-/// rotation mints the key material. `rotate-nonce-key` follows, because MCP
+/// Both engines list `rotate-audit-key`, then `enroll-signer`. The audit key
+/// must exist before the first key-writing command so its audit row is written.
+/// `init` writes the keyring coordinate; rotation mints the key material.
+/// `rotate-nonce-key` follows, because MCP
 /// payment simulation requires the commit-nonce key. The V1 list then names
 /// owner enrollment, attestation key rotation, the policy file `sign-policy`
 /// reads, and policy signing, in that order. A mainnet V1 profile adds the
@@ -387,12 +389,12 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
 fn next_steps(profile_name: &str, engine: PolicyEngineKind, network: TargetNetwork) -> Vec<String> {
     let mut steps = vec![
         format!(
-            "Run `stellar-agent profile enroll-signer --profile {profile_name} --secret-env \
-             <VAR>` to register the MCP signer seed."
-        ),
-        format!(
             "Run `stellar-agent profile rotate-audit-key {profile_name}` to mint the audit-log \
              hash-chain key (required before any signing verb will proceed)."
+        ),
+        format!(
+            "Run `stellar-agent profile enroll-signer --profile {profile_name} --secret-env \
+             <VAR>` to register the MCP signer seed."
         ),
         format!(
             "Run `stellar-agent profile rotate-nonce-key {profile_name}` to mint the \
@@ -925,16 +927,16 @@ mod tests {
         }
     }
 
-    /// A `noop` profile lists the signer, the audit key, and the commit-nonce
+    /// A `noop` profile lists the audit key, the signer, and the commit-nonce
     /// key, in that order, and nothing of the V1 setup.
     #[test]
-    fn next_steps_for_noop_list_signer_audit_and_nonce_keys() {
+    fn next_steps_for_noop_list_audit_signer_and_nonce_keys() {
         let steps = next_steps("alpha", PolicyEngineKind::Noop, TargetNetwork::Testnet);
         assert_steps_in_order(
             &steps,
             &[
-                "profile enroll-signer --profile alpha ",
                 "profile rotate-audit-key alpha`",
+                "profile enroll-signer --profile alpha ",
                 "profile rotate-nonce-key alpha`",
             ],
         );
@@ -949,8 +951,8 @@ mod tests {
         assert_steps_in_order(
             &steps,
             &[
-                "profile enroll-signer --profile alpha ",
                 "profile rotate-audit-key alpha`",
+                "profile enroll-signer --profile alpha ",
                 "profile rotate-nonce-key alpha`",
                 "profile enroll-owner-key --profile alpha ",
                 "profile rotate-attestation-key alpha`",
