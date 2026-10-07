@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.11] - 2026-10-07
+
+A security fix for MCP policy evaluation with chain-bound rules, and the fixes from the alpha.10 release tests on macOS and Windows.
+
 ### Security
 
 - In `0.1.0-alpha.1` through `0.1.0-alpha.10`, the MCP server and the CLI
@@ -2684,7 +2688,8 @@ policy engine, operator-approval spine, and tamper-evident audit log.
 - An agent integration guide (`docs/agents.md`) and capability-isolation example
   toolsets under `examples/toolsets/`.
 
-[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.10...HEAD
+[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.11...HEAD
+[0.1.0-alpha.11]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.10...v0.1.0-alpha.11
 [0.1.0-alpha.10]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.9...v0.1.0-alpha.10
 [0.1.0-alpha.9]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.8...v0.1.0-alpha.9
 [0.1.0-alpha.8]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.7...v0.1.0-alpha.8
