@@ -147,7 +147,22 @@ The store is a per-profile TOML file holding a flat list of pending entries:
 - Writes are atomic (write-to-temp then rename, with a parent-directory fsync) and the file is created with owner-only permissions.
 - Nonces are validated on load; malformed nonces are rejected. The store has a hard cap on the number of pending entries (expired entries are pruned first) and a default entry TTL of 24 hours.
 
-Entries are kinded. The kinds are `PaymentSimulated`, `ClaimSimulated`, `SignWithPasskey`, `RegisterPasskey`, `ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`, and `RuleProposalSimulated`.
+Entries are kinded. The kinds are `PaymentSimulated`, `TrustlineSimulated`,
+`ClaimSimulated`, `SignWithPasskey`, `RegisterPasskey`, `ToolsetFirstInvokeGate`,
+`TrustlineClawbackOptIn`, `RuleProposalSimulated`, `MppChargeSimulated`, `Rejected`,
+and `Consumed`.
+
+Trustline approvals name the holder, asset code, full issuer, and limit.
+An absent limit means unlimited; zero means removal.
+The MCP commit gate accepts only the approval kind of its tool.
+
+Processes sharing an approval store upgrade together.
+An older binary rejects the whole approval file when it contains a
+`trustline_simulated` entry, including unrelated entries.
+Expiry alone does not make that file loadable by an older binary.
+Trustline approvals minted before the upgrade remain flat payment entries.
+The trustline commit gate returns `policy.approval_required` for them;
+simulate and approve again to create a trustline approval.
 
 ### What `approve` does
 

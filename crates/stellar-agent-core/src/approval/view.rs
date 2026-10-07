@@ -49,8 +49,9 @@ pub struct PendingApprovalView {
     pub expired: bool,
 
     /// `true` if the entry already carries a recorded operator consent: an
-    /// HMAC attestation (`PaymentSimulated` / `ClaimSimulated` /
-    /// `TrustlineClawbackOptIn`) or a WebAuthn result (`SignWithPasskey` /
+    /// HMAC attestation (`PaymentSimulated` / `ClaimSimulated` / `TrustlineSimulated` /
+    /// `TrustlineClawbackOptIn` / `RuleProposalSimulated` / `MppChargeSimulated`)
+    /// or a WebAuthn result (`SignWithPasskey` /
     /// `RegisterPasskey`).
     ///
     /// Always `false` for `ToolsetFirstInvokeGate` (approval consumes the
@@ -69,13 +70,13 @@ pub struct PendingApprovalView {
 /// every field here is either public on-chain data or already redacted.
 ///
 /// Serialises as a JSON object tagged with a `"kind"` discriminator
-/// (`"payment"`, `"claim"`, `"sign_with_passkey"`, `"register_passkey"`,
+/// (`"payment"`, `"trustline"`, `"claim"`, `"sign_with_passkey"`, `"register_passkey"`,
 /// `"toolset_first_invoke_gate"`, `"trustline_clawback_opt_in"`,
 /// `"rule_proposal"`, `"rejected"`), the same tagging convention as
 /// `stellar_agent_stablecoin::preview::GateDecisionView`.
 ///
 /// Every value-denominated field (`amount_stroops`, `fee_stroops`,
-/// `amount_min_stroops`, `amount_max_stroops`) is encoded as a decimal
+/// `limit_stroops`, `amount_min_stroops`, `amount_max_stroops`) is encoded as a decimal
 /// string via [`crate::wire_stroops`]: a JSON number backed by `f64` cannot
 /// represent an `i64`/`u32` stroop amount exactly once it exceeds `2^53`.
 /// `seq_num` and rule id lists are counts/ids, not value-denominated, and
@@ -101,6 +102,26 @@ pub enum ApprovalSummaryView {
         /// Optional memo text.
         memo: Option<String>,
         /// Simulated transaction fee in stroops, decimal-string encoded.
+        #[serde(with = "crate::wire_stroops::u32")]
+        fee_stroops: u32,
+        /// Simulated sequence number.
+        seq_num: i64,
+    },
+
+    /// [`ApprovalKind::TrustlineSimulated`] summary fields.
+    Trustline {
+        /// Effective source decoded from the envelope.
+        source: Option<String>,
+        /// Full trustline holder G-strkey.
+        holder: String,
+        /// Asset code.
+        asset_code: String,
+        /// Full issuer G-strkey the operator consents to trust.
+        asset_issuer: String,
+        /// Exact limit in stroops; `None` means unlimited.
+        #[serde(with = "crate::wire_stroops::i64_opt")]
+        limit_stroops: Option<i64>,
+        /// Exact simulated fee in stroops.
         #[serde(with = "crate::wire_stroops::u32")]
         fee_stroops: u32,
         /// Simulated sequence number.
@@ -167,7 +188,7 @@ pub enum ApprovalSummaryView {
 
     /// [`ApprovalKind::TrustlineClawbackOptIn`] summary fields.
     TrustlineClawbackOptIn {
-        /// Network passphrase.
+        /// CAIP-2 chain id.
         network: String,
         /// Asset code.
         code: String,
@@ -250,12 +271,23 @@ pub enum ApprovalSummaryView {
     },
 }
 
+/// Formats a trustline limit for wallet-controlled approval surfaces.
+#[must_use]
+pub fn format_trustline_limit(limit_stroops: Option<i64>) -> String {
+    match limit_stroops {
+        None => "unlimited".to_owned(),
+        Some(0) => "0 stroops (removes the trustline)".to_owned(),
+        Some(n) => format!("{n} stroops"),
+    }
+}
+
 impl PendingApprovalView {
     /// Builds a redacted view from a stored entry.
     pub(super) fn from_entry(entry: &PendingApproval, now_unix_ms: u64) -> Self {
         let attested = match &entry.kind {
             ApprovalKind::PaymentSimulated { .. }
             | ApprovalKind::ClaimSimulated { .. }
+            | ApprovalKind::TrustlineSimulated { .. }
             | ApprovalKind::TrustlineClawbackOptIn { .. }
             | ApprovalKind::RuleProposalSimulated { .. }
             | ApprovalKind::MppChargeSimulated { .. } => entry.attestation_blob_b64.is_some(),
@@ -284,6 +316,24 @@ impl PendingApprovalView {
                 amount_stroops: *summary_amount_stroops,
                 asset: summary_asset.clone(),
                 memo: summary_memo.clone(),
+                fee_stroops: *summary_simulated_fee_stroops,
+                seq_num: *summary_simulated_seq_num,
+            },
+            ApprovalKind::TrustlineSimulated {
+                envelope_xdr_b64,
+                summary_holder,
+                summary_asset_code,
+                summary_asset_issuer,
+                summary_limit_stroops,
+                summary_simulated_fee_stroops,
+                summary_simulated_seq_num,
+                ..
+            } => ApprovalSummaryView::Trustline {
+                source: crate::envelope_decode::envelope_source_account(envelope_xdr_b64).ok(),
+                holder: summary_holder.clone(),
+                asset_code: summary_asset_code.clone(),
+                asset_issuer: summary_asset_issuer.clone(),
+                limit_stroops: *summary_limit_stroops,
                 fee_stroops: *summary_simulated_fee_stroops,
                 seq_num: *summary_simulated_seq_num,
             },
@@ -427,6 +477,13 @@ mod tests {
         clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
+
+    // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
+    const CHANGE_TRUST_ENVELOPE: &str = concat!(
+        "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
+        "AAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAGAAAAAVVT",
+        "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
+    );
 
     use super::super::store::{DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore};
     use super::super::user_id::process_uid_for_attestation;
@@ -938,5 +995,62 @@ mod tests {
         assert!(!json.contains(payer));
         assert!(!json.contains(&["11"; 32].concat()));
         assert!(!json.contains(&["22"; 32].concat()));
+    }
+
+    fn trustline_entry(limit: Option<i64>) -> PendingApproval {
+        PendingApproval::new_trustline_pending(
+            CHANGE_TRUST_ENVELOPE.to_owned(),
+            CHANGE_TRUST_ENVELOPE.as_bytes(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "USDC".to_owned(),
+            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+            limit,
+            100,
+            42,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn snapshot_renders_trustline_simulated() {
+        for limit in [None, Some(0), Some(i64::MAX)] {
+            let mut entry = trustline_entry(limit);
+            entry.attestation_blob_b64 = Some("blob".to_owned());
+            let view = PendingApprovalView::from_entry(&entry, TEST_NOW_MS);
+            assert!(view.attested);
+            assert_eq!(view.kind_name, "TrustlineSimulated");
+            let json = serde_json::to_value(view).unwrap();
+            assert_eq!(json["summary"]["kind"], "trustline");
+            assert_eq!(
+                json["summary"]["holder"],
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            );
+            assert_eq!(
+                json["summary"]["asset_issuer"],
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+            );
+            assert_eq!(json["summary"]["asset_code"], "USDC");
+            assert_eq!(
+                json["summary"]["limit_stroops"],
+                serde_json::json!(limit.map(|n| n.to_string()))
+            );
+            assert_eq!(json["summary"]["fee_stroops"], "100");
+            assert_eq!(json["summary"]["seq_num"], 42);
+        }
+    }
+
+    #[test]
+    fn trustline_snapshot_decodes_source() {
+        let view = PendingApprovalView::from_entry(&trustline_entry(None), TEST_NOW_MS);
+        let ApprovalSummaryView::Trustline { source, holder, .. } = view.summary else {
+            panic!("trustline")
+        };
+        assert_eq!(
+            source.as_deref(),
+            Some("GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA")
+        );
+        assert_ne!(source.as_ref(), Some(&holder));
     }
 }

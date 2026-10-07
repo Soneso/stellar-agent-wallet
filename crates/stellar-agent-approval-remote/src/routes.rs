@@ -181,14 +181,14 @@ fn require_csrf(session: &SessionState, headers: &HeaderMap, nonce: &str) -> Res
 /// Derives the server-side envelope-hash input to the per-action challenge
 /// for `entry`, per [`ApprovalKind`].
 ///
-/// `PaymentSimulated` / `ClaimSimulated` entries carry a real envelope
-/// SHA-256. MPP and rule-proposal entries carry their own content digests.
+/// `PaymentSimulated`, `ClaimSimulated`, and `TrustlineSimulated` entries carry
+/// a real envelope SHA-256. MPP and rule-proposal entries carry their own content digests.
 /// `RuleProposalSimulated` has no envelope but carries its own
 /// domain-separated `proposal_sha256` digest over the resolved rule
 /// definition — using it here (rather than falling back to the zero
 /// placeholder) binds the per-action challenge to the EXACT rule the
 /// operator reviewed, the same strengthening `envelope_sha256_hex` gives
-/// `PaymentSimulated` / `ClaimSimulated`. Other attestable kinds
+/// payments, claims, and trustlines. Other attestable kinds
 /// (`ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`) have no such digest,
 /// and use a fixed all-zero 32-byte placeholder — the challenge's binding for
 /// those kinds rests on `approval_nonce` (unique per entry) rather than a
@@ -198,6 +198,10 @@ fn require_csrf(session: &SessionState, headers: &HeaderMap, nonce: &str) -> Res
 fn entry_envelope_sha256(entry: &PendingApproval) -> [u8; 32] {
     match &entry.kind {
         ApprovalKind::PaymentSimulated {
+            envelope_sha256_hex,
+            ..
+        }
+        | ApprovalKind::TrustlineSimulated {
             envelope_sha256_hex,
             ..
         }
@@ -832,6 +836,13 @@ mod tests {
         clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
+
+    // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
+    const CHANGE_TRUST_ENVELOPE: &str = concat!(
+        "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
+        "AAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAGAAAAAVVT",
+        "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
+    );
 
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -2357,5 +2368,27 @@ mod tests {
                 assert!(html.contains(value), "missing {value}: {html}");
             }
         });
+    }
+
+    #[test]
+    fn remote_trustline_challenge_uses_envelope_digest() {
+        let limit = None;
+        let entry = PendingApproval::new_trustline_pending(
+            CHANGE_TRUST_ENVELOPE.to_owned(),
+            CHANGE_TRUST_ENVELOPE.as_bytes(),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "USDC".to_owned(),
+            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+            limit,
+            100,
+            42,
+            "1000".to_owned(),
+            stellar_agent_core::approval::DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let expected =
+            stellar_agent_core::approval::envelope_sha256(CHANGE_TRUST_ENVELOPE.as_bytes());
+        assert_ne!(expected, [0; 32]);
+        assert_eq!(entry_envelope_sha256(&entry), expected);
     }
 }

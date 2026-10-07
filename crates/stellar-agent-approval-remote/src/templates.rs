@@ -83,6 +83,7 @@ fn kind_is_approvable(summary: &ApprovalSummaryView) -> bool {
         summary,
         ApprovalSummaryView::Payment { .. }
             | ApprovalSummaryView::Claim { .. }
+            | ApprovalSummaryView::Trustline { .. }
             | ApprovalSummaryView::ToolsetFirstInvokeGate { .. }
             | ApprovalSummaryView::TrustlineClawbackOptIn { .. }
             | ApprovalSummaryView::RuleProposal { .. }
@@ -488,6 +489,13 @@ mod tests {
         clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
+    // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
+    const CHANGE_TRUST_ENVELOPE: &str = concat!(
+        "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
+        "AAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAGAAAAAVVT",
+        "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
+    );
+
     use super::*;
     use stellar_agent_core::approval::{
         DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, process_uid_for_attestation,
@@ -1297,7 +1305,8 @@ mod tests {
         // A store file holds one entry per fixture, so each fixture gets its
         // own directory rather than reading back the first entry written.
         type Fixture = fn(&TempDir) -> PendingApprovalView;
-        let fixtures: [(Fixture, &str, bool); 9] = [
+        let fixtures: [(Fixture, &str, bool); 10] = [
+            (trustline_view, "TRUSTLINE", false),
             (claim_view, "CLAIM", false),
             (mpp_charge_view, "CHARGE", false),
             (sign_with_passkey_view, "PASSKEY", true),
@@ -1485,5 +1494,67 @@ mod tests {
         let view = payment_view(&dir, false, NOW_MS);
         let html = render_detail_page(&view, &test_context(), "csrf", None, &neutral());
         assert!(html.contains("<dt>Source</dt><dd>(undecodable envelope)</dd>"));
+    }
+
+    fn trustline_view(dir: &TempDir) -> PendingApprovalView {
+        let mut store = PendingApprovalStore::open(dir.path().join("trustline.toml")).unwrap();
+        let limit = Some(123456789);
+        store
+            .insert(
+                PendingApproval::new_trustline_pending(
+                    CHANGE_TRUST_ENVELOPE.to_owned(),
+                    CHANGE_TRUST_ENVELOPE.as_bytes(),
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                    "USDC".to_owned(),
+                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+                    limit,
+                    100,
+                    42,
+                    "1000".to_owned(),
+                    DEFAULT_TTL_MS,
+                )
+                .unwrap(),
+                NOW_MS,
+            )
+            .unwrap();
+        store.snapshot(NOW_MS).remove(0)
+    }
+
+    #[test]
+    fn trustline_detail_page_is_approvable_until_resolved() {
+        let dir = TempDir::new().unwrap();
+        let mut view = trustline_view(&dir);
+        for (limit, shown) in [
+            (None, "unlimited"),
+            (Some(0), "0 stroops (removes the trustline)"),
+            (Some(9_007_199_254_740_993), "9007199254740993 stroops"),
+        ] {
+            if let ApprovalSummaryView::Trustline { limit_stroops, .. } = &mut view.summary {
+                *limit_stroops = limit;
+            }
+            let html =
+                render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+            for text in [
+                "TRUSTLINE",
+                ">Approve trustline</button>",
+                "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                shown,
+                "Source",
+                "<dt>Simulated fee (stroops)</dt><dd>100</dd>",
+                "<dt>Simulated seq num</dt><dd>42</dd>",
+                "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA",
+            ] {
+                assert!(html.contains(text), "missing {text}: {html}");
+            }
+            assert!(!html.contains(">Approve payment</button>"));
+        }
+        view.attested = true;
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        assert!(!html.contains(">Approve trustline</button>"));
+        view.attested = false;
+        view.expired = true;
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        assert!(!html.contains(">Approve trustline</button>"));
     }
 }

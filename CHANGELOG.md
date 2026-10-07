@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The `TrustlineSimulated` approval kind names a trustline change and its limit.
+
 ### Changed
 
 - The two-argument `map_keyring_error` and `classify_keyring_error` functions
@@ -21,7 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependents. Contribution guides start local verification with preflight and
   use CI for the offline workspace suite.
 - The building guide documents disk use, debugging overrides, and opt-in cleanup.
-
+- Trustline approvals are stored, rendered, listed, and audited as trustline changes.
+  The MCP commit gate accepts only the approval kind of its tool.
+- An approval file with a `trustline_simulated` entry needs this version or later.
+  Processes sharing a store upgrade together.
+  Older binaries reject the whole file, including unrelated entries; expiry alone does not restore compatibility.
+- Trustline approvals from an earlier version answer `policy.approval_required`.
+  Simulate and approve again.
 - The three log lines of the CLI's shared value audit writer acquisition end in
   `refusing`, which fits the callers that neither sign nor submit. Two tests pin
   the Enforce binding check at the `approve` site and at the value audit
@@ -37,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `headless-dpapi` names a failed `CryptProtectData` operation and its numeric
   Windows code when available, with guidance for master-key access failures.
 - `profile enroll-signer` refuses an unset secret without touching the profile.
+- The approval prompt, `approve list`, and both inboxes name the trustline,
+  account, asset, and limit.
 
 ## [0.1.0-alpha.11] - 2026-10-07
 

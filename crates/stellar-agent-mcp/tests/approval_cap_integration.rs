@@ -818,6 +818,19 @@ async fn approved_trustline_preserves_non_debit_audit_leg() {
             .unwrap(),
     );
     assert_eq!(sim["ok"], true, "{sim}");
+    {
+        let store =
+            PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
+                .unwrap();
+        let nonce = sim["data"]["approval"]["approval_nonce"].as_str().unwrap();
+        assert!(matches!(
+            store.get(nonce).unwrap().kind,
+            stellar_agent_core::approval::ApprovalKind::TrustlineSimulated {
+                summary_limit_stroops: Some(1_000_000_000),
+                ..
+            }
+        ));
+    }
     let (nonce, attestation) = h.attest(&sim["data"]);
     for field in ["nonce", "expires_at_unix_ms", "envelope_xdr"] {
         args[field] = sim["data"][field].clone();
@@ -1179,4 +1192,117 @@ async fn profile_chain_payment_accounting_persists_cap() {
         "{second}"
     );
     assert_eq!(h.sends.lock().expect("sends").len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_simulate_persists_each_limit() {
+    use stellar_agent_core::approval::ApprovalKind;
+    for (limit, expected_limit) in [
+        (None, None),
+        (Some(0), Some(0)),
+        (Some(1_000_000_000_i64), Some(1_000_000_000)),
+        (Some(i64::MAX), None),
+    ] {
+        let h = Harness::new(
+            "trustline-limit-record",
+            "require_approval",
+            Outcome::Success,
+        )
+        .await;
+        let mut args = json!({"chain_id":"stellar:testnet", "from":h.source, "asset":"USDC"});
+        if let Some(limit) = limit {
+            args["limit_stroops"] = json!(limit.to_string());
+        }
+        let sim = result_json(
+            &h.server
+                .call_stellar_trustline(serde_json::from_value(args).unwrap())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(sim["ok"], true, "{sim}");
+        let nonce = sim["data"]["approval"]["approval_nonce"].as_str().unwrap();
+        let store =
+            PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
+                .unwrap();
+        let ApprovalKind::TrustlineSimulated {
+            summary_holder,
+            summary_asset_code,
+            summary_asset_issuer,
+            summary_limit_stroops,
+            envelope_sha256_hex,
+            ..
+        } = &store.get(nonce).unwrap().kind
+        else {
+            panic!("trustline record")
+        };
+        assert_eq!(summary_holder, &h.source);
+        assert_eq!(summary_asset_code, "USDC");
+        assert_eq!(summary_asset_issuer, USDC_ISSUER);
+        assert_eq!(*summary_limit_stroops, expected_limit);
+        assert_eq!(
+            envelope_sha256_hex,
+            &hex::encode(envelope_sha256(
+                sim["data"]["envelope_xdr"].as_str().unwrap().as_bytes()
+            ))
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_commit_refuses_payment_approval_for_same_envelope() {
+    use stellar_agent_core::approval::{DEFAULT_TTL_MS, PendingApproval};
+    let h = Harness::new(
+        "trustline-payment-refusal",
+        "require_approval",
+        Outcome::Success,
+    )
+    .await;
+    let mut args = json!({"chain_id":"stellar:testnet", "from":h.source, "asset":"USDC", "limit_stroops":"1000000000"});
+    let sim = result_json(
+        &h.server
+            .call_stellar_trustline(serde_json::from_value(args.clone()).unwrap())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(sim["ok"], true, "{sim}");
+    let envelope = sim["data"]["envelope_xdr"].as_str().unwrap();
+    let entry = PendingApproval::new_payment_pending(
+        envelope.to_owned(),
+        envelope.as_bytes(),
+        h.source.clone(),
+        1_000_000_000,
+        format!("USDC:{USDC_ISSUER}"),
+        None,
+        100,
+        1,
+        process_uid_for_attestation().unwrap(),
+        DEFAULT_TTL_MS,
+    )
+    .unwrap();
+    let nonce = entry.approval_nonce.clone();
+    {
+        let mut store =
+            PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
+                .unwrap();
+        store.insert(entry, now_unix_ms().unwrap()).unwrap();
+    }
+    let (nonce, blob) = h.attest_nonce(&nonce, envelope);
+    for field in ["nonce", "expires_at_unix_ms", "envelope_xdr"] {
+        args[field] = sim["data"][field].clone();
+    }
+    args["approval_nonce"] = json!(nonce);
+    args["approval_attestation"] = json!(blob);
+    let result = result_json(
+        &h.server
+            .call_stellar_trustline_commit(serde_json::from_value(args).unwrap())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        result["error"]["code"], "policy.approval_required",
+        "{result}"
+    );
+    assert!(h.sends.lock().unwrap().is_empty());
 }

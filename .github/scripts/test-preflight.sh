@@ -49,9 +49,9 @@ REAL_PYTHON=$(python3 -c 'import sys; print(sys.executable)')
 FIXTURE="$TMP/fixture"
 
 CASES="docs-only install-surface-doc deleted-install-surface-doc welcome-workflow ci-yml-only
-python-check-script shell-check-script skill one-crate two-owners target-specific-edge
-dev-dependency-edge root-manifest lockfile toolchain unowned-rust-path wallet-manifest
-removed-member untracked-test-file fixture-markdown
+python-check-script shell-check-script skill inbox-web one-crate two-owners
+target-specific-edge dev-dependency-edge root-manifest lockfile toolchain unowned-rust-path
+wallet-manifest removed-member untracked-test-file fixture-markdown
 committed-cross-scope-rename staged-rename-record spaces-and-an-apostrophe
 full vendored contracts action-script invariants-helper duplicate-triggers changed-self-test
 deleted-shell-script deleted-self-test unavailable-tool
@@ -109,6 +109,7 @@ machete	cargo machete
 deny	cargo deny check
 coverage	cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov.json
 coverage-floors	python3 .github/scripts/check-coverage.py cov.json
+inbox-js	node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs
 interop:mpp	.github/scripts/test-mpp-interop.sh
 interop:sdk-v17	.github/scripts/test-sdk-v17-interop.sh
 EOF
@@ -922,6 +923,15 @@ case_skill() {
   expect_list "${ALWAYS[@]}" self-test:test-check-install-surface.py package-skill
 }
 
+case_inbox_web() {
+  start_case
+  mkdir -p crates/stellar-agent-approval-ui/src/web
+  edit crates/stellar-agent-approval-ui/src/web/app_shared.js
+  pin_packages "stellar-agent-approval-ui stellar-agent-approval-remote stellar-agent-cli stellar-agent-mcp" test-helpers \
+    crates/stellar-agent-approval-ui/src/web/app_shared.js
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" inbox-js
+}
+
 # The MCP manifest inherits stellar-agent-sep7 from [workspace.dependencies].
 case_one_crate() {
   start_case
@@ -1081,8 +1091,8 @@ case_full() {
   start_case
   edit CONTRIBUTING.md
   read -r -a ids <<<"$(printf '%s\n' "$EXPECTED_REGISTRY" | awk -F '\t' '{ printf "%s ", $1 }')"
-  if [ "${#ids[@]}" -ne 38 ]; then
-    fail "the expected registry holds ${#ids[@]} rows, expected 38"
+  if [ "${#ids[@]}" -ne 39 ]; then
+    fail "the expected registry holds ${#ids[@]} rows, expected 39"
   fi
   expect_list --full "${ids[@]}"
 }

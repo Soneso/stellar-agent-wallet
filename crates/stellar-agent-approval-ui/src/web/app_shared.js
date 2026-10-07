@@ -198,6 +198,7 @@ var stellarAgentApproval = (function () {
 
   var KIND_LABELS = {
     payment: "PAYMENT",
+    trustline: "TRUSTLINE",
     claim: "CLAIM",
     mpp_charge: "CHARGE",
     rule_proposal: "RULE PROPOSAL",
@@ -223,11 +224,13 @@ var stellarAgentApproval = (function () {
     return String(view.kind_name || "approval").toUpperCase();
   }
 
-  // The row's headline: what this request is, in one line. Total over the nine
+  // The row's headline: what this request is, in one line. Total over the ten
   // kinds, with a plain fallback for a kind this build does not know.
   function headlineText(view) {
     var s = view.summary || {};
     switch (s.kind) {
+      case "trustline":
+        return "Trustline " + s.asset_code + ":" + s.asset_issuer;
       case "payment":
       case "claim":
         return amountText(s.amount_stroops, s.asset) || kindLabel(view);
@@ -258,6 +261,11 @@ var stellarAgentApproval = (function () {
   function metaText(view) {
     var s = view.summary || {};
     switch (s.kind) {
+      case "trustline":
+        var limit = s.limit_stroops == null ? "unlimited"
+          : s.limit_stroops === "0" ? "0 stroops (remove)"
+          : s.limit_stroops + " stroops";
+        return "limit " + limit + " for " + s.holder;
       case "payment":
         return "to " + s.to;
       case "claim":
@@ -476,3 +484,8 @@ var stellarAgentApproval = (function () {
     setPageState: setPageState,
   };
 })();
+
+// Node loads the same renderers that both browser inboxes ship.
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = stellarAgentApproval;
+}

@@ -5,11 +5,11 @@
 //! stdout — stdout is reserved for the single terminal JSON envelope), reads
 //! y/n from stdin, and on approval:
 //!
-//! - For `PaymentSimulated`: computes the HMAC-SHA256 attestation blob and
+//! - For `PaymentSimulated`, `ClaimSimulated`, `TrustlineSimulated`, and
+//!   `MppChargeSimulated`: computes the HMAC-SHA256 attestation blob and
 //!   persists it via `PendingApprovalStore::record_attestation`.
 //! - For `ToolsetFirstInvokeGate`: builds a `ToolsetGrant`, persists it to the
 //!   grant store, and CONSUMES (removes) the pending entry.
-//!   Does NOT call `record_attestation` — that function is `PaymentSimulated`-only.
 //!
 //! # Security properties
 //!
@@ -65,6 +65,7 @@ use clap::Args;
 use serde::Serialize;
 
 use stellar_agent_core::amount::StellarAmount;
+use stellar_agent_core::approval::view::format_trustline_limit;
 use stellar_agent_core::approval::{
     ApprovalKind, ApproverIdentity, ConsentAudit, ContextRuleProposalSnapshot,
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApproval, PendingApprovalStore,
@@ -608,8 +609,8 @@ fn render_rule_proposal_definition(definition: &ContextRuleProposalSnapshot) -> 
 /// unit-testable against an in-memory sink.
 ///
 /// Every kind opens with the context's profile, network, endpoint, and signer rows.
-/// Payments and claims add the envelope's effective source; claims show a stored
-/// summary source when it differs. Passkey signing entries show the redacted
+/// Payments, claims, and trustlines add the envelope's effective source.
+/// Claims show a stored summary source when it differs. Passkey signing entries show the redacted
 /// smart-account address and rule IDs.
 fn write_summary(
     entry: &PendingApproval,
@@ -629,6 +630,9 @@ fn write_summary(
     )?;
     match &entry.kind {
         ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64, ..
+        }
+        | ApprovalKind::TrustlineSimulated {
             envelope_xdr_b64, ..
         }
         | ApprovalKind::ClaimSimulated {
@@ -695,6 +699,31 @@ fn write_summary(
                 memo = memo,
                 fee = summary_simulated_fee_stroops,
                 seq = summary_simulated_seq_num,
+            )
+        }
+        ApprovalKind::TrustlineSimulated {
+            summary_holder,
+            summary_asset_code,
+            summary_asset_issuer,
+            summary_limit_stroops,
+            summary_simulated_fee_stroops,
+            summary_simulated_seq_num,
+            ..
+        } => {
+            let mut limit = format_trustline_limit(*summary_limit_stroops);
+            if let Some(n) = summary_limit_stroops.filter(|n| *n != 0) {
+                limit.push_str(&format!(
+                    " ({} {summary_asset_code})",
+                    StellarAmount::from_stroops(n).as_xlm_decimal_string()
+                ));
+            }
+            format!(
+                "  Kind:              trustline change (ChangeTrust)\n  \
+                 Account:           {summary_holder}\n  \
+                 Asset:             {summary_asset_code}:{summary_asset_issuer}\n  \
+                 Limit:             {limit}\n  \
+                 Simulated fee:     {summary_simulated_fee_stroops} stroops\n  \
+                 Simulated seq num: {summary_simulated_seq_num}"
             )
         }
         ApprovalKind::SignWithPasskey {
@@ -911,6 +940,13 @@ mod tests {
         clippy::expect_used,
         reason = "test-only; panics acceptable in unit tests"
     )]
+
+    // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
+    const CHANGE_TRUST_ENVELOPE: &str = concat!(
+        "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
+        "AAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAGAAAAAVVT",
+        "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
+    );
 
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -2158,5 +2194,56 @@ mod tests {
         let reread = PendingApprovalStore::open(dir.path().join("approvals.toml")).unwrap();
         assert_nothing_persisted(&reread, &entry.approval_nonce);
         assert_eq!(inspect_outbox(&profile.audit_log_path).unwrap().pending, 0);
+    }
+
+    #[test]
+    fn write_summary_trustline_writes_block_to_sink() {
+        for (limit, shown) in [
+            (None, "unlimited"),
+            (Some(0), "0 stroops (removes the trustline)"),
+            (Some(123456789), "123456789 stroops (12.3456789 USDC)"),
+        ] {
+            let entry = PendingApproval::new_trustline_pending(
+                CHANGE_TRUST_ENVELOPE.to_owned(),
+                CHANGE_TRUST_ENVELOPE.as_bytes(),
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                "USDC".to_owned(),
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+                limit,
+                100,
+                42,
+                "1000".to_owned(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap();
+            let mut sink = Vec::new();
+            write_summary(&entry, &test_context(), &mut sink).unwrap();
+            let text = String::from_utf8(sink).unwrap();
+            for row in [
+                format!(
+                    "  Source:            {}",
+                    "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA"
+                ),
+                "  Kind:              trustline change (ChangeTrust)".to_owned(),
+                format!(
+                    "  Account:           {}",
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                ),
+                format!(
+                    "  Asset:             {}",
+                    "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+                ),
+                format!("  Limit:             {shown}"),
+                "  Simulated fee:     100 stroops".to_owned(),
+                "  Simulated seq num: 42".to_owned(),
+            ] {
+                assert!(
+                    text.lines().any(|line| line == row),
+                    "missing {row}: {text}"
+                );
+            }
+            assert!(!text.contains("To:"));
+            assert!(!text.contains("Amount:"));
+        }
     }
 }

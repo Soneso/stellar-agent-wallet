@@ -197,9 +197,9 @@ not recognized until you do.
 2. Click it and complete the passkey prompt your platform shows (Touch ID,
    Windows Hello, or a security key), same as any other passkey sign-in.
 3. You land on the inbox: the pending approvals list, updating automatically.
-4. Click an entry to see its detail page: the wallet-decoded summary
-   (destination, amount, asset, fee) the server itself parked, never the
-   agent's description of it.
+4. Click an entry to see the wallet-decoded summary of the parked action:
+   payment, claim, or trustline. A trustline names the full holder and issuer,
+   asset code, and limit.
 5. Click Approve or Reject. Each one prompts a FRESH passkey assertion.
    The browser calls out to your authenticator again, over a challenge bound
    to that exact entry, before the decision is applied. This is by design:

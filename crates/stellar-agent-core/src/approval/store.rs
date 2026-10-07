@@ -430,11 +430,9 @@ pub enum ApprovalKind {
 
     /// A trustline clawback opt-in record awaiting wallet-owner confirmation.
     ///
-    /// Queued by the `stellar_trustline_commit` path when the issuer has
-    /// `auth_clawback_enabled` set and the operator has explicitly opted in to
-    /// the clawback risk for this asset on this network.  Once the operator
-    /// confirms via the approval flow, the approval record is consumed and the
-    /// `ChangeTrust` envelope proceeds to submission.
+    /// Minted by `stellar_trustline` simulate and the CLI `trustline` command.
+    /// The next simulate verifies the consent to clawback risk for this asset.
+    /// Commit does not consume this opt-in record.
     ///
     /// Security: the `network`, `code`, and `issuer` fields are validated at
     /// construction time.  `issuer` is a canonical G-strkey; it is redacted to
@@ -452,6 +450,26 @@ pub enum ApprovalKind {
         ///
         /// Displayed redacted (first-5-last-5) in the Debug impl.
         issuer: String,
+    },
+
+    /// A simulated `ChangeTrust` transaction awaiting wallet-owner HMAC attestation.
+    TrustlineSimulated {
+        /// Base64-encoded simulated `ChangeTrust` envelope.
+        envelope_xdr_b64: String,
+        /// Hex-encoded SHA-256 used by the envelope attestation.
+        envelope_sha256_hex: String,
+        /// Trustline holder G-strkey.
+        summary_holder: String,
+        /// Asset code, 1 to 12 ASCII alphanumeric characters.
+        summary_asset_code: String,
+        /// Asset issuer G-strkey.
+        summary_asset_issuer: String,
+        /// Limit in stroops; `None` means unlimited and `Some(0)` removes the trustline.
+        summary_limit_stroops: Option<i64>,
+        /// Simulated transaction fee in stroops.
+        summary_simulated_fee_stroops: u32,
+        /// Simulated sequence number.
+        summary_simulated_seq_num: i64,
     },
 
     /// A simulated `ClaimClaimableBalance` transaction awaiting wallet-owner
@@ -765,6 +783,7 @@ impl ApprovalKind {
             Self::SignWithPasskey { .. } => "SignWithPasskey",
             Self::TrustlineClawbackOptIn { .. } => "TrustlineClawbackOptIn",
             Self::ClaimSimulated { .. } => "ClaimSimulated",
+            Self::TrustlineSimulated { .. } => "TrustlineSimulated",
             Self::RegisterPasskey { .. } => "RegisterPasskey",
             Self::ToolsetFirstInvokeGate { .. } => "ToolsetFirstInvokeGate",
             Self::RuleProposalSimulated { .. } => "RuleProposalSimulated",
@@ -882,6 +901,31 @@ impl std::fmt::Debug for ApprovalKind {
                     .field("issuer_redacted", &issuer_redacted)
                     .finish()
             }
+            Self::TrustlineSimulated {
+                envelope_sha256_hex,
+                summary_holder,
+                summary_asset_code,
+                summary_asset_issuer,
+                summary_limit_stroops,
+                summary_simulated_fee_stroops,
+                summary_simulated_seq_num,
+                ..
+            } => f
+                .debug_struct("TrustlineSimulated")
+                .field("envelope_sha256_hex", envelope_sha256_hex)
+                .field("holder_redacted", &redact_g_strkey(summary_holder))
+                .field("summary_asset_code", summary_asset_code)
+                .field(
+                    "asset_issuer_redacted",
+                    &redact_g_strkey(summary_asset_issuer),
+                )
+                .field("summary_limit_stroops", summary_limit_stroops)
+                .field(
+                    "summary_simulated_fee_stroops",
+                    summary_simulated_fee_stroops,
+                )
+                .field("summary_simulated_seq_num", summary_simulated_seq_num)
+                .finish(),
             Self::ClaimSimulated {
                 envelope_xdr_b64,
                 envelope_sha256_hex,
@@ -1010,13 +1054,14 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Redacts a G-strkey to first-5-last-5 characters for debug output and CLI
 /// rendering, preventing full addresses from appearing in logs.
 ///
-/// Returns `"<redacted>"` for strings shorter than 10 characters.
-pub(crate) fn redact_g_strkey(s: &str) -> String {
+/// Returns `"<redacted>"` for strings shorter than 10 bytes or invalid slice boundaries.
+pub fn redact_g_strkey(s: &str) -> String {
     if s.len() < 10 {
         return "<redacted>".to_owned();
     }
-    let first5 = &s[..5];
-    let last5 = &s[s.len() - 5..];
+    let (Some(first5), Some(last5)) = (s.get(..5), s.get(s.len() - 5..)) else {
+        return "<redacted>".to_owned();
+    };
     format!("{first5}...{last5}")
 }
 
@@ -1116,6 +1161,20 @@ struct TrustlineClawbackOptInWire {
     issuer: String,
 }
 
+/// Wire representation for `ApprovalKind::TrustlineSimulated`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrustlineSimulatedWire {
+    envelope_xdr_b64: String,
+    envelope_sha256_hex: String,
+    holder: String,
+    asset_code: String,
+    asset_issuer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    limit_stroops: Option<i64>,
+    simulated_fee_stroops: u32,
+    simulated_seq_num: i64,
+}
+
 /// Wire representation for `ApprovalKind::Rejected`.
 ///
 /// Serialised as a `rejected = { ... }` sub-table, structurally distinct from
@@ -1195,12 +1254,9 @@ struct MppChargeSimulatedWire {
 
 /// Flat on-disk representation of a `PendingApproval` entry.
 ///
-/// Used by the custom `Serialize`/`Deserialize` impls to map between the
-/// kinded in-memory shape and the two distinct TOML wire shapes.
-///
-/// A legacy TOML entry has `sign_with_passkey = None` and the payment-summary
-/// flat fields set; a new `SignWithPasskey` entry has `sign_with_passkey = Some(…)`
-/// and the payment-summary flat fields absent.
+/// Used by the custom `Serialize`/`Deserialize` impls to map the kinded
+/// in-memory shape to one flat payment shape and one sub-table per other kind.
+/// Each sub-table kind omits the payment-summary flat fields.
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingApprovalOnDisk {
     #[serde(deserialize_with = "deserialize_approval_nonce")]
@@ -1245,6 +1301,10 @@ struct PendingApprovalOnDisk {
     // TrustlineClawbackOptIn sub-table — present iff all other kind fields are absent.
     #[serde(default)]
     trustline_clawback_opt_in: Option<TrustlineClawbackOptInWire>,
+
+    // TrustlineSimulated sub-table follows the structural kind routing.
+    #[serde(default)]
+    trustline_simulated: Option<TrustlineSimulatedWire>,
 
     // ClaimSimulated sub-table — present iff all other kind fields are absent.
     #[serde(default)]
@@ -1436,7 +1496,7 @@ pub struct PendingApproval {
     /// HMAC-SHA256 attestation blob, base64-encoded (URL-safe no-pad).
     ///
     /// `None` until the operator runs `stellar-agent approve --id <nonce> --profile <name>`.
-    /// Set by `record_attestation` (`PaymentSimulated` / `ClaimSimulated`,
+    /// Set by `record_attestation` (`PaymentSimulated` / `ClaimSimulated` / `TrustlineSimulated`,
     /// over `envelope_sha256_hex`), by `record_rule_proposal_attestation`
     /// (`RuleProposalSimulated`, over `proposal_sha256`), or by
     /// `record_trustline_clawback_opt_in_attestation`
@@ -1492,11 +1552,12 @@ impl std::fmt::Debug for PendingApproval {
 }
 
 impl Serialize for PendingApproval {
-    /// Custom serialiser: maps the kinded in-memory shape back to the five
-    /// distinct TOML wire representations.
+    /// Custom serializer maps each kind to its structurally distinct TOML representation.
     ///
     /// - `PaymentSimulated`: serialises the payment-summary fields flat on
     ///   the entry (no sub-tables; preserves on-disk compatibility).
+    /// - `TrustlineSimulated`: serializes a `trustline_simulated = { ... }` sub-table
+    ///   and omits the payment-summary flat fields.
     /// - `SignWithPasskey`: serialises a `sign_with_passkey = { ... }` sub-table
     ///   and omits the payment-summary flat fields.
     /// - `RegisterPasskey`: serialises a `register_passkey = { ... }` sub-table.
@@ -1527,6 +1588,7 @@ impl Serialize for PendingApproval {
             mpp_charge_simulated,
             rejected,
             consumed,
+            trustline_simulated,
             // registration_input lives inside the RegisterPasskey arm; extract it here
             // so it can be written to the top-level on-disk field.
             registration_input_for_disk,
@@ -1558,6 +1620,7 @@ impl Serialize for PendingApproval {
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
                 None::<ConsumedWire>,
+                None::<TrustlineSimulatedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::SignWithPasskey {
@@ -1592,6 +1655,7 @@ impl Serialize for PendingApproval {
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
                 None::<ConsumedWire>,
+                None::<TrustlineSimulatedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::RegisterPasskey {
@@ -1625,6 +1689,7 @@ impl Serialize for PendingApproval {
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
                 None::<ConsumedWire>,
+                None::<TrustlineSimulatedWire>,
                 registration_input.clone(),
             ),
             ApprovalKind::ToolsetFirstInvokeGate {
@@ -1659,6 +1724,7 @@ impl Serialize for PendingApproval {
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
                 None::<ConsumedWire>,
+                None::<TrustlineSimulatedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::TrustlineClawbackOptIn {
@@ -1687,6 +1753,46 @@ impl Serialize for PendingApproval {
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
                 None::<ConsumedWire>,
+                None::<TrustlineSimulatedWire>,
+                None::<RegistrationInput>,
+            ),
+            ApprovalKind::TrustlineSimulated {
+                envelope_xdr_b64,
+                envelope_sha256_hex,
+                summary_holder,
+                summary_asset_code,
+                summary_asset_issuer,
+                summary_limit_stroops,
+                summary_simulated_fee_stroops,
+                summary_simulated_seq_num,
+            } => (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None::<SignWithPasskeyWire>,
+                None::<RegisterPasskeyWire>,
+                None::<ToolsetFirstInvokeGateWire>,
+                None::<TrustlineClawbackOptInWire>,
+                None::<ClaimSimulatedWire>,
+                None::<RuleProposalSimulatedWire>,
+                None::<MppChargeSimulatedWire>,
+                None::<RejectedWire>,
+                None::<ConsumedWire>,
+                Some(TrustlineSimulatedWire {
+                    envelope_xdr_b64: envelope_xdr_b64.clone(),
+                    envelope_sha256_hex: envelope_sha256_hex.clone(),
+                    holder: summary_holder.clone(),
+                    asset_code: summary_asset_code.clone(),
+                    asset_issuer: summary_asset_issuer.clone(),
+                    limit_stroops: *summary_limit_stroops,
+                    simulated_fee_stroops: *summary_simulated_fee_stroops,
+                    simulated_seq_num: *summary_simulated_seq_num,
+                }),
                 None::<RegistrationInput>,
             ),
             ApprovalKind::ClaimSimulated {
@@ -1727,6 +1833,7 @@ impl Serialize for PendingApproval {
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
                 None::<ConsumedWire>,
+                None::<TrustlineSimulatedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::RuleProposalSimulated {
@@ -1763,6 +1870,7 @@ impl Serialize for PendingApproval {
                 None::<MppChargeSimulatedWire>,
                 None::<RejectedWire>,
                 None::<ConsumedWire>,
+                None::<TrustlineSimulatedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::MppChargeSimulated {
@@ -1811,6 +1919,7 @@ impl Serialize for PendingApproval {
                 }),
                 None::<RejectedWire>,
                 None::<ConsumedWire>,
+                None::<TrustlineSimulatedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::Rejected { original_kind_name } => (
@@ -1833,6 +1942,7 @@ impl Serialize for PendingApproval {
                     original_kind_name: original_kind_name.clone(),
                 }),
                 None::<ConsumedWire>,
+                None::<TrustlineSimulatedWire>,
                 None::<RegistrationInput>,
             ),
             ApprovalKind::Consumed {
@@ -1861,6 +1971,7 @@ impl Serialize for PendingApproval {
                     tx_hash: tx_hash.clone(),
                     outcome: outcome.label().to_owned(),
                 }),
+                None::<TrustlineSimulatedWire>,
                 None::<RegistrationInput>,
             ),
         };
@@ -1890,6 +2001,7 @@ impl Serialize for PendingApproval {
             consumed,
             attestation_blob_b64: self.attestation_blob_b64.clone(),
             passkey_assertion: self.passkey_assertion.clone(),
+            trustline_simulated,
             registration_input: registration_input_for_disk,
         };
         on_disk.serialize(serializer)
@@ -1900,7 +2012,8 @@ impl<'de> Deserialize<'de> for PendingApproval {
     /// Custom deserialiser: routes the flat on-disk shape to the kinded
     /// in-memory shape and rejects tampered or cross-kind-contaminated entries.
     ///
-    /// Routing priority (first sub-table present wins):
+    /// A census rejects multiple kind sub-tables before routing the entry:
+    /// all competing kind sub-tables must be absent.
     ///
     /// 1. `sign_with_passkey` present → `ApprovalKind::SignWithPasskey`.
     ///    - All `PaymentSimulated` flat fields MUST be absent.
@@ -1937,7 +2050,17 @@ impl<'de> Deserialize<'de> for PendingApproval {
     ///    - All other sub-tables MUST be absent.
     ///    - Validates `TrustlineClawbackOptIn` field invariants on reload.
     ///
-    /// 5. Otherwise → `ApprovalKind::PaymentSimulated` from flat fields.
+    /// 5. `trustline_simulated` present: `ApprovalKind::TrustlineSimulated`.
+    ///    - All payment flat fields, `passkey_assertion`, and `registration_input` must be absent.
+    ///    - `attestation_blob_b64` may hold the operator's envelope HMAC.
+    ///    - Validates trustline identifiers and the limit on reload.
+    ///
+    /// 6. `claim_simulated` present: `ApprovalKind::ClaimSimulated`.
+    /// 7. `rule_proposal_simulated` present: `ApprovalKind::RuleProposalSimulated`.
+    /// 8. `mpp_charge_simulated` present: `ApprovalKind::MppChargeSimulated`.
+    /// 9. `rejected` present: `ApprovalKind::Rejected`.
+    /// 10. `consumed` present: `ApprovalKind::Consumed`.
+    /// 11. Otherwise: `ApprovalKind::PaymentSimulated` from flat fields.
     ///    - `passkey_assertion` MUST be absent.
     ///    - `registration_input` MUST be absent.
     ///
@@ -1961,6 +2084,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
                 "trustline_clawback_opt_in",
                 raw.trustline_clawback_opt_in.is_some(),
             ),
+            ("trustline_simulated", raw.trustline_simulated.is_some()),
             ("claim_simulated", raw.claim_simulated.is_some()),
             (
                 "rule_proposal_simulated",
@@ -2013,6 +2137,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
                     "trustline_clawback_opt_in",
                     raw.trustline_clawback_opt_in.is_some(),
                 ),
+                ("trustline_simulated", raw.trustline_simulated.is_some()),
                 ("claim_simulated", raw.claim_simulated.is_some()),
                 (
                     "rule_proposal_simulated",
@@ -2083,6 +2208,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
                     "trustline_clawback_opt_in",
                     raw.trustline_clawback_opt_in.is_some(),
                 ),
+                ("trustline_simulated", raw.trustline_simulated.is_some()),
                 ("claim_simulated", raw.claim_simulated.is_some()),
                 (
                     "rule_proposal_simulated",
@@ -2159,6 +2285,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
                     "trustline_clawback_opt_in",
                     raw.trustline_clawback_opt_in.is_some(),
                 ),
+                ("trustline_simulated", raw.trustline_simulated.is_some()),
                 ("claim_simulated", raw.claim_simulated.is_some()),
                 (
                     "rule_proposal_simulated",
@@ -2226,6 +2353,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
                 ),
                 ("passkey_assertion", raw.passkey_assertion.is_some()),
                 ("registration_input", raw.registration_input.is_some()),
+                ("trustline_simulated", raw.trustline_simulated.is_some()),
                 ("claim_simulated", raw.claim_simulated.is_some()),
                 (
                     "rule_proposal_simulated",
@@ -2250,6 +2378,62 @@ impl<'de> Deserialize<'de> for PendingApproval {
                 network: tcoi.network,
                 code: tcoi.code,
                 issuer: tcoi.issuer,
+            }
+        } else if let Some(ts) = raw.trustline_simulated {
+            // Check flat fields and competing sub-tables for cross-kind contamination.
+            // The sub-table checks repeat the census for parity with the other arms.
+            // Trustline attestations are allowed.
+            for (field, present) in [
+                ("envelope_xdr_b64", raw.envelope_xdr_b64.is_some()),
+                ("envelope_sha256_hex", raw.envelope_sha256_hex.is_some()),
+                ("summary_to", raw.summary_to.is_some()),
+                (
+                    "summary_amount_stroops",
+                    raw.summary_amount_stroops.is_some(),
+                ),
+                ("summary_asset", raw.summary_asset.is_some()),
+                ("summary_memo", raw.summary_memo.is_some()),
+                (
+                    "summary_simulated_fee_stroops",
+                    raw.summary_simulated_fee_stroops.is_some(),
+                ),
+                (
+                    "summary_simulated_seq_num",
+                    raw.summary_simulated_seq_num.is_some(),
+                ),
+                ("passkey_assertion", raw.passkey_assertion.is_some()),
+                ("registration_input", raw.registration_input.is_some()),
+                (
+                    "rule_proposal_simulated",
+                    raw.rule_proposal_simulated.is_some(),
+                ),
+                ("rejected", raw.rejected.is_some()),
+                ("consumed", raw.consumed.is_some()),
+            ] {
+                if present {
+                    return Err(serde::de::Error::custom(format!(
+                        "cross-kind field contamination: TrustlineSimulated entry must not carry \
+                         field `{field}`",
+                    )));
+                }
+            }
+
+            validate_trustline_simulated_invariants(
+                &ts.holder,
+                &ts.asset_code,
+                &ts.asset_issuer,
+                ts.limit_stroops,
+            )
+            .map_err(serde::de::Error::custom)?;
+            ApprovalKind::TrustlineSimulated {
+                envelope_xdr_b64: ts.envelope_xdr_b64,
+                envelope_sha256_hex: ts.envelope_sha256_hex,
+                summary_holder: ts.holder,
+                summary_asset_code: ts.asset_code,
+                summary_asset_issuer: ts.asset_issuer,
+                summary_limit_stroops: ts.limit_stroops,
+                summary_simulated_fee_stroops: ts.simulated_fee_stroops,
+                summary_simulated_seq_num: ts.simulated_seq_num,
             }
         } else if let Some(cs) = raw.claim_simulated {
             // Cross-kind contamination check: ClaimSimulated must not carry
@@ -3083,13 +3267,13 @@ impl PendingApproval {
     /// Constructs a new `TrustlineClawbackOptIn` approval pending operator
     /// confirmation of the clawback risk for the specified asset.
     ///
-    /// Called by the `stellar_trustline_commit` path when the issuer has
-    /// `auth_clawback_enabled` and the operator has opted in to the clawback
-    /// risk.  All fields are validated at construction time.
+    /// Minted by `stellar_trustline` simulate and the CLI `trustline` command.
+    /// The next simulate verifies it; commit does not consume it.
+    /// All fields are validated at construction time.
     ///
     /// # Parameters
     ///
-    /// - `network`: Stellar network passphrase (non-empty, ≤ 64 bytes).
+    /// - `network`: CAIP-2 chain id (non-empty, at most 64 bytes).
     /// - `code`: asset code, uppercase, 1–12 alphanumeric ASCII characters.
     /// - `issuer`: canonical G-strkey of the asset issuer.
     /// - `process_uid`: from `process_uid_for_attestation()`.
@@ -3110,7 +3294,7 @@ impl PendingApproval {
     /// # fn example() -> Result<(), stellar_agent_core::approval::error::ApprovalError> {
     /// let uid = process_uid_for_attestation()?;
     /// let entry = PendingApproval::new_trustline_clawback_opt_in_pending(
-    ///     "Test SDF Network ; September 2015".to_owned(),
+    ///     "stellar:testnet".to_owned(),
     ///     "USDC".to_owned(),
     ///     "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
     ///     uid,
@@ -3147,6 +3331,57 @@ impl PendingApproval {
                 network,
                 code,
                 issuer,
+            },
+            attestation_blob_b64: None,
+            passkey_assertion: None,
+        })
+    }
+
+    /// Constructs an unattested `TrustlineSimulated` approval with a fresh nonce.
+    ///
+    /// `envelope_xdr_bytes` contains the envelope's base64 text bytes for hashing.
+    /// A missing limit means unlimited; zero means removal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApprovalError::Invalid`] for unsafe summary fields or
+    /// [`ApprovalError::Io`] if the system clock is unavailable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_trustline_pending(
+        envelope_xdr_b64: String,
+        envelope_xdr_bytes: &[u8],
+        holder: String,
+        asset_code: String,
+        asset_issuer: String,
+        limit_stroops: Option<i64>,
+        simulated_fee_stroops: u32,
+        simulated_seq_num: i64,
+        process_uid: String,
+        ttl_ms: u64,
+    ) -> Result<Self, ApprovalError> {
+        validate_trustline_simulated_invariants(&holder, &asset_code, &asset_issuer, limit_stroops)
+            .map_err(|reason| ApprovalError::Invalid { reason })?;
+        let mut raw = [0u8; 16];
+        OsRng.fill_bytes(&mut raw);
+        let approval_nonce = URL_SAFE_NO_PAD.encode(raw);
+        let envelope_sha256_hex =
+            hex_encode(&super::attestation::envelope_sha256(envelope_xdr_bytes));
+        let created_at_unix_ms = approval_now_unix_ms()?;
+        Ok(Self {
+            approval_nonce,
+            process_uid,
+            created_at_unix_ms,
+            expires_at_unix_ms: created_at_unix_ms.saturating_add(ttl_ms),
+            reason: None,
+            kind: ApprovalKind::TrustlineSimulated {
+                envelope_xdr_b64,
+                envelope_sha256_hex,
+                summary_holder: holder,
+                summary_asset_code: asset_code,
+                summary_asset_issuer: asset_issuer,
+                summary_limit_stroops: limit_stroops,
+                summary_simulated_fee_stroops: simulated_fee_stroops,
+                summary_simulated_seq_num: simulated_seq_num,
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
@@ -3720,7 +3955,7 @@ fn validate_toolset_first_invoke_gate_invariants(
 /// entries are rejected at `PendingApprovalStore::open`.
 ///
 /// Validates:
-/// - `network`: non-empty, ≤ 64 bytes (fits common Stellar passphrase lengths).
+/// - `network`: CAIP-2 chain id, non-empty and at most 64 bytes.
 /// - `code`: 1–12 bytes, `[A-Z0-9]` uppercase alphanumeric charset.
 /// - `issuer`: valid Stellar G-strkey (56 chars, `^G[A-Z2-7]{55}$`).
 fn validate_trustline_clawback_opt_in_invariants(
@@ -3728,13 +3963,13 @@ fn validate_trustline_clawback_opt_in_invariants(
     code: &str,
     issuer: &str,
 ) -> Result<(), String> {
-    // network: non-empty, ≤ 64 bytes (Stellar passphrases are ≤ 64 bytes in practice).
+    // The stored CAIP-2 chain id is non-empty and bounded to 64 bytes.
     if network.is_empty() {
         return Err("network must not be empty".to_owned());
     }
     if network.len() > 64 {
         return Err(format!(
-            "network must be ≤ 64 bytes (Stellar passphrase length limit), got {} bytes",
+            "network must be at most 64 bytes, got {} bytes",
             network.len()
         ));
     }
@@ -3770,6 +4005,38 @@ fn validate_trustline_clawback_opt_in_invariants(
         ));
     }
 
+    Ok(())
+}
+
+/// Validates trustline identifiers and limits at construction and reload.
+fn validate_trustline_simulated_invariants(
+    holder: &str,
+    asset_code: &str,
+    asset_issuer: &str,
+    limit_stroops: Option<i64>,
+) -> Result<(), String> {
+    for (label, account) in [("holder", holder), ("issuer", asset_issuer)] {
+        if account.len() != 56
+            || !account.starts_with('G')
+            || !account
+                .bytes()
+                .skip(1)
+                .all(|b| matches!(b, b'A'..=b'Z' | b'2'..=b'7'))
+        {
+            return Err(format!("trustline {label} must match ^G[A-Z2-7]{{55}}$"));
+        }
+    }
+    if asset_code.is_empty()
+        || asset_code.len() > 12
+        || !asset_code.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return Err(
+            "trustline asset code must be 1 to 12 ASCII alphanumeric characters".to_owned(),
+        );
+    }
+    if limit_stroops.is_some_and(|limit| limit < 0) {
+        return Err("trustline limit must not be negative".to_owned());
+    }
     Ok(())
 }
 
@@ -4396,14 +4663,13 @@ impl PendingApprovalStore {
             .collect()
     }
 
-    /// Records the HMAC-SHA256 attestation blob for a `PaymentSimulated` or
-    /// `ClaimSimulated` entry.
+    /// Records a digest-HMAC attestation for a payment, claim, trustline, or MPP charge.
     ///
-    /// Both kinds share the envelope-hash HMAC attestation path: the operator's
-    /// `stellar-agent approve` computes the blob from the entry's
-    /// `envelope_sha256_hex`, and the matching `*_commit` tool re-derives and
-    /// constant-time-compares it. The 32-byte `attestation_blob` is encoded as
-    /// URL-safe base64 no-pad and stored in `attestation_blob_b64`.
+    /// Payments, claims, and trustlines bind `envelope_sha256_hex`.
+    /// MPP charges bind the prepared artifact hash.
+    /// The matching gate checks the digest and verifies the HMAC in constant time.
+    /// The 32-byte blob is encoded as URL-safe base64 without padding and stored
+    /// in `attestation_blob_b64`.
     ///
     /// # Errors
     ///
@@ -4445,10 +4711,11 @@ impl PendingApprovalStore {
             entry.kind,
             ApprovalKind::PaymentSimulated { .. }
                 | ApprovalKind::ClaimSimulated { .. }
+                | ApprovalKind::TrustlineSimulated { .. }
                 | ApprovalKind::MppChargeSimulated { .. }
         ) {
             return Err(ApprovalError::WrongKind {
-                expected: "PaymentSimulated, ClaimSimulated, or MppChargeSimulated",
+                expected: "PaymentSimulated, ClaimSimulated, TrustlineSimulated, or MppChargeSimulated",
                 actual: entry.kind.kind_name(),
             });
         }
@@ -4938,7 +5205,7 @@ impl PendingApprovalStore {
     /// let uid = process_uid_for_attestation()?;
     /// let now_ms = 1_700_000_000_000_u64; // caller-supplied current time
     /// let entry = PendingApproval::new_trustline_clawback_opt_in_pending(
-    ///     "Test SDF Network ; September 2015".to_owned(),
+    ///     "stellar:testnet".to_owned(),
     ///     "USDC".to_owned(),
     ///     "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
     ///     uid,
@@ -6040,7 +6307,7 @@ expires_at_unix_ms = 9999999999999
             matches!(
                 err,
                 ApprovalError::WrongKind {
-                    expected: "PaymentSimulated, ClaimSimulated, or MppChargeSimulated",
+                    expected: "PaymentSimulated, ClaimSimulated, TrustlineSimulated, or MppChargeSimulated",
                     actual: "SignWithPasskey"
                 }
             ),
@@ -8195,7 +8462,7 @@ amount_max_stroops = 1000000
             matches!(
                 err,
                 ApprovalError::WrongKind {
-                    expected: "PaymentSimulated, ClaimSimulated, or MppChargeSimulated",
+                    expected: "PaymentSimulated, ClaimSimulated, TrustlineSimulated, or MppChargeSimulated",
                     actual: "TrustlineClawbackOptIn"
                 }
             ),
@@ -10323,5 +10590,378 @@ is_proposer = true
             &artifact,
             now
         ));
+    }
+
+    fn make_trustline_entry(limit: Option<i64>) -> PendingApproval {
+        PendingApproval::new_trustline_pending(
+            "trustline-xdr".to_owned(),
+            b"trustline-xdr",
+            VALID_SUMMARY_TO.to_owned(),
+            "USDC".to_owned(),
+            TESTNET_USDC_ISSUER.to_owned(),
+            limit,
+            123,
+            456,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn trustline_simulated_roundtrips_all_limits() {
+        for limit in [None, Some(0), Some(9_007_199_254_740_993)] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("trustline.toml");
+            let entry = make_trustline_entry(limit);
+            let nonce = entry.approval_nonce.clone();
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            store.insert(entry.clone(), TEST_NOW_MS).unwrap();
+            drop(store);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let wire: toml::Value = toml::from_str(&text).unwrap();
+            let row = &wire["pending"][0];
+            assert!(row.get("summary_to").is_none());
+            assert!(row.get("envelope_xdr_b64").is_none());
+            let sub = &row["trustline_simulated"];
+            let mut expected = toml::Table::from_iter([
+                (
+                    "envelope_xdr_b64".to_owned(),
+                    toml::Value::String("trustline-xdr".to_owned()),
+                ),
+                (
+                    "envelope_sha256_hex".to_owned(),
+                    toml::Value::String(hex_encode(&super::super::envelope_sha256(
+                        b"trustline-xdr",
+                    ))),
+                ),
+                (
+                    "holder".to_owned(),
+                    toml::Value::String(VALID_SUMMARY_TO.to_owned()),
+                ),
+                (
+                    "asset_code".to_owned(),
+                    toml::Value::String("USDC".to_owned()),
+                ),
+                (
+                    "asset_issuer".to_owned(),
+                    toml::Value::String(TESTNET_USDC_ISSUER.to_owned()),
+                ),
+                (
+                    "simulated_fee_stroops".to_owned(),
+                    toml::Value::Integer(123),
+                ),
+                ("simulated_seq_num".to_owned(), toml::Value::Integer(456)),
+            ]);
+            if let Some(limit) = limit {
+                expected.insert("limit_stroops".to_owned(), toml::Value::Integer(limit));
+            } else {
+                assert!(sub.get("limit_stroops").is_none());
+            }
+            assert_eq!(sub.as_table().unwrap(), &expected);
+            let store = PendingApprovalStore::open(path).unwrap();
+            let loaded = store.get(&nonce).unwrap();
+            assert_eq!(loaded.approval_nonce, entry.approval_nonce);
+            assert_eq!(loaded.process_uid, entry.process_uid);
+            assert_eq!(loaded.created_at_unix_ms, entry.created_at_unix_ms);
+            assert_eq!(loaded.expires_at_unix_ms, entry.expires_at_unix_ms);
+            let ApprovalKind::TrustlineSimulated {
+                envelope_xdr_b64,
+                envelope_sha256_hex,
+                summary_holder,
+                summary_asset_code,
+                summary_asset_issuer,
+                summary_limit_stroops,
+                summary_simulated_fee_stroops,
+                summary_simulated_seq_num,
+            } = &loaded.kind
+            else {
+                panic!("expected trustline")
+            };
+            assert_eq!(envelope_xdr_b64, "trustline-xdr");
+            assert_eq!(
+                envelope_sha256_hex,
+                &hex_encode(&super::super::envelope_sha256(b"trustline-xdr"))
+            );
+            assert_eq!(summary_holder, VALID_SUMMARY_TO);
+            assert_eq!(summary_asset_code, "USDC");
+            assert_eq!(summary_asset_issuer, TESTNET_USDC_ISSUER);
+            assert_eq!(*summary_limit_stroops, limit);
+            assert_eq!(*summary_simulated_fee_stroops, 123);
+            assert_eq!(*summary_simulated_seq_num, 456);
+        }
+    }
+
+    #[test]
+    fn trustline_rejects_flat_payment_contamination() {
+        let mut payment = make_payment_entry(DEFAULT_TTL_MS);
+        if let ApprovalKind::PaymentSimulated { summary_memo, .. } = &mut payment.kind {
+            *summary_memo = Some("memo".to_owned());
+        }
+        let payment = toml::Value::try_from(&payment).unwrap();
+        for field in [
+            "envelope_xdr_b64",
+            "envelope_sha256_hex",
+            "summary_to",
+            "summary_amount_stroops",
+            "summary_asset",
+            "summary_memo",
+            "summary_simulated_fee_stroops",
+            "summary_simulated_seq_num",
+        ] {
+            let mut wire = toml::Value::try_from(make_trustline_entry(None)).unwrap();
+            wire.as_table_mut()
+                .unwrap()
+                .insert(field.to_owned(), payment[field].clone());
+            let error =
+                toml::from_str::<PendingApproval>(&toml::to_string(&wire).unwrap()).unwrap_err();
+            assert!(
+                error.to_string().contains("contamination"),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn trustline_rejects_competing_subtables() {
+        let mut rejected = make_payment_entry(DEFAULT_TTL_MS);
+        rejected.kind = ApprovalKind::Rejected {
+            original_kind_name: "PaymentSimulated".to_owned(),
+        };
+        let mut consumed = rejected.clone();
+        consumed.kind = ApprovalKind::Consumed {
+            original_kind_name: "PaymentSimulated".to_owned(),
+            tx_hash: "ab".repeat(32),
+            outcome: ConsumedOutcome::Unknown,
+        };
+        let claim = PendingApproval::new_claim_pending(
+            "xdr".to_owned(),
+            b"xdr",
+            "ab".repeat(36),
+            format!("B{}", "A".repeat(57)),
+            "XLM".to_owned(),
+            1,
+            VALID_SUMMARY_TO.to_owned(),
+            100,
+            1,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let opt_in = PendingApproval::new_trustline_clawback_opt_in_pending(
+            "stellar:testnet".to_owned(),
+            "USDC".to_owned(),
+            TESTNET_USDC_ISSUER.to_owned(),
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let mpp = PendingApproval::new_mpp_charge_pending(
+            [1; 32],
+            [2; 32],
+            "default".to_owned(),
+            "stellar:testnet".to_owned(),
+            VALID_SUMMARY_TO.to_owned(),
+            "mcp".to_owned(),
+            "merchant".to_owned(),
+            "tools/charge".to_owned(),
+            "100".to_owned(),
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            VALID_SUMMARY_TO.to_owned(),
+            approval_now_unix_ms().unwrap() / 1000 + 3600,
+            100,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        for (field, entry) in [
+            ("sign_with_passkey", make_passkey_entry(DEFAULT_TTL_MS)),
+            (
+                "register_passkey",
+                make_register_passkey_entry(DEFAULT_TTL_MS),
+            ),
+            (
+                "toolset_first_invoke_gate",
+                make_toolset_gate_entry(DEFAULT_TTL_MS),
+            ),
+            ("trustline_clawback_opt_in", opt_in),
+            ("claim_simulated", claim),
+            (
+                "rule_proposal_simulated",
+                make_rule_proposal_entry(DEFAULT_TTL_MS),
+            ),
+            ("mpp_charge_simulated", mpp),
+            ("rejected", rejected),
+            ("consumed", consumed),
+        ] {
+            let mut wire = toml::Value::try_from(make_trustline_entry(None)).unwrap();
+            wire.as_table_mut().unwrap().insert(
+                field.to_owned(),
+                toml::Value::try_from(entry).unwrap()[field].clone(),
+            );
+            let error =
+                toml::from_str::<PendingApproval>(&toml::to_string(&wire).unwrap()).unwrap_err();
+            assert!(
+                error.to_string().contains("multiple kind sub-tables"),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn trustline_attested_roundtrip_rejects_passkey_contamination() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("trustline.toml");
+        let entry = make_trustline_entry(None);
+        let nonce = entry.approval_nonce.clone();
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        store.insert(entry, TEST_NOW_MS).unwrap();
+        store
+            .record_attestation_at(&nonce, [42; 32], TEST_NOW_MS)
+            .unwrap();
+        drop(store);
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        let entry = store.get(&nonce).unwrap();
+        assert_eq!(
+            entry.attestation_blob_b64,
+            Some(URL_SAFE_NO_PAD.encode([42; 32]))
+        );
+        for (field, value) in [
+            (
+                "passkey_assertion",
+                toml::Value::try_from(make_assertion()).unwrap(),
+            ),
+            (
+                "registration_input",
+                toml::Value::try_from(make_registration_input()).unwrap(),
+            ),
+        ] {
+            let mut wire = toml::Value::try_from(entry).unwrap();
+            wire.as_table_mut().unwrap().insert(field.to_owned(), value);
+            let error =
+                toml::from_str::<PendingApproval>(&toml::to_string(&wire).unwrap()).unwrap_err();
+            assert!(
+                error.to_string().contains("contamination"),
+                "{field}: {error}"
+            );
+        }
+        store
+            .consume(&nonce, &"ab".repeat(32), ConsumedOutcome::Confirmed)
+            .unwrap();
+        drop(store);
+        let store = PendingApprovalStore::open(path).unwrap();
+        assert!(matches!(&store.get(&nonce).unwrap().kind,
+            ApprovalKind::Consumed { original_kind_name, .. } if original_kind_name == "TrustlineSimulated"));
+    }
+
+    #[test]
+    fn trustline_constructor_and_loader_reject_unsafe_fields() {
+        for (field, value) in [
+            ("holder", toml::Value::String("bad-holder".to_owned())),
+            ("asset_issuer", toml::Value::String("bad-issuer".to_owned())),
+            ("limit_stroops", toml::Value::Integer(-1)),
+            ("asset_code", toml::Value::String("US\u{1b}DC".to_owned())),
+            ("asset_code", toml::Value::String("US\nDC".to_owned())),
+            ("asset_code", toml::Value::String("US\u{202e}DC".to_owned())),
+            ("asset_code", toml::Value::String("ÜSDC".to_owned())),
+            ("asset_code", toml::Value::String(String::new())),
+            (
+                "asset_code",
+                toml::Value::String("ABCDEFGHIJKLM".to_owned()),
+            ),
+        ] {
+            let mut wire = toml::Value::try_from(make_trustline_entry(Some(100))).unwrap();
+            wire["trustline_simulated"][field] = value;
+            let ts = &wire["trustline_simulated"];
+            let expected_error = match field {
+                "holder" => "trustline holder",
+                "asset_issuer" => "trustline issuer",
+                "limit_stroops" => "trustline limit",
+                "asset_code" => "trustline asset code",
+                _ => unreachable!(),
+            };
+            let error = PendingApproval::new_trustline_pending(
+                "xdr".to_owned(),
+                b"xdr",
+                ts["holder"].as_str().unwrap().to_owned(),
+                ts["asset_code"].as_str().unwrap().to_owned(),
+                ts["asset_issuer"].as_str().unwrap().to_owned(),
+                ts.get("limit_stroops").and_then(toml::Value::as_integer),
+                100,
+                1,
+                "1000".to_owned(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(expected_error),
+                "constructor {field}: {error}"
+            );
+            let error =
+                toml::from_str::<PendingApproval>(&toml::to_string(&wire).unwrap()).unwrap_err();
+            assert!(
+                error.to_string().contains(expected_error),
+                "loader {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_sub_table_fails_the_whole_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("unknown.toml");
+        let payment = make_payment_entry(DEFAULT_TTL_MS);
+        let mut unknown = toml::Value::try_from(make_trustline_entry(None)).unwrap();
+        let future = unknown
+            .as_table_mut()
+            .unwrap()
+            .remove("trustline_simulated")
+            .unwrap();
+        unknown
+            .as_table_mut()
+            .unwrap()
+            .insert("future_approval_kind".to_owned(), future);
+        let wire = toml::Value::Table(toml::Table::from_iter([(
+            "pending".to_owned(),
+            toml::Value::Array(vec![toml::Value::try_from(payment).unwrap(), unknown]),
+        )]));
+        std::fs::write(&path, toml::to_string(&wire).unwrap()).unwrap();
+        assert!(PendingApprovalStore::open(path).is_err());
+    }
+
+    #[test]
+    fn redact_g_strkey_handles_multibyte_boundaries() {
+        for input in ["abcdé123456", "abcdefé1234"] {
+            assert_eq!(redact_g_strkey(input), "<redacted>");
+        }
+    }
+
+    #[test]
+    fn trustline_debug_redacts_identifiers() {
+        let entry = make_trustline_entry(Some(500));
+        let debug = format!("{entry:?}");
+        for secret in ["trustline-xdr", VALID_SUMMARY_TO, TESTNET_USDC_ISSUER] {
+            assert!(!debug.contains(secret), "{debug}");
+        }
+        assert!(debug.contains(&format!(
+            "holder_redacted: {:?}",
+            redact_g_strkey(VALID_SUMMARY_TO)
+        )));
+        assert!(debug.contains(&format!(
+            "asset_issuer_redacted: {:?}",
+            redact_g_strkey(TESTNET_USDC_ISSUER)
+        )));
+        for shown in [
+            "TrustlineSimulated",
+            "summary_asset_code: \"USDC\"",
+            "summary_limit_stroops: Some(500)",
+            "summary_simulated_fee_stroops: 123",
+            "summary_simulated_seq_num: 456",
+        ] {
+            assert!(debug.contains(shown), "{debug}");
+        }
+        assert!(debug.contains(&hex_encode(&super::super::envelope_sha256(
+            b"trustline-xdr"
+        ))));
     }
 }

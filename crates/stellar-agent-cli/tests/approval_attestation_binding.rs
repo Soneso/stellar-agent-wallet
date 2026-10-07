@@ -31,6 +31,7 @@ const SIGNER: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
 #[derive(Clone, Copy)]
 enum ApprovalCase {
     Attest,
+    Trustline,
     UnknownNonce,
     ClosedStdin,
 }
@@ -111,11 +112,25 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
             memo: Memo::None,
             operations: vec![Operation {
                 source_account: Some(operation_source),
-                body: OperationBody::Payment(PaymentOp {
-                    destination,
-                    asset: Asset::Native,
-                    amount: 1_000_000,
-                }),
+                body: if matches!(case, ApprovalCase::Trustline) {
+                    OperationBody::ChangeTrust(stellar_xdr::ChangeTrustOp {
+                        line: stellar_xdr::ChangeTrustAsset::CreditAlphanum4(
+                            stellar_xdr::AlphaNum4 {
+                                asset_code: stellar_xdr::AssetCode4(*b"USDC"),
+                                issuer: stellar_xdr::AccountId(
+                                    stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256([4; 32])),
+                                ),
+                            },
+                        ),
+                        limit: i64::MAX,
+                    })
+                } else {
+                    OperationBody::Payment(PaymentOp {
+                        destination,
+                        asset: Asset::Native,
+                        amount: 1_000_000,
+                    })
+                },
             }]
             .try_into()
             .unwrap(),
@@ -139,6 +154,21 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
         DEFAULT_TTL_MS,
     )
     .unwrap();
+    if matches!(case, ApprovalCase::Trustline) {
+        entry = PendingApproval::new_trustline_pending(
+            envelope.clone(),
+            envelope.as_bytes(),
+            operation_source_strkey.to_string(),
+            "USDC".to_owned(),
+            destination_strkey.to_string(),
+            None,
+            100,
+            1,
+            uid.clone(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+    }
     entry.approval_nonce = format!("-{}", &entry.approval_nonce[1..]);
     let nonce = entry.approval_nonce.clone();
     let mut approvals =
@@ -173,7 +203,7 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
     let expected_code = match case {
         ApprovalCase::UnknownNonce => Some("approval.not_found"),
         ApprovalCase::ClosedStdin => Some("approval.denied"),
-        ApprovalCase::Attest => None,
+        ApprovalCase::Attest | ApprovalCase::Trustline => None,
     };
     if let Some(expected_code) = expected_code {
         assert_eq!(
@@ -226,7 +256,19 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
     assert_eq!(rows.len(), 1, "one consent row: {log}");
     assert_eq!(rows[0]["nonce_prefix"], nonce[..8]);
     assert_eq!(rows[0]["origin"], "cli");
-    assert_eq!(rows[0]["approval_kind"], "PaymentSimulated");
+    assert_eq!(
+        rows[0]["approval_kind"],
+        if matches!(case, ApprovalCase::Trustline) {
+            "TrustlineSimulated"
+        } else {
+            "PaymentSimulated"
+        }
+    );
+    if matches!(case, ApprovalCase::Trustline) {
+        assert!(stderr.contains("trustline change (ChangeTrust)"));
+        assert!(stderr.contains(&format!("USDC:{destination_strkey}")));
+        assert_eq!(rows[0]["gated_tool"], "stellar_trustline_commit");
+    }
 }
 
 #[test]
@@ -251,4 +293,10 @@ fn approve_binary_unknown_nonce_has_approval_code() {
 #[serial]
 fn approve_binary_closed_stdin_denies_without_attesting() {
     approve_binary_case(false, ApprovalCase::ClosedStdin);
+}
+
+#[test]
+#[serial]
+fn approve_trustline_json_returns_approval_attestation() {
+    approve_binary_case(false, ApprovalCase::Trustline);
 }

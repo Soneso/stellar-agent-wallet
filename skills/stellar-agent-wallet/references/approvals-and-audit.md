@@ -163,7 +163,7 @@ of pending entries:
   hard cap on pending entries (expired entries pruned first) and a default entry
   TTL of 24 hours.
 
-Entry kinds: `PaymentSimulated`, `ClaimSimulated`, `SignWithPasskey`,
+Entry kinds: `PaymentSimulated`, `TrustlineSimulated`, `ClaimSimulated`, `SignWithPasskey`,
 `RegisterPasskey`, `ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`,
 `RuleProposalSimulated` and `MppChargeSimulated`.
 `Rejected` and `Consumed` record resolved requests and cannot be approved.
@@ -185,10 +185,10 @@ Per kind:
 
 | Kind | What `approve` records |
 |---|---|
-| `PaymentSimulated` / `ClaimSimulated` | Computes the HMAC attestation over the envelope SHA-256 and persists it; returns `approval_attestation`. Both kinds share the same attestation path. |
+| `PaymentSimulated` / `ClaimSimulated` / `TrustlineSimulated` | Computes the HMAC attestation over the envelope SHA-256 and persists it; returns `approval_attestation`. Each commit tool accepts its own approval kind. |
 | `TrustlineClawbackOptIn` | Computes a domain-separated HMAC over `(network, code, issuer)` and stores it; the trustline gate recomputes and verifies it. No `approval_attestation` returned. |
 | `ToolsetFirstInvokeGate` | Builds and persists a time-boxed toolset grant, then consumes (removes) the pending entry. Does not set an attestation blob on the entry. No `approval_attestation` returned. |
-| `RuleProposalSimulated` | Computes the HMAC attestation over `proposal_sha256` (the domain-separated digest of the FULL resolved rule definition), not an envelope hash; persists it and returns `approval_attestation`. A DEDICATED gate verifies it at commit. The shared `PaymentSimulated`/`ClaimSimulated` gate rejects this kind outright. |
+| `RuleProposalSimulated` | Computes the HMAC attestation over `proposal_sha256` (the domain-separated digest of the FULL resolved rule definition), not an envelope hash; persists it and returns `approval_attestation`. A DEDICATED gate verifies it at commit. The envelope approval gate rejects this kind. |
 | `MppChargeSimulated` | Attests the prepared artifact hash under the profile and chain binding; returns `approval_attestation`. |
 | `Consumed` | Already resolved; cannot be attested again. |
 
@@ -200,9 +200,15 @@ validation is refused with `approval.already_attested`, `approval.rejected`, or
 
 The CLI summary and both inbox detail pages show the profile name, CAIP-2 chain id, endpoint authority, and enrolled signer.
 An enrollment placeholder appears as `(not enrolled)`.
-Payment and claim rows show the envelope's effective source; an operation source overrides the transaction source.
+Payment, claim, and trustline rows show the envelope's effective source; an operation source overrides the transaction source.
 An undecodable envelope appears as `(undecodable envelope)`.
 A claim whose stored summary source differs also shows `Source (stored summary)`.
+Trustline summaries show the full holder account, asset code, issuer, limit,
+simulated fee, and sequence number.
+The CLI names the action `trustline change (ChangeTrust)`.
+The CLI limit reads `unlimited`, `0 stroops (removes the trustline)`, or the exact
+stroop count and decimal asset amount.
+Both inboxes label it `TRUSTLINE` and offer `Approve trustline`.
 
 ### The attestation
 
