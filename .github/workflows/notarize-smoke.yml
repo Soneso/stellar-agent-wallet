@@ -16,7 +16,7 @@ permissions:
 jobs:
   build:
     name: build (aarch64-apple-darwin)
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,7 +57,7 @@ jobs:
   sign:
     name: sign + notarize smoke (aarch64-apple-darwin)
     needs: build
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 60
     # The release-signing environment holds the Apple signing and notarization
     # secrets and limits the refs that can use them.

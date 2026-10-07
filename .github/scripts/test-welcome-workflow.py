@@ -47,7 +47,7 @@ HEADER = {
     "job": "jobs:\n  welcome:\n",
     "bot condition": "    if: >-\n"
     "      (github.event.pull_request.user.type || github.event.issue.user.type) != 'Bot'\n",
-    "runner": "    runs-on: ubuntu-latest\n",
+    "runner": "    runs-on: ubuntu-24.04\n",
     "job permissions": "    permissions:\n      issues: write\n      pull-requests: write\n",
     "timeout": "    timeout-minutes: 5\n",
     "concurrency": "    concurrency:\n"

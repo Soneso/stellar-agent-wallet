@@ -39,7 +39,7 @@ permissions:
 jobs:
   preflight:
     name: preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The crates.io check paces one request per publishable member, up to 30 s
     # each, so a hanging crates.io needs more than 15 min with the other steps.
     timeout-minutes: 30
@@ -155,15 +155,15 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-26
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-26
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            os: windows-2025
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -310,7 +310,7 @@ jobs:
   sign-macos:
     name: sign ${{ matrix.target }}
     needs: [preflight, build]
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 60
     # The release-signing environment holds the Apple signing and notarization
     # secrets and limits the refs that can use them.
@@ -405,7 +405,7 @@ jobs:
   hashes:
     name: hashes
     needs: [preflight, build, sign-macos]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       subjects: ${{ steps.subjects.outputs.subjects }}
@@ -467,7 +467,7 @@ jobs:
   sign:
     name: sign
     needs: [preflight, build, hashes]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       id-token: write
@@ -528,7 +528,7 @@ jobs:
   publish:
     name: publish
     needs: [preflight, build, sign-macos, sign, hashes, provenance]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
