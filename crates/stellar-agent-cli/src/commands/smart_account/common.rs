@@ -822,11 +822,10 @@ mod tests {
         }
     }
 
-    /// The Ledger signer path never reports a keyring error: with no device
-    /// attached (CI) `resolve_signer` surfaces a `wallet_state.*` error; with a
-    /// live device it returns a signer. In every case the code is neither
-    /// `auth.keyring_not_found` nor `auth.keyring_locked` — a keyring lookup is
-    /// never performed on the hardware path.
+    /// The Ledger signer path resolves through the hardware layer.
+    /// With no device attached, it reports a `wallet_state.*` error; a live
+    /// device can return a signer. The test rejects every `auth.keyring_*`
+    /// code, including missing entries and platform failures.
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_signer_ledger_source_never_reports_keyring_error() {
         let flags = SignerSourceFlags {
@@ -852,9 +851,9 @@ mod tests {
             code, "auth.keyring_not_found",
             "the Ledger path must not surface a keyring-not-found error; got {code}"
         );
-        assert_ne!(
-            code, "auth.keyring_locked",
-            "the Ledger path must not surface a keyring-locked error; got {code}"
+        assert!(
+            !code.starts_with("auth.keyring_"),
+            "the Ledger path must not surface a keyring error; got {code}"
         );
     }
 

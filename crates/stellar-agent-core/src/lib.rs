@@ -80,10 +80,12 @@ pub mod counterparty;
 /// taxonomy overview, wire-format specification, and secret-material policy.
 pub mod error;
 
-/// Single classification point for platform-keyring failures
-/// (`classify_keyring_error`, `map_keyring_error`).  `stellar-agent-network`
-/// re-exports both from `stellar_agent_network::keyring`, so callers on that
-/// path are unaffected by the classifier living here.
+/// Classifies platform-keyring failures with fixed labels.
+/// Exports `classify_keyring_operation_error`, `KeyringOperation`, and
+/// `map_keyring_operation_error` for core's callers.
+/// `stellar_agent_network::keyring` re-exports the classifier and operation type.
+/// Its own `map_keyring_operation_error` adds typed headless DPAPI protect
+/// diagnostics. Callers outside core use the network functions.
 pub mod keyring_errors;
 
 /// Uniform JSON wire-format envelope for all CLI commands, MCP tools, and

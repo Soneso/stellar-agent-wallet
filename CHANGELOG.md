@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The two-argument `map_keyring_error` and `classify_keyring_error` functions
+  in core and network are deprecated. Use their operation-aware counterparts.
+- `AuthError::KeyringPlatformError` carries a safe `detail`. Constructors supply
+  the detail; matches use `KeyringPlatformError { .. }`. The Display changes;
+  `auth.keyring_platform_error` and the auth category stay unchanged.
+- Dev and test profiles use workspace line tables and omit dependency debuginfo;
+  tests disable incremental caches. The toolchain uses the minimal installation
+  profile with rustfmt and clippy.
+- Preflight scopes clippy, rustdoc, and tests to changed packages and their direct
+  dependents. Contribution guides start local verification with preflight and
+  use CI for the offline workspace suite.
+- The building guide documents disk use, debugging overrides, and opt-in cleanup.
 - Trustline approvals are stored, rendered, listed, and audited as trustline changes.
   The MCP commit gate accepts only the approval kind of its tool.
 - An approval file with a `trustline_simulated` entry needs this version or later.
@@ -28,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keyring write and store failures report `auth.keyring_platform_error` with
+  their cause instead of `auth.keyring_not_found`.
+  Read failures other than a missing entry, and construction failures, now
+  report `auth.keyring_platform_error`.
+- `headless-dpapi` names a failed `CryptProtectData` operation and its numeric
+  Windows code when available, with guidance for master-key access failures.
+- `profile enroll-signer` refuses an unset secret without touching the profile.
 - The approval prompt, `approve list`, and both inboxes name the trustline,
   account, asset, and limit.
 

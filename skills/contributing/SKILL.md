@@ -26,9 +26,14 @@ in these steps from the checkout root.
 4. Implement the acceptance criteria to
    [The bar for changes in CONTRIBUTING.md](../../CONTRIBUTING.md#the-bar-for-changes).
    Apply [Writing style](../../CONTRIBUTING.md#writing-style) to the edits.
-5. Run `bash .github/scripts/preflight.sh` and every test command named in the
-   issue's Gates. Use `bash .github/scripts/preflight.sh --list` to inspect the
-   selection. Follow [docs/maintainers/building.md](../../docs/maintainers/building.md#preflight)
+5. Start local verification with `bash .github/scripts/preflight.sh`, then run
+   the issue's Acceptance and Gates commands.
+   Use `bash .github/scripts/preflight.sh --list` to inspect the selection.
+   `bash .github/scripts/preflight.sh --full` runs the complete local registry,
+   including coverage. Local coverage, machete, and deny are optional reproductions.
+   CI runs the offline workspace suite on every pull request. Pull-request
+   coverage requires the `coverage` label; live acceptance uses its separate workflow.
+   Follow [docs/maintainers/building.md](../../docs/maintainers/building.md#preflight)
    for the gates, and record each exit code and unavailable gate.
 6. Complete the self-review in
    [docs/maintainers/review-checklist.md](../../docs/maintainers/review-checklist.md#self-review-before-you-open-a-pull-request).

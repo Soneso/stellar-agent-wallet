@@ -165,7 +165,7 @@ impl CredentialApi for HeadlessCredential {
         let _lock = acquire_store_lock(&self.path)?;
         let mut file = read_wire_file(&self.path)?;
         let sealed = crypto::seal(&self.mode, &aad_bytes(&self.service, &self.account), secret)
-            .map_err(map_crypto_error)?;
+            .map_err(|error| KcError::PlatformFailure(Box::new(error)))?;
         file.version = WIRE_VERSION;
         file.entries.insert(
             coord_key(&self.service, &self.account),
@@ -400,6 +400,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
     use std::sync::Arc as StdArc;
@@ -407,6 +408,62 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn dpapi_set_secret_preserves_protect_failure_as_platform_failure() {
+        use crate::crypto::{DpapiError, with_dpapi_protect_result};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keyring.json");
+        let store = HeadlessStore::new(path.clone(), ProtectionMode::Dpapi);
+        let entry = store.build("service", "account", None).unwrap();
+        with_dpapi_protect_result(
+            Err(DpapiError::Win32 {
+                api: "hostile-api-label",
+                code: 2148073483,
+            }),
+            || {
+                let error = entry.set_secret(b"secret-sentinel").unwrap_err();
+                let KcError::PlatformFailure(inner) = error else {
+                    panic!("protect errors must be platform failures");
+                };
+                assert!(matches!(
+                    inner.downcast_ref::<CryptoError>(),
+                    Some(CryptoError::DpapiProtectFailed { code: 2148073483 })
+                ));
+                assert!(!path.exists(), "failed protection must not persist a value");
+            },
+        );
+        with_dpapi_protect_result(Err(DpapiError::InputTooLarge), || {
+            let error = entry.set_secret(b"secret-sentinel").unwrap_err();
+            let KcError::PlatformFailure(inner) = error else {
+                panic!("protect errors must be platform failures");
+            };
+            assert!(matches!(
+                inner.downcast_ref::<CryptoError>(),
+                Some(CryptoError::DpapiProtectInternalFailure)
+            ));
+        });
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn unsupported_seal_is_platform_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeadlessStore::new(dir.path().join("keyring.json"), ProtectionMode::Dpapi);
+        let error = store
+            .build("service", "account", None)
+            .unwrap()
+            .set_secret(b"secret")
+            .unwrap_err();
+        let KcError::PlatformFailure(inner) = error else {
+            panic!("seal errors must be platform failures");
+        };
+        assert!(matches!(
+            inner.downcast_ref::<CryptoError>(),
+            Some(CryptoError::DpapiUnsupportedPlatform)
+        ));
+    }
 
     fn env_key_store(path: PathBuf) -> HeadlessStore {
         HeadlessStore::new(

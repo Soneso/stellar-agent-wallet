@@ -42,7 +42,8 @@ stellar-agent-core = { path = "../stellar-agent-core" }
 
 [features]
 # STELLAR_AGENT_HOME override on headless_keyring_path, for the CLI/MCP
-# acceptance-test harness. Never enabled in a release build.
+# acceptance-test harness, plus scoped Windows DPAPI protect-result injection.
+# Never enabled in a release build.
 test-helpers = []
 
 [lints]

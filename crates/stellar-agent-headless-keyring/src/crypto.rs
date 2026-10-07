@@ -10,10 +10,16 @@
 //! - [`ProtectionMode::Dpapi`] (Windows only) — `CryptProtectData` /
 //!   `CryptUnprotectData`, CurrentUser scope, via
 //!   `stellar_agent_windows_identity::dpapi_protect` /
-//!   `dpapi_unprotect`. Any process running as the same Windows user can
-//!   decrypt the result — the SAME trust boundary as Windows Credential
-//!   Manager, minus the interactive-logon-session requirement DPAPI
-//!   CurrentUser scope does not have.
+//!   `dpapi_unprotect`. Processes running as the same Windows user can decrypt
+//!   when the session can access that user's DPAPI master key. Key-authenticated
+//!   SSH sessions can lack access; an interactive desktop logon may help.
+//!   `headless-env` has no DPAPI dependency and needs its configured key.
+//!
+//! DPAPI protect failures carry only a typed numeric Windows code when
+//! available. The store maps seal errors to `PlatformFailure`, and the wallet
+//! reports `auth.keyring_platform_error` naming `CryptProtectData`. Unprotect
+//! failures remain [`CryptoError::SealFailed`] and map to `BadDataFormat`,
+//! without a decryption reason or code.
 //!
 //! Both modes are tamper-evident: `open` returns [`CryptoError::SealFailed`]
 //! for a corrupted or tampered ciphertext rather than silently returning
@@ -35,13 +41,23 @@ pub(crate) const NONCE_LEN: usize = 24;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CryptoError {
-    /// Encryption or decryption failed. For `open`, this is the fail-closed
-    /// outcome for a corrupted or tampered ciphertext — deliberately carries
-    /// no further detail (an AEAD/DPAPI failure reason is not
-    /// operator-actionable and must never hint at how close an attacker's
-    /// forgery came).
+    /// AEAD encryption or decryption failed, or DPAPI unprotect failed.
+    /// Every DPAPI unprotect failure uses this variant, without a reason or
+    /// code, since those details must not describe rejected data.
     #[error("seal/open operation failed (corrupt or tampered data, or a key mismatch)")]
     SealFailed,
+    /// DPAPI protect failed with a Windows code from `CryptProtectData`.
+    /// Display suggests remedies for sessions that cannot access the master key.
+    #[error(
+        "DPAPI CryptProtectData failed (error {code}) while writing headless-dpapi; if this session cannot access the user's DPAPI master key, try an interactive desktop logon, or configure STELLAR_AGENT_KEYRING_BACKEND=headless-env and STELLAR_AGENT_HEADLESS_KEYRING_KEY"
+    )]
+    DpapiProtectFailed {
+        /// Numeric Windows error returned by CryptProtectData.
+        code: u32,
+    },
+    /// DPAPI protect failed without a Windows error code.
+    #[error("headless-dpapi could not protect the value")]
+    DpapiProtectInternalFailure,
     /// [`ProtectionMode::Dpapi`] was selected on a non-Windows target.
     #[error("DPAPI protection mode is only available on Windows")]
     DpapiUnsupportedPlatform,
@@ -166,10 +182,48 @@ pub(crate) fn open(
     }
 }
 
+/// Typed Windows error used by scoped protect fixtures.
+#[cfg(all(target_os = "windows", any(test, feature = "test-helpers")))]
+pub use stellar_agent_windows_identity::DpapiError;
+
+#[cfg(all(target_os = "windows", any(test, feature = "test-helpers")))]
+thread_local! {
+    static PROTECT_RESULT: std::cell::RefCell<Option<Result<Vec<u8>, stellar_agent_windows_identity::DpapiError>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with a one-shot protect result on this thread.
+///
+/// The production DPAPI sealing path consumes the result. The previous
+/// injection is restored when the scope ends, including during unwinding.
+#[cfg(all(target_os = "windows", any(test, feature = "test-helpers")))]
+pub fn with_dpapi_protect_result<T>(
+    result: Result<Vec<u8>, stellar_agent_windows_identity::DpapiError>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Result<Vec<u8>, stellar_agent_windows_identity::DpapiError>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PROTECT_RESULT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(PROTECT_RESULT.with(|slot| slot.replace(Some(result))));
+    f()
+}
+
 #[cfg(target_os = "windows")]
 fn dpapi_seal(plaintext: &[u8]) -> Result<Sealed, CryptoError> {
-    let ciphertext = stellar_agent_windows_identity::dpapi_protect(plaintext)
-        .map_err(|_| CryptoError::SealFailed)?;
+    #[cfg(any(test, feature = "test-helpers"))]
+    let result = PROTECT_RESULT
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_else(|| stellar_agent_windows_identity::dpapi_protect(plaintext));
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    let result = stellar_agent_windows_identity::dpapi_protect(plaintext);
+    let ciphertext = result.map_err(|error| match error {
+        stellar_agent_windows_identity::DpapiError::Win32 { code, .. } => {
+            CryptoError::DpapiProtectFailed { code }
+        }
+        _ => CryptoError::DpapiProtectInternalFailure,
+    })?;
     Ok(Sealed {
         nonce: None,
         ciphertext,
@@ -252,6 +306,61 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
     use super::*;
+
+    #[test]
+    fn dpapi_protect_failed_display_names_code_and_remedies() {
+        assert_eq!(
+            CryptoError::DpapiProtectFailed { code: 2148073483 }.to_string(),
+            "DPAPI CryptProtectData failed (error 2148073483) while writing headless-dpapi; if this session cannot access the user's DPAPI master key, try an interactive desktop logon, or configure STELLAR_AGENT_KEYRING_BACKEND=headless-env and STELLAR_AGENT_HEADLESS_KEYRING_KEY"
+        );
+        assert_eq!(
+            CryptoError::DpapiProtectInternalFailure.to_string(),
+            "headless-dpapi could not protect the value"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn dpapi_seal_preserves_only_win32_protect_code() {
+        with_dpapi_protect_result(
+            Err(DpapiError::Win32 {
+                api: "hostile-api-label",
+                code: 2148073483,
+            }),
+            || {
+                assert!(matches!(
+                    dpapi_seal(b"secret"),
+                    Err(CryptoError::DpapiProtectFailed { code: 2148073483 })
+                ));
+            },
+        );
+        for error in [
+            DpapiError::NullBuffer {
+                api: "hostile-api-label",
+            },
+            DpapiError::InputTooLarge,
+            DpapiError::UnsupportedPlatform,
+        ] {
+            with_dpapi_protect_result(Err(error), || {
+                assert!(matches!(
+                    dpapi_seal(b"secret"),
+                    Err(CryptoError::DpapiProtectInternalFailure)
+                ));
+            });
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn dpapi_unprotect_failure_exposes_no_reason_or_code() {
+        let error = dpapi_open(b"invalid-dpapi-blob").unwrap_err();
+        assert!(matches!(error, CryptoError::SealFailed));
+        assert_eq!(
+            error.to_string(),
+            "seal/open operation failed (corrupt or tampered data, or a key mismatch)"
+        );
+        assert_eq!(format!("{error:?}"), "SealFailed");
+    }
 
     fn env_key_mode() -> ProtectionMode {
         ProtectionMode::EnvKey(Arc::new(Zeroizing::new([0x42u8; 32])))

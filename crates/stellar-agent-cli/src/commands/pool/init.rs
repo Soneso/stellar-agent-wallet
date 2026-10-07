@@ -33,7 +33,8 @@ use stellar_agent_core::profile::{
 use stellar_agent_network::NetworkContext;
 use stellar_agent_network::{
     SoftwareSigningKey, StellarRpcClient, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
-    WalletSubmissionRecorder, fetch_account, keyring::enrolled_keyring_signer,
+    WalletSubmissionRecorder, fetch_account,
+    keyring::{KeyringOperation, enrolled_keyring_signer},
 };
 use stellar_agent_pool::{
     PoolError,
@@ -204,19 +205,15 @@ fn prepare_seed(
                 }
             }
             KeyringProbe::Absent => fresh_seed(),
-            KeyringProbe::BackendError(error) => {
-                return Err(classify_probe_backend_error(&error, master));
+            KeyringProbe::BackendError(error, operation) => {
+                return Err(classify_probe_backend_error(&error, operation, master));
             }
         },
     };
     pending.channels = channels(&seed, pending.channels.len())?;
     persist(name, master, pending)?;
     let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(seed.as_ref()));
-    KeyringEntry::new(&master.service, &master.account)
-        .and_then(|entry| entry.set_password(&encoded))
-        .map_err(|error| {
-            classify_pool_seed_write_failure(&error, master, "keyring write failed")
-        })?;
+    write_pool_seed(master, &encoded)?;
     pending.seed_ready = true;
     persist(name, master, pending)?;
     Ok(seed)
@@ -357,8 +354,8 @@ where
                 KeyringProbe::Present if !args.force => {
                     return Err(pool_err_to_wallet_err(&PoolError::AlreadyInitialised));
                 }
-                KeyringProbe::BackendError(error) => {
-                    return Err(classify_probe_backend_error(&error, &master));
+                KeyringProbe::BackendError(error, operation) => {
+                    return Err(classify_probe_backend_error(&error, operation, &master));
                 }
                 _ => {}
             }
@@ -680,72 +677,75 @@ enum KeyringProbe {
     Present,
     /// The entry does not exist (`keyring_core::Error::NoEntry`).
     Absent,
-    /// The keyring backend returned an error other than `NoEntry`; presence
-    /// is ambiguous. Carries the typed error so the refusal site can
-    /// classify environmental causes (a non-interactive Windows session)
-    /// instead of reporting a generic backend failure.
-    BackendError(keyring_core::Error),
+    /// Construction or a read failed, so existence is unknown. Construction
+    /// failures include `NoEntry`; only a missing read proves absence.
+    BackendError(keyring_core::Error, KeyringOperation),
 }
 
 /// Probes whether a keyring entry exists, distinguishing `NoEntry` from backend
 /// errors.
 ///
-/// Only `keyring_core::Error::NoEntry` is treated as
-/// "definitely absent".  All other errors are returned as `BackendError`.
+/// Only a read returning `keyring_core::Error::NoEntry` proves absence.
+/// Construction failures and other read errors retain their operation.
 fn probe_keyring_entry(service: &str, account: &str) -> KeyringProbe {
     let entry = match KeyringEntry::new(service, account) {
         Ok(e) => e,
         Err(e) => {
-            return KeyringProbe::BackendError(e);
+            return KeyringProbe::BackendError(e, KeyringOperation::Construct);
         }
     };
     match entry.get_password() {
         Ok(_) => KeyringProbe::Present,
         Err(keyring_core::Error::NoEntry) => KeyringProbe::Absent,
-        Err(e) => KeyringProbe::BackendError(e),
+        Err(e) => KeyringProbe::BackendError(e, KeyringOperation::Read),
     }
 }
 
-/// Classifies an ambiguous existence-probe failure for the pool master
-/// coordinate.
-///
-/// Environmental causes keep their typed classification — most notably a
-/// non-interactive Windows session, which surfaces as
-/// `auth.keyring_interactive_session_required`. Only when the classification
-/// falls back to the generic not-found shape does the error carry the
-/// cannot-determine-existence guidance that explains why the probe refuses
-/// even with `--force`.
+/// Classifies a failed probe and explains why existence is unknown.
 fn classify_probe_backend_error(
     e: &keyring_core::Error,
+    operation: KeyringOperation,
     pool_master_ref: &KeyringEntryRef,
 ) -> WalletError {
-    match stellar_agent_network::keyring::map_keyring_error(e, &pool_master_ref.service) {
-        WalletError::Auth(AuthError::KeyringNotFound { .. }) => {
-            WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!(
-                    "{}:{} (keyring backend error — cannot determine existence)",
-                    pool_master_ref.service, pool_master_ref.account
-                ),
+    match stellar_agent_network::keyring::map_keyring_operation_error(
+        e,
+        operation,
+        &pool_master_ref.service,
+    ) {
+        WalletError::Auth(AuthError::KeyringPlatformError { detail }) => {
+            WalletError::Auth(AuthError::KeyringPlatformError {
+                detail: format!("{detail}; cannot determine existence"),
             })
         }
         classified => classified,
     }
 }
 
-/// Preserves the keyring error classification and names the completion command.
+/// Writes the seed with the operation that failed and the resume instruction.
+fn write_pool_seed(master: &KeyringEntryRef, encoded: &str) -> Result<(), WalletError> {
+    let entry = KeyringEntry::new(&master.service, &master.account).map_err(|error| {
+        classify_pool_seed_write_failure(&error, KeyringOperation::Construct, master)
+    })?;
+    entry.set_password(encoded).map_err(|error| {
+        classify_pool_seed_write_failure(&error, KeyringOperation::Write, master)
+    })?;
+    Ok(())
+}
+
+/// Preserves the error classification and names the completion command.
 fn classify_pool_seed_write_failure(
     e: &keyring_core::Error,
+    operation: KeyringOperation,
     pool_master_ref: &KeyringEntryRef,
-    phase: &str,
 ) -> WalletError {
-    match stellar_agent_network::keyring::map_keyring_error(e, &pool_master_ref.service) {
-        WalletError::Auth(AuthError::KeyringNotFound { .. }) => {
-            WalletError::Auth(AuthError::KeyringNotFound {
-                name: format!(
-                    "{}:{} (seed persistence pending; {phase}; \
-                     re-run with --resume)",
-                    pool_master_ref.service, pool_master_ref.account
-                ),
+    match stellar_agent_network::keyring::map_keyring_operation_error(
+        e,
+        operation,
+        &pool_master_ref.service,
+    ) {
+        WalletError::Auth(AuthError::KeyringPlatformError { detail }) => {
+            WalletError::Auth(AuthError::KeyringPlatformError {
+                detail: format!("{detail}; seed persistence pending; re-run with --resume"),
             })
         }
         classified => classified,
@@ -872,39 +872,77 @@ mod tests {
             WINDOWS_NO_LOGON_SESSION_TEXT,
         )));
         assert_eq!(
-            classify_probe_backend_error(&e, &r).code(),
+            classify_probe_backend_error(&e, KeyringOperation::Construct, &r).code(),
             "auth.keyring_interactive_session_required"
         );
         assert_eq!(
-            classify_pool_seed_write_failure(&e, &r, "keyring write failed").code(),
+            classify_pool_seed_write_failure(&e, KeyringOperation::Write, &r).code(),
             "auth.keyring_interactive_session_required"
         );
     }
 
-    /// Failures that classify to the generic not-found shape keep the
-    /// pool-specific operator guidance: the probe refusal explains the
-    /// cannot-determine-existence stance, and the seed write
-    /// failure carries the completion instruction.
     #[test]
-    fn pool_keyring_generic_failures_keep_operator_guidance() {
-        let r = KeyringEntryRef::new("stellar-agent-pool-classify", "master");
-        let e = keyring_core::Error::NoEntry;
-
-        let probe = classify_probe_backend_error(&e, &r);
-        assert_eq!(probe.code(), "auth.keyring_not_found");
-        assert!(
-            probe.message().contains("cannot determine existence"),
-            "probe guidance lost: {}",
-            probe.message()
+    #[serial]
+    fn pool_keyring_no_entry_distinguishes_construct_read_and_write() {
+        use keyring_core::api::CredentialStoreApi;
+        use stellar_agent_test_support::keyring_mock;
+        struct MissingConstruction;
+        impl CredentialStoreApi for MissingConstruction {
+            fn vendor(&self) -> String {
+                "hostile-vendor".to_owned()
+            }
+            fn id(&self) -> String {
+                "hostile-id".to_owned()
+            }
+            fn build(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&std::collections::HashMap<&str, &str>>,
+            ) -> keyring_core::Result<KeyringEntry> {
+                Err(keyring_core::Error::NoEntry)
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let r = KeyringEntryRef::new("private-service", "private-account");
+        keyring_core::set_default_store(std::sync::Arc::new(MissingConstruction));
+        let KeyringProbe::BackendError(error, operation) =
+            probe_keyring_entry(&r.service, &r.account)
+        else {
+            panic!("construction failure must refuse the probe");
+        };
+        assert_eq!(operation, KeyringOperation::Construct);
+        let probe = classify_probe_backend_error(&error, operation, &r);
+        assert_eq!(probe.code(), "auth.keyring_platform_error");
+        assert_eq!(
+            probe.message(),
+            "keyring operation failed: construct unknown credential store: no matching credential; cannot determine existence"
+        );
+        let construct = write_pool_seed(&r, "seed-sentinel").unwrap_err();
+        assert_eq!(construct.code(), "auth.keyring_platform_error");
+        assert_eq!(
+            construct.message(),
+            "keyring operation failed: construct unknown credential store: no matching credential; seed persistence pending; re-run with --resume"
         );
 
-        let write = classify_pool_seed_write_failure(&e, &r, "keyring write failed");
-        assert_eq!(write.code(), "auth.keyring_not_found");
-        assert!(
-            write.message().contains("seed persistence pending")
-                && write.message().contains("re-run with --resume"),
-            "write guidance lost: {}",
-            write.message()
+        keyring_mock::install().unwrap();
+        assert!(matches!(
+            probe_keyring_entry(&r.service, &r.account),
+            KeyringProbe::Absent
+        ));
+        let entry = KeyringEntry::new(&r.service, &r.account).unwrap();
+        entry
+            .as_any()
+            .downcast_ref::<keyring_core::mock::Cred>()
+            .unwrap()
+            .set_error(keyring_core::Error::NoEntry);
+        let write = write_pool_seed(&r, "seed-sentinel").unwrap_err();
+        assert_eq!(write.code(), "auth.keyring_platform_error");
+        assert_eq!(
+            write.message(),
+            "keyring operation failed: write unknown credential store: no matching credential; seed persistence pending; re-run with --resume"
         );
     }
 

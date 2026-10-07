@@ -9,9 +9,15 @@ Meet [The bar for changes](CONTRIBUTING.md#the-bar-for-changes) for every change
 
 ## Proof
 
-Run `bash .github/scripts/preflight.sh` before a pull request; use
-`bash .github/scripts/preflight.sh --list` to see the selection. See
-[docs/maintainers/building.md](docs/maintainers/building.md#preflight) for the gates.
+Start local verification with `bash .github/scripts/preflight.sh` and run the
+issue-specific acceptance commands. Use `bash .github/scripts/preflight.sh --list`
+to see the selection. `bash .github/scripts/preflight.sh --full` runs the complete
+local registry, including coverage.
+
+CI runs the offline workspace suite on every pull request. Pull-request
+coverage requires the `coverage` label; live acceptance uses its separate
+workflow. Local coverage, machete, and deny are optional reproductions.
+See [the building guide](docs/maintainers/building.md#preflight) for the gates.
 
 ## Self-review
 

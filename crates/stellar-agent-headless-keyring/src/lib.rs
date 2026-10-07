@@ -55,12 +55,16 @@
 //!   `CryptProtectData` / `CryptUnprotectData`, CurrentUser scope, via
 //!   `stellar_agent_windows_identity::dpapi_protect` /
 //!   `dpapi_unprotect` (`CRYPTPROTECT_UI_FORBIDDEN`, so a headless session
-//!   can never block on a UI prompt). **Any process running as the same
-//!   Windows user can decrypt the result — the SAME trust boundary as
-//!   Windows Credential Manager**, minus the interactive-logon-session
-//!   requirement DPAPI CurrentUser scope does not have. This is the mode the
-//!   tester's `stellar-win-vm` acceptance evidence targets (an SSH / network
-//!   logon session).
+//!   can never block on a UI prompt). Processes running as the same Windows
+//!   user can decrypt when the session can access that user's DPAPI master key.
+//!   Key-authenticated SSH sessions can lack access; an interactive desktop
+//!   logon may help. `headless-env` needs its configured encryption key and has
+//!   no DPAPI dependency.
+//!
+//! Protect failures map to `PlatformFailure`. The wallet reports
+//! `auth.keyring_platform_error`, naming `CryptProtectData` and its numeric
+//! Windows code when available. Unprotect failures remain detail-free and map
+//! to `BadDataFormat`, exposing no decryption reason or code.
 //!
 //! Both modes fail closed on a corrupted or tampered entry — see
 //! [`crypto`]'s module docs.

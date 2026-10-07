@@ -54,7 +54,7 @@ use zeroize::Zeroizing;
 use stellar_agent_core::error::{AuthError, ValidationError, WalletError};
 use stellar_agent_core::profile::owner_key::{self, OwnerKeyContext};
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
-use stellar_agent_network::keyring::classify_keyring_error;
+use stellar_agent_network::keyring::{KeyringOperation, classify_keyring_operation_error};
 
 use crate::{ReplayWindow, error::NonceError};
 
@@ -872,7 +872,7 @@ impl NonceMint {
     /// - [`NonceError::KeyringError`] if the platform keyring is unavailable,
     ///   the entry does not exist, or the keyring is locked. The wrapped
     ///   `AuthError` is classified by
-    ///   [`stellar_agent_network::keyring::classify_keyring_error`]
+    ///   [`stellar_agent_network::keyring::classify_keyring_operation_error`]
     ///   (interactive-session / platform / not-found).
     /// - [`NonceError::SerialiseFailed`] if the stored value is not valid base64.
     /// - [`NonceError::KeyTooShort`] if fewer than 32 bytes decode.
@@ -895,14 +895,22 @@ impl NonceMint {
         // typed code instead of collapsing into "not found".
         let entry =
             KeyringEntry::new(&self.entry_ref.service, &self.entry_ref.account).map_err(|e| {
-                tracing::debug!(error = %e, "nonce keyring entry construction failed");
-                NonceError::KeyringError(classify_keyring_error(&e, &self.entry_ref.service))
+                tracing::debug!("nonce keyring entry construction failed");
+                NonceError::KeyringError(classify_keyring_operation_error(
+                    &e,
+                    KeyringOperation::Construct,
+                    &self.entry_ref.service,
+                ))
             })?;
 
         // Retrieve the password as a Zeroizing<String> to clear it on drop.
         let raw: Zeroizing<String> = Zeroizing::new(entry.get_password().map_err(|e| {
-            tracing::debug!(error = %e, "nonce keyring get_password failed");
-            NonceError::KeyringError(classify_keyring_error(&e, &self.entry_ref.service))
+            tracing::debug!("nonce keyring get_password failed");
+            NonceError::KeyringError(classify_keyring_operation_error(
+                &e,
+                KeyringOperation::Read,
+                &self.entry_ref.service,
+            ))
         })?);
 
         // Base64-decode into a Zeroizing<Vec<u8>>.
@@ -932,7 +940,9 @@ impl NonceMint {
                     NonceError::KeyMatchesOwnerPublicKey
                 }
                 WalletError::Auth(auth) => NonceError::KeyringError(auth),
-                _ => NonceError::KeyringError(AuthError::KeyringPlatformError),
+                _ => NonceError::KeyringError(AuthError::KeyringPlatformError {
+                    detail: "owner public-key validation failed".to_owned(),
+                }),
             },
         )?;
 
