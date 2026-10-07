@@ -152,7 +152,7 @@ coding agent this prompt with the number in place of NNN:
 > the issue states, and `bash .github/scripts/preflight.sh` passes.
 > 6. Show me the diff, the gate results, and a pull request description that
 > fills in `.github/PULL_REQUEST_TEMPLATE.md` with the preflight table and
-> "Closes #NNN". After I confirm, commit in conventional-commit style, push to
+> "Closes #NNN". After I confirm, commit with that subject and body, push to
 > my fork, and open the pull request against `main` with `gh pr create`. Keep
 > "Allow edits by maintainers" enabled.
 > 7. When a review comment arrives, show it to me with your proposed answer or
@@ -209,8 +209,7 @@ maintainer approves it. Every required check must pass before merge.
 
 ## Writing style
 
-Documentation, code comments, commit messages, and pull request descriptions
-follow these rules:
+Documentation and code comments follow these rules:
 
 - Sentences under 35 words, in present tense.
 - No em dash or en dash. Use a comma, a period, or a colon.
@@ -224,17 +223,34 @@ follow these rules:
 
 `python3 .github/scripts/check-docs-style.py <file>` checks the mechanical rules.
 
+Commit messages and pull request descriptions follow the same rules except for
+tense, which the next section sets.
+
 ## Commit and pull request conventions
 
-- Write commit messages in conventional-commit style, for example
-  `fix: redact account id in network error` or `feat: add per-period cap criterion`.
+- The subject line of a commit and the title of a pull request are one imperative
+  sentence that completes "If applied, this change will ...".
+  For example: `Report keyring write failures with their cause`.
+  Capitalize the subject and title, and omit the period. Aim for about 50
+  characters, with at most 72 including the `(#N)` that the squash merge appends.
+  Use no type prefix such as `fix:` or `docs:`: the CHANGELOG carries the category.
+- The body of a commit and the description of a pull request state the motivation
+  first. Describe what the code did before the change and why that was a problem,
+  or what the change enables. Anchor the motivation in time, for example
+  "Before this change, ...". Then describe what the change does with "This change:"
+  followed by bullets that start with a verb, or with imperative sentences.
+  Then state the verification: the gates that ran and their results, scoped to
+  what ran. Name the CI job that proves what the local machine cannot.
+  Add `Closes #N` on its own line only when the pull request resolves that issue.
+  Use one issue per line.
 - Keep one focused change per pull request. Split unrelated work into separate
   pull requests.
-- Describe what the change does and why. State the rationale, not the history of how
-  the code got there.
 - Fill in every part of the
   [pull request template](.github/PULL_REQUEST_TEMPLATE.md), which GitHub places
   in the description when you open a pull request.
+- The maintainer sets the squash commit's subject to the pull request title and
+  its body to the description. The maintainer adjusts a title in another form
+  at merge.
 
 ## Reporting bugs and requesting features
 
