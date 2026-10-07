@@ -929,7 +929,7 @@ case_inbox_web() {
   edit crates/stellar-agent-approval-ui/src/web/app_shared.js
   pin_packages "stellar-agent-approval-ui stellar-agent-approval-remote stellar-agent-cli stellar-agent-mcp" test-helpers \
     crates/stellar-agent-approval-ui/src/web/app_shared.js
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" "test=$TEST_COMMAND" inbox-js
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" inbox-js
 }
 
 # The MCP manifest inherits stellar-agent-sep7 from [workspace.dependencies].
