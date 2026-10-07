@@ -9,9 +9,12 @@ Closes #N
 ## Gates run
 
 <!--
-Paste the table that `bash .github/scripts/preflight.sh` prints. A change
-outside documentation, scripts, and workflows also lists the acceptance gates
-of CONTRIBUTING.md it ran, with their exit codes.
+Start local verification with `bash .github/scripts/preflight.sh` and paste its
+table here. Also list issue-specific acceptance commands and their exit codes.
+`bash .github/scripts/preflight.sh --full` runs the complete local registry,
+including coverage. Local coverage, machete, and deny are optional reproductions.
+CI runs the offline workspace suite on every pull request. Pull-request
+coverage requires the `coverage` label; live acceptance uses its separate workflow.
 -->
 
 -

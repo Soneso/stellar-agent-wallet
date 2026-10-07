@@ -1,7 +1,7 @@
 # Building and testing
 
 This guide is for maintainers and contributors building the `stellar-agent-wallet`
-workspace and running the gates every change must pass. The workspace is a Cargo
+workspace and running the gates that apply to each change. The workspace is a Cargo
 workspace of `stellar-agent-*` crates that produces two binaries: `stellar-agent`
 (the CLI, from crate `stellar-agent-cli`) and `stellar-agent-mcp` (the MCP stdio
 server, from crate `stellar-agent-mcp`). For the crate layout and dependency
@@ -17,7 +17,7 @@ The toolchain is pinned in `rust-toolchain.toml`:
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
-profile = "default"
+profile = "minimal"
 ```
 
 The channel is `stable` (not a fixed version). With `rustup` installed, the pinned
@@ -25,6 +25,8 @@ channel and the `rustfmt` and `clippy` components are provisioned automatically 
 first build in the workspace. Run `rustup update stable` before a gate pass so
 `clippy` matches the latest stable lints.
 
+The minimal profile avoids installing `rust-docs` on a fresh toolchain.
+It does not remove components from an existing installation.
 The workspace targets Rust edition 2024.
 
 ### Gate tools
@@ -56,14 +58,14 @@ Build the whole workspace:
 cargo build
 ```
 
-Release build:
+For maintainer release validation:
 
 ```bash
 cargo build --release
 ```
 
-A release build (no `--all-targets`) surfaces dead code that a test-targets build
-can mask, so run it before sealing a change.
+A release build without `--all-targets` surfaces dead code that a test-targets
+build can mask.
 
 ### Platform note: `windows-identity`
 
@@ -75,12 +77,106 @@ macOS and Linux the crate compiles to a dependency-free shim whose lookup return
 a `WindowsIdentityError::UnsupportedPlatform` error and pulls in no Win32
 dependency, so nothing extra is required to build the workspace off Windows.
 
+## Disk use
+
+The dev profile gives workspace members line tables, including members built
+as dependencies. Non-workspace dependencies receive no debuginfo. Workspace
+variable and type inspection and non-workspace dependency source-line debugging
+are unavailable. The test profile inherits these debug settings and prevents
+new incremental caches. Existing incremental caches remain until cleaned.
+Repeated test compilation can take longer without incremental caches.
+
+Dev-profile build and check loops remain incremental unless configuration or
+environment overrides them. Debug assertions stay enabled. Panic behavior,
+optimization levels, and release profiles retain their defaults.
+Distinct feature and profile builds can retain multiple artifact variants.
+
+For full debugging, remove conflicting profile or debug overrides and append
+these options to the selected offline test command:
+
+```sh
+--config 'profile.dev.debug=true' --config 'profile.dev.package."*".debug=true'
+```
+
+### Measurements
+
+Each run starts with an empty target directory. Paired runs use the same
+machine, toolchain, build jobs, Cargo configuration, environment overrides,
+and download-cache conditions. Pause housekeeping throughout the measurements.
+Use isolated committed snapshots for baseline and current runs.
+Keep the toolchain fixed between paired runs.
+
+Record the OS, architecture, exact Rust, Cargo, and gate-tool versions, commit,
+lockfile hash, commands, package and feature selection, elapsed time, and every
+gate exit status. Keep Cargo-home, rustup, and interop storage separate.
+
+Sample target size before execution, every 30 seconds, and immediately after
+completion. The maximum is the 30-second sampled peak. Ratios divide current
+sizes by baseline sizes. Failed or unavailable runs do not establish comparable
+savings.
+
+| Run | Retained KiB | 30-second sampled peak KiB | Retained ratio | Peak ratio | Elapsed seconds |
+| --- | --- | --- | --- | --- | --- |
+| Docs-only, current | measured | measured | Not paired | Not paired | measured |
+| CLI, baseline | measured | measured | Not applicable | Not applicable | measured |
+| CLI, current | measured | measured | measured | measured | measured |
+| Full suite, baseline | measured | measured | Not applicable | Not applicable | measured |
+| Full suite, current | measured | measured | measured | measured | measured |
+| Coverage alone, current | measured | measured | Not paired | Not paired | measured |
+
+Measure each existing path with `du -sk`; record absent paths as zero.
+Subdirectories are breakdowns, not additive totals. Paths below are relative
+to the effective target directory.
+
+| Run | debug/deps KiB | debug/incremental KiB | debug/build KiB | doc KiB | llvm-cov-target KiB |
+| --- | --- | --- | --- | --- | --- |
+| Docs-only, current | measured | measured | measured | measured | measured |
+| CLI, baseline | measured | measured | measured | measured | measured |
+| CLI, current | measured | measured | measured | measured | measured |
+| Full suite, baseline | measured | measured | measured | measured | measured |
+| Full suite, current | measured | measured | measured | measured | measured |
+| Coverage alone, current | measured | measured | measured | measured | measured |
+
+| Separate storage | KiB |
+| --- | --- |
+| Cargo-home | measured |
+| Rustup | measured |
+| Interop | measured |
+
+Docs-only and CLI runs use `bash .github/scripts/preflight.sh --base HEAD`
+after verifying the selection with `--list`. Add a temporary probe to
+`README.md` for docs-only runs or `crates/stellar-agent-cli/Cargo.toml` for CLI
+runs, then remove it afterward. The full suite uses
+`bash .github/scripts/preflight.sh --full`, including coverage and its floor
+check. Coverage alone uses the command in [Coverage](#coverage).
+
+### Cleanup
+
+Cleanup is opt-in. Run it only after builds, tests, and debugging sessions
+using the affected target directory finish.
+
+`cargo clean` removes the effective target directory, including shared
+artifacts when `CARGO_TARGET_DIR` is set. `cargo clean --doc` removes generated
+documentation selectively. Removing the effective target's `debug/incremental`
+directory discards incremental caches. Both selective cleanup operations cause
+later rebuilding.
+
+Compatible worktrees may share `CARGO_TARGET_DIR`. Coordinate Cargo runs and
+cleanup across every user of that directory. Cargo downloads, rustup
+toolchains, and other storage remain outside this cleanup. Coverage uses a
+separate `llvm-cov-target` subtree.
+
 ## Gate suite
 
-A change to Rust code must pass all of the gates below before commit. A change
-to documentation, scripts, or workflows passes the checks of the Install
-surface workflow. They mirror the build-gate dimension of the
-[review checklist](review-checklist.md); run them locally before requesting review.
+Start local verification with `bash .github/scripts/preflight.sh` and run the
+issue-specific acceptance commands. `bash .github/scripts/preflight.sh --full`
+runs the complete local registry, including coverage.
+
+CI runs the offline workspace suite on every pull request. Pull-request
+coverage requires the `coverage` label; live acceptance uses its separate
+workflow. Local coverage, `cargo machete`, and `cargo deny check` are optional
+reproductions. See the build-gate dimension of the
+[review checklist](review-checklist.md#8-build-gates).
 
 ### Preflight
 
@@ -94,7 +190,8 @@ bash .github/scripts/preflight.sh
 
 - `--base <ref>` compares the branch with its merge base with `<ref>`. The
   default is `origin/main`, or `main` when `origin/main` does not exist.
-- `--full` runs every gate in the registry, with the workspace test command.
+- `--full` runs every gate in the registry, with workspace Cargo commands.
+  It includes coverage and its floor check.
 - `--list` prints the selected gates, one `<id><TAB><command>` line each in
   registry order, and runs nothing.
 
@@ -124,15 +221,21 @@ matches:
 - A file under `interop/` adds no gate of its own, since the interop
   harnesses run under `--full`.
 
-The test gate runs `cargo test` for the packages that own the changed Rust
-paths, in path order, followed by their direct dependents, sorted by name. A
-dependent is a workspace member whose `[dependencies]`, `[dev-dependencies]`,
-or target-specific dependency table names an owner by `path`, directly or
-through `workspace = true`. The `--features` list holds the offline test
-features that at least one selected package declares: `test-helpers`,
-`test-hooks`, `test-loopback`, and `verifier-registry`, in that order. A
-changed Rust path outside every member, such as a root manifest, a path under
-`tests/`, or a deleted member manifest, selects the workspace command instead.
+Clippy, rustdoc, and tests select the packages that own the changed Rust
+paths, in path order, followed by their direct dependents, sorted by name.
+Cargo builds the required dependency closures. A dependent names an owner by
+`path`, directly or through `workspace = true`, in `[dependencies]`,
+`[dev-dependencies]`, or a target-specific dependency table.
+
+Clippy and rustdoc use the same `-p` list as tests, with `--all-features`.
+Tests use the offline features that at least one selected package declares:
+`test-helpers`, `test-hooks`, `test-loopback`, and `verifier-registry`, in that
+order.
+
+A Rust path outside every member selects workspace commands. This includes
+root manifests, the lockfile, the toolchain, paths under `tests/`, and deleted
+member manifests. Scoped checks provide less workspace-wide assurance, so CI
+remains authoritative for the offline workspace suite.
 
 Each gate lists the tools and Python modules it needs. A missing one makes the
 gate unavailable: its line names the requirement and an install hint, the later
@@ -227,16 +330,21 @@ check reads step names, not commands, so a changed CI command needs the same
 change in the registry by hand.
 Package-scoped tests use the offline features the selected packages declare.
 
-### Format
+### Full suite
+
+`bash .github/scripts/preflight.sh --full` runs the complete local registry.
+The commands below reproduce its workspace Rust checks individually.
+Coverage, machete, and deny remain optional local reproductions.
+
+#### Format
 
 ```bash
 cargo fmt --all -- --check
 ```
 
-Run `cargo fmt --all` immediately before staging; late edits made after an earlier
-format pass otherwise slip through and fail the format gate.
+Run `cargo fmt --all` to format Rust sources.
 
-### Lint
+#### Lint
 
 ```bash
 cargo clippy --all-targets --all-features -- -D warnings
@@ -245,46 +353,49 @@ cargo clippy --all-targets --all-features -- -D warnings
 Warnings are denied. The workspace lints (declared in the root `Cargo.toml`)
 already deny `unsafe_code`, `missing_docs`, the full clippy `all` group, and the
 restriction lints `unwrap_used`, `expect_used`, `panic`, `print_stdout`,
-`print_stderr`, and `dbg_macro`, among others. Run clippy unscoped (not
-`-p <crate>`) so new rustdoc and public-API lints are caught across the workspace.
+`print_stderr`, and `dbg_macro`, among others.
 
-### Test
+#### Rustdoc
 
 ```bash
-cargo test --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
-This runs unit, integration, and doc-tests. `--all-features` enables every crate
-feature across the workspace, including each crate's `testnet-acceptance` feature
-(see [Test tiers](#test-tiers)), so the live tests compile in and attempt testnet
-RPC and Friendbot access. Those tests self-skip with an early return only when the
-network is unreachable. For a strictly offline run, use plain `cargo test` (no
-`--features`).
+Rustdoc warnings are denied.
 
-### Coverage
+#### Test
+
+```bash
+cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
+```
+
+This runs the offline unit, integration, and doc-tests. Live acceptance uses
+its separate workflow and feature selections; see [Test tiers](#test-tiers).
+
+#### Coverage
 
 ```bash
 cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov.json
 python3 .github/scripts/check-coverage.py cov.json
 ```
 
-The enforced gate is the per-crate floor set in
-`.github/scripts/check-coverage.py`: a default floor of 85% offline line
-coverage, with explicit lower floors for the crates whose remaining lines are
-live-network or on-chain paths exercised only by the `testnet-acceptance` /
-`testnet-integration` suites (which do not run in this offline gate). The
-floors are a regression ratchet, set a few points below each crate's current
-offline coverage, and 90% per crate remains the aspirational target new code
-is reviewed against. The measurement uses the offline feature set (deliberately not
-`--all-features`, which would compile in the live tiers and attempt real RPC
-and Friendbot access).
+Coverage enforces the per-crate floors in `.github/scripts/check-coverage.py`.
+The default floor is 85% offline line coverage. Explicit lower floors cover
+crates whose remaining lines require live network or on-chain tests.
+Those paths run in the separate `testnet-acceptance` and `testnet-integration`
+suites.
+
+The floors form a regression ratchet, set a few points below each crate's
+current offline coverage. The aspirational target for new code is 90% per
+crate. Coverage uses the offline feature set; `--all-features` enables the
+live tiers that attempt RPC and Friendbot access.
 
 CI runs this gate in the Coverage workflow: weekly on main, on a pull request
 that carries the `coverage` label, and on demand through `workflow_dispatch`.
-A maintainer adds the label to a pull request that changes Rust code. Run the
-gate locally before you open such a pull request.
+A maintainer adds the label to a pull request that changes Rust code.
+Local reproduction is optional.
 
-### Unused dependencies
+#### Unused dependencies
 
 ```bash
 cargo machete
@@ -292,7 +403,7 @@ cargo machete
 
 Fails on any declared-but-unused dependency.
 
-### License and advisory check
+#### License and advisory check
 
 ```bash
 cargo deny check
@@ -363,8 +474,8 @@ declared on individual crates (and on `stellar-agent-test-support`), are:
 The CI `test (offline)` job and the Coverage workflow run the offline tier
 with `--features test-helpers,test-hooks,test-loopback,verifier-registry`.
 
-MPP development should run its focused protocol/security suite and both binary
-adapters before the full workspace gates:
+MPP changes can reproduce their focused protocol and security checks and
+both binary adapters with:
 
 ```bash
 cargo test -p stellar-agent-mpp

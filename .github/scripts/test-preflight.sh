@@ -2,16 +2,16 @@
 # Offline self-test of preflight.sh.
 #
 # Builds a scratch Git repository with one commit on main. It holds copies of
-# the root manifest, every crates/*/Cargo.toml, four crate sources, and the
-# cap85-beacon record of the smart-account crate. It also holds the .github
-# directory, CHANGELOG.md, CONTRIBUTING.md, the building guide, and the skill.
+# the root manifest, lockfile, toolchain, every crates/*/Cargo.toml, four crate
+# sources, and the cap85-beacon record of the smart-account crate. It also
+# holds .github, CHANGELOG.md, CONTRIBUTING.md, the building guide, and the skill.
 # Each case copies that repository, changes it on a branch, and runs
 # preflight.sh against main.
 #
 # Planning cases compare the whole --list output with the expected gates. The
-# package cases also compute the test packages from the fixture manifests
-# with a TOML reader of their own, and pin the result. Execution cases run
-# preflight.sh on a PATH that holds only the driver's tools and logging shims
+# package cases pin the clippy, rustdoc, and test packages, and check them
+# against the fixture manifests with a TOML reader of their own. Execution
+# cases run preflight.sh on a PATH with only the driver's tools and logging shims
 # for python3, bash, cargo, actionlint, and shellcheck, and the scripts that
 # preflight.sh executes by path are logging stubs. No real gate, cargo,
 # actionlint, or shellcheck runs.
@@ -50,7 +50,8 @@ FIXTURE="$TMP/fixture"
 
 CASES="docs-only install-surface-doc deleted-install-surface-doc welcome-workflow ci-yml-only
 python-check-script shell-check-script skill one-crate two-owners target-specific-edge
-dev-dependency-edge root-manifest wallet-manifest removed-member untracked-test-file fixture-markdown
+dev-dependency-edge root-manifest lockfile toolchain unowned-rust-path wallet-manifest
+removed-member untracked-test-file fixture-markdown
 committed-cross-scope-rename staged-rename-record spaces-and-an-apostrophe
 full vendored contracts action-script invariants-helper duplicate-triggers changed-self-test
 deleted-shell-script deleted-self-test unavailable-tool
@@ -169,7 +170,8 @@ build_fixture() {
     mkdir -p "$dir/$(dirname "$file")"
     cp "$manifest" "$dir/$file"
   done
-  for file in crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/REFERENCE.md \
+  for file in Cargo.lock rust-toolchain.toml \
+    crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/REFERENCE.md \
     crates/stellar-agent-sep7/src/lib.rs crates/stellar-agent-sep5/src/lib.rs \
     crates/stellar-agent-windows-identity/src/lib.rs crates/stellar-agent-test-support/src/lib.rs \
     CHANGELOG.md CONTRIBUTING.md docs/maintainers/building.md skills/stellar-agent-wallet/SKILL.md; do
@@ -333,23 +335,25 @@ PY
 }
 
 # Fails unless the computed packages for changed paths $3... are the pinned
-# packages $1 with the feature subset $2, and sets TEST_COMMAND to the
-# per-package test command for them.
+# packages $1 with the feature subset $2. Sets PACKAGE_GATES to explicit
+# clippy, rustdoc, and test commands built from that pinned selection.
 pin_packages() {
-  local packages=$1 features=$2 computed package list
+  local packages=$1 features=$2 computed package list operands="" test_command
   shift 2
   computed=$(computed_packages "$@")
   if [ "$computed" != "$packages|$features" ]; then
     fail "computed '$computed', pinned '$packages|$features'"
   fi
   read -r -a list <<<"$packages"
-  TEST_COMMAND="cargo test"
   for package in "${list[@]}"; do
-    TEST_COMMAND="$TEST_COMMAND -p $package"
+    operands="$operands -p $package"
   done
+  test_command="cargo test$operands"
   if [ -n "$features" ]; then
-    TEST_COMMAND="$TEST_COMMAND --features $features"
+    test_command="$test_command --features $features"
   fi
+  PACKAGE_GATES=(fmt "clippy=cargo clippy$operands --all-targets --all-features -- -D warnings"
+    "rustdoc=${RUSTDOC_PREFIX}cargo doc --no-deps$operands --all-features" "test=$test_command")
 }
 
 # Prints the .github/scripts/ paths that EXPECTED_REGISTRY runs with
@@ -923,7 +927,7 @@ case_one_crate() {
   start_case
   edit crates/stellar-agent-sep7/src/lib.rs
   pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers crates/stellar-agent-sep7/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" "test=$TEST_COMMAND"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
 }
 
 case_two_owners() {
@@ -931,7 +935,7 @@ case_two_owners() {
   edit crates/stellar-agent-sep7/src/lib.rs crates/stellar-agent-sep5/src/lib.rs
   pin_packages "stellar-agent-sep5 stellar-agent-sep7 stellar-agent-cli stellar-agent-mcp stellar-agent-pool" \
     test-helpers crates/stellar-agent-sep7/src/lib.rs crates/stellar-agent-sep5/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" "test=$TEST_COMMAND"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
 }
 
 # Core and headless-keyring depend on windows-identity only in their Windows
@@ -941,7 +945,7 @@ case_target_specific_edge() {
   edit crates/stellar-agent-windows-identity/src/lib.rs
   pin_packages "stellar-agent-windows-identity stellar-agent-core stellar-agent-headless-keyring" test-helpers \
     crates/stellar-agent-windows-identity/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" "test=$TEST_COMMAND"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
 }
 
 # Most members reach test-support through a dev-dependency path; the
@@ -956,7 +960,7 @@ stellar-agent-pool stellar-agent-sep43 stellar-agent-sep48 stellar-agent-sep53 s
 stellar-agent-smart-account stellar-agent-stablecoin stellar-agent-toolsets-install \
 stellar-agent-toolsets-runtime stellar-agent-x402" test-helpers,test-hooks,test-loopback,verifier-registry \
     crates/stellar-agent-test-support/src/lib.rs
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" "test=$TEST_COMMAND" test-vendored-release-cfg
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" test-vendored-release-cfg
 }
 
 case_root_manifest() {
@@ -966,14 +970,32 @@ case_root_manifest() {
     test-vendored-release-cfg
 }
 
+case_lockfile() {
+  start_case
+  edit Cargo.lock
+  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg
+}
+
+case_toolchain() {
+  start_case
+  edit rust-toolchain.toml
+  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg
+}
+
+case_unowned_rust_path() {
+  start_case
+  mkdir -p tests
+  edit tests/unowned.rs
+  expect_list "${ALWAYS[@]}" "${RUST[@]}" test test-vendored-release-cfg
+}
+
 # The install-surface check reads the binstall metadata of the wallet crate
 # manifests.
 case_wallet_manifest() {
   start_case
   edit crates/stellar-agent-cli/Cargo.toml
   pin_packages stellar-agent-cli test-helpers crates/stellar-agent-cli/Cargo.toml
-  expect_list "${ALWAYS[@]}" self-test:test-check-install-surface.py "${RUST[@]}" \
-    "test=$TEST_COMMAND"
+  expect_list "${ALWAYS[@]}" self-test:test-check-install-surface.py "${PACKAGE_GATES[@]}"
 }
 
 case_removed_member() {
@@ -989,7 +1011,7 @@ case_untracked_test_file() {
   printf '#[test]\nfn new_case() {}\n' >crates/stellar-agent-sep7/tests/new_case.rs
   assert_changed crates/stellar-agent-sep7/tests/new_case.rs
   pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers crates/stellar-agent-sep7/tests/new_case.rs
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" "test=$TEST_COMMAND"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
 }
 
 # Markdown under the test fixtures of a crate is outside the surface scope.
@@ -1000,7 +1022,7 @@ case_fixture_markdown() {
   assert_changed crates/stellar-agent-sep7/tests/fixtures/notes.md
   pin_packages "stellar-agent-sep7 stellar-agent-mcp" test-helpers \
     crates/stellar-agent-sep7/tests/fixtures/notes.md
-  expect_list "${ALWAYS[@]}" "${RUST[@]}" "test=$TEST_COMMAND"
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
 }
 
 case_committed_cross_scope_rename() {
@@ -1072,7 +1094,7 @@ case_vendored() {
   pin_packages "stellar-agent-smart-account stellar-agent-approval-remote stellar-agent-cli \
 stellar-agent-defindex stellar-agent-dex stellar-agent-mcp stellar-agent-webauthn-bridge" test-helpers \
     crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/REFERENCE.md
-  expect_list "${ALWAYS[@]}" vendored-tree-check "${RUST[@]}" "test=$TEST_COMMAND" test-vendored-release-cfg
+  expect_list "${ALWAYS[@]}" vendored-tree-check "${PACKAGE_GATES[@]}" test-vendored-release-cfg
 }
 
 case_contracts() {

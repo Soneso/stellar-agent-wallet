@@ -58,27 +58,28 @@ The full production-readiness bar is the
 
 ## Gate suite
 
-These gates must pass before a change is accepted:
+Start local verification with `bash .github/scripts/preflight.sh`. It selects
+checks for the files your branch changes and prints their results for the pull
+request description. Issue-specific acceptance commands still apply.
 
-- `cargo fmt --all -- --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --all-features` (unit, integration, and doc-tests)
-- `cargo llvm-cov` + `python3 .github/scripts/check-coverage.py` (per-crate
-  line-coverage floors; 90% per crate is the aspirational target, shortfalls
-  below it justified in review)
-- `cargo machete` (no unused dependencies)
-- `cargo deny check` (permissive-only license allowlist and advisory check)
+`bash .github/scripts/preflight.sh --full` runs the complete local registry,
+including coverage. Local coverage, `cargo machete`, and `cargo deny check` are
+optional reproductions of CI checks.
 
-`bash .github/scripts/preflight.sh` runs the local CI checks that apply to the
-files your branch changes and prints their results for the pull request
-description. `--full` runs every gate in its registry. The gates above remain
-the acceptance bar for a change outside documentation, scripts, and workflows;
-run the ones that apply. The exact commands, the gate-tool installation, and
-the test tiers are in
+CI runs the offline workspace suite on every pull request. Pull-request
+coverage requires the `coverage` label; live acceptance uses its separate
+workflow. The exact commands, gate-tool installation, and test tiers are in
 [docs/maintainers/building.md](docs/maintainers/building.md).
 
-CI runs the coverage gate on a pull request once a maintainer adds the
-`coverage` label, and weekly on main.
+A CLI preflight retains measured KiB with a 30-second sampled peak of measured
+KiB, at measured and measured times the baseline sizes, respectively.
+A full preflight retains measured KiB with a 30-second sampled peak of measured
+KiB, at measured and measured times the baseline sizes, respectively.
+See [Disk use](docs/maintainers/building.md#disk-use) for the measurements and
+cleanup guidance.
+
+Only a remote Codespace moves builds off your laptop; a local container does
+not, and a coding agent must run inside that remote environment to benefit.
 
 ## Review process
 

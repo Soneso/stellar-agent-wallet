@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Dev and test profiles use workspace line tables and omit dependency debuginfo;
+  tests disable incremental caches. The toolchain uses the minimal installation
+  profile with rustfmt and clippy.
+- Preflight scopes clippy, rustdoc, and tests to changed packages and their direct
+  dependents. Contribution guides start local verification with preflight and
+  use CI for the offline workspace suite.
+- The building guide documents disk use, debugging overrides, and opt-in cleanup.
+
 - The three log lines of the CLI's shared value audit writer acquisition end in
   `refusing`, which fits the callers that neither sign nor submit. Two tests pin
   the Enforce binding check at the `approve` site and at the value audit
