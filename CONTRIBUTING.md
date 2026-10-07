@@ -71,10 +71,11 @@ coverage requires the `coverage` label; live acceptance uses its separate
 workflow. The exact commands, gate-tool installation, and test tiers are in
 [docs/maintainers/building.md](docs/maintainers/building.md).
 
-A CLI preflight retains measured KiB with a 30-second sampled peak of measured
-KiB, at measured and measured times the baseline sizes, respectively.
-A full preflight retains measured KiB with a 30-second sampled peak of measured
-KiB, at measured and measured times the baseline sizes, respectively.
+A CLI preflight retains 3,756,896 KiB (about 3.6 GiB) with a 30-second sampled
+peak of 3,756,896 KiB, at 0.43 and 0.43 times the baseline sizes, respectively.
+A full preflight retains 21,188,348 KiB (about 20.2 GiB) with a 30-second
+sampled peak of 21,188,348 KiB, at 0.51 and 0.51 times the baseline sizes,
+respectively.
 See [Disk use](docs/maintainers/building.md#disk-use) for the measurements and
 cleanup guidance.
 

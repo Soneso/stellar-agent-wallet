@@ -115,14 +115,35 @@ completion. The maximum is the 30-second sampled peak. Ratios divide current
 sizes by baseline sizes. Failed or unavailable runs do not establish comparable
 savings.
 
+The tables in this section record runs on one Mac with macOS 26.6.2 on arm64.
+The toolchain was `rustc 1.99.0 (b940084d7 2026-09-28)` with Cargo 1.99.0, and
+the gate tools were cargo-llvm-cov 0.8.7, cargo-machete 0.9.2, cargo-deny
+0.19.9, shellcheck 0.11.0, actionlint 1.7.12, and Node.js v24.5.0. Every run
+used the default number of build jobs, left `CARGO_INCREMENTAL` unset, and
+started with a fresh target directory. A `du -sk` sample of the target
+directory ran every 30 seconds, and housekeeping stayed paused. The Interop row
+measures the checkout's `interop/` tree with `du -sk`, separately from the
+target directory. The baseline is main at commit `38dabdd`. The current runs
+use the same tree with the Cargo profile settings, rustup profile, and
+preflight gate selection in this guide applied. Both trees have the same
+lockfile, whose SHA-256 hash starts with `6a0d7f74eb27`. Both full-suite runs
+reported `33 gates run, 0 failed, 5 unavailable`. The five unavailable gates
+are Python checks that need PyYAML and build nothing: `workflow-invariants` and
+the `test-check-workflow-invariants.py`, `test-sync-labels.py`,
+`test-take-workflow.py`, and `test-triage-workflow.py` self-tests. The
+docs-only run selected no Cargo gate, so its target directory stayed empty. The
+coverage-alone run shared the machine with three unrelated builds, so its
+elapsed time is not comparable. In every run, the 30-second sampled peak equals
+the retained size because no gate removed build output while the run executed.
+
 | Run | Retained KiB | 30-second sampled peak KiB | Retained ratio | Peak ratio | Elapsed seconds |
 | --- | --- | --- | --- | --- | --- |
-| Docs-only, current | measured | measured | Not paired | Not paired | measured |
-| CLI, baseline | measured | measured | Not applicable | Not applicable | measured |
-| CLI, current | measured | measured | measured | measured | measured |
-| Full suite, baseline | measured | measured | Not applicable | Not applicable | measured |
-| Full suite, current | measured | measured | measured | measured | measured |
-| Coverage alone, current | measured | measured | Not paired | Not paired | measured |
+| Docs-only, current | 0 | 0 | Not paired | Not paired | 316 |
+| CLI, baseline | 8,803,364 | 8,803,364 | Not applicable | Not applicable | 737 |
+| CLI, current | 3,756,896 | 3,756,896 | 0.43 | 0.43 | 400 |
+| Full suite, baseline | 41,384,108 | 41,384,108 | Not applicable | Not applicable | 3,410 |
+| Full suite, current | 21,188,348 | 21,188,348 | 0.51 | 0.51 | 2,361 |
+| Coverage alone, current | 9,363,136 | 9,363,136 | Not paired | Not paired | 1,953 |
 
 Measure each existing path with `du -sk`; record absent paths as zero.
 Subdirectories are breakdowns, not additive totals. Paths below are relative
@@ -130,18 +151,18 @@ to the effective target directory.
 
 | Run | debug/deps KiB | debug/incremental KiB | debug/build KiB | doc KiB | llvm-cov-target KiB |
 | --- | --- | --- | --- | --- | --- |
-| Docs-only, current | measured | measured | measured | measured | measured |
-| CLI, baseline | measured | measured | measured | measured | measured |
-| CLI, current | measured | measured | measured | measured | measured |
-| Full suite, baseline | measured | measured | measured | measured | measured |
-| Full suite, current | measured | measured | measured | measured | measured |
-| Coverage alone, current | measured | measured | measured | measured | measured |
+| Docs-only, current | 0 | 0 | 0 | 0 | 0 |
+| CLI, baseline | 5,250,728 | 3,922,276 | 240,988 | 200,852 | 0 |
+| CLI, current | 2,703,700 | 791,076 | 143,072 | 53,396 | 0 |
+| Full suite, baseline | 16,986,688 | 10,229,008 | 259,104 | 200,852 | 17,567,904 |
+| Full suite, current | 9,511,672 | 1,938,852 | 148,388 | 200,852 | 9,131,900 |
+| Coverage alone, current | 0 | 0 | 0 | 0 | 9,274,808 |
 
 | Separate storage | KiB |
 | --- | --- |
-| Cargo-home | measured |
-| Rustup | measured |
-| Interop | measured |
+| Cargo-home | 1,879,332 |
+| Rustup | 4,174,448 |
+| Interop | 217,188 |
 
 Docs-only and CLI runs use `bash .github/scripts/preflight.sh --base HEAD`
 after verifying the selection with `--list`. Add a temporary probe to
