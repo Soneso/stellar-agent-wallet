@@ -58,7 +58,7 @@ release archive carries both binaries:
 - Binaries inside that folder: `stellar-agent` and `stellar-agent-mcp` (`.exe` on Windows).
 
 ```bash
-cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.10 stellar-agent-mcp@0.1.0-alpha.10
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.11 stellar-agent-mcp@0.1.0-alpha.11
 ```
 
 While crates.io holds only prerelease (alpha) versions, spell out the version.
@@ -86,8 +86,8 @@ your target in the commands.
 Linux or macOS (this example selects Apple Silicon):
 
 ```bash
-curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.10/stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin.tar.xz
-curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.10/SHA256SUMS
+curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.11/stellar-agent-0.1.0-alpha.11-aarch64-apple-darwin.tar.xz
+curl -fsSLO https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.11/SHA256SUMS
 ```
 
 On Linux, check the checksum with `sha256sum --ignore-missing --check SHA256SUMS`.
@@ -96,15 +96,15 @@ When the checksum matches, extract the archive. Then add its folder to this
 shell's `PATH`:
 
 ```bash
-tar -xJf stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin.tar.xz
-export PATH="$PWD/stellar-agent-0.1.0-alpha.10-aarch64-apple-darwin:$PATH"
+tar -xJf stellar-agent-0.1.0-alpha.11-aarch64-apple-darwin.tar.xz
+export PATH="$PWD/stellar-agent-0.1.0-alpha.11-aarch64-apple-darwin:$PATH"
 ```
 
 Windows PowerShell:
 
 ```powershell
-$release = 'https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.10'
-$folder = 'stellar-agent-0.1.0-alpha.10-x86_64-pc-windows-msvc'
+$release = 'https://github.com/Soneso/stellar-agent-wallet/releases/download/v0.1.0-alpha.11'
+$folder = 'stellar-agent-0.1.0-alpha.11-x86_64-pc-windows-msvc'
 $archive = "$folder.zip"
 curl.exe -fsSLO "$release/$archive"
 curl.exe -fsSLO "$release/SHA256SUMS"
@@ -147,7 +147,7 @@ your `PATH`; the `stellar-agent-cli` crate installs the binary named
 `stellar-agent`:
 
 ```bash
-cargo install --locked stellar-agent-cli@0.1.0-alpha.10 stellar-agent-mcp@0.1.0-alpha.10
+cargo install --locked stellar-agent-cli@0.1.0-alpha.11 stellar-agent-mcp@0.1.0-alpha.11
 ```
 
 `--locked` makes cargo build with the `Cargo.lock` published in the crate.
@@ -157,7 +157,7 @@ cargo install --locked stellar-agent-cli@0.1.0-alpha.10 stellar-agent-mcp@0.1.0-
 Clone the release tag and build with its committed `Cargo.lock`:
 
 ```bash
-git clone --branch v0.1.0-alpha.10 https://github.com/Soneso/stellar-agent-wallet
+git clone --branch v0.1.0-alpha.11 https://github.com/Soneso/stellar-agent-wallet
 cd stellar-agent-wallet
 cargo build --release --locked
 ```
