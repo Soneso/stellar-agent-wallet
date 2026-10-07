@@ -237,9 +237,23 @@ tense, which the next section sets.
   characters, with at most 72 including the `(#N)` that the squash merge appends.
   Use no type prefix such as `fix:` or `docs:`: the CHANGELOG carries the category.
 - The body of a commit and the description of a pull request state the motivation
-  first. Describe what the code did before the change and why that was a problem,
-  or what the change enables. Anchor the motivation in time, for example
-  "Before this change, ...". Then describe what the change does with "This change:"
+  first. Write the motivation in the past tense, because the log is read long
+  after the merge. Anchor it in time. A change with several purposes leads with
+  the main one. The opening depends on the kind of change:
+  - A defect: what the code did before and why that was wrong, for example
+    "Before this change, ...".
+  - A new capability: the task that prompted it. What the capability enables
+    goes under "This change:".
+  - An upstream change, such as a protocol version, a specification revision, a
+    dependency, or generated code: the upstream fact with its identifier, then
+    where the code stood.
+  - An improvement, such as refactoring, simplification, performance, or
+    hardening: the goal and the starting state. Add a measurement and its source
+    where one exists.
+  - A changed default, a deprecation, or a removal: the requirement and the
+    intended transition.
+  - CI, tooling, and configuration: the requirement or the operational reason.
+- After the motivation, describe what the change does with "This change:"
   followed by bullets that start with a verb, or with imperative sentences.
   Then state the verification: the gates that ran and their results, scoped to
   what ran. Name the CI job that proves what the local machine cannot.

@@ -1,9 +1,21 @@
 ## What this changes
 
 <!--
-Before this change: what the code did and why that was a problem, or what this
-enables. Then "This change:" with bullets that start with a verb. Then the
-verification, scoped to what ran.
+State the motivation first, in the past tense and anchored in time. The opening
+depends on the kind of change:
+- A defect: what the code did before and why that was wrong, for example
+  "Before this change, ...".
+- A new capability: the task that prompted it. What the capability enables
+  goes under "This change:".
+- An upstream change: the upstream fact with its identifier, then where the
+  code stood.
+- An improvement: the goal and the starting state. Add a measurement and its
+  source where one exists.
+- A changed default, a deprecation, or a removal: the requirement and the
+  intended transition.
+- CI, tooling, and configuration: the requirement or the operational reason.
+A change with several purposes leads with the main one. Then "This change:"
+with bullets that start with a verb. Then the verification, scoped to what ran.
 -->
 
 Closes #N
