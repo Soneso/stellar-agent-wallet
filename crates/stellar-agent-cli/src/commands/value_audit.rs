@@ -165,14 +165,14 @@ pub(crate) fn acquire_keyed_audit_writer(
             tracing::warn!(
                 profile = %profile_name,
                 code = %e.code(),
-                "value audit: audit binding changed; refusing before signing/submit"
+                "value audit: audit binding changed; refusing"
             );
             return KeyedAcquireError::BindingChanged(e);
         }
         tracing::warn!(
             profile = %profile_name,
             error = %e,
-            "value audit: could not load audit chain key; refusing before signing/submit"
+            "value audit: could not load audit chain key; refusing"
         );
         KeyedAcquireError::KeyUnavailable
     })?;
@@ -188,7 +188,7 @@ fn audit_writer_acquisition_error(profile_name: &str, e: &WriterError) -> Wallet
         profile = %profile_name,
         error = %e,
         code = refusal.code(),
-        "value audit: audit writer unavailable; refusing before signing/submit"
+        "value audit: audit writer unavailable; refusing"
     );
     refusal
 }
@@ -1093,6 +1093,28 @@ mod tests {
             .expect_err("a changed binding refuses");
         assert_eq!(err.code(), "audit.log_binding_changed", "{err}");
         assert!(!dir.path().join("repointed").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn the_pre_flight_records_an_absent_binding() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = keyed_profile("binding-preflight-absent", dir.path());
+        require_value_audit_writer(&profile, "binding-preflight-absent")
+            .expect("an absent binding proceeds");
+        assert_eq!(
+            stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(
+                "binding-preflight-absent"
+            )
+            .load_raw()
+            .expect("read binding"),
+            Some(
+                stellar_agent_core::audit_log::AuditBinding::for_profile(&profile)
+                    .to_keyring_value()
+            ),
+            "the pre-flight records an absent binding"
+        );
     }
 
     #[test]

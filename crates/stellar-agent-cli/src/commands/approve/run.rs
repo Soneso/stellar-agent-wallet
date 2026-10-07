@@ -1932,6 +1932,16 @@ mod tests {
                 .attestation_blob_b64
                 .is_some()
         );
+        assert_eq!(
+            stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile("approve-free")
+                .load_raw()
+                .unwrap(),
+            Some(
+                stellar_agent_core::audit_log::AuditBinding::for_profile(&profile)
+                    .to_keyring_value()
+            ),
+            "the approval records an absent binding"
+        );
     }
 
     #[test]
