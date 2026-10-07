@@ -408,9 +408,15 @@ CLI approval prompt. The reason is display text and grants no authority.
 
 The CLI summary and both inbox detail pages show the profile name, CAIP-2 chain id, endpoint authority, and enrolled signer.
 An enrollment placeholder appears as `(not enrolled)`.
-Payment and claim rows show the envelope's effective source; an operation source overrides the transaction source.
+Payment, claim, and trustline rows show the envelope's effective source; an operation source overrides the transaction source.
 An undecodable envelope appears as `(undecodable envelope)`.
 A claim whose stored summary source differs also shows `Source (stored summary)`.
+Trustline summaries show the full holder account, asset code, issuer, limit,
+simulated fee, and sequence number.
+The CLI names the action `trustline change (ChangeTrust)`.
+The CLI limit reads `unlimited`, `0 stroops (removes the trustline)`, or the exact
+stroop count and decimal asset amount.
+Both inboxes label it `TRUSTLINE` and offer `Approve trustline`.
 
 The `approve`, `approve gc`, `approve list`, and `approve serve` commands return failures with `error.code` and a plain diagnostic message.
 These failures carry `approval.*` codes: `approval.not_found`, `approval.expired`, `approval.already_attested`, `approval.user_mismatch`, `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.rejected`, `approval.consumed`, `approval.record_failed`, `approval.uid_unavailable`, `approval.denied`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`, `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed`.
@@ -475,6 +481,12 @@ agent relaying a nonce.
 ```json
 {"ok":true,"data":{"profile":"default","pending":[{"approval_nonce":"ABCxyzNonce","kind_name":"PaymentSimulated","created_at_unix_ms":1717000000000,"expires_at_unix_ms":1717086400000,"expired":false,"attested":false,"summary":{"kind":"payment","source":"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY","to":"GDEST...","amount_stroops":"100000000","asset":"XLM","memo":null,"fee_stroops":"100","seq_num":12345}}],"expired_count":0},"request_id":"..."}
 ```
+
+Trustline table rows read
+`trustline CODE:ISSUER_REDACTED limit LIMIT for HOLDER`.
+`LIMIT` is `unlimited`, `n stroops`, or `0 stroops (remove)`.
+JSON uses `summary.kind: "trustline"` with the full holder and issuer.
+Its `limit_stroops` is a decimal string, or `null` for unlimited.
 
 ### `approve serve`
 

@@ -1793,6 +1793,17 @@ fn nonce_replayed_error_result() -> rmcp::model::CallToolResult {
 // verify_attestation_gate — shared attestation-gate helper
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Envelope approval kind required by a commit tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatedApprovalKind {
+    /// Payments and account creation.
+    Payment,
+    /// Claimable balance claims.
+    Claim,
+    /// Trustline changes.
+    Trustline,
+}
+
 /// Runs the 8-step attestation verification gate for a `*_commit` MCP tool.
 ///
 /// Payments, claims, account creation and trustlines share this approval gate.
@@ -1816,15 +1827,15 @@ fn nonce_replayed_error_result() -> rmcp::model::CallToolResult {
 /// 3. Approval store opens at `<approvals_dir>/<profile_name>.toml`.
 /// 4. Entry exists in the store.
 /// 5. Entry is not expired.
-/// 6. Envelope SHA-256 matches the stored hash.
+/// 6. The kind matches the tool, and the envelope SHA-256 matches the stored hash.
 /// 7. Attestation key loads from the keyring.
 /// 8. HMAC-SHA256 verifies byte-for-byte (constant-time).
 ///
 /// # Errors
 ///
-/// All failure modes produce [`approval_required_indistinguishable`] per the
-/// indistinguishability invariant.  Internal `tracing::debug!` calls distinguish
-/// each failure arm for operator forensics only.
+/// Live rejection and consumption markers retain their terminal error codes.
+/// Other failures produce [`approval_required_indistinguishable`].
+/// Internal debug tracing identifies the refusal for operator forensics.
 ///
 /// Returns `Ok(())` when:
 /// - `dispatch_outcome` is `DispatchOutcome::Allow` (gate is a no-op), OR
@@ -1832,6 +1843,7 @@ fn nonce_replayed_error_result() -> rmcp::model::CallToolResult {
 pub(crate) async fn verify_attestation_gate(
     server: &WalletServer,
     dispatch_outcome: &DispatchOutcome,
+    expected_kind: GatedApprovalKind,
     envelope_xdr: &str,
     approval_nonce: Option<&str>,
     approval_attestation: Option<&str>,
@@ -1978,27 +1990,26 @@ pub(crate) async fn verify_attestation_gate(
         return Err(approval_consumed_error());
     }
 
-    // 6. Confirm envelope XDR hash matches the stored hash.
-    //    Extract envelope_sha256_hex from the PaymentSimulated or ClaimSimulated
-    //    arm; both bind a simulated classic-transaction envelope through the same
-    //    envelope-hash HMAC attestation path. Non-envelope kinds (SignWithPasskey)
-    //    do not carry an envelope XDR hash and are handled by a different commit
-    //    path.
+    // 6. The tool accepts only its own envelope approval kind.
     let stored_sha256_hex = match &entry.kind {
         stellar_agent_core::approval::ApprovalKind::PaymentSimulated {
             envelope_sha256_hex,
             ..
-        }
-        | stellar_agent_core::approval::ApprovalKind::ClaimSimulated {
+        } if expected_kind == GatedApprovalKind::Payment => envelope_sha256_hex.clone(),
+        stellar_agent_core::approval::ApprovalKind::ClaimSimulated {
             envelope_sha256_hex,
             ..
-        } => envelope_sha256_hex.clone(),
+        } if expected_kind == GatedApprovalKind::Claim => envelope_sha256_hex.clone(),
+        stellar_agent_core::approval::ApprovalKind::TrustlineSimulated {
+            envelope_sha256_hex,
+            ..
+        } if expected_kind == GatedApprovalKind::Trustline => envelope_sha256_hex.clone(),
         other => {
             tracing::debug!(
                 kind = other.kind_name(),
                 tool = tool_name,
-                "approval kind mismatch: expected PaymentSimulated or ClaimSimulated for HMAC \
-                 attestation path"
+                ?expected_kind,
+                "approval kind mismatch"
             );
             return Err(approval_required_indistinguishable(&profile_name));
         }
@@ -3617,6 +3628,7 @@ mod tests {
         let result = verify_attestation_gate(
             &server,
             &dispatch_outcome,
+            GatedApprovalKind::Payment,
             "AAAA",
             Some("approval-nonce"),
             Some(&attestation_b64),
@@ -3708,6 +3720,7 @@ mod tests {
         let result = verify_attestation_gate(
             &server,
             &dispatch_outcome,
+            GatedApprovalKind::Payment,
             "AAAA",
             Some(&approval_nonce),
             Some(&attestation_b64),
@@ -3728,12 +3741,9 @@ mod tests {
     //
     // GH issue #8: `RuleProposalSimulated`
     // has its OWN dedicated gate (`PendingApprovalStore::verify_rule_proposal_gate`,
-    // wired inside `stellar_rule_create_commit`); the shared pay/claim
-    // `verify_attestation_gate` (this fn) MUST NOT accept it — defense in
-    // depth in both directions. A `RuleProposalSimulated` entry reaching step
-    // 6 (`match &entry.kind { PaymentSimulated | ClaimSimulated => .., other =>
-    // refuse }`) must fall into the `other` arm and refuse
-    // indistinguishably, exactly like any other wrong-kind entry.
+    // wired inside `stellar_rule_create_commit`). The shared payment, claim,
+    // and trustline gate refuses it at step 6 through the `other` arm,
+    // with the same response as every wrong-kind entry.
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
@@ -3802,6 +3812,7 @@ mod tests {
         let result = verify_attestation_gate(
             &server,
             &dispatch_outcome,
+            GatedApprovalKind::Payment,
             "AAAA",
             Some(&approval_nonce),
             Some(&attestation_b64),
@@ -3932,6 +3943,7 @@ mod tests {
         let result = verify_attestation_gate(
             &server,
             &dispatch_outcome,
+            GatedApprovalKind::Payment,
             envelope_xdr,
             Some(&approval_nonce),
             Some(&attestation_b64),
@@ -4070,6 +4082,7 @@ mod tests {
             let result = verify_attestation_gate(
                 &server,
                 &dispatch_outcome,
+                GatedApprovalKind::Payment,
                 envelope_xdr,
                 Some(&approval_nonce),
                 Some(&wrong_b64),
@@ -4097,6 +4110,7 @@ mod tests {
         let result = verify_attestation_gate(
             &server,
             &dispatch_outcome,
+            GatedApprovalKind::Payment,
             envelope_xdr,
             Some(&approval_nonce),
             Some(&attestation_b64),
@@ -4357,6 +4371,245 @@ mod tests {
             "redacted destination strkey missing: {wire}"
         );
         assert!(wire.contains("ledger.destination_invalid"));
+    }
+
+    fn envelope_gate_entry(
+        kind: GatedApprovalKind,
+    ) -> stellar_agent_core::approval::PendingApproval {
+        use stellar_agent_core::approval::{
+            DEFAULT_TTL_MS, PendingApproval, process_uid_for_attestation,
+        };
+        let holder = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
+        let uid = process_uid_for_attestation().unwrap();
+        match kind {
+            GatedApprovalKind::Payment => PendingApproval::new_payment_pending(
+                "AAAA".to_owned(),
+                b"AAAA",
+                holder,
+                100,
+                "XLM".to_owned(),
+                None,
+                100,
+                1,
+                uid,
+                DEFAULT_TTL_MS,
+            ),
+            GatedApprovalKind::Claim => PendingApproval::new_claim_pending(
+                "AAAA".to_owned(),
+                b"AAAA",
+                "ab".repeat(36),
+                format!("B{}", "A".repeat(57)),
+                "XLM".to_owned(),
+                100,
+                holder,
+                100,
+                1,
+                uid,
+                DEFAULT_TTL_MS,
+            ),
+            GatedApprovalKind::Trustline => PendingApproval::new_trustline_pending(
+                "AAAA".to_owned(),
+                b"AAAA",
+                holder.clone(),
+                "USDC".to_owned(),
+                holder,
+                None,
+                100,
+                1,
+                uid,
+                DEFAULT_TTL_MS,
+            ),
+        }
+        .unwrap()
+    }
+
+    fn envelope_gate_server(dir: &std::path::Path) -> WalletServer {
+        use base64::Engine as _;
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let profile = Profile::builder_testnet(
+            "kind-matrix",
+            "kind-matrix",
+            "kind-matrix-n",
+            "kind-matrix-n",
+        )
+        .with_noop_engine()
+        .build();
+        keyring_core::Entry::new(
+            &profile.attestation_key_id.service,
+            &profile.attestation_key_id.account,
+        )
+        .unwrap()
+        .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([77; 32]))
+        .unwrap();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_approval_dir_for_test(dir.to_path_buf());
+        server
+    }
+
+    fn park_gate_entry(
+        server: &WalletServer,
+        dir: &std::path::Path,
+        entry: &stellar_agent_core::approval::PendingApproval,
+    ) -> String {
+        use base64::Engine as _;
+        use stellar_agent_core::approval::{
+            AttestationBinding, PendingApprovalStore, compute_attestation, envelope_sha256,
+        };
+        let blob = compute_attestation(
+            &[77; 32],
+            &AttestationBinding::new(&server.profile_name_for_approval(), "stellar:testnet"),
+            &entry.approval_nonce,
+            &envelope_sha256(b"AAAA"),
+            &entry.process_uid,
+        );
+        let mut store = PendingApprovalStore::open(
+            dir.join(format!("{}.toml", server.profile_name_for_approval())),
+        )
+        .unwrap();
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        store.insert(entry.clone(), now).unwrap();
+        store
+            .record_attestation(&entry.approval_nonce, blob)
+            .unwrap();
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    async fn attestation_gate_expected_kind_matrix() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let server = envelope_gate_server(dir.path());
+        let kinds = [
+            GatedApprovalKind::Payment,
+            GatedApprovalKind::Claim,
+            GatedApprovalKind::Trustline,
+        ];
+        for stored in kinds {
+            let entry = envelope_gate_entry(stored);
+            let blob = park_gate_entry(&server, dir.path(), &entry);
+            let dispatch = DispatchOutcome::RequireApproval(
+                ApprovalRequest::new(entry.approval_nonce.clone(), 120).into(),
+            );
+            for expected in kinds {
+                let result = verify_attestation_gate(
+                    &server,
+                    &dispatch,
+                    expected,
+                    "AAAA",
+                    Some(&entry.approval_nonce),
+                    Some(&blob),
+                    "kind-matrix",
+                )
+                .await;
+                if stored == expected {
+                    assert!(result.is_ok(), "{stored:?}/{expected:?}: {result:?}");
+                } else {
+                    let result = result.unwrap_err();
+                    assert_eq!(
+                        assert_business_envelope(&result).0,
+                        "policy.approval_required",
+                        "{stored:?}/{expected:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            verify_attestation_gate(
+                &server,
+                &DispatchOutcome::Allow(None),
+                GatedApprovalKind::Trustline,
+                "AAAA",
+                None,
+                None,
+                "kind-matrix"
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    async fn trustline_terminal_states_preserve_gate_errors() {
+        use stellar_agent_core::approval::{ConsumedOutcome, DEFAULT_TTL_MS, PendingApprovalStore};
+        use stellar_agent_core::profile::receipt::{BeginSubmissionOutcome, ReceiptStore};
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let server = envelope_gate_server(dir.path());
+        for terminal in ["rejected", "confirmed", "unknown", "receipt"] {
+            // A payment record deliberately mismatches the trustline gate.
+            let entry = envelope_gate_entry(GatedApprovalKind::Payment);
+            let blob = park_gate_entry(&server, dir.path(), &entry);
+            let nonce = &entry.approval_nonce;
+            let mut store = PendingApprovalStore::open(
+                dir.path()
+                    .join(format!("{}.toml", server.profile_name_for_approval())),
+            )
+            .unwrap();
+            match terminal {
+                "rejected" => {
+                    store
+                        .reject(
+                            nonce,
+                            stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                            DEFAULT_TTL_MS,
+                        )
+                        .unwrap();
+                }
+                "confirmed" => {
+                    store
+                        .consume(nonce, &"ab".repeat(32), ConsumedOutcome::Confirmed)
+                        .unwrap();
+                }
+                "unknown" => {
+                    store
+                        .consume(nonce, &"ab".repeat(32), ConsumedOutcome::Unknown)
+                        .unwrap();
+                }
+                "receipt" => {
+                    let receipts = ReceiptStore::open(&server.profile_name_for_approval()).unwrap();
+                    assert!(matches!(
+                        receipts
+                            .begin_submission_with_approval(
+                                "hash",
+                                &"ab".repeat(32),
+                                "source",
+                                1,
+                                0,
+                                100,
+                                Some(nonce)
+                            )
+                            .unwrap(),
+                        BeginSubmissionOutcome::Recorded
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            drop(store);
+            let dispatch =
+                DispatchOutcome::RequireApproval(ApprovalRequest::new(nonce.clone(), 120).into());
+            let result = verify_attestation_gate(
+                &server,
+                &dispatch,
+                GatedApprovalKind::Trustline,
+                "AAAA",
+                Some(nonce),
+                Some(&blob),
+                "stellar_trustline_commit",
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                assert_business_envelope(&result).0,
+                if terminal == "rejected" {
+                    "policy.approval_rejected"
+                } else {
+                    "policy.approval_consumed"
+                },
+                "{terminal}"
+            );
+        }
     }
 }
 

@@ -12,6 +12,13 @@
     reason = "test-only; panics acceptable in unit tests"
 )]
 
+// ChangeTrust with transaction source [1; 32] and operation source [2; 32].
+const CHANGE_TRUST_ENVELOPE: &str = concat!(
+    "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
+    "AAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAGAAAAAVVT",
+    "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
+);
+
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -340,6 +347,86 @@ async fn approve_payment_mints_verifiable_attestation() {
         &process_uid,
         &blob
     ));
+}
+
+#[tokio::test]
+#[serial]
+async fn serve_trustline_json_returns_attestation() {
+    let h = Harness::new("approve-trustline");
+    let cookie = h.bootstrap().await;
+    let limit = None;
+    let entry = PendingApproval::new_trustline_pending(
+        CHANGE_TRUST_ENVELOPE.to_owned(),
+        CHANGE_TRUST_ENVELOPE.as_bytes(),
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        "USDC".to_owned(),
+        "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+        limit,
+        100,
+        42,
+        process_uid_for_attestation().unwrap(),
+        DEFAULT_TTL_MS,
+    )
+    .unwrap();
+    let process_uid = entry.process_uid.clone();
+    let envelope_sha256_hex = match &entry.kind {
+        ApprovalKind::TrustlineSimulated {
+            envelope_sha256_hex,
+            ..
+        } => envelope_sha256_hex.clone(),
+        _ => unreachable!(),
+    };
+    let nonce = h.insert(entry);
+    let csrf = h.csrf_for(&nonce);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/approval/{nonce}/approve"))
+        .header(header::HOST, HOST)
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::COOKIE, &cookie)
+        .header("x-stellar-approval-csrf", csrf)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "attested");
+    let blob_b64 = json["attestation"].as_str().unwrap();
+
+    let sha = decode_sha256_hex(&envelope_sha256_hex).unwrap();
+    let expected = compute_attestation(
+        &h.raw_key,
+        &h.state.ctx.context.binding(),
+        &nonce,
+        &sha,
+        &process_uid,
+    );
+    let blob: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(blob_b64)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(blob, expected);
+    assert!(verify_attestation(
+        &h.raw_key,
+        &h.state.ctx.context.binding(),
+        &nonce,
+        &sha,
+        &process_uid,
+        &blob
+    ));
+    let req = Request::builder()
+        .uri("/pending.json")
+        .header(header::HOST, HOST)
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let snapshot = body_json(resp).await;
+    assert_eq!(snapshot["pending"][0]["summary"]["kind"], "trustline");
+    assert_eq!(snapshot["pending"][0]["attested"], true);
 }
 
 #[tokio::test]

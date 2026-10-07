@@ -269,7 +269,7 @@ resolved chain is used when omitted.)
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
-| `stellar_trustline` | Build the ChangeTrust envelope, run the issuer clawback-flag gate, mint a single-use nonce. | No signing; no submission. Mints the nonce the commit step consumes. An approval block includes `profile` and `chain_id`. |
+| `stellar_trustline` | Build the ChangeTrust envelope, run the issuer clawback-flag gate, mint a single-use nonce. | No signing; no submission. Mints the nonce the commit step consumes. An approval block includes `profile` and `chain_id`. The pending record names the trustline holder, asset, issuer, and limit. |
 | `stellar_trustline_commit` | Verify the nonce, re-derive the authoritative asset/issuer/limit from the envelope, sign, submit. | Signs and submits. Two-phase; approval spine. |
 
 ### stellar_trustline (simulate) arguments

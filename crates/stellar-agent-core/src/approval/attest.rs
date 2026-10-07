@@ -330,7 +330,7 @@ impl ConsentAudit<'_> {
 /// Computes and persists the operator's attestation (or recorded consent) for
 /// a pending approval, dispatching on [`ApprovalKind`].
 ///
-/// Returns `Some(base64url_blob)` for `PaymentSimulated`, `ClaimSimulated`,
+/// Returns `Some(base64url_blob)` for `PaymentSimulated`, `ClaimSimulated`, `TrustlineSimulated`,
 /// `RuleProposalSimulated`, and `MppChargeSimulated`: the attestation the agent
 /// surface presents as `approval_attestation` to the matching `*_commit` tool,
 /// or that the MPP gate reads from the store. Returns `None` for
@@ -418,56 +418,51 @@ pub fn attest_and_persist(
         ApprovalKind::PaymentSimulated {
             envelope_sha256_hex,
             ..
-        } => {
-            let presented_sha256 = decode_sha256_hex(envelope_sha256_hex)?;
-            let attestation_blob = compute_attestation(
-                &key_arr,
-                binding,
-                &entry.approval_nonce,
-                &presented_sha256,
-                &entry.process_uid,
-            );
-            emit_attested_audit(
-                &mut audit,
-                profile,
-                "PaymentSimulated",
-                "stellar_pay_commit",
-                Some(envelope_sha256_hex.clone()),
-                &entry.approval_nonce,
-                surface,
-                operator_credential_id_b64url,
-            )?;
-            record_attestation_on_store(store, &entry.approval_nonce, attestation_blob, now_ms)?;
-            Some(URL_SAFE_NO_PAD.encode(attestation_blob))
-        }
+        } => attest_envelope_and_persist(
+            store,
+            entry,
+            &key_arr,
+            binding,
+            &mut audit,
+            surface,
+            operator_credential_id_b64url,
+            now_ms,
+            envelope_sha256_hex,
+            "PaymentSimulated",
+            "stellar_pay_commit",
+        )?,
+        ApprovalKind::TrustlineSimulated {
+            envelope_sha256_hex,
+            ..
+        } => attest_envelope_and_persist(
+            store,
+            entry,
+            &key_arr,
+            binding,
+            &mut audit,
+            surface,
+            operator_credential_id_b64url,
+            now_ms,
+            envelope_sha256_hex,
+            "TrustlineSimulated",
+            "stellar_trustline_commit",
+        )?,
         ApprovalKind::ClaimSimulated {
             envelope_sha256_hex,
             ..
-        } => {
-            // ClaimSimulated shares the envelope-hash HMAC attestation path with
-            // PaymentSimulated: the blob binds the envelope SHA-256, the nonce,
-            // and the process UID, and is surfaced to `stellar_claim_commit`.
-            let presented_sha256 = decode_sha256_hex(envelope_sha256_hex)?;
-            let attestation_blob = compute_attestation(
-                &key_arr,
-                binding,
-                &entry.approval_nonce,
-                &presented_sha256,
-                &entry.process_uid,
-            );
-            emit_attested_audit(
-                &mut audit,
-                profile,
-                "ClaimSimulated",
-                "stellar_claim_commit",
-                Some(envelope_sha256_hex.clone()),
-                &entry.approval_nonce,
-                surface,
-                operator_credential_id_b64url,
-            )?;
-            record_attestation_on_store(store, &entry.approval_nonce, attestation_blob, now_ms)?;
-            Some(URL_SAFE_NO_PAD.encode(attestation_blob))
-        }
+        } => attest_envelope_and_persist(
+            store,
+            entry,
+            &key_arr,
+            binding,
+            &mut audit,
+            surface,
+            operator_credential_id_b64url,
+            now_ms,
+            envelope_sha256_hex,
+            "ClaimSimulated",
+            "stellar_claim_commit",
+        )?,
         ApprovalKind::ToolsetFirstInvokeGate {
             toolset_name,
             capability,
@@ -477,8 +472,8 @@ pub fn attest_and_persist(
             amount_max_stroops,
         } => {
             // A `ToolsetFirstInvokeGate` entry MUST NOT use `record_attestation_on_store`
-            // (which calls `store.record_attestation` — PaymentSimulated/ClaimSimulated-only,
-            // returns `WrongKind` for this variant) and MUST NOT set
+            // (which calls `store.record_attestation` and returns `WrongKind`
+            // for this variant) and MUST NOT set
             // `attestation_blob_b64` on the entry (the ToolsetFirstInvokeGate
             // deserialiser rejects it as cross-kind contamination on the next
             // store reload).
@@ -652,7 +647,7 @@ pub fn attest_and_persist(
             return Err(WalletError::Approval(ApprovalFailure::WrongKind {
                 detail: format!(
                     "attest_and_persist does not support {}, \
-                     expected PaymentSimulated, ClaimSimulated, MppChargeSimulated, \
+                     expected PaymentSimulated, ClaimSimulated, TrustlineSimulated, MppChargeSimulated, \
                      ToolsetFirstInvokeGate, TrustlineClawbackOptIn, or RuleProposalSimulated",
                     other.kind_name()
                 ),
@@ -732,6 +727,46 @@ fn record_error(e: &ApprovalError) -> WalletError {
             detail: other.to_string(),
         }),
     }
+}
+
+/// Attests an envelope digest, writes its consent row, and persists the blob.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared envelope attestation uses the caller's binding and consent context"
+)]
+fn attest_envelope_and_persist(
+    store: &mut PendingApprovalStore,
+    entry: &PendingApproval,
+    key: &[u8; 32],
+    binding: &super::AttestationBinding<'_>,
+    audit: &mut ConsentAudit<'_>,
+    surface: Surface,
+    operator_credential_id_b64url: Option<&str>,
+    now_ms: u64,
+    envelope_sha256_hex: &str,
+    kind_name: &str,
+    gated_tool: &str,
+) -> Result<Option<String>, WalletError> {
+    let presented_sha256 = decode_sha256_hex(envelope_sha256_hex)?;
+    let attestation_blob = compute_attestation(
+        key,
+        binding,
+        &entry.approval_nonce,
+        &presented_sha256,
+        &entry.process_uid,
+    );
+    emit_attested_audit(
+        audit,
+        binding.profile_name,
+        kind_name,
+        gated_tool,
+        Some(envelope_sha256_hex.to_owned()),
+        &entry.approval_nonce,
+        surface,
+        operator_credential_id_b64url,
+    )?;
+    record_attestation_on_store(store, &entry.approval_nonce, attestation_blob, now_ms)?;
+    Ok(Some(URL_SAFE_NO_PAD.encode(attestation_blob)))
 }
 
 /// Helper: records an HMAC attestation blob on the store entry.
@@ -1683,6 +1718,22 @@ mod tests {
         vec![
             ("PaymentSimulated", make_entry(DEFAULT_TTL_MS)),
             (
+                "TrustlineSimulated",
+                PendingApproval::new_trustline_pending(
+                    "trustline-envelope".to_owned(),
+                    b"trustline-envelope",
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                    "USDC".to_owned(),
+                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+                    None,
+                    100,
+                    42,
+                    process_uid_for_attestation().unwrap(),
+                    DEFAULT_TTL_MS,
+                )
+                .unwrap(),
+            ),
+            (
                 "ClaimSimulated",
                 PendingApproval::new_claim_pending(
                     "b64xdr".to_owned(),
@@ -1896,6 +1947,9 @@ mod tests {
             let rows = consent_rows(&dir);
             assert_eq!(rows.len(), 1, "{kind}: the row was written first");
             assert_eq!(rows[0]["approval_kind"], kind);
+            if kind == "TrustlineSimulated" {
+                assert_eq!(rows[0]["gated_tool"], "stellar_trustline_commit");
+            }
             if kind == "ToolsetFirstInvokeGate" {
                 assert_eq!(row_before_grant, Some(true), "the row precedes the grant");
             }
@@ -2088,5 +2142,104 @@ mod tests {
         let err = attest_validated_copy(&dir, &mut store, &entry);
         assert_eq!(err.code(), "approval.consumed", "{err}");
         assert!(consent_rows(&dir).is_empty());
+    }
+
+    #[test]
+    fn trustline_attest_persist_reload_returns_verifiable_blob() {
+        for operator in [None, Some("trustline-operator-credential")] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("trustline.toml");
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            let entry = PendingApproval::new_trustline_pending(
+                "trustline-envelope".to_owned(),
+                b"trustline-envelope",
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                "USDC".to_owned(),
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+                None,
+                100,
+                42,
+                process_uid_for_attestation().unwrap(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap();
+            store
+                .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+                .unwrap();
+            let mut writer = test_audit_writer(&dir);
+            let key = [42; 32];
+            let binding = crate::approval::AttestationBinding::new("default", "stellar:testnet");
+            let blob = attest_and_persist(
+                &mut store,
+                &entry,
+                &key,
+                &binding,
+                if operator.is_some() {
+                    Surface::ServeRemote
+                } else {
+                    Surface::Cli
+                },
+                ConsentAudit::Writer(&mut writer),
+                operator,
+                |_, _| panic!("trustlines do not mint grants"),
+            )
+            .unwrap()
+            .unwrap();
+            drop(store);
+            let reopened = PendingApprovalStore::open(path).unwrap();
+            assert_eq!(
+                reopened
+                    .get(&entry.approval_nonce)
+                    .unwrap()
+                    .attestation_blob_b64
+                    .as_ref(),
+                Some(&blob)
+            );
+            let bytes: [u8; 32] = URL_SAFE_NO_PAD.decode(&blob).unwrap().try_into().unwrap();
+            let expected_digest = crate::approval::envelope_sha256(b"trustline-envelope");
+            assert!(crate::approval::verify_attestation(
+                &key,
+                &binding,
+                &entry.approval_nonce,
+                &expected_digest,
+                &entry.process_uid,
+                &bytes
+            ));
+            let log = std::fs::read_to_string(dir.path().join("audit/audit.jsonl")).unwrap();
+            let rows: Vec<serde_json::Value> = log
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|row| {
+                    row["kind"] == "approval_attested" || row["kind"] == "approval_attested_remote"
+                })
+                .collect();
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row["approval_kind"], "TrustlineSimulated");
+            assert_eq!(row["gated_tool"], "stellar_trustline_commit");
+            assert_eq!(
+                row["envelope_sha256_hex"],
+                expected_digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            );
+            assert_eq!(row["nonce_prefix"], entry.approval_nonce[..8]);
+            if let Some(operator) = operator {
+                assert_eq!(row["kind"], "approval_attested_remote");
+                let digest = crate::approval::envelope_sha256(operator.as_bytes());
+                assert_eq!(
+                    row["operator_credential_id_redacted"],
+                    digest[..4]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                );
+                assert!(!log.contains(operator));
+            } else {
+                assert_eq!(row["kind"], "approval_attested");
+                assert_eq!(row["origin"], "cli");
+            }
+        }
     }
 }

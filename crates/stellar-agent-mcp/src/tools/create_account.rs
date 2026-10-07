@@ -1044,6 +1044,7 @@ impl WalletServer {
         if let Err(result) = verify_attestation_gate(
             self,
             &dispatch_outcome,
+            super::common::GatedApprovalKind::Payment,
             &args.envelope_xdr,
             args.approval_nonce.as_deref(),
             args.approval_attestation.as_deref(),

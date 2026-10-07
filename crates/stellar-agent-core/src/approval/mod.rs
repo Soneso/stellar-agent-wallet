@@ -2,7 +2,7 @@
 //!
 //! Provides the `stellar-agent approve --id <nonce> --profile <name>` CLI half and the MCP
 //! commit-path verifier.  Supports a kinded approval shape:
-//! `PaymentSimulated`, `ClaimSimulated`, `SignWithPasskey`, `RegisterPasskey`,
+//! `PaymentSimulated`, `TrustlineSimulated`, `ClaimSimulated`, `SignWithPasskey`, `RegisterPasskey`,
 //! `ToolsetFirstInvokeGate`, `TrustlineClawbackOptIn`, `RuleProposalSimulated`,
 //! `MppChargeSimulated`, `Rejected` and `Consumed`.
 //!

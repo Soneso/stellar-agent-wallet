@@ -2529,7 +2529,8 @@ pub enum EventKind {
     ///
     /// Emitted from the shared `stellar_agent_core::approval::attest` path
     /// after the entry's HMAC attestation (`PaymentSimulated` /
-    /// `ClaimSimulated` / `TrustlineClawbackOptIn`) or recorded consent
+    /// `ClaimSimulated` / `TrustlineSimulated` / `TrustlineClawbackOptIn` /
+    /// `RuleProposalSimulated` / `MppChargeSimulated`) or recorded consent
     /// (`ToolsetFirstInvokeGate`) is durably persisted to the pending-approval
     /// store. The `stellar-agent approve --id <nonce> --profile <name>` CLI path and
     /// server-driven approval surfaces emit this same event. Emission is
@@ -2560,7 +2561,7 @@ pub enum EventKind {
         /// guards against (see `SaContextRuleNameUpdated`).
         gated_tool: String,
         /// Hex-encoded SHA-256 of the envelope XDR bytes, for
-        /// `PaymentSimulated` and `ClaimSimulated` entries.
+        /// `PaymentSimulated`, `ClaimSimulated`, and `TrustlineSimulated` entries.
         #[serde(skip_serializing_if = "Option::is_none")]
         envelope_sha256_hex: Option<String>,
         /// First 8 characters of the approval nonce.
@@ -2623,7 +2624,7 @@ pub enum EventKind {
         /// MCP tool this approval gates (e.g. `"stellar_pay_commit"`).
         gated_tool: String,
         /// Hex-encoded SHA-256 of the envelope XDR bytes, for
-        /// `PaymentSimulated` and `ClaimSimulated` entries.
+        /// `PaymentSimulated`, `ClaimSimulated`, and `TrustlineSimulated` entries.
         #[serde(skip_serializing_if = "Option::is_none")]
         envelope_sha256_hex: Option<String>,
         /// First 8 characters of the approval nonce.

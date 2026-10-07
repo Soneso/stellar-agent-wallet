@@ -274,12 +274,8 @@ fn parse_denomination_input(asset: &str) -> DenominationInput {
 impl WalletServer {
     /// Persists a [`PendingApproval`] entry for a `stellar_trustline` simulate call.
     ///
-    /// Reuses `PendingApproval::new_payment_pending` with trustline-adapted field
-    /// values:
-    ///
-    /// - `summary_to` — the trustline holder (same as `from`).
-    /// - `summary_amount_stroops` — the `limit_stroops` (or `0` for unlimited).
-    /// - `summary_asset` — `"CODE:ISSUER"` string.
+    /// Records the holder, asset issuer, and optional limit as a trustline change.
+    /// A missing or `i64::MAX` limit is stored as unlimited; zero removes the trustline.
     ///
     /// Opens (or creates) the profile-scoped approval store, constructs an
     /// unattested entry, inserts it, and returns the entry for nonce/expiry
@@ -287,7 +283,8 @@ impl WalletServer {
     ///
     /// # Errors
     ///
-    /// Returns a string error on any I/O, store-lock, or clock failure.
+    /// Returns a string error on any I/O, store-lock, clock, or trustline-field
+    /// validation failure from [`PendingApproval::new_trustline_pending`].
     ///
     /// The simulate path persists a wallet-owned `PendingApproval` entry.
     #[allow(clippy::too_many_arguments)]
@@ -315,26 +312,19 @@ impl WalletServer {
         let uid =
             process_uid_for_attestation().map_err(|e| format!("process UID unavailable: {e}"))?;
 
-        // Reuse PaymentSimulated with adapted fields:
-        //   summary_to       = trustline holder (from_account)
-        //   summary_amount_stroops = limit_stroops or 0 for unlimited
-        //   summary_asset    = "CODE:ISSUER"
-        let asset_str = format!("{summary_asset_code}:{summary_asset_issuer}");
-        let limit_stroops = summary_limit_stroops.unwrap_or(0_i64);
-
-        let entry = PendingApproval::new_payment_pending(
+        let entry = PendingApproval::new_trustline_pending(
             envelope_xdr.to_owned(),
             envelope_xdr.as_bytes(),
             from_account.to_owned(),
-            limit_stroops,
-            asset_str,
-            None, // no memo for trustline
+            summary_asset_code.to_owned(),
+            summary_asset_issuer.to_owned(),
+            summary_limit_stroops.filter(|limit| *limit != i64::MAX),
             summary_simulated_total_stroops,
             summary_simulated_seq_num,
             uid,
             APPROVAL_TTL_MS,
         )
-        .map_err(|e| format!("PendingApproval::new_payment_pending (trustline) failed: {e}"))?;
+        .map_err(|e| format!("PendingApproval::new_trustline_pending failed: {e}"))?;
 
         let entry = entry.with_policy_request(request);
 
@@ -1134,6 +1124,7 @@ impl WalletServer {
         if let Err(result) = verify_attestation_gate(
             self,
             &dispatch_outcome,
+            super::common::GatedApprovalKind::Trustline,
             &args.envelope_xdr,
             args.approval_nonce.as_deref(),
             args.approval_attestation.as_deref(),

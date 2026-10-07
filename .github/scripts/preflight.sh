@@ -22,6 +22,7 @@
 #   surface    each path that is_scanned of check-install-surface.py accepts:
 #              the Markdown files and manifests that check reads
 #   skill      skills/, .claude-plugin/
+#   inbox-js   crates/stellar-agent-approval-ui/src/web/
 #   rust       crates/, tests/, examples/, and the root files Cargo.toml,
 #              Cargo.lock, rust-toolchain.toml, rustfmt.toml, Cross.toml, and
 #              deny.toml
@@ -114,6 +115,7 @@ machete	cargo machete	cargo,cargo-machete	ci.yml	machete	Check for unused depend
 deny	cargo deny check	cargo,cargo-deny	ci.yml	deny	Check licenses and advisories
 coverage	cargo llvm-cov --workspace --features $OFFLINE_FEATURES --json --output-path cov.json	cargo,cargo-llvm-cov	coverage.yml	coverage	Measure offline line coverage
 coverage-floors	python3 .github/scripts/check-coverage.py cov.json	-	coverage.yml	coverage	Enforce per-crate line-coverage floors
+inbox-js	node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs	node	ci.yml	inbox-js	Test the inbox renderers
 interop:mpp	.github/scripts/test-mpp-interop.sh	node,corepack	ci.yml	mpp-interop	Run the MPP interop harness
 interop:sdk-v17	.github/scripts/test-sdk-v17-interop.sh	node,corepack	ci.yml	sdk-v17-interop	Run the stellar-sdk v17 interop harness
 EOF
@@ -306,6 +308,9 @@ select_for_path() {
         select_gate workflow-invariants
       fi
       ;;
+  esac
+  case "$path" in
+    crates/stellar-agent-approval-ui/src/web/*) select_gate inbox-js ;;
   esac
   select_self_tests "$path"
   case "$path" in

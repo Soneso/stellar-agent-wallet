@@ -43,6 +43,7 @@
 use clap::Args;
 use serde::Serialize;
 
+use stellar_agent_core::approval::view::format_trustline_limit;
 use stellar_agent_core::approval::{
     ApprovalSummaryView, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApprovalView,
     open_with_retry,
@@ -251,6 +252,17 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
             asset,
             ..
         } => format!("pay {amount_stroops} stroops {asset} to {to}"),
+        ApprovalSummaryView::Trustline {
+            holder,
+            asset_code,
+            asset_issuer,
+            limit_stroops,
+            ..
+        } => {
+            let issuer = stellar_agent_core::approval::store::redact_g_strkey(asset_issuer);
+            let limit = format_trustline_limit(*limit_stroops);
+            format!("trustline {asset_code}:{issuer} limit {limit} for {holder}")
+        }
         ApprovalSummaryView::Claim {
             balance_id_strkey,
             asset,
@@ -337,6 +349,13 @@ mod tests {
         clippy::expect_used,
         reason = "test-only; panics acceptable in unit tests"
     )]
+
+    // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
+    const CHANGE_TRUST_ENVELOPE: &str = concat!(
+        "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
+        "AAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAGAAAAAVVT",
+        "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
+    );
 
     use serial_test::serial;
     use stellar_agent_core::approval::{
@@ -544,6 +563,45 @@ mod tests {
 
     #[test]
     fn render_summary_line_covers_every_kind() {
+        for (limit, shown) in [
+            (None, "unlimited"),
+            (Some(0), "0 stroops (removes the trustline)"),
+            (Some(123456789), "123456789 stroops"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mut store = PendingApprovalStore::open(dir.path().join("trustline.toml")).unwrap();
+            store
+                .insert(
+                    PendingApproval::new_trustline_pending(
+                        CHANGE_TRUST_ENVELOPE.to_owned(),
+                        CHANGE_TRUST_ENVELOPE.as_bytes(),
+                        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                        "USDC".to_owned(),
+                        "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+                        limit,
+                        100,
+                        42,
+                        "1000".to_owned(),
+                        DEFAULT_TTL_MS,
+                    )
+                    .unwrap(),
+                    0,
+                )
+                .unwrap();
+            let view = store.snapshot(0).remove(0);
+            assert_eq!(
+                render_summary_line(&view),
+                format!(
+                    "trustline USDC:GBBD4...LFLA5 limit {shown} for GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                )
+            );
+            let json = serde_json::to_value(&view).unwrap();
+            assert_eq!(
+                json["summary"]["asset_issuer"],
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+            );
+        }
+
         // Payment
         let dir = TempDir::new().unwrap();
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();

@@ -7,13 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The `TrustlineSimulated` approval kind names a trustline change and its limit.
+
 ### Changed
 
+- Trustline approvals are stored, rendered, listed, and audited as trustline changes.
+  The MCP commit gate accepts only the approval kind of its tool.
+- An approval file with a `trustline_simulated` entry needs this version or later.
+  Processes sharing a store upgrade together.
+  Older binaries reject the whole file, including unrelated entries; expiry alone does not restore compatibility.
+- Trustline approvals from an earlier version answer `policy.approval_required`.
+  Simulate and approve again.
 - The three log lines of the CLI's shared value audit writer acquisition end in
   `refusing`, which fits the callers that neither sign nor submit. Two tests pin
   the Enforce binding check at the `approve` site and at the value audit
   pre-flight. The audit log recovery guide names the `audit reanchor` repair rows
   in the plural. Thanks to @ngybnc.
+
+### Fixed
+
+- The approval prompt, `approve list`, and both inboxes name the trustline,
+  account, asset, and limit.
 
 ## [0.1.0-alpha.11] - 2026-10-07
 
