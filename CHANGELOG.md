@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The three log lines of the CLI's shared value audit writer acquisition end in
+  `refusing`, which fits the callers that neither sign nor submit. Two tests pin
+  the Enforce binding check at the `approve` site and at the value audit
+  pre-flight. The audit log recovery guide names the `audit reanchor` repair rows
+  in the plural. Thanks to @ngybnc.
+
 ## [0.1.0-alpha.11] - 2026-10-07
 
 A security fix for MCP policy evaluation with chain-bound rules, and the fixes from the alpha.10 release tests on macOS and Windows.

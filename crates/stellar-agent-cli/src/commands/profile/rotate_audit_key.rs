@@ -24,8 +24,8 @@
 //! chain root brought onto the new key by the same pass.  The writer appends
 //! nothing after it.  The re-sign pass reads the replacement key from the
 //! keyring after persistence.  If re-signing fails partway (some sidecars carry
-//! the new key, some the old), re-running the command
-//! converges: the re-sign step recomputes every sidecar deterministically.
+//! the new key, some the old), re-running the command converges: the re-sign
+//! step recomputes every sidecar deterministically.
 //!
 //! The lock acquisition also runs the audit log's tip-anchor check, before the
 //! key is touched: a log that was rolled back or truncated is refused with
