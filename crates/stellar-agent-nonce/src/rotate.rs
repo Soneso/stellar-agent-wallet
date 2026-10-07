@@ -49,12 +49,11 @@ use stellar_agent_network::keyring::rotate_keyring_secret_32;
 /// # Errors
 ///
 /// - [`WalletError::Auth`] with the keyring failure classified by
-///   [`stellar_agent_network::keyring::classify_keyring_error`]:
+///   [`stellar_agent_network::keyring::map_keyring_operation_error`]:
 ///   `KeyringInteractiveSessionRequired` when the Windows Credential Manager
-///   is unreachable from a non-interactive session,
-///   `KeyringPlatformError` for other backend failures, and
-///   `KeyringNotFound` when the platform keyring is unavailable (not
-///   initialised or unsupported OS).
+///   is unreachable from a non-interactive session, and
+///   `KeyringPlatformError { detail }` for construction or write failures.
+///   The detail names the operation, store, and safe cause.
 ///
 /// # Panics
 ///

@@ -291,7 +291,16 @@ jobs:
       # rest of the job budget.
       - name: Build test binaries (unbounded compile phase)
         shell: bash
-        run: cargo test -p stellar-agent-core -p stellar-agent-mpp -p stellar-agent-smart-account -p stellar-agent-mcp --lib --no-run
+        run: cargo test -p stellar-agent-core -p stellar-agent-mpp -p stellar-agent-smart-account -p stellar-agent-mcp -p stellar-agent-headless-keyring -p stellar-agent-windows-identity -p stellar-agent-network --lib --no-run
+      - name: Headless keyring and Windows identity suites
+        shell: bash
+        run: "timeout 600 cargo test -p stellar-agent-headless-keyring -p stellar-agent-windows-identity --lib"
+      - name: DPAPI protect failure regression
+        shell: bash
+        run: |
+          set -o pipefail
+          timeout 600 cargo test -p stellar-agent-network --lib keyring::tests::dpapi_protect_failure_reaches_wallet_error -- --exact 2>&1 | tee dpapi-regression.log
+          grep -q 'test result: ok. 1 passed' dpapi-regression.log
       - name: Audit-log regression (stellar-agent-core)
         shell: bash
         run: "timeout 600 cargo test -p stellar-agent-core --lib audit_log::"

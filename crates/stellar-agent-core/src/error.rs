@@ -1849,22 +1849,15 @@ pub enum AuthError {
     #[error("the keyring is locked; unlock it before proceeding")]
     KeyringLocked,
 
-    /// The platform keyring backend failed or is unavailable.
+    /// A credential store operation failed.
     ///
-    /// Distinct from [`AuthError::KeyringLocked`]: unlocking the user's
-    /// keyring is not expected to fix platform backend failures, missing
-    /// storage access, or keyring service misconfiguration.
-    ///
-    /// Upstream mappings intentionally share one stable wire code:
-    /// `keyring_core::Error::PlatformFailure(_)` means the keyring service
-    /// failed or is misconfigured, while `keyring_core::Error::NoStorageAccess(_)`
-    /// means the backend refused storage access, often due to a user-denied
-    /// prompt. Operator remediation differs, but the variant remains lumped to
-    /// preserve `auth.keyring_platform_error` wire compatibility until a
-    /// dedicated wire-code-change cycle splits it.
-    /// Carries no fields; no secret material crosses the variant boundary.
-    #[error("platform keyring backend error; check keyring service configuration")]
-    KeyringPlatformError,
+    /// The detail contains only fixed diagnostic labels and extracted numeric
+    /// codes. It must never contain credentials or upstream error formatting.
+    #[error("keyring operation failed: {detail}")]
+    KeyringPlatformError {
+        /// Safe operation, store, and cause diagnostic.
+        detail: String,
+    },
 
     /// Windows Credential Manager refused access because the current process
     /// has no interactive logon session.
@@ -1992,7 +1985,7 @@ impl AuthError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::KeyringLocked => "auth.keyring_locked",
-            Self::KeyringPlatformError => "auth.keyring_platform_error",
+            Self::KeyringPlatformError { .. } => "auth.keyring_platform_error",
             Self::KeyringInteractiveSessionRequired => "auth.keyring_interactive_session_required",
             Self::KeyringNotFound { .. } => "auth.keyring_not_found",
             Self::KeyringConfigInvalid { .. } => "auth.keyring_config_invalid",
@@ -3289,6 +3282,17 @@ mod tests {
     // ── Auth errors ──────────────────────────────────────────────────────────
 
     #[test]
+    fn keyring_platform_error_display_uses_safe_detail() {
+        let error = AuthError::KeyringPlatformError {
+            detail: "write headless-env: credential store access denied".to_owned(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "keyring operation failed: write headless-env: credential store access denied"
+        );
+    }
+
+    #[test]
     fn auth_code_round_trip() {
         let cases: &[(AuthError, &'static str)] = &[
             (
@@ -3308,7 +3312,10 @@ mod tests {
             ),
             (AuthError::KeyringLocked, "auth.keyring_locked"),
             (
-                AuthError::KeyringPlatformError,
+                AuthError::KeyringPlatformError {
+                    detail: "write unknown credential store: credential store operation failed"
+                        .to_owned(),
+                },
                 "auth.keyring_platform_error",
             ),
             (
@@ -3924,7 +3931,10 @@ mod tests {
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned();
         let cases = [
             WalletError::Auth(AuthError::KeyringLocked),
-            WalletError::Auth(AuthError::KeyringPlatformError),
+            WalletError::Auth(AuthError::KeyringPlatformError {
+                detail: "write unknown credential store: credential store operation failed"
+                    .to_owned(),
+            }),
             WalletError::Auth(AuthError::KeyringInteractiveSessionRequired),
             WalletError::Auth(AuthError::KeyringNotFound {
                 name: "main".to_owned(),

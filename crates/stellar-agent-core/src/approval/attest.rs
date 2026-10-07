@@ -34,7 +34,7 @@ use crate::audit_log::entry::AuditEntry;
 use crate::audit_log::outbox::AuditOutbox;
 use crate::audit_log::writer::{AuditWriter, WriterError, audit_writer_refusal};
 use crate::error::{ApprovalFailure, WalletError};
-use crate::keyring_errors::map_keyring_error;
+use crate::keyring_errors::{KeyringOperation, map_keyring_operation_error};
 use crate::profile::schema::KeyringEntryRef;
 use crate::timefmt;
 
@@ -258,20 +258,18 @@ pub fn load_attestation_key(
     crate::profile::owner_key::refuse_owner_key_coordinate(entry_ref, ATTESTATION_KEY_FIELD)?;
     let entry = KeyringEntry::new(&entry_ref.service, &entry_ref.account).map_err(|e| {
         tracing::debug!(
-            error = %e,
             service = %entry_ref.service,
             "keyring Entry::new failed for attestation key"
         );
-        map_keyring_error(&e, &entry_ref.service)
+        map_keyring_operation_error(&e, KeyringOperation::Construct, &entry_ref.service)
     })?;
 
     let secret_b64 = Zeroizing::new(entry.get_password().map_err(|e| {
         tracing::debug!(
-            error = %e,
             service = %entry_ref.service,
             "get_password failed for attestation key"
         );
-        map_keyring_error(&e, &entry_ref.service)
+        map_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service)
     })?);
 
     let key_bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {

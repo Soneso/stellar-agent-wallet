@@ -70,10 +70,7 @@ fn load_pool_master_seed_all_branches() {
     let result = load_pool_master_seed_from_keyring(SERVICE, ACCOUNT);
     match result {
         Err(PoolError::InitFailed { detail }) => {
-            assert!(
-                detail.contains("keyring get_password failed"),
-                "error detail must mention keyring failure; got: {detail}"
-            );
+            assert_eq!(detail, "keyring entry 'pool-test-svc' was not found");
         }
         other => panic!("expected InitFailed for missing entry, got: {other:?}"),
     }

@@ -1,6 +1,10 @@
 ## What this changes
 
-<!-- Two or three sentences in present tense: what the change does and why. -->
+<!--
+Before this change: what the code did and why that was a problem, or what this
+enables. Then "This change:" with bullets that start with a verb. Then the
+verification, scoped to what ran.
+-->
 
 Closes #N
 
@@ -24,6 +28,7 @@ coverage requires the `coverage` label; live acceptance uses its separate workfl
 Confirm each item for this description, the documentation, and the code comments in the change. The rules are in the [Writing style](https://github.com/Soneso/stellar-agent-wallet/blob/main/CONTRIBUTING.md#writing-style) section of the contributing guide.
 
 - [ ] "Allow edits by maintainers" is enabled, so a maintainer can push small fixes to the branch.
+- [ ] The title is one imperative sentence without a type prefix.
 - [ ] Every sentence is under 35 words.
 - [ ] No em dash.
 - [ ] No filler adjectives.
