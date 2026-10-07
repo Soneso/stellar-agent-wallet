@@ -94,17 +94,14 @@ the review approves with no blocking findings.
 
 ### 8. Build gates
 
-`bash .github/scripts/preflight.sh` runs the local CI checks that apply to the
-files your branch changes; `--full` runs every gate in its registry.
+Start local verification with `bash .github/scripts/preflight.sh` and run the
+issue-specific acceptance commands. `bash .github/scripts/preflight.sh --full`
+runs the complete local registry, including coverage.
 
-All of the following pass:
-
-- `cargo fmt --all --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --all-features` (unit, integration, and doc-tests)
-- `cargo llvm-cov` meets the coverage bar
-- `cargo machete`
-- `cargo deny check`
+CI runs the offline workspace suite on every pull request. Pull-request
+coverage requires the `coverage` label; live acceptance uses its separate
+workflow. Local coverage, `cargo machete`, and `cargo deny check` are optional
+reproductions. Record each local gate's exit code or unavailable status.
 
 ## Self-review before you open a pull request
 

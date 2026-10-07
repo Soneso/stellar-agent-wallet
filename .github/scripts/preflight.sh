@@ -7,7 +7,7 @@
 #   --base <ref>  Compares the branch with its merge base with <ref>. The
 #                 default is origin/main, or main when origin/main does not
 #                 exist.
-#   --full        Selects every gate, with the workspace test command.
+#   --full        Selects every gate, with workspace Cargo commands.
 #   --list        Prints the selected gates as <id><TAB><command>, one per
 #                 line in registry order, and runs nothing.
 #
@@ -32,6 +32,12 @@
 # select_for_path holds the triggers, and plan_surface_self_test the trigger
 # of the surface scope. A gate that several triggers select runs once, at its
 # registry position.
+#
+# Clippy, rustdoc, and tests select the owning packages and their direct
+# dependents when every changed Rust path belongs to a workspace member.
+# Unowned paths, including root manifests, the lockfile, the toolchain, and
+# deleted members, select workspace commands. Tests use the declared subset
+# of the offline features; clippy and rustdoc use all features.
 #
 # A selected gate whose tool or Python module is missing is unavailable: its
 # row names the requirement and an install hint, and the later gates still
@@ -120,9 +126,9 @@ EOF
 }
 
 # Loads the id, command, and requirements of each registry record into
-# REG_ID, REG_CMD, and REG_REQ. A per-package run replaces the workspace test
-# command, and the planner appends the operands of the shellcheck-changed
-# command.
+# REG_ID, REG_CMD, and REG_REQ. A per-package run replaces the workspace
+# clippy, rustdoc, and test commands. The planner appends the operands of
+# the shellcheck-changed command.
 load_registry() {
   local id command requirements
   REG_COUNT=0
@@ -370,12 +376,12 @@ PY
   fi
 }
 
-# Replaces the test command with the per-package command when every changed
-# Rust path belongs to a workspace member. Selects the release configuration
-# test of the vendored crate when the packages include it or the workspace
-# command applies.
-plan_tests() {
-  local command vendored
+# Replaces clippy, rustdoc, and test commands with per-package commands when
+# every changed Rust path belongs to a workspace member. Selects the vendored
+# crate's release configuration test when the packages include it or the
+# workspace command applies.
+plan_rust_gates() {
+  local clippy rustdoc command vendored
   # Any planner failure, an unexpected exception included, exits 2.
   python3 - "$OFFLINE_FEATURES" "$VENDORED_CRATE" "$SCRATCH/rust" >"$SCRATCH/plan" <<'PY' || exit 2
 import pathlib
@@ -435,13 +441,15 @@ def owner(path):
     return names.get(max(containing, key=len)) if containing else None
 
 
-# The output is two lines: the per-package test command, or an empty line for
-# the workspace command; then 1 when the release configuration test of the
-# vendored crate applies, else 0.
+# The output has four lines: clippy, rustdoc, and test commands, then 1 when
+# the vendored crate's release configuration test applies, else 0.
+# Empty command lines retain the workspace commands.
 owners = []
 for path in changed:
     name = owner(path)
     if name is None:
+        print()
+        print()
         print()
         print(1)
         raise SystemExit(0)
@@ -489,16 +497,26 @@ for member, manifest in manifests.items():
         declared.update(feature_table)
 features = [feature for feature in offline_features if feature in declared]
 
-command = ["cargo", "test"]
+packages = []
 for package in selected:
-    command += ["-p", package]
+    packages += ["-p", package]
+print(shlex.join(["cargo", "clippy", *packages, "--all-targets", "--all-features", "--", "-D", "warnings"]))
+print('RUSTDOCFLAGS="-D warnings" ' + shlex.join(["cargo", "doc", "--no-deps", *packages, "--all-features"]))
+command = ["cargo", "test", *packages]
 if features:
     command += ["--features", ",".join(features)]
 print(shlex.join(command))
 print(1 if vendored_crate in selected else 0)
 PY
-  { IFS= read -r command && IFS= read -r vendored; } <"$SCRATCH/plan"
+  {
+    IFS= read -r clippy && IFS= read -r rustdoc &&
+      IFS= read -r command && IFS= read -r vendored
+  } <"$SCRATCH/plan"
   if [ -n "$command" ]; then
+    find_gate clippy
+    REG_CMD[GATE]=$clippy
+    find_gate rustdoc
+    REG_CMD[GATE]=$rustdoc
     find_gate test
     REG_CMD[GATE]=$command
   fi
@@ -557,7 +575,7 @@ plan() {
   else
     plan_surface_self_test
     if [ -s "$SCRATCH/rust" ]; then
-      plan_tests
+      plan_rust_gates
     fi
   fi
   if [ -s "$SCRATCH/shell" ]; then

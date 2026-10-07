@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AuthError::KeyringPlatformError` carries a safe `detail`. Constructors supply
   the detail; matches use `KeyringPlatformError { .. }`. The Display changes;
   `auth.keyring_platform_error` and the auth category stay unchanged.
+- Dev and test profiles use workspace line tables and omit dependency debuginfo;
+  tests disable incremental caches. The toolchain uses the minimal installation
+  profile with rustfmt and clippy.
+- Preflight scopes clippy, rustdoc, and tests to changed packages and their direct
+  dependents. Contribution guides start local verification with preflight and
+  use CI for the offline workspace suite.
+- The building guide documents disk use, debugging overrides, and opt-in cleanup.
 
 - The three log lines of the CLI's shared value audit writer acquisition end in
   `refusing`, which fits the callers that neither sign nor submit. Two tests pin
