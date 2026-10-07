@@ -38,7 +38,7 @@ env:
 jobs:
   acceptance:
     name: testnet acceptance (serialized)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     # Setting the repository variable TESTNET_SCHEDULE to "off" disables the
     # weekly run without a commit; manual dispatch always runs.

@@ -39,7 +39,7 @@ permissions:
 jobs:
   check:
     name: tree check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       rebuild: ${{ steps.decide.outputs.rebuild }}
@@ -257,7 +257,7 @@ jobs:
     name: vendored-wasm
     needs: [check, stellar-cli-25, stellar-cli-28, rebuild]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

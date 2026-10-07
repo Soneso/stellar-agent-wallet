@@ -34,7 +34,7 @@ jobs:
     if: >-
       (github.event.comment.user.type || github.event.review.user.type
       || github.event.pull_request.user.type || github.event.issue.user.type) != 'Bot'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       issues: write
       pull-requests: write

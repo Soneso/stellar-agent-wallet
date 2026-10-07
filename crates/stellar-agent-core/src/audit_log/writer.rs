@@ -4164,7 +4164,7 @@ mod tests {
     /// `ERROR_ACCESS_DENIED` (raw os error 5). POSIX advisory locks never
     /// block a second handle's I/O, so this test cannot distinguish a
     /// single-handle design from a two-handle one on this platform; the
-    /// `windows-storage` CI job runs it on `windows-latest`, where the
+    /// `windows-storage` CI job runs it on `windows-2025`, where the
     /// distinction is observable.
     #[test]
     fn reopen_nonempty_log_then_write_succeeds() {

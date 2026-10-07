@@ -45,7 +45,7 @@ env:
 jobs:
   verify:
     name: verify (${{ inputs.tag }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # One cargo invocation verify-builds every workspace crate.
     timeout-minutes: 90
     permissions:
@@ -157,7 +157,7 @@ jobs:
     name: publish (${{ inputs.tag }})
     needs: verify
     if: ${{ !inputs.verify_only }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: crates-io
     # Uploads only, plus registry rate-limit and index waits.
     timeout-minutes: 300

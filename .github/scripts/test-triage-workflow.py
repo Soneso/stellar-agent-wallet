@@ -253,7 +253,7 @@ def check_structure(workflow_path):
         "no action or checkout": "uses" not in job and all("uses" not in s for s in job["steps"])
         and "checkout" not in step["run"],
         "bot condition": " ".join(str(job.get("if", "")).split()) == BOT_CONDITION,
-        "runner": job.get("runs-on") == "ubuntu-latest",
+        "runner": job.get("runs-on") == "ubuntu-24.04",
         "timeout": job.get("timeout-minutes") == 5,
         "concurrency": job.get("concurrency") == {
             "group": "triage-${{ github.event.issue.number || github.event.pull_request.number }}",

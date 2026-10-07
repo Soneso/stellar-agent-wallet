@@ -37,7 +37,7 @@ jobs:
       && github.event.issue.state == 'open'
       && github.event.comment.user.type != 'Bot'
       && contains(github.event.comment.body, 'take this')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     # One claim per issue runs at a time, so a second claim reads the
     # assignment the first one made.
