@@ -25,6 +25,9 @@
 - name: 'area: mpp'
   color: fbca04
   description: Agent payments with MPP
+- name: 'area: build'
+  color: bfd4f2
+  description: Cargo profiles, test targets, and the build footprint
 - name: security-sensitive
   color: b60205
   description: Signing, key handling, or serialized state; second review pass

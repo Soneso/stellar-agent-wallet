@@ -27,6 +27,7 @@ LABELS = [
     ("area: mcp", "5319e7", "The MCP server"),
     ("area: smart-account", "c2e0c6", "Smart-account governance"),
     ("area: mpp", "fbca04", "Agent payments with MPP"),
+    ("area: build", "bfd4f2", "Cargo profiles, test targets, and the build footprint"),
     ("security-sensitive", "b60205", "Signing, key handling, or serialized state; second review pass"),
     ("coverage", "c5def5", "CI runs the coverage gate on this pull request"),
     ("waiting on author", "fef2c0", "The next step is the contributor's"),
