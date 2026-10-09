@@ -24,6 +24,10 @@
 //! env vars are process-global state. All tests in the same binary that mutate
 //! proxy env vars must use `#[serial_test::serial]`.
 //!
+//! This file keeps its own test target because `t8b` rewrites the process-wide
+//! proxy variables. A separate process keeps every other test's HTTP client out
+//! of that window. No other test in the crate needs a serial guard for it.
+//!
 //! # Per-test server design
 //!
 //! Each test calls `MockServer::start().await` independently rather than sharing

@@ -38,29 +38,9 @@ test-helpers = []
 # verifier / policy contracts at runtime.
 deploy-cli = []
 
-# Tests that consume gated test-helpers (interop deployer helpers):
+# Offline tests that consume gated test helpers.
 [[test]]
-name = "audit_log_emission"
-required-features = ["test-helpers"]
-
-[[test]]
-name = "deploy_c_via_cli_returns_strkey_and_seed"
-required-features = ["test-helpers"]
-
-[[test]]
-name = "deterministic_address_derivation"
-required-features = ["test-helpers"]
-
-[[test]]
-name = "recover_strkey_from_seed_and_deployer"
-required-features = ["test-helpers"]
-
-[[test]]
-name = "deploy_smart_account_collective_budget_mock"
-required-features = ["test-helpers"]
-
-[[test]]
-name = "execute_path_drift_check_mock"
+name = "smart_account_test_helpers"
 required-features = ["test-helpers"]
 
 # testnet acceptance tests: each requires the testnet-integration feature.

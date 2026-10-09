@@ -31,8 +31,7 @@ use stellar_xdr::{
 };
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
 
-#[path = "smart-account-fixtures/adversarial/rpc_mock_helpers.rs"]
-mod rpc_helpers;
+use crate::rpc_mock_helpers as rpc_helpers;
 
 const PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const SEED: [u8; 32] = [0x53; 32];

@@ -27,15 +27,8 @@ use wiremock::{
     matchers::{method, path},
 };
 
-#[path = "smart-account-fixtures/adversarial/combined_rpc_responder.rs"]
-mod combined_rpc_responder;
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "shared adversarial fixture helpers assert setup invariants"
-)]
-#[path = "smart-account-fixtures/adversarial/rpc_mock_helpers.rs"]
-mod rpc_mock_helpers;
+use crate::combined_rpc_responder;
+use crate::rpc_mock_helpers;
 
 use combined_rpc_responder::{CombinedRpcResponder, SequencedSimulate};
 use rpc_mock_helpers::{

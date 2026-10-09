@@ -10,7 +10,7 @@
 //! [`SignersManager`] whose audit log holds no signer-set state row. The
 //! pair entry, its state rows, its pending add and its partial-failure
 //! shapes are pinned against the stateful mock RPC in
-//! `tests/execute_path_drift_check_mock.rs`.
+//! `tests/smart_account_test_helpers/execute_path_drift_check_mock.rs`.
 //!
 //! # Gating
 //!
@@ -25,7 +25,7 @@
 //!
 //! ```text
 //! cargo test -p stellar-agent-smart-account --features test-helpers \
-//!   --test adversarial_fixtures verifier_migration
+//!   --test smart_account adversarial_fixtures::verifier_migration
 //! ```
 //!
 //! # Implements
