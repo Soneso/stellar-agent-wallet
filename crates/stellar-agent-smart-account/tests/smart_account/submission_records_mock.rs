@@ -46,10 +46,9 @@ use tempfile::TempDir;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-#[path = "smart-account-fixtures/adversarial/rpc_mock_helpers.rs"]
-mod rpc_helpers;
+use crate::rpc_mock_helpers as rpc_helpers;
 
-#[path = "common/pin_check_manager.rs"]
+#[path = "../common/pin_check_manager.rs"]
 mod pin_check_manager;
 
 const PASSPHRASE: &str = "Test SDF Network ; September 2015";

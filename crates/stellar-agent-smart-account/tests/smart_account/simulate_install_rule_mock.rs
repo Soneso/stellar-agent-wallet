@@ -39,8 +39,7 @@ use wiremock::{
     matchers::{method, path},
 };
 
-#[path = "smart-account-fixtures/adversarial/rpc_mock_helpers.rs"]
-mod rpc_mock_helpers;
+use crate::rpc_mock_helpers;
 
 use rpc_mock_helpers::{
     SOURCE_G, SorobanRpcDispatcher, build_ledger_entries_account, manager_one_url, tmp_audit_writer,

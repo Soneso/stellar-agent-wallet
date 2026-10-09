@@ -63,7 +63,7 @@ use crate::SaError;
 ///
 /// **Empirical verification:** the byte-parity gate
 /// `webauthn_sigdata_inner_encoding_parity_with_onchain_canonical` at
-/// `tests/wallet_install_arg_parity.rs` exercises this against a fixed
+/// `tests/smart_account/wallet_install_arg_parity.rs` exercises this against a fixed
 /// fixture cross-encoded through the soroban-sdk-side `WebAuthnSigData`
 /// type imported from the OZ `stellar-accounts` v0.7.2 crate.
 ///
@@ -113,7 +113,7 @@ pub fn encode_webauthn_sig_data_scval(a: &WebAuthnAssertion) -> Result<ScVal, Sa
     // byte-equivalent to the on-chain `BytesN<64>` payload — empirically
     // pinned by the byte-parity gate
     // `webauthn_sigdata_inner_encoding_parity_with_onchain_canonical` at
-    // `tests/wallet_install_arg_parity.rs`.
+    // `tests/smart_account/wallet_install_arg_parity.rs`.
     let signature_sym = ScSymbol::try_from("signature")
         .map_err(|e| auth_payload_err(format!("encode signature symbol: {e:?}")))?;
     let signature_bytesm: BytesM = a

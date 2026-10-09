@@ -72,7 +72,7 @@ use crate::profile::caip2::Caip2;
 /// (`stellar-agent-smart-account` already depends on `stellar-agent-core`).
 ///
 /// **Drift-protection:** an integration test in
-/// `crates/stellar-agent-smart-account/tests/upper_bound_max_scan_id_parity_test.rs`
+/// `crates/stellar-agent-smart-account/tests/smart_account/upper_bound_max_scan_id_parity_test.rs`
 /// asserts `MIRRORED_UPPER_BOUND_MAX_SCAN_ID == UPPER_BOUND_MAX_SCAN_ID`
 /// across crate boundaries — if either side changes, the parity test fails.
 pub const MIRRORED_UPPER_BOUND_MAX_SCAN_ID: u32 = 10_000;
@@ -85,7 +85,7 @@ pub const MIRRORED_UPPER_BOUND_MAX_SCAN_ID: u32 = 10_000;
 /// smart-account crate; this mirror avoids a crate-dependency cycle.
 ///
 /// **Drift-protection:** the integration test
-/// `crates/stellar-agent-smart-account/tests/horizon_bound_parity_test.rs`
+/// `crates/stellar-agent-smart-account/tests/smart_account/horizon_bound_parity_test.rs`
 /// asserts `MIRRORED_UPPER_BOUND_HORIZON_LEDGERS == UPPER_BOUND_HORIZON_LEDGERS`
 /// across crate boundaries.
 pub const MIRRORED_UPPER_BOUND_HORIZON_LEDGERS: u32 = 10_000;

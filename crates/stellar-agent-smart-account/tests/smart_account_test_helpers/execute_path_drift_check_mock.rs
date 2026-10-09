@@ -17,7 +17,7 @@
 //!
 //! ```text
 //! cargo test -p stellar-agent-smart-account --features test-helpers \
-//!   --test execute_path_drift_check_mock
+//!   --test smart_account_test_helpers execute_path_drift_check_mock
 //! ```
 
 #![allow(
@@ -83,7 +83,7 @@ use stellar_xdr::{
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-#[path = "smart-account-fixtures/adversarial/rpc_mock_helpers.rs"]
+#[path = "../smart-account-fixtures/adversarial/rpc_mock_helpers.rs"]
 mod rpc_mock_helpers;
 
 use rpc_mock_helpers::KNOWN_WASM_HASH;

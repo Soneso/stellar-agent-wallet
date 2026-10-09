@@ -50,7 +50,7 @@
 //! Each test group is its own sub-module. The submodule files live in
 //! `tests/smart-account-fixtures/adversarial/`; this file
 //! includes them via the `#[path]` attribute so Cargo discovers them through a
-//! single `tests/adversarial_fixtures.rs` entry point.
+//! single `tests/smart_account/adversarial_fixtures.rs` entry point.
 //!
 //! # Implements
 //!
@@ -65,110 +65,108 @@
 
 // ── Shared RPC mock helpers (used by wiremock-dependent fixtures) ─────────────
 
-#[path = "smart-account-fixtures/adversarial/rpc_mock_helpers.rs"]
-mod rpc_mock_helpers;
+use crate::rpc_mock_helpers;
 
-#[path = "smart-account-fixtures/adversarial/combined_rpc_responder.rs"]
-mod combined_rpc_responder;
+use crate::combined_rpc_responder;
 
 // ── Sub-modules (one per adversarial fixture) ─────────────────────────────────
 
-#[path = "smart-account-fixtures/adversarial/audit_log_baseline_reconstruction.rs"]
+#[path = "../smart-account-fixtures/adversarial/audit_log_baseline_reconstruction.rs"]
 mod audit_log_baseline_reconstruction;
 
-#[path = "smart-account-fixtures/adversarial/audit_log_tampering_detection.rs"]
+#[path = "../smart-account-fixtures/adversarial/audit_log_tampering_detection.rs"]
 mod audit_log_tampering_detection;
 
-#[path = "smart-account-fixtures/adversarial/audit_log_wholesale_replacement.rs"]
+#[path = "../smart-account-fixtures/adversarial/audit_log_wholesale_replacement.rs"]
 mod audit_log_wholesale_replacement;
 
-#[path = "smart-account-fixtures/adversarial/fresh_wallet_missing_baseline.rs"]
+#[path = "../smart-account-fixtures/adversarial/fresh_wallet_missing_baseline.rs"]
 mod fresh_wallet_missing_baseline;
 
-#[path = "smart-account-fixtures/adversarial/threshold_brick.rs"]
+#[path = "../smart-account-fixtures/adversarial/threshold_brick.rs"]
 mod threshold_brick;
 
-#[path = "smart-account-fixtures/adversarial/signer_set_divergence_out_of_band.rs"]
+#[path = "../smart-account-fixtures/adversarial/signer_set_divergence_out_of_band.rs"]
 mod signer_set_divergence_out_of_band;
 
-#[path = "smart-account-fixtures/adversarial/signer_set_undecodable_signer.rs"]
+#[path = "../smart-account-fixtures/adversarial/signer_set_undecodable_signer.rs"]
 mod signer_set_undecodable_signer;
 
-#[path = "smart-account-fixtures/adversarial/rpc_divergence_before.rs"]
+#[path = "../smart-account-fixtures/adversarial/rpc_divergence_before.rs"]
 mod rpc_divergence_before;
 
-#[path = "smart-account-fixtures/adversarial/threshold_policy_not_installed.rs"]
+#[path = "../smart-account-fixtures/adversarial/threshold_policy_not_installed.rs"]
 mod threshold_policy_not_installed;
 
-#[path = "smart-account-fixtures/adversarial/threshold_policy_identification_zero_match.rs"]
+#[path = "../smart-account-fixtures/adversarial/threshold_policy_identification_zero_match.rs"]
 mod threshold_policy_identification_zero_match;
 
-#[path = "smart-account-fixtures/adversarial/threshold_policy_identification_multi_match.rs"]
+#[path = "../smart-account-fixtures/adversarial/threshold_policy_identification_multi_match.rs"]
 mod threshold_policy_identification_multi_match;
 
-#[path = "smart-account-fixtures/adversarial/signer_set_divergence_rpc_suppression.rs"]
+#[path = "../smart-account-fixtures/adversarial/signer_set_divergence_rpc_suppression.rs"]
 mod signer_set_divergence_rpc_suppression;
 
-#[path = "smart-account-fixtures/adversarial/threshold_policy_identification_rpc_divergence.rs"]
+#[path = "../smart-account-fixtures/adversarial/threshold_policy_identification_rpc_divergence.rs"]
 mod threshold_policy_identification_rpc_divergence;
 
-#[path = "smart-account-fixtures/adversarial/prop_audit_log_baseline_reconstruction.rs"]
+#[path = "../smart-account-fixtures/adversarial/prop_audit_log_baseline_reconstruction.rs"]
 mod prop_audit_log_baseline_reconstruction;
 
-#[path = "smart-account-fixtures/adversarial/verifier_identification_rpc_divergence.rs"]
+#[path = "../smart-account-fixtures/adversarial/verifier_identification_rpc_divergence.rs"]
 mod verifier_identification_rpc_divergence;
 
-#[path = "smart-account-fixtures/adversarial/contract_mutability_admin_key_present.rs"]
+#[path = "../smart-account-fixtures/adversarial/contract_mutability_admin_key_present.rs"]
 mod contract_mutability_admin_key_present;
 
-#[path = "smart-account-fixtures/adversarial/contract_mutability_non_address_admin_value.rs"]
+#[path = "../smart-account-fixtures/adversarial/contract_mutability_non_address_admin_value.rs"]
 mod contract_mutability_non_address_admin_value;
 
-#[path = "smart-account-fixtures/adversarial/contract_mutability_non_map_instance_storage.rs"]
+#[path = "../smart-account-fixtures/adversarial/contract_mutability_non_map_instance_storage.rs"]
 mod contract_mutability_non_map_instance_storage;
 
-#[path = "smart-account-fixtures/adversarial/divergence_failure_self_audit_writer.rs"]
+#[path = "../smart-account-fixtures/adversarial/divergence_failure_self_audit_writer.rs"]
 mod divergence_failure_self_audit_writer;
 
 #[cfg(feature = "test-helpers")]
-#[path = "smart-account-fixtures/adversarial/wasm_hash_canonicalisation_parity.rs"]
+#[path = "../smart-account-fixtures/adversarial/wasm_hash_canonicalisation_parity.rs"]
 mod wasm_hash_canonicalisation_parity;
 
 #[cfg(feature = "test-helpers")]
-#[path = "smart-account-fixtures/adversarial/rule_id_downgrade.rs"]
+#[path = "../smart-account-fixtures/adversarial/rule_id_downgrade.rs"]
 mod rule_id_downgrade;
 
-#[path = "smart-account-fixtures/adversarial/multicall_inner_invocation_count_cap_51_inner.rs"]
+#[path = "../smart-account-fixtures/adversarial/multicall_inner_invocation_count_cap_51_inner.rs"]
 mod multicall_inner_invocation_count_cap_51_inner;
 
-#[path = "smart-account-fixtures/adversarial/multicall_bundle_aggregate_cap.rs"]
+#[path = "../smart-account-fixtures/adversarial/multicall_bundle_aggregate_cap.rs"]
 mod multicall_bundle_aggregate_cap;
 
-#[path = "smart-account-fixtures/adversarial/multicall_upper_bound_assertion.rs"]
+#[path = "../smart-account-fixtures/adversarial/multicall_upper_bound_assertion.rs"]
 mod multicall_upper_bound_assertion;
 
-#[path = "smart-account-fixtures/adversarial/cross_rpc_consumer_audit.rs"]
+#[path = "../smart-account-fixtures/adversarial/cross_rpc_consumer_audit.rs"]
 mod cross_rpc_consumer_audit;
 
-#[path = "smart-account-fixtures/adversarial/spending_limit_policy_identification_zero_match.rs"]
+#[path = "../smart-account-fixtures/adversarial/spending_limit_policy_identification_zero_match.rs"]
 mod spending_limit_policy_identification_zero_match;
 
-#[path = "smart-account-fixtures/adversarial/spending_limit_policy_identification_multi_match.rs"]
+#[path = "../smart-account-fixtures/adversarial/spending_limit_policy_identification_multi_match.rs"]
 mod spending_limit_policy_identification_multi_match;
 
-#[path = "smart-account-fixtures/adversarial/spending_limit_policy_identification_rpc_divergence.rs"]
+#[path = "../smart-account-fixtures/adversarial/spending_limit_policy_identification_rpc_divergence.rs"]
 mod spending_limit_policy_identification_rpc_divergence;
 
-#[path = "smart-account-fixtures/adversarial/spending_limit_data_read_wiring.rs"]
+#[path = "../smart-account-fixtures/adversarial/spending_limit_data_read_wiring.rs"]
 mod spending_limit_data_read_wiring;
 
-#[path = "smart-account-fixtures/adversarial/weighted_threshold_policy_identification_zero_match.rs"]
+#[path = "../smart-account-fixtures/adversarial/weighted_threshold_policy_identification_zero_match.rs"]
 mod weighted_threshold_policy_identification_zero_match;
 
-#[path = "smart-account-fixtures/adversarial/weighted_threshold_policy_identification_multi_match.rs"]
+#[path = "../smart-account-fixtures/adversarial/weighted_threshold_policy_identification_multi_match.rs"]
 mod weighted_threshold_policy_identification_multi_match;
 
-#[path = "smart-account-fixtures/adversarial/weighted_threshold_policy_identification_rpc_divergence.rs"]
+#[path = "../smart-account-fixtures/adversarial/weighted_threshold_policy_identification_rpc_divergence.rs"]
 mod weighted_threshold_policy_identification_rpc_divergence;
 
 // Tests 3/4/5 call `derive_schedule_salt` which is only visible when the
@@ -176,16 +174,16 @@ mod weighted_threshold_policy_identification_rpc_divergence;
 // Tests 1/2 (source-grep) do not require the feature but live in the same
 // file; gating the whole module here is the simplest consistent approach.
 #[cfg(feature = "test-helpers")]
-#[path = "smart-account-fixtures/adversarial/timelock_salt_collision.rs"]
+#[path = "../smart-account-fixtures/adversarial/timelock_salt_collision.rs"]
 mod timelock_salt_collision;
 
 #[cfg(feature = "test-helpers")]
-#[path = "smart-account-fixtures/adversarial/verifier_migration_dry_run.rs"]
+#[path = "../smart-account-fixtures/adversarial/verifier_migration_dry_run.rs"]
 mod verifier_migration_dry_run;
 
 #[cfg(feature = "test-helpers")]
-#[path = "smart-account-fixtures/adversarial/verifier_migration_submit.rs"]
+#[path = "../smart-account-fixtures/adversarial/verifier_migration_submit.rs"]
 mod verifier_migration_submit;
 
-#[path = "smart-account-fixtures/adversarial/concurrent_signing_race.rs"]
+#[path = "../smart-account-fixtures/adversarial/concurrent_signing_race.rs"]
 mod concurrent_signing_race;

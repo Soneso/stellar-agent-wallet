@@ -15,7 +15,7 @@
 //! - Deploys a C-account on testnet via `deploy_smart_account`.
 //! - Returns the C-strkey + derivation seed in `DeploymentResult`.
 //! - Recovers the same C-strkey from the same seed + deployer (in-process
-//!   equivalent at `tests/recover_strkey_from_seed_and_deployer.rs`).
+//!   equivalent at `tests/smart_account_test_helpers/recover_strkey_from_seed_and_deployer.rs`).
 //!
 //! End-to-end acceptance of `deploy_smart_account` on testnet.
 //! Address-recovery property: re-derive from (deployer, salt, passphrase) without a network call.

@@ -32,7 +32,7 @@
 //! No feature flags required. Runs under default `cargo test`.
 //!
 //! ```text
-//! cargo test --test audit_log_missing_mock
+//! cargo test --test smart_account audit_log_missing_mock
 //! ```
 //!
 //! # Active rule enumeration
@@ -59,8 +59,7 @@ use wiremock::{
     matchers::{method, path},
 };
 
-#[path = "smart-account-fixtures/adversarial/rpc_mock_helpers.rs"]
-mod rpc_mock_helpers;
+use crate::rpc_mock_helpers;
 
 use rpc_mock_helpers::{
     SorobanRpcDispatcher, build_context_rule_scval_xdr, build_ledger_entries_account,

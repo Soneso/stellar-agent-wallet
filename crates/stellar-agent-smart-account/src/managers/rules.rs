@@ -3259,7 +3259,7 @@ pub const DEFAULT_SESSION_RULE_HORIZON_LEDGERS: u32 = 1000;
 /// to avoid a crate dependency cycle.
 ///
 /// **Drift-protection:** the integration test
-/// `crates/stellar-agent-smart-account/tests/horizon_bound_parity_test.rs`
+/// `crates/stellar-agent-smart-account/tests/smart_account/horizon_bound_parity_test.rs`
 /// asserts `UPPER_BOUND_HORIZON_LEDGERS == MIRRORED_UPPER_BOUND_HORIZON_LEDGERS`
 /// across crate boundaries.
 pub const UPPER_BOUND_HORIZON_LEDGERS: u32 = 10_000;
@@ -3279,7 +3279,7 @@ pub const UPPER_BOUND_HORIZON_LEDGERS: u32 = 10_000;
 /// (`mod.rs:558`, SHA `a9c4216`).
 ///
 /// **Cross-crate parity test:**
-/// `crates/stellar-agent-smart-account/tests/oz_caps_parity_test.rs` asserts
+/// `crates/stellar-agent-smart-account/tests/smart_account/oz_caps_parity_test.rs` asserts
 /// this constant equals `15` against the OZ canonical pinned at SHA `a9c4216`.
 /// If either side drifts, the parity test fails CI at the next pin-advancement.
 pub const OZ_MAX_SIGNERS: u32 = 15;
@@ -3296,7 +3296,7 @@ pub const OZ_MAX_SIGNERS: u32 = 15;
 /// `TooManyPolicies` panic discriminant `3011` (`mod.rs:560`, SHA `a9c4216`).
 ///
 /// **Cross-crate parity test:**
-/// `crates/stellar-agent-smart-account/tests/oz_caps_parity_test.rs` asserts
+/// `crates/stellar-agent-smart-account/tests/smart_account/oz_caps_parity_test.rs` asserts
 /// this constant equals `5` against the OZ canonical pinned at SHA `a9c4216`.
 pub const OZ_MAX_POLICIES: u32 = 5;
 
@@ -6415,10 +6415,10 @@ mod tests {
     // ── OZ caps panic discriminant mapping ────────────────────────────────────
     //
     // These tests are placed in this internal `#[cfg(test)]` block rather than
-    // in `tests/oz_panic_discriminant_mapping_mock.rs` because
+    // in `tests/smart_account/oz_panic_discriminant_mapping_mock.rs` because
     // `augment_with_oz_error_name` is `pub(crate)` — integration tests in
     // `tests/` are separate compilation units and cannot access `pub(crate)`
-    // items. The `tests/oz_panic_discriminant_mapping_mock.rs` file exists as
+    // items. The `tests/smart_account/oz_panic_discriminant_mapping_mock.rs` file exists as
     // a stub pointing here.
 
     /// `Error(Contract, #3010)` is augmented with `[OZ:TooManySigners]`.

@@ -1,7 +1,7 @@
 //! Byte-parity gate for the `add_context_rule` arg shapes the wallet's
 //! `build_add_context_rule_args` constructs.
 //!
-//! Sibling of `tests/auth_digest_parity.rs` (which covers only the
+//! Sibling of `tests/smart_account/auth_digest_parity.rs` (which covers only the
 //! `Vec<u32>` rule-IDs arg of the auth-digest preimage). This file extends
 //! the parity discipline to every other `add_context_rule` arg shape so
 //! arg-shape regressions surface as test failures rather than testnet traps:

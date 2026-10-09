@@ -24,7 +24,7 @@
 //! - `signer_set_divergence_rpc_suppression.rs` and
 //!   `rpc_divergence_before.rs`: the signer-set observation's rule
 //!   disagreement (`signer_set_rpc_divergence`). Mock tests in
-//!   `tests/execute_path_drift_check_mock.rs` pin its other disagreements:
+//!   `tests/smart_account_test_helpers/execute_path_drift_check_mock.rs` pin its other disagreements:
 //!   the policy list
 //!   (`the_endpoints_disagreeing_on_the_policy_list_refuse_with_rpc_divergence`),
 //!   the simple-threshold value

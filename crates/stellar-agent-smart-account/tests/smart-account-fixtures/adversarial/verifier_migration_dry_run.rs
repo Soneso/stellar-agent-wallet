@@ -31,7 +31,7 @@
 //!
 //! ```text
 //! cargo test -p stellar-agent-smart-account --features test-helpers \
-//!   --test adversarial_fixtures verifier_migration
+//!   --test smart_account adversarial_fixtures::verifier_migration
 //! ```
 //!
 //! # Implements
