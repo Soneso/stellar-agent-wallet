@@ -12,6 +12,7 @@
 /crates/stellar-agent-soroban-auth/ @christian-rogobete
 /crates/stellar-agent-nonce/ @christian-rogobete
 /crates/stellar-agent-smart-account/ @christian-rogobete
+/crates/stellar-agent-smart-account-acceptance/ @christian-rogobete
 /crates/stellar-agent-webauthn-bridge/ @christian-rogobete
 /crates/stellar-agent-approval-ui/ @christian-rogobete
 /crates/stellar-agent-approval-remote/ @christian-rogobete

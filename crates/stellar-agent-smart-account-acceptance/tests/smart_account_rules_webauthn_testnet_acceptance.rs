@@ -67,7 +67,7 @@
 //! testnet-integration` does not run them unintentionally; use:
 //!
 //! ```text
-//! cargo test --features testnet-integration \
+//! cargo test -p stellar-agent-smart-account-acceptance --features testnet-integration \
 //!   --test smart_account_rules_webauthn_testnet_acceptance -- --ignored
 //! ```
 //!

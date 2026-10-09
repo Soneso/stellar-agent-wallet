@@ -10,10 +10,12 @@ churn.
 
 Facts that apply to every crate:
 
-- All 36 crates are published on crates.io at the shared workspace version.
-  Cargo requires every dependency of a published crate to be published, so
-  internal crates are published too; their tier and description say what
-  that does and does not mean.
+- Of the 37 workspace members, 36 are published on crates.io at the shared
+  workspace version. Cargo requires every dependency of a published crate to
+  be published, so internal crates are published too; their tier and
+  description say what that does and does not mean.
+- The unpublished `stellar-agent-smart-account-acceptance` member holds live
+  acceptance suites only. It has no tier and no row in the Crates table.
 - Mainnet writes are structurally refused by every surface today, at the
   network layer. The mainnet column below records the intended posture once
   the constrained-mainnet capability ships, not present behavior.

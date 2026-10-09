@@ -1,0 +1,127 @@
+[package]
+name = "stellar-agent-smart-account-acceptance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Unpublished live testnet acceptance suites of the smart-account crate that need a browser, the MCP server, the WebAuthn bridge, or the SEP-48, DeFi, DeFindex, and soroban-spec-tools crates."
+publish = false
+
+[features]
+# Compiles the live testnet suites below. They need Friendbot and Soroban RPC
+# access, so the offline workspace runs leave this feature off; the serialized
+# driver and an explicit invocation enable it:
+#   cargo test -p stellar-agent-smart-account-acceptance \
+#     --features testnet-integration --test <suite>
+# Every dependency is optional and listed here, so with the feature off the
+# crate activates no dependency and compiles an empty library.
+testnet-integration = [
+    "dep:base64",
+    "dep:chromiumoxide",
+    "dep:ed25519-dalek",
+    "dep:futures",
+    "dep:hex",
+    "dep:keyring-core",
+    "dep:rand_core",
+    "dep:reqwest",
+    "dep:rmcp",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:soroban-spec-tools",
+    "dep:stellar-agent-core",
+    "dep:stellar-agent-defi",
+    "dep:stellar-agent-defindex",
+    "dep:stellar-agent-mcp",
+    "dep:stellar-agent-network",
+    "dep:stellar-agent-sep48",
+    "dep:stellar-agent-smart-account",
+    "dep:stellar-agent-test-support",
+    "dep:stellar-agent-webauthn-bridge",
+    "dep:stellar-baselib",
+    "dep:stellar-rpc-client",
+    "dep:stellar-strkey",
+    "dep:stellar-xdr",
+    "dep:tempfile",
+    "dep:tokio",
+    "dep:url",
+    "dep:uuid",
+    "dep:zeroize",
+]
+
+[[test]]
+name = "cap85_external_ref_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "smart_account_policy_observability_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "smart_account_rules_webauthn_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+[[test]]
+name = "smart_account_ergonomics_testnet_acceptance"
+required-features = ["testnet-integration"]
+
+# Cargo accepts no optional dev-dependencies, so the suites' dependencies are
+# optional normal dependencies that only the testnet-integration feature
+# activates. Three of them (the MCP server, the WebAuthn bridge, and DeFindex)
+# depend on the smart-account crate, which is why the suites live in this
+# member and not in the smart-account crate itself.
+[dependencies]
+# The crate under test. testnet-integration enables its test-helpers, which
+# expose the manager constructors the suites build on.
+stellar-agent-smart-account = { workspace = true, optional = true, features = ["testnet-integration"] }
+# Live-network helpers: Friendbot funding, contract upload, source-account
+# invocation, SAC funding. keyring_mock seeds the in-memory keyring store.
+stellar-agent-test-support = { workspace = true, optional = true, features = ["testnet-helpers"] }
+stellar-agent-core = { workspace = true, optional = true }
+stellar-agent-network = { workspace = true, optional = true }
+# WebAuthn ceremony (rules_webauthn and the ergonomics passkey test): the
+# bridge listener, the CDP virtual-authenticator client, StreamExt for its
+# event handler, and structural parsing of the page URL.
+stellar-agent-webauthn-bridge = { workspace = true, optional = true }
+chromiumoxide = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+# MCP dispatch leg of the policy observability suite: test-helpers exposes the
+# call_stellar_* and set_*_for_test hooks of WalletServer; keyring-core seeds
+# its keyring entries and rmcp types the tool results.
+stellar-agent-mcp = { workspace = true, optional = true, features = ["test-helpers"] }
+keyring-core = { workspace = true, optional = true }
+rmcp = { workspace = true, optional = true }
+# CAP-85 external-reference suite: the SEP-48 spec fetch, the DeFi sign-time
+# pin gate, the DeFindex vault pin gate, and the offline parse of the vendored
+# verifier specs the live fetch is compared against.
+stellar-agent-sep48 = { workspace = true, optional = true }
+stellar-agent-defi = { workspace = true, optional = true }
+stellar-agent-defindex = { workspace = true, optional = true }
+soroban-spec-tools = { workspace = true, optional = true }
+# Friendbot status check in the shared smart-account `tests/common/mod.rs`.
+reqwest = { workspace = true, optional = true }
+# The suites name the sync and time modules directly.
+tokio = { workspace = true, optional = true, features = ["sync", "time"] }
+base64 = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+stellar-baselib = { workspace = true, optional = true }
+stellar-rpc-client = { workspace = true, optional = true }
+stellar-strkey = { workspace = true, optional = true }
+stellar-xdr = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+
+[lints]
+workspace = true
+
+# The suites reach reqwest only through the shared smart-account
+# `tests/common/mod.rs`, which they include by path from outside this
+# directory, so a scan of this directory finds no use.
+[package.metadata.cargo-machete]
+ignored = ["reqwest"]

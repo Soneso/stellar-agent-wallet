@@ -1,12 +1,14 @@
 name: Publish to crates.io
 
-# Publishes all workspace crates to crates.io from a tagged release commit.
+# Publishes the workspace crates to crates.io from a tagged release commit.
+# The unpublished smart-account acceptance member is packaged with the others
+# and never uploaded.
 #
 # Publishing is a separate, manually dispatched act, so pushing a tag never
 # publishes by itself. Two jobs split the work:
-# - verify holds no credential. It builds and packages every crate of the tag
-#   with `cargo package --workspace` and records the archive checksums in
-#   SHA256SUMS.
+# - verify holds no credential. It builds and packages every workspace member
+#   of the tag, the unpublished one included, with `cargo package --workspace`
+#   and records the archive checksums in SHA256SUMS.
 # - publish runs in the `crates-io` environment and compiles nothing. It
 #   regenerates the archives with `--no-verify`, requires them to equal the
 #   verify job's SHA256SUMS, and uploads each crate with
@@ -46,7 +48,7 @@ jobs:
   verify:
     name: verify (${{ inputs.tag }})
     runs-on: ubuntu-24.04
-    # One cargo invocation verify-builds every workspace crate.
+    # One cargo invocation verify-builds every workspace member.
     timeout-minutes: 90
     permissions:
       contents: read
@@ -119,8 +121,8 @@ jobs:
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
 
-      # Cargo packages every crate, then verify-builds each one against the
-      # other workspace crates through its temporary local registry, so no
+      # Cargo packages every workspace member, then verify-builds each one
+      # against the other members through its temporary local registry, so no
       # lower tier needs to be on crates.io yet.
       - name: Build and package every crate
         working-directory: src

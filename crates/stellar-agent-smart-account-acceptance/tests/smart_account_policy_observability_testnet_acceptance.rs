@@ -41,7 +41,7 @@
 //! Compiled only under `--features testnet-integration`:
 //!
 //! ```text
-//! cargo test --features testnet-integration \
+//! cargo test -p stellar-agent-smart-account-acceptance --features testnet-integration \
 //!   --test smart_account_policy_observability_testnet_acceptance
 //! ```
 //!
@@ -61,6 +61,7 @@
     reason = "test-only; panics are acceptable in testnet acceptance tests"
 )]
 
+#[path = "../../stellar-agent-smart-account/tests/common/mod.rs"]
 mod common;
 
 use std::io::BufRead;
