@@ -791,7 +791,7 @@ fn mpp_surfaces_the_reconciliation_refusal_not_state_unavailable() {
 ///
 /// 1. The bytes are one artefact. `stellar_agent_test_support::profile_fixtures`
 ///    generates them, and `stellar-agent-mcp`'s
-///    `tests/profile_selection_integration.rs` writes the same generator's
+///    `tests/mcp/profile_selection_integration.rs` writes the same generator's
 ///    output in `noop_profile_copied_from_another_profile_refuses_to_serve_under_the_new_name`.
 ///    Two hand-copied literals could drift; one generator cannot. The MCP's
 ///    call passes a different `rpc_url` (its own unreachable host), which the

@@ -49,8 +49,6 @@ use stellar_xdr::{
     TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
 
-mod common;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixture constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -189,7 +187,7 @@ async fn create_account_commit_with_payment_xdr_returns_simulation_divergence() 
         .call_stellar_create_account_commit(args)
         .await
         .expect("Payment XDR must return Ok(is_error) envelope");
-    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
     assert_eq!(
         code, "simulation.divergence",
         "error must be simulation.divergence (op-kind mismatch); got: {code}"

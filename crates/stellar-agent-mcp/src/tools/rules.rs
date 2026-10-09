@@ -71,7 +71,7 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 /// inside the MCP server process.
 ///
 /// RESERVED NAME: this is the one permitted unkeyed, name-derived
-/// registration in the registry (see `tests/registry_walk.rs`'s discipline
+/// registration in the registry (see `tests/mcp/registry_walk.rs`'s discipline
 /// scan). It never collides with an operator profile's keyed registration
 /// because no real profile shares this name; an operator profile literally
 /// named `mcp-rules-observability` would contend for this registry slot and

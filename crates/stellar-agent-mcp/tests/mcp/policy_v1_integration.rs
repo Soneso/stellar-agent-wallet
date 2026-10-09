@@ -46,8 +46,6 @@ use stellar_agent_core::profile::schema::{PolicyConfig, PolicyEngineKind, Profil
 use stellar_agent_mcp::server::{StellarBalancesArgs, WalletServer};
 use tempfile::TempDir;
 
-mod common;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -407,7 +405,7 @@ decision = "deny"
         .await
         .expect("Decision::Deny must return Ok(is_error) envelope");
 
-    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
     let expected_wire_code = format!("policy.deny.{}", DenyReason::ExplicitRuleDeny.code());
     assert_eq!(
         code, expected_wire_code,

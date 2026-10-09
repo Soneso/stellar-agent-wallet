@@ -4,7 +4,7 @@
 
 #[test]
 fn the_server_advises_once_after_a_successful_policy_load() {
-    let source = include_str!("../src/server.rs");
+    let source = include_str!("../../src/server.rs");
     let production = source
         .split("#[cfg(test)]")
         .next()

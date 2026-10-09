@@ -27,8 +27,6 @@ use stellar_agent_test_support::xdr_fixtures::{
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-mod common;
-
 /// Pinned testnet USDC issuer (matches
 /// `stellar_agent_stablecoin::resolve`'s testnet pin table).
 const USDC_TESTNET_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
@@ -49,7 +47,7 @@ fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
         .with_noop_engine()
         .build();
     p.rpc_url = rpc_url.to_owned();
-    common::install_test_audit_key(&mut p);
+    crate::common::install_test_audit_key(&mut p);
     p
 }
 
@@ -109,7 +107,7 @@ struct TrustlineSubmitSuccessRpcResponder {
     source_xdr: String,
     issuer_key_xdr: String,
     issuer_xdr: String,
-    network: common::EndpointNetwork,
+    network: crate::common::EndpointNetwork,
 }
 
 #[async_trait::async_trait]
@@ -161,7 +159,7 @@ impl Respond for TrustlineSubmitSuccessRpcResponder {
             // the hash it computed from the bytes it signed, and reports a
             // disagreement as `submission.hash_mismatch`.
             "sendTransaction" => serde_json::json!({
-                "hash": common::submitted_tx_hash(request),
+                "hash": crate::common::submitted_tx_hash(request),
                 "status": "PENDING",
                 "latestLedger": 1001,
                 "latestLedgerCloseTime": "1234567890"
@@ -169,7 +167,7 @@ impl Respond for TrustlineSubmitSuccessRpcResponder {
             "getTransaction" => serde_json::json!({
                 "status": "SUCCESS",
                 "ledger": 1005,
-                "txHash": common::polled_tx_hash(request),
+                "txHash": crate::common::polled_tx_hash(request),
             }),
             _ => serde_json::json!({}),
         };
@@ -194,7 +192,7 @@ impl Respond for TrustlineSubmitSuccessRpcResponder {
 #[tokio::test]
 #[serial]
 async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(210);
 
@@ -223,7 +221,7 @@ async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
             source_xdr,
             issuer_key_xdr,
             issuer_xdr,
-            network: common::EndpointNetwork::testnet(),
+            network: crate::common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -321,7 +319,7 @@ async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
 #[tokio::test]
 #[serial]
 async fn trustline_simulate_echoes_canonical_limit_stroops_not_raw_caller_string() {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(211);
 
@@ -340,7 +338,7 @@ async fn trustline_simulate_echoes_canonical_limit_stroops_not_raw_caller_string
             source_xdr,
             issuer_key_xdr,
             issuer_xdr,
-            network: common::EndpointNetwork::testnet(),
+            network: crate::common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -393,7 +391,7 @@ async fn trustline_simulate_echoes_canonical_limit_stroops_not_raw_caller_string
 #[tokio::test]
 #[serial]
 async fn simulate_nonce_mint_failed_envelope_shape() {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     // Deliberately no `install_test_nonce_key(...)` call — the mock store
     // stays empty at the nonce coordinate.
@@ -417,7 +415,7 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
             source_xdr,
             issuer_key_xdr,
             issuer_xdr,
-            network: common::EndpointNetwork::testnet(),
+            network: crate::common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -437,7 +435,7 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
         .await
         .expect("handler must return a business-error result, not a protocol error");
 
-    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
     assert_eq!(
         code, "nonce.mint_failed",
         "an absent nonce-key keyring entry must surface nonce.mint_failed"
@@ -467,7 +465,7 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
 #[tokio::test]
 #[serial]
 async fn commit_rejects_invalid_from_strkey_before_any_rpc_call() {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(212);
 
@@ -490,7 +488,7 @@ async fn commit_rejects_invalid_from_strkey_before_any_rpc_call() {
             source_xdr,
             issuer_key_xdr,
             issuer_xdr,
-            network: common::EndpointNetwork::testnet(),
+            network: crate::common::EndpointNetwork::testnet(),
         })
         .mount(&mock_server)
         .await;
@@ -573,7 +571,7 @@ async fn commit_rejects_invalid_from_strkey_before_any_rpc_call() {
 #[tokio::test]
 #[serial]
 async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key(212);
 
@@ -591,7 +589,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
 
     // The endpoint starts out serving a third network while the profile below
     // declares testnet.
-    let network = common::EndpointNetwork::reporting(common::FUTURENET_PASSPHRASE);
+    let network = crate::common::EndpointNetwork::reporting(crate::common::FUTURENET_PASSPHRASE);
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(TrustlineSubmitSuccessRpcResponder {
@@ -656,7 +654,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         .call_stellar_trustline_commit(commit_args.clone())
         .await
         .expect("the refusal must surface as an is_error envelope, not a protocol error");
-    let (code, _message, _text) = common::assert_business_envelope(&refused);
+    let (code, _message, _text) = crate::common::assert_business_envelope(&refused);
     assert_eq!(
         code, "network.endpoint_network_mismatch",
         "a commit whose endpoint serves a different network must carry the \

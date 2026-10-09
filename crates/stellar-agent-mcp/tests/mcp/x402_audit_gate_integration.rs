@@ -15,8 +15,6 @@
     reason = "test-only; panics and unwraps are acceptable in integration tests"
 )]
 
-mod common;
-
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -314,7 +312,7 @@ async fn fixture(
         Profile::builder_testnet_named(profile_name, SIGNER_SERVICE, &payer, "n-svc", "n-acct")
             .with_noop_engine()
             .build();
-    common::install_test_audit_key(&mut profile);
+    crate::common::install_test_audit_key(&mut profile);
     let _ = std::fs::remove_file(&profile.audit_log_path);
     let mut rpc = X402Rpc::new(&payer, profile.audit_log_path.clone());
     configure(&mut rpc);
@@ -384,12 +382,12 @@ fn result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
 }
 
 fn x402_rows(profile: &Profile) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
-    let rows = common::audit_rows(profile);
-    let authorized = common::rows_of_kind(&rows, "x402_payment_authorized")
+    let rows = crate::common::audit_rows(profile);
+    let authorized = crate::common::rows_of_kind(&rows, "x402_payment_authorized")
         .into_iter()
         .cloned()
         .collect();
-    let withheld = common::rows_of_kind(&rows, "x402_authorization_withheld")
+    let withheld = crate::common::rows_of_kind(&rows, "x402_authorization_withheld")
         .into_iter()
         .cloned()
         .collect();
@@ -458,11 +456,11 @@ async fn a_refused_gate_write_sends_nothing_signed(tool: Tool, profile_name: &st
         .await;
     fixture.rpc.observed.lock().unwrap().signed.clear();
     *fixture.rpc.roll_back_to.lock().unwrap() = Some(Vec::new());
-    let log_rows_before = common::audit_rows(&fixture.profile).len();
+    let log_rows_before = crate::common::audit_rows(&fixture.profile).len();
     assert!(log_rows_before > 0);
 
     let second = call(&fixture, tool).await;
-    let (code, _message, text) = common::assert_business_envelope(&second);
+    let (code, _message, text) = crate::common::assert_business_envelope(&second);
     assert_eq!(
         code, "audit.tip_anchor_mismatch",
         "{tool:?}: the gate's refusal answers its own audit code"
@@ -517,7 +515,7 @@ async fn a_failure_after_the_gate_is_paired(
     })
     .await;
     let result = call(&fixture, tool).await;
-    let (code, _message, text) = common::assert_business_envelope(&result);
+    let (code, _message, text) = crate::common::assert_business_envelope(&result);
     assert_eq!(
         code, expected_code,
         "{tool:?}: the primary error is returned"
@@ -532,7 +530,7 @@ async fn a_failure_after_the_gate_is_paired(
         withheld[0]["request_id"], authorized[0]["request_id"],
         "{tool:?}: the two rows share one request id"
     );
-    let rows = common::audit_rows(&fixture.profile);
+    let rows = crate::common::audit_rows(&fixture.profile);
     let authorized_at = rows
         .iter()
         .position(|row| row["kind"] == "x402_payment_authorized")
@@ -611,7 +609,7 @@ async fn an_error_before_the_gate_writes_no_row(tool: Tool, profile_name: &str, 
     })
     .await;
     let result = call(&fixture, tool).await;
-    let _ = common::assert_business_envelope(&result);
+    let _ = crate::common::assert_business_envelope(&result);
     let (authorized, withheld) = x402_rows(&fixture.profile);
     assert!(authorized.is_empty(), "{tool:?}: {authorized:?}");
     assert!(withheld.is_empty(), "{tool:?}: {withheld:?}");

@@ -47,9 +47,9 @@
 
 use std::sync::Arc;
 
+use crate::common::policy_mock::MockPolicyEngine;
 use async_trait::async_trait;
 use base64::Engine as _;
-use common::policy_mock::MockPolicyEngine;
 use serial_test::serial;
 use stellar_agent_core::{
     policy::PolicyEngine,
@@ -62,8 +62,6 @@ use stellar_agent_nonce::{NonceMint, ToolCatalogue};
 use stellar_agent_test_support::keyring_mock;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
-
-mod common;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -274,7 +272,7 @@ async fn stellar_pay_commit_require_approval_no_attestation_is_blocked() {
             // Ok(is_error) business envelope) is the expected outcome here.
             // `nonce.expired`/`nonce.replayed` (also business envelopes) are
             // accepted as well, in case the gate ordering ever changes.
-            let (code, _message, _text) = common::assert_business_envelope(&tool_result);
+            let (code, _message, _text) = crate::common::assert_business_envelope(&tool_result);
             let blocked = code == "nonce.expired"
                 || code == "nonce.replayed"
                 || code == "policy.approval_required";
@@ -337,7 +335,7 @@ async fn stellar_create_account_commit_require_approval_no_attestation_is_blocke
             "commit blocked at the nonce/attestation gate is surfaced as an Ok(is_error) envelope, \
              not a protocol error or a signed submission",
         );
-    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
     let blocked =
         code == "nonce.expired" || code == "nonce.replayed" || code == "policy.approval_required";
     assert!(
@@ -388,7 +386,7 @@ async fn stellar_pay_commit_allow_engine_no_attestation_gate() {
             // The stub envelope_xdr ("AAAAAA==") fails re-derivation before the
             // dispatch/attestation gates are even reached, so the expected
             // outcome here is the `simulation.divergence` business envelope.
-            let (code, message, _text) = common::assert_business_envelope(&tool_result);
+            let (code, message, _text) = crate::common::assert_business_envelope(&tool_result);
             assert_ne!(
                 code, "policy.approval_required",
                 "Allow engine must NOT trigger policy.approval_required; got: {code}"
@@ -671,7 +669,7 @@ async fn commit_with_valid_nonce_but_no_attestation_returns_indistinguishable_ap
     // ── Assert: SPECIFICALLY policy.approval_required ─────────────────────────
     // Correct order: attestation gate fires first → policy.approval_required.
     // Regression (nonce before attestation): nonce.expired (HMAC mismatch).
-    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
     assert_eq!(
         code, "policy.approval_required",
         "ordering invariant: attestation gate must fire before nonce HMAC verify; \

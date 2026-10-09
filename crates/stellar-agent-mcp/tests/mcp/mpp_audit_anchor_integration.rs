@@ -15,8 +15,6 @@
     reason = "test-only; panics and unwraps are acceptable in integration tests"
 )]
 
-mod common;
-
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -276,7 +274,7 @@ async fn cli_and_mcp_authorization_fingerprint_and_preview_match() {
     let _home_guard = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().expect("mock keyring");
     install_test_nonce_key(243);
-    let payer = gstrkey_for_seed([0x6f; 32]);
+    let payer = gstrkey_for_seed([0xa1; 32]);
     let rpc_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(SponsoredSimulateResponder::new(payer_sc_address(&payer)))
@@ -288,7 +286,7 @@ async fn cli_and_mcp_authorization_fingerprint_and_preview_match() {
             .with_noop_engine()
             .build();
     profile.rpc_url = rpc_server.uri();
-    common::install_test_audit_key(&mut profile);
+    crate::common::install_test_audit_key(&mut profile);
     let server = WalletServer::new(profile.clone()).expect("wallet server");
 
     // An explicit expiry keeps both selections stable across clock ticks.
@@ -445,7 +443,7 @@ async fn mpp_charge_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_ba
         Profile::builder_testnet_named(PROFILE, SIGNER_SERVICE, &payer_g, "n-svc", "n-acct")
             .with_noop_engine()
             .build();
-    common::install_test_audit_key(&mut profile);
+    crate::common::install_test_audit_key(&mut profile);
     let audit_log_path = profile.audit_log_path.clone();
 
     // The rollback lands inside the signed re-simulation of round two: after
@@ -500,7 +498,7 @@ async fn mpp_charge_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_ba
         "the second commit must reach its signed re-simulation, so the refusal \
          comes from the delivery gate"
     );
-    let (code, _message, _text) = common::assert_business_envelope(&second);
+    let (code, _message, _text) = crate::common::assert_business_envelope(&second);
     assert_eq!(
         code, "audit.tip_anchor_mismatch",
         "the commit must refuse under the code that names the rolled-back log, \
@@ -581,7 +579,7 @@ async fn mpp_accounting_cap_refusal_withholds_the_credential() {
             .with_noop_engine()
             .build();
     profile.rpc_url = mock.uri();
-    common::install_test_audit_key(&mut profile);
+    crate::common::install_test_audit_key(&mut profile);
     let mut server = WalletServer::new(profile.clone()).unwrap();
     let engine = PolicyEngineV1::new(
         PolicyDocument {
@@ -608,7 +606,7 @@ async fn mpp_accounting_cap_refusal_withholds_the_credential() {
     );
     server.set_policy_engine_for_test(std::sync::Arc::new(engine));
     let result = prepare_and_commit(&server, PROFILE, 3).await;
-    let (code, _, _) = common::assert_business_envelope(&result);
+    let (code, _, _) = crate::common::assert_business_envelope(&result);
     assert_eq!(code, "policy.deny.per_period_cap_exceeded");
     assert!(result_json(&result)["data"]["credential"].is_null());
     let window = PolicyStateStore::new();
@@ -661,7 +659,7 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
             .with_noop_engine()
             .build();
     profile.rpc_url = mock.uri();
-    common::install_test_audit_key(&mut profile);
+    crate::common::install_test_audit_key(&mut profile);
     let mut server = WalletServer::new(profile.clone()).unwrap();
     server.set_policy_engine_for_test(std::sync::Arc::new(PolicyEngineV1::new(
         PolicyDocument {
@@ -699,7 +697,7 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
         })
         .await
         .unwrap();
-    let (code, _, _) = common::assert_business_envelope(&result);
+    let (code, _, _) = crate::common::assert_business_envelope(&result);
     assert_eq!(code, "policy.deny.per_period_cap_exceeded");
     assert!(
         mock.received_requests().await.unwrap().is_empty(),
@@ -739,7 +737,11 @@ struct MppFixture {
 
 /// Builds a server for `profile_name`. `seed_secret` decides whether the
 /// payer's secret is in the keyring; without it the lazy signer fails at the
-/// sign call.
+/// sign call. The seed's signer account is the keyring account name, and
+/// `install_test_audit_key` names the audit log after it. That name and log
+/// path must stay distinct from every other test in the process. The audit
+/// writer registry holds one log path and key per profile name, and a log file
+/// opens under one profile name only.
 async fn mpp_fixture(
     profile_name: &str,
     seed: [u8; 32],
@@ -761,7 +763,7 @@ async fn mpp_fixture(
         Profile::builder_testnet_named(profile_name, SIGNER_SERVICE, &payer, "n-svc", "n-acct")
             .with_noop_engine()
             .build();
-    common::install_test_audit_key(&mut profile);
+    crate::common::install_test_audit_key(&mut profile);
     let _ = std::fs::remove_file(&profile.audit_log_path);
     let responder = configure(
         SponsoredSimulateResponder::new(payer_sc_address(&payer)),
@@ -788,8 +790,8 @@ async fn mpp_fixture(
 
 /// The single `mpp_authorization_withheld` row in the log.
 fn withheld_row(profile: &Profile) -> serde_json::Value {
-    let rows = common::audit_rows(profile);
-    let withheld = common::rows_of_kind(&rows, "mpp_authorization_withheld");
+    let rows = crate::common::audit_rows(profile);
+    let withheld = crate::common::rows_of_kind(&rows, "mpp_authorization_withheld");
     assert_eq!(withheld.len(), 1, "one withheld row: {rows:?}");
     withheld[0].clone()
 }
@@ -801,7 +803,7 @@ fn withheld_row(profile: &Profile) -> serde_json::Value {
 async fn mpp_commit_failure_at_the_sign_call_records_signing() {
     let fixture = mpp_fixture("mpp-stage-signing", [0x71; 32], false, |r, _| r).await;
     let result = prepare_and_commit(&fixture.server, "mpp-stage-signing", 11).await;
-    let (code, _, _) = common::assert_business_envelope(&result);
+    let (code, _, _) = crate::common::assert_business_envelope(&result);
     assert_eq!(code, "mpp.signing_failed");
     assert_eq!(
         fixture
@@ -825,7 +827,7 @@ async fn mpp_commit_failure_at_the_send_records_resimulation() {
     })
     .await;
     let result = prepare_and_commit(&fixture.server, "mpp-stage-resim", 12).await;
-    let (code, _, _) = common::assert_business_envelope(&result);
+    let (code, _, _) = crate::common::assert_business_envelope(&result);
     assert_eq!(code, "mpp.simulation_failed");
     assert_eq!(
         fixture
@@ -845,7 +847,7 @@ async fn mpp_commit_failure_at_the_send_records_resimulation() {
 #[tokio::test]
 #[serial]
 async fn mpp_commit_failure_before_the_sign_call_records_pre_signing() {
-    let fixture = mpp_fixture("mpp-stage-pre", [0x73; 32], true, |r, _| r).await;
+    let fixture = mpp_fixture("mpp-stage-pre", [0xa3; 32], true, |r, _| r).await;
     let prepared = fixture
         .server
         .call_stellar_mpp_charge_prepare("mpp-stage-pre".to_owned(), challenge(13))
@@ -871,7 +873,7 @@ async fn mpp_commit_failure_before_the_sign_call_records_pre_signing() {
         )
         .await
         .expect("commit");
-    let (code, _, _) = common::assert_business_envelope(&result);
+    let (code, _, _) = crate::common::assert_business_envelope(&result);
     assert_eq!(code, "mpp.signing_failed");
     assert_eq!(
         fixture
@@ -936,7 +938,7 @@ async fn mpp_withheld_row_write_failure_is_logged_and_the_primary_error_returned
     let result = prepare_and_commit(&fixture.server, "mpp-stage-logged", 14).await;
     drop(guard);
 
-    let (code, _, _) = common::assert_business_envelope(&result);
+    let (code, _, _) = crate::common::assert_business_envelope(&result);
     assert_eq!(
         code, "mpp.simulation_failed",
         "the primary error is returned"
@@ -959,7 +961,7 @@ async fn mpp_withheld_row_write_failure_is_logged_and_the_primary_error_returned
 #[tokio::test]
 #[serial]
 async fn mpp_policy_denial_without_an_audit_key_answers_the_policy_code() {
-    let mut fixture = mpp_fixture("mpp-stage-deny", [0x76; 32], true, |r, _| r).await;
+    let mut fixture = mpp_fixture("mpp-stage-deny", [0xa6; 32], true, |r, _| r).await;
     let prepared = fixture
         .server
         .call_stellar_mpp_charge_prepare("mpp-stage-deny".to_owned(), challenge(15))
@@ -976,7 +978,7 @@ async fn mpp_policy_denial_without_an_audit_key_answers_the_policy_code() {
     fixture
         .server
         .set_policy_engine_for_test(std::sync::Arc::new(
-            common::policy_mock::MockPolicyEngine::deny_no_matching_rule(),
+            crate::common::policy_mock::MockPolicyEngine::deny_no_matching_rule(),
         ));
     let result = fixture
         .server
@@ -993,7 +995,7 @@ async fn mpp_policy_denial_without_an_audit_key_answers_the_policy_code() {
         Ok(result) => result,
         Err(error) => panic!("the denial is a business envelope, got {error:?}"),
     };
-    let (code, _, _) = common::assert_business_envelope(&result);
+    let (code, _, _) = crate::common::assert_business_envelope(&result);
     assert_eq!(code, "policy.deny.no_matching_rule");
 }
 
@@ -1017,7 +1019,7 @@ async fn mpp_commit_drains_a_queued_consent_row_before_the_signed_resimulation()
     const NAME: &str = "mpp-consent-drain";
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen_in_handler = std::sync::Arc::clone(&seen);
-    let mut fixture = mpp_fixture(NAME, [0x77; 32], true, |r, profile| {
+    let mut fixture = mpp_fixture(NAME, [0xa7; 32], true, |r, profile| {
         let path = profile.audit_log_path.clone();
         r.on_signed(std::sync::Arc::new(move || {
             let log = std::fs::read_to_string(&path).unwrap_or_default();
@@ -1035,7 +1037,7 @@ async fn mpp_commit_drains_a_queued_consent_row_before_the_signed_resimulation()
     fixture
         .server
         .set_policy_engine_for_test(std::sync::Arc::new(
-            common::policy_mock::MockPolicyEngine::require_approval(),
+            crate::common::policy_mock::MockPolicyEngine::require_approval(),
         ));
     let attestation_key = [0x5a_u8; 32];
     keyring_core::Entry::new(
@@ -1178,7 +1180,7 @@ fn assert_profile_chain_authorization_window(profile: &Profile, name: &str) {
 #[serial]
 async fn profile_chain_mpp_accounting_persists_cap() {
     const NAME: &str = "chain-mpp";
-    let mut fixture = mpp_fixture(NAME, [0x78; 32], true, |responder, _| responder).await;
+    let mut fixture = mpp_fixture(NAME, [0xa8; 32], true, |responder, _| responder).await;
     fixture
         .server
         .set_policy_engine_for_test(std::sync::Arc::new(profile_chain_cap_engine(NAME)));
@@ -1209,7 +1211,7 @@ async fn profile_chain_mpp_accounting_persists_cap() {
         .await
         .expect("second commit");
     assert_eq!(
-        common::assert_business_envelope(&second).0,
+        crate::common::assert_business_envelope(&second).0,
         "policy.deny.per_period_cap_exceeded"
     );
     assert_eq!(
@@ -1255,7 +1257,7 @@ async fn profile_chain_x402_accounting_persists_cap() {
         .await
         .expect("cap refusal");
     assert_eq!(
-        common::assert_business_envelope(&second).0,
+        crate::common::assert_business_envelope(&second).0,
         "policy.deny.per_period_cap_exceeded"
     );
     assert_eq!(

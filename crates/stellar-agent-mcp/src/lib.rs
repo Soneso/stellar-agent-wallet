@@ -28,10 +28,10 @@
 //! # Primary consumers
 //!
 //! - `main.rs` — binary entry point that starts the server process.
-//! - `tests/resource_no_secrets.rs` — verifies resource generator output
+//! - `tests/mcp/resource_no_secrets.rs` — verifies resource generator output
 //!   contains no secret-shaped bytes (runtime gate).
-//! - `tests/integration.rs` — end-to-end MCP JSON-RPC protocol tests.
-//! - `tests/registry_walk.rs` — inventory registry ↔ rmcp ToolRouter parity
+//! - `tests/mcp/integration.rs` — end-to-end MCP JSON-RPC protocol tests.
+//! - `tests/mcp/registry_walk.rs` — inventory registry ↔ rmcp ToolRouter parity
 //!   test.
 
 #![deny(unsafe_code)]

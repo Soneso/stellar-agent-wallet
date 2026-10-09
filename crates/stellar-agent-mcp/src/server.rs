@@ -906,7 +906,7 @@ impl WalletServer {
     /// `~/.local/share/stellar-agent/approvals/<profile_name>.toml`.
     ///
     /// Exposed as `pub` (not `pub(crate)`) because integration tests in
-    /// `tests/approval_spine_integration.rs` need to verify the name-derivation
+    /// `tests/mcp/approval_spine_integration.rs` need to verify the name-derivation
     /// logic.  The method derives only a non-secret string (the profile name);
     /// there is no security concern with public visibility.
     pub fn profile_name_for_approval(&self) -> String {
@@ -987,7 +987,7 @@ impl WalletServer {
 impl WalletServer {
     /// Replaces the active [`PolicyEngine`] for cross-track integration testing.
     ///
-    /// The integration test in `tests/policy_v1_integration.rs` builds a real
+    /// The integration test in `tests/mcp/policy_v1_integration.rs` builds a real
     /// [`PolicyEngineV1`] from a signed temp policy file and substitutes it
     /// here so the dispatch gate can be exercised end-to-end without touching
     /// the OS-conventional policy directory or the keyring.

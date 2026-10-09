@@ -82,8 +82,6 @@ use stellar_agent_toolsets::{
 use stellar_agent_toolsets_runtime::matrix::SIGNING_DENYLIST;
 use tempfile::TempDir;
 
-mod common;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -130,7 +128,9 @@ fn build_allow_server_with_overrides(
         .with_noop_engine()
         .build();
     let mut server = WalletServer::new(profile).expect("WalletServer::new");
-    server.set_policy_engine_for_test(Arc::new(common::policy_mock::MockPolicyEngine::allow()));
+    server.set_policy_engine_for_test(Arc::new(
+        crate::common::policy_mock::MockPolicyEngine::allow(),
+    ));
     server.set_toolsets_root_for_test(toolsets_root.to_path_buf());
     if let Some(dir) = approval_dir {
         server.set_approval_dir_for_test(dir.to_path_buf());
