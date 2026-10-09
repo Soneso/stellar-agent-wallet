@@ -187,36 +187,6 @@ cleanup across every user of that directory. Cargo downloads, rustup
 toolchains, and other storage remain outside this cleanup. Coverage uses a
 separate `llvm-cov-target` subtree.
 
-### Remote development
-
-The repository ships a dev container definition in `.devcontainer/` for GitHub
-Codespaces. The image provides these tools.
-
-- The stable toolchain of `rust-toolchain.toml` with `rustfmt`, `clippy`, and
-  `llvm-tools-preview`.
-- `cargo-llvm-cov`, `cargo-machete`, and `cargo-deny` at the versions in
-  [Gate tools](#gate-tools).
-- `shellcheck` and `actionlint` at the versions of the Install surface workflow.
-- Node.js and pnpm at the versions of the interop harnesses, with Corepack
-  enabled.
-- Python 3 with PyYAML, `jq`, `zip`, `unzip`, Perl, `pkg-config`,
-  `libudev-dev`, and a C toolchain.
-
-The container sets `CARGO_INCREMENTAL=0`. After creation, it runs
-`bash .github/scripts/check-gate-tool-versions.sh`. A pin change in a workflow,
-an interop manifest, or `.github/scripts/workflow-check-requirements.txt` needs
-the same change in `.devcontainer/Dockerfile`.
-
-The definition requires 32 GB of storage, the size of the smallest Codespace
-machine type. That type holds the image of about 3.5 GiB, about 1.8 GiB of
-Cargo downloads, and the 3.6 GiB that a CLI-scoped preflight retains. A
-`--full` preflight retains about 20.2 GiB beside the image and its toolchain,
-so it needs a machine type with 64 GB of storage.
-
-The gate commands are the same inside the container. Start with
-`bash .github/scripts/preflight.sh` from the checkout, as in
-[Preflight](#preflight).
-
 ## Gate suite
 
 Start local verification with `bash .github/scripts/preflight.sh` and run the

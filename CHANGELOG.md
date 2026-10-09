@@ -10,7 +10,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - The `TrustlineSimulated` approval kind names a trustline change and its limit.
-- A dev container definition provides the gate tools for Codespaces.
 
 ### Changed
 
