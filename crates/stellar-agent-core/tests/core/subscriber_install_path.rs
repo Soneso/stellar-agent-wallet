@@ -19,7 +19,11 @@ const HELPER_ENV: &str = "STELLAR_AGENT_SUBSCRIBER_INSTALL_HELPER";
 fn run_helper(scenario: &str) -> (ExitStatus, String, String) {
     let current_exe = std::env::current_exe().expect("current test binary path");
     let output = Command::new(current_exe)
-        .args(["--exact", "helper_entrypoint", "--nocapture"])
+        .args([
+            "--exact",
+            "subscriber_install_path::helper_entrypoint",
+            "--nocapture",
+        ])
         .env(HELPER_ENV, scenario)
         .output()
         .expect("helper process runs");

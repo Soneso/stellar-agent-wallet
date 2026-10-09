@@ -48,7 +48,11 @@ fn straddle_message() -> String {
 fn logged_panic_event(scenario: &str) -> Value {
     let current_exe = std::env::current_exe().expect("current test binary path");
     let output = Command::new(current_exe)
-        .args(["--exact", "helper_entrypoint", "--nocapture"])
+        .args([
+            "--exact",
+            "panic_hook_message_bound::helper_entrypoint",
+            "--nocapture",
+        ])
         .env(HELPER_ENV, scenario)
         .output()
         .expect("helper process runs");
