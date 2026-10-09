@@ -10,8 +10,8 @@
 //! What it proves is that each verb's source carries the call, at least as
 //! many times as the verb has submitting pipelines. It proves neither where in
 //! the body the call sits nor that the path reaches it; the behavioural pins
-//! for the pass live in `window_reconcile.rs` and the commit integration
-//! tests.
+//! for the pass live in `stellar-agent-network/tests/network/window_reconcile.rs`
+//! and the commit integration tests.
 
 #![allow(
     clippy::unwrap_used,

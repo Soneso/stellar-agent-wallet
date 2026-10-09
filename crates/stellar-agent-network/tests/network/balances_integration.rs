@@ -11,7 +11,7 @@
 //!
 //! # Live testnet tests
 //!
-//! See `tests/balances_live.rs` for `#[ignore]`-gated live testnet tests that
+//! See `tests/network/balances_live.rs` for `#[ignore]`-gated live testnet tests that
 //! run against `https://soroban-testnet.stellar.org`. Those tests are excluded
 //! from CI; invoke manually with `cargo test -- --ignored`.
 //!

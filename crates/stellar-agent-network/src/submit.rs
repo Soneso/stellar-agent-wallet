@@ -599,7 +599,7 @@ const SEND_NO_RESPONSE_MARKER: &str = "No status yet:";
 /// Both sides are pinned against the real client by
 /// `a_transport_failure_after_the_record_returns_the_timeout_shape` and
 /// `a_refused_send_releases_the_reservation_and_frees_the_sequence`
-/// (`tests/submission_record_integration.rs`), which drive a mocked endpoint
+/// (`tests/network/submission_record_integration.rs`), which drive a mocked endpoint
 /// through the real client. A reword fails those two rather than silently
 /// reclassifying submissions, so a `stellar-rpc-client` bump that turns them
 /// red is reporting this coupling, not a flake.

@@ -108,7 +108,7 @@ stellar-agent-test-support = { path = "../stellar-agent-test-support", features 
 stellar-agent-headless-keyring = { path = "../stellar-agent-headless-keyring", features = ["test-helpers"] }
 wiremock = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "test-util"] }
-# CaptureWriter-backed subscriber in redaction_audit.rs.
+# CaptureWriter-backed subscriber in tests/network/redaction_audit.rs.
 tracing-subscriber = { workspace = true }
 # ledger-apdu provides the APDUAnswer / APDUCommand types used in hardware
 # signing tests. Pinned to the version stellar-ledger resolves (via
@@ -119,19 +119,7 @@ ledger-apdu = "=0.10.0"
 serial_test = { workspace = true }
 
 [[test]]
-name = "counterparty_cache_integration"
-required-features = ["test-helpers"]
-
-[[test]]
-name = "counterparty_concurrent_first_fetch"
-required-features = ["test-helpers"]
-
-[[test]]
-name = "counterparty_fetch_integration"
-required-features = ["test-helpers"]
-
-[[test]]
-name = "counterparty_fetch_extended_integration"
+name = "network_test_helpers"
 required-features = ["test-helpers"]
 
 [[test]]
@@ -139,48 +127,8 @@ name = "fee_bump_testnet"
 required-features = ["testnet-acceptance"]
 
 [[test]]
-name = "idempotent_submit_integration"
-
-[[test]]
-name = "idempotent_submit_block_b_integration"
-
-[[test]]
-name = "idempotent_submit_receipt_reconcile"
-
-[[test]]
-name = "retry_backoff_integration"
-
-[[test]]
-name = "fee_bump_idempotent_integration"
-
-[[test]]
 name = "fee_bump_idempotent_testnet"
 required-features = ["testnet-acceptance"]
-
-[[test]]
-name = "sep29_cross_rpc_integration"
-
-[[test]]
-name = "account_client_coverage"
-
-[[test]]
-name = "cache_coverage"
-required-features = ["test-helpers"]
-
-[[test]]
-name = "builder_cache_account_topup"
-required-features = ["test-helpers"]
-
-[[test]]
-name = "builder_cache_account_topup2"
-required-features = ["test-helpers"]
-
-[[test]]
-name = "builder_cache_account_topup3"
-required-features = ["test-helpers"]
-
-[[test]]
-name = "submit_result_mapping"
 
 [lints]
 workspace = true

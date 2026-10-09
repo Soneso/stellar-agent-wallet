@@ -739,7 +739,7 @@ impl RedactingJsonFormatter {
     ///
     /// Used by [`init_subscriber`] when [`FormatChoice::Json`] is selected,
     /// and by external crates building a test subscriber with redaction
-    /// (e.g. `stellar-agent-network/tests/redaction_audit.rs`).
+    /// (e.g. `stellar-agent-network/tests/network/redaction_audit.rs`).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
