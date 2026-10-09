@@ -2,12 +2,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod helpers;
-
 use serial_test::serial;
 use stellar_agent_nonce::{NonceError, NonceMint, ReplayWindow};
 
-use helpers::{
+use crate::helpers::{
     StaticCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry, seed_key,
     verify_request,
 };

@@ -19,8 +19,6 @@
     reason = "test-only; panics and expects acceptable in panic-injection tests"
 )]
 
-mod helpers;
-
 use serial_test::serial;
 use std::sync::atomic::Ordering;
 use stellar_agent_nonce::{
@@ -28,7 +26,7 @@ use stellar_agent_nonce::{
     mint::{DROP_COUNTER, PANIC_AFTER_LOAD},
 };
 
-use helpers::{
+use crate::helpers::{
     StaticCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry, seed_key,
 };
 

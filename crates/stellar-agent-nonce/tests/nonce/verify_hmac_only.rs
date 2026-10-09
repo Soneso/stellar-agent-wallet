@@ -23,13 +23,11 @@
     reason = "test-only"
 )]
 
-mod helpers;
-
 use keyring_core::mock;
 use serial_test::serial;
 use stellar_agent_nonce::{NonceError, NonceMint, NonceVerifyHmacOnlyRequest, ReplayWindow};
 
-use helpers::{
+use crate::helpers::{
     StaticCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry, seed_key,
 };
 

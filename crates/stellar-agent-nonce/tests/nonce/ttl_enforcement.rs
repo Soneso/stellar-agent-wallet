@@ -5,12 +5,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod helpers;
-
 use serial_test::serial;
 use stellar_agent_nonce::{NonceError, NonceMint};
 
-use helpers::{StaticCatalogue, init_mock, make_profile, seed_key};
+use crate::helpers::{StaticCatalogue, init_mock, make_profile, seed_key};
 
 const MIN_TTL_MS: u64 = NonceMint::MIN_TTL_MS;
 const MAX_TTL_MS: u64 = NonceMint::MAX_TTL_MS;
