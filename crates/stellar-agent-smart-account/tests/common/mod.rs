@@ -6,6 +6,10 @@
 //! source-account deploy and invoke wrappers, so the endpoint set and the
 //! transaction plumbing have a single definition per crate.
 //!
+//! The suites of `stellar-agent-smart-account-acceptance` include this file
+//! through a `#[path]` attribute, so they share these definitions; moving or
+//! renaming it breaks their build.
+//!
 //! Only compiled when the `testnet-integration` feature is active; callers
 //! guard the top of their file with `#![cfg(feature = "testnet-integration")]`.
 

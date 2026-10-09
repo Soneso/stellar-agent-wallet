@@ -2,8 +2,9 @@
 # Offline regression checks for the publish path of publish-crates.sh.
 #
 # Stubs for cargo, curl, and sleep on PATH drive the real script end to end.
-# The stub cargo serves the workspace metadata and answers each publish call
-# from a per-scenario sequence. The stub curl answers HTTP 403 to a request
+# The stub cargo serves the workspace metadata, with one synthetic member that
+# has `publish = false` added, and answers each publish call from a
+# per-scenario sequence. The stub curl answers HTTP 403 to a request
 # without the expected User-Agent, which names only this repository and its
 # URL. Otherwise it answers for one target crate from a sequence and serves
 # the SHA256SUMS checksum for every other crate. The stub sleep only records
@@ -17,9 +18,19 @@ trap 'rm -rf "$TMP"' EXIT
 
 TARGET=stellar-agent-core
 LATER=stellar-agent-network
+UNPUBLISHED=stellar-agent-unpublished-probe
 USER_AGENT="stellar-agent-wallet (https://github.com/Soneso/stellar-agent-wallet)"
 
-(cd "$ROOT" && cargo metadata --no-deps --format-version 1) >"$TMP/metadata.json"
+(cd "$ROOT" && cargo metadata --no-deps --format-version 1) >"$TMP/workspace.json"
+python3 - "$TMP/workspace.json" "$TMP/metadata.json" "$UNPUBLISHED" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+version = data["packages"][0]["version"]
+data["packages"].append({"name": sys.argv[3], "version": version, "publish": []})
+json.dump(data, open(sys.argv[2], "w"))
+PY
+# The verify job packages every member, so the sums cover the unpublished
+# members too.
 python3 - "$TMP/metadata.json" "$TMP/SHA256SUMS" <<'PY'
 import hashlib, json, sys
 packages = json.load(open(sys.argv[1]))["packages"]
@@ -168,7 +179,7 @@ label="upload with a matching checksum"
 before=$failures
 if run_case "$label" 0 "success\n" "200 $TARGET_SUM\n"; then
   expect_output "$label" "VERIFIED $TARGET $TARGET_VERSION sha256 $TARGET_SUM"
-  expect_output "$label" "All crates published."
+  expect_output "$label" "All publishable crates published."
   report "$label" "$before"
 fi
 
@@ -284,9 +295,26 @@ before=$failures
 if run_case "$label" 0 "" "200 $TARGET_SUM\n"; then
   calls=$(count_lines "$STATE/cargo.log" '^cargo publish ')
   flagged=$(grep '^cargo publish ' "$STATE/cargo.log" | grep -c -- ' --locked --no-verify' || true)
-  members=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))['packages']))" "$TMP/metadata.json")
-  [ "$calls" -eq "$members" ] || fail "$label" "$calls publish calls for $members members"
+  members=$(python3 -c "import json,sys; print(sum(1 for p in json.load(open(sys.argv[1]))['packages'] if p['publish'] is None or p['publish']))" "$TMP/metadata.json")
+  [ "$calls" -eq "$members" ] || fail "$label" "$calls publish calls for $members publishable members"
   [ "$calls" -eq "$flagged" ] || fail "$label" "$((calls - flagged)) publish call(s) without --locked --no-verify"
+  report "$label" "$before"
+fi
+
+label="an unpublished member gets no publish call"
+before=$failures
+if run_case "$label" 0 "" "200 $TARGET_SUM\n"; then
+  unpublished=$(python3 -c "import json,sys; [print(p['name']) for p in json.load(open(sys.argv[1]))['packages'] if p['publish'] == []]" "$TMP/metadata.json")
+  grep -qxF "$UNPUBLISHED" <<<"$unpublished" || fail "$label" "the stub metadata lacks $UNPUBLISHED"
+  while IFS= read -r name; do
+    if grep -q "publish -p $name " "$STATE/cargo.log"; then
+      fail "$label" "$name has publish = false and was published"
+    fi
+    if grep -qF "/$name/" "$STATE/curl.log"; then
+      fail "$label" "$name has publish = false and its checksum was read"
+    fi
+  done <<<"$unpublished"
+  expect_output "$label" "All publishable crates published."
   report "$label" "$before"
 fi
 

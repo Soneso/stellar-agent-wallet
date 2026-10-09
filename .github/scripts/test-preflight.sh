@@ -50,7 +50,8 @@ FIXTURE="$TMP/fixture"
 
 CASES="docs-only install-surface-doc deleted-install-surface-doc welcome-workflow ci-yml-only
 python-check-script shell-check-script skill inbox-web one-crate two-owners
-target-specific-edge dev-dependency-edge root-manifest lockfile toolchain unowned-rust-path
+target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
+unowned-rust-path
 wallet-manifest removed-member untracked-test-file fixture-markdown
 committed-cross-scope-rename staged-rename-record spaces-and-an-apostrophe
 full vendored contracts action-script invariants-helper duplicate-triggers changed-self-test
@@ -195,8 +196,8 @@ import tomllib
 root = pathlib.Path(sys.argv[1])
 problems = []
 manifests = sorted(root.glob("crates/*/Cargo.toml"))
-if len(manifests) != 36:
-    problems.append(f"{len(manifests)} member manifests, expected 36")
+if len(manifests) != 37:
+    problems.append(f"{len(manifests)} member manifests, expected 37")
 top = tomllib.loads((root / "Cargo.toml").read_text())
 for member in top["workspace"]["members"]:
     if not (root / member / "Cargo.toml").is_file():
@@ -210,6 +211,10 @@ core = tomllib.loads((root / "crates/stellar-agent-core/Cargo.toml").read_text()
 windows = core.get("target", {}).get('cfg(target_os = "windows")', {}).get("dependencies", {})
 if "stellar-agent-windows-identity" not in windows:
     problems.append("the core manifest has no Windows target table with stellar-agent-windows-identity")
+acceptance = tomllib.loads((root / "crates/stellar-agent-smart-account-acceptance/Cargo.toml").read_text())
+sep48 = acceptance.get("dependencies", {}).get("stellar-agent-sep48", {})
+if sep48.get("optional") is not True or sep48.get("workspace") is not True:
+    problems.append("the acceptance manifest has no optional inherited stellar-agent-sep48 dependency")
 for problem in problems:
     print(f"fixture incomplete: {problem}", file=sys.stderr)
 raise SystemExit(1 if problems else 0)
@@ -967,10 +972,21 @@ case_dev_dependency_edge() {
 stellar-agent-claimable stellar-agent-cli stellar-agent-core stellar-agent-defi stellar-agent-defindex \
 stellar-agent-dex stellar-agent-mcp stellar-agent-mpp stellar-agent-network stellar-agent-nonce \
 stellar-agent-pool stellar-agent-sep43 stellar-agent-sep48 stellar-agent-sep53 stellar-agent-sep7 \
-stellar-agent-smart-account stellar-agent-stablecoin stellar-agent-toolsets-install \
-stellar-agent-toolsets-runtime stellar-agent-x402" test-helpers,test-hooks,test-loopback,verifier-registry \
-    crates/stellar-agent-test-support/src/lib.rs
+stellar-agent-smart-account stellar-agent-smart-account-acceptance stellar-agent-stablecoin \
+stellar-agent-toolsets-install stellar-agent-toolsets-runtime stellar-agent-x402" \
+    test-helpers,test-hooks,test-loopback,verifier-registry crates/stellar-agent-test-support/src/lib.rs
   expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" test-vendored-release-cfg
+}
+
+# The acceptance member reaches sep48 only through an optional dependency,
+# and an optional edge selects a dependent like any other edge.
+case_optional_dependency_edge() {
+  start_case
+  mkdir -p crates/stellar-agent-sep48/src
+  edit crates/stellar-agent-sep48/src/lib.rs
+  pin_packages "stellar-agent-sep48 stellar-agent-mcp stellar-agent-smart-account-acceptance" test-helpers \
+    crates/stellar-agent-sep48/src/lib.rs
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
 }
 
 case_root_manifest() {
@@ -1102,7 +1118,8 @@ case_vendored() {
   start_case
   edit crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/REFERENCE.md
   pin_packages "stellar-agent-smart-account stellar-agent-approval-remote stellar-agent-cli \
-stellar-agent-defindex stellar-agent-dex stellar-agent-mcp stellar-agent-webauthn-bridge" test-helpers \
+stellar-agent-defindex stellar-agent-dex stellar-agent-mcp stellar-agent-smart-account-acceptance \
+stellar-agent-webauthn-bridge" test-helpers \
     crates/stellar-agent-smart-account/vendor/cap85-beacon/v0.1.0/REFERENCE.md
   expect_list "${ALWAYS[@]}" vendored-tree-check "${PACKAGE_GATES[@]}" test-vendored-release-cfg
 }

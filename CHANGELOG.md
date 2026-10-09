@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the Enforce binding check at the `approve` site and at the value audit
   pre-flight. The audit log recovery guide names the `audit reanchor` repair rows
   in the plural. Thanks to @ngybnc.
+- The smart-account crate's browser, MCP, SEP-48, DeFi, and DeFindex
+  acceptance suites live in the unpublished
+  `stellar-agent-smart-account-acceptance` crate, so an isolated test build of
+  smart-account excludes the browser client, the MCP server, the WebAuthn
+  bridge, and those three crates.
 
 ### Fixed
 

@@ -1,9 +1,11 @@
 #!/bin/bash
-# Publishes every workspace crate to crates.io in dependency order.
+# Publishes every publishable workspace member to crates.io in dependency
+# order. A member with `publish = false`, such as the smart-account
+# acceptance member, is never published and belongs to no tier.
 #
-# The workspace is a 7-tier dependency DAG; each tier must be live on the
-# registry before cargo can package the next tier against it. Within a tier,
-# order is free. The script uploads each crate with
+# The publishable members form a 7-tier dependency DAG; each tier must be
+# live on the registry before cargo can package the next tier against it.
+# Within a tier, order is free. The script uploads each crate with
 # `cargo publish --no-verify`: the verify job built every crate without
 # credentials and recorded the archive checksums in SHA256SUMS, so this
 # script compiles nothing.
@@ -23,10 +25,10 @@
 #
 # Usage: publish-crates.sh --check
 #        publish-crates.sh --sums <SHA256SUMS>
-# --check verifies only that the tier lists cover the workspace. Publishing
-# requires CARGO_REGISTRY_TOKEN in the environment (in CI the short-lived
-# OIDC token minted by rust-lang/crates-io-auth-action) and runs in the
-# workspace root.
+# --check verifies only that the tier lists cover the publishable members.
+# Publishing requires CARGO_REGISTRY_TOKEN in the environment (in CI the
+# short-lived OIDC token minted by rust-lang/crates-io-auth-action) and runs
+# in the workspace root.
 set -u
 
 usage() {
@@ -62,26 +64,29 @@ if ! METADATA=$(cargo metadata --no-deps --format-version 1); then
   echo "cargo metadata failed" >&2
   exit 2
 fi
-# One "name version" line per workspace member.
+# One "name version" line per publishable workspace member. cargo metadata
+# reports `publish = false` as an empty list and an absent publish field as
+# null; check-crates-exist.sh selects the same members.
 if ! MEMBERS=$(printf '%s' "$METADATA" |
-  python3 -c "import json,sys; [print(p['name'], p['version']) for p in json.load(sys.stdin)['packages']]"); then
+  python3 -c "import json,sys; [print(p['name'], p['version']) for p in json.load(sys.stdin)['packages'] if p['publish'] is None or p['publish']]"); then
   echo "cannot read the workspace members from cargo metadata" >&2
   exit 2
 fi
 
-# Completeness guard: every workspace member must appear in exactly the tier
-# lists above. A crate added to the workspace without a tier assignment fails
-# the run here, before anything is uploaded.
+# Completeness guard: every publishable workspace member must appear in
+# exactly the tier lists above, and no other name may. A publishable crate
+# added to the workspace without a tier assignment, or an unpublished member
+# placed in a tier, fails the run here, before anything is uploaded.
 ALL_TIERED=$(echo "$TIER0 $TIER1 $TIER2 $TIER3 $TIER4 $TIER5 $TIER6" | tr ' ' '\n' | sort)
 ALL_WORKSPACE=$(printf '%s\n' "$MEMBERS" | awk '{print $1}' | sort)
 if [ "$ALL_TIERED" != "$ALL_WORKSPACE" ]; then
-  echo "Tier lists do not match the workspace members:" >&2
+  echo "Tier lists do not match the publishable workspace members:" >&2
   diff <(echo "$ALL_TIERED") <(echo "$ALL_WORKSPACE") >&2
   exit 2
 fi
 
 if [ "$MODE" = "check" ]; then
-  echo "Publish tiers match every workspace member exactly once."
+  echo "Publish tiers match every publishable workspace member exactly once."
   exit 0
 fi
 
@@ -233,4 +238,4 @@ for tier in "$TIER0" "$TIER1" "$TIER2" "$TIER3" "$TIER4" "$TIER5" "$TIER6"; do
   echo "=== tier $tier_index done $(date -u '+%H:%M:%S') ==="
   tier_index=$((tier_index + 1))
 done
-echo "All crates published."
+echo "All publishable crates published."

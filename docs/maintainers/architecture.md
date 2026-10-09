@@ -1,12 +1,12 @@
 # Architecture
 
-This document maps the workspace for maintainers and contributors. It describes how the 36 crates are layered, which crate owns which responsibility, and how the two shipped binaries wire the tool surface to the policy, approval, and audit substrate.
+This document maps the workspace for maintainers and contributors. It describes how the 37 workspace members are layered, which crate owns which responsibility, and how the two shipped binaries wire the tool surface to the policy, approval, and audit substrate.
 
 For concept-level background read [../concepts.md](../concepts.md). For build and toolchain instructions read [building.md](building.md). For the security-relevant internals read [security-internals.md](security-internals.md). The contributor gate checklist is [review-checklist.md](review-checklist.md).
 
 ## Workspace overview
 
-The repository is a single Cargo workspace (`resolver = "2"`) with 35 member crates under `crates/`, all named `stellar-agent-*`. Shared package metadata is inherited from `[workspace.package]`: version `0.1.0-alpha.11`, Rust edition `2024`, license `Apache-2.0`, repository `https://github.com/Soneso/stellar-agent-wallet`, author `Soneso`. Every member crate is published on crates.io at the shared workspace version, in dependency order from the tagged release commit.
+The repository is a single Cargo workspace (`resolver = "2"`) with 37 member crates under `crates/`, all named `stellar-agent-*`. Shared package metadata is inherited from `[workspace.package]`: version `0.1.0-alpha.11`, Rust edition `2024`, license `Apache-2.0`, repository `https://github.com/Soneso/stellar-agent-wallet`, author `Soneso`. Of these, 36 are published on crates.io at the shared workspace version, in dependency order from the tagged release commit. The unpublished `stellar-agent-smart-account-acceptance` member holds the smart-account live suites that need a browser, the MCP server, the WebAuthn bridge, or the SEP-48, DeFi, DeFindex, and soroban-spec-tools crates.
 
 Shared dependency pins live in `[workspace.dependencies]` in the root `Cargo.toml` and are added when a crate first needs them, so the workspace only carries dependencies it actually uses.
 
@@ -36,7 +36,7 @@ dbg_macro = "deny"
 
 ## Dependency layering
 
-Crates form a directed acyclic graph from foundational substrate up to the two binaries. No crate depends on a binary.
+Crates form a directed acyclic graph from foundational substrate up to the two binaries. No published crate depends on a binary. The unpublished `stellar-agent-smart-account-acceptance` member sits above layer 4 as a test-only leaf that nothing depends on.
 
 ### Layer 0: substrate
 
@@ -109,6 +109,7 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 | `stellar-agent-mcp` | MCP stdio server library and binary: `WalletServer`, the bounded stdio transport, per-family tool modules, and the inventory-collected tool registry feeding the policy engine. |
 | `stellar-agent-cli` | The `stellar-agent` CLI binary (discovered as `stellar agent ...`); a clap dispatch layer over the library crates. |
 | `stellar-agent-test-support` | Dev-only harness: log-capture and secret-leakage assertions, in-memory keyring mock, XDR and strkey fixtures, HTTP and contract doubles, live-network testnet helpers. |
+| `stellar-agent-smart-account-acceptance` | Unpublished member holding the smart-account live testnet suites that drive a browser, the MCP server, the WebAuthn bridge, or the SEP-48, DeFi, and DeFindex crates. Its `testnet-integration` feature activates every dependency, so offline builds compile an empty library. |
 
 ## Crate classification
 
@@ -116,7 +117,8 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 - **Plain libraries:** `core`, `network`, `claimable`, `sep5`, `xdr-limits`, `soroban-auth`, `nonce`, `headless-keyring`, `smart-account`, `webauthn-bridge`, `loopback-http`, `approval-ui`, `approval-remote`, `pool`, `sep7`, `sep10`, `sep43`, `sep45`, `sep48`, `sep53`, `anchor`, `toolsets`, `toolsets-install`, `toolsets-runtime`, `defi`, `defindex`, `dex`, `stablecoin`, `x402`, `x402-identity`, `mpp`.
 - **Proc-macro library:** `mcp-macros`, the compiler-plugin companion to the `inventory` runtime in `mcp`.
 - **Platform-gated:** `windows-identity`, target-gated to `cfg(target_os = "windows")`. It uses `unsafe` for Win32 FFI as its core capability and is absent off Windows. (The CLI also carries a narrowly-scoped `#[allow(unsafe_code)]` for a POSIX `geteuid` FFI declaration in the audit-verify owner check.)
-- **Dev-only:** `test-support`, consumed strictly as a `[dev-dependencies]` entry behind gated test-harness features and never as a runtime dependency.
+- **Dev-only:** `test-support`, consumed only by tests and test-only members and never by a shipped code path. Most members take it as a `[dev-dependencies]` entry; `core` and the acceptance member take it as an optional `[dependencies]` entry behind a test feature.
+- **Unpublished test member:** `smart-account-acceptance`, which holds live acceptance suites only and is never published.
 
 ## Where the policy, approval, and audit substrate lives
 

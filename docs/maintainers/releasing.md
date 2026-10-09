@@ -154,7 +154,8 @@ gh workflow run publish.yml --ref main -f tag=v<version>
 ```
 
 - `verify` checks out the tag and runs `cargo package --workspace --locked`,
-  which builds and packages every crate. It uploads the archive checksums as
+  which builds and packages every workspace member, the unpublished
+  acceptance member included. It uploads the archive checksums as
   `SHA256SUMS` and holds no credential.
 - `publish` starts after the `crates-io` approval. It regenerates the archives
   without building and requires them to equal `SHA256SUMS`. It then mints a
@@ -171,17 +172,18 @@ the approval.
 
 Both jobs package the tag's tree and run the scripts of the commit the
 dispatch runs on, which is `main` for a publish. The tier lists in
-`publish-crates.sh` must match the tag's workspace members, so a tag with
-another member set stops before any upload. Every tag up to `v0.1.0-alpha.9`
-has another member set, so none of them can be published again through this
-workflow.
+`publish-crates.sh` must match the tag's publishable workspace members, so a
+tag with another member set stops before any upload. Every tag up to
+`v0.1.0-alpha.9` has another member set, so none of them can be published
+again through this workflow.
 
 ## Publish a new crate for the first time
 
 Trusted Publishing updates crates that exist on crates.io, and it cannot
-create a crate. The `publish` job therefore halts at every new workspace
-member, with the crates.io answer "Trusted Publishing tokens do not support
-creating new crates". A maintainer then uploads that crate once by hand:
+create a crate. The `publish` job therefore halts at every new publishable
+workspace member, with the crates.io answer "Trusted Publishing tokens do not
+support creating new crates". A maintainer then uploads that crate once by
+hand:
 
 1. On Linux or macOS, clone the tagged commit with LF line endings. The `-c`
    option sets `core.autocrlf` to `false` before the checkout:

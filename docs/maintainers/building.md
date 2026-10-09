@@ -549,9 +549,14 @@ release-artifact feature set. The crates that submit on-chain (for example
 `stellar-agent-defindex`, `stellar-agent-dex`,
 `stellar-agent-stablecoin`) pull `stellar-agent-test-support/testnet-helpers` in
 through their own `testnet-acceptance` feature. A sibling `testnet-integration`
-feature on `stellar-agent-sep10`, `stellar-agent-sep45`, and
-`stellar-agent-smart-account` gates their live suites the same way; the
-serialized driver and the `Testnet acceptance` workflow run both.
+feature on `stellar-agent-sep10`, `stellar-agent-sep45`,
+`stellar-agent-smart-account`, and `stellar-agent-smart-account-acceptance`
+gates their live suites the same way; the serialized driver and the
+`Testnet acceptance` workflow run both. The unpublished acceptance member
+holds the smart-account suites that need a browser, the MCP server, the
+WebAuthn bridge, or the SEP-48, DeFi, DeFindex, and soroban-spec-tools
+crates, so a test build of `stellar-agent-smart-account` alone compiles none
+of them.
 
 These tests require network reachability to testnet RPC and Friendbot. Testnet is
 the default network; Friendbot funding is testnet-only. Write and signing commands
@@ -590,14 +595,14 @@ in the run summary so a green leg stays explicit about what did not execute.
 Two live suites prove the wallet's handling of contracts whose executable is a
 CAP-85 external reference, a Wasm hash that the owning contract can repoint:
 
-- `stellar-agent-smart-account` / `cap85_external_ref_testnet_acceptance`
-  (feature `testnet-integration`): invocation through the reference and its
-  footprint, the rule-install refusal and pin, a transfer signed through a
-  rule whose verifier is the reference with the pinned-hash drift check,
-  drift detection after a repoint on the execute path
-  (`submit_signed_invoke`), the passkey signing path and in
-  `verify_rule_wasm_pins`, the SEP-48 spec fetch, and the DeFi and DeFindex
-  pin gates.
+- `stellar-agent-smart-account-acceptance` /
+  `cap85_external_ref_testnet_acceptance` (feature `testnet-integration`):
+  invocation through the reference and its footprint, and the rule-install
+  refusal and pin. A transfer signed through a rule whose verifier is the
+  reference confirms with the pinned-hash drift check on. After a repoint,
+  the suite detects the drift on the execute path (`submit_signed_invoke`),
+  on the passkey signing path, and in `verify_rule_wasm_pins`. It also covers
+  the SEP-48 spec fetch and the DeFi and DeFindex pin gates.
 - `stellar-agent-cli` / `cap85_external_ref_cli_testnet_acceptance` (feature
   `testnet-acceptance`): `smart-account rules create` refusing and then
   pinning the reference, `smart-account execute` confirming through the rule

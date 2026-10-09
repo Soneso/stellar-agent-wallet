@@ -51,8 +51,8 @@
 //! # Gating
 //!
 //! ```text
-//! cargo test -p stellar-agent-smart-account --features testnet-integration \
-//!   --test cap85_external_ref_testnet_acceptance
+//! cargo test -p stellar-agent-smart-account-acceptance \
+//!   --features testnet-integration --test cap85_external_ref_testnet_acceptance
 //! ```
 
 #![cfg(feature = "testnet-integration")]
@@ -64,6 +64,7 @@
     reason = "test-only; panics and diagnostic output are acceptable in testnet acceptance tests"
 )]
 
+#[path = "../../stellar-agent-smart-account/tests/common/mod.rs"]
 mod common;
 
 use std::io::{BufRead, BufReader};

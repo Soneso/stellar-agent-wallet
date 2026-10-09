@@ -19,10 +19,6 @@ exclude = ["vendor/*/v0.7.1/*.wasm", "vendor/*/v0.7.1/build.sh"]
 name = "stellar_agent_smart_account"
 path = "src/lib.rs"
 
-# soroban-sdk is a dev-dependency with testutils always on for the auth_digest_parity
-# gate. The testutils machinery is only needed in tests/auth_digest_parity.rs; it is
-# not needed in any production path.
-
 [features]
 default = []
 # Gate end-to-end testnet acceptance tests that require live Friendbot + RPC.
@@ -128,22 +124,6 @@ required-features = ["testnet-integration"]
 name = "quorum_authorization_info_testnet_acceptance"
 required-features = ["testnet-integration"]
 
-[[test]]
-name = "smart_account_rules_webauthn_testnet_acceptance"
-required-features = ["testnet-integration"]
-
-[[test]]
-name = "smart_account_policy_observability_testnet_acceptance"
-required-features = ["testnet-integration"]
-
-[[test]]
-name = "smart_account_ergonomics_testnet_acceptance"
-required-features = ["testnet-integration"]
-
-[[test]]
-name = "cap85_external_ref_testnet_acceptance"
-required-features = ["testnet-integration"]
-
 [dependencies]
 bon = { workspace = true }
 stellar-accounts = { workspace = true }
@@ -191,10 +171,11 @@ sha2 = { workspace = true }
 [dev-dependencies]
 static_assertions = { workspace = true }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["verifier-registry", "wiremock-helpers", "test-helpers"] }
-tracing-subscriber = { workspace = true }
 stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
-# soroban-sdk with testutils for the auth_digest_parity byte-parity gate.
-soroban-sdk = { workspace = true, features = ["testutils"] }
+# soroban-sdk: the on-chain encoders that the auth_digest_parity and
+# wallet_install_arg_parity byte-parity tests compare the wallet's encoding
+# against. Both run on the default host Env, so testutils stays off.
+soroban-sdk = { workspace = true }
 sha2 = { workspace = true }
 wiremock = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -205,35 +186,6 @@ tempfile = { workspace = true }
 proptest = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
-url = { workspace = true }
-# chromiumoxide: CDP virtual-authenticator client for the WebAuthn ceremony in
-# smart_account_rules_webauthn_testnet_acceptance.rs (testnet-integration only).
-chromiumoxide = { workspace = true }
-# futures: StreamExt for the chromiumoxide CDP event handler.
-futures = { workspace = true }
-# stellar-agent-webauthn-bridge: the bridge listener driven by the WebAuthn
-# acceptance test.
-stellar-agent-webauthn-bridge = { path = "../stellar-agent-webauthn-bridge" }
-# stellar-agent-mcp: real WalletServer dispatch (registry/matrix/toolsets) for
-# the MCP-dispatch leg of smart_account_policy_observability_testnet_acceptance.rs.
-# test-helpers exposes the call_stellar_*/set_*_for_test cross-crate test hooks;
-# this dev-only back-edge (mcp depends on smart-account normally) is supported
-# by cargo because dev-dependencies are not part of the library build graph.
-stellar-agent-mcp = { path = "../stellar-agent-mcp", features = ["test-helpers"] }
-# keyring-core: seeds the mock in-memory keyring store for WalletServer::new.
-keyring-core = { workspace = true }
-# rmcp: inspects CallToolResult from the MCP-dispatch leg.
-rmcp = { workspace = true }
-# CAP-85 external-reference acceptance suite: the SEP-48 spec fetch, the DeFi
-# sign-time pin gate and the DeFindex vault pin gate run against a live
-# external-reference contract. Path-only dev-only back-edges (defindex depends
-# on this crate normally); cargo strips path-only dev-dependencies at publish.
-stellar-agent-sep48 = { path = "../stellar-agent-sep48" }
-stellar-agent-defi = { path = "../stellar-agent-defi" }
-stellar-agent-defindex = { path = "../stellar-agent-defindex" }
-# Offline parse of the vendored verifier specs the SEP-48 proof compares the
-# live fetch against.
-soroban-spec-tools = { workspace = true }
 
 [lints]
 workspace = true
