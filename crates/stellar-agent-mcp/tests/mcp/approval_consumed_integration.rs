@@ -45,8 +45,6 @@ use tempfile::TempDir;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-mod common;
-
 /// Source-account sequence the mocked ledger reports.
 const SOURCE_SEQ: i64 = 100;
 const DEST: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
@@ -114,7 +112,7 @@ impl Respond for TimeoutRpcResponder {
             .unwrap_or("");
 
         let result = match rpc_method {
-            "getNetwork" => common::EndpointNetwork::testnet().result(),
+            "getNetwork" => crate::common::EndpointNetwork::testnet().result(),
             "getLedgerEntries" => {
                 let raw = String::from_utf8_lossy(&request.body);
                 if raw.contains(&self.account_key_xdr) {
@@ -131,14 +129,14 @@ impl Respond for TimeoutRpcResponder {
                 }
             }
             "sendTransaction" if self.refuse_send => serde_json::json!({
-                "hash": common::submitted_tx_hash(request),
+                "hash": crate::common::submitted_tx_hash(request),
                 "status": "ERROR",
                 "errorResultXdr": insufficient_fee_result_xdr(),
                 "latestLedger": 1001,
                 "latestLedgerCloseTime": "1234567890"
             }),
             "sendTransaction" => serde_json::json!({
-                "hash": common::submitted_tx_hash(request),
+                "hash": crate::common::submitted_tx_hash(request),
                 "status": "PENDING",
                 "latestLedger": 1001,
                 "latestLedgerCloseTime": "1234567890"
@@ -242,7 +240,7 @@ async fn owed_approval_blocks_reuse_until_status_completes_consumption() {
 }
 
 async fn exercise_approval_consumption(fail_once: bool) {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
     let seed = [0x71_u8; 32];
@@ -264,7 +262,7 @@ async fn exercise_approval_consumption(fail_once: bool) {
         .build();
     profile.rpc_url = mock_server.uri();
     profile.submit_timeout_seconds = Some(1);
-    common::install_test_audit_key(&mut profile);
+    crate::common::install_test_audit_key(&mut profile);
 
     // The attestation key the gate verifies against.
     let attestation_key = [0xD2_u8; 32];
@@ -422,7 +420,7 @@ async fn exercise_approval_consumption(fail_once: bool) {
         ))
         .await
         .expect("the second commit must not error");
-    let (code, _message, text) = common::assert_business_envelope(&second);
+    let (code, _message, text) = crate::common::assert_business_envelope(&second);
     assert_eq!(
         code, "policy.approval_consumed",
         "a spent approval is refused under its own code: {text}"
@@ -490,7 +488,7 @@ async fn exercise_approval_consumption(fail_once: bool) {
 #[tokio::test]
 #[serial]
 async fn a_refused_commit_leaves_its_approval_untouched() {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
     let seed = [0x75_u8; 32];
@@ -519,7 +517,7 @@ async fn a_refused_commit_leaves_its_approval_untouched() {
         .build();
     profile.rpc_url = mock_server.uri();
     profile.submit_timeout_seconds = Some(1);
-    common::install_test_audit_key(&mut profile);
+    crate::common::install_test_audit_key(&mut profile);
 
     // The attestation key the gate verifies against.
     let attestation_key = [0xD5_u8; 32];
@@ -644,7 +642,7 @@ async fn pay_commit_logs_a_queued_consent_row_before_the_signer_loads() {
     use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox, AuditWriterRegistry};
 
     const ACCOUNT: &str = "acct-consent-pay";
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     let log_path = Arc::new(std::sync::Mutex::new(None::<std::path::PathBuf>));
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let hook = {
@@ -680,7 +678,7 @@ async fn pay_commit_logs_a_queued_consent_row_before_the_signer_loads() {
         .build();
     profile.rpc_url = mock_server.uri();
     profile.submit_timeout_seconds = Some(1);
-    common::install_test_audit_key(&mut profile);
+    crate::common::install_test_audit_key(&mut profile);
     let _ = std::fs::remove_file(&profile.audit_log_path);
     let attestation_key = [0xD3_u8; 32];
     keyring_core::Entry::new(

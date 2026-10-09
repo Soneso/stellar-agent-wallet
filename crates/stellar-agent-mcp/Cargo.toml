@@ -231,5 +231,55 @@ test-helpers = [
 # feature set.
 testnet-acceptance = ["stellar-agent-test-support/testnet-helpers"]
 
+# The live testnet suites build only with `testnet-acceptance`, so an offline
+# test run never links them.
+[[test]]
+name = "approve_serve_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "claim_commit_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "create_account_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "dex_quote_wire_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "pay_commit_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "policy_value_descriptor_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "rule_create_commit_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "sep43_sign_and_submit_transaction_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "toolset_sign_payment_gated_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "trustline_classic_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "x402_authenticated_payment_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "x402_create_payment_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
 [lints]
 workspace = true

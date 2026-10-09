@@ -9,8 +9,6 @@
     reason = "test-only; panics and unwraps are acceptable in integration tests"
 )]
 
-mod common;
-
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serial_test::serial;
@@ -68,7 +66,7 @@ async fn a_value_tool_refuses_a_changed_binding_and_sends_nothing() {
             .with_noop_engine()
             .build();
     profile.rpc_url = mock.uri();
-    common::install_test_audit_key(&mut profile);
+    crate::common::install_test_audit_key(&mut profile);
     let mut recorded = profile.clone();
     recorded.audit_log_path = home.path().join("elsewhere.jsonl");
     KeyringAuditBindingStore::for_profile(PROFILE)
@@ -81,7 +79,7 @@ async fn a_value_tool_refuses_a_changed_binding_and_sends_nothing() {
         .call_stellar_x402_create_payment(x402_args())
         .await
         .unwrap();
-    let (code, message, text) = common::assert_business_envelope(&result);
+    let (code, message, text) = crate::common::assert_business_envelope(&result);
     assert_eq!(code, "audit.log_binding_changed", "{text}");
     assert!(
         message.contains("--acknowledge-binding-change"),
@@ -108,7 +106,7 @@ async fn unnamed_start_x402_code() -> String {
         .call_stellar_x402_create_payment(x402_args())
         .await
         .unwrap();
-    common::assert_business_envelope(&result).0
+    crate::common::assert_business_envelope(&result).0
 }
 
 /// An unnamed start over an existing `default.toml` serves a persisted

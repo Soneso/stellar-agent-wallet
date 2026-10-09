@@ -1565,42 +1565,42 @@ fn value_kind_classification_matches_design() {
 /// twice (deposit and withdraw share one file); both checks are redundant
 /// against the same content, which is harmless.
 const MOVES_VALUE_COMMIT_HANDLER_SOURCES: &[(&str, &str)] = &[
-    ("stellar_pay_commit", include_str!("../src/tools/pay.rs")),
+    ("stellar_pay_commit", include_str!("../../src/tools/pay.rs")),
     (
         "stellar_create_account_commit",
-        include_str!("../src/tools/create_account.rs"),
+        include_str!("../../src/tools/create_account.rs"),
     ),
     (
         "stellar_claim_commit",
-        include_str!("../src/tools/claim.rs"),
+        include_str!("../../src/tools/claim.rs"),
     ),
     (
         "stellar_trustline_commit",
-        include_str!("../src/tools/trustline.rs"),
+        include_str!("../../src/tools/trustline.rs"),
     ),
     (
         "stellar_dex_trade",
-        include_str!("../src/tools/dex_trade.rs"),
+        include_str!("../../src/tools/dex_trade.rs"),
     ),
     (
         "stellar_defindex_vault_deposit",
-        include_str!("../src/tools/vault.rs"),
+        include_str!("../../src/tools/vault.rs"),
     ),
     (
         "stellar_defindex_vault_withdraw",
-        include_str!("../src/tools/vault.rs"),
+        include_str!("../../src/tools/vault.rs"),
     ),
     (
         "stellar_x402_authenticated_payment",
-        include_str!("../src/tools/x402_authenticated_payment.rs"),
+        include_str!("../../src/tools/x402_authenticated_payment.rs"),
     ),
     (
         "stellar_x402_create_payment",
-        include_str!("../src/tools/x402_create_payment.rs"),
+        include_str!("../../src/tools/x402_create_payment.rs"),
     ),
     (
         "stellar_mpp_charge_commit",
-        include_str!("../src/tools/mpp.rs"),
+        include_str!("../../src/tools/mpp.rs"),
     ),
 ];
 
@@ -1748,7 +1748,7 @@ fn every_audit_writer_open_registers_the_profile_keyed_pair() {
 /// (PathMismatch/HmacKeyMismatch) for the remainder of the process.
 #[test]
 fn rule_create_audit_writer_routes_through_the_keyed_preflight() {
-    let production = production_half(include_str!("../src/tools/rule_create.rs"));
+    let production = production_half(include_str!("../../src/tools/rule_create.rs"));
     assert!(
         production.contains("require_value_audit_writer("),
         "rule_create must acquire its audit writer via require_value_audit_writer"
@@ -1770,7 +1770,7 @@ fn rule_create_audit_writer_routes_through_the_keyed_preflight() {
 fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the_signer() {
     assert_called_between(
         "mpp.rs",
-        include_str!("../src/tools/mpp.rs"),
+        include_str!("../../src/tools/mpp.rs"),
         "pub async fn stellar_mpp_charge_commit(",
         "verify_pending_approval(",
         "require_value_audit_writer(",
@@ -1778,7 +1778,7 @@ fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the
     );
     assert_called_between(
         "rule_create.rs",
-        include_str!("../src/tools/rule_create.rs"),
+        include_str!("../../src/tools/rule_create.rs"),
         "pub(crate) async fn stellar_rule_create_commit_impl(",
         "verify_rule_proposal_gate(",
         "require_value_audit_writer(",
@@ -1787,22 +1787,22 @@ fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the
     for (file, source, function) in [
         (
             "pay.rs",
-            include_str!("../src/tools/pay.rs"),
+            include_str!("../../src/tools/pay.rs"),
             "pub(crate) async fn stellar_pay_commit_impl(",
         ),
         (
             "claim.rs",
-            include_str!("../src/tools/claim.rs"),
+            include_str!("../../src/tools/claim.rs"),
             "pub(crate) async fn stellar_claim_commit_impl(",
         ),
         (
             "create_account.rs",
-            include_str!("../src/tools/create_account.rs"),
+            include_str!("../../src/tools/create_account.rs"),
             "async fn stellar_create_account_commit(",
         ),
         (
             "trustline.rs",
-            include_str!("../src/tools/trustline.rs"),
+            include_str!("../../src/tools/trustline.rs"),
             "async fn stellar_trustline_commit(",
         ),
     ] {

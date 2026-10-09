@@ -76,8 +76,6 @@ use tracing::instrument::WithSubscriber as _;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-mod common;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -311,7 +309,7 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
         })
         .await
         .expect("case a: absent attestation must return Ok(is_error) envelope");
-    let (code_a, message_a, _text_a) = common::assert_business_envelope(&result_a);
+    let (code_a, message_a, _text_a) = crate::common::assert_business_envelope(&result_a);
 
     // ── Case b: forged attestation (nonce not in store) ──────────────────────
     let temp_b = TempDir::new().expect("TempDir::new for case b");
@@ -347,7 +345,7 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
         })
         .await
         .expect("case b: forged attestation must return Ok(is_error) envelope");
-    let (code_b, message_b, _text_b) = common::assert_business_envelope(&result_b);
+    let (code_b, message_b, _text_b) = crate::common::assert_business_envelope(&result_b);
 
     // ── Case c: expired approval entry ───────────────────────────────────────
     let temp_c = TempDir::new().expect("TempDir::new for case c");
@@ -416,7 +414,7 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
         })
         .await
         .expect("case c: expired entry must return Ok(is_error) envelope");
-    let (code_c, message_c, _text_c) = common::assert_business_envelope(&result_c);
+    let (code_c, message_c, _text_c) = crate::common::assert_business_envelope(&result_c);
 
     // Temp dirs dropped at end of test: temp_a, temp_b, temp_c.
 
@@ -444,17 +442,17 @@ async fn property4_all_failure_modes_produce_byte_identical_wire_error() {
     let pair_a = (
         code_a,
         message_a,
-        common::business_envelope_details(&result_a),
+        crate::common::business_envelope_details(&result_a),
     );
     let pair_b = (
         code_b,
         message_b,
-        common::business_envelope_details(&result_b),
+        crate::common::business_envelope_details(&result_b),
     );
     let pair_c = (
         code_c,
         message_c,
-        common::business_envelope_details(&result_c),
+        crate::common::business_envelope_details(&result_c),
     );
     assert!(
         pair_a.2.is_none(),
@@ -531,7 +529,7 @@ async fn property4a_absent_attestation_returns_approval_required() {
         .with_subscriber(subscriber)
         .await
         .expect("absent attestation must return Ok(is_error) envelope");
-    let (code, message, _text) = common::assert_business_envelope(&result);
+    let (code, message, _text) = crate::common::assert_business_envelope(&result);
 
     assert_eq!(
         code, POLICY_APPROVAL_REQUIRED_CODE,
@@ -608,7 +606,7 @@ async fn property4b_forged_attestation_returns_approval_required() {
         .with_subscriber(subscriber)
         .await
         .expect("forged attestation must return Ok(is_error) envelope");
-    let (code, message, _text) = common::assert_business_envelope(&result);
+    let (code, message, _text) = crate::common::assert_business_envelope(&result);
 
     assert_eq!(
         code, POLICY_APPROVAL_REQUIRED_CODE,
@@ -711,7 +709,7 @@ async fn property4c_expired_approval_entry_returns_approval_required() {
         .with_subscriber(subscriber)
         .await
         .expect("expired entry must return Ok(is_error) envelope");
-    let (code, message, _text) = common::assert_business_envelope(&result);
+    let (code, message, _text) = crate::common::assert_business_envelope(&result);
 
     assert_eq!(
         code, POLICY_APPROVAL_REQUIRED_CODE,
@@ -964,10 +962,10 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
         .with_subscriber(subscriber)
         .await
         .expect("an owner-key refusal returns an is_error envelope");
-    let (code, message, _text) = common::assert_business_envelope(&result);
+    let (code, message, _text) = crate::common::assert_business_envelope(&result);
     assert_eq!(code, POLICY_APPROVAL_REQUIRED_CODE);
     assert_eq!(message, POLICY_APPROVAL_REQUIRED_MSG);
-    assert!(common::business_envelope_details(&result).is_none());
+    assert!(crate::common::business_envelope_details(&result).is_none());
 
     let captured = logs.captured_str();
     assert!(

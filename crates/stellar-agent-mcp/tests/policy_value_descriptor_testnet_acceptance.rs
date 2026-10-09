@@ -18,7 +18,7 @@
 //! Four scenarios, each constructing its own [`PolicyEngineV1`] directly from
 //! an in-memory [`PolicyDocument`] (no signed policy file on disk — see
 //! `set_policy_engine_for_test`, the same substitution point
-//! `tests/policy_v1_integration.rs` uses):
+//! `tests/mcp/policy_v1_integration.rs` uses):
 //!
 //! 1. **Allow, on-chain submit.** A `stellar_pay` of native XLM under a
 //!    `per_tx_cap` rule (well above the payment amount) simulates, commits,

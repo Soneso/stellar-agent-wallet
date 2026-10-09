@@ -44,9 +44,7 @@ use stellar_xdr::{
     SorobanCredentials, TransactionEnvelope, WriteXdr,
 };
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
-
-mod common;
-#[path = "../../stellar-agent-smart-account/tests/smart-account-fixtures/adversarial/rpc_mock_helpers.rs"]
+#[path = "../../../stellar-agent-smart-account/tests/smart-account-fixtures/adversarial/rpc_mock_helpers.rs"]
 mod rpc_helpers;
 
 const PASSPHRASE: &str = "Test SDF Network ; September 2015";
@@ -125,7 +123,7 @@ struct Rpc {
 impl Respond for Rpc {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
-        let mut delegate = common::TimeoutRpc::new(self.entries.clone());
+        let mut delegate = crate::common::TimeoutRpc::new(self.entries.clone());
         if self.confirming.load(Ordering::SeqCst) {
             delegate = delegate.confirming_in(1001);
         }
@@ -174,11 +172,15 @@ enum Tool {
 }
 
 impl Tool {
+    /// The signer seed. Its signer account is the keyring account name, and
+    /// `install_test_audit_key` names the audit log after it. That name and log
+    /// path must stay distinct from every other test in the process. The audit
+    /// writer registry holds one log path and key per profile name.
     fn seed(self, confirmed: bool) -> [u8; 32] {
         [match self {
-            Self::Trade => 0x71,
-            Self::Deposit => 0x73,
-            Self::Withdraw => 0x75,
+            Self::Trade => 0x91,
+            Self::Deposit => 0x93,
+            Self::Withdraw => 0x95,
         } + u8::from(confirmed); 32]
     }
 
@@ -276,7 +278,7 @@ fn assert_window_total(
 }
 
 async fn exercise(tool: Tool, initially_confirmed: bool) {
-    let _root = common::isolated_data_root();
+    let _root = crate::common::isolated_data_root();
     keyring_mock::install().unwrap();
     install_test_nonce_key();
     let seed = tool.seed(initially_confirmed);
@@ -318,7 +320,7 @@ async fn exercise(tool: Tool, initially_confirmed: bool) {
         })
         .mount(&mock)
         .await;
-    let profile = common::timeout_profile(&mock.uri(), &source);
+    let profile = crate::common::timeout_profile(&mock.uri(), &source);
     let mut server = WalletServer::new(profile.clone()).unwrap();
     let profile_name = server.profile_name_for_approval();
     server.set_policy_engine_for_test(Arc::new(PolicyEngineV1::new(
@@ -374,9 +376,12 @@ async fn exercise(tool: Tool, initially_confirmed: bool) {
             .expect("pending receipt");
         assert_eq!(receipt.status, ReceiptStatus::Pending);
         assert!(receipt.submitted);
-        let rows = common::audit_rows(&profile);
-        assert_eq!(common::rows_of_kind(&rows, "value_action_pending").len(), 1);
-        assert!(common::rows_of_kind(&rows, "value_action_submitted").is_empty());
+        let rows = crate::common::audit_rows(&profile);
+        assert_eq!(
+            crate::common::rows_of_kind(&rows, "value_action_pending").len(),
+            1
+        );
+        assert!(crate::common::rows_of_kind(&rows, "value_action_submitted").is_empty());
         let pending = window.pending_reservations(&profile).unwrap();
         if matches!(tool, Tool::Withdraw) {
             // Withdrawal carries a non-debit leg, so this spending cap reserves nothing.
@@ -396,7 +401,11 @@ async fn exercise(tool: Tool, initially_confirmed: bool) {
         );
         assert!(window.pending_reservations(&profile).unwrap().is_empty());
         assert_eq!(
-            common::rows_of_kind(&common::audit_rows(&profile), "value_action_submitted").len(),
+            crate::common::rows_of_kind(
+                &crate::common::audit_rows(&profile),
+                "value_action_submitted"
+            )
+            .len(),
             1
         );
     }
@@ -422,10 +431,13 @@ async fn exercise(tool: Tool, initially_confirmed: bool) {
         );
         assert!(window.pending_reservations(&profile).unwrap().is_empty());
         assert_window_total(&window, &profile, &profile_name, tool);
-        let rows = common::audit_rows(&profile);
-        assert_eq!(common::rows_of_kind(&rows, "value_action_pending").len(), 1);
+        let rows = crate::common::audit_rows(&profile);
         assert_eq!(
-            common::rows_of_kind(&rows, "value_action_submitted").len(),
+            crate::common::rows_of_kind(&rows, "value_action_pending").len(),
+            1
+        );
+        assert_eq!(
+            crate::common::rows_of_kind(&rows, "value_action_submitted").len(),
             1,
             "settlement is idempotent"
         );

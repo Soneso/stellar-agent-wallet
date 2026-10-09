@@ -39,8 +39,6 @@ use stellar_agent_test_support::{
 use tempfile::TempDir;
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate, matchers::method};
 
-mod common;
-
 const AMOUNT: i128 = 60_000_000;
 const ATTESTATION_KEY: [u8; 32] = [0xD2; 32];
 const DEST: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
@@ -141,7 +139,7 @@ struct Harness {
     policy_dir: TempDir,
     approval_dir: TempDir,
     _rpc: MockServer,
-    _root: common::IsolatedDataRoot,
+    _root: crate::common::IsolatedDataRoot,
 }
 
 impl Harness {
@@ -165,7 +163,7 @@ impl Harness {
         approval_fields: &str,
         chain: &str,
     ) -> Self {
-        let root = common::isolated_data_root();
+        let root = crate::common::isolated_data_root();
         let signer_reads = Arc::new(AtomicI64::new(0));
         let observed_reads = Arc::clone(&signer_reads);
         keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
@@ -191,7 +189,7 @@ impl Harness {
             .unwrap();
         seed_key("n-svc", "n-acct", &[7; 32]);
         let rpc = MockServer::start().await;
-        let mut profile = common::timeout_profile(&rpc.uri(), name);
+        let mut profile = crate::common::timeout_profile(&rpc.uri(), name);
         profile.policy.engine = PolicyEngineKind::V1;
         seed_key(
             &profile.attestation_key_id.service,
@@ -262,7 +260,7 @@ decision = "allow"
                         "createdAt": (stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000).to_string() }
                 }));
             }
-        let responder = common::TimeoutRpc::new(vec![
+        let responder = crate::common::TimeoutRpc::new(vec![
             claim_entry(&response_source),
             (
                 account_ledger_key_xdr(USDC_ISSUER),
@@ -385,8 +383,8 @@ decision = "allow"
     }
 
     fn assert_legs(&self, kind: &str, action: &str, amount: Option<i128>) {
-        let rows = common::audit_rows(&self.profile);
-        let selected = common::rows_of_kind(&rows, kind);
+        let rows = crate::common::audit_rows(&self.profile);
+        let selected = crate::common::rows_of_kind(&rows, kind);
         assert_eq!(selected.len(), 1, "one row per submission: {rows:?}");
         let legs = selected[0]["legs"].as_array().expect("audit legs");
         assert_eq!(
@@ -473,7 +471,11 @@ async fn approved_timeout_keeps_cap_until_transaction_status_settles() {
         }
     );
     assert!(
-        common::rows_of_kind(&common::audit_rows(&h.profile), "value_action_submitted").is_empty()
+        crate::common::rows_of_kind(
+            &crate::common::audit_rows(&h.profile),
+            "value_action_submitted"
+        )
+        .is_empty()
     );
     let details = &result["error"]["details"];
     *h.outcomes.lock().unwrap() = Outcome::Success;
@@ -502,8 +504,8 @@ async fn approved_timeout_keeps_cap_until_transaction_status_settles() {
         .unwrap();
     assert_eq!(receipt.status, ReceiptStatus::Success);
     h.assert_legs("value_action_submitted", "payment", Some(AMOUNT));
-    let rows = common::audit_rows(&h.profile);
-    let submitted = common::rows_of_kind(&rows, "value_action_submitted");
+    let rows = crate::common::audit_rows(&h.profile);
+    let submitted = crate::common::rows_of_kind(&rows, "value_action_submitted");
     assert_eq!(submitted[0]["policy_decision"], "require_approval");
     assert_eq!(
         submitted[0]["approval_nonce"],
@@ -568,8 +570,11 @@ async fn missing_or_invalid_attestation_never_reserves_or_sends() {
         );
         assert!(h.sends.lock().unwrap().is_empty());
         assert!(
-            common::rows_of_kind(&common::audit_rows(&h.profile), "value_action_pending")
-                .is_empty()
+            crate::common::rows_of_kind(
+                &crate::common::audit_rows(&h.profile),
+                "value_action_pending"
+            )
+            .is_empty()
         );
     }
     assert_eq!(
@@ -878,9 +883,9 @@ async fn submission_rows_preserve_allowed_and_approved_decisions() {
                 .commit_pay(h.pay_args(&simulation["data"], AMOUNT, approval))
                 .await;
             assert_eq!(result["ok"], suffix == "success", "{result}");
-            let rows = common::audit_rows(&h.profile);
+            let rows = crate::common::audit_rows(&h.profile);
             for kind in ["value_action_pending", final_kind] {
-                let matching = common::rows_of_kind(&rows, kind);
+                let matching = crate::common::rows_of_kind(&rows, kind);
                 assert_eq!(matching.len(), 1, "{kind}: {rows:?}");
                 let row = &matching[0];
                 assert_eq!(row["policy_decision"], decision, "{row}");
@@ -966,9 +971,9 @@ async fn allowed_submission_ignores_an_unverified_approval_nonce() {
         .commit_pay(h.pay_args(&simulation["data"], AMOUNT, stray))
         .await;
     assert_eq!(result["ok"], true, "{result}");
-    let rows = common::audit_rows(&h.profile);
+    let rows = crate::common::audit_rows(&h.profile);
     for kind in ["value_action_pending", "value_action_submitted"] {
-        let matching = common::rows_of_kind(&rows, kind);
+        let matching = crate::common::rows_of_kind(&rows, kind);
         assert_eq!(matching.len(), 1, "{kind}: {rows:?}");
         assert_eq!(matching[0]["policy_decision"], "allow", "{}", matching[0]);
         assert!(
@@ -1076,9 +1081,9 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
             .unwrap(),
     );
     assert_eq!(result["error"], prompt["error"], "{result}");
-    let rows = common::audit_rows(&h.profile);
+    let rows = crate::common::audit_rows(&h.profile);
     assert!(
-        common::rows_of_kind(&rows, "value_action_pending").is_empty(),
+        crate::common::rows_of_kind(&rows, "value_action_pending").is_empty(),
         "{rows:?}"
     );
 }
@@ -1118,7 +1123,11 @@ async fn profile_chain_approval_preserves_nonce_and_consumes_attestation() {
     assert_eq!(h.window().entries, 0);
     assert_eq!(h.signer_reads.load(Ordering::SeqCst), reads_before_commit);
     assert!(
-        common::rows_of_kind(&common::audit_rows(&h.profile), "value_action_submitted").is_empty()
+        crate::common::rows_of_kind(
+            &crate::common::audit_rows(&h.profile),
+            "value_action_submitted"
+        )
+        .is_empty()
     );
 
     let approval = h.attest(data);
@@ -1129,8 +1138,8 @@ async fn profile_chain_approval_preserves_nonce_and_consumes_attestation() {
     assert_eq!(h.window().amount, amount);
     assert!(h.signer_reads.load(Ordering::SeqCst) > reads_before_commit);
     h.assert_legs("value_action_submitted", "payment", Some(amount));
-    let rows = common::audit_rows(&h.profile);
-    let submitted = common::rows_of_kind(&rows, "value_action_submitted");
+    let rows = crate::common::audit_rows(&h.profile);
+    let submitted = crate::common::rows_of_kind(&rows, "value_action_submitted");
     assert_eq!(submitted.len(), 1);
     assert_eq!(submitted[0]["chain_id"], h.profile.chain_id.caip2_str());
     assert_eq!(submitted[0]["policy_decision"], "require_approval");

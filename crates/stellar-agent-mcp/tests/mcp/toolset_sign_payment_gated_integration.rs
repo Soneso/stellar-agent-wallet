@@ -71,8 +71,6 @@ use stellar_agent_test_support::keyring_mock;
 use stellar_agent_toolsets_runtime::resolve_gated_action;
 use tempfile::TempDir;
 
-mod common;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -226,7 +224,9 @@ fn build_allow_server(
         .with_noop_engine()
         .build();
     let mut server = WalletServer::new(profile).expect("WalletServer::new");
-    server.set_policy_engine_for_test(Arc::new(common::policy_mock::MockPolicyEngine::allow()));
+    server.set_policy_engine_for_test(Arc::new(
+        crate::common::policy_mock::MockPolicyEngine::allow(),
+    ));
     server.set_approval_dir_for_test(approval_dir.to_path_buf());
     server.set_grant_store_path_for_test(grant_store_path.to_path_buf());
     server.set_toolsets_root_for_test(toolsets_root.to_path_buf());
@@ -249,7 +249,7 @@ async fn assert_approved_submission_audit(
     };
     use wiremock::{Mock, MockServer, matchers::method};
 
-    let _root = common::isolated_data_root();
+    let _root = crate::common::isolated_data_root();
     let signer = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
     let source = stellar_strkey::ed25519::PublicKey(signer.verifying_key().to_bytes())
         .to_string()
@@ -266,7 +266,7 @@ async fn assert_approved_submission_audit(
     let rpc = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(
-            common::TimeoutRpc::new(vec![
+            crate::common::TimeoutRpc::new(vec![
                 (
                     account_ledger_key_xdr(&source),
                     account_entry_xdr_with_seq(&source, 1_000_000_000, 0, 42),
@@ -280,7 +280,7 @@ async fn assert_approved_submission_audit(
         )
         .mount(&rpc)
         .await;
-    let mut profile = common::timeout_profile(&rpc.uri(), name);
+    let mut profile = crate::common::timeout_profile(&rpc.uri(), name);
     profile.submit_timeout_seconds = Some(30);
     keyring_core::Entry::new(
         &profile.attestation_key_id.service,
@@ -290,7 +290,9 @@ async fn assert_approved_submission_audit(
     .set_password(&URL_SAFE_NO_PAD.encode(key))
     .unwrap();
     let mut server = WalletServer::new(profile.clone()).unwrap();
-    server.set_policy_engine_for_test(Arc::new(common::policy_mock::MockPolicyEngine::allow()));
+    server.set_policy_engine_for_test(Arc::new(
+        crate::common::policy_mock::MockPolicyEngine::allow(),
+    ));
     server.set_approval_dir_for_test(approval_dir.to_path_buf());
     server.set_grant_store_path_for_test(grant_file.to_path_buf());
     server.set_toolsets_root_for_test(toolsets_root.to_path_buf());
@@ -325,7 +327,7 @@ async fn assert_approved_submission_audit(
         .await
         .unwrap();
     assert_eq!(
-        common::assert_business_envelope(&queued).0,
+        crate::common::assert_business_envelope(&queued).0,
         "policy.approval_required"
     );
     let (approval_nonce, attestation) = {
@@ -356,9 +358,9 @@ async fn assert_approved_submission_audit(
     let submitted: serde_json::Value =
         serde_json::from_str(&submitted.content[0].as_text().unwrap().text).unwrap();
     assert_eq!(submitted["ok"], true, "{submitted}");
-    let rows = common::audit_rows(&profile);
+    let rows = crate::common::audit_rows(&profile);
     for kind in ["value_action_pending", "value_action_submitted"] {
-        let matching = common::rows_of_kind(&rows, kind);
+        let matching = crate::common::rows_of_kind(&rows, kind);
         assert_eq!(matching.len(), 1, "{kind}: {rows:?}");
         assert_eq!(
             matching[0]["policy_decision"], "require_approval",
@@ -703,7 +705,7 @@ async fn grant_present_creates_per_action_queue_entry() {
         .call_stellar_toolset_invoke(args)
         .await
         .expect("per-action approval required must return Ok(is_error) envelope");
-    let (code, message, _text) = common::assert_business_envelope(&result);
+    let (code, message, _text) = crate::common::assert_business_envelope(&result);
 
     // Must be policy.approval_required (forced per-action approval), not first-invoke gate.
     assert_eq!(
@@ -792,7 +794,7 @@ async fn permissive_policy_forces_per_action_approval() {
         "invented attestation under permissive policy MUST be refused via an Ok(is_error) \
              envelope; this assertion failing means an attestation bypass is active",
     );
-    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
 
     // Must be policy.approval_required (forged attestation rejected).
     assert_eq!(
@@ -874,7 +876,7 @@ async fn forged_grant_still_forces_per_action_approval() {
     // approval_nonce is not in the store → `policy.approval_required`.
     // This must NOT be `first_invoke_approval_required` because the grant fields
     // matched; only the per-action attestation failed.
-    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
     assert_eq!(
         code, "policy.approval_required",
         "forged grant must trigger per-action approval_required (not first_invoke gate); got: {code}"
@@ -1145,10 +1147,11 @@ fn build_mainnet_server(
     let mut server = WalletServer::new(profile).expect("WalletServer::new");
     match engine {
         CaseEngine::Noop => {}
-        CaseEngine::AllowAll => server
-            .set_policy_engine_for_test(Arc::new(common::policy_mock::MockPolicyEngine::allow())),
+        CaseEngine::AllowAll => server.set_policy_engine_for_test(Arc::new(
+            crate::common::policy_mock::MockPolicyEngine::allow(),
+        )),
         CaseEngine::DenyAll => server.set_policy_engine_for_test(Arc::new(
-            common::policy_mock::MockPolicyEngine::deny_explicit_rule(),
+            crate::common::policy_mock::MockPolicyEngine::deny_explicit_rule(),
         )),
     }
     server.set_approval_dir_for_test(approval_dir.to_path_buf());
@@ -1159,7 +1162,7 @@ fn build_mainnet_server(
 
 /// Asserts the canonical mainnet refusal envelope.
 fn assert_mainnet_write_forbidden(result: &rmcp::model::CallToolResult) {
-    let (code, _message, _text) = common::assert_business_envelope(result);
+    let (code, _message, _text) = crate::common::assert_business_envelope(result);
     assert_eq!(
         code, "network.mainnet_write_forbidden",
         "a mainnet signing action must answer the canonical refusal code"
@@ -1206,7 +1209,7 @@ async fn mainnet_sign_payment_refuses_before_any_approval_is_queued_under_denyin
 }
 
 async fn mainnet_sign_payment_case(engine: CaseEngine) {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     let rpc = wiremock::MockServer::start().await;
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
@@ -1291,7 +1294,7 @@ async fn mainnet_rule_create_case(engine: CaseEngine) {
 
     const SMART_ACCOUNT: &str = "CC53XO53XO53XO53XO53XO53XO53XO53XO53XO53XO53XO53XO53WQD5";
 
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     let rpc = wiremock::MockServer::start().await;
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
@@ -1370,7 +1373,7 @@ async fn mainnet_rule_create_case(engine: CaseEngine) {
 #[tokio::test]
 #[serial]
 async fn mainnet_read_only_toolset_action_still_succeeds() {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     let rpc = wiremock::MockServer::start().await;
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();

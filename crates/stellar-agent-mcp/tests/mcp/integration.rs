@@ -10,6 +10,11 @@
 //! the server falls back to the testnet default profile (as documented in
 //! `loader::load_default_or_testnet_fallback`).
 //!
+//! The child inherits this process's environment, and other tests in this
+//! target override `STELLAR_AGENT_HOME` while they hold the `#[serial]` lock.
+//! Every test that spawns the server is `#[serial]` as well, so a child never
+//! starts under another test's data root.
+//!
 //! # Covered scenarios
 //!
 //! 1. `initialize` handshake → server returns capabilities including `tools`.
@@ -33,6 +38,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+
+use serial_test::serial;
 
 /// Returns the path to the `stellar-agent-mcp` binary built by Cargo.
 ///
@@ -113,6 +120,7 @@ impl Drop for McpDriver {
 
 /// 1. initialize handshake → server responds with capabilities.
 #[test]
+#[serial]
 fn initialize_returns_capabilities() {
     let mut driver = McpDriver::spawn();
 
@@ -141,6 +149,7 @@ fn initialize_returns_capabilities() {
 
 /// 2. `notifications/initialized` → server processes without error.
 #[test]
+#[serial]
 fn notifications_initialized_processed() {
     let mut driver = McpDriver::spawn();
 
@@ -177,6 +186,7 @@ fn notifications_initialized_processed() {
 
 /// 3. `tools/list` → returns `stellar_balances` with chain_id and account_id args.
 #[test]
+#[serial]
 fn tools_list_includes_stellar_balances() {
     let mut driver = McpDriver::spawn();
 
@@ -229,6 +239,7 @@ fn tools_list_includes_stellar_balances() {
 /// 4a. `tools/call stellar_balances` → unknown account returns error envelope,
 ///     not a protocol-level error (account-not-found is a tool-level error).
 #[test]
+#[serial]
 fn tools_call_stellar_balances_unknown_account_returns_tool_error() {
     let mut driver = McpDriver::spawn();
 
@@ -271,6 +282,7 @@ fn tools_call_stellar_balances_unknown_account_returns_tool_error() {
 
 /// 4b. `tools/call stellar_balances` with invalid strkey → invalid_params error.
 #[test]
+#[serial]
 fn tools_call_stellar_balances_invalid_strkey_returns_invalid_params() {
     let mut driver = McpDriver::spawn();
 
@@ -312,6 +324,7 @@ fn tools_call_stellar_balances_invalid_strkey_returns_invalid_params() {
 
 /// 5. `tools/call <unknown>` → protocol error or tool.unknown error.
 #[test]
+#[serial]
 fn tools_call_unknown_tool_returns_error() {
     let mut driver = McpDriver::spawn();
 

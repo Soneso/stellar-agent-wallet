@@ -30,8 +30,6 @@ use stellar_agent_test_support::xdr_fixtures::{
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer};
 
-mod common;
-
 const SOURCE_BALANCE_STROOPS: i64 = 500_000_000_000;
 /// The issuer the trustline verb resolves `USDC` to on testnet. Its ledger
 /// entry has to be answerable: the clawback gate is fail-closed on the issuer's
@@ -122,7 +120,7 @@ fn timeout_server(
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
-    let profile = common::timeout_profile(mock_uri, account);
+    let profile = crate::common::timeout_profile(mock_uri, account);
     let server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     (profile, server, source_g)
 }
@@ -158,14 +156,14 @@ fn assert_timeout_records(
         "the message stays redacted: {json}"
     );
 
-    let rows = common::audit_rows(profile);
+    let rows = crate::common::audit_rows(profile);
     assert_eq!(
-        common::rows_of_kind(&rows, "value_action_pending").len(),
+        crate::common::rows_of_kind(&rows, "value_action_pending").len(),
         1,
         "exactly one pending row is written before the send: {rows:?}"
     );
     assert!(
-        common::rows_of_kind(&rows, "value_action_submitted").is_empty(),
+        crate::common::rows_of_kind(&rows, "value_action_submitted").is_empty(),
         "an unconfirmed submission writes no submitted row: {rows:?}"
     );
 
@@ -189,7 +187,7 @@ fn assert_timeout_records(
 #[tokio::test]
 #[serial]
 async fn a_timed_out_claim_records_the_submission_and_reports_the_hash() {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -198,7 +196,7 @@ async fn a_timed_out_claim_records_the_submission_and_reports_the_hash() {
     let id = test_balance_id();
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(common::TimeoutRpc::new(vec![
+        .respond_with(crate::common::TimeoutRpc::new(vec![
             (
                 claim_key_xdr(&id),
                 claim_entry_xdr(&id, &claimant_g, 5_000_000),
@@ -255,7 +253,7 @@ async fn a_timed_out_claim_records_the_submission_and_reports_the_hash() {
 #[tokio::test]
 #[serial]
 async fn a_timed_out_trustline_records_the_submission_and_reports_the_hash() {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -263,7 +261,7 @@ async fn a_timed_out_trustline_records_the_submission_and_reports_the_hash() {
     let source_g = gstrkey_for_seed(seed);
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(common::TimeoutRpc::new(vec![
+        .respond_with(crate::common::TimeoutRpc::new(vec![
             (
                 account_ledger_key_xdr(&source_g),
                 account_entry_xdr_with_seq(&source_g, SOURCE_BALANCE_STROOPS, 0, SOURCE_SEQ),
@@ -323,7 +321,7 @@ async fn a_timed_out_trustline_records_the_submission_and_reports_the_hash() {
 #[tokio::test]
 #[serial]
 async fn a_timed_out_create_account_records_the_submission_and_reports_the_hash() {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -332,7 +330,7 @@ async fn a_timed_out_create_account_records_the_submission_and_reports_the_hash(
     let destination_g = gstrkey_for_seed([0x74_u8; 32]);
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(common::TimeoutRpc::new(vec![(
+        .respond_with(crate::common::TimeoutRpc::new(vec![(
             account_ledger_key_xdr(&source_g),
             account_entry_xdr_with_seq(&source_g, SOURCE_BALANCE_STROOPS, 0, SOURCE_SEQ),
         )]))
@@ -406,7 +404,7 @@ async fn a_timed_out_create_account_records_the_submission_and_reports_the_hash(
 #[tokio::test]
 #[serial]
 async fn a_timed_out_sep43_submission_is_recorded_and_reconcilable() {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -417,7 +415,7 @@ async fn a_timed_out_sep43_submission_is_recorded_and_reconcilable() {
     let source_g = envelope.source().to_owned();
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(common::TimeoutRpc::new(vec![(
+        .respond_with(crate::common::TimeoutRpc::new(vec![(
             account_ledger_key_xdr(&source_g),
             account_entry_xdr_with_seq(&source_g, SOURCE_BALANCE_STROOPS, 0, SOURCE_SEQ),
         )]))
@@ -464,9 +462,9 @@ async fn a_timed_out_sep43_submission_is_recorded_and_reconcilable() {
     assert!(receipt.submitted, "the record says the bytes left");
     assert_eq!(receipt.source, source_g, "the record names the source");
 
-    let rows = common::audit_rows(&profile);
+    let rows = crate::common::audit_rows(&profile);
     assert_eq!(
-        common::rows_of_kind(&rows, "value_action_pending").len(),
+        crate::common::rows_of_kind(&rows, "value_action_pending").len(),
         1,
         "a pending row is written before the send: {rows:?}"
     );
@@ -490,7 +488,7 @@ async fn a_timed_out_sep43_submission_is_recorded_and_reconcilable() {
 #[tokio::test]
 #[serial]
 async fn a_muxed_source_reaches_the_send_through_sep43() {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -502,7 +500,7 @@ async fn a_muxed_source_reaches_the_send_through_sep43() {
     let source_g = envelope.source().to_owned();
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(common::TimeoutRpc::new(vec![(
+        .respond_with(crate::common::TimeoutRpc::new(vec![(
             account_ledger_key_xdr(&source_g),
             account_entry_xdr_with_seq(&source_g, SOURCE_BALANCE_STROOPS, 0, SOURCE_SEQ),
         )]))
@@ -536,7 +534,7 @@ async fn a_muxed_source_reaches_the_send_through_sep43() {
 #[tokio::test]
 #[serial]
 async fn a_confirmed_sep43_submission_writes_one_settled_row() {
-    let _data_root = common::isolated_data_root();
+    let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
     install_test_nonce_key();
 
@@ -548,7 +546,7 @@ async fn a_confirmed_sep43_submission_writes_one_settled_row() {
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(
-            common::TimeoutRpc::new(vec![(
+            crate::common::TimeoutRpc::new(vec![(
                 account_ledger_key_xdr(&source_g),
                 account_entry_xdr_with_seq(&source_g, SOURCE_BALANCE_STROOPS, 0, SOURCE_SEQ),
             )])
@@ -575,8 +573,8 @@ async fn a_confirmed_sep43_submission_writes_one_settled_row() {
         "the submission confirms: {json}"
     );
 
-    let rows = common::audit_rows(&profile);
-    let submitted = common::rows_of_kind(&rows, "value_action_submitted");
+    let rows = crate::common::audit_rows(&profile);
+    let submitted = crate::common::rows_of_kind(&rows, "value_action_submitted");
     assert_eq!(
         submitted.len(),
         1,
@@ -587,7 +585,7 @@ async fn a_confirmed_sep43_submission_writes_one_settled_row() {
         "the row kept is the one carrying the tool's own contract: {rows:?}"
     );
     assert_eq!(
-        common::rows_of_kind(&rows, "value_action_pending").len(),
+        crate::common::rows_of_kind(&rows, "value_action_pending").len(),
         1,
         "the pending row is written once: {rows:?}"
     );
@@ -625,9 +623,9 @@ async fn a_confirmed_sep43_submission_writes_one_settled_row() {
         .await
         .expect("the status tool must not error");
     assert_ne!(status.is_error, Some(true), "reconciliation must succeed");
-    let rows_after = common::audit_rows(&profile);
+    let rows_after = crate::common::audit_rows(&profile);
     assert_eq!(
-        common::rows_of_kind(&rows_after, "value_action_submitted").len(),
+        crate::common::rows_of_kind(&rows_after, "value_action_submitted").len(),
         1,
         "reconciling a settled submission appends no second row: {rows_after:?}"
     );
@@ -645,7 +643,7 @@ async fn profile_chain_sep43_accounting_persists_rate_limit() {
     use stellar_agent_network::policy_state::PersistedWindowStore;
     use stellar_agent_test_support::signed_envelope::SignedTestEnvelope;
 
-    let _root = common::isolated_data_root();
+    let _root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring");
     install_test_nonce_key();
     let seed = [0x73; 32];
@@ -659,7 +657,7 @@ async fn profile_chain_sep43_accounting_persists_rate_limit() {
     let rpc = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(
-            common::TimeoutRpc::new(vec![(
+            crate::common::TimeoutRpc::new(vec![(
                 account_ledger_key_xdr(first.source()),
                 account_entry_xdr_with_seq(first.source(), SOURCE_BALANCE_STROOPS, 0, SOURCE_SEQ),
             )])
@@ -736,7 +734,7 @@ async fn profile_chain_sep43_accounting_persists_rate_limit() {
         .await
         .expect("second submission refusal");
     assert_eq!(
-        common::assert_business_envelope(&refused).0,
+        crate::common::assert_business_envelope(&refused).0,
         "policy.deny.rate_limit_exceeded"
     );
     let requests = rpc.received_requests().await.expect("RPC requests");

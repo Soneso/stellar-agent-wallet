@@ -29,13 +29,11 @@ use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::{Sep47DiscoverArgs, Sep48PreviewInvocationArgs, WalletServer};
 use stellar_agent_test_support::{KeyedLedgerEntriesResponder, xdr_fixtures};
 
-mod common;
-
 // The SEP-41 token fixture Wasm, committed for `stellar-agent-sep48`'s own
 // offline RPC-path coverage; has a valid `contractspecv0` section with an
 // `approve` function.
 const WASM_BYTES: &[u8] =
-    include_bytes!("../../stellar-agent-sep48/tests/fixtures/sep41_token.wasm");
+    include_bytes!("../../../stellar-agent-sep48/tests/fixtures/sep41_token.wasm");
 
 /// A valid contract C-strkey seeded by `seed`.
 fn contract_strkey(seed: u8) -> String {
@@ -104,7 +102,7 @@ async fn preview_invocation_empty_instance_entries_returns_spec_fetch_failed_env
         .await
         .expect("handler must return a business-error result, not a protocol error");
 
-    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
     assert_eq!(
         code, "sep48.spec_fetch_failed",
         "an empty instance-entries RPC response must surface sep48.spec_fetch_failed"
@@ -149,7 +147,7 @@ async fn preview_invocation_unknown_function_returns_render_failed_envelope() {
         .await
         .expect("handler must return a business-error result, not a protocol error");
 
-    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
     assert_eq!(
         code, "sep48.render_failed",
         "a successfully-fetched spec with an unknown function name must surface \
@@ -183,7 +181,7 @@ async fn discover_empty_instance_entries_returns_discovery_failed_envelope() {
         .await
         .expect("handler must return a business-error result, not a protocol error");
 
-    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
     assert_eq!(
         code, "sep47.discovery_failed",
         "an empty instance-entries RPC response must surface sep47.discovery_failed"

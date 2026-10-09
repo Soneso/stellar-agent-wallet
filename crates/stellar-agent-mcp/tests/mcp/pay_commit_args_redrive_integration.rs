@@ -48,8 +48,6 @@ use stellar_xdr::{
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-mod common;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixture constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -247,7 +245,7 @@ async fn pay_commit_with_create_account_xdr_returns_simulation_divergence() {
         .call_stellar_pay_commit(args)
         .await
         .expect("CreateAccount XDR must return Ok(is_error) envelope");
-    let (code, _message, _text) = common::assert_business_envelope(&result);
+    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
     assert_eq!(
         code, "simulation.divergence",
         "error must be simulation.divergence (op-kind mismatch); got: {code}"
@@ -393,7 +391,7 @@ async fn pay_commit_hash_memo_xdr_reaches_nonce_check() {
         .call_stellar_pay_commit(args)
         .await
         .expect("hash-memo XDR reaches the nonce gate, surfaced as Ok(is_error) envelope");
-    let (code, _msg, _text) = common::assert_business_envelope(&result);
+    let (code, _msg, _text) = crate::common::assert_business_envelope(&result);
     // The nonce-parse gate fires before the envelope-rebuild divergence check.
     assert_eq!(
         code, "nonce.expired",
