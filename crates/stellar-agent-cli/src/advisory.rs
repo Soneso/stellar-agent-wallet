@@ -9,7 +9,7 @@
 //!
 //! [`run_startup_advisory`] accepts NO `StellarRpcClient` parameter. The only
 //! I/O is reading the local audit-log file. The in-crate AST import-scan test
-//! in `tests/advisory_no_network_deps.rs` enforces this invariant by walking
+//! in `tests/cli/advisory_no_network_deps.rs` enforces this invariant by walking
 //! the transitive call closure of `run_startup_advisory` and asserting that no
 //! networking, subprocess, or DNS import is reachable.
 //!
@@ -79,7 +79,7 @@ pub struct AdvisoryResult {
 /// This function MUST NOT import or invoke `StellarRpcClient`,
 /// `stellar_agent_network::rpc::*`, `use reqwest`, or `tokio::net::*`.
 /// The only I/O is reading the local audit-log file at `audit_log_path`.
-/// The AST import-scan in `tests/advisory_no_network_deps.rs` enforces this
+/// The AST import-scan in `tests/cli/advisory_no_network_deps.rs` enforces this
 /// invariant by walking the transitive call closure and checking for forbidden
 /// networking, subprocess, or DNS imports.
 #[must_use]

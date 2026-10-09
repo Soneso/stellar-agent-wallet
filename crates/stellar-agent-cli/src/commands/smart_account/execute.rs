@@ -1137,7 +1137,7 @@ mod tests {
     }
 
     /// A mainnet profile exits 1 before any request reaches its endpoint.
-    /// The binary tests in `tests/profile_env_var_resolution.rs` pin the
+    /// The binary tests in `tests/cli/profile_env_var_resolution.rs` pin the
     /// refusal's wire code; `validate_inputs_mainnet_yields_mainnet_write_forbidden`
     /// pins the refusal inside `validate_execute_inputs`.
     #[tokio::test]

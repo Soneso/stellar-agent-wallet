@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The MCP crate's offline integration tests run from two test targets, `mcp` and
   `owner_key_rewrite_integration`, and its live suites build only with
   `testnet-acceptance`.
+- The CLI crate's offline integration tests run from one test target, `cli`, and its
+  live suites build only with `testnet-acceptance`.
 - The two-argument `map_keyring_error` and `classify_keyring_error` functions
   in core and network are deprecated. Use their operation-aware counterparts.
 - `AuthError::KeyringPlatformError` carries a safe `detail`. Constructors supply

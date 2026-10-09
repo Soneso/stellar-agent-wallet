@@ -11,7 +11,7 @@ use stellar_agent_test_support::source_order::assert_called_between;
 fn mpp_charge_authorize_acquires_the_writer_between_the_approval_read_and_the_signer() {
     assert_called_between(
         "commands/mpp.rs",
-        include_str!("../src/commands/mpp.rs"),
+        include_str!("../../src/commands/mpp.rs"),
         "async fn commit_cli(",
         "verify_pending_approval(",
         "drain_consent_rows_before_signing(",
@@ -23,7 +23,7 @@ fn mpp_charge_authorize_acquires_the_writer_between_the_approval_read_and_the_si
 fn trustline_acquires_the_writer_between_the_opt_in_read_and_the_signer() {
     assert_called_between(
         "commands/trustline.rs",
-        include_str!("../src/commands/trustline.rs"),
+        include_str!("../../src/commands/trustline.rs"),
         "async fn run_with_dependencies<",
         "verify_attested_trustline_clawback_opt_in(",
         "drain_consent_rows_before_signing(",

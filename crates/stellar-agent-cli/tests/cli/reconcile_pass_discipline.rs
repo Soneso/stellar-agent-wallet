@@ -25,29 +25,33 @@
 /// `pay` and `claim` carry two pipelines each (the full one and
 /// `--submit-only`), which the occurrence count covers.
 const VALUE_VERB_SOURCES: &[(&str, &str, usize)] = &[
-    ("pay", include_str!("../src/commands/pay.rs"), 2),
-    ("claim", include_str!("../src/commands/claim.rs"), 2),
-    ("trustline", include_str!("../src/commands/trustline.rs"), 1),
+    ("pay", include_str!("../../src/commands/pay.rs"), 2),
+    ("claim", include_str!("../../src/commands/claim.rs"), 2),
     (
-        "accounts create",
-        include_str!("../src/commands/accounts/create.rs"),
+        "trustline",
+        include_str!("../../src/commands/trustline.rs"),
         1,
     ),
-    ("trade", include_str!("../src/commands/trade.rs"), 1),
-    ("vault", include_str!("../src/commands/vault.rs"), 2),
+    (
+        "accounts create",
+        include_str!("../../src/commands/accounts/create.rs"),
+        1,
+    ),
+    ("trade", include_str!("../../src/commands/trade.rs"), 1),
+    ("vault", include_str!("../../src/commands/vault.rs"), 2),
     (
         "smart-account execute",
-        include_str!("../src/commands/smart_account/execute.rs"),
+        include_str!("../../src/commands/smart_account/execute.rs"),
         1,
     ),
     (
         "smart-account multicall",
-        include_str!("../src/commands/smart_account/multicall.rs"),
+        include_str!("../../src/commands/smart_account/multicall.rs"),
         1,
     ),
     (
         "smart-account timelock execute",
-        include_str!("../src/commands/smart_account/timelock/execute.rs"),
+        include_str!("../../src/commands/smart_account/timelock/execute.rs"),
         1,
     ),
 ];

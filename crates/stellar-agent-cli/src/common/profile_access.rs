@@ -6,7 +6,7 @@
 //! synthesised zero-config profile, and whether the loaded file is the profile
 //! the operator actually named.
 //!
-//! `crates/stellar-agent-cli/tests/profile_reconciliation_discipline.rs`
+//! `crates/stellar-agent-cli/tests/cli/profile_reconciliation_discipline.rs`
 //! enforces the routing as a source scan: outside this module, only
 //! `commands/profile/show.rs` may call the loader directly.
 //!

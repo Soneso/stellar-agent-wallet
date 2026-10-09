@@ -161,7 +161,7 @@ tracing-subscriber = { workspace = true }
 # $HOME-path-redaction regression test (wallet/common.rs).
 toml = { workspace = true }
 # Parse Rust source via AST and walk the advisory module's `use` graph in
-# tests/advisory_no_network_deps.rs (the `visit` feature provides syn::visit::Visit).
+# tests/cli/advisory_no_network_deps.rs (the `visit` feature provides syn::visit::Visit).
 syn = { workspace = true, features = ["visit"] }
 
 [features]
@@ -191,6 +191,34 @@ testnet-acceptance = [
     "stellar-agent-core/test-helpers",
     "stellar-agent-test-support/testnet-helpers",
 ]
+
+[[test]]
+name = "cap85_external_ref_cli_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "claim_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "cli_submit_only_network_binding_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "pay_policy_v1_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "pay_timeout_reconcile_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "profile_init_enroll_signer_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "smart_account_execute_testnet_acceptance"
+required-features = ["testnet-acceptance"]
 
 [lints]
 workspace = true
