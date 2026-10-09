@@ -99,7 +99,7 @@ pub async fn run(args: &ShowArgs) -> i32 {
     // opens no store, mints no key, signs nothing, and derives no per-profile
     // path from the loaded contents.
     //
-    // `crates/stellar-agent-cli/tests/profile_reconciliation_discipline.rs`
+    // `crates/stellar-agent-cli/tests/cli/profile_reconciliation_discipline.rs`
     // pins this file as the sole allowlist entry.
     match loader::load(args.profile_name(), None) {
         Ok(profile) => {

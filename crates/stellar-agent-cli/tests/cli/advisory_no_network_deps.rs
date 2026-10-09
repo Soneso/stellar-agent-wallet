@@ -384,7 +384,7 @@ fn assert_seed_closure_matches_advisory_use_statements() {
         "ADVISORY_CALL_CLOSURE seed list is incomplete — `advisory.rs` imports \
          from internal-crate modules not currently scanned:\n{}\n\n\
          Add the missing file paths to ADVISORY_CALL_CLOSURE at \
-         `tests/advisory_no_network_deps.rs` so the closure walk covers them.",
+         `tests/cli/advisory_no_network_deps.rs` so the closure walk covers them.",
         missing.join("\n  - "),
     );
 }

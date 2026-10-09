@@ -1475,7 +1475,7 @@ mod tests {
 
     /// The friendbot arm on a mainnet profile exits 1 before any request
     /// reaches the profile's endpoint. The binary tests in
-    /// `tests/profile_env_var_resolution.rs` pin the refusal's wire code.
+    /// `tests/cli/profile_env_var_resolution.rs` pin the refusal's wire code.
     #[tokio::test]
     #[serial_test::serial]
     async fn friendbot_mainnet_profile_reaches_no_endpoint() {

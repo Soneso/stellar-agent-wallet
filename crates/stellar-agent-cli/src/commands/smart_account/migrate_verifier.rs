@@ -1627,7 +1627,7 @@ mod tests {
 
     /// A mainnet profile's submit exits 1 before any request reaches the
     /// profile's endpoint. The binary tests in
-    /// `tests/profile_env_var_resolution.rs` pin the refusal's wire code.
+    /// `tests/cli/profile_env_var_resolution.rs` pin the refusal's wire code.
     #[tokio::test]
     #[serial_test::serial]
     async fn run_mainnet_profile_submit_reaches_no_endpoint() {

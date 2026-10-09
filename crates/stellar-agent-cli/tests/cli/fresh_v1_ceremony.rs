@@ -69,6 +69,7 @@ fn keypair(seed: u8) -> (String, String) {
 }
 
 #[test]
+#[serial_test::serial]
 fn a_fresh_v1_profile_through_inits_order_passes_audit_verify() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();

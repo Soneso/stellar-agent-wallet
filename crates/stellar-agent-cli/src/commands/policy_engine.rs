@@ -2107,7 +2107,7 @@ decision = "allow"
     /// eliminated the case.
     ///
     /// So the load is the raw loader and the engine is built directly, with no
-    /// command in between. `tests/profile_reconciliation_discipline.rs` scans
+    /// command in between. `tests/cli/profile_reconciliation_discipline.rs` scans
     /// production code only, and this module's `#[cfg(test)]` block is excluded
     /// from that scan.
     ///

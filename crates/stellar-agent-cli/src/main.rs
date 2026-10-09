@@ -447,7 +447,7 @@ mod tests {
     /// advisory falls through to `STELLAR_AGENT_PROFILE` exactly as they do.
     ///
     /// No CLI verb carries a clap default on its profile selector
-    /// (`tests/profile_flag_discipline.rs` enforces that), so a `Some(..)`
+    /// (`tests/cli/profile_flag_discipline.rs` enforces that), so a `Some(..)`
     /// here would mean the advisory scans a different profile's audit log
     /// than the command it precedes.
     #[test]

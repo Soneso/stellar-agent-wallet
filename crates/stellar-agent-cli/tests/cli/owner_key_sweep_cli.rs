@@ -54,6 +54,7 @@ fn stored(entry_ref: &KeyringEntryRef) -> Option<String> {
 /// request, and the build rewrites another profile's older-form owner entry.
 /// The verb then refuses for want of a signed policy, after the rewrite.
 #[test]
+#[serial_test::serial]
 fn a_v1_engine_build_rewrites_another_profiles_older_form_owner_entry() {
     let home = tempfile::tempdir().unwrap();
     install_store(home.path());
