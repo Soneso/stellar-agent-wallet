@@ -2,15 +2,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod helpers;
-
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use keyring_core::Entry as KeyringEntry;
 use serial_test::serial;
 use stellar_agent_nonce::rotate_nonce_key;
 
-use helpers::{init_mock, make_profile};
+use crate::helpers::{init_mock, make_profile};
 
 #[test]
 #[serial]

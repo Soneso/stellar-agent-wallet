@@ -21,14 +21,14 @@
     reason = "test-only"
 )]
 
-mod helpers;
-
 use keyring_core::mock;
 use serial_test::serial;
 use stellar_agent_core::error::{AuthError, WalletError};
 use stellar_agent_nonce::{NonceError, NonceMint, rotate_nonce_key};
 
-use helpers::{StaticCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry};
+use crate::helpers::{
+    StaticCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry,
+};
 
 // ─── load_key: missing entry ──────────────────────────────────────────────────
 

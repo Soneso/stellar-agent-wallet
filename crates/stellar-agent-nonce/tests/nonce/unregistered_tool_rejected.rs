@@ -10,12 +10,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod helpers;
-
 use serial_test::serial;
 use stellar_agent_nonce::{NonceError, NonceMint};
 
-use helpers::{RejectAllCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry};
+use crate::helpers::{
+    RejectAllCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry,
+};
 
 #[test]
 #[serial]

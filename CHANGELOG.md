@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The nonce crate's integration tests run from one test target, `nonce`.
 - The two-argument `map_keyring_error` and `classify_keyring_error` functions
   in core and network are deprecated. Use their operation-aware counterparts.
 - `AuthError::KeyringPlatformError` carries a safe `detail`. Constructors supply

@@ -1,23 +1,21 @@
-//! Verify that presenting the same nonce twice returns Replayed.
+//! Verify that a nonce with a past expiry returns Expired.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-
-mod helpers;
 
 use serial_test::serial;
 use stellar_agent_nonce::{NonceError, NonceMint, ReplayWindow};
 
-use helpers::{
+use crate::helpers::{
     StaticCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry, seed_key,
     verify_request,
 };
 
 #[test]
 #[serial]
-fn replay_rejected() {
+fn expired_rejected() {
     init_mock();
-    let key = [0xCCu8; 32];
-    let profile = make_profile("replay-rejected");
+    let key = [0xDDu8; 32];
+    let profile = make_profile("expired-rejected");
     seed_key(&profile, &key);
 
     let mint = NonceMint::from_profile(&profile, "nonce-test").expect("from_profile");
@@ -39,19 +37,8 @@ fn replay_rejected() {
 
     let mut window = ReplayWindow::new();
 
-    // First use — accepted.
-    mint.verify(verify_request(
-        &mut window,
-        &nonce,
-        envelope,
-        expiry,
-        "stellar_balances",
-        "stellar:testnet",
-        now,
-    ))
-    .expect("first verify ok");
-
-    // Second use — same nonce → Replayed.
+    // now_unix_ms > expiry → Expired.
+    let now_past_expiry = expiry + 1;
     let err = mint
         .verify(verify_request(
             &mut window,
@@ -60,12 +47,12 @@ fn replay_rejected() {
             expiry,
             "stellar_balances",
             "stellar:testnet",
-            now,
+            now_past_expiry,
         ))
-        .expect_err("second verify must fail");
+        .expect_err("expired nonce must be rejected");
 
     assert!(
-        matches!(err, NonceError::Replayed),
-        "expected Replayed, got: {err:?}"
+        matches!(err, NonceError::Expired),
+        "expected Expired, got: {err:?}"
     );
 }

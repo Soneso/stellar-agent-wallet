@@ -13,12 +13,10 @@
 
 use base64::Engine as _;
 
-mod helpers;
-
 use serial_test::serial;
 use stellar_agent_nonce::{NonceError, NonceMint, ReplayWindow, mint::Nonce};
 
-use helpers::{
+use crate::helpers::{
     StaticCatalogue, far_future_expiry, init_mock, make_profile, now_before_expiry, seed_key,
     verify_request,
 };
