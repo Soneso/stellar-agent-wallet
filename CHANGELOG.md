@@ -54,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The MCP refusal tests accept a server that exits before reading stdin.
 - Keyring write and store failures report `auth.keyring_platform_error` with
   their cause instead of `auth.keyring_not_found`.
   Read failures other than a missing entry, and construction failures, now

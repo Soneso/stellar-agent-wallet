@@ -119,7 +119,12 @@ fn run_with_initialize(mut command: Command) -> Output {
             stdin,
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"test-client","version":"0.1.0"}}}}}}"#
         )
-        .expect("write to child stdin must succeed");
+        .unwrap_or_else(|error| {
+            // A refusing server exits before reading stdin.
+            if error.kind() != std::io::ErrorKind::BrokenPipe {
+                panic!("write to child stdin must succeed: {error:?}");
+            }
+        });
     }
     child.wait_with_output().expect("child must exit")
 }
