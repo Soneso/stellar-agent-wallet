@@ -729,14 +729,21 @@ impl WalletServer {
             rmcp::ErrorData::internal_error(format!("approval.dir_error: {e}"), None)
         })?;
         let store_path = approvals_dir.join(format!("{}.toml", self.profile_name_for_approval()));
-        let store = stellar_agent_core::approval::open_with_retry(
-            &store_path,
-            stellar_agent_core::approval::DEFAULT_RETRY_ATTEMPTS,
-            stellar_agent_core::approval::DEFAULT_RETRY_BACKOFF,
-        )
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("approval.store_open: {e}"), None))?;
-
-        let entry = store.get(&approval_nonce).cloned().ok_or_else(|| {
+        // The store holds its writer lock while this handle lives. The handle closes
+        // at the end of this block, before the gated resolver or the commit opens the same store.
+        // The commit rereads the entry under its own lock and verifies its digest and attestation.
+        let entry = {
+            let store = stellar_agent_core::approval::open_with_retry(
+                &store_path,
+                stellar_agent_core::approval::DEFAULT_RETRY_ATTEMPTS,
+                stellar_agent_core::approval::DEFAULT_RETRY_BACKOFF,
+            )
+            .map_err(|e| {
+                rmcp::ErrorData::internal_error(format!("approval.store_open: {e}"), None)
+            })?;
+            store.get(&approval_nonce).cloned()
+        }
+        .ok_or_else(|| {
             rmcp::ErrorData::invalid_params(
                 "toolset.gated_missing_approval_nonce: approval_nonce does not resolve to a \
                  pending RuleProposalSimulated entry; call stellar_rule_create first",

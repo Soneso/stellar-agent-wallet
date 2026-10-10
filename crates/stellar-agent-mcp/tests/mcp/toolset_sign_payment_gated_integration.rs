@@ -42,6 +42,11 @@
 //!     for the rule-create action over a pending rule proposal.
 //! 13. **mainnet_read_only_toolset_action_still_succeeds**: a read-only action
 //!     stays allowed on mainnet.
+//! 14. **rule_create_pending_proposal_without_grant_queues_first_invoke_approval**:
+//!     with a pending rule proposal and no grant, the route answers
+//!     `toolset.first_invoke_approval_required` and queues the approval beside the proposal.
+//! 15. **rule_create_pending_proposal_with_grant_reaches_signer_load**: a matching
+//!     grant and valid proposal attestation reach the signer load.
 //!
 //! # `#[serial]` requirement
 //!
@@ -63,12 +68,15 @@ use stellar_agent_core::{
         PendingApprovalStore, TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrantStore,
         build_attested_grant, process_uid_for_attestation,
     },
-    profile::schema::Profile,
+    profile::{caip2::TESTNET_PASSPHRASE, schema::Profile},
     timefmt::now_unix_ms,
 };
 use stellar_agent_mcp::server::{StellarToolsetInvokeArgs, WalletServer};
 use stellar_agent_test_support::keyring_mock;
-use stellar_agent_toolsets_runtime::resolve_gated_action;
+use stellar_agent_toolsets_runtime::{
+    matrix::{SIGN_RULE_CREATE_AMOUNT_SENTINEL, SIGN_RULE_CREATE_ASSET_SENTINEL},
+    resolve_gated_action,
+};
 use tempfile::TempDir;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,6 +85,9 @@ use tempfile::TempDir;
 
 /// Valid testnet G-strkey for source account.
 const SOURCE_G: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
+
+/// Valid C-strkey for the smart account in rule proposals.
+const SMART_ACCOUNT: &str = "CC53XO53XO53XO53XO53XO53XO53XO53XO53XO53XO53XO53XO53WQD5";
 
 /// A syntactically valid nonce (parseable base64 of 48 bytes) with an invalid
 /// HMAC — reaches `verify_attestation_gate` but is rejected there.
@@ -214,15 +225,47 @@ fn setup_mock_keyring() -> [u8; 32] {
     key
 }
 
+/// Seeds the profile's attestation key in the mock keyring.
+fn seed_attestation_key(profile: &Profile, key: &[u8; 32]) {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    keyring_core::Entry::new(
+        &profile.attestation_key_id.service,
+        &profile.attestation_key_id.account,
+    )
+    .expect("attestation key entry")
+    .set_password(&URL_SAFE_NO_PAD.encode(key))
+    .expect("set attestation key");
+}
+
+/// Builds a testnet profile with the Noop policy engine and shared keyring coordinates.
+fn testnet_profile() -> Profile {
+    Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .with_noop_engine()
+        .build()
+}
+
 /// Builds a `WalletServer` for testnet with the `Allow` policy (permissive).
 fn build_allow_server(
     approval_dir: &std::path::Path,
     grant_store_path: &std::path::Path,
     toolsets_root: &std::path::Path,
 ) -> WalletServer {
-    let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
-        .with_noop_engine()
-        .build();
+    allow_server_for(
+        testnet_profile(),
+        approval_dir,
+        grant_store_path,
+        toolsets_root,
+    )
+}
+
+/// Builds a server with the `Allow` policy and isolated toolset stores.
+fn allow_server_for(
+    profile: Profile,
+    approval_dir: &std::path::Path,
+    grant_store_path: &std::path::Path,
+    toolsets_root: &std::path::Path,
+) -> WalletServer {
     let mut server = WalletServer::new(profile).expect("WalletServer::new");
     server.set_policy_engine_for_test(Arc::new(
         crate::common::policy_mock::MockPolicyEngine::allow(),
@@ -282,20 +325,8 @@ async fn assert_approved_submission_audit(
         .await;
     let mut profile = crate::common::timeout_profile(&rpc.uri(), name);
     profile.submit_timeout_seconds = Some(30);
-    keyring_core::Entry::new(
-        &profile.attestation_key_id.service,
-        &profile.attestation_key_id.account,
-    )
-    .unwrap()
-    .set_password(&URL_SAFE_NO_PAD.encode(key))
-    .unwrap();
-    let mut server = WalletServer::new(profile.clone()).unwrap();
-    server.set_policy_engine_for_test(Arc::new(
-        crate::common::policy_mock::MockPolicyEngine::allow(),
-    ));
-    server.set_approval_dir_for_test(approval_dir.to_path_buf());
-    server.set_grant_store_path_for_test(grant_file.to_path_buf());
-    server.set_toolsets_root_for_test(toolsets_root.to_path_buf());
+    seed_attestation_key(&profile, key);
+    let server = allow_server_for(profile.clone(), approval_dir, grant_file, toolsets_root);
     let simulated = server
         .call_stellar_pay(
             serde_json::from_value(serde_json::json!({
@@ -432,6 +463,68 @@ fn count_pending_approvals(approval_dir: &std::path::Path, profile_name: &str) -
     }
     let store = PendingApprovalStore::open(store_path).expect("open approval store");
     store.len()
+}
+
+/// Inserts a pending rule proposal with a matching digest and releases the store.
+/// Returns the proposal nonce and its digest.
+fn insert_rule_proposal(
+    store_path: &std::path::Path,
+    network_passphrase: &str,
+    chain_id: &str,
+) -> (String, [u8; 32]) {
+    use stellar_agent_core::approval::PendingApproval;
+    use stellar_agent_core::approval::rule_proposal::{
+        ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
+    };
+    use stellar_agent_core::smart_account::rule_id::ContextRuleId;
+    use stellar_agent_smart_account::managers::rules::{
+        compute_context_rule_proposal_sha256, context_rule_definition_from_snapshot,
+        parse_c_strkey_to_smart_account,
+    };
+
+    let snapshot = ContextRuleProposalSnapshot::new(
+        RuleProposalContextType::Default,
+        "spend-daily".to_owned(),
+        None,
+        vec![RuleProposalSigner::delegated(SOURCE_G.to_owned(), true)],
+        vec![],
+        vec![0],
+        false,
+        false,
+    );
+    let smart_account = parse_c_strkey_to_smart_account(SMART_ACCOUNT).expect("smart account");
+    let rule_definition =
+        context_rule_definition_from_snapshot(&snapshot).expect("reconstruct rule definition");
+    let auth_rule_ids: Vec<ContextRuleId> = snapshot
+        .auth_rule_ids
+        .iter()
+        .map(|id| ContextRuleId::new(*id))
+        .collect();
+    let digest = compute_context_rule_proposal_sha256(
+        &smart_account,
+        &rule_definition,
+        &auth_rule_ids,
+        snapshot.accept_mutable_verifier,
+        snapshot.accept_unknown_verifier,
+    )
+    .expect("rule proposal digest");
+    let proposal = PendingApproval::new_rule_proposal_pending(
+        SMART_ACCOUNT.to_owned(),
+        network_passphrase.to_owned(),
+        chain_id.to_owned(),
+        snapshot,
+        digest,
+        "Default rule \"spend-daily\"".to_owned(),
+        process_uid_for_attestation().expect("process uid"),
+        TOOLSET_GRANT_DEFAULT_TTL_MS,
+    )
+    .expect("rule proposal");
+    let approval_nonce = proposal.approval_nonce.clone();
+    PendingApprovalStore::open(store_path.to_path_buf())
+        .expect("open approval store")
+        .insert(proposal, now_unix_ms().expect("now_unix_ms"))
+        .expect("insert proposal");
+    (approval_nonce, digest)
 }
 
 /// Profile name derived from `Profile::builder_testnet("svc", "acct", ...)`.
@@ -1177,7 +1270,7 @@ async fn assert_no_requests(rpc: &wiremock::MockServer) {
         .expect("request recording is enabled");
     assert!(
         received.is_empty(),
-        "a refused mainnet action must send no request; got {}",
+        "the action must send no RPC request; got {}",
         received.len()
     );
 }
@@ -1286,13 +1379,7 @@ async fn mainnet_rule_create_refuses_before_any_approval_is_queued_under_denying
 }
 
 async fn mainnet_rule_create_case(engine: CaseEngine) {
-    use stellar_agent_core::approval::PendingApproval;
-    use stellar_agent_core::approval::rule_proposal::{
-        ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
-    };
     use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
-
-    const SMART_ACCOUNT: &str = "CC53XO53XO53XO53XO53XO53XO53XO53XO53XO53XO53XO53XO53WQD5";
 
     let _data_root = crate::common::isolated_data_root();
     let rpc = wiremock::MockServer::start().await;
@@ -1315,31 +1402,8 @@ async fn mainnet_rule_create_case(engine: CaseEngine) {
     // gate unless the refusal answers first.
     let profile_name = server.profile_name_for_approval();
     let store_path = approval_dir.path().join(format!("{profile_name}.toml"));
-    let proposal = PendingApproval::new_rule_proposal_pending(
-        SMART_ACCOUNT.to_owned(),
-        MAINNET_PASSPHRASE.to_owned(),
-        "stellar:mainnet".to_owned(),
-        ContextRuleProposalSnapshot::new(
-            RuleProposalContextType::Default,
-            "spend-daily".to_owned(),
-            None,
-            vec![RuleProposalSigner::delegated(SOURCE_G.to_owned(), true)],
-            vec![],
-            vec![0],
-            false,
-            false,
-        ),
-        [0u8; 32],
-        "Default rule \"spend-daily\"".to_owned(),
-        process_uid_for_attestation().expect("process uid"),
-        TOOLSET_GRANT_DEFAULT_TTL_MS,
-    )
-    .expect("rule proposal");
-    let approval_nonce = proposal.approval_nonce.clone();
-    PendingApprovalStore::open(store_path.clone())
-        .expect("open approval store")
-        .insert(proposal, now_unix_ms().expect("now_unix_ms"))
-        .expect("insert proposal");
+    let (approval_nonce, _) =
+        insert_rule_proposal(&store_path, MAINNET_PASSPHRASE, "stellar:mainnet");
     let store_before = std::fs::read(&store_path).expect("read approval store");
 
     let args = StellarToolsetInvokeArgs {
@@ -1407,6 +1471,163 @@ async fn mainnet_read_only_toolset_action_still_succeeds() {
         result.is_error,
         Some(true),
         "a read-only action on mainnet must not be refused: {result:?}"
+    );
+    assert_no_requests(&rpc).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests 14 and 15: rule-create over a pending proposal
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// With a pending rule proposal and no grant, the route answers
+/// `toolset.first_invoke_approval_required` and queues the approval beside the proposal.
+#[tokio::test]
+#[serial]
+async fn rule_create_pending_proposal_without_grant_queues_first_invoke_approval() {
+    use stellar_agent_core::approval::store::ApprovalKind;
+
+    setup_mock_keyring();
+    let toolsets_dir = TempDir::new().unwrap();
+    let approval_dir = TempDir::new().unwrap();
+    let grant_dir = TempDir::new().unwrap();
+    let grant_file = grant_dir.path().join("grants.toml");
+
+    write_pin_with_capabilities(toolsets_dir.path(), TOOLSET_NAME, &["sign-rule-create"]);
+    let server = build_allow_server(approval_dir.path(), &grant_file, toolsets_dir.path());
+    let store_path = approval_dir
+        .path()
+        .join(format!("{TEST_PROFILE_NAME}.toml"));
+    let (approval_nonce, _) =
+        insert_rule_proposal(&store_path, TESTNET_PASSPHRASE, "stellar:testnet");
+
+    let args = StellarToolsetInvokeArgs {
+        toolset: TOOLSET_NAME.to_owned(),
+        action: "stellar_rule_create_commit".to_owned(),
+        chain_id: Some("stellar:testnet".to_owned()),
+        args: serde_json::json!({
+            "approval_nonce": approval_nonce,
+            "chain_id": "stellar:testnet"
+        }),
+    };
+    let result = server.call_stellar_toolset_invoke(args).await;
+    assert!(result.is_err(), "first invoke must fail with gate fired");
+    let err = result.unwrap_err();
+    let msg = error_message(&err);
+    assert!(
+        msg.contains("toolset.first_invoke_approval_required"),
+        "expected toolset.first_invoke_approval_required; got: {msg}"
+    );
+
+    let payload = error_payload(&err);
+    let gate_nonce = payload["approval_nonce"].as_str().unwrap_or("");
+    assert!(!gate_nonce.is_empty(), "approval_nonce must be present");
+    assert_ne!(
+        gate_nonce, approval_nonce,
+        "the first-invoke approval gets its own nonce"
+    );
+    assert_eq!(payload["capability"], "sign-rule-create");
+    assert_eq!(payload["toolset_name"], TOOLSET_NAME);
+
+    let store = PendingApprovalStore::open(store_path).expect("open approval store");
+    assert_eq!(store.len(), 2);
+    assert!(matches!(
+        store.get(&approval_nonce).expect("pending proposal").kind,
+        ApprovalKind::RuleProposalSimulated { .. }
+    ));
+    assert!(matches!(
+        &store.get(gate_nonce).expect("first-invoke approval").kind,
+        ApprovalKind::ToolsetFirstInvokeGate { destination, asset, .. }
+            if destination == SMART_ACCOUNT && asset == SIGN_RULE_CREATE_ASSET_SENTINEL
+    ));
+}
+
+/// A matching grant and valid attestation reach the signer load.
+/// The signer coordinate stays unseeded on purpose, so the call stops before RPC access.
+#[tokio::test]
+#[serial]
+async fn rule_create_pending_proposal_with_grant_reaches_signer_load() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use stellar_agent_core::approval::{
+        AttestationBinding, attestation::compute_attestation, store::ApprovalKind,
+    };
+
+    let _data_root = crate::common::isolated_data_root();
+    let rpc = wiremock::MockServer::start().await;
+    let key = setup_mock_keyring();
+    let toolsets_dir = TempDir::new().unwrap();
+    let approval_dir = TempDir::new().unwrap();
+    let grant_dir = TempDir::new().unwrap();
+    let grant_file = grant_dir.path().join("grants.toml");
+
+    write_pin_with_capabilities(toolsets_dir.path(), TOOLSET_NAME, &["sign-rule-create"]);
+    let mut profile = testnet_profile();
+    // The mock RPC endpoint is the backstop if a call passes the signer load.
+    profile.rpc_url = rpc.uri();
+    crate::common::install_test_audit_key(&mut profile);
+    seed_attestation_key(&profile, &key);
+    let server = allow_server_for(
+        profile,
+        approval_dir.path(),
+        &grant_file,
+        toolsets_dir.path(),
+    );
+
+    let store_path = approval_dir
+        .path()
+        .join(format!("{TEST_PROFILE_NAME}.toml"));
+    let (approval_nonce, digest) =
+        insert_rule_proposal(&store_path, TESTNET_PASSPHRASE, "stellar:testnet");
+    let blob = compute_attestation(
+        &key,
+        &AttestationBinding::new(&server.profile_name_for_approval(), "stellar:testnet"),
+        &approval_nonce,
+        &digest,
+        &process_uid_for_attestation().expect("process uid"),
+    );
+    PendingApprovalStore::open(store_path.clone())
+        .expect("open approval store")
+        .record_rule_proposal_attestation(&approval_nonce, blob)
+        .expect("record proposal attestation");
+    insert_valid_grant(
+        &grant_file,
+        TOOLSET_NAME,
+        "sign-rule-create",
+        SMART_ACCOUNT,
+        SIGN_RULE_CREATE_ASSET_SENTINEL,
+        0,
+        SIGN_RULE_CREATE_AMOUNT_SENTINEL,
+        &key,
+    );
+
+    let args = StellarToolsetInvokeArgs {
+        toolset: TOOLSET_NAME.to_owned(),
+        action: "stellar_rule_create_commit".to_owned(),
+        chain_id: Some("stellar:testnet".to_owned()),
+        args: serde_json::json!({
+            "approval_nonce": approval_nonce,
+            "approval_attestation": URL_SAFE_NO_PAD.encode(blob),
+            "chain_id": "stellar:testnet"
+        }),
+    };
+    let result = server
+        .call_stellar_toolset_invoke(args)
+        .await
+        .expect("the missing signer returns a business envelope");
+    assert_eq!(
+        crate::common::assert_business_envelope(&result).0,
+        "auth.keyring_not_found"
+    );
+    let store = PendingApprovalStore::open(store_path).expect("open approval store");
+    assert_eq!(store.len(), 1, "only the attested proposal remains");
+    let proposal = store.get(&approval_nonce).expect("attested rule proposal");
+    assert!(matches!(
+        proposal.kind,
+        ApprovalKind::RuleProposalSimulated { .. }
+    ));
+    assert_eq!(
+        proposal.attestation_blob_b64,
+        Some(URL_SAFE_NO_PAD.encode(blob)),
+        "the proposal retains its attestation"
     );
     assert_no_requests(&rpc).await;
 }
