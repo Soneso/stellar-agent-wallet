@@ -10,8 +10,7 @@ The `smart-account` command group (also available under the shorter alias `sa`) 
 
 The following commands refuse a mainnet profile with `network.mainnet_write_forbidden` before any RPC call or signer access:
 
-- Rule writes, policy writes, and all signer verbs, including `list` and `refresh`.
-- `rules verify-pins`, which loads a signer to derive its simulation source account.
+- Rule writes, policy writes, and the signer verbs that sign: `add`, `remove`, `set-threshold`, `set-weighted-threshold`, `set-signer-weight`, and `batch-add`.
 - `execute`, `multicall`, and `migrate-verifier` submit mode.
 - Timelock `schedule`, `cancel`, and `execute`, and all four deployment commands.
 
@@ -19,6 +18,7 @@ The following operations have no structural refusal:
 
 - `smart-account register-multicall` / `smart-account unregister-multicall` accept `mainnet` as a local-registry key.
 - The read-only verbs (`smart-account rules get`, `smart-account rules get-spending-limit`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account timelock list-pending`) allow mainnet inspection.
+- `smart-account rules verify-pins`, `smart-account signers list`, and `smart-account signers refresh` load no signer, sign nothing, and write nothing on chain, so they accept a mainnet profile. They keep their local audit writes. On a persisted profile they need `profile rotate-audit-key` first, and otherwise refuse with `audit.chain_key_unavailable`. The mainnet endpoint rules above still apply.
 
 For the terms used here — [profile](../profiles.md), policy engine, approval spine, audit log, [context rule](../concepts.md), auth digest — see [concepts](../concepts.md). The shared flags (`--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`, and the signer-source group) are defined once on the [CLI reference index](index.md#global-conventions); this page names each flag a command takes and only describes the flags specific to that command.
 
@@ -204,9 +204,11 @@ stellar-agent smart-account rules delete \
 
 ### `smart-account rules verify-pins`
 
-Verifies a rule's pinned verifier and policy WASM hashes against the live on-chain contracts (drift detection). Read-only; no signing, no submission. A mainnet profile is refused with `network.mainnet_write_forbidden` before the signer loads. Exit code is `1` when either pin status is `drift`, otherwise `0`; the JSON envelope is well-formed in both cases.
+Verifies a rule's pinned verifier and policy WASM hashes against the live on-chain contracts (drift detection). It loads no signer, signs nothing, and submits nothing, and it accepts a mainnet profile. Drift rows still go to the local audit log, so a persisted profile needs its audit key (see the intro). Exit code is `1` when either pin status is `drift`, otherwise `0`; the JSON envelope is well-formed in both cases.
 
-Each `*_pin_status` is one of `match`, `drift`, `unavailable`, `no_pin`, or `no_contracts`. `drift` also covers a pinned policy with no policy on chain: the pin record holds policy pins while the rule has none, and `policy_pin_status` is `drift` with an empty observed list. It covers a live verifier the record does not pin too: the rule holds an `External` signer while the record pins no verifier, and `verifier_pin_status` is `drift` with an empty observed list; `signers refresh` repairs it. The signer-source flags are used only to derive a source account for the simulation; no transaction is signed.
+Each `*_pin_status` is one of `match`, `drift`, `unavailable`, `no_pin`, or `no_contracts`. `drift` also covers a pinned policy with no policy on chain: the pin record holds policy pins while the rule has none, and `policy_pin_status` is `drift` with an empty observed list. It covers a live verifier the record does not pin too: the rule holds an `External` signer while the record pins no verifier, and `verifier_pin_status` is `drift` with an empty observed list; `signers refresh` repairs it.
+
+The rule's verifier and policy addresses come from a `get_context_rule` simulation. Without `--source-account`, it simulates from a sentinel source and fetches no account. With `--source-account <G_STRKEY>`, the wallet fetches that account, which must exist, and simulates from it; the account is never debited. The WASM-hash reads take no source account.
 
 A rule with one drifted and one unavailable pin reports both statuses, carries the unavailable probe's code in `unavailable_reason`, and exits 1.
 A failed executable read reports `sa.deployment_failed` in `unavailable_reason`.
@@ -215,16 +217,16 @@ Flags:
 
 - `--account <C_STRKEY>` (required).
 - `--rule-id <U32>` (required) — rule whose pins to verify.
+- `--source-account <G_STRKEY>` (optional): an existing account to use as the simulation source. A malformed value refuses with `validation.address_invalid` before the audit log opens and before any RPC.
 - `--rpc-url <URL>`: optional testnet override; absent uses the profile endpoint. Mainnet profiles refuse the flag.
-- Shared: `--profile`, signer-source group, `--network`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
+- Shared: `--profile`, `--network`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
 Envelope: `{ smart_account, rule_id, verifier_pin_status, policy_pin_status, pinned_verifier_first8, pinned_policy_first8, observed_verifier_first8, observed_policy_first8, observed_verifier_executable?, observed_policy_executable?, pinned_verifier_executable_refs?, pinned_policy_executable_refs?, mutable_override, unknown_override, unavailable_reason?, chain_id }`. `observed_*_executable` is aligned with `observed_*_first8`: an entry is the bounded summary of an external-reference executable (owner, tag and resolved hash) or `no code`, and `null` for a plain WASM executable. `pinned_*_executable_refs` is aligned with `pinned_*_first8`: an entry is the pinned external reference (`owner_redacted`, `tag`, `ref_key_hex`, `resolved_hash_first8`) and `null` for a position pinned by its WASM hash. The four fields are omitted when empty.
 
 ```bash
 stellar-agent smart-account rules verify-pins \
   --account CABC...WXYZ \
-  --rule-id 1 \
-  --signer-secret-env WALLET_SK
+  --rule-id 1
 ```
 
 ### `smart-account rules add-policy`
@@ -388,9 +390,9 @@ stellar-agent smart-account rules set-spending-limit \
 
 ## `smart-account signers` — signer-set lifecycle
 
-Manages the signer set and threshold of a context rule. All verbs take `--account <C_STRKEY>` and `--rule-id <U32>` (both required), the signer-source group, `--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, and `--timeout-seconds`. None of these verbs accept `--output` (passing it is rejected). All structurally refuse `mainnet`, including `list` and `refresh` (see the intro).
+Manages the signer set and threshold of a context rule. All verbs take `--account <C_STRKEY>` and `--rule-id <U32>` (both required), `--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, and `--timeout-seconds`. None of these verbs accept `--output` (passing it is rejected). The verbs that sign take the signer-source group and structurally refuse `mainnet` (see the intro).
 
-`list` and `refresh` also require a signer source: the manager needs a source account to assemble the read envelope.
+`list` and `refresh` take no signer-source group and accept a mainnet profile: they load no signer, sign nothing, and write nothing on chain. Their optional `--source-account <G_STRKEY>` names an existing account as the source of the read simulations (`get_context_rule`, and `get_threshold` on a rule with a simple-threshold policy), and a malformed value refuses with `validation.address_invalid`. Without it, the simulations use a sentinel source and fetch no account. Their baseline, divergence, override, and pin rows still go to the local audit log. On a persisted profile they need `profile rotate-audit-key` first, and otherwise refuse with `audit.chain_key_unavailable`.
 
 Every verb waits for the rule's lock at most `--timeout-seconds`, then refuses with `sa.auth_entry_construction_failed` at stage `rule_lock`; another verb on the same rule holds the lock while it signs and records.
 
@@ -404,20 +406,19 @@ Every verb waits for the rule's lock at most `--timeout-seconds`, then refuses w
 
 ### `smart-account signers list`
 
-Reads the rule's signer set through both RPC endpoints and compares it with the rule's audit-log state. When the `(rule_id, account)` pair has no state, it writes a `SaSignerSetBaselinedV2` audit row to anchor future divergence detection; otherwise it writes nothing. A rule without a simple-threshold policy is baselined with no threshold. Submits no on-chain transaction, but is state-changing on the audit log. Testnet only. A rule holding a signer the wallet cannot decode is refused with `sa.deployment_failed` naming the signer's index, and no baseline is written. Delete such a rule with `smart-account rules delete --rule-id N` authorized by a rule the wallet can read (see [pinned-hash drift check](#pinned-hash-drift-check)).
+Reads the rule's signer set through both RPC endpoints and compares it with the rule's audit-log state. When the `(rule_id, account)` pair has no state, it writes a `SaSignerSetBaselinedV2` audit row to anchor future divergence detection; otherwise it writes nothing. A rule without a simple-threshold policy is baselined with no threshold. Submits no on-chain transaction, but is state-changing on the audit log. Accepts a mainnet profile. A rule holding a signer the wallet cannot decode is refused with `sa.deployment_failed` naming the signer's index, and no baseline is written. Delete such a rule with `smart-account rules delete --rule-id N` authorized by a rule the wallet can read (see [pinned-hash drift check](#pinned-hash-drift-check)).
 
 The envelope reports `signer_count`, `threshold` (`null` when the rule has no simple-threshold policy), `snapshot_version` (`2`), the `signer_ids` with parallel `signer_kinds` and `signer_summaries` lists, and `baseline`. A `signer_kinds` entry is `delegated_ed25519`, `external` (a passkey signer included) or `delegated_contract`; a `signer_summaries` entry renders the signer's identity as first-8 hex projections. `baseline` is `none` when this call wrote the first baseline, otherwise `matched`, `diverged` or `not_comparable`. `not_comparable` reports a version 1 state the wallet cannot compare the chain with, because the rule holds a signer delegated to a contract address or has no simple-threshold policy.
 
 ```bash
 stellar-agent smart-account signers list \
   --account CABC...WXYZ \
-  --rule-id 0 \
-  --signer-secret-env WALLET_SK
+  --rule-id 0
 ```
 
 ### `smart-account signers refresh`
 
-Compares the chain with the rule's audit-log state and writes a fresh `SaSignerSetBaselinedV2` audit row. Use it to re-anchor after an intentional out-of-band signer change, and to repair a rule refused with `sa.pinned_verifier_absent`. Use it once to upgrade a version 1 state, which the wallet compares with the version 1 form of the chain's signer set. State-changing on the audit log only. Testnet only. Same flags as `list`, plus:
+Compares the chain with the rule's audit-log state and writes a fresh `SaSignerSetBaselinedV2` audit row. Use it to re-anchor after an intentional out-of-band signer change, and to repair a rule refused with `sa.pinned_verifier_absent`. Use it once to upgrade a version 1 state, which the wallet compares with the version 1 form of the chain's signer set. State-changing on the audit log only. Accepts a mainnet profile. Same flags as `list`, including the optional `--source-account`, plus:
 
 - `--accept-divergence`: record the chain state even when it differs from the rule's state, or when a version 1 state cannot be compared with it. Without the flag, a differing set writes a `SaSignerSetDiverged` row and refuses with `sa.signer_set_diverged`, and an incomparable version 1 state refuses the same way without writing a row. With the flag, a differing set writes the `SaSignerSetDiverged` row and then the baseline, and the command prints one warning line on stderr.
 - `--accept-mutable-verifier`: pin a live verifier that is mutable (admin/owner key, or an owner-managed external reference). Applies only as **Verifier pin** describes; the audit log then records `SaMutableContractOverride`, carrying the rule id.
@@ -430,8 +431,7 @@ The envelope reports `signer_count`, `threshold` (`null` without a simple-thresh
 ```bash
 stellar-agent smart-account signers refresh \
   --account CABC...WXYZ \
-  --rule-id 0 \
-  --signer-secret-env WALLET_SK
+  --rule-id 0
 ```
 
 ### `smart-account signers add`

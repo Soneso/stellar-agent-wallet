@@ -2315,7 +2315,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
         .verify_rule_wasm_pins(
             smart_account_addr.clone(),
             new_rule_id,
-            &signer_g,
+            Some(&signer_g),
             &uuid::Uuid::new_v4().to_string(),
         )
         .await

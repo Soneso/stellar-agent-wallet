@@ -771,8 +771,8 @@ mod tests {
         assert_eq!(
             mapped.message(),
             format!(
-                "profile 'default' cannot be audited: {detail}; signing refuses to proceed \
-             unaudited — see docs/maintainers/audit-log-recovery.md"
+                "profile 'default' cannot be audited: {detail}; the command refuses to proceed \
+             unaudited. See docs/maintainers/audit-log-recovery.md"
             )
         );
     }

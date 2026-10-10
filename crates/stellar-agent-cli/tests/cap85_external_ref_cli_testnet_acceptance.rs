@@ -679,14 +679,12 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
             smart_account.as_str(),
             "--rule-id",
             rule_id_arg.as_str(),
-            "--signer-secret-env",
-            FEE_PAYER_ENV_VAR,
             "--network",
             "testnet",
             "--rpc-url",
             TESTNET_RPC_URL,
         ],
-        &fee_payer_env,
+        &[],
     );
     assert_eq!(
         envelope["data"]["verifier_pin_status"].as_str(),

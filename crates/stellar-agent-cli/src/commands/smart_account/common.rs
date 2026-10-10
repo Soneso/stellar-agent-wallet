@@ -4,10 +4,17 @@
 //! loads the profile once ([`load_command_profile`]). It builds the network
 //! context from the loaded profile and the flags. The write verbs then apply
 //! the structural mainnet refusal. Last, the handler opens the audit writer
-//! ([`open_audit_writer`]) and resolves the signer ([`resolve_signer`]).
+//! ([`open_audit_writer`]) and, on a signing verb, resolves the signer
+//! ([`resolve_signer`]).
 //!
 //! [`CommonHandlerContext::new`] runs those last two steps, parses the smart
 //! account, and builds manager configs from the context's endpoints.
+//!
+//! [`ReadHandlerContext::new`] serves the inspection verbs that record local
+//! audit rows: `rules verify-pins`, `signers list`, and `signers refresh`. It
+//! validates their optional `--source-account` with
+//! [`validate_source_account`], then opens the same audit writer and parses
+//! the smart account, and it resolves no signer.
 //!
 //! Also provides [`emit_sa_error`] — the canonical `SaError → WalletError::SmartAccount`
 //! bridge used by all multicall CLI subcommands.
@@ -72,14 +79,13 @@ impl SignerSourceFlags {
     }
 }
 
-/// View over the common wallet handler arguments.
-pub(crate) trait CommonArgsView {
+/// View over the smart-account handler arguments every verb takes, signing
+/// or not.
+pub(crate) trait ReadArgsView {
     /// Smart-account contract C-strkey.
     fn account(&self) -> &str;
     /// Optional profile override.
     fn profile(&self) -> Option<&str>;
-    /// Shared signer-source flags.
-    fn signer_source(&self) -> &SignerSourceFlags;
     /// Target network.
     fn network(&self) -> Option<TargetNetwork>;
     /// Primary RPC URL.
@@ -94,8 +100,186 @@ pub(crate) trait CommonArgsView {
             secondary_rpc_url: self.secondary_rpc_url(),
         }
     }
-    /// Submission timeout in seconds.
+    /// Request timeout in seconds.
     fn timeout_seconds(&self) -> u64;
+}
+
+/// View over the arguments of a signing smart-account verb: the shared
+/// arguments plus the signer-source flags.
+pub(crate) trait CommonArgsView: ReadArgsView {
+    /// Shared signer-source flags.
+    fn signer_source(&self) -> &SignerSourceFlags;
+}
+
+/// Implements [`ReadArgsView`] for an argument struct.
+///
+/// `impl_read_args_view!(Ty)` reads the struct's own fields;
+/// `impl_read_args_view!(Ty, field)` reads them through `self.field`, for a
+/// struct that flattens its shared arguments into one field.
+macro_rules! impl_read_args_view {
+    ($ty:ty $(, $field:ident)?) => {
+        impl $crate::commands::smart_account::common::ReadArgsView for $ty {
+            fn account(&self) -> &str {
+                &self $(.$field)? .account
+            }
+
+            fn profile(&self) -> Option<&str> {
+                self $(.$field)? .profile.as_deref()
+            }
+
+            fn network(&self) -> Option<$crate::common::network::TargetNetwork> {
+                self $(.$field)? .network
+            }
+
+            fn rpc_url(&self) -> Option<&str> {
+                self $(.$field)? .rpc_url.as_deref()
+            }
+
+            fn secondary_rpc_url(&self) -> Option<&str> {
+                self $(.$field)? .secondary_rpc_url.as_deref()
+            }
+
+            fn timeout_seconds(&self) -> u64 {
+                self $(.$field)? .timeout_seconds
+            }
+        }
+    };
+}
+
+/// Implements [`ReadArgsView`] and [`CommonArgsView`] for the argument
+/// struct of a signing verb, with the optional field path of
+/// [`impl_read_args_view!`].
+macro_rules! impl_common_args_view {
+    ($ty:ty $(, $field:ident)?) => {
+        $crate::commands::smart_account::common::impl_read_args_view!($ty $(, $field)?);
+
+        impl $crate::commands::smart_account::common::CommonArgsView for $ty {
+            fn signer_source(
+                &self,
+            ) -> &$crate::commands::smart_account::common::SignerSourceFlags {
+                &self $(.$field)? .signer_source
+            }
+        }
+    };
+}
+
+pub(crate) use impl_common_args_view;
+pub(crate) use impl_read_args_view;
+
+/// Validates the G-strkey an operator passes as `--source-account`.
+///
+/// # Errors
+///
+/// Returns `validation.address_invalid` naming the flag when `source` is not
+/// an ed25519 account strkey.
+pub(crate) fn validate_source_account(source: &str) -> Result<(), WalletError> {
+    stellar_strkey::ed25519::PublicKey::from_string(source)
+        .map(|_| ())
+        .map_err(|e| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!("--source-account: invalid G-strkey ({e})"),
+            })
+        })
+}
+
+/// Context of an inspection verb that records local audit rows and loads no
+/// signer: `rules verify-pins`, `signers list`, and `signers refresh`.
+///
+/// The verb signs nothing and writes nothing on chain, so it runs on any
+/// network. Its baseline, divergence, override, pin, and drift rows still go
+/// to the audit log, which [`open_audit_writer`] opens under the same rule as
+/// a signing verb's.
+pub(crate) struct ReadHandlerContext {
+    /// Parsed smart-account address.
+    pub(crate) smart_account: SmartAccountAddress,
+    /// Network identity resolved by the command.
+    pub(crate) context: NetworkContext,
+    /// Resolved profile name.
+    profile_name: String,
+    /// The loaded profile governing this command.
+    profile: Profile,
+    /// Shared audit writer handle.
+    audit_writer: Arc<Mutex<AuditWriter>>,
+    /// Audit log path backing `audit_writer`.
+    audit_log_path: PathBuf,
+    /// Request timeout.
+    timeout: Duration,
+}
+
+impl ReadHandlerContext {
+    /// Builds a context from the shared CLI args and the verb's optional
+    /// `--source-account`.
+    ///
+    /// The source feeds only the read simulations (`get_context_rule`, and
+    /// `get_threshold` on a rule with a simple-threshold policy). It is
+    /// validated first, so a malformed one refuses before the audit writer
+    /// opens and before any RPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns `validation.address_invalid` for a malformed source, and a
+    /// wallet error when the audit writer refuses to open or the smart
+    /// account does not parse.
+    pub(crate) fn new(
+        args: &impl ReadArgsView,
+        source_account: Option<&str>,
+        resolved: ResolvedProfileName,
+        profile: Profile,
+        origin: ProfileOrigin,
+        context: &NetworkContext,
+    ) -> Result<Self, WalletError> {
+        if let Some(source) = source_account {
+            validate_source_account(source)?;
+        }
+        let profile_name = resolved.name;
+        let (audit_writer, audit_log_path) = open_audit_writer(&profile, origin, &profile_name)?;
+        let smart_account = parse_c_strkey_to_smart_account(args.account()).map_err(|e| {
+            WalletError::Validation(ValidationError::AddressInvalid {
+                input: format!("--account: {e}"),
+            })
+        })?;
+        Ok(Self {
+            smart_account,
+            profile_name,
+            profile,
+            audit_writer,
+            audit_log_path,
+            context: context.clone(),
+            timeout: Duration::from_secs(args.timeout_seconds()),
+        })
+    }
+
+    /// Builds a `SignersManager` sharing this context's audit writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a wallet validation error if `SignersManager` construction fails.
+    pub(crate) fn signers_manager(&self) -> Result<SignersManager, WalletError> {
+        construct_signers_manager_from_fields(
+            &self.profile_name,
+            &self.context,
+            self.timeout,
+            Arc::clone(&self.audit_writer),
+            &self.audit_log_path,
+        )
+    }
+
+    /// Builds a `ContextRuleManager` with this context's audit writer and a
+    /// signers manager sharing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a wallet error if manager construction fails.
+    pub(crate) fn context_rule_manager(&self) -> Result<ContextRuleManager, WalletError> {
+        construct_context_rule_manager_from_fields(
+            &self.profile_name,
+            &self.profile,
+            &self.context,
+            self.timeout,
+            Arc::clone(&self.audit_writer),
+            &self.audit_log_path,
+        )
+    }
 }
 
 /// Common wallet handler context shared by rules and signers handlers.
@@ -188,40 +372,19 @@ impl CommonHandlerContext {
     /// Builds a `ContextRuleManager` with the same audit writer and signers
     /// manager used by this context.
     ///
-    /// Uses the loaded profile's session horizon and the context's endpoints.
+    /// Delegates to [`construct_context_rule_manager_from_fields`].
     ///
     /// # Errors
     /// Returns a wallet error if manager construction fails.
     pub fn context_rule_manager(&self) -> Result<ContextRuleManager, WalletError> {
-        let signers_manager = self.signers_manager().map_err(|e| {
-            WalletError::Validation(ValidationError::ConfigInvalid {
-                component: "SignersManager",
-                reason: format!("construction for divergence check: {e}"),
-            })
-        })?;
-
-        let mut config = ContextRuleManagerConfig::new(
-            self.context.rpc_url.clone(),
-            self.context.network_passphrase().to_owned(),
+        construct_context_rule_manager_from_fields(
+            &self.profile_name,
+            &self.profile,
+            &self.context,
             self.timeout,
-            self.context.chain_id.caip2_str().to_owned(),
+            Arc::clone(&self.audit_writer),
+            &self.audit_log_path,
         )
-        .with_signers_manager(Arc::new(signers_manager))
-        .with_audit_writer(Arc::clone(&self.audit_writer));
-
-        if let Some(url) = self.context.secondary_rpc_url.clone() {
-            config = config.with_secondary_rpc_url(url);
-        }
-        if let Some(ledgers) = self.profile.session_rule_max_horizon_ledgers {
-            config = config.with_session_rule_max_horizon_ledgers(ledgers);
-        }
-
-        ContextRuleManager::new(config).map_err(|e| {
-            WalletError::Validation(ValidationError::ConfigInvalid {
-                component: "ContextRuleManager",
-                reason: e.to_string(),
-            })
-        })
     }
 }
 
@@ -298,6 +461,66 @@ pub(crate) fn construct_signers_manager_from_fields(
     SignersManager::new(config).map_err(|e| {
         WalletError::Validation(ValidationError::ConfigInvalid {
             component: "SignersManager",
+            reason: e.to_string(),
+        })
+    })
+}
+
+/// Constructs a [`ContextRuleManager`] from pre-resolved fields and an
+/// already-opened audit writer.
+///
+/// The manager carries a [`SignersManager`] built by
+/// [`construct_signers_manager_from_fields`] over the same writer, the
+/// context's primary and secondary endpoints, and the profile's session
+/// horizon. No I/O is performed inside this function.
+///
+/// # Errors
+///
+/// Returns [`WalletError::Validation`] wrapping
+/// [`ValidationError::ConfigInvalid`] with `component = "SignersManager"`
+/// when the signers manager fails to build, and with
+/// `component = "ContextRuleManager"` when [`ContextRuleManager::new`] fails.
+fn construct_context_rule_manager_from_fields(
+    profile_name: &str,
+    profile: &Profile,
+    context: &NetworkContext,
+    timeout: Duration,
+    audit_writer: Arc<Mutex<AuditWriter>>,
+    audit_log_path: &std::path::Path,
+) -> Result<ContextRuleManager, WalletError> {
+    let signers_manager = construct_signers_manager_from_fields(
+        profile_name,
+        context,
+        timeout,
+        Arc::clone(&audit_writer),
+        audit_log_path,
+    )
+    .map_err(|e| {
+        WalletError::Validation(ValidationError::ConfigInvalid {
+            component: "SignersManager",
+            reason: format!("construction for divergence check: {e}"),
+        })
+    })?;
+
+    let mut config = ContextRuleManagerConfig::new(
+        context.rpc_url.clone(),
+        context.network_passphrase().to_owned(),
+        timeout,
+        context.chain_id.caip2_str().to_owned(),
+    )
+    .with_signers_manager(Arc::new(signers_manager))
+    .with_audit_writer(audit_writer);
+
+    if let Some(url) = context.secondary_rpc_url.clone() {
+        config = config.with_secondary_rpc_url(url);
+    }
+    if let Some(ledgers) = profile.session_rule_max_horizon_ledgers {
+        config = config.with_session_rule_max_horizon_ledgers(ledgers);
+    }
+
+    ContextRuleManager::new(config).map_err(|e| {
+        WalletError::Validation(ValidationError::ConfigInvalid {
+            component: "ContextRuleManager",
             reason: e.to_string(),
         })
     })

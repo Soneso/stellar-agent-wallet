@@ -36,16 +36,23 @@
 //! # Signer-source modes (mirror of `smart-account rules`)
 //!
 //! Write subcommands accept exactly one of:
-//! - `--signer-secret-env <VAR>` — read S-strkey from env var.
-//! - `--sign-with-ledger` — Ledger hardware wallet (BIP-44 `--account-index`).
+//! - `--signer-secret-env <VAR>`: read S-strkey from env var.
+//! - `--sign-with-ledger`: Ledger hardware wallet (BIP-44 `--account-index`).
 //!
-//! Read subcommands (`list`, `refresh`) also accept these modes because the
-//! manager requires a `source_account_strkey` for the fee-paying envelope.
+//! `list` and `refresh` take no signer-source flags. Their optional
+//! `--source-account <G_STRKEY>` names an existing account as the source of
+//! the read simulations (`get_context_rule`, and `get_threshold` on a rule
+//! with a simple-threshold policy); without it the simulations use a sentinel
+//! source and fetch no account. Wasm-hash reads (`getLedgerEntries`) take no
+//! source account.
 //!
 //! # Mainnet defence
 //!
-//! All subcommands (including `list` and `refresh`, which trigger baseline-write
-//! audit rows) structurally refuse mainnet before any RPC or signing call.
+//! The write subcommands structurally refuse mainnet before any RPC or
+//! signing call. `list` and `refresh` accept mainnet: they load no signing
+//! key, sign nothing, and write nothing on chain. Their baseline, divergence,
+//! override, and pin rows still go to the local audit log, so a persisted
+//! profile needs its audit key as for any audited verb.
 //!
 //! # Inverse-bypass discipline
 //!
@@ -105,8 +112,9 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    CommonArgsView, CommonHandlerContext, SignerSourceFlags, load_command_profile,
-    map_access_error, wrap_sa_error,
+    CommonHandlerContext, ReadArgsView, ReadHandlerContext, SignerSourceFlags,
+    impl_common_args_view, impl_read_args_view, load_command_profile, map_access_error,
+    wrap_sa_error,
 };
 use crate::common::network::{EndpointUrlFlag, TargetNetwork, network_context_for_command};
 use crate::common::render::render_json;
@@ -279,7 +287,7 @@ pub async fn run(args: &SignersArgs) -> i32 {
 ///
 /// Reads the on-chain signer set; writes `SaSignerSetBaselinedV2` if no prior
 /// baseline exists, and otherwise compares the chain with it and writes
-/// nothing. Mainnet is structurally refused.
+/// nothing. Loads no signer and accepts a mainnet profile.
 #[non_exhaustive]
 #[derive(Debug, Args)]
 #[command(
@@ -298,8 +306,12 @@ pub struct ListArgs {
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
-    #[command(flatten)]
-    pub signer_source: SignerSourceFlags,
+    /// An existing account to use as the source of the read simulations
+    /// (`get_context_rule`, and `get_threshold` on a rule with a
+    /// simple-threshold policy). When absent, the simulations use a sentinel
+    /// source and no account is fetched. The account is never debited.
+    #[arg(long, value_name = "G_STRKEY")]
+    pub source_account: Option<String>,
 
     /// The network comes from the profile when absent.
     /// When supplied, this flag must equal the profile's chain.
@@ -441,29 +453,16 @@ async fn list_run(args: &ListArgs) -> i32 {
         Err(e) => return emit_error(&e, &request_id),
     };
 
-    // Mainnet defence.
-    if context.chain_id.is_mainnet() {
-        return emit_error(
-            &WalletError::Network(NetworkError::MainnetWriteForbidden),
-            &request_id,
-        );
-    }
-
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match ReadHandlerContext::new(
+        args,
+        args.source_account.as_deref(),
+        resolved,
+        profile,
+        origin,
+        &context,
+    ) {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
-    };
-
-    let source_account_strkey = match ctx.signer.public_key().await {
-        Ok(pk) => pk.to_string(),
-        Err(e) => {
-            return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("signer.public_key(): {e}"),
-                }),
-                &request_id,
-            );
-        }
     };
 
     let manager = match ctx.signers_manager() {
@@ -481,7 +480,7 @@ async fn list_run(args: &ListArgs) -> i32 {
         .list_signers(
             ctx.smart_account,
             args.rule_id,
-            Some(&source_account_strkey),
+            args.source_account.as_deref(),
             request_id.clone(),
         )
         .await
@@ -505,7 +504,8 @@ async fn list_run(args: &ListArgs) -> i32 {
 /// baseline, or a version 1 baseline the chain state cannot be compared with,
 /// is recorded only with `--accept-divergence`. On a rule whose pin record
 /// pins no verifier while the rule holds `External` signers, the refresh also
-/// pins the live verifier, probed as `rules create` probes one.
+/// pins the live verifier, probed as `rules create` probes one. Loads no
+/// signer and accepts a mainnet profile.
 #[non_exhaustive]
 #[derive(Debug, Args)]
 pub struct RefreshArgs {
@@ -553,8 +553,12 @@ pub struct RefreshArgs {
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
-    #[command(flatten)]
-    pub signer_source: SignerSourceFlags,
+    /// An existing account to use as the source of the read simulations
+    /// (`get_context_rule`, and `get_threshold` on a rule with a
+    /// simple-threshold policy). When absent, the simulations use a sentinel
+    /// source and no account is fetched. The account is never debited.
+    #[arg(long, value_name = "G_STRKEY")]
+    pub source_account: Option<String>,
 
     /// The network comes from the profile when absent.
     /// When supplied, this flag must equal the profile's chain.
@@ -696,28 +700,16 @@ async fn refresh_run(args: &RefreshArgs) -> i32 {
         Err(e) => return emit_error(&e, &request_id),
     };
 
-    if context.chain_id.is_mainnet() {
-        return emit_error(
-            &WalletError::Network(NetworkError::MainnetWriteForbidden),
-            &request_id,
-        );
-    }
-
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match ReadHandlerContext::new(
+        args,
+        args.source_account.as_deref(),
+        resolved,
+        profile,
+        origin,
+        &context,
+    ) {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, &request_id),
-    };
-
-    let source_account_strkey = match ctx.signer.public_key().await {
-        Ok(pk) => pk.to_string(),
-        Err(e) => {
-            return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("signer.public_key(): {e}"),
-                }),
-                &request_id,
-            );
-        }
     };
 
     let manager = match ctx.signers_manager() {
@@ -735,7 +727,7 @@ async fn refresh_run(args: &RefreshArgs) -> i32 {
         &manager,
         ctx.smart_account,
         args,
-        Some(&source_account_strkey),
+        args.source_account.as_deref(),
         request_id.clone(),
     )
     .await
@@ -1660,42 +1652,8 @@ pub struct SetThresholdResult {
     pub new_threshold: u32,
 }
 
-macro_rules! impl_common_args_view {
-    ($ty:ty) => {
-        impl CommonArgsView for $ty {
-            fn account(&self) -> &str {
-                &self.account
-            }
-
-            fn profile(&self) -> Option<&str> {
-                self.profile.as_deref()
-            }
-
-            fn signer_source(&self) -> &SignerSourceFlags {
-                &self.signer_source
-            }
-
-            fn network(&self) -> Option<TargetNetwork> {
-                self.network
-            }
-
-            fn rpc_url(&self) -> Option<&str> {
-                self.rpc_url.as_deref()
-            }
-
-            fn secondary_rpc_url(&self) -> Option<&str> {
-                self.secondary_rpc_url.as_deref()
-            }
-
-            fn timeout_seconds(&self) -> u64 {
-                self.timeout_seconds
-            }
-        }
-    };
-}
-
-impl_common_args_view!(ListArgs);
-impl_common_args_view!(RefreshArgs);
+impl_read_args_view!(ListArgs);
+impl_read_args_view!(RefreshArgs);
 impl_common_args_view!(AddArgs);
 impl_common_args_view!(RemoveArgs);
 impl_common_args_view!(SetThresholdArgs);
@@ -2690,6 +2648,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::commands::smart_account::common::validate_source_account;
     use clap::Parser;
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
     use stellar_xdr::{ScMap, ScMapEntry, ScSymbol, ScVal, ScVec};
@@ -2770,6 +2729,17 @@ mod tests {
             .expect("enforce_add_signer_cap must return Ok(()) for attempted=15");
     }
 
+    /// The signer-source flags `list` and `refresh` reject, each with its
+    /// value.
+    const SIGNER_SOURCE_FLAGS: [&[&str]; 3] = [
+        &[
+            "--signer-secret-env",
+            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
+        ],
+        &["--sign-with-ledger"],
+        &["--account-index", "0"],
+    ];
+
     // ── list ─────────────────────────────────────────────────────────────────
 
     #[derive(Parser)]
@@ -2786,8 +2756,6 @@ mod tests {
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
             "--rule-id",
             "1",
-            "--signer-secret-env",
-            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
         ]);
         assert_eq!(parsed.args.rule_id, 1);
         assert_eq!(parsed.args.network, None);
@@ -2798,8 +2766,6 @@ mod tests {
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
             "--rule-id",
             "1",
-            "--signer-secret-env",
-            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
             "--network",
             "mainnet",
             "--rpc-url",
@@ -2812,6 +2778,49 @@ mod tests {
         );
     }
 
+    /// `list` loads no signer: each signer-source flag is an unknown
+    /// argument.
+    #[test]
+    fn list_args_reject_signer_source_flags() {
+        for flag in SIGNER_SOURCE_FLAGS {
+            let mut argv = vec!["test", "--account", ACCOUNT, "--rule-id", "1"];
+            argv.extend_from_slice(flag);
+            let err = ListArgsHarness::try_parse_from(argv)
+                .err()
+                .unwrap_or_else(|| panic!("{flag:?} must be rejected"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag:?}"
+            );
+        }
+    }
+
+    /// `list --source-account` is optional: absent it is `None`, a supplied
+    /// value is carried as given, and a malformed value parses so the
+    /// runtime validation refuses it with `validation.address_invalid`.
+    #[test]
+    fn list_args_source_account_is_optional_and_validated_at_runtime() {
+        let base = ["test", "--account", ACCOUNT, "--rule-id", "1"];
+        assert_eq!(ListArgsHarness::parse_from(base).args.source_account, None);
+        let with = |value: &'static str| {
+            let argv: Vec<&str> = base
+                .iter()
+                .copied()
+                .chain(["--source-account", value])
+                .collect();
+            ListArgsHarness::parse_from(argv).args.source_account
+        };
+        assert_eq!(
+            with(SIMULATE_SENTINEL_G).as_deref(),
+            Some(SIMULATE_SENTINEL_G)
+        );
+        let malformed = with("not-a-g-strkey").unwrap();
+        let err = validate_source_account(&malformed).unwrap_err();
+        assert_eq!(err.code(), "validation.address_invalid");
+        assert!(err.to_string().contains("--source-account"), "{err}");
+    }
+
     #[test]
     fn list_args_accepts_secondary_rpc_url() {
         let parsed = ListArgsHarness::parse_from([
@@ -2820,8 +2829,6 @@ mod tests {
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
             "--rule-id",
             "0",
-            "--signer-secret-env",
-            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
             "--secondary-rpc-url",
             "https://soroban-testnet.stellar.org",
         ]);
@@ -2839,8 +2846,6 @@ mod tests {
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
             "--rule-id",
             "1",
-            "--signer-secret-env",
-            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
             "--output",
             "json",
         ])
@@ -2865,10 +2870,54 @@ mod tests {
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
             "--rule-id",
             "2",
-            "--signer-secret-env",
-            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
         ]);
         assert_eq!(parsed.args.rule_id, 2);
+    }
+
+    /// `refresh` loads no signer: each signer-source flag is an unknown
+    /// argument.
+    #[test]
+    fn refresh_args_reject_signer_source_flags() {
+        for flag in SIGNER_SOURCE_FLAGS {
+            let mut argv = vec!["test", "--account", ACCOUNT, "--rule-id", "2"];
+            argv.extend_from_slice(flag);
+            let err = RefreshArgsHarness::try_parse_from(argv)
+                .err()
+                .unwrap_or_else(|| panic!("{flag:?} must be rejected"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag:?}"
+            );
+        }
+    }
+
+    /// `refresh --source-account` is optional: absent it is `None`, a supplied
+    /// value is carried as given, and a malformed value parses so the
+    /// runtime validation refuses it with `validation.address_invalid`.
+    #[test]
+    fn refresh_args_source_account_is_optional_and_validated_at_runtime() {
+        let base = ["test", "--account", ACCOUNT, "--rule-id", "2"];
+        assert_eq!(
+            RefreshArgsHarness::parse_from(base).args.source_account,
+            None
+        );
+        let with = |value: &'static str| {
+            let argv: Vec<&str> = base
+                .iter()
+                .copied()
+                .chain(["--source-account", value])
+                .collect();
+            RefreshArgsHarness::parse_from(argv).args.source_account
+        };
+        assert_eq!(
+            with(SIMULATE_SENTINEL_G).as_deref(),
+            Some(SIMULATE_SENTINEL_G)
+        );
+        let malformed = with("not-a-g-strkey").unwrap();
+        let err = validate_source_account(&malformed).unwrap_err();
+        assert_eq!(err.code(), "validation.address_invalid");
+        assert!(err.to_string().contains("--source-account"), "{err}");
     }
 
     #[test]
@@ -2879,8 +2928,6 @@ mod tests {
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
             "--rule-id",
             "2",
-            "--signer-secret-env",
-            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
             "--output",
             "json",
         ])
@@ -3601,15 +3648,7 @@ mod tests {
     /// own field.
     #[test]
     fn refresh_args_verifier_overrides_default_off() {
-        let base = [
-            "test",
-            "--account",
-            ACCOUNT,
-            "--rule-id",
-            "2",
-            "--signer-secret-env",
-            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
-        ];
+        let base = ["test", "--account", ACCOUNT, "--rule-id", "2"];
         let default = RefreshArgsHarness::parse_from(base).args;
         assert!(!default.accept_mutable_verifier);
         assert!(!default.accept_unknown_verifier);
@@ -3628,15 +3667,7 @@ mod tests {
     /// `--accept-divergence` defaults to off.
     #[test]
     fn refresh_args_accept_divergence_defaults_off() {
-        let base = [
-            "test",
-            "--account",
-            ACCOUNT,
-            "--rule-id",
-            "2",
-            "--signer-secret-env",
-            "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
-        ];
+        let base = ["test", "--account", ACCOUNT, "--rule-id", "2"];
         assert!(!RefreshArgsHarness::parse_from(base).args.accept_divergence);
         let with_flag: Vec<&str> = base
             .iter()
@@ -4088,15 +4119,7 @@ mod tests {
         .unwrap();
         let smart_account = parse_c_strkey_to_smart_account(ACCOUNT).unwrap();
         let args_with = |flag: bool| {
-            let mut argv = vec![
-                "test",
-                "--account",
-                ACCOUNT,
-                "--rule-id",
-                "1",
-                "--signer-secret-env",
-                "__STELLAR_AGENT_SIGNERS_TEST_DUMMY_VAR",
-            ];
+            let mut argv = vec!["test", "--account", ACCOUNT, "--rule-id", "1"];
             if flag {
                 argv.push("--accept-divergence");
             }

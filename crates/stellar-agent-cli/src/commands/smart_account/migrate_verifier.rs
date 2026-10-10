@@ -91,8 +91,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    CommonArgsView, CommonHandlerContext, SignerSourceFlags, construct_signers_manager_from_fields,
-    load_command_profile, map_access_error, open_audit_writer_read_only, wrap_sa_error,
+    CommonHandlerContext, SignerSourceFlags, construct_signers_manager_from_fields,
+    impl_common_args_view, load_command_profile, map_access_error, open_audit_writer_read_only,
+    wrap_sa_error,
 };
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
@@ -200,35 +201,7 @@ pub struct MigrateVerifierArgs {
     pub dry_run: bool,
 }
 
-impl CommonArgsView for MigrateVerifierArgs {
-    fn account(&self) -> &str {
-        &self.account
-    }
-
-    fn profile(&self) -> Option<&str> {
-        self.profile.as_deref()
-    }
-
-    fn signer_source(&self) -> &SignerSourceFlags {
-        &self.signer_source
-    }
-
-    fn network(&self) -> Option<TargetNetwork> {
-        self.network
-    }
-
-    fn rpc_url(&self) -> Option<&str> {
-        self.rpc_url.as_deref()
-    }
-
-    fn secondary_rpc_url(&self) -> Option<&str> {
-        self.secondary_rpc_url.as_deref()
-    }
-
-    fn timeout_seconds(&self) -> u64 {
-        self.timeout_seconds
-    }
-}
+impl_common_args_view!(MigrateVerifierArgs);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Result envelope types

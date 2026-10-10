@@ -54,6 +54,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar-agent-smart-account-acceptance` crate, so an isolated test build of
   smart-account excludes the browser client, the MCP server, the WebAuthn
   bridge, and those three crates.
+- Breaking (CLI and smart-account API): `smart-account rules verify-pins`,
+  `signers list`, and `signers refresh` load no signer and accept mainnet
+  profiles. They no longer take `--signer-secret-env`, `--sign-with-ledger`, or
+  `--account-index`; the optional `--source-account <G>` names an existing
+  account as the simulation source. On a persisted profile they need
+  `profile rotate-audit-key` first, and otherwise refuse with
+  `audit.chain_key_unavailable`. The smart-account crate's
+  `ContextRuleManager::verify_rule_wasm_pins` takes an optional source account;
+  `None` simulates from the sentinel account without an account lookup.
 
 ### Fixed
 

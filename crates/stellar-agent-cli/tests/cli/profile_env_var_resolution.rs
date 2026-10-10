@@ -1303,9 +1303,7 @@ fn guarded_verbs(endpoint: &str) -> Vec<GuardedVerb> {
             takes_network_flags: true,
         });
     }
-    let rule_verbs: [(&'static str, &[&str]); 16] = [
-        ("signers list", &["signers", "list", "--rule-id", "0"]),
-        ("signers refresh", &["signers", "refresh", "--rule-id", "0"]),
+    let rule_verbs: [(&'static str, &[&str]); 13] = [
         (
             "signers add",
             &[
@@ -1377,10 +1375,6 @@ fn guarded_verbs(endpoint: &str) -> Vec<GuardedVerb> {
             ],
         ),
         ("rules delete", &["rules", "delete", "--rule-id", "0"]),
-        (
-            "rules verify-pins",
-            &["rules", "verify-pins", "--rule-id", "0"],
-        ),
         (
             "rules add-policy",
             &["rules", "add-policy", "--rule-id", "0"],
@@ -1589,7 +1583,7 @@ fn guarded_table_failures(
 ) -> Vec<String> {
     let mut failures = Vec::new();
     let verbs = guarded_verbs(&endpoint.https_uri());
-    assert_eq!(verbs.len(), 36, "the table covers every guarded path");
+    assert_eq!(verbs.len(), 33, "the table covers every guarded path");
     for verb in &verbs {
         let Some(expected) = expected_code(verb) else {
             continue;
@@ -1639,11 +1633,15 @@ fn every_guarded_path_refuses_a_mainnet_profile_before_endpoint_contact() {
 /// `profile.network_flag_mismatch`. `--rpc-url` names the counter, so the
 /// zero-connection assertion observes the endpoint the command is given. The
 /// rows marked `takes_network_flags: false` accept neither flag.
+///
+/// `rules verify-pins`, `signers list`, and `signers refresh` have no
+/// structural refusal and take no signer flag; the flag check refuses them
+/// the same way.
 #[test]
 fn every_guarded_path_refuses_a_mainnet_flag_without_a_profile() {
     let endpoint = connection_counter();
     let home = tempfile::tempdir().unwrap();
-    let failures = guarded_table_failures(
+    let mut failures = guarded_table_failures(
         home.path(),
         &endpoint,
         &[
@@ -1657,6 +1655,43 @@ fn every_guarded_path_refuses_a_mainnet_flag_without_a_profile() {
                 .then_some("profile.network_flag_mismatch")
         },
     );
+    let counter_uri = endpoint.https_uri();
+    for tail in [
+        ["rules", "verify-pins"],
+        ["signers", "list"],
+        ["signers", "refresh"],
+    ] {
+        let mut argv = vec!["smart-account"];
+        argv.extend(tail);
+        argv.extend([
+            "--account",
+            ACCOUNT_C,
+            "--rule-id",
+            "0",
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            &counter_uri,
+        ]);
+        let before = endpoint.accepted().expect("connection count");
+        let run = run_cli(home.path(), None, &argv);
+        let connections = endpoint.accepted().expect("connection count") - before;
+        let code = serde_json::from_str::<Value>(run.stdout.trim())
+            .ok()
+            .and_then(|json| json["error"]["code"].as_str().map(str::to_owned));
+        if run.code != 1
+            || code.as_deref() != Some("profile.network_flag_mismatch")
+            || connections != 0
+        {
+            failures.push(format!(
+                "`{}`: exit {}, code {code:?}, {connections} connection(s); stdout={} stderr={}",
+                tail.join(" "),
+                run.code,
+                run.stdout.trim(),
+                run.stderr.lines().last().unwrap_or_default()
+            ));
+        }
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 

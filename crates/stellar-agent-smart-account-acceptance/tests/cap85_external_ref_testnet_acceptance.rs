@@ -1120,7 +1120,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
 
     // ── Proof 3b: verify_rule_wasm_pins reports drift ───────────────────────
     let pins = manager
-        .verify_rule_wasm_pins(smart_account_sc, rule_id, &bootstrap_g, &rid())
+        .verify_rule_wasm_pins(smart_account_sc, rule_id, Some(&bootstrap_g), &rid())
         .await
         .expect("verify_rule_wasm_pins must return a report");
     assert_eq!(pins.verifier_pin_status, PinStatus::Drift);
