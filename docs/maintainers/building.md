@@ -602,12 +602,14 @@ The same script backs the `Testnet acceptance` workflow
 (`.github/workflows/testnet.yml`), which runs on manual dispatch (with an
 optional suite filter input) and on a weekly schedule; it is deliberately not
 part of per-push CI. The WebAuthn suite needs a Chromium binary on `PATH` (or
-the `CHROME` env var); the multicall happy-path test skips itself unless
-`STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS` and
+the `CHROME` env var). The live multicall cases
+`h1_happy_path_3_transfer_bundle` and
+`h5_bundle_under_a_rule_other_than_0_checks_its_signer_set` skip themselves
+unless `STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS` and
 `STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL` are set. The workflow does not set
-those variables, so the multicall happy path runs only where a router
-deployment is available; the driver surfaces such self-skips as skip markers
-in the run summary so a green leg stays explicit about what did not execute.
+those variables, so those two cases run only where a router deployment is
+available. The driver reports each self-skip as a skip marker in the run
+summary, so a green leg states what did not execute.
 
 #### CAP-85 external-reference suites
 
@@ -658,23 +660,62 @@ optimizer state and version, and the SHA-256. When the digest changes, update
 `WASM_PINS` in the crate's `build.rs`, and `CAP85_BEACON_WASM_SHA256` in
 `src/cap85_beacon.rs` together.
 
+#### Multicall router
+
+`smart-account multicall` and the live multicall suite submit each bundle
+through a deployed router contract. Its source is the independent Cargo
+workspace `contracts/multicall-router/` (excluded from the wallet workspace,
+`publish = false`). Its one function, `exec`, requires the caller's
+authorization, invokes the bundle's entries in input order, and returns their
+results in that order. The built Wasm, its build record, and the build script
+live in `crates/stellar-agent-smart-account/vendor/multicall-router/v0.1.0/`.
+The smart-account crate embeds it as `multicall::MULTICALL_WASM` and pins its
+SHA-256 in `build.rs` and in `MULTICALL_WASM_SHA256`. That constant is the
+registry's trust anchor. `register-multicall` refuses another digest, a lookup
+refuses an entry with another digest, and the submit path requires both RPCs
+to report it as the router's on-chain Wasm hash.
+
+To rebuild the router, install the toolchain and stellar-cli 28.1.0, built
+with host rustc 1.98.0, then run the build script:
+
+```bash
+rustup toolchain install 1.99.0 --profile minimal --target wasm32v1-none
+rustup toolchain install 1.98.0 --profile minimal
+RUSTUP_TOOLCHAIN=1.98.0 cargo install --locked stellar-cli --version 28.1.0
+crates/stellar-agent-smart-account/vendor/multicall-router/v0.1.0/build.sh
+```
+
+The script refuses a `stellar` whose first `--version` line is not
+`stellar 28.1.0 (c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd)`. It builds a copy
+of the tracked source with `RUSTUP_TOOLCHAIN=1.99.0` and
+`stellar contract build --locked`, and copies the Wasm into the vendor
+directory. It prints the rustc, stellar-cli, and soroban-sdk versions, the
+optimizer state and version, and the SHA-256. When the digest changes, update
+`REFERENCE.md` in the vendor directory, the `multicall_router.wasm` row of
+`WASM_PINS` in the crate's `build.rs`, and `MULTICALL_WASM_SHA256` in
+`src/multicall.rs` together.
+
+A registry entry with another digest fails lookup, and `register-multicall`
+refuses to replace it. Remove it with `smart-account unregister-multicall` on
+its normal path, without `--force`. Then register the address of a router
+deployed from the new Wasm with the new digest.
+
 ## Vendored Wasm rebuild
 
 The smart-account crate vendors the contract Wasm files that the wallet uploads
 or recognizes under `crates/stellar-agent-smart-account/vendor/`.
 Each rebuildable file has a record naming its source, toolchain, stellar-cli
-binary, build command, and digest. The multicall record documents its frozen
-exception.
+binary, build command, and digest.
 
 ### What the workflow proves
 
 The `vendored-wasm` workflow (`.github/workflows/vendored-wasm.yml`) runs
 `.github/scripts/rebuild-vendored-wasm.sh`, which holds the manifest of
-rebuildable files, the one exception, and every pinned version.
+rebuildable files, the exception list, and every pinned version.
 
 - The tree check runs on every pull request, every push to `main`, every tag,
   twice a week, and on dispatch. It fails unless every tracked Wasm file is a
-  manifest file, the exception, or out of scope. Each vendored file must equal
+  manifest file, an exception, or out of scope. Each vendored file must equal
   its record and, where one exists, its `WASM_PINS` row in `build.rs`. Every
   `include_bytes!` or `include_str!` in the crate's `src/` must name one string
   literal that resolves to a vendored file. In every other crate's `src/`, each
@@ -717,8 +758,9 @@ rebuildable files, the one exception, and every pinned version.
   Its `test-helpers` and `deploy-cli` assertions run when those features are
   enabled. Its fixture-exclusion test runs without `test-helpers`.
   The ordinary `ci.yml` test job runs both feature selections.
-- The multicall router is the exception: its source is not in the repository,
-  so the workflow holds it at one frozen digest.
+- The exception list is empty, so the `rebuild` job rebuilds every vendored
+  file. An exception is a vendored file that no pinned source rebuilds; the
+  tree check holds its bytes at one frozen digest.
 
 The `vendored-wasm` job reads every job result and is the check to require.
 
@@ -817,9 +859,9 @@ Adding a vendored file takes, in one change:
 
 A constant or allowlist entry pinned to the file also takes its assertion in
 both `src/vendored_wasm_tests.rs` and `tests/vendored_wasm_release_cfg.rs`,
-plus its entry in the script's `DEFINITIONS` list. Removing the exception is
-deleting its line. A new toolchain or target needs no workflow change:
-the `rebuild` job installs every pair that `--list-toolchains` prints.
+plus its entry in the script's `DEFINITIONS` list. A new toolchain or target
+needs no workflow change: the `rebuild` job installs every pair that
+`--list-toolchains` prints.
 
 Each `build.sh` re-vendors its file through the script's `--exec` mode, with the
 same refusals and environment allowlist as the workflow. When the printed digest
@@ -851,10 +893,10 @@ and every constant and allowlist entry that pins it in the same change.
   encoded-string literal, from a tracked file without the Wasm magic that the
   build decodes, or from a file that a build script writes to `OUT_DIR`. Each is
   a visible code change.
-- For an in-tree source (`contracts/cap85-beacon/`), the rebuild proves the
-  bytes match the committed source; review of the source diff remains the
-  defense. A compromise of an upstream source at its pinned commit is outside
-  this check.
+- For the in-tree sources (`contracts/cap85-beacon/` and
+  `contracts/multicall-router/`), the rebuild proves the bytes match the
+  committed source; review of the source diff remains the defense. A
+  compromise of an upstream source at its pinned commit is outside this check.
 - Two checks prove a cached stellar-cli binary: its version line and the byte
   comparison of its output. A binary that writes the vendored bytes whatever
   its input passes both. Every workflow of a branch shares the cache. Code that
