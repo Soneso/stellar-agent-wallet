@@ -2181,7 +2181,7 @@ mod tests {
         // To avoid a 60-second test, we directly confirm that the sentinel is
         // detected by invoking the guard logic inline (a unit assertion).
         // Integration coverage of the full path is in
-        // tests/idempotent_submit_integration.rs.
+        // tests/network/idempotent_submit_integration.rs.
         let _ = client; // client would not be reached
         let result_is_zero = receipt.tx_hash == ZERO_HASH_SENTINEL;
         assert!(

@@ -4,7 +4,7 @@
 //! and must be run manually against the live Stellar testnet:
 //!
 //! ```text
-//! cargo test -p stellar-agent-network --test balances_live -- --ignored
+//! cargo test -p stellar-agent-network --test network balances_live:: -- --ignored
 //! ```
 //!
 //! The testnet RPC endpoint (`https://soroban-testnet.stellar.org`) may be
@@ -102,7 +102,7 @@ async fn live_fetch_unfunded_account_returns_not_found() {
 /// the native XLM balance is present and the USDC entry is absent from
 /// `balances` (absent trustlines are omitted, not surfaced as zero).
 ///
-/// Run manually: `cargo test -p stellar-agent-network --test balances_live -- --ignored`.
+/// Run manually: `cargo test -p stellar-agent-network --test network balances_live:: -- --ignored`.
 #[tokio::test]
 #[ignore]
 async fn live_fetch_trustline_not_held_is_omitted() {

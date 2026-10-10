@@ -3,7 +3,7 @@
 //! Gated with `#[ignore]` — run manually with:
 //!
 //! ```text
-//! cargo test -p stellar-agent-network --test pay_live -- --ignored
+//! cargo test -p stellar-agent-network --test network pay_live:: -- --ignored
 //! ```
 //!
 //! # Prerequisites

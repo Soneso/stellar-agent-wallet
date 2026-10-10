@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `smart_account` and `smart_account_test_helpers`; the vendored Wasm configuration
   test and the proxy-isolation test keep their own targets.
 - The core crate's integration tests run from one test target, `core`.
+- The network crate's offline integration tests run from two test targets,
+  `network` and `network_test_helpers`.
 - The nonce crate's integration tests run from one test target, `nonce`.
 - The MCP crate's offline integration tests run from two test targets, `mcp` and
   `owner_key_rewrite_integration`, and its live suites build only with

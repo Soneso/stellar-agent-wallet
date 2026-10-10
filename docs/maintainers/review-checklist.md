@@ -72,7 +72,7 @@ the review approves with no blocking findings.
   from a definitive endpoint refusal; that distinction controls reservation
   retention and sequence release.
 - Run both real-client tests in
-  `crates/stellar-agent-network/tests/submission_record_integration.rs`:
+  `crates/stellar-agent-network/tests/network/submission_record_integration.rs`:
   `a_transport_failure_after_the_record_returns_the_timeout_shape` and
   `a_refused_send_releases_the_reservation_and_frees_the_sequence`. Confirm that
   transport failures retain the submission for reconciliation and definitive

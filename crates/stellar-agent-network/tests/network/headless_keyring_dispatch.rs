@@ -1,10 +1,8 @@
 //! `init_platform_keyring_store` headless-backend dispatch.
 //!
-//! An integration test (not a `src/keyring.rs` unit test) because
-//! `stellar-agent-network`'s crate root carries `#![forbid(unsafe_code)]`,
-//! which cannot be locally overridden even for test-only `std::env::set_var`
-//! — this file is its own compilation unit and is not subject to that
-//! crate-level attribute.
+//! These integration tests use test-only `std::env::set_var` calls.
+//! The integration target permits local `unsafe_code` allowances; the library
+//! crate carries `#![forbid(unsafe_code)]`, which cannot be locally overridden.
 
 #![allow(
     clippy::unwrap_used,
