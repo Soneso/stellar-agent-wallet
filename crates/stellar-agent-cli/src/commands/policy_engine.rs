@@ -859,7 +859,7 @@ mod tests {
     // These tests drive `evaluate_value_moving_policy` directly against a
     // `PolicyEngineV1` built from a literal `PolicyDocument` (the same
     // construction convention as
-    // `stellar-agent-core/tests/policy_descriptor_equivalence.rs`'s
+    // `stellar-agent-core/tests/core/policy_descriptor_equivalence.rs`'s
     // `engine_derives_descriptor_and_denies_over_cap_pay`), rather than through
     // `build_v1_policy_engine`'s keyring/file-backed loader. The `policy_args`
     // literals below MUST stay byte-for-byte in sync with the shapes built by

@@ -22,7 +22,7 @@
 //! No feature flags required. Runs under default `cargo test`.
 //!
 //! ```text
-//! cargo test -p stellar-agent-core --test profile_scan_id_bound_test
+//! cargo test -p stellar-agent-core --test core profile_scan_id_bound_test
 //! ```
 
 #![allow(
