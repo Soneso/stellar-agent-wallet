@@ -50,7 +50,8 @@ vendor/oz-smart-account-multisig/v0.7.1/multisig_account_example.wasm|oz-v0.7.1|
 vendor/oz-webauthn-verifier/v0.7.1/multisig_webauthn_verifier_example.wasm|oz-v0.7.1|multisig-webauthn-verifier-example|1.94.0|oz-v0.7.1|release/multisig_webauthn_verifier_example.wasm
 vendor/oz-timelock-controller/v0.7.1/timelock_controller_example.wasm|oz-v0.7.1|timelock-controller-example|1.94.0|oz-v0.7.1|release/timelock_controller_example.wasm
 vendor/oz-threshold-policy/v0.7.1/multisig_threshold_policy_example.wasm|oz-v0.7.1|multisig-threshold-policy-example|1.94.0|oz-v0.7.1|release/multisig_threshold_policy_example.wasm
-vendor/cap85-beacon/v0.1.0/cap85_beacon.wasm|tree-contracts-cap85-beacon|-|1.98.0|tree-contracts-cap85-beacon|release/cap85_beacon.wasm"
+vendor/cap85-beacon/v0.1.0/cap85_beacon.wasm|tree-contracts-cap85-beacon|-|1.98.0|tree-contracts-cap85-beacon|release/cap85_beacon.wasm
+vendor/multicall-router/v0.1.0/multicall_router.wasm|tree-contracts-multicall-router|-|1.99.0|tree-contracts-multicall-router|release/multicall_router.wasm"
 
 S25_LINE="stellar 25.2.0"
 S28_LINE="stellar 28.1.0 (c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd)"
@@ -59,6 +60,7 @@ OZ_V071="3f81125bed3114cc93f5fca6d13240082050269a"
 RUSTC_194="rustc 1.94.0 (4a4ef493e 2026-03-02)"
 RUSTC_196="rustc 1.96.0 (ac68faa20 2026-05-25)"
 RUSTC_198="rustc 1.98.0 (88d9e12ae 2026-08-18)"
+RUSTC_199="rustc 1.99.0 (b940084d7 2026-09-28)"
 
 PASSED=0
 
@@ -245,7 +247,7 @@ new_case() {
   printf '%s\n' "$S25_LINE" >"$DATA/stellar-25.version"
   printf '%s\n' "$S28_LINE" >"$DATA/stellar-28.version"
   printf '%s\n' "$S25_LINE" >"$DATA/stellar.version"
-  printf '1.94.0|%s\n1.96.0|%s\n1.98.0|%s\n' "$RUSTC_194" "$RUSTC_196" "$RUSTC_198" >"$DATA/rustc"
+  printf '1.94.0|%s\n1.96.0|%s\n1.98.0|%s\n1.99.0|%s\n' "$RUSTC_194" "$RUSTC_196" "$RUSTC_198" "$RUSTC_199" >"$DATA/rustc"
   printf 'v0.7.2 %s\nv0.7.1 %s\n' "$OZ_V072" "$OZ_V071" >"$DATA/git-tags"
   printf '%s\n' "$REAL_GIT" >"$DATA/real-git"
   printf '%s\n' "$OZ" >"$DATA/oz-clone"
@@ -428,6 +430,17 @@ stage() {
   "$REAL_GIT" -C "$REPO" add -A
 }
 
+# Writes to $1 a copy of the script whose manifest lacks the cap85 beacon row
+# and whose exception list holds the beacon file at the digest $2 as a pin.
+exception_copy() {
+  ROW="$CAP85" LINE="EXCEPTIONS=\"$CAP85 $2 pin\"" awk '
+    $1 == ENVIRON["ROW"] { removed++; next }
+    $0 == "EXCEPTIONS=\"\"" { print ENVIRON["LINE"]; set++; next }
+    { print }
+    END { if (removed != 1 || set != 1) exit 3 }
+  ' "$SCRIPT" >"$1" || fail "exception copy: the beacon row or the empty exception list was not found exactly once"
+}
+
 V072_MULTISIG="vendor/oz-smart-account-multisig/v0.7.2/multisig_account_example.wasm"
 V072_TIMELOCK="vendor/oz-timelock-controller/v0.7.2/timelock_controller_example.wasm"
 V072_ED25519="vendor/oz-ed25519-verifier/v0.7.2/multisig_ed25519_verifier_example.wasm"
@@ -436,20 +449,20 @@ V071_THRESHOLD="vendor/oz-threshold-policy/v0.7.1/multisig_threshold_policy_exam
 V071_WEBAUTHN="vendor/oz-webauthn-verifier/v0.7.1/multisig_webauthn_verifier_example.wasm"
 V071_TIMELOCK="vendor/oz-timelock-controller/v0.7.1/timelock_controller_example.wasm"
 CAP85="vendor/cap85-beacon/v0.1.0/cap85_beacon.wasm"
-MULTICALL="vendor/multicall/v0.1.0/multicall.wasm"
+MULTICALL="vendor/multicall-router/v0.1.0/multicall_router.wasm"
 
 # ---------------------------------------------------------------------------
 # Cases
 # ---------------------------------------------------------------------------
 
-# 1. The honest tree passes: 14 builds with the expected packages,
+# 1. The honest tree passes: 15 builds with the expected packages,
 # toolchains, --locked, working directories, and target directories, under
 # the build environment allowlist.
 new_case c01
 run_full "SELFTEST_SENTINEL=1" "CARGO_INCREMENTAL=1" "HTTPS_PROXY=http://proxy.invalid:3128"
 expect_rc 0 "pass"
 expect_out "rebuild-vendored-wasm: PASS" "pass"
-expect_builds 14 "pass"
+expect_builds 15 "pass"
 while IFS='|' read -r path key pkg tc tkey output; do
   if [ "$pkg" = - ]; then
     want_args="contract build --locked"
@@ -463,19 +476,17 @@ while IFS='|' read -r path key pkg tc tkey output; do
   expect_column "$path" 7 match "pass"
   expect_column "$path" 10 pass "pass"
 done <<<"$ROWS"
-[ "$(awk -F '|' '{ print $4 }' "$DATA/log" | LC_ALL=C sort -u | awk 'END { print NR }')" = 5 ] ||
-  fail "pass: expected five target directories (one per tag, one per stellar_accounts.wasm row, one for the tree row)"
+[ "$(awk -F '|' '{ print $4 }' "$DATA/log" | LC_ALL=C sort -u | awk 'END { print NR }')" = 6 ] ||
+  fail "pass: expected six target directories (one per tag, one per stellar_accounts.wasm row, one per tree row)"
 if grep -E 'env=.*(SELFTEST_SENTINEL|CARGO_INCREMENTAL)' "$DATA/log" >/dev/null; then
   fail "pass: a build saw SELFTEST_SENTINEL or CARGO_INCREMENTAL"
 fi
-[ "$(awk -F '|' '{ n = split(substr($7, 5), v, " "); for (i = 1; i <= n; i++) if (v[i] == "HTTPS_PROXY") c++ } END { print c + 0 }' "$DATA/log")" = 14 ] ||
+[ "$(awk -F '|' '{ n = split(substr($7, 5), v, " "); for (i = 1; i <= n; i++) if (v[i] == "HTTPS_PROXY") c++ } END { print c + 0 }' "$DATA/log")" = 15 ] ||
   fail "pass: a build did not see HTTPS_PROXY"
-expect_column "$MULTICALL" 7 frozen-match "pass"
-expect_column "$MULTICALL" 10 "pass (exception, not rebuilt)" "pass"
-pass "1 honest tree: 14 builds, allowlisted environment, every row matches"
+pass "1 honest tree: 15 builds, allowlisted environment, every row matches"
 
 # 2. Rebuilt bytes differ for one row: only that row's cmp fails.
-for target_row in "$V072_MULTISIG" "$V071_THRESHOLD" "$V072_ACCOUNTS" "$CAP85"; do
+for target_row in "$V072_MULTISIG" "$V071_THRESHOLD" "$V072_ACCOUNTS" "$CAP85" "$MULTICALL"; do
   new_case "c02-$(basename "$(dirname "$(dirname "$target_row")")")-$(basename "$(dirname "$target_row")")"
   cp "$REPO/$CRATE/$target_row" "$CASE/different.wasm"
   printf 'x' >>"$CASE/different.wasm"
@@ -485,9 +496,9 @@ for target_row in "$V072_MULTISIG" "$V071_THRESHOLD" "$V072_ACCOUNTS" "$CAP85"; 
   expect_column "$target_row" 7 MISMATCH "bytes differ for $target_row"
   expect_column "$target_row" 10 "FAIL; vendored sha256 $(sha_of "$REPO/$CRATE/$target_row") size *" "bytes differ for $target_row"
   expect_others_match "$target_row" "bytes differ for $target_row"
-  expect_builds 14 "bytes differ for $target_row"
+  expect_builds 15 "bytes differ for $target_row"
 done
-pass "2 differing bytes fail only their row (v0.7.2, v0.7.1, deps, and the cap85 row, which is built last)"
+pass "2 differing bytes fail only their row (v0.7.2, v0.7.1, deps, the cap85 row, and the router row, which is built last)"
 
 # 3. A WASM_PINS digest differs from its file: the tree check names it, and
 # every row is still built.
@@ -500,8 +511,8 @@ expect_rc 1 "WASM_PINS digest"
 expect_out "tree-check [wasm-pins] $CRATE/$V072_TIMELOCK: the WASM_PINS digest" "WASM_PINS digest"
 expect_column "$V072_TIMELOCK" 8 MISMATCH "WASM_PINS digest"
 expect_column "$V072_TIMELOCK" 7 match "WASM_PINS digest"
-expect_builds 14 "WASM_PINS digest"
-pass "3 a WASM_PINS digest that differs from its file fails, and all 14 rows are built"
+expect_builds 15 "WASM_PINS digest"
+pass "3 a WASM_PINS digest that differs from its file fails, and all 15 rows are built"
 
 # 4. A record digest differs from its file; a record with a second distinct
 # 64-hex token fails too.
@@ -563,22 +574,37 @@ expect_out "tree-check [wasm-pins] $CRATE/$V071_TIMELOCK: a nopin file has a WAS
 expect_out "WASM_PINS names $V071_TIMELOCK, which is no pin row or pin exception" "WASM_PINS row of a nopin file"
 pass "5 a missing pin row, an extra WASM_PINS path, an unreadable block, and a row for a nopin file fail"
 
-# 6. The exception's file, pin, and record changed together: the frozen
-# digest fails.
-new_case c06
-old=$(sha_of "$REPO/$CRATE/$MULTICALL")
-printf 'x' >>"$REPO/$CRATE/$MULTICALL"
-new=$(sha_of "$REPO/$CRATE/$MULTICALL")
+# 6. Exceptions, through a copy of the script whose exception list holds the
+# cap85 beacon file at its digest and whose manifest lacks the beacon row. The
+# honest tree passes with that file at its frozen digest and unbuilt. Its
+# file, pin, and record changed together fail on the frozen digest.
+new_case c06a
+frozen=$(sha_of "$REPO/$CRATE/$CAP85")
+exception_copy "$CASE/rebuild-copy.sh" "$frozen"
+run_full "SCRIPT=$CASE/rebuild-copy.sh"
+expect_rc 0 "exception at its frozen digest"
+expect_out "rebuild-vendored-wasm: PASS" "exception at its frozen digest"
+expect_column "$CAP85" 7 frozen-match "exception at its frozen digest"
+expect_column "$CAP85" 10 "pass (exception, not rebuilt)" "exception at its frozen digest"
+expect_builds 14 "exception at its frozen digest"
+if grep -qF "|cwd=$WORK/src/tree-contracts-cap85-beacon|" "$DATA/log"; then
+  fail "exception at its frozen digest: the exception's source was built"
+fi
+new_case c06b
+old=$(sha_of "$REPO/$CRATE/$CAP85")
+exception_copy "$CASE/rebuild-copy.sh" "$old"
+printf 'x' >>"$REPO/$CRATE/$CAP85"
+new=$(sha_of "$REPO/$CRATE/$CAP85")
 swap_digest "$REPO/$CRATE/build.rs" "$old" "$new"
-swap_digest "$REPO/$CRATE/vendor/multicall/v0.1.0/REFERENCE.md" "$old" "$new"
+swap_digest "$REPO/$CRATE/vendor/cap85-beacon/v0.1.0/REFERENCE.md" "$old" "$new"
 stage
-run_full
+run_full "SCRIPT=$CASE/rebuild-copy.sh"
 expect_rc 1 "exception frozen digest"
-expect_out "tree-check [frozen] $CRATE/$MULTICALL: the exception's sha256 $new differs from its frozen digest $old" "exception frozen digest"
-expect_column "$MULTICALL" 7 frozen-MISMATCH "exception frozen digest"
-expect_column "$MULTICALL" 8 match "exception frozen digest"
-expect_column "$MULTICALL" 9 match "exception frozen digest"
-pass "6 an exception changed with its pin and record fails on its frozen digest"
+expect_out "tree-check [frozen] $CRATE/$CAP85: the exception's sha256 $new differs from its frozen digest $old" "exception frozen digest"
+expect_column "$CAP85" 7 frozen-MISMATCH "exception frozen digest"
+expect_column "$CAP85" 8 match "exception frozen digest"
+expect_column "$CAP85" 9 match "exception frozen digest"
+pass "6 an exception passes at its frozen digest unbuilt, and fails when changed with its pin and record"
 
 # 7. Completeness.
 new_case c07a
@@ -743,7 +769,7 @@ pass "10 a builder with another version line stops the run before any build"
 
 # 11. A toolchain whose rustc --version differs fails before any build.
 new_case c11
-printf '1.94.0|%s\n1.96.0|rustc 1.96.0 (0000000 2026-05-25)\n1.98.0|%s\n' "$RUSTC_194" "$RUSTC_198" >"$DATA/rustc"
+printf '1.94.0|%s\n1.96.0|rustc 1.96.0 (0000000 2026-05-25)\n1.98.0|%s\n1.99.0|%s\n' "$RUSTC_194" "$RUSTC_198" "$RUSTC_199" >"$DATA/rustc"
 run_full
 expect_rc 2 "rustc string"
 expect_out "precondition failed: rustc of toolchain 1.96.0 prints 'rustc 1.96.0 (0000000 2026-05-25)'" "rustc string"
@@ -819,7 +845,7 @@ expect_rc 1 "failing and stale rows"
 expect_column "$V071_WEBAUTHN" 7 build-failed "failing and stale rows"
 expect_column "$V072_TIMELOCK" 7 missing-output "failing and stale rows"
 expect_column "$V072_MULTISIG" 7 match "failing and stale rows"
-expect_builds 14 "failing and stale rows"
+expect_builds 15 "failing and stale rows"
 pass "13 a failing build fails its row, and a stale output in a shared target directory does not pass a later row"
 
 # 14. A build that rewrites a vendored file fails the end-of-run check.
@@ -1032,8 +1058,9 @@ STUBS="$NO_STUBS" CASE="$TMP" run_script -- --list-toolchains
 expect_rc 0 "list-toolchains"
 [ "$(cat "$OUT")" = "1.94.0 wasm32v1-none
 1.96.0 wasm32v1-none
-1.98.0 wasm32v1-none" ] || fail "list-toolchains printed: $(cat "$OUT")"
-pass "21 --list-toolchains prints the three toolchain and target pairs"
+1.98.0 wasm32v1-none
+1.99.0 wasm32v1-none" ] || fail "list-toolchains printed: $(cat "$OUT")"
+pass "21 --list-toolchains prints the four toolchain and target pairs"
 
 # 22. cfg rules, one edit at a time in the scratch src/.
 new_case c22a

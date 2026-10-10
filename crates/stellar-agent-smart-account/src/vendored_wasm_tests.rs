@@ -60,7 +60,7 @@ const TIMELOCK_V071: &str = "vendor/oz-timelock-controller/v0.7.1/timelock_contr
 const THRESHOLD_V071: &str =
     "vendor/oz-threshold-policy/v0.7.1/multisig_threshold_policy_example.wasm";
 const CAP85_BEACON: &str = "vendor/cap85-beacon/v0.1.0/cap85_beacon.wasm";
-const MULTICALL: &str = "vendor/multicall/v0.1.0/multicall.wasm";
+const MULTICALL: &str = "vendor/multicall-router/v0.1.0/multicall_router.wasm";
 
 /// The 15 vendored Wasm files, each with its bytes from a direct
 /// `include_bytes!` of its path.
@@ -145,7 +145,7 @@ const VENDORED: &[VendoredFile] = &[
     },
     VendoredFile {
         path: MULTICALL,
-        bytes: include_bytes!("../vendor/multicall/v0.1.0/multicall.wasm"),
+        bytes: include_bytes!("../vendor/multicall-router/v0.1.0/multicall_router.wasm"),
     },
 ];
 

@@ -33,8 +33,7 @@
 //! # Reference cross-check
 //!
 //! - Router contract `exec(caller, invocations: Vec<(Address, Symbol, Vec<Val>)>)`:
-//!   Meridian Pay smart-wallet-demo-app router, SHA `8f4bfdc`,
-//!   `contracts/router/src/lib.rs:21-22`.
+//!   the in-tree router contract `contracts/multicall-router/src/lib.rs`.
 //! - SAC `transfer(from, to, amount)` ABI: soroban-sdk SAC derive macro; three-arg
 //!   shape required by `decompose_bundle` recognition criteria (bundle.rs:288-325).
 //! - `PerPeriodCapCriterion` evaluation (per_period_cap.rs:231-): denies when

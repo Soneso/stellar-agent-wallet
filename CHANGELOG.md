@@ -63,6 +63,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `audit.chain_key_unavailable`. The smart-account crate's
   `ContextRuleManager::verify_rule_wasm_pins` takes an optional source account;
   `None` simulates from the sentinel account without an account lookup.
+- The multicall router Wasm that `smart-account multicall` and the live multicall
+  suite target builds from the in-tree contract `contracts/multicall-router/`
+  with a pinned toolchain, so the vendored router uploads on protocol 29
+  networks. `MULTICALL_WASM_SHA256` changes with it: remove an existing
+  registration with `smart-account unregister-multicall` (no `--force`), then
+  register a router deployed from the new Wasm.
 
 ### Fixed
 

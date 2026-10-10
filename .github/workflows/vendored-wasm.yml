@@ -4,7 +4,7 @@ name: vendored-wasm
 # recognizes is rebuilt from its pinned source with pinned tools, and the
 # rebuilt bytes equal the vendored file. Each vendored file also equals its
 # record and, where one exists, its build.rs WASM_PINS row. The manifest,
-# the one exception, and the pins live in .github/scripts/rebuild-vendored-wasm.sh.
+# the exception list, and the pins live in .github/scripts/rebuild-vendored-wasm.sh.
 #
 # The check job runs the tree check and the script's self-test on every event.
 # When a change can affect a rebuild, two macOS jobs provide the pinned
