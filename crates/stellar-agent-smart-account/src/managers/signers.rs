@@ -1638,8 +1638,9 @@ impl SignersManager {
     ///
     /// - `smart_account` — the smart-account contract's [`ScAddress`].
     /// - `rule_id` — the context rule to query.
-    /// - `source_account_strkey` — `Some(G...)` for a real fee-paying account
-    ///   or `None` for read-only simulate fallback.
+    /// - `source_account_strkey`: the source of the read simulations. `None`
+    ///   simulates from [`SIMULATE_SENTINEL_G`] with no account lookup;
+    ///   `Some(G)` fetches the account `G`, which must exist. No fee is paid.
     /// - `request_id` — caller-supplied UUID for audit-log correlation.
     ///
     /// # Errors
@@ -1816,7 +1817,9 @@ impl SignersManager {
     ///
     /// - `smart_account` — the smart-account contract's [`ScAddress`].
     /// - `rule_id` — the context rule to baseline.
-    /// - `source_account_strkey` — G-strkey of the fee-paying account.
+    /// - `source_account_strkey`: the source of the read simulations. `None`
+    ///   simulates from [`SIMULATE_SENTINEL_G`] with no account lookup;
+    ///   `Some(G)` fetches the account `G`, which must exist. No fee is paid.
     /// - `options`: whether a differing state is recorded, and the verifier
     ///   overrides of the reconciliation.
     /// - `request_id` — caller-supplied UUID for audit-log correlation.
@@ -3879,7 +3882,9 @@ impl SignersManager {
     ///
     /// - `smart_account` — the smart-account contract's [`ScAddress`].
     /// - `rule_id` — the context rule whose policies are examined.
-    /// - `source_account_strkey` — G-strkey of the fee-paying account.
+    /// - `source_account_strkey`: the source of the read simulations. `None`
+    ///   simulates from [`SIMULATE_SENTINEL_G`] with no account lookup;
+    ///   `Some(G)` fetches the account `G`, which must exist. No fee is paid.
     /// - `request_id` — caller-supplied UUID for error reporting.
     ///
     /// # Errors
@@ -5322,7 +5327,9 @@ impl SignersManager {
     ///
     /// - `smart_account` — the smart-account contract's [`ScAddress`].
     /// - `rule_id` — the context rule whose policies are classified.
-    /// - `source_account_strkey` — G-strkey of the fee-paying account.
+    /// - `source_account_strkey`: the source of the read simulations. `None`
+    ///   simulates from [`SIMULATE_SENTINEL_G`] with no account lookup;
+    ///   `Some(G)` fetches the account `G`, which must exist. No fee is paid.
     ///
     /// # Errors
     ///

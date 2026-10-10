@@ -157,8 +157,9 @@ pub enum SmartAccountSubcommand {
     /// - `smart-account signers set-weighted-threshold`: changes a weighted threshold.
     /// - `smart-account signers set-signer-weight`: changes one signer's weight.
     ///
-    /// All subcommands structurally refuse mainnet and invoke
-    /// `Signer::sign_auth_digest` exclusively.
+    /// The signing subcommands structurally refuse mainnet and sign only
+    /// through `Signer::sign_auth_digest`. `list` and `refresh` load no
+    /// signer, sign nothing, and accept mainnet.
     Signers(Box<signers::SignersArgs>),
 
     /// Deploy the OZ WebAuthn-verifier WASM contract and record the address in the

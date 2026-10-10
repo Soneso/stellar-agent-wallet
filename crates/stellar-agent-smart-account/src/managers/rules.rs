@@ -2684,6 +2684,17 @@ impl ContextRuleManager {
     ///   contracts (Delegated-only rule) and, for the policy half, the pin
     ///   record holds no policy pin.
     ///
+    /// # Source account
+    ///
+    /// `source_account_strkey` is the source of the `get_context_rule`
+    /// simulation that reads the rule's addresses. `None` simulates from
+    /// [`SIMULATE_SENTINEL_G`] with no account lookup. `Some(G)` fetches the
+    /// account `G`, which must exist, and simulates from it. The Wasm-hash
+    /// reads use `getLedgerEntries` and take no source account. No path signs
+    /// or submits a transaction.
+    ///
+    /// [`SIMULATE_SENTINEL_G`]: stellar_agent_core::constants::SIMULATE_SENTINEL_G
+    ///
     /// # Requires `signers_manager`
     ///
     /// The manager must have been constructed with `with_signers_manager`.
@@ -2700,7 +2711,7 @@ impl ContextRuleManager {
         &self,
         smart_account: ScAddress,
         rule_id: u32,
-        source_account_strkey: &str,
+        source_account_strkey: Option<&str>,
         request_id: &str,
     ) -> Result<VerifyPinsResult, SaError> {
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
@@ -2714,7 +2725,7 @@ impl ContextRuleManager {
             .fetch_verifier_and_policy_addresses(
                 smart_account.clone(),
                 rule_id,
-                Some(source_account_strkey),
+                source_account_strkey,
             )
             .await?;
 
@@ -8794,7 +8805,7 @@ mod tests {
         .unwrap();
 
         let result = manager
-            .verify_rule_wasm_pins(smart_account, 1, SIMULATE_SENTINEL_G, "test-req-id")
+            .verify_rule_wasm_pins(smart_account, 1, None, "test-req-id")
             .await;
 
         assert!(

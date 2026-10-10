@@ -1199,7 +1199,7 @@ pub enum ValidationError {
         detail: String,
     },
 
-    /// A value-moving signing verb refused because the profile's audit
+    /// A verb that writes audit rows refused because the profile's audit
     /// chain-root HMAC key could not be loaded from the platform keyring.
     ///
     /// `stellar-agent profile init` mints the audit-log keyring-coordinate
@@ -1207,11 +1207,11 @@ pub enum ValidationError {
     /// audit chain-root key until `stellar-agent profile rotate-audit-key`
     /// mints one. This is the fail-closed pre-flight: the verb proves the
     /// audit writer is acquirable BEFORE any signing key is touched or
-    /// transaction submitted, refusing here instead of signing unaudited.
+    /// transaction submitted, refusing here instead of proceeding unaudited.
     ///
     /// Distinct from [`ValidationError::AuditLogNotFound`]: that variant is
     /// `stellar-agent audit verify` finding no log file to verify (a read-path
-    /// concern); this variant is a signing verb finding the audit chain-root
+    /// concern); this variant is an audited verb finding the audit chain-root
     /// key itself unavailable (a write-path pre-flight). Distinct from
     /// [`ValidationError::AuditWriterOpenFailed`]: that variant covers a key
     /// that loaded successfully but whose writer could not be opened (e.g. a
@@ -1221,15 +1221,15 @@ pub enum ValidationError {
     ///
     /// `"audit.chain_key_unavailable"`.
     #[error(
-        "profile '{profile}' has no audit chain-root key available; signing refuses to \
-         proceed unaudited — run `stellar-agent profile rotate-audit-key {profile}` to mint one"
+        "profile '{profile}' has no audit chain-root key available; the command refuses to \
+         proceed unaudited: run `stellar-agent profile rotate-audit-key {profile}` to mint one"
     )]
     AuditChainKeyUnavailable {
         /// The profile name whose audit chain-root key is unavailable.
         profile: String,
     },
 
-    /// A value-moving signing verb refused because the profile's audit writer
+    /// A verb that writes audit rows refused because the profile's audit writer
     /// could not be opened, even though its audit chain-root HMAC key loaded
     /// successfully.
     ///
@@ -1242,7 +1242,7 @@ pub enum ValidationError {
     /// path or key mismatch requires resolving the conflicting registration
     /// (or restarting the process), not minting a new key. Shares the same
     /// fail-closed pre-flight discipline: the verb refuses here instead of
-    /// signing unaudited.
+    /// proceeding unaudited.
     ///
     /// # Wire code
     ///
@@ -1253,8 +1253,8 @@ pub enum ValidationError {
     /// unauditable, refusing").
     #[error(
         "profile '{profile}' has an audit chain-root key but its audit writer could not be \
-         opened; signing refuses to proceed unaudited — this is not fixed by rotating the \
-         audit key; check for a conflicting audit-log path or key registration for this \
+         opened; the command refuses to proceed unaudited. Rotating the audit key does not \
+         fix this; check for a conflicting audit-log path or key registration for this \
          profile name"
     )]
     AuditWriterOpenFailed {
@@ -1262,7 +1262,7 @@ pub enum ValidationError {
         profile: String,
     },
 
-    /// A value-moving signing verb refused because the profile's audit log no
+    /// A verb that writes audit rows refused because the profile's audit log no
     /// longer contains the chain tip its keyring-held anchor names.
     ///
     /// The hash chain links each entry to its predecessor and the per-file
@@ -1289,8 +1289,8 @@ pub enum ValidationError {
     /// `"audit.tip_anchor_mismatch"`.
     #[error(
         "profile '{profile}' has an audit log whose chain tip is not the one its anchor \
-         names ({reason}); signing refuses to proceed against a log that may have been \
-         rolled back or truncated — investigate, then run \
+         names ({reason}); the command refuses to proceed against a log that may have been \
+         rolled back or truncated. Investigate, then run \
          `stellar-agent audit reanchor --profile {profile} --acknowledge-rollback` to accept \
          the current tip"
     )]
@@ -1305,7 +1305,7 @@ pub enum ValidationError {
         reason: String,
     },
 
-    /// A value-moving signing verb refused because the profile's audit log
+    /// A verb that writes audit rows refused because the profile's audit log
     /// could not be used, for a reason that is about the LOG rather than about
     /// the chain-root key or its registration.
     ///
@@ -1326,8 +1326,8 @@ pub enum ValidationError {
     /// proceed: the action is unauditable, so it is refused. The remedy is what
     /// differs, and that is in the message.
     #[error(
-        "profile '{profile}' cannot be audited: {detail}; signing refuses to proceed \
-         unaudited — see docs/maintainers/audit-log-recovery.md"
+        "profile '{profile}' cannot be audited: {detail}; the command refuses to proceed \
+         unaudited. See docs/maintainers/audit-log-recovery.md"
     )]
     AuditLogUnusable {
         /// The profile whose audit log could not be used.

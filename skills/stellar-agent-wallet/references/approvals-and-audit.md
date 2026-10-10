@@ -502,7 +502,9 @@ both policy engines. It is distinct from the writer's post-confirm emission
 (the `value_action_submitted` row above), which stays non-fatal: the
 transaction has already committed by then, so refusing helps nobody.
 Read-only tools and the build/simulate stages of two-phase verbs never reach
-this pre-flight. The zero-config synthesized profile `pay`/`claim`/
+this pre-flight. `smart-account rules verify-pins`, `signers list`, and
+`signers refresh` record audit rows, so they reach it without loading a signer.
+The zero-config synthesized profile `pay`/`claim`/
 `accounts create` fall back to when no profile was NAMED and no `default.toml`
 exists stays fail-open for this specific check, matching its documented
 no-profile-required posture; a profile named through `--profile` or

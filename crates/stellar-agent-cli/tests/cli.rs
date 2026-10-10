@@ -46,6 +46,8 @@ mod profile_show_load_failure_codes;
 mod profile_show_profile_flag_equivalence;
 #[path = "cli/reconcile_pass_discipline.rs"]
 mod reconcile_pass_discipline;
+#[path = "cli/smart_account_signer_free.rs"]
+mod smart_account_signer_free;
 #[path = "cli/staged_submit_probe_ordering.rs"]
 mod staged_submit_probe_ordering;
 #[path = "cli/tx_receipt_clear_integration.rs"]

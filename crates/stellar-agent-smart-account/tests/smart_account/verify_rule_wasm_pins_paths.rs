@@ -16,11 +16,10 @@ use stellar_agent_smart_account::managers::rules::{
     ContextRuleManager, ContextRuleManagerConfig, PinStatus, parse_c_strkey_to_smart_account,
 };
 use stellar_agent_smart_account::managers::signers::build_external_signer_scval;
-use stellar_agent_test_support::xdr_fixtures::{
-    account_entry_xdr_with_seq, contract_instance_ledger_entries_json,
-};
+use stellar_agent_test_support::xdr_fixtures::contract_instance_ledger_entries_json;
 use stellar_xdr::{
-    LedgerKey, Limits, ReadXdr, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec, WriteXdr,
+    AccountId, LedgerKey, Limits, MuxedAccount, PublicKey, ReadXdr, ScMap, ScMapEntry, ScSymbol,
+    ScVal, ScVec, TransactionEnvelope, Uint256, WriteXdr,
 };
 use wiremock::{
     Mock, MockServer, Request, Respond, ResponseTemplate,
@@ -40,6 +39,12 @@ const ACCOUNT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
 const NETWORK_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const CHAIN_ID: &str = "stellar:testnet";
 
+/// An account distinct from the sentinel, named as an explicit source.
+const EXPLICIT_SOURCE_G: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+/// A manager whose endpoint answers `get_context_rule` with rule `rule_id`
+/// attached to `policies`, and an account lookup with an entry for
+/// `account_g`. The returned server records every request it receives.
 #[allow(
     clippy::expect_used,
     reason = "test helper asserts fixture construction invariants"
@@ -47,7 +52,8 @@ const CHAIN_ID: &str = "stellar:testnet";
 async fn manager_with_rule(
     rule_id: u32,
     policies: Vec<stellar_xdr::ScAddress>,
-) -> (ContextRuleManager, tempfile::TempDir) {
+    account_g: &str,
+) -> (ContextRuleManager, MockServer, tempfile::TempDir) {
     let (audit_writer, audit_log_path, tmp_dir) = tmp_audit_writer();
     let signers = signer_set_n_of_n(0);
     let rule_xdr = build_context_rule_scval_xdr(rule_id, &signers, &policies);
@@ -56,7 +62,7 @@ async fn manager_with_rule(
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
-        .respond_with(CombinedRpcResponder::new_no_policies(SOURCE_G, simulate))
+        .respond_with(CombinedRpcResponder::new_no_policies(account_g, simulate))
         .mount(&server)
         .await;
 
@@ -78,28 +84,128 @@ async fn manager_with_rule(
         .with_audit_writer(audit_writer),
     )
     .expect("ContextRuleManager::new must succeed");
-    // Return `tmp_dir` so the caller keeps it in scope for the test's lifetime;
-    // when the test scope ends, `TempDir::Drop` cleans the directory naturally
-    // (avoids the previous `std::mem::forget` leak).
-    (manager, tmp_dir)
+    // The caller keeps `tmp_dir` in scope for the test's lifetime, and its
+    // drop removes the directory.
+    (manager, server, tmp_dir)
 }
 
+/// The account keys a recorded RPC exchange looked up and the simulations it
+/// ran.
+struct RecordedRpc {
+    /// The account of each `LedgerKey::Account` in a `getLedgerEntries`
+    /// request, as raw ed25519 bytes.
+    account_lookups: Vec<[u8; 32]>,
+    /// The source account bytes and sequence number of each
+    /// `simulateTransaction` envelope.
+    simulations: Vec<([u8; 32], i64)>,
+}
+
+/// Decodes every request `server` recorded.
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "test helper decodes recorded fixture requests"
+)]
+async fn recorded_rpc(server: &MockServer) -> RecordedRpc {
+    let mut recorded = RecordedRpc {
+        account_lookups: Vec::new(),
+        simulations: Vec::new(),
+    };
+    for request in server
+        .received_requests()
+        .await
+        .expect("the mock server records requests")
+    {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        match body["method"].as_str().unwrap() {
+            "getLedgerEntries" => {
+                for key in body["params"]["keys"].as_array().unwrap() {
+                    let key =
+                        LedgerKey::from_xdr_base64(key.as_str().unwrap(), Limits::none()).unwrap();
+                    if let LedgerKey::Account(account) = key {
+                        let AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes))) =
+                            account.account_id;
+                        recorded.account_lookups.push(bytes);
+                    }
+                }
+            }
+            "simulateTransaction" => {
+                let envelope = TransactionEnvelope::from_xdr_base64(
+                    body["params"]["transaction"].as_str().unwrap(),
+                    Limits::none(),
+                )
+                .unwrap();
+                let TransactionEnvelope::Tx(envelope) = envelope else {
+                    panic!("a simulation envelope is a version 1 transaction")
+                };
+                let MuxedAccount::Ed25519(Uint256(source)) = envelope.tx.source_account else {
+                    panic!("a simulation source is an ed25519 account")
+                };
+                recorded.simulations.push((source, envelope.tx.seq_num.0));
+            }
+            other => panic!("unexpected RPC method: {other}"),
+        }
+    }
+    recorded
+}
+
+/// The raw ed25519 bytes of a G-strkey.
+#[allow(clippy::expect_used, reason = "test constants are valid strkeys")]
+fn account_bytes(g: &str) -> [u8; 32] {
+    stellar_strkey::ed25519::PublicKey::from_string(g)
+        .expect("a valid G-strkey")
+        .0
+}
+
+/// With no source, the rule read simulates from the sentinel with sequence
+/// number 1 (the sentinel's sequence `0` plus one) and looks up no account.
+/// An explicit source is looked up once and simulates from that account.
 #[tokio::test]
 #[serial]
 #[allow(clippy::expect_used, reason = "test asserts successful fixture path")]
 async fn verify_rule_wasm_pins_returns_no_contracts_when_rule_has_no_external_contracts() {
     let rule_id = 31;
-    let (manager, _tmp_dir) = manager_with_rule(rule_id, vec![]).await;
+    for source in [None, Some(EXPLICIT_SOURCE_G)] {
+        let (manager, server, _tmp_dir) =
+            manager_with_rule(rule_id, vec![], EXPLICIT_SOURCE_G).await;
 
-    let result = manager
-        .verify_rule_wasm_pins(zero_sc_address(), rule_id, SOURCE_G, "req-no-contracts")
-        .await
-        .expect("verify_rule_wasm_pins must return a result");
+        let result = manager
+            .verify_rule_wasm_pins(zero_sc_address(), rule_id, source, "req-no-contracts")
+            .await
+            .expect("verify_rule_wasm_pins must return a result");
 
-    assert_eq!(result.verifier_pin_status, PinStatus::NoContracts);
-    assert_eq!(result.policy_pin_status, PinStatus::NoContracts);
-    assert!(result.pinned_verifier_first8.is_empty());
-    assert!(result.pinned_policy_first8.is_empty());
+        assert_eq!(result.verifier_pin_status, PinStatus::NoContracts);
+        assert_eq!(result.policy_pin_status, PinStatus::NoContracts);
+        assert!(result.pinned_verifier_first8.is_empty());
+        assert!(result.pinned_policy_first8.is_empty());
+
+        let recorded = recorded_rpc(&server).await;
+        assert_eq!(
+            recorded.simulations.len(),
+            1,
+            "one rule read; source={source:?}"
+        );
+        let (simulated_source, sequence) = recorded.simulations[0];
+        match source {
+            None => {
+                assert!(
+                    recorded.account_lookups.is_empty(),
+                    "no source looks up no account"
+                );
+                assert_eq!(simulated_source, account_bytes(SIMULATE_SENTINEL_G));
+                assert_eq!(sequence, 1);
+            }
+            Some(g) => {
+                assert_eq!(
+                    recorded.account_lookups,
+                    vec![account_bytes(g)],
+                    "an explicit source is looked up once"
+                );
+                assert_eq!(simulated_source, account_bytes(g));
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -107,10 +213,11 @@ async fn verify_rule_wasm_pins_returns_no_contracts_when_rule_has_no_external_co
 #[allow(clippy::expect_used, reason = "test asserts successful fixture path")]
 async fn verify_rule_wasm_pins_returns_no_pin_when_contracts_exist_without_audit_pin() {
     let rule_id = 32;
-    let (manager, _tmp_dir) = manager_with_rule(rule_id, vec![policy_sc_address()]).await;
+    let (manager, _server, _tmp_dir) =
+        manager_with_rule(rule_id, vec![policy_sc_address()], SOURCE_G).await;
 
     let result = manager
-        .verify_rule_wasm_pins(zero_sc_address(), rule_id, SOURCE_G, "req-no-pin")
+        .verify_rule_wasm_pins(zero_sc_address(), rule_id, None, "req-no-pin")
         .await
         .expect("verify_rule_wasm_pins must return a result");
 
@@ -147,12 +254,7 @@ impl Respond for MixedPinsResponder {
                 assert_eq!(keys.len(), 1);
                 let key =
                     LedgerKey::from_xdr_base64(keys[0].as_str().unwrap(), Limits::none()).unwrap();
-                if matches!(key, LedgerKey::Account(_)) {
-                    response["result"] = serde_json::json!({
-                        "entries": [{"key": keys[0], "xdr": account_entry_xdr_with_seq(SIMULATE_SENTINEL_G, 100_000_000, 0, 100), "lastModifiedLedgerSeq": 100}],
-                        "latestLedger": 1000,
-                    });
-                } else if key == self.unavailable_key {
+                if key == self.unavailable_key {
                     response["error"] =
                         serde_json::json!({"code": -32603, "message": "pin probe unavailable"});
                 } else {
@@ -275,7 +377,7 @@ async fn verify_pins_mixed_drift_and_unavailable_preserves_both_statuses_and_cod
             .verify_rule_wasm_pins(
                 parse_c_strkey_to_smart_account(ACCOUNT).unwrap(),
                 7,
-                SIMULATE_SENTINEL_G,
+                None,
                 "mixed-pins",
             )
             .await

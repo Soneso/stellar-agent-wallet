@@ -4570,7 +4570,7 @@ async fn verify_pins_names_the_verifier_failure_beside_a_drifted_policy() {
         .verify_rule_wasm_pins(
             smart_account(),
             1,
-            &account_id_for_seed(SEED),
+            Some(&account_id_for_seed(SEED)),
             "req-verify-merge",
         )
         .await
@@ -4603,7 +4603,7 @@ async fn verify_pins_reports_drift_for_a_policy_pin_with_no_live_policy() {
         .verify_rule_wasm_pins(
             smart_account(),
             1,
-            &account_id_for_seed(SEED),
+            Some(&account_id_for_seed(SEED)),
             "req-verify-absent",
         )
         .await
@@ -8668,7 +8668,7 @@ async fn verify_pins_reports_drift_for_a_live_verifier_the_record_does_not_pin()
         .verify_rule_wasm_pins(
             smart_account(),
             1,
-            &account_id_for_seed(SEED),
+            Some(&account_id_for_seed(SEED)),
             "req-verify-verifier-absent",
         )
         .await

@@ -39,18 +39,23 @@
 //! # Signer-source modes (mirror of `accounts deploy-c`)
 //!
 //! Write subcommands accept exactly one of:
-//! - `--signer-secret-env <VAR>` — read S-strkey from env var.
-//! - `--sign-with-ledger` — Ledger hardware wallet (BIP-44 `--account-index`).
+//! - `--signer-secret-env <VAR>`: read S-strkey from env var.
+//! - `--sign-with-ledger`: Ledger hardware wallet (BIP-44 `--account-index`).
 //!
-//! Read subcommands (`get`) accept neither — they need only the smart-account
-//! address + a source-account strkey for the simulation envelope.
+//! Read subcommands accept neither. `get` and `get-spending-limit` take a
+//! required `--source-account` strkey for the simulation envelope.
+//! `verify-pins` takes an optional `--source-account` naming an existing
+//! account as the source of its `get_context_rule` simulation; without it the
+//! simulation uses a sentinel source and fetches no account. Its Wasm-hash
+//! reads (`getLedgerEntries`) take no source account.
 //!
 //! # Mainnet write defence
 //!
-//! Write subcommands and `verify-pins` structurally refuse mainnet
+//! Write subcommands structurally refuse mainnet
 //! (`network.mainnet_write_forbidden`) before any RPC or signing call.
-//! `verify-pins` loads a signer to derive its simulation source account.
-//! The other read subcommands accept mainnet (read-only, no write risk).
+//! Read subcommands accept mainnet: they load no signing key, sign nothing,
+//! and write nothing on chain. `verify-pins` keeps its local audit rows, so a
+//! persisted profile needs its audit key as for any audited verb.
 //!
 //! # Inverse-bypass discipline
 //!
@@ -96,13 +101,13 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
-    CommonArgsView, CommonHandlerContext, SignerSourceFlags, construct_signers_manager_from_fields,
-    load_command_profile, map_access_error, open_audit_writer_read_only,
+    CommonArgsView, CommonHandlerContext, ReadArgsView, ReadHandlerContext, SignerSourceFlags,
+    construct_signers_manager_from_fields, impl_common_args_view, impl_read_args_view,
+    load_command_profile, map_access_error, open_audit_writer_read_only, validate_source_account,
 };
 use crate::commands::smart_account::list_rules as sa_list_rules;
 use crate::common::network::{
-    EndpointFlags, EndpointUrlFlag, TargetNetwork, mainnet_write_refusal,
-    network_context_for_command,
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
 };
 use crate::common::profile_access::ProfileOrigin;
 use crate::common::render::render_json;
@@ -331,8 +336,9 @@ pub enum RulesSubcommand {
     /// `"unavailable"`, `"no_pin"`, or `"no_contracts"`. The
     /// `pinned_*_first8` fields carry the stored pin from the audit log;
     /// `observed_*_first8` carry the live values fetched via two-RPC
-    /// consultation. A mainnet profile is refused with
-    /// `network.mainnet_write_forbidden` before the signer loads.
+    /// consultation. Loads no signer and accepts a mainnet profile. The
+    /// optional `--source-account` names an existing account as the source
+    /// of the `get_context_rule` simulation.
     VerifyPins(Box<VerifyPinsArgs>),
 
     /// Add a policy contract to an existing context rule (OZ `add_policy`).
@@ -1228,14 +1234,8 @@ async fn get_run(args: &GetArgs) -> i32 {
         Err(e) => return emit_error(&e, args.common.output, &request_id),
     };
 
-    if let Err(e) = stellar_strkey::ed25519::PublicKey::from_string(&args.source_account) {
-        return emit_error(
-            &WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("--source-account: invalid G-strkey ({e})"),
-            }),
-            args.common.output,
-            &request_id,
-        );
+    if let Err(e) = validate_source_account(&args.source_account) {
+        return emit_error(&e, args.common.output, &request_id);
     }
 
     // Use the read-only builder (no SignersManager): get_rule is a simulation-
@@ -1552,44 +1552,10 @@ pub struct DeleteResult {
     pub rule_id: u32,
 }
 
-macro_rules! impl_common_args_view {
-    ($ty:ty) => {
-        impl CommonArgsView for $ty {
-            fn account(&self) -> &str {
-                &self.common.account
-            }
-
-            fn profile(&self) -> Option<&str> {
-                self.common.profile.as_deref()
-            }
-
-            fn signer_source(&self) -> &SignerSourceFlags {
-                &self.common.signer_source
-            }
-
-            fn network(&self) -> Option<TargetNetwork> {
-                self.common.network
-            }
-
-            fn rpc_url(&self) -> Option<&str> {
-                self.common.rpc_url.as_deref()
-            }
-
-            fn secondary_rpc_url(&self) -> Option<&str> {
-                self.common.secondary_rpc_url.as_deref()
-            }
-
-            fn timeout_seconds(&self) -> u64 {
-                self.common.timeout_seconds
-            }
-        }
-    };
-}
-
-impl_common_args_view!(CreateArgs);
-impl_common_args_view!(SetNameArgs);
-impl_common_args_view!(SetValidUntilArgs);
-impl_common_args_view!(DeleteArgs);
+impl_common_args_view!(CreateArgs, common);
+impl_common_args_view!(SetNameArgs, common);
+impl_common_args_view!(SetValidUntilArgs, common);
+impl_common_args_view!(DeleteArgs, common);
 
 async fn delete_run(args: &DeleteArgs) -> i32 {
     let request_id = new_request_id();
@@ -1668,9 +1634,10 @@ async fn delete_run(args: &DeleteArgs) -> i32 {
 
 /// Arguments for `smart-account rules verify-pins`.
 ///
-/// Read-only: no signing, no submission. Requires a signer-source to derive
-/// the source-account G-strkey for the `getLedgerEntries` simulation envelope,
-/// so a mainnet profile is refused before the signer loads.
+/// Loads no signer, signs nothing, and writes nothing on chain, so a mainnet
+/// profile is accepted. Drift rows still go to the local audit log.
+/// `--source-account` optionally names the source of the `get_context_rule`
+/// simulation; the Wasm-hash reads take no source account.
 #[non_exhaustive]
 #[derive(Debug, Args)]
 pub struct VerifyPinsArgs {
@@ -1686,9 +1653,11 @@ pub struct VerifyPinsArgs {
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
-    /// Signer-source mode (used to derive source-account for RPC simulation).
-    #[command(flatten)]
-    pub signer_source: SignerSourceFlags,
+    /// An existing account to use as the source of the `get_context_rule`
+    /// simulation. When absent, the simulation uses a sentinel source and no
+    /// account is fetched. The account is never debited.
+    #[arg(long, value_name = "G_STRKEY")]
+    pub source_account: Option<String>,
 
     /// The network comes from the profile when absent.
     /// When supplied, this flag must equal the profile's chain.
@@ -1718,35 +1687,7 @@ pub struct VerifyPinsArgs {
     pub output: OutputFormat,
 }
 
-impl CommonArgsView for VerifyPinsArgs {
-    fn account(&self) -> &str {
-        &self.account
-    }
-
-    fn profile(&self) -> Option<&str> {
-        self.profile.as_deref()
-    }
-
-    fn signer_source(&self) -> &SignerSourceFlags {
-        &self.signer_source
-    }
-
-    fn network(&self) -> Option<TargetNetwork> {
-        self.network
-    }
-
-    fn rpc_url(&self) -> Option<&str> {
-        self.rpc_url.as_deref()
-    }
-
-    fn secondary_rpc_url(&self) -> Option<&str> {
-        self.secondary_rpc_url.as_deref()
-    }
-
-    fn timeout_seconds(&self) -> u64 {
-        self.timeout_seconds
-    }
-}
+impl_read_args_view!(VerifyPinsArgs);
 
 /// Result envelope for `smart-account rules verify-pins`.
 ///
@@ -1858,27 +1799,18 @@ async fn verify_pins_run(args: &VerifyPinsArgs) -> i32 {
         Ok(context) => context,
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
-    if let Some(err) = mainnet_write_refusal(context.chain_id) {
-        return emit_error(&err, args.output, &request_id);
-    }
     let account_redacted = redact_strkey_first5_last5(&args.account);
 
-    let ctx = match CommonHandlerContext::new(args, resolved, profile, origin, &context).await {
+    let ctx = match ReadHandlerContext::new(
+        args,
+        args.source_account.as_deref(),
+        resolved,
+        profile,
+        origin,
+        &context,
+    ) {
         Ok(ctx) => ctx,
         Err(e) => return emit_error(&e, args.output, &request_id),
-    };
-
-    let source_account_strkey = match ctx.signer.public_key().await {
-        Ok(pk) => pk.to_string(),
-        Err(e) => {
-            return emit_error(
-                &WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!("signer.public_key(): {e}"),
-                }),
-                args.output,
-                &request_id,
-            );
-        }
     };
 
     let manager = match ctx.context_rule_manager() {
@@ -1896,7 +1828,7 @@ async fn verify_pins_run(args: &VerifyPinsArgs) -> i32 {
         .verify_rule_wasm_pins(
             ctx.smart_account,
             args.rule_id,
-            &source_account_strkey,
+            args.source_account.as_deref(),
             &request_id,
         )
         .await
@@ -2123,35 +2055,7 @@ pub struct AddPolicyArgs {
     pub output: OutputFormat,
 }
 
-impl CommonArgsView for AddPolicyArgs {
-    fn account(&self) -> &str {
-        &self.account
-    }
-
-    fn profile(&self) -> Option<&str> {
-        self.profile.as_deref()
-    }
-
-    fn signer_source(&self) -> &SignerSourceFlags {
-        &self.signer_source
-    }
-
-    fn network(&self) -> Option<TargetNetwork> {
-        self.network
-    }
-
-    fn rpc_url(&self) -> Option<&str> {
-        self.rpc_url.as_deref()
-    }
-
-    fn secondary_rpc_url(&self) -> Option<&str> {
-        self.secondary_rpc_url.as_deref()
-    }
-
-    fn timeout_seconds(&self) -> u64 {
-        self.timeout_seconds
-    }
-}
+impl_common_args_view!(AddPolicyArgs);
 
 /// Result envelope for `smart-account rules add-policy`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2858,35 +2762,7 @@ pub struct RemovePolicyArgs {
     pub output: OutputFormat,
 }
 
-impl CommonArgsView for RemovePolicyArgs {
-    fn account(&self) -> &str {
-        &self.account
-    }
-
-    fn profile(&self) -> Option<&str> {
-        self.profile.as_deref()
-    }
-
-    fn signer_source(&self) -> &SignerSourceFlags {
-        &self.signer_source
-    }
-
-    fn network(&self) -> Option<TargetNetwork> {
-        self.network
-    }
-
-    fn rpc_url(&self) -> Option<&str> {
-        self.rpc_url.as_deref()
-    }
-
-    fn secondary_rpc_url(&self) -> Option<&str> {
-        self.secondary_rpc_url.as_deref()
-    }
-
-    fn timeout_seconds(&self) -> u64 {
-        self.timeout_seconds
-    }
-}
+impl_common_args_view!(RemovePolicyArgs);
 
 /// Result envelope for `smart-account rules remove-policy`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3087,14 +2963,8 @@ async fn get_spending_limit_run(args: &GetSpendingLimitArgs) -> i32 {
         Err(e) => return emit_error(&e, args.common.output, &request_id),
     };
 
-    if let Err(e) = stellar_strkey::ed25519::PublicKey::from_string(&args.source_account) {
-        return emit_error(
-            &WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("--source-account: invalid G-strkey ({e})"),
-            }),
-            args.common.output,
-            &request_id,
-        );
+    if let Err(e) = validate_source_account(&args.source_account) {
+        return emit_error(&e, args.common.output, &request_id);
     }
 
     // Read-only inspection uses the loaded profile without resolving a signer.
@@ -3248,35 +3118,7 @@ pub struct SetSpendingLimitArgs {
     pub output: OutputFormat,
 }
 
-impl CommonArgsView for SetSpendingLimitArgs {
-    fn account(&self) -> &str {
-        &self.account
-    }
-
-    fn profile(&self) -> Option<&str> {
-        self.profile.as_deref()
-    }
-
-    fn signer_source(&self) -> &SignerSourceFlags {
-        &self.signer_source
-    }
-
-    fn network(&self) -> Option<TargetNetwork> {
-        self.network
-    }
-
-    fn rpc_url(&self) -> Option<&str> {
-        self.rpc_url.as_deref()
-    }
-
-    fn secondary_rpc_url(&self) -> Option<&str> {
-        self.secondary_rpc_url.as_deref()
-    }
-
-    fn timeout_seconds(&self) -> u64 {
-        self.timeout_seconds
-    }
-}
+impl_common_args_view!(SetSpendingLimitArgs);
 
 /// Result envelope for `smart-account rules set-spending-limit`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4466,8 +4308,6 @@ mod tests {
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
             "--rule-id",
             "3",
-            "--signer-secret-env",
-            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
         ]);
 
         assert_eq!(
@@ -4492,8 +4332,6 @@ mod tests {
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
             "--rule-id",
             "3",
-            "--signer-secret-env",
-            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
             "--network",
             "mainnet",
             "--rpc-url",
@@ -4506,17 +4344,90 @@ mod tests {
         );
     }
 
+    /// `verify-pins` loads no signer: each signer-source flag is an unknown
+    /// argument.
+    #[test]
+    fn verify_pins_args_reject_signer_source_flags() {
+        for flag in [
+            &[
+                "--signer-secret-env",
+                "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
+            ][..],
+            &["--sign-with-ledger"][..],
+            &["--account-index", "0"][..],
+        ] {
+            let mut argv = vec![
+                "test",
+                "--account",
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "--rule-id",
+                "3",
+            ];
+            argv.extend_from_slice(flag);
+            let err = VerifyPinsArgsHarness::try_parse_from(argv)
+                .err()
+                .unwrap_or_else(|| panic!("{flag:?} must be rejected"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag:?}"
+            );
+        }
+    }
+
+    /// `--source-account` is optional: absent it is `None`, and a supplied
+    /// value is carried as given.
+    #[test]
+    fn verify_pins_args_source_account_is_optional() {
+        let base = [
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "3",
+        ];
+        assert_eq!(
+            VerifyPinsArgsHarness::parse_from(base).args.source_account,
+            None
+        );
+        let supplied: Vec<&str> = base
+            .iter()
+            .copied()
+            .chain(["--source-account", SIMULATE_SENTINEL_G])
+            .collect();
+        assert_eq!(
+            VerifyPinsArgsHarness::parse_from(supplied)
+                .args
+                .source_account
+                .as_deref(),
+            Some(SIMULATE_SENTINEL_G)
+        );
+    }
+
+    /// A malformed `--source-account` parses, and the runtime validation
+    /// refuses it with `validation.address_invalid` naming the flag.
+    #[test]
+    fn verify_pins_args_malformed_source_account_is_refused_at_runtime() {
+        let parsed = VerifyPinsArgsHarness::parse_from([
+            "test",
+            "--account",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rule-id",
+            "3",
+            "--source-account",
+            "not-a-g-strkey",
+        ]);
+        let source = parsed.args.source_account.as_deref().unwrap();
+        let err = validate_source_account(source).unwrap_err();
+        assert_eq!(err.code(), "validation.address_invalid");
+        assert!(err.to_string().contains("--source-account"), "{err}");
+        validate_source_account(SIMULATE_SENTINEL_G).expect("a G-strkey is accepted");
+    }
+
     #[test]
     fn verify_pins_args_requires_account_and_rule_id() {
         assert!(
-            VerifyPinsArgsHarness::try_parse_from([
-                "test",
-                "--rule-id",
-                "3",
-                "--signer-secret-env",
-                "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
-            ])
-            .is_err(),
+            VerifyPinsArgsHarness::try_parse_from(["test", "--rule-id", "3"]).is_err(),
             "--account is required"
         );
         assert!(
@@ -4524,8 +4435,6 @@ mod tests {
                 "test",
                 "--account",
                 "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-                "--signer-secret-env",
-                "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
             ])
             .is_err(),
             "--rule-id is required"
@@ -4546,8 +4455,6 @@ mod tests {
             "https://rpc.example",
             "--timeout-seconds",
             "17",
-            "--signer-secret-env",
-            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
         ]);
 
         assert_eq!(parsed.args.profile.as_deref(), Some("ops"));
@@ -4566,8 +4473,6 @@ mod tests {
             "5",
             "--secondary-rpc-url",
             "https://secondary.example",
-            "--signer-secret-env",
-            "__STELLAR_AGENT_RULES_TEST_DUMMY_VAR",
         ]);
 
         assert_eq!(

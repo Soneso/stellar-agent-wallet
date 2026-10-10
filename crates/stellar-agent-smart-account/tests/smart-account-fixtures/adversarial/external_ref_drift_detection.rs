@@ -589,7 +589,7 @@ async fn verify_pins_report(
         .verify_rule_wasm_pins(
             ScAddress::Contract(ContractId(Hash([0u8; 32]))),
             RULE_ID,
-            SOURCE_G,
+            Some(SOURCE_G),
             "req-verify-pins",
         )
         .await
