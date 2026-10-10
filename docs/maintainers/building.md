@@ -126,14 +126,27 @@ measures the checkout's `interop/` tree with `du -sk`, separately from the
 target directory. The baseline is main at commit `38dabdd`. The current runs
 use the same tree with the Cargo profile settings, rustup profile, and
 preflight gate selection in this guide applied. Both trees have the same
-lockfile, whose SHA-256 hash starts with `6a0d7f74eb27`. Both full-suite runs
-reported `33 gates run, 0 failed, 5 unavailable`. The five unavailable gates
-are Python checks that need PyYAML and build nothing: `workflow-invariants` and
+lockfile, whose SHA-256 hash starts with `6a0d7f74eb27`. The consolidated tree
+is main at commit `cb19fad`. Every crate's offline integration tests build as
+one or two targets. The unpublished member
+`stellar-agent-smart-account-acceptance` holds the smart-account crate's heavy
+live suites. This tree's lockfile SHA-256 hash starts with `b8a2c7338f40`,
+which differs from the earlier runs' lockfile. The consolidated runs used the
+same Mac, toolchain, tool versions, jobs, and sampling on 2026-10-10, with
+housekeeping paused. The consolidated CLI run reported
+`8 gates run, 0 failed, 0 unavailable`, using the same eight gates as the
+earlier CLI runs. The consolidated full-suite run reported
+`34 gates run, 0 failed, 5 unavailable`, with one more gate than the earlier
+full-suite runs. Both earlier full-suite runs reported
+`33 gates run, 0 failed, 5 unavailable`. The five unavailable gates were the
+same Python checks that need PyYAML and build nothing: `workflow-invariants` and
 the `test-check-workflow-invariants.py`, `test-sync-labels.py`,
 `test-take-workflow.py`, and `test-triage-workflow.py` self-tests. The
 docs-only run selected no Cargo gate, so its target directory stayed empty. The
-coverage-alone run shared the machine with three unrelated builds, so its
-elapsed time is not comparable. In every run, the 30-second sampled peak equals
+earlier coverage-alone run shared the machine with three unrelated builds, so
+its elapsed time is not comparable. The consolidated coverage-alone run executed
+only the coverage command and had the machine to itself, so its elapsed time
+stands on its own. In every run, the 30-second sampled peak equals
 the retained size because no gate removed build output while the run executed.
 
 | Run | Retained KiB | 30-second sampled peak KiB | Retained ratio | Peak ratio | Elapsed seconds |
@@ -144,6 +157,9 @@ the retained size because no gate removed build output while the run executed.
 | Full suite, baseline | 41,384,108 | 41,384,108 | Not applicable | Not applicable | 3,410 |
 | Full suite, current | 21,188,348 | 21,188,348 | 0.51 | 0.51 | 2,361 |
 | Coverage alone, current | 9,363,136 | 9,363,136 | Not paired | Not paired | 1,953 |
+| CLI, consolidated | 3,579,640 | 3,579,640 | 0.41 | 0.41 | 164 |
+| Full suite, consolidated | 13,344,220 | 13,344,220 | 0.32 | 0.32 | 1,506 |
+| Coverage alone, consolidated | 5,456,988 | 5,456,988 | Not paired | Not paired | 404 |
 
 Measure each existing path with `du -sk`; record absent paths as zero.
 Subdirectories are breakdowns, not additive totals. Paths below are relative
@@ -157,6 +173,9 @@ to the effective target directory.
 | Full suite, baseline | 16,986,688 | 10,229,008 | 259,104 | 200,852 | 17,567,904 |
 | Full suite, current | 9,511,672 | 1,938,852 | 148,388 | 200,852 | 9,131,900 |
 | Coverage alone, current | 0 | 0 | 0 | 0 | 9,274,808 |
+| CLI, consolidated | 2,545,064 | 773,284 | 143,072 | 53,432 | 0 |
+| Full suite, consolidated | 5,630,160 | 1,761,092 | 143,984 | 201,436 | 5,364,396 |
+| Coverage alone, consolidated | 0 | 0 | 0 | 0 | 5,368,656 |
 
 | Separate storage | KiB |
 | --- | --- |
