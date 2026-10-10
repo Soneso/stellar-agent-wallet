@@ -31,10 +31,12 @@ const WASM_PINS: &[WasmPin] = &[
         path: "vendor/oz-webauthn-verifier/v0.7.2/multisig_webauthn_verifier_example.wasm",
         expected_sha256: "9427e3dd71fb29115c6f0efdf2f703b32fec566b151421f991c3b4e248ebb1f7",
     },
+    // Multicall router v0.1.0 WASM, built from contracts/multicall-router/.
+    // Embedded by multicall.rs::MULTICALL_WASM and pinned by MULTICALL_WASM_SHA256.
     WasmPin {
-        label: "multicall.wasm",
-        path: "vendor/multicall/v0.1.0/multicall.wasm",
-        expected_sha256: "267e94a092df01fa02ad4edf8320a98bd65e4d4d6575254ac9521cb65727f3d4",
+        label: "multicall_router.wasm",
+        path: "vendor/multicall-router/v0.1.0/multicall_router.wasm",
+        expected_sha256: "2bf863ffdeba3315e1d9ca4fc2a970b2f16fe72ca92a7fdef0166eb3699db69d",
     },
     // OZ timelock-controller-example v0.7.2 WASM.
     WasmPin {

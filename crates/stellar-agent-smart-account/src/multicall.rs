@@ -16,9 +16,9 @@
 //!
 //! # Canonical-source citations
 //!
-//! The router contract's `invocations: Vec<(Address, Symbol, Vec<Val>)>` tuple shape
-//! is cited from the Meridian Pay smart-wallet-demo-app router contract at SHA `8f4bfdc`
-//! (`contracts/router/src/lib.rs`, `exec` function signature, lines 21-22).
+//! The router is the in-tree contract `contracts/multicall-router/src/lib.rs`, whose
+//! `exec(caller, invocations: Vec<(Address, Symbol, Vec<Val>)>)` takes the bundle as
+//! one `(Address, Symbol, Vec<Val>)` tuple per inner call.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -50,33 +50,41 @@ use crate::submit::{MulticallCheck, ResolvedFeePerOp, SubmitInvokeArgs, submit_s
 
 /// Vendored multicall router WASM bytes.
 ///
-/// Included at compile time from `vendor/multicall/v0.1.0/multicall.wasm`, for
-/// runtime deployment and runtime verification. `build.rs` fails every build of
-/// the crate unless that file hashes to its `WASM_PINS` row, and the tests in
-/// `src/vendored_wasm_tests.rs` fail unless this constant is that file. The
-/// source of this build is not in the repository, so no workflow rebuilds it;
-/// the tree check holds it at one frozen digest.
+/// Included at compile time from
+/// `vendor/multicall-router/v0.1.0/multicall_router.wasm` for the digest and
+/// identity tests. Runtime trust in a router rests on
+/// [`MULTICALL_WASM_SHA256`]. The registry enforces that digest on every entry.
+/// A submission verifies the deployed router's on-chain Wasm hash against it
+/// over both RPC endpoints. The file is built from the in-tree
+/// contract `contracts/multicall-router/`, and the `vendored-wasm` workflow
+/// rebuilds it from that source and fails unless the rebuilt bytes equal it.
+/// `build.rs` fails every build of the crate unless that file hashes to its
+/// `WASM_PINS` row, and the tests in `src/vendored_wasm_tests.rs` fail unless
+/// this constant is that file.
 ///
-/// Provenance: `vendor/multicall/v0.1.0/REFERENCE.md`.
-pub const MULTICALL_WASM: &[u8] = include_bytes!("../vendor/multicall/v0.1.0/multicall.wasm");
+/// Provenance: `vendor/multicall-router/v0.1.0/REFERENCE.md`.
+pub const MULTICALL_WASM: &[u8] =
+    include_bytes!("../vendor/multicall-router/v0.1.0/multicall_router.wasm");
 
 /// Expected SHA-256 of [`MULTICALL_WASM`], as 64-char lowercase hex.
 ///
-/// Equal to the `expected_sha256` of the `multicall.wasm` row of `WASM_PINS`
-/// in `crates/stellar-agent-smart-account/build.rs`, to the digest in
-/// `vendor/multicall/v0.1.0/REFERENCE.md`, and to the frozen digest of the
-/// exception list in `.github/scripts/rebuild-vendored-wasm.sh`.
-/// `build.rs` compares the vendored file with its `WASM_PINS` row,
+/// Equal to the `expected_sha256` of the `multicall_router.wasm` row of
+/// `WASM_PINS` in `crates/stellar-agent-smart-account/build.rs` and to the
+/// digest in `vendor/multicall-router/v0.1.0/REFERENCE.md`. `build.rs`
+/// compares the vendored file with its `WASM_PINS` row,
 /// `multicall_wasm_sha256_matches_provenance` compares [`MULTICALL_WASM`] with
 /// this constant, and the tests in `src/vendored_wasm_tests.rs` bind both
-/// constants to the vendored file.
+/// constants to the vendored file. The `vendored-wasm` workflow rebuilds that
+/// file from `contracts/multicall-router/` and fails unless the rebuilt bytes
+/// equal it.
 ///
 /// # Trust-anchor rotation
 ///
-/// When the vendored WASM changes, this constant, the `WASM_PINS` row, the
-/// record, and the frozen digest change together in one reviewed change.
+/// A change to the router source, its toolchain, or its stellar-cli changes
+/// the built WASM. The file, this constant, the `WASM_PINS` row, and the
+/// record then change together in one reviewed change.
 pub const MULTICALL_WASM_SHA256: &str =
-    "267e94a092df01fa02ad4edf8320a98bd65e4d4d6575254ac9521cb65727f3d4";
+    "2bf863ffdeba3315e1d9ca4fc2a970b2f16fe72ca92a7fdef0166eb3699db69d";
 
 // ── Bundle-size caps ──────────────────────────────────────────────────────────
 
@@ -145,9 +153,11 @@ const _: () = {
 ///
 /// # Canonical source
 ///
-/// The router contract's `invocations: Vec<(Address, Symbol, Vec<Val>)>` tuple
-/// type is cited from the Meridian Pay smart-wallet-demo-app router contract
-/// at SHA `8f4bfdc` (`contracts/router/src/lib.rs`, `exec` signature, lines 21-22).
+/// Each invocation becomes one `(Address, Symbol, Vec<Val>)` tuple of the
+/// router's `invocations` argument. The router is the in-tree contract
+/// `contracts/multicall-router/src/lib.rs`, whose
+/// `exec(caller, invocations: Vec<(Address, Symbol, Vec<Val>)>)` takes those
+/// tuples in bundle order.
 #[derive(Debug, Clone)]
 pub struct MulticallInvocation {
     /// C-strkey of the target contract to invoke.
@@ -1138,9 +1148,9 @@ pub(crate) fn cross_rpc_compare_simulate_responses(
 /// Encodes a `Vec<MulticallInvocation>` into the XDR `ScVal` representation
 /// required by the multicall router's `invocations` argument.
 ///
-/// The router contract's `exec(caller, invocations: Vec<(Address, Symbol, Vec<Val>)>)`
-/// signature is cited from the Meridian Pay smart-wallet-demo-app router at
-/// SHA `8f4bfdc` (`contracts/router/src/lib.rs:21-22`).
+/// The router is the in-tree contract `contracts/multicall-router/src/lib.rs`,
+/// whose `exec(caller, invocations: Vec<(Address, Symbol, Vec<Val>)>)` takes the
+/// value this function returns as its `invocations` argument.
 ///
 /// Each `MulticallInvocation` becomes a `ScVal::Vec` containing three elements:
 /// 1. `ScVal::Address` — the target contract address.
@@ -1848,10 +1858,9 @@ fn json_args_to_scval_vec(args_json: &serde_json::Value, idx: usize) -> Result<S
 /// Builds `MulticallInnerResult` values from the confirmed on-chain return value.
 ///
 /// The multicall router returns `ScVal::Vec(Some(VecM))` where each element is
-/// the per-inner return value in bundle order. Canonical source: the Meridian Pay
-/// smart-wallet-demo-app router at SHA `8f4bfdc` (`contracts/router/src/lib.rs`,
-/// lines 35-40) — `exec` collects inner results into a `Vec<Val>` and returns
-/// it as a Soroban `Vec<Val>`.
+/// the per-inner return value in bundle order. Canonical source: `exec` in the
+/// in-tree router contract `contracts/multicall-router/src/lib.rs`, which
+/// collects the inner results into a `Vec<Val>` in input order and returns it.
 ///
 /// # Errors
 ///
@@ -2765,20 +2774,23 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("networks.toml");
 
-        // Write a TOML with one valid and one invalid entry.
+        // Write a TOML with one valid and one invalid entry. Both carry the
+        // pinned digest, so the invalid address is the only cause of a warning.
         std::fs::write(
             &path,
-            r#"
+            format!(
+                r#"
 [multicall.testnet]
 network_passphrase = "Test SDF Network ; September 2015"
 address = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-wasm_sha256 = "267e94a092df01fa02ad4edf8320a98bd65e4d4d6575254ac9521cb65727f3d4"
+wasm_sha256 = "{MULTICALL_WASM_SHA256}"
 
 [multicall.bad-entry]
 network_passphrase = "Bad Network"
 address = "NOT_A_STRKEY"
-wasm_sha256 = "267e94a092df01fa02ad4edf8320a98bd65e4d4d6575254ac9521cb65727f3d4"
-"#,
+wasm_sha256 = "{MULTICALL_WASM_SHA256}"
+"#
+            ),
         )
         .expect("write toml");
 
@@ -2790,6 +2802,9 @@ wasm_sha256 = "267e94a092df01fa02ad4edf8320a98bd65e4d4d6575254ac9521cb65727f3d4"
             1,
             "expected 1 load warning"
         );
+        let warning = &reg.partial_load_warnings[0];
+        assert_eq!(warning.network_safename, "bad-entry");
+        assert_eq!(warning.reason, "invalid C-strkey address: NOT_A_STRKEY");
     }
 
     // ── cross_rpc_compare_wasm_hashes ─────────────────────────────────────────

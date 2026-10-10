@@ -215,7 +215,7 @@ stellar-agent smart-account migrate-verifier \
 
 ### Multicall router registry
 
-`smart-account register-multicall` records a deployed multicall-router address and its WASM hash in `<canonical_data_root>/networks.toml` (local file plus audit row, idempotent). Refuses if `--wasm-sha256` does not equal the binary's compiled-in router WASM hash.
+`smart-account register-multicall` records a deployed multicall-router address and its WASM hash in `<canonical_data_root>/networks.toml` (local file plus audit row, idempotent). Refuses if `--wasm-sha256` does not equal the binary's compiled-in router WASM hash. An existing entry with another digest fails lookup and blocks registration for its network: remove it with `smart-account unregister-multicall` on its normal path, without `--force`, then register.
 
 - `--network` (optional assertion against the profile chain), `--address <C>` (req), `--wasm-sha256 <HEX>` (req, 64-char lowercase hex), `--profile`.
 

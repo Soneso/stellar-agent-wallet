@@ -810,7 +810,7 @@ stellar-agent smart-account list-rules --account CABC...WXYZ
 
 ### `smart-account register-multicall`
 
-Registers a deployed multicall router address and its WASM hash in the local registry (`<canonical_data_root>/networks.toml`). State-changing on a local file plus an audit row. Idempotent. Refuses if `--wasm-sha256` does not equal the binary's compiled-in `MULTICALL_WASM_SHA256` (typo and config-plant defence).
+Registers a deployed multicall router address and its WASM hash in the local registry (`<canonical_data_root>/networks.toml`). State-changing on a local file plus an audit row. Idempotent. Refuses if `--wasm-sha256` does not equal the binary's compiled-in `MULTICALL_WASM_SHA256` (typo and config-plant defence). An existing entry with another digest fails lookup and blocks registration for its network: remove it with `smart-account unregister-multicall` on its normal path, without `--force`, then register.
 
 Flags:
 
@@ -822,7 +822,7 @@ Flags:
 ```bash
 stellar-agent smart-account register-multicall \
   --address CRTR...WXYZ \
-  --wasm-sha256 67800690...b27a
+  --wasm-sha256 2bf863ffdeba3315e1d9ca4fc2a970b2f16fe72ca92a7fdef0166eb3699db69d
 ```
 
 ### `smart-account unregister-multicall`

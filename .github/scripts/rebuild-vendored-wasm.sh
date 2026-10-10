@@ -59,13 +59,14 @@ vendor/oz-smart-account-multisig/v0.7.1/multisig_account_example.wasm oz:v0.7.1 
 vendor/oz-webauthn-verifier/v0.7.1/multisig_webauthn_verifier_example.wasm oz:v0.7.1 multisig-webauthn-verifier-example 1.94.0 wasm32v1-none s25 release/multisig_webauthn_verifier_example.wasm nopin
 vendor/oz-timelock-controller/v0.7.1/timelock_controller_example.wasm oz:v0.7.1 timelock-controller-example 1.94.0 wasm32v1-none s25 release/timelock_controller_example.wasm nopin
 vendor/oz-threshold-policy/v0.7.1/multisig_threshold_policy_example.wasm oz:v0.7.1 multisig-threshold-policy-example 1.94.0 wasm32v1-none s25 release/multisig_threshold_policy_example.wasm nopin
-vendor/cap85-beacon/v0.1.0/cap85_beacon.wasm tree:contracts/cap85-beacon - 1.98.0 wasm32v1-none s28 release/cap85_beacon.wasm pin"
+vendor/cap85-beacon/v0.1.0/cap85_beacon.wasm tree:contracts/cap85-beacon - 1.98.0 wasm32v1-none s28 release/cap85_beacon.wasm pin
+vendor/multicall-router/v0.1.0/multicall_router.wasm tree:contracts/multicall-router - 1.99.0 wasm32v1-none s28 release/multicall_router.wasm pin"
 
 # Vendored files that are not rebuilt: path (relative to the crate), frozen
-# digest, and pin or nopin. The multicall router's source is not in the
-# repository, so its bytes stay at one digest until that source is committed.
-EXCEPTIONS="\
-vendor/multicall/v0.1.0/multicall.wasm 267e94a092df01fa02ad4edf8320a98bd65e4d4d6575254ac9521cb65727f3d4 pin"
+# digest, and pin or nopin. An exception is a vendored file that no pinned
+# source rebuilds; the tree check holds its bytes at one frozen digest. Every
+# vendored file is a manifest row, so the list is empty.
+EXCEPTIONS=""
 
 # Tracked Wasm files that the wallet neither deploys nor recognizes
 # (repository-relative).
@@ -88,7 +89,8 @@ s28|stellar 28.1.0 (c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd)"
 TOOLCHAINS="\
 1.94.0|rustc 1.94.0 (4a4ef493e 2026-03-02)
 1.96.0|rustc 1.96.0 (ac68faa20 2026-05-25)
-1.98.0|rustc 1.98.0 (88d9e12ae 2026-08-18)"
+1.98.0|rustc 1.98.0 (88d9e12ae 2026-08-18)
+1.99.0|rustc 1.99.0 (b940084d7 2026-09-28)"
 
 # Repository paths whose change can change a rebuild or its verdict.
 REBUILD_PREFIXES="\
