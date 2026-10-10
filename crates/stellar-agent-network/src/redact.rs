@@ -13,16 +13,16 @@ pub use stellar_agent_core::redact::{redact_url_authority, redact_url_userinfo};
 /// HTTP client also embeds the URL in a transport-error tail, the URL can appear
 /// more than once. This helper scans every `http(s)://...` token
 /// case-insensitively and preserves only `host[:port]`, stripping scheme,
-/// `userinfo@`, path, query, and fragment.
+/// `userinfo@`, path, query, and fragment. A space or either quote character
+/// ends a token. A closing parenthesis ends a token only when no opening
+/// parenthesis remains unmatched since the scheme. A comma stays in the token.
 #[must_use]
 pub fn redact_rpc_error(err_display: &str) -> String {
-    // INVARIANT: TOKEN_TERMINATORS is a strict subset of AUTHORITY_TERMINATORS
-    // (the authority set adds the URL structural separators `/ ? #`). Because
-    // the token end is found over that subset, `tok_end` always falls at or
-    // after `auth_end`, so advancing `rest` to `tok_end` never re-emits the
-    // path/query/fragment bytes we just stripped from the authority. Preserve
-    // this subset relationship if either array is edited.
-    const TOKEN_TERMINATORS: [char; 5] = ['\'', ')', ' ', ',', '"'];
+    // INVARIANT: Every character that ends a token (a space, either quote
+    // character, and the closing parenthesis) is in `AUTHORITY_TERMINATORS`,
+    // as are the URL separators `/`, `?`, and `#`. The token end never precedes
+    // the authority end, so output never resumes inside a stripped userinfo,
+    // path, query, or fragment.
     const AUTHORITY_TERMINATORS: [char; 8] = ['/', '?', '#', '\'', ')', ' ', ',', '"'];
 
     fn scheme_len_ci(s: &str) -> Option<usize> {
@@ -55,8 +55,20 @@ pub fn redact_rpc_error(err_display: &str) -> String {
                     .rsplit_once('@')
                     .map_or(authority, |(_userinfo, host)| host);
                 out.push_str(host_port);
+                let mut open_parens = 0_usize;
                 let tok_end = after_scheme
-                    .find(TOKEN_TERMINATORS)
+                    .find(|ch: char| match ch {
+                        '(' => {
+                            open_parens += 1;
+                            false
+                        }
+                        ')' if open_parens > 0 => {
+                            open_parens -= 1;
+                            false
+                        }
+                        ')' | '\'' | '"' => true,
+                        _ => ch == ' ',
+                    })
                     .unwrap_or(after_scheme.len());
                 rest = &after_scheme[tok_end..];
             }
@@ -136,6 +148,53 @@ mod tests {
         assert!(redacted.contains("node.example.com"));
         assert!(!redacted.contains("token=SECRET"));
         assert!(redacted.contains("stop"));
+    }
+
+    #[test]
+    fn redact_rpc_error_strips_userinfo_and_query_containing_comma() {
+        let raw = "error sending request for url \
+                   (https://user:SECRET@rpc.example.com:8443/rpc?tags=a,b&token=SECRET) for x";
+        assert_eq!(
+            redact_rpc_error(raw),
+            "error sending request for url (rpc.example.com:8443) for x"
+        );
+    }
+
+    #[test]
+    fn redact_rpc_error_strips_query_containing_parenthesized_value() {
+        let raw = "error sending request for url \
+                   (https://rpc.example.com/rpc?f=(x)&token=SECRET): timed out";
+        assert_eq!(
+            redact_rpc_error(raw),
+            "error sending request for url (rpc.example.com): timed out"
+        );
+    }
+
+    #[test]
+    fn redact_rpc_error_strips_queries_and_comma_between_urls() {
+        let raw = "tried https://a.example/x?t=SECRET, https://b.example/y?t=SECRET";
+        assert_eq!(redact_rpc_error(raw), "tried a.example b.example");
+    }
+
+    #[test]
+    fn redact_rpc_error_strips_userinfo_containing_tab() {
+        let raw = "error for https://user:\tSECRET@rpc.example/x done";
+        assert_eq!(redact_rpc_error(raw), "error for rpc.example done");
+    }
+
+    #[test]
+    fn redact_rpc_error_strips_query_containing_nested_parentheses() {
+        let raw = "url (https://rpc.example.com/rpc?f=((x))&token=SECRET) end";
+        assert_eq!(redact_rpc_error(raw), "url (rpc.example.com) end");
+    }
+
+    #[test]
+    fn redact_rpc_error_strips_quoted_urls_and_keeps_quotes() {
+        let raw = r#"url 'https://rpc.example.com/rpc?token=SECRET' and "https://other.example/p?k=SECRET""#;
+        assert_eq!(
+            redact_rpc_error(raw),
+            r#"url 'rpc.example.com' and "other.example""#
+        );
     }
 
     #[test]

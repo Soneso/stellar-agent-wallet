@@ -52,6 +52,22 @@
 //! signer-set read that refuses with `sa.contract_instance_unsupported`
 //! renders at phase `submit`.
 //!
+//! # Policy
+//!
+//! Multicall requires `policy.engine = "v1"` and evaluates the selected
+//! profile's operator-signed policy, with persisted window state, under the
+//! tool name `wallet_multicall`. The engine kind is checked after the registry
+//! loads and before the audit writer is acquired: a Noop profile refuses with
+//! `policy.engine_required`, and an unknown kind refuses with
+//! `policy.engine_unavailable`. For a V1 profile the command acquires the
+//! audit writer, which registers the keyring store. It then reconciles open
+//! reservations, loads and verifies the signed policy, and resolves the
+//! signer. A policy that cannot be loaded or verified refuses with
+//! `policy.engine_unavailable`. Only an `Allow` decision is submitted; every
+//! other decision refuses as `sa.multicall_failed` at phase `policy_gate`.
+//! The loaded profile drives reconciliation, evaluation, and recording; the
+//! resolved endpoints stay in the command's network context.
+//!
 //! # Output
 //!
 //! JSON envelope on stdout. On success: `{ "bundle_tx_hash": "...", "inner_count": N,
@@ -66,8 +82,7 @@ use clap::{ArgGroup, Args};
 use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{IoSource, ValidationError, WalletError};
-use stellar_agent_core::policy::v1::PolicyEngineV1;
-use stellar_agent_network::NetworkContext;
+use stellar_agent_core::profile::schema::PolicyEngineKind;
 use stellar_agent_network::{ClassicFeeChoice, parse_classic_fee_choice};
 use stellar_agent_smart_account::ResolvedFeePerOp;
 use stellar_agent_smart_account::multicall::{
@@ -78,6 +93,7 @@ use stellar_agent_smart_account::verifiers::default_networks_toml_path;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::commands::policy_engine::load_v1_policy_engine;
 use crate::commands::smart_account::common::{
     SignerSourceFlags, construct_signers_manager_from_fields, emit_multicall_registry_error,
     emit_sa_error, load_command_profile, map_access_error, open_audit_writer, resolve_signer,
@@ -232,9 +248,11 @@ pub struct InnerResultOutput {
 
 /// Runs the `smart-account multicall` subcommand.
 ///
-/// Validates inputs, resolves signer and secondary RPC, loads the multicall
-/// registry, then delegates to `submit_multicall_bundle`. Renders the result
-/// as a JSON envelope on stdout.
+/// Validates inputs, resolves the network and secondary RPC, loads the
+/// multicall registry, and refuses a profile whose engine is not `v1`. It
+/// then acquires the audit writer, reconciles open reservations, loads the
+/// signed policy, resolves the signer, and delegates to
+/// `submit_multicall_bundle`. Renders the result as a JSON envelope on stdout.
 ///
 /// Returns an exit code: `0` on success, `1` on any error.
 ///
@@ -323,6 +341,14 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         }
     };
 
+    // Multicall evaluates the bundle through the V1 engine only. The kind is
+    // checked before the audit writer is acquired, so a profile that can
+    // never pass the gate touches no keyring, audit log, or endpoint.
+    if let Some(refusal) = engine_kind_refusal(&profile.policy.engine, &profile_name) {
+        render_json(&refusal);
+        return 1;
+    }
+
     let network_passphrase = context.network_passphrase().to_owned();
     let chain_id = context.chain_id.caip2_str().to_owned();
 
@@ -340,19 +366,11 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     // will refuse them with SaMulticallBundleDenied { refusal_phase: "build" }.
     let bundle = parse_invocations(&args.invocation);
 
-    // Load policy engine.
-    let policy_engine = match load_policy_engine_for_profile(&profile_name) {
-        Ok(pe) => pe,
-        Err(e) => {
-            render_json(&Envelope::<()>::err(&e));
-            return 1;
-        }
-    };
-
     // ── Audit pre-flight: prove the writer is acquirable BEFORE any signing ──
     // key is touched or the bundle is submitted. A persisted profile whose
     // audit chain key is unminted refuses here (audit.chain_key_unavailable);
-    // the SAME writer is reused for the post-confirm rows.
+    // the SAME writer is reused for the post-confirm rows. Acquiring it also
+    // registers the keyring store the policy loader reads the owner key from.
     let (profile_audit_writer, audit_log_path) =
         match open_audit_writer(&profile, origin, &profile_name) {
             Ok((writer, path)) => (writer, path),
@@ -362,6 +380,41 @@ pub async fn run(args: &MulticallArgs) -> i32 {
             }
         };
     let audit_writer = Some(Arc::clone(&profile_audit_writer));
+
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "wallet.clock_error",
+                e.to_string(),
+            ));
+            return 1;
+        }
+    };
+    // Settle what stands open before the engine hydrates its window state,
+    // so a reservation an earlier verb left behind is counted as the chain
+    // settled it. The loaded profile keys the window store; the client uses
+    // the resolved primary endpoint.
+    if let Ok(reconcile_client) = stellar_agent_network::StellarRpcClient::new(&context.rpc_url) {
+        crate::commands::submission_record::reconcile_open_reservations(
+            &profile,
+            &profile_name,
+            origin,
+            &reconcile_client,
+            now_ms,
+        )
+        .await;
+    }
+
+    // Load and verify the signed policy, then hydrate its persisted window
+    // state. A load failure refuses; there is no permissive fallback.
+    let policy_engine = match load_v1_policy_engine("multicall", &profile, &profile_name) {
+        Ok(engine) => Arc::new(engine),
+        Err(msg) => {
+            render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
+            return 1;
+        }
+    };
 
     // Resolve signer.
     let (signer, mlock_degradation) = {
@@ -378,9 +431,6 @@ pub async fn run(args: &MulticallArgs) -> i32 {
             }
         }
     };
-
-    // Build a minimal profile for policy evaluation.
-    let evaluation_profile = build_minimal_profile(&context);
 
     // Every non-zero authorizing rule reads its baseline and pin record from
     // this profile's audit log. The signer-set comparison and executable pin
@@ -410,33 +460,6 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         );
     }
 
-    // Record the submission before the bytes leave. The bundle's per-inner
-    // debits are sized by the multicall gate's own window accounting, so the
-    // record here is the receipt and the audit rows.
-    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
-        Ok(v) => v,
-        Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "wallet.clock_error",
-                e.to_string(),
-            ));
-            return 1;
-        }
-    };
-    // Settle what stands open before this verb's own submission. The
-    // multicall gate reads the window store for its own accounting, so a
-    // reservation an earlier verb left behind would count there unreconciled.
-    if let Ok(reconcile_client) = stellar_agent_network::StellarRpcClient::new(&context.rpc_url) {
-        crate::commands::submission_record::reconcile_open_reservations(
-            &evaluation_profile,
-            &profile_name,
-            origin,
-            &reconcile_client,
-            now_ms,
-        )
-        .await;
-    }
-
     let submit_args = MulticallSubmitArgs {
         smart_account: &args.smart_account,
         rule_id: args.rule_id,
@@ -449,7 +472,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
             .unwrap_or(&context.rpc_url),
         network_passphrase: &network_passphrase,
         policy_engine,
-        profile: &evaluation_profile,
+        profile: &profile,
         audit_writer: audit_writer.as_ref().map(Arc::clone),
         timeout: Duration::from_secs(args.timeout_seconds),
         fee,
@@ -569,56 +592,33 @@ fn parse_single_invocation(raw: &str) -> MulticallInvocation {
     }
 }
 
-/// Constructs a permissive `PolicyEngineV1` for the CLI multicall path.
+/// Returns the refusal for a profile whose policy engine cannot gate a
+/// multicall bundle, or `None` for `v1`.
 ///
-/// # Permissive-engine rationale
-///
-/// The CLI multicall path (`smart-account multicall`) bypasses profile-configured
-/// policy. A permissive engine with no rules is correct here because the
-/// operator is exercising **explicit intent** by running the binary directly.
-/// Profile-configured policy applies only to **MCP-mediated** multicall
-/// invocations, where the agent layer supplies the bundle and the MCP server
-/// gates it through the signed policy document.
-///
-/// CLI multicall does not load a signed policy file by design — doing so would
-/// require the CLI to know the policy document's signature key, which is a
-/// concern of the MCP server's trust model, not the CLI's direct-operator model.
-///
-/// If you need policy enforcement on CLI multicall, use the MCP server interface.
-///
-/// # Errors
-///
-/// Never returns `Err` (infallible for the permissive-engine path).
-fn load_policy_engine_for_profile(profile_name: &str) -> Result<Arc<PolicyEngineV1>, WalletError> {
-    use stellar_agent_core::policy::v1::loader::{PolicyDocument, ScopeId};
-
-    let doc = PolicyDocument {
-        version: 1,
-        scope: ScopeId::AllProfiles,
-        rules: vec![],
-        signature: None,
-    };
-    Ok(Arc::new(PolicyEngineV1::new(doc, profile_name.to_owned())))
-}
-
-/// Builds a minimal `Profile` for policy-engine evaluation.
-///
-/// Constructs a network-appropriate profile with `secondary_rpc_url` set.
-/// Only `chain_id`, `network_passphrase`, and `secondary_rpc_url` need to be
-/// correct for `evaluate_bundle` in `submit_multicall_bundle`.
-fn build_minimal_profile(context: &NetworkContext) -> stellar_agent_core::profile::schema::Profile {
-    let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
-        "stellar-agent-signer",
-        "multicall-cli",
-        "stellar-agent-nonce",
-        "multicall-cli",
-    )
-    .build();
-    profile.chain_id = context.chain_id;
-    profile.network_passphrase = context.network_passphrase().to_owned();
-    profile.rpc_url = context.rpc_url.clone();
-    profile.secondary_rpc_url = context.secondary_rpc_url.clone();
-    profile
+/// The bundle gate is inherent to the V1 engine, which evaluates the
+/// operator-signed policy. A Noop profile refuses with
+/// `policy.engine_required`; the message names multicall and
+/// `policy.engine = "v1"`. An unknown engine kind refuses with
+/// `policy.engine_unavailable`.
+fn engine_kind_refusal(kind: &PolicyEngineKind, profile_name: &str) -> Option<Envelope<()>> {
+    match kind {
+        PolicyEngineKind::V1 => None,
+        PolicyEngineKind::Noop => Some(Envelope::<()>::err_raw(
+            "policy.engine_required",
+            format!(
+                "smart-account multicall requires policy.engine = \"v1\"; profile \
+                 '{profile_name}' uses the noop engine, which cannot evaluate a bundle \
+                 against a signed policy"
+            ),
+        )),
+        _ => Some(Envelope::<()>::err_raw(
+            "policy.engine_unavailable",
+            format!(
+                "unsupported policy engine kind {kind:?} for profile '{profile_name}'; \
+                 smart-account multicall requires policy.engine = \"v1\""
+            ),
+        )),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -693,6 +693,25 @@ mod tests {
     fn resolve_multicall_fee_accepts_explicit_stroops() {
         let fee = resolve_multicall_fee(Some(&ClassicFeeChoice::Explicit(250))).unwrap();
         assert_eq!(fee.base_stroops, 250);
+    }
+
+    #[test]
+    fn engine_kind_refusal_admits_v1() {
+        assert!(engine_kind_refusal(&PolicyEngineKind::V1, "alpha").is_none());
+    }
+
+    #[test]
+    fn engine_kind_refusal_refuses_noop_naming_multicall_and_v1() {
+        let envelope = engine_kind_refusal(&PolicyEngineKind::Noop, "alpha").unwrap();
+        let error = envelope.error.unwrap();
+        assert_eq!(error.code, "policy.engine_required");
+        assert!(
+            error.message.contains("multicall")
+                && error.message.contains("policy.engine = \"v1\"")
+                && error.message.contains("'alpha'"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

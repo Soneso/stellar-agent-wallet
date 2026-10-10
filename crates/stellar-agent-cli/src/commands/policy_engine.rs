@@ -5,6 +5,9 @@
 //! Provides [`build_v1_policy_engine`]: a single fail-closed builder for
 //! `PolicyEngineV1` (or `NoopPolicyEngine`) shared by the `vault`, `trade`,
 //! `trustline`, `pay`, `claim`, and sponsored `accounts create` CLI commands.
+//! Its V1 branch is [`load_v1_policy_engine`], which `smart-account multicall`
+//! calls directly: the bundle gate is inherent to `PolicyEngineV1`, and
+//! multicall refuses every other engine kind.
 //!
 //! Also provides [`evaluate_value_moving_policy`] for shared policy evaluation
 //! and refusal-envelope construction. The
@@ -22,16 +25,17 @@
 //! # Invariants preserved
 //!
 //! - `PolicyEngineKind::Noop` → `NoopPolicyEngine` (permissive; no key fetch).
-//! - `PolicyEngineKind::V1` → full owner-key fetch, base64 decode, length check,
-//!   OS-state-dir resolve, and `load_signed_policy` signature verify; every
-//!   failure arm returns `Err`.
+//! - `PolicyEngineKind::V1` → [`load_v1_policy_engine`]: full owner-key fetch,
+//!   base64 decode, length check, OS-state-dir resolve, `load_signed_policy`
+//!   signature verify, and window-state hydration; every failure arm returns
+//!   `Err`.
 //! - Unknown engine kinds → `Err` (fail-closed), matching the MCP server.
 //! - The `verb` argument appears verbatim in every `Err` message so callers
 //!   can attribute the failure to the right operation.
 //!
 //! # Owner PUBLIC key source (production vs. test)
 //!
-//! [`build_v1_policy_engine`] resolves the owner **PUBLIC** key through
+//! [`load_v1_policy_engine`] resolves the owner **PUBLIC** key through
 //! [`owner_pubkey_raw`], which reads it from the OS keyring in production. A
 //! test-only file source, gated behind `#[cfg(any(test, feature =
 //! "test-helpers"))]` and armed only when `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE`
@@ -78,18 +82,50 @@ enum OwnerKeySource {
 ///
 /// `requested_profile_name` is the name the operator selected (`--profile`,
 /// `STELLAR_AGENT_PROFILE`, or the fallback), already resolved. It selects the
-/// policy-window-state FILE, and nothing else — see the window-state section
-/// below.
+/// policy-window-state FILE, and nothing else; see [`load_v1_policy_engine`].
 ///
 /// - [`PolicyEngineKind::Noop`] → [`NoopPolicyEngine`].
-/// - [`PolicyEngineKind::V1`] → derives the profile name from the owner-key
-///   service entry (stripping [`OWNER_KEY_SERVICE_PREFIX`]), fetches the owner
-///   public key from the OS keyring, and loads the operator-signed policy file
-///   from the OS state directory.
+/// - [`PolicyEngineKind::V1`] → [`load_v1_policy_engine`], boxed.
 /// - Any failure for `V1` → `Err(human-readable message)`. The caller MUST
 ///   refuse the value-moving operation (render the error, exit non-zero).
 ///   It MUST NOT fall back to a permissive engine.
 /// - Unknown engine kinds → `Err` (fail-closed), matching the MCP server.
+///
+/// # Errors
+///
+/// Returns `Err(human-readable message)` on any V1 build failure or unknown
+/// engine kind. The message names the verb, profile, and cause but carries no
+/// secret material or account address.
+pub(crate) fn build_v1_policy_engine(
+    verb: &str,
+    kind: &PolicyEngineKind,
+    profile: &stellar_agent_core::profile::schema::Profile,
+    requested_profile_name: &str,
+) -> Result<Box<dyn PolicyEngine>, String> {
+    match kind {
+        PolicyEngineKind::Noop => Ok(Box::new(NoopPolicyEngine)),
+        PolicyEngineKind::V1 => Ok(Box::new(load_v1_policy_engine(
+            verb,
+            profile,
+            requested_profile_name,
+        )?)),
+        _ => Err(format!(
+            "unsupported policy engine kind {kind:?}; {verb} refuses (fail closed)"
+        )),
+    }
+}
+
+/// Loads the operator-signed V1 policy for `profile` and hydrates its
+/// persisted window state.
+///
+/// Derives the profile name from the owner-key service entry by stripping
+/// [`OWNER_KEY_SERVICE_PREFIX`], and fetches the owner public key from the OS
+/// keyring. Verifies the signed policy file in the OS state directory, then
+/// loads the rolling-window store selected by `requested_profile_name`. The
+/// caller selects this loader for a `v1` profile; it does not read
+/// `profile.policy.engine`.
+///
+/// `verb` appears in every error message to attribute the failure.
 ///
 /// # Which name keys the window state
 ///
@@ -105,12 +141,11 @@ enum OwnerKeySource {
 /// and its write. The two surfaces cannot disagree in practice, because
 /// neither one operates on a profile whose derived and requested names differ:
 /// both reconcile the selected name against
-/// `policy_owner_key_id.service` before any state path is built — the server at
+/// `policy_owner_key_id.service` before any state path is built: the server at
 /// startup, this binary at `crate::common::profile_access`. For every profile
 /// either surface acts on, the two names are the same string, so which of them
-/// keys the store is unobservable. Settling the keying difference as one
-/// decision across both binaries is recorded as the surface-parity note on
-/// issue #114 and is not made here.
+/// keys the store is unobservable. This loader keeps the CLI keying; unifying
+/// the keying across both binaries is a separate decision.
 ///
 /// Only the FILE moves. The name attached to each hydrated entry
 /// (`load_into`) and the engine's own `StateKey` namespace (`new_with_store`)
@@ -132,144 +167,136 @@ enum OwnerKeySource {
 ///   the store's own definition and every value-moving command fails closed
 ///   with `GenerationMismatch` until `profile reset-window-state b` runs.
 /// - The copy omits the field: the coordinate is derived as `b`'s, so `b`
-///   starts a FRESH window with no accumulated history — `a`'s spend does not
-///   carry over. Copying a profile file is not a way to inherit a spend
+///   starts a FRESH window with no accumulated history, and `a`'s spend does
+///   not carry over. Copying a profile file is not a way to inherit a spend
 ///   window, and `docs/profiles.md` says so.
 ///
 /// # Errors
 ///
-/// Returns `Err(human-readable message)` on any V1 build failure or unknown
-/// engine kind. The message names the verb, profile, and cause but carries no
-/// secret material or account address.
-pub(crate) fn build_v1_policy_engine(
+/// Returns `Err(human-readable message)` when the owner key, the signed
+/// policy, or the window store cannot be read or verified. The caller MUST
+/// refuse the operation and MUST NOT fall back to a permissive engine. The
+/// message names the verb, profile, and cause but carries no secret material
+/// or account address.
+pub(crate) fn load_v1_policy_engine(
     verb: &str,
-    kind: &PolicyEngineKind,
     profile: &stellar_agent_core::profile::schema::Profile,
     requested_profile_name: &str,
-) -> Result<Box<dyn PolicyEngine>, String> {
+) -> Result<PolicyEngineV1, String> {
     use base64::Engine as _;
     use ed25519_dalek::PUBLIC_KEY_LENGTH;
     use stellar_agent_core::policy::v1::loader::load_signed_policy;
 
-    match kind {
-        PolicyEngineKind::Noop => Ok(Box::new(NoopPolicyEngine)),
-        PolicyEngineKind::V1 => {
-            // Derive profile name from the service field (strips prefix).
-            // `account` is always the literal "default", so we MUST use `service`.
-            let service = &profile.policy_owner_key_id.service;
-            let profile_name = match derive_profile_name_from_owner_key(profile) {
-                Some(n) => n.to_owned(),
-                None => {
-                    return Err(format!(
-                        "policy.engine is 'v1' but the owner-key service '{service}' does not \
-                         start with the expected prefix '{OWNER_KEY_SERVICE_PREFIX}'; \
-                         {verb} refuses (fail closed)"
-                    ));
-                }
-            };
-
-            // Resolve the owner PUBLIC key, a G-strkey or URL-safe base64 in the
-            // older form, from the OS keyring (production) or from a gated
-            // test-only file source.
-            let (raw_key, source) = owner_pubkey_raw(&profile_name, verb)?;
-
-            let owner_pubkey = match decode_owner_public_key(&raw_key) {
-                Some((key, form)) => {
-                    // Only a keyring entry is rewritten, never the test-only
-                    // file source.
-                    if form == OwnerKeyForm::OlderBase64 && source == OwnerKeySource::Keyring {
-                        let outcome = rewrite_owner_value_if_older(
-                            &stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key(
-                                &profile_name,
-                            ),
-                            &raw_key,
-                        );
-                        log_owner_entry_rewrite(&profile_name, &outcome);
-                    }
-                    key
-                }
-                None => {
-                    let key_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(raw_key.trim())
-                    {
-                        Ok(b) => b,
-                        Err(e) => {
-                            return Err(format!(
-                                "policy.engine is 'v1' but the owner key for profile \
-                                 '{profile_name}' is neither a G-strkey nor valid base64 ({e}); \
-                                 {verb} refuses (fail closed)"
-                            ));
-                        }
-                    };
-                    return Err(format!(
-                        "policy.engine is 'v1' but the owner key for profile '{profile_name}' has \
-                         length {} (expected {PUBLIC_KEY_LENGTH}); {verb} refuses (fail closed)",
-                        key_bytes.len()
-                    ));
-                }
-            };
-            if source == OwnerKeySource::Keyring {
-                rewrite_older_form_owner_entries_once(Some(&profile_name));
-            }
-
-            // Resolve the policy directory.
-            let policy_dir = match default_policy_dir() {
-                Ok(d) => d,
-                Err(e) => {
-                    return Err(format!(
-                        "policy.engine is 'v1' but the OS policy state directory is \
-                         unavailable ({e}); {verb} refuses (fail closed)"
-                    ));
-                }
-            };
-            let policy_path = policy_dir.join(format!("{profile_name}.toml"));
-
-            // Load and signature-verify the operator's policy document.
-            let document = match load_signed_policy(&policy_path, &profile_name, &owner_pubkey) {
-                Ok(doc) => doc,
-                Err(e) => {
-                    return Err(format!(
-                        "policy.engine is 'v1' but the policy file at {} failed to \
-                         load/verify ({e}); {verb} refuses (fail closed)",
-                        policy_path.display()
-                    ));
-                }
-            };
-
-            // Hydrate the persisted window-state store BEFORE constructing the
-            // engine so `per_period_cap` / `rate_limit` / `bundle_per_period_cap`
-            // / `bundle_rate_limit` evaluate against accumulated history, not an
-            // always-empty per-invocation store. Fail-closed on hydration
-            // error (tampered/unparseable store file): the caller MUST NOT
-            // fall back to an unhydrated engine, which would silently
-            // under-count and defeat the operator's configured caps.
-            // The FILE is selected by the requested name — the same file every
-            // write path appends to and `profile reset-window-state` resets.
-            // `load_into` and `new_with_store` below keep the DERIVED name and
-            // must stay equal to each other: the wire format carries no name,
-            // so the load re-attaches one, and the engine looks entries up
-            // under its own namespace.
-            let state_store = PolicyStateStore::new();
-            let window_store = PersistedWindowStore::for_profile(requested_profile_name);
-            if let Err(e) = window_store.load_into(&profile_name, profile, &state_store) {
-                return Err(format!(
-                    "policy.engine is 'v1' but the policy-window-state store for profile \
-                     '{requested_profile_name}' failed to load ({e}); {verb} refuses \
-                     (fail closed); run `stellar-agent profile reset-window-state \
-                     {requested_profile_name} --reason <reason>` to recover"
-                ));
-            }
-
-            Ok(Box::new(PolicyEngineV1::new_with_store(
-                document,
-                profile_name,
-                state_store,
-            )))
+    // Derive profile name from the service field (strips prefix).
+    // `account` is always the literal "default", so we MUST use `service`.
+    let service = &profile.policy_owner_key_id.service;
+    let profile_name = match derive_profile_name_from_owner_key(profile) {
+        Some(n) => n.to_owned(),
+        None => {
+            return Err(format!(
+                "policy.engine is 'v1' but the owner-key service '{service}' does not \
+                 start with the expected prefix '{OWNER_KEY_SERVICE_PREFIX}'; \
+                 {verb} refuses (fail closed)"
+            ));
         }
-        _ => Err(format!(
-            "unsupported policy engine kind {kind:?}; {verb} refuses (fail closed)"
-        )),
+    };
+
+    // Resolve the owner PUBLIC key, a G-strkey or URL-safe base64 in the
+    // older form, from the OS keyring (production) or from a gated
+    // test-only file source.
+    let (raw_key, source) = owner_pubkey_raw(&profile_name, verb)?;
+
+    let owner_pubkey = match decode_owner_public_key(&raw_key) {
+        Some((key, form)) => {
+            // Only a keyring entry is rewritten, never the test-only
+            // file source.
+            if form == OwnerKeyForm::OlderBase64 && source == OwnerKeySource::Keyring {
+                let outcome = rewrite_owner_value_if_older(
+                    &stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key(
+                        &profile_name,
+                    ),
+                    &raw_key,
+                );
+                log_owner_entry_rewrite(&profile_name, &outcome);
+            }
+            key
+        }
+        None => {
+            let key_bytes =
+                match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw_key.trim()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Err(format!(
+                            "policy.engine is 'v1' but the owner key for profile \
+                         '{profile_name}' is neither a G-strkey nor valid base64 ({e}); \
+                         {verb} refuses (fail closed)"
+                        ));
+                    }
+                };
+            return Err(format!(
+                "policy.engine is 'v1' but the owner key for profile '{profile_name}' has \
+                 length {} (expected {PUBLIC_KEY_LENGTH}); {verb} refuses (fail closed)",
+                key_bytes.len()
+            ));
+        }
+    };
+    if source == OwnerKeySource::Keyring {
+        rewrite_older_form_owner_entries_once(Some(&profile_name));
     }
+
+    // Resolve the policy directory.
+    let policy_dir = match default_policy_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(format!(
+                "policy.engine is 'v1' but the OS policy state directory is \
+                 unavailable ({e}); {verb} refuses (fail closed)"
+            ));
+        }
+    };
+    let policy_path = policy_dir.join(format!("{profile_name}.toml"));
+
+    // Load and signature-verify the operator's policy document.
+    let document = match load_signed_policy(&policy_path, &profile_name, &owner_pubkey) {
+        Ok(doc) => doc,
+        Err(e) => {
+            return Err(format!(
+                "policy.engine is 'v1' but the policy file at {} failed to \
+                 load/verify ({e}); {verb} refuses (fail closed)",
+                policy_path.display()
+            ));
+        }
+    };
+
+    // Hydrate the persisted window-state store BEFORE constructing the
+    // engine so `per_period_cap` / `rate_limit` / `bundle_per_period_cap`
+    // / `bundle_rate_limit` evaluate against accumulated history, not an
+    // always-empty per-invocation store. Fail-closed on hydration
+    // error (tampered/unparseable store file): the caller MUST NOT
+    // fall back to an unhydrated engine, which would silently
+    // under-count and defeat the operator's configured caps.
+    // The FILE is selected by the requested name: the same file every
+    // write path appends to and `profile reset-window-state` resets.
+    // `load_into` and `new_with_store` below keep the DERIVED name and
+    // must stay equal to each other: the wire format carries no name,
+    // so the load re-attaches one, and the engine looks entries up
+    // under its own namespace.
+    let state_store = PolicyStateStore::new();
+    let window_store = PersistedWindowStore::for_profile(requested_profile_name);
+    if let Err(e) = window_store.load_into(&profile_name, profile, &state_store) {
+        return Err(format!(
+            "policy.engine is 'v1' but the policy-window-state store for profile \
+             '{requested_profile_name}' failed to load ({e}); {verb} refuses \
+             (fail closed); run `stellar-agent profile reset-window-state \
+             {requested_profile_name} --reason <reason>` to recover"
+        ));
+    }
+
+    Ok(PolicyEngineV1::new_with_store(
+        document,
+        profile_name,
+        state_store,
+    ))
 }
 
 /// Resolves the operator's owner **PUBLIC** key, as stored, for

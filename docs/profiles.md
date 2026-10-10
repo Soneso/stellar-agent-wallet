@@ -276,7 +276,7 @@ which the 32-byte signing seed is resident in pinned, zeroize-on-drop memory.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `engine` | string | yes (in v2) | — | `"noop"` or `"v1"`. `noop`: testnet allow-all; mainnet read-only allowed; mainnet destructive operations refused with `policy.engine_required`. `v1`: signature-verified typed-criteria engine, first-match default-deny. Newly minted profiles default to `v1`; a profile migrated from v1 is set to `noop` explicitly. |
+| `engine` | string | yes (in v2) | — | `"noop"` or `"v1"`. `noop`: testnet allow-all; mainnet read-only allowed; mainnet destructive operations refused with `policy.engine_required`; `smart-account multicall` refused on testnet with `policy.engine_required`, since mainnet refuses it earlier with `network.mainnet_write_forbidden`. `v1`: signature-verified typed-criteria engine, first-match default-deny. Newly minted profiles default to `v1`; a profile migrated from v1 is set to `noop` explicitly. |
 
 ### `[remote_approval]` block
 

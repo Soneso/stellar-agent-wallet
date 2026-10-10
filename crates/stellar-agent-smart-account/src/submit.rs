@@ -1082,7 +1082,7 @@ pub async fn submit_signed_invoke(
         )?;
 
         // (b) Cross-RPC simulate comparison: re-simulate on secondary RPC and
-        // compare normalised response against primary result (including
+        // compare normalized response against primary result (including
         // sub_invocations byte-exact; see cross_rpc_compare_simulate_responses).
         let secondary_server = stellar_rpc_client::Client::new(secondary_url).map_err(|e| {
             auth_payload_err(format!("secondary RPC Client construction failed: {e}"))
@@ -1090,10 +1090,8 @@ pub async fn submit_signed_invoke(
         let secondary_sim = secondary_server
             .simulate_transaction_envelope(&sim_envelope, None)
             .await
-            .map_err(|e| SaError::MulticallFailed {
-                phase: "rpc_divergence",
-                redacted_reason: format!("secondary RPC simulate failed: {e}"),
-                post_submit_kind: None,
+            .map_err(|e| {
+                crate::multicall::rpc_client_divergence("secondary RPC simulate failed", &e)
             })?;
         crate::multicall::cross_rpc_compare_simulate_responses(&sim_response, &secondary_sim)?;
     }

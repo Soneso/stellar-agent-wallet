@@ -220,5 +220,9 @@ required-features = ["testnet-acceptance"]
 name = "smart_account_execute_testnet_acceptance"
 required-features = ["testnet-acceptance"]
 
+[[test]]
+name = "smart_account_multicall_cli_testnet_acceptance"
+required-features = ["testnet-acceptance"]
+
 [lints]
 workspace = true

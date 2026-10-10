@@ -233,11 +233,13 @@ pub struct MulticallSubmitArgs<'a> {
 }
 
 /// Builds the durable record from the same bundle view the policy gate evaluated.
+///
+/// The gate admits only [`Decision::Allow`] to submission, so the record
+/// carries an allow decision.
 fn build_bundle_recorder<'a>(
     args: &MulticallSubmitArgs<'a>,
     tool: &stellar_agent_core::policy::ToolDescriptor,
     bundle: &stellar_agent_core::policy::v1::bundle::BundleView<'_>,
-    policy_decision: &Decision,
 ) -> Result<stellar_agent_network::submission_record::WalletSubmissionRecorder<'a>, SaError> {
     use stellar_agent_core::audit_log::schema::ValueLegRecord;
     use stellar_agent_core::policy::v1::value::{ValueClass, value_class_for_inner};
@@ -274,20 +276,7 @@ fn build_bundle_recorder<'a>(
         profile_name,
         "stellar_smart_account_multicall",
         Some(args.chain_id.to_owned()),
-        match policy_decision {
-            Decision::Allow => stellar_agent_core::audit_log::PolicyDecision::Allow,
-            Decision::RequireApproval(_) => {
-                stellar_agent_core::audit_log::PolicyDecision::RequireApproval
-            }
-            Decision::Deny(reason) => stellar_agent_core::audit_log::PolicyDecision::Deny(
-                deny_reason_wire_code(reason).to_owned(),
-            ),
-            _ => {
-                return Err(unavailable(
-                    "the gate produced an unsupported decision".to_owned(),
-                ));
-            }
-        },
+        stellar_agent_core::audit_log::PolicyDecision::Allow,
         legs,
         entries,
         receipts,
@@ -884,6 +873,24 @@ pub(crate) fn cross_rpc_compare_wasm_hashes(
 
 // ── Step-4 dispatch helpers ───────────────────────────────────────────────────
 
+/// Builds the `rpc_divergence` refusal for a failed RPC client call.
+///
+/// The client error text can carry the endpoint URL, with credentials in its
+/// userinfo, path, or query, and account or contract strkeys. Every URL keeps
+/// only its authority. Every G, C, T, M, or P strkey keeps its first and last
+/// five characters as the `MulticallFailed` contract requires. Every
+/// 64-character lowercase hex hash keeps its first and last eight.
+pub(crate) fn rpc_client_divergence(context: &str, error: &dyn std::fmt::Display) -> SaError {
+    let url_redacted = stellar_agent_network::redact_rpc_error(&format!("{context}: {error}"));
+    SaError::MulticallFailed {
+        phase: "rpc_divergence",
+        redacted_reason: stellar_agent_core::audit_log::entry::redact_decision_reason(
+            &url_redacted,
+        ),
+        post_submit_kind: None,
+    }
+}
+
 /// Fetches the on-chain WASM hash for a deployed contract via an RPC endpoint.
 ///
 /// Used by `submit.rs` Step 4 to obtain primary-RPC and secondary-RPC hashes
@@ -919,11 +926,8 @@ pub(crate) async fn fetch_wasm_hash_via_rpc(
         post_submit_kind: None,
     };
 
-    let server = Client::new(rpc_url).map_err(|e| {
-        rpc_err(format!(
-            "Server construction failed for wasm-hash fetch: {e}"
-        ))
-    })?;
+    let server = Client::new(rpc_url)
+        .map_err(|e| rpc_client_divergence("Server construction failed for wasm-hash fetch", &e))?;
 
     // Parse the contract C-strkey to derive the ScAddress.
     let c_strkey = stellar_strkey::Contract::from_string(contract_address)
@@ -939,9 +943,7 @@ pub(crate) async fn fetch_wasm_hash_via_rpc(
     .await
     .map_err(|_| rpc_err("get_ledger_entries timed out for contract instance fetch".to_owned()))?
     .map_err(|e| {
-        rpc_err(format!(
-            "get_ledger_entries failed for contract instance fetch: {e}"
-        ))
+        rpc_client_divergence("get_ledger_entries failed for contract instance fetch", &e)
     })?;
 
     let entries = resp.entries.unwrap_or_default();
@@ -1003,77 +1005,67 @@ pub(crate) async fn fetch_wasm_hash_via_rpc(
     Ok(hex::encode(hash_bytes))
 }
 
-/// Compares primary vs secondary `SimulateTransactionResponse` for the multicall
-/// cross-RPC trust-anchor check.
+/// Compares primary and secondary simulations for the multicall cross-RPC check.
 ///
-/// Called by `submit.rs` Step 4 after fetching the secondary simulation.
+/// Check 1 guards against a primary RPC that returns an invocation tree with
+/// authorizations the caller did not request. The host draws an
+/// address-credential nonce per simulation. The wallet keeps the primary
+/// simulation's nonce, sets its own signature expiration ledger, and signs its
+/// own entry. The secondary simulation's nonce, expiration ledger, and
+/// signature therefore carry nothing the check binds.
+///
 /// Compares:
+/// 1. Authorization entries as sorted XDR after zeroing address-credential nonces
+///    and expiration ledgers and setting signatures to void on cloned entries.
+///    Credential addresses, source-account credentials, and entire invocation
+///    trees stay byte-exact.
+/// 2. Transaction data as XDR after zeroing temporary read-write nonce keys that
+///    match the simulation's address credentials. The host records consumed
+///    nonces in the footprint. A persistent read-write nonce key, or a
+///    read-write nonce key that matches no address credential of its own
+///    simulation, refuses. A nonce key in another access mode stays unchanged,
+///    so the byte-exact comparison refuses it when its nonce differs between
+///    the simulations. All other fields stay byte-exact.
+/// 3. `min_resource_fee` within 5 percent numeric tolerance.
 ///
-/// 1. **`sub_invocations` auth-tree** — byte-exact via XDR serialization of the
-///    auth entries returned by each RPC. A divergence here means one RPC is
-///    trying to inject additional authorizations the caller did not request,
-///    which is a rogue-RPC attack vector.
-/// 2. **`transaction_data` (footprint)** — byte-exact via XDR serialization.
-/// 3. **`min_resource_fee`** — within ±5% numeric tolerance.
-///
-/// The `latest_ledger` fields are deliberately NOT compared because the two RPCs
-/// may be at different ledger heights.
-///
-/// Returns `Ok(())` on agreement; `Err(SaError::MulticallFailed { phase: "rpc_divergence" })`
-/// on divergence.
+/// Ledger heights can differ between RPCs and are excluded from this comparison.
+/// Every refusal is a `MulticallFailed` error with phase `rpc_divergence`.
 pub(crate) fn cross_rpc_compare_simulate_responses(
     primary: &stellar_rpc_client::SimulateTransactionResponse,
     secondary: &stellar_rpc_client::SimulateTransactionResponse,
 ) -> Result<(), SaError> {
-    use stellar_xdr::{Limits, WriteXdr};
+    use stellar_xdr::{Limits, SorobanAuthorizationEntry, SorobanCredentials, WriteXdr};
 
-    // ── Check 1: sub_invocations auth-tree byte-exact ────────────────────────
-    //
-    // `stellar_rpc_client::SimulateTransactionResponse::results` is
-    // a private field. Access is through the public `results()` method which
-    // returns `Result<Vec<SimulateHostFunctionResult>>`.
-    //
-    // A rogue primary RPC could return escalated sub_invocations (e.g. adding
-    // extra `transfer` sub-invocations) that the wallet would blindly sign.
-    // Byte-exact comparison between primary and secondary RPCs detects this.
-    //
-    // We serialize each `SorobanAuthorizationEntry` to XDR base64 via
-    // `WriteXdr::to_xdr_base64` and sort before comparing to be insensitive to
-    // entry ordering (both RPCs should return the same set).
-    let primary_auth: Vec<String> = {
-        let mut entries: Vec<String> = primary
+    // Check 1 preserves each invocation tree and credential address.
+    let auth_entries = |response: &stellar_rpc_client::SimulateTransactionResponse| {
+        response
             .results()
             .ok()
             .and_then(|results| results.into_iter().next())
-            .map(|r| r.auth)
+            .map(|result| result.auth)
             .unwrap_or_default()
+    };
+    let primary_entries = auth_entries(primary);
+    let secondary_entries = auth_entries(secondary);
+    let normalized_auth = |entries: &[SorobanAuthorizationEntry]| {
+        let mut entries: Vec<String> = entries
             .iter()
             .map(|entry| {
-                entry
-                    .to_xdr_base64(Limits::none())
-                    .unwrap_or_else(|_| String::new())
+                let mut entry = entry.clone();
+                if let SorobanCredentials::Address(credentials) = &mut entry.credentials {
+                    credentials.nonce = 0;
+                    credentials.signature_expiration_ledger = 0;
+                    // Submission rebuilds the signature locally.
+                    credentials.signature = ScVal::Void;
+                }
+                entry.to_xdr_base64(Limits::none()).unwrap_or_default()
             })
             .collect();
         entries.sort();
         entries
     };
-    let secondary_auth: Vec<String> = {
-        let mut entries: Vec<String> = secondary
-            .results()
-            .ok()
-            .and_then(|results| results.into_iter().next())
-            .map(|r| r.auth)
-            .unwrap_or_default()
-            .iter()
-            .map(|entry| {
-                entry
-                    .to_xdr_base64(Limits::none())
-                    .unwrap_or_else(|_| String::new())
-            })
-            .collect();
-        entries.sort();
-        entries
-    };
+    let primary_auth = normalized_auth(&primary_entries);
+    let secondary_auth = normalized_auth(&secondary_entries);
 
     if primary_auth != secondary_auth {
         // Surface first-8 chars of each side's first auth-entry XDR for forensics.
@@ -1094,18 +1086,17 @@ pub(crate) fn cross_rpc_compare_simulate_responses(
         });
     }
 
-    // ── Check 2: transaction_data (footprint) byte-exact ─────────────────────
+    // Check 2 preserves transaction data after normalizing consumed nonce keys.
     //
-    // Both must be present (a None transaction_data indicates a simulate error,
-    // which is caught before Step 4 by the panic-insulation pre-check in submit.rs).
-    // transaction_data() returns Result<SorobanTransactionData>; convert to Option.
+    // The guard in submit.rs after this check refuses an empty
+    // `transaction_data` string. `transaction_data()` returns
+    // `Result<SorobanTransactionData>`; convert to `Option`.
     let primary_td = primary.transaction_data().ok();
     let secondary_td = secondary.transaction_data().ok();
 
     match (primary_td, secondary_td) {
         (None, None) => {
-            // Both returned no footprint — divergence check is irrelevant;
-            // submit will fail at Step 6 when the footprint is absent.
+            // The guard after this check refuses an empty `transaction_data` string.
         }
         (Some(_), None) | (None, Some(_)) => {
             return Err(SaError::MulticallFailed {
@@ -1117,8 +1108,10 @@ pub(crate) fn cross_rpc_compare_simulate_responses(
             });
         }
         (Some(p_td), Some(s_td)) => {
+            let p_td = normalize_simulated_nonce_keys(p_td, &primary_entries)?;
+            let s_td = normalize_simulated_nonce_keys(s_td, &secondary_entries)?;
             // Compare as XDR base64 strings.
-            // `SorobanTransactionData::to_xdr_base64` is from stellar-baselib::xdr::WriteXdr.
+            // `SorobanTransactionData::to_xdr_base64` is from `stellar_xdr::WriteXdr`.
             let p_xdr = p_td.to_xdr_base64(Limits::none()).unwrap_or_default();
             let s_xdr = s_td.to_xdr_base64(Limits::none()).unwrap_or_default();
             if p_xdr != s_xdr {
@@ -1133,14 +1126,58 @@ pub(crate) fn cross_rpc_compare_simulate_responses(
         }
     }
 
-    // ── Check 3: min_resource_fee within ±5% numeric tolerance ───────────────
-    // min_resource_fee is u64.
+    // Check 3 holds min_resource_fee, a u64, within 5 percent numeric tolerance.
     let primary_fee = primary.min_resource_fee;
     let secondary_fee = secondary.min_resource_fee;
 
     check_numeric_tolerance("min_resource_fee", primary_fee, secondary_fee)?;
 
     Ok(())
+}
+
+/// Normalizes the host's consumed nonce keys in a simulation's transaction data.
+///
+/// The wallet signs with the primary simulation's nonce and its own signature
+/// expiration ledger, so the nonce in a consumed nonce key differs per
+/// simulation and carries nothing the check binds. Each temporary read-write
+/// nonce key must match an address credential of that simulation by address
+/// and nonce, and its nonce is then zeroed. A persistent read-write nonce key,
+/// or one that matches no address credential of its own simulation, refuses
+/// with phase `rpc_divergence`. A nonce key in another access mode stays
+/// unchanged, so the byte-exact comparison refuses it with the same phase when
+/// its nonce differs between the simulations. Addresses, access modes, key
+/// counts, and resources stay exact.
+fn normalize_simulated_nonce_keys(
+    mut data: stellar_xdr::SorobanTransactionData,
+    auth: &[stellar_xdr::SorobanAuthorizationEntry],
+) -> Result<stellar_xdr::SorobanTransactionData, SaError> {
+    use stellar_xdr::{ContractDataDurability, LedgerKey, SorobanCredentials};
+
+    for key in data.resources.footprint.read_write.iter_mut() {
+        if let LedgerKey::ContractData(contract_data) = key
+            && let ScVal::LedgerKeyNonce(nonce_key) = &mut contract_data.key
+        {
+            let matches_credential = auth.iter().any(|entry| {
+                matches!(
+                    &entry.credentials,
+                    SorobanCredentials::Address(credentials)
+                        if credentials.address == contract_data.contract
+                            && credentials.nonce == nonce_key.nonce
+                )
+            });
+            if contract_data.durability != ContractDataDurability::Temporary || !matches_credential
+            {
+                return Err(SaError::MulticallFailed {
+                    phase: "rpc_divergence",
+                    redacted_reason: "footprint nonce key does not match simulated authorization"
+                        .to_owned(),
+                    post_submit_kind: None,
+                });
+            }
+            nonce_key.nonce = 0;
+        }
+    }
+    Ok(data)
 }
 
 // ── build_exec_invocations ────────────────────────────────────────────────────
@@ -1215,8 +1252,12 @@ pub fn build_exec_invocations(bundle: &[MulticallInvocation]) -> Result<Vec<ScVa
 ///    each invocation shape (C-strkey target, symbol fn_name, JSON args). Fail-CLOSED
 ///    `MulticallFailed { phase: "build" }` + emit `SaMulticallBundleDenied`.
 /// 2. **policy_gate** — decompose bundle via `decompose_bundle` → build `BundleView`
-///    → call `policy_engine.evaluate_bundle`. On `Deny` → `MulticallFailed { phase: "policy_gate" }`
-///    + emit `SaMulticallBundleDenied { denied_inner_index }`.
+///    → call `policy_engine.evaluate_bundle`. Only `Allow` proceeds to submission.
+///    Every other decision refuses with `MulticallFailed { phase: "policy_gate" }`
+///    and emits `SaMulticallBundleDenied`: a `Deny` carries its reason code and
+///    `denied_inner_index`, `RequireApproval` carries `multicall.approval_required`
+///    (this path has no approval route), and any other decision carries
+///    `multicall.unexpected_decision`.
 /// 3. **submit** — build `HostFunction` targeting the registered multicall address;
 ///    build `MulticallCheck`; call `submit_signed_invoke` with
 ///    `required_checks: &["multicall"]`. The free function performs wasm-hash pre-flight
@@ -1459,31 +1500,20 @@ pub async fn submit_multicall_bundle(
             post_submit_kind: None,
         })?;
 
-    if let Decision::Deny(ref deny_reason) = policy_decision {
-        let (denied_inner_index, deny_wire_code) = match deny_reason {
-            DenyReason::BundleDenied {
-                inner_index,
-                deny_reason,
-            } => (
-                Some(*inner_index),
-                format!("multicall.{}", deny_reason_wire_code(deny_reason)),
-            ),
-            other => (None, format!("multicall.{}", deny_reason_wire_code(other))),
-        };
-
+    if let Some(refusal) = policy_gate_refusal(&policy_decision) {
         let _ = emit_denied(
             &args.audit_writer,
-            denied_inner_index,
+            refusal.denied_inner_index,
             None,
             None,
-            deny_wire_code,
+            refusal.deny_wire_code,
             "policy_gate",
             inner_count,
         );
 
         return Err(SaError::MulticallFailed {
             phase: "policy_gate",
-            redacted_reason: "policy denied the multicall bundle".to_owned(),
+            redacted_reason: refusal.redacted_reason.to_owned(),
             post_submit_kind: None,
         });
     }
@@ -1564,11 +1594,14 @@ pub async fn submit_multicall_bundle(
     let rule_id = ContextRuleId::from(args.rule_id);
     let auth_rule_ids = vec![rule_id];
 
-    let recorder = build_bundle_recorder(&args, &tool, &bundle_view, &policy_decision)?;
+    let recorder = build_bundle_recorder(&args, &tool, &bundle_view)?;
 
+    // The transaction invokes the router's `exec`; the wallet is the
+    // authorizing address whose credentials sign the simulated tree.
     let submit_result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
-            .target_contract(args.smart_account)
+            .target_contract(&registry_entry.address)
+            .auth_address(args.smart_account)
             .auth_rule_ids(&auth_rule_ids)
             .host_function(host_function)
             .signer(args.signer)
@@ -1957,6 +1990,57 @@ const RULE_CHECK_STAGES: &[&str] = &[
     "signer_set_compare",
 ];
 
+/// The refusal the policy gate of [`submit_multicall_bundle`] reports for a
+/// decision other than [`Decision::Allow`].
+#[derive(Debug, PartialEq, Eq)]
+struct PolicyGateRefusal {
+    /// `denied_inner_index` of the `SaMulticallBundleDenied` row.
+    denied_inner_index: Option<u32>,
+    /// `deny_wire_code` of the `SaMulticallBundleDenied` row.
+    deny_wire_code: String,
+    /// `redacted_reason` of the returned [`SaError::MulticallFailed`].
+    redacted_reason: &'static str,
+}
+
+/// Maps a bundle decision to the refusal the gate reports, or `None` for
+/// [`Decision::Allow`], the only decision that proceeds to submission.
+///
+/// - [`Decision::Deny`]: `multicall.<reason>`, with the inner index of a
+///   [`DenyReason::BundleDenied`].
+/// - [`Decision::RequireApproval`]: `multicall.approval_required`. The
+///   multicall path has no approval route, so the bundle is refused.
+/// - Any other decision: `multicall.unexpected_decision`.
+fn policy_gate_refusal(decision: &Decision) -> Option<PolicyGateRefusal> {
+    match decision {
+        Decision::Allow => None,
+        Decision::Deny(reason) => {
+            let (denied_inner_index, code) = match reason {
+                DenyReason::BundleDenied {
+                    inner_index,
+                    deny_reason,
+                } => (Some(*inner_index), deny_reason_wire_code(deny_reason)),
+                other => (None, deny_reason_wire_code(other)),
+            };
+            Some(PolicyGateRefusal {
+                denied_inner_index,
+                deny_wire_code: format!("multicall.{code}"),
+                redacted_reason: "policy denied the multicall bundle",
+            })
+        }
+        Decision::RequireApproval(_) => Some(PolicyGateRefusal {
+            denied_inner_index: None,
+            deny_wire_code: "multicall.approval_required".to_owned(),
+            redacted_reason: "policy requires approval for the multicall bundle; \
+                              this submission path has no approval route",
+        }),
+        _ => Some(PolicyGateRefusal {
+            denied_inner_index: None,
+            deny_wire_code: "multicall.unexpected_decision".to_owned(),
+            redacted_reason: "policy returned an unexpected decision for the multicall bundle",
+        }),
+    }
+}
+
 /// The denied audit row [`submit_multicall_bundle`] writes for a failed
 /// submission.
 #[derive(Debug, PartialEq, Eq)]
@@ -1976,6 +2060,8 @@ struct SubmitDeniedRow {
 ///   canonical code. Its row has phase `policy_gate` and deny code
 ///   `multicall.network.mainnet_write_forbidden`: the wallet refused it, and
 ///   no transaction was sent.
+/// - A nested [`SaError::MulticallFailed`] keeps its phase, reason, and
+///   post-submit kind, and writes a denied row at that phase.
 /// - Every other error writes a row at the phase of
 ///   `map_sa_error_to_multicall_phase` and becomes [`SaError::MulticallFailed`]
 ///   in that phase.
@@ -1999,10 +2085,13 @@ fn classify_submit_failure(sa_err: SaError) -> (Option<SubmitDeniedRow>, SaError
                 deny_wire_code: format!("multicall.{}", other.wire_code()),
                 refusal_phase: phase,
             };
-            let wrapped = SaError::MulticallFailed {
-                phase,
-                redacted_reason: format!("submit error: {}", other.wire_code()),
-                post_submit_kind: None,
+            let wrapped = match other {
+                SaError::MulticallFailed { .. } => other,
+                _ => SaError::MulticallFailed {
+                    phase,
+                    redacted_reason: format!("submit error: {}", other.wire_code()),
+                    post_submit_kind: None,
+                },
             };
             (Some(row), wrapped)
         }
@@ -2017,8 +2106,10 @@ fn classify_submit_failure(sa_err: SaError) -> (Option<SubmitDeniedRow>, SaError
 ///   `rule_lock_missing`, `rule_locks_without_pin_check`, `baseline_read`,
 ///   `signer_set_compare`) → `"policy_gate"`; at any other stage → `"sign"`
 ///   (auth-entry assembly failure).
+/// - `"sa.rule_id_mismatch"` / `"sa.simulation_divergence"` → `"sign"` (context-rule
+///   divergence checks after simulation, before submission).
 /// - `"sa.submit_check_missing"` → `"build"` (programming-gate; fires before any I/O).
-/// - `"sa.horizon_exceeded"` / `"sa.rule_expired"` / `"sa.simulation_divergence"` → `"policy_gate"`.
+/// - `"sa.horizon_exceeded"` / `"sa.rule_expired"` → `"policy_gate"`.
 /// - `"sa.verifier_hash_drift"` / `"sa.policy_hash_drift"` / `"sa.pinned_policy_absent"` /
 ///   `"sa.pinned_verifier_absent"` / `"sa.pin_check_unavailable"` → `"policy_gate"` (the
 ///   pinned-hash drift check).
@@ -2027,9 +2118,12 @@ fn classify_submit_failure(sa_err: SaError) -> (Option<SubmitDeniedRow>, SaError
 ///   `"sa.threshold_policy_not_installed"` /
 ///   `"sa.threshold_policy_identification_failed"` / `"sa.threshold_read_failed"`
 ///   → `"policy_gate"` (the signer-set check of the authorizing rule).
-/// - `"sa.multicall_failed"` (nested) → `"submit"` (double-wrap, catches re-entrant errors).
-/// - Other (unrecognised) → `"submit"` as last resort.
+/// - `"sa.multicall_failed"` (nested) keeps its own phase.
+/// - Other (unrecognized) → `"submit"` as last resort.
 fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
+    if let SaError::MulticallFailed { phase, .. } = err {
+        return phase;
+    }
     match err.wire_code() {
         "sa.deployment_failed" => {
             // Inspect the phase field to route correctly: simulate-phase errors
@@ -2093,10 +2187,6 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
             // (after simulate, before signing). They are session-policy checks,
             // not network submission failures.
             "policy_gate"
-        }
-        "sa.multicall_failed" => {
-            // Nested MulticallFailed (should not normally occur; catch as submit).
-            "submit"
         }
         _ => {
             // Refine catch-all mapping as new SaError variants land.
@@ -2807,6 +2897,367 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
         assert_eq!(warning.reason, "invalid C-strkey address: NOT_A_STRKEY");
     }
 
+    // ── cross_rpc_compare_simulate_responses ──────────────────────────────────
+
+    fn simulated_auth_entry(nonce: i64, expiration: u32) -> stellar_xdr::SorobanAuthorizationEntry {
+        simulated_auth_entry_at(1, nonce, expiration)
+    }
+
+    /// An address-credential entry whose credential address is the contract
+    /// with every id byte equal to `address`.
+    fn simulated_auth_entry_at(
+        address: u8,
+        nonce: i64,
+        expiration: u32,
+    ) -> stellar_xdr::SorobanAuthorizationEntry {
+        use stellar_xdr::{
+            ContractId, Hash, InvokeContractArgs, ScAddress, SorobanAddressCredentials,
+            SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+            SorobanCredentials,
+        };
+        SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: ScAddress::Contract(ContractId(Hash([address; 32]))),
+                nonce,
+                signature_expiration_ledger: expiration,
+                signature: ScVal::Void,
+            }),
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([2; 32]))),
+                    function_name: "exec".try_into().unwrap(),
+                    args: vec![ScVal::U32(1)].try_into().unwrap(),
+                }),
+                sub_invocations: vec![].try_into().unwrap(),
+            },
+        }
+    }
+
+    fn simulated_response(
+        auth: &[stellar_xdr::SorobanAuthorizationEntry],
+        data: &stellar_xdr::SorobanTransactionData,
+    ) -> stellar_rpc_client::SimulateTransactionResponse {
+        use stellar_xdr::{Limits, WriteXdr};
+        let auth: Vec<_> = auth
+            .iter()
+            .map(|entry| entry.to_xdr_base64(Limits::none()).unwrap())
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "latestLedger": 100,
+            "minResourceFee": "1000",
+            "transactionData": data.to_xdr_base64(Limits::none()).unwrap(),
+            "results": [{"auth": auth, "xdr": ScVal::Void.to_xdr_base64(Limits::none()).unwrap()}],
+        }))
+        .unwrap()
+    }
+
+    /// The temporary nonce key the host records for an address credential.
+    fn simulated_nonce_key(
+        entry: &stellar_xdr::SorobanAuthorizationEntry,
+    ) -> stellar_xdr::LedgerKey {
+        use stellar_xdr::{
+            ContractDataDurability, LedgerKey, LedgerKeyContractData, ScNonceKey,
+            SorobanCredentials,
+        };
+        let SorobanCredentials::Address(credentials) = &entry.credentials else {
+            panic!("fixture requires address credentials");
+        };
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract: credentials.address.clone(),
+            key: ScVal::LedgerKeyNonce(ScNonceKey {
+                nonce: credentials.nonce,
+            }),
+            durability: ContractDataDurability::Temporary,
+        })
+    }
+
+    /// Transaction data whose read-write footprint holds `keys` in order.
+    fn simulated_read_write_data(
+        keys: Vec<stellar_xdr::LedgerKey>,
+    ) -> stellar_xdr::SorobanTransactionData {
+        let mut data = stellar_xdr::SorobanTransactionData::default();
+        data.resources.footprint.read_write = keys.try_into().unwrap();
+        data
+    }
+
+    fn simulated_nonce_data(
+        entry: &stellar_xdr::SorobanAuthorizationEntry,
+    ) -> stellar_xdr::SorobanTransactionData {
+        simulated_read_write_data(vec![simulated_nonce_key(entry)])
+    }
+
+    fn assert_rpc_divergence(
+        primary: &stellar_rpc_client::SimulateTransactionResponse,
+        secondary: &stellar_rpc_client::SimulateTransactionResponse,
+        reason_fragment: &str,
+    ) {
+        let error = cross_rpc_compare_simulate_responses(primary, secondary).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SaError::MulticallFailed { phase: "rpc_divergence", ref redacted_reason, .. }
+                    if redacted_reason.contains(reason_fragment)
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// Simulation nonces and expiration ledgers vary independently of the invocation tree.
+    #[test]
+    fn cross_rpc_simulation_nonce_and_expiration_agree() {
+        let primary_entry = simulated_auth_entry(123, 200);
+        let secondary_entry = simulated_auth_entry(456, 300);
+        let data = stellar_xdr::SorobanTransactionData::default();
+        let primary = simulated_response(std::slice::from_ref(&primary_entry), &data);
+        let secondary = simulated_response(std::slice::from_ref(&secondary_entry), &data);
+        assert!(cross_rpc_compare_simulate_responses(&primary, &secondary).is_ok());
+        assert_eq!(primary.results().unwrap()[0].auth, vec![primary_entry]);
+        assert_eq!(secondary.results().unwrap()[0].auth, vec![secondary_entry]);
+    }
+
+    /// Signature placeholders are excluded from the simulation comparison.
+    #[test]
+    fn cross_rpc_simulation_signature_placeholders_agree() {
+        let primary_entry = simulated_auth_entry(123, 200);
+        let mut secondary_entry = primary_entry.clone();
+        if let stellar_xdr::SorobanCredentials::Address(credentials) =
+            &mut secondary_entry.credentials
+        {
+            credentials.signature = ScVal::Bytes(vec![1, 2, 3].try_into().unwrap());
+        }
+        let data = stellar_xdr::SorobanTransactionData::default();
+        let primary = simulated_response(&[primary_entry], &data);
+        let secondary = simulated_response(&[secondary_entry], &data);
+        assert!(cross_rpc_compare_simulate_responses(&primary, &secondary).is_ok());
+    }
+
+    /// Every root argument remains bound by the comparison.
+    #[test]
+    fn cross_rpc_simulation_root_argument_diverges() {
+        let primary_entry = simulated_auth_entry(123, 200);
+        let mut secondary_entry = primary_entry.clone();
+        let stellar_xdr::SorobanAuthorizedFunction::ContractFn(function) =
+            &mut secondary_entry.root_invocation.function
+        else {
+            panic!("fixture requires contract invocation");
+        };
+        function.args = vec![ScVal::U32(2)].try_into().unwrap();
+        let data = stellar_xdr::SorobanTransactionData::default();
+        let primary = simulated_response(&[primary_entry], &data);
+        let secondary = simulated_response(&[secondary_entry], &data);
+        assert_rpc_divergence(&primary, &secondary, "tree disagreement");
+    }
+
+    /// Each sub-invocation remains bound by the comparison.
+    #[test]
+    fn cross_rpc_simulation_extra_sub_invocation_diverges() {
+        let primary_entry = simulated_auth_entry(123, 200);
+        let mut secondary_entry = primary_entry.clone();
+        secondary_entry.root_invocation.sub_invocations =
+            vec![primary_entry.root_invocation.clone()]
+                .try_into()
+                .unwrap();
+        let data = stellar_xdr::SorobanTransactionData::default();
+        let primary = simulated_response(&[primary_entry], &data);
+        let secondary = simulated_response(&[secondary_entry], &data);
+        assert_rpc_divergence(&primary, &secondary, "tree disagreement");
+    }
+
+    /// Credential addresses and credential types remain exact.
+    #[test]
+    fn cross_rpc_simulation_credential_address_and_type_diverge() {
+        use stellar_xdr::{ContractId, Hash, ScAddress, SorobanCredentials};
+        let primary_entry = simulated_auth_entry(123, 200);
+        let mut secondary_entry = primary_entry.clone();
+        if let SorobanCredentials::Address(credentials) = &mut secondary_entry.credentials {
+            credentials.address = ScAddress::Contract(ContractId(Hash([3; 32])));
+        }
+        let data = stellar_xdr::SorobanTransactionData::default();
+        let primary = simulated_response(&[primary_entry], &data);
+        let secondary = simulated_response(std::slice::from_ref(&secondary_entry), &data);
+        assert_rpc_divergence(&primary, &secondary, "tree disagreement");
+        secondary_entry.credentials = SorobanCredentials::SourceAccount;
+        let secondary = simulated_response(&[secondary_entry], &data);
+        assert_rpc_divergence(&primary, &secondary, "tree disagreement");
+    }
+
+    /// Entry ordering is irrelevant, and source-account invocation trees remain exact.
+    #[test]
+    fn cross_rpc_simulation_source_account_tree_and_entry_order() {
+        let address = simulated_auth_entry(123, 200);
+        let mut source = address.clone();
+        source.credentials = stellar_xdr::SorobanCredentials::SourceAccount;
+        let data = stellar_xdr::SorobanTransactionData::default();
+        let primary = simulated_response(&[address.clone(), source.clone()], &data);
+        let secondary = simulated_response(&[source.clone(), address.clone()], &data);
+        assert!(cross_rpc_compare_simulate_responses(&primary, &secondary).is_ok());
+        source.root_invocation.sub_invocations =
+            vec![address.root_invocation.clone()].try_into().unwrap();
+        let secondary = simulated_response(&[source, address], &data);
+        assert_rpc_divergence(&primary, &secondary, "tree disagreement");
+    }
+
+    /// The host's temporary nonce footprint varies with the recorded credential nonce.
+    #[test]
+    fn cross_rpc_simulation_consumed_nonce_footprints_agree() {
+        let primary_entry = simulated_auth_entry(123, 200);
+        let secondary_entry = simulated_auth_entry(456, 300);
+        let primary_data = simulated_nonce_data(&primary_entry);
+        let secondary_data = simulated_nonce_data(&secondary_entry);
+        let primary = simulated_response(&[primary_entry], &primary_data);
+        let secondary = simulated_response(&[secondary_entry], &secondary_data);
+        assert!(cross_rpc_compare_simulate_responses(&primary, &secondary).is_ok());
+        assert_eq!(primary.transaction_data().unwrap(), primary_data);
+        assert_eq!(secondary.transaction_data().unwrap(), secondary_data);
+    }
+
+    /// Transaction resources and ordinary footprint keys remain byte-exact.
+    #[test]
+    fn cross_rpc_simulation_transaction_data_diverges() {
+        use stellar_xdr::{Hash, LedgerKey, LedgerKeyContractCode};
+        let entry = simulated_auth_entry(123, 200);
+        let data = simulated_nonce_data(&entry);
+        let primary = simulated_response(std::slice::from_ref(&entry), &data);
+        let mut resource_change = data.clone();
+        resource_change.resources.instructions += 1;
+        let mut fee_change = data.clone();
+        fee_change.resource_fee += 1;
+        let mut footprint_change = data;
+        footprint_change.resources.footprint.read_only =
+            vec![LedgerKey::ContractCode(LedgerKeyContractCode {
+                hash: Hash([9; 32]),
+            })]
+            .try_into()
+            .unwrap();
+        for changed in [resource_change, fee_change, footprint_change] {
+            let secondary = simulated_response(std::slice::from_ref(&entry), &changed);
+            assert_rpc_divergence(&primary, &secondary, "transaction_data");
+        }
+    }
+
+    /// A nonce key must match its simulation's credential address, nonce, and durability.
+    #[test]
+    fn cross_rpc_simulation_unmatched_nonce_footprints_diverge() {
+        use stellar_xdr::{ContractDataDurability, ContractId, Hash, LedgerKey, ScAddress};
+        let entry = simulated_auth_entry(123, 200);
+        let data = simulated_nonce_data(&entry);
+        let primary = simulated_response(std::slice::from_ref(&entry), &data);
+        let mut changed_address = data.resources.footprint.read_write[0].clone();
+        if let LedgerKey::ContractData(key) = &mut changed_address {
+            key.contract = ScAddress::Contract(ContractId(Hash([3; 32])));
+        }
+        let mut changed_durability = data.resources.footprint.read_write[0].clone();
+        if let LedgerKey::ContractData(key) = &mut changed_durability {
+            key.durability = ContractDataDurability::Persistent;
+        }
+        let mut changed_nonce = data.resources.footprint.read_write[0].clone();
+        if let LedgerKey::ContractData(key) = &mut changed_nonce {
+            key.key = ScVal::LedgerKeyNonce(stellar_xdr::ScNonceKey { nonce: 0 });
+        }
+        for key in [changed_address, changed_durability, changed_nonce] {
+            let mut changed = data.clone();
+            changed.resources.footprint.read_write = vec![key].try_into().unwrap();
+            let secondary = simulated_response(std::slice::from_ref(&entry), &changed);
+            assert_rpc_divergence(&primary, &secondary, "nonce key");
+        }
+    }
+
+    /// Nonce-key counts and access modes remain exact after normalization.
+    #[test]
+    fn cross_rpc_simulation_nonce_key_count_and_access_mode_diverge() {
+        let entry = simulated_auth_entry(123, 200);
+        let data = simulated_nonce_data(&entry);
+        let primary = simulated_response(std::slice::from_ref(&entry), &data);
+        let mut missing = data.clone();
+        missing.resources.footprint.read_write = vec![].try_into().unwrap();
+        let mut extra = data.clone();
+        extra.resources.footprint.read_write = vec![
+            data.resources.footprint.read_write[0].clone(),
+            data.resources.footprint.read_write[0].clone(),
+        ]
+        .try_into()
+        .unwrap();
+        let mut read_only = missing.clone();
+        read_only.resources.footprint.read_only = data.resources.footprint.read_write;
+        for changed in [missing, extra, read_only] {
+            let secondary = simulated_response(std::slice::from_ref(&entry), &changed);
+            assert_rpc_divergence(&primary, &secondary, "transaction_data");
+        }
+    }
+
+    /// An authorization entry added on one side, or removed from it, diverges.
+    #[test]
+    fn cross_rpc_simulation_added_or_removed_auth_entry_diverges() {
+        let entry = simulated_auth_entry(123, 200);
+        let other = simulated_auth_entry_at(3, 456, 200);
+        let data = stellar_xdr::SorobanTransactionData::default();
+        let one = simulated_response(std::slice::from_ref(&entry), &data);
+        let two = simulated_response(&[entry, other], &data);
+        let none = simulated_response(&[], &data);
+        assert_rpc_divergence(&one, &two, "tree disagreement");
+        assert_rpc_divergence(&two, &one, "tree disagreement");
+        assert_rpc_divergence(&one, &none, "tree disagreement");
+    }
+
+    /// An ordinary read-write contract-data key stays byte-exact while the
+    /// nonce keys beside it normalize.
+    #[test]
+    fn cross_rpc_simulation_ordinary_read_write_key_diverges() {
+        use stellar_xdr::{
+            ContractDataDurability, ContractId, Hash, LedgerKey, LedgerKeyContractData, ScAddress,
+        };
+        let balance_key = |value: u32| {
+            LedgerKey::ContractData(LedgerKeyContractData {
+                contract: ScAddress::Contract(ContractId(Hash([5; 32]))),
+                key: ScVal::U32(value),
+                durability: ContractDataDurability::Temporary,
+            })
+        };
+        let primary_entry = simulated_auth_entry(123, 200);
+        let secondary_entry = simulated_auth_entry(456, 300);
+        let primary = simulated_response(
+            std::slice::from_ref(&primary_entry),
+            &simulated_read_write_data(vec![simulated_nonce_key(&primary_entry), balance_key(1)]),
+        );
+        let data_with = |value: u32| {
+            simulated_read_write_data(vec![
+                simulated_nonce_key(&secondary_entry),
+                balance_key(value),
+            ])
+        };
+        let agreeing = simulated_response(std::slice::from_ref(&secondary_entry), &data_with(1));
+        assert!(cross_rpc_compare_simulate_responses(&primary, &agreeing).is_ok());
+        let changed = simulated_response(std::slice::from_ref(&secondary_entry), &data_with(2));
+        assert_rpc_divergence(&primary, &changed, "transaction_data");
+    }
+
+    /// Each nonce key matches its own credential by address and nonce together.
+    #[test]
+    fn cross_rpc_simulation_two_credentials_match_their_own_nonce_keys() {
+        let nonce_data = |auth: &[stellar_xdr::SorobanAuthorizationEntry]| {
+            simulated_read_write_data(auth.iter().map(simulated_nonce_key).collect())
+        };
+        let primary_auth = [
+            simulated_auth_entry_at(1, 11, 200),
+            simulated_auth_entry_at(3, 22, 200),
+        ];
+        let secondary_auth = [
+            simulated_auth_entry_at(1, 33, 300),
+            simulated_auth_entry_at(3, 44, 300),
+        ];
+        let primary = simulated_response(&primary_auth, &nonce_data(&primary_auth));
+        let secondary = simulated_response(&secondary_auth, &nonce_data(&secondary_auth));
+        assert!(cross_rpc_compare_simulate_responses(&primary, &secondary).is_ok());
+
+        // The first credential's key carries the second credential's nonce.
+        let crossed = simulated_read_write_data(vec![
+            simulated_nonce_key(&simulated_auth_entry_at(1, 44, 300)),
+            simulated_nonce_key(&secondary_auth[1]),
+        ]);
+        let secondary = simulated_response(&secondary_auth, &crossed);
+        assert_rpc_divergence(&primary, &secondary, "nonce key");
+    }
+
     // ── cross_rpc_compare_wasm_hashes ─────────────────────────────────────────
 
     /// All four legs agreeing on the binary const returns `Ok(())`.
@@ -3381,6 +3832,42 @@ wasm_sha256 = "{drifted_sha}"
         );
     }
 
+    /// Nested multicall failures retain every error field and their denied-row phase.
+    #[test]
+    fn classify_submit_failure_preserves_nested_multicall_error() {
+        for (phase, kind) in [
+            ("rpc_divergence", None),
+            (
+                "post_submit_verification",
+                Some(PostSubmitVerificationKind::XdrEmptyVec),
+            ),
+        ] {
+            let (row, returned) = classify_submit_failure(SaError::MulticallFailed {
+                phase,
+                redacted_reason: "x".to_owned(),
+                post_submit_kind: kind,
+            });
+            assert_eq!(
+                row,
+                Some(SubmitDeniedRow {
+                    deny_wire_code: "multicall.sa.multicall_failed".to_owned(),
+                    refusal_phase: phase,
+                })
+            );
+            let SaError::MulticallFailed {
+                phase: returned_phase,
+                redacted_reason,
+                post_submit_kind,
+            } = returned
+            else {
+                panic!("expected nested multicall failure");
+            };
+            assert_eq!(returned_phase, phase);
+            assert_eq!(redacted_reason, "x");
+            assert_eq!(post_submit_kind, kind);
+        }
+    }
+
     /// A policy denial passes through with no second row.
     #[test]
     fn classify_submit_failure_passes_a_policy_denial_through_without_a_row() {
@@ -3587,15 +4074,15 @@ wasm_sha256 = "{drifted_sha}"
         }
     }
 
-    /// `MulticallFailed` (nested) maps to `"submit"`.
+    /// A nested multicall failure keeps its phase.
     #[test]
-    fn map_sa_error_to_phase_multicall_failed_nested_maps_to_submit() {
+    fn map_sa_error_to_phase_multicall_failed_nested_keeps_its_phase() {
         let err = SaError::MulticallFailed {
             phase: "build",
             redacted_reason: "nested".to_owned(),
             post_submit_kind: None,
         };
-        assert_eq!(map_sa_error_to_multicall_phase(&err), "submit");
+        assert_eq!(map_sa_error_to_multicall_phase(&err), "build");
     }
 
     /// An unrecognised error (e.g. `MulticallRegistryEntryNotFound`) maps to `"submit"`.
@@ -3724,6 +4211,65 @@ wasm_sha256 = "{drifted_sha}"
             deny_reason: Box::new(inner),
         };
         assert_eq!(deny_reason_wire_code(&r), "no_matching_rule");
+    }
+
+    // ── policy_gate_refusal ───────────────────────────────────────────────────
+
+    /// `Allow` is the only decision that reaches submission.
+    #[test]
+    fn policy_gate_admits_only_allow() {
+        assert_eq!(policy_gate_refusal(&Decision::Allow), None);
+    }
+
+    /// A rule's explicit deny keeps its reason code and names no inner.
+    #[test]
+    fn policy_gate_refuses_explicit_deny_with_its_reason_code() {
+        let refusal = policy_gate_refusal(&Decision::Deny(DenyReason::ExplicitRuleDeny))
+            .expect("a deny refuses");
+        assert_eq!(
+            refusal,
+            PolicyGateRefusal {
+                denied_inner_index: None,
+                deny_wire_code: "multicall.explicit_rule_deny".to_owned(),
+                redacted_reason: "policy denied the multicall bundle",
+            }
+        );
+    }
+
+    /// A bundle denial names the inner that tipped it and the inner reason.
+    #[test]
+    fn policy_gate_refuses_bundle_denial_at_its_inner() {
+        let refusal = policy_gate_refusal(&Decision::Deny(DenyReason::BundleDenied {
+            inner_index: 2,
+            deny_reason: Box::new(DenyReason::RateLimitExceeded {
+                window: "1h".to_owned(),
+                max_calls: 3,
+                calls_in_window: 3,
+            }),
+        }))
+        .expect("a bundle denial refuses");
+        assert_eq!(refusal.denied_inner_index, Some(2));
+        assert_eq!(refusal.deny_wire_code, "multicall.rate_limit_exceeded");
+    }
+
+    /// An approval requirement refuses: the multicall path has no approval
+    /// route.
+    #[test]
+    fn policy_gate_refuses_require_approval() {
+        let refusal = policy_gate_refusal(&Decision::RequireApproval(
+            stellar_agent_core::policy::ApprovalRequest::new("nonce".to_owned(), 300),
+        ))
+        .expect("an approval requirement refuses");
+        assert_eq!(refusal.denied_inner_index, None);
+        assert_eq!(refusal.deny_wire_code, "multicall.approval_required");
+        assert!(
+            refusal.redacted_reason.contains("requires approval")
+                && refusal
+                    .redacted_reason
+                    .contains("this submission path has no approval route"),
+            "{}",
+            refusal.redacted_reason
+        );
     }
 
     // ── json_args_to_scval_vec ────────────────────────────────────────────────
@@ -4061,6 +4607,105 @@ wasm_sha256 = "{drifted_sha}"
         };
         assert_eq!(phase, "rpc_divergence");
         assert_eq!(redacted_reason, "RPC returned a malformed ledger key");
+    }
+
+    /// A JSON-RPC error from the endpoint reaches the refusal with every URL
+    /// reduced to its authority and every strkey to its first and last five
+    /// characters.
+    #[tokio::test]
+    async fn fetch_wasm_hash_via_rpc_redacts_the_endpoint_error() {
+        const ACCOUNT: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let id = serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .ok()
+                    .and_then(|body| body.get("id").cloned())
+                    .unwrap_or_else(|| serde_json::json!(1));
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32603,
+                        "message": format!(
+                            "upstream https://user:SECRET@archive.example.com:8443/rpc?token=SECRET \
+                             refused {ACCOUNT}"
+                        ),
+                    },
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let result = fetch_wasm_hash_via_rpc(
+            &server.uri(),
+            ROUTER_UNDER_TEST,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+
+        let Err(SaError::MulticallFailed {
+            phase,
+            redacted_reason,
+            post_submit_kind,
+        }) = result
+        else {
+            panic!("expected MulticallFailed; got {result:?}");
+        };
+        assert_eq!(phase, "rpc_divergence");
+        assert_eq!(post_submit_kind, None);
+        assert!(
+            redacted_reason.starts_with("get_ledger_entries failed for contract instance fetch: "),
+            "{redacted_reason}"
+        );
+        assert!(
+            redacted_reason.contains("upstream archive.example.com:8443 refused GAQAA...QSTVY"),
+            "{redacted_reason}"
+        );
+        assert!(!redacted_reason.contains("SECRET"), "{redacted_reason}");
+        assert!(!redacted_reason.contains("https://"), "{redacted_reason}");
+        assert!(
+            !contains_full_strkey_shape(&redacted_reason),
+            "{redacted_reason}"
+        );
+    }
+
+    // ── rpc_client_divergence ─────────────────────────────────────────────────
+
+    /// A refusal built from an RPC client error at each call site keeps only
+    /// the endpoint authority of every URL and the first and last five
+    /// characters of every strkey.
+    #[test]
+    fn rpc_client_divergence_redacts_urls_and_strkeys_at_every_site() {
+        const ACCOUNT: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let error = format!(
+            "error sending request for url \
+             (https://user:SECRET@rpc.example.com:8443/soroban/rpc?token=SECRET) \
+             for {ACCOUNT} at {ROUTER_UNDER_TEST}"
+        );
+        for context in [
+            "secondary RPC simulate failed",
+            "Server construction failed for wasm-hash fetch",
+            "get_ledger_entries failed for contract instance fetch",
+        ] {
+            let SaError::MulticallFailed {
+                phase,
+                redacted_reason,
+                post_submit_kind,
+            } = rpc_client_divergence(context, &error)
+            else {
+                panic!("expected MulticallFailed");
+            };
+            assert_eq!(phase, "rpc_divergence");
+            assert_eq!(post_submit_kind, None);
+            assert_eq!(
+                redacted_reason,
+                format!(
+                    "{context}: error sending request for url (rpc.example.com:8443) \
+                     for GAQAA...QSTVY at CAAAA...AD2KM"
+                )
+            );
+        }
     }
 
     // ── build_inner_results — ScVal::Vec(None) path ───────────────────────────

@@ -79,11 +79,14 @@ Every tool or command invocation is evaluated by the active Policy engine before
 - **RequireApproval** — the call is held pending an out-of-band operator approval.
 
 Which engine runs is selected per profile in `[policy]`. `pay`, `claim`,
-sponsored `accounts create`, `trade`, `vault`, and `trustline` evaluate policy
-before signing. `pay` and `claim` build or decode the envelope before
-evaluation. Sponsored `accounts create` and `trustline` evaluate before
-building their envelopes. `trade` and `vault` evaluate before their adapter submit paths
-construct transactions. Each uses the same value descriptor as its MCP twin.
+sponsored `accounts create`, `trade`, `vault`, `trustline`, and
+`smart-account multicall` evaluate policy before signing. `pay` and `claim`
+build or decode the envelope before evaluation. Sponsored `accounts create`
+and `trustline` evaluate before building their envelopes. `trade` and `vault`
+evaluate before their adapter submit paths construct transactions. Each of
+these verbs except `smart-account multicall` uses the same value descriptor as
+its MCP twin. `smart-account multicall` has no MCP twin; it evaluates the bundle
+under the tool name `wallet_multicall` and requires the V1 engine.
 `pay` and `claim` gate their default
 build-sign-submit flow and their `--build-only`, `--sign-only`, and
 `--submit-only` invocations. The staged flows use the MCP commit path's decoder
@@ -107,11 +110,15 @@ The Noop engine is the binding gate used when no full engine is configured. Its 
 
 | Profile | Tool | Result |
 |---------|------|--------|
-| testnet | any | Allow |
+| testnet | any except `smart-account multicall` | Allow |
+| testnet | `smart-account multicall` | refused with `policy.engine_required` |
 | mainnet | read-only | Allow |
 | mainnet | destructive | refused with `policy.engine_required` |
 
-A destructive tool on a mainnet profile cannot pass the Noop engine. Newly minted profiles default to the V1 engine; profiles carried over from schema version 1 are set to Noop explicitly until the operator completes the key-rotation steps that stand up a V1 owner key. The engine choice governs the policy layer only: every mainnet write is additionally refused at the network layer (`network.mainnet_write_forbidden`) in this alpha, on Noop and V1 alike. MPP refuses mainnet with `mpp.network_forbidden` instead.
+A destructive tool on a mainnet profile cannot pass the Noop engine.
+`smart-account multicall` requires the V1 engine: on testnet it refuses a Noop
+profile with `policy.engine_required`, and on mainnet it refuses earlier with
+`network.mainnet_write_forbidden`. Newly minted profiles default to the V1 engine; profiles carried over from schema version 1 are set to Noop explicitly until the operator completes the key-rotation steps that stand up a V1 owner key. The engine choice governs the policy layer only: every mainnet write is additionally refused at the network layer (`network.mainnet_write_forbidden`) in this alpha, on Noop and V1 alike. MPP refuses mainnet with `mpp.network_forbidden` instead.
 
 ### V1 engine
 

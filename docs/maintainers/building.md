@@ -602,14 +602,22 @@ The same script backs the `Testnet acceptance` workflow
 (`.github/workflows/testnet.yml`), which runs on manual dispatch (with an
 optional suite filter input) and on a weekly schedule; it is deliberately not
 part of per-push CI. The WebAuthn suite needs a Chromium binary on `PATH` (or
-the `CHROME` env var). The live multicall cases
-`h1_happy_path_3_transfer_bundle` and
-`h5_bundle_under_a_rule_other_than_0_checks_its_signer_set` skip themselves
-unless `STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS` and
-`STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL` are set. The workflow does not set
-those variables, so those two cases run only where a router deployment is
-available. The driver reports each self-skip as a skip marker in the run
-summary, so a green leg states what did not execute.
+the `CHROME` env var). The driver reports each self-skip as a skip marker in
+the run summary, so a green leg states what did not execute.
+
+The multicall suites run without extra configuration. The library suite
+`stellar-agent-smart-account` / `smart_account_multicall_testnet_acceptance`
+(feature `testnet-integration`) deploys the vendored router and submits
+native-SAC `symbol` bundles under rule 0 and under a rule other than 0. The CLI
+suite `stellar-agent-cli` / `smart_account_multicall_cli_testnet_acceptance`
+(feature `testnet-acceptance`) provisions a signed V1 policy on the headless
+keyring, registers a freshly deployed router, and submits a bundle through the
+test-built binary. Without overrides the primary endpoint stands in as the
+secondary, so the cross-RPC check does not exercise an independent provider.
+The library suite reads two optional overrides:
+`STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS` names a deployed router, and
+`STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL` names an independent secondary
+endpoint. An override that does not parse fails the suite.
 
 #### CAP-85 external-reference suites
 
@@ -662,7 +670,7 @@ optimizer state and version, and the SHA-256. When the digest changes, update
 
 #### Multicall router
 
-`smart-account multicall` and the live multicall suite submit each bundle
+`smart-account multicall` and the live multicall suites submit each bundle
 through a deployed router contract. Its source is the independent Cargo
 workspace `contracts/multicall-router/` (excluded from the wallet workspace,
 `publish = false`). Its one function, `exec`, requires the caller's

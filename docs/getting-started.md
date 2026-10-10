@@ -353,6 +353,8 @@ requirement is independent of the policy engine.
 
 - `noop`: the Noop engine: testnet allow-all; on mainnet it allows read-only
   commands and refuses destructive ones with `policy.engine_required`.
+  `smart-account multicall` requires `v1` and refuses a Noop profile with
+  `policy.engine_required`.
 - `v1`: the V1 engine: a signature-verified, typed-criteria, first-match
   default-deny engine. Beyond the audit key, the V1 engine requires the owner
   public key enrolled (`profile enroll-owner-key`), the attestation keyring key

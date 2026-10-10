@@ -5,10 +5,15 @@
 //!
 //! | Fixture | Description |
 //! |---------|-------------|
-//! | [`h1_happy_path_3_transfer_bundle`] | Deploy SA; install rule; submit 3-transfer bundle against a testnet-deployed multicall router — asserts `MulticallResult { inner_count: 3 }` |
+//! | [`h1_three_native_sac_symbol_calls_confirm`] | Deploy the vendored router and a smart account; submit three native-SAC `symbol` calls under rule 0; asserts `MulticallResult { inner_count: 3 }`, on-chain confirmation, and each inner returning the native asset's symbol |
 //! | [`h2_per_period_cap_deny_at_inner_3`] | Policy engine denies 5-transfer bundle at inner 3 (0-based) via `bundle_per_period_cap` 100 USDC with 30 USDC per inner — host-side only, no network required |
 //! | [`h3_bundle_aggregate_cap_deny`] | Policy engine denies 6-transfer bundle via `bundle_aggregate_cap` 150 USDC when sum is 180 USDC — host-side only, no network required |
-//! | [`h5_bundle_under_a_rule_other_than_0_checks_its_signer_set`] | Install a rule other than 0 and submit a bundle under it, which the submit path checks against the rule's signer-set state. After an out-of-band `signers add`, the next bundle refuses with `sa.signer_set_diverged` at phase `policy_gate` |
+//! | [`h5_bundle_under_a_rule_other_than_0_checks_its_signer_set`] | Install a rule other than 0 and submit three native-SAC `symbol` calls under it, which the submit path checks against the rule's signer-set state. After an out-of-band `signers add`, the next bundle refuses with `sa.signer_set_diverged` at phase `policy_gate` |
+//!
+//! The live bundles call the native asset's SAC `symbol`, which takes no
+//! arguments and requires no authorization. They cover router invocation,
+//! the wallet's authorization of `exec`, and the router's return values; a
+//! typed SAC transfer is outside their coverage.
 //!
 //! # Gating
 //!
@@ -18,17 +23,21 @@
 //! cargo test --features testnet-integration --test smart_account_multicall_testnet_acceptance
 //! ```
 //!
-//! `h1_happy_path_3_transfer_bundle` and
-//! `h5_bundle_under_a_rule_other_than_0_checks_its_signer_set` additionally
-//! require:
-//! - `STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS` env var set to a deployed
-//!   multicall router C-strkey on testnet.
-//! - `STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL` env var set (e.g. another Soroban
-//!   RPC endpoint) for cross-RPC trust-anchor verification.
+//! `h1_three_native_sac_symbol_calls_confirm` and
+//! `h5_bundle_under_a_rule_other_than_0_checks_its_signer_set` need only
+//! testnet RPC and Friendbot. Each deploys the vendored router
+//! ([`MULTICALL_WASM`]) from a funded ephemeral deployer with a fresh salt,
+//! unless `STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS` names a deployed
+//! router C-strkey. `STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL` optionally names
+//! a second Soroban RPC endpoint for the cross-RPC trust-anchor check; without
+//! it the primary endpoint stands in as the secondary, so the check compares
+//! one provider with itself. An empty variable counts as unset. An override
+//! that does not parse, and a router deployment that fails, fail the test.
+//! `h2_per_period_cap_deny_at_inner_3` and `h3_bundle_aggregate_cap_deny` are
+//! host-side and require no network access.
 //!
-//! If either env var is absent, each of the two logs a skip message and
-//! returns without failing. `h2_per_period_cap_deny_at_inner_3` and
-//! `h3_bundle_aggregate_cap_deny` are host-side and require no network access.
+//! The CLI's on-chain multicall coverage lives in the `stellar-agent-cli`
+//! suite `smart_account_multicall_cli_testnet_acceptance`.
 //!
 //! # Reference cross-check
 //!
@@ -51,6 +60,7 @@
     reason = "test-only; panics and diagnostic output are acceptable in testnet acceptance tests"
 )]
 
+mod common;
 #[path = "common/pin_check_manager.rs"]
 mod pin_check_manager;
 
@@ -78,23 +88,39 @@ use stellar_agent_smart_account::managers::signers::{
     PreviousBaseline, build_delegated_signer_scval,
 };
 use stellar_agent_smart_account::multicall::{
-    MULTICALL_WASM_SHA256, MulticallInvocation, MulticallRegistry, MulticallRegistryEntry,
-    MulticallSubmitArgs, submit_multicall_bundle,
+    MULTICALL_WASM, MULTICALL_WASM_SHA256, MulticallInnerResult, MulticallInvocation,
+    MulticallRegistry, MulticallRegistryEntry, MulticallSubmitArgs, submit_multicall_bundle,
 };
 use stellar_agent_smart_account::test_helpers::{
     rule_manager_for_tests, signers_manager_for_tests,
 };
 use stellar_agent_smart_account::{ResolvedFeePerOp, SaError};
+use stellar_xdr::{Limits, ReadXdr as _, ScString, ScVal};
 use zeroize::Zeroizing;
+
+use common::{
+    TESTNET_PASSPHRASE, TESTNET_RPC_URL, XLM_SAC_TESTNET, fund_via_friendbot,
+    upload_and_create_contract,
+};
 
 // ── Network constants ─────────────────────────────────────────────────────────
 
-const TESTNET_RPC_URL: &str = "https://soroban-testnet.stellar.org";
-const TESTNET_FRIENDBOT_URL: &str = "https://friendbot.stellar.org";
-const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const CHAIN_ID: &str = "stellar:testnet";
 const FEE_STROOPS: u32 = 1_000_000;
 const TIMEOUT_SECS: u64 = 120;
+
+/// Names a deployed multicall router C-strkey that replaces the per-test
+/// deployment.
+const ROUTER_ADDRESS_ENV: &str = "STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS";
+
+/// Names a second Soroban RPC endpoint for the cross-RPC trust-anchor check.
+const SECONDARY_RPC_URL_ENV: &str = "STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL";
+
+/// The symbol the native asset's SAC returns from `symbol`.
+const NATIVE_ASSET_SYMBOL: &str = "native";
+
+/// Inner invocations in each live bundle.
+const LIVE_INNER_COUNT: usize = 3;
 
 // ── Dummy strkeys used in host-side policy tests ──────────────────────────────
 
@@ -118,51 +144,25 @@ const DUMMY_G_STRKEY_TO: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 
 /// Generates a fresh ed25519 signer for testnet use.
 ///
-/// Returns `(g_strkey, s_strkey, signer_box)` where:
-/// - `g_strkey` is the Stellar public-key strkey (`G...`).
-/// - `s_strkey` is the Stellar private-key strkey (`S...`), used when the
-///   S-strkey must be passed to a subprocess via an env var.
-/// - `signer_box` is the in-process signer implementation.
-///
-/// Generates a fresh ed25519 keypair and derives the S-strkey from it.
-/// The S-strkey is injected into the release-binary subprocess env via
-/// `STELLAR_AGENT_TESTNET_H4_SIGNER_SECRET` so the subprocess signs with
-/// the same key that owns the freshly-deployed smart account.
-fn fresh_signer() -> (
-    String,
-    Zeroizing<String>,
-    Box<dyn stellar_agent_network::Signer + Send + Sync>,
-) {
+/// Returns `(g_strkey, signer_box)`: the Stellar public-key strkey (`G...`)
+/// and the in-process signer implementation.
+fn fresh_signer() -> (String, Box<dyn stellar_agent_network::Signer + Send + Sync>) {
     let signing_key = SigningKey::generate(&mut OsRng);
-    let verifying_key = signing_key.verifying_key();
     let g_strkey = format!(
         "{}",
-        stellar_strkey::ed25519::PublicKey(verifying_key.to_bytes())
+        stellar_strkey::ed25519::PublicKey(signing_key.verifying_key().to_bytes())
     );
-    let seed_bytes: [u8; 32] = signing_key.to_bytes();
-    let s_strkey: Zeroizing<String> = Zeroizing::new(format!(
-        "{}",
-        stellar_strkey::ed25519::PrivateKey(seed_bytes).as_unredacted()
-    ));
-    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(seed_bytes);
+    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(signing_key.to_bytes());
     let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> =
         Box::new(stellar_agent_network::SoftwareSigningKey::new_from_zeroizing(seed));
-    (g_strkey, s_strkey, signer)
+    (g_strkey, signer)
 }
 
 fn fresh_deployer_keypair() -> (
     String,
     stellar_agent_smart_account::deployment::DeployerKeypair,
 ) {
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let verifying_key = signing_key.verifying_key();
-    let g_strkey = format!(
-        "{}",
-        stellar_strkey::ed25519::PublicKey(verifying_key.to_bytes())
-    );
-    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(signing_key.to_bytes());
-    let signer: Box<dyn stellar_agent_network::Signer + Send + Sync> =
-        Box::new(stellar_agent_network::SoftwareSigningKey::new_from_zeroizing(seed));
+    let (g_strkey, signer) = fresh_signer();
     (
         g_strkey,
         stellar_agent_smart_account::deployment::DeployerKeypair::SecretEnv {
@@ -170,18 +170,6 @@ fn fresh_deployer_keypair() -> (
             signer,
         },
     )
-}
-
-async fn fund_via_friendbot(g_strkey: &str) {
-    let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");
-    let resp = stellar_agent_test_support::testnet_helpers::friendbot_funding_request(&url)
-        .await
-        .expect("Friendbot HTTP must succeed");
-    assert!(
-        resp.status().is_success(),
-        "Friendbot must return 200 for {g_strkey}; got {}",
-        resp.status()
-    );
 }
 
 async fn deploy_fresh_smart_account(signer_g: &str) -> String {
@@ -216,6 +204,111 @@ async fn deploy_fresh_smart_account(signer_g: &str) -> String {
     .expect("deploy_smart_account must succeed on testnet");
 
     result.smart_account
+}
+
+/// The value of `name`, or `None` when it is unset or empty.
+fn env_override(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// The router the live bundles go through: the C-strkey named by
+/// [`ROUTER_ADDRESS_ENV`], or a fresh deployment of [`MULTICALL_WASM`] from a
+/// funded ephemeral deployer with a random salt and no constructor
+/// arguments.
+///
+/// # Panics
+///
+/// Panics when the override is not a C-strkey or the deployment fails.
+async fn multicall_router() -> String {
+    if let Some(address) = env_override(ROUTER_ADDRESS_ENV) {
+        assert!(
+            stellar_strkey::Contract::from_string(&address).is_ok(),
+            "{ROUTER_ADDRESS_ENV} must be a contract C-strkey"
+        );
+        return address;
+    }
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let deployer_g = format!(
+        "{}",
+        stellar_strkey::ed25519::PublicKey(signing_key.verifying_key().to_bytes())
+    );
+    let deployer_seed: Zeroizing<[u8; 32]> = Zeroizing::new(signing_key.to_bytes());
+    fund_via_friendbot(&deployer_g).await;
+    let mut salt = [0u8; 32];
+    rand_core::RngCore::fill_bytes(&mut OsRng, &mut salt);
+    upload_and_create_contract(
+        MULTICALL_WASM,
+        &deployer_g,
+        &deployer_seed,
+        salt,
+        Vec::new(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the vendored multicall router must deploy on testnet: {e}"))
+    .contract
+}
+
+/// The secondary endpoint of the cross-RPC trust-anchor check: the URL named
+/// by [`SECONDARY_RPC_URL_ENV`], or the primary endpoint. The primary
+/// standing in as the secondary does not demonstrate verification against an
+/// independent provider.
+///
+/// # Panics
+///
+/// Panics when the override is not an `http` or `https` URL.
+fn secondary_rpc_url() -> String {
+    match env_override(SECONDARY_RPC_URL_ENV) {
+        Some(url) => {
+            let parsed = reqwest::Url::parse(&url)
+                .unwrap_or_else(|e| panic!("{SECONDARY_RPC_URL_ENV} must be a URL: {e}"));
+            assert!(
+                matches!(parsed.scheme(), "http" | "https"),
+                "{SECONDARY_RPC_URL_ENV} must be an http or https URL"
+            );
+            url
+        }
+        None => TESTNET_RPC_URL.to_owned(),
+    }
+}
+
+/// [`LIVE_INNER_COUNT`] calls of the native asset SAC's `symbol`.
+fn native_symbol_bundle() -> Vec<MulticallInvocation> {
+    (0..LIVE_INNER_COUNT)
+        .map(|_| MulticallInvocation {
+            target_contract: XLM_SAC_TESTNET.to_owned(),
+            fn_name: "symbol".to_owned(),
+            args_json: serde_json::json!([]),
+        })
+        .collect()
+}
+
+/// Asserts each inner of a confirmed [`native_symbol_bundle`] returned the
+/// native asset's symbol.
+fn assert_native_symbols(label: &str, inner_results: &[MulticallInnerResult]) {
+    assert_eq!(
+        inner_results.len(),
+        LIVE_INNER_COUNT,
+        "[{label}] one result per inner"
+    );
+    let expected = ScVal::String(ScString(
+        NATIVE_ASSET_SYMBOL
+            .try_into()
+            .expect("the native symbol fits an ScString"),
+    ));
+    for inner in inner_results {
+        let returned = ScVal::from_xdr_base64(&inner.return_scval_b64, Limits::none())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[{label}] inner {} return value must decode: {e}",
+                    inner.inner_index
+                )
+            });
+        assert_eq!(
+            returned, expected,
+            "[{label}] inner {} returns the native asset's symbol",
+            inner.inner_index
+        );
+    }
 }
 
 /// Constructs a `PolicyEngineV1` with a single rule allowing `wallet_multicall`
@@ -290,23 +383,6 @@ fn dummy_transfer_invocation(amount_usdc_units: i128) -> MulticallInvocation {
     }
 }
 
-/// A bundle of three self-transfers of `signer_g` (10, 20 and 30 USDC) on the
-/// USDC SAC named by `STELLAR_AGENT_TESTNET_USDC_SAC_ADDRESS`, or on
-/// [`DUMMY_C_STRKEY`] (structurally valid) when it is not set.
-fn three_transfer_bundle(signer_g: &str) -> Vec<MulticallInvocation> {
-    let usdc_sac = std::env::var("STELLAR_AGENT_TESTNET_USDC_SAC_ADDRESS")
-        .unwrap_or_else(|_| DUMMY_C_STRKEY.to_owned());
-    // 10, 20 and 30 USDC at 7 decimal places.
-    ["100000000", "200000000", "300000000"]
-        .into_iter()
-        .map(|amount| MulticallInvocation {
-            target_contract: usdc_sac.clone(),
-            fn_name: "transfer".to_owned(),
-            args_json: serde_json::json!([signer_g, signer_g, amount]),
-        })
-        .collect()
-}
-
 /// Builds an in-memory `MulticallRegistry` with a single testnet entry pointing
 /// to the given `router_address` C-strkey and `MULTICALL_WASM_SHA256`.
 fn registry_with_entry(router_address: &str) -> MulticallRegistry {
@@ -323,96 +399,45 @@ fn registry_with_entry(router_address: &str) -> MulticallRegistry {
     registry
 }
 
-// ── h1_happy_path_3_transfer_bundle ───────────────────────────────────────────
+// ── h1_three_native_sac_symbol_calls_confirm ──────────────────────────────────
 
-/// Deploy a fresh smart account, install a context rule, then submit
-/// a 3-transfer bundle via `submit_multicall_bundle`.
+/// Deploy the router and a fresh smart account, then submit three native-SAC
+/// `symbol` calls under rule 0 via `submit_multicall_bundle`.
 ///
 /// Asserts:
 /// - `MulticallResult::inner_count == 3`
 /// - The bundle lands on-chain (ledger > 0)
 /// - `audit_degraded == false`
+/// - Each inner's return value decodes to the native asset's symbol
 ///
-/// # Environment variables required
-///
-/// - `STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS` — deployed multicall
-///   router C-strkey on testnet.
-/// - `STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL` — secondary RPC URL for
-///   cross-RPC trust-anchor verification.
-///
-/// # Skip condition
-///
-/// If either env var is absent, the test logs a skip message and returns
-/// without failing. This test requires a deployed multicall router; it can only
-/// fully execute after the router is deployed on testnet.
-/// To run it locally, set both env vars and invoke:
-///
-/// ```text
-/// cargo test --features testnet-integration --test smart_account_multicall_testnet_acceptance h1_happy_path_3_transfer_bundle
-/// ```
-///
-/// # Design
-///
-/// The 3 inner transfers use the deployed testnet USDC SAC address obtained from
-/// `STELLAR_AGENT_TESTNET_USDC_SAC_ADDRESS` (falls back to `DUMMY_C_STRKEY` for
-/// structural testing when real SAC is not available — in that case the transaction
-/// will succeed at the multicall layer but the SAC call itself would revert; the
-/// acceptance gate is the full on-chain confirmation path, not the SAC outcome).
+/// The router is [`multicall_router`]'s and the secondary endpoint
+/// [`secondary_rpc_url`]'s; see the module's gating section.
 #[tokio::test]
 #[serial_test::serial]
-async fn h1_happy_path_3_transfer_bundle() {
+async fn h1_three_native_sac_symbol_calls_confirm() {
     let data_root = tempfile::tempdir().expect("temporary wallet data root");
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
-    let router_address = match std::env::var("STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS") {
-        Ok(addr) => addr,
-        Err(_) => {
-            eprintln!(
-                "[h1] SKIP: STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS not set. \
-                 Deploy the multicall router and register it before running this test."
-            );
-            return;
-        }
-    };
-
-    let secondary_rpc_url = match std::env::var("STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL") {
-        Ok(url) => url,
-        Err(_) => {
-            eprintln!(
-                "[h1] SKIP: STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL not set. \
-                     Provide a secondary RPC endpoint for cross-RPC trust-anchor verification."
-            );
-            return;
-        }
-    };
-
-    eprintln!("[h1] router_address: {}", &router_address[..8]);
-    eprintln!("[h1] secondary_rpc_url: [set]");
+    let secondary_rpc_url = secondary_rpc_url();
 
     // ── Step 1: Fresh signer + fund ───────────────────────────────────────────
-    let (signer_g, _s_strkey, signer_box) = fresh_signer();
+    let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
     eprintln!("[h1] signer funded: {}", &signer_g[..8]);
 
-    // ── Step 2: Deploy fresh smart account ────────────────────────────────────
+    // ── Step 2: Deploy the router and a fresh smart account ──────────────────
+    let router_address = multicall_router().await;
+    eprintln!("[h1] router_address: {}", &router_address[..8]);
     let sa_strkey = deploy_fresh_smart_account(&signer_g).await;
     eprintln!("[h1] smart_account: {}", &sa_strkey[..8]);
 
-    // ── Step 3: Install a context rule ────────────────────────────────────────
-    // For the happy-path test, we need an installed rule with rule_id 0.
-    // We rely on the smart account's default first-deployment rule if it exists.
-    // The acceptance gate here is the multicall submission returning inner_count=3;
-    // the rule-management ceremony is exercised by smart_account_rules tests.
-    let rule_id: u32 = 0;
-
-    // ── Step 4: Build a 3-transfer bundle ─────────────────────────────────────
-    let bundle = three_transfer_bundle(&signer_g);
-
-    // ── Step 5: Build registry + policy engine ────────────────────────────────
+    // ── Step 3: Build registry + policy engine ────────────────────────────────
+    // The bundle signs under the deployment's bootstrap rule 0; the
+    // rule-management ceremony is exercised by the smart_account_rules suites.
     let registry = registry_with_entry(&router_address);
     let profile = testnet_profile();
     let policy_engine = policy_engine_allow_all();
 
-    // ── Step 6: Submit the multicall bundle ───────────────────────────────────
+    // ── Step 4: Submit the multicall bundle ───────────────────────────────────
     let signers_manager = pin_check_manager::pin_check_manager(
         TESTNET_RPC_URL,
         &secondary_rpc_url,
@@ -422,8 +447,8 @@ async fn h1_happy_path_3_transfer_bundle() {
     let result = submit_multicall_bundle(
         MulticallSubmitArgs {
             smart_account: &sa_strkey,
-            rule_id,
-            bundle,
+            rule_id: 0,
+            bundle: native_symbol_bundle(),
             signer: signer_box.as_ref(),
             primary_rpc_url: TESTNET_RPC_URL,
             secondary_rpc_url: &secondary_rpc_url,
@@ -434,7 +459,7 @@ async fn h1_happy_path_3_transfer_bundle() {
             timeout: Duration::from_secs(TIMEOUT_SECS),
             fee: ResolvedFeePerOp::default(),
             chain_id: CHAIN_ID,
-            request_id: "h1-happy-path-3-transfer",
+            request_id: "h1-three-native-sac-symbol-calls",
             signers_manager: &signers_manager,
         },
         &registry,
@@ -448,7 +473,7 @@ async fn h1_happy_path_3_transfer_bundle() {
         )
     });
 
-    // ── Step 7: Assert outcome ────────────────────────────────────────────────
+    // ── Step 5: Assert outcome ────────────────────────────────────────────────
     assert_eq!(
         mc_result.inner_count, 3,
         "[h1] inner_count must be 3; got {}",
@@ -463,9 +488,10 @@ async fn h1_happy_path_3_transfer_bundle() {
         !mc_result.audit_degraded,
         "[h1] audit_degraded must be false when audit_writer is None"
     );
+    assert_native_symbols("h1", &mc_result.inner_results);
 
     eprintln!(
-        "[h1] PASS: 3-transfer bundle confirmed at ledger {} (tx_hash prefix: {})",
+        "[h1] PASS: 3 symbol calls confirmed at ledger {} (tx_hash prefix: {})",
         mc_result.ledger,
         &mc_result.bundle_tx_hash[..8.min(mc_result.bundle_tx_hash.len())],
     );
@@ -548,7 +574,7 @@ async fn h2_per_period_cap_deny_at_inner_3() {
                     Box<dyn stellar_agent_network::Signer + Send + Sync>,
                 > = std::sync::OnceLock::new();
                 STUB_SIGNER.get_or_init(|| {
-                    let (_, _s, signer) = fresh_signer();
+                    let (_, signer) = fresh_signer();
                     signer
                 })
             }
@@ -650,7 +676,7 @@ async fn h3_bundle_aggregate_cap_deny() {
                     Box<dyn stellar_agent_network::Signer + Send + Sync>,
                 > = std::sync::OnceLock::new();
                 STUB_SIGNER.get_or_init(|| {
-                    let (_, _s, signer) = fresh_signer();
+                    let (_, signer) = fresh_signer();
                     signer
                 })
             }
@@ -697,284 +723,6 @@ async fn h3_bundle_aggregate_cap_deny() {
     );
 }
 
-// ── h4_release_binary_acceptance ─────────────────────────────────────────────
-
-/// End-to-end release-binary acceptance for the three multicall CLI subcommands:
-///
-/// 1. `smart-account register-multicall` — registers a testnet multicall router
-///    address in a temp `networks.toml` and asserts `status: "registered"`.
-/// 2. `smart-account unregister-multicall` — removes the registered entry and
-///    asserts `status: "unregistered"`.
-/// 3. `smart-account multicall --invocation …` — submits a 1-transfer bundle through
-///    the registered router and asserts `bundle_tx_hash` + `inner_count: 1`.
-///
-/// # Environment variables required
-///
-/// - `STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS` — deployed multicall
-///   router C-strkey on testnet. Required by steps 1 and 3.
-/// - `STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL` — secondary RPC URL for
-///   cross-RPC trust-anchor verification. Required by step 3.
-///
-/// The signing key is derived from a freshly-generated ed25519 keypair created
-/// in-process. The S-strkey is injected into the subprocess via the
-/// `STELLAR_AGENT_TESTNET_H4_SIGNER_SECRET` env var so the subprocess signs
-/// with the same key that owns the freshly-deployed smart account.
-/// No external `STELLAR_AGENT_TESTNET_SIGNER_SECRET` is required.
-///
-/// If any required env var is absent the test logs a skip message and returns
-/// without failing.
-///
-/// # Binary location
-///
-/// The test locates the release binary by walking from `CARGO_MANIFEST_DIR`
-/// up to the workspace root and resolving `target/release/stellar-agent`. If
-/// the binary is not found it skips.
-///
-/// Build the release binary before running this test:
-///
-/// ```text
-/// cargo build --release -p stellar-agent-cli
-/// cargo test --features testnet-integration --test smart_account_multicall_testnet_acceptance h4_release_binary_acceptance
-/// ```
-#[tokio::test]
-async fn h4_release_binary_acceptance() {
-    // ── Locate the release binary ─────────────────────────────────────────────
-    let binary_path = {
-        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        // Walk up to workspace root (which contains target/).
-        let workspace_root = manifest_dir
-            .ancestors()
-            .find(|p| p.join("Cargo.lock").exists())
-            .expect("[h4] workspace root with Cargo.lock must exist");
-        let bin = workspace_root
-            .join("target")
-            .join("release")
-            .join("stellar-agent");
-        if !bin.exists() {
-            eprintln!(
-                "[h4] SKIP: release binary not found at {}. \
-                 Run `cargo build --release -p stellar-agent-cli` first.",
-                bin.display()
-            );
-            return;
-        }
-        bin
-    };
-
-    // ── Resolve required env vars ─────────────────────────────────────────────
-    let router_address = match std::env::var("STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS") {
-        Ok(addr) => addr,
-        Err(_) => {
-            eprintln!("[h4] SKIP: STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS not set.");
-            return;
-        }
-    };
-
-    let secondary_rpc_url = match std::env::var("STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL") {
-        Ok(url) => url,
-        Err(_) => {
-            eprintln!("[h4] SKIP: STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL not set.");
-            return;
-        }
-    };
-
-    // ── Step 0: Deploy a fresh smart account for the bundle target ────────────
-    // The S-strkey is injected into the subprocess env via
-    // STELLAR_AGENT_TESTNET_H4_SIGNER_SECRET so the binary signs with the same
-    // key that owns the freshly-deployed SA. No external signer secret is needed.
-    let (signer_g, signer_s_strkey, _signer_box) = fresh_signer();
-    fund_via_friendbot(&signer_g).await;
-    let sa_strkey = deploy_fresh_smart_account(&signer_g).await;
-    eprintln!("[h4] smart_account: {}", &sa_strkey[..8]);
-
-    // ── Step 1: register-multicall via CLI ────────────────────────────────────
-    let networks_toml = tempfile::NamedTempFile::new()
-        .expect("[h4] temp networks.toml must be created")
-        .into_temp_path();
-    let networks_toml_path = networks_toml.to_str().unwrap().to_owned();
-
-    let register_output = std::process::Command::new(&binary_path)
-        .args([
-            "smart-account",
-            "register-multicall",
-            "--network",
-            "testnet",
-            "--address",
-            &router_address,
-            "--wasm-sha256",
-            MULTICALL_WASM_SHA256,
-        ])
-        .env(
-            stellar_agent_smart_account::multicall::STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV,
-            &networks_toml_path,
-        )
-        .output()
-        .expect("[h4] register-multicall binary must run");
-
-    assert!(
-        register_output.status.success(),
-        "[h4] register-multicall must exit 0; got {}\nstdout: {}\nstderr: {}",
-        register_output.status,
-        String::from_utf8_lossy(&register_output.stdout),
-        String::from_utf8_lossy(&register_output.stderr),
-    );
-
-    let register_json: serde_json::Value = serde_json::from_slice(&register_output.stdout)
-        .unwrap_or_else(|e| {
-            panic!(
-                "[h4] register-multicall stdout must be valid JSON; parse error: {e}\nraw: {}",
-                String::from_utf8_lossy(&register_output.stdout)
-            )
-        });
-    assert_eq!(
-        register_json["result"]["status"].as_str(),
-        Some("registered"),
-        "[h4] register-multicall status must be 'registered'; got: {register_json}"
-    );
-    eprintln!("[h4] Step 1 PASS: register-multicall");
-
-    // ── Step 2: unregister-multicall via CLI ──────────────────────────────────
-    let unregister_output = std::process::Command::new(&binary_path)
-        .args([
-            "smart-account",
-            "unregister-multicall",
-            "--network",
-            "testnet",
-            "--yes-i-have-verified-the-prior-values",
-        ])
-        .env(
-            stellar_agent_smart_account::multicall::STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV,
-            &networks_toml_path,
-        )
-        .output()
-        .expect("[h4] unregister-multicall binary must run");
-
-    // Note: unregister-multicall without --force goes through normal path.
-    // Passing --yes-i-have-verified-the-prior-values without --force is a no-op
-    // (the flag is only checked in the force path). Normal path always proceeds.
-    assert!(
-        unregister_output.status.success(),
-        "[h4] unregister-multicall must exit 0; got {}\nstdout: {}\nstderr: {}",
-        unregister_output.status,
-        String::from_utf8_lossy(&unregister_output.stdout),
-        String::from_utf8_lossy(&unregister_output.stderr),
-    );
-
-    let unregister_json: serde_json::Value = serde_json::from_slice(&unregister_output.stdout)
-        .unwrap_or_else(|e| {
-            panic!(
-                "[h4] unregister-multicall stdout must be valid JSON; parse error: {e}\nraw: {}",
-                String::from_utf8_lossy(&unregister_output.stdout)
-            )
-        });
-    assert_eq!(
-        unregister_json["result"]["status"].as_str(),
-        Some("unregistered"),
-        "[h4] unregister-multicall status must be 'unregistered'; got: {unregister_json}"
-    );
-    eprintln!("[h4] Step 2 PASS: unregister-multicall");
-
-    // ── Step 3: Re-register + smart-account multicall bundle submission ──────────────
-    // Re-register so the router is available for the multicall step.
-    let re_register = std::process::Command::new(&binary_path)
-        .args([
-            "smart-account",
-            "register-multicall",
-            "--network",
-            "testnet",
-            "--address",
-            &router_address,
-            "--wasm-sha256",
-            MULTICALL_WASM_SHA256,
-        ])
-        .env(
-            stellar_agent_smart_account::multicall::STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV,
-            &networks_toml_path,
-        )
-        .output()
-        .expect("[h4] re-register-multicall binary must run");
-    assert!(
-        re_register.status.success(),
-        "[h4] re-register-multicall must exit 0; stderr: {}",
-        String::from_utf8_lossy(&re_register.stderr)
-    );
-
-    // Build a 1-transfer invocation using the signer_g as both sender and receiver.
-    let usdc_sac = std::env::var("STELLAR_AGENT_TESTNET_USDC_SAC_ADDRESS")
-        .unwrap_or_else(|_| DUMMY_C_STRKEY.to_owned());
-    let invocation = format!(r#"{usdc_sac}:transfer:["{signer_g}","{signer_g}","1000000"]"#);
-
-    // Inject the fresh signer S-strkey into the subprocess environment.
-    // STELLAR_AGENT_TESTNET_H4_SIGNER_SECRET is a test-local name; it does not
-    // collide with any persistent operator env var.
-    let h4_signer_env_name = "STELLAR_AGENT_TESTNET_H4_SIGNER_SECRET";
-    let multicall_output = std::process::Command::new(&binary_path)
-        .args([
-            "smart-account",
-            "multicall",
-            "--smart-account",
-            &sa_strkey,
-            "--rule-id",
-            "0",
-            "--invocation",
-            &invocation,
-            "--secondary-rpc-url",
-            &secondary_rpc_url,
-            "--signer-secret-env",
-            h4_signer_env_name,
-            "--network",
-            "testnet",
-        ])
-        .env(
-            stellar_agent_smart_account::multicall::STELLAR_AGENT_MULTICALL_REGISTRY_TOML_ENV,
-            &networks_toml_path,
-        )
-        // Pass the freshly-generated S-strkey so the subprocess signs with
-        // the key that owns the freshly-deployed SA.
-        .env(h4_signer_env_name, signer_s_strkey.as_str())
-        .output()
-        .expect("[h4] smart-account multicall binary must run");
-
-    assert!(
-        multicall_output.status.success(),
-        "[h4] smart-account multicall must exit 0; got {}\nstdout: {}\nstderr: {}",
-        multicall_output.status,
-        String::from_utf8_lossy(&multicall_output.stdout),
-        String::from_utf8_lossy(&multicall_output.stderr),
-    );
-
-    let multicall_json: serde_json::Value = serde_json::from_slice(&multicall_output.stdout)
-        .unwrap_or_else(|e| {
-            panic!(
-                "[h4] smart-account multicall stdout must be valid JSON; parse error: {e}\nraw: {}",
-                String::from_utf8_lossy(&multicall_output.stdout)
-            )
-        });
-
-    assert!(
-        multicall_json["result"]["bundle_tx_hash"]
-            .as_str()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false),
-        "[h4] smart-account multicall must return a non-empty bundle_tx_hash; got: {multicall_json}"
-    );
-    assert_eq!(
-        multicall_json["result"]["inner_count"].as_u64(),
-        Some(1),
-        "[h4] smart-account multicall inner_count must be 1; got: {multicall_json}"
-    );
-
-    eprintln!(
-        "[h4] Step 3 PASS: smart-account multicall 1-transfer bundle confirmed (tx_hash prefix: {})",
-        multicall_json["result"]["bundle_tx_hash"]
-            .as_str()
-            .unwrap_or("")
-            .get(..8)
-            .unwrap_or(""),
-    );
-    eprintln!("[h4] PASS: all 3 CLI subcommand acceptance steps complete");
-}
-
 // ── h5_bundle_under_a_rule_other_than_0_checks_its_signer_set ────────────────
 
 /// The rows of the audit log at `path`, in order.
@@ -1010,29 +758,23 @@ fn audit_writer_in(dir: &std::path::Path) -> (Arc<Mutex<AuditWriter>>, std::path
 /// `policy_gate` with `sa.signer_set_diverged`, writing the divergence row
 /// and the denied-bundle row into the first log.
 ///
-/// # Environment variables required
-///
-/// The two of [`h1_happy_path_3_transfer_bundle`]; the test skips without
-/// either.
+/// Each bundle is three native-SAC `symbol` calls. The router is
+/// [`multicall_router`]'s and the secondary endpoint [`secondary_rpc_url`]'s;
+/// see the module's gating section.
 #[tokio::test]
 #[serial_test::serial]
 async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
     let data_root = tempfile::tempdir().expect("temporary wallet data root");
     let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(data_root.path());
-    let Ok(router_address) = std::env::var("STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS") else {
-        eprintln!("[h5] SKIP: STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS not set.");
-        return;
-    };
-    let Ok(secondary_rpc_url) = std::env::var("STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL") else {
-        eprintln!("[h5] SKIP: STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL not set.");
-        return;
-    };
+    let secondary_rpc_url = secondary_rpc_url();
     let timeout = Duration::from_secs(TIMEOUT_SECS);
     let rid = || uuid::Uuid::new_v4().to_string();
 
-    // ── Step 1: a fresh signer and smart account ──────────────────────────────
-    let (signer_g, _s_strkey, signer_box) = fresh_signer();
+    // ── Step 1: a fresh signer, the router, and a smart account ──────────────
+    let (signer_g, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
+    let router_address = multicall_router().await;
+    eprintln!("[h5] router_address: {}", &router_address[..8]);
     let sa_strkey = deploy_fresh_smart_account(&signer_g).await;
     let sa_addr = parse_c_strkey_to_smart_account(&sa_strkey).expect("C-strkey must parse");
     eprintln!("[h5] smart_account: {}", &sa_strkey[..8]);
@@ -1091,7 +833,7 @@ async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
             MulticallSubmitArgs {
                 smart_account: &sa_strkey,
                 rule_id,
-                bundle: three_transfer_bundle(&signer_g),
+                bundle: native_symbol_bundle(),
                 signer: signer_box.as_ref(),
                 primary_rpc_url: TESTNET_RPC_URL,
                 secondary_rpc_url: &secondary_rpc_url,
@@ -1113,6 +855,7 @@ async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
         .unwrap_or_else(|e| panic!("[h5] the bundle under rule {rule_id} must confirm: {e:?}"));
     assert_eq!(confirmed.inner_count, 3, "[h5] inner_count");
     assert!(confirmed.ledger > 0, "[h5] the bundle confirmed on chain");
+    assert_native_symbols("h5", &confirmed.inner_results);
     let listed = signers_manager
         .list_signers(sa_addr.clone(), rule_id, Some(&signer_g), rid())
         .await
@@ -1140,7 +883,7 @@ async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
         .await
         .expect("signers list records the rule in the other log");
     assert_eq!(first.baseline, PreviousBaseline::None);
-    let (added_g, _added_s, _added_signer) = fresh_signer();
+    let (added_g, _added_signer) = fresh_signer();
     other_manager
         .add_signer(
             sa_addr.clone(),
