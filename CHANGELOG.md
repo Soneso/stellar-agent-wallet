@@ -76,6 +76,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `profile enroll-signer` refuses an unset secret without touching the profile.
 - The approval prompt, `approve list`, and both inboxes name the trustline,
   account, asset, and limit.
+- With a pending rule proposal, the rule-create action of
+  `stellar_toolset_invoke` queues the first-invoke approval and answers
+  `toolset.first_invoke_approval_required`
+  instead of `toolset.enforcement_error` with `approval.writer_locked`.
+  With a matching grant and a valid attestation, the action proceeds to signing
+  instead of answering `policy.approval_required`.
 
 ## [0.1.0-alpha.11] - 2026-10-07
 
