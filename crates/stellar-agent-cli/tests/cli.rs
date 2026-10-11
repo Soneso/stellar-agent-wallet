@@ -18,6 +18,8 @@ mod fresh_v1_ceremony;
 mod keyring_classification_discipline;
 #[path = "cli/mpp_first_run_vs_unavailable_state.rs"]
 mod mpp_first_run_vs_unavailable_state;
+#[path = "cli/multicall_policy.rs"]
+mod multicall_policy;
 #[path = "cli/output_failure_exit_code.rs"]
 mod output_failure_exit_code;
 #[path = "cli/owner_key_sweep_cli.rs"]
@@ -54,3 +56,5 @@ mod staged_submit_probe_ordering;
 mod tx_receipt_clear_integration;
 #[path = "cli/usage_error_envelope.rs"]
 mod usage_error_envelope;
+#[path = "cli/v1_ceremony.rs"]
+mod v1_ceremony;

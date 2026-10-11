@@ -41,8 +41,10 @@
 //! `STELLAR_AGENT_HOME` redirects every data-root-derived path and is set on
 //! CHILD processes only, never on the test process. Profile fixtures are
 //! written in-process through `stellar-agent-core`'s own loader, so no test
-//! depends on a host profile directory. The headless keyring backend is forced
-//! on every child so no run can reach the login keychain.
+//! depends on a host profile directory. The two multicall ordering tests
+//! provision V1 profiles through `profile init` in an isolated home from the
+//! shared ceremony module. The headless keyring backend is forced on every
+//! child so no run can reach the login keychain.
 
 #![allow(
     clippy::expect_used,
@@ -1716,55 +1718,51 @@ fn list_rules_refuses_a_mainnet_profile_named_by_the_environment() {
     assert_no_contact(&endpoint);
 }
 
+/// On a V1 profile whose audit key is unminted, `--secondary-rpc-url`
+/// reaches the audit pre-flight, which refuses before any endpoint is
+/// contacted. The profile's endpoint and the secondary flag name the same
+/// mock, so the zero-request assertion observes both.
 #[tokio::test]
 async fn multicall_secondary_flag_reaches_writer_without_rpc_contact() {
     let rpc = wiremock::MockServer::start().await;
-    let home = tempfile::tempdir().unwrap();
-    write_profile(home.path(), "testnet", &rpc.uri(), None);
-    let registry = home.path().join("networks.toml");
-    std::fs::write(&registry, format!("[multicall.testnet]\nnetwork_passphrase = \"Test SDF Network ; September 2015\"\naddress = \"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM\"\nwasm_sha256 = \"{}\"\n", stellar_agent_smart_account::multicall::MULTICALL_WASM_SHA256)).unwrap();
     let endpoint = rpc.uri();
+    let home = crate::v1_ceremony::IsolatedHome::new();
+    home.init_profile("testnet", &["--rpc-url", &endpoint]);
+    home.write_multicall_registry(ACCOUNT_C);
     let mut args = multicall_base();
     args.extend(["--profile", "testnet", "--secondary-rpc-url", &endpoint]);
-    let run = run_cli_with_env(
-        home.path(),
-        None,
-        &args,
-        &[(
-            stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
-            registry.to_str().unwrap(),
-        )],
-    );
+    let run = home.run(&args, &[]);
     assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
-    let json = run.json();
-    let code = json["error"]["code"].as_str().unwrap();
-    assert!(
-        [
-            "audit.chain_key_unavailable",
-            "validation.secret_env_not_set"
-        ]
-        .contains(&code),
-        "{json}"
+    assert_eq!(
+        run.error_code(),
+        "audit.chain_key_unavailable",
+        "{}",
+        run.envelope
     );
     assert!(rpc.received_requests().await.unwrap().is_empty());
 }
 
+/// On a V1 profile with every key enrolled, an unreadable multicall registry
+/// refuses before the audit writer and the signer are reached.
 #[test]
 fn multicall_registry_error_precedes_writer_and_signer() {
-    let home = tempfile::tempdir().unwrap();
-    write_profile(
-        home.path(),
+    let home = crate::v1_ceremony::IsolatedHome::new();
+    home.init_profile("testnet", &["--rpc-url", UNREACHABLE_RPC]);
+    home.enroll_keys(
         "testnet",
-        UNREACHABLE_RPC,
-        Some("https://secondary.example"),
+        &crate::v1_ceremony::Keypair::from_seed([0x11; 32]),
+        &crate::v1_ceremony::Keypair::from_seed([0x22; 32]),
     );
     let registry = home.path().join("unreadable-registry");
     std::fs::create_dir(&registry).unwrap();
     let mut args = multicall_base();
-    args.extend(["--profile", "testnet"]);
-    let run = run_cli_with_env(
-        home.path(),
-        None,
+    args.extend([
+        "--profile",
+        "testnet",
+        "--secondary-rpc-url",
+        "https://secondary.example",
+    ]);
+    let run = home.run(
         &args,
         &[(
             stellar_agent_smart_account::verifiers::STELLAR_AGENT_NETWORKS_TOML_ENV,
@@ -1772,5 +1770,5 @@ fn multicall_registry_error_precedes_writer_and_signer() {
         )],
     );
     assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
-    assert_eq!(run.json()["error"]["code"], "io.multicall_registry_load");
+    assert_eq!(run.error_code(), "io.multicall_registry_load");
 }

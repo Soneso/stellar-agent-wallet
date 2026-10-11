@@ -38,8 +38,8 @@ use stellar_agent_test_support::signed_envelope::{
 };
 use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
 use stellar_xdr::{
-    ContractId, Hash, HostFunction, Limits, OperationBody, ReadXdr, ScAddress, ScVal,
-    SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
+    ContractId, Hash, HostFunction, InvokeContractArgs, Limits, OperationBody, ReadXdr, ScAddress,
+    ScVal, SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
     SorobanAuthorizedInvocation, SorobanCredentials, TransactionEnvelope, VecM, WriteXdr,
 };
 use tempfile::TempDir;
@@ -69,6 +69,49 @@ struct Rpc {
     /// Runs once, on the first simulation: the point after the bundle gate
     /// has admitted the call and before its reservation is written.
     before_simulate: Arc<Mutex<Option<SimulateHook>>>,
+    /// Whether the unsigned `exec` simulation authorizes one sub-invocation
+    /// per inner call beneath the router's root invocation.
+    exec_subtree: bool,
+    /// The envelopes this endpoint saw, in order.
+    seen: Arc<Mutex<SeenEnvelopes>>,
+}
+
+/// The envelopes a mock endpoint received.
+#[derive(Default)]
+struct SeenEnvelopes {
+    /// Each simulation that carried signed authorization entries.
+    signed_simulations: Vec<TransactionEnvelope>,
+    /// Each envelope sent with `sendTransaction`.
+    sent: Vec<TransactionEnvelope>,
+}
+
+/// One authorized sub-invocation per inner call of the router's `exec`
+/// arguments, in bundle order.
+fn exec_subtree(invoke: &InvokeContractArgs) -> Vec<SorobanAuthorizedInvocation> {
+    let Some(ScVal::Vec(Some(inners))) = invoke.args.get(1) else {
+        return Vec::new();
+    };
+    inners
+        .iter()
+        .filter_map(|inner| {
+            let ScVal::Vec(Some(parts)) = inner else {
+                return None;
+            };
+            let (ScVal::Address(contract_address), ScVal::Symbol(function_name), ScVal::Vec(args)) =
+                (parts.first()?, parts.get(1)?, parts.get(2)?)
+            else {
+                return None;
+            };
+            Some(SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: contract_address.clone(),
+                    function_name: function_name.clone(),
+                    args: args.clone().map(|args| args.0).unwrap_or_default(),
+                }),
+                sub_invocations: VecM::default(),
+            })
+        })
+        .collect()
 }
 
 impl Respond for Rpc {
@@ -128,8 +171,18 @@ impl Respond for Rpc {
                     &value.to_xdr_base64(Limits::none()).unwrap(),
                 );
                 let auth = if !op.auth.is_empty() {
+                    self.seen
+                        .lock()
+                        .unwrap()
+                        .signed_simulations
+                        .push(TransactionEnvelope::Tx(tx.clone()));
                     op.auth.to_vec()
                 } else if function == "exec" {
+                    let sub_invocations = if self.exec_subtree {
+                        exec_subtree(invoke).try_into().unwrap()
+                    } else {
+                        VecM::default()
+                    };
                     vec![SorobanAuthorizationEntry {
                         credentials: SorobanCredentials::Address(SorobanAddressCredentials {
                             address: ScAddress::Contract(ContractId(Hash([0x44; 32]))),
@@ -139,7 +192,7 @@ impl Respond for Rpc {
                         }),
                         root_invocation: SorobanAuthorizedInvocation {
                             function: SorobanAuthorizedFunction::ContractFn(invoke.clone()),
-                            sub_invocations: VecM::default(),
+                            sub_invocations,
                         },
                     }]
                 } else {
@@ -154,6 +207,13 @@ impl Respond for Rpc {
             }
             "sendTransaction" => {
                 self.sends.fetch_add(1, Ordering::SeqCst);
+                self.seen.lock().unwrap().sent.push(
+                    TransactionEnvelope::from_xdr_base64(
+                        body["params"]["transaction"].as_str().unwrap(),
+                        Limits::none(),
+                    )
+                    .unwrap(),
+                );
                 let hash = send_transaction_hash_hex(&body, PASSPHRASE);
                 *self.sent_hash.lock().unwrap() = hash.clone();
                 json!({"status": "PENDING", "hash": hash, "latestLedger": 1000, "latestLedgerCloseTime": "1234567890"})
@@ -371,10 +431,49 @@ async fn rpc_with_hook(
             sends: Arc::clone(&sends),
             sent_hash: Arc::clone(&sent_hash),
             before_simulate: Arc::new(Mutex::new(before_simulate)),
+            exec_subtree: false,
+            seen: Arc::default(),
         })
         .mount(&server)
         .await;
     (server, sends, sent_hash)
+}
+
+/// A confirming endpoint whose `exec` simulation authorizes a sub-invocation
+/// per inner call, with the envelopes it received.
+async fn rpc_with_exec_subtree() -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<SeenEnvelopes>>) {
+    let server = MockServer::start().await;
+    let sends = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(SeenEnvelopes::default()));
+    Mock::given(method("POST"))
+        .respond_with(Rpc {
+            poll_status: "SUCCESS",
+            sends: Arc::clone(&sends),
+            sent_hash: Arc::default(),
+            before_simulate: Arc::default(),
+            exec_subtree: true,
+            seen: Arc::clone(&seen),
+        })
+        .mount(&server)
+        .await;
+    (server, sends, seen)
+}
+
+/// The single host-function operation of a v1 envelope: its contract
+/// invocation and its authorization entries.
+fn invocation_of(
+    envelope: &TransactionEnvelope,
+) -> (InvokeContractArgs, Vec<SorobanAuthorizationEntry>) {
+    let TransactionEnvelope::Tx(tx) = envelope else {
+        panic!("expected a v1 envelope")
+    };
+    let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body else {
+        panic!("expected a host-function invocation")
+    };
+    let HostFunction::InvokeContract(invoke) = &op.host_function else {
+        panic!("expected a contract invocation")
+    };
+    (invoke.clone(), op.auth.to_vec())
 }
 
 /// A bundle the gate admits against an empty window is refused at its
@@ -518,6 +617,83 @@ async fn confirmed_multicall_counts_each_leg_once() {
     assert_eq!(fixture.rows("value_action_pending").len(), 1);
     assert_eq!(fixture.rows("value_action_submitted").len(), 1);
     assert_eq!(sends.load(Ordering::SeqCst), 1);
+}
+
+/// A confirmed bundle's transaction invokes the registered router's `exec`
+/// with the wallet as its caller, and carries the wallet's authorization over
+/// the simulated tree, sub-invocations included, through the signed
+/// re-simulation and the submission.
+#[tokio::test]
+#[serial]
+async fn confirmed_multicall_submits_the_router_exec_under_wallet_authorization() {
+    let fixture = Fixture::new();
+    let (server, sends, seen) = rpc_with_exec_subtree().await;
+    fixture.multicall(&server.uri()).await.unwrap();
+    assert_eq!(fixture.total(), (60, 2));
+    assert!(
+        PersistedWindowStore::for_profile(PROFILE)
+            .pending_reservations(&fixture.profile)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fixture.rows("value_action_pending").len(), 1);
+    assert_eq!(fixture.rows("value_action_submitted").len(), 1);
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
+
+    let router = ScAddress::Contract(ContractId(Hash([0x45; 32])));
+    let wallet = ScAddress::Contract(ContractId(Hash([0x44; 32])));
+    let seen = seen.lock().unwrap();
+    let [sent] = seen.sent.as_slice() else {
+        panic!("one envelope is sent")
+    };
+    let (invoke, auth) = invocation_of(sent);
+    assert_eq!(
+        invoke.contract_address, router,
+        "the submitted transaction invokes the registered router"
+    );
+    assert_eq!(invoke.function_name.0.as_slice(), b"exec");
+    assert_eq!(
+        invoke.args.first(),
+        Some(&ScVal::Address(wallet.clone())),
+        "the router's caller argument is the wallet"
+    );
+
+    let subtree = exec_subtree(&invoke);
+    assert_eq!(subtree.len(), 2, "one sub-invocation per inner call");
+    let wallet_entries: Vec<&SorobanAuthorizationEntry> = auth
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.credentials, SorobanCredentials::Address(credentials)
+                if credentials.address == wallet)
+        })
+        .collect();
+    let [entry] = wallet_entries.as_slice() else {
+        panic!("the wallet authorizes the bundle with one entry: {auth:?}")
+    };
+    assert_eq!(
+        entry.root_invocation.function,
+        SorobanAuthorizedFunction::ContractFn(invoke.clone()),
+        "the authorized root is the submitted router invocation"
+    );
+    assert_eq!(
+        entry.root_invocation.sub_invocations.as_slice(),
+        subtree.as_slice(),
+        "the submission keeps the simulated subtree"
+    );
+
+    let [resimulated] = seen.signed_simulations.as_slice() else {
+        panic!("one signed re-simulation")
+    };
+    let (resimulated_invoke, resimulated_auth) = invocation_of(resimulated);
+    assert_eq!(
+        resimulated_invoke, invoke,
+        "the re-simulation invokes the router"
+    );
+    assert_eq!(
+        resimulated_auth.as_slice(),
+        auth.as_slice(),
+        "the re-simulation carries the submitted authorization"
+    );
 }
 
 #[tokio::test]

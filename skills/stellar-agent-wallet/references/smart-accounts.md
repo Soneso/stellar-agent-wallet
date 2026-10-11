@@ -237,6 +237,15 @@ Each `--invocation` is `<target>:<fn>:<json-args>` where `<target>` is the C-str
 | `--secondary-rpc-url <URL>` | Secondary RPC for cross-verification: the flag, else the profile's `secondary_rpc_url`, else a typed error. |
 | `--fee <STROOPS>` | Per-op base fee, default `100`; `auto[:pNN]` is rejected here (unlike the deploy verbs) |
 
+Multicall requires `policy.engine = "v1"` and evaluates the selected profile's signed policy with persisted window state. Match `wallet_multicall` or `*`; `wallet_multicall` is this CLI command's policy identifier. Only an allow decision submits the bundle:
+
+- A Noop profile refuses with `policy.engine_required` before the command acquires the audit writer; its message names multicall and `policy.engine = "v1"`.
+- A V1 policy that cannot be loaded or verified, and an unknown engine kind, refuse with `policy.engine_unavailable`.
+- Policy-gate refusals render `sa.multicall_failed` at phase `policy_gate` and write an `SaMulticallBundleDenied` audit row; the command sends nothing.
+- A matching deny rule records audit code `multicall.explicit_rule_deny`; a persisted bundle-rate limit records `multicall.rate_limit_exceeded`.
+- A `require_approval` rule records audit code `multicall.approval_required`. The reason names the approval requirement and states that this submission path has no approval route.
+- Any other non-allow decision records audit code `multicall.unexpected_decision`.
+
 ```bash
 stellar-agent smart-account multicall \
   --smart-account CABC...WXYZ \

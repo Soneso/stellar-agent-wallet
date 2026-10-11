@@ -66,12 +66,14 @@ The binding gate used when no full engine is configured. Behavior is fixed:
 
 | Profile | Tool | Result |
 |---|---|---|
-| testnet | any | Allow |
+| testnet | any except `smart-account multicall` | Allow |
+| testnet | `smart-account multicall` | refused with `policy.engine_required` |
 | mainnet | read-only | Allow |
 | mainnet | destructive | refused with `policy.engine_required` |
 
-A destructive tool on a mainnet profile cannot pass the Noop engine. Newly
-minted profiles default to the V1 engine.
+A destructive tool on a mainnet profile cannot pass the Noop engine.
+`smart-account multicall` requires the V1 engine and refuses a Noop profile
+with `policy.engine_required`. Newly minted profiles default to the V1 engine.
 
 ### V1 engine
 

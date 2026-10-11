@@ -38,10 +38,14 @@
 # in this list it has NO testnet/RPC dependency at all (the interactive
 # enrollment server is purely loopback HTTP).
 #
-# The multicall suite's happy-path test additionally wants
-# STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS and
-# STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL; it skips itself (without failing)
-# when they are absent.
+# The multicall suites deploy the vendored router themselves and need no
+# extra configuration. The library suite
+# (smart_account_multicall_testnet_acceptance) also reads two optional
+# overrides: STELLAR_AGENT_TESTNET_MULTICALL_ROUTER_ADDRESS names a deployed
+# router to use instead. STELLAR_AGENT_TESTNET_SECONDARY_RPC_URL names an
+# independent secondary endpoint for the cross-RPC check, which otherwise
+# compares the primary endpoint with itself. An override that does not parse
+# fails the suite.
 
 set -u -o pipefail
 
@@ -147,6 +151,7 @@ SUITES=(
   "stellar-agent-cli testnet-acceptance cli_submit_only_network_binding_testnet_acceptance"
   "stellar-agent-cli testnet-acceptance profile_init_enroll_signer_testnet_acceptance"
   "stellar-agent-cli testnet-acceptance smart_account_execute_testnet_acceptance"
+  "stellar-agent-cli testnet-acceptance smart_account_multicall_cli_testnet_acceptance"
   "stellar-agent-cli testnet-acceptance cap85_external_ref_cli_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration deploy_c_testnet_acceptance"
   "stellar-agent-smart-account testnet-integration quorum_authorization_info_testnet_acceptance"
@@ -179,9 +184,9 @@ SUITES=(
 # feature) that a retry cannot change.
 #
 # Sets LAST_SKIPS to the number of self-skip markers the suite printed. Tests
-# that need an unavailable precondition (for example the multicall suite's
-# router env vars) print a SKIP line and return without failing; surfacing the
-# count in the summary keeps a green run honest about what did not execute.
+# that need an unavailable precondition print a SKIP line and return without
+# failing; surfacing the count in the summary keeps a green run honest about
+# what did not execute.
 run_suite() {
   local crate="$1" feature="$2" target="$3" log status summary executed deterministic
   log=$(mktemp)

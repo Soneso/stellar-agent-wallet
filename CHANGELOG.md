@@ -88,6 +88,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of `toolset.enforcement_error` with `approval.writer_locked`.
   With a matching grant and a valid attestation, the action proceeds to signing
   instead of answering `policy.approval_required`.
+- `smart-account multicall` evaluates the selected profile's signed V1 policy,
+  with persisted window state, so a matching allow rule whose criteria pass
+  permits the bundle. A Noop profile refuses with `policy.engine_required`, and a
+  policy that cannot load refuses with `policy.engine_unavailable`.
+- The multicall cross-RPC check accepts two simulations that differ only in
+  their authorization nonces, expiration ledgers, signature placeholders, and
+  matching footprint nonce keys. A refusal raised during submission, such as a
+  cross-RPC divergence, reports its own phase and reason.
+- Multicall transactions invoke the registered router's `exec` and carry the
+  smart account's authorization.
+- The multicall testnet acceptance suites deploy the vendored router and run
+  without a hand-set router address or secondary endpoint.
+- The RPC error redaction keeps the query of a URL out of the output when the
+  query holds a comma or parentheses.
 
 ## [0.1.0-alpha.11] - 2026-10-07
 

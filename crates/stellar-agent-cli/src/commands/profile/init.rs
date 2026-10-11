@@ -47,6 +47,8 @@
 //! immediately. MCP payment simulation requires `rotate-nonce-key`. MCP signing
 //! requires `rotate-audit-key` and `enroll-signer` on both engines. The Noop
 //! engine allows testnet calls and restricts mainnet to read-only calls.
+//! `smart-account multicall` requires `v1` and refuses a Noop profile with
+//! `policy.engine_required`.
 //!
 //! # Endpoint rule
 //!
