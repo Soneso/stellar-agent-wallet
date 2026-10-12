@@ -4,16 +4,33 @@ name: Triage
 # when a non-maintainer's issue or pull request opens or reopens, when such a
 # pull request gets a push, and when a non-maintainer comments. Those pull
 # request events and comments also remove `waiting on author`. Reopens and
-# pushes use the author's role, not the actor's. A maintainer comment or
-# review on a pull request adds `waiting on author` and removes
-# `waiting on maintainer`; a maintainer comment on an issue removes
-# `waiting on maintainer`. Bots, claim comments, and other activity change
-# nothing. A label already in the wanted state is not touched.
+# pushes use the author's role, not the actor's. A maintainer comment on a
+# pull request adds `waiting on author` and removes `waiting on maintainer`;
+# a maintainer comment on an issue removes `waiting on maintainer`.
+# Maintainer reviews move the pull request labels within about 15 minutes
+# through the `review-sweep` job. Bots, claim comments, and other activity
+# change nothing. Closed issues and pull requests keep their labels.
+# A label already in the wanted state is not touched.
 #
-# pull_request_target uses the base repository's token for fork pull requests.
-# This job never checks out code or runs anything from the pull request.
-# It only reads event fields and edits labels.
-# .github/scripts/test-triage-workflow.py runs the script against a simulated API.
+# The sweep flips a pull request whose latest maintainer review sits on the
+# current head and is newer than every contributor comment or review and
+# the latest `waiting on maintainer` label event.
+# A push, comment, or review by a contributor after that review keeps the
+# pull request with the maintainer.
+# A reopen or a re-added label also keeps it with the maintainer.
+# The sweep re-reads the labels just before it edits them and leaves a
+# label the live job changed in the meantime. A contributor comment in the
+# seconds between the comment read and the edit goes unseen until the next
+# activity.
+#
+# Review events of fork pull requests get a read-only token, so the sweep
+# handles reviews with the base repository's token.
+# pull_request_target also uses the base repository's token for fork pull
+# requests.
+# Both jobs only read event fields or API data and edit labels.
+# Neither job checks out code or runs anything from the pull request.
+# .github/scripts/test-triage-workflow.py tests both jobs against a
+# simulated API.
 
 on:
   issues:
@@ -22,18 +39,19 @@ on:
     types: [created]
   pull_request_target:
     types: [opened, reopened, synchronize]
-  pull_request_review:
-    types: [submitted]
+  schedule:
+    - cron: '*/15 * * * *'
 
 permissions: {}
 
 jobs:
   triage:
-    # Skips bots, judged by the first user the event carries: comment, review,
-    # pull request, or issue.
+    # Runs on events only and skips bots, judged by the first user the event
+    # carries: comment, pull request, or issue.
     if: >-
-      (github.event.comment.user.type || github.event.review.user.type
-      || github.event.pull_request.user.type || github.event.issue.user.type) != 'Bot'
+      github.event_name != 'schedule' &&
+      ((github.event.comment.user.type || github.event.pull_request.user.type
+      || github.event.issue.user.type) != 'Bot')
     runs-on: ubuntu-24.04
     permissions:
       issues: write
@@ -54,7 +72,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
           EVENT: ${{ format('{0}:{1}', github.event_name, github.event.action) }}
-          ASSOCIATION: ${{ github.event.comment.author_association || github.event.review.author_association || github.event.pull_request.author_association || github.event.issue.author_association }}
+          ASSOCIATION: ${{ github.event.comment.author_association || github.event.pull_request.author_association || github.event.issue.author_association }}
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           set -euo pipefail
@@ -85,6 +103,10 @@ jobs:
             echo '::error::Cannot parse labels.' >&2
             exit 1
           fi
+          if [[ $(jq -r '.state' <<<"$issue") == closed ]]; then
+            echo "no change on #$NUMBER: closed"
+            exit 0
+          fi
           is_pr=$(jq -r '.pull_request != null' <<<"$issue")
 
           add=''
@@ -99,7 +121,7 @@ jobs:
           elif [[ "$EVENT" == issue_comment:created && "$maintainer" == false ]]; then
             add='waiting on maintainer'
             remove='waiting on author'
-          elif [[ "$EVENT" == issue_comment:created || "$EVENT" == pull_request_review:submitted ]] &&
+          elif [[ "$EVENT" == issue_comment:created ]] &&
             [[ "$maintainer" == true && "$is_pr" == true ]]; then
             add='waiting on author'
             remove='waiting on maintainer'
@@ -133,3 +155,140 @@ jobs:
           if [[ "$changed" == false ]]; then
             echo "no change on #$NUMBER: labels already match"
           fi
+
+  review-sweep:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+      pull-requests: write
+    timeout-minutes: 5
+    concurrency:
+      group: triage-review-sweep
+      cancel-in-progress: false
+    steps:
+      - name: Sweep maintainer reviews
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if ! issues=$(gh api "repos/$GH_REPO/issues?state=open&labels=waiting%20on%20maintainer&per_page=100" --paginate); then
+            echo '::error::Cannot read pull requests.' >&2
+            exit 1
+          fi
+          if ! pull_requests=$(jq -cs '.[][] | select(.pull_request != null and .user.type != "Bot")' <<<"$issues"); then
+            echo '::error::Cannot parse pull requests.' >&2
+            exit 1
+          fi
+
+          checked=0
+          flipped=0
+          while IFS= read -r issue; do
+            [[ -n "$issue" ]] || continue
+            number=$(jq -r '.number' <<<"$issue")
+            checked=$((checked + 1))
+            if ! reviews=$(gh api "repos/$GH_REPO/pulls/$number/reviews" --paginate); then
+              echo '::error::Cannot read reviews.' >&2
+              exit 1
+            fi
+            if ! review=$(jq -cs '[.[][]
+              | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
+              | select(.user.type != "Bot")
+              | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "COMMENTED")]
+              | max_by(.submitted_at) // empty' <<<"$reviews"); then
+              echo '::error::Cannot parse reviews.' >&2
+              exit 1
+            fi
+            if [[ -z "$review" ]]; then
+              echo "no change on #$number: no maintainer review"
+              continue
+            fi
+            review_time=$(jq -r '.submitted_at' <<<"$review")
+            review_commit=$(jq -r '.commit_id' <<<"$review")
+            if ! pull_request=$(gh api "repos/$GH_REPO/pulls/$number"); then
+              echo '::error::Cannot read pull request.' >&2
+              exit 1
+            fi
+            if ! head=$(jq -er '.head.sha' <<<"$pull_request"); then
+              echo '::error::Cannot parse pull request.' >&2
+              exit 1
+            fi
+            if [[ "$review_commit" != "$head" ]]; then
+              echo "no change on #$number: push after the review"
+              continue
+            fi
+            if ! comments=$(gh api "repos/$GH_REPO/issues/$number/comments" --paginate); then
+              echo '::error::Cannot read comments.' >&2
+              exit 1
+            fi
+            if ! review_comments=$(gh api "repos/$GH_REPO/pulls/$number/comments" --paginate); then
+              echo '::error::Cannot read review comments.' >&2
+              exit 1
+            fi
+            if ! commented=$(jq -rs --arg review_time "$review_time" '[.[][]
+              | select(.author_association != "OWNER" and .author_association != "MEMBER" and .author_association != "COLLABORATOR")
+              | select(.user.type != "Bot" and (.submitted_at // .created_at) > $review_time)]
+              | length > 0' <<<"$comments"$'\n'"$review_comments"$'\n'"$reviews"); then
+              echo '::error::Cannot parse comments.' >&2
+              exit 1
+            fi
+            if [[ "$commented" == true ]]; then
+              echo "no change on #$number: comment after the review"
+              continue
+            fi
+            if ! events=$(gh api "repos/$GH_REPO/issues/$number/events" --paginate); then
+              echo '::error::Cannot read label events.' >&2
+              exit 1
+            fi
+            if ! label_time=$(jq -rs '[.[][]
+              | select(.event == "labeled" and .label.name == "waiting on maintainer")
+              | .created_at] | max // empty' <<<"$events"); then
+              echo '::error::Cannot parse label events.' >&2
+              exit 1
+            fi
+            if [[ -z "$label_time" ]]; then
+              echo "no change on #$number: no label event"
+              continue
+            fi
+            if ! [[ "$review_time" > "$label_time" ]]; then
+              echo "no change on #$number: label after the review"
+              continue
+            fi
+            if ! issue=$(gh api "repos/$GH_REPO/issues/$number"); then
+              echo '::error::Cannot read labels.' >&2
+              exit 1
+            fi
+            if ! labels=$(jq -ce '[.labels[].name]' <<<"$issue"); then
+              echo '::error::Cannot parse labels.' >&2
+              exit 1
+            fi
+            add='waiting on author'
+            remove='waiting on maintainer'
+            changed=false
+            if ! jq -e --arg label "$add" 'index($label) != null' <<<"$labels" >/dev/null; then
+              if ! gh api --method POST "repos/$GH_REPO/issues/$number/labels" -f "labels[]=$add" >/dev/null; then
+                echo '::error::Cannot add label.' >&2
+                exit 1
+              fi
+              echo "add $add on #$number"
+              changed=true
+            fi
+            if jq -e --arg label "$remove" 'index($label) != null' <<<"$labels" >/dev/null; then
+              encoded=${remove// /%20}
+              if ! gh api --method DELETE "repos/$GH_REPO/issues/$number/labels/$encoded" >/dev/null; then
+                echo '::error::Cannot remove label.' >&2
+                exit 1
+              fi
+              echo "remove $remove on #$number"
+              changed=true
+            fi
+            if [[ "$changed" == true ]]; then
+              flipped=$((flipped + 1))
+            else
+              echo "no change on #$number: labels already match"
+            fi
+          done <<<"$pull_requests"
+          echo "sweep: $checked pull requests checked, $flipped flipped"
