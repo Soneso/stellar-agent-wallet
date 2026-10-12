@@ -19,7 +19,13 @@ the review approves with no blocking findings.
 - Secret values zeroize on drop; no un-zeroized copies linger.
 - No `unsafe`. No `unwrap`, `expect`, or `panic` in library code unless provably
   infallible with an inline justification.
-- Every error path fails closed; nothing fails open.
+- Fail closed. A check that runs before signing or submission refuses on error
+  rather than proceeds. The behaviors that deliberately differ are documented:
+  the audit chain-key pre-flight on the synthesized zero-config profile in
+  [SECURITY.md](../../SECURITY.md#security-model-summary) and the
+  post-confirmation audit append in
+  [concepts](../concepts.md#fail-closed-on-an-unminted-audit-key). A change adds
+  no new one without a security review.
 - No secrets or mainnet keys are committed.
 - A credential or authorization returned without local submission is treated as
   a one-shot value action: policy accounting happens before signing, durable

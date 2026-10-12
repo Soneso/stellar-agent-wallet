@@ -32,7 +32,7 @@ LABELS = [
     ("coverage", "c5def5", "CI runs the coverage gate on this pull request"),
     ("waiting on author", "fef2c0", "The next step is the contributor's"),
     ("waiting on maintainer", "d4c5f9", "The next step is ours"),
-    ("stale", "ededed", "No activity for 14 days; closes after 21"),
+    ("stale", "ededed", "Pull request waiting on its author, idle 14 days; closes after 21; drafts and issues exempt"),
     ("hacktoberfest-accepted", "ff7518", "Counts for Hacktoberfest after the review"),
 ]
 HONEST = [dict(zip(("name", "color", "description"), values)) for values in LABELS]

@@ -38,7 +38,12 @@ workspace. In particular:
 
 Beyond the lints, a change is expected to:
 
-- Fail closed. Every error path must refuse rather than proceed; nothing fails open.
+- Fail closed. A check that runs before signing or submission refuses on error
+  rather than proceeds. The behaviors that deliberately differ are documented: the
+  audit chain-key pre-flight on the synthesized zero-config profile in
+  [SECURITY.md](SECURITY.md#security-model-summary) and the post-confirmation audit
+  append in [concepts](docs/concepts.md#fail-closed-on-an-unminted-audit-key). A
+  change adds no new one without a security review.
 - Keep secrets out of logs, `Debug` output, and error messages. Account identifiers
   and transaction hashes are redacted at info level. Secret material zeroizes on
   drop.
@@ -191,10 +196,10 @@ Issues touching signing paths, key handling, or serialized state get the second
 review pass and are better second contributions than first ones.
 
 To claim an issue that carries `good first issue` or `help wanted` and has no
-assignee, comment "I'll take this" on it, and the repository assigns it to you
-at once. Hold one open assignment at a time. After 14 days with no pull
-request and no comment, a maintainer releases the assignment and says so on the
-issue.
+assignee, comment "I'll take this" on it, and the repository usually assigns it
+to you within a few minutes. Hold one open assignment at a time. After 14 days
+with no pull request and no comment, a maintainer releases the assignment and
+says so on the issue.
 
 If an issue is unassigned when you open a pull request for it, the first pull
 request that fills in the template is the one reviewed. A maintainer closes a
