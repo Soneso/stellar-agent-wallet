@@ -210,8 +210,14 @@ later pull request for the same issue, with thanks and a pointer to another open
 issue.
 
 Work on a branch named for the change, for example `docs/exit-code-2` or
-`fix/claim-refusal-codes`. Changes land through pull requests from a fork. CI
-runs on every pull request. On your first contribution, the run starts after a
+`fix/claim-refusal-codes`. Changes land through pull requests from a fork. In a
+clone made with `gh repo fork --clone`, start the branch from the current
+upstream `main` with `git fetch upstream` and
+`git switch -c <branch> upstream/main`. Push it to your fork with
+`git push -u origin <branch>`. A push over HTTPS that carries upstream changes
+to workflow files needs a token with the `workflow` scope. Run
+`gh auth refresh -s workflow` to add the scope to your gh login. CI runs on
+every pull request. On your first contribution, the run starts after a
 maintainer approves it. Every required check must pass before merge.
 
 ## Writing style

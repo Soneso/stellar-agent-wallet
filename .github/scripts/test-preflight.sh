@@ -6,7 +6,7 @@
 # sources, and the cap85-beacon record of the smart-account crate. It also
 # holds .github, CHANGELOG.md, CONTRIBUTING.md, the building guide, and the skill.
 # Each case copies that repository, changes it on a branch, and runs
-# preflight.sh against main.
+# preflight.sh against main, or against the default base in the base cases.
 #
 # Planning cases compare the whole --list output with the expected gates. The
 # package cases pin the clippy, rustdoc, and test packages, and check them
@@ -48,7 +48,7 @@ REAL_BASH=$(command -v bash)
 REAL_PYTHON=$(python3 -c 'import sys; print(sys.executable)')
 FIXTURE="$TMP/fixture"
 
-CASES="docs-only install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
+CASES="docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
 ci-yml-only python-check-script shell-check-script skill inbox-web one-crate two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
@@ -262,11 +262,19 @@ edit() {
   assert_changed "$@"
 }
 
-# Runs preflight.sh --list --base main, with --full when the first argument
-# is --full, and fails unless it exits 0 with nothing on stderr and prints
-# exactly the rows the other arguments name (see expected_rows).
+# Runs preflight.sh --list --base main. With --default-base <ref> as the
+# first arguments, it requires that resolve_base picks <ref> and runs --list
+# without --base. Accepts --full next, and requires exit 0, empty stderr, and
+# exactly the gate rows the remaining arguments name (see expected_rows).
 expect_list() {
-  local rc=0 flags=(--list --base main)
+  local rc=0 flags=(--list --base main) base=main
+  if [ "${1-}" = --default-base ]; then
+    flags=(--list)
+    # shellcheck disable=SC2016 # The inner shell expands its own variables.
+    base=$("$REAL_BASH" -c '. "$1"; BASE=""; resolve_base; printf "%s\n" "$BASE"' base "$SCRIPT_REL")
+    [ "$base" = "$2" ] || fail "the default base is $base, expected $2"
+    shift 2
+  fi
   if [ "${1-}" = --full ]; then
     flags+=(--full)
     shift
@@ -278,7 +286,7 @@ expect_list() {
     fail "preflight.sh ${flags[*]} exited $rc"
   fi
   if ! diff -u "$CASE_DIR.expected" "$CASE_DIR.actual" >&2; then
-    fail "the list differs from the expected gates"
+    fail "the list differs from the expected gates with base $base"
   fi
 }
 
@@ -879,6 +887,58 @@ case_docs_only() {
   expect_list "${ALWAYS[@]}"
 }
 
+# Upstream has a workflow commit beyond origin, and the branch changes
+# only Markdown from upstream/main.
+case_upstream_base() {
+  start_case
+  git remote add origin "$CASE_DIR"
+  git update-ref refs/remotes/origin/main main
+  git remote add upstream "$CASE_DIR"
+  edit .github/workflows/release.yml
+  git add .github/workflows/release.yml
+  git commit -q -m "edit the upstream workflow"
+  git update-ref refs/remotes/upstream/main HEAD
+  git checkout -q -b docs upstream/main
+  edit CHANGELOG.md
+  git add CHANGELOG.md
+  git commit -q -m "edit the changelog"
+  expect_list --default-base upstream/main "${ALWAYS[@]}"
+}
+
+# Origin has a workflow commit beyond local main, and the fixture has no
+# upstream remote.
+case_origin_base() {
+  start_case
+  git remote add origin "$CASE_DIR"
+  edit .github/workflows/release.yml
+  git add .github/workflows/release.yml
+  git commit -q -m "edit the origin workflow"
+  git update-ref refs/remotes/origin/main HEAD
+  git checkout -q -b docs origin/main
+  edit CHANGELOG.md
+  git add CHANGELOG.md
+  git commit -q -m "edit the changelog"
+  expect_list --default-base origin/main "${ALWAYS[@]}"
+}
+
+# Origin is a synced fork that contains a stale upstream/main plus a workflow
+# commit, and the branch changes only Markdown from origin/main.
+case_synced_fork_base() {
+  start_case
+  git remote add origin "$CASE_DIR"
+  git remote add upstream "$CASE_DIR"
+  git update-ref refs/remotes/upstream/main main
+  edit .github/workflows/release.yml
+  git add .github/workflows/release.yml
+  git commit -q -m "edit the synced workflow"
+  git update-ref refs/remotes/origin/main HEAD
+  git checkout -q -b docs origin/main
+  edit CHANGELOG.md
+  git add CHANGELOG.md
+  git commit -q -m "edit the changelog"
+  expect_list --default-base origin/main "${ALWAYS[@]}"
+}
+
 # The install-surface check reads CONTRIBUTING.md, and its self-test injects
 # into copies of the files that check reads.
 case_install_surface_doc() {
@@ -1281,6 +1341,13 @@ case_bad_base() {
     "preflight: cannot find a merge base with no-such-ref; run git fetch origin main or pass --base <ref>" ]; then
     cat "$CASE_DIR.out" >&2
     fail "a bad base exited $rc"
+  fi
+  rc=0
+  "$REAL_BASH" "$SCRIPT_REL" --list --base upstream/main >"$CASE_DIR.out" 2>&1 || rc=$?
+  if [ "$rc" -ne 2 ] || [ "$(cat "$CASE_DIR.out")" != \
+    "preflight: cannot find a merge base with upstream/main; run git fetch upstream main or pass --base <ref>" ]; then
+    cat "$CASE_DIR.out" >&2
+    fail "a missing upstream base exited $rc"
   fi
 }
 
