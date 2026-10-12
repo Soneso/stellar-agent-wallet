@@ -7,10 +7,12 @@ each rule and message fragment the case expects, in order, a line of its
 output after the previous match must name the rule and hold the fragment. The
 unmodified copy must pass, and so must each copy that a PASSING entry edits
 into another accepted form. Each replacement must match the expected number
-of times; a case whose text drifted fails.
+of times; a case whose text drifted fails. A fixture read from the live
+workflows must match exactly once, or the run stops before any case.
 """
 
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +29,9 @@ COVERAGE = ".github/workflows/coverage.yml"
 ACTION = ".github/actions/macos-sign-notarize/action.yml"
 SIGN_SCRIPT = ".github/actions/macos-sign-notarize/sign-notarize.sh"
 PUBLISH_SCRIPT = ".github/scripts/publish-crates.sh"
+# A full-length commit pin for the actions a case adds; the check matches the
+# action name and ignores the revision.
+PLACEHOLDER_REVISION = "0" * 40
 COVERAGE_CONDITION = "github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage')"
 COVERAGE_IF_LINE = f"    if: {COVERAGE_CONDITION}\n"
 COVERAGE_IF_WRAPPED_LINE = f"    if: ${{{{ {COVERAGE_CONDITION} }}}}\n"
@@ -42,7 +47,6 @@ COVERAGE_ON_BLOCK = (
     "    - cron: '41 4 * * 1'\n"
     "  workflow_dispatch:\n"
 )
-
 SIGN_MACOS_FIRST_STEP = (
     "      - name: Check tool paths\n"
     "        run: /bin/bash .github/actions/macos-sign-notarize/check-tools.sh\n"
@@ -159,12 +163,30 @@ SIGNING_FIRST_CLEAN_BLOCK = (
     "          fi\n"
     "\n"
 )
-SIGN_MACOS_DOWNLOAD_STEP = (
-    "      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1\n"
-    "        with:\n"
-    "          name: unsigned-${{ matrix.target }}\n"
-    "          path: ${{ runner.temp }}/unsigned\n"
-    "\n"
+
+
+def live_text(relative, pattern, purpose):
+    """Returns the unique live fixture so shape drift fails before mutation cases run."""
+    matches = list(pattern.finditer((ROOT / relative).read_text()))
+    if len(matches) != 1:
+        raise SystemExit(f"{relative}: {purpose}: found {len(matches)} matches, expected 1")
+    return matches[0].group(0)
+
+
+# The pinned revision of the download action changes with every bump, so this
+# fixture comes from the live workflow. The pattern pins the action, the
+# artifact name, and the path, and nothing else.
+SIGN_MACOS_DOWNLOAD_STEP = live_text(
+    RELEASE,
+    re.compile(
+        r"^      - uses: actions/download-artifact@[0-9a-fA-F]{40} # v[^\n]*\n"
+        r"        with:\n"
+        r"          name: unsigned-\$\{\{ matrix\.target \}\}\n"
+        r"          path: \$\{\{ runner\.temp \}\}/unsigned\n"
+        r"\n",
+        re.MULTILINE,
+    ),
+    "signing job download step",
 )
 PUBLISH_FIRST_CLEAN_BLOCK = (
     "      # Both trees stay unmodified from the download to the token step:\n"
@@ -246,7 +268,7 @@ CASES = [
         (WELCOME, "\npermissions: {}\n", "\n", 1)]),
     ("rust-cache in the signing job", "cred-compile",
      'release.yml:sign-macos step 2: cred-compile: uses Swatinem/rust-cache@', [before_sign_macos_tools(
-        "      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n\n")]),
+        f"      - uses: Swatinem/rust-cache@{PLACEHOLDER_REVISION}\n\n")]),
     ("cargo build in the signing job", "cred-compile",
      'release.yml:sign-macos step 2: cred-compile: runs cargo build: cargo build --release --locked', [before_sign_macos_tools(
         "      - run: cargo build --release --locked\n\n")]),
@@ -299,7 +321,7 @@ CASES = [
     ("rust-cache inside the composite action", "cred-compile",
      'action.yml step 1: cred-compile: uses Swatinem/rust-cache@', [
         (ACTION, "  steps:\n    - name: Sign and notarize\n",
-         "  steps:\n    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2\n"
+         f"  steps:\n    - uses: Swatinem/rust-cache@{PLACEHOLDER_REVISION}\n"
          "    - name: Sign and notarize\n", 1)]),
     ("credentialed job names a missing script", "cred-compile",
      'cred-compile: names .github/scripts/publish-crates-missing.sh, which does not exist', [
@@ -311,7 +333,7 @@ CASES = [
          "\npermissions:\n  contents: read\n  id-token: write\n\njobs:\n", 1)]),
     ("toolchain install in the signing job", "cred-toolchain",
      'release.yml:sign-macos step 2: cred-toolchain: installs a Rust toolchain', [before_sign_macos_tools(
-        "      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master\n"
+        f"      - uses: dtolnay/rust-toolchain@{PLACEHOLDER_REVISION}\n"
         "        with:\n          toolchain: stable\n\n")]),
     ("build job references release-signing", "signing-env",
      'release.yml:build: signing-env: references release-signing', [
@@ -403,7 +425,7 @@ CASES = [
          "        uses: ./.github/actions/macos-sign-and-notarize\n", 1)]),
     ("cache restore in the signing job", "cred-compile",
      "release.yml:sign-macos step 2: cred-compile: uses actions/cache/restore@", [before_sign_macos_tools(
-        "      - uses: actions/cache/restore@0000000000000000000000000000000000000000\n"
+        f"      - uses: actions/cache/restore@{PLACEHOLDER_REVISION}\n"
         "        with:\n          path: ~/.cargo/bin\n          key: tools\n\n")]),
     ("cargo package in a backtick substitution with --no-verify after it", "cred-compile",
      "cred-compile: cargo package without --no-verify: cargo package --workspace --locked --target-dir", [
