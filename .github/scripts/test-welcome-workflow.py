@@ -213,7 +213,13 @@ CASES += [
           want_calls=[search_call(), lookup_call()]),
     welcome("welcome text from another user",
             comments=[comment("Thanks for the pull request, @bob, and welcome.", login="alice")]),
+    welcome("unrelated bot comment", comments=[comment("Thanks for contributing.")]),
 ]
+quoted_welcomes = [
+    welcome("quoted pull request welcome", comments=[comment("Quoted text: Thanks for the pull request, @bob")]),
+    welcome("quoted issue welcome", comments=[comment("Quoted text: Thanks for the report, @bob")]),
+]
+CASES += quoted_welcomes
 second_page = [comment("Thanks for contributing."), comment("Thanks for the report, @bob, and welcome.")]
 CASES.append(Case("welcome on second page", comments=second_page, want_comments=second_page,
                   want_calls=[search_call(), lookup_call()],
@@ -341,6 +347,12 @@ def mutation_controls(root):
          '            and (.body | startswith("Thanks for the pull request, @") or startswith("Thanks for the report, @")))\' '
          '<<<"$comments" >/dev/null 2>&1; then', 'if false; then', ["pull request rerun"]),
         ("welcome identity", '.user.login? == "github-actions[bot]" and ', '', ["welcome text from another user"]),
+        ("welcome prefix", '\n            and (.body | startswith("Thanks for the pull request, @") '
+         'or startswith("Thanks for the report, @"))', '',
+         ["unrelated bot comment"] + [case.name for case in quoted_welcomes]),
+        ("anchored prefix", 'startswith("Thanks for the pull request, @") or startswith("Thanks for the report, @")',
+         'contains("Thanks for the pull request, @") or contains("Thanks for the report, @")',
+         [case.name for case in quoted_welcomes]),
         ("lookup error exit", 'echo "::error::Cannot welcome #$NUMBER: comment lookup fails." >&2\n            exit 1',
          'echo "::error::Cannot welcome #$NUMBER: comment lookup fails." >&2', ["comment lookup error"]),
         ("repository search", 'q=repo:$GH_REPO author:$LOGIN', 'q=author:$LOGIN',
