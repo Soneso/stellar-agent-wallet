@@ -325,7 +325,9 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    - `test-check-no-direct-sasignersetbaselined-emit.sh`:
      `check-no-direct-sasignersetbaselined-emit.sh`
    - `test-check-ref-on-main.sh`: `check-ref-on-main.sh`
-   - `test-check-workflow-invariants.py`: `check-workflow-invariants.py`
+   - `test-check-workflow-invariants.py`: `check-workflow-invariants.py`, or
+     any change that selects `workflow-invariants`, because the self-test
+     runs that check on copies of the same files
    - `test-compare-crate-sums.py`: `compare-crate-sums.py`
    - `test-preflight.sh`: `preflight.sh`
    - `test-publish-crates-check.sh`: `publish-crates.sh`
