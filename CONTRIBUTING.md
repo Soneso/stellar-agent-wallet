@@ -116,8 +116,8 @@ request. If you prefer to make every change yourself, say so in the pull
 request.
 
 A `waiting on maintainer` label means the next step is ours; `waiting on author`
-means it is yours. The labels move by themselves when either side comments,
-pushes, or reviews.
+means it is yours. Comments and pushes move the labels at once; a maintainer
+review moves them within about 15 minutes.
 
 A pull request that waits on its author for 14 days gets a reminder, and it
 closes after 21 days. You can reopen it at any time.
