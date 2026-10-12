@@ -5,8 +5,9 @@
 # Usage: preflight.sh [--base <ref>] [--full] [--list]
 #
 #   --base <ref>  Compares the branch with its merge base with <ref>. The
-#                 default is origin/main, or main when origin/main does not
-#                 exist.
+#                 default is upstream/main, or origin/main when upstream/main
+#                 is missing or an ancestor of origin/main, or main when
+#                 neither exists.
 #   --full        Selects every gate, with workspace Cargo commands.
 #   --list        Prints the selected gates as <id><TAB><command>, one per
 #                 line in registry order, and runs nothing.
@@ -187,16 +188,26 @@ check_prerequisites() {
 # Sets BASE to the ref that the branch is diffed against, and exits 2 unless
 # BASE names a commit that shares a merge base with HEAD.
 resolve_base() {
+  local fetch_remote=origin
   if [ -z "$BASE" ]; then
+    BASE=main
     if git rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null; then
       BASE=origin/main
-    else
-      BASE=main
+    fi
+    # origin/main stays the base when it contains upstream/main, which holds
+    # after a fork sync that did not fetch upstream.
+    if git rev-parse --verify --quiet 'upstream/main^{commit}' >/dev/null &&
+      ! { [ "$BASE" = origin/main ] &&
+        git merge-base --is-ancestor upstream/main origin/main; }; then
+      BASE=upstream/main
     fi
   fi
   if ! git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null ||
     ! git merge-base HEAD "$BASE" >/dev/null 2>&1; then
-    die "cannot find a merge base with $BASE; run git fetch origin main or pass --base <ref>"
+    if [ "$BASE" = upstream/main ]; then
+      fetch_remote=upstream
+    fi
+    die "cannot find a merge base with $BASE; run git fetch $fetch_remote main or pass --base <ref>"
   fi
 }
 
