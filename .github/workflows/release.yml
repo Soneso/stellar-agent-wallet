@@ -52,7 +52,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
 
@@ -126,7 +126,7 @@ jobs:
         # Dependency-graph gate specific to a release cut: cargo-deny runs on
         # every push to main too, but the dependency graph (and the RustSec
         # advisory database) can shift between the last CI run and the tag.
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-deny@0.19.9
       - run: cargo deny check
@@ -169,7 +169,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -258,7 +258,7 @@ jobs:
             --file "$RUNNER_TEMP/unsigned/unsigned-$TARGET.tar" \
             -C "target/$TARGET/release" stellar-agent stellar-agent-mcp
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: contains(matrix.target, 'apple-darwin')
         with:
           name: unsigned-${{ matrix.target }}
@@ -296,7 +296,7 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.version }}
           TARGET: ${{ matrix.target }}
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !contains(matrix.target, 'apple-darwin') }}
         with:
           name: artifacts-${{ matrix.target }}
@@ -348,7 +348,7 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: unsigned-${{ matrix.target }}
           path: ${{ runner.temp }}/unsigned
@@ -395,7 +395,7 @@ jobs:
           asc-key-id: ${{ secrets.APPLE_ASC_KEY_ID }}
           asc-issuer-id: ${{ secrets.APPLE_ASC_ISSUER_ID }}
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifacts-${{ matrix.target }}
           path: ${{ steps.sign.outputs.archive }}
@@ -410,7 +410,7 @@ jobs:
     outputs:
       subjects: ${{ steps.subjects.outputs.subjects }}
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: artifacts-*
           path: all-artifacts
@@ -458,7 +458,7 @@ jobs:
           SUBJECTS=$(base64 -w0 < release-combined/SHA256SUMS)
           echo "subjects=${SUBJECTS}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-hashes
           path: release-combined/SHA256SUMS
@@ -475,12 +475,12 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: artifacts-*
           path: ${{ runner.temp }}/artifacts
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-hashes
           path: ${{ runner.temp }}/release-combined
@@ -499,7 +499,7 @@ jobs:
             cosign sign-blob --yes --bundle "$file.sigstore.json" "$file"
           done
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: signatures
           path: |
@@ -555,22 +555,22 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: artifacts-*
           path: ${{ runner.temp }}/release/all-artifacts
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: signatures
           path: ${{ runner.temp }}/release/all-signatures
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-hashes
           path: ${{ runner.temp }}/release/release-combined
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: stellar-agent-${{ steps.version.outputs.version }}.intoto.jsonl
           path: ${{ runner.temp }}/release/release-provenance
