@@ -55,14 +55,15 @@ Keep the following properties of the current alpha in mind when assessing impact
   mainnet write exceptions. Commands that take `--network` refuse before any RPC call
   or signing. The CLI write commands, including `vault deposit`, `vault withdraw`,
   `trade`, `trustline`, and `pool init`, refuse a mainnet profile before signer access
-  and any RPC call. `smart-account rules verify-pins` loads a signer, so it refuses a
-  mainnet profile the same way. The MCP DeFi, sign-and-submit, commit, and rule-commit
-  tools refuse it at entry, before the policy gate and any RPC request. At the submit
-  layer, which every write goes through including the profile-driven flows, a declared
-  mainnet network passphrase and a known mainnet RPC URL are each refused at zero RPC
-  cost. Beyond those two the endpoint is asked which network it serves, that answer is
-  authoritative over the declaration, and every signature on the envelope must verify
-  under that network's id.
+  and any RPC call. `smart-account rules verify-pins`, `smart-account signers list`, and
+  `smart-account signers refresh` keep their local audit writes but load no signer, sign
+  nothing, and write nothing on chain, so they accept a mainnet profile. The MCP DeFi,
+  sign-and-submit, commit, and rule-commit tools refuse it at entry, before the policy
+  gate and any RPC request. At the submit layer, which every write goes through
+  including the profile-driven flows, a declared mainnet network passphrase and a known
+  mainnet RPC URL are each refused at zero RPC cost. Beyond those two the endpoint is
+  asked which network it serves, that answer is authoritative over the declaration, and
+  every signature on the envelope must verify under that network's id.
   Friendbot funding is scoped to
   `testnet` and `futurenet` and structurally refuses `mainnet`
   (`network.friendbot_mainnet_forbidden`).

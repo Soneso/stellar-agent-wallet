@@ -42,7 +42,7 @@
   description: The next step is ours
 - name: stale
   color: ededed
-  description: No activity for 14 days; closes after 21
+  description: Pull request waiting on its author, idle 14 days; closes after 21; drafts and issues exempt
 - name: hacktoberfest-accepted
   color: ff7518
   description: Counts for Hacktoberfest after the review
