@@ -37,7 +37,9 @@ and fill in [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md)
 ## Tasks
 
 Choose an unassigned issue labeled `good first issue` or `help wanted`, with
-`agent-ready` identifying tasks whose Where, Acceptance, and Gates are commands.
+`agent-ready` identifying tasks whose Where and Acceptance are commands. Such a
+task states Gates only when it needs a check beyond
+`bash .github/scripts/preflight.sh`.
 Comment "I'll take this" and hold one open assignment at a time, as described in
 [CONTRIBUTING.md](CONTRIBUTING.md#contributing-with-a-coding-agent).
 

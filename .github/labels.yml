@@ -6,7 +6,7 @@
   description: Rust code or tests; needs the gate suite; the issue states the design
 - name: agent-ready
   color: 1d76db
-  description: Where, acceptance, and gates are stated as commands; a coding agent can take it
+  description: Where and Acceptance are commands; a coding agent can take it; Gates only beyond preflight
 - name: 'area: docs'
   color: 0075ca
   description: Documentation and the agent skill
