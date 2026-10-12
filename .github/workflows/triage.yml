@@ -7,9 +7,12 @@ name: Triage
 # pushes use the author's role, not the actor's. A maintainer comment on a
 # pull request adds `waiting on author` and removes `waiting on maintainer`;
 # a maintainer comment on an issue removes `waiting on maintainer`.
-# Maintainer reviews move the pull request labels within about 15 minutes
-# through the `review-sweep` job. Bots, claim comments, and other activity
-# change nothing. Closed issues and pull requests keep their labels.
+# Maintainer reviews move the pull request labels through the `review-sweep`
+# job, which runs on the schedule and on `workflow_dispatch`. Bots, claim
+# comments, and other activity change nothing. An issue or pull request
+# loses both waiting labels when a person closes it; a close by the stale
+# workflow starts no run and keeps them. Later activity on a closed item
+# changes nothing.
 # A label already in the wanted state is not touched.
 #
 # The sweep flips a pull request whose latest maintainer review sits on the
@@ -34,22 +37,23 @@ name: Triage
 
 on:
   issues:
-    types: [opened, reopened]
+    types: [opened, reopened, closed]
   issue_comment:
     types: [created]
   pull_request_target:
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, closed]
   schedule:
     - cron: '*/15 * * * *'
+  workflow_dispatch:
 
 permissions: {}
 
 jobs:
   triage:
-    # Runs on events only and skips bots, judged by the first user the event
-    # carries: comment, pull request, or issue.
+    # Runs on item events only and skips bots, judged by the first user the
+    # event carries: comment, pull request, or issue.
     if: >-
-      github.event_name != 'schedule' &&
+      github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' &&
       ((github.event.comment.user.type || github.event.pull_request.user.type
       || github.event.issue.user.type) != 'Bot')
     runs-on: ubuntu-24.04
@@ -102,6 +106,31 @@ jobs:
           if ! labels=$(jq -ce '[.labels[].name]' <<<"$issue"); then
             echo '::error::Cannot parse labels.' >&2
             exit 1
+          fi
+          # Closing ends the wait on both sides, whoever closes the item.
+          if [[ "$EVENT" == issues:closed || "$EVENT" == pull_request_target:closed ]]; then
+            # The fresh state decides, so a re-run after a reopen keeps the labels
+            # that the reopen set.
+            if [[ $(jq -r '.state' <<<"$issue") != closed ]]; then
+              echo "no change on #$NUMBER: reopened"
+              exit 0
+            fi
+            removed=false
+            for label in 'waiting on maintainer' 'waiting on author'; do
+              if jq -e --arg label "$label" 'index($label) != null' <<<"$labels" >/dev/null; then
+                encoded=${label// /%20}
+                if ! gh api --method DELETE "repos/$GH_REPO/issues/$NUMBER/labels/$encoded" >/dev/null; then
+                  echo '::error::Cannot remove label.' >&2
+                  exit 1
+                fi
+                echo "remove $label on #$NUMBER"
+                removed=true
+              fi
+            done
+            if [[ "$removed" == false ]]; then
+              echo "no change on #$NUMBER: closed without waiting labels"
+            fi
+            exit 0
           fi
           if [[ $(jq -r '.state' <<<"$issue") == closed ]]; then
             echo "no change on #$NUMBER: closed"
@@ -157,7 +186,7 @@ jobs:
           fi
 
   review-sweep:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     permissions:
       issues: write

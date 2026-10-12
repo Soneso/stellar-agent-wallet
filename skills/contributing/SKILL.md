@@ -22,8 +22,9 @@ in these steps from the checkout root.
 2. Claim the issue by commenting "I'll take this". Hold one open assignment at a
    time, following [CONTRIBUTING.md](../../CONTRIBUTING.md#contributing-with-a-coding-agent).
 3. Fork the repository and create a branch whose name says what the change
-   does, such as `fix/claim-refusal-codes`, following
-   [CONTRIBUTING.md](../../CONTRIBUTING.md#contributing-with-a-coding-agent).
+   does, such as `fix/claim-refusal-codes`. Start it from the current upstream
+   `main` with `git fetch upstream` and `git switch -c <branch> upstream/main`,
+   following [CONTRIBUTING.md](../../CONTRIBUTING.md#contributing-with-a-coding-agent).
 4. Implement the acceptance criteria to
    [The bar for changes in CONTRIBUTING.md](../../CONTRIBUTING.md#the-bar-for-changes).
    Apply [Writing style](../../CONTRIBUTING.md#writing-style) to the edits.

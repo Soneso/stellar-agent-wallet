@@ -117,7 +117,8 @@ request.
 
 A `waiting on maintainer` label means the next step is ours; `waiting on author`
 means it is yours. Comments and pushes move the labels at once; a maintainer
-review moves them within about 15 minutes.
+review moves them through a scheduled sweep. An issue or pull request loses
+both labels when a person closes it.
 
 A pull request that waits on its author for 14 days gets a reminder, and it
 closes after 21 days. You can reopen it at any time.
@@ -144,7 +145,8 @@ coding agent this prompt with the number in place of NNN:
 > workflow assigns the issue to me. Confirm the assignment before you continue.
 > If nothing assigns it within a few minutes, stop and tell me.
 > 2. Fork and clone with `gh repo fork Soneso/stellar-agent-wallet --clone`,
-> then create a branch named for the change.
+> then start a branch named for the change from the current upstream `main`:
+> `git fetch upstream` and `git switch -c <branch> upstream/main`.
 > 3. Read `AGENTS.md`, the sections "Contributing with a coding agent", "Commit
 > and pull request conventions", and "Writing style" in `CONTRIBUTING.md`, and
 > the section "Self-review before you open a pull request" in

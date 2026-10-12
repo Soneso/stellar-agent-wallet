@@ -20,10 +20,12 @@ components = ["rustfmt", "clippy"]
 profile = "minimal"
 ```
 
-The channel is `stable` (not a fixed version). With `rustup` installed, the pinned
-channel and the `rustfmt` and `clippy` components are provisioned automatically on
-first build in the workspace. Run `rustup update stable` before a gate pass so
-`clippy` matches the latest stable lints.
+The channel is `stable` (not a fixed version). With `rustup` installed and the
+`stable` channel not yet installed, the first build in the workspace installs the
+pinned channel with the `rustfmt` and `clippy` components. A `stable` toolchain
+that already exists without them needs `rustup component add rustfmt clippy`.
+Run `rustup update stable` before a gate pass so `clippy` matches the latest
+stable lints.
 
 The minimal profile avoids installing `rust-docs` on a fresh toolchain.
 It does not remove components from an existing installation.
@@ -240,6 +242,16 @@ Run it from a Git checkout with bash 3.2 or later, Git, Python 3.11 or later,
 and the standard Unix utilities; new Markdown must be tracked for the style
 check to read it.
 
+The preflight runs its Python checks with the `python3` first on PATH. macOS
+ships an older system `python3`, so a Homebrew or pyenv Python 3.11 or later
+has to come first on PATH. The workflow checks also need PyYAML. With that
+Python first on PATH, install PyYAML into a virtual environment with the
+command that the preflight prints when PyYAML is missing:
+
+```bash
+python3 -m venv .venv && .venv/bin/python -m pip install --require-hashes -r .github/scripts/workflow-check-requirements.txt && export PATH=$PWD/.venv/bin:$PATH
+```
+
 The changed set is the union of the paths that differ from the merge base and
 the paths that `git status` lists. It includes untracked and deleted files.
 Every run includes the three always gates: `docs-style`, `install-surface`,
@@ -356,7 +368,8 @@ gate except `shellcheck-changed`, which needs a changed shell script.
 
 `package-skill.sh`, `check-coverage.py`, `run-testnet-acceptance.sh`, and
 `release-preflight-version-check.sh` have no self-test. The preflight runs the
-workflow checks with `python3`, which needs PyYAML importable.
+workflow checks with `python3`, which needs PyYAML importable, for example from
+the `.venv` virtual environment of the PyYAML install command.
 
 The preflight does not carry these CI checks: the `windows-storage` job, the
 `stellar-agent-test-support` feature matrix of the `test` job, the setup steps,
