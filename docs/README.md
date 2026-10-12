@@ -60,6 +60,13 @@ describes.
 - [Review checklist](maintainers/review-checklist.md): the production-readiness
   gate every change passes.
 
+## Contributing and security
+
+- [Contributing](../CONTRIBUTING.md): setup, claiming an issue, and the pull
+  request process.
+- [Security policy](../SECURITY.md): reporting a vulnerability privately and
+  the security model summary.
+
 ---
 
 "Stellar" is a trademark of the Stellar Development Foundation.
