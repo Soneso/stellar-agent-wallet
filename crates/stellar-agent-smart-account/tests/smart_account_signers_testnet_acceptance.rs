@@ -205,7 +205,7 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
     (Arc::new(Mutex::new(writer)), path, dir)
 }
 
-/// Counts confirmed signer removals and threshold changes across the audit chain.
+/// Counts `(SaSignerRemovedV2, SaThresholdChangedV2)` rows across the verified audit chain.
 fn signer_mutation_counts(audit_writer: &Arc<Mutex<AuditWriter>>) -> (usize, usize) {
     let writer = audit_writer.lock().expect("audit writer lock");
     let verified = verify_log(writer.path(), None).expect("audit log must verify");
@@ -732,6 +732,9 @@ async fn b4_fresh_wallet_missing_baseline_then_refresh_then_verify_ok() {
 /// The post-op state after removing the sole signer would be (0, 1) which
 /// violates the invariant `threshold <= signer_count`.
 ///
+/// After the refusal, adding and removing a second signer records one
+/// `SaSignerRemovedV2` row.
+///
 /// Note: no atomic bundle; CAP-46 restricts each Soroban transaction to one
 /// `InvokeHostFunctionOp`.
 #[tokio::test]
@@ -919,7 +922,6 @@ async fn b3_divergence_detection_via_injected_baseline() {
         use std::fs;
         use std::io::{BufRead, BufReader};
         use stellar_agent_core::audit_log::entry::AuditEntry;
-        use stellar_agent_core::audit_log::schema::EventKind;
 
         let writer_guard = audit_writer.lock().expect("audit writer lock");
         let log_path = writer_guard.path().to_path_buf();
@@ -1018,7 +1020,6 @@ async fn b3_divergence_detection_via_injected_baseline() {
 #[tokio::test]
 async fn b7_add_external_signer_to_existing_rule() {
     use std::io::{BufRead, BufReader};
-    use stellar_agent_core::audit_log::schema::EventKind;
     use stellar_agent_smart_account::deployment::{
         ResolvedFeePerOp, WebAuthnVerifierDeployArgs, deploy_webauthn_verifier,
     };
@@ -1270,7 +1271,6 @@ async fn b7_add_external_signer_to_existing_rule() {
 #[tokio::test]
 async fn b8_add_webauthn_signer_to_existing_rule() {
     use std::io::{BufRead, BufReader};
-    use stellar_agent_core::audit_log::schema::EventKind;
     use stellar_agent_smart_account::deployment::{
         ResolvedFeePerOp, WebAuthnVerifierDeployArgs, deploy_webauthn_verifier,
     };
@@ -1868,8 +1868,6 @@ async fn b6_audit_log_request_id_pairing_across_divergence_emit() {
     let file = std::fs::File::open(&log_path)
         .expect("audit log file must exist after sign_with_passkey_rule");
     let reader = BufReader::new(file);
-
-    use stellar_agent_core::audit_log::schema::EventKind;
 
     // Retain the full entry for each row so we can check both request_id AND
     // smart_account_redacted across the two-row set (forensic-correlation invariant).
