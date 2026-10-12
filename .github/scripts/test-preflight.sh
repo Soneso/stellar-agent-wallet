@@ -48,8 +48,8 @@ REAL_BASH=$(command -v bash)
 REAL_PYTHON=$(python3 -c 'import sys; print(sys.executable)')
 FIXTURE="$TMP/fixture"
 
-CASES="docs-only install-surface-doc deleted-install-surface-doc welcome-workflow ci-yml-only
-python-check-script shell-check-script skill inbox-web one-crate two-owners
+CASES="docs-only install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
+ci-yml-only python-check-script shell-check-script skill inbox-web one-crate two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
 wallet-manifest removed-member untracked-test-file fixture-markdown
@@ -900,7 +900,16 @@ case_deleted_install_surface_doc() {
 case_welcome_workflow() {
   start_case
   edit .github/workflows/welcome.yml
-  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-welcome-workflow.py
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-welcome-workflow.py
+}
+
+# The invariants check reads release.yml, and its self-test builds fixtures
+# from it, so the change selects both gates.
+case_release_workflow() {
+  start_case
+  edit .github/workflows/release.yml
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py
 }
 
 case_ci_yml_only() {
@@ -1134,7 +1143,7 @@ case_contracts() {
 case_action_script() {
   start_case
   edit .github/actions/macos-sign-notarize/sign-notarize.sh
-  expect_list "${ALWAYS[@]}" actionlint workflow-invariants \
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py \
     "shellcheck-changed=shellcheck -s bash .github/actions/macos-sign-notarize/sign-notarize.sh"
 }
 
@@ -1149,7 +1158,7 @@ case_invariants_helper() {
     fail "the invariants inputs lack release-preflight-version-check.sh"
   fi
   edit .github/scripts/release-preflight-version-check.sh
-  expect_list "${ALWAYS[@]}" workflow-invariants \
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
     "shellcheck-changed=shellcheck -s bash .github/scripts/release-preflight-version-check.sh"
 }
 
@@ -1172,7 +1181,8 @@ case_deleted_shell_script() {
   git rm -q .github/scripts/check-ref-on-main.sh
   git commit -q -m "remove check-ref-on-main.sh"
   assert_changed .github/scripts/check-ref-on-main.sh
-  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-ref-on-main.sh
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-ref-on-main.sh \
+    self-test:test-check-workflow-invariants.py
 }
 
 # A deleted self-test file selects neither its own record nor shellcheck.

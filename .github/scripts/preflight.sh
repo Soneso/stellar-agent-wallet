@@ -31,8 +31,9 @@
 # gates. Directory scopes also apply to Markdown files. A path under interop/
 # adds no gate of its own; the interop harnesses run under --full.
 # select_for_path holds the triggers, and plan_surface_self_test the trigger
-# of the surface scope. A gate that several triggers select runs once, at its
-# registry position.
+# of the surface scope. Every trigger of workflow-invariants also selects the
+# self-test of check-workflow-invariants.py, through select_invariant_gates.
+# A gate that several triggers select runs once, at its registry position.
 #
 # Clippy, rustdoc, and tests select the owning packages and their direct
 # dependents when every changed Rust path belongs to a workspace member.
@@ -292,6 +293,15 @@ select_self_tests() {
   esac
 }
 
+# Selects workflow-invariants and the self-test of the check it runs. The
+# self-test runs check-workflow-invariants.py on copies of the workflows, the
+# action files, and the scripts that the check reads, so a change to any of
+# them can break the self-test.
+select_invariant_gates() {
+  select_gate workflow-invariants
+  select_gate self-test:test-check-workflow-invariants.py
+}
+
 # Selects the gates that a change to path $1 triggers. Records a Rust path in
 # $SCRATCH/rust for the package planner, and an existing shell script in
 # $SCRATCH/shell as an operand of the shellcheck-changed gate.
@@ -301,17 +311,17 @@ select_for_path() {
     .github/workflows/*.yml | .github/actions/* | .github/labels.yml) select_gate actionlint ;;
   esac
   case "$path" in
-    .github/actions/*) select_gate workflow-invariants ;;
+    .github/actions/*) select_invariant_gates ;;
     .github/workflows/*.yml)
       for name in $INVARIANT_WORKFLOWS; do
         if [ "$path" = ".github/workflows/$name.yml" ]; then
-          select_gate workflow-invariants
+          select_invariant_gates
         fi
       done
       ;;
     .github/scripts/*)
       if is_invariant_script "$path"; then
-        select_gate workflow-invariants
+        select_invariant_gates
       fi
       ;;
   esac
