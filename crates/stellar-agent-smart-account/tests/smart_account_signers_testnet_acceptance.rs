@@ -71,9 +71,11 @@ use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
+use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_core::audit_log::signer_set::{
     BaselineReason, ObservedSignerSet, SignerIdentityV2, SignerPubkey, SignerSetView,
 };
+use stellar_agent_core::audit_log::verify::verify_log;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
@@ -93,7 +95,8 @@ use stellar_agent_smart_account::managers::rules::{
     parse_c_strkey_to_smart_account, parse_g_strkey_to_signer_address,
 };
 use stellar_agent_smart_account::managers::signers::{
-    PreviousBaseline, RefreshOptions, SignersManager, build_external_signer_scval,
+    PreviousBaseline, RefreshOptions, SignersManager, build_delegated_signer_scval,
+    build_external_signer_scval,
 };
 use stellar_agent_smart_account::signers::policy_identification::THRESHOLD_POLICY_WASM;
 use stellar_agent_smart_account::test_helpers::{
@@ -200,6 +203,26 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
     let path = dir.path().join("audit.jsonl");
     let writer = AuditWriter::open(path.clone(), None).expect("AuditWriter::open must succeed");
     (Arc::new(Mutex::new(writer)), path, dir)
+}
+
+/// Counts `(SaSignerRemovedV2, SaThresholdChangedV2)` rows across the verified audit chain.
+fn signer_mutation_counts(audit_writer: &Arc<Mutex<AuditWriter>>) -> (usize, usize) {
+    let writer = audit_writer.lock().expect("audit writer lock");
+    let verified = verify_log(writer.path(), None).expect("audit log must verify");
+    let mut signer_removed_count = 0;
+    let mut threshold_changed_count = 0;
+    for file in verified.per_file {
+        let contents = std::fs::read_to_string(file.path).expect("audit log must be readable");
+        for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+            let entry: AuditEntry = serde_json::from_str(line).expect("audit row must parse");
+            match entry.event_kind {
+                EventKind::SaSignerRemovedV2 { .. } => signer_removed_count += 1,
+                EventKind::SaThresholdChangedV2 { .. } => threshold_changed_count += 1,
+                _ => {}
+            }
+        }
+    }
+    (signer_removed_count, threshold_changed_count)
 }
 
 /// Constructs a `ContextRuleManager` for testnet whose installs record their
@@ -709,6 +732,9 @@ async fn b4_fresh_wallet_missing_baseline_then_refresh_then_verify_ok() {
 /// The post-op state after removing the sole signer would be (0, 1) which
 /// violates the invariant `threshold <= signer_count`.
 ///
+/// After the refusal, adding and removing a second signer records one
+/// `SaSignerRemovedV2` row.
+///
 /// Note: no atomic bundle; CAP-46 restricts each Soroban transaction to one
 /// `InvokeHostFunctionOp`.
 #[tokio::test]
@@ -764,79 +790,37 @@ async fn b1_threshold_brick_refusal() {
         "remove sole signer must return ThresholdUnreachable; got: {result:?}"
     );
 
-    // Zero-row assertion: after a pre-flight refusal, the audit log MUST contain
-    // ZERO `SaSignerRemoved` rows — the refusal must be genuinely pre-submission,
-    // with no mutation submitted on-chain.
-    //
-    // This assertion holds across ALL rotated-file siblings: even if rotation
-    // happened mid-test, the full log chain must be clean.
-    {
-        use std::fs;
-        use std::io::{BufRead, BufReader};
-        use stellar_agent_core::audit_log::entry::AuditEntry;
-        use stellar_agent_core::audit_log::schema::EventKind;
+    // A pre-flight refusal leaves no mutation rows in the audit chain.
+    assert_eq!(
+        signer_mutation_counts(&audit_writer),
+        (0, 0),
+        "pre-flight refusal must leave zero SaSignerRemovedV2 and SaThresholdChangedV2 rows"
+    );
 
-        let writer_guard = audit_writer.lock().expect("audit writer lock");
-        let log_path = writer_guard.path().to_path_buf();
-        drop(writer_guard);
-
-        // Collect the active log file. (No rotation expected in a short test run,
-        // but scanning all siblings matches the reader's traversal semantics.)
-        let mut signer_removed_count = 0usize;
-        let mut threshold_changed_count = 0usize;
-        let mut files_to_scan = vec![log_path.clone()];
-
-        // Also check for rotated siblings (e.g. log_path + ".1", ".2", ...).
-        if let Ok(parent) = log_path.parent().map(fs::read_dir).transpose() {
-            for entry in parent.into_iter().flatten().flatten() {
-                let sibling = entry.path();
-                if sibling != log_path
-                    && sibling
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| {
-                            n.starts_with(
-                                log_path.file_name().and_then(|f| f.to_str()).unwrap_or(""),
-                            )
-                        })
-                        .unwrap_or(false)
-                {
-                    files_to_scan.push(sibling);
-                }
-            }
-        }
-
-        for path in &files_to_scan {
-            if let Ok(file) = fs::File::open(path) {
-                let reader = BufReader::new(file);
-                for line in reader.lines() {
-                    let Ok(line) = line else { continue };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) {
-                        if matches!(entry.event_kind, EventKind::SaSignerRemoved { .. }) {
-                            signer_removed_count += 1;
-                        }
-                        if matches!(entry.event_kind, EventKind::SaThresholdChanged { .. }) {
-                            threshold_changed_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        assert_eq!(
-            signer_removed_count, 0,
-            "pre-flight refusal must leave ZERO SaSignerRemoved rows in the audit log \
-             (across all rotated files); found {signer_removed_count} unexpected rows"
-        );
-        assert_eq!(
-            threshold_changed_count, 0,
-            "pre-flight refusal must leave ZERO SaThresholdChanged rows in the audit log \
-             (across all rotated files); found {threshold_changed_count} unexpected rows"
-        );
-    }
+    // A confirmed removal writes one row of the kind the refusal assertion counts.
+    let (signer2_g, _signer2_box) = fresh_signer();
+    let signer2_scval =
+        build_delegated_signer_scval(&signer2_g).expect("delegated signer must encode");
+    let signer2_id = mgr
+        .add_signer(
+            sa_addr.clone(),
+            rule_id,
+            signer2_scval,
+            signer_box.as_ref(),
+            rid(),
+            false,
+            false,
+        )
+        .await
+        .expect("adding a second signer must succeed");
+    mgr.remove_signer(sa_addr, rule_id, signer2_id, signer_box.as_ref(), rid())
+        .await
+        .expect("removing the second signer must succeed");
+    assert_eq!(
+        signer_mutation_counts(&audit_writer),
+        (1, 0),
+        "a confirmed removal must write one SaSignerRemovedV2 row"
+    );
 }
 
 // ── Divergence detection (synthetic injected baseline) ───────────────────────
@@ -938,7 +922,6 @@ async fn b3_divergence_detection_via_injected_baseline() {
         use std::fs;
         use std::io::{BufRead, BufReader};
         use stellar_agent_core::audit_log::entry::AuditEntry;
-        use stellar_agent_core::audit_log::schema::EventKind;
 
         let writer_guard = audit_writer.lock().expect("audit writer lock");
         let log_path = writer_guard.path().to_path_buf();
@@ -1037,7 +1020,6 @@ async fn b3_divergence_detection_via_injected_baseline() {
 #[tokio::test]
 async fn b7_add_external_signer_to_existing_rule() {
     use std::io::{BufRead, BufReader};
-    use stellar_agent_core::audit_log::schema::EventKind;
     use stellar_agent_smart_account::deployment::{
         ResolvedFeePerOp, WebAuthnVerifierDeployArgs, deploy_webauthn_verifier,
     };
@@ -1289,7 +1271,6 @@ async fn b7_add_external_signer_to_existing_rule() {
 #[tokio::test]
 async fn b8_add_webauthn_signer_to_existing_rule() {
     use std::io::{BufRead, BufReader};
-    use stellar_agent_core::audit_log::schema::EventKind;
     use stellar_agent_smart_account::deployment::{
         ResolvedFeePerOp, WebAuthnVerifierDeployArgs, deploy_webauthn_verifier,
     };
@@ -1675,6 +1656,11 @@ async fn b2_set_threshold_single_op() {
         "threshold must be 2 after set_threshold; got {}",
         post_op.view
     );
+    assert_eq!(
+        signer_mutation_counts(&audit_writer),
+        (0, 1),
+        "a confirmed threshold change must write one SaThresholdChangedV2 row"
+    );
 }
 
 // ── Policyless rule ───────────────────────────────────────────────────────────
@@ -1882,8 +1868,6 @@ async fn b6_audit_log_request_id_pairing_across_divergence_emit() {
     let file = std::fs::File::open(&log_path)
         .expect("audit log file must exist after sign_with_passkey_rule");
     let reader = BufReader::new(file);
-
-    use stellar_agent_core::audit_log::schema::EventKind;
 
     // Retain the full entry for each row so we can check both request_id AND
     // smart_account_redacted across the two-row set (forensic-correlation invariant).
