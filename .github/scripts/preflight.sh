@@ -665,7 +665,10 @@ install_hint() {
     cargo-machete | cargo-deny)
       echo "cargo install --locked $1 --version $(version_or_file "$(tool_pin "$ci" "$1")" "$ci")"
       ;;
-    yaml) echo "python3 -m pip install --require-hashes -r .github/scripts/workflow-check-requirements.txt" ;;
+    yaml)
+      # shellcheck disable=SC2016 # The reader's shell expands $PWD and $PATH.
+      echo 'python3 -m venv .venv && .venv/bin/python -m pip install --require-hashes -r .github/scripts/workflow-check-requirements.txt && export PATH=$PWD/.venv/bin:$PATH'
+      ;;
     jq | zip) echo "brew install $1 or apt-get install $1" ;;
     unzip | zipinfo) echo "brew install unzip or apt-get install unzip" ;;
     shasum) echo "brew install perl or apt-get install perl" ;;

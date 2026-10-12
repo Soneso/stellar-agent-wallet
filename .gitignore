@@ -21,6 +21,9 @@ Cargo.lock.bak
 .env.local
 *.env
 
+# Python virtual environment of the preflight workflow checks
+.venv/
+
 # Misc
 .cache/
 

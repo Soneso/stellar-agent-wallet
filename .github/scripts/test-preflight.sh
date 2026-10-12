@@ -1462,6 +1462,10 @@ case_install_hint() {
     *" 9.9.9") ;;
     *) fail "the hint '$hint' does not follow the pin to 9.9.9" ;;
   esac
+  hint=$(hint_of yaml)
+  # shellcheck disable=SC2016 # The hint keeps $PWD and $PATH for the reader's shell.
+  [ "$hint" = 'python3 -m venv .venv && .venv/bin/python -m pip install --require-hashes -r .github/scripts/workflow-check-requirements.txt && export PATH=$PWD/.venv/bin:$PATH' ] ||
+    fail "the PyYAML hint '$hint' is not the virtual-environment command"
   # shellcheck disable=SC2016 # The inner shell expands its own variables.
   missing=$("$REAL_BASH" -c '
     . "$1"

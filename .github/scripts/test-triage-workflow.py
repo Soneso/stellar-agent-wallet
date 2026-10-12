@@ -12,8 +12,9 @@ Needs Python 3.9+, PyYAML, bash, and jq.
 
 --case selects behavior cases by name. The structure case always runs, and
 --case "workflow structure" runs it alone. Mutation controls remove rules,
-guards, job conditions, concurrency groups, sweep filters, the contributor
-review input, and head or label-time comparisons in scratch copies.
+guards, triggers, job conditions, concurrency groups, sweep filters, the
+contributor review input, and head or label-time comparisons in scratch
+copies.
 Each control requires named cases to fail.
 """
 
@@ -36,10 +37,11 @@ AUTHOR = "waiting on author"
 READ = ["api", ENDPOINT]
 STRUCTURE = "workflow structure"
 BOT_CONDITION = (
-    "github.event_name != 'schedule' && "
+    "github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' && "
     "((github.event.comment.user.type || github.event.pull_request.user.type "
     "|| github.event.issue.user.type) != 'Bot')"
 )
+SWEEP_CONDITION = "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
 LISTING = f"repos/{REPO}/issues?state=open&labels=waiting%20on%20maintainer&per_page=100"
 LIST = ["api", LISTING, "--paginate"]
 REVIEWS = f"repos/{REPO}/pulls/{NUMBER}/reviews"
@@ -168,6 +170,13 @@ def change(name, event, labels, want_labels, edits, **kwargs):
                 or f"no change on #{NUMBER}: labels already match\n", **kwargs)
 
 
+def closing(name, event, labels, want_labels, removed, **kwargs):
+    return Case(name, event=event, state="closed", labels=labels, want_labels=want_labels,
+                want_calls=[READ] + [edit_call("remove", label) for label in removed],
+                want_out="".join(f"remove {label} on #{NUMBER}\n" for label in removed)
+                or f"no change on #{NUMBER}: closed without waiting labels\n", **kwargs)
+
+
 CASES = []
 for action in ("opened", "reopened"):
     CASES.append(change(f"external issue {action}", f"issues:{action}", ("bug", AUTHOR),
@@ -192,6 +201,22 @@ for association in ("CONTRIBUTOR", "FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR", "MAN
                         (), (MAINTAINER,), [("add", MAINTAINER)], association=association))
 
 CASES += [
+    closing("closed pull request: both waiting labels", "pull_request_target:closed",
+            (MAINTAINER, AUTHOR), (), [MAINTAINER, AUTHOR], pr=True),
+    closing("closed pull request: author label only", "pull_request_target:closed",
+            ("bug", AUTHOR), ("bug",), [AUTHOR], pr=True, association="MEMBER"),
+    closing("closed issue: maintainer label", "issues:closed", ("bug", MAINTAINER), ("bug",),
+            [MAINTAINER]),
+    closing("closed pull request: no waiting label", "pull_request_target:closed", ("bug",),
+            ("bug",), [], pr=True),
+    replace(closing("closed pull request: label removal fails", "pull_request_target:closed",
+                    ("bug", MAINTAINER, AUTHOR), ("bug", MAINTAINER, AUTHOR), [MAINTAINER], pr=True),
+            fail=(f"DELETE {ENDPOINT}/labels/waiting%20on%20maintainer",), want_rc=1, want_out="",
+            want_error="::error::Cannot remove label."),
+    replace(closing("closed pull request: second label removal fails", "pull_request_target:closed",
+                    ("bug", MAINTAINER, AUTHOR), ("bug", AUTHOR), [MAINTAINER, AUTHOR], pr=True),
+            fail=(f"DELETE {ENDPOINT}/labels/waiting%20on%20author",), want_rc=1,
+            want_out=f"remove {MAINTAINER} on #{NUMBER}\n", want_error="::error::Cannot remove label."),
     Case("closed pull request: maintainer comment", event="issue_comment:created", association="MEMBER",
          pr=True, state="closed", labels=("bug", MAINTAINER), want_labels=("bug", MAINTAINER),
          want_out=f"no change on #{NUMBER}: closed\n"),
@@ -225,13 +250,17 @@ for event, pr in (
     CASES.append(Case(f"maintainer {event}", event=event, pr=pr, association="OWNER",
                       labels=("bug", MAINTAINER, AUTHOR), want_labels=("bug", MAINTAINER, AUTHOR)))
 for event, pr, association in (
-    ("pull_request_target:closed", True, "NONE"),
-    ("issues:closed", False, "NONE"),
+    ("pull_request_target:edited", True, "NONE"),
+    ("issues:edited", False, "NONE"),
     ("issue_comment:edited", True, "NONE"),
     ("unknown:created", True, "NONE"),
 ):
     CASES.append(Case(f"no rule for {event} pr={pr} {association}", event=event, pr=pr,
                       association=association, labels=(AUTHOR,), want_labels=(AUTHOR,)))
+for event, pr in (("pull_request_target:closed", True), ("issues:closed", False)):
+    CASES.append(Case(f"reopened before the run: {event}", event=event, pr=pr,
+                      labels=("bug", MAINTAINER, AUTHOR), want_labels=("bug", MAINTAINER, AUTHOR),
+                      want_out=f"no change on #{NUMBER}: reopened\n"))
 for association in ("NONE", "MEMBER"):
     for pr in (False, True):
         CASES.append(Case(f"claim comment {association} pr={pr}", event="issue_comment:created",
@@ -455,15 +484,16 @@ def check_structure(workflow_path):
     sweep = doc["jobs"]["review-sweep"]
     expected = {
         "triggers": trigger == {
-            "issues": {"types": ["opened", "reopened"]},
+            "issues": {"types": ["opened", "reopened", "closed"]},
             "issue_comment": {"types": ["created"]},
-            "pull_request_target": {"types": ["opened", "reopened", "synchronize"]},
+            "pull_request_target": {"types": ["opened", "reopened", "synchronize", "closed"]},
             "schedule": [{"cron": "*/15 * * * *"}],
+            "workflow_dispatch": None,
         },
         "workflow permissions": doc.get("permissions") == {},
         "two jobs": list(doc["jobs"]) == ["triage", "review-sweep"],
         "bot condition": " ".join(str(job.get("if", "")).split()) == BOT_CONDITION,
-        "sweep condition": sweep.get("if") == "github.event_name == 'schedule'",
+        "sweep condition": sweep.get("if") == SWEEP_CONDITION,
         "concurrency": job.get("concurrency") == {
             "group": "triage-${{ github.event.issue.number || github.event.pull_request.number }}",
             "cancel-in-progress": False,
@@ -601,20 +631,36 @@ def mutation_controls(root):
          "            :\n          else\n", 1, ["OWNER comment on issue"]),
         ("rule 6 fallback", "            echo \"no change on #$NUMBER: no matching rule\"\n            exit 0\n",
          "            add='waiting on maintainer'\n", 1,
-         ["no rule for pull_request_target:closed pr=True NONE"]),
+         ["no rule for pull_request_target:edited pr=True NONE"]),
         ("rule 6 add idempotence", " && ! jq -e --arg label \"$add\" 'index($label) != null' <<<\"$labels\" >/dev/null",
          "", 1, ["issue already waits on maintainer", "maintainer comment: labels already match"]),
         ("rule 6 remove idempotence", " && jq -e --arg label \"$remove\" 'index($label) != null' <<<\"$labels\" >/dev/null",
          "", 1, ["external pull request: labels already match", "maintainer issue comment with absent label"]),
         ("claim skip", "            echo \"no change on #$NUMBER: claim comment\"\n            exit 0\n",
          "            :\n", 1, ["claim comment NONE pr=False", "claim comment MEMBER pr=True"]),
-        ("bot filter", "      github.event_name != 'schedule' &&\n"
+        ("bot filter", "      github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' &&\n"
          "      ((github.event.comment.user.type || github.event.pull_request.user.type\n"
          "      || github.event.issue.user.type) != 'Bot')",
          "      'true'", 1, [STRUCTURE]),
         ("concurrency", "    concurrency:\n"
          "      group: triage-${{ github.event.issue.number || github.event.pull_request.number }}\n"
          "      cancel-in-progress: false\n", "", 1, [STRUCTURE]),
+        ("closed rule", "          # Closing ends the wait on both sides, whoever closes the item.\n"
+         '          if [[ "$EVENT" == issues:closed || "$EVENT" == pull_request_target:closed ]]; then\n',
+         "          if false; then\n", 1,
+         ["closed pull request: both waiting labels", "closed pull request: author label only",
+          "closed issue: maintainer label"]),
+        ("closed state check", "            if [[ $(jq -r '.state' <<<\"$issue\") != closed ]]; then\n"
+         "              echo \"no change on #$NUMBER: reopened\"\n              exit 0\n            fi\n",
+         "", 1, ["reopened before the run: pull_request_target:closed",
+                 "reopened before the run: issues:closed"]),
+        ("closed triggers", "    types: [opened, reopened, closed]\n", "    types: [opened, reopened]\n", 1,
+         [STRUCTURE]),
+        ("dispatch trigger", "  workflow_dispatch:\n", "", 1, [STRUCTURE]),
+        ("dispatch exclusion", " && github.event_name != 'workflow_dispatch' &&\n", " &&\n", 1,
+         [STRUCTURE]),
+        ("sweep dispatch", f"    if: {SWEEP_CONDITION}\n", "    if: github.event_name == 'schedule'\n", 1,
+         [STRUCTURE]),
         ("closed guard", '          if [[ $(jq -r \'.state\' <<<"$issue") == closed ]]; then\n'
          '            echo "no change on #$NUMBER: closed"\n            exit 0\n          fi\n',
          "", 1, ["closed pull request: maintainer comment"]),
