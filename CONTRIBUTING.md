@@ -126,8 +126,9 @@ closes after 21 days. You can reopen it at any time.
 
 Coding agents start at [AGENTS.md](AGENTS.md) and can install
 [skills/contributing](skills/README.md#contributing-skill).
-The `agent-ready` label marks issues whose Where, Acceptance, and Gates are stated
-as commands.
+The `agent-ready` label marks issues whose Where and Acceptance are stated as
+commands. Such an issue states Gates only when it needs a check beyond
+`bash .github/scripts/preflight.sh`.
 
 ### Start here with your agent
 
@@ -154,11 +155,13 @@ coding agent this prompt with the number in place of NNN:
 > it pins and confirm the test fails, then restore it and note how you checked.
 > 5. Verify the result: every acceptance command in the issue gives the value
 > the issue states, and `bash .github/scripts/preflight.sh` passes.
-> 6. Show me the diff, the gate results, and a pull request description that
-> fills in `.github/PULL_REQUEST_TEMPLATE.md` with the preflight table and
-> "Closes #NNN". After I confirm, commit with that subject and body, push to
-> my fork, and open the pull request against `main` with `gh pr create`. Keep
-> "Allow edits by maintainers" enabled.
+> 6. Show me the diff, the gate results, a commit message, and a pull request
+> description. The commit message has one imperative subject line and a short
+> body that states what was wrong and what the change does. The pull request
+> description fills in `.github/PULL_REQUEST_TEMPLATE.md` with the preflight
+> table and "Closes #NNN". After I confirm, commit with that message, push to
+> my fork, and open the pull request against `main` with `gh pr create` and
+> that description. Keep "Allow edits by maintainers" enabled.
 > 7. When a review comment arrives, show it to me with your proposed answer or
 > change before you reply or push.
 

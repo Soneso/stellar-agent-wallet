@@ -95,7 +95,7 @@ jobs:
           if [[ "$EVENT" == pull_request_target ]]; then
             # The backticks in the template hint are literal Markdown.
             # shellcheck disable=SC2016
-            body=$(printf 'Thanks for the pull request, @%s, and welcome. A maintainer replies within one working day. The review follows within three working days for documentation, scripts, or workflows, and within five for Rust code. CI on a first contribution starts after a maintainer approves the run, which comes with the review.
+            body=$(printf 'Thanks for the pull request, @%s, and welcome. A maintainer replies within one working day. The review follows within three working days for documentation, scripts, or workflows, and within five for Rust code. CI on a first contribution starts after a maintainer approves the run, usually when they first look at the pull request.
 
           Three things that save a review round:
 

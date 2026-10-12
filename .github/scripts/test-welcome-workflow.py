@@ -28,7 +28,7 @@ REPO = "o/r"
 NUMBER = "12"
 ENDPOINT = f"repos/{REPO}/issues/{NUMBER}/comments"
 STRUCTURE = "workflow structure"
-PR_BODY = """Thanks for the pull request, @<login>, and welcome. A maintainer replies within one working day. The review follows within three working days for documentation, scripts, or workflows, and within five for Rust code. CI on a first contribution starts after a maintainer approves the run, which comes with the review.
+PR_BODY = """Thanks for the pull request, @<login>, and welcome. A maintainer replies within one working day. The review follows within three working days for documentation, scripts, or workflows, and within five for Rust code. CI on a first contribution starts after a maintainer approves the run, usually when they first look at the pull request.
 
 Three things that save a review round:
 

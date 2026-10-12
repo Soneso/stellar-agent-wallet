@@ -83,7 +83,8 @@ SEPs, x402, and the DeFi venues.
 Give your coding agent [`AGENTS.md`](AGENTS.md); it tells the agent where to
 start. Issues labeled
 [`agent-ready`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3Aagent-ready)
-carry the file, an acceptance check, and the gate commands. Claim an unassigned
+state Where and Acceptance as commands. They list Gates only for checks beyond
+`bash .github/scripts/preflight.sh`. Claim an unassigned
 [`good first issue`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
 or
 [`help wanted`](https://github.com/Soneso/stellar-agent-wallet/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
