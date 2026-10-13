@@ -4,7 +4,8 @@
 Usage: ``check-workflow-invariants.py [repository-root]``
 
 Reads ``release.yml``, ``publish.yml``, ``notarize-smoke.yml``, ``labels.yml``,
-``stale.yml``, ``triage.yml``, ``welcome.yml``, and ``coverage.yml`` under
+``stale.yml``, ``triage.yml``, ``triage-review.yml``, ``triage-sweep.yml``,
+``welcome.yml``, and ``coverage.yml`` under
 ``.github/workflows/``.
 Also reads the composite action
 ``.github/actions/macos-sign-notarize/action.yml``. Needs PyYAML.
@@ -90,8 +91,8 @@ try:
 except ImportError:
     sys.exit("check-workflow-invariants.py needs PyYAML (pip install PyYAML)")
 
-WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml", "labels.yml", "stale.yml", "triage.yml", "welcome.yml",
-             "coverage.yml")
+WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml", "labels.yml", "stale.yml", "triage.yml",
+             "triage-review.yml", "triage-sweep.yml", "welcome.yml", "coverage.yml")
 COMPOSITE = pathlib.PurePosixPath(".github/actions/macos-sign-notarize")
 SIGNING_JOBS = {("release.yml", "sign-macos"), ("notarize-smoke.yml", "sign")}
 TOOLCHAIN_ALLOWED = {("publish.yml", "publish")}

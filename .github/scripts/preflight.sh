@@ -65,7 +65,7 @@ OFFLINE_FEATURES=test-helpers,test-hooks,test-loopback,verifier-registry
 VENDORED_CRATE=stellar-agent-smart-account
 # The workflows that check-workflow-invariants.py reads, as its docstring
 # names them.
-INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage welcome coverage"
+INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage"
 
 die() {
   echo "preflight: $*" >&2
@@ -293,6 +293,8 @@ select_self_tests() {
       ;;
     .github/workflows/take.yml) select_gate self-test:test-take-workflow.py ;;
     .github/workflows/triage.yml) select_gate self-test:test-triage-workflow.py ;;
+    .github/workflows/triage-review.yml) select_gate self-test:test-triage-workflow.py ;;
+    .github/workflows/triage-sweep.yml) select_gate self-test:test-triage-workflow.py ;;
     .github/scripts/validate-unsigned-archive.py) select_gate self-test:test-validate-unsigned-archive.py ;;
     .github/workflows/welcome.yml) select_gate self-test:test-welcome-workflow.py ;;
     .github/scripts/test-*)

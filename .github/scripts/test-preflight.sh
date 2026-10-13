@@ -49,6 +49,7 @@ REAL_PYTHON=$(python3 -c 'import sys; print(sys.executable)')
 FIXTURE="$TMP/fixture"
 
 CASES="docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
+triage-workflow triage-review-workflow triage-sweep-workflow
 ci-yml-only python-check-script shell-check-script skill inbox-web one-crate two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
@@ -962,6 +963,27 @@ case_welcome_workflow() {
   edit .github/workflows/welcome.yml
   expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py \
     self-test:test-welcome-workflow.py
+}
+
+case_triage_workflow() {
+  start_case
+  edit .github/workflows/triage.yml
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-triage-workflow.py
+}
+
+case_triage_review_workflow() {
+  start_case
+  edit .github/workflows/triage-review.yml
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-triage-workflow.py
+}
+
+case_triage_sweep_workflow() {
+  start_case
+  edit .github/workflows/triage-sweep.yml
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-triage-workflow.py
 }
 
 # The invariants check reads release.yml, and its self-test builds fixtures
