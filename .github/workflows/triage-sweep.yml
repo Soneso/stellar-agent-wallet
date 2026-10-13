@@ -1,0 +1,168 @@
+name: Triage sweep
+
+# Runs after every completed `Triage review` run, on the schedule, and on
+# `workflow_dispatch`.
+# The sweep flips a pull request whose latest maintainer review sits on the
+# current head and is newer than every contributor comment or review and
+# the latest `waiting on maintainer` label event.
+# A push, comment, or review by a contributor after that review keeps the
+# pull request with the maintainer.
+# A reopen or a re-added label also keeps it with the maintainer.
+# Just before the edit, the sweep re-reads the labels, so it skips an edit
+# that the triage job in triage.yml already made. It does not re-check the
+# open state, the head, or the activity times. An item that closes or gets
+# activity between the earlier reads and the edit can still receive the flip.
+#
+# The sweep starts with the base repository's token, checks out no code,
+# downloads no artifact, reads no payload field, and edits labels only.
+# Any completed run named `Triage review` starts the sweep, including a run
+# from a pull request's own copy of that file, so the sweep reads nothing
+# from the run that started it.
+# The schedule is a fallback that GitHub runs with delay.
+
+on:
+  workflow_run:
+    workflows: ["Triage review"]
+    types: [completed]
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  review-sweep:
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+      pull-requests: write
+    timeout-minutes: 5
+    concurrency:
+      group: triage-review-sweep
+      cancel-in-progress: false
+    steps:
+      - name: Sweep maintainer reviews
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if ! issues=$(gh api "repos/$GH_REPO/issues?state=open&labels=waiting%20on%20maintainer&per_page=100" --paginate); then
+            echo '::error::Cannot read pull requests.' >&2
+            exit 1
+          fi
+          if ! pull_requests=$(jq -cs '.[][] | select(.pull_request != null and .user.type != "Bot")' <<<"$issues"); then
+            echo '::error::Cannot parse pull requests.' >&2
+            exit 1
+          fi
+
+          checked=0
+          flipped=0
+          while IFS= read -r issue; do
+            [[ -n "$issue" ]] || continue
+            number=$(jq -r '.number' <<<"$issue")
+            checked=$((checked + 1))
+            if ! reviews=$(gh api "repos/$GH_REPO/pulls/$number/reviews" --paginate); then
+              echo '::error::Cannot read reviews.' >&2
+              exit 1
+            fi
+            if ! review=$(jq -cs '[.[][]
+              | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
+              | select(.user.type != "Bot")
+              | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "COMMENTED")]
+              | max_by(.submitted_at) // empty' <<<"$reviews"); then
+              echo '::error::Cannot parse reviews.' >&2
+              exit 1
+            fi
+            if [[ -z "$review" ]]; then
+              echo "no change on #$number: no maintainer review"
+              continue
+            fi
+            review_time=$(jq -r '.submitted_at' <<<"$review")
+            review_commit=$(jq -r '.commit_id' <<<"$review")
+            if ! pull_request=$(gh api "repos/$GH_REPO/pulls/$number"); then
+              echo '::error::Cannot read pull request.' >&2
+              exit 1
+            fi
+            if ! head=$(jq -er '.head.sha' <<<"$pull_request"); then
+              echo '::error::Cannot parse pull request.' >&2
+              exit 1
+            fi
+            if [[ "$review_commit" != "$head" ]]; then
+              echo "no change on #$number: push after the review"
+              continue
+            fi
+            if ! comments=$(gh api "repos/$GH_REPO/issues/$number/comments" --paginate); then
+              echo '::error::Cannot read comments.' >&2
+              exit 1
+            fi
+            if ! review_comments=$(gh api "repos/$GH_REPO/pulls/$number/comments" --paginate); then
+              echo '::error::Cannot read review comments.' >&2
+              exit 1
+            fi
+            if ! commented=$(jq -rs --arg review_time "$review_time" '[.[][]
+              | select(.author_association != "OWNER" and .author_association != "MEMBER" and .author_association != "COLLABORATOR")
+              | select(.user.type != "Bot" and (.submitted_at // .created_at) > $review_time)]
+              | length > 0' <<<"$comments"$'\n'"$review_comments"$'\n'"$reviews"); then
+              echo '::error::Cannot parse comments.' >&2
+              exit 1
+            fi
+            if [[ "$commented" == true ]]; then
+              echo "no change on #$number: comment after the review"
+              continue
+            fi
+            if ! events=$(gh api "repos/$GH_REPO/issues/$number/events" --paginate); then
+              echo '::error::Cannot read label events.' >&2
+              exit 1
+            fi
+            if ! label_time=$(jq -rs '[.[][]
+              | select(.event == "labeled" and .label.name == "waiting on maintainer")
+              | .created_at] | max // empty' <<<"$events"); then
+              echo '::error::Cannot parse label events.' >&2
+              exit 1
+            fi
+            if [[ -z "$label_time" ]]; then
+              echo "no change on #$number: no label event"
+              continue
+            fi
+            if ! [[ "$review_time" > "$label_time" ]]; then
+              echo "no change on #$number: label after the review"
+              continue
+            fi
+            if ! issue=$(gh api "repos/$GH_REPO/issues/$number"); then
+              echo '::error::Cannot read labels.' >&2
+              exit 1
+            fi
+            if ! labels=$(jq -ce '[.labels[].name]' <<<"$issue"); then
+              echo '::error::Cannot parse labels.' >&2
+              exit 1
+            fi
+            add='waiting on author'
+            remove='waiting on maintainer'
+            changed=false
+            if ! jq -e --arg label "$add" 'index($label) != null' <<<"$labels" >/dev/null; then
+              if ! gh api --method POST "repos/$GH_REPO/issues/$number/labels" -f "labels[]=$add" >/dev/null; then
+                echo '::error::Cannot add label.' >&2
+                exit 1
+              fi
+              echo "add $add on #$number"
+              changed=true
+            fi
+            if jq -e --arg label "$remove" 'index($label) != null' <<<"$labels" >/dev/null; then
+              encoded=${remove// /%20}
+              if ! gh api --method DELETE "repos/$GH_REPO/issues/$number/labels/$encoded" >/dev/null; then
+                echo '::error::Cannot remove label.' >&2
+                exit 1
+              fi
+              echo "remove $remove on #$number"
+              changed=true
+            fi
+            if [[ "$changed" == true ]]; then
+              flipped=$((flipped + 1))
+            else
+              echo "no change on #$number: labels already match"
+            fi
+          done <<<"$pull_requests"
+          echo "sweep: $checked pull requests checked, $flipped flipped"

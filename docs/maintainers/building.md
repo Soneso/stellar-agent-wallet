@@ -143,8 +143,8 @@ full-suite runs. Both earlier full-suite runs reported
 `33 gates run, 0 failed, 5 unavailable`. The five unavailable gates were the
 same Python checks that need PyYAML and build nothing: `workflow-invariants` and
 the `test-check-workflow-invariants.py`, `test-sync-labels.py`,
-`test-take-workflow.py`, and `test-triage-workflow.py` self-tests. The
-docs-only run selected no Cargo gate, so its target directory stayed empty. The
+`test-take-workflow.py`, and `test-triage-workflow.py` self-tests.
+The docs-only run selected no Cargo gate, so its target directory stayed empty. The
 earlier coverage-alone run shared the machine with three unrelated builds, so
 its elapsed time is not comparable. The consolidated coverage-alone run executed
 only the coverage command and had the machine to itself, so its elapsed time
@@ -325,9 +325,12 @@ gate except `shellcheck-changed`, which needs a changed shell script.
 2. `actionlint`: a workflow change.
 3. `workflow-invariants`: a change to `release.yml`, `publish.yml`,
    `notarize-smoke.yml`, `labels.yml`, `stale.yml`, `triage.yml`,
-   `welcome.yml`, or `coverage.yml` under `.github/workflows/`, to
+   `triage-review.yml`, `triage-sweep.yml`, `welcome.yml`, or `coverage.yml`
+   under `.github/workflows/`, to
    `.github/actions/`, or to a file under `.github/scripts/` that one of them
    names.
+   `triage.yml` handles item events; `triage-review.yml` starts `triage-sweep.yml`
+   after a submitted review, with a schedule as the fallback.
 4. The self-tests, in filename order. Each runs when the file it tests or the
    self-test itself changes:
    - `test-check-crates-exist.sh`: `check-crates-exist.sh`
@@ -349,7 +352,10 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    - `test-sync-labels.py`: `sync-labels.py`, `.github/labels.yml`, or
      `.github/workflows/labels.yml`
    - `test-take-workflow.py`: `.github/workflows/take.yml`
-   - `test-triage-workflow.py`: `.github/workflows/triage.yml`
+   - `test-triage-workflow.py`: `.github/workflows/triage.yml` for item events,
+     `.github/workflows/triage-review.yml` for submitted reviews, and
+     `.github/workflows/triage-sweep.yml` for the sweep that follows each review,
+     with a schedule as the fallback
    - `test-validate-unsigned-archive.py`: `validate-unsigned-archive.py`
    - `test-welcome-workflow.py`: `.github/workflows/welcome.yml`
 5. `shellcheck-preflight`: a change to `preflight.sh` or `test-preflight.sh`.

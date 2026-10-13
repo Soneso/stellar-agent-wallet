@@ -24,6 +24,8 @@ RELEASE = ".github/workflows/release.yml"
 PUBLISH = ".github/workflows/publish.yml"
 SMOKE = ".github/workflows/notarize-smoke.yml"
 TRIAGE = ".github/workflows/triage.yml"
+TRIAGE_REVIEW = ".github/workflows/triage-review.yml"
+TRIAGE_SWEEP = ".github/workflows/triage-sweep.yml"
 WELCOME = ".github/workflows/welcome.yml"
 COVERAGE = ".github/workflows/coverage.yml"
 ACTION = ".github/actions/macos-sign-notarize/action.yml"
@@ -263,6 +265,12 @@ CASES = [
     ("triage workflow without top-level permissions", "workflow-permissions",
      'triage.yml: workflow-permissions: no top-level permissions', [
         (TRIAGE, "\npermissions: {}\n", "\n", 1)]),
+    ("triage review workflow without top-level permissions", "workflow-permissions",
+     'triage-review.yml: workflow-permissions: no top-level permissions', [
+        (TRIAGE_REVIEW, "\npermissions: {}\n", "\n", 1)]),
+    ("triage sweep workflow without top-level permissions", "workflow-permissions",
+     'triage-sweep.yml: workflow-permissions: no top-level permissions', [
+        (TRIAGE_SWEEP, "\npermissions: {}\n", "\n", 1)]),
     ("welcome workflow without top-level permissions", "workflow-permissions",
      'welcome.yml: workflow-permissions: no top-level permissions', [
         (WELCOME, "\npermissions: {}\n", "\n", 1)]),

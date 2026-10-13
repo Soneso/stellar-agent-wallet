@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Offline behavior test for the triage workflow.
+"""Offline behavior test for the three triage workflows.
 
 Usage: test-triage-workflow.py [ROOT] [--mutations | --case NAME ...]
 
-Loads the workflow with PyYAML and checks its triggers, job conditions,
-permissions, and concurrency groups. Each behavior case runs the live or
-sweep run block under bash with step variables and a stub gh on PATH.
+Loads triage.yml, triage-review.yml, and triage-sweep.yml with PyYAML.
+Checks their triggers, job conditions, permissions, concurrency groups, and
+the chain from a submitted review to the sweep. Live and sweep cases run
+their Bash blocks with step variables and a stub gh on PATH.
 The stub serves per-case JSON pages, stores labels per issue, and records
 every argument list. Cases assert exact calls, labels, output, and exit codes.
+Review signal cases check the output, digits guard, exit code, and no API calls.
 Needs Python 3.9+, PyYAML, bash, and jq.
 
 --case selects behavior cases by name. The structure case always runs, and
---case "workflow structure" runs it alone. Mutation controls remove rules,
-guards, triggers, job conditions, concurrency groups, sweep filters, the
-contributor review input, and head or label-time comparisons in scratch
-copies.
+--case "workflow structure" runs it alone. Mutation controls change rules,
+guards, workflow names, triggers, trigger types, job conditions, permissions,
+concurrency groups, sweep filters, payload fields, and API calls in scratch copies.
+They also change the review echo, contributor review input, and head or
+label-time comparisons.
 Each control requires named cases to fail.
 """
 
@@ -25,10 +28,13 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field, replace
+from typing import Optional
 
 import yaml
 
-WORKFLOW = ".github/workflows/triage.yml"
+TRIAGE_WORKFLOW = ".github/workflows/triage.yml"
+REVIEW_WORKFLOW = ".github/workflows/triage-review.yml"
+SWEEP_WORKFLOW = ".github/workflows/triage-sweep.yml"
 REPO = "o/r"
 NUMBER = "12"
 ENDPOINT = f"repos/{REPO}/issues/{NUMBER}"
@@ -37,11 +43,9 @@ AUTHOR = "waiting on author"
 READ = ["api", ENDPOINT]
 STRUCTURE = "workflow structure"
 BOT_CONDITION = (
-    "github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' && "
     "((github.event.comment.user.type || github.event.pull_request.user.type "
     "|| github.event.issue.user.type) != 'Bot')"
 )
-SWEEP_CONDITION = "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
 LISTING = f"repos/{REPO}/issues?state=open&labels=waiting%20on%20maintainer&per_page=100"
 LIST = ["api", LISTING, "--paginate"]
 REVIEWS = f"repos/{REPO}/pulls/{NUMBER}/reviews"
@@ -161,6 +165,31 @@ class Case:
     want_labels: tuple = ("bug",)
     want_out: str = f"no change on #{NUMBER}: no matching rule\n"
     want_error: str = ""
+
+
+@dataclass
+class ReviewCase:
+    name: str
+    review_state: str = "APPROVED"
+    association: str = "OWNER"
+    number: str = NUMBER
+    want_rc: int = 0
+    want_calls: list = field(default_factory=list)
+    want_out: Optional[str] = None
+    want_error: str = ""
+
+    def __post_init__(self):
+        if self.want_out is None:
+            self.want_out = (
+                f"review {self.review_state} by {self.association} on #{self.number}; the sweep follows\n"
+            )
+
+
+REVIEW_CASES = [
+    ReviewCase("review signal"),
+    ReviewCase("review invalid number", number="12x", want_rc=1, want_out="",
+               want_error="::error::NUMBER must contain only digits."),
+]
 
 
 def change(name, event, labels, want_labels, edits, **kwargs):
@@ -475,25 +504,46 @@ for name, endpoint, calls, error in (
                                want_out="", want_error=f"::error::{error}"))
 
 
-def check_structure(workflow_path):
-    doc = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+def check_structure(root):
+    doc, review_doc, sweep_doc = [
+        yaml.safe_load((root / path).read_text(encoding="utf-8"))
+        for path in (TRIAGE_WORKFLOW, REVIEW_WORKFLOW, SWEEP_WORKFLOW)
+    ]
     # PyYAML reads the bare key on as the boolean True.
     trigger = doc.get(True, doc.get("on"))
     job = doc["jobs"]["triage"]
     step = job["steps"][0]
-    sweep = doc["jobs"]["review-sweep"]
+    review = review_doc["jobs"]["review"]
+    sweep = sweep_doc["jobs"]["review-sweep"]
     expected = {
         "triggers": trigger == {
             "issues": {"types": ["opened", "reopened", "closed"]},
             "issue_comment": {"types": ["created"]},
             "pull_request_target": {"types": ["opened", "reopened", "synchronize", "closed"]},
+        },
+        "workflow permissions": doc.get("permissions") == {},
+        "triage jobs": list(doc["jobs"]) == ["triage"],
+        "review workflow name": review_doc.get("name") == "Triage review",
+        "review triggers": review_doc.get(True, review_doc.get("on")) == {
+            "pull_request_review": {"types": ["submitted"]},
+        },
+        "review workflow permissions": review_doc.get("permissions") == {},
+        "review jobs": list(review_doc["jobs"]) == ["review"],
+        "review condition": "if" not in review,
+        "review environment": review["steps"][0].get("env") == {
+            "REVIEW_STATE": "${{ github.event.review.state }}",
+            "ASSOCIATION": "${{ github.event.review.author_association }}",
+            "NUMBER": "${{ github.event.pull_request.number }}",
+        },
+        "sweep triggers": sweep_doc.get(True, sweep_doc.get("on")) == {
+            "workflow_run": {"workflows": ["Triage review"], "types": ["completed"]},
             "schedule": [{"cron": "*/15 * * * *"}],
             "workflow_dispatch": None,
         },
-        "workflow permissions": doc.get("permissions") == {},
-        "two jobs": list(doc["jobs"]) == ["triage", "review-sweep"],
+        "sweep workflow permissions": sweep_doc.get("permissions") == {},
+        "sweep jobs": list(sweep_doc["jobs"]) == ["review-sweep"],
         "bot condition": " ".join(str(job.get("if", "")).split()) == BOT_CONDITION,
-        "sweep condition": sweep.get("if") == SWEEP_CONDITION,
+        "sweep condition": "if" not in sweep,
         "concurrency": job.get("concurrency") == {
             "group": "triage-${{ github.event.issue.number || github.event.pull_request.number }}",
             "cancel-in-progress": False,
@@ -515,12 +565,13 @@ def check_structure(workflow_path):
         },
     }
     scripts = {}
-    for name, current in doc["jobs"].items():
+    for name, current in (("triage", job), ("review-sweep", sweep), ("review", review)):
         steps = current["steps"]
         script = steps[0]["run"]
         scripts[name] = script
         for check, ok in {
-            "permissions": current.get("permissions") == {"issues": "write", "pull-requests": "write"},
+            "permissions": ("permissions" not in current if name == "review" else
+                            current.get("permissions") == {"issues": "write", "pull-requests": "write"}),
             "one step": len(steps) == 1,
             "no action or checkout": "uses" not in current and all("uses" not in s for s in steps)
             and "checkout" not in script,
@@ -543,7 +594,11 @@ def run_case(case, scripts, bindir):
             "TRIAGE_STATE": str(state_path), "GH_TOKEN": "test-token", "GH_REPO": REPO,
             "LC_ALL": "C",
         }
-        if isinstance(case, SweepCase):
+        if isinstance(case, ReviewCase):
+            script = scripts["review"]
+            issues, pages, responses, want_labels = {}, {}, {}, {}
+            env.update(REVIEW_STATE=case.review_state, ASSOCIATION=case.association, NUMBER=case.number)
+        elif isinstance(case, SweepCase):
             script = scripts["review-sweep"]
             issues, pages = case.issues, case.pages
             responses = case.responses
@@ -558,7 +613,7 @@ def run_case(case, scripts, bindir):
             env.update(NUMBER=case.number, EVENT=case.event, ASSOCIATION=case.association,
                        COMMENT_BODY=case.body)
         state = {"issues": issues, "pages": pages, "responses": responses, "calls": [],
-                 "fail": case.fail, "malformed": case.malformed}
+                 "fail": getattr(case, "fail", ()), "malformed": getattr(case, "malformed", ())}
         state_path.write_text(json.dumps(state), encoding="utf-8")
         result = subprocess.run(["bash", "-c", script], env=env, cwd=tmp, capture_output=True,
                                 text=True, stdin=subprocess.DEVNULL, timeout=30)
@@ -586,14 +641,14 @@ def run_case(case, scripts, bindir):
 
 
 def run_suite(root, selected=None):
-    scripts, problems = check_structure(root / WORKFLOW)
+    scripts, problems = check_structure(root)
     failures = []
     if problems:
         failures.append(STRUCTURE)
         print(f"FAIL  {STRUCTURE}: {', '.join(problems)}")
     else:
         print(f"ok    {STRUCTURE}")
-    cases = CASES + SWEEP_CASES
+    cases = CASES + SWEEP_CASES + REVIEW_CASES
     if selected is not None:
         behavior = [name for name in selected if name != STRUCTURE]
         cases = [case for case in cases if case.name in behavior]
@@ -615,71 +670,100 @@ def run_suite(root, selected=None):
 
 
 def mutation_controls(root):
-    source = (root / WORKFLOW).read_text(encoding="utf-8")
+    sources = {path: (root / path).read_text(encoding="utf-8")
+               for path in (TRIAGE_WORKFLOW, REVIEW_WORKFLOW, SWEEP_WORKFLOW)}
     mutations = [
-        ("rule 1", "            add='waiting on maintainer'\n", "            :\n", 3,
+        ("rule 1", TRIAGE_WORKFLOW, '          if [[ "$EVENT" == issues:opened || "$EVENT" == issues:reopened ]] &&\n'
+         '            [[ "$maintainer" == false ]]; then\n'
+         "            add='waiting on maintainer'\n",
+         '          if [[ "$EVENT" == issues:opened || "$EVENT" == issues:reopened ]] &&\n'
+         '            [[ "$maintainer" == false ]]; then\n'
+         "            :\n", 1,
          ["external issue opened", "external issue reopened"]),
-        ("rule 2", "            add='waiting on maintainer'\n            remove='waiting on author'\n",
-         "            :\n", 2, ["external pull request synchronize"]),
-        ("rule 3", "          elif [[ \"$EVENT\" == issue_comment:created && \"$maintainer\" == false ]]; then\n"
+        ("rule 2", TRIAGE_WORKFLOW, '          elif [[ "$EVENT" == pull_request_target:opened || "$EVENT" == pull_request_target:reopened ||\n'
+         '            "$EVENT" == pull_request_target:synchronize ]] && [[ "$maintainer" == false ]]; then\n'
+         "            add='waiting on maintainer'\n            remove='waiting on author'\n",
+         '          elif [[ "$EVENT" == pull_request_target:opened || "$EVENT" == pull_request_target:reopened ||\n'
+         '            "$EVENT" == pull_request_target:synchronize ]] && [[ "$maintainer" == false ]]; then\n'
+         "            :\n", 1, ["external pull request synchronize"]),
+        ("rule 3", TRIAGE_WORKFLOW, "          elif [[ \"$EVENT\" == issue_comment:created && \"$maintainer\" == false ]]; then\n"
          "            add='waiting on maintainer'\n            remove='waiting on author'\n",
          "          elif [[ \"$EVENT\" == issue_comment:created && \"$maintainer\" == false ]]; then\n"
          "            :\n", 1, ["external comment on issue", "external comment on pull request"]),
-        ("rule 4", "            add='waiting on author'\n            remove='waiting on maintainer'\n",
-         "            :\n", 2, ["OWNER comment on pull request", "MEMBER comment on pull request"]),
-        ("rule 5", "            remove='waiting on maintainer'\n          else\n",
+        ("rule 4", TRIAGE_WORKFLOW, "            add='waiting on author'\n            remove='waiting on maintainer'\n",
+         "            :\n", 1, ["OWNER comment on pull request", "MEMBER comment on pull request"]),
+        ("rule 5", TRIAGE_WORKFLOW, "            remove='waiting on maintainer'\n          else\n",
          "            :\n          else\n", 1, ["OWNER comment on issue"]),
-        ("rule 6 fallback", "            echo \"no change on #$NUMBER: no matching rule\"\n            exit 0\n",
+        ("rule 6 fallback", TRIAGE_WORKFLOW, "            echo \"no change on #$NUMBER: no matching rule\"\n            exit 0\n",
          "            add='waiting on maintainer'\n", 1,
          ["no rule for pull_request_target:edited pr=True NONE"]),
-        ("rule 6 add idempotence", " && ! jq -e --arg label \"$add\" 'index($label) != null' <<<\"$labels\" >/dev/null",
+        ("rule 6 add idempotence", TRIAGE_WORKFLOW, " && ! jq -e --arg label \"$add\" 'index($label) != null' <<<\"$labels\" >/dev/null",
          "", 1, ["issue already waits on maintainer", "maintainer comment: labels already match"]),
-        ("rule 6 remove idempotence", " && jq -e --arg label \"$remove\" 'index($label) != null' <<<\"$labels\" >/dev/null",
+        ("rule 6 remove idempotence", TRIAGE_WORKFLOW, " && jq -e --arg label \"$remove\" 'index($label) != null' <<<\"$labels\" >/dev/null",
          "", 1, ["external pull request: labels already match", "maintainer issue comment with absent label"]),
-        ("claim skip", "            echo \"no change on #$NUMBER: claim comment\"\n            exit 0\n",
+        ("claim skip", TRIAGE_WORKFLOW, "            echo \"no change on #$NUMBER: claim comment\"\n            exit 0\n",
          "            :\n", 1, ["claim comment NONE pr=False", "claim comment MEMBER pr=True"]),
-        ("bot filter", "      github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' &&\n"
-         "      ((github.event.comment.user.type || github.event.pull_request.user.type\n"
+        ("bot filter", TRIAGE_WORKFLOW, "      ((github.event.comment.user.type || github.event.pull_request.user.type\n"
          "      || github.event.issue.user.type) != 'Bot')",
          "      'true'", 1, [STRUCTURE]),
-        ("concurrency", "    concurrency:\n"
+        ("concurrency", TRIAGE_WORKFLOW, "    concurrency:\n"
          "      group: triage-${{ github.event.issue.number || github.event.pull_request.number }}\n"
          "      cancel-in-progress: false\n", "", 1, [STRUCTURE]),
-        ("closed rule", "          # Closing ends the wait on both sides, whoever closes the item.\n"
+        ("closed rule", TRIAGE_WORKFLOW, "          # Closing ends the wait on both sides, whoever closes the item.\n"
          '          if [[ "$EVENT" == issues:closed || "$EVENT" == pull_request_target:closed ]]; then\n',
          "          if false; then\n", 1,
          ["closed pull request: both waiting labels", "closed pull request: author label only",
           "closed issue: maintainer label"]),
-        ("closed state check", "            if [[ $(jq -r '.state' <<<\"$issue\") != closed ]]; then\n"
+        ("closed state check", TRIAGE_WORKFLOW, "            if [[ $(jq -r '.state' <<<\"$issue\") != closed ]]; then\n"
          "              echo \"no change on #$NUMBER: reopened\"\n              exit 0\n            fi\n",
          "", 1, ["reopened before the run: pull_request_target:closed",
                  "reopened before the run: issues:closed"]),
-        ("closed triggers", "    types: [opened, reopened, closed]\n", "    types: [opened, reopened]\n", 1,
+        ("closed triggers", TRIAGE_WORKFLOW, "    types: [opened, reopened, closed]\n", "    types: [opened, reopened]\n", 1,
          [STRUCTURE]),
-        ("dispatch trigger", "  workflow_dispatch:\n", "", 1, [STRUCTURE]),
-        ("dispatch exclusion", " && github.event_name != 'workflow_dispatch' &&\n", " &&\n", 1,
-         [STRUCTURE]),
-        ("sweep dispatch", f"    if: {SWEEP_CONDITION}\n", "    if: github.event_name == 'schedule'\n", 1,
-         [STRUCTURE]),
-        ("closed guard", '          if [[ $(jq -r \'.state\' <<<"$issue") == closed ]]; then\n'
+        ("dispatch trigger", SWEEP_WORKFLOW, "  workflow_dispatch:\n", "", 1, [STRUCTURE]),
+        ("sweep trigger", SWEEP_WORKFLOW, '  workflow_run:\n    workflows: ["Triage review"]\n    types: [completed]\n',
+         "", 1, [STRUCTURE]),
+        ("review workflow name", SWEEP_WORKFLOW, '    workflows: ["Triage review"]\n',
+         '    workflows: ["Another review"]\n', 1, [STRUCTURE]),
+        ("review trigger type", REVIEW_WORKFLOW, "    types: [submitted]\n", "    types: [edited]\n", 1, [STRUCTURE]),
+        ("sweep schedule", SWEEP_WORKFLOW, "  schedule:\n    - cron: '*/15 * * * *'\n", "", 1, [STRUCTURE]),
+        ("review script", REVIEW_WORKFLOW, '          echo "review $REVIEW_STATE by $ASSOCIATION on #$NUMBER; the sweep follows"\n',
+         "", 1, ["review signal"]),
+        ("review workflow renamed", REVIEW_WORKFLOW, "name: Triage review\n", "name: Another review\n", 1, [STRUCTURE]),
+        ("review digits guard", REVIEW_WORKFLOW, '          if ! [[ "$NUMBER" =~ ^[0-9]+$ ]]; then\n'
+         "            echo '::error::NUMBER must contain only digits.' >&2\n"
+         "            exit 1\n          fi\n", "", 1, ["review invalid number"]),
+        ("sweep job condition", SWEEP_WORKFLOW, "  review-sweep:\n",
+         "  review-sweep:\n    if: true\n", 1, [STRUCTURE]),
+        ("review job condition", REVIEW_WORKFLOW, "  review:\n",
+         "  review:\n    if: true\n", 1, [STRUCTURE]),
+        ("review job permissions", REVIEW_WORKFLOW, "  review:\n",
+         "  review:\n    permissions: {issues: write}\n", 1, [STRUCTURE]),
+        ("review script api call", REVIEW_WORKFLOW, "          set -euo pipefail\n",
+         '          set -euo pipefail\n          gh api "repos/$GH_REPO/issues/$NUMBER"\n', 1, ["review signal"]),
+        ("sweep payload field", SWEEP_WORKFLOW, "          GH_REPO: ${{ github.repository }}\n",
+         "          GH_REPO: ${{ github.repository }}\n"
+         "          NUMBER: ${{ github.event.workflow_run.id }}\n", 1, [STRUCTURE]),
+        ("closed guard", TRIAGE_WORKFLOW, '          if [[ $(jq -r \'.state\' <<<"$issue") == closed ]]; then\n'
          '            echo "no change on #$NUMBER: closed"\n            exit 0\n          fi\n',
          "", 1, ["closed pull request: maintainer comment"]),
-        ("sweep head comparison", '            if [[ "$review_commit" != "$head" ]]; then\n',
+        ("sweep head comparison", SWEEP_WORKFLOW, '            if [[ "$review_commit" != "$head" ]]; then\n',
          "            if false; then\n", 1, ["sweep push after the review"]),
-        ("sweep comment filter", '            if [[ "$commented" == true ]]; then\n',
+        ("sweep comment filter", SWEEP_WORKFLOW, '            if [[ "$commented" == true ]]; then\n',
          "            if false; then\n", 1, ["sweep comment after the review"]),
-        ("sweep time comparison", '            if ! [[ "$review_time" > "$label_time" ]]; then\n',
+        ("sweep time comparison", SWEEP_WORKFLOW, '            if ! [[ "$review_time" > "$label_time" ]]; then\n',
          "            if false; then\n", 1, ["sweep review older than the label"]),
-        ("sweep contributor review input", r'''<<<"$comments"$'\n'"$review_comments"$'\n'"$reviews"''',
+        ("sweep contributor review input", SWEEP_WORKFLOW, r'''<<<"$comments"$'\n'"$review_comments"$'\n'"$reviews"''',
          r'''<<<"$comments"$'\n'"$review_comments"''', 1, ["sweep contributor review after the review"]),
-        ("sweep association filter",
+        ("sweep association filter", SWEEP_WORKFLOW,
          '              | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")\n',
          "", 1, ["sweep non-maintainer review"]),
-        ("sweep bot filter", '              | select(.user.type != "Bot")\n',
+        ("sweep bot filter", SWEEP_WORKFLOW, '              | select(.user.type != "Bot")\n',
          "", 1, ["sweep bot review"]),
     ]
     failures = 0
-    for name, old, new, count, cases in mutations:
+    for name, workflow, old, new, count, cases in mutations:
+        source = sources[workflow]
         found = source.count(old)
         if found != count:
             print(f"FAIL  mutation {name}: pattern found {found} times, want {count}")
@@ -687,9 +771,11 @@ def mutation_controls(root):
             continue
         with tempfile.TemporaryDirectory() as tmp:
             scratch = pathlib.Path(tmp)
-            target = scratch / WORKFLOW
-            target.parent.mkdir(parents=True)
-            target.write_text(source.replace(old, new, 1), encoding="utf-8")
+            for path, text in sources.items():
+                target = scratch / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            (scratch / workflow).write_text(source.replace(old, new, 1), encoding="utf-8")
             command = [sys.executable, str(pathlib.Path(__file__).resolve()), str(scratch)]
             for case in cases:
                 command += ["--case", case]

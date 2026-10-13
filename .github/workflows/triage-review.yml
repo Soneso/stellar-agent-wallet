@@ -1,0 +1,35 @@
+name: Triage review
+
+# This run lets `triage-sweep.yml` start after a submitted review with the
+# base repository's token. A review that a workflow submits with its
+# GITHUB_TOKEN starts no run; the sweep's schedule covers it.
+# The job reads its event fields, calls no API, and writes nothing.
+# A review on a fork pull request gives this run a read-only token, which
+# it does not use.
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Signal the review sweep
+        shell: bash
+        env:
+          REVIEW_STATE: ${{ github.event.review.state }}
+          ASSOCIATION: ${{ github.event.review.author_association }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$NUMBER" =~ ^[0-9]+$ ]]; then
+            echo '::error::NUMBER must contain only digits.' >&2
+            exit 1
+          fi
+
+          echo "review $REVIEW_STATE by $ASSOCIATION on #$NUMBER; the sweep follows"

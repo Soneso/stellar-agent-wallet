@@ -117,8 +117,8 @@ request.
 
 A `waiting on maintainer` label means the next step is ours; `waiting on author`
 means it is yours. Comments and pushes move the labels at once; a maintainer
-review moves them through a scheduled sweep. An issue or pull request loses
-both labels when a person closes it.
+review moves them through a sweep that starts after the review, with a schedule
+as the fallback. An issue or pull request loses both labels when a person closes it.
 
 A pull request that waits on its author for 14 days gets a reminder, and it
 closes after 21 days. You can reopen it at any time.
