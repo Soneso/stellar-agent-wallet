@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.12] - 2026-10-15
+
+Consolidated test targets for smaller test builds, trustline approvals stored as trustline changes, read-only smart-account verbs without a signer, a multicall router built from an in-tree contract, and keyring failures reported with their cause. The rustls update to 0.23.46 resolves four advisories.
+
+Contributions by @ngybnc (#351) and @norman-bodis (#380, #383, #386, #390).
+
 ### Added
 
 - The `TrustlineSimulated` approval kind names a trustline change and its limit.
@@ -2797,7 +2803,8 @@ policy engine, operator-approval spine, and tamper-evident audit log.
 - An agent integration guide (`docs/agents.md`) and capability-isolation example
   toolsets under `examples/toolsets/`.
 
-[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.11...HEAD
+[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.12...HEAD
+[0.1.0-alpha.12]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.11...v0.1.0-alpha.12
 [0.1.0-alpha.11]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.10...v0.1.0-alpha.11
 [0.1.0-alpha.10]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.9...v0.1.0-alpha.10
 [0.1.0-alpha.9]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.8...v0.1.0-alpha.9
