@@ -120,7 +120,7 @@ stellar-agent-loopback-http = { path = "crates/stellar-agent-loopback-http", ver
 # ring/rustls stack; axum-server itself disables default features on both
 # shared deps, so this pin is authoritative.
 axum-server = { version = "=0.8.0", default-features = false }
-rustls = { version = "=0.23.45", default-features = false }
+rustls = { version = "=0.23.46", default-features = false }
 tokio-rustls = { version = "=0.26.4", default-features = false }
 rustls-pki-types = { version = "=1.15.0" }
 rcgen = { version = "=0.14.8", default-features = false }

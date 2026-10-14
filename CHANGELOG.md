@@ -103,6 +103,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The RPC error redaction keeps the query of a URL out of the output when the
   query holds a comma or parentheses.
 
+### Security
+
+- `rustls` 0.23.45 to 0.23.46, which resolves four advisories.
+  RUSTSEC-2026-0346: the `Debug` output of client session values exposes TLS
+  secrets. RUSTSEC-2026-0347: buffered application data reaches the outer
+  server after an ECH rejection. RUSTSEC-2026-0348: Brotli certificate
+  decompression can allocate up to 1 GiB before authentication.
+  RUSTSEC-2026-0349: an unauthenticated ServerHello can downgrade later
+  connections to classical key exchange. The remote approval server uses
+  `rustls` for its TLS listener. The HTTPS clients use it for Stellar RPC
+  calls and for requests to Friendbot, `stellar.toml` files, SEP-6 and SEP-24
+  anchors, and SEP-10 and SEP-45 authentication endpoints.
+
 ## [0.1.0-alpha.11] - 2026-10-07
 
 A security fix for MCP policy evaluation with chain-bound rules, and the fixes from the alpha.10 release tests on macOS and Windows.
