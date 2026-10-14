@@ -16,8 +16,8 @@ Needs Python 3.9+, PyYAML, bash, and jq.
 --case "workflow structure" runs it alone. Mutation controls change rules,
 guards, workflow names, triggers, trigger types, job conditions, permissions,
 concurrency groups, sweep filters, payload fields, and API calls in scratch copies.
-They also change the review echo, contributor review input, and head or
-label-time comparisons.
+They also change the review echo, the approval stop, contributor review input,
+and head or label-time comparisons.
 Each control requires named cases to fail.
 """
 
@@ -339,7 +339,8 @@ class SweepCase:
     responses: dict = field(default_factory=dict)
 
 
-def review(time=MIDDLE, association="MEMBER", user_type="User", state="APPROVED", commit=CURRENT_HEAD):
+def review(time=MIDDLE, association="MEMBER", user_type="User", state="CHANGES_REQUESTED",
+           commit=CURRENT_HEAD):
     return {"submitted_at": time, "author_association": association,
             "user": {"type": user_type}, "state": state, "commit_id": commit}
 
@@ -383,6 +384,13 @@ def sweep_case(name, reviews=None, comments=None, review_comments=None, labels=(
 
 SWEEP_CASES = [
     sweep_case("sweep review on the current head"),
+    sweep_case("sweep approved review", reviews=[[review(state="APPROVED")]], edits=(),
+               want_labels=("bug", MAINTAINER), reason="approved, the maintainer merges next",
+               read_count=2),
+    sweep_case("sweep approval after a request for changes",
+               reviews=[[review()], [review(LATE, state="APPROVED")]], edits=(),
+               want_labels=("bug", MAINTAINER), reason="approved, the maintainer merges next",
+               read_count=2),
     sweep_case("sweep review older than the label", events=[[label_event(LATE)]],
                edits=(), want_labels=("bug", MAINTAINER), reason="label after the review", read_count=6),
     sweep_case("sweep review equals the label", events=[[label_event(MIDDLE)]],
@@ -760,6 +768,16 @@ def mutation_controls(root):
          "", 1, ["sweep non-maintainer review"]),
         ("sweep bot filter", SWEEP_WORKFLOW, '              | select(.user.type != "Bot")\n',
          "", 1, ["sweep bot review"]),
+        ("sweep approval stop", SWEEP_WORKFLOW,
+         '              echo "no change on #$number: approved, the maintainer merges next"\n'
+         "              continue\n",
+         '              echo "no change on #$number: approved, the maintainer merges next"\n', 1,
+         ["sweep approved review"]),
+        ("sweep state filter", SWEEP_WORKFLOW,
+         '              | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "COMMENTED")]\n',
+         "              ]\n", 1, ["sweep pending review", "sweep dismissed review"]),
+        ("sweep approval selection", SWEEP_WORKFLOW, '.state == "APPROVED" or ', "", 1,
+         ["sweep approval after a request for changes"]),
     ]
     failures = 0
     for name, workflow, old, new, count, cases in mutations:

@@ -5,6 +5,8 @@ Usage: test-check-docs-style.py [ROOT]
 
 Each rule case checks every diagnostic line, hit count, and allowance.
 Passing cases cover code, links, spelling, exclusions, and baseline allowances.
+Explicit file cases cover untracked files, files outside the root by relative
+and absolute path, and files without .md.
 Scratch repositories use the system temp directory and are removed on exit.
 """
 
@@ -33,6 +35,14 @@ HERE = pathlib.Path(__file__).resolve().parent
 CHECK = HERE / "check-docs-style.py"
 PROBE = "docs/style-probe.md"
 BASELINE = pathlib.Path(".github/scripts/docs-style-baseline.json")
+# SCRATCH in a case's args or path stands for the directory that holds the
+# case's tree, so a case can name a file outside the root by absolute path.
+SCRATCH = "<scratch>"
+# The poison text hits every rule once, so its diagnostics list each rule.
+POISON_RULES = (
+    "british-authoris", "british-behaviour", "british-initialis", "british-licence",
+    "british-recognis", "british-serialis", "curly-quotes", "em-dash", "emoji", "en-dash", "filler",
+)
 
 
 def load_check():
@@ -63,6 +73,7 @@ class Case:
     mutate: Callable[[pathlib.Path], None]
     code: int = 0
     rule: str | None = None
+    rules: tuple[str, ...] = ()
     path: str = PROBE
     line: int = 3
     args: tuple[str, ...] = ()
@@ -218,11 +229,34 @@ def cases() -> list[Case]:
     result.append(Case("missing explicit file", lambda tree: None, 2, args=(PROBE,), error="check-docs-style:"))
     result.append(Case(
         "explicit file outside root", lambda tree: (tree.parent / "outside.md").write_text("Read.\n", encoding="utf-8"),
-        2, args=("../outside.md",), error="check-docs-style:",
+        args=("../outside.md",),
+    ))
+    result.append(Case(
+        "explicit file outside root with a violation",
+        lambda tree: (tree.parent / "outside-poison.md").write_text(poison, encoding="utf-8"),
+        1, rules=POISON_RULES, path="../outside-poison.md", line=1, args=("../outside-poison.md",),
+    ))
+    result.append(Case(
+        "explicit absolute file outside root with a violation",
+        lambda tree: (tree.parent / "outside-absolute.md").write_text("Read\u2014write.\n", encoding="utf-8"),
+        1, "em-dash", path=f"{SCRATCH}/outside-absolute.md", line=1, args=(f"{SCRATCH}/outside-absolute.md",),
+    ))
+
+    def linked_outside(tree: pathlib.Path):
+        outside = tree.parent / f"{tree.name}-linked"
+        outside.mkdir()
+        (outside / "draft.md").write_text("Read\u2014write.\n", encoding="utf-8")
+        (tree / "docs").mkdir(exist_ok=True)
+        (tree / "docs" / "linked").symlink_to(outside, target_is_directory=True)
+        allowance(tree, "docs/linked/draft.md", {"em-dash": 1})
+
+    result.append(Case(
+        "explicit file outside root through a symlink has no allowance", linked_outside,
+        1, "em-dash", path="docs/linked/draft.md", line=1, args=("docs/linked/draft.md",),
     ))
     result.append(Case(
         "explicit non-Markdown file", lambda tree: write(tree, "docs/probe.txt", poison),
-        2, args=("docs/probe.txt",), error="not a scanned path",
+        1, rules=POISON_RULES, path="docs/probe.txt", line=1, args=("docs/probe.txt",),
     ))
     result.append(Case("tracked non-Markdown file skipped", lambda tree: write(tree, "docs/probe.txt", poison)))
 
@@ -308,15 +342,19 @@ def main(argv: list[str]) -> int:
             shutil.copytree(pristine, tree)
             try:
                 case.mutate(tree)
+                args = [argument.replace(SCRATCH, scratch) for argument in case.args]
                 result = subprocess.run(
-                    [sys.executable, str(CHECK), "--root", str(tree), *case.args],
+                    [sys.executable, str(CHECK), "--root", str(tree), *args],
                     capture_output=True, text=True, check=False,
                 )
                 assert result.returncode == case.code, f"exit {result.returncode}, expected {case.code}"
-                if case.rule:
+                rules = case.rules or ((case.rule,) if case.rule else ())
+                if rules:
                     violations = result.stdout.splitlines()
+                    path = case.path.replace(SCRATCH, scratch)
                     expected = [
-                        f"{case.path}:{line}: rule {case.rule}: {case.hits} hits exceed baseline {case.allowed}"
+                        f"{path}:{line}: rule {rule}: {case.hits} hits exceed baseline {case.allowed}"
+                        for rule in rules
                         for line in (case.lines or (case.line,))
                     ]
                     assert violations == expected, f"expected {expected}, got {violations}"

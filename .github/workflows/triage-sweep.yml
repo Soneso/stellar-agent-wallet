@@ -8,6 +8,7 @@ name: Triage sweep
 # A push, comment, or review by a contributor after that review keeps the
 # pull request with the maintainer.
 # A reopen or a re-added label also keeps it with the maintainer.
+# An approval leaves the labels alone because the maintainer merges next.
 # Just before the edit, the sweep re-reads the labels, so it skips an edit
 # that the triage job in triage.yml already made. It does not re-check the
 # open state, the head, or the activity times. An item that closes or gets
@@ -78,6 +79,11 @@ jobs:
             fi
             if [[ -z "$review" ]]; then
               echo "no change on #$number: no maintainer review"
+              continue
+            fi
+            review_state=$(jq -r '.state' <<<"$review")
+            if [[ "$review_state" == APPROVED ]]; then
+              echo "no change on #$number: approved, the maintainer merges next"
               continue
             fi
             review_time=$(jq -r '.submitted_at' <<<"$review")
