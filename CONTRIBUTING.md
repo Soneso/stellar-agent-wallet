@@ -116,9 +116,11 @@ request. If you prefer to make every change yourself, say so in the pull
 request.
 
 A `waiting on maintainer` label means the next step is ours; `waiting on author`
-means it is yours. Comments and pushes move the labels at once; a maintainer
-review moves them through a sweep that starts after the review, with a schedule
-as the fallback. An issue or pull request loses both labels when a person closes it.
+means it is yours. Comments and pushes move the labels at once. A review that
+asks for changes or comments moves them through a sweep that starts after the
+review, with a schedule as the fallback; an approval leaves them because the
+maintainer merges next. An issue or pull request loses both labels when a person
+closes it.
 
 A pull request that waits on its author for 14 days gets a reminder, and it
 closes after 21 days. You can reopen it at any time.
@@ -237,6 +239,7 @@ Documentation and code comments follow these rules:
   or cut the word.
 
 `python3 .github/scripts/check-docs-style.py <file>` checks the mechanical rules.
+The file may live outside the checkout.
 
 Commit messages and pull request descriptions follow the same rules except for
 tense, which the next section sets.

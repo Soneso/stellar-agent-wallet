@@ -3,11 +3,12 @@
 
 Usage: check-docs-style.py [--root ROOT] [FILE ...]
 
-ROOT defaults to this repository, and FILE paths are relative to ROOT. With no
-FILE, scan tracked Markdown except
-CHANGELOG.md and crates/*/vendor/**. Explicit files may be untracked.
-Explicit files use the same exclusions and .md filter; other paths exit 2
-with "not a scanned path".
+ROOT defaults to this repository. With no FILE, scan tracked Markdown except
+CHANGELOG.md and crates/*/vendor/**.
+FILE paths are relative to ROOT; a FILE outside ROOT or without .md is checked
+as given with no baseline allowance. Explicit files may be untracked.
+A FILE inside ROOT is reported by its path from ROOT and uses the same
+exclusions; an excluded FILE exits 2 with "not a scanned path".
 Fenced code, inline code spans, autolinks, link destinations and titles,
 and bare URLs are exempt. Link and reference labels remain subject to the
 prose rules.
@@ -255,34 +256,53 @@ def load_baseline(root: pathlib.Path) -> dict[str, dict[str, int]]:
     return baseline
 
 
+def explicit_targets(root: pathlib.Path, files: list[str]) -> list[tuple[str, pathlib.Path, str | None]]:
+    """Map FILE arguments to (label, file, baseline key) entries sorted by label.
+
+    A file inside ROOT is labeled and baselined by its path from ROOT and
+    honors the scan exclusions. A file outside ROOT keeps the label it was
+    given and has no baseline key, so every hit counts.
+    """
+    targets: dict[pathlib.Path, tuple[str, pathlib.Path, str | None]] = {}
+    for given in files:
+        file = (root / given).resolve()
+        try:
+            path = file.relative_to(root).as_posix()
+        except ValueError:
+            targets.setdefault(file, (given, file, None))
+            continue
+        if excluded(path):
+            raise ValueError(f"not a scanned path: {path}")
+        targets[file] = (path, file, path)
+    return sorted(targets.values(), key=lambda target: target[0])
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path(__file__).resolve().parents[2])
-    parser.add_argument("files", nargs="*", type=pathlib.Path)
+    parser.add_argument("files", nargs="*")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     try:
         baseline = load_baseline(root)
         if args.files:
-            paths = sorted({(root / path).resolve().relative_to(root).as_posix() for path in args.files})
-            for path in paths:
-                if excluded(path) or not path.endswith(".md"):
-                    raise ValueError(f"not a scanned path: {path}")
+            targets = explicit_targets(root, args.files)
         else:
-            paths = scanned_files(root)
+            targets = [(path, root / path, path) for path in scanned_files(root)]
         failures = 0
-        for path in paths:
-            hits = findings((root / path).read_text(encoding="utf-8"))
+        for label, file, key in targets:
+            hits = findings(file.read_text(encoding="utf-8"))
             counts = Counter(rule for _, rule in hits)
+            allowances = baseline.get(key, {}) if key is not None else {}
             for rule, count in sorted(counts.items()):
-                allowed = baseline.get(path, {}).get(rule, 0)
+                allowed = allowances.get(rule, 0)
                 if count > allowed:
                     for line in sorted({line for line, name in hits if name == rule}):
-                        print(f"{path}:{line}: rule {rule}: {count} hits exceed baseline {allowed}")
+                        print(f"{label}:{line}: rule {rule}: {count} hits exceed baseline {allowed}")
                     failures += 1
         if failures:
             return 1
-        print(f"docs style: {len(paths)} files pass")
+        print(f"docs style: {len(targets)} files pass")
         return 0
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"check-docs-style: {error}", file=sys.stderr)

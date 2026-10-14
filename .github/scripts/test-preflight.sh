@@ -1288,7 +1288,7 @@ case_unavailable_tool() {
   run_preflight
   version=$(sed -n 's/.*actionlint_\([0-9][0-9.]*\)_linux_amd64.*/\1/p' .github/workflows/install-surface.yml)
   [ -n "$version" ] || fail "install-surface.yml pins no actionlint archive"
-  expect_line "- \`actionlint\`: unavailable (actionlint: brew install actionlint, or the $version release archive)"
+  expect_line "- \`actionlint\`: unavailable (actionlint: brew install actionlint, or the $version release archive for your platform (actionlint_${version}_<os>_<arch>.tar.gz))"
   expect_end 1 "preflight: 3 gates run, 0 failed, 1 unavailable"
   expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
     "bash .github/scripts/check-gate-tool-versions.sh"

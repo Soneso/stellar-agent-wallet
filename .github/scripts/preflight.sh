@@ -649,13 +649,15 @@ version_or_file() {
 }
 
 # Prints the install hint for requirement $1. The versions come from the
-# files that pin them, so a hint follows a pin change.
+# files that pin them, so a hint follows a pin change. The actionlint hint
+# names the archive pattern because the pinned download is the Linux asset.
 install_hint() {
   local ci=.github/workflows/ci.yml coverage=.github/workflows/coverage.yml
-  local surface=.github/workflows/install-surface.yml
+  local surface=.github/workflows/install-surface.yml pin
   case "$1" in
     actionlint)
-      echo "brew install actionlint, or the $(version_or_file "$(actionlint_pin "$surface")" "$surface") release archive"
+      pin=$(actionlint_pin "$surface")
+      echo "brew install actionlint, or the $(version_or_file "$pin" "$surface") release archive for your platform (actionlint_${pin:-<version>}_<os>_<arch>.tar.gz)"
       ;;
     shellcheck)
       echo "brew install shellcheck, or the $(version_or_file "$(tool_pin "$surface" shellcheck)" "$surface") release archive"

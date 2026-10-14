@@ -4,14 +4,18 @@
 Usage: test-welcome-workflow.py [ROOT] [--mutations | --case NAME ...]
 
 The structure case pins the workflow header, ignoring comments and blank lines.
+The ci case reads .github/workflows/ci.yml. In job release-contracts, the step
+"Check the workflow structure and the label sync" holds a line that is exactly
+"$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-welcome-workflow.py,
+and the next line is the same command with --mutations.
 This uses the Python standard library; actionlint checks the YAML syntax.
 Each behavior case runs the run block under bash with step variables and a
 stub gh on PATH. Cases assert exact calls, comment bodies, exit codes, and
 single-line output. Needs Python 3.11+, bash, and jq.
 
-The structure case always runs. --case selects named behavior cases.
---mutations removes guards or changes rules in scratch copies and requires
-the named cases to fail with exit 1.
+The structure case always runs. --case selects the ci case and named behavior
+cases. --mutations removes guards or changes rules in scratch copies of
+welcome.yml and ci.yml and requires the named cases to fail with exit 1.
 """
 
 import json
@@ -24,6 +28,12 @@ import textwrap
 from dataclasses import dataclass, field, replace
 
 WORKFLOW = ".github/workflows/welcome.yml"
+CI_WORKFLOW = ".github/workflows/ci.yml"
+CI_JOB = "release-contracts"
+CI_STEP = "Check the workflow structure and the label sync"
+CI_CASE = "ci runs the welcome mutation controls"
+SELF_TEST = ".github/scripts/test-welcome-workflow.py"
+CI_INTERPRETER = '"$RUNNER_TEMP/workflow-check/bin/python"'
 REPO = "o/r"
 NUMBER = "12"
 ENDPOINT = f"repos/{REPO}/issues/{NUMBER}/comments"
@@ -255,6 +265,68 @@ def check_structure(workflow_path):
     return script, problems
 
 
+def indentation(line):
+    return len(line) - len(line.lstrip(" "))
+
+
+def ends_block(line, parent):
+    """True for a YAML key or list item indented no deeper than `parent`."""
+    return bool(line.strip()) and not line.lstrip().startswith("#") and indentation(line) <= parent
+
+
+def literal_run_block(source, job, step):
+    """Returns the dedented `run: |` block of step `step` in job `job`, or None.
+
+    Jobs sit two spaces under a top-level `jobs:` line and steps are `- name:`
+    list items, the layout of every workflow in this repository. A key or list
+    item indented no deeper than its parent ends a job or a step; any text line
+    indented no deeper than the `run` key ends the literal block.
+    """
+    lines = source.splitlines()
+    try:
+        start = lines.index(f"  {job}:", lines.index("jobs:") + 1) + 1
+    except ValueError:
+        return None
+    end = next((index for index in range(start, len(lines)) if ends_block(lines[index], 2)), len(lines))
+    job_lines = lines[start:end]
+    for index, line in enumerate(job_lines):
+        if line.lstrip(" ") != f"- name: {step}":
+            continue
+        item = indentation(line)
+        for offset in range(index + 1, len(job_lines)):
+            key = job_lines[offset]
+            if ends_block(key, item):
+                return None
+            if indentation(key) == item + 2 and key.strip() in ("run: |", "run: |-"):
+                block = []
+                for body in job_lines[offset + 1:]:
+                    if body.strip() and indentation(body) <= item + 2:
+                        break
+                    block.append(body + "\n")
+                return textwrap.dedent("".join(block))
+        return None
+    return None
+
+
+def check_ci(root):
+    """Returns the problems with the CI step that runs this self-test."""
+    try:
+        source = (root / CI_WORKFLOW).read_text(encoding="utf-8")
+    except OSError as error:
+        return [f"cannot read {CI_WORKFLOW}: {error.strerror}"]
+    script = literal_run_block(source, CI_JOB, CI_STEP)
+    if script is None:
+        return [f"no run block in step '{CI_STEP}' of job {CI_JOB}"]
+    # Whole-line equality keeps a comment marker, echo, or any other word off
+    # both lines, so each line runs the interpreter itself.
+    invocation = f"{CI_INTERPRETER} {SELF_TEST}"
+    lines = [line.strip() for line in script.splitlines()]
+    if any(line == invocation and following == f"{invocation} --mutations"
+           for line, following in zip(lines, lines[1:])):
+        return []
+    return [f"no line '{invocation}' followed by the same command with --mutations"]
+
+
 def run_case(case, script, bindir):
     with tempfile.TemporaryDirectory() as tmp:
         tmp = pathlib.Path(tmp)
@@ -302,9 +374,18 @@ def run_suite(root, selected=None):
         print(f"FAIL  {STRUCTURE}: {', '.join(problems)}")
     else:
         print(f"ok    {STRUCTURE}")
+    checked = 1
+    if selected is None or CI_CASE in selected:
+        checked += 1
+        problems = check_ci(root)
+        if problems:
+            failures.append(CI_CASE)
+            print(f"FAIL  {CI_CASE}: {', '.join(problems)}")
+        else:
+            print(f"ok    {CI_CASE}")
     cases = CASES
     if selected is not None:
-        behavior = [name for name in selected if name != STRUCTURE]
+        behavior = [name for name in selected if name not in (STRUCTURE, CI_CASE)]
         cases = [case for case in CASES if case.name in behavior]
         if len(cases) != len(behavior):
             raise AssertionError("selection names an unknown case")
@@ -319,12 +400,12 @@ def run_suite(root, selected=None):
                 print(f"FAIL  {case.name}\n        " + "\n        ".join(problems))
             else:
                 print(f"ok    {case.name}")
-    print(f"welcome workflow test: {1 + len(cases) - len(failures)} of {1 + len(cases)} passed")
+    print(f"welcome workflow test: {checked + len(cases) - len(failures)} of {checked + len(cases)} passed")
     return 1 if failures else 0
 
 
 def mutation_controls(root):
-    source = (root / WORKFLOW).read_text(encoding="utf-8")
+    sources = {path: (root / path).read_text(encoding="utf-8") for path in (WORKFLOW, CI_WORKFLOW)}
     mutations = [(name, text, "", [STRUCTURE]) for name, text in HEADER.items()]
     for association in ("OWNER", "MEMBER", "COLLABORATOR"):
         mutations.append((f"skip {association}", "OWNER | MEMBER | COLLABORATOR",
@@ -380,18 +461,33 @@ def mutation_controls(root):
         ("checkout command", '          set -euo pipefail\n',
          '          set -euo pipefail\n          git checkout HEAD\n', [STRUCTURE]),
     ]
+    mutations = [(name, WORKFLOW, old, new, cases) for name, old, new, cases in mutations]
+    suite_line = f"          {CI_INTERPRETER} {SELF_TEST}\n"
+    mutation_line = f"          {CI_INTERPRETER} {SELF_TEST} --mutations\n"
+    mutations += [
+        ("ci mutation invocation removed", CI_WORKFLOW, mutation_line, "", [CI_CASE]),
+        ("ci mutation invocation interpreter", CI_WORKFLOW, mutation_line,
+         f"          python3 {SELF_TEST} --mutations\n", [CI_CASE]),
+        ("ci mutation invocation commented", CI_WORKFLOW, suite_line + mutation_line,
+         f"          # {CI_INTERPRETER} {SELF_TEST}\n          # {CI_INTERPRETER} {SELF_TEST} --mutations\n",
+         [CI_CASE]),
+        ("ci mutation invocation echoed", CI_WORKFLOW, suite_line + mutation_line,
+         f"          echo {CI_INTERPRETER} {SELF_TEST}\n          echo {CI_INTERPRETER} {SELF_TEST} --mutations\n",
+         [CI_CASE]),
+    ]
     failures = 0
-    for name, old, new, cases in mutations:
-        found = source.count(old)
+    for name, path, old, new, cases in mutations:
+        found = sources[path].count(old)
         if found != 1:
             print(f"FAIL  mutation {name}: pattern found {found} times, want 1")
             failures += 1
             continue
         with tempfile.TemporaryDirectory() as tmp:
             scratch = pathlib.Path(tmp)
-            target = scratch / WORKFLOW
-            target.parent.mkdir(parents=True)
-            target.write_text(source.replace(old, new, 1), encoding="utf-8")
+            for copy, text in sources.items():
+                target = scratch / copy
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text.replace(old, new, 1) if copy == path else text, encoding="utf-8")
             command = [sys.executable, str(pathlib.Path(__file__).resolve()), str(scratch)]
             for case in cases:
                 command += ["--case", case]

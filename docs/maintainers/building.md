@@ -305,7 +305,7 @@ table for the pull request description and a summary line:
 - `python3 .github/scripts/check-docs-style.py`: exit 0
 - `python3 .github/scripts/check-install-surface.py`: exit 0
 - `bash .github/scripts/check-gate-tool-versions.sh`: exit 1
-- `actionlint`: unavailable (actionlint: brew install actionlint, or the <version> release archive)
+- `actionlint`: unavailable (actionlint: brew install actionlint, or the <version> release archive for your platform (actionlint_<version>_<os>_<arch>.tar.gz))
 - `.github/scripts/test-mpp-interop.sh`: not run (--full; needs Node <version> and Corepack)
 - `.github/scripts/test-sdk-v17-interop.sh`: not run (--full; needs Node <version> and Corepack)
 preflight: 3 gates run, 1 failed, 1 unavailable
@@ -330,7 +330,8 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    `.github/actions/`, or to a file under `.github/scripts/` that one of them
    names.
    `triage.yml` handles item events; `triage-review.yml` starts `triage-sweep.yml`
-   after a submitted review, with a schedule as the fallback.
+   after a submitted review, with a schedule as the fallback; an approving review
+   leaves the labels alone.
 4. The self-tests, in filename order. Each runs when the file it tests or the
    self-test itself changes:
    - `test-check-crates-exist.sh`: `check-crates-exist.sh`
