@@ -231,6 +231,7 @@ jobs:
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-sync-labels.py
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-triage-workflow.py
           "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-welcome-workflow.py
+          "$RUNNER_TEMP/workflow-check/bin/python" .github/scripts/test-welcome-workflow.py --mutations
 
   windows-storage:
     name: windows-storage
