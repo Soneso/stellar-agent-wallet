@@ -967,12 +967,12 @@ fn load_attestation_key_for_verify(
     Ok(arr)
 }
 
+/// The keyring loader reports authentication errors under their own codes.
+/// The fallback uses `trustline.signer_load_failed` to name the verb for any other error.
+/// Both preserve the error message.
 fn signer_load_failure_parts(e: &WalletError) -> (&'static str, String) {
     match e {
-        WalletError::Auth(
-            stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
-            | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. },
-        ) => (e.code(), e.to_string()),
+        WalletError::Auth(_) => (e.code(), e.to_string()),
         _ => ("trustline.signer_load_failed", e.to_string()),
     }
 }
@@ -1453,34 +1453,48 @@ mod tests {
 #[cfg(test)]
 mod enrolled_failure_tests {
     use super::*;
-    use stellar_agent_core::error::AuthError;
+    use stellar_agent_core::error::{AuthError, NetworkError};
 
     #[test]
-    fn enrolled_signer_load_failure_codes_pass_through() {
-        for error in [
-            AuthError::EnrolledSignerUnpinned {
-                profile: "mainnet".into(),
-                reason: "placeholder",
-            },
-            AuthError::EnrolledSignerMismatch {
-                profile: "mainnet".into(),
-                enrolled: "A".into(),
-                derived: "B".into(),
-            },
-        ] {
-            let error = WalletError::Auth(error);
-            assert_eq!(
-                signer_load_failure_parts(&error),
-                (error.code(), error.to_string())
-            );
+    fn signer_load_failure_codes() {
+        let cases: [(WalletError, &str); 5] = [
+            (
+                WalletError::Auth(AuthError::EnrolledSignerUnpinned {
+                    profile: "mainnet".into(),
+                    reason: "placeholder",
+                }),
+                "auth.enrolled_signer_unpinned",
+            ),
+            (
+                WalletError::Auth(AuthError::EnrolledSignerMismatch {
+                    profile: "mainnet".into(),
+                    enrolled: "A".into(),
+                    derived: "B".into(),
+                }),
+                "auth.enrolled_signer_mismatch",
+            ),
+            (
+                WalletError::Auth(AuthError::KeyringNotFound {
+                    name: "missing".into(),
+                }),
+                "auth.keyring_not_found",
+            ),
+            (
+                WalletError::Auth(AuthError::KeyringPlatformError {
+                    detail: "credential store unavailable".into(),
+                }),
+                "auth.keyring_platform_error",
+            ),
+            (
+                WalletError::Network(NetworkError::AccountNotFound {
+                    account_id: "missing".into(),
+                }),
+                "trustline.signer_load_failed",
+            ),
+        ];
+        for (e, code) in cases {
+            assert_eq!(signer_load_failure_parts(&e), (code, e.to_string()));
         }
-        let error = WalletError::Auth(AuthError::KeyringNotFound {
-            name: "missing".into(),
-        });
-        assert_eq!(
-            signer_load_failure_parts(&error),
-            ("trustline.signer_load_failed", error.to_string())
-        );
     }
 
     // ── A consent row queued after the pre-flight ────────────────────────────

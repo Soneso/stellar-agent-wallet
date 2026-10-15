@@ -1,6 +1,6 @@
 //! `stellar-agent accounts create` subcommand — account creation.
 //!
-//! Creates a new Stellar account on-chain in one of two mutually-exclusive
+//! Creates or funds a Stellar account on-chain in one of two mutually-exclusive
 //! modes:
 //!
 //! ## Mode A — sponsored `CreateAccount`
@@ -17,8 +17,11 @@
 //!
 //! ## Mode B — Friendbot
 //!
-//! Required flag: `--fund-with-friendbot`. The new account public key is
+//! Required flag: `--fund-with-friendbot`. The account public key is
 //! supplied as a positional argument or generated with `--generate`.
+//! Friendbot creates a missing account and pays an existing account whose
+//! balance is below the Friendbot starting balance. At or above the Friendbot
+//! starting balance, it refuses funding.
 //! Structurally refused on mainnet at two layers:
 //!
 //! 1. CLI enum: `TargetNetwork::Mainnet` returns
@@ -63,7 +66,7 @@
 //! sponsored mode keeps working without an authored profile file; a profile
 //! the operator NAMED — through `--profile` or `STELLAR_AGENT_PROFILE` — but
 //! never authored is refused instead. Friendbot
-//! mode is not gated: it funds the new account from the external Friendbot
+//! mode is not gated: it funds an eligible account from the external Friendbot
 //! faucet and debits no wallet-held funds, and touches no keyring.
 //!
 //! # Audit pre-flight (sponsored mode only; fail-closed for a persisted
@@ -548,7 +551,7 @@ fn resolve_new_account(args: &CreateArgs) -> Result<NewAccount, WalletError> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_friendbot(context: &NetworkContext, args: &CreateArgs) -> i32 {
-    // No operator-policy gate here: Friendbot mode funds the new account from
+    // No operator-policy gate here: Friendbot mode funds the account from
     // the external testnet faucet and debits no wallet-held funds, so there is
     // no value-moving leg for the policy engine to evaluate.
     // First layer: structural mainnet rejection.
