@@ -52,6 +52,8 @@ use std::time::Duration;
 use rand_core::{OsRng, RngCore};
 use tokio::time::Instant;
 
+use crate::redact::redact_rpc_error_display;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Error-display truncation helper
 // ─────────────────────────────────────────────────────────────────────────────
@@ -67,17 +69,21 @@ use tokio::time::Instant;
 /// triage without echoing an entire server response body into the log stream.
 const MAX_ERROR_DISPLAY_CHARS: usize = 200;
 
-/// Returns at most the first `MAX_ERROR_DISPLAY_CHARS` characters of
-/// `e.to_string()` for safe structured-log emission.
+/// Returns at most the first `MAX_ERROR_DISPLAY_CHARS` characters of the
+/// display of `e`, scrubbed with [`redact_rpc_error_display`], for safe
+/// structured-log emission.
 ///
-/// Used at retry-attempt warning/debug sites in `submit.rs` and
-/// `idempotent_submit.rs` so a server-controlled `JsonRpc` body cannot
-/// produce unbounded log entries.
+/// Used at log sites and for the diagnostic text a
+/// [`SubmissionOutcome`](crate::submission_record::SubmissionOutcome) carries.
+/// A server-controlled `JsonRpc` body therefore cannot produce unbounded log
+/// entries.
+/// The scrub runs before the cut, so a URL the server echoed reaches the log
+/// as host and port even when it straddles the bound.
 ///
 /// Not crypto-sensitive: no envelope XDR or signing material appears in
 /// `stellar_rpc_client::Error` display output.
 pub(crate) fn truncate_error_display(e: &stellar_rpc_client::Error) -> String {
-    let s = e.to_string();
+    let s = redact_rpc_error_display(e);
     if s.chars().count() <= MAX_ERROR_DISPLAY_CHARS {
         s
     } else {
@@ -631,6 +637,45 @@ mod tests {
     use tokio::time::Instant;
 
     use super::*;
+
+    /// A URL the server echoed into an error reaches the log as host and port,
+    /// and the scrubbed text keeps the length bound.
+    #[test]
+    fn truncate_error_display_scrubs_a_url_before_the_cut() {
+        let text = format!(
+            "upstream https://user:SECRET@archive.example.com:8443/rpc?token=SECRET refused {}",
+            "x".repeat(300)
+        );
+        let e = stellar_rpc_client::Error::TransactionSubmissionFailed(text);
+        assert!(
+            e.to_string().chars().count() > MAX_ERROR_DISPLAY_CHARS,
+            "the fixture must exceed the bound"
+        );
+
+        let out = truncate_error_display(&e);
+
+        assert_eq!(
+            out.chars().count(),
+            MAX_ERROR_DISPLAY_CHARS + 1,
+            "the bound plus the ellipsis: {out}"
+        );
+        assert!(
+            out.ends_with('…'),
+            "a cut display ends with an ellipsis: {out}"
+        );
+        assert!(
+            out.starts_with(
+                "transaction submission failed: upstream archive.example.com:8443 refused x"
+            ),
+            "the URL keeps host and port: {out}"
+        );
+        for leaked in ["SECRET", "token=", "user:", "https://"] {
+            assert!(
+                !out.contains(leaked),
+                "{leaked} reached the log text: {out}"
+            );
+        }
+    }
 
     // ─── is_retryable_send_error ─────────────────────────────────────────────
 
