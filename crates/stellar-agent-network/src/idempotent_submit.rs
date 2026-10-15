@@ -98,7 +98,8 @@ use stellar_agent_core::profile::receipt::{
 use stellar_xdr::{Limits, Preconditions, ReadXdr, TransactionEnvelope};
 
 use crate::StellarRpcClient;
-use crate::redact::redact_url_authority;
+use crate::client::{STALE_PENDING_RECOVERY, rpc_unreachable, unexpected_status};
+use crate::redact::{redact_rpc_error, redact_url_authority};
 use crate::retry::{
     RetryPolicy, is_retryable_poll_error, is_retryable_send_error, retry_with_backoff,
     truncate_error_display,
@@ -565,12 +566,7 @@ async fn handle_stale_pending(
     let record = client
         .get_transaction_record(&tx_hash_obj)
         .await
-        .map_err(|e| {
-            WalletError::Network(NetworkError::RpcUnreachable {
-                url: redact_url_authority(&client.url),
-                reason: e.to_string(),
-            })
-        })?;
+        .map_err(|e| transport_failure(&client.url, &e))?;
 
     match record.status() {
         "SUCCESS" => {
@@ -673,10 +669,11 @@ async fn handle_stale_pending(
             )
             .await
         }
-        other => Err(WalletError::Network(NetworkError::RpcUnreachable {
-            url: redact_url_authority(&client.url),
-            reason: format!("stale-Pending recovery: unexpected getTransaction status: {other}"),
-        })),
+        other => Err(WalletError::Network(unexpected_status(
+            &client.url,
+            STALE_PENDING_RECOVERY,
+            other,
+        ))),
     }
 }
 
@@ -1050,12 +1047,7 @@ pub(crate) async fn submit_with_retention_poll(
             || async { inner.send_transaction(&envelope).await },
         )
         .await
-        .map_err(|e| {
-            WalletError::Network(NetworkError::RpcUnreachable {
-                url: redact_url_authority(url),
-                reason: e.to_string(),
-            })
-        })?
+        .map_err(|e| transport_failure(url, &e))?
     };
 
     // The hash polled and recorded is the one computed from the bytes that
@@ -1145,10 +1137,7 @@ pub(crate) async fn submit_with_retention_poll(
                 continue;
             }
             Err(e) => {
-                return Err(WalletError::Network(NetworkError::RpcUnreachable {
-                    url: redact_url_authority(&client.url),
-                    reason: e.to_string(),
-                }));
+                return Err(transport_failure(&client.url, &e));
             }
         };
 
@@ -1241,10 +1230,11 @@ pub(crate) async fn submit_with_retention_poll(
             }
 
             other => {
-                return Err(WalletError::Network(NetworkError::RpcUnreachable {
-                    url: redact_url_authority(&client.url),
-                    reason: format!("unexpected getTransaction status: {other}"),
-                }));
+                return Err(WalletError::Network(unexpected_status(
+                    &client.url,
+                    "",
+                    other,
+                )));
             }
         }
 
@@ -1575,12 +1565,7 @@ pub async fn reconcile_receipt(
     let record = client
         .get_transaction_record(&tx_hash_obj)
         .await
-        .map_err(|e| {
-            WalletError::Network(NetworkError::RpcUnreachable {
-                url: redact_url_authority(&client.url),
-                reason: e.to_string(),
-            })
-        })?;
+        .map_err(|e| transport_failure(&client.url, &e))?;
 
     match record.status() {
         "SUCCESS" => {
@@ -1771,13 +1756,23 @@ pub async fn reconcile_receipt(
             // log and return the current status unchanged.
             tracing::warn!(
                 envelope_hash = %redact_envelope_hash(envelope_hash),
-                status = other,
+                status = %redact_rpc_error(other),
                 "reconcile_receipt: unexpected getTransaction status for a Success \
                  receipt; returning current status unchanged"
             );
             Ok(receipt.status)
         }
     }
+}
+
+/// Maps an RPC call that failed against the endpoint at `url` to
+/// [`NetworkError::RpcUnreachable`], with the server text scrubbed.
+///
+/// The stale-Pending recovery read, the send, the non-retryable confirmation
+/// poll, and the reconciliation read all report their transport failures this
+/// way.
+fn transport_failure(url: &str, e: &stellar_rpc_client::Error) -> WalletError {
+    WalletError::Network(rpc_unreachable(url, "", e))
 }
 
 /// Decodes a 64-character lowercase hex string to a 32-byte array.
@@ -1812,7 +1807,37 @@ mod tests {
     )]
 
     use super::*;
+    use crate::redact::rpc_error_fixtures::{
+        ECHOED_URL, ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_error,
+        xdr_error,
+    };
     use stellar_agent_core::profile::receipt::ReceiptStore;
+
+    /// Every error the transport mapping receives, whatever its variant,
+    /// leaves only the echoed host and port in the reason.
+    #[test]
+    fn transport_failure_scrubs_the_server_text() {
+        let mut errors: Vec<(&str, stellar_rpc_client::Error)> = ERROR_OBJECTS
+            .iter()
+            .map(|(case, raw)| (*case, call_error(raw)))
+            .collect();
+        errors.push(("xdr", xdr_error()));
+        errors.push((
+            "submission failed",
+            stellar_rpc_client::Error::TransactionSubmissionFailed(format!(
+                "upstream {ECHOED_URL} refused"
+            )),
+        ));
+        for (case, e) in errors {
+            match transport_failure(ENDPOINT, &e) {
+                WalletError::Network(NetworkError::RpcUnreachable { url, reason }) => {
+                    assert_eq!(url, ENDPOINT_AUTHORITY, "{case}");
+                    assert_scrubbed(case, &reason);
+                }
+                other => panic!("{case}: expected RpcUnreachable, got {other:?}"),
+            }
+        }
+    }
 
     fn open_temp_store() -> (tempfile::TempDir, ReceiptStore) {
         let dir = tempfile::tempdir().unwrap();

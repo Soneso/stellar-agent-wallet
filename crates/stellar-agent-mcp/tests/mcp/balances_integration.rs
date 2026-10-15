@@ -17,9 +17,11 @@
 //! 6. **Invalid account_id** — not a valid G-strkey → `invalid_params`.
 //! 7. **Cap exceeded (101 assets)** — handler returns `invalid_params` before any RPC call.
 //! 8. **Cap boundary (100 assets)** — handler does NOT fire cap guard; proceeds to network.
+//! 9. **Echoed credential URL**: an endpoint error object that repeats the RPC
+//!    URL reaches the envelope with only host and port.
 //!
 //! Network-layer trustline tests live in the `stellar-agent-network` crate;
-//! this file keeps one wiremock-backed MCP dispatch test so the
+//! this file keeps wiremock-backed MCP dispatch tests so the
 //! handler-to-envelope path is covered at the MCP boundary.
 
 #![allow(
@@ -406,6 +408,88 @@ async fn stellar_balances_dispatch_returns_native_and_trustline_from_wiremock() 
         TEST_USDC_ISSUER
     );
     assert_eq!(payload["data"]["balances"][1]["balance"], "50.0000000");
+}
+
+/// `stellar_balances` runs against an endpoint whose JSON-RPC error object
+/// echoes the profile's credential-bearing RPC URL in `message`. Its `data`
+/// carries a second URL with JSON-escaped slashes. The tool-level error
+/// envelope keeps only the host and port of both URLs. The profile points at
+/// the loopback server, so the test reaches no external network.
+#[tokio::test]
+async fn stellar_balances_error_envelope_keeps_only_host_and_port_of_echoed_urls() {
+    use stellar_agent_core::profile::schema::Profile;
+    use stellar_agent_mcp::server::{StellarBalancesArgs, WalletServer};
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let rpc_url = format!("{}/?token=CLIENTSECRET", mock_server.uri());
+    let escaped_data =
+        r#"{"url":"https:\/\/user:SECRET@archive.example.com:8443\/rpc?token=SECRET"}"#;
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":-32000,"message":"upstream rejected {rpc_url} for this caller","data":{escaped_data}}}}}"#
+    );
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(query_param("token", "CLIENTSECRET"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+        .mount(&mock_server)
+        .await;
+
+    let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .rpc_url(rpc_url)
+        .with_noop_engine()
+        .build();
+    let server = WalletServer::new(profile).expect("WalletServer::new must succeed");
+    let args = StellarBalancesArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        account_id: TEST_ACCOUNT.to_owned(),
+        assets: Vec::new(),
+    };
+
+    let result = server
+        .call_stellar_balances(args)
+        .await
+        .expect("an endpoint failure is a tool-level error, not a protocol error");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "the call reports a tool-level error"
+    );
+
+    let text = call_result_text(&result);
+    let payload = call_result_json(&result);
+    assert_eq!(payload["ok"], false);
+    assert_eq!(
+        payload["error"]["code"], "network.rpc_unreachable",
+        "the envelope names the failure: {payload}"
+    );
+    let message = payload["error"]["message"]
+        .as_str()
+        .expect("the error carries a message");
+    let authority = mock_server
+        .uri()
+        .strip_prefix("http://")
+        .expect("wiremock serves plain HTTP")
+        .to_owned();
+    assert!(
+        message.contains(&format!("upstream rejected {authority} for this caller")),
+        "the echoed request URL keeps its host and port: {message}"
+    );
+    assert!(
+        message.contains(r#"{"url":"archive.example.com:8443"}"#),
+        "the escaped URL in the data keeps its host and port: {message}"
+    );
+    for leaked in ["SECRET", "token=", "user:", "https://", r"https:\/", "/rpc"] {
+        assert!(
+            !message.contains(leaked),
+            "{leaked} reached the envelope message: {message}"
+        );
+        assert!(
+            !text.contains(leaked),
+            "{leaked} reached the tool result: {text}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

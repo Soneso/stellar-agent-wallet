@@ -46,8 +46,8 @@ use stellar_xdr::{
     TransactionEnvelope, TransactionResult, TransactionResultResult,
 };
 
-use crate::client::StellarRpcClient;
-use crate::redact::redact_url_authority;
+use crate::client::{StellarRpcClient, rpc_unreachable, unexpected_status};
+use crate::redact::{redact_rpc_error, redact_rpc_error_display, redact_url_authority};
 use crate::retry::{
     RetryPolicy, is_retryable_poll_error, is_retryable_send_error, retry_with_backoff,
     truncate_error_display,
@@ -436,16 +436,18 @@ pub async fn submit_transaction_and_wait(
 
             other => {
                 let Some(rec) = recorder else {
-                    return Err(WalletError::Network(NetworkError::RpcUnreachable {
-                        url: redact_url_authority(&client.url),
-                        reason: format!("unexpected getTransaction status: {other}"),
-                    }));
+                    return Err(WalletError::Network(unexpected_status(
+                        &client.url,
+                        "",
+                        other,
+                    )));
                 };
                 rec.outcome(
                     &intent,
                     &SubmissionOutcome::TransportAfterSend {
                         error: format!(
-                            "the endpoint reported an unexpected transaction status: {other}"
+                            "the endpoint reported an unexpected transaction status: {}",
+                            redact_rpc_error(other)
                         ),
                     },
                 )
@@ -803,13 +805,16 @@ pub fn redact_tx_hash(hash: &str) -> String {
 ///
 /// `timeout_secs` is the actual caller-configured timeout, used in the
 /// `RpcTimeout` variant so the value is accurate rather than hardcoded.
+///
+/// Every text field is scrubbed with [`redact_rpc_error`] before it enters the
+/// error, because the client's submission-failure message and the error
+/// display both carry server text.
 fn map_send_error(e: &stellar_rpc_client::Error, url: &str, timeout_secs: u64) -> WalletError {
     use stellar_rpc_client::Error as RpcErr;
     match e {
         RpcErr::TransactionSubmissionFailed(msg) => {
-            // Try to parse the message for specific error codes.
             WalletError::Submission(SubmissionError::TxMalformed {
-                detail: msg.clone(),
+                detail: redact_rpc_error(msg),
             })
         }
         RpcErr::TransactionSubmissionTimeout => WalletError::Network(NetworkError::RpcTimeout {
@@ -817,12 +822,9 @@ fn map_send_error(e: &stellar_rpc_client::Error, url: &str, timeout_secs: u64) -
             timeout_secs,
         }),
         RpcErr::Xdr(_) => WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: e.to_string(),
+            detail: redact_rpc_error_display(e),
         }),
-        _ => WalletError::Network(NetworkError::RpcUnreachable {
-            url: redact_url_authority(url),
-            reason: e.to_string(),
-        }),
+        _ => WalletError::Network(rpc_unreachable(url, "", e)),
     }
 }
 
@@ -830,6 +832,9 @@ fn map_send_error(e: &stellar_rpc_client::Error, url: &str, timeout_secs: u64) -
 ///
 /// `timeout_secs` is the actual caller-configured timeout, used in the
 /// `RpcTimeout` variant so the value is accurate rather than hardcoded.
+///
+/// Every text field takes the error display scrubbed with
+/// [`redact_rpc_error_display`], because that display can carry server text.
 fn map_rpc_error_generic(
     e: &stellar_rpc_client::Error,
     url: &str,
@@ -842,12 +847,9 @@ fn map_rpc_error_generic(
             timeout_secs,
         }),
         RpcErr::Xdr(_) => WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: e.to_string(),
+            detail: redact_rpc_error_display(e),
         }),
-        _ => WalletError::Network(NetworkError::RpcUnreachable {
-            url: redact_url_authority(url),
-            reason: e.to_string(),
-        }),
+        _ => WalletError::Network(rpc_unreachable(url, "", e)),
     }
 }
 
@@ -1073,6 +1075,83 @@ mod tests {
     )]
 
     use super::*;
+    use crate::redact::rpc_error_fixtures::{
+        ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_client_error,
+        call_error, xdr_error,
+    };
+
+    /// The send step's failure message, in the form the RPC client renders a
+    /// JSON-RPC error object it got instead of a status, keeps its own wording
+    /// and only the echoed host and port.
+    #[test]
+    fn map_send_error_scrubs_a_submission_failure_message() {
+        for (case, raw) in ERROR_OBJECTS {
+            let msg = format!("No status yet:\n {:#?}", call_client_error(raw));
+            let e = stellar_rpc_client::Error::TransactionSubmissionFailed(msg);
+            match map_send_error(&e, ENDPOINT, 30) {
+                WalletError::Submission(SubmissionError::TxMalformed { detail }) => {
+                    assert!(
+                        detail.starts_with(SEND_NO_RESPONSE_MARKER),
+                        "{case}: the detail keeps the message without a prefix: {detail}"
+                    );
+                    assert_scrubbed(case, &detail);
+                }
+                other => panic!("{case}: expected TxMalformed, got {other:?}"),
+            }
+        }
+    }
+
+    /// An XDR error on the send step keeps only the echoed host and port.
+    #[test]
+    fn map_send_error_scrubs_an_xdr_error() {
+        match map_send_error(&xdr_error(), ENDPOINT, 30) {
+            WalletError::Protocol(ProtocolError::XdrCodecFailed { detail }) => {
+                assert_scrubbed("xdr", &detail);
+            }
+            other => panic!("expected XdrCodecFailed, got {other:?}"),
+        }
+    }
+
+    /// Any other send error, here a JSON-RPC error object, keeps only the
+    /// echoed host and port in its reason.
+    #[test]
+    fn map_send_error_scrubs_a_json_rpc_error_object() {
+        for (case, raw) in ERROR_OBJECTS {
+            match map_send_error(&call_error(raw), ENDPOINT, 30) {
+                WalletError::Network(NetworkError::RpcUnreachable { url, reason }) => {
+                    assert_eq!(url, ENDPOINT_AUTHORITY, "{case}");
+                    assert_scrubbed(case, &reason);
+                }
+                other => panic!("{case}: expected RpcUnreachable, got {other:?}"),
+            }
+        }
+    }
+
+    /// An XDR error on the poll step keeps only the echoed host and port.
+    #[test]
+    fn map_rpc_error_generic_scrubs_an_xdr_error() {
+        match map_rpc_error_generic(&xdr_error(), ENDPOINT, 30) {
+            WalletError::Protocol(ProtocolError::XdrCodecFailed { detail }) => {
+                assert_scrubbed("xdr", &detail);
+            }
+            other => panic!("expected XdrCodecFailed, got {other:?}"),
+        }
+    }
+
+    /// A JSON-RPC error object on the poll step keeps only the echoed host
+    /// and port in its reason.
+    #[test]
+    fn map_rpc_error_generic_scrubs_a_json_rpc_error_object() {
+        for (case, raw) in ERROR_OBJECTS {
+            match map_rpc_error_generic(&call_error(raw), ENDPOINT, 30) {
+                WalletError::Network(NetworkError::RpcUnreachable { url, reason }) => {
+                    assert_eq!(url, ENDPOINT_AUTHORITY, "{case}");
+                    assert_scrubbed(case, &reason);
+                }
+                other => panic!("{case}: expected RpcUnreachable, got {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn is_mainnet_url_detects_mainnet() {

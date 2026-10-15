@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Friendbot refusal names the starting-balance rule: Friendbot funds an
   account only when its balance is below the Friendbot starting balance.
 
+### Security
+
+- The network crate scrubs server-provided RPC error text before the text enters
+  a network error. Each `http`, `https`, `ws`, or `wss` URL in the text, and
+  each JSON-escaped form of these URLs, loses its scheme, userinfo, path, and
+  query. Such a URL reaches a CLI or MCP error envelope or a wallet log line as
+  host and port. The endpoint field of a network error keeps its scheme, host,
+  and port.
+
 ## [0.1.0-alpha.12] - 2026-10-15
 
 Consolidated test targets for smaller test builds, trustline approvals stored as trustline changes, read-only smart-account verbs without a signer, a multicall router built from an in-tree contract, and keyring failures reported with their cause. The rustls update to 0.23.46 resolves four advisories.

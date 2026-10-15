@@ -16,7 +16,7 @@ use stellar_xdr::LedgerKey;
 use tokio::time::Instant;
 
 use crate::fees::FeeStatsView;
-use crate::redact::redact_url_authority;
+use crate::redact::{redact_rpc_error, redact_rpc_error_display, redact_url_authority};
 use crate::retry::{RetryPolicy, is_retryable_send_error, retry_with_backoff};
 use crate::submit::MAINNET_PASSPHRASE;
 use crate::transaction_record::TransactionRecord;
@@ -78,16 +78,7 @@ impl StellarRpcClient {
     /// assert!(client.is_ok());
     /// ```
     pub fn new(url: &str) -> Result<Self, WalletError> {
-        let inner = Client::new(url).map_err(|e| {
-            // Redact the URL to authority-only so credentials embedded in a URL
-            // (e.g. `https://user:token@rpc.example.com`) are not emitted into
-            // logs or error messages.  The `NetworkError::RpcUnreachable.url`
-            // field carries the redacted authority form (scheme://host\[:port\]).
-            WalletError::Network(NetworkError::RpcUnreachable {
-                url: redact_url_authority(url),
-                reason: e.to_string(),
-            })
-        })?;
+        let inner = Client::new(url).map_err(|e| construction_failure(url, &e))?;
         Ok(Self {
             inner,
             url: url.to_owned(),
@@ -128,10 +119,7 @@ impl StellarRpcClient {
         self.inner
             .get_ledger_entries(keys)
             .await
-            .map_err(|e| NetworkError::RpcUnreachable {
-                url: self.redacted_url(),
-                reason: format!("getLedgerEntries failed: {e}"),
-            })
+            .map_err(|e| rpc_unreachable(&self.url, GET_LEDGER_ENTRIES_FAILED, &e))
     }
 
     /// Fetches Stellar RPC `getFeeStats` and maps it to [`FeeStatsView`].
@@ -142,14 +130,11 @@ impl StellarRpcClient {
     /// cannot be mapped.  The `url` field in the error is authority-only
     /// (scheme://host\[:port\]).
     pub async fn get_fee_stats(&self) -> Result<FeeStatsView, NetworkError> {
-        let response =
-            self.inner
-                .get_fee_stats()
-                .await
-                .map_err(|e| NetworkError::RpcUnreachable {
-                    url: self.redacted_url(),
-                    reason: e.to_string(),
-                })?;
+        let response = self
+            .inner
+            .get_fee_stats()
+            .await
+            .map_err(|e| rpc_unreachable(&self.url, "", &e))?;
         FeeStatsView::from_rpc(&response)
     }
 
@@ -168,10 +153,7 @@ impl StellarRpcClient {
         self.inner
             .get_health()
             .await
-            .map_err(|e| NetworkError::RpcUnreachable {
-                url: self.redacted_url(),
-                reason: format!("getHealth failed: {e}"),
-            })
+            .map_err(|e| rpc_unreachable(&self.url, GET_HEALTH_FAILED, &e))
     }
 
     /// Asks the endpoint what became of one transaction.
@@ -223,10 +205,7 @@ impl StellarRpcClient {
     ) -> Result<TransactionRecord, NetworkError> {
         self.get_transaction_record(hash)
             .await
-            .map_err(|e| NetworkError::RpcUnreachable {
-                url: self.redacted_url(),
-                reason: format!("getTransaction failed: {e}"),
-            })
+            .map_err(|e| rpc_unreachable(&self.url, GET_TRANSACTION_FAILED, &e))
     }
 
     /// Issues `getTransaction` through the RPC client's JSON-RPC transport
@@ -335,5 +314,168 @@ impl StellarRpcClient {
     /// (e.g. `https://user:token@rpc.example.com`).
     fn redacted_url(&self) -> String {
         redact_url_authority(&self.url)
+    }
+}
+
+/// Builds the error for a transport that refuses to construct for `url`.
+///
+/// The `url` field carries the authority form (scheme://host\[:port\]). Credentials
+/// embedded in a URL, for example `https://user:token@rpc.example.com`, therefore
+/// reach no log or error message. The reason goes through the same scrub as
+/// every other RPC failure.
+fn construction_failure(url: &str, e: &stellar_rpc_client::Error) -> WalletError {
+    WalletError::Network(rpc_unreachable(url, "", e))
+}
+
+/// The reason prefix of a failed `getLedgerEntries` call.
+pub(crate) const GET_LEDGER_ENTRIES_FAILED: &str = "getLedgerEntries failed: ";
+
+/// The reason prefix of a failed `getHealth` call.
+const GET_HEALTH_FAILED: &str = "getHealth failed: ";
+
+/// The reason prefix of a failed `getTransaction` call.
+const GET_TRANSACTION_FAILED: &str = "getTransaction failed: ";
+
+/// The reason prefix of an unexpected status met while recovering a stale
+/// pending receipt.
+pub(crate) const STALE_PENDING_RECOVERY: &str = "stale-Pending recovery: ";
+
+/// Builds [`NetworkError::RpcUnreachable`] for a failed call to the RPC
+/// endpoint at `url`.
+///
+/// The `url` field holds only the endpoint's scheme, host, and port. The
+/// reason is `prefix` followed by the display of `e`, scrubbed with
+/// [`redact_rpc_error_display`]. That display carries the server's JSON-RPC
+/// error `message` and raw `data`. A server or proxy can echo the
+/// credential-bearing request URL there.
+pub(crate) fn rpc_unreachable(
+    url: &str,
+    prefix: &str,
+    e: &stellar_rpc_client::Error,
+) -> NetworkError {
+    NetworkError::RpcUnreachable {
+        url: redact_url_authority(url),
+        reason: format!("{prefix}{}", redact_rpc_error_display(e)),
+    }
+}
+
+/// Builds [`NetworkError::RpcUnreachable`] for a `getTransaction` answer from
+/// the endpoint at `url` whose status is none of `SUCCESS`, `FAILED`, and
+/// `NOT_FOUND`.
+///
+/// The status is the endpoint's own text, so it enters the reason scrubbed
+/// with [`redact_rpc_error`], after `prefix`.
+pub(crate) fn unexpected_status(url: &str, prefix: &str, status: &str) -> NetworkError {
+    NetworkError::RpcUnreachable {
+        url: redact_url_authority(url),
+        reason: format!(
+            "{prefix}unexpected getTransaction status: {}",
+            redact_rpc_error(status)
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test-only; panics and unwraps are acceptable in unit tests"
+    )]
+
+    use super::*;
+    use crate::redact::rpc_error_fixtures::{
+        ECHOED_URL, ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_error,
+    };
+
+    fn unreachable_parts(err: NetworkError) -> (String, String) {
+        match err {
+            NetworkError::RpcUnreachable { url, reason } => (url, reason),
+            other => panic!("expected RpcUnreachable, got {other:?}"),
+        }
+    }
+
+    /// Every prefix the client's call sites pass keeps its place, and the
+    /// server text after it keeps only the echoed host and port.
+    #[test]
+    fn rpc_unreachable_scrubs_the_server_text_after_each_prefix() {
+        let prefixes = [
+            "",
+            GET_LEDGER_ENTRIES_FAILED,
+            GET_HEALTH_FAILED,
+            GET_TRANSACTION_FAILED,
+        ];
+        for prefix in prefixes {
+            for (case, raw) in ERROR_OBJECTS {
+                let (url, reason) =
+                    unreachable_parts(rpc_unreachable(ENDPOINT, prefix, &call_error(raw)));
+                assert_eq!(
+                    url, ENDPOINT_AUTHORITY,
+                    "{case}: the endpoint keeps its authority"
+                );
+                assert!(
+                    reason.starts_with(prefix),
+                    "{case}: the prefix stays: {reason}"
+                );
+                assert!(
+                    reason.contains("ErrorObject"),
+                    "{case}: the reason still names the error object: {reason}"
+                );
+                assert_scrubbed(case, &reason);
+            }
+        }
+    }
+
+    /// A construction failure whose error text holds a URL keeps only that
+    /// URL's host and port in the reason, and the endpoint keeps only its
+    /// authority. The error is synthetic: the mapping is the same for every
+    /// error the transport returns.
+    #[test]
+    fn construction_failure_scrubs_its_reason() {
+        let e = stellar_rpc_client::Error::InvalidUrl(format!("refused {ECHOED_URL}"));
+        let WalletError::Network(err) = construction_failure(ENDPOINT, &e) else {
+            panic!("a construction failure is a network error");
+        };
+        let (url, reason) = unreachable_parts(err);
+        assert_eq!(url, ENDPOINT_AUTHORITY);
+        assert_scrubbed("construction", &reason);
+    }
+
+    /// A URL the transport refuses to parse fails construction with the
+    /// stable code, and the credentials it carried reach neither field.
+    #[test]
+    fn new_with_an_unparseable_credentialed_url_reports_rpc_unreachable() {
+        let err = StellarRpcClient::new("https://user:SECRET@archive example.com/rpc?token=SECRET")
+            .err()
+            .expect("a URL with a space in its host must not construct");
+        assert_eq!(err.code(), "network.rpc_unreachable");
+        let rendered = err.to_string();
+        for leaked in ["SECRET", "token=", "user:"] {
+            assert!(
+                !rendered.contains(leaked),
+                "{leaked} reached the error: {rendered}"
+            );
+        }
+    }
+
+    /// A status the endpoint invented enters the reason scrubbed, after the
+    /// prefix and the fixed wording.
+    #[test]
+    fn unexpected_status_scrubs_the_status_text() {
+        for prefix in ["", STALE_PENDING_RECOVERY] {
+            let (url, reason) = unreachable_parts(unexpected_status(
+                ENDPOINT,
+                prefix,
+                &format!("PENDING {ECHOED_URL}"),
+            ));
+            assert_eq!(url, ENDPOINT_AUTHORITY);
+            assert_eq!(
+                reason,
+                format!(
+                    "{prefix}unexpected getTransaction status: PENDING archive.example.com:8443"
+                )
+            );
+        }
     }
 }

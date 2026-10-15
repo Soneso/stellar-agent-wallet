@@ -46,6 +46,8 @@ mod pay_live;
 mod redaction_audit;
 #[path = "network/retry_backoff_integration.rs"]
 mod retry_backoff_integration;
+#[path = "network/rpc_error_text_redaction.rs"]
+mod rpc_error_text_redaction;
 #[path = "network/sep29_cross_rpc_integration.rs"]
 mod sep29_cross_rpc_integration;
 #[path = "network/sign_with_ledger_no_keyring_lookup.rs"]

@@ -44,9 +44,9 @@ use stellar_xdr::{
 };
 
 use crate::builder::Asset;
-use crate::client::StellarRpcClient;
+use crate::client::{GET_LEDGER_ENTRIES_FAILED, StellarRpcClient, rpc_unreachable};
 use crate::counterparty::validation::is_valid_ldh_home_domain;
-use crate::redact::redact_url_authority;
+use crate::redact::{redact_rpc_error_display, redact_url_authority};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AccountView and sub-types
@@ -824,12 +824,7 @@ pub(crate) async fn fetch_account_signers(
         client.inner.get_ledger_entries(&keys).await
     })
     .await
-    .map_err(|e| {
-        WalletError::Network(NetworkError::RpcUnreachable {
-            url: redact_url_authority(&client.url),
-            reason: format!("getLedgerEntries failed: {e}"),
-        })
-    })?;
+    .map_err(|e| map_signer_fetch_error(&e, &client.url))?;
 
     let entries = response.entries.unwrap_or_default();
     let mut signers_by_account: BTreeMap<String, Vec<[u8; 32]>> = BTreeMap::new();
@@ -1275,6 +1270,9 @@ pub async fn fetch_data_entry(
 /// Maps a generic `stellar_rpc_client::Error` to a [`WalletError`] without
 /// an account-ID context. Used by operations that are not account-specific
 /// (e.g. data-entry lookups that already validated the account separately).
+///
+/// Every text field takes the error display scrubbed with
+/// [`redact_rpc_error_display`], because that display can carry server text.
 fn map_rpc_error_generic(e: &RpcError, url: &str) -> WalletError {
     match e {
         RpcError::TransactionSubmissionTimeout => WalletError::Network(NetworkError::RpcTimeout {
@@ -1282,13 +1280,16 @@ fn map_rpc_error_generic(e: &RpcError, url: &str) -> WalletError {
             timeout_secs: 30,
         }),
         RpcError::Xdr(_) => WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: e.to_string(),
+            detail: redact_rpc_error_display(e),
         }),
-        _ => WalletError::Network(NetworkError::RpcUnreachable {
-            url: redact_url_authority(url),
-            reason: e.to_string(),
-        }),
+        _ => WalletError::Network(rpc_unreachable(url, "", e)),
     }
+}
+
+/// Maps a failed signer-set `getLedgerEntries` read against the endpoint at
+/// `url` to [`NetworkError::RpcUnreachable`], with the server text scrubbed.
+fn map_signer_fetch_error(e: &RpcError, url: &str) -> WalletError {
+    WalletError::Network(rpc_unreachable(url, GET_LEDGER_ENTRIES_FAILED, e))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1299,12 +1300,62 @@ fn map_rpc_error_generic(e: &RpcError, url: &str) -> WalletError {
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
-    reason = "test-only; assertions via unwrap/expect are idiomatic in unit tests"
+    clippy::panic,
+    reason = "test-only; assertions via unwrap/expect/panic are idiomatic in unit tests"
 )]
 mod tests {
     use stellar_agent_core::STROOPS_PER_XLM;
 
     use super::*;
+    use crate::redact::rpc_error_fixtures::{
+        ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_error, xdr_error,
+    };
+
+    /// A JSON-RPC error object whose text holds a credential-bearing URL maps
+    /// to a reason that keeps only that URL's host and port.
+    #[test]
+    fn map_rpc_error_generic_scrubs_a_json_rpc_error_object() {
+        for (case, raw) in ERROR_OBJECTS {
+            match map_rpc_error_generic(&call_error(raw), ENDPOINT) {
+                WalletError::Network(NetworkError::RpcUnreachable { url, reason }) => {
+                    assert_eq!(url, ENDPOINT_AUTHORITY, "{case}");
+                    assert_scrubbed(case, &reason);
+                }
+                other => panic!("{case}: expected RpcUnreachable, got {other:?}"),
+            }
+        }
+    }
+
+    /// An XDR error whose text holds a credential-bearing URL maps to a
+    /// detail that keeps only that URL's host and port.
+    #[test]
+    fn map_rpc_error_generic_scrubs_an_xdr_error() {
+        match map_rpc_error_generic(&xdr_error(), ENDPOINT) {
+            WalletError::Protocol(ProtocolError::XdrCodecFailed { detail }) => {
+                assert_scrubbed("xdr", &detail);
+            }
+            other => panic!("expected XdrCodecFailed, got {other:?}"),
+        }
+    }
+
+    /// A failed signer-set read keeps its prefix and only the echoed host and
+    /// port of the server text.
+    #[test]
+    fn map_signer_fetch_error_scrubs_the_server_text() {
+        for (case, raw) in ERROR_OBJECTS {
+            match map_signer_fetch_error(&call_error(raw), ENDPOINT) {
+                WalletError::Network(NetworkError::RpcUnreachable { url, reason }) => {
+                    assert_eq!(url, ENDPOINT_AUTHORITY, "{case}");
+                    assert!(
+                        reason.starts_with("getLedgerEntries failed: "),
+                        "{case}: the prefix stays: {reason}"
+                    );
+                    assert_scrubbed(case, &reason);
+                }
+                other => panic!("{case}: expected RpcUnreachable, got {other:?}"),
+            }
+        }
+    }
 
     // ─── balance_stroops unit tests ───────────────────────────────────────────
 
