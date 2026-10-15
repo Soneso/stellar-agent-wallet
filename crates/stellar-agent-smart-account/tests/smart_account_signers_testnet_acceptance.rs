@@ -205,21 +205,29 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
     (Arc::new(Mutex::new(writer)), path, dir)
 }
 
-/// Counts `(SaSignerRemovedV2, SaThresholdChangedV2)` rows across the verified audit chain.
-fn signer_mutation_counts(audit_writer: &Arc<Mutex<AuditWriter>>) -> (usize, usize) {
+/// Returns every audit row in chain order after verifying the complete chain.
+fn verified_audit_entries(audit_writer: &Arc<Mutex<AuditWriter>>) -> Vec<AuditEntry> {
     let writer = audit_writer.lock().expect("audit writer lock");
     let verified = verify_log(writer.path(), None).expect("audit log must verify");
-    let mut signer_removed_count = 0;
-    let mut threshold_changed_count = 0;
+    let mut entries = Vec::new();
     for file in verified.per_file {
         let contents = std::fs::read_to_string(file.path).expect("audit log must be readable");
         for line in contents.lines().filter(|line| !line.trim().is_empty()) {
-            let entry: AuditEntry = serde_json::from_str(line).expect("audit row must parse");
-            match entry.event_kind {
-                EventKind::SaSignerRemovedV2 { .. } => signer_removed_count += 1,
-                EventKind::SaThresholdChangedV2 { .. } => threshold_changed_count += 1,
-                _ => {}
-            }
+            entries.push(serde_json::from_str(line).expect("audit row must parse"));
+        }
+    }
+    entries
+}
+
+/// Counts `(SaSignerRemovedV2, SaThresholdChangedV2)` rows across the verified audit chain.
+fn signer_mutation_counts(audit_writer: &Arc<Mutex<AuditWriter>>) -> (usize, usize) {
+    let mut signer_removed_count = 0;
+    let mut threshold_changed_count = 0;
+    for entry in verified_audit_entries(audit_writer) {
+        match entry.event_kind {
+            EventKind::SaSignerRemovedV2 { .. } => signer_removed_count += 1,
+            EventKind::SaThresholdChangedV2 { .. } => threshold_changed_count += 1,
+            _ => {}
         }
     }
     (signer_removed_count, threshold_changed_count)
@@ -913,37 +921,22 @@ async fn b3_divergence_detection_via_injected_baseline() {
 
     // Audit-row assertion: `verify_signer_set_against_chain` MUST have emitted
     // a `SaSignerSetDiverged` audit row in addition to returning the typed error.
-    // Scan the raw log file for an entry with EventKind::SaSignerSetDiverged and
+    // Scan the verified chain for an entry with EventKind::SaSignerSetDiverged and
     // assert the forensic-correlation fields are correctly populated.
     //
     // This asserts the dual-reporting contract (typed error to caller + audit row to log)
     // and that the forensic-field content is correctly populated.
     {
-        use std::fs;
-        use std::io::{BufRead, BufReader};
-        use stellar_agent_core::audit_log::entry::AuditEntry;
-
-        let writer_guard = audit_writer.lock().expect("audit writer lock");
-        let log_path = writer_guard.path().to_path_buf();
-        drop(writer_guard);
-
-        let file = fs::File::open(&log_path).expect("audit log file must exist after verify call");
-        let reader = BufReader::new(file);
         let mut found_diverged_row = false;
-        for line in reader.lines() {
-            let line = line.expect("audit log line must be valid UTF-8");
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line)
-                && let EventKind::SaSignerSetDiverged {
-                    expected_signer_set_digest,
-                    observed_signer_set_digest,
-                    smart_account_redacted: row_sa_redacted,
-                    expected_threshold,
-                    observed_threshold,
-                    ..
-                } = &entry.event_kind
+        for entry in verified_audit_entries(&audit_writer) {
+            if let EventKind::SaSignerSetDiverged {
+                expected_signer_set_digest,
+                observed_signer_set_digest,
+                smart_account_redacted: row_sa_redacted,
+                expected_threshold,
+                observed_threshold,
+                ..
+            } = &entry.event_kind
             {
                 // a. Both digest fields must match the canonical <16hex>...<16hex> format.
                 assert!(
@@ -1019,7 +1012,6 @@ async fn b3_divergence_detection_via_injected_baseline() {
 /// - [`build_external_signer_scval`] encodes this layout.
 #[tokio::test]
 async fn b7_add_external_signer_to_existing_rule() {
-    use std::io::{BufRead, BufReader};
     use stellar_agent_smart_account::deployment::{
         ResolvedFeePerOp, WebAuthnVerifierDeployArgs, deploy_webauthn_verifier,
     };
@@ -1191,26 +1183,14 @@ async fn b7_add_external_signer_to_existing_rule() {
         key_data_len: u32::try_from(key_data.len()).expect("key data length fits u32"),
     };
     {
-        let writer_guard = audit_writer.lock().expect("audit writer lock");
-        let log_path = writer_guard.path().to_path_buf();
-        drop(writer_guard);
-
-        let file =
-            std::fs::File::open(&log_path).expect("audit log file must exist after add_signer");
-        let reader = BufReader::new(file);
         let mut found = false;
-        for line in reader.lines() {
-            let line = line.expect("audit line must be valid UTF-8");
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line)
-                && let EventKind::SaSignerAddedV2 {
-                    rule_id: row_rule_id,
-                    signer_id: row_id,
-                    snapshot,
-                    ..
-                } = &entry.event_kind
+        for entry in verified_audit_entries(&audit_writer) {
+            if let EventKind::SaSignerAddedV2 {
+                rule_id: row_rule_id,
+                signer_id: row_id,
+                snapshot,
+                ..
+            } = &entry.event_kind
                 && *row_rule_id == rule_id
                 && *row_id == new_signer_id
             {
@@ -1270,7 +1250,6 @@ async fn b7_add_external_signer_to_existing_rule() {
 /// - `Signer::External(Address, Bytes)` ScVal encoding (no WebAuthn variant on-chain).
 #[tokio::test]
 async fn b8_add_webauthn_signer_to_existing_rule() {
-    use std::io::{BufRead, BufReader};
     use stellar_agent_smart_account::deployment::{
         ResolvedFeePerOp, WebAuthnVerifierDeployArgs, deploy_webauthn_verifier,
     };
@@ -1443,26 +1422,14 @@ async fn b8_add_webauthn_signer_to_existing_rule() {
         key_data_len: u32::try_from(key_data.len()).expect("key data length fits u32"),
     };
     {
-        let writer_guard = audit_writer.lock().expect("audit writer lock");
-        let log_path = writer_guard.path().to_path_buf();
-        drop(writer_guard);
-
-        let file =
-            std::fs::File::open(&log_path).expect("audit log file must exist after add_signer");
-        let reader = BufReader::new(file);
         let mut found = false;
-        for line in reader.lines() {
-            let line = line.expect("audit line must be valid UTF-8");
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line)
-                && let EventKind::SaSignerAddedV2 {
-                    rule_id: row_rule_id,
-                    signer_id: row_id,
-                    snapshot,
-                    ..
-                } = &entry.event_kind
+        for entry in verified_audit_entries(&audit_writer) {
+            if let EventKind::SaSignerAddedV2 {
+                rule_id: row_rule_id,
+                signer_id: row_id,
+                snapshot,
+                ..
+            } = &entry.event_kind
                 && *row_rule_id == rule_id
                 && *row_id == new_signer_id
             {
@@ -1753,7 +1720,6 @@ async fn b5_a_policyless_rule_baselines_without_a_threshold() {
 /// writer-sharing architecture, not an on-chain contract surface.
 #[tokio::test(flavor = "multi_thread")]
 async fn b6_audit_log_request_id_pairing_across_divergence_emit() {
-    use std::io::{BufRead, BufReader};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     let (signer_g, signer_box) = fresh_signer();
@@ -1859,30 +1825,12 @@ async fn b6_audit_log_request_id_pairing_across_divergence_emit() {
 
     // ── Scan audit rows for request_id pairing ────────────────────────────────
 
-    // Drop the lock guard if any (the managers released it; scanning is safe).
-    let log_path = {
-        let guard = audit_writer.lock().expect("audit writer lock for path");
-        guard.path().to_path_buf()
-    };
-
-    let file = std::fs::File::open(&log_path)
-        .expect("audit log file must exist after sign_with_passkey_rule");
-    let reader = BufReader::new(file);
-
     // Retain the full entry for each row so we can check both request_id AND
     // smart_account_redacted across the two-row set (forensic-correlation invariant).
     let mut diverged_entry: Option<AuditEntry> = None;
     let mut assertion_entry: Option<AuditEntry> = None;
 
-    for line in reader.lines() {
-        let line = line.expect("audit log line must be valid UTF-8");
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) else {
-            continue;
-        };
-
+    for entry in verified_audit_entries(&audit_writer) {
         match &entry.event_kind {
             EventKind::SaSignerSetDiverged { .. } => {
                 diverged_entry = Some(entry);
