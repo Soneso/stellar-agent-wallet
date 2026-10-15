@@ -18,10 +18,11 @@ use stellar_agent_core::{
 };
 use stellar_agent_mcp_macros::mcp_tool_router;
 use stellar_agent_mpp::{
-    ApprovalDisposition, ChallengeInput, MppAuthorizationStore, MppError, MppErrorCode,
-    ReceiptInput, StellarReconciliationRpc, StellarSponsoredRpc, authorization_status,
-    commit_authorization, mpp_value_effects, parse_receipt, persist_prepared_authorization,
-    prepare_sponsored, reconcile_transaction, select_and_validate, verify_pending_approval,
+    ApprovalDisposition, AuthorizationRecord, ChallengeInput, MppAuthorizationStore, MppError,
+    MppErrorCode, ReceiptInput, StellarReconciliationRpc, StellarSponsoredRpc,
+    authorization_status, commit_authorization, mpp_value_effects, parse_receipt,
+    persist_prepared_authorization, prepare_sponsored, reconcile_transaction, select_and_validate,
+    verify_pending_approval,
 };
 use stellar_agent_network::keyring::lazy_signer_from_keyring;
 use stellar_agent_nonce::Nonce;
@@ -126,12 +127,12 @@ impl WalletServer {
         let effects = mpp_value_effects(prepared.selected());
         let args_value = serde_json::to_value(&args)
             .map_err(|_| rmcp::ErrorData::invalid_params("invalid MPP arguments", None))?;
-        let disposition = match self
+        let mut disposition = match self
             .dispatch_gate_with_value(
                 "stellar_mpp_charge_prepare",
                 &args_value,
                 "stellar:testnet",
-                ValueClass::Value(effects),
+                ValueClass::Value(effects.clone()),
                 None,
                 None,
             )
@@ -141,6 +142,47 @@ impl WalletServer {
             Ok(DispatchOutcome::RequireApproval(_)) => ApprovalDisposition::RequireApproval,
             Err(error) => return error.into_result(),
         };
+
+        // As in `paired_commit_outcome`, only a commit RequireApproval parks a request.
+        if disposition == ApprovalDisposition::Allow {
+            match AuthorizationRecord::new(
+                &args.profile,
+                self.context.network_passphrase(),
+                &prepared,
+                now_unix,
+            ) {
+                Ok(record) => match self
+                    .evaluate_policy_only(
+                        "stellar_mpp_charge_commit",
+                        &json!({"authorization_id": record.authorization_id()}),
+                        "stellar:testnet",
+                        Some(ValueClass::Value(effects)),
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(evaluation) => {
+                        if matches!(
+                            evaluation.decision,
+                            stellar_agent_core::policy::Decision::RequireApproval(_)
+                        ) {
+                            disposition = ApprovalDisposition::RequireApproval;
+                        }
+                    }
+                    Err(error) => tracing::debug!(
+                        tool = "stellar_mpp_charge_commit",
+                        error_code = %error.code(),
+                        "stellar_mpp_charge_prepare: commit policy evaluation failed; disposition unchanged"
+                    ),
+                },
+                Err(error) => tracing::debug!(
+                    tool = "stellar_mpp_charge_commit",
+                    error_code = error.code(),
+                    "stellar_mpp_charge_prepare: authorization record not derivable; disposition unchanged"
+                ),
+            }
+        }
 
         // Successful simulation precedes lazy MPP key creation.
         let state = match MppAuthorizationStore::open_for_prepare(

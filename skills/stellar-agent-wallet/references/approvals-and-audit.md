@@ -10,12 +10,19 @@ surface that drives the simulate/commit handshake see `./mcp-tools.md`.
 Every tool/command invocation is evaluated by the active policy engine before
 any RPC call or signature. The engine returns Allow, Deny, or RequireApproval.
 A RequireApproval action does not execute on the agent's say-so: it is held in a
-per-profile pending-approval store and returns an `approval_nonce`. The wallet
-owner runs `stellar-agent approve --id <nonce> --profile <name>` out-of-band in a trusted
+per-profile pending-approval store. For pay, create-account, trustline, and
+claim, simulation records a pending approval when policy requires approval for
+either the simulate tool or its paired commit tool, and returns an
+`approval_nonce`. The wallet owner runs
+`stellar-agent approve --id <nonce> --profile <name>` out-of-band in a trusted
 context, reads a wallet-controlled summary, and consents. The command records an
 HMAC attestation bound to the profile name, CAIP-2 chain id, exact envelope, nonce, and
 local user, and returns `approval_attestation`. The agent presents that blob to
 the matching `*_commit` tool, which constant-time-verifies it before executing.
+MPP prepare records a request when policy requires approval for prepare or
+`stellar_mpp_charge_commit`, and its preview returns the nonce as
+`authorization.approval_id`. After the operator approves that nonce, charge
+commit reads the recorded attestation from the store; the agent passes none.
 Transaction submissions, signed authorizations, approvals, and explicit
 key-management and lifecycle events enter a hash-chained audit log.
 MCP balance reads and payment simulations produce no automatic invocation row.
@@ -379,9 +386,11 @@ challenge, receipt, XDR, or signature.
 `MppChargeSimulated` is a dedicated short-lived approval kind. It binds the
 authorization fingerprint, prepared artifact hash, profile, testnet, payer,
 transport authority/target, amount, token, recipient, simulated fee, and
-challenge expiry. Local and remote views redact payer/recipient. A policy change
-from allow to require-approval promotes the stored authorization into this flow;
-commit cannot sign until the matching attestation exists.
+challenge expiry. Local and remote views redact payer/recipient. Prepare records
+the request when policy requires approval for prepare or charge commit. Commit
+re-evaluates its own tool name against current state and requires the matching
+attestation. An exhausted cap returns `policy.deny.per_period_cap_exceeded`.
+The loaded policy document stays fixed for the server's lifetime.
 
 Each entry's hash is computed over its own canonical JSON (with the previous-hash
 field treated as empty) concatenated with the previous entry's hash, chaining

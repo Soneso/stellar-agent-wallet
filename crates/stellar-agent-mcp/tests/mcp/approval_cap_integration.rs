@@ -43,6 +43,9 @@ const AMOUNT: i128 = 60_000_000;
 const ATTESTATION_KEY: [u8; 32] = [0xD2; 32];
 const DEST: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 const USDC_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+/// A destination whose on-chain home domain no cached `stellar.toml` resolves.
+const DOMAIN_DEST: &str = "GBRWGY3DMNRWGY3DMNRWGY3DMNRWGY3DMNRWGY3DMNRWGY3DMNRWHOI2";
+const UNRESOLVED_HOME_DOMAIN: &str = "unresolved.example";
 
 fn claim_entry(source: &str) -> (String, String) {
     use stellar_xdr::{
@@ -74,6 +77,22 @@ fn claim_entry(source: &str) -> (String, String) {
         key.to_xdr_base64(Limits::none()).unwrap(),
         entry.to_xdr_base64(Limits::none()).unwrap(),
     )
+}
+
+/// An account entry for `account` whose on-chain `home_domain` is `domain`.
+fn home_domain_account_entry(account: &str, domain: &str) -> String {
+    use stellar_xdr::{LedgerEntryData, Limits, ReadXdr, String32, WriteXdr};
+    let LedgerEntryData::Account(mut entry) = LedgerEntryData::from_xdr_base64(
+        account_entry_xdr_with_seq(account, 500_000_000_000, 0, 42),
+        Limits::none(),
+    )
+    .unwrap() else {
+        panic!("the account fixture decodes to an account entry");
+    };
+    entry.home_domain = String32::try_from(domain.as_bytes().to_vec()).unwrap();
+    LedgerEntryData::Account(entry)
+        .to_xdr_base64(Limits::none())
+        .unwrap()
 }
 
 fn result_json(result: &CallToolResult) -> Value {
@@ -138,7 +157,7 @@ struct Harness {
     signer_reads: Arc<AtomicI64>,
     policy_dir: TempDir,
     approval_dir: TempDir,
-    _rpc: MockServer,
+    rpc: MockServer,
     _root: crate::common::IsolatedDataRoot,
 }
 
@@ -163,6 +182,26 @@ impl Harness {
         approval_fields: &str,
         chain: &str,
     ) -> Self {
+        let rules = format!(
+            r#"[[rules]]
+match = {{ tool = "stellar_transaction_status", chain = "*" }}
+criteria = []
+decision = "allow"
+[[rules]]
+match = {{ tool = "*", chain = "{chain}" }}
+criteria = [{{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 100000000 }}]
+decision = "{decision}"
+{approval_fields}
+[[rules]]
+match = {{ tool = "*", chain = "*" }}
+criteria = []
+decision = "allow"
+"#
+        );
+        Self::with_rules(name, outcome, &rules).await
+    }
+
+    async fn with_rules(name: &str, outcome: Outcome, rules: &str) -> Self {
         let root = crate::common::isolated_data_root();
         let signer_reads = Arc::new(AtomicI64::new(0));
         let observed_reads = Arc::clone(&signer_reads);
@@ -202,24 +241,7 @@ impl Harness {
             &signer.verifying_key().to_bytes(),
         );
 
-        let body = format!(
-            r#"version = 1
-scope = "profile:{name}"
-[[rules]]
-match = {{ tool = "stellar_transaction_status", chain = "*" }}
-criteria = []
-decision = "allow"
-[[rules]]
-match = {{ tool = "*", chain = "{chain}" }}
-criteria = [{{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 100000000 }}]
-decision = "{decision}"
-{approval_fields}
-[[rules]]
-match = {{ tool = "*", chain = "*" }}
-criteria = []
-decision = "allow"
-"#
-        );
+        let body = format!("version = 1\nscope = \"profile:{name}\"\n{rules}");
         let signature = hex::encode(
             signer
                 .sign(&digest(&canonical_bytes(&body).unwrap()))
@@ -274,6 +296,10 @@ decision = "allow"
                 account_ledger_key_xdr(DEST),
                 account_entry_xdr_with_seq(DEST, 500_000_000_000, 0, 42),
             ),
+            (
+                account_ledger_key_xdr(DOMAIN_DEST),
+                home_domain_account_entry(DOMAIN_DEST, UNRESOLVED_HOME_DOMAIN),
+            ),
         ]);
             responder.respond(request)
         }).mount(&rpc).await;
@@ -287,7 +313,7 @@ decision = "allow"
             signer_reads,
             policy_dir,
             approval_dir,
-            _rpc: rpc,
+            rpc,
             _root: root,
         }
     }
@@ -859,6 +885,15 @@ async fn approved_trustline_preserves_non_debit_audit_leg() {
     );
     h.assert_legs("value_action_pending", "trustline", None);
     h.assert_legs("value_action_submitted", "trustline", None);
+    let rows = crate::common::audit_rows(&h.profile);
+    for kind in ["value_action_pending", "value_action_submitted"] {
+        let row = crate::common::rows_of_kind(&rows, kind)[0];
+        assert_eq!(
+            row["legs"][0]["asset"],
+            format!("USDC:{USDC_ISSUER}"),
+            "{kind}: {row}"
+        );
+    }
 }
 
 /// Submission rows retain the decision and approval binding of the gate.
@@ -1314,4 +1349,533 @@ async fn trustline_commit_refuses_payment_approval_for_same_envelope() {
         "{result}"
     );
     assert!(h.sends.lock().unwrap().is_empty());
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ClassicPair {
+    Pay,
+    CreateAccount,
+    Trustline,
+    Claim,
+}
+
+impl ClassicPair {
+    fn tool(self) -> &'static str {
+        match self {
+            Self::Pay => "stellar_pay",
+            Self::CreateAccount => "stellar_create_account",
+            Self::Trustline => "stellar_trustline",
+            Self::Claim => "stellar_claim",
+        }
+    }
+
+    fn args(self, h: &Harness) -> Value {
+        match self {
+            Self::Pay => json!({"chain_id":"stellar:testnet", "source":h.source,
+                "destination":DEST, "asset":"native", "amount_in_stroops":AMOUNT.to_string()}),
+            Self::CreateAccount => json!({"chain_id":"stellar:testnet", "source":h.source,
+                "destination":stellar_strkey::ed25519::PublicKey([0x62; 32]).to_string().to_string(),
+                "starting_balance":"6 XLM"}),
+            Self::Trustline => json!({"chain_id":"stellar:testnet", "from":h.source,
+                "asset":"USDC", "limit_stroops":"1000000000"}),
+            Self::Claim => json!({"chain_id":"stellar:testnet", "source_account":h.source,
+                "balance_id":"ab".repeat(32)}),
+        }
+    }
+
+    async fn simulate(self, h: &Harness) -> Value {
+        let args = self.args(h);
+        let result = match self {
+            Self::Pay => {
+                h.server
+                    .call_stellar_pay(serde_json::from_value(args).unwrap())
+                    .await
+            }
+            Self::CreateAccount => {
+                h.server
+                    .call_stellar_create_account(serde_json::from_value(args).unwrap())
+                    .await
+            }
+            Self::Trustline => {
+                h.server
+                    .call_stellar_trustline(serde_json::from_value(args).unwrap())
+                    .await
+            }
+            Self::Claim => {
+                h.server
+                    .call_stellar_claim(serde_json::from_value(args).unwrap())
+                    .await
+            }
+        }
+        .unwrap();
+        result_json(&result)
+    }
+
+    async fn commit(self, h: &Harness, data: &Value, approval: Option<(String, String)>) -> Value {
+        let mut args = self.args(h);
+        for field in ["nonce", "expires_at_unix_ms", "envelope_xdr"] {
+            args[field] = data[field].clone();
+        }
+        if let Some((nonce, attestation)) = approval {
+            args["approval_nonce"] = json!(nonce);
+            args["approval_attestation"] = json!(attestation);
+        }
+        let result = match self {
+            Self::Pay => {
+                h.server
+                    .call_stellar_pay_commit(serde_json::from_value(args).unwrap())
+                    .await
+            }
+            Self::CreateAccount => {
+                h.server
+                    .call_stellar_create_account_commit(serde_json::from_value(args).unwrap())
+                    .await
+            }
+            Self::Trustline => {
+                h.server
+                    .call_stellar_trustline_commit(serde_json::from_value(args).unwrap())
+                    .await
+            }
+            Self::Claim => {
+                h.server
+                    .call_stellar_claim_commit(serde_json::from_value(args).unwrap())
+                    .await
+            }
+        }
+        .unwrap();
+        result_json(&result)
+    }
+
+    fn assert_pending(self, h: &Harness, data: &Value, ttl: u64, reason: &str) {
+        use stellar_agent_core::approval::ApprovalKind;
+        let store =
+            PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
+                .unwrap();
+        let approval = &data["approval"];
+        let nonce = approval["approval_nonce"]
+            .as_str()
+            .expect("paired commit requests approval");
+        let entry = store.get(nonce).expect("pending approval is durable");
+        let digest = match (self, &entry.kind) {
+            (
+                Self::Pay | Self::CreateAccount,
+                ApprovalKind::PaymentSimulated {
+                    envelope_sha256_hex,
+                    ..
+                },
+            )
+            | (
+                Self::Trustline,
+                ApprovalKind::TrustlineSimulated {
+                    envelope_sha256_hex,
+                    ..
+                },
+            )
+            | (
+                Self::Claim,
+                ApprovalKind::ClaimSimulated {
+                    envelope_sha256_hex,
+                    ..
+                },
+            ) => envelope_sha256_hex,
+            _ => panic!("wrong approval kind for {self:?}: {:?}", entry.kind),
+        };
+        assert_eq!(
+            digest,
+            &hex::encode(envelope_sha256(
+                data["envelope_xdr"].as_str().unwrap().as_bytes()
+            ))
+        );
+        assert_eq!(entry.expires_at_unix_ms - entry.created_at_unix_ms, ttl);
+        assert_eq!(entry.reason.as_deref(), Some(reason));
+        assert_eq!(approval["reason"], reason);
+        assert_eq!(approval["expires_at_unix_ms"], entry.expires_at_unix_ms);
+        assert_eq!(approval["profile"], h.name);
+        assert_eq!(approval["chain_id"], "stellar:testnet");
+        assert!(approval["summary"].is_object());
+    }
+}
+
+const CLASSIC_PAIRS: [ClassicPair; 4] = [
+    ClassicPair::Pay,
+    ClassicPair::CreateAccount,
+    ClassicPair::Trustline,
+    ClassicPair::Claim,
+];
+const CAP: &str =
+    r#"{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 100000000 }"#;
+
+fn split_rules(pair: ClassicPair, simulate: &str, commit: &str, commit_criteria: &str) -> String {
+    let tool = pair.tool();
+    let simulate_criteria = if matches!(pair, ClassicPair::Pay) {
+        CAP
+    } else {
+        ""
+    };
+    let simulate_fields = if simulate == "require_approval" {
+        "ttl_secs = 419\nreason = \"Simulate review\""
+    } else {
+        ""
+    };
+    let commit_fields = if commit == "require_approval" {
+        "ttl_secs = 617\nreason = \"Commit review\""
+    } else {
+        ""
+    };
+    format!(
+        r#"[[rules]]
+match = {{ tool = "{tool}", chain = "stellar:testnet" }}
+criteria = [{simulate_criteria}]
+decision = "{simulate}"
+{simulate_fields}
+[[rules]]
+match = {{ tool = "*", chain = "*" }}
+criteria = [{commit_criteria}]
+decision = "{commit}"
+{commit_fields}
+"#
+    )
+}
+
+async fn split_approval_round_trip(pair: ClassicPair) {
+    let h = Harness::with_rules(
+        pair.tool(),
+        Outcome::Success,
+        &split_rules(pair, "allow", "require_approval", ""),
+    )
+    .await;
+    let sim = pair.simulate(&h).await;
+    assert_eq!(sim["ok"], true, "{sim}");
+    pair.assert_pending(&h, &sim["data"], 617_000, "Commit review");
+    assert_eq!(h.window().pending, 0);
+    let data = &sim["data"];
+    let nonce = data["approval"]["approval_nonce"].as_str().unwrap();
+    let expired = {
+        let mut store =
+            PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
+                .unwrap();
+        let mut entry = store.get(nonce).unwrap().clone();
+        entry.approval_nonce = "E".repeat(22);
+        entry.expires_at_unix_ms = entry.created_at_unix_ms;
+        let blob = compute_attestation(
+            &ATTESTATION_KEY,
+            &stellar_agent_core::approval::AttestationBinding::new(&h.name, "stellar:testnet"),
+            &entry.approval_nonce,
+            &envelope_sha256(data["envelope_xdr"].as_str().unwrap().as_bytes()),
+            &process_uid_for_attestation().unwrap(),
+        );
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
+        entry.attestation_blob_b64 = Some(encoded.clone());
+        let approval = (entry.approval_nonce.clone(), encoded);
+        store.insert(entry, now_unix_ms().unwrap()).unwrap();
+        approval
+    };
+    let mut errors = Vec::new();
+    for approval in [
+        None,
+        Some((
+            nonce.to_owned(),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0; 32]),
+        )),
+        Some(expired),
+    ] {
+        let result = pair.commit(&h, data, approval).await;
+        assert_eq!(
+            result["error"]["code"], "policy.approval_required",
+            "{result}"
+        );
+        assert_eq!(
+            result["error"]["message"],
+            format!(
+                "approval attestation absent, invalid, or expired; run `{}` then re-submit with attestation",
+                stellar_agent_core::approval::approve_hint("<nonce>", &h.name)
+            )
+        );
+        assert!(result["error"].get("details").is_none(), "{result}");
+        errors.push(result["error"].clone());
+    }
+    assert!(errors.windows(2).all(|adjacent| adjacent[0] == adjacent[1]));
+    assert!(h.sends.lock().unwrap().is_empty());
+    let approved = h.attest_nonce(nonce, data["envelope_xdr"].as_str().unwrap());
+    let result = pair.commit(&h, data, Some(approved)).await;
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(
+        *h.sends.lock().unwrap(),
+        vec![WindowSnapshot {
+            amount: 0,
+            entries: 0,
+            pending: 0
+        }]
+    );
+    assert_eq!(h.window().pending, 0);
+    let (action, amount) = match pair {
+        ClassicPair::Pay => ("payment", Some(AMOUNT)),
+        ClassicPair::CreateAccount => ("account_creation", Some(AMOUNT)),
+        ClassicPair::Trustline => ("trustline", None),
+        ClassicPair::Claim => ("claim", None),
+    };
+    h.assert_legs("value_action_submitted", action, amount);
+}
+
+#[tokio::test]
+#[serial]
+async fn split_pay_approval_round_trip() {
+    split_approval_round_trip(ClassicPair::Pay).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn split_create_account_approval_round_trip() {
+    split_approval_round_trip(ClassicPair::CreateAccount).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn split_trustline_approval_round_trip() {
+    split_approval_round_trip(ClassicPair::Trustline).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn split_claim_approval_round_trip() {
+    split_approval_round_trip(ClassicPair::Claim).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn split_pay_approval_commit_cap_reserves_and_settles() {
+    let h = Harness::with_rules(
+        "split-cap",
+        Outcome::Success,
+        &split_rules(ClassicPair::Pay, "allow", "require_approval", CAP),
+    )
+    .await;
+    let sim = h.simulate_pay(AMOUNT).await;
+    ClassicPair::Pay.assert_pending(&h, &sim["data"], 617_000, "Commit review");
+    let result = h
+        .commit_pay(h.pay_args(&sim["data"], AMOUNT, Some(h.attest(&sim["data"]))))
+        .await;
+    assert_eq!(result["ok"], true, "{result}");
+    h.assert_send_reserved();
+    assert_eq!(
+        h.window(),
+        WindowSnapshot {
+            amount: AMOUNT,
+            entries: 1,
+            pending: 0
+        }
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn split_approval_verdict_matrix_preserves_simulate_precedence() {
+    for pair in CLASSIC_PAIRS {
+        for (simulate, commit) in [
+            ("allow", "allow"),
+            ("allow", "deny"),
+            ("require_approval", "allow"),
+            ("require_approval", "require_approval"),
+            ("deny", "require_approval"),
+        ] {
+            let h = Harness::with_rules(
+                "split-matrix",
+                Outcome::Success,
+                &split_rules(pair, simulate, commit, ""),
+            )
+            .await;
+            let result = pair.simulate(&h).await;
+            assert_eq!(
+                result["ok"],
+                simulate != "deny",
+                "{pair:?} {simulate}/{commit}: {result}"
+            );
+            if simulate == "require_approval" {
+                pair.assert_pending(&h, &result["data"], 419_000, "Simulate review");
+            } else {
+                assert!(result["data"].get("approval").is_none(), "{result}");
+                let store = PendingApprovalStore::open(
+                    h.approval_dir.path().join(format!("{}.toml", h.name)),
+                )
+                .unwrap();
+                assert!(store.snapshot(now_unix_ms().unwrap()).is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn split_pay_approval_uses_destination_identity_view() {
+    let h = Harness::with_rules(
+        "split-identity",
+        Outcome::Success,
+        &split_rules(
+            ClassicPair::Pay,
+            "allow",
+            "require_approval",
+            r#"{ kind = "home_domain_resolved" }"#,
+        ),
+    )
+    .await;
+    let sim = h.simulate_pay(AMOUNT).await;
+    assert_eq!(sim["ok"], true, "{sim}");
+    ClassicPair::Pay.assert_pending(&h, &sim["data"], 617_000, "Commit review");
+
+    // The source has no home domain and this destination has an unresolved one,
+    // so only the destination's identity view makes the commit refuse.
+    let mut args = ClassicPair::Pay.args(&h);
+    args["destination"] = json!(DOMAIN_DEST);
+    let sim = result_json(
+        &h.server
+            .call_stellar_pay(serde_json::from_value(args.clone()).unwrap())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(sim["ok"], true, "{sim}");
+    assert!(sim["data"].get("approval").is_none(), "{sim}");
+    let store =
+        PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name))).unwrap();
+    assert_eq!(store.snapshot(now_unix_ms().unwrap()).len(), 1);
+    drop(store);
+    for field in ["nonce", "expires_at_unix_ms", "envelope_xdr"] {
+        args[field] = sim["data"][field].clone();
+    }
+    let result = result_json(
+        &h.server
+            .call_stellar_pay_commit(serde_json::from_value(args).unwrap())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        result["error"]["code"], "policy.deny.home_domain_not_resolved",
+        "{result}"
+    );
+    assert!(h.sends.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn split_trustline_approval_uses_decoded_issuer() {
+    let criteria = format!(
+        r#"{{ kind = "counterparty_allowlist", kinds = ["KNOWN_ISSUER"], allowlist = ["{USDC_ISSUER}"], gate_inflows = true }}"#
+    );
+    let h = Harness::with_rules(
+        "split-issuer",
+        Outcome::Success,
+        &split_rules(
+            ClassicPair::Trustline,
+            "allow",
+            "require_approval",
+            &criteria,
+        ),
+    )
+    .await;
+    for issuer in [USDC_ISSUER, DEST] {
+        let mut args = ClassicPair::Trustline.args(&h);
+        args["asset"] = json!(format!("TEST:{issuer}"));
+        let sim = result_json(
+            &h.server
+                .call_stellar_trustline(serde_json::from_value(args).unwrap())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(sim["ok"], true, "{sim}");
+        if issuer == USDC_ISSUER {
+            ClassicPair::Trustline.assert_pending(&h, &sim["data"], 617_000, "Commit review");
+        } else {
+            assert!(sim["data"].get("approval").is_none(), "{sim}");
+        }
+    }
+    let store =
+        PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name))).unwrap();
+    assert_eq!(store.snapshot(now_unix_ms().unwrap()).len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn split_approval_reconciles_only_one_bounded_pass() {
+    use stellar_agent_core::policy::v1::criteria::state_store::{WindowEntry, WindowLimit};
+    use stellar_agent_network::policy_state::{RECONCILE_MIN_AGE_MS, WindowReservation};
+    let h = Harness::with_rules(
+        "split-reconcile",
+        Outcome::Success,
+        &split_rules(ClassicPair::Pay, "allow", "require_approval", ""),
+    )
+    .await;
+    let disk = PersistedWindowStore::for_profile(&h.name);
+    let old = now_unix_ms().unwrap() - RECONCILE_MIN_AGE_MS - 1_000;
+    let receipts = ReceiptStore::open(&h.name).unwrap();
+    for index in 0..6 {
+        let id = format!("{index:064x}");
+        let reservation = WindowReservation {
+            id: id.clone(),
+            tx_hash: id.clone(),
+            source: h.source.clone(),
+            sequence: 30 + index,
+            max_time: 0,
+            pending_since_ms: old,
+            submission_ledger: 1000,
+            operator_required: false,
+        };
+        let entry = WindowEntry::new(
+            StateKey::new(&h.name, 0, "native", 86_400),
+            old,
+            1,
+            WindowLimit::Amount {
+                asset: "native".to_owned(),
+                window: "1d".to_owned(),
+                max_stroops: 100_000_000,
+            },
+        );
+        disk.record_pending(&h.profile, &[entry], &reservation)
+            .unwrap();
+        receipts
+            .try_begin(&id, &id, &h.source, reservation.sequence, 0, 1000)
+            .unwrap();
+    }
+    let sim = h.simulate_pay(AMOUNT).await;
+    assert_eq!(sim["ok"], true, "{sim}");
+    ClassicPair::Pay.assert_pending(&h, &sim["data"], 617_000, "Commit review");
+    let requests = h.rpc.received_requests().await.unwrap();
+    let statuses = requests
+        .iter()
+        .filter(|request| {
+            serde_json::from_slice::<Value>(&request.body).unwrap()["method"] == "getTransaction"
+        })
+        .count();
+    assert_eq!(
+        statuses, 5,
+        "one simulate dispatch reconciles at most five reservations"
+    );
+    assert_eq!(disk.pending_reservations(&h.profile).unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn split_approval_commit_evaluation_error_leaves_simulate_allowed() {
+    let pair = ClassicPair::CreateAccount;
+    let h = Harness::with_rules(
+        "split-eval-error",
+        Outcome::Success,
+        &split_rules(
+            pair,
+            "allow",
+            "require_approval",
+            r#"{ kind = "home_domain_resolved" }"#,
+        ),
+    )
+    .await;
+    let sim = pair.simulate(&h).await;
+    assert_eq!(sim["ok"], true, "{sim}");
+    assert!(sim["data"].get("approval").is_none(), "{sim}");
+    let store =
+        PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name))).unwrap();
+    assert!(store.snapshot(now_unix_ms().unwrap()).is_empty());
+    drop(store);
+    let result = pair.commit(&h, &sim["data"], None).await;
+    assert_eq!(
+        result["error"]["code"], "policy.engine_required",
+        "{result}"
+    );
 }

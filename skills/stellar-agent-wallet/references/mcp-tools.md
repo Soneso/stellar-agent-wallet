@@ -116,14 +116,21 @@ wire codes.
 How `RequireApproval` is satisfied depends on tool shape:
 
 - Two-phase signing verbs (`stellar_pay`, `stellar_create_account`,
-  `stellar_trustline`, `stellar_claim`, `stellar_rule_create`, each paired with a
-  `*_commit`) split into a simulate step
-  and a commit step. The simulate step builds an envelope and mints a single-use
-  nonce; if approval is required it records the pending approval. The commit step
-  re-checks the nonce, byte-compares the envelope against a fresh rebuild,
+  `stellar_trustline`, `stellar_claim`, each paired with a `*_commit`) split
+  into a simulate step and a commit step. The simulate step builds an envelope
+  and mints a single-use nonce. It records a pending approval when policy
+  requires approval for the simulate tool or its paired commit tool. The commit
+  step re-checks the nonce, byte-compares the envelope against a fresh rebuild,
   verifies the HMAC-SHA256 attestation minted at approve time, signs from the
-  keyring, and submits. The wire error on any approval-path failure is the
+  keyring, and submits. It re-evaluates its own tool name against current state
+  and can still deny. An exhausted cap returns
+  `policy.deny.per_period_cap_exceeded`. The loaded policy document stays fixed
+  for the server's lifetime. The wire error on any approval-path failure is the
   uniform `policy.approval_required`.
+- `stellar_mpp_charge_prepare` records a pending approval when policy requires
+  approval for prepare or `stellar_mpp_charge_commit`. The request keeps its
+  challenge-bounded lifetime.
+- `stellar_rule_create` records its pending rule proposal unconditionally.
 - One-shot signing verbs sign in a single call. If the policy returns
   `RequireApproval` for one of these, the call is refused fail-closed with
   `policy.approval_required_unsupported`; the wallet never signs without a
@@ -210,8 +217,8 @@ A mismatch is refused before any network call.
 | `fee` | string | no | Classic fee selector: `<stroops>`, `auto`, `auto:pNN`. |
 
 Returns `{ envelope_xdr, nonce, expires_at_unix_ms, simulation }`. When the
-policy requires approval, the simulation includes an `approval` block carrying
-`approval_nonce` and `expires_at_unix_ms`.
+policy requires approval for `stellar_pay` or `stellar_pay_commit`, the response
+includes an `approval` block carrying `approval_nonce` and `expires_at_unix_ms`.
 
 ### stellar_pay_commit arguments
 
@@ -306,8 +313,9 @@ Returns `{ envelope_xdr, nonce, expires_at_unix_ms, preview }`. `preview`
 carries the balance id (both hex72 and strkey forms), asset code/issuer
 (absent for native XLM), `amount_stroops`, `amount_display`, the entry's
 claimants, whether `source_account` is a claimant, and the matched predicate
-verdict. When the policy requires approval, the response includes an
-`approval` block with `approval_nonce` and `expires_at_unix_ms`.
+verdict. When policy requires approval for `stellar_claim` or
+`stellar_claim_commit`, the response includes an `approval` block with
+`approval_nonce` and `expires_at_unix_ms`.
 
 Claim guards enforced before the nonce is minted, in order: claimant
 membership (`claim.not_claimant`), predicate satisfaction

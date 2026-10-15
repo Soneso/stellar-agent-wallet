@@ -180,9 +180,11 @@ On success `data` carries `tx_hash` and `ledger`.
 
 ### When approval is required
 
-If the policy engine returns `RequireApproval` (a V1 policy rule, the high-value
-cross-check, or any toolset-routed payment), the build call returns an `approval`
-block with `approval_nonce`, `profile`, and `chain_id`; the commit is held. The handshake:
+For pay, create-account, trustline, and claim, the simulate call records a pending
+approval when policy requires approval for either the simulate tool or its paired
+commit tool. It returns an `approval` block with `approval_nonce`, `profile`, and
+`chain_id`. Toolset-routed payments also require operator approval at commit. The
+handshake:
 
 1. The operator consents out-of-band with `stellar-agent approve --id
    <approval_nonce> --profile <name>` at a terminal, `approve list` / `approve serve` (a local
@@ -198,6 +200,11 @@ block with `approval_nonce`, `profile`, and `chain_id`; the commit is held. The 
 You cannot mint or guess the attestation. Treat `policy.approval_required` as "ask
 the operator to approve, then retry the commit with the attestation" — never as a
 transient error to retry blindly.
+
+MPP prepare records a request when policy requires approval for prepare or
+`stellar_mpp_charge_commit`. Its preview returns the nonce as
+`authorization.approval_id`. After the operator approves that nonce,
+`stellar_mpp_charge_commit` reads the recorded attestation, so you pass none.
 
 ## 4. Accounts and trustlines
 

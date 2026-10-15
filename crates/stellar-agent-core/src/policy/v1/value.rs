@@ -445,7 +445,12 @@ pub fn derive_value_class(tool_name: &str, args: &Value) -> ValueClass {
             let asset = args
                 .get("asset")
                 .and_then(Value::as_str)
-                .map(asset_normalise);
+                .map(asset_normalise)
+                .or_else(|| {
+                    let code = args.get("asset_code")?.as_str()?;
+                    let issuer = args.get("asset_issuer")?.as_str()?;
+                    Some(asset_normalise(&format!("{code}:{issuer}")))
+                });
             ValueClass::single(ValueLeg {
                 kind: ActionKind::Trustline,
                 amount: None,
@@ -772,6 +777,63 @@ mod tests {
         assert_eq!(
             leg.asset.as_deref(),
             Some("USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
+        );
+    }
+
+    #[test]
+    fn approval_decoded_trustline_commit_preserves_asset() {
+        use stellar_xdr::{
+            AccountId, AlphaNum4, AssetCode4, ChangeTrustAsset, ChangeTrustOp, Limits, Memo,
+            MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, SequenceNumber,
+            Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
+            WriteXdr,
+        };
+        let issuer = stellar_strkey::ed25519::PublicKey([4; 32]).to_string();
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([2; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::ChangeTrust(ChangeTrustOp {
+                        line: ChangeTrustAsset::CreditAlphanum4(AlphaNum4 {
+                            asset_code: AssetCode4(*b"USDC"),
+                            issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([4; 32]))),
+                        }),
+                        limit: 1_000_000,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+        let args = crate::envelope_decode::decode_authoritative_args(
+            &envelope,
+            "stellar_trustline_commit",
+        )
+        .unwrap();
+        assert!(args.get("asset").is_none());
+        let value = derive_value_class("stellar_trustline_commit", &args);
+        let leg = value.sole_value_leg().unwrap();
+        assert_eq!(leg.asset, Some(format!("USDC:{issuer}")));
+        assert!(!leg.kind.carries_debit());
+
+        let args =
+            json!({"asset": "native", "asset_code": "USDC", "asset_issuer": issuer.as_str()});
+        assert_eq!(
+            derive_value_class("stellar_trustline_commit", &args)
+                .sole_value_leg()
+                .unwrap()
+                .asset
+                .as_deref(),
+            Some("native")
         );
     }
 

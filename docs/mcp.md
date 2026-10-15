@@ -273,13 +273,17 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
 - Two-phase signing verbs (`stellar_pay`, `stellar_create_account`,
   `stellar_trustline`, `stellar_claim`, each paired with a `*_commit`) split into a simulate step
   and a commit step. The simulate step builds an envelope and mints a single-use
-  nonce; if the policy required approval it records the pending approval. The
-  commit step re-checks the nonce, byte-compares the envelope against a fresh
-  rebuild, verifies the HMAC-SHA256 [attestation](./concepts.md) minted at
-  approve time, signs from the keyring, and submits. The wire error on any
-  approval-path failure is the uniform `policy.approval_required`, except an
-  explicit operator rejection recorded via the approval inbox, which commits
-  report as `policy.approval_rejected` so the agent stops retrying.
+  nonce. It records a pending approval when policy requires approval for either
+  the simulate tool or its paired commit tool. The commit step re-checks the
+  nonce, byte-compares the envelope against a fresh rebuild, verifies the
+  HMAC-SHA256 [attestation](./concepts.md) minted at approve time, signs from
+  the keyring, and submits. It re-evaluates its own tool name against current
+  state and can still deny an approved request. An exhausted cap returns
+  `policy.deny.per_period_cap_exceeded`. The loaded policy document stays fixed
+  for the server's lifetime. The wire error on any approval-path failure is the
+  uniform `policy.approval_required`, except an explicit operator rejection
+  recorded via the approval inbox, which commits report as
+  `policy.approval_rejected` so the agent stops retrying.
 - One-shot signing verbs sign in a single call. If the policy returns
   `RequireApproval` for one of these tools, the call is refused fail-closed with
   `policy.approval_required_unsupported`; the wallet never signs without a

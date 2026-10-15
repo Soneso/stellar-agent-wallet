@@ -1268,3 +1268,127 @@ async fn profile_chain_x402_accounting_persists_cap() {
     );
     assert_profile_chain_authorization_window(&fixture.profile, NAME);
 }
+
+#[tokio::test]
+#[serial]
+async fn split_mpp_approval_prepare_records_commit_request() {
+    use stellar_agent_core::approval::{
+        AttestationBinding, ConsentAudit, PendingApprovalStore, Surface, attest_and_persist,
+    };
+    use stellar_agent_core::audit_log::AuditOutbox;
+    use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
+    use stellar_agent_core::policy::{ApprovalRequest, Decision};
+    use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+
+    const NAME: &str = "mpp-split-approval";
+    let mut fixture = mpp_fixture(NAME, [0xb7; 32], true, |r, _| r).await;
+    let approvals = tempfile::tempdir().unwrap();
+    fixture
+        .server
+        .set_approval_dir_for_test(approvals.path().to_owned());
+    let document = PolicyDocument {
+        version: 1,
+        scope: ScopeId::AllProfiles,
+        signature: None,
+        rules: vec![
+            PolicyRule {
+                r#match: RuleMatch {
+                    tool: "stellar_mpp_charge_prepare".into(),
+                    chain: "*".into(),
+                },
+                criteria: vec![],
+                decision: Decision::Allow,
+                allow_opaque_signing: false,
+            },
+            PolicyRule {
+                r#match: RuleMatch {
+                    tool: "stellar_mpp_charge_commit".into(),
+                    chain: "*".into(),
+                },
+                criteria: vec![Box::new(PerPeriodCapCriterion::new(
+                    CONTRACT.into(),
+                    Window::parse("1d").unwrap(),
+                    15_000_000,
+                ))],
+                decision: Decision::RequireApproval(ApprovalRequest::new("mpp-policy".into(), 617)),
+                allow_opaque_signing: false,
+            },
+        ],
+    };
+    fixture
+        .server
+        .set_policy_engine_for_test(std::sync::Arc::new(PolicyEngineV1::new(
+            document,
+            NAME.into(),
+        )));
+    let key = [0x5a; 32];
+    keyring_core::Entry::new(
+        &fixture.profile.attestation_key_id.service,
+        &fixture.profile.attestation_key_id.account,
+    )
+    .unwrap()
+    .set_password(&URL_SAFE_NO_PAD.encode(key))
+    .unwrap();
+    for attempt in 0..3 {
+        let result = fixture
+            .server
+            .call_stellar_mpp_charge_prepare(NAME.into(), challenge(30 + attempt))
+            .await
+            .unwrap();
+        let prepared = result_json(&result);
+        assert_eq!(prepared["ok"], true, "{prepared}");
+        let data = &prepared["data"];
+        let approval_id = data["authorization"]["approval_id"]
+            .as_str()
+            .expect("commit policy requests approval during prepare");
+        let mut store =
+            PendingApprovalStore::open(approvals.path().join(format!("{NAME}.toml"))).unwrap();
+        let entry = store.get(approval_id).unwrap().clone();
+        assert!(entry.expires_at_unix_ms - entry.created_at_unix_ms <= 300_000);
+        assert!(
+            entry.expires_at_unix_ms
+                <= data["authorization"]["expires_at_unix"].as_u64().unwrap() * 1_000
+        );
+        if attempt == 1 {
+            store.record_attestation(approval_id, [0; 32]).unwrap();
+        } else if attempt == 2 {
+            let outbox = AuditOutbox::for_log(&fixture.profile.audit_log_path);
+            attest_and_persist(
+                &mut store,
+                &entry,
+                &key,
+                &AttestationBinding::new(NAME, "stellar:testnet"),
+                Surface::Cli,
+                ConsentAudit::Outbox(&outbox),
+                None,
+                |_, _| Err("no grant".into()),
+            )
+            .unwrap();
+        }
+        drop(store);
+        let result = fixture
+            .server
+            .call_stellar_mpp_charge_commit(
+                data["authorization"]["authorization_id"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                data["nonce"].as_str().unwrap().into(),
+                data["nonce_expires_at_unix_ms"].as_u64().unwrap(),
+            )
+            .await
+            .unwrap();
+        let result = result_json(&result);
+        if attempt < 2 {
+            assert_eq!(result["error"]["code"], "mpp.approval_invalid", "{result}");
+        } else {
+            assert_eq!(result["ok"], true, "{result}");
+        }
+    }
+    assert_eq!(
+        fixture
+            .signed_requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}

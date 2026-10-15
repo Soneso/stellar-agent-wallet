@@ -864,6 +864,17 @@ impl WalletServer {
         );
 
         // ── Step 11: Persist pending approval if policy requires it ──────────
+        let dispatch_outcome = self
+            .paired_commit_outcome(
+                dispatch_outcome,
+                &envelope_xdr,
+                "stellar_trustline_commit",
+                &args.chain_id,
+                Some(&source_adapter),
+                None,
+            )
+            .await;
+
         let approval_block =
             if let DispatchOutcome::RequireApproval(ref approval) = dispatch_outcome {
                 let profile_name = self.profile_name_for_approval();
