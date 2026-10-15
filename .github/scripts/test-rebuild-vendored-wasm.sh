@@ -19,7 +19,8 @@ SCRIPT="$ROOT/.github/scripts/rebuild-vendored-wasm.sh"
 CRATE="crates/stellar-agent-smart-account"
 BASH_BIN=${BASH:-/bin/bash}
 REAL_GIT=$(command -v git)
-TMP=$(mktemp -d)
+tmp_root=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "${tmp_root%/}/test-rebuild-vendored-wasm.XXXXXX")
 TMP=$(cd "$TMP" && pwd -P)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -2067,5 +2068,48 @@ RS
   fi
 done <<<"$SPELLINGS"
 pass "28 every spelling has its expected tree-check verdict and diagnostic"
+
+# 29. The script makes its scratch directory from a template under TMPDIR. A
+# stub mktemp first on PATH logs each call's argument count and arguments,
+# separated by "|", and then runs the real mktemp. A bare mktemp -d on macOS
+# prefers the per-user temporary directory to TMPDIR, so a -d call that names
+# no template under TMPDIR fails the case on every platform.
+new_case c29
+command -v mktemp >"$DATA/real-mktemp"
+: >"$DATA/mktemp-log"
+cat >"$STUBS/mktemp" <<'STUB'
+#!/bin/sh
+# Stub mktemp: logs the call to data/mktemp-log, then runs the real mktemp.
+set -eu
+data="$(cd "$(dirname "$0")" && pwd -P)/data"
+{
+  printf '%s' "$#"
+  for arg in "$@"; do printf '|%s' "$arg"; done
+  printf '\n'
+} >>"$data/mktemp-log"
+exec "$(cat "$data/real-mktemp")" "$@"
+STUB
+chmod +x "$STUBS/mktemp"
+run_check_tree
+expect_rc 0 "mktemp template"
+expect_out "rebuild-vendored-wasm: PASS" "mktemp template"
+# One line per -d call of the log: "named" when its arguments include a
+# template under TMPDIR, "bare" otherwise.
+MKTEMP_D_CALLS=$(PREFIX="$TMP/" awk -F '|' '
+  {
+    d = 0; named = 0
+    for (i = 2; i <= NF; i++) {
+      if ($i == "-d") d = 1
+      else if (index($i, ENVIRON["PREFIX"]) == 1) named = 1
+    }
+    if (d) print (named ? "named" : "bare")
+  }
+' "$DATA/mktemp-log")
+grep -qx named <<<"$MKTEMP_D_CALLS" ||
+  fail "mktemp template: no mktemp -d call names a template under TMPDIR $TMP; the log holds: $(cat "$DATA/mktemp-log")"
+if grep -qx bare <<<"$MKTEMP_D_CALLS"; then
+  fail "mktemp template: a mktemp -d call names no template under TMPDIR $TMP; the log holds: $(cat "$DATA/mktemp-log")"
+fi
+pass "29 the scratch directory comes from a template under TMPDIR, never from a bare mktemp -d"
 
 echo "test-rebuild-vendored-wasm: PASS ($PASSED cases, $CORPUS_PASSED corpus rows, $CONTROLS_PASSED controls)"

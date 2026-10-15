@@ -1678,7 +1678,10 @@ mode_full() {
   echo "$NAME: PASS: $n files rebuilt byte for byte, every exception at its frozen digest, every pin and record equal to its file"
 }
 
-TMP=$(mktemp -d)
+# The template names TMPDIR because a bare mktemp -d on macOS prefers
+# _CS_DARWIN_USER_TEMP_DIR (mktemp(1)), which a sandbox can deny.
+tmp_root=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "${tmp_root%/}/$NAME.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 [ $# -gt 0 ] || usage

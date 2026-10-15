@@ -5,7 +5,8 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SCRIPT="$ROOT/.github/scripts/check-ref-on-main.sh"
-TMP=$(mktemp -d)
+tmp_root=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "${tmp_root%/}/test-check-ref-on-main.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid

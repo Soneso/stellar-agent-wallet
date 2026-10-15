@@ -88,7 +88,7 @@ single-use nonce is burned, so a refusal here leaves the nonce usable.
 
 | Code | Meaning | Agent action |
 |---|---|---|
-| `network.friendbot_account_already_funded` | Friendbot refused to fund the account because it already exists and is funded. `stellar-agent friendbot`, `accounts create --fund-with-friendbot`, and `stellar_friendbot` report it; the message names the account. | Do not retry. The account is usable as it is: continue with it, or fund a new account if a fresh one was intended. |
+| `network.friendbot_account_already_funded` | Friendbot refuses to fund the account because its XLM balance is at or above the Friendbot starting balance (10,000 XLM on the SDF testnet). `stellar-agent friendbot`, `accounts create --fund-with-friendbot`, and `stellar_friendbot` report it; the message names the account. An existing account below the starting balance receives that amount instead. | Do not retry. The account is usable as it is: continue with it, or fund a new account if you need a fresh account. |
 
 ## Submission codes (unresolved outcomes)
 

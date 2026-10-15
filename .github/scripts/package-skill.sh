@@ -25,7 +25,8 @@ for command in zip unzip zipinfo shasum python3; do
   }
 done
 
-TMP=$(mktemp -d)
+tmp_root=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "${tmp_root%/}/package-skill.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 if find "$SOURCE" -type l -o -name '.DS_Store' -o -name 'Thumbs.db' -o -name '__MACOSX' | grep -q .; then
