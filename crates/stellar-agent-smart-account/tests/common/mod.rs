@@ -58,11 +58,10 @@ const SUBMIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Ensures an account is funded via testnet Friendbot.
 ///
-/// Friendbot refuses to fund an account that already exists, answering 400
-/// with an "account already funded to starting balance" detail; for this
-/// helper's postcondition (the account exists and holds XLM) that state is
-/// success. Fixed well-known accounts such as the interop deployer hit it on
-/// every run after their first funding. Panics if the HTTP request fails or
+/// Friendbot refuses to fund an account at or above the Friendbot starting
+/// balance, answering 400 with an "account already funded to starting balance"
+/// detail. For this helper's postcondition (the account exists and holds XLM),
+/// that state is success. Panics if the HTTP request fails or
 /// Friendbot answers with anything else.
 pub async fn fund_via_friendbot(g_strkey: &str) {
     let url = format!("{TESTNET_FRIENDBOT_URL}?addr={g_strkey}");

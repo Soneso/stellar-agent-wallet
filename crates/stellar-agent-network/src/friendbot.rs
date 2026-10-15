@@ -437,6 +437,8 @@ async fn verify_funding_landed_with(
 /// against an unpropagated account fail with a confusing `TxNoAccount`
 /// downstream. This verification is a read-side wait only: it never
 /// resubmits or rebuilds anything.
+/// For an existing account the first poll succeeds, so the check confirms
+/// only that the account exists.
 ///
 /// Mainnet is rejected structurally before any network call: if
 /// `network_passphrase` equals the Stellar mainnet passphrase or if
@@ -453,8 +455,8 @@ async fn verify_funding_landed_with(
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcUnreachable`] if
 ///   the Friendbot HTTP endpoint is unreachable or returns any other error
 ///   status.
-/// - [`WalletError::Network`] wrapping [`NetworkError::AccountNotFound`] if
-///   the Friendbot response cannot be parsed (unexpected Friendbot response).
+/// - [`WalletError::Network`] wrapping [`NetworkError::RpcUnreachable`] if
+///   the Friendbot response cannot be parsed or lacks a string `hash` field.
 /// - [`WalletError::Network`] wrapping [`NetworkError::FriendbotFundingNotConfirmed`]
 ///   if the funded account never becomes queryable on `rpc_url` within the
 ///   verification window.
@@ -738,8 +740,8 @@ mod tests {
         .expect_err("an error status must fail")
     }
 
-    /// Friendbot's answer for an existing account: HTTP 400 with an
-    /// "account already funded" detail.
+    /// Friendbot answers HTTP 400 with an "account already funded" detail
+    /// for an account at or above the Friendbot starting balance.
     #[tokio::test]
     async fn an_already_funded_account_reports_the_already_funded_code() {
         let error = fund_against(

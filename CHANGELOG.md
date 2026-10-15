@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `trustline` reports keyring and signer-key failures with their own `auth.*`
+  codes, as the other keyring-signing verbs do: a missing signer entry is
+  `auth.keyring_not_found`, a store failure `auth.keyring_platform_error`.
+- The Friendbot refusal names the starting-balance rule: Friendbot funds an
+  account only when its balance is below the Friendbot starting balance.
+
 ## [0.1.0-alpha.12] - 2026-10-15
 
 Consolidated test targets for smaller test builds, trustline approvals stored as trustline changes, read-only smart-account verbs without a signer, a multicall router built from an in-tree contract, and keyring failures reported with their cause. The rustls update to 0.23.46 resolves four advisories.
