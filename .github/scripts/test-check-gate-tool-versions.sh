@@ -6,7 +6,8 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SCRIPT_REL=".github/scripts/check-gate-tool-versions.sh"
-TMP=$(mktemp -d)
+tmp_root=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "${tmp_root%/}/test-check-gate-tool-versions.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 make_fixture() {

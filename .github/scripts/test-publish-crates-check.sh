@@ -10,7 +10,8 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SCRIPT="$ROOT/.github/scripts/publish-crates.sh"
-TMP=$(mktemp -d)
+tmp_root=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "${tmp_root%/}/test-publish-crates-check.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 UNPUBLISHED=stellar-agent-unpublished-probe

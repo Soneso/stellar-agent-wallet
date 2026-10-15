@@ -32,7 +32,7 @@ Creates a new Stellar account in one of two mutually exclusive modes: a sponsore
 
 - **Signing.** Sponsored mode signs the `CreateAccount` operation with the sponsor's key. Friendbot mode performs no signing and touches no key.
 - **Policy (sponsored mode only).** After `--starting-balance` and the new account's public key are resolved and before signing, the sponsored `CreateAccount` is evaluated against `--profile`'s policy engine. This is the same evaluation the `stellar_create_account` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized. So sponsored mode works without an authored profile file until an operator opts into `policy.engine = "v1"`. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`). A profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). Friendbot mode is not gated: it debits no wallet-held funds.
-- **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` is structurally refused before any RPC, HTTP, or key access. Sponsored mode returns `network.mainnet_write_forbidden`; Friendbot mode returns `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only. In Friendbot mode, an account that already exists exits `1` with `network.friendbot_account_already_funded`.
+- **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` is structurally refused before any RPC, HTTP, or key access. Sponsored mode returns `network.mainnet_write_forbidden`; Friendbot mode returns `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only. In Friendbot mode, an account at or above the Friendbot starting balance (10,000 XLM on the SDF testnet) exits `1` with `network.friendbot_account_already_funded`. Friendbot pays the starting balance to an existing account below it.
 - **Account identity.** Provide the new account's G-strkey as the positional argument, or pass `--generate` to mint a fresh ed25519 keypair in-process. Exactly one is required.
 - **Secret-key discipline.** `--generate` returns the new S-strkey in the JSON envelope's `data.secret_key` field. It is never emitted in `--output table` and never logged. Capture it from the JSON output and store it securely. The command output holds the seed, so do not write it to a log or a shared terminal.
 
@@ -317,7 +317,7 @@ Example: read XLM plus a USDC trustline:
 ```bash
 stellar-agent balances \
   --account GABC...WXYZ \
-  --asset USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN
+  --asset USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
 ```
 
 ## `stellar-agent trustline [flags]`
@@ -355,7 +355,7 @@ Funds a testnet or futurenet account via the Stellar Friendbot HTTP endpoint.
 - **Signing.** No local signing or key access; Friendbot funds the account.
 - **Network.** `--network` accepts `testnet`, `futurenet`, or `mainnet` at the parser, but `mainnet` is structurally refused at dispatch with `network.friendbot_mainnet_forbidden` before any HTTP call. The endpoint URL is validated against an allow-list (`friendbot.stellar.org`, `friendbot-futurenet.stellar.org`) unless `--friendbot-url-unchecked` is set.
 - **Funding verification.** After a successful Friendbot HTTP response, the command polls `--rpc-url` until the funded account is queryable before reporting success. The JSON envelope's `data.funding_confirmed_after_ms` reports how long that took. If the account never becomes queryable, the command exits `1` with `network.friendbot_funding_not_confirmed` rather than reporting a Friendbot HTTP success that has not actually landed.
-- **Already funded.** Friendbot funds only an account that does not exist yet. For an existing account it answers HTTP 400 with an "account already funded" detail, and the command exits `1` with `network.friendbot_account_already_funded`, naming the account. The account is usable as it is. Every other Friendbot error status exits `1` with `network.rpc_unreachable`.
+- **Already funded.** Friendbot creates an account that does not exist yet with its starting balance, 10,000 XLM on the SDF testnet. It pays the same amount to an existing account whose XLM balance is below the starting balance. For an account at or above the starting balance, Friendbot answers HTTP 400 with an "account already funded" detail, and the command exits `1` with `network.friendbot_account_already_funded`, naming the account. That account is usable as it is. Every other Friendbot error status exits `1` with `network.rpc_unreachable`.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|

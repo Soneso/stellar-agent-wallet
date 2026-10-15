@@ -13,7 +13,8 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SCRIPT="$ROOT/.github/scripts/publish-crates.sh"
-TMP=$(mktemp -d)
+tmp_root=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "${tmp_root%/}/test-publish-crates-verify.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 TARGET=stellar-agent-core

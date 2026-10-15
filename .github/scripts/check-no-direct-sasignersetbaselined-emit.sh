@@ -67,7 +67,8 @@ if [ ! -d crates ] || [ ! -f "$SIGNERS" ]; then
   exit 1
 fi
 
-TMP=$(mktemp -d)
+tmp_root=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "${tmp_root%/}/check-no-direct-sasignersetbaselined-emit.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 find crates -path '*/src/*' -name '*.rs' | LC_ALL=C sort >"$TMP/files"

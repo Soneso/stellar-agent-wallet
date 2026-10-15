@@ -188,8 +188,9 @@ SUITES=(
 # failing; surfacing the count in the summary keeps a green run honest about
 # what did not execute.
 run_suite() {
-  local crate="$1" feature="$2" target="$3" log status summary executed deterministic
-  log=$(mktemp)
+  local crate="$1" feature="$2" target="$3" log status summary executed deterministic tmp_root
+  tmp_root=${TMPDIR:-/tmp}
+  log=$(mktemp "${tmp_root%/}/run-testnet-acceptance.XXXXXX")
   cargo test -p "$crate" --features "$feature" --test "$target" \
     -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$log"
   status=${PIPESTATUS[0]}

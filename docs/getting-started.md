@@ -140,6 +140,11 @@ spctl -a -vv -t install ./stellar-agent
 and `spctl` prints `accepted` and `source=Notarized Developer ID`. Run both
 commands on `./stellar-agent-mcp` too.
 
+When `spctl` answers `internal error in Code Signing subsystem`, that Mac's
+assessment service could not complete the check, and the message says nothing
+about the binary. The checksum step and the `codesign` output still verify the
+download, and you can repeat the `spctl` check on another Mac.
+
 ### cargo install (from crates.io)
 
 Builds the binaries from the sources published on crates.io and places them on
@@ -428,6 +433,11 @@ criteria = [{ kind = "per_period_cap", asset = "native", window = "1d", max_stro
 decision = "allow"
 
 [[rules]]
+match = { tool = "stellar_pay_commit", chain = "stellar:testnet" }
+criteria = [{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 1000000000 }]
+decision = "allow"
+
+[[rules]]
 match = { tool = "*", chain = "*" }
 criteria = []
 decision = "require_approval"
@@ -435,6 +445,9 @@ decision = "require_approval"
 
 For another profile, replace `default` in the filename and `scope`.
 Balance reads are allowed, and testnet payments are allowed up to 100 XLM per day.
+An MCP payment needs both payment rules: `stellar_pay` builds and simulates it,
+`stellar_pay_commit` signs and submits it, and each phase matches rules under
+its own tool name.
 Everything else waits for operator approval.
 Review the rules before signing. See [policy rules](concepts.md#the-policy-engine)
 for additional restrictions.
@@ -517,9 +530,11 @@ Save the printed secret; the [enroll](#enroll-the-mcp-signer) and
 [payment](#make-a-first-payment-on-testnet) steps read it. The command output
 holds the seed, so do not write it to a log or a shared terminal.
 
-To fund an account you already hold, call Friendbot directly. Mainnet is
-structurally refused (`network.friendbot_mainnet_forbidden`) before any HTTP
-call.
+To fund an account you already hold, call Friendbot directly. Friendbot pays an
+existing account only while its XLM balance is below the Friendbot starting
+balance, 10,000 XLM on the SDF testnet, and the command exits `1` with
+`network.friendbot_account_already_funded` otherwise. Mainnet is structurally
+refused (`network.friendbot_mainnet_forbidden`) before any HTTP call.
 
 ```bash
 stellar-agent friendbot --account GABC...WXYZ --network testnet
@@ -609,8 +624,10 @@ Flags:
 ```bash
 stellar-agent balances \
   --account GABC...WXYZ \
-  --asset USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN
+  --asset USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
 ```
+
+The example names the testnet USDC issuer, and mainnet USDC has a different one.
 
 ## Make a first payment on testnet
 
@@ -684,6 +701,13 @@ You can run the stages independently. The flags are mutually exclusive:
 - `--sign-only <BASE64_XDR>`: sign a built envelope and emit signed
   XDR.
 - `--submit-only <BASE64_XDR>`: submit a signed envelope.
+
+Under a V1 policy, `--sign-only` and `--submit-only` match rules under the
+`stellar_pay_commit` tool name, the same name the MCP commit phase matches. The
+[sample policy](#create-the-v1-policy-file) names it. A ruleset that names only
+`stellar_pay` refuses the staged flows, as the policy entry of
+[`stellar-agent pay`](cli-reference/stellar-ops.md#stellar-agent-pay-destination-amount-asset-flags)
+in the CLI reference states.
 
 `--use-oz-relayer` is an opt-in that is not implemented in this build: it prints
 an AGPL-3.0 disclosure to stderr and declines with

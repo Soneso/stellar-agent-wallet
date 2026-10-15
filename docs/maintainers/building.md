@@ -27,6 +27,22 @@ that already exists without them needs `rustup component add rustfmt clippy`.
 Run `rustup update stable` before a gate pass so `clippy` matches the latest
 stable lints.
 
+When the `sh.rustup.rs` bootstrap script fails at `mktemp -d`, as it does in a
+sandbox that denies the system temporary directory, run the platform
+`rustup-init` executable directly. Download it from
+`https://static.rust-lang.org/rustup/dist/<target>/rustup-init`. The block below
+uses the target `aarch64-apple-darwin`. On Windows the file is `rustup-init.exe`.
+`--no-modify-path` leaves the shell startup files alone, so put `$CARGO_HOME/bin`
+(default `~/.cargo/bin`) on `PATH` by hand:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSfO https://static.rust-lang.org/rustup/dist/aarch64-apple-darwin/rustup-init
+chmod +x rustup-init
+./rustup-init -y --no-modify-path --profile minimal --default-toolchain stable \
+  --component rustfmt --component clippy
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+```
+
 The minimal profile avoids installing `rust-docs` on a fresh toolchain.
 It does not remove components from an existing installation.
 The workspace targets Rust edition 2024.

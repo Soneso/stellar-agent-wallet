@@ -9,7 +9,8 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 GATE="$ROOT/.github/scripts/check-no-direct-sasignersetbaselined-emit.sh"
-TMP=$(mktemp -d)
+tmp_root=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "${tmp_root%/}/test-check-no-direct-sasignersetbaselined-emit.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 SIGNERS="crates/stellar-agent-smart-account/src/managers/signers.rs"

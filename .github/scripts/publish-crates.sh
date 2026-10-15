@@ -126,8 +126,9 @@ done
 # found, 1 when crates.io has no such version (HTTP 404), and 2 on any other
 # outcome (network error, other status, or a body without a checksum).
 published_checksum() {
-  local name=$1 version=$2 body code checksum
-  body=$(mktemp)
+  local name=$1 version=$2 body code checksum tmp_root
+  tmp_root=${TMPDIR:-/tmp}
+  body=$(mktemp "${tmp_root%/}/publish-crates.XXXXXX")
   if ! code=$(curl --silent --show-error --location --max-time 30 \
     --user-agent "$USER_AGENT" --output "$body" --write-out '%{http_code}' \
     "$CRATES_IO_API/$name/$version"); then
@@ -185,10 +186,11 @@ verify_published() {
 }
 
 publish_one() {
-  local name=$1 version expected log attempt=0 rc
+  local name=$1 version expected log attempt=0 rc tmp_root
   version=$(version_of "$name")
   expected=$(expected_checksum "$name-$version.crate")
-  log=$(mktemp)
+  tmp_root=${TMPDIR:-/tmp}
+  log=$(mktemp "${tmp_root%/}/publish-crates.XXXXXX")
   while : ; do
     attempt=$((attempt + 1))
     cargo publish -p "$name" --locked --no-verify 2>&1 | tee "$log"
