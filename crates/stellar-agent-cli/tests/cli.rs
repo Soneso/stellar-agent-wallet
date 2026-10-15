@@ -4,6 +4,8 @@
 mod advisory_no_network_deps;
 #[path = "cli/approval_attestation_binding.rs"]
 mod approval_attestation_binding;
+#[path = "cli/approval_split_commit.rs"]
+mod approval_split_commit;
 #[path = "cli/audit_binding_cli.rs"]
 mod audit_binding_cli;
 #[path = "cli/audit_path_discipline.rs"]

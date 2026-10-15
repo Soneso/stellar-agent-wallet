@@ -1082,6 +1082,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn approval_trustline_commit_known_issuer_gates_decoded_inflow() {
+        let tool = make_tool("stellar_trustline_commit");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::KnownIssuer],
+            vec![USDC_ISSUER.to_owned()],
+        )
+        .with_gate_inflows(true);
+        for issuer in [USDC_ISSUER, G_DENIED] {
+            let args =
+                json!({"asset_code": "USDC", "asset_issuer": issuer, "limit_stroops": "1000000"});
+            let value = crate::policy::v1::value::derive_value_class(&tool.name, &args);
+            let ctx = EvalContext::new(&tool, &args, "alice", &profile, &store).with_value(value);
+            let result = criterion.evaluate(&ctx).unwrap();
+            if issuer == USDC_ISSUER {
+                assert!(
+                    result.is_none(),
+                    "allowlisted trustline issuer passes: {result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Some(DenyReason::CounterpartyDenied { kind, .. }) if kind == "KNOWN_ISSUER")
+                );
+            }
+        }
+    }
+
     // ── gate_inflows tests ───────────────────────────────────────────────────
 
     /// Constructs an inflow (`LendWithdraw`, non-debit) leg with the given

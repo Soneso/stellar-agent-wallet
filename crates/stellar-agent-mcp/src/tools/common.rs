@@ -137,6 +137,24 @@ impl ToolError {
             ToolError::Protocol(err) => Err(err),
         }
     }
+
+    /// The failure's machine-readable code without its message: the business
+    /// envelope's `error.code`, or the JSON-RPC error code of a protocol fault.
+    ///
+    /// Diagnostics log this code because a message can carry caller-supplied
+    /// values. A business result without a readable code yields an empty string.
+    pub(crate) fn code(&self) -> String {
+        match self {
+            ToolError::Business(result) => result
+                .content
+                .first()
+                .and_then(|content| content.as_text())
+                .and_then(|text| serde_json::from_str::<Value>(&text.text).ok())
+                .and_then(|envelope| envelope["error"]["code"].as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            ToolError::Protocol(err) => err.code.0.to_string(),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1392,29 +1410,24 @@ impl WalletServer {
         }
     }
 
-    /// Shared gate core. `value` is `Some` for the value-carrying path
-    /// ([`Self::dispatch_gate_with_value`]) and `None` for the args-derived path
-    /// ([`Self::dispatch_gate`] / [`Self::dispatch_gate_with_views`]).
-    async fn dispatch_gate_inner(
+    /// Checks policy inputs against the profile-bound descriptor.
+    fn checked_policy_descriptor(
         &self,
         tool_name: &'static str,
         args_value: &Value,
         chain_id: &str,
-        value: Option<stellar_agent_core::policy::v1::ValueClass>,
-        account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
-        identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
-    ) -> Result<DispatchOutcome, ToolError> {
+    ) -> Result<ToolDescriptor, ToolError> {
         // Pre-step: dangerous-key guard.
         //
         // Reuse the same guard that toolset dispatch applies (validate_toolset_tool_args).
         // For first-party tools the args are not attacker-authored in the normal
-        // flow, but a compromised upstream agent could route attacker JSON here.
+        // flow, but a compromised upstream agent can route attacker JSON here.
         // Applying the guard at this chokepoint covers ALL first-party tools
         // without per-tool duplication.
         //
         // Note: toolset dispatch sites apply this guard before calling dispatch_gate,
-        // so toolset-routed calls get a second (idempotent) application here — that
-        // is correct and adds defence-in-depth at the chokepoint.
+        // so toolset-routed calls get a second (idempotent) application here, which
+        // adds defence-in-depth at the chokepoint.
         stellar_agent_toolsets::validate_toolset_tool_args(args_value).map_err(|e| {
             ToolError::Protocol(ErrorData::invalid_params(
                 format!("args.validation: {e}"),
@@ -1443,6 +1456,47 @@ impl WalletServer {
             )));
         }
 
+        Ok(descriptor)
+    }
+
+    /// Evaluates `tool_name` against the engine's current window state without
+    /// reconciling, refreshing, or writing anything.
+    ///
+    /// The gate runs the same evaluation after its refresh, and a simulate step
+    /// calls this for its paired commit tool. Every verdict, `Deny` included,
+    /// returns to the caller for inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] for a descriptor, chain, or engine failure.
+    pub(crate) async fn evaluate_policy_only(
+        &self,
+        tool_name: &'static str,
+        args_value: &Value,
+        chain_id: &str,
+        value: Option<stellar_agent_core::policy::v1::ValueClass>,
+        account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+        identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+    ) -> Result<stellar_agent_core::policy::Evaluation, ToolError> {
+        let descriptor = self.checked_policy_descriptor(tool_name, args_value, chain_id)?;
+        self.evaluate_with_descriptor(&descriptor, args_value, value, account_view, identity_view)
+            .await
+    }
+
+    /// Evaluates policy for a descriptor that [`Self::checked_policy_descriptor`]
+    /// returned, so a gate dispatch checks its inputs once.
+    ///
+    /// # Errors
+    ///
+    /// Returns `policy.engine_required` when the engine fails to evaluate.
+    async fn evaluate_with_descriptor(
+        &self,
+        descriptor: &ToolDescriptor,
+        args_value: &Value,
+        value: Option<stellar_agent_core::policy::v1::ValueClass>,
+        account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+        identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+    ) -> Result<stellar_agent_core::policy::Evaluation, ToolError> {
         let counterparty_cache =
             match stellar_agent_network::CounterpartyCacheSnapshot::from_resolver(
                 &*self.counterparty_resolver,
@@ -1452,13 +1506,147 @@ impl WalletServer {
                 Ok(snapshot) => Some(snapshot),
                 Err(err) => {
                     tracing::debug!(
-                        tool = tool_name,
+                        tool = descriptor.name.as_str(),
                         error = %err,
-                        "dispatch_gate: counterparty cache snapshot unavailable"
+                        "evaluate_with_descriptor: counterparty cache snapshot unavailable"
                     );
                     None
                 }
             };
+
+        // Evaluate policy with the profile-bound descriptor.
+        //
+        // The value-carrying path (`value = Some`) sizes the exact effect the
+        // handler decoded; the args-derived path (`value = None`) lets the engine
+        // derive the descriptor from `args_value` (pay/create/opaque-sign tools).
+        let counterparty_view = counterparty_cache
+            .as_ref()
+            .map(|snapshot| snapshot as &dyn stellar_agent_core::policy::v1::CounterpartyCacheView);
+        // The `_full` evaluation additionally surfaces the value descriptor the
+        // gate sized on the allow path, threaded into `DispatchOutcome::Allow` so
+        // the value-verb handlers record exactly what the gate evaluated.
+        let evaluation = match value {
+            Some(value) => self.policy_engine.evaluate_with_value_full(
+                descriptor,
+                args_value,
+                &self.profile,
+                value,
+                account_view,
+                identity_view,
+                counterparty_view,
+                None,
+                None,
+            ),
+            None => self.policy_engine.evaluate_full(
+                descriptor,
+                args_value,
+                &self.profile,
+                account_view,
+                identity_view,
+                counterparty_view,
+                None,
+                None, // sep45_sessions: wired at dispatch site when sep45_session_active criterion active
+            ),
+        };
+        let evaluation = match evaluation {
+            Ok(evaluation) => evaluation,
+            Err(err) => {
+                // Engine error → fail closed as `policy.engine_required`
+                // (fires for `Noop` and for `V1` engine errors such as a
+                // missing policy document).
+                return Err(ToolError::Business(business_error_result(
+                    "policy.engine_required",
+                    format!("policy engine evaluation failed: {err}"),
+                )));
+            }
+        };
+        Ok(evaluation)
+    }
+
+    /// Applies the paired commit tool's verdict to a simulate step's outcome.
+    ///
+    /// Only an `Allow` outcome is examined, so a simulate `RequireApproval`
+    /// keeps its own request, reason, and TTL. The commit arguments are the ones
+    /// [`decode_authoritative_args`](stellar_agent_core::envelope_decode::decode_authoritative_args)
+    /// returns for `commit_tool` from `envelope_xdr`, with `chain_id` set as the
+    /// commit step sets it. A commit `RequireApproval` replaces the outcome with
+    /// its request and value effects.
+    ///
+    /// A commit `Allow` or `Deny`, a decode error, and an evaluation error return
+    /// `outcome` unchanged. The commit step evaluates again and reports its own
+    /// verdict, so the simulate step never parks a request on input the commit
+    /// refuses.
+    pub(crate) async fn paired_commit_outcome(
+        &self,
+        outcome: DispatchOutcome,
+        envelope_xdr: &str,
+        commit_tool: &'static str,
+        chain_id: &str,
+        account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+        identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+    ) -> DispatchOutcome {
+        if !matches!(outcome, DispatchOutcome::Allow(_)) {
+            return outcome;
+        }
+        let mut commit_args = match stellar_agent_core::envelope_decode::decode_authoritative_args(
+            envelope_xdr,
+            commit_tool,
+        ) {
+            Ok(commit_args) => commit_args,
+            Err(err) => {
+                tracing::debug!(
+                    tool = commit_tool,
+                    error_kind = envelope_decode_error_kind(&err),
+                    "paired_commit_outcome: commit arguments not decodable; outcome unchanged"
+                );
+                return outcome;
+            }
+        };
+        commit_args["chain_id"] = Value::String(chain_id.to_owned());
+        match self
+            .evaluate_policy_only(
+                commit_tool,
+                &commit_args,
+                chain_id,
+                None,
+                account_view,
+                identity_view,
+            )
+            .await
+        {
+            Ok(evaluation) => match evaluation.decision {
+                Decision::RequireApproval(request) => {
+                    DispatchOutcome::RequireApproval(ApprovalOutcome {
+                        request,
+                        value_effects: evaluation.value_effects,
+                    })
+                }
+                _ => outcome,
+            },
+            Err(err) => {
+                tracing::debug!(
+                    tool = commit_tool,
+                    error_code = %err.code(),
+                    "paired_commit_outcome: commit policy evaluation failed; outcome unchanged"
+                );
+                outcome
+            }
+        }
+    }
+
+    /// Shared gate core. `value` is `Some` for the value-carrying path
+    /// ([`Self::dispatch_gate_with_value`]) and `None` for the args-derived path
+    /// ([`Self::dispatch_gate`] / [`Self::dispatch_gate_with_views`]).
+    async fn dispatch_gate_inner(
+        &self,
+        tool_name: &'static str,
+        args_value: &Value,
+        chain_id: &str,
+        value: Option<stellar_agent_core::policy::v1::ValueClass>,
+        account_view: Option<&dyn stellar_agent_core::policy::v1::AccountReservesView>,
+        identity_view: Option<&dyn stellar_agent_core::policy::v1::AccountIdentityView>,
+    ) -> Result<DispatchOutcome, ToolError> {
+        let descriptor = self.checked_policy_descriptor(tool_name, args_value, chain_id)?;
 
         // Settle the reservations that have stood long enough to be
         // settleable, before the refresh below reads them.
@@ -1527,52 +1715,9 @@ impl WalletServer {
             }
         }
 
-        // Evaluate policy with the profile-bound descriptor.
-        //
-        // The value-carrying path (`value = Some`) sizes the exact effect the
-        // handler decoded; the args-derived path (`value = None`) lets the engine
-        // derive the descriptor from `args_value` (pay/create/opaque-sign tools).
-        let counterparty_view = counterparty_cache
-            .as_ref()
-            .map(|snapshot| snapshot as &dyn stellar_agent_core::policy::v1::CounterpartyCacheView);
-        // The `_full` evaluation additionally surfaces the value descriptor the
-        // gate sized on the allow path, threaded into `DispatchOutcome::Allow` so
-        // the value-verb handlers record exactly what the gate evaluated.
-        let evaluation = match value {
-            Some(value) => self.policy_engine.evaluate_with_value_full(
-                &descriptor,
-                args_value,
-                &self.profile,
-                value,
-                account_view,
-                identity_view,
-                counterparty_view,
-                None,
-                None,
-            ),
-            None => self.policy_engine.evaluate_full(
-                &descriptor,
-                args_value,
-                &self.profile,
-                account_view,
-                identity_view,
-                counterparty_view,
-                None,
-                None, // sep45_sessions: wired at dispatch site when sep45_session_active criterion active
-            ),
-        };
-        let evaluation = match evaluation {
-            Ok(evaluation) => evaluation,
-            Err(err) => {
-                // Engine error → fail closed as `policy.engine_required`
-                // (fires for `Noop` and for `V1` engine errors such as a
-                // missing policy document).
-                return Err(ToolError::Business(business_error_result(
-                    "policy.engine_required",
-                    format!("policy engine evaluation failed: {err}"),
-                )));
-            }
-        };
+        let evaluation = self
+            .evaluate_with_descriptor(&descriptor, args_value, value, account_view, identity_view)
+            .await?;
         let value_effects = evaluation.value_effects;
         let outcome = match evaluation.decision {
             Decision::Allow => DispatchOutcome::Allow(value_effects),
@@ -1612,6 +1757,24 @@ impl WalletServer {
         };
 
         Ok(outcome)
+    }
+}
+
+/// Names the kind of an envelope decode failure without the values its
+/// message can carry, such as an asset code.
+fn envelope_decode_error_kind(
+    err: &stellar_agent_core::envelope_decode::EnvelopeDecodeError,
+) -> &'static str {
+    use stellar_agent_core::envelope_decode::EnvelopeDecodeError;
+    match err {
+        EnvelopeDecodeError::Base64Decode { .. } => "base64_decode",
+        EnvelopeDecodeError::XdrDecode { .. } => "xdr_decode",
+        EnvelopeDecodeError::NotTransactionV1 => "not_transaction_v1",
+        EnvelopeDecodeError::UnexpectedOperationCount { .. } => "unexpected_operation_count",
+        EnvelopeDecodeError::OperationKindMismatch { .. } => "operation_kind_mismatch",
+        EnvelopeDecodeError::UnsupportedTool { .. } => "unsupported_tool",
+        EnvelopeDecodeError::IssuerEncodeFailed { .. } => "issuer_encode_failed",
+        _ => "unrecognised",
     }
 }
 
@@ -3243,6 +3406,65 @@ mod tests {
             }
             other => panic!("expected Ok(RequireApproval), got {other:?}"),
         }
+    }
+
+    // ── paired_commit_outcome: only decodable commit arguments park a request ─
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn paired_commit_outcome_requires_decodable_commit_arguments() {
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let req = ApprovalRequest::new("commit-nonce".into(), 120);
+        let engine = MockPolicyEngine::returns(Ok(Decision::RequireApproval(req)));
+        let server = make_server_with_engine(engine);
+        let envelope =
+            stellar_agent_test_support::signed_envelope::SignedTestEnvelope::for_source([0x31; 32]);
+
+        let decoded = server
+            .paired_commit_outcome(
+                DispatchOutcome::Allow(None),
+                envelope.envelope_xdr(),
+                "stellar_pay_commit",
+                "stellar:testnet",
+                None,
+                None,
+            )
+            .await;
+        match decoded {
+            DispatchOutcome::RequireApproval(approval) => {
+                assert_eq!(approval.request.nonce, "commit-nonce");
+            }
+            other => panic!("expected the commit request, got {other:?}"),
+        }
+
+        let undecodable = server
+            .paired_commit_outcome(
+                DispatchOutcome::Allow(None),
+                "not-an-envelope",
+                "stellar_pay_commit",
+                "stellar:testnet",
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(undecodable, DispatchOutcome::Allow(None)),
+            "an undecodable envelope leaves the outcome unchanged, got {undecodable:?}"
+        );
+    }
+
+    #[test]
+    fn tool_error_code_omits_the_message() {
+        let business = ToolError::Business(business_error_result(
+            "policy.engine_required",
+            "policy engine evaluation failed: GAAAA",
+        ));
+        assert_eq!(business.code(), "policy.engine_required");
+        let protocol = ToolError::Protocol(ErrorData::invalid_params(
+            "chain_id mismatch: stellar:pubnet",
+            None,
+        ));
+        assert_eq!(protocol.code(), "-32602");
     }
 
     // ── dispatch_gate: approval_required_indistinguishable wire code ──────────

@@ -565,6 +565,17 @@ impl WalletServer {
         );
 
         // ── Persist pending approval if policy requires it ───────────────────
+        let dispatch_outcome = self
+            .paired_commit_outcome(
+                dispatch_outcome,
+                &envelope_xdr,
+                "stellar_create_account_commit",
+                &args.chain_id,
+                Some(&source_adapter),
+                None,
+            )
+            .await;
+
         let approval_block = if let DispatchOutcome::RequireApproval(approval) = &dispatch_outcome {
             let profile_name = self.profile_name_for_approval();
             match self.persist_create_account_pending_approval(

@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `auth.keyring_not_found`, a store failure `auth.keyring_platform_error`.
 - The Friendbot refusal names the starting-balance rule: Friendbot funds an
   account only when its balance is below the Friendbot starting balance.
+- The MCP simulate steps for pay, create-account, trustline, and claim, and MPP
+  charge prepare, record a pending approval when policy requires approval only
+  for the paired commit tool. Such rulesets reach an approvable request.
+- A `KNOWN_ISSUER` criterion that gates inflows checks the trustline commit
+  against the trustline's asset, and the commit's audit rows record that asset.
 
 ### Security
 

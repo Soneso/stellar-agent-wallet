@@ -945,7 +945,19 @@ impl WalletServer {
         let memo_json = memo_json(&memo);
 
         // ── Persist pending approval if policy requires it ────────────────────
-        //
+        let dispatch_outcome = self
+            .paired_commit_outcome(
+                dispatch_outcome,
+                &envelope_xdr,
+                "stellar_pay_commit",
+                &args.chain_id,
+                Some(&source_adapter),
+                dest_adapter
+                    .as_ref()
+                    .map(|a| a as &dyn stellar_agent_core::policy::v1::AccountIdentityView),
+            )
+            .await;
+
         // `process_uid_for_attestation` at simulate time is the user running the
         // MCP server process.  The CLI-side `stellar-agent approve` MUST run as
         // the same user because the HMAC input binds `process_uid`; an

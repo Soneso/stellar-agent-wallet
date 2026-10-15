@@ -123,8 +123,8 @@ approves. See below.
 
 ## When approval is required
 
-A `RequireApproval` verdict (a V1 policy rule, the high-value cross-check, or any
-toolset-routed payment) routes through the operator. The handshake:
+A `RequireApproval` verdict (a V1 policy rule or any toolset-routed payment)
+routes through the operator. The handshake:
 
 1. The build/simulate call returns an `approval` block carrying an
    `approval_nonce` instead of executing.
@@ -201,7 +201,9 @@ the settlement receipt. See [protocols.md](protocols.md) for the flow.
 ## Sponsored MPP charges
 
 For an MPP Payment challenge, call `stellar_mpp_charge_prepare` with the exact
-HTTP or MCP request context. Review the returned preview and nonce. If approval
+HTTP or MCP request context. Prepare records a pending approval when policy
+requires approval for either `stellar_mpp_charge_prepare` or
+`stellar_mpp_charge_commit`. Review the returned preview and nonce. If approval
 is required, wait for the operator; then call `stellar_mpp_charge_commit` once
 with only the authorization ID and returned nonce fields. Deliver the resulting
 credential only through the trusted host to the exact bound request.

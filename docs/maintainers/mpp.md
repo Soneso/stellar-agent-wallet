@@ -174,13 +174,20 @@ commit and post-event digests.
 ```text
 prepared -> approval_pending -> ready -> authorizing -> delivery_pending -> authorized
 prepared ----------------------> ready
-ready -> approval_pending                 (policy changed before commit)
+ready -> approval_pending                 (prepare requires approval)
 authorized -> receipt_observed
 authorized|receipt_observed -> settled|failed|expired_unresolved
 prepared|approval_pending|ready -> expired_unresolved
 authorizing -> refused|failed|indeterminate
 delivery_pending -> authorized_withheld
 ```
+
+Prepare records a pending approval when policy requires approval for either
+`stellar_mpp_charge_prepare` or `stellar_mpp_charge_commit`. Its lifetime stays
+bounded by the challenge expiry. Commit re-evaluates its own tool name against
+current state and can still deny an approved request. An exhausted cap returns
+`policy.deny.per_period_cap_exceeded`. The loaded policy document stays fixed
+for the server's lifetime.
 
 Terminal states are `settled`, `failed`, `refused`, `expired_unresolved`,
 `authorized_withheld`, and `indeterminate`. No terminal state transitions or
