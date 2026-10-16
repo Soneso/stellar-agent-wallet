@@ -77,7 +77,9 @@ This is a testnet-first alpha. `mainnet` is accepted for read-only commands but 
 
 ### Submit-layer network binding
 
-The submit layer does not take the declared network on trust. Before sending it asks the endpoint which network it serves, on the client that will send, and treats that answer as authoritative: an endpoint reporting mainnet is refused with `network.mainnet_write_forbidden`, one reporting a different network than declared with `network.endpoint_network_mismatch`, and one whose identity cannot be established within the submission timeout with `network.endpoint_identity_unavailable`. The probe is retried with bounded backoff inside the caller's timeout and never falls back to the declaration.
+The submit layer does not take the declared network on trust. Before sending, it asks the endpoint which network it serves and which protocol it runs, on the client that sends. That answer is authoritative. An endpoint reporting mainnet is refused with `network.mainnet_write_forbidden`. One reporting a different network than declared is refused with `network.endpoint_network_mismatch`. One whose identity cannot be established within the submission timeout is refused with `network.endpoint_identity_unavailable`. The probe is retried with bounded backoff inside the caller's timeout and never falls back to the declaration. An answer that does not parse is not retried.
+
+This release supports protocol version 29. On testnet and other networks, a version outside that range is logged as a warning and the submission continues. On mainnet the same version is refused with `network.unsupported_protocol_version`; while mainnet writes are refused, a mainnet endpoint is refused with `network.mainnet_write_forbidden` before this rule applies.
 
 It then verifies every decorated signature on the envelope against the network id the endpoint reported, using the ed25519 signer sets of the transaction source and every operation source (an account absent from the ledger is `network.account_not_found`). A signature that verifies only under the mainnet network id is `network.envelope_signed_for_mainnet`, one that verifies under neither is `network.envelope_signature_unverifiable`, and an envelope with no signature, or a fee-bump whose outer or inner transaction has none, is `network.envelope_unsigned`. Every signature must pass and each signature set must have at least one, so an envelope signed for one network cannot be submitted under another network's passphrase.
 
@@ -181,7 +183,7 @@ Memo flags are a mutually exclusive group (at most one).
 
 Under `policy.engine = "v1"` `pay` evaluates operator policy before signing. The staged `--sign-only` / `--submit-only` stages gate too: they decode the supplied envelope and match rules under the `stellar_pay_commit` tool name, and deny `policy.deny.unsizable_value_effect` on an envelope the decoder cannot size unless the matched rule sets `allow_opaque_signing = true`.
 
-`--submit-only` runs the endpoint identity probe on its own client before the policy gate and before the audit-key pre-flight, so an `--rpc-url` pointing at a different network than `--network` is refused early. It also requires an already-signed envelope: handing it the unsigned XDR that `--build-only` emitted is refused with `network.envelope_unsigned` before anything is sent. `claim --submit-only` behaves the same way.
+`--submit-only` runs the endpoint identity probe on its own client before the policy gate and before the audit-key pre-flight, so an `--rpc-url` pointing at a different network than `--network` is refused early. The probe reads the endpoint's protocol version too and applies the same protocol rule as the submit layer, under its own `--timeout-seconds` deadline; the submission then starts a fresh one. It also requires an already-signed envelope: handing it the unsigned XDR that `--build-only` emitted is refused with `network.envelope_unsigned` before anything is sent. `claim --submit-only` behaves the same way.
 
 Before the transaction is sent, `pay` records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. A submission whose confirmation does not arrive exits 1 with `submission.tx_timeout`, keeps that record, and carries the full transaction hash in `error.details`. Resolve it with `tx status <HASH>`, never by rebuilding and re-sending: a second submission for the same source account and sequence is refused with `submission.tx_already_submitted` while the first stands. The same applies to `claim`, `accounts create`, `trustline`, `trade` and `vault`.
 
@@ -260,6 +262,8 @@ stellar-agent balances --account GABC...WXYZ \
 | `--fee` | shared | profile `classic_fee_per_op_stroops` |
 
 One JSON envelope: once the clawback gate passes, the typed preview is in `data.preview` on success and in `error.details.preview` when a later step (fee, envelope build, signing, submission) fails.
+
+The submission runs under the profile's `submit_timeout_seconds`, 60 seconds when the field is unset; there is no `--timeout-seconds` flag.
 
 ```bash
 stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default

@@ -184,13 +184,6 @@ const _: () = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Submit timeout for commit steps (conservative; classic ops settle fast)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Maximum time to wait for a submitted transaction to confirm.
-pub(crate) const SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Oracle RPC timeout — independent-RPC cross-check
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -204,8 +197,8 @@ pub(crate) const SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// without a valid oracle comparison.
 ///
 /// 15 s is a conservative upper bound for a hosted Stellar RPC endpoint; it is
-/// independent of `SUBMIT_TIMEOUT` (which governs transaction confirmation, not
-/// the pre-commit cross-check).
+/// independent of [`submit_timeout`] (which governs transaction confirmation,
+/// not the pre-commit cross-check).
 ///
 /// Operator note: if `profile.submit_timeout_seconds` is smaller than 15, the
 /// oracle timeout is not automatically reduced — the two timeouts have different
@@ -227,18 +220,16 @@ const ORACLE_REBUILD_RETRY_ATTEMPTS: u32 = 3;
 /// across 3 attempts ≈ 15s total re-poll window).
 const ORACLE_REBUILD_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(7);
 
-/// Resolves the submit timeout for a profile, falling back to the documented
-/// 60-second default when the profile omits an override.
+/// Resolves the submit timeout for a profile through
+/// [`Profile::submit_timeout`], which falls back to the documented 60-second
+/// default when the profile omits an override.
 #[must_use]
 pub(crate) fn submit_timeout(profile: &Profile) -> std::time::Duration {
-    profile
-        .submit_timeout_seconds
-        .map(std::time::Duration::from_secs)
-        .unwrap_or(SUBMIT_TIMEOUT)
+    profile.submit_timeout()
 }
 
-/// Asks the RPC endpoint which network it serves and requires it to be the
-/// profile's.
+/// Asks the RPC endpoint which network it serves and which protocol it runs,
+/// and requires the network to be the profile's.
 ///
 /// Every commit tool runs this on the client it will submit with, before the
 /// nonce is consumed. A commit whose endpoint serves a different network is
@@ -246,15 +237,17 @@ pub(crate) fn submit_timeout(profile: &Profile) -> std::time::Duration {
 /// can correct the endpoint and retry with the same approval rather than
 /// having spent a single-use nonce on an unreachable target.
 ///
-/// The submit layer runs the same probe on the same client; this one exists to
-/// place the refusal ahead of state the submit layer never sees.
+/// The submit layer runs the same check on the same client; this one exists
+/// to place the refusal ahead of state the submit layer never sees. It runs
+/// under its own deadline, `timeout` from now.
 ///
 /// # Errors
 ///
-/// Returns the probe's own refusal:
+/// Returns the check's own refusal:
 /// [`stellar_agent_core::error::NetworkError::MainnetWriteForbidden`],
-/// [`stellar_agent_core::error::NetworkError::EndpointNetworkMismatch`] or
-/// [`stellar_agent_core::error::NetworkError::EndpointIdentityUnavailable`].
+/// [`stellar_agent_core::error::NetworkError::EndpointNetworkMismatch`],
+/// [`stellar_agent_core::error::NetworkError::EndpointIdentityUnavailable`] or
+/// [`stellar_agent_core::error::NetworkError::UnsupportedProtocolVersion`].
 pub(crate) async fn probe_endpoint_network(
     client: &stellar_agent_network::StellarRpcClient,
     context: &stellar_agent_network::NetworkContext,
@@ -262,8 +255,9 @@ pub(crate) async fn probe_endpoint_network(
 ) -> Result<(), stellar_agent_core::error::WalletError> {
     let deadline = tokio::time::Instant::now() + timeout;
     client
-        .verify_network_passphrase(context.network_passphrase(), deadline)
-        .await
+        .endpoint_identity(context.network_passphrase(), deadline)
+        .await?;
+    Ok(())
 }
 
 /// Renders a commit-path refusal as an error tool result.
@@ -2488,6 +2482,20 @@ mod tests {
         atomic::{AtomicBool, AtomicU32, Ordering},
     };
     use stellar_agent_core::AuthError;
+
+    // ── submit_timeout ──────────────────────────────────────────────────────────
+
+    /// An unset `submit_timeout_seconds` gives the 60-second default and a
+    /// configured one its own value.
+    #[test]
+    fn submit_timeout_resolves_the_default_and_the_configured_value() {
+        let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
+        profile.submit_timeout_seconds = None;
+        assert_eq!(submit_timeout(&profile), std::time::Duration::from_secs(60));
+
+        profile.submit_timeout_seconds = Some(17);
+        assert_eq!(submit_timeout(&profile), std::time::Duration::from_secs(17));
+    }
 
     // ── x402 value-descriptor helpers ───────────────────────────────────────────
 

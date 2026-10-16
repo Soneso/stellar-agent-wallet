@@ -7,8 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `StellarRpcClient::endpoint_identity` returns the checked `EndpointIdentity`,
+  with its chain, protocol version, and authority. `check_protocol_version` and
+  `SUPPORTED_PROTOCOL_VERSIONS` state the protocol rule.
+- Core `Profile::submit_timeout` resolves `submit_timeout_seconds` against
+  `DEFAULT_SUBMIT_TIMEOUT_SECS`.
+- The endpoint check before a submission reads the RPC endpoint's protocol
+  version from its `getNetwork` answer. This release supports protocol 29. On
+  testnet and other networks, a version outside that range logs a warning and
+  the submission continues. On mainnet such a version refuses with the new code
+  `network.unsupported_protocol_version`; while mainnet writes are refused, a
+  mainnet endpoint is refused with `network.mainnet_write_forbidden` first.
+
+### Changed
+
+- `trustline` waits 60 seconds for its submission when the profile leaves
+  `submit_timeout_seconds` unset, the default the MCP commit tools use.
+- A `getNetwork` answer that does not parse, for example one without
+  `protocolVersion`, is not retried. The endpoint check reports
+  `network.endpoint_identity_unavailable` after that one request.
+- A `SUCCESS` or `FAILED` status that arrives after the submission deadline is
+  not accepted. The submission reports its timeout, and `tx status` settles the
+  transaction hash.
+
+### Removed
+
+- `StellarRpcClient::verify_network_passphrase`, replaced by
+  `StellarRpcClient::endpoint_identity`.
+
 ### Fixed
 
+- A confirmation poll request that the endpoint holds open ends at the
+  submission deadline, and the sleep between polls ends there too. A submission
+  returns within its timeout instead of waiting up to 60 seconds more. The
+  idempotent submit path's one final retention check adds at most 2 seconds.
+- A retry sleep ends at the caller's deadline instead of running up to 4
+  seconds past it. A sleep that reaches the deadline ends the retries with the
+  last error.
 - `trustline` reports keyring and signer-key failures with their own `auth.*`
   codes, as the other keyring-signing verbs do: a missing signer entry is
   `auth.keyring_not_found`, a store failure `auth.keyring_platform_error`.

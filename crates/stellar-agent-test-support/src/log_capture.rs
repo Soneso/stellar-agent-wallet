@@ -10,6 +10,8 @@
 //! [`CaptureWriter::captured_str`]) and pass the result to
 //! [`crate::assert_no_secret_bytes`] to assert that no secret material
 //! reached the writer.
+//!
+//! [`WarningCapture`] records the fields of each warning on the test thread.
 
 // The `expect` calls in this module are on `std::sync::Mutex::lock()` results.
 // A mutex can only be poisoned if a thread panicked while holding the lock.
@@ -21,6 +23,78 @@ use std::{
     io,
     sync::{Arc, Mutex},
 };
+
+/// A subscriber layer that records warning fields in emission order.
+#[derive(Clone, Default)]
+pub struct WarningCapture {
+    events: Arc<Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+    target_prefix: Option<&'static str>,
+}
+
+struct WarningFields(std::collections::BTreeMap<String, String>);
+
+impl tracing::field::Visit for WarningFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let metadata = event.metadata();
+        if *metadata.level() == tracing::Level::WARN
+            && self
+                .target_prefix
+                .is_none_or(|prefix| metadata.target().starts_with(prefix))
+        {
+            let mut fields = WarningFields(std::collections::BTreeMap::new());
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .expect("warning capture mutex poisoned")
+                .push(fields.0);
+        }
+    }
+}
+
+impl WarningCapture {
+    /// Captures warnings on this thread until the returned guard drops.
+    ///
+    /// `target_prefix` restricts capture to matching targets when present.
+    /// Async callers use a current-thread runtime and keep the guard across awaits.
+    #[must_use]
+    pub fn capture(
+        target_prefix: Option<&'static str>,
+    ) -> (Self, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = Self {
+            target_prefix,
+            ..Self::default()
+        };
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        tracing::callsite::rebuild_interest_cache();
+        (capture, guard)
+    }
+
+    /// Returns the captured warning fields in emission order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a thread panics while holding the capture mutex.
+    #[must_use]
+    pub fn seen(&self) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.events
+            .lock()
+            .expect("warning capture mutex poisoned")
+            .clone()
+    }
+}
 
 /// In-memory writer that accumulates bytes written by a `tracing_subscriber`
 /// fmt layer.

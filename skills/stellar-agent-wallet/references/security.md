@@ -150,13 +150,18 @@ answer as authoritative: an endpoint reporting mainnet is refused with
 endpoint reporting a different network than declared with
 `network.endpoint_network_mismatch`, and an endpoint whose identity cannot be
 established within the submission timeout with
-`network.endpoint_identity_unavailable`. It then verifies every signature on the
-envelope against the network the endpoint reported:
-`network.envelope_signed_for_mainnet` when a signature was made for mainnet,
-`network.envelope_signature_unverifiable` when it verifies under neither
-network, and `network.envelope_unsigned` when the envelope, or on a fee-bump
-either the outer or the inner transaction, carries no signature. An envelope
-signed for one network therefore cannot be relayed onto another.
+`network.endpoint_identity_unavailable`. The same answer carries the endpoint's
+protocol version. This release supports protocol 29: outside it, testnet and
+other networks log a warning, and a mainnet endpoint is refused with
+`network.unsupported_protocol_version`. While mainnet writes are refused, a
+mainnet endpoint is refused with `network.mainnet_write_forbidden` first. The
+submit layer then verifies every signature on the envelope against the network
+the endpoint reported. An envelope with a signature made for mainnet is refused
+with `network.envelope_signed_for_mainnet`. One with a signature that verifies
+under neither network is refused with `network.envelope_signature_unverifiable`.
+An envelope without a signature, or a fee-bump whose outer or inner transaction
+carries none, is refused with `network.envelope_unsigned`. An envelope signed
+for one network therefore cannot be relayed onto another.
 
 Agent rule: if you receive `network.mainnet_write_forbidden`,
 `policy.engine_required`, or any of the network-binding codes above, the action

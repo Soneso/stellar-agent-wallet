@@ -277,12 +277,20 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   regardless of engine or keys. No configuration unlocks mainnet writes in this
   alpha.
 - The submit layer does not trust the declared network. It asks the RPC endpoint
-  which network it serves and binds the submission to that answer, then verifies
-  every signature on the envelope against it. Five codes carry those refusals:
-  `network.endpoint_network_mismatch` (endpoint serves a different network than
-  declared), `network.endpoint_identity_unavailable` (endpoint identity could
-  not be established in time), `network.envelope_signed_for_mainnet`,
-  `network.envelope_signature_unverifiable`, and `network.envelope_unsigned`.
+  which network it serves and which protocol it runs, binds the submission to
+  that answer, then verifies every signature on the envelope against it.
+  Six codes carry those refusals:
+  - `network.endpoint_network_mismatch`: the endpoint serves a different
+    network than declared.
+  - `network.endpoint_identity_unavailable`: the endpoint identity cannot be
+    established in time.
+  - `network.unsupported_protocol_version`: a mainnet endpoint reports a version
+    outside the supported range. While mainnet writes are refused, a mainnet
+    endpoint is refused before this check.
+  - `network.envelope_signed_for_mainnet`: a signature verifies only on mainnet.
+  - `network.envelope_signature_unverifiable`: a signature does not verify.
+  - `network.envelope_unsigned`: a required signature set is empty.
+
   See references/troubleshooting.md.
 - These tools refuse `stellar:mainnet` structurally at handler entry with
   `network.mainnet_write_forbidden`, before the policy gate and regardless of
@@ -360,7 +368,11 @@ three codes for mainnet refusals.
 layer asks the RPC endpoint which network it serves and binds the submission to
 that answer. An endpoint serving a different network than the profile declares
 is `network.endpoint_network_mismatch`; an endpoint whose identity cannot be
-established in time is `network.endpoint_identity_unavailable`. Signatures are
+established in time is `network.endpoint_identity_unavailable`. The same answer
+carries the endpoint's protocol version: this release supports protocol 29.
+Outside it, testnet logs a warning and continues; on mainnet the rule refuses
+with `network.unsupported_protocol_version`, which a mainnet endpoint never
+reaches while mainnet writes are refused. Signatures are
 then checked against the network the endpoint reported: an envelope signed for
 mainnet is `network.envelope_signed_for_mainnet`, one whose signatures verify
 under neither that network nor mainnet is

@@ -241,24 +241,31 @@ one whose `rpc_url` names a known mainnet host, are each refused there with no
 RPC call at all.
 
 The network layer does not take the profile's declared network on trust either.
-Before sending, it asks the endpoint which network it serves (`getNetwork`), on
-the same client instance that will send, and that answer is authoritative: an
-endpoint reporting mainnet is refused with `network.mainnet_write_forbidden`,
-an endpoint reporting a different network than the profile declares with
-`network.endpoint_network_mismatch`, and an endpoint whose identity cannot be
-established within the submission timeout with
+Before sending, it asks the endpoint which network it serves and which protocol
+it runs (`getNetwork`), on the same client instance that sends. That answer is
+authoritative. An endpoint reporting mainnet is refused with
+`network.mainnet_write_forbidden`. One reporting a different network than the
+profile declares is refused with `network.endpoint_network_mismatch`. One whose
+identity cannot be established within the submission timeout is refused with
 `network.endpoint_identity_unavailable`. The probe is retried with bounded
 exponential backoff inside the caller's timeout and never falls back to the
-declaration. It then verifies every decorated signature on the envelope against
-the network id the endpoint reported, after fetching the relevant accounts'
-ed25519 signer sets (an account absent from the ledger is
-`network.account_not_found`): a signature that verifies only under the mainnet
-network id is `network.envelope_signed_for_mainnet`, one that verifies under
-neither is `network.envelope_signature_unverifiable`, and an envelope carrying
-no signature, or on a fee-bump either the outer or the inner transaction, is `network.envelope_unsigned`. The four commit tools
-`stellar_pay_commit`, `stellar_claim_commit`, `stellar_trustline_commit`, and
-`stellar_create_account_commit` run this probe before the single-use nonce is
-burned, so a mismatch does not consume the nonce.
+declaration; an answer that does not parse is not retried.
+[Retries, deadlines, and failover](maintainers/security-internals.md#retries-deadlines-and-failover)
+gives the numbers. This release supports protocol version 29. On testnet and
+other networks, a version outside that range is logged as a warning. On mainnet
+it is refused with `network.unsupported_protocol_version`, a refusal a mainnet
+endpoint never reaches while `network.mainnet_write_forbidden` refuses it first.
+The network layer then fetches the relevant accounts' ed25519 signer sets.
+It verifies every decorated signature on the envelope against the network id
+the endpoint reports. An account absent from the ledger is
+`network.account_not_found`. A signature that verifies only under the mainnet
+network id is `network.envelope_signed_for_mainnet`. One that verifies under
+neither network is `network.envelope_signature_unverifiable`. An envelope
+carrying no signature is `network.envelope_unsigned`. For fee bumps, this code
+also applies when either the outer or inner transaction has no signature. The
+four commit tools `stellar_pay_commit`, `stellar_claim_commit`,
+`stellar_trustline_commit`, and `stellar_create_account_commit` run this probe
+before the single-use nonce is burned, so a mismatch does not consume the nonce.
 
 The two [policy engines](./concepts.md) are Noop (testnet allow-all; mainnet
 read-only allow, mainnet destructive refused) and V1 (signature-verified typed

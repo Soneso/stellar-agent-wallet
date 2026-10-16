@@ -290,7 +290,9 @@ every mainnet write is additionally refused at the network layer
 That layer binds each submission to the network the RPC endpoint reports it
 serves, not to the profile's declared `network_passphrase`, so a profile whose
 `rpc_url` and network do not name the same chain is refused before anything is
-sent (`network.endpoint_network_mismatch`).
+sent (`network.endpoint_network_mismatch`). The same answer carries the
+endpoint's protocol version, checked against the supported range as
+[cli-reference.md](cli-reference.md#submit-layer-network-binding) describes.
 MPP refuses mainnet with `mpp.network_forbidden` instead of
 `network.mainnet_write_forbidden`.
 

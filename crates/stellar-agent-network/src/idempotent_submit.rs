@@ -95,6 +95,7 @@ use stellar_agent_core::error::{NetworkError, ProtocolError, SubmissionError, Wa
 use stellar_agent_core::profile::receipt::{
     BeginOutcome, ReceiptStatus, ReceiptStore, SubmissionReceipt,
 };
+use stellar_rpc_client::GetHealthResponse;
 use stellar_xdr::{Limits, Preconditions, ReadXdr, TransactionEnvelope};
 
 use crate::StellarRpcClient;
@@ -106,6 +107,7 @@ use crate::retry::{
 };
 // bytes_to_hex: canonical pub(crate) definition from submit.rs.
 use crate::submit::{SubmissionResult, bytes_to_hex, map_failed_record, redact_tx_hash};
+use crate::transaction_record::TransactionRecord;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Poll configuration
@@ -894,9 +896,9 @@ async fn pre_send_checks(
     crate::signing::verify_binding::reject_v0_envelope(&envelope)?;
 
     // The endpoint decides which network this lands on, so it is asked, on the
-    // client instance that will send.
+    // client instance that will send, together with the protocol it runs.
     client
-        .verify_network_passphrase(network_passphrase, send_deadline)
+        .endpoint_identity(network_passphrase, send_deadline)
         .await?;
 
     // Every signature must have been produced for that network.
@@ -916,7 +918,9 @@ async fn pre_send_checks(
 ///
 /// `timeout` is one budget for the whole submission: the endpoint identity
 /// probe and the signer-set fetch that precede the send are bounded by the
-/// same deadline as the send and the confirmation poll.
+/// same deadline as the send and the confirmation poll. The poll returns
+/// within that deadline plus [`FINAL_RETENTION_CHECK_TIMEOUT`], the bound on
+/// its one request past the deadline; see [`poll_with_retention`].
 ///
 /// Owns the poll loop directly — the upstream poller does not provide
 /// retention/reorg/Ambiguous semantics — and calls `get_health()` on every
@@ -964,8 +968,7 @@ pub(crate) async fn submit_with_retention_poll(
     // endpoint identity probe, and signature-network binding are enforced
     // explicitly here.
 
-    let started = tokio::time::Instant::now();
-    let send_deadline = started + timeout;
+    let send_deadline = tokio::time::Instant::now() + timeout;
 
     // Callers reach this function with a Pending receipt already written for
     // `envelope_hash`. Nothing below has touched the network yet, so a refusal
@@ -1071,34 +1074,141 @@ pub(crate) async fn submit_with_retention_poll(
 
     let tx_hash_obj = Hash(local_tx_hash_bytes);
 
-    // Poll until SUCCESS, FAILED, timeout, or retention-window closure.
-    //
-    // Each poll reads the raw `getTransaction` answer: status and ledger are
-    // read as received, and the result XDR is decoded only for a `FAILED`
-    // transaction, so an answer whose meta the wallet cannot decode still
-    // confirms.
-    //
-    // Transient `JsonRpc(_)` errors from `get_transaction_record` are treated
-    // like `NOT_FOUND`: log at debug and fall through to the deadline check +
-    // RETENTION_POLL_INTERVAL sleep.  This prevents a transient 429 from
-    // aborting the entire submission.
-    //
-    // `get_health` errors map to HealthCheckFailed (keep-polling) in
-    // check_retention_window and are not affected by this path.
-    //
-    // Keep in sync with the poll loop in submit.rs: any change to the
-    // retryable-error treatment here must be mirrored there.
+    poll_with_retention(
+        || client.get_transaction_record(&tx_hash_obj),
+        || client.get_health(),
+        RetentionPoll {
+            store,
+            url: &client.url,
+            envelope_hash,
+            tx_hash_hex,
+            recorded_at_ledger,
+            max_time,
+            send_deadline,
+            timeout,
+        },
+    )
+    .await
+}
+
+/// The bound on the one retention check that runs after the submission
+/// deadline.
+///
+/// That check decides between the two ambiguous outcomes a timeout can have,
+/// and it is the only request the retention poll makes past the deadline. An
+/// endpoint that does not answer within this bound is treated as a failed
+/// health check, which keeps the within-window outcome.
+const FINAL_RETENTION_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What [`poll_with_retention`] needs besides its two reads.
+struct RetentionPoll<'a> {
+    /// The store holding the submission's receipt.
+    store: &'a ReceiptStore,
+    /// The endpoint URL, for error construction; redacted before use.
+    url: &'a str,
+    /// The idempotency key of the receipt.
+    envelope_hash: &'a str,
+    /// The locally computed transaction hash, 64 lowercase hex characters.
+    tx_hash_hex: String,
+    /// The ledger the submission is recorded against.
+    recorded_at_ledger: u32,
+    /// `TimeBounds.maxTime` of the transaction, for the resubmission hint.
+    max_time: u64,
+    /// The submission deadline.
+    send_deadline: tokio::time::Instant,
+    /// The submission timeout the deadline was built from, for messages.
+    timeout: Duration,
+}
+
+/// Polls `getTransaction` through `poll`, with a `getHealth` retention check
+/// through `health` on every `NOT_FOUND`, until the transaction settles, the
+/// retention window closes, or the submission deadline passes. Finalises the
+/// receipt to match.
+///
+/// Each poll reads the raw `getTransaction` answer: status and ledger are
+/// read as received, and the result XDR is decoded only for a `FAILED`
+/// transaction, so an answer whose meta the wallet cannot decode still
+/// confirms.
+///
+/// The deadline bounds every step. No poll request starts at or past it, an
+/// in-flight `getTransaction` or in-loop `getHealth` is cut at it, and each
+/// sleep between polls ends at it at the latest. Tokio polls a request before
+/// its deadline timer, so an answer can complete after the deadline; the
+/// deadline is therefore checked again before the answer is read or the
+/// receipt changes. A deadline exit finalises `Ambiguous`, as described at
+/// [`DeadlineExit::settle`]. The final retention check is the one request past
+/// the deadline, bounded by [`FINAL_RETENTION_CHECK_TIMEOUT`], so the poll
+/// returns within the deadline plus that bound.
+///
+/// Transient `JsonRpc(_)` errors from `getTransaction` are treated like
+/// `NOT_FOUND`: logged at debug and followed by the next poll, so a transient
+/// 429 does not abort the submission. `getHealth` errors map to
+/// `HealthCheckFailed` (keep polling) in [`check_retention_window`].
+///
+/// Keep in sync with the poll loop in submit.rs: any change to the deadline
+/// or retryable-error treatment here must be mirrored there.
+async fn poll_with_retention<P, PF, H, HF>(
+    mut poll: P,
+    mut health: H,
+    poll_state: RetentionPoll<'_>,
+) -> Result<SubmissionResult, WalletError>
+where
+    P: FnMut() -> PF,
+    PF: std::future::Future<Output = Result<TransactionRecord, stellar_rpc_client::Error>>,
+    H: FnMut() -> HF,
+    HF: std::future::Future<Output = Result<GetHealthResponse, NetworkError>>,
+{
+    let RetentionPoll {
+        store,
+        url,
+        envelope_hash,
+        tx_hash_hex,
+        recorded_at_ledger,
+        max_time,
+        send_deadline,
+        timeout,
+    } = poll_state;
+    let redacted = redact_envelope_hash(envelope_hash);
+    let redacted_tx = redact_tx_hash(&tx_hash_hex);
+    let at_deadline = DeadlineExit {
+        store,
+        url,
+        envelope_hash,
+        redacted: &redacted,
+        redacted_tx: &redacted_tx,
+        recorded_at_ledger,
+        max_time,
+        timeout,
+    };
+
+    // Whether the last poll answer was a transient error, which selects the
+    // deadline exit that answer leads to.
+    let mut after_transient_error = false;
     loop {
-        let poll_result = client.get_transaction_record(&tx_hash_obj).await;
+        // A sleep that reached the deadline ends the loop here, before another
+        // request starts.
+        if tokio::time::Instant::now() >= send_deadline {
+            return Err(at_deadline.settle(&mut health, after_transient_error).await);
+        }
+        // A request the endpoint holds open is cut at the deadline rather than
+        // left to the transport's own 60 s bound. A cut request has no answer,
+        // as at a NOT_FOUND.
+        let Ok(poll_result) = tokio::time::timeout_at(send_deadline, poll()).await else {
+            return Err(at_deadline.settle(&mut health, false).await);
+        };
+        after_transient_error = matches!(&poll_result, Err(e) if is_retryable_poll_error(e));
+        // An answer that completed at or after the deadline is not read.
+        if tokio::time::Instant::now() >= send_deadline {
+            return Err(at_deadline.settle(&mut health, after_transient_error).await);
+        }
 
         let record = match poll_result {
             Ok(r) => r,
             Err(ref e) if is_retryable_poll_error(e) => {
                 // Treat transient transport error as NOT_FOUND: log at debug
-                // and fall through to deadline + sleep.
-                // Truncate error display to bound log volume from a hostile
-                // endpoint.
-                let url_authority = redact_url_authority(&client.url);
+                // and poll again after the interval. Truncate error display to
+                // bound log volume from a hostile endpoint.
+                let url_authority = redact_url_authority(url);
                 tracing::debug!(
                     envelope_hash = %redacted,
                     tx_hash = %redacted_tx,
@@ -1107,37 +1217,11 @@ pub(crate) async fn submit_with_retention_poll(
                     "submit_with_retention_poll: transient getTransaction error \
                      (treating as NOT_FOUND, continuing poll)"
                 );
-                // Fall through to deadline check below.
-                if started.elapsed() >= timeout {
-                    // Timeout with a poll error — finalise Ambiguous (same as
-                    // NOT_FOUND + within-window timeout, no result XDR available).
-                    tracing::warn!(
-                        envelope_hash = %redacted,
-                        tx_hash = %redacted_tx,
-                        timeout_secs = timeout.as_secs(),
-                        "submit_with_retention_poll: timeout during poll error; \
-                         finalising Ambiguous"
-                    );
-                    if let Err(fe) = store.finalize(envelope_hash, ReceiptStatus::Ambiguous, None) {
-                        tracing::warn!(
-                            envelope_hash = %redacted,
-                            error = %fe,
-                            "submit_with_retention_poll: finalize(Ambiguous/poll-error) failed"
-                        );
-                    }
-                    return Err(WalletError::Network(NetworkError::RpcUnreachable {
-                        url: redact_url_authority(&client.url),
-                        reason: format!(
-                            "transaction status ambiguous: timeout with transient poll error \
-                             (resubmit safely after max_time={max_time})"
-                        ),
-                    }));
-                }
-                tokio::time::sleep(RETENTION_POLL_INTERVAL).await;
+                crate::submit::sleep_before_next_poll(RETENTION_POLL_INTERVAL, send_deadline).await;
                 continue;
             }
             Err(e) => {
-                return Err(transport_failure(&client.url, &e));
+                return Err(transport_failure(url, &e));
             }
         };
 
@@ -1193,9 +1277,10 @@ pub(crate) async fn submit_with_retention_poll(
                 return Err(err);
             }
 
-            // NOT_FOUND: check retention window before continuing.
+            // NOT_FOUND: check retention window before continuing. The check
+            // is cut at the submission deadline like the poll request.
             "NOT_FOUND" => {
-                match check_retention_window(client, recorded_at_ledger).await {
+                match check_retention_window(&mut health, recorded_at_ledger, send_deadline).await {
                     RetentionCheck::OutsideWindow { oldest_ledger } => {
                         tracing::warn!(
                             envelope_hash = %redacted,
@@ -1214,7 +1299,7 @@ pub(crate) async fn submit_with_retention_poll(
                             );
                         }
                         return Err(WalletError::Network(NetworkError::RpcUnreachable {
-                            url: redact_url_authority(&client.url),
+                            url: redact_url_authority(url),
                             reason: format!(
                                 "transaction status ambiguous: NOT_FOUND and submission \
                                  (recorded_at_ledger={recorded_at_ledger}) predates the RPC \
@@ -1230,76 +1315,135 @@ pub(crate) async fn submit_with_retention_poll(
             }
 
             other => {
-                return Err(WalletError::Network(unexpected_status(
-                    &client.url,
-                    "",
-                    other,
-                )));
+                return Err(WalletError::Network(unexpected_status(url, "", other)));
             }
         }
 
-        if started.elapsed() >= timeout {
-            // Timeout: check retention one last time before declaring Ambiguous.
-            match check_retention_window(client, recorded_at_ledger).await {
-                RetentionCheck::OutsideWindow { oldest_ledger } => {
-                    tracing::warn!(
-                        envelope_hash = %redacted,
-                        recorded_at_ledger,
-                        oldest_ledger,
-                        "submit_with_retention_poll: timeout + outside retention window; \
-                         finalising Ambiguous"
-                    );
-                    if let Err(e) = store.finalize(envelope_hash, ReceiptStatus::Ambiguous, None) {
-                        tracing::warn!(
-                            envelope_hash = %redacted,
-                            error = %e,
-                            "submit_with_retention_poll: finalize(Ambiguous) on timeout failed"
-                        );
-                    }
-                    return Err(WalletError::Network(NetworkError::RpcUnreachable {
-                        url: redact_url_authority(&client.url),
-                        reason: format!(
-                            "transaction status ambiguous: timeout + submission predates \
-                             retention floor (oldest_ledger={oldest_ledger}). Resubmit \
-                             safely after max_time={max_time}."
-                        ),
-                    }));
-                }
-                RetentionCheck::WithinWindow | RetentionCheck::HealthCheckFailed => {
-                    // Timed out while still within the retention window.
-                    //
-                    // A NOT_FOUND timeout is NOT a terminal on-chain failure
-                    // (the tx may still land after our polling window closes).
-                    // Finalise as Ambiguous — not Failed{tx_timeout} — to
-                    // match the honest-non-masking stance and the stale-Pending
-                    // max_time path.  A caller resubmits safely after max_time.
-                    tracing::warn!(
-                        envelope_hash = %redacted,
-                        timeout_secs = timeout.as_secs(),
-                        "submit_with_retention_poll: timeout while within retention \
-                         window; finalising Ambiguous (not Failed)"
-                    );
-                    if let Err(e) = store.finalize(envelope_hash, ReceiptStatus::Ambiguous, None) {
-                        tracing::warn!(
-                            envelope_hash = %redacted,
-                            error = %e,
-                            "submit_with_retention_poll: finalize(Ambiguous/timeout) failed"
-                        );
-                    }
-                    return Err(WalletError::Network(NetworkError::RpcUnreachable {
-                        url: redact_url_authority(&client.url),
-                        reason: format!(
-                            "transaction status ambiguous: not confirmed within {s}s \
-                             (still within retention window; resubmit safely after \
-                             max_time={max_time})",
-                            s = timeout.as_secs()
-                        ),
-                    }));
-                }
+        crate::submit::sleep_before_next_poll(RETENTION_POLL_INTERVAL, send_deadline).await;
+    }
+}
+
+/// What a retention poll needs to settle at its deadline.
+struct DeadlineExit<'a> {
+    store: &'a ReceiptStore,
+    url: &'a str,
+    envelope_hash: &'a str,
+    redacted: &'a str,
+    redacted_tx: &'a str,
+    recorded_at_ledger: u32,
+    max_time: u64,
+    timeout: Duration,
+}
+
+impl DeadlineExit<'_> {
+    /// Finalises `Ambiguous` for a retention poll the submission deadline
+    /// ended, and builds the error the caller returns.
+    ///
+    /// After a transient poll error, nothing is known about the transaction
+    /// and the exit says so. Otherwise one last retention check, bounded by
+    /// [`FINAL_RETENTION_CHECK_TIMEOUT`], picks the reason: a submission that
+    /// predates the retention floor, or one still within the window. A check
+    /// that does not answer keeps the within-window reason. Either way the
+    /// transaction may still land, so the receipt is `Ambiguous` and never
+    /// `Failed`, and a caller resubmits safely after `max_time`.
+    async fn settle<H, HF>(&self, health: &mut H, after_transient_error: bool) -> WalletError
+    where
+        H: FnMut() -> HF,
+        HF: std::future::Future<Output = Result<GetHealthResponse, NetworkError>>,
+    {
+        let Self {
+            store,
+            url,
+            envelope_hash,
+            redacted,
+            redacted_tx,
+            recorded_at_ledger,
+            max_time,
+            timeout,
+        } = *self;
+
+        if after_transient_error {
+            tracing::warn!(
+                envelope_hash = %redacted,
+                tx_hash = %redacted_tx,
+                timeout_secs = timeout.as_secs(),
+                "submit_with_retention_poll: timeout during poll error; \
+                 finalising Ambiguous"
+            );
+            if let Err(fe) = store.finalize(envelope_hash, ReceiptStatus::Ambiguous, None) {
+                tracing::warn!(
+                    envelope_hash = %redacted,
+                    error = %fe,
+                    "submit_with_retention_poll: finalize(Ambiguous/poll-error) failed"
+                );
             }
+            return WalletError::Network(NetworkError::RpcUnreachable {
+                url: redact_url_authority(url),
+                reason: format!(
+                    "transaction status ambiguous: timeout with transient poll error \
+                     (resubmit safely after max_time={max_time})"
+                ),
+            });
         }
 
-        tokio::time::sleep(RETENTION_POLL_INTERVAL).await;
+        let final_check_deadline = tokio::time::Instant::now() + FINAL_RETENTION_CHECK_TIMEOUT;
+        match check_retention_window(health, recorded_at_ledger, final_check_deadline).await {
+            RetentionCheck::OutsideWindow { oldest_ledger } => {
+                tracing::warn!(
+                    envelope_hash = %redacted,
+                    recorded_at_ledger,
+                    oldest_ledger,
+                    "submit_with_retention_poll: timeout + outside retention window; \
+                     finalising Ambiguous"
+                );
+                if let Err(e) = store.finalize(envelope_hash, ReceiptStatus::Ambiguous, None) {
+                    tracing::warn!(
+                        envelope_hash = %redacted,
+                        error = %e,
+                        "submit_with_retention_poll: finalize(Ambiguous) on timeout failed"
+                    );
+                }
+                WalletError::Network(NetworkError::RpcUnreachable {
+                    url: redact_url_authority(url),
+                    reason: format!(
+                        "transaction status ambiguous: timeout + submission predates \
+                         retention floor (oldest_ledger={oldest_ledger}). Resubmit \
+                         safely after max_time={max_time}."
+                    ),
+                })
+            }
+            RetentionCheck::WithinWindow | RetentionCheck::HealthCheckFailed => {
+                // Timed out while still within the retention window.
+                //
+                // A NOT_FOUND timeout is NOT a terminal on-chain failure
+                // (the tx may still land after our polling window closes).
+                // Finalise as Ambiguous, not Failed{tx_timeout}, to match
+                // the honest-non-masking stance and the stale-Pending
+                // max_time path.  A caller resubmits safely after max_time.
+                tracing::warn!(
+                    envelope_hash = %redacted,
+                    timeout_secs = timeout.as_secs(),
+                    "submit_with_retention_poll: timeout while within retention \
+                     window; finalising Ambiguous (not Failed)"
+                );
+                if let Err(e) = store.finalize(envelope_hash, ReceiptStatus::Ambiguous, None) {
+                    tracing::warn!(
+                        envelope_hash = %redacted,
+                        error = %e,
+                        "submit_with_retention_poll: finalize(Ambiguous/timeout) failed"
+                    );
+                }
+                WalletError::Network(NetworkError::RpcUnreachable {
+                    url: redact_url_authority(url),
+                    reason: format!(
+                        "transaction status ambiguous: not confirmed within {s}s \
+                         (still within retention window; resubmit safely after \
+                         max_time={max_time})",
+                        s = timeout.as_secs()
+                    ),
+                })
+            }
+        }
     }
 }
 
@@ -1318,18 +1462,22 @@ enum RetentionCheck {
     /// untrustworthy (sanity check failed) — treat as within-window to avoid
     /// masking a legitimate `getTransaction` result.
     ///
+    /// A check whose deadline passed before the request started or before its
+    /// answer was read also returns this variant.
+    ///
     /// Degradation is observable: the calling poll path logs `tracing::warn!`
     /// so operators can detect a persistent health-probe failure.
     HealthCheckFailed,
 }
 
-/// Calls `get_health()` and compares `recorded_at_ledger` against
-/// `oldest_ledger` to determine whether the submission has fallen outside the
-/// RPC retention window.
+/// Starts `health` before `deadline`, awaits its answer, and compares
+/// `recorded_at_ledger` against `oldest_ledger` to determine whether the
+/// submission has fallen outside the RPC retention window.
 ///
-/// Returns [`RetentionCheck::HealthCheckFailed`] on any `getHealth` error
-/// **or** when the health response fails a sanity check — a `getHealth` blip
-/// must not mask a legitimate `getTransaction` result.
+/// Returns [`RetentionCheck::HealthCheckFailed`] on any `getHealth` error,
+/// when the deadline expires before the request starts or its answer is read,
+/// or when the health response fails a sanity check. A health blip must not
+/// mask a legitimate `getTransaction` result.
 ///
 /// # Sanity bounds
 ///
@@ -1357,7 +1505,9 @@ enum RetentionCheck {
 ///
 /// # Poll frequency
 ///
-/// Called once per `NOT_FOUND` poll iteration in `submit_with_retention_poll`.
+/// Called once per `NOT_FOUND` poll iteration in [`poll_with_retention`],
+/// under the submission deadline, and once more at that deadline under
+/// [`FINAL_RETENTION_CHECK_TIMEOUT`].
 /// `getHealth` is an O(1) RPC call (no ledger scan); the cost is one
 /// additional JSON-RPC round-trip per `NOT_FOUND` poll vs bare `getTransaction`.
 /// Checking every N iterations would delay retention-window detection by up to
@@ -1371,11 +1521,30 @@ enum RetentionCheck {
 /// The node is assumed to be the operator's own endpoint, not adversarially
 /// controlled.  The sanity bound above provides defence-in-depth against
 /// misconfiguration or endpoint hijacking.
-async fn check_retention_window(
-    client: &StellarRpcClient,
+async fn check_retention_window<H, HF>(
+    health: &mut H,
     recorded_at_ledger: u32,
-) -> RetentionCheck {
-    match client.get_health().await {
+    deadline: tokio::time::Instant,
+) -> RetentionCheck
+where
+    H: FnMut() -> HF,
+    HF: std::future::Future<Output = Result<GetHealthResponse, NetworkError>>,
+{
+    if tokio::time::Instant::now() >= deadline {
+        return RetentionCheck::HealthCheckFailed;
+    }
+    let Ok(answer) = tokio::time::timeout_at(deadline, health()).await else {
+        tracing::warn!(
+            "check_retention_window: getHealth did not answer before its deadline; \
+             treating as within-window"
+        );
+        return RetentionCheck::HealthCheckFailed;
+    };
+    // Tokio can complete an answer on the deadline tick before its timer.
+    if tokio::time::Instant::now() >= deadline {
+        return RetentionCheck::HealthCheckFailed;
+    }
+    match answer {
         Ok(health) => {
             // Sanity-bound the response before trusting it.
             // oldest_ledger == 0 with latest_ledger > 0 is structurally
@@ -1807,6 +1976,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::poll_test_support::{answer, assert_answer_wins_at_deadline};
     use crate::redact::rpc_error_fixtures::{
         ECHOED_URL, ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_error,
         xdr_error,
@@ -2377,5 +2547,321 @@ mod tests {
             "receipt must finalise Failed with the generic code (not Ambiguous); got: {:?}",
             finalised.status
         );
+    }
+
+    // ── Retention poll deadline ──────────────────────────────────────────────
+
+    /// A `getHealth` answer whose window still covers ledger 100.
+    fn within_window_health() -> GetHealthResponse {
+        GetHealthResponse {
+            status: "healthy".to_owned(),
+            latest_ledger: 200,
+            oldest_ledger: 50,
+            ledger_retention_window: 150,
+        }
+    }
+
+    /// A pending receipt recorded against ledger 100, in a store of its own.
+    ///
+    /// `store` is declared before `_dir` so the store drops before its
+    /// directory is removed.
+    struct PendingReceipt {
+        store: ReceiptStore,
+        envelope_hash: String,
+        _dir: tempfile::TempDir,
+    }
+
+    impl PendingReceipt {
+        /// Opens a fresh store and begins the receipt.
+        fn new() -> Self {
+            let (dir, store) = open_temp_store();
+            let envelope_hash = "ab".repeat(32);
+            store
+                .try_begin(&envelope_hash, &"cd".repeat(32), "", 0, 0, 100)
+                .unwrap();
+            Self {
+                store,
+                envelope_hash,
+                _dir: dir,
+            }
+        }
+
+        /// The retention poll for this receipt under a one-second submission
+        /// timeout that ends at `deadline`.
+        fn poll(&self, deadline: tokio::time::Instant) -> RetentionPoll<'_> {
+            RetentionPoll {
+                store: &self.store,
+                url: ENDPOINT,
+                envelope_hash: &self.envelope_hash,
+                tx_hash_hex: "cd".repeat(32),
+                recorded_at_ledger: 100,
+                max_time: 0,
+                send_deadline: deadline,
+                timeout: Duration::from_secs(1),
+            }
+        }
+
+        /// The receipt's current status.
+        fn status(&self) -> ReceiptStatus {
+            self.store.get(&self.envelope_hash).unwrap().unwrap().status
+        }
+    }
+
+    /// Asserts the within-window deadline outcome: the one-second timeout
+    /// reason, and the receipt finalised `Ambiguous`.
+    fn assert_within_window_timeout(
+        result: Result<SubmissionResult, WalletError>,
+        receipt: &PendingReceipt,
+    ) {
+        match result {
+            Err(WalletError::Network(NetworkError::RpcUnreachable { reason, .. })) => {
+                assert!(
+                    reason.contains("not confirmed within 1s"),
+                    "the within-window deadline branch must win: {reason}"
+                );
+            }
+            other => panic!("expected the within-window deadline outcome: {other:?}"),
+        }
+        assert_eq!(receipt.status(), ReceiptStatus::Ambiguous);
+    }
+
+    /// A retention-poll answer that becomes ready only at the deadline is not
+    /// accepted: the receipt is finalised `Ambiguous`, never `Success` or
+    /// `Failed`, and the caller gets the within-window timeout.
+    ///
+    /// Deterministic through the poll seam and a paused clock: the scripted
+    /// `getTransaction` completes on the deadline's own timer tick, which
+    /// Tokio delivers through `timeout_at` as a completed result, and the
+    /// scripted `getHealth` answers at once. Only the deadline check after the
+    /// await keeps the answer from being read.
+    #[tokio::test(start_paused = true)]
+    async fn a_retention_answer_ready_only_at_the_deadline_is_not_accepted() {
+        assert_answer_wins_at_deadline().await;
+
+        for status in ["SUCCESS", "FAILED"] {
+            let receipt = PendingReceipt::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let polls = std::cell::Cell::new(0);
+            let health_checks = std::cell::Cell::new(0);
+
+            let result = poll_with_retention(
+                || {
+                    polls.set(polls.get() + 1);
+                    async move {
+                        tokio::time::sleep_until(deadline).await;
+                        Ok(answer(status))
+                    }
+                },
+                || {
+                    health_checks.set(health_checks.get() + 1);
+                    async { Ok(within_window_health()) }
+                },
+                receipt.poll(deadline),
+            )
+            .await;
+
+            assert_within_window_timeout(result, &receipt);
+            assert_eq!(polls.get(), 1, "{status}: one request, then the deadline");
+            assert_eq!(
+                health_checks.get(),
+                1,
+                "{status}: the one final retention check"
+            );
+        }
+    }
+
+    /// A retention check whose deadline has passed returns `HealthCheckFailed`
+    /// without calling the request factory.
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_health_check_starts_no_request() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        tokio::time::sleep_until(deadline).await;
+        let calls = std::cell::Cell::new(0);
+        let result = check_retention_window(
+            &mut || {
+                calls.set(calls.get() + 1);
+                std::future::ready(Ok(within_window_health()))
+            },
+            100,
+            deadline,
+        )
+        .await;
+        assert_eq!(
+            calls.get(),
+            0,
+            "an expired health check must not start a request"
+        );
+        assert!(
+            matches!(result, RetentionCheck::HealthCheckFailed),
+            "{result:?}"
+        );
+    }
+
+    /// A `getHealth` answer ready only at its deadline is a failed check,
+    /// under both budgets the callers use. `oldest_ledger` 150 is the input
+    /// only the post-await guard keeps from the outside-window branch; 50
+    /// would otherwise read as within the window.
+    #[tokio::test(start_paused = true)]
+    async fn a_health_answer_ready_at_its_deadline_is_a_failed_check() {
+        assert_answer_wins_at_deadline().await;
+        for budget in [Duration::from_secs(1), FINAL_RETENTION_CHECK_TIMEOUT] {
+            for oldest_ledger in [50, 150] {
+                let deadline = tokio::time::Instant::now() + budget;
+                let result = check_retention_window(
+                    &mut || async {
+                        tokio::time::sleep_until(deadline).await;
+                        Ok(GetHealthResponse {
+                            oldest_ledger,
+                            ..within_window_health()
+                        })
+                    },
+                    100,
+                    deadline,
+                )
+                .await;
+                assert!(
+                    matches!(result, RetentionCheck::HealthCheckFailed),
+                    "health at its deadline is unread, even outside the window: {result:?}"
+                );
+            }
+        }
+    }
+
+    /// Runs a retention poll whose first `getHealth` answer is ready only at
+    /// its deadline: the in-loop check's submission deadline, or with
+    /// `final_check` the final check's two-second bound. The poll ends with
+    /// the within-window timeout at that deadline. `oldest_ledger` 150 is the
+    /// input only the post-await guard keeps from the outside-window branch;
+    /// 50 reaches the same outcome either way.
+    async fn assert_late_health_uses_deadline_branch(final_check: bool) {
+        assert_answer_wins_at_deadline().await;
+        for oldest_ledger in [150, 50] {
+            let receipt = PendingReceipt::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let polls = std::cell::Cell::new(0);
+            let health_checks = std::cell::Cell::new(0);
+            let result = poll_with_retention(
+                || {
+                    polls.set(polls.get() + 1);
+                    async move {
+                        if final_check {
+                            tokio::time::sleep_until(deadline).await;
+                        }
+                        Ok(answer("NOT_FOUND"))
+                    }
+                },
+                || {
+                    let check = health_checks.get();
+                    health_checks.set(check + 1);
+                    async move {
+                        if check == 0 {
+                            let health_deadline = if final_check {
+                                tokio::time::Instant::now() + FINAL_RETENTION_CHECK_TIMEOUT
+                            } else {
+                                deadline
+                            };
+                            tokio::time::sleep_until(health_deadline).await;
+                            Ok(GetHealthResponse {
+                                oldest_ledger,
+                                ..within_window_health()
+                            })
+                        } else {
+                            Ok(within_window_health())
+                        }
+                    }
+                },
+                receipt.poll(deadline),
+            )
+            .await;
+            assert_within_window_timeout(result, &receipt);
+            assert_eq!(polls.get(), 1);
+            assert_eq!(health_checks.get(), if final_check { 1 } else { 2 });
+            assert_eq!(
+                tokio::time::Instant::now(),
+                if final_check {
+                    deadline + FINAL_RETENTION_CHECK_TIMEOUT
+                } else {
+                    deadline
+                }
+            );
+        }
+    }
+
+    /// An in-loop `getHealth` answer ready only at the submission deadline is
+    /// not read, so the poll ends through the deadline branch. `oldest_ledger`
+    /// 150 is the input only the post-await guard keeps from the
+    /// outside-window branch.
+    #[tokio::test(start_paused = true)]
+    async fn an_in_loop_health_answer_at_the_deadline_uses_the_deadline_branch() {
+        assert_late_health_uses_deadline_branch(false).await;
+    }
+
+    /// The final `getHealth` answer ready only at its two-second bound is not
+    /// read, so the poll ends through the within-window branch. `oldest_ledger`
+    /// 150 is the input only the post-await guard keeps from the
+    /// outside-window branch.
+    #[tokio::test(start_paused = true)]
+    async fn a_final_health_answer_at_its_deadline_uses_the_within_window_branch() {
+        assert_late_health_uses_deadline_branch(true).await;
+    }
+
+    /// Runs a retention poll whose every `getTransaction` answers at once,
+    /// `NOT_FOUND` or with `transient` a transport error, so the sleep after
+    /// the first answer is the one that reaches the deadline. The poll factory
+    /// counts calls, so a request that starts and is cut at once still counts.
+    async fn assert_no_poll_after_deadline(transient: bool) {
+        let receipt = PendingReceipt::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let polls = std::cell::Cell::new(0);
+        let health_checks = std::cell::Cell::new(0);
+        let result = poll_with_retention(
+            || {
+                polls.set(polls.get() + 1);
+                std::future::ready(if transient {
+                    Err(stellar_rpc_client::Error::JsonRpc(
+                        jsonrpsee_core::ClientError::Custom("transient".into()),
+                    ))
+                } else {
+                    Ok(answer("NOT_FOUND"))
+                })
+            },
+            || {
+                health_checks.set(health_checks.get() + 1);
+                std::future::ready(Ok(within_window_health()))
+            },
+            receipt.poll(deadline),
+        )
+        .await;
+        assert_eq!(polls.get(), 1, "no poll starts after the clamped sleep");
+        if transient {
+            match result {
+                Err(WalletError::Network(NetworkError::RpcUnreachable { reason, .. })) => {
+                    assert!(
+                        reason.contains("timeout with transient poll error"),
+                        "{reason}"
+                    );
+                }
+                other => panic!("expected the transient-error deadline outcome: {other:?}"),
+            }
+            assert_eq!(receipt.status(), ReceiptStatus::Ambiguous);
+        } else {
+            assert_within_window_timeout(result, &receipt);
+        }
+        assert_eq!(health_checks.get(), if transient { 0 } else { 2 });
+        assert_eq!(tokio::time::Instant::now(), deadline);
+    }
+
+    /// No poll request starts after the sleep that follows a `NOT_FOUND`
+    /// reaches the deadline. The in-loop check and the final check both run.
+    #[tokio::test(start_paused = true)]
+    async fn no_poll_starts_after_the_not_found_sleep_reaches_the_deadline() {
+        assert_no_poll_after_deadline(false).await;
+    }
+
+    /// No poll request starts after the sleep that follows a transient poll
+    /// error reaches the deadline, and no retention check runs.
+    #[tokio::test(start_paused = true)]
+    async fn no_poll_starts_after_the_transient_sleep_reaches_the_deadline() {
+        assert_no_poll_after_deadline(true).await;
     }
 }

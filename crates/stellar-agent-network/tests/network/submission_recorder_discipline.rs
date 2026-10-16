@@ -60,6 +60,12 @@ const ALLOWED_NONE: &[(&str, usize, &str)] = &[
     ),
 ];
 
+/// The callee names of the submission seam: the submit layer's own entry
+/// point, and the injected submission step of the trustline verb, which
+/// production fills with that entry point and which takes the same six
+/// arguments.
+const SEAM_CALLEES: &[&str] = &["submit_transaction_and_wait", "submit_and_wait"];
+
 const REQUIRED_FILES: &[&str] = &[
     "crates/stellar-agent-pool/src/init.rs",
     "crates/stellar-agent-pool/src/submit.rs",
@@ -158,7 +164,7 @@ impl<'ast> Visit<'ast> for RecorderSites {
             && let Some(name) = function.path.segments.last()
             && call.span().start().line < self.test_boundary
         {
-            if name.ident == "submit_transaction_and_wait" {
+            if SEAM_CALLEES.iter().any(|seam| name.ident == seam) {
                 assert_eq!(
                     call.args.len(),
                     6,
