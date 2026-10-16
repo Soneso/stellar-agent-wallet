@@ -867,19 +867,40 @@ mod tests {
     fn concurrent_appends_from_two_threads_both_drain() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let threads: Vec<_> = (0..2)
-            .map(|t| {
-                let path = path.clone();
-                std::thread::spawn(move || {
-                    let outbox = AuditOutbox::for_log(&path);
-                    for i in 0..10 {
-                        outbox.append(&row(&format!("thread-{t}-{i}"))).unwrap();
-                    }
+        // The outbox lock is not fair, and unbounded contention can outlast
+        // `OUTBOX_LOCK_WAIT`. Each round lets a worker wait for at most one append
+        // of the other.
+        let barrier = std::sync::Barrier::new(2);
+        let joined: Vec<_> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..2)
+                .map(|t| {
+                    let path = &path;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let outbox = AuditOutbox::for_log(path);
+                        let mut rounds = Vec::with_capacity(10);
+                        for i in 0..10 {
+                            barrier.wait();
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    outbox
+                                        .append(&row(&format!("thread-{t}-{i}")))
+                                        .map_err(|error| format!("{error:?}"))
+                                }))
+                                .unwrap_or_else(|_| Err("panicked".to_owned()));
+                            rounds.push(result);
+                        }
+                        rounds
+                    })
                 })
-            })
-            .collect();
-        for thread in threads {
-            thread.join().unwrap();
+                .collect();
+            workers.into_iter().map(|worker| worker.join()).collect()
+        });
+        for (t, worker) in joined.into_iter().enumerate() {
+            let rounds = worker.unwrap_or_else(|_| panic!("worker {t} panicked"));
+            for (i, result) in rounds.into_iter().enumerate() {
+                assert!(result.is_ok(), "worker {t}, round {i}: {result:?}");
+            }
         }
         let mut writer = AuditWriter::open(path.clone(), None).unwrap();
         assert_eq!(writer.drain_outbox().unwrap(), 20);
