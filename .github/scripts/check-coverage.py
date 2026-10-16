@@ -20,6 +20,7 @@ Usage: ``check-coverage.py <cov.json>``
 import collections
 import json
 import pathlib
+import re
 import sys
 
 # Minimum line-coverage percent per crate for the offline suite.
@@ -66,12 +67,16 @@ FLOORS = {
 # legitimately testnet-covered below this bar must add an explicit entry above.
 DEFAULT_FLOOR = 85
 
+# The crate name is the one segment between `/crates/` and `/src/`, so a
+# `crates` directory higher in the clone path and a `src` directory under
+# `tests/` or `examples/` both fail to match.
+CRATE_SRC = re.compile(r"/crates/([^/]+)/src/")
+
 
 def crate_of(filename: str) -> str | None:
     """Returns the owning crate for a `crates/<crate>/src/...` path, else None."""
-    if "/crates/" not in filename or "/src/" not in filename:
-        return None
-    return filename.split("/crates/", 1)[1].split("/", 1)[0]
+    match = CRATE_SRC.search(filename)
+    return match.group(1) if match else None
 
 
 def main(path: str) -> int:

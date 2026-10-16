@@ -81,6 +81,7 @@ install-surface	python3 .github/scripts/check-install-surface.py
 gate-tool-versions	bash .github/scripts/check-gate-tool-versions.sh
 actionlint	actionlint
 workflow-invariants	python3 .github/scripts/check-workflow-invariants.py
+self-test:test-check-coverage.py	python3 .github/scripts/test-check-coverage.py
 self-test:test-check-crates-exist.sh	bash .github/scripts/test-check-crates-exist.sh
 self-test:test-check-docs-style.py	python3 .github/scripts/test-check-docs-style.py
 self-test:test-check-gate-tool-versions.sh	bash .github/scripts/test-check-gate-tool-versions.sh
@@ -1199,8 +1200,8 @@ case_full() {
   start_case
   edit CONTRIBUTING.md
   read -r -a ids <<<"$(printf '%s\n' "$EXPECTED_REGISTRY" | awk -F '\t' '{ printf "%s ", $1 }')"
-  if [ "${#ids[@]}" -ne 39 ]; then
-    fail "the expected registry holds ${#ids[@]} rows, expected 39"
+  if [ "${#ids[@]}" -ne 40 ]; then
+    fail "the expected registry holds ${#ids[@]} rows, expected 40"
   fi
   expect_list --full "${ids[@]}"
 }
@@ -1531,7 +1532,7 @@ case_coverage_suppression() {
   expect_line "- \`$floors\`: not run (no coverage file from this run)"
   record_gate_calls
   grep -qxF -- "$(command_record "$coverage")" "$CASE_DIR.calls" || fail "coverage did not run"
-  if grep -qF check-coverage.py "$CASE_DIR.calls"; then
+  if grep -qxF -- "$(command_record "$floors")" "$CASE_DIR.calls"; then
     fail "check-coverage.py ran"
   fi
   cmp -s cov.json "$CASE_DIR.stale" || fail "cov.json changed"
@@ -1580,7 +1581,8 @@ case_coverage_unavailable() {
   record_gate_calls
   grep -qxF -- "$(command_record "cargo llvm-cov --version")" "$CASE_DIR.calls" ||
     fail "the cargo-llvm-cov probe did not run"
-  if grep -qxF -- "$(command_record "$coverage")" "$CASE_DIR.calls" || grep -qF check-coverage.py "$CASE_DIR.calls"; then
+  if grep -qxF -- "$(command_record "$coverage")" "$CASE_DIR.calls" ||
+    grep -qxF -- "$(command_record "$floors")" "$CASE_DIR.calls"; then
     fail "a coverage command ran"
   fi
   cmp -s cov.json "$CASE_DIR.stale" || fail "cov.json changed"

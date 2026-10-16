@@ -350,6 +350,7 @@ gate except `shellcheck-changed`, which needs a changed shell script.
    leaves the labels alone.
 4. The self-tests, in filename order. Each runs when the file it tests or the
    self-test itself changes:
+   - `test-check-coverage.py`: `check-coverage.py`
    - `test-check-crates-exist.sh`: `check-crates-exist.sh`
    - `test-check-docs-style.py`: `check-docs-style.py`
    - `test-check-gate-tool-versions.sh`: `check-gate-tool-versions.sh`
@@ -389,7 +390,7 @@ gate except `shellcheck-changed`, which needs a changed shell script.
 12. `machete`, `deny`, `coverage`, and `coverage-floors`: `--full` only.
 13. `interop:mpp` and `interop:sdk-v17`: `--full` only.
 
-`package-skill.sh`, `check-coverage.py`, `run-testnet-acceptance.sh`, and
+`package-skill.sh`, `run-testnet-acceptance.sh`, and
 `release-preflight-version-check.sh` have no self-test. The preflight runs the
 workflow checks with `python3`, which needs PyYAML importable, for example from
 the `.venv` virtual environment of the PyYAML install command.
