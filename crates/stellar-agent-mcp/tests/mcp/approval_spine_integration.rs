@@ -7,11 +7,14 @@
 //! 2. `profile_name_for_approval` falls back to `"default"` for non-standard
 //!    profiles.
 //! 3. Commit `stellar_pay_commit` with `RequireApproval` engine and an
-//!    un-parseable nonce returns a gate error (nonce-parse path).
+//!    un-parseable nonce returns `policy.approval_required`: its attestation
+//!    gate precedes the nonce parse.
 //! 4. Commit `stellar_create_account_commit` with `RequireApproval` engine and
-//!    an un-parseable nonce returns a gate error.
-//! 5. Commit `stellar_pay_commit` with `Allow` engine and no attestation fields
-//!    proceeds past the attestation gate (may fail at nonce step, not policy).
+//!    an un-parseable nonce returns `nonce.expired`: its nonce parse precedes
+//!    its attestation gate.
+//! 5. Commit `stellar_pay_commit` with `Allow` engine, a valid envelope, no
+//!    attestation fields, and an un-parseable nonce returns `nonce.expired`:
+//!    under `Allow` the attestation gate is a no-op and the nonce parse refuses.
 //! 6. `dispatch_gate` with `RequireApproval` engine returns a non-error outcome
 //!    (indirectly verified: the simulate call does NOT return a `policy.deny.*`
 //!    error when the engine says RequireApproval — it returns a tool result with
@@ -67,15 +70,31 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn make_server_with_engine(engine: impl PolicyEngine + 'static) -> WalletServer {
+fn make_server_with_engine(engine: impl PolicyEngine + 'static, rpc_url: &str) -> WalletServer {
     // Explicitly set Noop so WalletServer::new succeeds without a policy file
     // on disk (PolicyEngineKind::default() is V1); the real engine is
     // substituted below via set_policy_engine_for_test.
     let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+        .rpc_url(rpc_url)
         .with_noop_engine()
         .build();
     let mut server = WalletServer::new(profile).expect("WalletServer::new must not fail in tests");
     server.set_policy_engine_for_test(Arc::new(engine));
+    server
+}
+
+/// Starts a local endpoint that reports testnet and answers for `account`,
+/// so a commit passes the endpoint check and its account read and reaches the
+/// gates under test.
+async fn local_endpoint_for(account: &str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(crate::common::TimeoutRpc::new(vec![(
+            t7_account_ledger_key_xdr(account),
+            t7_account_entry_xdr(account, 1_000_000_000),
+        )]))
+        .mount(&server)
+        .await;
     server
 }
 
@@ -229,19 +248,20 @@ fn profile_name_for_approval_falls_back_to_default() {
 /// no `approval_nonce` / `approval_attestation`, the handler must return a
 /// gate error before signing.
 ///
-/// Gate ordering: nonce parse → nonce verify → attestation.  A deliberately
-/// un-parseable nonce produces `nonce.expired` (indistinguishability) before
-/// the attestation gate.  Both `nonce.expired` and `policy.approval_required`
-/// are expected outcomes; the test confirms no signing or network call is made.
+/// Gate ordering on `stellar_pay_commit`: endpoint check → account reads →
+/// policy gate → attestation gate → nonce parse. The local endpoint passes
+/// the check and the reads, so the attestation gate refuses with
+/// `policy.approval_required` before the un-parseable nonce is looked at.
 #[tokio::test]
 #[serial]
 async fn stellar_pay_commit_require_approval_no_attestation_is_blocked() {
     keyring_mock::install().ok();
-    let server = make_server_with_engine(MockPolicyEngine::require_approval());
+    let source = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
+    let endpoint = local_endpoint_for(source).await;
+    let server = make_server_with_engine(MockPolicyEngine::require_approval(), &endpoint.uri());
 
     // Use valid XDR so the re-derivation step succeeds and the test reaches the
     // nonce/attestation gate that this test exercises.
-    let source = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
     let dest = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
     let envelope_xdr = minimal_payment_envelope_b64(source, dest);
 
@@ -264,55 +284,34 @@ async fn stellar_pay_commit_require_approval_no_attestation_is_blocked() {
         approval_attestation: None,
     };
 
-    let result = server.call_stellar_pay_commit(commit_args).await;
-    match result {
-        Ok(tool_result) => {
-            // The attestation gate fires before nonce parse for
-            // `stellar_pay_commit`, so `policy.approval_required` (an
-            // Ok(is_error) business envelope) is the expected outcome here.
-            // `nonce.expired`/`nonce.replayed` (also business envelopes) are
-            // accepted as well, in case the gate ordering ever changes.
-            let (code, _message, _text) = crate::common::assert_business_envelope(&tool_result);
-            let blocked = code == "nonce.expired"
-                || code == "nonce.replayed"
-                || code == "policy.approval_required";
-            assert!(
-                blocked,
-                "commit must be blocked at nonce or attestation gate; \
-                 expected nonce.expired, nonce.replayed, or policy.approval_required, got: {code}"
-            );
-        }
-        Err(e) => {
-            // nonce.expired (from nonce parse) or policy.approval_required
-            // (from attestation gate if nonce parse were to succeed) are
-            // both valid outcomes that confirm the gate is active.
-            let blocked = e.message.contains("nonce.expired")
-                || e.message.contains("nonce.replayed")
-                || e.message.contains("policy.approval_required");
-            assert!(
-                blocked,
-                "commit must be blocked at nonce or attestation gate; \
-                 expected nonce.expired or policy.approval_required, got: {}",
-                e.message
-            );
-        }
-    }
+    let result = server
+        .call_stellar_pay_commit(commit_args)
+        .await
+        .expect("the attestation refusal is a tool result, not a protocol error");
+    let (code, _message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "policy.approval_required",
+        "the attestation gate refuses before the nonce parse: {text}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test 4: stellar_create_account_commit with RequireApproval + absent attestation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Same as test 3 for `stellar_create_account_commit`.
+/// The same setup for `stellar_create_account_commit`, whose nonce parse
+/// follows the policy gate directly and precedes its attestation gate: the
+/// un-parseable nonce refuses with `nonce.expired` before anything is signed.
 #[tokio::test]
 #[serial]
 async fn stellar_create_account_commit_require_approval_no_attestation_is_blocked() {
     keyring_mock::install().ok();
-    let server = make_server_with_engine(MockPolicyEngine::require_approval());
+    let source = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
+    let endpoint = local_endpoint_for(source).await;
+    let server = make_server_with_engine(MockPolicyEngine::require_approval(), &endpoint.uri());
 
     // Use valid XDR so the re-derivation step succeeds and the test reaches the
     // nonce/attestation gate that this test exercises.
-    let source = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
     let dest = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
     let envelope_xdr = minimal_create_account_envelope_b64(source, dest);
 
@@ -335,35 +334,38 @@ async fn stellar_create_account_commit_require_approval_no_attestation_is_blocke
             "commit blocked at the nonce/attestation gate is surfaced as an Ok(is_error) envelope, \
              not a protocol error or a signed submission",
         );
-    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
-    let blocked =
-        code == "nonce.expired" || code == "nonce.replayed" || code == "policy.approval_required";
-    assert!(
-        blocked,
-        "commit must be blocked at nonce or attestation gate; \
-         expected nonce.expired / nonce.replayed / policy.approval_required, got: {code}"
+    let (code, _message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "nonce.expired",
+        "the nonce parse refuses after the policy gate: {text}"
     );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 5: stellar_pay_commit with Allow + absent attestation is NOT blocked by
-// the attestation gate (may fail at nonce step for different reasons)
+// Test 5: stellar_pay_commit with Allow + absent attestation passes the
+// attestation gate and refuses at the nonce parse
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// When the dispatch gate returns `Allow`, the attestation gate is bypassed.
-/// An unparseable nonce still returns `nonce.expired` but NOT `policy.approval_required`.
+/// When the dispatch gate returns `Allow`, the attestation gate is a no-op.
 ///
-/// This verifies the attestation gate is conditional on `RequireApproval` only.
+/// The commit carries a valid payment envelope and no attestation fields, so
+/// it passes the endpoint check, the account reads, the policy gate, and the
+/// attestation gate. The un-parseable nonce then refuses with `nonce.expired`.
+/// An attestation gate that fired under `Allow` would refuse with
+/// `policy.approval_required` instead.
 #[tokio::test]
 #[serial]
 async fn stellar_pay_commit_allow_engine_no_attestation_gate() {
     keyring_mock::install().ok();
-    let server = make_server_with_engine(MockPolicyEngine::allow());
+    let source = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
+    let endpoint = local_endpoint_for(source).await;
+    let server = make_server_with_engine(MockPolicyEngine::allow(), &endpoint.uri());
+    let dest = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 
     let commit_args = StellarPayCommitArgs {
         chain_id: "stellar:testnet".to_owned(),
-        source: "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI".to_owned(),
-        destination: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN".to_owned(),
+        source: source.to_owned(),
+        destination: dest.to_owned(),
         amount: Some(serde_json::from_str(r#""10 XLM""#).expect("valid amount")),
         amount_in_stroops: None,
         asset: "native".to_owned(),
@@ -373,55 +375,20 @@ async fn stellar_pay_commit_allow_engine_no_attestation_gate() {
         memo_return_hex: None,
         nonce: "not-a-valid-nonce".to_owned(),
         expires_at_unix_ms: 9_999_999_999_000,
-        envelope_xdr: "AAAAAA==".to_owned(),
-        // No attestation fields — with Allow engine, these should NOT trigger
-        // policy.approval_required.
+        envelope_xdr: minimal_payment_envelope_b64(source, dest),
         approval_nonce: None,
         approval_attestation: None,
     };
 
-    let result = server.call_stellar_pay_commit(commit_args).await;
-    match result {
-        Ok(tool_result) => {
-            // The stub envelope_xdr ("AAAAAA==") fails re-derivation before the
-            // dispatch/attestation gates are even reached, so the expected
-            // outcome here is the `simulation.divergence` business envelope.
-            let (code, message, _text) = crate::common::assert_business_envelope(&tool_result);
-            assert_ne!(
-                code, "policy.approval_required",
-                "Allow engine must NOT trigger policy.approval_required; got: {code}"
-            );
-            let blocked = code == "nonce.expired"
-                || code == "nonce.replayed"
-                || code.starts_with("nonce.")
-                || code == "simulation.divergence"
-                || message.contains("chain_id mismatch");
-            assert!(
-                blocked,
-                "Allow engine should fail at nonce gate or divergence check, not policy gate; \
-                 got: {code} / {message}"
-            );
-        }
-        Err(e) => {
-            // Must NOT be policy.approval_required (attestation gate bypassed
-            // for Allow flows).
-            assert!(
-                !e.message.contains("policy.approval_required"),
-                "Allow engine must NOT trigger policy.approval_required; got: {}",
-                e.message
-            );
-            // Expected: nonce.expired from the nonce parse/verify step.
-            assert!(
-                e.message.contains("nonce.expired")
-                    || e.message.contains("nonce.replayed")
-                    || e.message.contains("nonce.")
-                    || e.message.contains("chain_id mismatch")
-                    || e.message.contains("simulation.divergence"),
-                "Allow engine should fail at nonce gate, not policy gate; got: {}",
-                e.message
-            );
-        }
-    }
+    let result = server
+        .call_stellar_pay_commit(commit_args)
+        .await
+        .expect("the nonce refusal is a tool result, not a protocol error");
+    let (code, _message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "nonce.expired",
+        "under Allow the attestation gate passes and the nonce parse refuses: {text}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -567,6 +534,7 @@ async fn commit_with_valid_nonce_but_no_attestation_returns_indistinguishable_ap
 
     // ── Start mock RPC ────────────────────────────────────────────────────────
     let mock_server = MockServer::start().await;
+    crate::common::mount_testnet_identity(&mock_server).await;
 
     const SOURCE: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
     const DEST: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";

@@ -313,7 +313,8 @@ impl Respond for ClaimRpcResponder {
 
 /// Serves the claimable-balance entry on the FIRST `getLedgerEntries` query for
 /// the entry key (the simulate re-fetch) and an empty result on every later
-/// query (the commit re-fetch), while always serving the source account.
+/// query (the commit re-fetch). It always serves the source account and
+/// reports testnet. Only entry queries move the counter.
 struct EntryGoneResponder {
     cb_key_xdr: String,
     entry_xdr: String,
@@ -326,7 +327,9 @@ struct EntryGoneResponder {
 impl Respond for EntryGoneResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let (req_id, method) = request_id_and_method(request);
-        let result = if method == "getLedgerEntries" {
+        let result = if method == "getNetwork" {
+            crate::common::EndpointNetwork::testnet().result()
+        } else if method == "getLedgerEntries" {
             let body = String::from_utf8_lossy(&request.body);
             if body.contains(&self.cb_key_xdr) {
                 let hit = self.cb_hits.fetch_add(1, Ordering::SeqCst);
@@ -1024,11 +1027,11 @@ async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
         balance_id: "ab".repeat(32),
         source_account: Some(claimant_g.clone()),
     };
-    let sim_result = server
-        .call_stellar_claim(simulate_args)
-        .await
-        .expect("simulate must not error");
+    let (sim_result, simulate_clients) =
+        crate::common::clients_built_by(server.call_stellar_claim(simulate_args)).await;
+    let sim_result = sim_result.expect("simulate must not error");
     assert_ne!(sim_result.is_error, Some(true), "simulate must succeed");
+    let simulate_methods = crate::common::received_methods(&mock_server).await;
     let sim_json = call_result_json(&sim_result);
     let sim_data = sim_json.get("data").expect("simulate success carries data");
 
@@ -1051,10 +1054,9 @@ async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let commit_result = server
-        .call_stellar_claim_commit(commit_args)
-        .await
-        .expect("commit must not error");
+    let (commit_result, commit_clients) =
+        crate::common::clients_built_by(server.call_stellar_claim_commit(commit_args)).await;
+    let commit_result = commit_result.expect("commit must not error");
     let commit_json = call_result_json(&commit_result);
     assert_ne!(
         commit_result.is_error,
@@ -1077,6 +1079,33 @@ async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
             .and_then(serde_json::Value::as_u64),
         Some(1005),
         "committed response must carry the submitted ledger: {commit_data}"
+    );
+
+    // The simulate and the commit each check their endpoint before their
+    // first read, on the one client each builds; the submit layer checks the
+    // commit's client again. The `Noop` engine builds no reconcile client.
+    let all_methods = crate::common::received_methods(&mock_server).await;
+    let commit_methods = &all_methods[simulate_methods.len()..];
+    let network_checks = |methods: &[String]| {
+        methods
+            .iter()
+            .filter(|m| m.as_str() == "getNetwork")
+            .count()
+    };
+    assert_eq!(
+        simulate_methods.first().map(String::as_str),
+        Some("getNetwork")
+    );
+    assert_eq!(
+        commit_methods.first().map(String::as_str),
+        Some("getNetwork")
+    );
+    assert_eq!(network_checks(&simulate_methods), 1, "{simulate_methods:?}");
+    assert_eq!(network_checks(commit_methods), 2, "{commit_methods:?}");
+    assert_eq!(simulate_clients, 1, "the simulate reads through one client");
+    assert_eq!(
+        commit_clients, 1,
+        "the commit reads and sends through one client"
     );
 }
 
@@ -1334,16 +1363,20 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `stellar_claim_commit` refuses with `network.endpoint_network_mismatch`
-/// when the endpoint serves a network other than the profile's, and the nonce
-/// it was handed survives that refusal.
+/// when the endpoint serves a network other than the profile's, before any
+/// other request, and the nonce it was handed survives that refusal.
+///
+/// The simulate runs while the endpoint reports testnet, since the simulate
+/// checks the endpoint too. The endpoint then reports a third network for the
+/// refused commit, whose only request is the endpoint check.
 ///
 /// The survival proof is the second commit: the endpoint's reported identity
-/// is swapped to the profile's network and the SAME nonce is committed again,
-/// which submits. A nonce recorded in the replay window by the first call
-/// would instead return `nonce.replayed` there. Repeating the refused call and
-/// asserting the mismatch code again would discriminate nothing, because the
-/// probe precedes the nonce gate and answers identically whether or not the
-/// nonce was consumed.
+/// is swapped back to the profile's network and the SAME nonce is committed
+/// again, which submits. A nonce recorded in the replay window by the first
+/// call would instead return `nonce.replayed` there. Repeating the refused
+/// call and asserting the mismatch code again would discriminate nothing,
+/// because the check precedes the nonce gate and answers identically whether
+/// or not the nonce was consumed.
 #[tokio::test]
 #[serial]
 async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
@@ -1370,9 +1403,8 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
     let account_xdr =
         account_entry_xdr_with_seq(&claimant_g, SOURCE_BALANCE_STROOPS, 0, SOURCE_SEQ);
 
-    // The endpoint starts out serving a third network while the profile below
-    // declares testnet.
-    let network = crate::common::EndpointNetwork::reporting(crate::common::FUTURENET_PASSPHRASE);
+    // The endpoint serves the profile's testnet for the simulate.
+    let network = crate::common::EndpointNetwork::testnet();
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ClaimSubmitSuccessRpcResponder {
@@ -1412,6 +1444,8 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
     };
 
     // ── Commit against the wrong network ───────────────────────────────────
+    network.set(crate::common::FUTURENET_PASSPHRASE);
+    let before_commit = crate::common::received_methods(&mock_server).await.len();
     let refused = server
         .call_stellar_claim_commit(commit_args.clone())
         .await
@@ -1421,6 +1455,11 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         code, "network.endpoint_network_mismatch",
         "a commit whose endpoint serves a different network must carry the \
          mismatch code, got: {code}"
+    );
+    assert_eq!(
+        crate::common::received_methods(&mock_server).await[before_commit..],
+        ["getNetwork"],
+        "the refused commit's endpoint check is its first and only request"
     );
 
     // ── Commit again once the endpoint serves the profile's network ────────
@@ -1441,4 +1480,58 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         committed_json["data"]["tx_hash"].as_str().is_some(),
         "the retry must report an on-chain tx_hash: {committed_json}"
     );
+}
+
+/// A simulate whose endpoint serves another network is refused before the
+/// claim-entry read and every later read, as an `is_error` envelope rather
+/// than a protocol error. The claim simulate takes its fee from the profile,
+/// so it has no automatic-fee branch.
+#[tokio::test]
+#[serial]
+async fn simulate_refuses_an_endpoint_serving_another_network_before_any_read() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key();
+    let claimant_g = gstrkey_for_seed([0x5a_u8; 32]);
+    let id = test_balance_id();
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ClaimSubmitSuccessRpcResponder {
+            cb_key_xdr: claim_key_xdr(&id),
+            entry_xdr: claim_entry_xdr(
+                &id,
+                &claimant_g,
+                stellar_xdr::ClaimPredicate::Unconditional,
+                CLAIM_AMOUNT_STROOPS,
+            ),
+            account_key_xdr: account_ledger_key_xdr(&claimant_g),
+            account_xdr: account_entry_xdr_with_seq(
+                &claimant_g,
+                SOURCE_BALANCE_STROOPS,
+                0,
+                SOURCE_SEQ,
+            ),
+            network: crate::common::EndpointNetwork::reporting(crate::common::FUTURENET_PASSPHRASE),
+        })
+        .mount(&mock_server)
+        .await;
+    let server =
+        WalletServer::new(testnet_profile_with_rpc(&mock_server.uri())).expect("WalletServer::new");
+
+    let (result, built) =
+        crate::common::clients_built_by(server.call_stellar_claim(StellarClaimArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            balance_id: "ab".repeat(32),
+            source_account: Some(claimant_g),
+        }))
+        .await;
+    let result = result.expect("the refusal is a tool result, not a protocol error");
+    let (code, _message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "network.endpoint_network_mismatch", "{text}");
+    assert_eq!(
+        crate::common::received_methods(&mock_server).await,
+        ["getNetwork"],
+        "the endpoint check precedes every read"
+    );
+    assert_eq!(built, 1, "one client for the simulate");
 }

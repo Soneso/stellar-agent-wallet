@@ -262,10 +262,28 @@ the endpoint reports. An account absent from the ledger is
 network id is `network.envelope_signed_for_mainnet`. One that verifies under
 neither network is `network.envelope_signature_unverifiable`. An envelope
 carrying no signature is `network.envelope_unsigned`. For fee bumps, this code
-also applies when either the outer or inner transaction has no signature. The
-four commit tools `stellar_pay_commit`, `stellar_claim_commit`,
-`stellar_trustline_commit`, and `stellar_create_account_commit` run this probe
-before the single-use nonce is burned, so a mismatch does not consume the nonce.
+also applies when either the outer or inner transaction has no signature.
+
+The classic prepare tools `stellar_pay`, `stellar_create_account`,
+`stellar_trustline`, and `stellar_claim` run the same check on their client
+before the first read on it. Their commit tools do the same on the client they
+submit with. The fee, the sequence, the claim entry, and the account views
+these tools read feed the envelope that is signed or the policy gate. A prepare
+refuses an endpoint that serves another network or reports mainnet with an
+error result carrying that code. A commit runs the check before any other
+request and before the single-use nonce is burned, so a refusal there does not
+consume the nonce. The submit layer's own check comes after the nonce is
+consumed. A commit reads the clock for the nonce's expiry after its check, so
+the check's time counts toward that expiry.
+
+An endpoint refusal precedes a missing account or claim entry, a policy
+denial, an approval refusal, a rebuild divergence, the audit pre-flight, and a
+malformed nonce. It also precedes the chain, fee, asset, and amount checks that
+follow a read. Where such a check ends in an `invalid_params` protocol error,
+the endpoint refusal is an error result instead. Checks that need no request
+come first: argument and envelope decoding, the structural mainnet refusal,
+and the forced approval of a toolset-gated pay commit that carries no approval
+fields.
 
 The two [policy engines](./concepts.md) are Noop (testnet allow-all; mainnet
 read-only allow, mainnet destructive refused) and V1 (signature-verified typed

@@ -67,7 +67,7 @@ The signers manager and timelock commands use the primary when no secondary is c
 
 ### Timeout
 
-`--timeout-seconds <SECONDS>` bounds submission and simulation. The default is `60`.
+`--timeout-seconds <SECONDS>` bounds submission and simulation. On `pay`, `claim`, sponsored `accounts create`, and `pool init`, it also bounds the [endpoint identity check](#endpoint-identity-before-the-first-read), which gets a budget of its own. The default is `60`, and `120` on `pool init`.
 
 ### Output format
 
@@ -120,6 +120,19 @@ Read-only inspection remains available. `tx` signs nothing, and `pool init` is t
 
 The submit layer applies the same refusal in a fixed order. A declared mainnet network passphrase is refused first, then an `--rpc-url` matching a known mainnet host; both cost zero RPC calls. The envelope is then decoded locally, so a malformed or legacy V0 envelope is refused without a round trip.
 
+## Endpoint identity before the first read
+
+`pay`, `claim`, sponsored `accounts create`, `trustline`, and `pool init` read the values they sign or gate on through one client per run. That client asks the endpoint which network it serves before its first such request. The requests it precedes include the fee statistics, the account sequence, the claim entry, the policy views, and the reservation reconcile. Every later read and the send use the same client, and the submit layer checks it again before the send. The refusals carry the codes of [Submit-layer network binding](#submit-layer-network-binding).
+
+- The full pipeline and `--submit-only` check before the reservation reconcile. The full `pay` pipeline checks `--source` and `--fee` after the reconcile.
+- `--build-only` checks before the fee and sequence reads.
+- `--sign-only` checks before the account reads of an envelope it decodes. It signs an envelope it cannot decode without any request.
+- `pool init --resume` makes no request when the profile already holds the pool or the checkpoint records its completion. Every other resume checks before its first read, whether or not it sends.
+
+Checks that need no request come first: argument, keyring, and profile validation, the structural mainnet refusal, and the relayer refusal. `pool init` also runs its audit pre-flight before the check. An endpoint refusal precedes every refusal that follows a read. These include a missing account or claim entry, a policy denial, the audit pre-flight of the other commands, and the amount, asset, and fee checks. It also precedes the reservation reconcile and its settlement. A `claim` or `trustline` refused at this early check carries no preview.
+
+Each check gets a budget of its own: `--timeout-seconds` on `pay`, `claim`, `accounts create`, and `pool init`, and the profile's `submit_timeout_seconds` on `trustline`. The submit layer's check starts a fresh budget.
+
 ## Submit-layer network binding
 
 The submit layer does not take the declared network on trust. Before sending, it asks the endpoint which network it serves and which protocol it runs (`getNetwork`), on the same client instance that will send. It treats that answer, not the declaration, as authoritative:
@@ -140,7 +153,7 @@ The layer then verifies the envelope's signatures against that network. It fetch
 - verifies under neither: `network.envelope_signature_unverifiable`;
 - the envelope carries no signature, or on a fee-bump the outer or the inner transaction carries none: `network.envelope_unsigned`.
 
-Every signature must pass, and each signature set must have at least one: on a fee-bump the outer and the inner transaction are checked separately, so an outer signature cannot stand in for a missing inner one. Hash-x and pre-auth-tx signers contribute no ed25519 key, so a signature only such a signer could account for is refused. Two consequences follow. An envelope signed for one network cannot be submitted under another network's passphrase at either submit entry point, including from a library consumer of the published crate with no CLI involved. And the submit path performs two reads before it sends, so every submission makes two round trips before the send.
+Every signature must pass, and each signature set must have at least one: on a fee-bump the outer and the inner transaction are checked separately, so an outer signature cannot stand in for a missing inner one. Hash-x and pre-auth-tx signers contribute no ed25519 key, so a signature only such a signer could account for is refused. Two consequences follow. An envelope signed for one network cannot be submitted under another network's passphrase at either submit entry point, including from a library consumer of the published crate with no CLI involved. And the submit layer performs two reads before it sends, so inside the submit layer every submission makes two round trips before the send.
 
 ## Audit-key pre-flight refusal
 
@@ -152,10 +165,11 @@ the key. Until it runs, these verbs refuse with `audit.chain_key_unavailable`.
 Build-only and simulate stages never reach this pre-flight because they neither
 sign nor submit.
 
-On `pay --submit-only` and `claim --submit-only`, the endpoint identity probe
-runs on the command's own client before the policy gate and audit pre-flight.
+On `pay --submit-only` and `claim --submit-only`, the endpoint identity check
+runs before the policy gate and audit pre-flight, on the client that later
+reconciles, reads the gate's account views, and sends.
 An `--rpc-url` pointing at a different network than `--network` is refused before
-either check runs. The probe also reads the endpoint's protocol version and
+either check runs. The check also reads the endpoint's protocol version and
 applies the protocol rule of
 [Submit-layer network binding](#submit-layer-network-binding). It runs under
 its own `--timeout-seconds` deadline, and the submission that follows starts a

@@ -70,6 +70,58 @@ impl PolicyEngine for MockPolicyEngine {
     }
 }
 
+/// Allows every call and records the tool name and the arguments of each
+/// evaluation, so a test can show which values the gate evaluated.
+///
+/// Clones share one record: a test keeps a clone and hands another to the
+/// server.
+#[derive(Clone, Default)]
+pub struct CapturingPolicyEngine {
+    evaluated: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+}
+
+#[allow(
+    dead_code,
+    reason = "shared integration-test helper; each test binary uses a different subset"
+)]
+impl CapturingPolicyEngine {
+    /// An engine with an empty record.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The arguments evaluated for `tool`, in order.
+    pub fn arguments_for(&self, tool: &str) -> Vec<serde_json::Value> {
+        self.evaluated
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|(name, _)| name == tool)
+            .map(|(_, args)| args.clone())
+            .collect()
+    }
+}
+
+impl PolicyEngine for CapturingPolicyEngine {
+    fn evaluate(
+        &self,
+        tool: &ToolDescriptor,
+        args: &serde_json::Value,
+        _profile: &Profile,
+        _account_view: Option<&dyn AccountReservesView>,
+        _identity_view: Option<&dyn AccountIdentityView>,
+        _counterparty_cache: Option<&dyn CounterpartyCacheView>,
+        _sep10_sessions: Option<&dyn Sep10SessionView>,
+        _sep45_sessions: Option<&dyn Sep45SessionView>,
+    ) -> Result<Decision, PolicyError> {
+        self.evaluated
+            .lock()
+            .expect("capture lock")
+            .push((tool.name.to_string(), args.clone()));
+        Ok(Decision::Allow)
+    }
+}
+
 /// Returns a testnet `WalletServer` with the given engine injected AND
 /// `rpc_url` set to a caller-supplied endpoint (typically a local wiremock
 /// server).

@@ -252,9 +252,9 @@ fn profile_show_redacts_every_url_component_with_credentials() {
 /// Runs `trustline` against a fixture profile and returns the run.
 ///
 /// `USDC` resolves through the testnet pin table, so the command reaches the
-/// source-account fetch and fails against the fixture's unreachable endpoint —
-/// which is exactly the observation: the failure message names the endpoint,
-/// and therefore the profile.
+/// endpoint check and fails against the fixture's unreachable endpoint. That
+/// is exactly the observation: the failure message names the endpoint, and
+/// therefore the profile.
 fn run_trustline(home: &Path, env_profile: Option<&str>, extra: &[&str]) -> Run {
     let mut args = vec!["trustline", "--from", SOURCE_G, "--asset", "USDC"];
     args.extend_from_slice(extra);
@@ -609,7 +609,7 @@ fn assert_reached_only_the_unreachable_endpoint(run: &Run, verb: &str) {
     let json = run.json();
     let message = json["error"]["message"].as_str().unwrap_or_default();
     assert_eq!(
-        json["error"]["code"], "network.rpc_unreachable",
+        json["error"]["code"], "network.endpoint_identity_unavailable",
         "`{verb}` must fail on the endpoint it was handed, not reach a live one: {json}"
     );
     assert!(

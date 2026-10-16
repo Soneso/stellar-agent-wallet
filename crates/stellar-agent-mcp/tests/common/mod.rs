@@ -313,6 +313,8 @@ pub struct TimeoutRpc {
     /// When set, `getTransaction` confirms the submission instead of never
     /// answering for it.
     confirm_in_ledger: Option<u32>,
+    /// The identity `getNetwork` reports.
+    network: EndpointNetwork,
 }
 
 #[allow(
@@ -327,7 +329,16 @@ impl TimeoutRpc {
             accounts,
             simulate: None,
             confirm_in_ledger: None,
+            network: EndpointNetwork::testnet(),
         }
+    }
+
+    /// Answers `getNetwork` with what `network` reports at the time of each
+    /// call, instead of testnet.
+    #[must_use]
+    pub fn with_network(mut self, network: EndpointNetwork) -> Self {
+        self.network = network;
+        self
     }
 
     /// Confirms every submission in `ledger` instead of never answering for
@@ -360,7 +371,7 @@ impl wiremock::Respond for TimeoutRpc {
             .unwrap_or("");
 
         let result = match rpc_method {
-            "getNetwork" => EndpointNetwork::testnet().result(),
+            "getNetwork" => self.network.result(),
             "getFeeStats" => serde_json::json!({
                 "sorobanInclusionFee": {
                     "max": "100", "min": "100", "mode": "100", "p10": "100", "p20": "100",
@@ -427,6 +438,70 @@ impl wiremock::Respond for TimeoutRpc {
             }))
             .insert_header("content-type", "application/json")
     }
+}
+
+/// Answers every `getNetwork` request on `server` with testnet, ahead of the
+/// server's other mocks.
+///
+/// A mock that answers any request, or answers only a limited number, is
+/// then reached only by the reads it is for: the endpoint check never takes
+/// an answer meant for an account read.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub async fn mount_testnet_identity(server: &wiremock::MockServer) {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({ "method": "getNetwork" }),
+        ))
+        .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+            EndpointNetwork::testnet().result(),
+        ))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// The JSON-RPC methods `server` received, in order.
+///
+/// # Panics
+///
+/// Panics if request recording is disabled on `server`.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub async fn received_methods(server: &wiremock::MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .expect("request recording is enabled")
+        .iter()
+        .filter_map(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|body| body["method"].as_str().map(str::to_owned))
+        })
+        .collect()
+}
+
+/// How many `StellarRpcClient` values `call` builds on this thread.
+///
+/// The tool tests run on a current-thread runtime, so every client a tool
+/// call builds is built on the test's thread and counted here.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub async fn clients_built_by<F, T>(call: F) -> (T, usize)
+where
+    F: std::future::Future<Output = T>,
+{
+    let before = stellar_agent_network::client::constructions_on_this_thread();
+    let output = call.await;
+    let built = stellar_agent_network::client::constructions_on_this_thread() - before;
+    (output, built)
 }
 
 /// A profile whose submissions time out after one second, under its own signer

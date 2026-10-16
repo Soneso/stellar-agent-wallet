@@ -19,8 +19,9 @@
 //!
 //! The wire code and the profile named in the refusal message, not the exit
 //! code: a run that synthesized and then failed on the unreachable endpoint
-//! also exits 1. `network.rpc_unreachable` means the run got past profile
-//! resolution — that is what the zero-config pins assert.
+//! also exits 1. `network.endpoint_identity_unavailable`, the refusal of the
+//! endpoint check every verb runs before its first read, means the run got
+//! past profile resolution, which is what the zero-config pins assert.
 //!
 //! # Hermetic fixtures
 //!
@@ -281,7 +282,7 @@ fn no_profile_named_and_no_default_file_still_synthesizes() {
         );
         assert_eq!(
             run.code_field(),
-            "network.rpc_unreachable",
+            "network.endpoint_identity_unavailable",
             "`{verb}` must reach the endpoint, proving profile resolution succeeded; \
              stdout={}",
             run.stdout
@@ -360,7 +361,7 @@ fn the_flag_beats_the_variable_at_the_verbs_own_load() {
         let run = run_cli(home.path(), Some(ABSENT_PROFILE), &args);
         assert_eq!(
             run.code_field(),
-            "network.rpc_unreachable",
+            "network.endpoint_identity_unavailable",
             "`{verb}`: the flag's existing profile must win over the variable's absent \
              one and the run must proceed; stdout={} stderr={}",
             run.stdout,
@@ -383,7 +384,7 @@ fn a_named_profile_with_a_file_is_loaded() {
         let run = run_cli(home.path(), None, &args);
         assert_eq!(
             run.code_field(),
-            "network.rpc_unreachable",
+            "network.endpoint_identity_unavailable",
             "`{verb}` must load the named profile that exists and reach the endpoint; \
              stdout={} stderr={}",
             run.stdout,

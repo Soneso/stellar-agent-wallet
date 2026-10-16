@@ -211,7 +211,9 @@ transaction. Signing command: the funder signer is loaded from the keyring. The
 pool master seed is generated in memory and written to the OS keyring only after
 the on-chain transaction confirms; the public `PoolConfig` bookkeeping is then
 persisted to the profile TOML. A failure before confirmation leaves no keyring
-entry and no config, so a clean retry needs no `--force`.
+entry and no config, so a clean retry needs no `--force`. Before the channel
+reads, `pool init` asks the endpoint which network it serves, on the client
+that later sends, under its own `--timeout-seconds` budget.
 
 `--size` must be in `1..=19`. The bound exists because the funder plus each
 channel must sign the sandwich envelope, and `N+1` signatures must fit the
@@ -231,6 +233,7 @@ master orphans all previously funded channels.
 | `--size <N>` | Number of channel accounts to create (`1..=19`) | Required | none |
 | `--profile <NAME>` | Profile for the funder key and RPC endpoint | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--force` | Overwrite an existing pool master key (orphans previously funded channels) | Optional | `false` |
+| `--timeout-seconds <N>` | Deadline for the endpoint identity check and, separately, for confirming the creation transaction | Optional | `120` |
 | `--output <FORMAT>` | `json` or `table` | Optional | `json` |
 
 ```bash

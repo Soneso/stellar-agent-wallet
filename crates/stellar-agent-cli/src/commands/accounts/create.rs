@@ -85,6 +85,13 @@
 //! acquired, it is reused (not re-acquired) for the post-confirm
 //! `value_action_submitted` row.
 //!
+//! # Endpoint identity (sponsored mode)
+//!
+//! Sponsored mode builds one client and asks the endpoint which network it
+//! serves before the sponsor read that feeds the policy gate. The reconcile,
+//! the fee and sequence reads, and the send use that same client. The submit
+//! layer checks the sending client again before the send.
+//!
 //! # Behavior
 //!
 //! - All RPC calls go through Stellar RPC.
@@ -118,7 +125,8 @@ use crate::commands::policy_engine::{
     build_v1_policy_engine, create_policy_args, evaluate_value_moving_policy,
 };
 use crate::common::network::{
-    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity,
+    network_context_for_command,
 };
 use crate::common::profile_access::{
     ProfileOrigin, injected_profile_load, load_profile_or_synthesize_testnet_with,
@@ -371,7 +379,8 @@ pub struct CreateArgs {
     #[arg(long, default_value_t = OutputFormat::DEFAULT, value_name = "FORMAT")]
     pub output: OutputFormat,
 
-    /// Submission timeout in seconds (sponsored mode). Default: 60.
+    /// Timeout in seconds for the endpoint check and, separately, for the
+    /// submission (sponsored mode). Default: 60.
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
     pub timeout_seconds: u64,
 
@@ -806,6 +815,11 @@ where
     // runs strictly before any build/sign/submit work in this command, so
     // the fetched view cannot be threaded into that later call without
     // restructuring the build pipeline — a known, accepted extra round-trip).
+    //
+    // The client is the one the reconcile, the build reads, and the send use.
+    // Its endpoint is checked first, under a fresh budget of
+    // `--timeout-seconds`, so no value the sponsor signs comes from an
+    // endpoint serving another network.
     let client = match StellarRpcClient::new(&context.rpc_url) {
         Ok(c) => c,
         Err(e) => {
@@ -813,6 +827,12 @@ where
             return 1;
         }
     };
+    if let Err(e) =
+        check_endpoint_identity(&client, context, Duration::from_secs(args.timeout_seconds)).await
+    {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
     let sponsor_account_view =
         match stellar_agent_network::fetch_account(&client, &sponsor, &[]).await {
             Ok(v) => v,
@@ -909,13 +929,18 @@ where
     };
 
     match sponsored_create(
+        &client,
         context,
         args,
-        profile,
-        &resolved.name,
-        &sponsor,
-        &new_account.g_strkey,
-        starting_balance,
+        SignedBy {
+            profile,
+            profile_name: &resolved.name,
+        },
+        SponsoredAccount {
+            sponsor: &sponsor,
+            new_account: &new_account.g_strkey,
+            starting_balance,
+        },
         Some(&recorder),
     )
     .await
@@ -992,7 +1017,25 @@ async fn sign_envelope(
     attach_signature(unsigned_xdr, signer.as_ref(), passphrase).await
 }
 
+/// The loaded profile whose enrolled signer signs the transaction.
+#[derive(Clone, Copy)]
+struct SignedBy<'a> {
+    profile: &'a Profile,
+    profile_name: &'a str,
+}
+
+/// The account the sponsor creates, and with what balance.
+#[derive(Clone, Copy)]
+struct SponsoredAccount<'a> {
+    sponsor: &'a str,
+    new_account: &'a str,
+    starting_balance: StellarAmount,
+}
+
 /// Builds, signs, and submits the `CreateAccount` transaction.
+///
+/// `client` is the client whose endpoint the caller checked before the
+/// sponsor read; the fee and sequence reads and the send go through it.
 ///
 /// # Signing path
 ///
@@ -1006,23 +1049,32 @@ async fn sign_envelope(
 /// # Errors
 ///
 /// Propagates errors from account fetch, signing, or submission.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "loaded profile identity accompanies the transaction and recorder"
-)]
 async fn sponsored_create(
+    client: &StellarRpcClient,
     context: &NetworkContext,
     args: &CreateArgs,
-    profile: &Profile,
-    profile_name: &str,
-    sponsor: &str,
-    new_account: &str,
-    starting_balance: StellarAmount,
+    signed_by: SignedBy<'_>,
+    account: SponsoredAccount<'_>,
     recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>,
 ) -> Result<SponsoredCreateResult, WalletError> {
-    let built =
-        build_sponsored_unsigned_envelope(context, args, sponsor, new_account, starting_balance)
-            .await?;
+    let SignedBy {
+        profile,
+        profile_name,
+    } = signed_by;
+    let SponsoredAccount {
+        sponsor,
+        new_account,
+        starting_balance,
+    } = account;
+    let built = build_sponsored_unsigned_envelope(
+        client,
+        context,
+        args,
+        sponsor,
+        new_account,
+        starting_balance,
+    )
+    .await?;
 
     let signed_xdr = sign_envelope(
         context,
@@ -1036,10 +1088,9 @@ async fn sponsored_create(
     let passphrase = context.network_passphrase();
 
     // Submit and wait for confirmation.
-    let client = StellarRpcClient::new(&context.rpc_url)?;
     let timeout = Duration::from_secs(args.timeout_seconds);
     let submission = submit_transaction_and_wait(
-        &client,
+        client,
         &signed_xdr,
         timeout,
         passphrase,
@@ -1054,21 +1105,23 @@ async fn sponsored_create(
     })
 }
 
+/// Reads the fee and the sponsor's sequence through `client` and builds the
+/// unsigned `CreateAccount` envelope.
 async fn build_sponsored_unsigned_envelope(
+    client: &StellarRpcClient,
     context: &NetworkContext,
     args: &CreateArgs,
     sponsor: &str,
     new_account: &str,
     starting_balance: StellarAmount,
 ) -> Result<BuiltCreateAccountEnvelope, WalletError> {
-    let client = StellarRpcClient::new(&context.rpc_url)?;
     let fee_choice = parse_classic_fee_choice(args.fee.as_deref())?;
     let fee_selection =
-        resolve_classic_fee_selection(&client, DEFAULT_FEE_STROOPS, fee_choice).await?;
+        resolve_classic_fee_selection(client, DEFAULT_FEE_STROOPS, fee_choice).await?;
 
     // Fetch sponsor account for sequence number.
     // Pass empty slice: account creation only needs the sponsor's sequence number.
-    let sponsor_account = stellar_agent_network::fetch_account(&client, sponsor, &[]).await?;
+    let sponsor_account = stellar_agent_network::fetch_account(client, sponsor, &[]).await?;
     // Pass the current on-chain sequence directly; `stellar_baselib::TransactionBuilder::build`
     // calls `Account::increment_sequence_number` internally. An explicit +1
     // here would produce CURRENT+2 → TxBadSeq.
@@ -1216,6 +1269,9 @@ mod tests {
                 .unwrap_or("");
 
             let result = match method {
+                "getNetwork" => stellar_agent_test_support::signed_envelope::get_network_result(
+                    stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                ),
                 "getFeeStats" => (*self.fee_stats).clone(),
                 "getLedgerEntries" => {
                     let body = String::from_utf8_lossy(&request.body);
@@ -1700,8 +1756,11 @@ mod tests {
         let starting_balance =
             StellarAmount::parse_with_unit("1 XLM").expect("test amount with unit must parse");
 
+        let context = flag_context(&args);
+        let client = StellarRpcClient::new(&context.rpc_url).expect("mock client");
         let built = build_sponsored_unsigned_envelope(
-            &flag_context(&args),
+            &client,
+            &context,
             &args,
             SOURCE_G,
             DEST_G,
@@ -1761,8 +1820,11 @@ mod tests {
         let starting_balance =
             StellarAmount::parse_with_unit("1 XLM").expect("test amount with unit must parse");
 
+        let context = flag_context(&args);
+        let client = StellarRpcClient::new(&context.rpc_url).expect("mock client");
         let built = build_sponsored_unsigned_envelope(
-            &flag_context(&args),
+            &client,
+            &context,
             &args,
             SOURCE_G,
             DEST_G,
@@ -1786,8 +1848,11 @@ mod tests {
         let starting_balance =
             StellarAmount::parse_with_unit("1 XLM").expect("test amount with unit must parse");
 
+        let context = flag_context(&args);
+        let client = StellarRpcClient::new(&context.rpc_url).expect("mock client");
         let built = build_sponsored_unsigned_envelope(
-            &flag_context(&args),
+            &client,
+            &context,
             &args,
             SOURCE_G,
             DEST_G,
@@ -2239,14 +2304,28 @@ mod tests {
             "the run must still refuse for lack of a configured signer, not for the \
              tolerated keyring-init failure"
         );
-        let requests = server
+        let methods: Vec<String> = server
             .received_requests()
             .await
-            .expect("request recording is enabled by default");
-        assert!(
-            !requests.is_empty(),
-            "execution must reach the sponsor-account RPC fetch, proving the synthesized \
-             profile's keyring-init failure was tolerated rather than treated as fatal"
+            .expect("request recording is enabled by default")
+            .iter()
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["method"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        // The endpoint check, the sponsor read that feeds the gate, then the
+        // build's sponsor read. The run passed the gate, the audit pre-flight,
+        // and the recorder. It stopped at signing for lack of a signer, before
+        // the submit layer's own endpoint check.
+        assert_eq!(
+            methods,
+            ["getNetwork", "getLedgerEntries", "getLedgerEntries"],
+            "execution must reach the build reads and stop at signing, proving the \
+             synthesized profile's keyring-init failure was tolerated rather than \
+             treated as fatal"
         );
     }
 
@@ -2273,7 +2352,9 @@ mod tests {
         args.sponsor = Some(g.clone());
         args.secret_env = Some(var.into());
         args.fee = Some("100".into());
+        let client = StellarRpcClient::new(&context.rpc_url).expect("mock client");
         let built = build_sponsored_unsigned_envelope(
+            &client,
             &context,
             &args,
             &g,
@@ -2313,5 +2394,85 @@ mod tests {
     #[serial_test::serial]
     async fn enrolled_signing_mismatch() {
         enrolled_signing_case(EnrolledPin::Other).await;
+    }
+
+    // ── Endpoint identity: one client, checked before the sponsor read ─────
+
+    /// Runs a sponsored creation by the account of `seed` on the zero-config
+    /// profile against `server`, with the sponsor's secret in `var`, and
+    /// returns the exit code and the number of clients the run built.
+    async fn sponsored_run(
+        seed: [u8; 32],
+        var: &'static str,
+        server: &MockServer,
+        fee: Option<&str>,
+    ) -> (i32, usize) {
+        let sponsor = crate::test_rpc::EnvSigner::new(seed, var);
+        let mut args = minimal_sponsored_args();
+        args.sponsor = Some(sponsor.g.clone());
+        args.secret_env = Some(sponsor.var.to_owned());
+        args.rpc_url = Some(server.uri());
+        args.fee = fee.map(str::to_owned);
+        crate::test_rpc::clients_built_by(run_with_dependencies(
+            &args,
+            crate::test_rpc::absent_profile_file,
+            || Ok(()),
+        ))
+        .await
+    }
+
+    /// A sponsored creation builds one client: the endpoint check is its
+    /// first request, ahead of the sponsor read, and the reconcile, the build
+    /// reads, and the send go through it. The submit layer checks it again,
+    /// so two `getNetwork` requests.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_sponsored_creation_checks_the_endpoint_first_and_sends_through_one_client() {
+        for fee in [None, Some("auto")] {
+            let _zero_config = crate::test_rpc::zero_config();
+            let seed = [0x81; 32];
+            let sponsor = stellar_agent_test_support::signed_envelope::account_id_for_seed(seed);
+            let server = crate::test_rpc::ClassicRpc::testnet(&[&sponsor])
+                .serve()
+                .await;
+
+            let (code, built) = sponsored_run(seed, "CREATE_ONE_CLIENT_SK", &server, fee).await;
+            let methods = crate::test_rpc::methods(&server).await;
+
+            assert_eq!(code, 0, "fee {fee:?}: {methods:?}");
+            assert_eq!(built, 1, "fee {fee:?}: one client reads and sends");
+            assert_eq!(methods.first().map(String::as_str), Some("getNetwork"));
+            assert_eq!(crate::test_rpc::network_checks(&methods), 2, "{methods:?}");
+            assert!(
+                methods.iter().any(|m| m == "sendTransaction"),
+                "{methods:?}"
+            );
+        }
+    }
+
+    /// An endpoint serving another network refuses a sponsored creation
+    /// before the sponsor read, with the fixed fee and the automatic fee.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_sponsored_creation_refuses_another_network_before_any_read() {
+        for fee in [None, Some("auto")] {
+            let _zero_config = crate::test_rpc::zero_config();
+            let seed = [0x82; 32];
+            let sponsor = stellar_agent_test_support::signed_envelope::account_id_for_seed(seed);
+            let endpoint = crate::test_rpc::ClassicRpc::testnet(&[&sponsor]);
+            endpoint.report("Test SDF Future Network ; October 2022");
+            let server = endpoint.serve().await;
+
+            let (code, built) =
+                sponsored_run(seed, "CREATE_ENDPOINT_MISMATCH_SK", &server, fee).await;
+
+            assert_eq!(code, 1, "fee {fee:?}");
+            assert_eq!(built, 1, "fee {fee:?}");
+            assert_eq!(
+                crate::test_rpc::methods(&server).await,
+                ["getNetwork"],
+                "fee {fee:?}: the endpoint check precedes every read"
+            );
+        }
     }
 }

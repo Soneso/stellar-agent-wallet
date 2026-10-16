@@ -341,7 +341,24 @@ A Stellar signature commits to a network: the SEP-23 `TransactionSignaturePayloa
 6. Every decorated signature is verified under the network id the endpoint reported.
 7. `sendTransaction`, then poll `getTransaction`.
 
-Steps 4 and 5 are two reads ahead of the send, so every submission makes two round trips before the send.
+Steps 4 and 5 are two reads ahead of the send, so inside the submit layer every submission makes two round trips before the send.
+
+### Endpoint identity before the first signed read
+
+The submit layer's check covers the bytes it sends, but the values in those bytes are read earlier. The fee, the source sequence, and the claim entry are signed. The account views and the reservation reconcile shape the policy decision. The classic paths therefore read and send through one client and check its endpoint first:
+
+- CLI `pay` and `claim` in every stage that reads, sponsored `accounts create`, `trustline`, and `pool init` build one `StellarRpcClient` per run. Its endpoint check runs immediately before the first request whose answer feeds a signature or a policy decision, and the send goes through it.
+- The MCP prepare tools `stellar_pay`, `stellar_create_account`, `stellar_trustline`, and `stellar_claim` check their client before its first read. The commit tools check the client they submit with before the sequence read, so the check is the first request on it.
+- `--sign-only` checks only when it decodes the envelope and reads the accounts its gate needs. An envelope it cannot decode is signed with no request.
+- A `pool init` resume makes no request when the profile already holds the pool or the checkpoint records its completion. Every other resume checks before its first read, whether or not it sends.
+
+Checks that need no request keep their place ahead of the endpoint check: argument, keyring, and profile validation, envelope decoding, the structural mainnet refusal, and the relayer refusal. The `pool init` audit pre-flight and the forced approval of a toolset-gated MCP pay commit without approval fields need no request either and come first. On the full CLI `pay` pipeline, `--source` and `--fee` are checked after the reconcile.
+
+Every refusal that follows a read comes after the endpoint check. Those are account and claim-entry errors, policy denial, approval refusal, rebuild divergence, the audit pre-flight, a malformed nonce, and the chain, fee, asset, and amount checks. The reservation reconcile and its settlement come after it too. A CLI `claim` or `trustline` refused at the early check carries no preview.
+
+Three clients are exempt because they read but never send. The MCP dispatch gate reconciles reservations on a client of its own. The oracle rebuild of the high-value cross-check uses the oracle endpoint. The SEP-29 secondary read uses the secondary endpoint. On the CLI, the reconcile runs on the primary client.
+
+An MCP commit's early check refuses without consuming the nonce. The commit reads the clock for the nonce's expiry after the check, so the check's time counts toward that expiry. A refusal by the submit layer's own check comes after the nonce is consumed.
 
 ### Endpoint identity is authoritative
 
@@ -368,7 +385,7 @@ The identity check, the signer-set fetch, and `sendTransaction` share one retry 
 
 The confirmation poll asks `getTransaction` every 2 s under the same deadline. No poll request and no sleep between polls runs past it. An answer that arrives after it is not accepted. The caller gets the timeout outcome and reconciles the hash with `tx status`. The retention-aware poll of the idempotent path makes one exception. At the deadline it runs one final `getHealth` retention check, bounded to 2 s, so it returns within the deadline plus 2 s.
 
-A standalone identity check, such as the `pay --submit-only` probe or an MCP commit tool's check, runs under its own deadline. The submission that follows starts a fresh deadline. Inside a submission, the identity check shares the submission's deadline.
+A standalone identity check, the one a command or tool runs before its first read, runs under its own deadline. On CLI `pay`, `claim`, sponsored `accounts create`, and `pool init`, that deadline is `--timeout-seconds` from the check's start. On `trustline` and the MCP tools, it is the profile's `submit_timeout_seconds`. The submission that follows starts a fresh deadline. Inside a submission, the identity check shares the submission's deadline.
 
 The wallet has no automatic failover: the secondary and oracle endpoints verify reads and never send a transaction. It has no circuit breaker either, because the CLI runs one command per process.
 

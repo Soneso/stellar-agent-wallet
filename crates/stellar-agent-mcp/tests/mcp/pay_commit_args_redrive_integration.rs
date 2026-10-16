@@ -14,8 +14,8 @@
 //! 2. `envelope_xdr` that is valid XDR but encodes a `Payment` to
 //!    `G_REAL_DEST` while caller args supply `destination = G_ATTACKER` →
 //!    the policy engine sees `G_REAL_DEST` from the XDR, not `G_ATTACKER`.
-//!    With `NoopPolicyEngine::testnet` the call proceeds to the nonce-expired
-//!    gate (not a policy deny), confirming the authoritative args flow is wired.
+//!    An engine that records what it evaluates shows the destination it saw,
+//!    and the call proceeds to the nonce-expired gate.
 //!
 //! 3. `envelope_xdr` with a `Memo::Hash` → `nonce.expired`: Hash memos decode
 //!    as `Ok(None)`; the tamper is caught by the envelope-rebuild divergence
@@ -166,8 +166,8 @@ fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
     p
 }
 
-/// Simple wiremock responder serving `getLedgerEntries` for one account and
-/// an empty result for anything else.
+/// Simple wiremock responder reporting testnet from `getNetwork`, serving
+/// `getLedgerEntries` for one account, and an empty result for anything else.
 struct AccountOnlyResponder {
     account_key_xdr: String,
     account_xdr: String,
@@ -182,7 +182,9 @@ impl Respond for AccountOnlyResponder {
             .get("method")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        let result = if method_name == "getLedgerEntries"
+        let result = if method_name == "getNetwork" {
+            crate::common::EndpointNetwork::testnet().result()
+        } else if method_name == "getLedgerEntries"
             && String::from_utf8_lossy(&request.body).contains(&self.account_key_xdr)
         {
             serde_json::json!({
@@ -257,20 +259,28 @@ async fn pay_commit_with_create_account_xdr_returns_simulation_divergence() {
 //
 // With authoritative args re-derivation, the policy engine receives the XDR-
 // encoded `G_REAL_DEST` as `destination`, not the caller-supplied `G_ATTACKER`.
-// The testnet `NoopPolicyEngine` returns Allow for non-mainnet destructive
-// tools.  The call proceeds past the policy gate to the nonce verification
-// step, which fails with `nonce.expired` because the nonce ("dGVzdA") is a
-// trivially-invalid stub — NOT `policy.engine_required` or a `policy.deny`.
-//
-// This confirms the args are flowing through re-derivation (if they weren't,
-// the behaviour might differ on mainnet where the policy engine rejects).
+// An engine that allows and records what it evaluates shows the destination
+// the gate evaluated. The call then proceeds past the gate to the nonce step,
+// which fails with `nonce.expired` because the nonce ("dGVzdA") is a
+// trivially-invalid stub.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 #[serial]
 async fn pay_commit_policy_engine_sees_xdr_destination_not_caller_destination() {
     keyring_mock::install().expect("mock keyring store init");
-    let server = WalletServer::new(testnet_profile()).expect("WalletServer::new");
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(AccountOnlyResponder {
+            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
+            account_xdr: account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000_000),
+        })
+        .mount(&mock_server)
+        .await;
+    let mut server =
+        WalletServer::new(testnet_profile_with_rpc(&mock_server.uri())).expect("WalletServer::new");
+    let engine = crate::common::policy_mock::CapturingPolicyEngine::new();
+    server.set_policy_engine_for_test(std::sync::Arc::new(engine.clone()));
 
     // envelope_xdr encodes G_REAL_DEST; caller args claim G_ATTACKER.
     let envelope_xdr = payment_envelope_b64(G_REAL_DEST, 10_000_000, Memo::None);
@@ -293,45 +303,25 @@ async fn pay_commit_policy_engine_sees_xdr_destination_not_caller_destination() 
         approval_attestation: None,
     };
 
-    let result = server.call_stellar_pay_commit(args).await;
-    // The call must either:
-    // (a) Fail at nonce parse with nonce.expired (policy gate passed with XDR args), OR
-    // (b) Succeed with G-strkey validation error (invalid destination — but G_ATTACKER is
-    //     a valid G-strkey so this doesn't fire).
-    //
-    // It must NOT fail with policy.engine_required or simulation.divergence at
-    // the re-derivation step (the XDR is a valid Payment to G_REAL_DEST).
-    match result {
-        Err(err) => {
-            let msg = err.to_string();
-            assert!(
-                msg.contains("nonce.expired") || msg.contains("nonce."),
-                "after policy gate, must fail at nonce step; got: {msg}"
-            );
-            assert!(
-                !msg.contains("simulation.divergence"),
-                "must NOT return simulation.divergence for valid Payment XDR; got: {msg}"
-            );
-            assert!(
-                !msg.contains("policy.engine_required"),
-                "must NOT return policy gate error for testnet; got: {msg}"
-            );
-        }
-        Ok(tool_result) => {
-            // If for some reason it returns Ok (e.g. tool-level error result),
-            // the is_error flag distinguishes it from a success.
-            // We accept any outcome that isn't simulation.divergence or policy rejection.
-            let json_str = tool_result
-                .content
-                .first()
-                .and_then(|c| c.as_text())
-                .map_or_else(String::new, |raw| raw.text.clone());
-            assert!(
-                !json_str.contains("simulation.divergence"),
-                "must NOT return simulation.divergence for valid Payment XDR; got: {json_str}"
-            );
-        }
-    }
+    let result = server
+        .call_stellar_pay_commit(args)
+        .await
+        .expect("the nonce refusal is a tool result, not a protocol error");
+    let (code, _message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "nonce.expired",
+        "the call passes the gate and fails at the nonce step: {text}"
+    );
+    let evaluated = engine.arguments_for("stellar_pay_commit");
+    assert_eq!(
+        evaluated.len(),
+        1,
+        "the gate evaluates the commit once: {evaluated:?}"
+    );
+    assert_eq!(
+        evaluated[0]["destination"], G_REAL_DEST,
+        "the gate evaluates the destination the envelope encodes, not the caller's: {evaluated:?}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

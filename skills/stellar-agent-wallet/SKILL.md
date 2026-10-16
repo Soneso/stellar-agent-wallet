@@ -278,7 +278,11 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   alpha.
 - The submit layer does not trust the declared network. It asks the RPC endpoint
   which network it serves and which protocol it runs, binds the submission to
-  that answer, then verifies every signature on the envelope against it.
+  that answer, then verifies every signature on the envelope against it. The
+  classic payment, sponsored account creation, trustline, claim, and pool paths
+  ask the same question earlier, before the first read whose answer they sign
+  or gate on. They ask on the client that sends, and the MCP simulate tools ask
+  on their own client.
   Six codes carry those refusals:
   - `network.endpoint_network_mismatch`: the endpoint serves a different
     network than declared.
@@ -378,9 +382,12 @@ mainnet is `network.envelope_signed_for_mainnet`, one whose signatures verify
 under neither that network nor mainnet is
 `network.envelope_signature_unverifiable`, and an
 envelope with no signature, or a fee-bump whose outer or inner transaction
-has none, is `network.envelope_unsigned`. On the
-four two-phase commit tools this runs before the single-use nonce is burned, so
-a refusal here leaves the nonce usable.
+has none, is `network.envelope_unsigned`. The four classic simulate tools and
+their commit tools check the endpoint before their first read, and a simulate
+against an endpoint reporting mainnet is refused with
+`network.mainnet_write_forbidden`. A commit checks before the single-use nonce
+is burned, so a refusal at that check leaves the nonce usable. A refusal by the
+submit layer's own check, after the nonce is consumed, does not.
 
 **Branch on `ok` and the error `code`, not the message.** The human message text
 is not a stable contract; the wire `code` is.

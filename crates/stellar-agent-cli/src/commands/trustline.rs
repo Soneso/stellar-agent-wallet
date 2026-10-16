@@ -7,27 +7,31 @@
 //!
 //! 1. `resolve_denomination` — USDT hard-refusal + known-lookalike denylist +
 //!    pinned-issuer-mismatch + unpinned-bare-code.
-//! 2. Live issuer account fetch via `fetch_account` → `AccountFlagsView`
+//! 2. Endpoint identity check on the one client that every later read and the
+//!    send use, under the profile's [`Profile::submit_timeout`]. An endpoint
+//!    serving another network is refused before it answers any read.
+//! 3. Live issuer account fetch via `fetch_account` → `AccountFlagsView`
 //!    (for the clawback gate).
-//! 3. Source account fetch via `fetch_account` (for the policy gate's
+//! 4. Source account fetch via `fetch_account` (for the policy gate's
 //!    `account_view`; sequence number consumed at envelope-build time).
-//! 4. Operator policy evaluation — the shared
+//! 5. Operator policy evaluation: the shared
 //!    [`crate::commands::policy_engine::build_v1_policy_engine`]
 //!    (V1 `NoopPolicyEngine` / `PolicyEngineV1`; fail-closed on build failures),
-//!    now that both views from steps 2-3 are populated. A denial is a clean
+//!    once both views from steps 3-4 are populated. A denial is a clean
 //!    refusal that signs nothing and requires no audit setup.
-//! 5. Audit pre-flight (fail-closed) — the profile's audit
+//! 6. Audit pre-flight (fail-closed): the profile's audit
 //!    chain-root key must be acquirable via
 //!    [`crate::commands::value_audit::require_value_audit_writer`] before any
 //!    later step touches the signer or submits; refuses
 //!    `audit.chain_key_unavailable` otherwise. The acquired writer is reused
 //!    for the post-confirm row.
-//! 6. `clawback_gate(flags, opt_in_present)` where `opt_in_present` is derived
+//! 7. `clawback_gate(flags, opt_in_present)` where `opt_in_present` is derived
 //!    from the wallet-controlled `PendingApprovalStore` (NOT a CLI flag).
-//! 7. `TrustlinePreview::build` — the typed preview of the trustline.
-//! 8. `RefuseWithWarning` / `Refuse` gate decisions → early return (exit 1).
-//! 9. Build `ChangeTrust` envelope via `ClassicOpBuilder::change_trust`.
-//! 10. Sign via keyring → submit → wait for confirmation.
+//! 8. `TrustlinePreview::build`: the typed preview of the trustline.
+//! 9. `RefuseWithWarning` / `Refuse` gate decisions → early return (exit 1).
+//! 10. Build `ChangeTrust` envelope via `ClassicOpBuilder::change_trust`.
+//! 11. Sign via keyring → submit → wait for confirmation. The submit layer
+//!     checks the endpoint of the sending client again before the send.
 //!
 //! # Policy engine
 //!
@@ -46,11 +50,11 @@
 //!
 //! One JSON envelope on stdout. Returns `0` on success, `1` on error.
 //!
-//! The typed preview from step 7 is rendered once, as a nested `preview`
-//! object, after the step 8 gate decision passes. It sits in `data.preview`
+//! The typed preview from step 8 is rendered once, as a nested `preview`
+//! object, after the step 9 gate decision passes. It sits in `data.preview`
 //! beside the submission result on success. It sits in
 //! `error.details.preview` when a later stage fails: fee resolution, envelope
-//! build, signing, or submission. A refusal up to and including the step 8
+//! build, signing, or submission. A refusal up to and including the step 9
 //! gate decision carries no preview.
 //!
 //! # Behavior
@@ -101,7 +105,7 @@ use stellar_agent_stablecoin::{
     resolve::{DenominationInput, ResolvedAsset, resolve_denomination},
 };
 
-use crate::common::network::mainnet_write_refusal;
+use crate::common::network::{check_endpoint_identity, mainnet_write_refusal};
 use crate::common::profile_access::{
     ProfileAccessError, injected_profile_load, reconcile_loaded_profile,
 };
@@ -322,6 +326,13 @@ where
             );
         }
     };
+
+    // The endpoint check precedes the issuer read: the issuer flags feed the
+    // clawback gate, and every later read and the send use this client. It
+    // gets its own budget of the profile's submit timeout.
+    if let Err(e) = check_endpoint_identity(&rpc_client, &context, profile.submit_timeout()).await {
+        return write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
 
     // Fetch the ISSUER account (not the wallet account) for `issuer_flags`
     // (the clawback gate, below). The issuer account is deliberately NOT
@@ -1566,6 +1577,130 @@ mod tests {
         );
         let forwarded = *forwarded.lock().unwrap();
         forwarded.expect("the stages must reach the submission step")
+    }
+
+    // ── Endpoint identity: one client, checked before the issuer read ──────
+
+    /// A persisted `Noop` profile named `name` whose endpoint is `rpc_url`,
+    /// with its audit key and the signer of `SEED` seeded in the mock keyring
+    /// store, under a temporary data root. Returns the profile, the signer's
+    /// G-strkey, and the guards to hold.
+    fn seeded_trustline_profile(
+        name: &str,
+        rpc_url: &str,
+    ) -> (
+        Profile,
+        String,
+        tempfile::TempDir,
+        stellar_agent_test_support::StellarAgentHomeGuard,
+    ) {
+        const SEED: [u8; 32] = [0x5d; 32];
+        let home = tempfile::tempdir().unwrap();
+        let home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let from = stellar_agent_test_support::signed_envelope::account_id_for_seed(SEED);
+        let mut profile = Profile::builder_testnet_named(name, "svc-endpoint", &from, "n", "a")
+            .with_noop_engine()
+            .build();
+        profile.rpc_url = rpc_url.to_owned();
+        profile.audit_log_path = home.path().join("audit").join(format!("{name}.jsonl"));
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let audit_key = &profile.audit_log_hash_chain_key_id;
+        KeyringEntry::new(&audit_key.service, &audit_key.account)
+            .unwrap()
+            .set_password(&URL_SAFE_NO_PAD.encode([0x3a; 32]))
+            .unwrap();
+        let signer = &profile.mcp_signer_default;
+        KeyringEntry::new(&signer.service, &signer.account)
+            .unwrap()
+            .set_password(
+                &stellar_agent_test_support::testnet_strkeys::strkey_from_seed(
+                    stellar_agent_test_support::testnet_strkeys::VERSION_PRIVATE_KEY,
+                    &SEED,
+                ),
+            )
+            .unwrap();
+        (profile, from, home, home_guard)
+    }
+
+    /// A `USDC` trustline builds one client: the endpoint check is its first
+    /// request, ahead of the issuer read, and the reads and the send go
+    /// through it. The submit layer checks it again, so two `getNetwork`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_trustline_checks_the_endpoint_first_and_sends_through_one_client() {
+        const NAME: &str = "trustline-one-client";
+        let from = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x5d; 32]);
+        let server = crate::test_rpc::ClassicRpc::testnet(&[&from, ONE_ENVELOPE_ISSUER])
+            .serve()
+            .await;
+        let (profile, from, _home, _home_guard) = seeded_trustline_profile(NAME, &server.uri());
+        let args = TrustlineArgs {
+            profile: Some(NAME.to_owned()),
+            from,
+            asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
+            limit_stroops: None,
+            classic_base: Some("auto".to_owned()),
+        };
+        let mut out = Vec::new();
+        let loaded = profile.clone();
+        let (code, built) = crate::test_rpc::clients_built_by(run_with_dependencies(
+            &args,
+            move |_| Ok(loaded.clone()),
+            || Ok(()),
+            &mut out,
+        ))
+        .await;
+        let envelope = crate::common::render::single_json_document(&out);
+        let methods = crate::test_rpc::methods(&server).await;
+
+        assert_eq!(code, 0, "{envelope}");
+        assert_eq!(built, 1, "one client reads and sends");
+        assert_eq!(methods.first().map(String::as_str), Some("getNetwork"));
+        assert_eq!(crate::test_rpc::network_checks(&methods), 2, "{methods:?}");
+        assert!(
+            methods.iter().any(|m| m == "sendTransaction"),
+            "{methods:?}"
+        );
+    }
+
+    /// An endpoint serving another network is refused before the issuer read,
+    /// with the mismatch code and no preview.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_endpoint_serving_another_network_is_refused_before_the_issuer_read() {
+        const NAME: &str = "trustline-endpoint-mismatch";
+        let from = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x5d; 32]);
+        let endpoint = crate::test_rpc::ClassicRpc::testnet(&[&from, ONE_ENVELOPE_ISSUER]);
+        endpoint.report("Test SDF Future Network ; October 2022");
+        let server = endpoint.serve().await;
+        let (profile, from, _home, _home_guard) = seeded_trustline_profile(NAME, &server.uri());
+        let args = TrustlineArgs {
+            profile: Some(NAME.to_owned()),
+            from,
+            asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
+            limit_stroops: None,
+            classic_base: None,
+        };
+        let mut out = Vec::new();
+        let loaded = profile.clone();
+        let code =
+            run_with_dependencies(&args, move |_| Ok(loaded.clone()), || Ok(()), &mut out).await;
+        let envelope = crate::common::render::single_json_document(&out);
+
+        assert_eq!(code, 1, "{envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "network.endpoint_network_mismatch",
+            "{envelope}"
+        );
+        assert!(
+            envelope["error"].get("details").is_none(),
+            "an endpoint refusal carries no preview: {envelope}"
+        );
+        assert_eq!(
+            crate::test_rpc::methods(&server).await,
+            ["getNetwork"],
+            "the endpoint check precedes the issuer read and every later read"
+        );
     }
 
     /// An unset `submit_timeout_seconds` hands the submission the 60-second

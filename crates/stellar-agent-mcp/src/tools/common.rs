@@ -231,15 +231,16 @@ pub(crate) fn submit_timeout(profile: &Profile) -> std::time::Duration {
 /// Asks the RPC endpoint which network it serves and which protocol it runs,
 /// and requires the network to be the profile's.
 ///
-/// Every commit tool runs this on the client it will submit with, before the
-/// nonce is consumed. A commit whose endpoint serves a different network is
-/// refused outright, and refusing it before the nonce burn means the caller
-/// can correct the endpoint and retry with the same approval rather than
-/// having spent a single-use nonce on an unreachable target.
+/// The classic prepare and commit tools run this on their client before the
+/// first read on it. The fee, the sequence, the claim entry, and the account
+/// views they read feed the envelope that is signed or the policy gate, so an
+/// endpoint serving a different network answers none of them. A commit tool's
+/// client is also the one it submits with. Refusing there consumes no nonce,
+/// so the caller can correct the endpoint and retry with the same approval.
 ///
-/// The submit layer runs the same check on the same client; this one exists
-/// to place the refusal ahead of state the submit layer never sees. It runs
-/// under its own deadline, `timeout` from now.
+/// The submit layer runs the same check on the same client before the send;
+/// a refusal there comes after the nonce is consumed. This check runs under
+/// its own deadline, `timeout` from now.
 ///
 /// # Errors
 ///
@@ -260,13 +261,14 @@ pub(crate) async fn probe_endpoint_network(
     Ok(())
 }
 
-/// Renders a commit-path refusal as an error tool result.
+/// Renders an endpoint identity refusal of a prepare or commit tool as an
+/// error tool result.
 ///
 /// The refusal carries its own wire code rather than being collapsed into the
 /// nonce taxonomy: the caller has to be able to tell "your endpoint serves the
 /// wrong network" from "your nonce expired", because only the first is fixed
 /// by changing configuration.
-pub(crate) fn commit_refusal_result(
+pub(crate) fn endpoint_refusal_result(
     err: &stellar_agent_core::error::WalletError,
 ) -> rmcp::model::CallToolResult {
     let json = stellar_agent_core::envelope::Envelope::<()>::err(err)

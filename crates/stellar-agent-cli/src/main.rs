@@ -19,6 +19,8 @@ mod advisory;
 mod commands;
 pub mod common;
 mod render;
+#[cfg(test)]
+mod test_rpc;
 
 use clap::{Parser, Subcommand};
 use stellar_agent_core::observability;

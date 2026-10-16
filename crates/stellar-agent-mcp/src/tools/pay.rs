@@ -630,6 +630,20 @@ impl WalletServer {
             }
         };
 
+        // Establish which network the endpoint serves before the first read
+        // on this client. The values read here feed the envelope the commit
+        // signs and the policy gate, so an endpoint serving another network
+        // answers none of them.
+        if let Err(e) = crate::tools::common::probe_endpoint_network(
+            &client,
+            &self.context,
+            crate::tools::common::submit_timeout(&self.profile),
+        )
+        .await
+        {
+            return Ok(crate::tools::common::endpoint_refusal_result(&e));
+        }
+
         let trustline_request: Vec<Asset> = if matches!(asset, Asset::Native) {
             Vec::new()
         } else {
@@ -1244,6 +1258,21 @@ impl WalletServer {
             }
         };
 
+        // Establish which network the endpoint serves before the first read
+        // on this client, which also sends. The sequence read below feeds the
+        // rebuilt envelope that is signed, and the account views feed the
+        // policy gate. A refusal here consumes no nonce, so the caller can
+        // correct the endpoint and retry with the same approval.
+        if let Err(e) = crate::tools::common::probe_endpoint_network(
+            &client,
+            &self.context,
+            crate::tools::common::submit_timeout(&self.profile),
+        )
+        .await
+        {
+            return Ok(crate::tools::common::endpoint_refusal_result(&e));
+        }
+
         let account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
             &self.sequence_floor,
             &client,
@@ -1590,10 +1619,9 @@ impl WalletServer {
 
         // ── Nonce verification + replay window ────────────────────────────────
         //
-        // Note: verify_attestation_gate runs BEFORE nonce parse + RPC fetch
-        // (see its call site above, just after G-strkey validation) to support
-        // toolset-gated tests that bypass the RPC.  The ordering remains correct:
-        // the attestation gate still fires before this nonce HMAC+replay step.
+        // verify_attestation_gate runs before the nonce parse (see its call
+        // site above), so the attestation gate fires before this nonce
+        // HMAC+replay step.
         //
         // Running AFTER the attestation gate means the nonce is only consumed
         // when the approval has been verified.  This prevents replay-window
@@ -1623,20 +1651,6 @@ impl WalletServer {
                 return Ok(result);
             }
         };
-
-        // Establish which network the endpoint serves before the nonce is
-        // consumed. A commit aimed at the wrong network is a configuration
-        // error the caller can correct and retry; burning the nonce first
-        // would cost them the approval as well.
-        if let Err(e) = crate::tools::common::probe_endpoint_network(
-            &client,
-            &self.context,
-            crate::tools::common::submit_timeout(&self.profile),
-        )
-        .await
-        {
-            return Ok(crate::tools::common::commit_refusal_result(&e));
-        }
 
         // Delegates to `commit_envelope_and_verify_nonce` in `tools/common.rs`.
         // Same split-phase pattern as stellar_create_account_commit; all wire

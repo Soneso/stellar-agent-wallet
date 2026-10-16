@@ -106,10 +106,14 @@ first-match default-deny).
 
 Below both layers, the submit layer binds each submission to the network the RPC
 endpoint reports it serves rather than to the declared `chain_id`, and verifies
-every signature on the envelope against that network. `stellar_pay_commit`,
-`stellar_claim_commit`, `stellar_trustline_commit`, and
-`stellar_create_account_commit` run that probe before the single-use nonce is
-burned, so a refusal there leaves the nonce usable. See
+every signature on the envelope against that network. The simulate tools
+`stellar_pay`, `stellar_create_account`, `stellar_trustline`, and `stellar_claim`
+and their commit tools ask the same question before their first read. A
+simulate refuses an endpoint serving another network, or reporting mainnet,
+with an `is_error` result carrying that code. A commit asks before the
+single-use nonce is burned, so a refusal at that check leaves the nonce
+usable. A refusal by the submit layer's own check comes after the nonce is
+consumed. A commit reads the clock for the nonce's expiry after its check. See
 [Troubleshooting](troubleshooting.md#network-binding-codes-submit-layer) for the
 wire codes.
 
@@ -164,7 +168,9 @@ x402 tools also accept `stellar:pubnet`) and must match the loaded profile.
   optional and defaults to the profile chain when omitted, but is still validated
   against the profile when supplied.
 
-A mismatch is refused before any network call.
+A mismatch is refused before policy evaluation. On the classic simulate and
+commit tools, the endpoint check and the account reads come first, so an
+endpoint refusal precedes the `chain_id` check there.
 
 ## Amount and asset conventions
 

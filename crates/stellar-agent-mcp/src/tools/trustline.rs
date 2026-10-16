@@ -14,8 +14,9 @@
 //!
 //! 1. `resolve_denomination` — USDT hard-refusal + lookalike denylist +
 //!    pinned-issuer-mismatch + unpinned-bare-code.
-//! 2. Live issuer account fetch via `fetch_account` → `AccountFlagsView`
-//!    (for the clawback gate).
+//! 2. Endpoint identity check on the simulate client
+//!    (`probe_endpoint_network`), then the live issuer account fetch on it via
+//!    `fetch_account` → `AccountFlagsView` (for the clawback gate).
 //! 3. Source account fetch via `fetch_account` (for the policy gate's
 //!    `account_view`; sequence number consumed at envelope-build time).
 //! 4. `dispatch_gate_with_views` — policy engine evaluation (chain_id, rate
@@ -456,6 +457,20 @@ impl WalletServer {
                 ));
             }
         };
+
+        // Establish which network the endpoint serves before the first read
+        // on this client. The values read here feed the envelope the commit
+        // signs and the policy gate, so an endpoint serving another network
+        // answers none of them.
+        if let Err(e) = crate::tools::common::probe_endpoint_network(
+            &client,
+            &self.context,
+            crate::tools::common::submit_timeout(&self.profile),
+        )
+        .await
+        {
+            return Ok(crate::tools::common::endpoint_refusal_result(&e));
+        }
 
         // Fetch the ISSUER account (not the wallet account) for
         // `issuer_flags` (the clawback gate, below). The issuer account is
@@ -1090,6 +1105,21 @@ impl WalletServer {
             }
         };
 
+        // Establish which network the endpoint serves before the first read
+        // on this client, which also sends. The sequence read below feeds the
+        // rebuilt envelope that is signed, and the account views feed the
+        // policy gate. A refusal here consumes no nonce, so the caller can
+        // correct the endpoint and retry with the same approval.
+        if let Err(e) = crate::tools::common::probe_endpoint_network(
+            &client,
+            &self.context,
+            crate::tools::common::submit_timeout(&self.profile),
+        )
+        .await
+        {
+            return Ok(crate::tools::common::endpoint_refusal_result(&e));
+        }
+
         let source_account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
             &self.sequence_floor,
             &client,
@@ -1202,20 +1232,6 @@ impl WalletServer {
                 return Ok(result);
             }
         };
-
-        // Establish which network the endpoint serves before the nonce is
-        // consumed. A commit aimed at the wrong network is a configuration
-        // error the caller can correct and retry; burning the nonce first
-        // would cost them the approval as well.
-        if let Err(e) = crate::tools::common::probe_endpoint_network(
-            &client,
-            &self.context,
-            crate::tools::common::submit_timeout(&self.profile),
-        )
-        .await
-        {
-            return Ok(crate::tools::common::commit_refusal_result(&e));
-        }
 
         // ── Nonce verification + replay window ────────────────────────────────
         let now_ms = now_unix_ms()
