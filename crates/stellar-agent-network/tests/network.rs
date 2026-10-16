@@ -30,6 +30,8 @@ mod fetch_data_entry_regression;
 mod friendbot_integration;
 #[path = "network/headless_keyring_dispatch.rs"]
 mod headless_keyring_dispatch;
+#[path = "network/health_within_deadline.rs"]
+mod health_within_deadline;
 #[path = "network/idempotent_submit_block_b_integration.rs"]
 mod idempotent_submit_block_b_integration;
 #[path = "network/idempotent_submit_integration.rs"]

@@ -178,10 +178,10 @@ Payer-side construction and signing of a `PAYMENT-SIGNATURE` payload for the x40
 | Arg | Type | Required | Notes |
 |---|---|---|---|
 | `payment_required` | string | yes | base64 `PAYMENT-REQUIRED` or raw JSON `PaymentRequirements` |
-| `chain_id` | string | yes | CAIP-2; validated against the profile |
+| `chain_id` | string | yes | CAIP-2 `stellar:testnet` or `stellar:mainnet`; validated against the profile after the requirements |
 | `address` | string | no | signer G-strkey; must match the active signer if given |
 
-Flow: validate → build SAC transfer → simulate → check the simulated authorization → sign auth entry → write the `x402_payment_authorized` audit row → re-simulate → check the re-simulated authorization → serialize. The re-simulation sends the signed authorization to the profile's RPC, so the row is written first; if it cannot be written, the tool answers the `audit.*` code and the signature never leaves the wallet. A failure after the row adds an `x402_authorization_withheld` row with the same request id. Returns `{ paymentSignature, payer, asset, amount, payTo, network }` (`paymentSignature` is the standard-base64 `PAYMENT-SIGNATURE` header value; `asset` is the SAC C-strkey; `amount` is the atomic-unit string from `PaymentRequirements`). Errors carry per-variant codes `x402.<reason>` (for example `x402.invalid_payment_required`, `x402.unsupported_scheme`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.transmit_gate_refused`) in the standard `{ok:false, error:{code, message}, request_id}` envelope with `is_error` set.
+Flow: validate the requirements, then admit the payment through the policy and the spending window. Check the endpoint identity with `getNetwork`, the first request on the payment's one client. Build the SAC transfer, simulate, and check restoration, fees, and the simulated authorization. Read `getHealth` and check the ledger bounds. Sign the auth entry and write the `x402_payment_authorized` audit row. Re-simulate, check restoration, fees, the re-simulated authorization, and the ledger bounds, then serialize. The re-simulation sends the signed authorization to the profile's RPC, so the row is written first; if it cannot be written, the tool answers the `audit.*` code and the signature never leaves the wallet. A failure after the row adds an `x402_authorization_withheld` row with the same request id. Returns `{ paymentSignature, payer, asset, amount, payTo, network }` (`paymentSignature` is the standard-base64 `PAYMENT-SIGNATURE` header value; `asset` is the SAC C-strkey; `amount` is the atomic-unit string from `PaymentRequirements`). Errors carry per-variant codes `x402.<reason>` (for example `x402.invalid_payment_required`, `x402.unsupported_scheme`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.transmit_gate_refused`) in the standard `{ok:false, error:{code, message}, request_id}` envelope with `is_error` set.
 
 ### `stellar_x402_authenticated_payment`
 
@@ -190,7 +190,7 @@ Runs the SEP-10 counterparty-identity gate BEFORE building the payment. Any iden
 | Arg | Type | Required | Notes |
 |---|---|---|---|
 | `payment_required` | string | yes | as above |
-| `chain_id` | string | yes | CAIP-2 |
+| `chain_id` | string | yes | CAIP-2, as above |
 | `home_domain` | string | yes | operator-supplied domain for SEP-10 identity verification (e.g. `"testanchor.stellar.org"`); the gate resolves its `stellar.toml`, extracts `WEB_AUTH_ENDPOINT` + `SIGNING_KEY`, verifies the SSRF bind, and runs the SEP-10 ephemeral challenge/response |
 | `address` | string | no | signer G-strkey; must match the active signer if given |
 
@@ -207,7 +207,12 @@ Read-only. Arg `payment_response` (base64 `PAYMENT-RESPONSE` header value or raw
 - `exact` scheme only, no `upto`.
 - Targets x402 v2, not v3.x.
 - No HTTP retry loop; the host orchestrates the HTTP exchange. The wallet produces the signed payload (and, for the authenticated variant, the Bearer token); it does not submit.
-- `create_payment` validation refuses when `scheme != "exact"`, `network` is not `"stellar:pubnet"`/`"stellar:testnet"`, the x402 `network` passphrase mismatches the profile, `extra.areFeesSponsored != true`, or `amount` cannot be parsed as `i128`.
+- Validation runs before the dispatch gate and consumes no spending window on a refusal. It refuses when `scheme != "exact"`, `network` is not `"stellar:pubnet"`/`"stellar:testnet"`, or the x402 `network` passphrase mismatches the profile. It also refuses an asset that is not a C-strkey, `extra.areFeesSponsored != true`, and an `amount` that is not a positive `i128`. A `payTo` that is not a G-, C-, or M-strkey and a `maxTimeoutSeconds` of zero refuse too.
+- The endpoint identity check is the first request. An endpoint serving another network, reporting mainnet, or not identified before `submit_timeout_seconds` refuses with its `network.*` code before any simulation. Admission comes first, so the refusal keeps the admitted spend.
+- `maxTimeoutSeconds` is clamped to 300 seconds as input; the requirement names a maximum, and a shorter validity meets it. With the five-second ledger estimate this gives a window of `ceil(min(t, 300) / 5)` ledgers, 1 to 60. The window counts ledger advances, not a guaranteed wall-clock lifetime.
+- A `getHealth` read on the same endpoint must report `healthy`. The unsigned simulation's ledger is above zero and at most one ledger ahead of the health ledger, and the re-simulation's ledger at most one behind it. The health and re-simulation ledgers lie before the expiration ledger. This is same-endpoint consistency, not independent freshness.
+- Both simulations' `minResourceFee` lies between 1 and 10,000,000 stroops, and the embedded resource fee lies between zero and that minimum. The ceiling is a local sanity bound, separate from facilitator fee policy.
+- A restore preamble, or archived entries in the transaction data, in either simulation refuses. On this path they come from an archived asset contract instance or the archived balance of a contract-address recipient. The wallet has no restore path; a restoration made elsewhere unblocks the payment. The reference client checks only the preamble.
 - Before signing, `create_payment` refuses a simulation whose authorization is not one unsigned legacy `Address` entry for the payer, with a root invocation equal to the built SAC `transfer` and no nested calls. After the signed re-simulation, it refuses authorization entries other than the signed entry, and a missing or undecodable result.
 
 ## MPP sponsored Stellar charges

@@ -1,34 +1,40 @@
-//! Exact Stellar scheme orchestrator — constructs a signed SAC `transfer`
+//! Exact Stellar scheme orchestrator: constructs a signed SAC `transfer`
 //! payment payload compatible with the x402 v2 `PAYMENT-SIGNATURE` wire format.
 //!
 //! # Flow
 //!
 //! ```text
-//! 1. Validate requirements (scheme, network, asset, areFeesSponsored, amount)
-//! 2. Build SAC transfer InvokeHostFunction
-//! 3. simulateTransaction → check the payer authorization against the built
-//!    transfer; harvest simulated nonce + latest_ledger
-//! 4. Compute signature_expiration_ledger
-//! 5. Set expiration on auth entry; sign via sep43 (single auth-signing call site)
-//! 6. Transmit gate: the caller's `before_transmit` runs; an error stops here
-//! 7. Re-simulate with signed auth (mandatory footprint refresh); check that
-//!    the answer returns no authorization other than the signed entry
-//! 8. Build + serialize final TransactionEnvelope to base64 XDR
-//! 9. Wrap in PaymentPayload
+//! 1. Validate requirements (validate_requirements)
+//! 2. Endpoint identity: getNetwork on the caller's client, the first request
+//! 3. Build SAC transfer InvokeHostFunction
+//! 4. simulateTransaction: restoration, fee bounds, transaction data, and the
+//!    payer authorization against the built transfer; harvest the nonce and
+//!    latest_ledger
+//! 5. Compute signature_expiration_ledger (window of 1 to 60 ledgers);
+//!    getHealth on the same client; ledger consistency
+//! 6. Set expiration on auth entry; sign via sep43 (single auth-signing call site)
+//! 7. Transmit gate: the caller's `before_transmit` runs; an error stops here
+//! 8. Re-simulate with signed auth (mandatory footprint refresh): restoration,
+//!    fee bounds, transaction data, no authorization other than the signed
+//!    entry, ledger consistency
+//! 9. Build + serialize final TransactionEnvelope to base64 XDR
+//! 10. Wrap in PaymentPayload
 //! ```
 //!
-//! The flow matches the @x402/stellar reference implementation.  Auth-entry
+//! The flow matches the @x402/stellar reference implementation. Auth-entry
 //! signing goes through a single call site
-//! (`stellar_agent_sep43::sign_soroban_auth_entry`). The re-simulation in step 7
+//! (`stellar_agent_sep43::sign_soroban_auth_entry`). The re-simulation in step 8
 //! is the first time the signed authorization leaves the wallet, to the
-//! configured RPC. The transmit gate in step 6 is the last point at which the
+//! configured RPC. The transmit gate in step 7 is the last point at which the
 //! caller can withhold it.
 //!
-//! The simulation answers come from the configured RPC. Nothing is signed
-//! unless the first answer holds exactly one unsigned payer authorization for
-//! the transfer built in step 2, with no nested calls. The nonce and
-//! `latest_ledger` still come from that answer, and the re-simulation's
-//! resource data and fee pass structural checks only.
+//! Every request goes to the one client the caller passes, and the endpoint
+//! identity check is its first request. The simulation answers come from that
+//! endpoint. Nothing is signed unless the first answer holds exactly one
+//! unsigned payer authorization for the transfer built in step 3, with no
+//! nested calls. The nonce, the `latest_ledger`, the resource data, and the fee
+//! still come from that endpoint. The checks on them are local consistency
+//! checks against the same endpoint, not independent evidence of freshness.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -36,24 +42,26 @@ use sha2::{Digest as _, Sha256};
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::TransactionBehavior;
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
-use stellar_rpc_client::Client;
+use stellar_rpc_client::SimulateTransactionResponse;
 use stellar_strkey::Strkey;
 use stellar_xdr::{
     Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, HostFunction, InvokeContractArgs,
     InvokeHostFunctionOp, Limits, Operation, OperationBody, ScAddress, ScBytes, ScMap, ScMapEntry,
     ScSymbol, ScVal, ScVec, SorobanAddressCredentials, SorobanAuthorizationEntry,
-    SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials, StringM, VecM,
-    WriteXdr,
+    SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials,
+    SorobanTransactionData, SorobanTransactionDataExt, StringM, VecM, WriteXdr,
 };
+use tokio::time::Instant;
 
 use stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL;
+use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::refuse_mainnet_write;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_sep43::signing::sign_soroban_auth_entry;
 
 use crate::X402Error;
 use crate::constants::x402_network_to_passphrase;
-use crate::sac_transfer::build_sac_transfer_invoke;
+use crate::sac_transfer::{build_sac_transfer_invoke, strkey_to_recipient_sc_address};
 use crate::wire::{ExactStellarPayloadV2, PaymentPayload, PaymentRequirements};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -62,17 +70,41 @@ use crate::wire::{ExactStellarPayloadV2, PaymentPayload, PaymentRequirements};
 
 /// Base transaction fee in stroops used for simulate and re-simulate builds.
 ///
-/// The resource fee from simulate is added on top.
+/// The resource fee from the re-simulation is added on top.
 const BASE_FEE_STROOPS: u32 = 100;
 
 /// Estimated ledger close time in seconds for x402 expiration calculation.
 ///
-/// Fallback default `5`; the @x402/stellar reference implementation samples
-/// recent Horizon ledgers and averages the inter-close intervals, falling back
-/// to `5` seconds on error.  We pin the documented default constant.
-///
-/// Used in: `signature_expiration_ledger = latest_ledger + ceil(max_timeout_seconds / 5)`.
+/// The @x402/stellar reference implementation samples recent Horizon ledgers
+/// and averages the inter-close intervals, falling back to `5` seconds on
+/// error. The wallet uses the documented fallback constant.
 const ESTIMATED_LEDGER_CLOSE_SECONDS: u32 = 5;
+
+/// Longest validity, in seconds, the wallet signs a payment authorization for.
+///
+/// `maxTimeoutSeconds` names a maximum, so a shorter signed validity meets it.
+/// A larger value is clamped to this one, which bounds the signature window
+/// at 60 ledgers.
+const MAX_SIGNED_VALIDITY_SECONDS: u32 = 300;
+
+/// Ceiling, in stroops, on the resource fee a simulation answer may report.
+///
+/// A local sanity bound on the values that enter the payment transaction,
+/// separate from any fee policy of the facilitator that settles it. The payer
+/// signs no transaction fee. The value matches the MPP sponsored-charge
+/// ceiling.
+const MAX_RESOURCE_FEE_STROOPS: u32 = 10_000_000;
+
+// The final fee is `BASE_FEE_STROOPS` plus a resource fee no larger than the
+// ceiling, so the sum fits the `u32` fee field.
+const _: () = assert!(
+    MAX_RESOURCE_FEE_STROOPS
+        .checked_add(BASE_FEE_STROOPS)
+        .is_some()
+);
+
+/// `getHealth` status of an endpoint that serves current ledgers.
+const HEALTHY_STATUS: &str = "healthy";
 
 /// Placeholder transaction source account used while constructing the payment.
 ///
@@ -100,7 +132,8 @@ const PLACEHOLDER_SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 #[non_exhaustive]
 pub struct AuthorizationToTransmit<'a> {
     /// x402 wire network of the signed authorization. Always `stellar:testnet`:
-    /// step 1 refuses `stellar:pubnet` before anything is signed.
+    /// [`validate_requirements`] refuses `stellar:pubnet` before anything is
+    /// signed.
     pub network: &'a str,
     /// x402 scheme of the signed authorization; always `exact`.
     pub scheme: &'a str,
@@ -117,121 +150,84 @@ pub struct AuthorizationToTransmit<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// create_payment
+// validate_requirements
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Constructs a signed x402 v2 [`PaymentPayload`] for the Exact Stellar scheme.
+/// Checks `requirements` against the wallet's local rules and returns the
+/// transfer amount in atomic units.
 ///
-/// Implements the step flow below, wire-compatible with the @x402/stellar
-/// reference implementation.
+/// The check sends no request and touches no key, so a host can run it before
+/// it admits the payment against a spending window. [`create_payment`] runs it
+/// again on the requirements it receives.
 ///
-/// A mainnet network passphrase or a mainnet-pattern `rpc_url` is refused with
-/// [`X402Error::MainnetSigningForbidden`] before any signing call and any
-/// request.
+/// The checks run in this order:
 ///
-/// The signed authorization first leaves the wallet in the re-simulation of
-/// step 7, sent to `rpc_url`. `before_transmit` runs once, immediately before
-/// that request, and only after the signature exists. An error from it returns
-/// at once: nothing is sent, and the error is returned unchanged. A caller that
-/// must record the authorization before it leaves the wallet does so inside
-/// `before_transmit`.
+/// 1. `scheme` is `exact`.
+/// 2. `network` is `stellar:testnet` or `stellar:pubnet`, and its passphrase
+///    equals `profile_passphrase`.
+/// 3. Neither the passphrase nor `rpc_url` is mainnet.
+/// 4. `asset` is a C-strkey.
+/// 5. `extra.areFeesSponsored` is the JSON boolean `true`.
+/// 6. `amount` is an integer string above zero that fits `i128`.
+/// 7. `payTo` is a G-, C-, or M-strkey.
+/// 8. `maxTimeoutSeconds` is at least one. A value above 300 is accepted, and
+///    [`create_payment`] signs a validity of 300 seconds for it.
 ///
-/// # Steps
-///
-/// 1. Validate `requirements` (scheme, network, the mainnet refusal, asset,
-///    `areFeesSponsored`, amount > 0).
-/// 2. Build a SAC `transfer` `InvokeHostFunction`.
-/// 3. `simulateTransaction` to populate the auth-entry nonce and
-///    `latest_ledger`. Before anything is signed, the answer's first result
-///    must hold exactly one authorization entry. That entry carries legacy
-///    `Address` credentials for the payer, a zero
-///    `signature_expiration_ledger`, and a `Void` signature. Its root
-///    invocation equals the SAC `transfer` built in step 2 and has no nested
-///    calls.
-/// 4. Compute `signature_expiration_ledger` from `max_timeout_seconds` via the
-///    formula `latest_ledger + ceil(max_timeout_seconds / 5)`, giving
-///    expiration parity with the x402 Exact Stellar scheme.
-/// 5. Set `signature_expiration_ledger` on the payer's credentials and sign
-///    the built `transfer` invocation via
-///    `stellar_agent_sep43::sign_soroban_auth_entry` (the single auth-signing
-///    call site).
-/// 6. Call `before_transmit` with the [`AuthorizationToTransmit`]; return its
-///    error unchanged.
-/// 7. Re-simulate with the signed auth entry (MANDATORY).  Without this, submit
-///    traps with "trying to access contract data key outside of the footprint".
-///    The answer must carry a decodable first result whose authorization
-///    entries are empty or equal to the signed entries.
-/// 8. Build the final `TransactionEnvelope`, serialize to base64 XDR.
-/// 9. Wrap in a [`PaymentPayload`].
-///
-/// The step 3 check accepts the answer of an honest recording simulation for a
-/// G-account payer distinct from the placeholder source. That answer holds one
-/// legacy `Address` entry that records the original `transfer` arguments, a
-/// muxed recipient included. The step 7 check accepts the empty or unchanged entries of an
-/// honest enforcing simulation. The nonce, the `latest_ledger`, the resource
-/// data, and the fee still come from the configured RPC.
-///
-/// # Arguments
-///
-/// - `requirements` — validated payment requirements from the 402 header.
-/// - `signer` — signer implementation providing the payer's key.
-/// - `rpc_url` — Soroban RPC URL (from operator profile; NEVER from the
-///   payment-required body).
-/// - `profile_passphrase` — the network passphrase from the operator's profile
-///   used to cross-check the `requirements.network` field.
-/// - `before_transmit`: the transmit gate of step 6. A gate that refuses
-///   returns [`X402Error::TransmitGateRefused`] or any other variant.
+/// A C-strkey `asset` is a contract address; the check does not establish
+/// that the contract is a Stellar Asset Contract.
 ///
 /// # Errors
 ///
-/// - [`X402Error::UnsupportedScheme`] — scheme is not `"exact"`.
-/// - [`X402Error::UnsupportedNetwork`] — network not in `{stellar:pubnet, stellar:testnet}`.
-/// - [`X402Error::NetworkPassphraseMismatch`] — network passphrase mismatch.
-/// - [`X402Error::MainnetSigningForbidden`]: the network is mainnet
-///   (`stellar:pubnet` with the mainnet profile passphrase), or `rpc_url`
-///   matches a mainnet host pattern.
-/// - [`X402Error::InvalidAssetAddress`] — `asset` is not a valid C-strkey.
-/// - [`X402Error::FeesNotSponsored`] — `extra.areFeesSponsored != true`.
-/// - [`X402Error::AmountConversion`] — `amount` parse failure.
-/// - [`X402Error::RpcSimulateFailed`] — simulate or re-simulate failure, or
-///   `min_resource_fee` absent on the success path. Also returned when the
-///   re-simulation answer carries no first result or a result that does not
-///   decode.
-/// - [`X402Error::UnexpectedAuthEntries`]: the first simulation's
-///   authorization is not the single unsigned payer entry for the built
-///   `transfer` that step 3 requires, or the re-simulation returned
-///   authorization entries other than the signed entries. Its `detail` names
-///   the failed check and carries no value from the answer.
-/// - [`X402Error::AuthEntrySignFailed`] — auth-entry signing failure.
-/// - [`X402Error::TransactionBuildFailed`] — XDR envelope build failure.
-/// - Whatever `before_transmit` returns, unchanged, when the gate refuses.
+/// - [`X402Error::UnsupportedScheme`]: `scheme` is not `"exact"`.
+/// - [`X402Error::UnsupportedNetwork`]: `network` is not in
+///   `{stellar:pubnet, stellar:testnet}`.
+/// - [`X402Error::NetworkPassphraseMismatch`]: the network's passphrase is
+///   not `profile_passphrase`.
+/// - [`X402Error::MainnetSigningForbidden`]: the passphrase is mainnet, or
+///   `rpc_url` matches a mainnet host pattern.
+/// - [`X402Error::InvalidAssetAddress`]: `asset` is not a valid C-strkey.
+/// - [`X402Error::FeesNotSponsored`]: `extra.areFeesSponsored` is not `true`.
+/// - [`X402Error::AmountConversion`]: `amount` is not a positive `i128`.
+/// - [`X402Error::InvalidRecipientAddress`]: `payTo` is not a G-, C-, or
+///   M-strkey.
+/// - [`X402Error::InvalidPaymentRequired`]: `maxTimeoutSeconds` is zero.
 ///
-/// # Panics
+/// # Examples
 ///
-/// Never panics.
-#[allow(
-    clippy::too_many_lines,
-    reason = "step-ordered payment-construction flow; splitting into sub-functions \
-              would obscure the sequential validate→build→sim→sign→gate→resim→serialize \
-              invariant ordering"
-)]
-pub async fn create_payment(
+/// ```
+/// use stellar_agent_x402::exact::validate_requirements;
+/// use stellar_agent_x402::wire::PaymentRequirements;
+///
+/// let requirements = PaymentRequirements {
+///     scheme: "exact".to_owned(),
+///     network: "stellar:testnet".to_owned(),
+///     asset: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_owned(),
+///     amount: "1000000".to_owned(),
+///     pay_to: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_owned(),
+///     max_timeout_seconds: 300,
+///     extra: serde_json::json!({ "areFeesSponsored": true }),
+/// };
+/// let amount = validate_requirements(
+///     &requirements,
+///     "Test SDF Network ; September 2015",
+///     "https://soroban-testnet.stellar.org",
+/// )
+/// .unwrap();
+/// assert_eq!(amount, 1_000_000);
+/// ```
+pub fn validate_requirements(
     requirements: &PaymentRequirements,
-    signer: &(dyn Signer + Send + Sync),
-    rpc_url: &str,
     profile_passphrase: &str,
-    before_transmit: impl FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error>,
-) -> Result<PaymentPayload, X402Error> {
-    // ── Step 1: Validate ──────────────────────────────────────────────────────
-
+    rpc_url: &str,
+) -> Result<i128, X402Error> {
     if requirements.scheme != "exact" {
         return Err(X402Error::UnsupportedScheme {
             scheme: requirements.scheme.clone(),
         });
     }
 
-    // Map x402 wire network → passphrase.
-    // x402 uses "stellar:pubnet"; Caip2 uses "stellar:mainnet".
+    // The x402 wire says "stellar:pubnet" where the wallet's CAIP-2 says
+    // "stellar:mainnet"; the passphrase is the common ground.
     let network_passphrase = x402_network_to_passphrase(&requirements.network)?;
     if network_passphrase != profile_passphrase {
         return Err(X402Error::NetworkPassphraseMismatch {
@@ -241,29 +237,25 @@ pub async fn create_payment(
         });
     }
 
-    // Mainnet refusal: a mainnet passphrase or a mainnet-pattern endpoint
-    // never reaches the signer or the endpoint.
+    // A mainnet passphrase or a mainnet-pattern endpoint never reaches the
+    // signer or the endpoint.
     refuse_mainnet_write(network_passphrase, rpc_url).map_err(|_| {
         X402Error::MainnetSigningForbidden {
             detail: MAINNET_SIGNING_REFUSAL_DETAIL.to_owned(),
         }
     })?;
 
-    // Validate asset is a C-strkey.
     validate_c_strkey(&requirements.asset)?;
 
-    // Hard precondition: areFeesSponsored must be true.
-    // INTENTIONAL DIVERGENCE from upstream: upstream uses JS-truthy `if
-    // (!extra.areFeesSponsored)`, which accepts `"true"`, `1`, or any non-null
-    // value.  We require the strict JSON `Bool(true)` form — rejecting
-    // ambiguous encodings such as `"true"` or `1`.  This is a hardening choice.
+    // The reference implementation tests `extra.areFeesSponsored` for
+    // JavaScript truthiness, which accepts `"true"`, `1`, or any non-null
+    // value. The wallet requires the JSON boolean `true` and refuses the
+    // ambiguous encodings.
     if requirements.extra.get("areFeesSponsored") != Some(&serde_json::Value::Bool(true)) {
         return Err(X402Error::FeesNotSponsored);
     }
 
-    // Parse amount from the wire format (already atomic units — do NOT
-    // re-apply decimals; the wire `amount` is an integer string).
-    // The amount must be a positive integer; zero is explicitly invalid.
+    // The wire amount is already in atomic units; no decimals are applied.
     let amount: i128 =
         requirements
             .amount
@@ -283,13 +275,165 @@ pub async fn create_payment(
         });
     }
 
-    // ── Step 2: Build SAC transfer InvokeHostFunction ─────────────────────────
-    // SEP-41: transfer(from: Address, to: Address, amount: i128)
+    strkey_to_recipient_sc_address(&requirements.pay_to)?;
 
-    // signer.public_key() returns stellar_strkey::ed25519::PublicKey directly;
-    // no PublicKey(pk.0) re-wrap needed.
-    // to_string() on stellar_strkey types returns heapless::String<56>;
-    // as_str().to_owned() converts to std::String.
+    if requirements.max_timeout_seconds == 0 {
+        return Err(X402Error::InvalidPaymentRequired {
+            detail: "maxTimeoutSeconds must be at least 1".to_owned(),
+        });
+    }
+
+    Ok(amount)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// create_payment
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Constructs a signed x402 v2 [`PaymentPayload`] for the Exact Stellar scheme.
+///
+/// Implements the step flow below, wire-compatible with the @x402/stellar
+/// reference implementation.
+///
+/// Every request goes to `client`. A caller passes a client it built for this
+/// payment from the operator's profile, never from the payment-required body.
+/// The first request is the endpoint identity check, so a client whose
+/// endpoint serves another network, or whose identity cannot be established
+/// before `identity_deadline`, sends nothing else.
+///
+/// A mainnet network passphrase or a mainnet-pattern `client.url()` is refused
+/// with [`X402Error::MainnetSigningForbidden`] before any signing call and any
+/// request. An endpoint that reports the mainnet passphrase is refused by the
+/// identity check, before any simulation.
+///
+/// The signed authorization first leaves the wallet in the re-simulation of
+/// step 8. `before_transmit` runs once, immediately before that request, and
+/// only after the signature exists. An error from it returns at once: nothing
+/// is sent, and the error is returned unchanged. A caller that must record the
+/// authorization before it leaves the wallet does so inside `before_transmit`.
+///
+/// # Steps
+///
+/// 1. [`validate_requirements`] with `profile_passphrase` and `client.url()`.
+/// 2. [`StellarRpcClient::endpoint_identity`] under `identity_deadline`.
+/// 3. Build a SAC `transfer` `InvokeHostFunction`.
+/// 4. `simulateTransaction`. The answer carries no error and no restore
+///    preamble. Its `min_resource_fee` lies in `1..=10_000_000` stroops, and
+///    its transaction data decodes, lists no archived entries to restore, and
+///    embeds a resource fee in `0..=min_resource_fee`. Its first result holds
+///    exactly one authorization entry, with legacy `Address` credentials for
+///    the payer. The entry carries a zero `signature_expiration_ledger`, a
+///    `Void` signature, and a root invocation equal to the step 3 transfer
+///    with no nested calls.
+/// 5. Compute `signature_expiration_ledger` as `L + ceil(min(t, 300) / 5)`,
+///    with `L` the answer's `latest_ledger` and `t` the requirement's
+///    `maxTimeoutSeconds`; an overflow refuses. Read `getHealth` on `client`
+///    under `identity_deadline`. The status is `healthy`, `L` is above zero,
+///    `L` is at most one ledger ahead of the health ledger `H`, and `H` lies
+///    before the expiration ledger.
+/// 6. Set `signature_expiration_ledger` on the payer's credentials and sign
+///    the built `transfer` invocation via
+///    `stellar_agent_sep43::sign_soroban_auth_entry` (the single auth-signing
+///    call site).
+/// 7. Call `before_transmit` with the [`AuthorizationToTransmit`]; return its
+///    error unchanged.
+/// 8. Re-simulate with the signed auth entry (MANDATORY). Without this,
+///    submit traps with "trying to access contract data key outside of the
+///    footprint". The answer passes the step 4 checks on errors,
+///    restoration, fees, and transaction data. Its first result decodes, and
+///    its authorization entries are empty or equal to the signed entries. Its
+///    `latest_ledger` `R` is at most one ledger behind `H` and lies before the
+///    expiration ledger.
+/// 9. Build the final `TransactionEnvelope` with the re-simulation's
+///    transaction data and a fee of 100 stroops plus its `min_resource_fee`,
+///    and serialize it to base64 XDR.
+/// 10. Wrap in a [`PaymentPayload`].
+///
+/// The step 4 check accepts the answer of an honest recording simulation for a
+/// G-account payer distinct from the placeholder source. That answer holds one
+/// legacy `Address` entry that records the original `transfer` arguments, a
+/// muxed recipient included. The step 8 check accepts the empty or unchanged
+/// entries of an honest enforcing simulation.
+///
+/// The ledger checks of steps 5 and 8 compare answers of one endpoint with each
+/// other. They tolerate one ledger of skew between load-balanced backends and
+/// bound the signed window at 60 ledger advances plus that skew. They do not
+/// establish that the endpoint's ledgers are current.
+///
+/// The wallet has no restore path. An answer that asks for a restoration, by a
+/// restore preamble or by archived entries in its transaction data, refuses.
+/// A restoration made elsewhere unblocks the payment.
+///
+/// A failure after `before_transmit` returned `Ok` follows the signed
+/// authorization's send, so the caller cannot withdraw that authorization.
+///
+/// # Arguments
+///
+/// - `requirements`: payment requirements from the 402 header.
+/// - `signer`: signer implementation providing the payer's key.
+/// - `client`: the Stellar RPC client for this payment, built from the
+///   operator's profile and never from the payment-required body.
+/// - `profile_passphrase`: the network passphrase from the operator's profile,
+///   checked against `requirements.network` and against the endpoint.
+/// - `identity_deadline`: the absolute deadline of the endpoint identity check
+///   and of the health read. A caller derives it from its own timeout, never
+///   from `maxTimeoutSeconds`.
+/// - `before_transmit`: the transmit gate of step 7. A gate that refuses
+///   returns [`X402Error::TransmitGateRefused`] or any other variant.
+///
+/// # Errors
+///
+/// - Every error of [`validate_requirements`].
+/// - [`X402Error::EndpointIdentity`]: the endpoint identity check refused. The
+///   wire code is the check's own `network.*` code.
+/// - [`X402Error::RpcSimulateFailed`]: a simulation request or answer failed
+///   a check of step 4, 5, or 8 other than the authorization checks. The
+///   variant also covers a failed health read, a status other than `healthy`,
+///   and a signer public key that could not be read. A failed request's
+///   detail carries the scrubbed network error after a phase prefix.
+/// - [`X402Error::UnexpectedAuthEntries`]: the first simulation's
+///   authorization is not the single unsigned payer entry for the built
+///   `transfer` that step 4 requires, or the re-simulation returned
+///   authorization entries other than the signed entries. Its `detail` names
+///   the failed check and carries no value from the answer.
+/// - [`X402Error::AuthEntrySignFailed`]: auth-entry signing failure.
+/// - [`X402Error::TransactionBuildFailed`]: XDR envelope build failure, or
+///   re-simulation transaction data that does not decode.
+/// - Whatever `before_transmit` returns, unchanged, when the gate refuses.
+///
+/// # Panics
+///
+/// Never panics.
+#[allow(
+    clippy::too_many_lines,
+    reason = "step-ordered payment-construction flow; splitting into sub-functions \
+              would obscure the sequential validate, identify, build, simulate, sign, \
+              gate, re-simulate, serialize ordering"
+)]
+pub async fn create_payment(
+    requirements: &PaymentRequirements,
+    signer: &(dyn Signer + Send + Sync),
+    client: &StellarRpcClient,
+    profile_passphrase: &str,
+    identity_deadline: Instant,
+    before_transmit: impl FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error>,
+) -> Result<PaymentPayload, X402Error> {
+    // ── Step 1: Validate ──────────────────────────────────────────────────────
+    let amount = validate_requirements(requirements, profile_passphrase, client.url())?;
+    // `validate_requirements` holds the requirement's passphrase equal to the
+    // profile's, so this is the network the payment is built for.
+    let network_passphrase = profile_passphrase;
+
+    // ── Step 2: Endpoint identity, the client's first request ────────────────
+    // The endpoint answers every later request of this payment, so it must be
+    // shown to serve the profile's network before it is asked anything else.
+    let identity = client
+        .endpoint_identity(network_passphrase, identity_deadline)
+        .await
+        .map_err(X402Error::EndpointIdentity)?;
+
+    // ── Step 3: Build SAC transfer InvokeHostFunction ─────────────────────────
+    // SEP-41: transfer(from: Address, to: Address, amount: i128)
     let payer_key = signer
         .public_key()
         .await
@@ -314,13 +458,9 @@ pub async fn create_payment(
         }),
     };
 
-    // ── Step 3: First simulateTransaction → simulated nonce ───────────────────
-    // The simulate response populates the auth-entry nonce — we do NOT generate
-    // one.
-
-    let server = Client::new(rpc_url).map_err(|e| X402Error::RpcSimulateFailed {
-        detail: format!("stellar-rpc-client Client construction failed: {e}"),
-    })?;
+    // ── Step 4: First simulateTransaction ─────────────────────────────────────
+    // The simulate response populates the auth-entry nonce; the wallet does
+    // not generate one.
 
     // The transaction source is a placeholder at sequence 0; the facilitator
     // rebuilds with its own account as the source before settling. Using a
@@ -338,24 +478,25 @@ pub async fn create_payment(
         .map_err(|e| X402Error::RpcSimulateFailed {
             detail: format!("first simulate: to_envelope failed: {e:?}"),
         })?;
-    let sim_response = server
-        .simulate_transaction_envelope(&sim_envelope, None)
+    let sim_response = client
+        .simulate_transaction_envelope(&sim_envelope)
         .await
         .map_err(|e| X402Error::RpcSimulateFailed {
-            detail: format!("first simulate_transaction_envelope failed: {e}"),
+            detail: format!("{}{e}", FIRST_SIMULATION.request_failed),
         })?;
 
-    if let Some(ref sim_error) = sim_response.error {
-        return Err(X402Error::RpcSimulateFailed {
-            detail: format!("simulate returned error: {sim_error}"),
-        });
-    }
-
-    if sim_response.min_resource_fee == 0 || sim_response.transaction_data.is_empty() {
-        return Err(X402Error::RpcSimulateFailed {
-            detail: "simulate returned no min_resource_fee / transaction_data".to_owned(),
-        });
-    }
+    let first_min_resource_fee = check_simulation_answer(&sim_response, &FIRST_SIMULATION)?;
+    let first_transaction_data =
+        sim_response
+            .transaction_data()
+            .map_err(|_| X402Error::RpcSimulateFailed {
+                detail: FIRST_SIMULATION_DATA_UNDECODABLE.to_owned(),
+            })?;
+    check_transaction_data(
+        &first_transaction_data,
+        first_min_resource_fee,
+        &FIRST_SIMULATION,
+    )?;
 
     // Extract the auth entry containing the simulated nonce.
     let first_result = sim_response
@@ -377,20 +518,44 @@ pub async fn create_payment(
         select_payer_auth_entry(first_result.auth, &payer_sc_address)?;
     check_payer_auth_entry(&payer_credentials, &simulated_invocation, &invoke_args)?;
 
-    // ── Step 4: Compute signature_expiration_ledger ───────────────────────────
-    // The x402 Exact Stellar scheme formula (NOT a fixed auth-validity window)
-    // gives wire-interop expiration parity.
-    let latest_ledger = sim_response.latest_ledger;
+    // ── Step 5: Expiration ledger and ledger consistency ──────────────────────
+    // The x402 Exact Stellar formula, with the window clamped to 60 ledgers.
+    let simulation_ledger = sim_response.latest_ledger;
     let signature_expiration_ledger =
-        compute_signature_expiration_ledger(latest_ledger, requirements.max_timeout_seconds);
+        compute_signature_expiration_ledger(simulation_ledger, requirements.max_timeout_seconds)
+            .ok_or_else(|| X402Error::RpcSimulateFailed {
+                detail: "the simulation's latest ledger leaves no room for the signature \
+                         expiration window"
+                    .to_owned(),
+            })?;
 
-    // ── Step 5: Set expiration, build the signing preimage, sign, and embed ───
+    // The health read runs on the same client under the identity deadline, so
+    // the ledgers it compares come from the endpoint the identity check named.
+    let health = client
+        .get_health_within(identity_deadline)
+        .await
+        .map_err(|_| X402Error::RpcSimulateFailed {
+            detail: "the endpoint's health could not be read".to_owned(),
+        })?;
+    if health.status != HEALTHY_STATUS {
+        return Err(X402Error::RpcSimulateFailed {
+            detail: "the endpoint reports a health status other than healthy".to_owned(),
+        });
+    }
+    let health_ledger = health.latest_ledger;
+    check_simulation_ledger(
+        simulation_ledger,
+        health_ledger,
+        signature_expiration_ledger,
+    )?;
+
+    // ── Step 6: Set expiration, build the signing preimage, sign, and embed ───
     // The simulated credentials carry signature_expiration_ledger = 0. Overwrite
     // it with the computed value, construct the
     // HashIdPreimage::SorobanAuthorization the signer authorizes over, sign it
     // via the single auth-signing call site, then embed the resulting
     // classic-account signature into the entry. The signed invocation is the
-    // transfer built in step 2; the step 3 check holds the simulated invocation
+    // transfer built in step 3; the step 4 check holds the simulated invocation
     // equal to it.
     payer_credentials.signature_expiration_ledger = signature_expiration_ledger;
     let root_invocation = SorobanAuthorizedInvocation {
@@ -419,9 +584,9 @@ pub async fn create_payment(
         signer,
         &payer_key,
         network_passphrase,
-        None, // no override — passphrase already validated above
+        None, // no override: the passphrase was validated above
     )
-    .await?; // #[from] Sep43Error → X402Error::AuthEntrySignFailed
+    .await?; // #[from] Sep43Error -> X402Error::AuthEntrySignFailed
 
     let signature_bytes: [u8; 64] = BASE64_STANDARD
         .decode(&raw_signature_b64)
@@ -450,7 +615,7 @@ pub async fn create_payment(
         root_invocation,
     }];
 
-    // ── Step 6: Re-simulation envelope, then the transmit gate ───────────────
+    // ── Step 7: Re-simulation envelope, then the transmit gate ───────────────
     // The envelope is built first, so every step that can still fail without
     // sending anything runs before the gate.
 
@@ -501,34 +666,49 @@ pub async fn create_payment(
         signature_expiration_ledger,
     })?;
 
-    // ── Step 7: Re-simulate with signed auth (MANDATORY) ─────────────────────
+    // ── Step 8: Re-simulate with signed auth (MANDATORY) ─────────────────────
     // Without re-simulation, submit traps with:
     //   "trying to access contract data key outside of the footprint"
     // because the signed auth entry changes the storage read-set.
-    let resim_response = server
-        .simulate_transaction_envelope(&resim_envelope, None)
+    let resim_response = client
+        .simulate_transaction_envelope(&resim_envelope)
         .await
         .map_err(|e| X402Error::RpcSimulateFailed {
-            detail: format!("re-simulate: simulate_transaction_envelope failed: {e}"),
+            detail: format!("{}{e}", RESIMULATION.request_failed),
         })?;
 
-    if let Some(ref resim_error) = resim_response.error {
-        return Err(X402Error::RpcSimulateFailed {
-            detail: format!("re-simulate returned error: {resim_error}"),
-        });
-    }
-    if resim_response.min_resource_fee == 0 || resim_response.transaction_data.is_empty() {
-        return Err(X402Error::RpcSimulateFailed {
-            detail: "re-simulate returned no min_resource_fee / transaction_data".to_owned(),
-        });
-    }
+    let resource_fee = check_simulation_answer(&resim_response, &RESIMULATION)?;
+    // A malformed footprint fails closed: a footprint-less envelope cannot
+    // settle, so the error is surfaced rather than producing an unsubmittable
+    // payload.
+    let soroban_data =
+        resim_response
+            .transaction_data()
+            .map_err(|e| X402Error::TransactionBuildFailed {
+                detail: format!("re-simulate transaction_data decode failed: {e}"),
+            })?;
+    check_transaction_data(&soroban_data, resource_fee, &RESIMULATION)?;
+
     // The answer returns no authorization other than the signed entries. The
     // final envelope below carries the wallet's own signed entries.
     check_resimulation_auth(&resim_response, &signed_entries)?;
 
-    // ── Step 8: Build final envelope and serialize ────────────────────────────
-    // Attach the soroban transaction data (resource footprint + refundable fee)
-    // from the re-simulate response.
+    let resimulation_ledger = resim_response.latest_ledger;
+    check_resimulation_ledger(
+        health_ledger,
+        resimulation_ledger,
+        signature_expiration_ledger,
+    )?;
+    tracing::debug!(
+        protocol_version = identity.protocol_version(),
+        simulation_ledger,
+        health_ledger,
+        resimulation_ledger,
+        signature_expiration_ledger,
+        "x402 payment ledgers checked"
+    );
+
+    // ── Step 9: Build final envelope and serialize ────────────────────────────
     let auth_vecm_final: VecM<SorobanAuthorizationEntry> =
         signed_entries
             .try_into()
@@ -544,28 +724,18 @@ pub async fn create_payment(
         }),
     };
 
-    // Parse min resource fee from re-simulate.
-    let resource_fee = parse_min_resource_fee(&resim_response)?;
-
     // Build the final envelope with the same placeholder source; the facilitator
     // re-sources before settling.
     let mut source_account3 = placeholder_source_account()?;
 
     let mut final_builder = TransactionBuilder::new(&mut source_account3, network_passphrase, None);
+    // `resource_fee` is at most MAX_RESOURCE_FEE_STROOPS, and the compile-time
+    // assertion beside that constant shows the sum fits `u32`.
     final_builder.fee(BASE_FEE_STROOPS.saturating_add(resource_fee));
     final_builder.add_operation(final_op);
     let mut final_tx = final_builder.build_for_simulation();
 
-    // Attach the soroban transaction data (resource footprint + refundable fee).
-    // Transaction::soroban_data → TransactionExt::V1 on to_envelope(). A malformed
-    // footprint must fail closed: a footprint-less envelope cannot settle, so the
-    // error is surfaced rather than silently producing an unsubmittable payload.
-    let soroban_data =
-        resim_response
-            .transaction_data()
-            .map_err(|e| X402Error::TransactionBuildFailed {
-                detail: format!("re-simulate transaction_data decode failed: {e}"),
-            })?;
+    // Transaction::soroban_data becomes TransactionExt::V1 on to_envelope().
     final_tx.soroban_data = Some(soroban_data);
 
     let envelope = final_tx
@@ -581,7 +751,7 @@ pub async fn create_payment(
                 detail: format!("envelope to_xdr_base64 failed: {e}"),
             })?;
 
-    // ── Step 9: Wrap in PaymentPayload ────────────────────────────────────────
+    // ── Step 10: Wrap in PaymentPayload ───────────────────────────────────────
     Ok(PaymentPayload {
         x402_version: 2,
         resource: None,
@@ -591,6 +761,190 @@ pub async fn create_payment(
         },
         extensions: None,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Simulation answer checks
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The fixed refusal details of one simulation phase.
+struct SimulationPhase {
+    /// Prefix of the detail of a request that failed; the scrubbed network
+    /// error follows it.
+    request_failed: &'static str,
+    /// Prefix of the detail of an answer that carries an error.
+    answer_error: &'static str,
+    /// The answer carries a restore preamble.
+    restore_preamble: &'static str,
+    /// The answer carries no minimum resource fee or no transaction data.
+    no_fee_or_data: &'static str,
+    /// The minimum resource fee exceeds [`MAX_RESOURCE_FEE_STROOPS`].
+    fee_ceiling: &'static str,
+    /// The transaction data lists archived entries to restore.
+    archived_entries: &'static str,
+    /// The transaction data embeds a resource fee outside
+    /// `0..=min_resource_fee`.
+    embedded_fee: &'static str,
+}
+
+/// The unsigned first simulation.
+const FIRST_SIMULATION: SimulationPhase = SimulationPhase {
+    request_failed: "first simulation request failed: ",
+    answer_error: "simulate returned error: ",
+    restore_preamble: "the simulation returned a restore preamble; this wallet does not restore \
+                       archived ledger entries",
+    no_fee_or_data: "simulate returned no min_resource_fee / transaction_data",
+    fee_ceiling: "the simulation's minimum resource fee exceeds the wallet's ceiling of \
+                  10000000 stroops",
+    archived_entries: "the simulation's transaction data restores archived ledger entries; this \
+                       wallet does not restore them",
+    embedded_fee: "the simulation's transaction data embeds a resource fee outside zero to its \
+                   minimum resource fee",
+};
+
+/// The signed re-simulation.
+const RESIMULATION: SimulationPhase = SimulationPhase {
+    request_failed: "re-simulation request failed: ",
+    answer_error: "re-simulate returned error: ",
+    restore_preamble: "the re-simulation returned a restore preamble; this wallet does not \
+                       restore archived ledger entries",
+    no_fee_or_data: "re-simulate returned no min_resource_fee / transaction_data",
+    fee_ceiling: "the re-simulation's minimum resource fee exceeds the wallet's ceiling of \
+                  10000000 stroops",
+    archived_entries: "the re-simulation's transaction data restores archived ledger entries; \
+                       this wallet does not restore them",
+    embedded_fee: "the re-simulation's transaction data embeds a resource fee outside zero to \
+                   its minimum resource fee",
+};
+
+/// The first simulation's transaction data does not decode.
+const FIRST_SIMULATION_DATA_UNDECODABLE: &str = "the simulation's transaction data does not decode";
+
+/// Checks the parts of a simulation answer that precede its transaction data
+/// and its authorization, and returns its minimum resource fee.
+///
+/// In order: the answer carries no error and no restore preamble, and it
+/// carries transaction data and a minimum resource fee in
+/// `1..=MAX_RESOURCE_FEE_STROOPS`.
+///
+/// # Errors
+///
+/// [`X402Error::RpcSimulateFailed`] with the phase's detail for the first
+/// failed check. Only the error check carries the answer's own text.
+fn check_simulation_answer(
+    response: &SimulateTransactionResponse,
+    phase: &SimulationPhase,
+) -> Result<u32, X402Error> {
+    let refuse = |detail: &str| X402Error::RpcSimulateFailed {
+        detail: detail.to_owned(),
+    };
+    if let Some(ref error) = response.error {
+        return Err(X402Error::RpcSimulateFailed {
+            detail: format!("{}{error}", phase.answer_error),
+        });
+    }
+    if response.restore_preamble.is_some() {
+        return Err(refuse(phase.restore_preamble));
+    }
+    if response.min_resource_fee == 0 || response.transaction_data.is_empty() {
+        return Err(refuse(phase.no_fee_or_data));
+    }
+    if response.min_resource_fee > u64::from(MAX_RESOURCE_FEE_STROOPS) {
+        return Err(refuse(phase.fee_ceiling));
+    }
+    // The ceiling above is a `u32`, so the conversion succeeds.
+    u32::try_from(response.min_resource_fee).map_err(|_| refuse(phase.fee_ceiling))
+}
+
+/// Checks decoded simulation transaction data against the answer's minimum
+/// resource fee.
+///
+/// The data lists no archived entries to restore, and its embedded resource
+/// fee lies in `0..=min_resource_fee`.
+///
+/// # Errors
+///
+/// [`X402Error::RpcSimulateFailed`] with the phase's fixed detail.
+fn check_transaction_data(
+    data: &SorobanTransactionData,
+    min_resource_fee: u32,
+    phase: &SimulationPhase,
+) -> Result<(), X402Error> {
+    let refuse = |detail: &str| X402Error::RpcSimulateFailed {
+        detail: detail.to_owned(),
+    };
+    if let SorobanTransactionDataExt::V1(ext) = &data.ext
+        && !ext.archived_soroban_entries.is_empty()
+    {
+        return Err(refuse(phase.archived_entries));
+    }
+    if data.resource_fee < 0 || data.resource_fee > i64::from(min_resource_fee) {
+        return Err(refuse(phase.embedded_fee));
+    }
+    Ok(())
+}
+
+/// Checks the first simulation's ledger `simulation` against the health
+/// ledger `health` and the signature expiration ledger `expiration`.
+///
+/// `simulation` is above zero and at most one ledger ahead of `health`, which
+/// tolerates one ledger of skew between load-balanced backends. `health` lies
+/// before `expiration`, so the authorization is not expired when it is signed.
+///
+/// # Errors
+///
+/// [`X402Error::RpcSimulateFailed`] with a fixed detail naming the failed
+/// predicate.
+fn check_simulation_ledger(simulation: u32, health: u32, expiration: u32) -> Result<(), X402Error> {
+    let refuse = |detail: &str| X402Error::RpcSimulateFailed {
+        detail: detail.to_owned(),
+    };
+    if simulation == 0 {
+        return Err(refuse("the simulation reports ledger zero"));
+    }
+    if simulation > health.saturating_add(1) {
+        return Err(refuse(
+            "the simulation reports a ledger more than one ahead of the endpoint's health",
+        ));
+    }
+    if health >= expiration {
+        return Err(refuse(
+            "the endpoint's health ledger has reached the signature expiration ledger",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks the re-simulation's ledger `resimulation` against the health ledger
+/// `health` and the signature expiration ledger `expiration`.
+///
+/// `resimulation` is at most one ledger behind `health`, which tolerates one
+/// ledger of skew between load-balanced backends, and lies before
+/// `expiration`.
+///
+/// # Errors
+///
+/// [`X402Error::RpcSimulateFailed`] with a fixed detail naming the failed
+/// predicate.
+fn check_resimulation_ledger(
+    health: u32,
+    resimulation: u32,
+    expiration: u32,
+) -> Result<(), X402Error> {
+    let refuse = |detail: &str| X402Error::RpcSimulateFailed {
+        detail: detail.to_owned(),
+    };
+    if health > resimulation.saturating_add(1) {
+        return Err(refuse(
+            "the re-simulation reports a ledger more than one behind the endpoint's health",
+        ));
+    }
+    if resimulation >= expiration {
+        return Err(refuse(
+            "the re-simulation reports a ledger at or past the signature expiration ledger",
+        ));
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -606,26 +960,39 @@ pub async fn create_payment(
 ///
 /// # Errors
 ///
-/// - [`X402Error::TransactionBuildFailed`] — if the placeholder account cannot
-///   be constructed (the placeholder strkey is a compile-time constant, so this
-///   is unreachable in practice).
+/// - [`X402Error::TransactionBuildFailed`]: the placeholder account cannot be
+///   constructed. The placeholder strkey is a compile-time constant, so this
+///   is unreachable in practice.
 fn placeholder_source_account() -> Result<BaselibAccount, X402Error> {
     BaselibAccount::new(PLACEHOLDER_SOURCE, "0").map_err(|e| X402Error::TransactionBuildFailed {
         detail: format!("placeholder source account construction failed: {e:?}"),
     })
 }
 
-/// Computes the auth-entry `signature_expiration_ledger` as
-/// `latest_ledger + ceil(max_timeout_seconds / ESTIMATED_LEDGER_CLOSE_SECONDS)`,
-/// the x402 Exact Stellar scheme expiration formula.
+/// Returns the signature window in ledgers for a requirement's
+/// `maxTimeoutSeconds`: `ceil(min(seconds, 300) / 5)`.
 ///
-/// Saturating arithmetic clamps an overflowing window to `u32::MAX`.
-fn compute_signature_expiration_ledger(latest_ledger: u32, max_timeout_seconds: u32) -> u32 {
-    let ledger_window = u32::try_from(
-        u64::from(max_timeout_seconds).div_ceil(u64::from(ESTIMATED_LEDGER_CLOSE_SECONDS)),
-    )
-    .unwrap_or(u32::MAX);
-    latest_ledger.saturating_add(ledger_window)
+/// The requirement names a maximum validity, so clamping it to
+/// [`MAX_SIGNED_VALIDITY_SECONDS`] signs a shorter validity that still meets
+/// it. A validated requirement carries at least one second, so the window lies
+/// in `1..=60`.
+fn expiration_window_ledgers(max_timeout_seconds: u32) -> u32 {
+    max_timeout_seconds
+        .min(MAX_SIGNED_VALIDITY_SECONDS)
+        .div_ceil(ESTIMATED_LEDGER_CLOSE_SECONDS)
+}
+
+/// Computes the auth-entry `signature_expiration_ledger` as
+/// `latest_ledger + expiration_window_ledgers(max_timeout_seconds)`, the x402
+/// Exact Stellar scheme expiration formula with a clamped window.
+///
+/// Returns `None` when the sum overflows `u32`: no valid expiration ledger
+/// exists for that `latest_ledger`.
+fn compute_signature_expiration_ledger(
+    latest_ledger: u32,
+    max_timeout_seconds: u32,
+) -> Option<u32> {
+    latest_ledger.checked_add(expiration_window_ledgers(max_timeout_seconds))
 }
 
 /// Builds the classic-account signature `ScVal` for the
@@ -893,24 +1260,6 @@ fn validate_c_strkey(strkey: &str) -> Result<(), X402Error> {
     }
 }
 
-/// Parses the `min_resource_fee` from a simulate response.
-///
-/// Casts the u64 field down to the u32 the fee builder requires.
-/// The `== 0` guard above makes a zero value unreachable on the success path,
-/// but we reject casts that overflow rather than silently truncating.
-///
-/// # Errors
-///
-/// - [`X402Error::TransactionBuildFailed`] — the u64 value does not fit in
-///   `u32`.
-fn parse_min_resource_fee(
-    sim: &stellar_rpc_client::SimulateTransactionResponse,
-) -> Result<u32, X402Error> {
-    u32::try_from(sim.min_resource_fee).map_err(|e| X402Error::TransactionBuildFailed {
-        detail: format!("min_resource_fee u64->u32 cast failed: {e}"),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1118,23 +1467,42 @@ mod tests {
 
     #[test]
     fn expiration_formula_300s_timeout() {
-        // 300 / 5 = 60 ledgers, latest = 1000 → expiration = 1060 (exact multiple)
-        assert_eq!(compute_signature_expiration_ledger(1000, 300), 1060);
+        // 300 / 5 = 60 ledgers, latest = 1000, expiration = 1060 (exact multiple).
+        assert_eq!(compute_signature_expiration_ledger(1000, 300), Some(1060));
     }
 
     #[test]
     fn expiration_formula_rounds_up_for_non_multiple() {
-        // 301 / 5 = 60.2 → ceil = 61, latest = 1000 → expiration = 1061
-        assert_eq!(compute_signature_expiration_ledger(1000, 301), 1061);
+        // 6 / 5 = 1.2, ceil = 2; 1 / 5 = 0.2, ceil = 1.
+        assert_eq!(compute_signature_expiration_ledger(1000, 6), Some(1002));
+        assert_eq!(compute_signature_expiration_ledger(1000, 1), Some(1001));
     }
 
     #[test]
-    fn expiration_formula_saturates_on_overflow() {
-        // A huge timeout near u32::MAX seconds clamps the window, and the
-        // ledger sum saturates rather than wrapping.
+    fn expiration_formula_clamps_the_window_at_sixty_ledgers() {
+        // A requirement above 300 s signs the 300 s window: 60 ledgers.
+        assert_eq!(compute_signature_expiration_ledger(1000, 301), Some(1060));
+        assert_eq!(
+            compute_signature_expiration_ledger(1000, u32::MAX),
+            Some(1060)
+        );
+    }
+
+    #[test]
+    fn expiration_formula_refuses_on_overflow() {
+        // The last ledger with room for a 60-ledger window still computes;
+        // one more has no valid expiration ledger.
+        assert_eq!(
+            compute_signature_expiration_ledger(u32::MAX - 60, 300),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            compute_signature_expiration_ledger(u32::MAX - 59, 300),
+            None
+        );
         assert_eq!(
             compute_signature_expiration_ledger(u32::MAX, u32::MAX),
-            u32::MAX
+            None
         );
     }
 

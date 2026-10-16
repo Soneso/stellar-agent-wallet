@@ -5,6 +5,7 @@
 
 use thiserror::Error;
 
+use stellar_agent_core::error::WalletError;
 use stellar_agent_sep43::Sep43Error;
 
 /// All errors produced by the x402 payment scheme implementation.
@@ -197,6 +198,17 @@ pub enum X402Error {
         detail: String,
     },
 
+    /// The configured RPC endpoint failed the endpoint identity check that
+    /// [`crate::exact::create_payment`] runs before its first simulation.
+    ///
+    /// The endpoint reports another network than the profile's, reports
+    /// mainnet, runs a protocol the release refuses, or could not be
+    /// identified before the caller's deadline. Nothing was simulated or
+    /// signed. The inner error is the check's own, unchanged; its URL is
+    /// authority-only.
+    #[error("RPC endpoint identity check failed: {0}")]
+    EndpointIdentity(WalletError),
+
     /// The transmit gate of [`crate::exact::create_payment`] refused, so the
     /// signed authorization was never sent.
     ///
@@ -216,11 +228,13 @@ impl X402Error {
     /// The x402 tools surface errors through the documented result envelope
     /// (`{ ok: false, error: { code, message }, request_id }`); this method
     /// supplies the `error.code`. Codes follow the `x402.<snake_variant>`
-    /// taxonomy so an agent can branch on the specific failure, with one
-    /// deliberate exception: [`X402Error::MainnetSigningForbidden`] returns the
+    /// taxonomy so an agent can branch on the specific failure, with two
+    /// deliberate exceptions. [`X402Error::MainnetSigningForbidden`] returns the
     /// canonical `network.mainnet_write_forbidden` code so the refusal correlates
     /// with the CLI, submit-layer, and SEP-43/SEP-53 signing guards across every
-    /// surface.
+    /// surface. [`X402Error::EndpointIdentity`] returns the code of the wallet
+    /// error it carries, such as `network.endpoint_network_mismatch`, the code
+    /// every other signing path answers for the same endpoint.
     #[must_use]
     pub fn wire_code(&self) -> &'static str {
         match self {
@@ -241,6 +255,7 @@ impl X402Error {
             X402Error::UnexpectedAuthEntries { .. } => "x402.unexpected_auth_entries",
             X402Error::KeyringLoadFailed { .. } => "x402.keyring_load_failed",
             X402Error::TransmitGateRefused { .. } => "x402.transmit_gate_refused",
+            X402Error::EndpointIdentity(inner) => inner.code(),
         }
     }
 }
@@ -448,6 +463,41 @@ mod tests {
         let d = err.to_string();
         assert!(d.contains("transmit gate refused"));
         assert!(d.contains("audit row not written"));
+    }
+
+    #[test]
+    fn endpoint_identity_carries_the_wire_code_of_its_wallet_error() {
+        use stellar_agent_core::error::NetworkError;
+        let cases = [
+            (
+                WalletError::Network(NetworkError::EndpointNetworkMismatch {
+                    expected: "Test SDF Network ; September 2015".to_owned(),
+                    server: "Test SDF Future Network ; October 2022".to_owned(),
+                }),
+                "network.endpoint_network_mismatch",
+            ),
+            (
+                WalletError::Network(NetworkError::MainnetWriteForbidden),
+                "network.mainnet_write_forbidden",
+            ),
+            (
+                WalletError::Network(NetworkError::EndpointIdentityUnavailable {
+                    url: "https://rpc.example.com".to_owned(),
+                }),
+                "network.endpoint_identity_unavailable",
+            ),
+        ];
+        for (inner, code) in cases {
+            let message = inner.to_string();
+            let err = X402Error::EndpointIdentity(inner);
+            assert_eq!(err.wire_code(), code);
+            let display = err.to_string();
+            assert!(
+                display.starts_with("RPC endpoint identity check failed: "),
+                "{display}"
+            );
+            assert!(display.ends_with(&message), "{display}");
+        }
     }
 
     #[test]

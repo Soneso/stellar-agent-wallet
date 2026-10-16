@@ -31,6 +31,10 @@
 //!   it is NEVER accepted from the `payment_required` input.
 //! - Network passphrase is taken from the active profile; a mismatch between
 //!   the x402 `network` field and the profile passphrase is a hard error.
+//! - The payment requirements are validated in full before the dispatch gate,
+//!   so invalid requirements never reach the spending window.
+//! - One RPC client serves the whole payment. Its first request is the
+//!   endpoint identity check, under the profile's `submit_timeout_seconds`.
 //! - Signer is loaded from the platform keyring at call time; the keypair is
 //!   never held in memory between calls.
 //!
@@ -72,8 +76,9 @@ use crate::tools::value_audit::emit_value_audit_row_strict;
 /// - `payment_required` — base64-encoded `PAYMENT-REQUIRED` header value OR
 ///   raw JSON `PaymentRequirements` object.  The tool accepts both forms and
 ///   tries base64-decode first.
-/// - `chain_id` — CAIP-2 chain identifier (`"stellar:pubnet"` or
-///   `"stellar:testnet"`); validated against the active profile.
+/// - `chain_id`: the wallet's CAIP-2 chain identifier, `"stellar:testnet"`
+///   or `"stellar:mainnet"`; validated against the active profile after the
+///   payment requirements are validated.
 /// - `address` — optional signer address (G-strkey); when provided must match
 ///   the active signer enrolled in the profile.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -86,10 +91,13 @@ pub struct X402CreatePaymentArgs {
     /// JSON-parse when base64 decoding fails or yields non-JSON bytes.
     pub payment_required: String,
 
-    /// CAIP-2 chain identifier (`"stellar:pubnet"` or `"stellar:testnet"`).
+    /// The wallet's CAIP-2 chain identifier: `"stellar:testnet"` or
+    /// `"stellar:mainnet"`. The x402 requirement `network` spells mainnet
+    /// `"stellar:pubnet"`; this argument does not.
     ///
-    /// Validated against the active profile.  Mismatch returns a JSON-RPC
-    /// `ErrorData` from the `dispatch_gate` preamble.
+    /// Validated against the active profile after the payment requirements:
+    /// invalid requirements answer their own `x402.*` code first. A mismatch
+    /// returns a JSON-RPC `ErrorData` from the `dispatch_gate` preamble.
     pub chain_id: String,
 
     /// Optional signer address (G-strkey).
@@ -139,20 +147,30 @@ pub struct X402CreatePaymentArgs {
 ///
 /// Returns `isError = true` with the business-error envelope (per-variant
 /// `x402.<reason>` `error.code`) when:
-/// - `chain_id` does not match the active profile.
 /// - `payment_required` is not valid base64+JSON or raw JSON `PaymentRequirements`.
-/// - The `scheme` field is not `"exact"`.
-/// - The `network` field is not `"stellar:pubnet"` or `"stellar:testnet"`.
-/// - The x402 `network` passphrase does not match the profile passphrase.
-/// - `extra.areFeesSponsored` is not `true`.
-/// - The `amount` field cannot be parsed as an `i128`.
+/// - The requirements fail validation. It runs before the dispatch gate, the
+///   audit pre-flight, and the signer load, and consumes no spending window:
+///   - the `scheme` is not `"exact"`;
+///   - the `network` is not `"stellar:pubnet"` or `"stellar:testnet"`, or
+///     does not match the profile passphrase;
+///   - the `asset` is not a C-strkey;
+///   - `extra.areFeesSponsored` is not `true`;
+///   - the `amount` is not a positive `i128`;
+///   - the `payTo` is not a G-, C-, or M-strkey;
+///   - `maxTimeoutSeconds` is zero.
 /// - The keyring entry for the signer cannot be loaded.
-/// - The Soroban RPC simulate call fails.
+/// - A Soroban RPC simulation, its answer, the health read, or the ledger and
+///   fee bounds fail.
 /// - The auth-entry signing step fails.
 ///
-/// The audit refusals carry their `audit.*` code: the pre-flight before the
-/// signer load, and the `x402_payment_authorized` row the transmit gate writes
-/// before the signed authorization leaves the wallet.
+/// A `chain_id` that does not match the active profile returns a JSON-RPC
+/// `ErrorData` from the dispatch gate. The endpoint identity refusals carry
+/// their `network.*` code: `network.endpoint_network_mismatch`,
+/// `network.endpoint_identity_unavailable`, `network.mainnet_write_forbidden`,
+/// and `network.rpc_unreachable` for a client that cannot be built. The audit
+/// refusals carry their `audit.*` code: the pre-flight before the signer load,
+/// and the `x402_payment_authorized` row the transmit gate writes before the
+/// signed authorization leaves the wallet.
 ///
 /// # Examples
 ///
@@ -189,8 +207,9 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use std::sync::Arc;
 
+        use stellar_agent_network::StellarRpcClient;
         use stellar_agent_network::keyring::enrolled_keyring_signer;
-        use stellar_agent_x402::exact::create_payment;
+        use stellar_agent_x402::exact::{create_payment, validate_requirements};
         use stellar_agent_x402::wire::encode_payment_signature;
 
         // Mainnet structural refusal — before any key access or signing.
@@ -203,26 +222,30 @@ impl WalletServer {
             return Ok(crate::tools::common::x402_mainnet_signing_forbidden_result());
         }
 
-        // ── Decode payment_required input FIRST ───────────────────────────────
+        // ── Decode and validate payment_required FIRST ────────────────────────
         // The dispatch gate needs the value-carrying descriptor, which is
-        // derived from this SAME decode (single-decode invariant §2.1) — the
-        // gate must run before any signing but AFTER the decode it sizes.
+        // derived from this single decode: the gate runs before any signing
+        // and after the decode it sizes. The requirements are validated in
+        // full before the gate, so invalid requirements answer their own
+        // `x402.*` code and never reach the spending window.
         let requirements = match decode_payment_required_input(&args.payment_required) {
             Ok(r) => r,
             Err(ref err) => return Ok(x402_error_to_tool_result(err)),
         };
-
-        // ── Build the value-carrying leg from the SAME decode ────────────────
-        // `x402_value_leg` parses `requirements.amount` to the atomic i128 via
-        // the identical logic `create_payment` applies to the same field
-        // (mirrored, not shared, because `create_payment` lives in the
-        // `stellar-agent-x402` crate and takes `&PaymentRequirements` rather
-        // than a pre-parsed amount); both parses are deterministic over the
-        // same immutable string and so cannot diverge.
-        let value_leg = match x402_value_leg(&requirements) {
-            Ok(leg) => leg,
+        let amount = match validate_requirements(
+            &requirements,
+            self.context.network_passphrase(),
+            &self.context.rpc_url,
+        ) {
+            Ok(amount) => amount,
             Err(ref err) => return Ok(x402_error_to_tool_result(err)),
         };
+
+        // ── Build the value-carrying leg from the SAME decode ────────────────
+        // The amount is the one the validator parsed from this immutable
+        // requirements object, which `create_payment` validates again and
+        // builds the transfer from.
+        let value_leg = x402_value_leg(&requirements, amount);
 
         // Capture the gate-derived leg as an audit record before it moves into
         // the value descriptor, so the row carries exactly what the gate sized.
@@ -334,9 +357,14 @@ impl WalletServer {
             }
         };
 
-        // ── Resolve RPC URL from active profile (NEVER from input) ────────────
-        // RPC URL is operator-controlled, not facilitator-supplied.
-        let rpc_url = self.context.rpc_url.as_str();
+        // ── One RPC client for the payment, from the active profile ──────────
+        // The URL is operator-controlled, never facilitator-supplied. Every
+        // request of the payment goes to this client, and `create_payment`
+        // makes the endpoint identity check its first request.
+        let client = match StellarRpcClient::new(&self.context.rpc_url) {
+            Ok(client) => client,
+            Err(err) => return Ok(crate::tools::common::endpoint_refusal_result(&err)),
+        };
         let profile_passphrase = self.context.network_passphrase();
 
         let payer_address = account.to_owned();
@@ -345,7 +373,9 @@ impl WalletServer {
         let signer: Arc<dyn stellar_agent_network::signing::Signer + Send + Sync> =
             Arc::new(signer_handle);
 
-        // Shared-window admission precedes signing and the signed RPC re-simulation.
+        // Shared-window admission precedes signing and the signed RPC
+        // re-simulation. A failure after it, an endpoint identity refusal
+        // included, keeps the admitted spend.
         if let Err(refusal) = crate::tools::x402_create_payment::record_x402_authorization(
             self,
             "stellar_x402_create_payment",
@@ -363,11 +393,18 @@ impl WalletServer {
             args.chain_id.as_str(),
             audit_leg,
         );
+        // The identity check runs under the profile's submit timeout, resolved
+        // here; the requirement's `maxTimeoutSeconds` bounds the signed
+        // authorization, never this deadline. Admission above stays when the
+        // check refuses.
+        let identity_deadline =
+            tokio::time::Instant::now() + crate::tools::common::submit_timeout(&self.profile);
         let created = create_payment(
             &requirements,
             signer.as_ref(),
-            rpc_url,
+            &client,
             profile_passphrase,
+            identity_deadline,
             |authorization| audit.before_transmit(authorization),
         )
         .await;
@@ -381,6 +418,9 @@ impl WalletServer {
                 );
                 if let Some(refusal) = audit.refusal_result() {
                     return Ok(refusal);
+                }
+                if let stellar_agent_x402::X402Error::EndpointIdentity(refusal) = err {
+                    return Ok(crate::tools::common::endpoint_refusal_result(refusal));
                 }
                 audit.record_withheld(X402Failure::CreatePayment(err));
                 return Ok(x402_error_to_tool_result(err));
@@ -631,6 +671,7 @@ fn classify_x402_error(err: &stellar_agent_x402::X402Error) -> &'static str {
         X402Error::TransactionBuildFailed { .. } => "transaction_build_failed",
         X402Error::UnexpectedAuthEntries { .. } => "unexpected_auth_entries",
         X402Error::TransmitGateRefused { .. } => "transmit_gate_refused",
+        X402Error::EndpointIdentity(_) => "endpoint_identity",
         _ => "x402_error",
     }
 }
@@ -689,7 +730,7 @@ mod tests {
             "network": "stellar:testnet",
             "asset": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
             "amount": "1000000",
-            "payTo": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "payTo": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
             "maxTimeoutSeconds": 300,
             "extra": { "areFeesSponsored": true }
         })
@@ -777,6 +818,9 @@ mod tests {
             X402Error::TransmitGateRefused {
                 detail: "j".to_owned(),
             },
+            X402Error::EndpointIdentity(stellar_agent_core::error::WalletError::Network(
+                stellar_agent_core::error::NetworkError::MainnetWriteForbidden,
+            )),
         ];
         for err in cases {
             let class = classify_x402_error(err);

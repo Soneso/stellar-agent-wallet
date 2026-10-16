@@ -30,12 +30,23 @@ thiserror = { workspace = true }
 stellar-agent-core = { workspace = true }
 stellar-agent-network = { workspace = true }
 stellar-agent-sep43 = { workspace = true }
+# `create_payment` takes the absolute deadline of its endpoint identity check
+# and health read as a `tokio::time::Instant`.
+tokio = { workspace = true, features = ["time"] }
+# A debug event names the ledgers each payment checked.
+tracing = { workspace = true }
 
 [dev-dependencies]
 # The simulation tests serve mocked Stellar RPC answers through wiremock and
 # count the simulate requests with the test-support helper.
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# test-hooks counts StellarRpcClient constructions, so the tests show that
+# `create_payment` builds no client of its own.
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-hooks"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# The testnet legs read the ledgers a payment checked from its debug event.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 rand_core = { workspace = true }
 ed25519-dalek = { workspace = true }
 serial_test = { workspace = true }

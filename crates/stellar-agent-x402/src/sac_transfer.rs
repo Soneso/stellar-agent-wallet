@@ -68,7 +68,7 @@ fn strkey_to_sc_address(strkey: &str) -> Result<ScAddress, X402Error> {
 ///
 /// - [`X402Error::InvalidRecipientAddress`] if the strkey is malformed or is not
 ///   a G-, C-, or M-strkey.
-fn strkey_to_recipient_sc_address(strkey: &str) -> Result<ScAddress, X402Error> {
+pub(crate) fn strkey_to_recipient_sc_address(strkey: &str) -> Result<ScAddress, X402Error> {
     use stellar_xdr::{AccountId, ContractId, Hash, MuxedEd25519Account, PublicKey, Uint256};
 
     let parsed = Strkey::from_string(strkey).map_err(|e| X402Error::InvalidRecipientAddress {
