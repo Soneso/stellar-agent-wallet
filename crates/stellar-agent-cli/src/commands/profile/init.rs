@@ -423,9 +423,9 @@ fn next_steps(profile_name: &str, engine: PolicyEngineKind, network: TargetNetwo
         ));
         if network == TargetNetwork::Mainnet {
             steps.push(
-                "Set `oracle_provider_url` in the profile before relying on V1 for \
-                 mainnet high-value flows (the independent-RPC cross-check is skipped \
-                 while it is unset)."
+                "Set `oracle_provider_url` and `[providers.oracle]` in the profile file \
+                 before relying on mainnet high-value cross-checks. Choose an independently \
+                 administered endpoint on a different host; the cross-check is skipped while its URL is unset."
                     .to_owned(),
             );
         }
@@ -975,5 +975,7 @@ mod tests {
         let steps = next_steps("alpha", PolicyEngineKind::V1, TargetNetwork::Mainnet);
         assert_eq!(steps.len(), 8, "{steps:#?}");
         assert!(steps[7].contains("`oracle_provider_url`"), "{}", steps[7]);
+        assert!(steps[7].contains("`[providers.oracle]`"), "{}", steps[7]);
+        assert!(steps[7].contains("different host"), "{}", steps[7]);
     }
 }

@@ -1561,6 +1561,10 @@ async fn create_account_commit_high_value_cross_check_passes_on_match() {
             );
         }
     }
+    assert_eq!(
+        crate::common::received_methods(&oracle_mock).await,
+        ["getNetwork", "getLedgerEntries"]
+    );
 }
 
 /// High-value cross-check fails when the oracle returns a different sequence
@@ -2402,5 +2406,96 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
     assert!(
         committed_json["data"]["tx_hash"].as_str().is_some(),
         "the retry must report an on-chain tx_hash: {committed_json}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn create_account_commit_oracle_identity_refusal_blocks_rebuild() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    install_test_nonce_key(243);
+    let seed = [0x73; 32];
+    let source = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .unwrap()
+        .set_password(&sstrkey_for_seed(seed))
+        .unwrap();
+    let identity = crate::common::EndpointNetwork::testnet();
+    let primary = MockServer::start().await;
+    let oracle = MockServer::start().await;
+    for (endpoint, network) in [
+        (&primary, crate::common::EndpointNetwork::testnet()),
+        (&oracle, identity.clone()),
+    ] {
+        Mock::given(method("POST"))
+            .respond_with(CreateAccountSubmitSuccessRpcResponder {
+                account_key_xdr: account_ledger_key_xdr(&source),
+                account_xdr: account_entry_xdr_with_balance(&source, 100_000_000_000_000),
+                network,
+            })
+            .mount(endpoint)
+            .await;
+    }
+    let mut profile = testnet_profile_with_rpc(&primary.uri());
+    profile.oracle_provider_url =
+        Some(url::Url::parse(&oracle.uri().replace("127.0.0.1", "localhost")).unwrap());
+    let server = WalletServer::new(profile).unwrap();
+    let args = StellarCreateAccountArgs {
+        source,
+        starting_balance: serde_json::from_str(r#""2000 XLM""#).unwrap(),
+        ..simulate_args_on("stellar:testnet", None)
+    };
+    let simulated = server
+        .call_stellar_create_account(args.clone())
+        .await
+        .unwrap();
+    assert_ne!(
+        simulated.is_error,
+        Some(true),
+        "{:?}",
+        call_result_json(&simulated)
+    );
+    let data = call_result_json(&simulated)["data"].clone();
+    let commit = StellarCreateAccountCommitArgs {
+        chain_id: args.chain_id,
+        source: args.source,
+        destination: args.destination,
+        starting_balance: args.starting_balance,
+        nonce: data["nonce"].as_str().unwrap().into(),
+        expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().unwrap(),
+        envelope_xdr: data["envelope_xdr"].as_str().unwrap().into(),
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    identity.set("PRIVATE_PASSPHRASE_SENTINEL");
+    let result = server
+        .call_stellar_create_account_commit(commit.clone())
+        .await
+        .unwrap();
+    let (code, message, _) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "simulation.divergence");
+    assert!(message.contains("oracle_provider_url endpoint identity failed"));
+    assert!(!message.contains("PRIVATE_PASSPHRASE_SENTINEL"));
+    assert_eq!(
+        crate::common::received_methods(&oracle).await,
+        ["getNetwork"]
+    );
+    assert!(
+        !crate::common::received_methods(&primary)
+            .await
+            .iter()
+            .any(|method| method == "sendTransaction")
+    );
+    identity.set(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE);
+    let result = server
+        .call_stellar_create_account_commit(commit)
+        .await
+        .unwrap();
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        call_result_json(&result)
     );
 }

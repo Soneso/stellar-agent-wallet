@@ -2163,6 +2163,10 @@ async fn pay_commit_high_value_cross_check_passes_on_match() {
             );
         }
     }
+    assert_eq!(
+        crate::common::received_methods(&oracle_mock).await,
+        ["getNetwork", "getLedgerEntries"]
+    );
 }
 
 /// High-value cross-check fails when the oracle RPC returns a different account
@@ -5081,4 +5085,462 @@ async fn commit_endpoint_refusal_precedes_the_audit_preflight() {
         "audit.chain_key_unavailable",
     )
     .await;
+}
+
+fn sep29_memo_entry(body: &serde_json::Value) -> Option<ResponseTemplate> {
+    use stellar_xdr::{
+        DataEntry, DataEntryExt, DataValue, LedgerEntryData, LedgerKey, Limits, ReadXdr, WriteXdr,
+    };
+    if body["method"] != "getLedgerEntries" {
+        return None;
+    }
+    let key_b64 = body["params"]["keys"][0].as_str().unwrap();
+    let LedgerKey::Data(key) = LedgerKey::from_xdr_base64(key_b64, Limits::none()).unwrap() else {
+        return None;
+    };
+    let xdr = LedgerEntryData::Data(DataEntry {
+        account_id: key.account_id,
+        data_name: key.data_name,
+        data_value: DataValue(vec![b'1'].try_into().unwrap()),
+        ext: DataEntryExt::V0,
+    })
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    Some(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": body["id"],
+        "result": {
+            "entries": [{"key": key_b64, "xdr": xdr, "lastModifiedLedgerSeq": 1000}],
+            "latestLedger": 1001,
+        },
+    })))
+}
+
+fn sep29_response(
+    request: &Request,
+    body: &serde_json::Value,
+    identity: &serde_json::Value,
+    memo_required: bool,
+) -> ResponseTemplate {
+    if body["method"] == "getNetwork" {
+        return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0", "id": body["id"], "result": identity,
+        }));
+    }
+    if memo_required && let Some(response) = sep29_memo_entry(body) {
+        return response;
+    }
+    AccountOnlyResponder {
+        account_key_xdr: account_ledger_key_xdr(SOURCE_G),
+        account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
+    }
+    .respond(request)
+}
+
+async fn sep29_endpoint(
+    identity: serde_json::Value,
+    identity_delay: std::time::Duration,
+    read_delay: std::time::Duration,
+    memo_required: bool,
+) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(move |request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let delay = if body["method"] == "getNetwork" {
+                identity_delay
+            } else {
+                read_delay
+            };
+            sep29_response(request, &body, &identity, memo_required).set_delay(delay)
+        })
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn sep29_primary() -> MockServer {
+    sep29_endpoint(
+        crate::common::EndpointNetwork::testnet().result(),
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        false,
+    )
+    .await
+}
+
+fn sep29_server(primary: &MockServer, oracle: Option<&str>) -> WalletServer {
+    let mut profile = testnet_profile_with_rpc(&primary.uri());
+    profile.submit_timeout_seconds = Some(1);
+    profile.oracle_provider_url = oracle.map(|url| url::Url::parse(url).unwrap());
+    WalletServer::new(profile).unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn simulate_sep29_oracle_identity_precedes_second_read() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    install_test_nonce_key(240);
+    let primary = sep29_primary().await;
+    let oracle = sep29_primary().await;
+    let server = sep29_server(
+        &primary,
+        Some(&oracle.uri().replace("127.0.0.1", "localhost")),
+    );
+    let (result, built) = crate::common::clients_built_by(
+        server.call_stellar_pay(simulate_args_on("stellar:testnet", None)),
+    )
+    .await;
+    let result = result.unwrap();
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        call_result_json(&result)
+    );
+    assert_eq!(
+        crate::common::received_methods(&oracle).await,
+        ["getNetwork", "getLedgerEntries"]
+    );
+    assert_eq!(built, 2, "identity and reads share each role's client");
+}
+
+#[tokio::test]
+#[serial]
+async fn simulate_sep29_oracle_identity_refusals_are_divergence() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    let primary = sep29_primary().await;
+    for (identity, delay) in [
+        (
+            crate::common::EndpointNetwork::reporting("Alien network").result(),
+            std::time::Duration::ZERO,
+        ),
+        (
+            crate::common::EndpointNetwork::reporting(
+                stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            )
+            .result(),
+            std::time::Duration::ZERO,
+        ),
+        (
+            serde_json::json!({"passphrase": 42}),
+            std::time::Duration::ZERO,
+        ),
+        (
+            crate::common::EndpointNetwork::testnet().result(),
+            std::time::Duration::from_millis(1500),
+        ),
+    ] {
+        let oracle = sep29_endpoint(identity, delay, std::time::Duration::ZERO, false).await;
+        let server = sep29_server(&primary, Some(&oracle.uri()));
+        let result = server
+            .call_stellar_pay(simulate_args_on("stellar:testnet", None))
+            .await
+            .unwrap();
+        let (code, message, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, "network.rpc_divergence");
+        assert!(
+            message.contains("SEP-29 oracle_provider_url endpoint identity failed"),
+            "{message}"
+        );
+        assert!(!text.contains("\"nonce\""));
+        assert_eq!(
+            crate::common::received_methods(&oracle).await,
+            ["getNetwork"]
+        );
+    }
+    let server = sep29_server(&primary, Some("http://127.0.0.1:1"));
+    let result = server
+        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::common::assert_business_envelope(&result).0,
+        "network.rpc_divergence"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn simulate_sep29_oracle_construction_failure_is_divergence() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    let primary = sep29_primary().await;
+    let server = sep29_server(&primary, Some("mailto:operator@example.com"));
+    let result = server
+        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
+        .await
+        .unwrap();
+    let (code, message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "network.rpc_divergence");
+    assert!(
+        message.contains("SEP-29 oracle_provider_url client construction failed"),
+        "{message}"
+    );
+    assert!(!text.contains("\"nonce\""));
+}
+
+#[tokio::test]
+#[serial]
+async fn simulate_sep29_oracle_uses_remaining_pay_deadline() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    let delay = std::time::Duration::from_millis(600);
+    let primary = sep29_endpoint(
+        crate::common::EndpointNetwork::testnet().result(),
+        delay,
+        delay,
+        false,
+    )
+    .await;
+    let oracle = sep29_primary().await;
+    let server = sep29_server(&primary, Some(&oracle.uri()));
+    let result = server
+        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
+        .await
+        .unwrap();
+    let (code, message, _) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "network.rpc_divergence");
+    assert!(
+        message.contains(
+            "SEP-29 oracle_provider_url endpoint identity failed: action deadline exhausted"
+        ),
+        "{message}"
+    );
+    assert_eq!(
+        crate::common::received_methods(&primary).await,
+        ["getNetwork", "getLedgerEntries", "getLedgerEntries"]
+    );
+    assert!(crate::common::received_methods(&oracle).await.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn simulate_sep29_oracle_identity_uses_partial_pay_budget() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    install_test_nonce_key(242);
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            // The source read and identity consume 600 ms; the destination read is immediate.
+            let delay = if body["method"] == "getNetwork"
+                || body["params"]["keys"][0] == account_ledger_key_xdr(SOURCE_G)
+            {
+                std::time::Duration::from_millis(300)
+            } else {
+                std::time::Duration::ZERO
+            };
+            sep29_response(
+                request,
+                &body,
+                &crate::common::EndpointNetwork::testnet().result(),
+                false,
+            )
+            .set_delay(delay)
+        })
+        .mount(&primary)
+        .await;
+    let oracle = sep29_endpoint(
+        crate::common::EndpointNetwork::testnet().result(),
+        std::time::Duration::from_millis(600),
+        std::time::Duration::ZERO,
+        false,
+    )
+    .await;
+    let server = sep29_server(&primary, Some(&oracle.uri()));
+    let started = std::time::Instant::now();
+    let result = server
+        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
+        .await
+        .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    let (code, message, _) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "network.rpc_divergence");
+    assert!(!message.contains("action deadline exhausted"));
+    assert!(
+        message.starts_with("SEP-29 oracle_provider_url endpoint identity failed"),
+        "{message}"
+    );
+    assert_eq!(
+        crate::common::received_methods(&primary).await,
+        ["getNetwork", "getLedgerEntries", "getLedgerEntries"]
+    );
+    assert_eq!(
+        crate::common::received_methods(&oracle).await,
+        ["getNetwork"]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn simulate_sep29_skips_oracle_with_memo_or_without_url() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    install_test_nonce_key(241);
+    let primary = sep29_primary().await;
+    let oracle = sep29_endpoint(
+        crate::common::EndpointNetwork::reporting("Alien").result(),
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        false,
+    )
+    .await;
+    for url in [
+        oracle.uri(),
+        "http://127.0.0.1:1".into(),
+        "mailto:operator@example.com".into(),
+    ] {
+        let server = sep29_server(&primary, Some(&url));
+        let mut args = simulate_args_on("stellar:testnet", None);
+        args.memo_text = Some("memo".try_into().unwrap());
+        let (result, built) = crate::common::clients_built_by(server.call_stellar_pay(args)).await;
+        let result = result.unwrap();
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "{:?}",
+            call_result_json(&result)
+        );
+        assert_eq!(built, 1);
+    }
+    assert!(crate::common::received_methods(&oracle).await.is_empty());
+    let primary = sep29_endpoint(
+        crate::common::EndpointNetwork::testnet().result(),
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        true,
+    )
+    .await;
+    let result = sep29_server(&primary, None)
+        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::common::assert_business_envelope(&result).0,
+        "validation.memo_required"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn simulate_sep29_oracle_identity_errors_do_not_echo_secrets() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    let primary = sep29_primary().await;
+    for passphrase in [
+        "PRIVATE_PASSPHRASE_SENTINEL",
+        concat!(
+            "https://USER_SENTINEL:PASS_SENTINEL@oracle.example/",
+            "PATH_SENTINEL?QUERY_SENTINEL#FRAGMENT_SENTINEL",
+        ),
+    ] {
+        let oracle = sep29_endpoint(
+            crate::common::EndpointNetwork::reporting(passphrase).result(),
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            false,
+        )
+        .await;
+        let server = sep29_server(&primary, Some(&oracle.uri()));
+        let capture = CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let result = server
+            .call_stellar_pay(simulate_args_on("stellar:testnet", None))
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        let (code, _, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, "network.rpc_divergence");
+        assert!(!text.contains("SENTINEL"), "{text}");
+        assert!(!capture.captured_str().contains("SENTINEL"));
+        assert_eq!(
+            crate::common::received_methods(&oracle).await,
+            ["getNetwork"]
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn simulate_sep29_still_detects_memo_disagreement() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    let primary = sep29_primary().await;
+    let oracle = sep29_endpoint(
+        crate::common::EndpointNetwork::testnet().result(),
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        true,
+    )
+    .await;
+    let server = sep29_server(
+        &primary,
+        Some(&oracle.uri().replace("127.0.0.1", "localhost")),
+    );
+    let result = server
+        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
+        .await
+        .unwrap();
+    let (code, message, _) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "network.rpc_divergence");
+    assert!(message.contains("SEP-29 config.memo_required"));
+    assert_eq!(
+        crate::common::received_methods(&oracle).await,
+        ["getNetwork", "getLedgerEntries"]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_oracle_identity_refusal_blocks_rebuild() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    install_test_nonce_key(242);
+    let seed = [0x72; 32];
+    let primary = round_trip_endpoint(seed, crate::common::EndpointNetwork::testnet()).await;
+    let identity = crate::common::EndpointNetwork::testnet();
+    let oracle = round_trip_endpoint(seed, identity.clone()).await;
+    let server = sep29_server(
+        &primary,
+        Some(&oracle.uri().replace("127.0.0.1", "localhost")),
+    );
+    let args = pay_args(&gstrkey_for_seed(seed), "20000000000");
+    let simulated = server.call_stellar_pay(args.clone()).await.unwrap();
+    let commit = simulated_commit_args(&simulated, &args);
+    let before = crate::common::received_methods(&oracle).await.len();
+    identity.set("PRIVATE_PASSPHRASE_SENTINEL");
+    let result = server
+        .call_stellar_pay_commit(commit.clone())
+        .await
+        .unwrap();
+    let (code, message, _) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "simulation.divergence");
+    assert!(message.contains("oracle_provider_url endpoint identity failed"));
+    assert!(!message.contains("PRIVATE_PASSPHRASE_SENTINEL"));
+    assert_eq!(
+        &crate::common::received_methods(&oracle).await[before..],
+        ["getNetwork"]
+    );
+    assert!(
+        !crate::common::received_methods(&primary)
+            .await
+            .iter()
+            .any(|method| method == "sendTransaction")
+    );
+    identity.set(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE);
+    let result = server.call_stellar_pay_commit(commit).await.unwrap();
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        call_result_json(&result)
+    );
 }

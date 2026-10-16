@@ -62,6 +62,7 @@ RPC URL flags refuse credentials. Configure credentialed endpoints in the profil
 
 Smart-account rule commands use the effective secondary for cross-RPC checks. `smart-account multicall` requires a secondary endpoint.
 The signers manager and timelock commands use the primary when no secondary is configured.
+A configured mainnet secondary requires `providers.secondary` and a host distinct from the primary; the fallback provides no independent provider.
 `balances` keeps its testnet endpoint default. Standalone `friendbot` derives its endpoint from its network selector.
 `fees stats --profile` applies the endpoint rules above and keeps its flag allowlist. Without `--profile`, it uses `--rpc-url`, else the testnet endpoint.
 

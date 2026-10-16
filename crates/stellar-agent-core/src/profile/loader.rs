@@ -59,7 +59,9 @@ use figment::{
 
 use super::name::validate_path_component_ascii_safe;
 use super::schema::{
-    MAX_SERVED_PAGE_DISPLAY_NAME_CHARS, Profile, check_endpoint_url, default_audit_log_path_for,
+    MAX_SERVED_PAGE_DISPLAY_NAME_CHARS, Profile, ProviderAttestationError,
+    ProviderAttestationRejection, ProviderRecord, Providers, check_endpoint_url,
+    default_audit_log_path_for, provider_host, same_provider_host,
 };
 pub use super::schema::{default_approval_dir, default_policy_dir, default_profile_dir};
 use crate::profile::caip2::Caip2;
@@ -196,6 +198,7 @@ const OVERLAY_CLASSES: &[(&str, OverlayClass)] = &[
     ("attestation_key_id", OverlayClass::Never),
     ("counterparty_cache_key_id", OverlayClass::Never),
     ("oracle_provider_url", OverlayClass::TestnetOnly),
+    ("providers", OverlayClass::Never),
     ("policy", OverlayClass::Never),
     ("wallet", OverlayClass::Never),
     (
@@ -377,6 +380,16 @@ pub enum ProfileLoadError {
         source: super::schema::EndpointUrlError,
     },
 
+    /// A provider attestation is invalid. The source contains no file values.
+    #[error("profile '{name}': {source}")]
+    InvalidProviderAttestation {
+        /// The profile name supplied by the caller.
+        name: String,
+        /// The field and repair.
+        #[source]
+        source: ProviderAttestationError,
+    },
+
     /// A v2 profile omitted the required `[policy]` TOML section.
     ///
     /// V2 profiles must explicitly choose `engine = "noop"` or `engine = "v1"`
@@ -547,6 +560,12 @@ impl ProfileLoadError {
             Self::MainnetRpcUrlRequired { name } => {
                 ValidationError::MainnetRpcUrlRequired { name: name.clone() }
             }
+            Self::InvalidProviderAttestation { name, source } => {
+                ValidationError::ProviderAttestationInvalid {
+                    name: name.clone(),
+                    source: source.clone(),
+                }
+            }
             _ => ValidationError::ConfigInvalid {
                 component: "profile",
                 reason: crate::observability::redact_path_in_message(&format!(
@@ -580,6 +599,7 @@ impl ProfileLoadError {
             | Self::VersionUnsupported { .. }
             | Self::MainnetRpcUrlRequired { .. }
             | Self::InvalidEndpointUrl { .. }
+            | Self::InvalidProviderAttestation { .. }
             | Self::MissingPolicySection { .. }
             | Self::SignerRefUnreadable { .. }
             | Self::Figment { .. }
@@ -866,6 +886,18 @@ fn load_from_path_with_overlays(
         .transpose()
         .map_err(invalid_endpoint)?;
 
+    let providers = validate_providers(
+        partial.providers.as_ref(),
+        chain_id,
+        &rpc_url,
+        partial.secondary_rpc_url.as_deref(),
+        partial.oracle_provider_url.as_deref(),
+    )
+    .map_err(|source| ProfileLoadError::InvalidProviderAttestation {
+        name: name.to_owned(),
+        source,
+    })?;
+
     let profile = Profile {
         version: partial.version,
         chain_id,
@@ -884,6 +916,7 @@ fn load_from_path_with_overlays(
         attestation_key_id: partial.attestation_key_id,
         counterparty_cache_key_id: partial.counterparty_cache_key_id,
         oracle_provider_url,
+        providers,
         policy,
         wallet: partial.wallet,
         smart_account_max_context_rule_scan_id: partial.smart_account_max_context_rule_scan_id,
@@ -1598,6 +1631,144 @@ struct OnDiskChainId {
     chain_id: Caip2,
 }
 
+struct RoleFields<'a> {
+    role: &'static str,
+    record_field: &'static str,
+    operator_field: &'static str,
+    host_field: &'static str,
+    independence_field: &'static str,
+    url_field: &'static str,
+    url: Option<&'a str>,
+    slot: &'a mut Option<ProviderRecord>,
+}
+
+fn validate_providers(
+    raw: Option<&serde_json::Value>,
+    chain: Caip2,
+    primary_url: &str,
+    secondary_url: Option<&str>,
+    oracle_url: Option<&str>,
+) -> Result<Option<Providers>, ProviderAttestationError> {
+    use ProviderAttestationRejection as Reason;
+    let reject = |field, reason| ProviderAttestationError { field, reason };
+    let table = raw
+        .map(|value| {
+            value
+                .as_object()
+                .ok_or_else(|| reject("providers", Reason::InvalidContainer))
+        })
+        .transpose()?;
+    if let Some(table) = table {
+        if table.contains_key("primary") {
+            return Err(reject("providers.primary", Reason::PrimaryReserved));
+        }
+        if table
+            .keys()
+            .any(|key| !matches!(key.as_str(), "secondary" | "oracle"))
+        {
+            return Err(reject("providers", Reason::InvalidContainer));
+        }
+    }
+    let mut providers = Providers::default();
+    for RoleFields {
+        role,
+        record_field,
+        operator_field,
+        host_field,
+        independence_field,
+        url_field,
+        url,
+        slot,
+    } in [
+        RoleFields {
+            role: "secondary",
+            record_field: "providers.secondary",
+            operator_field: "providers.secondary.operator",
+            host_field: "providers.secondary.host",
+            independence_field: "providers.secondary.independent_of_primary",
+            url_field: "secondary_rpc_url",
+            url: secondary_url,
+            slot: &mut providers.secondary,
+        },
+        RoleFields {
+            role: "oracle",
+            record_field: "providers.oracle",
+            operator_field: "providers.oracle.operator",
+            host_field: "providers.oracle.host",
+            independence_field: "providers.oracle.independent_of_primary",
+            url_field: "oracle_provider_url",
+            url: oracle_url,
+            slot: &mut providers.oracle,
+        },
+    ] {
+        let record = table
+            .and_then(|table| table.get(role))
+            .map(|value| {
+                decode_provider_record(value)
+                    .ok_or_else(|| reject(record_field, Reason::InvalidShape))
+            })
+            .transpose()?;
+        let (record, url) = match (record, url) {
+            (None, None) => continue,
+            (Some(_), None) => return Err(reject(record_field, Reason::UrlRequired { url_field })),
+            (None, Some(_)) if chain.is_mainnet() => {
+                return Err(reject(record_field, Reason::MissingRecord { url_field }));
+            }
+            (None, Some(_)) => continue,
+            (Some(record), Some(url)) => (record, url),
+        };
+        if record.operator.trim().is_empty() {
+            return Err(reject(operator_field, Reason::EmptyOperator));
+        }
+        if !matches!(
+            (normalized_record_host(&record.host), provider_host(url)),
+            (Some(record_host), Some(url_host)) if record_host == url_host
+        ) {
+            return Err(reject(host_field, Reason::HostMismatch { url_field }));
+        }
+        if chain.is_mainnet() && !record.independent_of_primary {
+            return Err(reject(independence_field, Reason::IndependenceRequired));
+        }
+        if record.independent_of_primary && same_provider_host(url, primary_url) {
+            return Err(reject(url_field, Reason::SamePrimaryHost { record_field }));
+        }
+        *slot = Some(record);
+    }
+    Ok(raw.map(|_| providers))
+}
+
+// Decode each member without carrying serde's input-bearing diagnostics.
+fn decode_provider_record(value: &serde_json::Value) -> Option<ProviderRecord> {
+    let table = value.as_object()?;
+    if table
+        .keys()
+        .any(|key| !matches!(key.as_str(), "operator" | "host" | "independent_of_primary"))
+    {
+        return None;
+    }
+    Some(ProviderRecord {
+        operator: match table.get("operator") {
+            Some(value) => value.as_str()?.to_owned(),
+            None => String::new(),
+        },
+        host: match table.get("host") {
+            Some(value) => value.as_str()?.to_owned(),
+            None => String::new(),
+        },
+        independent_of_primary: match table.get("independent_of_primary") {
+            Some(value) => value.as_bool()?,
+            None => false,
+        },
+    })
+}
+
+fn normalized_record_host(raw: &str) -> Option<String> {
+    // Host parsing preserves bracketed IPv6 and rejects URL components.
+    let host = url::Host::parse(raw).ok()?.to_string();
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    (!host.is_empty()).then(|| host.to_owned())
+}
+
 /// Partial profile with optional fields that have derived defaults.
 ///
 /// `audit_log_path` is optional in the TOML and resolves from OS conventions
@@ -1637,6 +1808,8 @@ struct PartialProfile {
     counterparty_cache_key_id: super::schema::KeyringEntryRef,
     #[serde(default)]
     oracle_provider_url: Option<String>,
+    #[serde(default)]
+    providers: Option<serde_json::Value>,
     policy: Option<super::schema::PolicyConfig>,
     #[serde(default)]
     wallet: super::schema::WalletConfig,
@@ -1708,6 +1881,7 @@ partial_profile_fields!(
     attestation_key_id,
     counterparty_cache_key_id,
     oracle_provider_url,
+    providers,
     policy,
     wallet,
     smart_account_max_context_rule_scan_id,
@@ -1755,6 +1929,13 @@ mod tests {
     /// match already forces the classification decision at compile time.
     fn one_of_every_variant() -> Vec<ProfileLoadError> {
         vec![
+            ProfileLoadError::InvalidProviderAttestation {
+                name: "p".into(),
+                source: ProviderAttestationError {
+                    field: "providers",
+                    reason: ProviderAttestationRejection::InvalidContainer,
+                },
+            },
             ProfileLoadError::NonOverlayableField { field: "chain_id" },
             ProfileLoadError::OverlayMayOnlyTighten {
                 field: "mcp_disabled",
@@ -2213,6 +2394,7 @@ mod tests {
     fn never_overlays() -> Vec<(&'static str, serde_json::Value)> {
         let coordinate = serde_json::json!({"service": "overlay-svc", "account": "overlay"});
         vec![
+            ("providers", serde_json::json!({})),
             ("version", serde_json::json!(2)),
             ("mcp_nonce_key_alias", coordinate.clone()),
             ("audit_log_path", serde_json::json!("/tmp/overlay.jsonl")),
@@ -2560,6 +2742,9 @@ mod tests {
                 ProfileLoadError::NotFound { .. } => "validation.profile_not_found",
                 ProfileLoadError::MainnetRpcUrlRequired { .. } => {
                     "validation.mainnet_rpc_url_required"
+                }
+                ProfileLoadError::InvalidProviderAttestation { .. } => {
+                    "validation.provider_attestation_invalid"
                 }
                 _ => "validation.config_invalid",
             };
@@ -2924,7 +3109,15 @@ account = "default"
             secondary_rpc_url: Some("https://secondary.example.invalid"),
             oracle_provider_url: Some("https://oracle.example.invalid/"),
         };
-        let (dir, name) = write_profile(&endpoint_toml("stellar:mainnet", endpoints));
+        let mut file = endpoint_toml("stellar:mainnet", endpoints);
+        file.push_str(
+            &toml::to_string(&serde_json::json!({"providers": {
+                "secondary": provider_record("secondary.example.invalid", true),
+                "oracle": provider_record("oracle.example.invalid", true)
+            }}))
+            .unwrap(),
+        );
+        let (dir, name) = write_profile(&file);
         let profile = load_from_dir(&name, dir.path(), None).unwrap();
         assert_eq!(profile.rpc_url, "https://127.0.0.1:8443");
         assert_eq!(
@@ -4446,5 +4639,660 @@ account = "a"
             matches!(err, ProfileSaveError::InvalidName { .. }),
             "expected InvalidName from set_pool_state_on_disk, got: {err}"
         );
+    }
+
+    fn provider_record(host: &str, independent: bool) -> serde_json::Value {
+        serde_json::json!({"operator": "Independent organization", "host": host, "independent_of_primary": independent})
+    }
+
+    fn provider_file(
+        chain: &str,
+        primary: &str,
+        secondary: Option<&str>,
+        oracle: Option<&str>,
+        providers: Option<serde_json::Value>,
+    ) -> String {
+        let file = endpoint_toml(
+            chain,
+            Endpoints {
+                rpc_url: Some(primary),
+                secondary_rpc_url: secondary,
+                oracle_provider_url: oracle,
+            },
+        );
+        let mut value: toml::Value = toml::from_str(&file).unwrap();
+        if let Some(providers) = providers {
+            value.as_table_mut().unwrap().insert(
+                "providers".into(),
+                toml::Value::try_from(providers).unwrap(),
+            );
+        }
+        toml::to_string(&value).unwrap()
+    }
+
+    fn load_provider_file(file: &str) -> Result<Profile, ProfileLoadError> {
+        let (dir, name) = write_profile(file);
+        load_from_dir(&name, dir.path(), None)
+    }
+
+    fn role_file(
+        chain: &str,
+        role: &str,
+        url: Option<&str>,
+        record: Option<serde_json::Value>,
+    ) -> String {
+        provider_file(
+            chain,
+            "https://primary.example",
+            if role == "secondary" { url } else { None },
+            if role == "oracle" { url } else { None },
+            record.map(|record| serde_json::json!({role: record})),
+        )
+    }
+
+    fn assert_provider_refusal(file: &str, field: &str, reason: ProviderAttestationRejection) {
+        let err = load_provider_file(file).unwrap_err();
+        let ProfileLoadError::InvalidProviderAttestation { source, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(source.field, field);
+        assert_eq!(source.reason, reason);
+        assert_eq!(
+            err.disposition(),
+            ProfileLoadDisposition::OperatorCorrectable
+        );
+        let validation = err.to_validation_error("fixture");
+        assert_eq!(validation.code(), "validation.provider_attestation_invalid");
+        assert!(validation.to_string().contains(field));
+        assert!(validation.to_string().contains("profile file"));
+        let wallet: crate::error::WalletError = validation.into();
+        let envelope = crate::envelope::Envelope::<()>::err(&wallet)
+            .to_json_pretty()
+            .unwrap();
+        assert!(envelope.contains("validation.provider_attestation_invalid"));
+        for text in [
+            err.to_string(),
+            format!("{err:?}"),
+            wallet.to_string(),
+            format!("{wallet:?}"),
+            envelope,
+        ] {
+            assert!(!text.contains("SECRET_SENTINEL"), "{text}");
+        }
+    }
+
+    #[test]
+    fn mainnet_provider_records_are_required_per_configured_role() {
+        for (role, field) in [
+            ("secondary", "secondary_rpc_url"),
+            ("oracle", "oracle_provider_url"),
+        ] {
+            assert_provider_refusal(
+                &role_file("stellar:mainnet", role, Some("https://other.example"), None),
+                &format!("providers.{role}"),
+                ProviderAttestationRejection::MissingRecord { url_field: field },
+            );
+        }
+    }
+
+    #[test]
+    fn testnet_missing_provider_records_are_allowed() {
+        for (secondary, oracle) in [
+            (Some("https://primary.example/second"), None),
+            (None, Some("https://primary.example/oracle")),
+            (
+                Some("https://primary.example/second"),
+                Some("https://primary.example/oracle"),
+            ),
+        ] {
+            assert!(
+                load_provider_file(&provider_file(
+                    "stellar:testnet",
+                    "https://primary.example",
+                    secondary,
+                    oracle,
+                    None
+                ))
+                .unwrap()
+                .providers
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn provider_operator_must_name_an_organization() {
+        for chain in ["stellar:testnet", "stellar:mainnet"] {
+            for role in ["secondary", "oracle"] {
+                for operator in [None, Some(""), Some(" \t\n")] {
+                    let mut record = provider_record("other.example", true);
+                    record.as_object_mut().unwrap().remove("operator");
+                    if let Some(operator) = operator {
+                        record["operator"] = operator.into();
+                    }
+                    assert_provider_refusal(
+                        &role_file(chain, role, Some("https://other.example"), Some(record)),
+                        &format!("providers.{role}.operator"),
+                        ProviderAttestationRejection::EmptyOperator,
+                    );
+                }
+                let mut record = provider_record("other.example", true);
+                record["operator"] = "  Meaningful organization  ".into();
+                let loaded = load_provider_file(&role_file(
+                    chain,
+                    role,
+                    Some("https://other.example"),
+                    Some(record),
+                ))
+                .unwrap();
+                let providers = loaded.providers.unwrap();
+                let record = if role == "secondary" {
+                    providers.secondary
+                } else {
+                    providers.oracle
+                }
+                .unwrap();
+                assert_eq!(record.operator, "  Meaningful organization  ");
+            }
+        }
+    }
+
+    #[test]
+    fn provider_host_must_match_exactly() {
+        for chain in ["stellar:testnet", "stellar:mainnet"] {
+            for (role, url_field) in [
+                ("secondary", "secondary_rpc_url"),
+                ("oracle", "oracle_provider_url"),
+            ] {
+                for (url, host) in [
+                    ("https://other.example", "OTHER.Example"),
+                    ("https://other.example", "other.example."),
+                    ("https://xn--bcher-kva.example", "BÜCHER.Example"),
+                    ("https://127.0.0.1", "127.1"),
+                    ("https://[2001:db8::1]", "[2001:0DB8::1]"),
+                ] {
+                    let loaded = load_provider_file(&role_file(
+                        chain,
+                        role,
+                        Some(url),
+                        Some(provider_record(host, true)),
+                    ))
+                    .unwrap();
+                    let providers = loaded.providers.unwrap();
+                    let record = if role == "secondary" {
+                        providers.secondary
+                    } else {
+                        providers.oracle
+                    }
+                    .unwrap();
+                    assert_eq!(record.host, host);
+                }
+                for host in [
+                    Some("stale.example"),
+                    Some("other.example:443"),
+                    Some("https://other.example"),
+                    Some("other.example/path"),
+                    Some("user@other.example"),
+                    Some(" other.example"),
+                    Some("other.example\t"),
+                    Some(""),
+                    None,
+                ] {
+                    let mut record = provider_record(host.unwrap_or_default(), true);
+                    if host.is_none() {
+                        record.as_object_mut().unwrap().remove("host");
+                    }
+                    assert_provider_refusal(
+                        &role_file(chain, role, Some("https://other.example"), Some(record)),
+                        &format!("providers.{role}.host"),
+                        ProviderAttestationRejection::HostMismatch { url_field },
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_host_requires_two_usable_hosts() {
+        for chain in ["stellar:testnet", "stellar:mainnet"] {
+            for (role, url_field) in [
+                ("secondary", "secondary_rpc_url"),
+                ("oracle", "oracle_provider_url"),
+            ] {
+                for host in ["", ".", "::1", "a b", "example.com"] {
+                    assert_provider_refusal(
+                        &role_file(
+                            chain,
+                            role,
+                            Some("https://./"),
+                            Some(provider_record(host, true)),
+                        ),
+                        &format!("providers.{role}.host"),
+                        ProviderAttestationRejection::HostMismatch { url_field },
+                    );
+                }
+            }
+        }
+        assert_provider_refusal(
+            &provider_file(
+                "stellar:mainnet",
+                "https://./",
+                Some("https://./"),
+                None,
+                Some(serde_json::json!({"secondary": provider_record(".", true)})),
+            ),
+            "providers.secondary.host",
+            ProviderAttestationRejection::HostMismatch {
+                url_field: "secondary_rpc_url",
+            },
+        );
+    }
+
+    #[test]
+    fn mainnet_provider_independence_must_be_true() {
+        for role in ["secondary", "oracle"] {
+            for omitted in [false, true] {
+                let mut record = provider_record("primary.example", false);
+                if omitted {
+                    record
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("independent_of_primary");
+                }
+                assert_provider_refusal(
+                    &role_file(
+                        "stellar:mainnet",
+                        role,
+                        Some("https://primary.example"),
+                        Some(record),
+                    ),
+                    &format!("providers.{role}.independent_of_primary"),
+                    ProviderAttestationRejection::IndependenceRequired,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn testnet_provider_independence_may_be_false() {
+        for role in ["secondary", "oracle"] {
+            for omitted in [false, true] {
+                let mut record = provider_record("primary.example", false);
+                if omitted {
+                    record
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("independent_of_primary");
+                }
+                assert!(
+                    load_provider_file(&role_file(
+                        "stellar:testnet",
+                        role,
+                        Some("https://primary.example"),
+                        Some(record)
+                    ))
+                    .is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mainnet_provider_must_differ_from_primary() {
+        for (role, field, record_field) in [
+            ("secondary", "secondary_rpc_url", "providers.secondary"),
+            ("oracle", "oracle_provider_url", "providers.oracle"),
+        ] {
+            for (primary, other, host) in [
+                (
+                    "https://PRIMARY.example.",
+                    "https://primary.example:8443/path?key=SECRET_SENTINEL#fragment",
+                    "primary.example",
+                ),
+                ("https://127.1", "https://127.0.0.1", "127.0.0.1"),
+            ] {
+                let file = role_file(
+                    "stellar:mainnet",
+                    role,
+                    Some(other),
+                    Some(provider_record(host, true)),
+                )
+                .replace("https://primary.example\"", &format!("{primary}\""));
+                assert_provider_refusal(
+                    &file,
+                    field,
+                    ProviderAttestationRejection::SamePrimaryHost { record_field },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_true_attestation_refuses_on_the_primary_host() {
+        for chain in ["stellar:testnet", "stellar:mainnet"] {
+            for (role, field, record_field) in [
+                ("secondary", "secondary_rpc_url", "providers.secondary"),
+                ("oracle", "oracle_provider_url", "providers.oracle"),
+            ] {
+                assert_provider_refusal(
+                    &role_file(
+                        chain,
+                        role,
+                        Some("https://primary.example/other"),
+                        Some(provider_record("PRIMARY.EXAMPLE.", true)),
+                    ),
+                    field,
+                    ProviderAttestationRejection::SamePrimaryHost { record_field },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_records_accept_distinct_hosts() {
+        for chain in ["stellar:testnet", "stellar:mainnet"] {
+            for role in ["secondary", "oracle"] {
+                for host in ["other.example", "child.primary.example"] {
+                    assert!(
+                        load_provider_file(&role_file(
+                            chain,
+                            role,
+                            Some(&format!("https://{host}")),
+                            Some(provider_record(host, true))
+                        ))
+                        .is_ok()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn secondary_and_oracle_may_share_a_provider() {
+        for chain in ["stellar:testnet", "stellar:mainnet"] {
+            let record = provider_record("shared.example", true);
+            assert!(
+                load_provider_file(&provider_file(
+                    chain,
+                    "https://primary.example",
+                    Some("https://shared.example/secondary"),
+                    Some("https://shared.example/oracle"),
+                    Some(serde_json::json!({"secondary": record, "oracle": record}))
+                ))
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn provider_url_absence_stays_optional() {
+        for chain in ["stellar:testnet", "stellar:mainnet"] {
+            for providers in [None, Some(serde_json::json!({}))] {
+                assert!(
+                    load_provider_file(&provider_file(
+                        chain,
+                        "https://primary.example",
+                        None,
+                        None,
+                        providers
+                    ))
+                    .is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_record_requires_its_url() {
+        for chain in ["stellar:testnet", "stellar:mainnet"] {
+            for (role, url_field) in [
+                ("secondary", "secondary_rpc_url"),
+                ("oracle", "oracle_provider_url"),
+            ] {
+                assert_provider_refusal(
+                    &role_file(
+                        chain,
+                        role,
+                        None,
+                        Some(provider_record("other.example", true)),
+                    ),
+                    &format!("providers.{role}"),
+                    ProviderAttestationRejection::UrlRequired { url_field },
+                );
+                assert!(load_provider_file(&role_file(chain, role, None, None)).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn provider_primary_is_reserved() {
+        for chain in ["stellar:testnet", "stellar:mainnet"] {
+            for record in [
+                serde_json::json!({}),
+                serde_json::json!({"SECRET_SENTINEL": "SECRET_SENTINEL"}),
+                serde_json::json!("SECRET_SENTINEL"),
+            ] {
+                assert_provider_refusal(
+                    &provider_file(
+                        chain,
+                        "https://primary.example",
+                        None,
+                        None,
+                        Some(serde_json::json!({"primary": record})),
+                    ),
+                    "providers.primary",
+                    ProviderAttestationRejection::PrimaryReserved,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_shape_errors_name_fields_without_values() {
+        for chain in ["stellar:testnet", "stellar:mainnet"] {
+            for value in [
+                serde_json::json!("SECRET_SENTINEL"),
+                serde_json::json!(false),
+                serde_json::json!(["SECRET_SENTINEL"]),
+                serde_json::json!({"SECRET_SENTINEL": "SECRET_SENTINEL"}),
+            ] {
+                assert_provider_refusal(
+                    &provider_file(chain, "https://primary.example", None, None, Some(value)),
+                    "providers",
+                    ProviderAttestationRejection::InvalidContainer,
+                );
+            }
+            for role in ["secondary", "oracle"] {
+                for record in [
+                    serde_json::json!("SECRET_SENTINEL"),
+                    serde_json::json!({"SECRET_SENTINEL": 1}),
+                    serde_json::json!({"operator": 1}),
+                    serde_json::json!({"host": ["SECRET_SENTINEL"]}),
+                    serde_json::json!({"independent_of_primary": "SECRET_SENTINEL"}),
+                ] {
+                    assert_provider_refusal(
+                        &role_file(
+                            chain,
+                            role,
+                            Some("https://other.example/SECRET_SENTINEL"),
+                            Some(record),
+                        ),
+                        &format!("providers.{role}"),
+                        ProviderAttestationRejection::InvalidShape,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_checks_follow_endpoint_checks() {
+        let file = provider_file(
+            "stellar:mainnet",
+            "http://primary.example",
+            Some("https://other.example"),
+            None,
+            Some(serde_json::json!({"primary": {}, "secondary": "bad", "oracle": "bad"})),
+        );
+        assert!(matches!(
+            load_provider_file(&file),
+            Err(ProfileLoadError::InvalidEndpointUrl { .. })
+        ));
+        let file = file.replace("http://primary.example", "https://primary.example");
+        assert_provider_refusal(
+            &file,
+            "providers.primary",
+            ProviderAttestationRejection::PrimaryReserved,
+        );
+        let file = provider_file(
+            "stellar:mainnet",
+            "https://primary.example",
+            Some("https://other.example"),
+            Some("https://other.example"),
+            Some(serde_json::json!({"secondary": {}, "oracle": "bad"})),
+        );
+        assert_provider_refusal(
+            &file,
+            "providers.secondary.operator",
+            ProviderAttestationRejection::EmptyOperator,
+        );
+        let file = file.replace(
+            "[providers.secondary]",
+            "[providers.secondary]\noperator = 'Valid'",
+        );
+        assert_provider_refusal(
+            &file,
+            "providers.secondary.host",
+            ProviderAttestationRejection::HostMismatch {
+                url_field: "secondary_rpc_url",
+            },
+        );
+        let file = file.replace(
+            "operator = 'Valid'",
+            "operator = 'Valid'\nhost = 'other.example'",
+        );
+        assert_provider_refusal(
+            &file,
+            "providers.secondary.independent_of_primary",
+            ProviderAttestationRejection::IndependenceRequired,
+        );
+        let file = file.replace(
+            "host = 'other.example'",
+            "host = 'other.example'\nindependent_of_primary = true",
+        );
+        assert_provider_refusal(
+            &file,
+            "providers.oracle",
+            ProviderAttestationRejection::InvalidShape,
+        );
+    }
+
+    #[test]
+    fn provider_errors_preserve_typed_wire_code_and_text() {
+        use ProviderAttestationRejection as R;
+        for reason in [
+            R::InvalidContainer,
+            R::InvalidShape,
+            R::PrimaryReserved,
+            R::UrlRequired {
+                url_field: "oracle_provider_url",
+            },
+            R::MissingRecord {
+                url_field: "oracle_provider_url",
+            },
+            R::EmptyOperator,
+            R::HostMismatch {
+                url_field: "oracle_provider_url",
+            },
+            R::IndependenceRequired,
+            R::SamePrimaryHost {
+                record_field: "providers.oracle",
+            },
+        ] {
+            let source = ProviderAttestationError {
+                field: "providers.oracle",
+                reason,
+            };
+            let error = ProfileLoadError::InvalidProviderAttestation {
+                name: "fixture".into(),
+                source: source.clone(),
+            };
+            let validation = error.to_validation_error("fixture");
+            assert_eq!(validation.code(), "validation.provider_attestation_invalid");
+            assert_eq!(validation.to_string(), error.to_string());
+            assert!(
+                matches!(validation, crate::error::ValidationError::ProviderAttestationInvalid { source: got, .. } if got == source)
+            );
+            assert_eq!(
+                error.disposition(),
+                ProfileLoadDisposition::OperatorCorrectable
+            );
+        }
+    }
+
+    #[test]
+    fn provider_overlays_refuse_on_every_chain() {
+        for chain in ["stellar:testnet", "stellar:mainnet"] {
+            let file = role_file(
+                chain,
+                "oracle",
+                Some("https://other.example"),
+                Some(provider_record("other.example", true)),
+            );
+            for value in [
+                serde_json::json!({}),
+                serde_json::json!("bad"),
+                serde_json::json!({"oracle": provider_record("other.example", true)}),
+                serde_json::json!({"oracle": {"host": "changed.example"}}),
+            ] {
+                assert!(matches!(
+                    provider_load(&file, "providers", value),
+                    Err(ProfileLoadError::NonOverlayableField { field: "providers" })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn testnet_url_overlay_revalidates_provider_host() {
+        for (role, field) in [
+            ("secondary", "secondary_rpc_url"),
+            ("oracle", "oracle_provider_url"),
+        ] {
+            let file = role_file(
+                "stellar:testnet",
+                role,
+                Some("https://other.example"),
+                Some(provider_record("other.example", true)),
+            );
+            assert!(
+                provider_load(
+                    &file,
+                    field,
+                    serde_json::json!("https://other.example/path")
+                )
+                .is_ok()
+            );
+            assert!(matches!(
+                provider_load(&file, "rpc_url", serde_json::json!("https://other.example")),
+                Err(ProfileLoadError::InvalidProviderAttestation {
+                    source: ProviderAttestationError {
+                        reason: ProviderAttestationRejection::SamePrimaryHost { .. },
+                        ..
+                    },
+                    ..
+                })
+            ));
+            assert!(matches!(
+                provider_load(&file, field, serde_json::json!("https://changed.example")),
+                Err(ProfileLoadError::InvalidProviderAttestation {
+                    source: ProviderAttestationError {
+                        reason: ProviderAttestationRejection::HostMismatch { .. },
+                        ..
+                    },
+                    ..
+                })
+            ));
+        }
     }
 }

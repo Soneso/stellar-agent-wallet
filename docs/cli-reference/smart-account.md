@@ -857,7 +857,7 @@ stellar-agent smart-account unregister-multicall --network testnet
 
 Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelock contract. The signer must hold the appropriate timelock role for each write verb. All four share `--timelock <C_STRKEY>` (required), `--rpc-url`, `--secondary-rpc-url`, `--network`, and `--profile`; the write verbs add the signer-source group. The write verbs (`schedule`, `cancel`, `execute`) structurally refuse `mainnet`; `list-pending` is read-only and accepts `mainnet`.
 
-Without `--secondary-rpc-url`, the profile secondary applies. The timelock manager uses the primary when neither source supplies a secondary.
+Without `--secondary-rpc-url`, the profile secondary applies. A configured mainnet secondary requires its provider attestation and a host distinct from the primary. If neither source supplies a secondary, timelock uses the primary.
 
 #### `smart-account timelock schedule`
 

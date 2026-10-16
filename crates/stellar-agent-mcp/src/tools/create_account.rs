@@ -1001,7 +1001,7 @@ impl WalletServer {
 
             if let Err(result) = high_value_cross_check(
                 &self.profile,
-                &self.context.rpc_url,
+                &self.context,
                 &rebuilt_envelope_xdr,
                 &args.source,
                 asset_is_native,

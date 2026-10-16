@@ -126,7 +126,7 @@ sha2 = { workspace = true }
 # manager calls.
 uuid = { workspace = true }
 
-# URL parsing for same-endpoint cross-check diagnostics.
+# URL parsing for secondary override validation in server.rs.
 url = { workspace = true }
 
 # Codec framing for the bounded max-line transport (FramedRead / FramedWrite).

@@ -385,6 +385,7 @@ fn migrate_v1_to_v2(profile_name: &str, v1: PartialV1Profile) -> Result<Profile,
         counterparty_cache_key_id: KeyringEntryRef::default_counterparty_key(profile_name),
         policy_window_state_key_id: KeyringEntryRef::default_policy_window_state_key(profile_name),
         oracle_provider_url: None,
+        providers: None,
         policy: PolicyConfig {
             engine: PolicyEngineKind::Noop,
         },
@@ -824,5 +825,31 @@ account = "a"
             matches!(err, MigrateError::UnknownVersion { found: 99, .. }),
             "expected UnknownVersion, got {err:?}"
         );
+    }
+
+    #[test]
+    fn migration_leaves_provider_records_absent() {
+        for chain in ["stellar:testnet", "stellar:mainnet"] {
+            let dir = tempfile::tempdir().unwrap();
+            let name = write_v1_toml(dir.path(), "provider-migration");
+            let path = dir.path().join(format!("{name}.toml"));
+            let file = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("stellar:testnet", chain)
+                .replace(
+                    "version = 1",
+                    "version = 1\nrpc_url = 'https://primary.example'",
+                );
+            std::fs::write(&path, file).unwrap();
+            migrate(&name, dir.path()).unwrap();
+            let file = std::fs::read_to_string(&path).unwrap();
+            assert!(!file.contains("providers"));
+            assert!(
+                load_from_dir(&name, dir.path(), None)
+                    .unwrap()
+                    .providers
+                    .is_none()
+            );
+        }
     }
 }

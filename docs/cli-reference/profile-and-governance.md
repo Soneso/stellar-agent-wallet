@@ -91,7 +91,7 @@ Read-only. Loads the named profile (applying any environment-variable overlays) 
 
 - `<NAME>` (positional) or `--profile <NAME>` — the profile to display. Supply exactly one; supplying both, or neither, is a usage error.
 
-Exits `1` with `validation.profile_not_found` when the profile does not exist. A mainnet file without `rpc_url` exits with `validation.mainnet_rpc_url_required`. An endpoint URL that breaks the endpoint rule (see [Loader source order](../profiles.md#loader-source-order)), an unsupported schema version, or another unreadable file exits with `validation.config_invalid`.
+Exits `1` with `validation.profile_not_found` when the profile does not exist. A mainnet file without `rpc_url` exits with `validation.mainnet_rpc_url_required`. An invalid provider attestation exits with `validation.provider_attestation_invalid`; correct the named field in the profile file. An endpoint URL that breaks the endpoint rule (see [Loader source order](../profiles.md#loader-source-order)), an unsupported schema version, or another unreadable file exits with `validation.config_invalid`.
 
 ### `profile migrate <NAME>`
 
