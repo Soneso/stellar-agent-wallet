@@ -20,6 +20,8 @@ mod endpoint_identity_ordering;
 mod fresh_v1_ceremony;
 #[path = "cli/keyring_classification_discipline.rs"]
 mod keyring_classification_discipline;
+#[path = "cli/mpp_authorize_preview_parity.rs"]
+mod mpp_authorize_preview_parity;
 #[path = "cli/mpp_first_run_vs_unavailable_state.rs"]
 mod mpp_first_run_vs_unavailable_state;
 #[path = "cli/multicall_policy.rs"]
