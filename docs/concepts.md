@@ -20,7 +20,7 @@ An AI agent calls wallet tools on its own initiative. The model does not assume 
   Synthesis applies when no profile is named and no `default.toml` exists.
 - **Key custody** keeps the signing seed out of the agent's reach: it lives in the platform keyring and is only briefly resident in pinned memory.
 
-A fifth control addresses a different risk — not what the agent decides, but which tool definitions it may load. **Toolsets** package third-party or untrusted tool definitions behind capability isolation: a toolset installs only after publisher-signature and hash verification, and a structural boundary keeps it from reaching a signing tool it was not granted. Where the four controls above constrain each action, toolsets constrain the surface an agent can act through. See [Toolsets](toolsets.md).
+A fifth control addresses a different risk: which tool definitions the agent may load. **Toolsets** package third-party or untrusted tool definitions behind capability isolation: a toolset installs only after publisher-signature and hash verification, and a structural boundary keeps it from reaching a signing tool it was not granted. Where the four controls above constrain each action, toolsets constrain the surface an agent can act through. See [Toolsets](toolsets.md).
 
 Two structural rules apply across all surfaces in this alpha. The default network is `stellar:testnet`: a command with no named profile and no `default.toml` runs on the zero-config testnet profile. Every write or signing command refuses `stellar:mainnet` with wire code `network.mainnet_write_forbidden`, except MPP, which refuses with `mpp.network_forbidden`. The transaction and smart-account write commands, `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init` refuse a mainnet profile before any RPC call or signer access. The MCP DeFi, sign-and-submit, commit, and rule-commit tools refuse it at entry, before the policy gate and any RPC request. At the submit layer, a declared mainnet network passphrase and a known mainnet RPC URL are each refused at zero RPC cost. Beyond those two, the submit layer asks the endpoint which network it serves and treats that answer as authoritative. Every signature on the envelope must verify under it, so an envelope signed for one network cannot be relayed onto another. `stellar:mainnet` remains accepted for read-only commands.
 
@@ -39,7 +39,7 @@ contract (`accounts deploy-c`), then install rules and signers (`smart-account
 rules`, `smart-account signers`). The agent can then trade or run vault writes
 through the contract.
 
-A handful of commands need neither model directly. `profile`, `credentials`, `approve`, `audit`, `toolsets`, and `counterparty` operate at the profile and operator layer — they configure the wallet, manage the approval spine and audit trail, or resolve counterparty metadata, independent of any single account.
+A handful of commands need neither model directly. `profile`, `credentials`, `approve`, `audit`, `toolsets`, and `counterparty` operate at the profile and operator layer. They configure the wallet, manage the approval spine and audit trail, or resolve counterparty metadata, independent of any single account.
 
 ### Prerequisite map
 
@@ -74,9 +74,9 @@ unlock_ttl_seconds = 30     # default; must be in the range 1–600
 
 Every tool or command invocation is evaluated by the active Policy engine before it does anything. The engine returns one of three decisions:
 
-- **Allow** — the call proceeds.
-- **Deny** — the call is refused, carrying a typed reason.
-- **RequireApproval** — the call is held pending an out-of-band operator approval.
+- **Allow**: the call proceeds.
+- **Deny**: the call is refused, carrying a typed reason.
+- **RequireApproval**: the call is held pending an out-of-band operator approval.
 
 Which engine runs is selected per profile in `[policy]`. `pay`, `claim`,
 sponsored `accounts create`, `trade`, `vault`, `trustline`, and
@@ -122,7 +122,7 @@ profile with `policy.engine_required`, and on mainnet it refuses earlier with
 
 ### V1 engine
 
-The V1 engine evaluates a signed policy document against typed Criteria. The document carries an ed25519 owner signature over its canonical form, produced with `profile sign-policy` and verified against the owner public key enrolled with `profile enroll-owner-key`; an invalid signature, or a signature from a key that was re-enrolled after signing, is rejected. The online agent holds only the owner public key — the seed stays with the operator and is supplied to `sign-policy` at sign time.
+The V1 engine evaluates a signed policy document against typed Criteria. The document carries an ed25519 owner signature over its canonical form, produced with `profile sign-policy` and verified against the owner public key enrolled with `profile enroll-owner-key`; an invalid signature, or a signature from a key that was re-enrolled after signing, is rejected. The online agent holds only the owner public key. The seed stays with the operator and is supplied to `sign-policy` at sign time.
 
 Evaluation is **first-match, default-deny**:
 
@@ -136,7 +136,7 @@ Evaluation is **first-match, default-deny**:
 
 A Criterion is one typed check. The available criteria include per-transaction cap, per-period (windowed) cap, rate limit, counterparty allowlist (by classic account, contract account, asset issuer, or resolved home domain; the `SEP10_IDENTITY` and `ONE_TIME_ADDRESS` kinds are reserved and not yet evaluated), minimum-reserve guard, bundle-level checks for multicall (inner-count cap, aggregate cap, rejection of unrecognized inner shapes), quorum satisfaction, a home-domain-resolved guard (requires the destination's on-chain `home_domain` to have been resolved and cached), and SEP-10 / SEP-45 session-active checks. Criteria that need external state (account reserves, account identity, the counterparty cache, an active session) receive that state as an injected view at the dispatch site; when a required session or cache view is absent, the criterion fails closed rather than passing.
 
-Value criteria size a call through a typed value descriptor derived at the dispatch gate. A rule matching a value-moving tool constrains every debit leg, and per-asset caps aggregate across legs. A matched call whose value cannot be sized — including raw signing tools — denies fail-closed with `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. `minimum_reserve` counts only native-XLM outflow legs. Cap amounts are i128 and cross the wire as decimal strings.
+Value criteria size a call through a typed value descriptor derived at the dispatch gate. A rule matching a value-moving tool constrains every debit leg, and per-asset caps aggregate across legs. A matched call whose value cannot be sized (including raw signing tools) denies fail-closed with `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. `minimum_reserve` counts only native-XLM outflow legs. Cap amounts are i128 and cross the wire as decimal strings.
 
 Each Deny carries a structured reason with a stable wire code. At the MCP boundary, account, strkey, and contract-id fields inside a deny reason are redacted to first-five-last-five characters before they cross the wire.
 
@@ -198,7 +198,7 @@ The length prefixes on the variable fields prevent boundary-collision attacks (t
 
 The MCP commit-path verifier recomputes the tag and compares it in constant time. It collapses the distinct internal outcomes (`Expired`, `NotFound`, `AlreadyAttested`) into the single wire code `policy.approval_required`, so a caller cannot probe which state a nonce is in; the distinction is kept only in internal debug tracing.
 
-The attestation proves that **the keyring holder ran `approve`** — not that a human clicked "yes" in some agent-controlled UI. The agent's own UI is not a trust input; the wallet-controlled `approve` step is.
+The attestation proves that **the keyring holder ran `approve`**, not that a human clicked "yes" in some agent-controlled UI. The agent's own UI is not a trust input; the wallet-controlled `approve` step is.
 
 What an attacker who can write to the store file can and cannot do: deleting a pending entry forces re-approval, which is a denial-of-service nuisance, not a bypass. The attacker cannot forge an attestation, because the HMAC key is in the keyring, not in the file. Rotating the attestation key invalidates all outstanding pending approvals.
 
@@ -250,7 +250,7 @@ Files rotate at a size bound with a fixed number of rotated files retained.
 
 Each entry carries a timestamp, the tool name, the chain id, the **argument key names** (`arg_keys`), the envelope hash, and the nonce id. It also carries the policy decision (`allow` / `deny:<reason>` / `require_approval`), an optional decision reason, a request id, the event kind, and the previous entry's hash. The event kind enumerates tool invocations alongside smart-account lifecycle events (rule changes, signer-set and threshold changes, passkey registration and assertion, multicall, timelock, channel-pool, rotation handoff, and others). Additional kinds record `value_action_submitted` on every confirmed value-moving submit (carrying the gate-sized value legs) and `keyring_key_written` for the key-writing profile commands. `x402_payment_authorized` is written before a signed x402 authorization leaves the wallet in the RPC re-simulation. `x402_authorization_withheld` is written when that payment then fails, paired with the authorized row by its request id. Approval rows (`approval_attested`, `approval_rejected`, and their remote twins) are written before the decision takes effect.
 
-Argument **values are never logged** — only their key names. Strkeys appearing in a decision reason are redacted to first-five-last-five and transaction hashes to first-eight-last-eight; the envelope hash is left intact because it is a SHA-256 digest carrying no user data.
+Argument **values are never logged**: only their key names. Strkeys appearing in a decision reason are redacted to first-five-last-five and transaction hashes to first-eight-last-eight; the envelope hash is left intact because it is a SHA-256 digest carrying no user data.
 
 ### Tamper evidence
 
