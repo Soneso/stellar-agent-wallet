@@ -181,7 +181,7 @@ Payer-side construction and signing of a `PAYMENT-SIGNATURE` payload for the x40
 | `chain_id` | string | yes | CAIP-2; validated against the profile |
 | `address` | string | no | signer G-strkey; must match the active signer if given |
 
-Flow: validate → build SAC transfer → simulate → sign auth entry → write the `x402_payment_authorized` audit row → re-simulate → serialize. The re-simulation sends the signed authorization to the profile's RPC, so the row is written first; if it cannot be written, the tool answers the `audit.*` code and the signature never leaves the wallet. A failure after the row adds an `x402_authorization_withheld` row with the same request id. Returns `{ paymentSignature, payer, asset, amount, payTo, network }` (`paymentSignature` is the standard-base64 `PAYMENT-SIGNATURE` header value; `asset` is the SAC C-strkey; `amount` is the atomic-unit string from `PaymentRequirements`). Errors carry per-variant codes `x402.<reason>` (for example `x402.invalid_payment_required`, `x402.unsupported_scheme`, `x402.rpc_simulate_failed`, `x402.transmit_gate_refused`) in the standard `{ok:false, error:{code, message}, request_id}` envelope with `is_error` set.
+Flow: validate → build SAC transfer → simulate → check the simulated authorization → sign auth entry → write the `x402_payment_authorized` audit row → re-simulate → check the re-simulated authorization → serialize. The re-simulation sends the signed authorization to the profile's RPC, so the row is written first; if it cannot be written, the tool answers the `audit.*` code and the signature never leaves the wallet. A failure after the row adds an `x402_authorization_withheld` row with the same request id. Returns `{ paymentSignature, payer, asset, amount, payTo, network }` (`paymentSignature` is the standard-base64 `PAYMENT-SIGNATURE` header value; `asset` is the SAC C-strkey; `amount` is the atomic-unit string from `PaymentRequirements`). Errors carry per-variant codes `x402.<reason>` (for example `x402.invalid_payment_required`, `x402.unsupported_scheme`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.transmit_gate_refused`) in the standard `{ok:false, error:{code, message}, request_id}` envelope with `is_error` set.
 
 ### `stellar_x402_authenticated_payment`
 
@@ -208,6 +208,7 @@ Read-only. Arg `payment_response` (base64 `PAYMENT-RESPONSE` header value or raw
 - Targets x402 v2, not v3.x.
 - No HTTP retry loop; the host orchestrates the HTTP exchange. The wallet produces the signed payload (and, for the authenticated variant, the Bearer token); it does not submit.
 - `create_payment` validation refuses when `scheme != "exact"`, `network` is not `"stellar:pubnet"`/`"stellar:testnet"`, the x402 `network` passphrase mismatches the profile, `extra.areFeesSponsored != true`, or `amount` cannot be parsed as `i128`.
+- Before signing, `create_payment` refuses a simulation whose authorization is not one unsigned legacy `Address` entry for the payer, with a root invocation equal to the built SAC `transfer` and no nested calls. After the signed re-simulation, it refuses authorization entries other than the signed entry, and a missing or undecodable result.
 
 ## MPP sponsored Stellar charges
 

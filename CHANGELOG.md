@@ -92,6 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   query. Such a URL reaches a CLI or MCP error envelope or a wallet log line as
   host and port. The endpoint field of a network error keeps its scheme, host,
   and port.
+- x402 `create_payment` refuses, before signing, a simulation whose payer
+  authorization differs from the SAC `transfer` it built or carries nested
+  calls. It also refuses a re-simulation that returns authorization entries
+  other than the signed entry.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 
