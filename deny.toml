@@ -3,14 +3,22 @@
 [advisories]
 # Fail on crates with an active security advisory or that have been yanked.
 yanked = "deny"
-# Unmaintained-class advisories (informational, not security vulnerabilities) on
-# deep transitive build-time proc-macro crates pulled by the OpenZeppelin Stellar
-# contract crates (stellar-accounts / stellar-governance) through
-# soroban-sdk -> soroban-env-host -> arkworks. There is no fixed release and no
-# way to drop them without abandoning the on-chain ABI types the smart-account
-# encoding is verified against.
+# Advisories and yanked crates accepted on purpose, each with its rationale.
 ignore = [
+    # Unmaintained-class advisories (informational, not security
+    # vulnerabilities) on deep transitive build-time proc-macro crates pulled by
+    # the OpenZeppelin Stellar contract crates (stellar-accounts /
+    # stellar-governance) through soroban-sdk -> soroban-env-host -> arkworks.
+    # There is no fixed release and no way to drop them without abandoning the
+    # on-chain ABI types the smart-account encoding is verified against.
     "RUSTSEC-2024-0436", # paste: unmaintained
+    # Dependency path: stellar-baselib 0.6.0 -> libsodium-sys-stable -> zip, as
+    # a build dependency. zip runs only in the libsodium-sys-stable build script
+    # on Windows MSVC targets, where it unpacks the prebuilt libsodium archive
+    # after the script verifies its minisign signature against a fixed key. zip
+    # is not linked into the binaries. Remove this entry once a
+    # libsodium-sys-stable release accepts an unyanked zip.
+    { crate = "zip@8.6.0", reason = "Build dependency of libsodium-sys-stable, whose releases accept only the yanked zip 8.x line." },
 ]
 
 [licenses]
