@@ -213,6 +213,8 @@ jobs:
         run: bash .github/scripts/test-publish-crates-verify.sh
       - name: Self-test the crate checksum comparison
         run: python3 .github/scripts/test-compare-crate-sums.py
+      - name: Self-test the coverage floor gate
+        run: python3 .github/scripts/test-check-coverage.py
       - name: Self-test the unsigned archive validation
         run: python3 .github/scripts/test-validate-unsigned-archive.py
       # The runner image documents no PyYAML for its system Python, so the
