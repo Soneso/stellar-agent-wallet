@@ -639,56 +639,25 @@ pub(crate) fn decode_payment_required_input(
 // x402 value-descriptor helpers — shared by both x402 payment tools
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Parses an x402 atomic-unit amount string to a positive `i128`.
+/// Builds the single x402-payment [`ValueLeg`] from `requirements` and the
+/// `amount` that [`stellar_agent_x402::exact::validate_requirements`] returned
+/// for them.
 ///
-/// Mirrors `stellar_agent_x402::exact::create_payment`'s own parse + `> 0`
-/// check byte-for-byte over the SAME immutable `requirements.amount` string, so
-/// the amount the value gate sizes is deterministically identical to the amount
-/// the SAC transfer carries (the single-decode invariant §2.1 for a value that
-/// the signing crate re-parses from the same string).
-///
-/// # Errors
-///
-/// Returns [`stellar_agent_x402::X402Error::AmountConversion`] — the same
-/// variant and detail shape `create_payment` returns — when `amount_str` is not
-/// a valid positive `i128`.
-pub(crate) fn x402_parse_atomic_amount(
-    amount_str: &str,
-) -> Result<i128, stellar_agent_x402::X402Error> {
-    let amount: i128 = amount_str.parse::<i128>().map_err(|e| {
-        stellar_agent_x402::X402Error::AmountConversion {
-            detail: format!("wire amount {amount_str:?} is not a valid i128: {e}"),
-        }
-    })?;
-    if amount <= 0 {
-        return Err(stellar_agent_x402::X402Error::AmountConversion {
-            detail: format!("wire amount must be a positive integer (> 0), got {amount_str}"),
-        });
-    }
-    Ok(amount)
-}
-
-/// Builds the single x402-payment [`ValueLeg`] from `requirements`.
-///
-/// The leg's `amount` is the atomic i128 the SAC transfer carries (via
-/// [`x402_parse_atomic_amount`]); `asset` is `requirements.asset` verbatim (a
-/// SAC C-strkey; the value criteria normalise it) and `destination` is
+/// The leg's `amount` is the atomic `i128` the SAC transfer carries, parsed
+/// once by the validator over the same immutable requirements object the
+/// payment is built from. `asset` is `requirements.asset` verbatim (a SAC
+/// C-strkey; the value criteria normalise it) and `destination` is
 /// `requirements.pay_to` verbatim.
-///
-/// # Errors
-///
-/// Propagates [`stellar_agent_x402::X402Error::AmountConversion`] from
-/// [`x402_parse_atomic_amount`] on a malformed or non-positive amount.
 pub(crate) fn x402_value_leg(
     requirements: &stellar_agent_x402::wire::PaymentRequirements,
-) -> Result<stellar_agent_core::policy::v1::ValueLeg, stellar_agent_x402::X402Error> {
-    let amount = x402_parse_atomic_amount(&requirements.amount)?;
-    Ok(stellar_agent_core::policy::v1::ValueLeg {
+    amount: i128,
+) -> stellar_agent_core::policy::v1::ValueLeg {
+    stellar_agent_core::policy::v1::ValueLeg {
         kind: stellar_agent_core::policy::v1::ActionKind::X402Payment,
         amount: Some(amount),
         asset: Some(requirements.asset.clone()),
         destination: Some(requirements.pay_to.clone()),
-    })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2507,7 +2476,7 @@ mod tests {
             "network": "stellar:testnet",
             "asset": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
             "amount": "1000000",
-            "payTo": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "payTo": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
             "maxTimeoutSeconds": 300,
             "extra": { "areFeesSponsored": true }
         })
@@ -2518,7 +2487,13 @@ mod tests {
     #[test]
     fn x402_value_leg_builds_x402_payment_leg_from_requirements() {
         let requirements = sample_requirements();
-        let leg = x402_value_leg(&requirements).expect("valid requirements must build a leg");
+        let amount = stellar_agent_x402::exact::validate_requirements(
+            &requirements,
+            "Test SDF Network ; September 2015",
+            "https://soroban-testnet.stellar.org",
+        )
+        .expect("the sample requirements are valid");
+        let leg = x402_value_leg(&requirements, amount);
         assert_eq!(
             leg.kind,
             stellar_agent_core::policy::v1::ActionKind::X402Payment
@@ -2528,67 +2503,6 @@ mod tests {
         assert_eq!(
             leg.destination.as_deref(),
             Some(requirements.pay_to.as_str())
-        );
-    }
-
-    #[test]
-    fn x402_value_leg_amount_matches_the_atomic_parse_path() {
-        // The leg's amount is the SAME i128 the SAC transfer carries, derived by
-        // the identical atomic parse over the same immutable requirements.amount.
-        let requirements = sample_requirements();
-        let parsed = x402_parse_atomic_amount(&requirements.amount)
-            .expect("sample amount must parse as a positive i128");
-        let leg = x402_value_leg(&requirements).expect("valid requirements must build a leg");
-        assert_eq!(leg.amount, Some(parsed));
-    }
-
-    #[test]
-    fn x402_parse_atomic_amount_malformed_string_surfaces_amount_conversion_error() {
-        let result = x402_parse_atomic_amount("not-a-number");
-        assert!(
-            matches!(
-                result,
-                Err(stellar_agent_x402::X402Error::AmountConversion { .. })
-            ),
-            "malformed amount must surface AmountConversion, not panic; got {result:?}"
-        );
-    }
-
-    #[test]
-    fn x402_parse_atomic_amount_zero_is_rejected() {
-        let result = x402_parse_atomic_amount("0");
-        assert!(
-            matches!(
-                result,
-                Err(stellar_agent_x402::X402Error::AmountConversion { .. })
-            ),
-            "zero amount must be rejected as AmountConversion; got {result:?}"
-        );
-    }
-
-    #[test]
-    fn x402_parse_atomic_amount_negative_is_rejected() {
-        let result = x402_parse_atomic_amount("-5");
-        assert!(
-            matches!(
-                result,
-                Err(stellar_agent_x402::X402Error::AmountConversion { .. })
-            ),
-            "negative amount must be rejected as AmountConversion; got {result:?}"
-        );
-    }
-
-    #[test]
-    fn x402_value_leg_malformed_amount_surfaces_error_not_panic() {
-        let mut requirements = sample_requirements();
-        requirements.amount = "not-a-number".to_owned();
-        let result = x402_value_leg(&requirements);
-        assert!(
-            matches!(
-                result,
-                Err(stellar_agent_x402::X402Error::AmountConversion { .. })
-            ),
-            "malformed amount must surface AmountConversion, not panic; got {result:?}"
         );
     }
     use stellar_agent_core::policy::v1::{
@@ -5014,7 +4928,13 @@ mod value_descriptor_enumeration {
             }
             "stellar_x402_create_payment" | "stellar_x402_authenticated_payment" => {
                 let requirements = sample_x402_requirements();
-                vec![x402_value_leg(&requirements).expect("valid requirements must build a leg")]
+                let amount = stellar_agent_x402::exact::validate_requirements(
+                    &requirements,
+                    "Test SDF Network ; September 2015",
+                    "https://soroban-testnet.stellar.org",
+                )
+                .expect("valid requirements must build a leg");
+                vec![x402_value_leg(&requirements, amount)]
             }
             "stellar_mpp_charge_prepare" | "stellar_mpp_charge_commit" => sample_mpp_legs(),
             other => panic!("family_b_legs_for: unrecognised family-(b) tool name '{other}'"),

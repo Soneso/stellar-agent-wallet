@@ -238,6 +238,87 @@ async fn get_health_scrubs_the_server_text_from_its_reason() {
     );
 }
 
+/// `simulateTransaction` sends the envelope it was given and no `authMode`,
+/// and a failed call keeps its prefix and only host and port of the echoed
+/// URLs.
+#[tokio::test]
+async fn simulate_wrapper_preserves_request_and_scrubs_transport_errors() {
+    use stellar_xdr::ReadXdr as _;
+
+    let envelope_xdr = SignedTestEnvelope::for_source(SOURCE_SEED)
+        .envelope_xdr()
+        .to_owned();
+    let envelope = stellar_xdr::TransactionEnvelope::from_xdr_base64(
+        &envelope_xdr,
+        stellar_xdr::Limits::none(),
+    )
+    .expect("the fixture envelope decodes");
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "simulateTransaction"})))
+        .respond_with(EchoIdResponder::new(json!({"latestLedger": 4242})))
+        .mount(&server)
+        .await;
+    let answer = StellarRpcClient::new(&server.uri())
+        .unwrap()
+        .simulate_transaction_envelope(&envelope)
+        .await
+        .expect("the endpoint answers the simulation");
+    assert_eq!(
+        answer.latest_ledger, 4242,
+        "the answer is returned as received"
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording is on");
+    let [request] = requests.as_slice() else {
+        panic!("one request, got {}", requests.len());
+    };
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["method"], "simulateTransaction");
+    let params = body["params"]
+        .as_object()
+        .expect("the request carries named parameters");
+    assert_eq!(
+        params
+            .get("transaction")
+            .and_then(serde_json::Value::as_str),
+        Some(envelope_xdr.as_str()),
+        "the envelope is sent unchanged"
+    );
+    assert_eq!(
+        params.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["transaction"],
+        "the request carries no authMode"
+    );
+
+    let endpoint = EchoingEndpoint::start().await;
+    endpoint.mount_error_for_every_method().await;
+    let err = endpoint
+        .client()
+        .simulate_transaction_envelope(&envelope)
+        .await
+        .expect_err("the endpoint answers with an error object");
+    let (url, reason) = unreachable_parts(err);
+    assert_eq!(
+        url,
+        endpoint.server.uri(),
+        "the endpoint keeps its authority"
+    );
+    assert!(
+        reason.starts_with("simulateTransaction failed: "),
+        "the prefix stays: {reason}"
+    );
+    endpoint.assert_scrubbed(&reason);
+    assert!(
+        !reason.contains("http://"),
+        "no scheme survives in the reason: {reason}"
+    );
+}
+
 /// `getTransaction` keeps its prefix and only host and port.
 #[tokio::test]
 async fn get_transaction_status_scrubs_the_server_text_from_its_reason() {

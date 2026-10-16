@@ -2,11 +2,12 @@
 //!
 //! These exercise the request validation that `create_payment` performs before
 //! any RPC contact: scheme, network, mainnet refusal, asset, fee-sponsorship,
-//! and amount checks all reject their input before the RPC client is
-//! constructed. They run under the default `cargo test` with no network access
-//! and no feature flag; the mainnet cases count connections on a loopback
-//! listener. Every case passes a transmit gate that records a call and refuses,
-//! and asserts the gate never ran: no signature exists on these paths.
+//! amount, recipient, and timeout checks all reject their input before the
+//! first request on the caller's client. They run under the default
+//! `cargo test` with no network access and no feature flag; the mainnet cases
+//! count connections on a loopback listener. Every case passes a transmit gate
+//! that records a call and refuses, and asserts the gate never ran: no
+//! signature exists on these paths.
 
 #![allow(
     clippy::unwrap_used,
@@ -18,17 +19,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
+use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::signing::SoftwareSigningKey;
 use stellar_agent_x402::X402Error;
 use stellar_agent_x402::constants::X402_STELLAR_TESTNET;
-use stellar_agent_x402::exact::{AuthorizationToTransmit, create_payment};
-use stellar_agent_x402::wire::PaymentRequirements;
+use stellar_agent_x402::exact::{AuthorizationToTransmit, create_payment, validate_requirements};
+use stellar_agent_x402::wire::{PaymentPayload, PaymentRequirements};
 use zeroize::Zeroizing;
 
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 
-/// Loopback address that is never contacted: every case here returns in step-1
-/// validation before the RPC client is built.
+/// Loopback address that is never contacted: every case here returns in
+/// validation before the first request on the client.
 const UNUSED_RPC_URL: &str = "http://127.0.0.1:1";
 
 /// Native-asset SAC on testnet (a structurally valid C-strkey; never reached).
@@ -57,6 +59,26 @@ fn gate_that_must_not_run(
             detail: "the transmit gate must not run on a validation refusal".to_owned(),
         })
     }
+}
+
+/// Runs `create_payment` on a fresh client for `rpc_url` under
+/// `profile_passphrase`, with a gate that must not run.
+async fn pay(
+    requirements: &PaymentRequirements,
+    rpc_url: &str,
+    profile_passphrase: &str,
+    called: &AtomicBool,
+) -> Result<PaymentPayload, X402Error> {
+    let client = StellarRpcClient::new(rpc_url).unwrap();
+    create_payment(
+        requirements,
+        &dummy_signer(),
+        &client,
+        profile_passphrase,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        gate_that_must_not_run(called),
+    )
+    .await
 }
 
 fn assert_gate_never_ran(called: &AtomicBool) {
@@ -90,14 +112,7 @@ fn requirements_with(
 async fn invalid_scheme_rejected() {
     let req = requirements_with("upto", X402_STELLAR_TESTNET, AMOUNT, true.into());
     let called = AtomicBool::new(false);
-    let r = create_payment(
-        &req,
-        &dummy_signer(),
-        UNUSED_RPC_URL,
-        TESTNET_PASSPHRASE,
-        gate_that_must_not_run(&called),
-    )
-    .await;
+    let r = pay(&req, UNUSED_RPC_URL, TESTNET_PASSPHRASE, &called).await;
     assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::UnsupportedScheme { .. })),
@@ -111,14 +126,7 @@ async fn invalid_scheme_rejected() {
 async fn stellar_mainnet_rejected_as_invalid_x402_network() {
     let req = requirements_with("exact", "stellar:mainnet", AMOUNT, true.into());
     let called = AtomicBool::new(false);
-    let r = create_payment(
-        &req,
-        &dummy_signer(),
-        UNUSED_RPC_URL,
-        TESTNET_PASSPHRASE,
-        gate_that_must_not_run(&called),
-    )
-    .await;
+    let r = pay(&req, UNUSED_RPC_URL, TESTNET_PASSPHRASE, &called).await;
     assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::UnsupportedNetwork { .. })),
@@ -131,12 +139,12 @@ async fn stellar_mainnet_rejected_as_invalid_x402_network() {
 async fn wrong_network_passphrase_rejected() {
     let req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
     let called = AtomicBool::new(false);
-    let r = create_payment(
+    // The mainnet passphrase as the profile's.
+    let r = pay(
         &req,
-        &dummy_signer(),
         UNUSED_RPC_URL,
-        "Public Global Stellar Network ; September 2015", // mainnet passphrase
-        gate_that_must_not_run(&called),
+        "Public Global Stellar Network ; September 2015",
+        &called,
     )
     .await;
     assert_gate_never_ran(&called);
@@ -152,14 +160,7 @@ async fn invalid_asset_address_rejected() {
     let mut req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
     req.asset = "not-a-strkey".to_owned();
     let called = AtomicBool::new(false);
-    let r = create_payment(
-        &req,
-        &dummy_signer(),
-        UNUSED_RPC_URL,
-        TESTNET_PASSPHRASE,
-        gate_that_must_not_run(&called),
-    )
-    .await;
+    let r = pay(&req, UNUSED_RPC_URL, TESTNET_PASSPHRASE, &called).await;
     assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::InvalidAssetAddress { .. })),
@@ -172,14 +173,7 @@ async fn invalid_asset_address_rejected() {
 async fn fees_not_sponsored_rejected() {
     let req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, false.into());
     let called = AtomicBool::new(false);
-    let r = create_payment(
-        &req,
-        &dummy_signer(),
-        UNUSED_RPC_URL,
-        TESTNET_PASSPHRASE,
-        gate_that_must_not_run(&called),
-    )
-    .await;
+    let r = pay(&req, UNUSED_RPC_URL, TESTNET_PASSPHRASE, &called).await;
     assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::FeesNotSponsored)),
@@ -193,14 +187,7 @@ async fn fees_not_sponsored_rejected() {
 async fn fees_sponsored_string_true_rejected() {
     let req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, "true".into());
     let called = AtomicBool::new(false);
-    let r = create_payment(
-        &req,
-        &dummy_signer(),
-        UNUSED_RPC_URL,
-        TESTNET_PASSPHRASE,
-        gate_that_must_not_run(&called),
-    )
-    .await;
+    let r = pay(&req, UNUSED_RPC_URL, TESTNET_PASSPHRASE, &called).await;
     assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::FeesNotSponsored)),
@@ -213,14 +200,7 @@ async fn fees_sponsored_string_true_rejected() {
 async fn amount_zero_rejected() {
     let req = requirements_with("exact", X402_STELLAR_TESTNET, "0", true.into());
     let called = AtomicBool::new(false);
-    let r = create_payment(
-        &req,
-        &dummy_signer(),
-        UNUSED_RPC_URL,
-        TESTNET_PASSPHRASE,
-        gate_that_must_not_run(&called),
-    )
-    .await;
+    let r = pay(&req, UNUSED_RPC_URL, TESTNET_PASSPHRASE, &called).await;
     assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::AmountConversion { .. })),
@@ -233,14 +213,7 @@ async fn amount_zero_rejected() {
 async fn negative_amount_rejected() {
     let req = requirements_with("exact", X402_STELLAR_TESTNET, "-1000000", true.into());
     let called = AtomicBool::new(false);
-    let r = create_payment(
-        &req,
-        &dummy_signer(),
-        UNUSED_RPC_URL,
-        TESTNET_PASSPHRASE,
-        gate_that_must_not_run(&called),
-    )
-    .await;
+    let r = pay(&req, UNUSED_RPC_URL, TESTNET_PASSPHRASE, &called).await;
     assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::AmountConversion { .. })),
@@ -253,19 +226,115 @@ async fn negative_amount_rejected() {
 async fn non_integer_amount_rejected() {
     let req = requirements_with("exact", X402_STELLAR_TESTNET, "1.5", true.into());
     let called = AtomicBool::new(false);
-    let r = create_payment(
-        &req,
-        &dummy_signer(),
-        UNUSED_RPC_URL,
-        TESTNET_PASSPHRASE,
-        gate_that_must_not_run(&called),
-    )
-    .await;
+    let r = pay(&req, UNUSED_RPC_URL, TESTNET_PASSPHRASE, &called).await;
     assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::AmountConversion { .. })),
         "expected AmountConversion for non-integer amount, got {r:?}"
     );
+}
+
+/// A `payTo` that is not a G-, C-, or M-strkey is rejected with
+/// `InvalidRecipientAddress`.
+#[tokio::test]
+async fn invalid_recipient_rejected() {
+    let mut req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
+    req.pay_to = "not-a-strkey".to_owned();
+    let called = AtomicBool::new(false);
+    let r = pay(&req, UNUSED_RPC_URL, TESTNET_PASSPHRASE, &called).await;
+    assert_gate_never_ran(&called);
+    assert!(
+        matches!(r, Err(X402Error::InvalidRecipientAddress { .. })),
+        "expected InvalidRecipientAddress, got {r:?}"
+    );
+}
+
+/// `maxTimeoutSeconds` of zero is rejected with `InvalidPaymentRequired`.
+#[tokio::test]
+async fn zero_max_timeout_rejected() {
+    let mut req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
+    req.max_timeout_seconds = 0;
+    let called = AtomicBool::new(false);
+    let r = pay(&req, UNUSED_RPC_URL, TESTNET_PASSPHRASE, &called).await;
+    assert_gate_never_ran(&called);
+    assert!(
+        matches!(&r, Err(X402Error::InvalidPaymentRequired { detail })
+            if detail == "maxTimeoutSeconds must be at least 1"),
+        "expected InvalidPaymentRequired, got {r:?}"
+    );
+}
+
+/// `validate_requirements` returns the atomic amount of valid requirements,
+/// accepts every recipient form and a timeout above 300 seconds, and refuses
+/// each invalid field with the variant `create_payment` returns for it.
+#[test]
+fn validate_requirements_returns_the_amount_and_names_each_refusal() {
+    let valid = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
+    assert_eq!(
+        validate_requirements(&valid, TESTNET_PASSPHRASE, UNUSED_RPC_URL).unwrap(),
+        1_000_000
+    );
+    let muxed =
+        stellar_strkey::Strkey::MuxedAccountEd25519(stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [0u8; 32],
+            id: 7,
+        })
+        .to_string();
+    for pay_to in [PAYER, NATIVE_SAC_TESTNET, muxed.as_str()] {
+        let mut req = valid.clone();
+        req.pay_to = pay_to.to_owned();
+        assert!(
+            validate_requirements(&req, TESTNET_PASSPHRASE, UNUSED_RPC_URL).is_ok(),
+            "{pay_to}"
+        );
+    }
+    let mut long = valid.clone();
+    long.max_timeout_seconds = u32::MAX;
+    assert!(validate_requirements(&long, TESTNET_PASSPHRASE, UNUSED_RPC_URL).is_ok());
+
+    let wire_code = |edit: &dyn Fn(&mut PaymentRequirements)| {
+        let mut req = valid.clone();
+        edit(&mut req);
+        validate_requirements(&req, TESTNET_PASSPHRASE, UNUSED_RPC_URL)
+            .unwrap_err()
+            .wire_code()
+    };
+    assert_eq!(
+        wire_code(&|r| r.scheme = "upto".to_owned()),
+        "x402.unsupported_scheme"
+    );
+    assert_eq!(
+        wire_code(&|r| r.network = "stellar:mainnet".to_owned()),
+        "x402.unsupported_network"
+    );
+    assert_eq!(
+        wire_code(&|r| r.network = "stellar:pubnet".to_owned()),
+        "x402.network_passphrase_mismatch"
+    );
+    assert_eq!(
+        wire_code(&|r| r.asset = PAYER.to_owned()),
+        "x402.invalid_asset_address"
+    );
+    assert_eq!(
+        wire_code(&|r| r.extra = serde_json::json!({ "areFeesSponsored": "true" })),
+        "x402.fees_not_sponsored"
+    );
+    assert_eq!(
+        wire_code(&|r| r.amount = "0".to_owned()),
+        "x402.amount_conversion"
+    );
+    assert_eq!(
+        wire_code(&|r| r.pay_to = "not-a-strkey".to_owned()),
+        "x402.invalid_recipient_address"
+    );
+    assert_eq!(
+        wire_code(&|r| r.max_timeout_seconds = 0),
+        "x402.invalid_payment_required"
+    );
+    let mainnet_url =
+        validate_requirements(&valid, TESTNET_PASSPHRASE, "https://rpc.pubnet.example.org")
+            .unwrap_err();
+    assert_eq!(mainnet_url.wire_code(), "network.mainnet_write_forbidden");
 }
 
 // ── Mainnet refusal ──────────────────────────────────────────────────────────
@@ -289,14 +358,7 @@ async fn pubnet_requirements_refused_before_signing_and_any_connection() {
         true.into(),
     );
     let called = AtomicBool::new(false);
-    let r = create_payment(
-        &req,
-        &dummy_signer(),
-        &counter.https_uri(),
-        MAINNET_PASSPHRASE,
-        gate_that_must_not_run(&called),
-    )
-    .await;
+    let r = pay(&req, &counter.https_uri(), MAINNET_PASSPHRASE, &called).await;
     assert_gate_never_ran(&called);
     assert!(
         matches!(&r, Err(X402Error::MainnetSigningForbidden { detail })
@@ -322,14 +384,7 @@ async fn mainnet_pattern_rpc_url_refused_before_signing_and_any_connection() {
     let req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
     let rpc_url = format!("{}/pubnet", counter.https_uri());
     let called = AtomicBool::new(false);
-    let r = create_payment(
-        &req,
-        &dummy_signer(),
-        &rpc_url,
-        TESTNET_PASSPHRASE,
-        gate_that_must_not_run(&called),
-    )
-    .await;
+    let r = pay(&req, &rpc_url, TESTNET_PASSPHRASE, &called).await;
     assert_gate_never_ran(&called);
     assert!(
         matches!(r, Err(X402Error::MainnetSigningForbidden { .. })),
@@ -340,4 +395,31 @@ async fn mainnet_pattern_rpc_url_refused_before_signing_and_any_connection() {
         0,
         "a refused mainnet payment must open no connection"
     );
+}
+
+// ── Network spellings ────────────────────────────────────────────────────────
+
+/// The wallet's CAIP-2 `chain_id` and the x402 requirement `network` keep
+/// their own spellings: `stellar:mainnet` is the wallet's mainnet and
+/// `stellar:pubnet` the x402 one, and neither parser accepts the other's.
+#[test]
+fn wallet_chain_and_x402_network_spellings_stay_distinct() {
+    use std::str::FromStr as _;
+
+    use stellar_agent_core::profile::caip2::Caip2;
+    use stellar_agent_x402::constants::x402_network_to_caip2;
+
+    assert_eq!(Caip2::from_str("stellar:testnet").unwrap(), Caip2::Testnet);
+    assert_eq!(Caip2::from_str("stellar:mainnet").unwrap(), Caip2::Mainnet);
+    assert!(Caip2::from_str("stellar:pubnet").is_err());
+
+    assert_eq!(
+        x402_network_to_caip2("stellar:testnet").unwrap(),
+        Caip2::Testnet
+    );
+    assert_eq!(
+        x402_network_to_caip2("stellar:pubnet").unwrap(),
+        Caip2::Mainnet
+    );
+    assert!(x402_network_to_caip2("stellar:mainnet").is_err());
 }

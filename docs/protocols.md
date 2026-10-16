@@ -99,7 +99,7 @@ All write and signing paths are testnet-only in this alpha. Every signing comman
 ### x402 v2 Exact Stellar: payer side
 
 - **Spec:** x402 v2 wire format, Exact Stellar scheme; wire-compatible with the published `@x402/stellar` package.
-- **Capability:** Payer-side construction and signing of a `PAYMENT-SIGNATURE` payload through a validate, build, simulate, sign, re-simulate, finalize flow.
+- **Capability:** Payer-side construction and signing of a `PAYMENT-SIGNATURE` payload through a validate, identify, build, simulate, sign, re-simulate, finalize flow.
 - **Side:** Payer/client only.
 - **Refusals and constraints:**
   - Payer-only; no payee or facilitator logic.
@@ -110,7 +110,17 @@ All write and signing paths are testnet-only in this alpha. Every signing comman
   - Before signing, the first simulation must return exactly one authorization entry. It carries legacy `Address` credentials for the payer, a zero expiration ledger, and no signature.
   - That entry's root invocation must equal the SAC `transfer` the wallet built, contract and every argument included, with no nested calls. Any other answer refuses before signing.
   - The signed re-simulation must return a decodable result whose authorization entries are empty or equal to the signed entry. Any other answer refuses, and no payment payload is returned.
-  - The nonce and the latest ledger come from the configured RPC. The re-simulation's resource data and fee pass structural checks only.
+  - The requirements are validated before any request. The checks cover the scheme, the network and the profile passphrase, the mainnet refusal, and a C-strkey asset. They also cover a strict `areFeesSponsored: true`, a positive amount, a G-, C-, or M-strkey `payTo`, and a `maxTimeoutSeconds` of at least one.
+  - Every request of one payment goes to one client built from the operator's profile. Its first request is `getNetwork`: an endpoint serving another network, reporting mainnet, or not identified before the caller's deadline refuses with its `network.*` code before any simulation.
+  - `maxTimeoutSeconds` is clamped to 300 seconds as input; the requirement names a maximum, so a shorter validity meets it. With the five-second ledger estimate, the clamped value gives a window of `ceil(min(t, 300) / 5)` ledgers, from 1 to 60. The window counts ledger advances, not a guaranteed wall-clock lifetime.
+  - The expiration ledger is the unsigned simulation's latest ledger plus the window; an overflow refuses. A `getHealth` read on the same endpoint must report `healthy`.
+  - The unsigned simulation's ledger is above zero and at most one ledger ahead of the health ledger. The re-simulation's ledger is at most one ledger behind the health ledger. The health and re-simulation ledgers lie before the expiration ledger.
+  - A `maxTimeoutSeconds` of five seconds or less gives a one-ledger window. Such a payment refuses when the endpoint's ledger advances between the simulation and the health read or the re-simulation.
+  - These ledger checks compare answers of one endpoint, not independent evidence of freshness. They bound the signed window at sixty ledger advances plus one ledger of skew between load-balanced backends.
+  - Both simulations' `minResourceFee` lies between 1 and 10,000,000 stroops, and the resource fee their transaction data embeds lies between zero and that minimum. The ceiling is a local sanity bound, separate from any facilitator fee policy.
+  - A restore preamble in either simulation refuses, and so do archived entries in either simulation's transaction data, which mark a restoration inside the simulation. On this path they come from an archived asset contract instance or the archived balance of a contract-address recipient.
+  - The wallet has no restore path, and a restoration made elsewhere unblocks the payment. The reference client checks only the restore preamble; refusing the in-simulation restoration as well is an intentional difference.
+  - The nonce, the resource data, and the fee still come from the configured RPC.
 
 ### x402 SEP-10 counterparty-identity gate
 

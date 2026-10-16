@@ -51,7 +51,7 @@ const PROFILE: &str = "mpp-anchor";
 /// Keyring service holding the payer's secret.
 const SIGNER_SERVICE: &str = "mpp-anchor-svc";
 
-/// Simulation endpoint for the sponsored charge flow.
+/// Simulation endpoint for the sponsored charge flow and the x402 payment flow.
 ///
 /// Answers `simulateTransaction` the way the network does for this charge: the
 /// first call carries no authorization entry and is answered with the one the
@@ -59,6 +59,10 @@ const SIGNER_SERVICE: &str = "mpp-anchor-svc";
 /// no entries at all. The response is derived from the envelope in the request,
 /// so an envelope that stopped matching what the tool built would fail the
 /// caller's own validation rather than be waved through.
+///
+/// The x402 flow also asks `getNetwork` for the endpoint identity and
+/// `getHealth` for the ledger consistency read; both are answered as a healthy
+/// testnet endpoint at the simulations' ledger. Any other method panics.
 struct SponsoredSimulateResponder {
     payer: ScAddress,
     /// Runs when a signed re-simulation arrives, before it is answered.
@@ -99,6 +103,34 @@ impl Respond for SponsoredSimulateResponder {
             .get("id")
             .cloned()
             .unwrap_or_else(|| serde_json::json!(1));
+        let answer = |result: serde_json::Value| {
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": result,
+                }))
+                .insert_header("content-type", "application/json")
+        };
+        match body.get("method").and_then(serde_json::Value::as_str) {
+            Some("getNetwork") => {
+                return answer(serde_json::json!({
+                    "friendbotUrl": "https://friendbot.stellar.org",
+                    "passphrase": "Test SDF Network ; September 2015",
+                    "protocolVersion": 29,
+                }));
+            }
+            Some("getHealth") => {
+                return answer(serde_json::json!({
+                    "status": "healthy",
+                    "latestLedger": 1000,
+                    "oldestLedger": 1,
+                    "ledgerRetentionWindow": 17_280,
+                }));
+            }
+            Some("simulateTransaction") => {}
+            other => panic!("the sponsored flows send no {other:?} request"),
+        }
         let envelope_b64 = body
             .get("params")
             .and_then(|params| params.get("transaction"))

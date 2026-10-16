@@ -562,6 +562,34 @@ that `stellar_sep24_interactive_url` consumes; it has no standalone tool. See
 | `stellar_x402_parse_receipt` | Decode an x402 v2 `PAYMENT-RESPONSE` into a structured settlement receipt. | Read-only; no keyring, no network. No `chain_id`. |
 | `stellar_x402_authenticated_payment` | Run a SEP-10 identity gate against a `home_domain` (stellar.toml, SSRF bind, ephemeral challenge/response, JWT), then construct the `PAYMENT-SIGNATURE`. Any identity failure aborts before payment. | Signs the payment authorization entry; does not submit. |
 
+The `chain_id` argument of both payment tools takes the wallet's spelling,
+`stellar:testnet` or `stellar:mainnet`. The x402 requirement `network` spells
+mainnet `stellar:pubnet`; that spelling is not a valid `chain_id`.
+
+Both payment tools run in this order:
+
+1. A mainnet profile refuses with `network.mainnet_write_forbidden`.
+2. The `payment_required` input is decoded and validated in full. An invalid
+   field answers its own `x402.*` code, such as `x402.invalid_recipient_address`
+   or `x402.invalid_payment_required` for a `maxTimeoutSeconds` of zero. This
+   step consumes no spending window.
+3. The dispatch gate checks `chain_id` and the policy. A `chain_id` mismatch
+   is a JSON-RPC invalid-params error, which invalid requirements never reach.
+4. The audit pre-flight runs, then the SEP-10 gate for the authenticated tool,
+   then the signer load.
+5. The tool builds one RPC client from the profile's `rpc_url`. A URL the
+   transport cannot parse refuses with `network.rpc_unreachable`.
+6. The payment is admitted against the spending window.
+7. The payment is built on that client. Its first request is the endpoint
+   identity check, under the profile's `submit_timeout_seconds` (default 60
+   seconds); `maxTimeoutSeconds` never sets this deadline.
+
+An identity refusal answers `network.endpoint_network_mismatch`,
+`network.endpoint_identity_unavailable`, or `network.mainnet_write_forbidden`
+through both tools. The authenticated tool answers every other build failure
+with `x402.payment_build_failed`. Admission comes before the identity check, so
+a refusal there, or any later failure, keeps the admitted spend.
+
 ### Machine Payments Protocol
 
 MPP is testnet-only, sponsored-pull, and credential-only. The server refuses all

@@ -13,16 +13,15 @@
 //!
 //! # Acceptance criteria
 //!
-//! - `stellar_x402_create_payment` with a known-good USDC-testnet
-//!   `PaymentRequirements` returns `{ paymentSignature, payer, asset, amount,
-//!   payTo, network }`.
-//! - The `paymentSignature` base64-decodes and JSON-parses to a
-//!   `PaymentPayload` with `x402Version == 2`, non-empty `payload.transaction`,
-//!   and the correct `accepted.scheme == "exact"`.
-//! - The `payload.transaction` base64-decodes to a valid
-//!   `TransactionEnvelope` XDR that contains a signed `SorobanAuthorizationEntry`
-//!   (non-empty `credentials.address.signature`).  This proves the
-//!   signed-auth-entry flow through the MCP tool boundary.
+//! - `stellar_x402_create_payment` with a native-SAC `PaymentRequirements`
+//!   paying a distinct funded recipient succeeds and returns, under `data`,
+//!   `{ paymentSignature, payer, asset, amount, payTo, network }`.
+//! - The `paymentSignature` decodes to a `PaymentPayload` with
+//!   `x402Version == 2`. Its transaction carries exactly the payer's signed
+//!   authorization of `transfer(payer, recipient, amount)`. The signature
+//!   verifies, and the expiration lies sixty ledgers after the simulation's.
+//! - The leg records the endpoint protocol and the ledgers `L`, `H`, and
+//!   `R` the payment checked. A build failure fails the leg; it never skips.
 //! - Negative: invalid scheme in `payment_required` returns `isError = true`.
 //! - Negative: `chain_id` mismatch returns `rmcp::ErrorData`.
 //!
@@ -54,8 +53,6 @@ use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::{WalletServer, X402CreatePaymentArgs};
 use stellar_agent_test_support::keyring_mock;
 use stellar_agent_x402::wire::PaymentPayload;
-use stellar_xdr::SorobanAuthorizationEntry;
-use stellar_xdr::{Limits, ReadXdr, SorobanCredentials, TransactionEnvelope};
 use zeroize::Zeroizing;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -181,268 +178,334 @@ fn extract_text(result: rmcp::model::CallToolResult) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Native-SAC payments
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Native-asset Stellar Asset Contract address on testnet. A Friendbot-funded
+/// account always holds native balance here, so a payment needs no trustline.
+const NATIVE_SAC_TESTNET: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+
+/// Atomic amount of the native payment: 0.1 XLM.
+const NATIVE_AMOUNT_STROOPS: u64 = 1_000_000;
+
+/// Signature window of a 300-second requirement, in ledgers.
+const WINDOW_LEDGERS: u64 = 60;
+
+/// `PaymentRequirements` JSON for a native-SAC payment to `pay_to`.
+fn native_requirements(pay_to: &str) -> String {
+    serde_json::json!({
+        "scheme": "exact",
+        "network": "stellar:testnet",
+        "asset": NATIVE_SAC_TESTNET,
+        "amount": NATIVE_AMOUNT_STROOPS.to_string(),
+        "payTo": pay_to,
+        "maxTimeoutSeconds": 300,
+        "extra": { "areFeesSponsored": true }
+    })
+    .to_string()
+}
+
+/// Waits until the endpoint shows `account`; fails when it never does.
+async fn wait_until_visible(account: &str) {
+    let rpc = stellar_agent_network::StellarRpcClient::new(TESTNET_RPC_URL)
+        .expect("RPC client construction");
+    for _ in 0..20 {
+        if stellar_agent_network::fetch_account(&rpc, account, &[])
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    panic!("[UNAVAILABLE] account {account} is not visible on the endpoint");
+}
+
+/// The numeric fields of every `create_payment` event that names the
+/// re-simulation ledger.
+#[derive(Clone, Default)]
+struct LedgerCapture(
+    std::sync::Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, u64>>>>,
+);
+
+struct NumericFields(std::collections::BTreeMap<String, u64>);
+
+impl tracing::field::Visit for NumericFields {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().to_owned(), value);
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LedgerCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "stellar_agent_x402::exact" {
+            return;
+        }
+        let mut fields = NumericFields(std::collections::BTreeMap::new());
+        event.record(&mut fields);
+        if fields.0.contains_key("resimulation_ledger") {
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+}
+
+impl LedgerCapture {
+    /// Captures `create_payment` events on this thread until the guard drops.
+    fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let capture = Self::default();
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        tracing::callsite::rebuild_interest_cache();
+        (capture, guard)
+    }
+
+    /// Checks and records the endpoint protocol and the ledgers of the one
+    /// payment captured, and returns its signature expiration ledger.
+    fn check_and_record(&self, leg: &str) -> u64 {
+        let events = self.0.lock().unwrap();
+        let [fields] = events.as_slice() else {
+            panic!("[{leg}] one payment event, got {}", events.len());
+        };
+        let field = |name: &str| *fields.get(name).unwrap_or_else(|| panic!("{name}"));
+        let (protocol, simulation, health, resimulation, expiration) = (
+            field("protocol_version"),
+            field("simulation_ledger"),
+            field("health_ledger"),
+            field("resimulation_ledger"),
+            field("signature_expiration_ledger"),
+        );
+        eprintln!(
+            "[{leg}] protocol {protocol} L={simulation} H={health} R={resimulation} E={expiration}"
+        );
+        assert!(
+            stellar_agent_network::SUPPORTED_PROTOCOL_VERSIONS
+                .contains(&u32::try_from(protocol).unwrap()),
+            "[{leg}] acceptance evidence needs a supported protocol, got {protocol}"
+        );
+        assert_eq!(expiration, simulation + WINDOW_LEDGERS, "[{leg}]");
+        assert!(simulation > 0 && simulation <= health + 1, "[{leg}]");
+        assert!(health < expiration, "[{leg}]");
+        assert!(
+            health <= resimulation + 1 && resimulation < expiration,
+            "[{leg}]"
+        );
+        expiration
+    }
+}
+
+/// The `PaymentPayload` behind a `paymentSignature` value and the
+/// authorization entries of its transaction.
+fn decode_payment(
+    payment_signature_b64: &str,
+) -> (PaymentPayload, Vec<stellar_xdr::SorobanAuthorizationEntry>) {
+    use base64::Engine as _;
+    let payload_bytes = base64::engine::general_purpose::STANDARD
+        .decode(payment_signature_b64)
+        .expect("paymentSignature must be valid standard base64");
+    let payload: PaymentPayload = serde_json::from_slice(&payload_bytes)
+        .expect("paymentSignature must decode to PaymentPayload JSON");
+    let envelope = <stellar_xdr::TransactionEnvelope as stellar_xdr::ReadXdr>::from_xdr_base64(
+        &payload.payload.transaction,
+        stellar_xdr::Limits::none(),
+    )
+    .expect("payload.transaction must decode to a TransactionEnvelope XDR");
+    let stellar_xdr::TransactionEnvelope::Tx(transaction) = envelope else {
+        panic!("TransactionEnvelope must be Tx (V1)");
+    };
+    let [operation] = transaction.tx.operations.as_slice() else {
+        panic!("the payment carries one operation");
+    };
+    let stellar_xdr::OperationBody::InvokeHostFunction(host) = &operation.body else {
+        panic!("tx operation must be InvokeHostFunction");
+    };
+    (payload, host.auth.to_vec())
+}
+
+/// The `ScAddress` of a G-strkey account.
+fn account_sc_address(account: &str) -> stellar_xdr::ScAddress {
+    let key = stellar_strkey::ed25519::PublicKey::from_string(account).expect("a G-strkey");
+    stellar_xdr::ScAddress::Account(stellar_xdr::AccountId(
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(key.0)),
+    ))
+}
+
+/// Asserts that `entries` is exactly the payer's signed authorization of
+/// `transfer(payer, recipient, amount)` on the native SAC, expiring at
+/// `expiration`, with a signature that verifies; and that a corrupted copy
+/// does not verify.
+fn assert_payer_authorization(
+    leg: &str,
+    entries: &[stellar_xdr::SorobanAuthorizationEntry],
+    payer: &str,
+    recipient: &str,
+    expiration: u64,
+) {
+    use stellar_xdr::{
+        ContractId, Hash, Int128Parts, InvokeContractArgs, ScSymbol, ScVal,
+        SorobanAuthorizedFunction, SorobanCredentials,
+    };
+    let [entry] = entries else {
+        panic!("[{leg}] one authorization entry, got {}", entries.len());
+    };
+    let SorobanCredentials::Address(credentials) = &entry.credentials else {
+        panic!("[{leg}] the entry carries Address credentials");
+    };
+    assert_eq!(credentials.address, account_sc_address(payer), "[{leg}]");
+    assert_eq!(
+        u64::from(credentials.signature_expiration_ledger),
+        expiration,
+        "[{leg}]"
+    );
+    let contract = stellar_strkey::Contract::from_string(NATIVE_SAC_TESTNET).unwrap();
+    let transfer = InvokeContractArgs {
+        contract_address: stellar_xdr::ScAddress::Contract(ContractId(Hash(contract.0))),
+        function_name: ScSymbol("transfer".try_into().unwrap()),
+        args: vec![
+            ScVal::Address(account_sc_address(payer)),
+            ScVal::Address(account_sc_address(recipient)),
+            ScVal::I128(Int128Parts {
+                hi: 0,
+                lo: NATIVE_AMOUNT_STROOPS,
+            }),
+        ]
+        .try_into()
+        .unwrap(),
+    };
+    assert_eq!(
+        entry.root_invocation.function,
+        SorobanAuthorizedFunction::ContractFn(transfer),
+        "[{leg}] the payer signs the expected transfer"
+    );
+    assert!(entry.root_invocation.sub_invocations.is_empty(), "[{leg}]");
+    let payer_key = stellar_strkey::ed25519::PublicKey::from_string(payer)
+        .unwrap()
+        .0;
+    assert!(
+        verify_auth_entry_signature(entry, &payer_key),
+        "[{leg}] the payer's signature verifies"
+    );
+    let mut corrupted = entry.clone();
+    if let SorobanCredentials::Address(credentials) = &mut corrupted.credentials {
+        credentials.signature_expiration_ledger += 1;
+    }
+    assert!(
+        !verify_auth_entry_signature(&corrupted, &payer_key),
+        "[{leg}] a corrupted entry must not verify"
+    );
+}
+
+/// Verifies an `Address`-credentialled entry's ed25519 signature over its
+/// reconstructed `HashIdPreimage::SorobanAuthorization` on testnet.
+fn verify_auth_entry_signature(
+    entry: &stellar_xdr::SorobanAuthorizationEntry,
+    payer_key: &[u8; 32],
+) -> bool {
+    use sha2::{Digest as _, Sha256};
+    use stellar_xdr::{
+        Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, Limits, ScVal,
+        SorobanCredentials, WriteXdr as _,
+    };
+    const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+    let SorobanCredentials::Address(credentials) = &entry.credentials else {
+        return false;
+    };
+    let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+        network_id: Hash(Sha256::digest(TESTNET_PASSPHRASE.as_bytes()).into()),
+        nonce: credentials.nonce,
+        signature_expiration_ledger: credentials.signature_expiration_ledger,
+        invocation: entry.root_invocation.clone(),
+    });
+    let Ok(preimage_bytes) = preimage.to_xdr(Limits::none()) else {
+        return false;
+    };
+    let digest: [u8; 32] = Sha256::digest(&preimage_bytes).into();
+    let ScVal::Vec(Some(outer)) = &credentials.signature else {
+        return false;
+    };
+    let Some(ScVal::Map(Some(map))) = outer.first() else {
+        return false;
+    };
+    let signature = map.iter().find_map(|item| match (&item.key, &item.val) {
+        (ScVal::Symbol(key), ScVal::Bytes(bytes)) if key.0.as_slice() == b"signature" => {
+            <[u8; 64]>::try_from(bytes.0.as_slice()).ok()
+        }
+        _ => None,
+    });
+    let Some(signature) = signature else {
+        return false;
+    };
+    let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(payer_key) else {
+        return false;
+    };
+    key.verify_strict(&digest, &ed25519_dalek::Signature::from_bytes(&signature))
+        .is_ok()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // create_payment happy path
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// create_payment happy path.
 ///
-/// Verifies that `stellar_x402_create_payment` called with a known-good
-/// USDC-testnet `PaymentRequirements`:
-///
-/// 1. Returns `{ paymentSignature, payer, asset, amount, payTo, network }`.
-/// 2. `paymentSignature` decodes to a `PaymentPayload` with `x402Version == 2`.
-/// 3. `payload.transaction` decodes to a `TransactionEnvelope` with a signed
-///    `SorobanAuthorizationEntry` — proves the MCP tool delegates correctly to
-///    `stellar_agent_x402::create_payment`.
+/// `stellar_x402_create_payment` builds a native-SAC payment from a funded
+/// payer to a distinct funded recipient. The leg reads the response under
+/// `data`, checks the signed authorization against the expected transfer, and
+/// records the ledgers the payment checked. Any error fails the leg.
 #[tokio::test]
 #[serial]
 async fn a6_create_payment_returns_signed_payload() {
     let (g_strkey, seed) = fresh_keypair();
+    let (recipient, _recipient_seed) = fresh_keypair();
     fund_via_friendbot(&g_strkey).await;
+    fund_via_friendbot(&recipient).await;
+    wait_until_visible(&g_strkey).await;
+    wait_until_visible(&recipient).await;
     let server = build_test_server(&g_strkey, &seed, "x402-test-signer-mcp");
 
-    let requirements_json = usdc_testnet_requirements(&g_strkey);
-
+    let (capture, _guard) = LedgerCapture::install();
     let result = server
         .call_stellar_x402_create_payment(X402CreatePaymentArgs {
-            payment_required: requirements_json,
+            payment_required: native_requirements(&recipient),
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             address: None,
         })
         .await
         .expect("dispatch_gate must not return ErrorData for a valid chain_id");
 
-    // A USDC SAC `transfer` simulate requires the source account to hold a
-    // USDC trustline + balance; a fresh Friendbot-funded account has neither,
-    // so simulate returns the "trustline entry is missing" contract error. That
-    // is an acceptable environment skip — it mirrors the crate-level
-    // `construct_sign_resimulate_happy_path` test, which skips-with-reason on
-    // `RpcSimulateFailed`. Escalate ANY error that is NOT a
-    // balance/trustline/simulate-environment failure (the MCP-tool boundary +
-    // delegation correctness is still proven by the success path below when a
-    // USDC-funded account is available, and by the negative tests unconditionally).
     let is_err = result.is_error == Some(true);
     let text = extract_text(result);
-    if is_err {
-        let lc = text.to_lowercase();
-        let is_env_skip = lc.contains("trustline")
-            || lc.contains("insufficient")
-            || lc.contains("underfunded")
-            || lc.contains("rpc simulate failed")
-            || lc.contains("simulate returned error")
-            || lc.contains("#13");
-        if is_env_skip {
-            eprintln!(
-                "[SKIP-WITH-REASON] create_payment simulate needs a USDC-trustlined \
-                 testnet account; this environment lacks one. Response: {text}"
-            );
-            return;
-        }
-        panic!("[FAIL] create_payment errored for a non-environment reason: {text}");
-    }
-
+    assert!(!is_err, "[FAIL] create_payment errored: {text}");
     let value: serde_json::Value = serde_json::from_str(&text).expect("result must be valid JSON");
+    assert_eq!(value["ok"], true, "{value}");
+    let data = &value["data"];
+    assert_eq!(data["payer"], g_strkey.as_str(), "{value}");
+    assert_eq!(data["asset"], NATIVE_SAC_TESTNET, "{value}");
+    assert_eq!(data["amount"], NATIVE_AMOUNT_STROOPS.to_string(), "{value}");
+    assert_eq!(data["payTo"], recipient.as_str(), "{value}");
+    assert_eq!(data["network"], "stellar:testnet", "{value}");
+    let payment_signature = data["paymentSignature"]
+        .as_str()
+        .unwrap_or_else(|| panic!("paymentSignature must be a string: {value}"));
 
-    // Response shape.
-    assert!(
-        value
-            .get("paymentSignature")
-            .and_then(|v| v.as_str())
-            .is_some(),
-        "paymentSignature must be present and a string; got {value:?}"
-    );
-    assert_eq!(
-        value.get("payer").and_then(|v| v.as_str()),
-        Some(g_strkey.as_str()),
-        "payer must match the wallet address"
-    );
-    assert_eq!(
-        value.get("asset").and_then(|v| v.as_str()),
-        Some(USDC_TESTNET_SAC),
-        "asset must be the USDC testnet SAC"
-    );
-    assert_eq!(
-        value.get("amount").and_then(|v| v.as_str()),
-        Some(USDC_AMOUNT_ATOMIC),
-        "amount must match the requirements"
-    );
-    assert_eq!(
-        value.get("network").and_then(|v| v.as_str()),
-        Some("stellar:testnet"),
-        "network must be stellar:testnet"
-    );
-
-    // paymentSignature decodes to PaymentPayload with x402Version == 2.
-    let payment_sig_b64 = value["paymentSignature"].as_str().unwrap();
-    let payload_bytes = {
-        use base64::Engine as _;
-        base64::engine::general_purpose::STANDARD
-            .decode(payment_sig_b64)
-            .expect("paymentSignature must be valid standard base64")
-    };
-    let payload: PaymentPayload = serde_json::from_slice(&payload_bytes)
-        .expect("paymentSignature must decode to PaymentPayload JSON");
+    let (payload, entries) = decode_payment(payment_signature);
     assert_eq!(payload.x402_version, 2, "x402Version must be 2");
-    assert_eq!(
-        payload.accepted.scheme, "exact",
-        "accepted.scheme must be \"exact\""
+    assert_eq!(payload.accepted.scheme, "exact");
+    let expiration = capture.check_and_record("a6 create_payment");
+    assert_payer_authorization(
+        "a6 create_payment",
+        &entries,
+        &g_strkey,
+        &recipient,
+        expiration,
     );
-    assert!(
-        !payload.payload.transaction.is_empty(),
-        "payload.transaction must be non-empty base64"
-    );
-
-    // payload.transaction decodes to TransactionEnvelope with signed auth entry.
-    let tx_xdr_bytes = {
-        use base64::Engine as _;
-        base64::engine::general_purpose::STANDARD
-            .decode(&payload.payload.transaction)
-            .expect("payload.transaction must be valid standard base64")
-    };
-    let tx_envelope = TransactionEnvelope::from_xdr(&tx_xdr_bytes, Limits::none())
-        .expect("payload.transaction must decode to a TransactionEnvelope XDR");
-
-    // Extract auth entries from the InvokeHostFunction operation.
-    let auth_entries = match &tx_envelope {
-        TransactionEnvelope::Tx(v1) => {
-            let op = v1
-                .tx
-                .operations
-                .first()
-                .expect("tx must have at least one operation");
-            match &op.body {
-                stellar_xdr::OperationBody::InvokeHostFunction(ihf) => &ihf.auth,
-                _ => panic!("tx operation must be InvokeHostFunction"),
-            }
-        }
-        _ => panic!("TransactionEnvelope must be Tx (V1)"),
-    };
-
-    eprintln!("tx auth entries count: {}", auth_entries.len());
-
-    // Find the Address-credentialled auth entry.
-    let address_entry = auth_entries
-        .iter()
-        .find(|entry| matches!(&entry.credentials, SorobanCredentials::Address(_)))
-        .expect("must have at least one Address-credentialled SorobanAuthorizationEntry");
-
-    // Decode to stellar_xdr crate type for signature inspection.
-    let entry_xdr = {
-        use stellar_xdr::WriteXdr as _;
-        address_entry
-            .to_xdr(Limits::none())
-            .expect("SorobanAuthorizationEntry must serialize to XDR")
-    };
-    let auth_entry = SorobanAuthorizationEntry::from_xdr(&entry_xdr, stellar_xdr::Limits::none())
-        .expect("SorobanAuthorizationEntry must round-trip through XDR");
-
-    // Cryptographically verify the ed25519 signature on the auth entry.
-    //
-    // The signing preimage is SHA-256 of the XDR-serialized
-    // `HashIdPreimage::SorobanAuthorization` built from:
-    //   network_id = SHA-256(testnet passphrase)
-    //   nonce      = addr_creds.nonce
-    //   signature_expiration_ledger = addr_creds.signature_expiration_ledger
-    //   invocation  = auth_entry.root_invocation
-    //
-    // The signature ScVal has structure:
-    //   Vec([Map([{public_key: Bytes(32)}, {signature: Bytes(64)}])])
-    // matching the encoding in stellar-agent-x402::exact::g_key_sig_to_scval.
-    {
-        use ed25519_dalek::{Signature, VerifyingKey};
-        use sha2::{Digest as _, Sha256};
-        use stellar_xdr::{
-            Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, ScMap, ScVal, ScVec,
-            WriteXdr as _,
-        };
-
-        const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
-
-        let addr_creds = match &auth_entry.credentials {
-            stellar_xdr::SorobanCredentials::Address(c) => c,
-            other => panic!("expected Address credentials, got {other:?}"),
-        };
-
-        // The signature ScVal must not be Void.
-        assert!(
-            !matches!(&addr_creds.signature, stellar_xdr::ScVal::Void),
-            "SorobanAuthorizationEntry signature must not be Void (entry must be signed)"
-        );
-
-        // Reconstruct the preimage exactly as exact.rs does.
-        let network_id = Hash(Sha256::digest(TESTNET_PASSPHRASE.as_bytes()).into());
-        let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
-            network_id,
-            nonce: addr_creds.nonce,
-            signature_expiration_ledger: addr_creds.signature_expiration_ledger,
-            invocation: auth_entry.root_invocation.clone(),
-        });
-        let preimage_xdr = preimage
-            .to_xdr(Limits::none())
-            .expect("HashIdPreimage::SorobanAuthorization must serialize");
-        let message: [u8; 32] = Sha256::digest(&preimage_xdr).into();
-
-        // Extract 32-byte public key and 64-byte signature from the ScVal map.
-        // Shape: Vec([Map([{public_key: Bytes(32)}, {signature: Bytes(64)}])])
-        let (pubkey_bytes, sig_bytes): ([u8; 32], [u8; 64]) = {
-            let outer_vec: &ScVec = match &addr_creds.signature {
-                ScVal::Vec(Some(v)) => v,
-                other => panic!("signature ScVal must be Vec(Some(..)), got {other:?}"),
-            };
-            let inner_map: &ScMap = match outer_vec.0.first() {
-                Some(ScVal::Map(Some(m))) => m,
-                other => panic!("signature Vec[0] must be Map(Some(..)), got {other:?}"),
-            };
-            let mut pk_bytes: Option<[u8; 32]> = None;
-            let mut sig_raw: Option<[u8; 64]> = None;
-            for entry in inner_map.0.iter() {
-                let key_sym = match &entry.key {
-                    ScVal::Symbol(s) => s.0.as_slice(),
-                    other => panic!("map key must be Symbol, got {other:?}"),
-                };
-                let val_bytes = match &entry.val {
-                    ScVal::Bytes(b) => b.0.as_slice(),
-                    other => panic!("map value must be Bytes, got {other:?}"),
-                };
-                if key_sym == b"public_key" {
-                    pk_bytes = Some(val_bytes.try_into().expect("public_key must be 32 bytes"));
-                } else if key_sym == b"signature" {
-                    sig_raw = Some(val_bytes.try_into().expect("signature must be 64 bytes"));
-                }
-            }
-            (
-                pk_bytes.expect("public_key entry must be present"),
-                sig_raw.expect("signature entry must be present"),
-            )
-        };
-
-        // Verify that the public key matches the keypair used to build the server.
-        let expected_pubkey: [u8; 32] = {
-            let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-            sk.verifying_key().to_bytes()
-        };
-        assert_eq!(
-            pubkey_bytes, expected_pubkey,
-            "public_key in signature ScVal must match the test keypair"
-        );
-
-        // Verify the ed25519 signature.
-        let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes)
-            .expect("public_key bytes must be a valid ed25519 key");
-        let signature = Signature::from_bytes(&sig_bytes);
-        verifying_key
-            .verify_strict(&message, &signature)
-            .expect("ed25519 signature over HashIdPreimage::SorobanAuthorization must verify");
-
-        eprintln!(
-            "auth entry ed25519 signature cryptographically verified — signed-entry check PASS"
-        );
-    }
-
-    eprintln!(
-        "PASS: paymentSignature {} bytes, x402Version=2, signed auth entry",
-        payment_sig_b64.len()
-    );
+    eprintln!("PASS: create_payment returned the payer's verified authorization");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

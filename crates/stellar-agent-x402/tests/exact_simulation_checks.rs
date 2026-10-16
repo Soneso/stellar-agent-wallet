@@ -1,13 +1,19 @@
-//! `create_payment` signs only the SAC `transfer` it built.
+//! `create_payment` signs only the SAC `transfer` it built, through one
+//! identified client, within its ledger and fee bounds.
 //!
-//! A mock RPC on loopback answers both simulations. The unsigned first
-//! simulation answers with authorization entries shaped from the honest entry:
-//! the payer's unsigned `Address` entry for exactly the transfer the
-//! requirements describe, built here from the test's own values. The signed
-//! re-simulation answers with entries derived from the signed entry it
-//! received. A counting signer records every signing primitive the flow calls
-//! and the digest it signs, and a counting transmit gate records whether the
-//! flow reached the send.
+//! A mock RPC on loopback answers every method the flow sends, routed by
+//! method: `getNetwork` for the endpoint identity check, `getHealth` for the
+//! ledger consistency read, and `simulateTransaction` for both simulations.
+//! Any other method panics. The unsigned first simulation answers with
+//! authorization entries shaped from the honest entry: the payer's unsigned
+//! `Address` entry for exactly the transfer the requirements describe, built
+//! here from the test's own values. The signed re-simulation answers with
+//! entries derived from the signed entry it received. A counting signer
+//! records every signing primitive the flow calls and the digest it signs,
+//! and a counting transmit gate records whether the flow reached the send.
+//!
+//! Every hostile case gives otherwise valid answers to every later request,
+//! so a check that fails to refuse yields a payment.
 
 #![allow(
     clippy::unwrap_used,
@@ -18,10 +24,13 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::error::WalletError;
+use stellar_agent_network::StellarRpcClient;
+use stellar_agent_network::client::constructions_on_this_thread;
 use stellar_agent_network::signing::{Signer, SoftwareSigningKey, WebAuthnAssertion};
 use stellar_agent_test_support::rpc_request_count;
 use stellar_agent_x402::X402Error;
@@ -34,14 +43,17 @@ use stellar_xdr::{
     Int128Parts, InvokeContractArgs, LedgerFootprint, Limits, OperationBody, PublicKey, ReadXdr,
     ScAddress, ScSymbol, ScVal, ScVec, SorobanAddressCredentials,
     SorobanAddressCredentialsWithDelegates, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
-    SorobanAuthorizedInvocation, SorobanCredentials, SorobanResources, SorobanTransactionData,
-    SorobanTransactionDataExt, TransactionEnvelope, Uint256, VecM, WriteXdr,
+    SorobanAuthorizedInvocation, SorobanCredentials, SorobanResources, SorobanResourcesExtV0,
+    SorobanTransactionData, SorobanTransactionDataExt, TransactionEnvelope, TransactionExt,
+    Uint256, VecM, WriteXdr,
 };
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use zeroize::Zeroizing;
 
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
+const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
 
 /// SAC contract of the payment asset.
 const ASSET: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
@@ -66,6 +78,19 @@ const MAX_TIMEOUT_SECONDS: u32 = 300;
 
 /// `LATEST_LEDGER + ceil(MAX_TIMEOUT_SECONDS / 5)`.
 const EXPECTED_EXPIRATION: u32 = 1060;
+
+/// The resource fee ceiling the wallet applies to both simulations.
+const FEE_CEILING: u64 = 10_000_000;
+
+/// The minimum resource fee and embedded resource fee of an honest answer.
+const HONEST_RESOURCE_FEE: u64 = 1000;
+
+/// Deadline of the identity check and the health read in an honest payment.
+const GENEROUS_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Deadline of a payment whose identity check or health read is meant to
+/// fail after its retries.
+const SHORT_DEADLINE: Duration = Duration::from_millis(700);
 
 // ── Values ───────────────────────────────────────────────────────────────────
 
@@ -222,9 +247,13 @@ fn expected_digest() -> [u8; 32] {
 
 // ── Mock RPC ─────────────────────────────────────────────────────────────────
 
-fn transaction_data_xdr() -> String {
+/// Transaction data with `ext` and an embedded resource fee of `resource_fee`.
+fn transaction_data_with(
+    ext: SorobanTransactionDataExt,
+    resource_fee: i64,
+) -> SorobanTransactionData {
     SorobanTransactionData {
-        ext: SorobanTransactionDataExt::V0,
+        ext,
         resources: SorobanResources {
             footprint: LedgerFootprint {
                 read_only: VecM::default(),
@@ -234,10 +263,33 @@ fn transaction_data_xdr() -> String {
             disk_read_bytes: 0,
             write_bytes: 0,
         },
-        resource_fee: 1_000,
+        resource_fee,
     }
+}
+
+fn transaction_data_xdr() -> String {
+    transaction_data_with(SorobanTransactionDataExt::V0, 1_000)
+        .to_xdr_base64(Limits::none())
+        .unwrap()
+}
+
+/// Transaction data whose extension lists one archived entry to restore.
+fn archived_transaction_data_xdr() -> String {
+    transaction_data_with(
+        SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+            archived_soroban_entries: vec![0].try_into().unwrap(),
+        }),
+        1_000,
+    )
     .to_xdr_base64(Limits::none())
     .unwrap()
+}
+
+/// Transaction data embedding `resource_fee`.
+fn transaction_data_xdr_with_fee(resource_fee: i64) -> String {
+    transaction_data_with(SorobanTransactionDataExt::V0, resource_fee)
+        .to_xdr_base64(Limits::none())
+        .unwrap()
 }
 
 fn void_xdr() -> String {
@@ -263,24 +315,120 @@ fn answer(auth: &[SorobanAuthorizationEntry]) -> serde_json::Value {
     answer_with_results(&serde_json::json!([{ "auth": auth, "xdr": void_xdr() }]))
 }
 
+/// `answer(auth)` reporting `ledger` as its latest ledger.
+fn answer_at(auth: &[SorobanAuthorizationEntry], ledger: u32) -> serde_json::Value {
+    let mut answer = answer(auth);
+    answer["latestLedger"] = serde_json::json!(ledger);
+    answer
+}
+
+/// `answer(auth)` with `field` set to `value`.
+fn answer_with(
+    auth: &[SorobanAuthorizationEntry],
+    field: &str,
+    value: serde_json::Value,
+) -> serde_json::Value {
+    let mut answer = answer(auth);
+    answer[field] = value;
+    answer
+}
+
+/// A `getNetwork` result reporting `passphrase` at a supported protocol.
+fn network_result(passphrase: &str) -> serde_json::Value {
+    serde_json::json!({
+        "friendbotUrl": "https://friendbot.stellar.org",
+        "passphrase": passphrase,
+        "protocolVersion": 29,
+    })
+}
+
+/// A complete `getHealth` result at `ledger` with `status`.
+fn health_result(status: &str, ledger: u32) -> serde_json::Value {
+    serde_json::json!({
+        "status": status,
+        "latestLedger": ledger,
+        "oldestLedger": 1,
+        "ledgerRetentionWindow": 17_280,
+    })
+}
+
+/// A JSON-RPC success answer to the request with `id`.
+fn rpc_result(id: &serde_json::Value, result: &serde_json::Value) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }))
+        .insert_header("content-type", "application/json")
+}
+
+/// A JSON-RPC error object answering the request with `id`.
+fn rpc_error_object(id: &serde_json::Value) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32603, "message": "backend unavailable"},
+        }))
+        .insert_header("content-type", "application/json")
+}
+
+/// How the mock answers `getNetwork` or `getHealth`.
+#[derive(Clone)]
+enum MethodAnswer {
+    /// This result.
+    Result(serde_json::Value),
+    /// This result, after a delay.
+    Delayed(serde_json::Value, Duration),
+    /// A JSON-RPC error object.
+    ErrorObject,
+    /// An HTTP error status with no JSON-RPC body: a transport failure.
+    HttpStatus(u16),
+    /// A JSON-RPC error object for the first request, this result afterwards.
+    ErrorObjectOnceThen(serde_json::Value),
+}
+
+impl MethodAnswer {
+    fn respond(&self, id: &serde_json::Value, seen_before: usize) -> ResponseTemplate {
+        match self {
+            Self::Result(result) => rpc_result(id, result),
+            Self::Delayed(result, delay) => rpc_result(id, result).set_delay(*delay),
+            Self::ErrorObject => rpc_error_object(id),
+            Self::HttpStatus(status) => ResponseTemplate::new(*status),
+            Self::ErrorObjectOnceThen(result) => {
+                if seen_before == 0 {
+                    rpc_error_object(id)
+                } else {
+                    rpc_result(id, result)
+                }
+            }
+        }
+    }
+}
+
 /// The re-simulation answer derived from the signed entries it received.
 type Resimulation = Box<dyn Fn(&[SorobanAuthorizationEntry]) -> serde_json::Value + Send + Sync>;
 
-/// Simulate endpoint for both simulations of one payment.
+/// The endpoint of one payment.
 ///
-/// A request without authorization entries is the first simulation, and one
-/// with entries is the signed re-simulation.
-struct SimulateRpc {
+/// A `simulateTransaction` request without authorization entries is the first
+/// simulation, and one with entries is the signed re-simulation.
+struct PaymentRpc {
+    network: MethodAnswer,
+    health: MethodAnswer,
     first: serde_json::Value,
     resimulation: Resimulation,
+    /// `getNetwork` requests answered so far.
+    network_requests: AtomicUsize,
+    /// `getHealth` requests answered so far.
+    health_requests: AtomicUsize,
     /// The entries each re-simulation request carried.
     received_signed: Arc<Mutex<Vec<Vec<SorobanAuthorizationEntry>>>>,
 }
 
-impl Respond for SimulateRpc {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        let body: serde_json::Value =
-            serde_json::from_slice(&request.body).expect("a JSON-RPC request body");
+impl PaymentRpc {
+    fn simulate(&self, body: &serde_json::Value) -> ResponseTemplate {
         let envelope = body["params"]["transaction"]
             .as_str()
             .expect("simulateTransaction carries a transaction envelope");
@@ -300,13 +448,26 @@ impl Respond for SimulateRpc {
             self.received_signed.lock().unwrap().push(signed.clone());
             (self.resimulation)(&signed)
         };
-        ResponseTemplate::new(200)
-            .set_body_json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": body["id"],
-                "result": result,
-            }))
-            .insert_header("content-type", "application/json")
+        rpc_result(&body["id"], &result)
+    }
+}
+
+impl Respond for PaymentRpc {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("a JSON-RPC request body");
+        match body["method"].as_str() {
+            Some("getNetwork") => {
+                let seen = self.network_requests.fetch_add(1, Ordering::SeqCst);
+                self.network.respond(&body["id"], seen)
+            }
+            Some("getHealth") => {
+                let seen = self.health_requests.fetch_add(1, Ordering::SeqCst);
+                self.health.respond(&body["id"], seen)
+            }
+            Some("simulateTransaction") => self.simulate(&body),
+            other => panic!("the x402 flow sends no {other:?} request"),
+        }
     }
 }
 
@@ -369,6 +530,65 @@ impl Signer for CountingSigner {
 
 // ── One payment ──────────────────────────────────────────────────────────────
 
+/// Everything one payment's endpoint answers and the caller passes.
+struct Scenario {
+    requirements: PaymentRequirements,
+    network: MethodAnswer,
+    health: MethodAnswer,
+    first: serde_json::Value,
+    resimulation: Resimulation,
+    deadline: Duration,
+}
+
+impl Scenario {
+    /// An honest endpoint: the testnet identity, a healthy endpoint at the
+    /// simulation's ledger, an honest first simulation, and a re-simulation
+    /// that returns no authorization.
+    fn honest() -> Self {
+        Self {
+            requirements: requirements(),
+            network: MethodAnswer::Result(network_result(TESTNET_PASSPHRASE)),
+            health: MethodAnswer::Result(health_result("healthy", LATEST_LEDGER)),
+            first: answer(&[honest_entry()]),
+            resimulation: Box::new(|_| answer(&[])),
+            deadline: GENEROUS_DEADLINE,
+        }
+    }
+
+    fn with_first(mut self, first: serde_json::Value) -> Self {
+        self.first = first;
+        self
+    }
+
+    fn with_resimulation(
+        mut self,
+        resimulation: impl Fn(&[SorobanAuthorizationEntry]) -> serde_json::Value + Send + Sync + 'static,
+    ) -> Self {
+        self.resimulation = Box::new(resimulation);
+        self
+    }
+
+    fn with_network(mut self, network: MethodAnswer) -> Self {
+        self.network = network;
+        self
+    }
+
+    fn with_health(mut self, health: MethodAnswer) -> Self {
+        self.health = health;
+        self
+    }
+
+    fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    fn with_max_timeout_seconds(mut self, seconds: u32) -> Self {
+        self.requirements.max_timeout_seconds = seconds;
+        self
+    }
+}
+
 /// What one `create_payment` call returned and caused.
 struct Outcome {
     result: Result<PaymentPayload, X402Error>,
@@ -377,7 +597,78 @@ struct Outcome {
     gate_calls: usize,
     simulate_requests: usize,
     requests: usize,
+    /// The method of every request, in the order the endpoint received them.
+    methods: Vec<String>,
+    /// `StellarRpcClient` constructions inside `create_payment`.
+    constructions: usize,
+    elapsed: Duration,
     received_signed: Vec<Vec<SorobanAuthorizationEntry>>,
+}
+
+/// Runs `create_payment` for `scenario` on a client built before the call.
+async fn run(scenario: Scenario) -> Outcome {
+    let received_signed = Arc::new(Mutex::new(Vec::new()));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PaymentRpc {
+            network: scenario.network,
+            health: scenario.health,
+            first: scenario.first,
+            resimulation: scenario.resimulation,
+            network_requests: AtomicUsize::new(0),
+            health_requests: AtomicUsize::new(0),
+            received_signed: Arc::clone(&received_signed),
+        })
+        .mount(&server)
+        .await;
+    let client = StellarRpcClient::new(&server.uri()).expect("the loopback URL parses");
+    let signer = CountingSigner::new();
+    let gate_calls = AtomicUsize::new(0);
+    let constructions_before = constructions_on_this_thread();
+    let started = tokio::time::Instant::now();
+    let result = create_payment(
+        &scenario.requirements,
+        &signer,
+        &client,
+        TESTNET_PASSPHRASE,
+        started + scenario.deadline,
+        |_| {
+            gate_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let constructions = constructions_on_this_thread() - constructions_before;
+    let address_auth_digests = signer.address_auth_digests.lock().unwrap().clone();
+    let signing_calls =
+        address_auth_digests.len() + signer.other_signing_calls.load(Ordering::SeqCst);
+    let received = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    let methods = received
+        .iter()
+        .map(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["method"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    let received_signed = received_signed.lock().unwrap().clone();
+    Outcome {
+        result,
+        address_auth_digests,
+        signing_calls,
+        gate_calls: gate_calls.load(Ordering::SeqCst),
+        simulate_requests: rpc_request_count(&server, "simulateTransaction").await,
+        requests: received.len(),
+        methods,
+        constructions,
+        elapsed,
+        received_signed,
+    }
 }
 
 /// Runs `create_payment` against a mock answering the first simulation with
@@ -386,47 +677,10 @@ async fn pay(
     first: serde_json::Value,
     resimulation: impl Fn(&[SorobanAuthorizationEntry]) -> serde_json::Value + Send + Sync + 'static,
 ) -> Outcome {
-    let received_signed = Arc::new(Mutex::new(Vec::new()));
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(SimulateRpc {
-            first,
-            resimulation: Box::new(resimulation),
-            received_signed: Arc::clone(&received_signed),
-        })
-        .mount(&server)
-        .await;
-    let signer = CountingSigner::new();
-    let gate_calls = AtomicUsize::new(0);
-    let result = create_payment(
-        &requirements(),
-        &signer,
-        &server.uri(),
-        TESTNET_PASSPHRASE,
-        |_| {
-            gate_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        },
-    )
-    .await;
-    let address_auth_digests = signer.address_auth_digests.lock().unwrap().clone();
-    let signing_calls =
-        address_auth_digests.len() + signer.other_signing_calls.load(Ordering::SeqCst);
-    let requests = server
-        .received_requests()
-        .await
-        .expect("request recording is enabled")
-        .len();
-    let received_signed = received_signed.lock().unwrap().clone();
-    Outcome {
-        result,
-        address_auth_digests,
-        signing_calls,
-        gate_calls: gate_calls.load(Ordering::SeqCst),
-        simulate_requests: rpc_request_count(&server, "simulateTransaction").await,
-        requests,
-        received_signed,
-    }
+    run(Scenario::honest()
+        .with_first(first)
+        .with_resimulation(resimulation))
+    .await
 }
 
 /// Runs `create_payment` with `first_auth` as the first simulation's entries.
@@ -489,7 +743,7 @@ fn assert_refused_before_signing(outcome: &Outcome, expected: &str) {
         outcome.simulate_requests, 1,
         "only the unsigned simulation is sent"
     );
-    assert_eq!(outcome.requests, 1, "no other request is sent");
+    assert_eq!(outcome.requests, 2, "no other request is sent");
 }
 
 /// Asserts that the payer signed once, the gate ran once, and both
@@ -503,7 +757,7 @@ fn assert_signed_and_sent_once(outcome: &Outcome) {
     assert_eq!(outcome.signing_calls, 1, "no other signing primitive runs");
     assert_eq!(outcome.gate_calls, 1, "the transmit gate runs once");
     assert_eq!(outcome.simulate_requests, 2, "both simulations are sent");
-    assert_eq!(outcome.requests, 2, "no other request is sent");
+    assert_eq!(outcome.requests, 4, "no other request is sent");
 }
 
 /// Asserts that the re-simulation answer was refused with `code` and exactly
@@ -928,4 +1182,762 @@ async fn a_resimulation_with_an_undecodable_result_value_is_a_failed_simulation(
         "x402.rpc_simulate_failed",
         RESIMULATION_DECODE_DETAIL,
     );
+}
+
+// ── Shared assertions of the bounds tests ────────────────────────────────────
+
+/// The successful primary sequence of one payment.
+const PAYMENT_METHODS: [&str; 4] = [
+    "getNetwork",
+    "simulateTransaction",
+    "getHealth",
+    "simulateTransaction",
+];
+
+/// Asserts that `result` is an `RpcSimulateFailed` refusal with exactly
+/// `expected` as its detail.
+fn assert_simulate_failed(result: &Result<PaymentPayload, X402Error>, expected: &str) {
+    assert_refusal(result, "x402.rpc_simulate_failed", expected);
+}
+
+/// Asserts that nothing was signed or gated and that the endpoint received
+/// exactly `methods`, in order.
+fn assert_nothing_signed_after(outcome: &Outcome, methods: &[&str]) {
+    assert_eq!(outcome.signing_calls, 0, "no signing primitive may run");
+    assert_eq!(outcome.gate_calls, 0, "the transmit gate must not run");
+    assert_eq!(
+        outcome.methods, methods,
+        "the requests the endpoint received"
+    );
+}
+
+/// Asserts that a refusal came after one signature, one gate call, and the
+/// full primary sequence.
+fn assert_refused_after_the_send(outcome: &Outcome, expected: &str) {
+    assert_simulate_failed(&outcome.result, expected);
+    assert_signed_and_sent_once(outcome);
+    assert_eq!(outcome.methods, PAYMENT_METHODS);
+}
+
+/// The signature expiration ledger of the one signed entry the re-simulation
+/// received.
+fn signed_expiration(outcome: &Outcome) -> u32 {
+    let [signed] = outcome.received_signed[0].as_slice() else {
+        panic!("one signed entry");
+    };
+    let SorobanCredentials::Address(credentials) = &signed.credentials else {
+        panic!("the signed entry carries Address credentials");
+    };
+    credentials.signature_expiration_ledger
+}
+
+/// The transaction envelope of a built payment.
+fn payment_transaction(outcome: &Outcome) -> stellar_xdr::TransactionV1Envelope {
+    let payload = outcome
+        .result
+        .as_ref()
+        .unwrap_or_else(|error| panic!("expected a payment payload, got {error:?}"));
+    let TransactionEnvelope::Tx(transaction) =
+        TransactionEnvelope::from_xdr_base64(&payload.payload.transaction, Limits::none())
+            .expect("the payload carries a decodable envelope")
+    else {
+        panic!("the payload carries a v1 envelope");
+    };
+    transaction
+}
+
+// ── Endpoint identity on the caller's client ─────────────────────────────────
+
+/// The endpoint identity check is the client's first request, both
+/// simulations and the health read use the same client, and `create_payment`
+/// builds no client of its own.
+#[tokio::test]
+async fn x402_identifies_one_client_before_both_simulations() {
+    let outcome = run(Scenario::honest()).await;
+    assert_paid(&outcome);
+    assert_eq!(outcome.methods, PAYMENT_METHODS);
+    assert_eq!(
+        outcome.constructions, 0,
+        "create_payment uses the caller's client and builds none"
+    );
+}
+
+/// An identity attempt that fails is retried, and no simulation is sent
+/// before the identity is established.
+#[tokio::test]
+async fn an_identity_retry_precedes_the_first_simulation() {
+    let outcome = run(
+        Scenario::honest().with_network(MethodAnswer::ErrorObjectOnceThen(network_result(
+            TESTNET_PASSPHRASE,
+        ))),
+    )
+    .await;
+    assert!(outcome.result.is_ok(), "{:?}", outcome.result.err());
+    assert_eq!(outcome.signing_calls, 1, "the payer signs once");
+    assert_eq!(outcome.gate_calls, 1, "the transmit gate runs once");
+    assert_eq!(
+        outcome.methods,
+        [
+            "getNetwork",
+            "getNetwork",
+            "simulateTransaction",
+            "getHealth",
+            "simulateTransaction",
+        ]
+    );
+}
+
+/// Every identity refusal returns the check's own network code before any
+/// simulation, signature, or gate call.
+#[tokio::test]
+async fn x402_identity_refusals_precede_simulation() {
+    let cases = [
+        (
+            "an endpoint reporting mainnet",
+            MethodAnswer::Result(network_result(MAINNET_PASSPHRASE)),
+            "network.mainnet_write_forbidden",
+        ),
+        (
+            "an endpoint serving another network",
+            MethodAnswer::Result(network_result(FUTURENET_PASSPHRASE)),
+            "network.endpoint_network_mismatch",
+        ),
+        (
+            "an answer without protocolVersion",
+            MethodAnswer::Result(serde_json::json!({ "passphrase": TESTNET_PASSPHRASE })),
+            "network.endpoint_identity_unavailable",
+        ),
+        (
+            "an endpoint answering only error objects",
+            MethodAnswer::ErrorObject,
+            "network.endpoint_identity_unavailable",
+        ),
+        (
+            "an endpoint failing at the transport",
+            MethodAnswer::HttpStatus(503),
+            "network.endpoint_identity_unavailable",
+        ),
+    ];
+    for (case, network, code) in cases {
+        let outcome = run(Scenario::honest()
+            .with_network(network)
+            .with_deadline(SHORT_DEADLINE))
+        .await;
+        let Err(error) = &outcome.result else {
+            panic!("{case}: expected an identity refusal, got a payment");
+        };
+        assert!(
+            matches!(error, X402Error::EndpointIdentity(_)),
+            "{case}: {error:?}"
+        );
+        assert_eq!(error.wire_code(), code, "{case}");
+        assert!(
+            !outcome.methods.is_empty() && outcome.methods.iter().all(|m| m == "getNetwork"),
+            "{case}: only identity requests are sent: {:?}",
+            outcome.methods
+        );
+        assert_eq!(outcome.signing_calls, 0, "{case}: nothing is signed");
+        assert_eq!(outcome.gate_calls, 0, "{case}: the gate does not run");
+    }
+}
+
+/// An identity answer that arrives after the caller's deadline refuses: the
+/// check runs under the supplied deadline, not a budget of its own.
+#[tokio::test]
+async fn x402_identity_obeys_the_supplied_deadline() {
+    let outcome = run(Scenario::honest()
+        .with_network(MethodAnswer::Delayed(
+            network_result(TESTNET_PASSPHRASE),
+            Duration::from_secs(3),
+        ))
+        .with_deadline(Duration::from_millis(500)))
+    .await;
+    let Err(error) = &outcome.result else {
+        panic!("expected an identity refusal, got a payment");
+    };
+    assert_eq!(error.wire_code(), "network.endpoint_identity_unavailable");
+    assert!(
+        outcome.elapsed < Duration::from_millis(2_500),
+        "the check stops at the deadline, took {:?}",
+        outcome.elapsed
+    );
+    assert_eq!(outcome.simulate_requests, 0, "no simulation is sent");
+    assert_eq!(outcome.signing_calls, 0, "nothing is signed");
+}
+
+/// No production source of the crate builds an RPC client: `create_payment`
+/// sends every request through the client its caller passes.
+#[test]
+fn x402_has_no_raw_rpc_client_construction() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    let mut pending = vec![src];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    assert!(
+        files.iter().any(|path| path.ends_with("exact.rs")),
+        "the scan reaches the payment flow: {files:?}"
+    );
+    for path in files {
+        let source = std::fs::read_to_string(&path).unwrap();
+        let production = stellar_agent_test_support::source_order::production_half(&source);
+        for banned in ["Client::new", "StellarRpcClient::new"] {
+            assert!(
+                !production.contains(banned),
+                "{}: production code calls {banned}",
+                path.display()
+            );
+        }
+    }
+}
+
+// ── Expiration bound ─────────────────────────────────────────────────────────
+
+/// `maxTimeoutSeconds` of zero refuses before any request; one and 300
+/// seconds sign windows of one and sixty ledgers.
+#[tokio::test]
+async fn timeout_range_is_validated_before_rpc() {
+    let outcome = run(Scenario::honest().with_max_timeout_seconds(0)).await;
+    let Err(X402Error::InvalidPaymentRequired { detail }) = &outcome.result else {
+        panic!("expected InvalidPaymentRequired, got {:?}", outcome.result);
+    };
+    assert_eq!(detail, "maxTimeoutSeconds must be at least 1");
+    assert_nothing_signed_after(&outcome, &[]);
+
+    for (seconds, window) in [(1, 1), (300, 60)] {
+        let outcome = run(Scenario::honest().with_max_timeout_seconds(seconds)).await;
+        assert_paid(&outcome);
+        assert_eq!(
+            signed_expiration(&outcome),
+            LATEST_LEDGER + window,
+            "{seconds} s"
+        );
+    }
+}
+
+/// The window rounds up to whole ledgers of five seconds.
+#[tokio::test]
+async fn expiration_rounds_up_within_sixty_ledgers() {
+    for (seconds, window) in [(1, 1), (5, 1), (6, 2), (300, 60)] {
+        let outcome = run(Scenario::honest().with_max_timeout_seconds(seconds)).await;
+        assert_paid(&outcome);
+        assert_eq!(
+            signed_expiration(&outcome),
+            LATEST_LEDGER + window,
+            "{seconds} s"
+        );
+    }
+}
+
+/// A requirement above 300 seconds signs the sixty-ledger window of 300
+/// seconds.
+#[tokio::test]
+async fn timeouts_above_the_maximum_sign_a_sixty_ledger_window() {
+    for seconds in [301, u32::MAX] {
+        let outcome = run(Scenario::honest().with_max_timeout_seconds(seconds)).await;
+        assert_paid(&outcome);
+        assert_eq!(
+            signed_expiration(&outcome),
+            EXPECTED_EXPIRATION,
+            "{seconds} s"
+        );
+    }
+}
+
+/// The simulation's ledger is above zero and at most one ledger ahead of the
+/// health ledger, and the health ledger lies before the expiration ledger.
+#[tokio::test]
+async fn simulation_ledger_must_bracket_health_and_expiration() {
+    // One ledger of skew between backends is tolerated.
+    let outcome = run(
+        Scenario::honest().with_health(MethodAnswer::Result(health_result(
+            "healthy",
+            LATEST_LEDGER - 1,
+        ))),
+    )
+    .await;
+    assert_paid(&outcome);
+
+    // `(first simulation ledger, health ledger, re-simulation ledger,
+    // detail)`. The re-simulation ledger lets the payment complete if the
+    // first-phase check fails to refuse.
+    let cases = [
+        (
+            LATEST_LEDGER,
+            LATEST_LEDGER - 2,
+            LATEST_LEDGER,
+            "the simulation reports a ledger more than one ahead of the endpoint's health",
+        ),
+        (0, 0, 0, "the simulation reports ledger zero"),
+        (
+            LATEST_LEDGER,
+            EXPECTED_EXPIRATION,
+            EXPECTED_EXPIRATION - 1,
+            "the endpoint's health ledger has reached the signature expiration ledger",
+        ),
+        (
+            LATEST_LEDGER,
+            u32::MAX,
+            EXPECTED_EXPIRATION - 1,
+            "the endpoint's health ledger has reached the signature expiration ledger",
+        ),
+    ];
+    for (simulation, health, resimulation, detail) in cases {
+        let outcome = run(Scenario::honest()
+            .with_first(answer_at(&[honest_entry()], simulation))
+            .with_health(MethodAnswer::Result(health_result("healthy", health)))
+            .with_resimulation(move |_| answer_at(&[], resimulation)))
+        .await;
+        assert_simulate_failed(&outcome.result, detail);
+        assert_nothing_signed_after(
+            &outcome,
+            &["getNetwork", "simulateTransaction", "getHealth"],
+        );
+    }
+}
+
+/// A simulation ledger without room for the window refuses before the
+/// health read and before signing.
+#[tokio::test]
+async fn expiration_overflow_refuses_before_signing() {
+    let ledger = u32::MAX - 10;
+    let outcome = run(Scenario::honest()
+        .with_first(answer_at(&[honest_entry()], ledger))
+        .with_health(MethodAnswer::Result(health_result("healthy", ledger)))
+        .with_resimulation(move |_| answer_at(&[], ledger)))
+    .await;
+    assert_simulate_failed(
+        &outcome.result,
+        "the simulation's latest ledger leaves no room for the signature expiration window",
+    );
+    assert_nothing_signed_after(&outcome, &["getNetwork", "simulateTransaction"]);
+}
+
+/// The re-simulation's ledger is at most one ledger behind the health ledger
+/// and lies before the expiration ledger.
+#[tokio::test]
+async fn resimulation_must_remain_before_expiration() {
+    // One ledger of skew between backends is tolerated.
+    let outcome =
+        run(Scenario::honest().with_resimulation(|_| answer_at(&[], LATEST_LEDGER - 1))).await;
+    assert_paid(&outcome);
+
+    let cases = [
+        (
+            LATEST_LEDGER - 2,
+            "the re-simulation reports a ledger more than one behind the endpoint's health",
+        ),
+        (
+            EXPECTED_EXPIRATION,
+            "the re-simulation reports a ledger at or past the signature expiration ledger",
+        ),
+        (
+            u32::MAX,
+            "the re-simulation reports a ledger at or past the signature expiration ledger",
+        ),
+    ];
+    for (resimulation, detail) in cases {
+        let outcome =
+            run(Scenario::honest().with_resimulation(move |_| answer_at(&[], resimulation))).await;
+        assert_refused_after_the_send(&outcome, detail);
+    }
+}
+
+/// Asserts that a payment whose health read answered `health` refuses with
+/// `detail` before signing, after the first simulation and at least one
+/// health read.
+async fn assert_health_refused(health: MethodAnswer, detail: &str) {
+    let outcome = run(Scenario::honest()
+        .with_health(health)
+        .with_deadline(SHORT_DEADLINE))
+    .await;
+    assert_simulate_failed(&outcome.result, detail);
+    assert_eq!(outcome.signing_calls, 0, "nothing is signed");
+    assert_eq!(outcome.gate_calls, 0, "the gate does not run");
+    assert_eq!(outcome.simulate_requests, 1, "only the first simulation");
+    assert!(
+        outcome
+            .methods
+            .starts_with(&["getNetwork".to_owned(), "simulateTransaction".to_owned()])
+            && outcome.methods[2..].iter().all(|m| m == "getHealth")
+            && outcome.methods.len() > 2,
+        "{:?}",
+        outcome.methods
+    );
+}
+
+/// A health read that reports a status other than `healthy` refuses before
+/// signing.
+#[tokio::test]
+async fn an_unhealthy_status_refuses_before_signing() {
+    assert_health_refused(
+        MethodAnswer::Result(health_result("unhealthy", LATEST_LEDGER)),
+        "the endpoint reports a health status other than healthy",
+    )
+    .await;
+}
+
+/// A health read answered only with JSON-RPC error objects refuses before
+/// signing once its deadline ends the retries.
+#[tokio::test]
+async fn a_health_error_object_refuses_before_signing() {
+    assert_health_refused(
+        MethodAnswer::ErrorObject,
+        "the endpoint's health could not be read",
+    )
+    .await;
+}
+
+/// A health answer without `ledgerRetentionWindow` does not deserialize and
+/// refuses before signing.
+#[tokio::test]
+async fn a_health_answer_without_a_field_refuses_before_signing() {
+    assert_health_refused(
+        MethodAnswer::Result(serde_json::json!({
+            "status": "healthy",
+            "latestLedger": LATEST_LEDGER,
+            "oldestLedger": 1,
+        })),
+        "the endpoint's health could not be read",
+    )
+    .await;
+}
+
+/// A health read that fails at the transport refuses before signing once its
+/// deadline ends the retries.
+#[tokio::test]
+async fn a_health_transport_failure_refuses_before_signing() {
+    assert_health_refused(
+        MethodAnswer::HttpStatus(503),
+        "the endpoint's health could not be read",
+    )
+    .await;
+}
+
+// ── Resource fee ceiling ─────────────────────────────────────────────────────
+
+/// Both simulations' minimum resource fee lies in `1..=10_000_000` stroops.
+#[tokio::test]
+async fn resource_fee_ceiling_applies_to_both_simulations() {
+    for (fee, first_detail, resimulation_detail) in [
+        (
+            0,
+            "simulate returned no min_resource_fee / transaction_data",
+            "re-simulate returned no min_resource_fee / transaction_data",
+        ),
+        (
+            FEE_CEILING + 1,
+            "the simulation's minimum resource fee exceeds the wallet's ceiling of 10000000 \
+             stroops",
+            "the re-simulation's minimum resource fee exceeds the wallet's ceiling of 10000000 \
+             stroops",
+        ),
+        (
+            u64::MAX,
+            "the simulation's minimum resource fee exceeds the wallet's ceiling of 10000000 \
+             stroops",
+            "the re-simulation's minimum resource fee exceeds the wallet's ceiling of 10000000 \
+             stroops",
+        ),
+    ] {
+        let fee_value = serde_json::json!(fee.to_string());
+        let outcome = run(Scenario::honest().with_first(answer_with(
+            &[honest_entry()],
+            "minResourceFee",
+            fee_value.clone(),
+        )))
+        .await;
+        assert_simulate_failed(&outcome.result, first_detail);
+        assert_nothing_signed_after(&outcome, &["getNetwork", "simulateTransaction"]);
+
+        let outcome = run(Scenario::honest()
+            .with_resimulation(move |_| answer_with(&[], "minResourceFee", fee_value.clone())))
+        .await;
+        assert_refused_after_the_send(&outcome, resimulation_detail);
+    }
+}
+
+/// A first simulation with a positive minimum resource fee and empty
+/// transaction data refuses before signing.
+#[tokio::test]
+async fn empty_transaction_data_in_first_simulation_refuses_before_signing() {
+    let first = answer_with(&[honest_entry()], "transactionData", serde_json::json!(""));
+    let outcome = run(Scenario::honest().with_first(first)).await;
+    assert_simulate_failed(
+        &outcome.result,
+        "simulate returned no min_resource_fee / transaction_data",
+    );
+    assert_nothing_signed_after(&outcome, &["getNetwork", "simulateTransaction"]);
+}
+
+/// A re-simulation with a positive minimum resource fee and empty transaction
+/// data is a failed simulation after the send, and no payload is returned.
+#[tokio::test]
+async fn empty_transaction_data_in_resimulation_withholds_payload() {
+    let outcome = run(Scenario::honest()
+        .with_resimulation(|_| answer_with(&[], "transactionData", serde_json::json!(""))))
+    .await;
+    assert_refused_after_the_send(
+        &outcome,
+        "re-simulate returned no min_resource_fee / transaction_data",
+    );
+}
+
+/// The resource fee embedded in both simulations' transaction data lies in
+/// `0..=min_resource_fee`.
+#[tokio::test]
+async fn embedded_resource_fee_is_bounded_and_covered() {
+    let first_detail = "the simulation's transaction data embeds a resource fee outside zero to \
+                        its minimum resource fee";
+    let resimulation_detail = "the re-simulation's transaction data embeds a resource fee \
+                               outside zero to its minimum resource fee";
+    let ceiling = i64::try_from(FEE_CEILING).unwrap();
+    // `(embedded fee, minimum resource fee)`.
+    let cases = [
+        (-1, HONEST_RESOURCE_FEE),
+        (ceiling + 1, FEE_CEILING),
+        (1001, HONEST_RESOURCE_FEE),
+    ];
+    for (embedded, minimum) in cases {
+        let data = serde_json::json!(transaction_data_xdr_with_fee(embedded));
+        let minimum = serde_json::json!(minimum.to_string());
+        let mut first = answer_with(&[honest_entry()], "transactionData", data.clone());
+        first["minResourceFee"] = minimum.clone();
+        let outcome = run(Scenario::honest().with_first(first)).await;
+        assert_simulate_failed(&outcome.result, first_detail);
+        assert_nothing_signed_after(&outcome, &["getNetwork", "simulateTransaction"]);
+
+        let outcome = run(Scenario::honest().with_resimulation(move |_| {
+            let mut answer = answer_with(&[], "transactionData", data.clone());
+            answer["minResourceFee"] = minimum.clone();
+            answer
+        }))
+        .await;
+        assert_refused_after_the_send(&outcome, resimulation_detail);
+    }
+}
+
+/// A minimum resource fee at the ceiling builds a payment whose fee is the
+/// ceiling plus the 100-stroop base fee.
+#[tokio::test]
+async fn resource_fee_boundary_builds_exact_total() {
+    let at_ceiling = |auth: &[SorobanAuthorizationEntry]| {
+        let mut answer = answer_with(
+            auth,
+            "transactionData",
+            serde_json::json!(transaction_data_xdr_with_fee(
+                i64::try_from(FEE_CEILING).unwrap()
+            )),
+        );
+        answer["minResourceFee"] = serde_json::json!(FEE_CEILING.to_string());
+        answer
+    };
+    let outcome = run(Scenario::honest()
+        .with_first(at_ceiling(&[honest_entry()]))
+        .with_resimulation(move |_| at_ceiling(&[])))
+    .await;
+    assert_paid(&outcome);
+    let transaction = payment_transaction(&outcome);
+    assert_eq!(transaction.tx.fee, 10_000_100);
+    let TransactionExt::V1(data) = &transaction.tx.ext else {
+        panic!("the payment carries Soroban transaction data");
+    };
+    assert_eq!(data.resource_fee, i64::try_from(FEE_CEILING).unwrap());
+}
+
+// ── Restoration ──────────────────────────────────────────────────────────────
+
+/// A restore preamble in the first simulation refuses before signing, a
+/// zero-fee preamble included.
+#[tokio::test]
+async fn restore_in_first_simulation_refuses_before_signing() {
+    for preamble_fee in ["0", "5000"] {
+        let first = answer_with(
+            &[honest_entry()],
+            "restorePreamble",
+            serde_json::json!({
+                "transactionData": transaction_data_xdr(),
+                "minResourceFee": preamble_fee,
+            }),
+        );
+        let outcome = run(Scenario::honest().with_first(first)).await;
+        assert_simulate_failed(
+            &outcome.result,
+            "the simulation returned a restore preamble; this wallet does not restore archived \
+             ledger entries",
+        );
+        assert_nothing_signed_after(&outcome, &["getNetwork", "simulateTransaction"]);
+    }
+}
+
+/// A restore preamble in the re-simulation refuses after the send: one
+/// signature, one signed request, and no payload.
+#[tokio::test]
+async fn restore_in_resimulation_withholds_payload() {
+    let outcome = run(Scenario::honest().with_resimulation(|_| {
+        answer_with(
+            &[],
+            "restorePreamble",
+            serde_json::json!({
+                "transactionData": transaction_data_xdr(),
+                "minResourceFee": "5000",
+            }),
+        )
+    }))
+    .await;
+    assert_refused_after_the_send(
+        &outcome,
+        "the re-simulation returned a restore preamble; this wallet does not restore archived \
+         ledger entries",
+    );
+    assert_eq!(outcome.received_signed.len(), 1, "one signed request");
+}
+
+/// Transaction data of the first simulation that restores archived entries
+/// inside the simulation refuses before signing.
+#[tokio::test]
+async fn archived_entries_in_first_simulation_refuse_before_signing() {
+    let first = answer_with(
+        &[honest_entry()],
+        "transactionData",
+        serde_json::json!(archived_transaction_data_xdr()),
+    );
+    let outcome = run(Scenario::honest().with_first(first)).await;
+    assert_simulate_failed(
+        &outcome.result,
+        "the simulation's transaction data restores archived ledger entries; this wallet does \
+         not restore them",
+    );
+    assert_nothing_signed_after(&outcome, &["getNetwork", "simulateTransaction"]);
+}
+
+/// Transaction data of the re-simulation that restores archived entries
+/// refuses after the send, and no payload is returned.
+#[tokio::test]
+async fn archived_entries_in_resimulation_withhold_payload() {
+    let outcome = run(Scenario::honest().with_resimulation(|_| {
+        answer_with(
+            &[],
+            "transactionData",
+            serde_json::json!(archived_transaction_data_xdr()),
+        )
+    }))
+    .await;
+    assert_refused_after_the_send(
+        &outcome,
+        "the re-simulation's transaction data restores archived ledger entries; this wallet \
+         does not restore them",
+    );
+}
+
+// ── Simulation request failures and malformed data ───────────────────────────
+
+/// First-phase transaction data that does not decode refuses before signing
+/// with a fixed detail.
+#[tokio::test]
+async fn an_undecodable_first_transaction_data_is_refused_before_signing() {
+    let first = answer_with(
+        &[honest_entry()],
+        "transactionData",
+        serde_json::json!("AAAA"),
+    );
+    let outcome = run(Scenario::honest().with_first(first)).await;
+    assert_simulate_failed(
+        &outcome.result,
+        "the simulation's transaction data does not decode",
+    );
+    assert_nothing_signed_after(&outcome, &["getNetwork", "simulateTransaction"]);
+}
+
+/// A simulation request that fails carries a phase prefix and the scrubbed
+/// network error: the echoed credential never reaches the detail.
+#[tokio::test]
+async fn a_failed_simulation_request_carries_a_phase_prefix_and_no_credentials() {
+    /// Answers `simulateTransaction` with an error object that echoes a
+    /// credential-bearing URL, from the request `fail_from` on.
+    struct EchoingFailure {
+        fail_from: usize,
+        simulations: AtomicUsize,
+        inner: PaymentRpc,
+    }
+    impl Respond for EchoingFailure {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body["method"] == "simulateTransaction"
+                && self.simulations.fetch_add(1, Ordering::SeqCst) >= self.fail_from
+            {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "error": {
+                        "code": -32000,
+                        "message": "upstream https://user:SECRET@archive.example.com:8443/rpc?token=SECRET failed",
+                    },
+                }));
+            }
+            self.inner.respond(request)
+        }
+    }
+
+    for (fail_from, prefix, signatures) in [
+        (0, "first simulation request failed: ", 0),
+        (1, "re-simulation request failed: ", 1),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(EchoingFailure {
+                fail_from,
+                simulations: AtomicUsize::new(0),
+                inner: PaymentRpc {
+                    network: MethodAnswer::Result(network_result(TESTNET_PASSPHRASE)),
+                    health: MethodAnswer::Result(health_result("healthy", LATEST_LEDGER)),
+                    first: answer(&[honest_entry()]),
+                    resimulation: Box::new(|_| answer(&[])),
+                    network_requests: AtomicUsize::new(0),
+                    health_requests: AtomicUsize::new(0),
+                    received_signed: Arc::new(Mutex::new(Vec::new())),
+                },
+            })
+            .mount(&server)
+            .await;
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let signer = CountingSigner::new();
+        let result = create_payment(
+            &requirements(),
+            &signer,
+            &client,
+            TESTNET_PASSPHRASE,
+            tokio::time::Instant::now() + GENEROUS_DEADLINE,
+            |_| Ok(()),
+        )
+        .await;
+        let Err(X402Error::RpcSimulateFailed { detail }) = result else {
+            panic!("expected RpcSimulateFailed, got {result:?}");
+        };
+        assert!(detail.starts_with(prefix), "{detail}");
+        assert!(
+            detail.contains("simulateTransaction failed: "),
+            "the network error follows the prefix: {detail}"
+        );
+        assert!(
+            detail.contains("archive.example.com:8443"),
+            "the echoed host stays: {detail}"
+        );
+        for leaked in ["SECRET", "token=", "user:", "https://"] {
+            assert!(!detail.contains(leaked), "{leaked} survived: {detail}");
+        }
+        assert_eq!(
+            signer.address_auth_digests.lock().unwrap().len(),
+            signatures,
+            "{prefix}"
+        );
+    }
 }

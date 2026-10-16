@@ -17,15 +17,19 @@
 //! ## Positive leg (testnet, feature-gated)
 //!
 //! - `stellar_x402_authenticated_payment` with `home_domain =
-//!   "testanchor.stellar.org"` and a USDC-testnet `PaymentRequirements`
-//!   produces `{ paymentSignature, authorization, payer, home_domain, payTo }`.
+//!   "testanchor.stellar.org"` and a native-SAC `PaymentRequirements` paying
+//!   a distinct funded recipient succeeds and returns, under `data`,
+//!   `{ paymentSignature, authorization, payer, home_domain, payTo }`.
 //! - `paymentSignature` decodes to a `PaymentPayload` with
-//!   `x402Version == 2`, non-empty `payload.transaction`, `accepted.scheme ==
-//!   "exact"`.
+//!   `x402Version == 2` whose transaction carries exactly the payer's signed
+//!   authorization of `transfer(payer, recipient, amount)`, with a signature
+//!   that verifies.
 //! - `authorization` is a non-empty Bearer token (`Bearer ` prefix +
 //!   3 dot-separated JWT segments).
 //! - `home_domain` in the response equals `"testanchor.stellar.org"`.
 //! - `payTo` matches the `PaymentRequirements.payTo` from the input.
+//! - The leg records the endpoint protocol and the ledgers the payment
+//!   checked. A SEP-10 or payment failure fails the leg; it never skips.
 //!
 //! ## Negative leg (no live-anchor dependency; compiled under `testnet-acceptance`)
 //!
@@ -41,26 +45,15 @@
 //!   `isError = true` with `error == "identity.home_domain_invalid"` AND NO
 //!   `paymentSignature` field.
 //!
-//! ## Positive-leg coverage note
+//! Abort-before-payment: neither negative case produces a `paymentSignature`
+//! or `authorization` field; the gate aborts before `create_payment` is
+//! called.
 //!
-//! The positive post-gate assertions (paymentSignature decode, Bearer JWT,
-//! payTo/network echo) execute ONLY on a USDC-funded account; on a CI
-//! Friendbot account `create_payment` skips at simulate (no USDC trustline,
-//! contract trustline-missing error) — so this run proves the SEP-10 identity
-//! GATE live, while the post-gate payment assertions are exercised separately
-//! by the `create_payment` acceptance test.
-//! - Abort-before-payment: neither negative case produces a
-//!   `paymentSignature` or `authorization` field — the gate aborts before
-//!   `create_payment` is called.
+//! # No skips (positive leg)
 //!
-//! # Distinguishable skip reasons (positive leg)
-//!
-//! The positive testnet leg prints one of:
-//! - `[SKIP-WITH-REASON] testanchor SEP-10 unavailable: ...`
-//! - `[SKIP-WITH-REASON] testnet RPC unreachable: ...`
-//! - `[SKIP-WITH-REASON] USDC trustline absent (Friendbot account)`
-//!
-//! Skip gates check existence/reachability, NOT funding thresholds.
+//! The positive leg needs a live SEP-10 session with testanchor and a live
+//! testnet RPC. An outage fails it: acceptance is then unavailable, and an
+//! unavailable leg never counts as a passing one.
 //!
 //! # Key discipline
 //!
@@ -225,6 +218,277 @@ fn extract_text(result: rmcp::model::CallToolResult) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Native-SAC payments
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Native-asset Stellar Asset Contract address on testnet. A Friendbot-funded
+/// account always holds native balance here, so a payment needs no trustline.
+const NATIVE_SAC_TESTNET: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+
+/// Atomic amount of the native payment: 0.1 XLM.
+const NATIVE_AMOUNT_STROOPS: u64 = 1_000_000;
+
+/// Signature window of a 300-second requirement, in ledgers.
+const WINDOW_LEDGERS: u64 = 60;
+
+/// `PaymentRequirements` JSON for a native-SAC payment to `pay_to`.
+fn native_requirements(pay_to: &str) -> String {
+    serde_json::json!({
+        "scheme": "exact",
+        "network": "stellar:testnet",
+        "asset": NATIVE_SAC_TESTNET,
+        "amount": NATIVE_AMOUNT_STROOPS.to_string(),
+        "payTo": pay_to,
+        "maxTimeoutSeconds": 300,
+        "extra": { "areFeesSponsored": true }
+    })
+    .to_string()
+}
+
+/// Waits until the endpoint shows `account`; fails when it never does.
+async fn wait_until_visible(account: &str) {
+    let rpc = stellar_agent_network::StellarRpcClient::new(TESTNET_RPC_URL)
+        .expect("RPC client construction");
+    for _ in 0..20 {
+        if stellar_agent_network::fetch_account(&rpc, account, &[])
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    panic!("[UNAVAILABLE] account {account} is not visible on the endpoint");
+}
+
+/// The numeric fields of every `create_payment` event that names the
+/// re-simulation ledger.
+#[derive(Clone, Default)]
+struct LedgerCapture(
+    std::sync::Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, u64>>>>,
+);
+
+struct NumericFields(std::collections::BTreeMap<String, u64>);
+
+impl tracing::field::Visit for NumericFields {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().to_owned(), value);
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LedgerCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "stellar_agent_x402::exact" {
+            return;
+        }
+        let mut fields = NumericFields(std::collections::BTreeMap::new());
+        event.record(&mut fields);
+        if fields.0.contains_key("resimulation_ledger") {
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+}
+
+impl LedgerCapture {
+    /// Captures `create_payment` events on this thread until the guard drops.
+    fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let capture = Self::default();
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        tracing::callsite::rebuild_interest_cache();
+        (capture, guard)
+    }
+
+    /// Checks and records the endpoint protocol and the ledgers of the one
+    /// payment captured, and returns its signature expiration ledger.
+    fn check_and_record(&self, leg: &str) -> u64 {
+        let events = self.0.lock().unwrap();
+        let [fields] = events.as_slice() else {
+            panic!("[{leg}] one payment event, got {}", events.len());
+        };
+        let field = |name: &str| *fields.get(name).unwrap_or_else(|| panic!("{name}"));
+        let (protocol, simulation, health, resimulation, expiration) = (
+            field("protocol_version"),
+            field("simulation_ledger"),
+            field("health_ledger"),
+            field("resimulation_ledger"),
+            field("signature_expiration_ledger"),
+        );
+        eprintln!(
+            "[{leg}] protocol {protocol} L={simulation} H={health} R={resimulation} E={expiration}"
+        );
+        assert!(
+            stellar_agent_network::SUPPORTED_PROTOCOL_VERSIONS
+                .contains(&u32::try_from(protocol).unwrap()),
+            "[{leg}] acceptance evidence needs a supported protocol, got {protocol}"
+        );
+        assert_eq!(expiration, simulation + WINDOW_LEDGERS, "[{leg}]");
+        assert!(simulation > 0 && simulation <= health + 1, "[{leg}]");
+        assert!(health < expiration, "[{leg}]");
+        assert!(
+            health <= resimulation + 1 && resimulation < expiration,
+            "[{leg}]"
+        );
+        expiration
+    }
+}
+
+/// The `PaymentPayload` behind a `paymentSignature` value and the
+/// authorization entries of its transaction.
+fn decode_payment(
+    payment_signature_b64: &str,
+) -> (PaymentPayload, Vec<stellar_xdr::SorobanAuthorizationEntry>) {
+    use base64::Engine as _;
+    let payload_bytes = base64::engine::general_purpose::STANDARD
+        .decode(payment_signature_b64)
+        .expect("paymentSignature must be valid standard base64");
+    let payload: PaymentPayload = serde_json::from_slice(&payload_bytes)
+        .expect("paymentSignature must decode to PaymentPayload JSON");
+    let envelope = <stellar_xdr::TransactionEnvelope as stellar_xdr::ReadXdr>::from_xdr_base64(
+        &payload.payload.transaction,
+        stellar_xdr::Limits::none(),
+    )
+    .expect("payload.transaction must decode to a TransactionEnvelope XDR");
+    let stellar_xdr::TransactionEnvelope::Tx(transaction) = envelope else {
+        panic!("TransactionEnvelope must be Tx (V1)");
+    };
+    let [operation] = transaction.tx.operations.as_slice() else {
+        panic!("the payment carries one operation");
+    };
+    let stellar_xdr::OperationBody::InvokeHostFunction(host) = &operation.body else {
+        panic!("tx operation must be InvokeHostFunction");
+    };
+    (payload, host.auth.to_vec())
+}
+
+/// The `ScAddress` of a G-strkey account.
+fn account_sc_address(account: &str) -> stellar_xdr::ScAddress {
+    let key = stellar_strkey::ed25519::PublicKey::from_string(account).expect("a G-strkey");
+    stellar_xdr::ScAddress::Account(stellar_xdr::AccountId(
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(key.0)),
+    ))
+}
+
+/// Asserts that `entries` is exactly the payer's signed authorization of
+/// `transfer(payer, recipient, amount)` on the native SAC, expiring at
+/// `expiration`, with a signature that verifies; and that a corrupted copy
+/// does not verify.
+fn assert_payer_authorization(
+    leg: &str,
+    entries: &[stellar_xdr::SorobanAuthorizationEntry],
+    payer: &str,
+    recipient: &str,
+    expiration: u64,
+) {
+    use stellar_xdr::{
+        ContractId, Hash, Int128Parts, InvokeContractArgs, ScSymbol, ScVal,
+        SorobanAuthorizedFunction, SorobanCredentials,
+    };
+    let [entry] = entries else {
+        panic!("[{leg}] one authorization entry, got {}", entries.len());
+    };
+    let SorobanCredentials::Address(credentials) = &entry.credentials else {
+        panic!("[{leg}] the entry carries Address credentials");
+    };
+    assert_eq!(credentials.address, account_sc_address(payer), "[{leg}]");
+    assert_eq!(
+        u64::from(credentials.signature_expiration_ledger),
+        expiration,
+        "[{leg}]"
+    );
+    let contract = stellar_strkey::Contract::from_string(NATIVE_SAC_TESTNET).unwrap();
+    let transfer = InvokeContractArgs {
+        contract_address: stellar_xdr::ScAddress::Contract(ContractId(Hash(contract.0))),
+        function_name: ScSymbol("transfer".try_into().unwrap()),
+        args: vec![
+            ScVal::Address(account_sc_address(payer)),
+            ScVal::Address(account_sc_address(recipient)),
+            ScVal::I128(Int128Parts {
+                hi: 0,
+                lo: NATIVE_AMOUNT_STROOPS,
+            }),
+        ]
+        .try_into()
+        .unwrap(),
+    };
+    assert_eq!(
+        entry.root_invocation.function,
+        SorobanAuthorizedFunction::ContractFn(transfer),
+        "[{leg}] the payer signs the expected transfer"
+    );
+    assert!(entry.root_invocation.sub_invocations.is_empty(), "[{leg}]");
+    let payer_key = stellar_strkey::ed25519::PublicKey::from_string(payer)
+        .unwrap()
+        .0;
+    assert!(
+        verify_auth_entry_signature(entry, &payer_key),
+        "[{leg}] the payer's signature verifies"
+    );
+    let mut corrupted = entry.clone();
+    if let SorobanCredentials::Address(credentials) = &mut corrupted.credentials {
+        credentials.signature_expiration_ledger += 1;
+    }
+    assert!(
+        !verify_auth_entry_signature(&corrupted, &payer_key),
+        "[{leg}] a corrupted entry must not verify"
+    );
+}
+
+/// Verifies an `Address`-credentialled entry's ed25519 signature over its
+/// reconstructed `HashIdPreimage::SorobanAuthorization` on testnet.
+fn verify_auth_entry_signature(
+    entry: &stellar_xdr::SorobanAuthorizationEntry,
+    payer_key: &[u8; 32],
+) -> bool {
+    use sha2::{Digest as _, Sha256};
+    use stellar_xdr::{
+        Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, Limits, ScVal,
+        SorobanCredentials, WriteXdr as _,
+    };
+    const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+    let SorobanCredentials::Address(credentials) = &entry.credentials else {
+        return false;
+    };
+    let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+        network_id: Hash(Sha256::digest(TESTNET_PASSPHRASE.as_bytes()).into()),
+        nonce: credentials.nonce,
+        signature_expiration_ledger: credentials.signature_expiration_ledger,
+        invocation: entry.root_invocation.clone(),
+    });
+    let Ok(preimage_bytes) = preimage.to_xdr(Limits::none()) else {
+        return false;
+    };
+    let digest: [u8; 32] = Sha256::digest(&preimage_bytes).into();
+    let ScVal::Vec(Some(outer)) = &credentials.signature else {
+        return false;
+    };
+    let Some(ScVal::Map(Some(map))) = outer.first() else {
+        return false;
+    };
+    let signature = map.iter().find_map(|item| match (&item.key, &item.val) {
+        (ScVal::Symbol(key), ScVal::Bytes(bytes)) if key.0.as_slice() == b"signature" => {
+            <[u8; 64]>::try_from(bytes.0.as_slice()).ok()
+        }
+        _ => None,
+    });
+    let Some(signature) = signature else {
+        return false;
+    };
+    let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(payer_key) else {
+        return false;
+    };
+    key.verify_strict(&digest, &ed25519_dalek::Signature::from_bytes(&signature))
+        .is_ok()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // NEGATIVE leg (always-runs, offline)
 // Runs without testnet network (aborts before any successful fetch).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -378,47 +642,31 @@ async fn a6f_neg2_invalid_home_domain_aborts_before_payment() {
 /// Positive: full SEP-10 authenticated payment against testanchor.
 ///
 /// Calls `stellar_x402_authenticated_payment` with `home_domain =
-/// "testanchor.stellar.org"` + a USDC-testnet `PaymentRequirements`.
-///
-/// The PRODUCTION gate performs a REAL SEP-10 ephemeral auth against
-/// testanchor's `WEB_AUTH_ENDPOINT` → JWT, then `create_payment` runs
-/// build→simulate against testnet RPC.
-///
-/// Asserts:
-/// - `paymentSignature` (base64; decodes to `PaymentPayload` with
-///   `x402Version == 2` + `transaction`).
-/// - `authorization` (non-empty; `Bearer <jwt>` with 3 dot-separated segments).
-/// - `payer` matches the wallet address.
-/// - `home_domain == "testanchor.stellar.org"`.
-/// - `payTo` matches the input `PaymentRequirements.payTo`.
-///
-/// Skip-with-distinguishable-reason if:
-/// - testanchor SEP-10 is unreachable (identity gate aborts; skip-reason logged).
-/// - testnet RPC is unreachable (create_payment simulate fails; skip-reason logged).
-/// - USDC trustline absent on Friendbot account (simulate returns the
-///   trustline-missing contract error; skip-reason logged).
-///
-/// No balance checks; do NOT fabricate a pass.
+/// "testanchor.stellar.org"` and a native-SAC payment from a funded payer to
+/// a distinct funded recipient. The production gate runs a real SEP-10
+/// ephemeral challenge/response against testanchor, then `create_payment`
+/// builds the payment against testnet RPC. The leg reads the response under
+/// `data` and fails on any error.
 #[tokio::test]
 #[serial]
 async fn a6f_positive_testanchor_sep10_authenticated_payment() {
     let (g_strkey, seed) = fresh_keypair();
-
-    // Fund via Friendbot — if Friendbot is down, skip with reason.
-    if let Err(reason) = try_fund_via_friendbot(&g_strkey).await {
-        eprintln!("[SKIP-WITH-REASON] testnet RPC unreachable (Friendbot failed): {reason}");
-        return;
-    }
-    eprintln!("funded {g_strkey} via Friendbot");
+    let (recipient, _recipient_seed) = fresh_keypair();
+    try_fund_via_friendbot(&g_strkey)
+        .await
+        .unwrap_or_else(|reason| panic!("[UNAVAILABLE] payer funding: {reason}"));
+    try_fund_via_friendbot(&recipient)
+        .await
+        .unwrap_or_else(|reason| panic!("[UNAVAILABLE] recipient funding: {reason}"));
+    wait_until_visible(&g_strkey).await;
+    wait_until_visible(&recipient).await;
 
     let server = build_test_server(&g_strkey, &seed, "x402-auth-test-positive");
 
-    // Use the payer's own address as payTo.
-    let requirements_json = usdc_testnet_requirements(&g_strkey);
-
+    let (capture, _guard) = LedgerCapture::install();
     let result = server
         .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
-            payment_required: requirements_json,
+            payment_required: native_requirements(&recipient),
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             home_domain: TESTANCHOR_HOME_DOMAIN.to_owned(),
             address: None,
@@ -428,139 +676,54 @@ async fn a6f_positive_testanchor_sep10_authenticated_payment() {
 
     let is_err = result.is_error == Some(true);
     let text = extract_text(result);
-
-    if is_err {
-        let lc = text.to_lowercase();
-
-        // testnet RPC / simulate skip (USDC trustline absent or simulate failure).
-        // NOTE: checked BEFORE sep10_skip — `payment_build_failed` means SEP-10
-        // succeeded but create_payment's simulate step failed (typically trustline
-        // missing on a Friendbot-funded account).  This is the expected environment
-        // skip for Friendbot accounts (existence/reachability, not funding amounts).
-        let is_rpc_skip = lc.contains("trustline")
-            || lc.contains("insufficient")
-            || lc.contains("underfunded")
-            || lc.contains("rpc simulate failed")
-            || lc.contains("simulate returned error")
-            || lc.contains("#13")
-            || lc.contains("payment_build_failed")
-            || lc.contains("payment build failed");
-
-        if is_rpc_skip {
-            eprintln!(
-                "[SKIP-WITH-REASON] USDC trustline absent (Friendbot account) or simulate failed: {text}"
-            );
-            return;
-        }
-
-        // testanchor SEP-10 unavailable — identity gate aborted before payment.
-        // Only matches when the error is NOT `payment_build_failed` (already handled above).
-        let is_sep10_skip = lc.contains("sep-10")
-            || lc.contains("sep10")
-            || lc.contains("web_auth")
-            || lc.contains("stellar.toml")
-            || lc.contains("toml fetch")
-            || lc.contains("home domain unreachable")
-            || lc.contains("home domain is invalid")
-            || lc.contains("signing_key")
-            || lc.contains("web_auth_endpoint")
-            || lc.contains("identity.home_domain")
-            || lc.contains("identity.toml")
-            || lc.contains("identity.signing")
-            || lc.contains("identity.web_auth")
-            || lc.contains("identity.sep10");
-
-        if is_sep10_skip {
-            eprintln!("[SKIP-WITH-REASON] testanchor SEP-10 unavailable: {text}");
-            return;
-        }
-
-        panic!("[FAIL] authenticated_payment errored for a non-environment reason: {text}");
-    }
-
+    assert!(!is_err, "[FAIL] authenticated_payment errored: {text}");
     let value: serde_json::Value = serde_json::from_str(&text).expect("result must be valid JSON");
+    assert_eq!(value["ok"], true, "{value}");
+    let data = &value["data"];
+    assert_eq!(data["payer"], g_strkey.as_str(), "{value}");
+    assert_eq!(data["home_domain"], TESTANCHOR_HOME_DOMAIN, "{value}");
+    assert_eq!(data["payTo"], recipient.as_str(), "{value}");
+    assert_eq!(data["asset"], NATIVE_SAC_TESTNET, "{value}");
+    assert_eq!(data["network"], "stellar:testnet", "{value}");
+    assert!(data["payto_anchored"].is_string(), "{value}");
 
-    // Response shape — all required fields present.
-    assert!(
-        value
-            .get("paymentSignature")
-            .and_then(|v| v.as_str())
-            .is_some(),
-        "paymentSignature must be present and a string; got {value:?}"
-    );
-    assert!(
-        value
-            .get("authorization")
-            .and_then(|v| v.as_str())
-            .is_some(),
-        "authorization must be present and a string; got {value:?}"
-    );
-    assert_eq!(
-        value.get("payer").and_then(|v| v.as_str()),
-        Some(g_strkey.as_str()),
-        "payer must match the wallet address"
-    );
-    assert_eq!(
-        value.get("home_domain").and_then(|v| v.as_str()),
-        Some(TESTANCHOR_HOME_DOMAIN),
-        "home_domain must be echoed from the gate"
-    );
-    assert_eq!(
-        value.get("payTo").and_then(|v| v.as_str()),
-        Some(g_strkey.as_str()),
-        "payTo must match the input PaymentRequirements.payTo"
-    );
-    assert_eq!(
-        value.get("network").and_then(|v| v.as_str()),
-        Some("stellar:testnet"),
-        "network must be stellar:testnet"
-    );
-
-    // paymentSignature decodes to PaymentPayload with x402Version == 2.
-    let payment_sig_b64 = value["paymentSignature"].as_str().unwrap();
-    let payload_bytes = {
-        use base64::Engine as _;
-        base64::engine::general_purpose::STANDARD
-            .decode(payment_sig_b64)
-            .expect("paymentSignature must be valid standard base64")
-    };
-    let payload: PaymentPayload = serde_json::from_slice(&payload_bytes)
-        .expect("paymentSignature must decode to PaymentPayload JSON");
-    assert_eq!(payload.x402_version, 2, "x402Version must be 2");
-    assert_eq!(
-        payload.accepted.scheme, "exact",
-        "accepted.scheme must be \"exact\""
-    );
-    assert!(
-        !payload.payload.transaction.is_empty(),
-        "payload.transaction must be non-empty base64"
-    );
-
-    // authorization is a Bearer token with 3 dot-separated JWT segments.
-    let authorization = value["authorization"].as_str().unwrap();
-    assert!(
-        authorization.starts_with("Bearer "),
-        "authorization must start with 'Bearer '; got: {authorization}"
-    );
-    let jwt_part = authorization.strip_prefix("Bearer ").unwrap();
-    assert!(
-        !jwt_part.is_empty(),
-        "JWT part of authorization must be non-empty"
-    );
+    let authorization = data["authorization"]
+        .as_str()
+        .unwrap_or_else(|| panic!("authorization must be a string: {value}"));
+    let jwt_part = authorization
+        .strip_prefix("Bearer ")
+        .unwrap_or_else(|| panic!("authorization must start with 'Bearer ': {authorization}"));
     let segments: Vec<&str> = jwt_part.split('.').collect();
     assert_eq!(
         segments.len(),
         3,
-        "JWT must have exactly 3 dot-separated segments; got {}: '{jwt_part}'",
-        segments.len()
+        "JWT must have exactly 3 dot-separated segments"
     );
+    for segment in &segments {
+        assert!(
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "every JWT segment must be non-empty base64url: {jwt_part}"
+        );
+    }
 
-    // home_domain and payTo already asserted above.
-
+    let payment_signature = data["paymentSignature"]
+        .as_str()
+        .unwrap_or_else(|| panic!("paymentSignature must be a string: {value}"));
+    let (payload, entries) = decode_payment(payment_signature);
+    assert_eq!(payload.x402_version, 2, "x402Version must be 2");
+    assert_eq!(payload.accepted.scheme, "exact");
+    let expiration = capture.check_and_record("a6f authenticated_payment");
+    assert_payer_authorization(
+        "a6f authenticated_payment",
+        &entries,
+        &g_strkey,
+        &recipient,
+        expiration,
+    );
     eprintln!(
-        "PASS: paymentSignature {} bytes, x402Version=2, Bearer JWT {} chars, \
-         home_domain={TESTANCHOR_HOME_DOMAIN}",
-        payment_sig_b64.len(),
-        jwt_part.len()
+        "PASS: SEP-10 session with {TESTANCHOR_HOME_DOMAIN} and the payer's verified authorization"
     );
 }

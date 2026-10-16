@@ -5376,6 +5376,8 @@ dependencies = [
  "stellar-xdr 28.0.0",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "wiremock",
  "zeroize",
 ]

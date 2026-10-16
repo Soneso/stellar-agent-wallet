@@ -12,8 +12,9 @@ use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
 use stellar_rpc_client::{
     Client, GetHealthResponse, GetLedgerEntriesResponse, GetTransactionResponseRaw,
+    SimulateTransactionResponse,
 };
-use stellar_xdr::LedgerKey;
+use stellar_xdr::{LedgerKey, TransactionEnvelope};
 use tokio::time::Instant;
 
 use crate::endpoint_identity::{EndpointIdentity, check_protocol_version};
@@ -158,6 +159,57 @@ impl StellarRpcClient {
             .get_health()
             .await
             .map_err(|e| rpc_unreachable(&self.url, GET_HEALTH_FAILED, &e))
+    }
+
+    /// Fetches Stellar RPC `getHealth`, retrying transport failures until
+    /// `deadline`.
+    ///
+    /// The retries follow the classification of
+    /// [`Self::endpoint_identity`]: a transport failure or a JSON-RPC error
+    /// object is retried with bounded exponential backoff under `deadline`,
+    /// the caller's own deadline. An answer whose body does not deserialize,
+    /// for example one without `ledgerRetentionWindow`, is not retried. The
+    /// answer is returned as received; judging its `status` is the caller's
+    /// part.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::RpcUnreachable`] when no attempt succeeds before
+    /// `deadline` or the retries run out, or when the answer does not
+    /// deserialize. The `url` field is authority-only and the reason is
+    /// scrubbed of credential-bearing URLs.
+    pub async fn get_health_within(
+        &self,
+        deadline: Instant,
+    ) -> Result<GetHealthResponse, NetworkError> {
+        let policy = RetryPolicy::default();
+        retry_with_backoff(&policy, deadline, is_retryable_identity_error, || async {
+            self.inner.get_health().await
+        })
+        .await
+        .map_err(|e| rpc_unreachable(&self.url, GET_HEALTH_FAILED, &e))
+    }
+
+    /// Simulates `envelope` through Stellar RPC `simulateTransaction`.
+    ///
+    /// The request carries the envelope as given and no `authMode` field, so
+    /// the endpoint applies its own default mode. The answer is returned as
+    /// received; every check of its content is the caller's part.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::RpcUnreachable`] when the envelope does not
+    /// encode, the request fails, or the answer does not deserialize. The
+    /// `url` field is authority-only and the reason is scrubbed of
+    /// credential-bearing URLs.
+    pub async fn simulate_transaction_envelope(
+        &self,
+        envelope: &TransactionEnvelope,
+    ) -> Result<SimulateTransactionResponse, NetworkError> {
+        self.inner
+            .simulate_transaction_envelope(envelope, None)
+            .await
+            .map_err(|e| rpc_unreachable(&self.url, SIMULATE_TRANSACTION_FAILED, &e))
     }
 
     /// Asks the endpoint what became of one transaction.
@@ -375,6 +427,9 @@ const GET_HEALTH_FAILED: &str = "getHealth failed: ";
 /// The reason prefix of a failed `getTransaction` call.
 const GET_TRANSACTION_FAILED: &str = "getTransaction failed: ";
 
+/// The reason prefix of a failed `simulateTransaction` call.
+const SIMULATE_TRANSACTION_FAILED: &str = "simulateTransaction failed: ";
+
 /// The reason prefix of an unexpected status met while recovering a stale
 /// pending receipt.
 pub(crate) const STALE_PENDING_RECOVERY: &str = "stale-Pending recovery: ";
@@ -444,6 +499,7 @@ mod tests {
             GET_LEDGER_ENTRIES_FAILED,
             GET_HEALTH_FAILED,
             GET_TRANSACTION_FAILED,
+            SIMULATE_TRANSACTION_FAILED,
         ];
         for prefix in prefixes {
             for (case, raw) in ERROR_OBJECTS {

@@ -2,11 +2,14 @@
 //! authorization leaves the wallet.
 //!
 //! `create_payment` sends the signed authorization to the profile's RPC in the
-//! re-simulation request. The mock RPC here inspects every simulate request: the
-//! unsigned first simulate carries no authorization entry, and the signed
-//! re-simulation carries the payer's signed entry. Its handler for the signed
-//! request counts the `x402_payment_authorized` rows already in the log, so a
-//! row written after the send, or not at all, fails the test.
+//! re-simulation request. The mock RPC here answers every method the payment
+//! sends, routed by method: `getNetwork` for the endpoint identity check,
+//! `getHealth` for the ledger consistency read, and `simulateTransaction` for
+//! both simulations; any other method panics. It inspects every simulate
+//! request: the unsigned first simulate carries no authorization entry, and
+//! the signed re-simulation carries the payer's signed entry. Its handler for
+//! the signed request counts the `x402_payment_authorized` rows already in the
+//! log, so a row written after the send, or not at all, fails the test.
 
 #![allow(
     clippy::unwrap_used,
@@ -55,6 +58,9 @@ enum FirstSimulate {
     /// The payer's entry for a transfer of another amount than the one the
     /// wallet built.
     OtherAmount,
+    /// The honest entry with a minimum resource fee above the wallet's
+    /// ceiling.
+    FeeAboveCeiling,
 }
 
 /// How the mock answers the signed re-simulation.
@@ -69,6 +75,25 @@ enum Resimulation {
     /// The signed entry with another nonce: authorization other than the
     /// signed entry.
     OtherAuthorization,
+    /// A minimum resource fee above the wallet's ceiling.
+    FeeAboveCeiling,
+    /// A restore preamble beside otherwise valid resource data.
+    RestorePreamble,
+    /// A latest ledger at the signature expiration ledger.
+    LedgerAtExpiration,
+    /// A positive minimum resource fee and empty transaction data.
+    EmptyTransactionData,
+}
+
+/// How the mock answers `getNetwork`.
+#[derive(Clone, PartialEq, Eq)]
+enum NetworkAnswer {
+    /// This passphrase at a supported protocol version.
+    Passphrase(&'static str),
+    /// This passphrase after a delay.
+    Delayed(&'static str, std::time::Duration),
+    /// A JSON-RPC error object.
+    ErrorObject,
 }
 
 /// What the mock observed, shared with the test.
@@ -77,11 +102,13 @@ struct Observed {
     /// `x402_payment_authorized` rows in the log when each signed
     /// re-simulation arrived.
     authorized_rows_at_resimulation: Vec<usize>,
-    /// Per request, whether it carried an authorization entry.
+    /// Per simulate request, whether it carried an authorization entry.
     signed: Vec<bool>,
     /// Per signed request, the expiration ledger, the address, and the
     /// invocation of the signed authorization entry it carried.
     transmitted: Vec<(u32, ScAddress, InvokeContractArgs)>,
+    /// The method of every request, in the order they arrived.
+    methods: Vec<String>,
 }
 
 /// Simulate endpoint for the x402 Exact flow.
@@ -91,9 +118,13 @@ struct X402Rpc {
     log_path: PathBuf,
     first: FirstSimulate,
     resimulation: Resimulation,
+    network: NetworkAnswer,
     /// Bytes the unsigned simulate writes over the log, once: a rollback that
     /// lands after the audit pre-flight and before the transmit gate.
     roll_back_to: Arc<Mutex<Option<Vec<u8>>>>,
+    /// The keyring entry the unsigned simulate deletes: the signer loaded
+    /// before it then fails at the sign call.
+    forget_on_first: Option<(String, String)>,
     observed: Arc<Mutex<Observed>>,
 }
 
@@ -104,7 +135,9 @@ impl X402Rpc {
             log_path,
             first: FirstSimulate::Ok,
             resimulation: Resimulation::Ok,
+            network: NetworkAnswer::Passphrase(TESTNET_PASSPHRASE),
             roll_back_to: Arc::new(Mutex::new(None)),
+            forget_on_first: None,
             observed: Arc::new(Mutex::new(Observed::default())),
         }
     }
@@ -134,6 +167,47 @@ fn void_xdr() -> String {
         .expect("ScVal::Void encodes")
 }
 
+/// Testnet passphrase the profiles here serve.
+const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+
+/// Mainnet passphrase.
+const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
+
+/// A network that is neither testnet nor mainnet.
+const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
+
+/// Latest ledger of every answer, and the health ledger.
+const LEDGER: u32 = 1000;
+
+/// A minimum resource fee one stroop above the wallet's ceiling.
+const FEE_ABOVE_CEILING: &str = "10000001";
+
+impl X402Rpc {
+    fn network_answer(&self, req_id: &serde_json::Value) -> ResponseTemplate {
+        let answer = |passphrase: &str| {
+            simulate_result(
+                req_id.clone(),
+                serde_json::json!({
+                    "friendbotUrl": "https://friendbot.stellar.org",
+                    "passphrase": passphrase,
+                    "protocolVersion": 29,
+                }),
+            )
+        };
+        match &self.network {
+            NetworkAnswer::Passphrase(passphrase) => answer(passphrase),
+            NetworkAnswer::Delayed(passphrase, delay) => answer(passphrase).set_delay(*delay),
+            NetworkAnswer::ErrorObject => ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32603, "message": "backend unavailable"},
+                }))
+                .insert_header("content-type", "application/json"),
+        }
+    }
+}
+
 impl Respond for X402Rpc {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body = serde_json::from_slice::<serde_json::Value>(&request.body)
@@ -142,6 +216,28 @@ impl Respond for X402Rpc {
             .get("id")
             .cloned()
             .unwrap_or_else(|| serde_json::json!(1));
+        let method = body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        self.observed.lock().unwrap().methods.push(method.clone());
+        match method.as_str() {
+            "getNetwork" => return self.network_answer(&req_id),
+            "getHealth" => {
+                return simulate_result(
+                    req_id,
+                    serde_json::json!({
+                        "status": "healthy",
+                        "latestLedger": LEDGER,
+                        "oldestLedger": 1,
+                        "ledgerRetentionWindow": 17_280,
+                    }),
+                );
+            }
+            "simulateTransaction" => {}
+            other => panic!("the x402 flow sends no {other:?} request"),
+        }
         let envelope_b64 = body
             .get("params")
             .and_then(|params| params.get("transaction"))
@@ -182,6 +278,12 @@ impl Respond for X402Rpc {
             if let Some(bytes) = self.roll_back_to.lock().unwrap().take() {
                 std::fs::write(&self.log_path, bytes).expect("roll the audit log back");
             }
+            if let Some((service, account)) = &self.forget_on_first {
+                keyring_core::Entry::new(service, account)
+                    .expect("Entry::new")
+                    .delete_credential()
+                    .expect("delete the signer's secret");
+            }
             if self.first == FirstSimulate::Error {
                 return simulate_result(
                     req_id,
@@ -206,11 +308,16 @@ impl Respond for X402Rpc {
                     sub_invocations: VecM::default(),
                 },
             };
+            let min_resource_fee = if self.first == FirstSimulate::FeeAboveCeiling {
+                FEE_ABOVE_CEILING
+            } else {
+                "1000"
+            };
             return simulate_result(
                 req_id,
                 serde_json::json!({
                     "transactionData": TRANSACTION_DATA,
-                    "minResourceFee": "1000",
+                    "minResourceFee": min_resource_fee,
                     "results": [{
                         "auth": [entry.to_xdr_base64(Limits::none()).expect("entry encodes")],
                         "xdr": void_xdr(),
@@ -276,6 +383,46 @@ impl Respond for X402Rpc {
                     }),
                 )
             }
+            Resimulation::FeeAboveCeiling => simulate_result(
+                req_id,
+                serde_json::json!({
+                    "transactionData": TRANSACTION_DATA,
+                    "minResourceFee": FEE_ABOVE_CEILING,
+                    "results": [{"auth": [], "xdr": void_xdr()}],
+                    "latestLedger": 1000,
+                }),
+            ),
+            Resimulation::RestorePreamble => simulate_result(
+                req_id,
+                serde_json::json!({
+                    "transactionData": TRANSACTION_DATA,
+                    "minResourceFee": "1000",
+                    "results": [{"auth": [], "xdr": void_xdr()}],
+                    "restorePreamble": {
+                        "transactionData": TRANSACTION_DATA,
+                        "minResourceFee": "5000",
+                    },
+                    "latestLedger": 1000,
+                }),
+            ),
+            Resimulation::LedgerAtExpiration => simulate_result(
+                req_id,
+                serde_json::json!({
+                    "transactionData": TRANSACTION_DATA,
+                    "minResourceFee": "1000",
+                    "results": [{"auth": [], "xdr": void_xdr()}],
+                    "latestLedger": 1060,
+                }),
+            ),
+            Resimulation::EmptyTransactionData => simulate_result(
+                req_id,
+                serde_json::json!({
+                    "transactionData": "",
+                    "minResourceFee": "1000",
+                    "results": [{"auth": [], "xdr": void_xdr()}],
+                    "latestLedger": 1000,
+                }),
+            ),
         }
     }
 }
@@ -318,6 +465,10 @@ impl Tool {
 }
 
 /// One isolated payer, profile, mock RPC, and server.
+///
+/// The payer seed names the payer account, and the shared test audit log is
+/// named after that account. A seed therefore belongs to one profile name in
+/// the whole test binary: the tests here use seeds no other suite uses.
 struct Fixture {
     _home: tempfile::TempDir,
     _home_guard: StellarAgentHomeGuard,
@@ -331,6 +482,17 @@ async fn fixture(
     profile_name: &str,
     seed: [u8; 32],
     configure: impl FnOnce(&mut X402Rpc),
+) -> Fixture {
+    fixture_with_profile(profile_name, seed, configure, |_| {}).await
+}
+
+/// [`fixture`] with `configure_profile` applied to the profile before the
+/// server is built.
+async fn fixture_with_profile(
+    profile_name: &str,
+    seed: [u8; 32],
+    configure: impl FnOnce(&mut X402Rpc),
+    configure_profile: impl FnOnce(&mut Profile),
 ) -> Fixture {
     let home = tempfile::tempdir().expect("temp home");
     let home_guard = StellarAgentHomeGuard::new(home.path());
@@ -354,6 +516,7 @@ async fn fixture(
         .mount(&mock)
         .await;
     profile.rpc_url = mock.uri();
+    configure_profile(&mut profile);
     let mut server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     server.set_x402_identity_session_for_test(
         "header.payload.signature".to_owned(),
@@ -764,11 +927,14 @@ async fn the_transmit_gate_sees_the_authorization_the_resimulation_carries() {
     let mut seen = None;
     // No row is written here, so the mock answers the signed request with an
     // error after recording it; the result does not matter to this test.
+    let client = stellar_agent_network::StellarRpcClient::new(&fixture.mock.uri())
+        .expect("the loopback URL parses");
     let _ = stellar_agent_x402::exact::create_payment(
         &requirements,
         &signer,
-        &fixture.mock.uri(),
+        &client,
         &fixture.profile.network_passphrase,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(60),
         |authorization| {
             seen = Some((
                 authorization.network.to_owned(),
@@ -817,4 +983,830 @@ async fn the_transmit_gate_sees_the_authorization_the_resimulation_carries() {
         ScVal::Address(payer_sc_address(&pay_to))
     );
     assert_eq!(sent_function.args[2], ScVal::from(amount));
+}
+
+// ── Endpoint identity through both tools ─────────────────────────────────────
+
+/// The successful primary sequence of one payment.
+const PAYMENT_METHODS: [&str; 4] = [
+    "getNetwork",
+    "simulateTransaction",
+    "getHealth",
+    "simulateTransaction",
+];
+
+/// Both tools build exactly one client per payment under a Noop policy, and
+/// every request of the payment goes to it: the identity check first, then
+/// the simulations and the health read.
+async fn the_primary_client_serves_the_whole_payment(tool: Tool, profile_name: &str, seed: u8) {
+    let fixture = fixture(profile_name, [seed; 32], |_| {}).await;
+    let (result, built) = crate::common::clients_built_by(call(&fixture, tool)).await;
+    let envelope = result_json(&result);
+    assert_ne!(result.is_error, Some(true), "{tool:?}: {envelope}");
+    assert!(
+        envelope["data"]["paymentSignature"].is_string(),
+        "{tool:?}: {envelope}"
+    );
+    assert_eq!(built, 1, "{tool:?}: one client per payment");
+    assert_eq!(
+        fixture.rpc.observed.lock().unwrap().methods,
+        PAYMENT_METHODS,
+        "{tool:?}: the identity check is the client's first request"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn mcp_x402_tools_share_the_primary_client() {
+    the_primary_client_serves_the_whole_payment(Tool::CreatePayment, "x402-client-cp", 0xc6).await;
+    the_primary_client_serves_the_whole_payment(Tool::AuthenticatedPayment, "x402-client-ap", 0xc7)
+        .await;
+}
+
+/// An endpoint that fails the identity check answers its own network code
+/// through both tools: an error result, no payload, no simulation, and no
+/// x402 audit row. The authenticated tool does not collapse it into
+/// `x402.payment_build_failed`.
+#[tokio::test]
+#[serial]
+async fn mcp_x402_identity_errors_keep_network_codes() {
+    let cases = [
+        (
+            NetworkAnswer::Passphrase(FUTURENET_PASSPHRASE),
+            "network.endpoint_network_mismatch",
+        ),
+        (
+            NetworkAnswer::Passphrase(MAINNET_PASSPHRASE),
+            "network.mainnet_write_forbidden",
+        ),
+        (
+            NetworkAnswer::ErrorObject,
+            "network.endpoint_identity_unavailable",
+        ),
+    ];
+    let mut seed = 0xc7;
+    for (network, code) in cases {
+        for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+            seed += 1;
+            let profile_name = format!("x402-identity-{seed:x}");
+            let answer = network.clone();
+            let fixture = fixture_with_profile(
+                &profile_name,
+                [seed; 32],
+                |rpc| rpc.network = answer,
+                |profile| profile.submit_timeout_seconds = Some(1),
+            )
+            .await;
+            let result = call(&fixture, tool).await;
+            let (got, _message, text) = crate::common::assert_business_envelope(&result);
+            assert_eq!(got, code, "{tool:?}");
+            assert!(!text.contains("paymentSignature"), "{tool:?}: {text}");
+            let observed = fixture.rpc.observed.lock().unwrap();
+            assert!(
+                observed.signed.is_empty(),
+                "{tool:?}: no simulation is sent"
+            );
+            assert!(
+                observed.methods.iter().all(|method| method == "getNetwork"),
+                "{tool:?}: {:?}",
+                observed.methods
+            );
+            drop(observed);
+            let (authorized, withheld) = x402_rows(&fixture.profile);
+            assert!(
+                authorized.is_empty() && withheld.is_empty(),
+                "{tool:?}: no x402 row"
+            );
+        }
+    }
+}
+
+/// A profile URL the transport cannot parse refuses through both tools with
+/// `network.rpc_unreachable` before any request.
+#[tokio::test]
+#[serial]
+async fn mcp_x402_client_construction_failure_is_rpc_unreachable() {
+    for (tool, profile_name, seed) in [
+        (Tool::CreatePayment, "x402-construct-cp", 0xce),
+        (Tool::AuthenticatedPayment, "x402-construct-ap", 0xcf),
+    ] {
+        let fixture = fixture_with_profile(
+            profile_name,
+            [seed; 32],
+            |_| {},
+            |profile| {
+                profile.rpc_url = "http://archive example.com/rpc".to_owned();
+            },
+        )
+        .await;
+        let result = call(&fixture, tool).await;
+        let (code, _message, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, "network.rpc_unreachable", "{tool:?}");
+        assert!(!text.contains("paymentSignature"), "{tool:?}: {text}");
+        assert!(
+            fixture.rpc.observed.lock().unwrap().methods.is_empty(),
+            "{tool:?}: no request"
+        );
+    }
+}
+
+/// The identity check runs under the profile's submit timeout. A configured
+/// one second refuses an answer that takes three, whatever the requirement's
+/// `maxTimeoutSeconds`. The default of sixty seconds waits for it, even under
+/// a one-second `maxTimeoutSeconds`.
+#[tokio::test]
+#[serial]
+async fn mcp_x402_identity_uses_profile_timeout() {
+    let slow = NetworkAnswer::Delayed(TESTNET_PASSPHRASE, std::time::Duration::from_secs(3));
+    let mut seed = 0xd5;
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        seed += 1;
+        let answer = slow.clone();
+        let configured = fixture_with_profile(
+            &format!("x402-timeout-set-{seed:x}"),
+            [seed; 32],
+            |rpc| rpc.network = answer,
+            |profile| profile.submit_timeout_seconds = Some(1),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let result = call_with(&configured, tool, &payment_required_with(|_| {})).await;
+        let (code, _message, _text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, "network.endpoint_identity_unavailable", "{tool:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{tool:?}: the configured timeout ends the check"
+        );
+
+        seed += 1;
+        let answer = slow.clone();
+        let default = fixture_with_profile(
+            &format!("x402-timeout-default-{seed:x}"),
+            [seed; 32],
+            |rpc| rpc.network = answer,
+            |profile| profile.submit_timeout_seconds = None,
+        )
+        .await;
+        let result = call_with(
+            &default,
+            tool,
+            &payment_required_with(|requirements| {
+                requirements["maxTimeoutSeconds"] = serde_json::json!(1);
+            }),
+        )
+        .await;
+        let envelope = result_json(&result);
+        assert_ne!(result.is_error, Some(true), "{tool:?}: {envelope}");
+        assert!(
+            envelope["data"]["paymentSignature"].is_string(),
+            "{tool:?}: {envelope}"
+        );
+    }
+}
+
+/// `payment_required()` edited by `edit`.
+fn payment_required_with(edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    let mut requirements: serde_json::Value =
+        serde_json::from_str(&payment_required()).expect("the fixture parses");
+    edit(&mut requirements);
+    requirements.to_string()
+}
+
+/// Calls `tool` with `payment_required` on the testnet chain.
+async fn call_with(
+    fixture: &Fixture,
+    tool: Tool,
+    payment_required: &str,
+) -> rmcp::model::CallToolResult {
+    call_on_chain(fixture, tool, payment_required, "stellar:testnet")
+        .await
+        .expect("no protocol error")
+}
+
+/// Calls `tool` with `payment_required` and `chain_id`.
+async fn call_on_chain(
+    fixture: &Fixture,
+    tool: Tool,
+    payment_required: &str,
+    chain_id: &str,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    match tool {
+        Tool::CreatePayment => {
+            fixture
+                .server
+                .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+                    chain_id: chain_id.into(),
+                    address: None,
+                    payment_required: payment_required.to_owned(),
+                })
+                .await
+        }
+        Tool::AuthenticatedPayment => {
+            fixture
+                .server
+                .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
+                    chain_id: chain_id.into(),
+                    address: None,
+                    home_domain: "merchant.example".into(),
+                    payment_required: payment_required.to_owned(),
+                })
+                .await
+        }
+    }
+}
+
+// ── Bounds after the gate keep their audit stages ────────────────────────────
+
+/// A first simulation above the fee ceiling refuses before the gate: no x402
+/// row. The authenticated tool answers `x402.payment_build_failed`.
+#[tokio::test]
+#[serial]
+async fn mcp_resource_refusals_preserve_audit_stages() {
+    for (tool, profile_name, seed, code) in [
+        (
+            Tool::CreatePayment,
+            "x402-fee-first-cp",
+            0xda,
+            "x402.rpc_simulate_failed",
+        ),
+        (
+            Tool::AuthenticatedPayment,
+            "x402-fee-first-ap",
+            0xdb,
+            "x402.payment_build_failed",
+        ),
+    ] {
+        let fixture = fixture(profile_name, [seed; 32], |rpc| {
+            rpc.first = FirstSimulate::FeeAboveCeiling;
+        })
+        .await;
+        let result = call(&fixture, tool).await;
+        let (got, _message, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(got, code, "{tool:?}");
+        assert!(!text.contains("paymentSignature"), "{tool:?}: {text}");
+        let (authorized, withheld) = x402_rows(&fixture.profile);
+        assert!(
+            authorized.is_empty() && withheld.is_empty(),
+            "{tool:?}: nothing was signed, so no x402 row"
+        );
+        assert_eq!(
+            fixture.rpc.observed.lock().unwrap().signed,
+            vec![false],
+            "{tool:?}: only the unsigned simulate was sent"
+        );
+    }
+    a_failure_after_the_gate_is_paired(
+        Tool::CreatePayment,
+        "x402-fee-resim-cp",
+        0xdc,
+        Resimulation::FeeAboveCeiling,
+        "resimulation",
+        "x402.rpc_simulate_failed",
+    )
+    .await;
+    a_failure_after_the_gate_is_paired(
+        Tool::AuthenticatedPayment,
+        "x402-fee-resim-ap",
+        0xdd,
+        Resimulation::FeeAboveCeiling,
+        "resimulation",
+        "x402.payment_build_failed",
+    )
+    .await;
+}
+
+/// A restore preamble in the re-simulation withholds the payload, and the
+/// withheld row pairs with the authorized row at stage `resimulation`.
+#[tokio::test]
+#[serial]
+async fn mcp_restore_refusal_records_paired_withheld_row() {
+    a_failure_after_the_gate_is_paired(
+        Tool::CreatePayment,
+        "x402-restore-cp",
+        0xde,
+        Resimulation::RestorePreamble,
+        "resimulation",
+        "x402.rpc_simulate_failed",
+    )
+    .await;
+    a_failure_after_the_gate_is_paired(
+        Tool::AuthenticatedPayment,
+        "x402-restore-ap",
+        0xdf,
+        Resimulation::RestorePreamble,
+        "resimulation",
+        "x402.payment_build_failed",
+    )
+    .await;
+}
+
+/// A re-simulation ledger at the expiration ledger withholds the payload, and
+/// the withheld row pairs with the authorized row at stage `resimulation`.
+#[tokio::test]
+#[serial]
+async fn mcp_resimulation_past_expiration_records_paired_withheld_row() {
+    a_failure_after_the_gate_is_paired(
+        Tool::CreatePayment,
+        "x402-expiry-cp",
+        0xe0,
+        Resimulation::LedgerAtExpiration,
+        "resimulation",
+        "x402.rpc_simulate_failed",
+    )
+    .await;
+    a_failure_after_the_gate_is_paired(
+        Tool::AuthenticatedPayment,
+        "x402-expiry-ap",
+        0xe1,
+        Resimulation::LedgerAtExpiration,
+        "resimulation",
+        "x402.payment_build_failed",
+    )
+    .await;
+}
+
+/// A re-simulation with a positive minimum resource fee and empty transaction
+/// data withholds the payload, and the withheld row pairs with the authorized
+/// row at stage `resimulation`.
+#[tokio::test]
+#[serial]
+async fn mcp_empty_resimulation_data_records_paired_withheld_row() {
+    a_failure_after_the_gate_is_paired(
+        Tool::CreatePayment,
+        "x402-empty-data-cp",
+        0xf8,
+        Resimulation::EmptyTransactionData,
+        "resimulation",
+        "x402.rpc_simulate_failed",
+    )
+    .await;
+    a_failure_after_the_gate_is_paired(
+        Tool::AuthenticatedPayment,
+        "x402-empty-data-ap",
+        0xf9,
+        Resimulation::EmptyTransactionData,
+        "resimulation",
+        "x402.payment_build_failed",
+    )
+    .await;
+}
+
+// ── Validation before admission ──────────────────────────────────────────────
+
+/// A V1 engine whose only rule caps the payment asset at `cap` per day.
+fn cap_engine(profile_name: &str, cap: i128) -> stellar_agent_core::PolicyEngineV1 {
+    use stellar_agent_core::policy::Decision;
+    use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
+    use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+    PolicyEngineV1::new(
+        PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            signature: None,
+            rules: vec![PolicyRule {
+                r#match: RuleMatch {
+                    tool: "*".into(),
+                    chain: "*".into(),
+                },
+                criteria: vec![Box::new(PerPeriodCapCriterion::new(
+                    ASSET.into(),
+                    Window::parse("1d").expect("window"),
+                    cap,
+                ))],
+                decision: Decision::Allow,
+                allow_opaque_signing: false,
+            }],
+        },
+        profile_name.into(),
+    )
+}
+
+/// The persisted spending window of the payment asset: the summed amount and
+/// the count of authorizations.
+fn window_state(profile: &Profile, profile_name: &str) -> (i128, u32) {
+    use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
+    let state = PolicyStateStore::new();
+    stellar_agent_network::policy_state::PersistedWindowStore::for_profile(profile_name)
+        .load_into(profile_name, profile, &state)
+        .expect("the persisted window loads");
+    state
+        .query_window(
+            &StateKey::new(
+                profile_name,
+                1,
+                &stellar_agent_core::policy::v1::value::asset_normalise(ASSET),
+                86_400,
+            ),
+            stellar_agent_core::timefmt::now_unix_ms().expect("clock"),
+        )
+        .expect("the window reads")
+}
+
+/// Every invalid requirement field answers its own `x402.*` code through both
+/// tools before any request, and the spending window stays empty.
+#[tokio::test]
+#[serial]
+async fn invalid_requirements_do_not_consume_window() {
+    type Edit = fn(&mut serde_json::Value);
+    let cases: [(Edit, &str); 8] = [
+        (|r| r["scheme"] = "upto".into(), "x402.unsupported_scheme"),
+        (
+            |r| r["network"] = "stellar:pubnet".into(),
+            "x402.network_passphrase_mismatch",
+        ),
+        (|r| r["asset"] = PAY_TO.into(), "x402.invalid_asset_address"),
+        (
+            |r| r["extra"] = serde_json::json!({ "areFeesSponsored": false }),
+            "x402.fees_not_sponsored",
+        ),
+        (|r| r["amount"] = "0".into(), "x402.amount_conversion"),
+        (
+            |r| r["payTo"] = "not-a-strkey".into(),
+            "x402.invalid_recipient_address",
+        ),
+        (
+            |r| r["payTo"] = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            "x402.invalid_recipient_address",
+        ),
+        (
+            |r| r["maxTimeoutSeconds"] = 0.into(),
+            "x402.invalid_payment_required",
+        ),
+    ];
+    let mut seed = 0xe1;
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        seed += 1;
+        let profile_name = format!("x402-invalid-{seed:x}");
+        let mut fixture = fixture(&profile_name, [seed; 32], |_| {}).await;
+        fixture
+            .server
+            .set_policy_engine_for_test(Arc::new(cap_engine(&profile_name, 100_000_000)));
+        for (edit, code) in cases {
+            let result = call_with(&fixture, tool, &payment_required_with(edit)).await;
+            let (got, _message, text) = crate::common::assert_business_envelope(&result);
+            assert_eq!(got, code, "{tool:?}");
+            assert!(!text.contains("paymentSignature"), "{tool:?}: {text}");
+        }
+        assert!(
+            fixture.rpc.observed.lock().unwrap().methods.is_empty(),
+            "{tool:?}: invalid requirements send no request"
+        );
+        assert_eq!(
+            window_state(&fixture.profile, &profile_name),
+            (0, 0),
+            "{tool:?}: invalid requirements consume no headroom"
+        );
+    }
+}
+
+/// The admitted leg is the transfer the payer signs, for a G, a C, and an M
+/// recipient. The window holds its amount and asset, and the authorized row
+/// its asset and redacted recipient. The signed invocation calls the contract
+/// of the admitted asset and carries the same recipient and amount.
+#[tokio::test]
+#[serial]
+async fn valid_requirements_preserve_window_leg() {
+    let muxed =
+        stellar_strkey::Strkey::MuxedAccountEd25519(stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [0x2c; 32],
+            id: 77,
+        })
+        .to_string()
+        .as_str()
+        .to_owned();
+    let recipients = [
+        PAY_TO.to_owned(),
+        "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_owned(),
+        muxed,
+    ];
+    let mut seed = 0xe3;
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        for recipient in &recipients {
+            seed += 1;
+            let profile_name = format!("x402-leg-{seed:x}");
+            let mut fixture = fixture(&profile_name, [seed; 32], |_| {}).await;
+            fixture
+                .server
+                .set_policy_engine_for_test(Arc::new(cap_engine(&profile_name, 100_000_000)));
+            let result = call_with(
+                &fixture,
+                tool,
+                &payment_required_with(|r| r["payTo"] = recipient.as_str().into()),
+            )
+            .await;
+            let envelope = result_json(&result);
+            assert_ne!(
+                result.is_error,
+                Some(true),
+                "{tool:?} {recipient}: {envelope}"
+            );
+            assert_eq!(
+                window_state(&fixture.profile, &profile_name),
+                (10_000_000, 1),
+                "{tool:?} {recipient}"
+            );
+            let (authorized, _) = x402_rows(&fixture.profile);
+            let leg = &authorized[0]["legs"][0];
+            assert_eq!(leg["amount"], "10000000", "{tool:?} {recipient}");
+            assert_eq!(leg["asset"], ASSET, "{tool:?} {recipient}");
+            assert_eq!(
+                leg["destination_redacted"],
+                stellar_agent_core::observability::redact_strkey_first5_last5(recipient),
+                "{tool:?} {recipient}"
+            );
+            let observed = fixture.rpc.observed.lock().unwrap();
+            let [(_, _, function)] = observed.transmitted.as_slice() else {
+                panic!("{tool:?} {recipient}: one signed request");
+            };
+            let recipient_address = match stellar_strkey::Strkey::from_string(recipient).unwrap() {
+                stellar_strkey::Strkey::PublicKeyEd25519(key) => {
+                    ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(key.0))))
+                }
+                stellar_strkey::Strkey::Contract(contract) => {
+                    ScAddress::Contract(ContractId(Hash(contract.0)))
+                }
+                stellar_strkey::Strkey::MuxedAccountEd25519(account) => {
+                    ScAddress::MuxedAccount(stellar_xdr::MuxedEd25519Account {
+                        id: account.id,
+                        ed25519: Uint256(account.ed25519),
+                    })
+                }
+                other => panic!("unexpected recipient {other:?}"),
+            };
+            let admitted_asset = leg["asset"].as_str().expect("the leg names its asset");
+            let admitted_contract = stellar_strkey::Contract::from_string(admitted_asset)
+                .expect("the admitted asset is a contract strkey");
+            assert_eq!(
+                function.contract_address,
+                ScAddress::Contract(ContractId(Hash(admitted_contract.0))),
+                "{tool:?} {recipient}: the signed transfer calls the admitted asset"
+            );
+            assert_eq!(function.args[1], ScVal::Address(recipient_address));
+            assert_eq!(function.args[2], ScVal::from(10_000_000_i128));
+        }
+    }
+}
+
+/// A sibling authorization reserves after evaluation and before accounting.
+#[derive(Debug)]
+struct CompetingAuthorization(
+    stellar_agent_core::policy::v1::criteria::per_period_cap::PerPeriodCapCriterion,
+);
+
+impl stellar_agent_core::policy::v1::criteria::Criterion for CompetingAuthorization {
+    fn kind(&self) -> &'static str {
+        "per_period_cap"
+    }
+
+    fn evaluate(
+        &self,
+        ctx: &stellar_agent_core::policy::v1::EvalContext<'_>,
+    ) -> Result<
+        Option<stellar_agent_core::policy::DenyReason>,
+        stellar_agent_core::policy::PolicyError,
+    > {
+        self.0.evaluate(ctx)
+    }
+
+    fn record_confirmed(
+        &self,
+        ctx: &stellar_agent_core::policy::v1::EvalContext<'_>,
+    ) -> Result<
+        Vec<stellar_agent_core::policy::v1::criteria::state_store::WindowEntry>,
+        stellar_agent_core::policy::PolicyError,
+    > {
+        let entries = self.0.record_confirmed(ctx)?;
+        stellar_agent_network::policy_state::PersistedWindowStore::for_profile(ctx.profile_name)
+            .record_authorized(ctx.profile, &entries)
+            .expect("the sibling authorization fits alone");
+        Ok(entries)
+    }
+}
+
+/// An authorization that loses the atomic admission to a sibling refuses
+/// through both tools before any request, so nothing is signed or sent, and
+/// the window holds only the sibling's spend.
+#[tokio::test]
+#[serial]
+async fn window_admission_refusal_precedes_signing() {
+    use stellar_agent_core::policy::Decision;
+    use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
+    use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
+    for (tool, profile_name, seed) in [
+        (Tool::CreatePayment, "x402-compete-cp", 0xea),
+        (Tool::AuthenticatedPayment, "x402-compete-ap", 0xeb),
+    ] {
+        let mut fixture = fixture(profile_name, [seed; 32], |_| {}).await;
+        fixture
+            .server
+            .set_policy_engine_for_test(Arc::new(PolicyEngineV1::new(
+                PolicyDocument {
+                    version: 1,
+                    scope: ScopeId::AllProfiles,
+                    signature: None,
+                    rules: vec![PolicyRule {
+                        r#match: RuleMatch {
+                            tool: "*".into(),
+                            chain: "*".into(),
+                        },
+                        criteria: vec![Box::new(CompetingAuthorization(
+                            PerPeriodCapCriterion::new(
+                                ASSET.into(),
+                                Window::parse("1d").expect("window"),
+                                15_000_000,
+                            ),
+                        ))],
+                        decision: Decision::Allow,
+                        allow_opaque_signing: false,
+                    }],
+                },
+                profile_name.into(),
+            )));
+        let result = call(&fixture, tool).await;
+        let (code, _message, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, "policy.deny.per_period_cap_exceeded", "{tool:?}");
+        assert!(!text.contains("paymentSignature"), "{tool:?}: {text}");
+        assert!(
+            fixture.rpc.observed.lock().unwrap().methods.is_empty(),
+            "{tool:?}: admission refuses before any request"
+        );
+        let (authorized, withheld) = x402_rows(&fixture.profile);
+        assert!(authorized.is_empty() && withheld.is_empty(), "{tool:?}");
+        assert_eq!(
+            window_state(&fixture.profile, profile_name),
+            (10_000_000, 1),
+            "{tool:?}: only the sibling's spend"
+        );
+    }
+}
+
+/// A failure after admission keeps the admitted spend: the endpoint identity
+/// check, the first simulation, the sign call, the transmit gate, and the
+/// re-simulation, through both tools.
+#[tokio::test]
+#[serial]
+async fn post_admission_failure_keeps_spend() {
+    #[derive(Clone, Copy, Debug)]
+    enum Failure {
+        Identity,
+        Simulation,
+        Signing,
+        TransmitGate,
+        Resimulation,
+    }
+    let mut seed = 0xeb;
+    for tool in [Tool::CreatePayment, Tool::AuthenticatedPayment] {
+        for failure in [
+            Failure::Identity,
+            Failure::Simulation,
+            Failure::Signing,
+            Failure::TransmitGate,
+            Failure::Resimulation,
+        ] {
+            seed += 1;
+            let profile_name = format!("x402-keep-{seed:x}");
+            let payer = gstrkey_for_seed([seed; 32]);
+            let mut fixture = fixture(&profile_name, [seed; 32], |rpc| match failure {
+                Failure::Identity => {
+                    rpc.network = NetworkAnswer::Passphrase(FUTURENET_PASSPHRASE);
+                }
+                Failure::Simulation => rpc.first = FirstSimulate::Error,
+                Failure::Signing => {
+                    rpc.forget_on_first = Some((SIGNER_SERVICE.to_owned(), payer.clone()));
+                }
+                Failure::Resimulation => rpc.resimulation = Resimulation::RpcError,
+                Failure::TransmitGate => {}
+            })
+            .await;
+            fixture
+                .server
+                .set_policy_engine_for_test(Arc::new(cap_engine(&profile_name, 100_000_000)));
+            let expected = if let Failure::TransmitGate = failure {
+                // A first payment anchors a non-empty log; the second payment's
+                // unsigned simulate then rolls the log back, so the gate's
+                // strict write refuses.
+                let first = call(&fixture, tool).await;
+                assert_ne!(first.is_error, Some(true), "{}", result_json(&first));
+                *fixture.rpc.roll_back_to.lock().unwrap() = Some(Vec::new());
+                (20_000_000, 2)
+            } else {
+                (10_000_000, 1)
+            };
+            let result = call(&fixture, tool).await;
+            let (code, _message, text) = crate::common::assert_business_envelope(&result);
+            assert!(
+                !text.contains("paymentSignature"),
+                "{tool:?} {failure:?}: {text}"
+            );
+            assert_eq!(
+                window_state(&fixture.profile, &profile_name),
+                expected,
+                "{tool:?} {failure:?} ({code}): the admitted spend stays: {text}"
+            );
+        }
+    }
+}
+
+// ── chain_id ─────────────────────────────────────────────────────────────────
+
+/// The generated `chain_id` description of both tools names the wallet's
+/// spellings, `stellar:testnet` and `stellar:mainnet`.
+#[test]
+fn x402_chain_id_schema_uses_mainnet() {
+    let expected = concat!(
+        "The wallet's CAIP-2 chain identifier: `\"stellar:testnet\"` or\n",
+        "`\"stellar:mainnet\"`. The x402 requirement `network` spells mainnet\n",
+        "`\"stellar:pubnet\"`; this argument does not.\n",
+        "\n",
+        "Validated against the active profile after the payment requirements:\n",
+        "invalid requirements answer their own `x402.*` code first. A mismatch\n",
+        "returns a JSON-RPC `ErrorData` from the `dispatch_gate` preamble.",
+    );
+    for name in [
+        "stellar_x402_create_payment",
+        "stellar_x402_authenticated_payment",
+    ] {
+        let tool = WalletServer::all_registered_tools()
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("{name} is registered"));
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        assert_eq!(
+            schema["properties"]["chain_id"]["description"], expected,
+            "{name}"
+        );
+    }
+}
+
+/// Valid requirements with the x402 spelling as `chain_id` reach the
+/// dispatch gate, which answers invalid params. Invalid requirements answer
+/// their own code before the gate, whatever the `chain_id`. A mainnet profile
+/// refuses structurally before both.
+#[tokio::test]
+#[serial]
+async fn x402_chain_arguments_preserve_refusal_order() {
+    for (tool, profile_name, seed) in [
+        (Tool::CreatePayment, "x402-chain-cp", 0xf6),
+        (Tool::AuthenticatedPayment, "x402-chain-ap", 0xf7),
+    ] {
+        let fixture = fixture(profile_name, [seed; 32], |_| {}).await;
+        let error = call_on_chain(&fixture, tool, &payment_required(), "stellar:pubnet")
+            .await
+            .expect_err("the dispatch gate refuses the chain");
+        assert_eq!(
+            error.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "{tool:?}"
+        );
+
+        let invalid = payment_required_with(|r| r["scheme"] = "upto".into());
+        let result = call_on_chain(&fixture, tool, &invalid, "stellar:pubnet")
+            .await
+            .expect("invalid requirements answer before the gate");
+        let (code, _message, _text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, "x402.unsupported_scheme", "{tool:?}");
+        assert!(
+            fixture.rpc.observed.lock().unwrap().methods.is_empty(),
+            "{tool:?}: no request"
+        );
+    }
+
+    let mainnet = WalletServer::new(
+        Profile::builder_mainnet(
+            "https://rpc.example.invalid",
+            "svc",
+            "acct",
+            "n-svc",
+            "n-acct",
+        )
+        .with_noop_engine()
+        .build(),
+    )
+    .expect("WalletServer::new");
+    let invalid = payment_required_with(|r| r["scheme"] = "upto".into());
+    let created = mainnet
+        .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            chain_id: "stellar:pubnet".into(),
+            address: None,
+            payment_required: invalid.clone(),
+        })
+        .await
+        .expect("the structural refusal is a business envelope");
+    assert_eq!(
+        crate::common::assert_business_envelope(&created).0,
+        "network.mainnet_write_forbidden"
+    );
+    let authenticated = mainnet
+        .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
+            chain_id: "stellar:pubnet".into(),
+            address: None,
+            home_domain: "merchant.example".into(),
+            payment_required: invalid,
+        })
+        .await
+        .expect("the structural refusal is a business envelope");
+    assert_eq!(
+        crate::common::assert_business_envelope(&authenticated).0,
+        "network.mainnet_write_forbidden"
+    );
 }

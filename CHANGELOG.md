@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the submission continues. On mainnet such a version refuses with the new code
   `network.unsupported_protocol_version`; while mainnet writes are refused, a
   mainnet endpoint is refused with `network.mainnet_write_forbidden` first.
+- `StellarRpcClient::simulate_transaction_envelope` sends an envelope to
+  `simulateTransaction` without `authMode` and returns the answer as received.
+  A failed request reports `network.rpc_unreachable` with a scrubbed reason.
+- `StellarRpcClient::get_health_within` reads `getHealth` and retries a failed
+  attempt until a deadline, with the classification of the endpoint check.
+- `stellar_agent_x402::exact::validate_requirements` runs the local checks of
+  an x402 payment without a request and returns its atomic amount.
+- `X402Error::EndpointIdentity` carries a refusal of the endpoint check. Its
+  wire code is the code of the network error it carries.
 
 ### Changed
 
@@ -58,6 +67,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries no preview. On the MCP pay, create-account, and claim commits, the
   check's time counts toward the nonce's expiry.
 - `pool init` checks the endpoint under `--timeout-seconds` (default 120).
+- x402 `create_payment` takes the payment's `StellarRpcClient` and an absolute
+  deadline for its endpoint check in place of an RPC URL. Every request of the
+  payment goes to that client.
+- x402 `create_payment` checks the RPC endpoint before its first simulation.
+  An endpoint that serves another network, reports mainnet, or is not
+  identified in time refuses with its `network.*` code.
+- The x402 MCP payment tools build one RPC client per payment and check the
+  endpoint under the profile's `submit_timeout_seconds`. Both tools answer an
+  endpoint refusal with its `network.*` code, and a client that cannot be
+  built with `network.rpc_unreachable`.
+- The x402 MCP payment tools validate the payment requirements in full before
+  the dispatch gate. Invalid requirements answer their field-specific `x402.*`
+  code before the policy check, the audit pre-flight, and the signer load.
+- `stellar_x402_authenticated_payment` answers invalid requirements with their
+  field-specific `x402.*` code, before its SEP-10 session, in place of
+  `x402.payment_build_failed`.
+- An x402 payment call with invalid requirements and a wrong `chain_id` answers
+  the requirement's code, not the invalid-params error.
 
 ### Removed
 
@@ -83,6 +110,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the paired commit tool. Such rulesets reach an approvable request.
 - A `KNOWN_ISSUER` criterion that gates inflows checks the trustline commit
   against the trustline's asset, and the commit's audit rows record that asset.
+- Invalid x402 payment requirements consume no spending-window headroom. A
+  failure after admission, an endpoint refusal included, keeps the admitted
+  spend.
+- The `chain_id` argument descriptions of the x402 payment tools name
+  `stellar:testnet` and `stellar:mainnet`. The x402 requirement spelling
+  `stellar:pubnet` is not a valid `chain_id`.
 
 ### Security
 
@@ -96,6 +129,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authorization differs from the SAC `transfer` it built or carries nested
   calls. It also refuses a re-simulation that returns authorization entries
   other than the signed entry.
+- x402 `create_payment` clamps `maxTimeoutSeconds` to 300 seconds and turns
+  it, with a five-second ledger estimate, into a window of 1 to 60 ledgers.
+  The window counts ledger advances, not a guaranteed wall-clock lifetime. A
+  `maxTimeoutSeconds` of zero and an expiration ledger that overflows refuse.
+- x402 `create_payment` reads `getHealth` on the same endpoint and requires
+  `healthy`. The unsigned simulation's ledger is at most one ledger ahead of
+  the health ledger, and the re-simulation's ledger at most one behind it. The
+  health and re-simulation ledgers lie before the expiration ledger. These
+  checks compare one endpoint's answers, not independent freshness.
+- x402 `create_payment` requires a minimum resource fee between 1 and
+  10,000,000 stroops in both simulations, and an embedded resource fee between
+  zero and that minimum.
+- x402 `create_payment` refuses a restore preamble, and archived entries in the
+  transaction data, in either simulation. The wallet has no restore path; a
+  restoration made elsewhere unblocks the payment.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 

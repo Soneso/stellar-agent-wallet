@@ -626,6 +626,21 @@ The MPP acceptance target also requires Node.js and pnpm for the pinned released
 SDK/runtime versions. The suite is registered in the serialized driver and a
 skip marker does not count as MPP acceptance.
 
+The x402 acceptance targets are `x402_exact_testnet_acceptance` in
+`stellar-agent-x402` and `x402_create_payment_testnet_acceptance` and
+`x402_authenticated_payment_testnet_acceptance` in `stellar-agent-mcp`, each
+under `testnet-acceptance`. They need Friendbot and the testnet RPC, and the
+authenticated leg also needs a live SEP-10 session with
+`testanchor.stellar.org`. Every positive leg pays the native SAC between
+distinct funded accounts and fails when a prerequisite is unavailable; none
+skips. The settlement leg re-sources the payment to a third funded account,
+refreshes its resource data with a simulation, submits it, and checks that the
+payer and recipient balances move by exactly the amount. Each leg prints the
+endpoint protocol and the ledgers `L`, `H`, and `R` the payment checked, and
+fails on a protocol outside the supported range. Acceptance evidence is a run
+in which every positive leg passed; a run with an unavailable prerequisite is
+no evidence.
+
 To run the full live leg, use the serialized driver, which paces the suites so
 Friendbot and the RPC load balancer are not hit back-to-back:
 

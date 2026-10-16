@@ -157,8 +157,9 @@ production, not confirmation).
 
 ## chain_id requirement
 
-`chain_id` carries the CAIP-2 chain id (`stellar:testnet` or `stellar:mainnet`;
-x402 tools also accept `stellar:pubnet`) and must match the loaded profile.
+`chain_id` carries the CAIP-2 chain id (`stellar:testnet` or `stellar:mainnet`)
+and must match the loaded profile. The x402 requirement `network` spells mainnet
+`stellar:pubnet`; that spelling is not a valid `chain_id`.
 
 - Required by every tool EXCEPT: `stellar_x402_parse_receipt`,
   `stellar_toolset_list`, `stellar_toolset_invoke`.
@@ -170,7 +171,9 @@ x402 tools also accept `stellar:pubnet`) and must match the loaded profile.
 
 A mismatch is refused before policy evaluation. On the classic simulate and
 commit tools, the endpoint check and the account reads come first, so an
-endpoint refusal precedes the `chain_id` check there.
+endpoint refusal precedes the `chain_id` check there. The x402 payment tools
+validate their payment requirements first, so invalid requirements answer
+their own `x402.*` code before the `chain_id` check.
 
 ## Amount and asset conventions
 
@@ -621,13 +624,22 @@ Arguments:
 
 - `stellar_x402_create_payment`: required `payment_required` (base64
   `PAYMENT-REQUIRED` header value OR raw JSON `PaymentRequirements`), required
-  `chain_id` (`stellar:pubnet` or `stellar:testnet`); optional `address`
-  (G-strkey signer; must match the enrolled signer when supplied).
+  `chain_id` (`stellar:testnet` or `stellar:mainnet`, checked after the
+  requirements); optional `address` (G-strkey signer; must match the enrolled
+  signer when supplied).
 - `stellar_x402_parse_receipt`: `payment_response` only (base64 / JSON). No
   `chain_id`.
 - `stellar_x402_authenticated_payment`: required `payment_required`, required
-  `chain_id`, required `home_domain` (the SEP-10 counterparty domain); optional
-  `address`.
+  `chain_id` (as above), required `home_domain` (the SEP-10 counterparty
+  domain); optional `address`.
+
+Both payment tools validate the requirements in full before the dispatch gate
+and consume no spending window on a refusal. They build one RPC client from
+the profile, and its first request is the endpoint identity check under the
+profile's `submit_timeout_seconds`. An identity refusal answers its
+`network.*` code through both tools; the authenticated tool answers every other
+build failure with `x402.payment_build_failed`. A failure after admission keeps
+the admitted spend.
 
 ## Machine Payments Protocol
 
