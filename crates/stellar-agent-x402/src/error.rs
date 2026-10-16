@@ -175,16 +175,22 @@ pub enum X402Error {
         detail: String,
     },
 
-    /// The auth-entry array returned by simulate does not satisfy the
-    /// single-payer invariant.
+    /// A simulation answer carries authorization entries the payment flow does
+    /// not sign or accept.
     ///
-    /// For a plain G-key payer doing a SAC `transfer`, the simulate host must
-    /// return exactly one `SorobanCredentials::Address` entry credentialed for
-    /// the payer's own account.  This error fires when:
-    /// - zero Address-credentialled entries match the payer's address, or
-    /// - more than one Address-credentialled entry matches the payer, or
-    /// - an `Address`-credentialled entry for a different account (non-payer)
-    ///   is present — violating the "no other signers required" invariant.
+    /// Before anything is signed, the first simulation of
+    /// [`crate::exact::create_payment`] must return exactly one entry for a G-key
+    /// payer's SAC `transfer`. This error fires when that entry:
+    /// - is missing, or other entries accompany it;
+    /// - has credentials other than legacy `SorobanCredentials::Address`, or
+    ///   credentials for an account other than the payer;
+    /// - has a non-zero `signature_expiration_ledger` or a signature;
+    /// - has a root invocation other than the `transfer` the wallet built, or
+    ///   one with nested calls.
+    ///
+    /// It also fires when the signed re-simulation returns authorization
+    /// entries that are neither empty nor equal to the signed entries. The
+    /// `detail` names the failed check and carries no value from the answer.
     #[error("unexpected auth entries in simulate response: {detail}")]
     UnexpectedAuthEntries {
         /// Human-readable description of the violation.

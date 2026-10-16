@@ -6,11 +6,13 @@
 //! ```text
 //! 1. Validate requirements (scheme, network, asset, areFeesSponsored, amount)
 //! 2. Build SAC transfer InvokeHostFunction
-//! 3. simulateTransaction → harvest simulated nonce + latest_ledger
+//! 3. simulateTransaction → check the payer authorization against the built
+//!    transfer; harvest simulated nonce + latest_ledger
 //! 4. Compute signature_expiration_ledger
 //! 5. Set expiration on auth entry; sign via sep43 (single auth-signing call site)
 //! 6. Transmit gate: the caller's `before_transmit` runs; an error stops here
-//! 7. Re-simulate with signed auth (mandatory footprint refresh)
+//! 7. Re-simulate with signed auth (mandatory footprint refresh); check that
+//!    the answer returns no authorization other than the signed entry
 //! 8. Build + serialize final TransactionEnvelope to base64 XDR
 //! 9. Wrap in PaymentPayload
 //! ```
@@ -21,6 +23,12 @@
 //! is the first time the signed authorization leaves the wallet, to the
 //! configured RPC. The transmit gate in step 6 is the last point at which the
 //! caller can withhold it.
+//!
+//! The simulation answers come from the configured RPC. Nothing is signed
+//! unless the first answer holds exactly one unsigned payer authorization for
+//! the transfer built in step 2, with no nested calls. The nonce and
+//! `latest_ledger` still come from that answer, and the re-simulation's
+//! resource data and fee pass structural checks only.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -31,9 +39,11 @@ use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilde
 use stellar_rpc_client::Client;
 use stellar_strkey::Strkey;
 use stellar_xdr::{
-    Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, HostFunction, InvokeHostFunctionOp,
-    Limits, Operation, OperationBody, ScAddress, ScBytes, ScMap, ScMapEntry, ScSymbol, ScVal,
-    ScVec, SorobanAuthorizationEntry, SorobanCredentials, StringM, VecM, WriteXdr,
+    Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, HostFunction, InvokeContractArgs,
+    InvokeHostFunctionOp, Limits, Operation, OperationBody, ScAddress, ScBytes, ScMap, ScMapEntry,
+    ScSymbol, ScVal, ScVec, SorobanAddressCredentials, SorobanAuthorizationEntry,
+    SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials, StringM, VecM,
+    WriteXdr,
 };
 
 use stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL;
@@ -132,21 +142,34 @@ pub struct AuthorizationToTransmit<'a> {
 ///    `areFeesSponsored`, amount > 0).
 /// 2. Build a SAC `transfer` `InvokeHostFunction`.
 /// 3. `simulateTransaction` to populate the auth-entry nonce and
-///    `latest_ledger`.
+///    `latest_ledger`. Before anything is signed, the answer's first result
+///    must hold exactly one authorization entry. That entry carries legacy
+///    `Address` credentials for the payer, a zero
+///    `signature_expiration_ledger`, and a `Void` signature. Its root
+///    invocation equals the SAC `transfer` built in step 2 and has no nested
+///    calls.
 /// 4. Compute `signature_expiration_ledger` from `max_timeout_seconds` via the
 ///    formula `latest_ledger + ceil(max_timeout_seconds / 5)`, giving
 ///    expiration parity with the x402 Exact Stellar scheme.
-/// 5. Verify the simulate-returned auth-entry array satisfies the single-payer
-///    invariant (exactly one `Address` entry for the payer; no other
-///    `Address`-credentialled entries).  Set `signature_expiration_ledger` on
-///    the payer entry and sign via `stellar_agent_sep43::sign_soroban_auth_entry`
-///    (the single auth-signing call site).
+/// 5. Set `signature_expiration_ledger` on the payer's credentials and sign
+///    the built `transfer` invocation via
+///    `stellar_agent_sep43::sign_soroban_auth_entry` (the single auth-signing
+///    call site).
 /// 6. Call `before_transmit` with the [`AuthorizationToTransmit`]; return its
 ///    error unchanged.
 /// 7. Re-simulate with the signed auth entry (MANDATORY).  Without this, submit
 ///    traps with "trying to access contract data key outside of the footprint".
+///    The answer must carry a decodable first result whose authorization
+///    entries are empty or equal to the signed entries.
 /// 8. Build the final `TransactionEnvelope`, serialize to base64 XDR.
 /// 9. Wrap in a [`PaymentPayload`].
+///
+/// The step 3 check accepts the answer of an honest recording simulation for a
+/// G-account payer distinct from the placeholder source. That answer holds one
+/// legacy `Address` entry that records the original `transfer` arguments, a
+/// muxed recipient included. The step 7 check accepts the empty or unchanged entries of an
+/// honest enforcing simulation. The nonce, the `latest_ledger`, the resource
+/// data, and the fee still come from the configured RPC.
 ///
 /// # Arguments
 ///
@@ -171,10 +194,14 @@ pub struct AuthorizationToTransmit<'a> {
 /// - [`X402Error::FeesNotSponsored`] — `extra.areFeesSponsored != true`.
 /// - [`X402Error::AmountConversion`] — `amount` parse failure.
 /// - [`X402Error::RpcSimulateFailed`] — simulate or re-simulate failure, or
-///   `min_resource_fee` absent on the success path.
-/// - [`X402Error::UnexpectedAuthEntries`] — simulate returned zero, multiple,
-///   or non-payer `Address`-credentialled entries (single-payer invariant
-///   violated).
+///   `min_resource_fee` absent on the success path. Also returned when the
+///   re-simulation answer carries no first result or a result that does not
+///   decode.
+/// - [`X402Error::UnexpectedAuthEntries`]: the first simulation's
+///   authorization is not the single unsigned payer entry for the built
+///   `transfer` that step 3 requires, or the re-simulation returned
+///   authorization entries other than the signed entries. Its `detail` names
+///   the failed check and carries no value from the answer.
 /// - [`X402Error::AuthEntrySignFailed`] — auth-entry signing failure.
 /// - [`X402Error::TransactionBuildFailed`] — XDR envelope build failure.
 /// - Whatever `before_transmit` returns, unchanged, when the gate refuses.
@@ -341,19 +368,14 @@ pub async fn create_payment(
         .ok_or_else(|| X402Error::RpcSimulateFailed {
             detail: "simulate returned no result entry".to_owned(),
         })?;
-    let mut auth_entries = first_result.auth;
 
-    // Verify the auth-entry array satisfies the single-payer invariant.
-    //
-    // For a plain G-key SAC `transfer`, the scheme requires that exactly the
-    // payer must sign, and that after signing no other signers remain.
-    //
-    // Concretely we require:
-    //   (a) exactly one Address-credentialled entry whose `c.address` equals the
-    //       payer's `ScAddress::Account(...)`,
-    //   (b) no OTHER Address-credentialled entry present (foreign signer → reject).
+    // The answer decides what the payer would sign, so it is checked before
+    // anything is signed: exactly the payer's unsigned entry, for exactly the
+    // transfer built above, with no nested calls.
     let payer_sc_address = crate::sac_transfer::g_strkey_to_account_address(&payer_strkey)?;
-    let auth_entry = select_payer_auth_entry(&mut auth_entries, &payer_sc_address)?;
+    let (mut payer_credentials, simulated_invocation) =
+        select_payer_auth_entry(first_result.auth, &payer_sc_address)?;
+    check_payer_auth_entry(&payer_credentials, &simulated_invocation, &invoke_args)?;
 
     // ── Step 4: Compute signature_expiration_ledger ───────────────────────────
     // The x402 Exact Stellar scheme formula (NOT a fixed auth-validity window)
@@ -363,24 +385,17 @@ pub async fn create_payment(
         compute_signature_expiration_ledger(latest_ledger, requirements.max_timeout_seconds);
 
     // ── Step 5: Set expiration, build the signing preimage, sign, and embed ───
-    // The simulated auth entry carries signature_expiration_ledger = 0. Overwrite
+    // The simulated credentials carry signature_expiration_ledger = 0. Overwrite
     // it with the computed value, construct the
     // HashIdPreimage::SorobanAuthorization the signer authorizes over, sign it
     // via the single auth-signing call site, then embed the resulting
-    // classic-account signature into the entry.
-
-    let creds_nonce = match &mut auth_entry.credentials {
-        SorobanCredentials::Address(creds) => {
-            creds.signature_expiration_ledger = signature_expiration_ledger;
-            creds.nonce
-        }
-        SorobanCredentials::SourceAccount
-        | SorobanCredentials::AddressV2(_)
-        | SorobanCredentials::AddressWithDelegates(_) => {
-            return Err(X402Error::UnexpectedAuthEntries {
-                detail: "payer auth entry is not Address-credentialled".to_owned(),
-            });
-        }
+    // classic-account signature into the entry. The signed invocation is the
+    // transfer built in step 2; the step 3 check holds the simulated invocation
+    // equal to it.
+    payer_credentials.signature_expiration_ledger = signature_expiration_ledger;
+    let root_invocation = SorobanAuthorizedInvocation {
+        function: SorobanAuthorizedFunction::ContractFn(invoke_args.clone()),
+        sub_invocations: VecM::default(),
     };
 
     // `sign_soroban_auth_entry` validates that `network_id` matches the active
@@ -388,9 +403,9 @@ pub async fn create_payment(
     let network_id = Hash(Sha256::digest(network_passphrase.as_bytes()).into());
     let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
         network_id,
-        nonce: creds_nonce,
+        nonce: payer_credentials.nonce,
         signature_expiration_ledger,
-        invocation: auth_entry.root_invocation.clone(),
+        invocation: root_invocation.clone(),
     });
     let preimage_xdr =
         preimage
@@ -429,11 +444,11 @@ pub async fn create_payment(
         }
     };
 
-    let signature_scval = g_key_sig_to_scval(&payer_pubkey_bytes, &signature_bytes)?;
-    if let SorobanCredentials::Address(ref mut creds) = auth_entry.credentials {
-        creds.signature = signature_scval;
-    }
-    let signed_entries = vec![auth_entry.clone()];
+    payer_credentials.signature = g_key_sig_to_scval(&payer_pubkey_bytes, &signature_bytes)?;
+    let signed_entries = vec![SorobanAuthorizationEntry {
+        credentials: SorobanCredentials::Address(payer_credentials),
+        root_invocation,
+    }];
 
     // ── Step 6: Re-simulation envelope, then the transmit gate ───────────────
     // The envelope is built first, so every step that can still fail without
@@ -507,6 +522,9 @@ pub async fn create_payment(
             detail: "re-simulate returned no min_resource_fee / transaction_data".to_owned(),
         });
     }
+    // The answer returns no authorization other than the signed entries. The
+    // final envelope below carries the wallet's own signed entries.
+    check_resimulation_auth(&resim_response, &signed_entries)?;
 
     // ── Step 8: Build final envelope and serialize ────────────────────────────
     // Attach the soroban transaction data (resource footprint + refundable fee)
@@ -673,72 +691,187 @@ fn g_key_sig_to_scval(pubkey: &[u8; 32], sig: &[u8; 64]) -> Result<ScVal, X402Er
     Ok(ScVal::Vec(Some(outer_vec)))
 }
 
-/// Selects the auth entry credentialed for the payer's own account.
+/// Takes the payer's authorization entry from the first simulation's answer.
 ///
-/// Enforces the single-payer invariant required for a G-key SAC `transfer`:
-/// - Exactly one address-bearing entry must authorize as `payer_sc_address`.
-/// - No other address-bearing entry may be present.
+/// A SAC `transfer` from a G-account payer distinct from the transaction
+/// source needs exactly the payer's signature. The answer must therefore hold
+/// exactly one entry, with legacy `Address` credentials whose address is the
+/// payer.
+/// The count covers every credential arm: an empty answer, a second payer
+/// entry, a `SourceAccount` entry, and an entry for another account beside the
+/// payer's all refuse. `AddressV2` and `AddressWithDelegates` credentials
+/// refuse because this flow signs only the legacy preimage.
 ///
-/// This realises the x402 Exact Stellar scheme invariant that exactly the payer
-/// must sign and that no other signers remain after signing. All address-bearing
-/// credential variants (`Address`, `AddressV2`, `AddressWithDelegates`) are
-/// considered; `SourceAccount` entries are ignored.
+/// Returns the payer's credentials and the entry's root invocation, which
+/// [`check_payer_auth_entry`] then checks against the built transfer.
 ///
 /// # Errors
 ///
-/// - [`X402Error::UnexpectedAuthEntries`] — zero, multiple, or non-payer
-///   address-bearing entries are present.
-fn select_payer_auth_entry<'a>(
-    entries: &'a mut [SorobanAuthorizationEntry],
+/// - [`X402Error::UnexpectedAuthEntries`]: the answer does not hold exactly
+///   one entry, the entry's credentials are not legacy `Address` credentials,
+///   or they are for an account other than the payer. The detail names the
+///   failed check and carries no value from the answer.
+fn select_payer_auth_entry(
+    entries: Vec<SorobanAuthorizationEntry>,
     payer_sc_address: &ScAddress,
-) -> Result<&'a mut SorobanAuthorizationEntry, X402Error> {
-    let payer_indices: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| credential_address(&e.credentials) == Some(payer_sc_address))
-        .map(|(i, _)| i)
-        .collect();
-
-    let foreign_address_count = entries
-        .iter()
-        .filter(|e| credential_address(&e.credentials).is_some_and(|a| a != payer_sc_address))
-        .count();
-
-    // Reject if any foreign address-bearing entry exists.
-    if foreign_address_count > 0 {
-        return Err(X402Error::UnexpectedAuthEntries {
-            detail: format!(
-                "simulate returned {foreign_address_count} address-bearing \
-                 entry(ies) for accounts other than the payer; a G-key SAC transfer \
-                 must need only the payer's signature"
-            ),
-        });
+) -> Result<(SorobanAddressCredentials, SorobanAuthorizedInvocation), X402Error> {
+    let [entry] = <[SorobanAuthorizationEntry; 1]>::try_from(entries).map_err(|_| {
+        unexpected_auth_entries(
+            "the simulation must return exactly one authorization entry, the payer's",
+        )
+    })?;
+    let credentials = match entry.credentials {
+        SorobanCredentials::Address(credentials) => credentials,
+        SorobanCredentials::SourceAccount => {
+            return Err(unexpected_auth_entries(
+                "the simulated authorization entry has source-account credentials, \
+                 not the payer's address credentials",
+            ));
+        }
+        SorobanCredentials::AddressV2(_) => {
+            return Err(unexpected_auth_entries(
+                "the simulated authorization entry has AddressV2 credentials; \
+                 this flow signs legacy address credentials only",
+            ));
+        }
+        SorobanCredentials::AddressWithDelegates(_) => {
+            return Err(unexpected_auth_entries(
+                "the simulated authorization entry has delegated address credentials; \
+                 this flow signs legacy address credentials only",
+            ));
+        }
+    };
+    if credentials.address != *payer_sc_address {
+        return Err(unexpected_auth_entries(
+            "the simulated authorization entry is for an account other than the payer",
+        ));
     }
-
-    match payer_indices.len() {
-        0 => Err(X402Error::UnexpectedAuthEntries {
-            detail: "simulate returned no address-bearing auth entry for the payer; \
-                     expected exactly one for a G-key SAC transfer"
-                .to_owned(),
-        }),
-        1 => Ok(&mut entries[payer_indices[0]]),
-        n => Err(X402Error::UnexpectedAuthEntries {
-            detail: format!(
-                "simulate returned {n} address-bearing entries for the payer; \
-                 expected exactly one"
-            ),
-        }),
-    }
+    Ok((credentials, entry.root_invocation))
 }
 
-/// Returns the authorizing `ScAddress` for any address-bearing credential
-/// variant (`Address`, `AddressV2`, `AddressWithDelegates`), or `None` for
-/// `SourceAccount`.
-fn credential_address(credentials: &SorobanCredentials) -> Option<&ScAddress> {
-    match credentials {
-        SorobanCredentials::Address(c) | SorobanCredentials::AddressV2(c) => Some(&c.address),
-        SorobanCredentials::AddressWithDelegates(d) => Some(&d.address_credentials.address),
-        SorobanCredentials::SourceAccount => None,
+/// Checks the payer's simulated authorization against the transfer the
+/// wallet built, before anything is signed.
+///
+/// A recording simulation returns the entry unsigned: a zero
+/// `signature_expiration_ledger` and a `Void` signature. Its root invocation
+/// must equal `built`, contract, function name, and every argument included,
+/// and it must carry no nested calls. The payer then signs exactly the
+/// transfer that the transmit gate, the policy, and the audit row describe.
+///
+/// # Errors
+///
+/// - [`X402Error::UnexpectedAuthEntries`]: any of these checks fails. The
+///   detail names the failed check and carries no value from the answer.
+fn check_payer_auth_entry(
+    credentials: &SorobanAddressCredentials,
+    invocation: &SorobanAuthorizedInvocation,
+    built: &InvokeContractArgs,
+) -> Result<(), X402Error> {
+    if credentials.signature_expiration_ledger != 0 {
+        return Err(unexpected_auth_entries(
+            "the simulated authorization entry has a non-zero signature expiration ledger",
+        ));
+    }
+    if credentials.signature != ScVal::Void {
+        return Err(unexpected_auth_entries(
+            "the simulated authorization entry already carries a signature",
+        ));
+    }
+    if let Some(detail) = root_function_difference(&invocation.function, built) {
+        return Err(unexpected_auth_entries(detail));
+    }
+    if !invocation.sub_invocations.is_empty() {
+        return Err(unexpected_auth_entries(
+            "the simulated root invocation carries nested calls",
+        ));
+    }
+    Ok(())
+}
+
+/// Compares a simulated root function with the built SEP-41
+/// `transfer(from, to, amount)` and names the first part that differs, for a
+/// refusal detail.
+///
+/// `built` is the three-argument transfer that [`build_sac_transfer_invoke`]
+/// builds. Returns `None` exactly when `simulated` equals
+/// `ContractFn(built)`: the contract, the function name, and the three
+/// arguments in order. An argument list of any other length gets the count
+/// detail.
+fn root_function_difference(
+    simulated: &SorobanAuthorizedFunction,
+    built: &InvokeContractArgs,
+) -> Option<&'static str> {
+    let SorobanAuthorizedFunction::ContractFn(simulated) = simulated else {
+        return Some("the simulated root invocation is not a contract call");
+    };
+    if simulated.contract_address != built.contract_address {
+        return Some("the simulated root invocation calls a contract other than the payment asset");
+    }
+    if simulated.function_name != built.function_name {
+        return Some("the simulated root invocation calls a function other than transfer");
+    }
+    let ([from, to, amount], [built_from, built_to, built_amount]) =
+        (simulated.args.as_slice(), built.args.as_slice())
+    else {
+        return Some(
+            "the simulated root invocation passes a different number of arguments \
+             than transfer(from, to, amount)",
+        );
+    };
+    if from != built_from {
+        return Some("the simulated root invocation passes a from argument other than the payer");
+    }
+    if to != built_to {
+        return Some("the simulated root invocation passes a to argument other than payTo");
+    }
+    if amount != built_amount {
+        return Some(
+            "the simulated root invocation passes an amount other than the required amount",
+        );
+    }
+    None
+}
+
+/// Checks the authorization entries of the answer to the signed
+/// re-simulation.
+///
+/// The answer must carry a first result that decodes. Its authorization
+/// entries are either empty or equal to `signed`, entry for entry; an
+/// enforcing simulation returns the supplied entries unchanged. A missing or
+/// undecodable result is a failed simulation, never an empty authorization.
+///
+/// # Errors
+///
+/// - [`X402Error::RpcSimulateFailed`]: the answer carries no result, or its
+///   results do not decode.
+/// - [`X402Error::UnexpectedAuthEntries`]: the first result's authorization
+///   entries are neither empty nor equal to `signed`.
+fn check_resimulation_auth(
+    response: &stellar_rpc_client::SimulateTransactionResponse,
+    signed: &[SorobanAuthorizationEntry],
+) -> Result<(), X402Error> {
+    let results = response
+        .results()
+        .map_err(|_| X402Error::RpcSimulateFailed {
+            detail: "the re-simulation results do not decode".to_owned(),
+        })?;
+    let Some(result) = results.first() else {
+        return Err(X402Error::RpcSimulateFailed {
+            detail: "the re-simulation returned no result".to_owned(),
+        });
+    };
+    if !result.auth.is_empty() && result.auth.as_slice() != signed {
+        return Err(unexpected_auth_entries(
+            "the re-simulation returned authorization entries other than the signed entry",
+        ));
+    }
+    Ok(())
+}
+
+/// Builds [`X402Error::UnexpectedAuthEntries`] with a wallet-written detail.
+fn unexpected_auth_entries(detail: &str) -> X402Error {
+    X402Error::UnexpectedAuthEntries {
+        detail: detail.to_owned(),
     }
 }
 
@@ -788,10 +921,7 @@ mod tests {
     )]
 
     use super::*;
-    use stellar_xdr::{
-        AccountId, Hash, PublicKey, SorobanAddressCredentials, SorobanAuthorizedFunction,
-        SorobanAuthorizedInvocation, Uint256,
-    };
+    use stellar_xdr::{AccountId, PublicKey, SorobanAddressCredentialsWithDelegates, Uint256};
 
     // ── select_payer_auth_entry ───────────────────────────────────────────────
 
@@ -831,109 +961,130 @@ mod tests {
         ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes))))
     }
 
-    /// Exactly one payer entry → selection succeeds.
+    /// The payer's entry with its credentials moved into another arm.
+    fn payer_entry_with_credentials(
+        arm: impl FnOnce(SorobanAddressCredentials) -> SorobanCredentials,
+    ) -> SorobanAuthorizationEntry {
+        let mut entry = make_address_entry(payer_sc_address());
+        let SorobanCredentials::Address(credentials) = entry.credentials else {
+            panic!("make_address_entry builds Address credentials");
+        };
+        entry.credentials = arm(credentials);
+        entry
+    }
+
+    /// The count refusal's detail.
+    const COUNT_DETAIL: &str =
+        "the simulation must return exactly one authorization entry, the payer's";
+
+    /// Asserts that selection refuses with exactly `expected` as its detail.
+    fn assert_selection_refused(entries: Vec<SorobanAuthorizationEntry>, expected: &str) {
+        match select_payer_auth_entry(entries, &payer_sc_address()) {
+            Err(X402Error::UnexpectedAuthEntries { detail }) => {
+                assert_eq!(detail, expected, "the refusal detail");
+            }
+            other => panic!("expected UnexpectedAuthEntries {expected:?}, got {other:?}"),
+        }
+    }
+
+    /// Exactly one payer entry → selection returns its credentials and root
+    /// invocation.
     #[test]
     fn select_payer_auth_entry_single_match_ok() {
-        let mut entries = vec![make_address_entry(payer_sc_address())];
-        let result = select_payer_auth_entry(&mut entries, &payer_sc_address());
-        assert!(result.is_ok(), "single payer entry should succeed");
+        let entry = make_address_entry(payer_sc_address());
+        let (credentials, invocation) =
+            select_payer_auth_entry(vec![entry.clone()], &payer_sc_address()).unwrap();
+        assert_eq!(SorobanCredentials::Address(credentials), entry.credentials);
+        assert_eq!(invocation, entry.root_invocation);
     }
 
-    /// A foreign Address entry with no payer match → `UnexpectedAuthEntries`
-    /// via the foreign-entry guard.
+    /// A sole Address entry for another account → refused by the payer check.
     #[test]
     fn select_payer_auth_entry_foreign_entry_only_rejects() {
-        let mut entries = vec![make_address_entry(foreign_sc_address())];
-        // foreign_sc_address is not the payer: payer_indices is empty AND
-        // foreign_address_count is 1, so the foreign-entry guard fires first.
-        let result = select_payer_auth_entry(&mut entries, &payer_sc_address());
-        assert!(
-            matches!(result, Err(X402Error::UnexpectedAuthEntries { .. })),
-            "expected UnexpectedAuthEntries, got {result:?}"
+        assert_selection_refused(
+            vec![make_address_entry(foreign_sc_address())],
+            "the simulated authorization entry is for an account other than the payer",
         );
     }
 
-    /// A non-empty array with no Address entries (only `SourceAccount`) → the
-    /// zero-payer-match arm rejects with `UnexpectedAuthEntries`.
+    /// A sole `SourceAccount` entry → refused by the credential-arm check.
     #[test]
     fn select_payer_auth_entry_only_source_account_rejects() {
-        let source_entry = SorobanAuthorizationEntry {
-            credentials: SorobanCredentials::SourceAccount,
-            root_invocation: make_address_entry(payer_sc_address()).root_invocation,
-        };
-        let mut entries = vec![source_entry];
-        let result = select_payer_auth_entry(&mut entries, &payer_sc_address());
-        assert!(
-            matches!(result, Err(X402Error::UnexpectedAuthEntries { .. })),
-            "no Address entry for the payer must reject, got {result:?}"
+        assert_selection_refused(
+            vec![payer_entry_with_credentials(|_| {
+                SorobanCredentials::SourceAccount
+            })],
+            "the simulated authorization entry has source-account credentials, \
+             not the payer's address credentials",
         );
     }
 
-    /// Multiple payer-matching entries → `UnexpectedAuthEntries`.
+    /// The payer's entry with `AddressV2` credentials → refused by the
+    /// credential-arm check.
+    #[test]
+    fn select_payer_auth_entry_address_v2_rejects() {
+        assert_selection_refused(
+            vec![payer_entry_with_credentials(SorobanCredentials::AddressV2)],
+            "the simulated authorization entry has AddressV2 credentials; \
+             this flow signs legacy address credentials only",
+        );
+    }
+
+    /// The payer's entry with delegated credentials → refused by the
+    /// credential-arm check.
+    #[test]
+    fn select_payer_auth_entry_delegated_credentials_rejects() {
+        assert_selection_refused(
+            vec![payer_entry_with_credentials(|address_credentials| {
+                SorobanCredentials::AddressWithDelegates(SorobanAddressCredentialsWithDelegates {
+                    address_credentials,
+                    delegates: VecM::default(),
+                })
+            })],
+            "the simulated authorization entry has delegated address credentials; \
+             this flow signs legacy address credentials only",
+        );
+    }
+
+    /// Two payer entries → refused by the count.
     #[test]
     fn select_payer_auth_entry_multiple_payer_matches_rejects() {
-        let mut entries = vec![
-            make_address_entry(payer_sc_address()),
-            make_address_entry(payer_sc_address()),
-        ];
-        let result = select_payer_auth_entry(&mut entries, &payer_sc_address());
-        assert!(
-            matches!(result, Err(X402Error::UnexpectedAuthEntries { .. })),
-            "expected UnexpectedAuthEntries for duplicate payer entries, got {result:?}"
+        assert_selection_refused(
+            vec![
+                make_address_entry(payer_sc_address()),
+                make_address_entry(payer_sc_address()),
+            ],
+            COUNT_DETAIL,
         );
     }
 
-    /// One payer entry + one foreign Account entry → `UnexpectedAuthEntries`.
-    ///
-    /// This is the "no other signers required" invariant: a SAC `transfer` for
-    /// a G-key payer must need exactly the payer's signature.
+    /// One payer entry + one foreign Account entry → refused by the count: a
+    /// SAC `transfer` from a G-key payer needs exactly the payer's signature.
     #[test]
     fn select_payer_auth_entry_foreign_account_entry_rejects() {
-        let mut entries = vec![
-            make_address_entry(payer_sc_address()),
-            make_address_entry(foreign_sc_address()),
-        ];
-        let result = select_payer_auth_entry(&mut entries, &payer_sc_address());
-        assert!(
-            matches!(result, Err(X402Error::UnexpectedAuthEntries { .. })),
-            "expected UnexpectedAuthEntries for foreign account entry, got {result:?}"
+        assert_selection_refused(
+            vec![
+                make_address_entry(payer_sc_address()),
+                make_address_entry(foreign_sc_address()),
+            ],
+            COUNT_DETAIL,
         );
     }
 
-    /// Empty auth entries → `UnexpectedAuthEntries`.
+    /// Empty auth entries → refused by the count.
     #[test]
     fn select_payer_auth_entry_empty_entries_rejects() {
-        let mut entries: Vec<SorobanAuthorizationEntry> = vec![];
-        let result = select_payer_auth_entry(&mut entries, &payer_sc_address());
-        assert!(
-            matches!(result, Err(X402Error::UnexpectedAuthEntries { .. })),
-            "expected UnexpectedAuthEntries for empty entries, got {result:?}"
-        );
+        assert_selection_refused(Vec::new(), COUNT_DETAIL);
     }
 
-    /// `SourceAccount`-credentialled entries are ignored in the
-    /// foreign-entry check; only the payer's `Address` entry matters.
+    /// One payer entry + one `SourceAccount` entry → refused by the count,
+    /// which covers every credential arm.
     #[test]
-    fn select_payer_auth_entry_ignores_source_account_entries() {
-        use stellar_xdr::{ContractId, InvokeContractArgs, ScSymbol};
-        let source_entry = SorobanAuthorizationEntry {
-            credentials: SorobanCredentials::SourceAccount,
-            root_invocation: SorobanAuthorizedInvocation {
-                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
-                    contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
-                    function_name: ScSymbol("transfer".try_into().unwrap()),
-                    args: VecM::default(),
-                }),
-                sub_invocations: VecM::default(),
-            },
-        };
-        let mut entries = vec![make_address_entry(payer_sc_address()), source_entry];
-        let result = select_payer_auth_entry(&mut entries, &payer_sc_address());
-        // SourceAccount entry is not an Address-credentialled entry, so it
-        // should not trigger the foreign-entry guard.
-        assert!(
-            result.is_ok(),
-            "SourceAccount entry alongside payer entry should succeed, got {result:?}"
+    fn select_payer_auth_entry_source_account_beside_payer_rejects() {
+        let source_entry = payer_entry_with_credentials(|_| SorobanCredentials::SourceAccount);
+        assert_selection_refused(
+            vec![make_address_entry(payer_sc_address()), source_entry],
+            COUNT_DETAIL,
         );
     }
 

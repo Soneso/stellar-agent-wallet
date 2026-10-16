@@ -107,6 +107,10 @@ All write and signing paths are testnet-only in this alpha. Every signing comman
   - The `exact` scheme only, no `upto`.
   - No HTTP retry loop; the host orchestrates the HTTP exchange.
   - Targets x402 v2, not v3.x.
+  - Before signing, the first simulation must return exactly one authorization entry. It carries legacy `Address` credentials for the payer, a zero expiration ledger, and no signature.
+  - That entry's root invocation must equal the SAC `transfer` the wallet built, contract and every argument included, with no nested calls. Any other answer refuses before signing.
+  - The signed re-simulation must return a decodable result whose authorization entries are empty or equal to the signed entry. Any other answer refuses, and no payment payload is returned.
+  - The nonce and the latest ledger come from the configured RPC. The re-simulation's resource data and fee pass structural checks only.
 
 ### x402 SEP-10 counterparty-identity gate
 

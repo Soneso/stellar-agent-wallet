@@ -32,13 +32,17 @@ stellar-agent-network = { workspace = true }
 stellar-agent-sep43 = { workspace = true }
 
 [dev-dependencies]
-stellar-agent-test-support = { path = "../stellar-agent-test-support" }
+# The simulation tests serve mocked Stellar RPC answers through wiremock and
+# count the simulate requests with the test-support helper.
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 rand_core = { workspace = true }
 ed25519-dalek = { workspace = true }
 serial_test = { workspace = true }
 reqwest = { workspace = true }
 zeroize = { workspace = true }
+wiremock = { workspace = true }
+async-trait = { workspace = true }
 
 [lints]
 workspace = true

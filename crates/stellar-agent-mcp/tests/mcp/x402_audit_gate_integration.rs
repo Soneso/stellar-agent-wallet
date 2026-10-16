@@ -52,6 +52,9 @@ enum FirstSimulate {
     Ok,
     /// An RPC error: `create_payment` fails before any signature exists.
     Error,
+    /// The payer's entry for a transfer of another amount than the one the
+    /// wallet built.
+    OtherAmount,
 }
 
 /// How the mock answers the signed re-simulation.
@@ -63,6 +66,9 @@ enum Resimulation {
     RpcError,
     /// A fee and resource data that does not decode.
     UndecodableTransactionData,
+    /// The signed entry with another nonce: authorization other than the
+    /// signed entry.
+    OtherAuthorization,
 }
 
 /// What the mock observed, shared with the test.
@@ -158,7 +164,8 @@ impl Respond for X402Rpc {
         let HostFunction::InvokeContract(invoke) = host.host_function else {
             panic!("the x402 flow invokes a contract");
         };
-        let signed = !host.auth.is_empty();
+        let signed_entries = host.auth.to_vec();
+        let signed = !signed_entries.is_empty();
         self.observed.lock().unwrap().signed.push(signed);
         if let Some(entry) = host.auth.first()
             && let SorobanCredentials::Address(credentials) = &entry.credentials
@@ -180,6 +187,12 @@ impl Respond for X402Rpc {
                     req_id,
                     serde_json::json!({"error": "host invocation failed", "latestLedger": 1000}),
                 );
+            }
+            let mut invoke = invoke;
+            if self.first == FirstSimulate::OtherAmount {
+                let mut args = invoke.args.to_vec();
+                args[2] = ScVal::from(1_i128 << 62);
+                invoke.args = args.try_into().expect("three arguments");
             }
             let entry = SorobanAuthorizationEntry {
                 credentials: SorobanCredentials::Address(SorobanAddressCredentials {
@@ -244,6 +257,25 @@ impl Respond for X402Rpc {
                     "latestLedger": 1000,
                 }),
             ),
+            Resimulation::OtherAuthorization => {
+                let mut entry = signed_entries[0].clone();
+                let SorobanCredentials::Address(credentials) = &mut entry.credentials else {
+                    panic!("the signed entry carries Address credentials");
+                };
+                credentials.nonce += 1;
+                simulate_result(
+                    req_id,
+                    serde_json::json!({
+                        "transactionData": TRANSACTION_DATA,
+                        "minResourceFee": "1000",
+                        "results": [{
+                            "auth": [entry.to_xdr_base64(Limits::none()).expect("entry encodes")],
+                            "xdr": void_xdr(),
+                        }],
+                        "latestLedger": 1000,
+                    }),
+                )
+            }
         }
     }
 }
@@ -601,6 +633,34 @@ async fn authenticated_payment_undecodable_resimulation_data_is_response_process
     .await;
 }
 
+#[tokio::test]
+#[serial]
+async fn create_payment_resimulated_other_authorization_writes_a_paired_withheld_row() {
+    a_failure_after_the_gate_is_paired(
+        Tool::CreatePayment,
+        "x402-gate-auth-cp",
+        0x3c,
+        Resimulation::OtherAuthorization,
+        "response_processing",
+        "x402.unexpected_auth_entries",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn authenticated_payment_resimulated_other_authorization_writes_a_paired_withheld_row() {
+    a_failure_after_the_gate_is_paired(
+        Tool::AuthenticatedPayment,
+        "x402-gate-auth-ap",
+        0x3d,
+        Resimulation::OtherAuthorization,
+        "response_processing",
+        "x402.payment_build_failed",
+    )
+    .await;
+}
+
 /// An error before the gate ran: nothing was signed or sent signed, and no x402
 /// row is written.
 async fn an_error_before_the_gate_writes_no_row(tool: Tool, profile_name: &str, seed: u8) {
@@ -631,6 +691,60 @@ async fn create_payment_error_before_the_gate_writes_no_row() {
 async fn authenticated_payment_error_before_the_gate_writes_no_row() {
     an_error_before_the_gate_writes_no_row(Tool::AuthenticatedPayment, "x402-gate-early-ap", 0x3a)
         .await;
+}
+
+/// A simulated authorization for another transfer than the one the wallet
+/// built is refused before signing: the gate never runs, no x402 row is
+/// written, and only the unsigned simulate reaches the RPC.
+async fn a_simulated_authorization_for_another_transfer_is_not_signed(
+    tool: Tool,
+    profile_name: &str,
+    seed: u8,
+    expected_code: &str,
+) {
+    let fixture = fixture(profile_name, [seed; 32], |rpc| {
+        rpc.first = FirstSimulate::OtherAmount;
+    })
+    .await;
+    let result = call(&fixture, tool).await;
+    let (code, _message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, expected_code, "{tool:?}: the tool's wire code");
+    assert!(
+        !text.contains("paymentSignature"),
+        "{tool:?}: no signature may be returned: {text}"
+    );
+    let (authorized, withheld) = x402_rows(&fixture.profile);
+    assert!(authorized.is_empty(), "{tool:?}: {authorized:?}");
+    assert!(withheld.is_empty(), "{tool:?}: {withheld:?}");
+    assert_eq!(
+        fixture.rpc.observed.lock().unwrap().signed,
+        vec![false],
+        "{tool:?}: one simulate request, carrying no signature"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn create_payment_refuses_a_simulated_authorization_for_another_transfer() {
+    a_simulated_authorization_for_another_transfer_is_not_signed(
+        Tool::CreatePayment,
+        "x402-gate-other-cp",
+        0x3e,
+        "x402.unexpected_auth_entries",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn authenticated_payment_refuses_a_simulated_authorization_for_another_transfer() {
+    a_simulated_authorization_for_another_transfer_is_not_signed(
+        Tool::AuthenticatedPayment,
+        "x402-gate-other-ap",
+        0x3f,
+        "x402.payment_build_failed",
+    )
+    .await;
 }
 
 /// The transmit gate sees the authorization that then leaves the wallet. Its
