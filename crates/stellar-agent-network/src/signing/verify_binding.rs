@@ -91,8 +91,8 @@ struct AccountRef {
 /// `endpoint_passphrase`.
 ///
 /// `endpoint_passphrase` must be the passphrase the RPC endpoint itself
-/// reported, established by [`StellarRpcClient::verify_network_passphrase`]
-/// before this call. Passing a caller-declared value that the endpoint has not
+/// reported, established by [`StellarRpcClient::endpoint_identity`] before
+/// this call. Passing a caller-declared value that the endpoint has not
 /// confirmed would verify the binding against the wrong network and defeat the
 /// check.
 ///

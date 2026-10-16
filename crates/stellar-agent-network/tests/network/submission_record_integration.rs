@@ -29,11 +29,11 @@ use stellar_agent_network::{
     StellarRpcClient, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
     WalletSubmissionRecorder,
 };
-use stellar_agent_test_support::EchoIdResponder;
 use stellar_agent_test_support::keyring_mock;
 use stellar_agent_test_support::signed_envelope::{
     SignedTestEnvelope, TESTNET_PASSPHRASE, get_network_result,
 };
+use stellar_agent_test_support::{EchoIdResponder, rpc_request_count};
 use tempfile::TempDir;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1393,5 +1393,166 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
     assert_eq!(
         closing_code, "policy.deny.per_period_cap_exceeded",
         "the closing audit row carries the refusal's own code"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The submission deadline bounds the confirmation poll
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The hang every held-open request below uses: far past the deadline, so a
+/// request left to run would overrun it by seconds.
+const HANG: Duration = Duration::from_secs(10);
+
+/// What a deadline exit may add to the deadline: the timeout record and
+/// scheduling. Smaller than the one-second overrun of an unclamped
+/// two-second poll sleep.
+const DEADLINE_MARGIN: Duration = Duration::from_millis(500);
+
+/// Answers like `inner`, after `delay`.
+struct Delayed<R> {
+    inner: R,
+    delay: Duration,
+}
+
+impl<R: wiremock::Respond> wiremock::Respond for Delayed<R> {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        self.inner.respond(request).set_delay(self.delay)
+    }
+}
+
+/// Submits `envelope` under [`TIMEOUT_DEADLINE`] against `server`, which must
+/// answer the reads before the send and the send itself, and checks that the
+/// submission ended at the deadline with the timeout outcome and its record
+/// standing.
+async fn assert_timeout_at_the_deadline(
+    fx: &Fixture,
+    envelope: &SignedTestEnvelope,
+    server: &MockServer,
+) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorder = fx.recorder(&calls);
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(
+        HANG,
+        submit_transaction_and_wait(
+            &client,
+            envelope.envelope_xdr(),
+            TIMEOUT_DEADLINE,
+            TESTNET_PASSPHRASE,
+            None,
+            Some(&recorder),
+        ),
+    )
+    .await
+    .expect("the submission must end before the held-open request would")
+    .expect_err("a submission that never confirms must report a timeout");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < TIMEOUT_DEADLINE + DEADLINE_MARGIN,
+        "the submission must end at its {TIMEOUT_DEADLINE:?} deadline; elapsed {elapsed:?}"
+    );
+    match &err {
+        WalletError::Submission(SubmissionError::TxTimeout { tx_hash, .. }) => {
+            assert_eq!(tx_hash, envelope.tx_hash_hex());
+        }
+        other => panic!("expected submission.tx_timeout; got {other:?}"),
+    }
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![
+            Call::PreSend,
+            Call::Outcome(SubmissionOutcome::Timeout {
+                tx_hash: envelope.tx_hash_hex().to_owned(),
+            }),
+        ],
+        "the deadline exit records the timeout and nothing else"
+    );
+    let hash = envelope_hash(envelope);
+    let receipt = fx.receipts.get(&hash).unwrap().unwrap();
+    assert_eq!(
+        receipt.status,
+        ReceiptStatus::Pending,
+        "a timeout settles nothing"
+    );
+    assert!(receipt.submitted, "the bytes were sent");
+    assert!(
+        fx.reservation_is_open(&hash),
+        "the reservation stands until reconciliation"
+    );
+}
+
+/// A poll request the endpoint holds open past the deadline is cut at the
+/// deadline, and the submission reports the timeout it reports for any
+/// unconfirmed transaction.
+#[tokio::test]
+#[serial]
+async fn a_poll_request_held_past_the_deadline_is_cut_at_the_deadline() {
+    let fx = fixture("record-poll-held");
+    let envelope = SignedTestEnvelope::for_source([0x26; 32]);
+    let server = MockServer::start().await;
+    mount_pre_send(&server, &envelope).await;
+    mount_send_pending(&server, envelope.tx_hash_hex()).await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(Delayed {
+            inner: rpc_ok(json!({"status": "NOT_FOUND", "latestLedger": 1_002, "oldestLedger": 1})),
+            delay: HANG,
+        })
+        .mount(&server)
+        .await;
+
+    assert_timeout_at_the_deadline(&fx, &envelope, &server).await;
+    assert_eq!(rpc_request_count(&server, "getTransaction").await, 1);
+}
+
+/// The sleep after a `NOT_FOUND` ends at the deadline rather than a full poll
+/// interval later, and no poll request reaches the endpoint after it.
+#[tokio::test]
+#[serial]
+async fn the_sleep_after_a_not_found_ends_at_the_deadline() {
+    let fx = fixture("record-poll-sleep");
+    let envelope = SignedTestEnvelope::for_source([0x27; 32]);
+    let server = MockServer::start().await;
+    mount_pre_send(&server, &envelope).await;
+    mount_send_pending(&server, envelope.tx_hash_hex()).await;
+    mount_get_not_found(&server).await;
+
+    assert_timeout_at_the_deadline(&fx, &envelope, &server).await;
+    assert_eq!(
+        rpc_request_count(&server, "getTransaction").await,
+        1,
+        "no poll request reaches the endpoint after the sleep that ended at the deadline"
+    );
+}
+
+/// The sleep after a transient poll error ends at the deadline rather than
+/// a full poll interval later, and no poll request reaches the endpoint
+/// after it.
+#[tokio::test]
+#[serial]
+async fn the_sleep_after_a_transient_poll_error_ends_at_the_deadline() {
+    let fx = fixture("record-poll-transient");
+    let envelope = SignedTestEnvelope::for_source([0x28; 32]);
+    let server = MockServer::start().await;
+    mount_pre_send(&server, &envelope).await;
+    mount_send_pending(&server, envelope.tx_hash_hex()).await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    assert_timeout_at_the_deadline(&fx, &envelope, &server).await;
+    assert_eq!(
+        rpc_request_count(&server, "getTransaction").await,
+        1,
+        "no poll request reaches the endpoint after the sleep that ended at the deadline"
     );
 }

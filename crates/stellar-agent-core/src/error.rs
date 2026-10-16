@@ -1738,6 +1738,28 @@ pub enum NetworkError {
         url: String,
     },
 
+    /// A mainnet RPC endpoint reports a protocol version outside the range
+    /// this release supports.
+    ///
+    /// A release adds a protocol version to its supported range only after
+    /// its testnet acceptance tests ran against that version. On testnet and
+    /// on any other network, a version outside the range is logged as a
+    /// warning instead. While every mainnet write is refused, an endpoint
+    /// reporting mainnet is refused with
+    /// [`NetworkError::MainnetWriteForbidden`] before this check runs.
+    #[error(
+        "the RPC endpoint runs protocol version {protocol_version}, outside the supported \
+         range {supported_min} to {supported_max}; not submitting"
+    )]
+    UnsupportedProtocolVersion {
+        /// The protocol version the endpoint reported.
+        protocol_version: u32,
+        /// The lowest supported protocol version.
+        supported_min: u32,
+        /// The highest supported protocol version.
+        supported_max: u32,
+    },
+
     /// A signature on the envelope was produced under the mainnet network id.
     ///
     /// Every mainnet write is structurally refused, including one reaching a
@@ -1810,6 +1832,7 @@ impl NetworkError {
             }
             Self::EndpointNetworkMismatch { .. } => "network.endpoint_network_mismatch",
             Self::EndpointIdentityUnavailable { .. } => "network.endpoint_identity_unavailable",
+            Self::UnsupportedProtocolVersion { .. } => "network.unsupported_protocol_version",
             Self::EnvelopeSignedForMainnet => "network.envelope_signed_for_mainnet",
             Self::EnvelopeSignatureUnverifiable { .. } => "network.envelope_signature_unverifiable",
             Self::EnvelopeUnsigned => "network.envelope_unsigned",
@@ -3254,6 +3277,14 @@ mod tests {
                 "network.endpoint_identity_unavailable",
             ),
             (
+                NetworkError::UnsupportedProtocolVersion {
+                    protocol_version: 31,
+                    supported_min: 28,
+                    supported_max: 30,
+                },
+                "network.unsupported_protocol_version",
+            ),
+            (
                 NetworkError::EnvelopeSignedForMainnet,
                 "network.envelope_signed_for_mainnet",
             ),
@@ -3852,6 +3883,11 @@ mod tests {
             WalletError::Network(NetworkError::EndpointIdentityUnavailable {
                 url: "https://rpc.example.com".to_owned(),
             }),
+            WalletError::Network(NetworkError::UnsupportedProtocolVersion {
+                protocol_version: 31,
+                supported_min: 28,
+                supported_max: 30,
+            }),
             WalletError::Network(NetworkError::EnvelopeSignedForMainnet),
             WalletError::Network(NetworkError::EnvelopeSignatureUnverifiable {
                 hint: "0a1b2c3d".to_owned(),
@@ -3879,6 +3915,31 @@ mod tests {
             err.message(),
             "account 'GABCDEFGHIJKLMNOPQR' already holds the Friendbot starting balance; Friendbot funds only an account below it"
         );
+    }
+
+    /// The unsupported-protocol refusal names the advertised version and both
+    /// ends of the supported range, so an operator can read all three from the
+    /// message alone. The three values are distinct, so each assertion finds
+    /// one field.
+    #[test]
+    fn unsupported_protocol_version_names_the_version_and_the_range() {
+        let err = WalletError::Network(NetworkError::UnsupportedProtocolVersion {
+            protocol_version: 31,
+            supported_min: 28,
+            supported_max: 30,
+        });
+        assert_eq!(err.code(), "network.unsupported_protocol_version");
+        let msg = err.message();
+        for (field, value) in [
+            ("protocol_version", "31"),
+            ("supported_min", "28"),
+            ("supported_max", "30"),
+        ] {
+            assert!(
+                msg.contains(value),
+                "the message must name {field} ({value}): {msg}"
+            );
+        }
     }
 
     /// A non-public network passphrase never reaches the `Display` surface of

@@ -7,11 +7,13 @@
 //!   fmt layer writes during a test and assert that no secret material
 //!   (Stellar S-strkeys, BIP-39 mnemonic words, sensitive field values) appears
 //!   in them.
+//! - [`WarningCapture`] records the fields of each warning a test emits.
 //! - [`keyring_mock`] — redirect `keyring_core` calls to an in-memory store
 //!   during unit tests, so no OS keychain dialog appears in `cargo test`.
 //! - [`xdr_fixtures`], [`testnet_strkeys`], [`verifier_registry`],
 //!   [`echo_id_responder`] — Stellar XDR / strkey fixtures and HTTP/contract
 //!   test doubles for consumer crates' tests.
+//! - [`rpc_request_count`] counts a mock server's requests for one RPC method.
 //! - [`signed_envelope`] — envelopes whose signatures are real and whose
 //!   source accounts are answerable by a mocked `getLedgerEntries`, for tests
 //!   that exercise a submit path.
@@ -72,9 +74,11 @@ pub use connection_counter::ConnectionCounter;
 #[cfg(feature = "test-helpers")]
 pub use echo_id_responder::SubmissionEchoResponder;
 #[cfg(feature = "wiremock-helpers")]
-pub use echo_id_responder::{EchoIdResponder, KeyedLedgerEntriesResponder};
+pub use echo_id_responder::{EchoIdResponder, KeyedLedgerEntriesResponder, rpc_request_count};
 pub use env_guard::{ProfileEnvVarGuard, StellarAgentHomeGuard};
-pub use log_capture::{CaptureWriter, RedactionStrictSubscriber, with_captured_logs};
+pub use log_capture::{
+    CaptureWriter, RedactionStrictSubscriber, WarningCapture, with_captured_logs,
+};
 pub use secret_patterns::assert_no_secret_bytes;
 #[cfg(feature = "test-helpers")]
 pub use signed_envelope::{

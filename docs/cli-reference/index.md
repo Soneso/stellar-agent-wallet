@@ -122,13 +122,16 @@ The submit layer applies the same refusal in a fixed order. A declared mainnet n
 
 ## Submit-layer network binding
 
-The submit layer does not take the declared network on trust. Before sending, it asks the endpoint which network it serves (`getNetwork`), on the same client instance that will send, and treats that answer, not the declaration, as authoritative:
+The submit layer does not take the declared network on trust. Before sending, it asks the endpoint which network it serves and which protocol it runs (`getNetwork`), on the same client instance that will send. It treats that answer, not the declaration, as authoritative:
 
 - the endpoint reports mainnet: `network.mainnet_write_forbidden`;
 - the endpoint reports a different network than the one declared: `network.endpoint_network_mismatch`;
-- the endpoint's identity cannot be established within the submission timeout: `network.endpoint_identity_unavailable`.
+- the endpoint's identity cannot be established within the submission timeout: `network.endpoint_identity_unavailable`;
+- a mainnet endpoint runs a protocol version outside the supported range: `network.unsupported_protocol_version`.
 
-The probe is retried with bounded exponential backoff inside the caller's own timeout and is fail-closed: it never falls back to the declared network. This is the one mainnet refusal that costs a round trip.
+The probe is retried with bounded exponential backoff inside the caller's own timeout and is fail-closed: it never falls back to the declared network. An answer that does not parse, for example one without `protocolVersion`, is not retried and reports `network.endpoint_identity_unavailable`. The endpoint check is the one mainnet refusal that costs a round trip. [Retries, deadlines, and failover](../maintainers/security-internals.md#retries-deadlines-and-failover) gives the retry numbers and the deadlines.
+
+This release supports protocol version 29. A release adds a version only after its testnet acceptance tests ran against it. On testnet and on any other network that matches the declaration, a version outside the range is logged as a warning and the submission continues. On mainnet the same version is refused with `network.unsupported_protocol_version`. While mainnet writes are refused, an endpoint reporting mainnet is refused with `network.mainnet_write_forbidden` before this rule applies.
 
 The layer then verifies the envelope's signatures against that network. It fetches the ed25519 signer sets of the transaction source account and of every distinct operation-level source account in one `getLedgerEntries` call (for a fee-bump, the fee source answers for the outer signatures and the inner transaction's sources for the inner ones); an account absent from the ledger is refused with `network.account_not_found` before anything is sent, unless the transaction itself creates it, in which case its own master key is the signer it will have at apply time and no ledger entry is needed. Every decorated signature must then verify: the SEP-23 signing payload is rebuilt under the network id the endpoint reported and checked against the gathered signers whose key hint matches.
 
@@ -152,7 +155,11 @@ sign nor submit.
 On `pay --submit-only` and `claim --submit-only`, the endpoint identity probe
 runs on the command's own client before the policy gate and audit pre-flight.
 An `--rpc-url` pointing at a different network than `--network` is refused before
-either check runs.
+either check runs. The probe also reads the endpoint's protocol version and
+applies the protocol rule of
+[Submit-layer network binding](#submit-layer-network-binding). It runs under
+its own `--timeout-seconds` deadline, and the submission that follows starts a
+fresh one.
 
 This pre-flight fails closed for persisted `<name>.toml` profiles. `pay`,
 `claim`, and `accounts create` synthesize an in-memory testnet profile when no

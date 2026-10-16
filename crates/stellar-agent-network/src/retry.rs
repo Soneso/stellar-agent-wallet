@@ -36,9 +36,11 @@
 //!   which is indistinguishable from a real on-chain rejection → **NOT retried**
 //!   (transport-429-on-send is not currently honoured; blind backoff is used instead).
 //!
-//! Two separate classifier functions enforce this:
-//! - [`is_retryable_send_error`] — for `send_transaction`.
-//! - [`is_retryable_poll_error`] — for `get_transaction` / `get_health`.
+//! Each call site selects its classifier:
+//! - [`is_retryable_send_error`] for `send_transaction`.
+//! - [`is_retryable_poll_error`] for `get_transaction` / `get_health`.
+//! - `is_retryable_identity_error` for `getNetwork`. It matches the send
+//!   classifier except that `JsonRpc(ParseError(_))` is not retryable.
 //!
 //! ## Jitter source
 //!
@@ -119,10 +121,8 @@ pub(crate) fn truncate_error_display(e: &stellar_rpc_client::Error) -> String {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
-    /// Maximum number of attempts (including the first).  The loop exits
-    /// after `max_attempts` have been made, regardless of the overall deadline.
-    ///
-    /// Minimum meaningful value is 1 (run the operation once, no retries).
+    /// Maximum number of attempts, including the first. Zero acts as one,
+    /// so the operation always runs at least once.
     pub max_attempts: u32,
 
     /// Base delay for the first retry.  Subsequent delays double per attempt
@@ -279,6 +279,22 @@ pub fn is_retryable_send_error(e: &stellar_rpc_client::Error) -> bool {
         // Missing op: protocol mismatch.
         E::MissingOp => false,
     }
+}
+
+/// Returns `true` if a `getNetwork` error met by the endpoint identity check
+/// is worth retrying.
+///
+/// The classification is [`is_retryable_send_error`] with one exception: an
+/// answer whose body does not deserialize, which arrives as
+/// `JsonRpc(ClientError::ParseError(_))`, is not retried. An answer without
+/// `protocolVersion`, or with a value of the wrong type, is one. The endpoint
+/// did answer, and a further attempt would only spend the caller's deadline
+/// on the same answer.
+pub(crate) fn is_retryable_identity_error(e: &stellar_rpc_client::Error) -> bool {
+    !matches!(
+        e,
+        stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::ParseError(_))
+    ) && is_retryable_send_error(e)
 }
 
 /// Returns `true` if a `getTransaction` or `getHealth` RPC error is worth
@@ -469,33 +485,35 @@ fn jitter_delay(attempt: u32, base_delay: Duration, max_delay: Duration) -> Dura
 ///
 /// # Behaviour
 ///
-/// 1. Runs `op()` **at least once** — even if `overall_deadline` has already
-///    passed on entry.  The caller's deadline is a best-effort bound on sleep
-///    scheduling, not a pre-flight gate that skips the first attempt.
+/// 1. Runs `op()` **at least once**, even if `overall_deadline` has already
+///    passed on entry. The deadline bounds the retries and the sleeps between
+///    them; it is not a pre-flight gate that skips the first attempt.
 /// 2. On a **non-retryable** error: returns immediately (1 attempt consumed).
-/// 3. On a **retryable** error: sleeps a jitter-capped delay, then retries.
+/// 3. On a **retryable** error: sleeps a jitter-capped delay, clamped to the
+///    time left before `overall_deadline`, then retries.
 /// 4. Exits when any of the following is true:
 ///    - `op()` returns `Ok(T)`.
 ///    - `op()` returns a non-retryable error.
 ///    - `attempt_count >= policy.max_attempts`.
-///    - `Instant::now() >= overall_deadline` (checked BEFORE each sleep, so
-///      the deadline governs sleep scheduling; the op itself may run slightly
-///      past the deadline on the final attempt).
+///    - `Instant::now() >= overall_deadline`, checked before each sleep and
+///      again after it, so no attempt starts once the deadline has passed.
 ///
-/// The last error seen is returned if all attempts are exhausted.
+/// The last error seen is returned if all attempts are exhausted, and when
+/// the deadline ends the retries between two attempts.
 ///
 /// # Bounded wall-time
 ///
-/// Total wall-time ≤ `overall_deadline + one max_delay`.  Specifically:
-/// - Every `op()` call is itself raced against `overall_deadline` via
+/// The call returns by `overall_deadline`, up to timer granularity:
+/// - Every `op()` call is raced against `overall_deadline` via
 ///   `tokio::time::timeout_at`, so an in-flight attempt cannot overshoot the
-///   deadline by its own transport-level bound (up to 60s) — the SAME
-///   deadline governs both attempt duration and inter-attempt sleeps.
-/// - If a sleep starts, it runs for at most `max_delay` regardless of the
-///   remaining time (we do NOT trim the sleep to fit the deadline exactly,
-///   because the poll interval already handles the hard cutoff at the deadline
-///   in the caller's loop).  This one-`max_delay` slop is bounded and small
-///   (≤ 8 s by default).
+///   deadline by its own transport-level bound (up to 60 s).
+/// - Every sleep lasts `min(delay, overall_deadline - now)`, so no sleep ends
+///   after the deadline, and a sleep that reaches it ends the retries.
+///
+/// When the deadline has already passed on entry, the first attempt still
+/// runs: Tokio polls it before the deadline timer, so an attempt that
+/// completes on its first poll returns its own result, and any other is cut
+/// at once.
 ///
 /// A malicious server cannot cause an unbounded wait: we never read
 /// `Retry-After` from server responses; blind backoff is used instead.
@@ -518,7 +536,7 @@ fn jitter_delay(attempt: u32, base_delay: Duration, max_delay: Duration) -> Dura
 /// - `overall_deadline`: the caller's absolute deadline (e.g. `started + timeout`).
 /// - `is_retryable`: per-call-site classifier; use [`is_retryable_send_error`]
 ///   for `send_transaction` and [`is_retryable_poll_error`] for poll calls.
-/// - `op`: the async operation to retry.  Called at most `policy.max_attempts` times.
+/// - `op`: the async operation to retry. Called at most `policy.max_attempts.max(1)` times.
 ///
 /// # Errors
 ///
@@ -558,6 +576,30 @@ pub async fn retry_with_backoff<F, Fut, T>(
     policy: &RetryPolicy,
     overall_deadline: Instant,
     is_retryable: fn(&stellar_rpc_client::Error) -> bool,
+    op: F,
+) -> Result<T, stellar_rpc_client::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, stellar_rpc_client::Error>>,
+{
+    retry_with_delay(policy, overall_deadline, is_retryable, jitter_delay, op).await
+}
+
+/// [`retry_with_backoff`] with the delay before each retry drawn from
+/// `delay_for(attempt, base_delay, max_delay)`.
+///
+/// Production passes [`jitter_delay`]. A test passes a fixed delay, which is
+/// how a delay longer than the remaining budget is produced on demand.
+#[expect(
+    clippy::result_large_err,
+    reason = "the error type is stellar_rpc_client's own, passed through unchanged \
+              as in retry_with_backoff"
+)]
+async fn retry_with_delay<F, Fut, T>(
+    policy: &RetryPolicy,
+    overall_deadline: Instant,
+    is_retryable: fn(&stellar_rpc_client::Error) -> bool,
+    delay_for: fn(u32, Duration, Duration) -> Duration,
     mut op: F,
 ) -> Result<T, stellar_rpc_client::Error>
 where
@@ -566,7 +608,7 @@ where
 {
     let mut last_err: Option<stellar_rpc_client::Error> = None;
 
-    for attempt in 0..policy.max_attempts {
+    for attempt in 0..policy.max_attempts.max(1) {
         match tokio::time::timeout_at(overall_deadline, op()).await {
             Ok(Ok(val)) => return Ok(val),
             Ok(Err(e)) => {
@@ -580,12 +622,20 @@ where
                 // Do not schedule another sleep if we have exhausted attempts
                 // or the overall deadline has passed.
                 let is_last_attempt = attempt + 1 >= policy.max_attempts;
-                if is_last_attempt || Instant::now() >= overall_deadline {
+                let now = Instant::now();
+                if is_last_attempt || now >= overall_deadline {
                     break;
                 }
 
-                let delay = jitter_delay(attempt, policy.base_delay, policy.max_delay);
+                // The sleep never outlasts the deadline, and a sleep that
+                // reaches it ends the retries with the last error, so no
+                // attempt starts past the caller's budget.
+                let delay = delay_for(attempt, policy.base_delay, policy.max_delay)
+                    .min(overall_deadline.saturating_duration_since(now));
                 tokio::time::sleep(delay).await;
+                if Instant::now() >= overall_deadline {
+                    break;
+                }
             }
             // `overall_deadline` elapsed while THIS attempt was in flight — a
             // one-off transport hang cannot overshoot the shared deadline by
@@ -599,12 +649,10 @@ where
         }
     }
 
-    // All attempts exhausted (or deadline passed before we could retry).
-    // SAFETY: the loop runs at least once (`max_attempts >= 1` enforced below by
-    // the `0..policy.max_attempts` range, and a deadline-already-past entry still
-    // executes attempt 0 before breaking).  Therefore `last_err` is always `Some`
-    // at this point — the non-retryable branch returns before reaching this line,
-    // and the Ok branch returns before reaching this line.
+    // All attempts exhausted (or the deadline ended the retries).
+    // SAFETY: `.max(1)` makes the loop run at least once, even when the deadline
+    // is already past. Only a retryable error can exit the loop without
+    // returning, so `last_err` is always `Some` here.
     //
     // We use `unwrap_or_else(|| unreachable!())` to satisfy clippy's
     // `clippy::expect_used` restriction without introducing an `unsafe` block.
@@ -1065,10 +1113,10 @@ mod tests {
         );
     }
 
-    /// Total advanced time under tokio::time::pause is bounded by the deadline
-    /// plus one max_delay.
+    /// Total advanced time under tokio::time::pause ends at the deadline, up
+    /// to timer granularity: every sleep is clamped to the time left.
     #[tokio::test]
-    async fn total_elapsed_bounded_by_deadline_plus_max_delay() {
+    async fn total_elapsed_bounded_by_deadline() {
         tokio::time::pause();
 
         let policy = RetryPolicy {
@@ -1088,11 +1136,148 @@ mod tests {
         .await;
 
         let elapsed = start.elapsed();
-        let slop = policy.max_delay;
+        let granularity = Duration::from_millis(1);
         assert!(
-            elapsed <= overall_deadline + slop,
-            "elapsed {elapsed:?} exceeds deadline+max_delay ({:?})",
-            overall_deadline + slop
+            elapsed <= overall_deadline + granularity,
+            "elapsed {elapsed:?} exceeds the deadline ({overall_deadline:?}) beyond timer \
+             granularity"
         );
+    }
+
+    /// A delay longer than the remaining budget is cut to the deadline, and
+    /// the retries end there with the first error. The second attempt would
+    /// succeed at once, so a retry after the clamped sleep would show as a
+    /// success and a second invocation.
+    #[tokio::test(start_paused = true)]
+    async fn a_delay_past_the_deadline_is_clamped_and_ends_the_retries() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+        };
+        let budget = Duration::from_secs(1);
+        let start = Instant::now();
+        let deadline = start + budget;
+
+        let result = retry_with_delay(
+            &policy,
+            deadline,
+            is_retryable_poll_error,
+            |_, _, _| Duration::from_secs(10),
+            || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(stellar_rpc_client::Error::JsonRpc(
+                            jsonrpsee_core::ClientError::Custom("first attempt".into()),
+                        ))
+                    } else {
+                        Ok(7u32)
+                    }
+                }
+            },
+        )
+        .await;
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed <= budget + Duration::from_millis(10),
+            "the forced 10 s delay must be cut to the 1 s budget; elapsed {elapsed:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no attempt may start after a sleep that reached the deadline"
+        );
+        match result {
+            Err(stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Custom(m))) => {
+                assert_eq!(m, "first attempt", "the first attempt's error is returned");
+            }
+            other => panic!("expected the first attempt's error; got {other:?}"),
+        }
+    }
+
+    /// The default policy is five attempts, a 500 ms base delay, and an 8 s
+    /// cap, the numbers the documentation states.
+    #[test]
+    fn the_default_policy_is_five_attempts_500_ms_base_8_s_cap() {
+        assert_eq!(
+            RetryPolicy::default(),
+            RetryPolicy {
+                max_attempts: 5,
+                base_delay: Duration::from_millis(500),
+                max_delay: Duration::from_secs(8),
+            }
+        );
+    }
+
+    // ─── is_retryable_identity_error ─────────────────────────────────────────
+
+    /// A `getNetwork` body that does not deserialize is not retried; every
+    /// other error is classified as the send path classifies it.
+    #[test]
+    fn identity_parse_error_is_not_retryable_and_the_rest_follow_the_send_classifier() {
+        let parse = serde_json::from_str::<u32>("\"protocolVersion\"").unwrap_err();
+        let cases = [
+            (
+                stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::ParseError(parse)),
+                false,
+            ),
+            (
+                stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Custom(
+                    "connection reset".into(),
+                )),
+                true,
+            ),
+            (
+                stellar_rpc_client::Error::TransactionSubmissionTimeout,
+                true,
+            ),
+            (stellar_rpc_client::Error::InvalidResponse, false),
+        ];
+        for (error, retryable) in cases {
+            assert_eq!(is_retryable_identity_error(&error), retryable, "{error:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_max_attempts_runs_once() {
+        for succeeds in [true, false] {
+            let calls = AtomicU32::new(0);
+            let result = retry_with_backoff(
+                &RetryPolicy {
+                    max_attempts: 0,
+                    ..RetryPolicy::default()
+                },
+                Instant::now() + Duration::from_secs(1),
+                is_retryable_poll_error,
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if succeeds {
+                            Ok(7)
+                        } else {
+                            Err(stellar_rpc_client::Error::JsonRpc(
+                                jsonrpsee_core::ClientError::Custom("first attempt".into()),
+                            ))
+                        }
+                    }
+                },
+            )
+            .await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            if succeeds {
+                assert_eq!(result.unwrap(), 7);
+            } else {
+                assert!(
+                    matches!(result,
+                        Err(stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Custom(ref message)))
+                        if message == "first attempt"
+                    ),
+                    "the only attempt's error is returned: {result:?}"
+                );
+            }
+        }
     }
 }

@@ -26,6 +26,10 @@
 //! `RpcUnreachable`.  This means a transient 429 on a poll does not abort the
 //! entire submission.
 //!
+//! The submission deadline bounds the poll as well: each poll request is cut
+//! at it, each sleep between polls ends at it at the latest, and an answer
+//! that completes after it is not accepted.
+//!
 //! Retry-After limitation: `stellar-rpc-client` surfaces no typed `Retry-After`
 //! header; blind backoff is used instead.  Retry-After / transport-429-on-send
 //! is not currently honoured.
@@ -115,7 +119,8 @@ pub enum SubmissionSignerKind {
 /// the endpoint identity probe and the signer-set fetch that precede the send
 /// are bounded by the same deadline, and each of their retries is cut off by
 /// it. A caller sizing this value has to allow for two reads ahead of the
-/// send.
+/// send. The confirmation poll ends at the same deadline: a status that
+/// arrives after it is not accepted, and the call returns the timeout.
 ///
 /// # Which network the transaction reaches
 ///
@@ -203,8 +208,7 @@ pub async fn submit_transaction_and_wait(
         })
     })?;
 
-    let started = tokio::time::Instant::now();
-    let send_deadline = started + timeout;
+    let send_deadline = tokio::time::Instant::now() + timeout;
     let retry_policy = RetryPolicy::default();
 
     // A legacy V0 envelope has no SEP-23 tagged-transaction form, so neither
@@ -212,12 +216,13 @@ pub async fn submit_transaction_and_wait(
     // it. Refused here so it costs no round trip.
     reject_v0_envelope(&envelope)?;
 
-    // Ask the endpoint which network it serves, on the client instance that
-    // will send. The target network is a property of the endpoint; the
-    // caller's declaration is only a claim about it, and the two must be shown
-    // to agree before anything is sent. Bounded by the caller's own deadline.
+    // Ask the endpoint which network it serves and which protocol it runs, on
+    // the client instance that will send. The target network is a property of
+    // the endpoint; the caller's declaration is only a claim about it, and the
+    // two must be shown to agree before anything is sent. Bounded by the
+    // caller's own deadline.
     client
-        .verify_network_passphrase(network_passphrase, send_deadline)
+        .endpoint_identity(network_passphrase, send_deadline)
         .await?;
 
     // With the endpoint's network established, verify that the envelope's
@@ -319,34 +324,79 @@ pub async fn submit_transaction_and_wait(
     let tx_hash = stellar_xdr::Hash(local_hash_bytes);
     tracing::info!(tx_hash = %redacted, "submit_transaction_and_wait: transaction submitted");
 
-    // Poll until SUCCESS, FAILED, or timeout.
-    //
-    // Each poll reads the raw `getTransaction` answer: status, ledger and
-    // created-at are read as received, and the result XDR is decoded only for
-    // a `FAILED` transaction, so an answer whose meta the wallet cannot
-    // decode still confirms.
-    //
-    // Transient `JsonRpc(_)` errors from `get_transaction_record` are treated
-    // like `NOT_FOUND`: log at debug level and fall through to the deadline
-    // check + POLL_INTERVAL sleep.  This prevents a transient rate-limit from
-    // aborting the entire submission while preserving the hard timeout bound.
-    // A retryable poll error never `continue`s past the deadline check: the
-    // loop terminates on timeout even if every poll errors.
-    //
-    // Keep in sync with the poll loop in `idempotent_submit.rs`: any change to
-    // retryable-error treatment here must be mirrored there.
+    poll_for_confirmation(
+        || client.get_transaction_record(&tx_hash),
+        &client.url,
+        send_deadline,
+        timeout.as_secs(),
+        &intent,
+        recorder,
+        signer_kind,
+    )
+    .await
+}
 
+/// Polls `getTransaction` through `poll` until the transaction settles or
+/// `send_deadline` passes, and settles the record to match.
+///
+/// `poll` issues one `getTransaction` request for the submitted transaction.
+/// Each poll reads the raw answer: status, ledger and created-at are read as
+/// received, and the result XDR is decoded only for a `FAILED` transaction, so
+/// an answer whose meta the wallet cannot decode still confirms.
+///
+/// The deadline bounds every step. No poll request starts at or past it, an
+/// in-flight request is cut at it, and each sleep between polls ends at it at
+/// the latest. Tokio polls a request before its deadline timer, so an answer
+/// can complete after the deadline; the deadline is therefore checked again
+/// before the answer is read or any record changes. Every deadline exit
+/// records [`SubmissionOutcome::Timeout`] and returns
+/// [`SubmissionError::TxTimeout`]: an answer that arrives too late is not
+/// accepted, and the hash it names is reconciled later.
+///
+/// Transient `JsonRpc(_)` errors are treated like `NOT_FOUND`: logged at debug
+/// level and followed by the next poll, so a transient rate-limit does not
+/// abort the submission. Every path ends at the deadline at the latest, even
+/// when every poll errors.
+///
+/// Keep in sync with the poll loop in `idempotent_submit.rs`: any change to
+/// the deadline or retryable-error treatment here must be mirrored there.
+async fn poll_for_confirmation<P, F>(
+    mut poll: P,
+    url: &str,
+    send_deadline: tokio::time::Instant,
+    timeout_secs: u64,
+    intent: &SubmissionIntent,
+    recorder: Option<&dyn SubmissionRecorder>,
+    signer_kind: Option<SubmissionSignerKind>,
+) -> Result<SubmissionResult, WalletError>
+where
+    P: FnMut() -> F,
+    F: std::future::Future<Output = Result<TransactionRecord, stellar_rpc_client::Error>>,
+{
+    let redacted = redact_tx_hash(&intent.tx_hash);
     loop {
-        let poll_result = client.get_transaction_record(&tx_hash).await;
+        // A sleep that reached the deadline ends the loop here, before another
+        // request starts.
+        if tokio::time::Instant::now() >= send_deadline {
+            return Err(record_timeout(recorder, intent, timeout_secs).await);
+        }
+        // A request the endpoint holds open is cut at the deadline rather than
+        // left to the transport's own 60 s bound.
+        let Ok(poll_result) = tokio::time::timeout_at(send_deadline, poll()).await else {
+            return Err(record_timeout(recorder, intent, timeout_secs).await);
+        };
+        // An answer that completed at or after the deadline is not read.
+        if tokio::time::Instant::now() >= send_deadline {
+            return Err(record_timeout(recorder, intent, timeout_secs).await);
+        }
 
         let record = match poll_result {
             Ok(r) => r,
             Err(ref e) if is_retryable_poll_error(e) => {
                 // Treat transient transport error as NOT_FOUND: log at debug
-                // and fall through to the deadline check + sleep.
-                // Truncate error display to bound log volume from a hostile
-                // endpoint.
-                let url_authority = redact_url_authority(&client.url);
+                // and poll again after the interval. Truncate error display to
+                // bound log volume from a hostile endpoint.
+                let url_authority = redact_url_authority(url);
                 tracing::debug!(
                     tx_hash = %redacted,
                     rpc_url = %url_authority,
@@ -354,11 +404,7 @@ pub async fn submit_transaction_and_wait(
                     "submit_transaction_and_wait: transient getTransaction error \
                      (treating as NOT_FOUND, continuing poll)"
                 );
-                // Fall through to deadline check below.
-                if started.elapsed() >= timeout {
-                    return Err(record_timeout(recorder, &intent, timeout.as_secs()).await);
-                }
-                tokio::time::sleep(POLL_INTERVAL).await;
+                sleep_before_next_poll(POLL_INTERVAL, send_deadline).await;
                 continue;
             }
             Err(e) => {
@@ -368,10 +414,10 @@ pub async fn submit_transaction_and_wait(
                 // Without a recorder there is nothing to settle, so the
                 // transport failure is reported as itself.
                 let Some(rec) = recorder else {
-                    return Err(map_rpc_error_generic(&e, &client.url, timeout.as_secs()));
+                    return Err(map_rpc_error_generic(&e, url, timeout_secs));
                 };
                 rec.outcome(
-                    &intent,
+                    intent,
                     &SubmissionOutcome::TransportAfterSend {
                         error: format!(
                             "the confirmation poll could not reach the endpoint: {}",
@@ -382,7 +428,7 @@ pub async fn submit_transaction_and_wait(
                 .await;
                 return Err(WalletError::Submission(SubmissionError::TxTimeout {
                     tx_hash: intent.tx_hash.clone(),
-                    seconds: timeout.as_secs(),
+                    seconds: timeout_secs,
                 }));
             }
         };
@@ -397,7 +443,7 @@ pub async fn submit_transaction_and_wait(
                 );
                 if let Some(rec) = recorder {
                     rec.outcome(
-                        &intent,
+                        intent,
                         &SubmissionOutcome::Success {
                             ledger,
                             created_at: record.created_at(),
@@ -406,7 +452,7 @@ pub async fn submit_transaction_and_wait(
                     .await;
                 }
                 return Ok(SubmissionResult {
-                    tx_hash: tx_hash_hex,
+                    tx_hash: intent.tx_hash.clone(),
                     ledger,
                     signer_kind,
                 });
@@ -421,7 +467,7 @@ pub async fn submit_transaction_and_wait(
                 );
                 if let Some(rec) = recorder {
                     rec.outcome(
-                        &intent,
+                        intent,
                         &SubmissionOutcome::OnChainFailed {
                             code: err.code().to_owned(),
                         },
@@ -436,14 +482,10 @@ pub async fn submit_transaction_and_wait(
 
             other => {
                 let Some(rec) = recorder else {
-                    return Err(WalletError::Network(unexpected_status(
-                        &client.url,
-                        "",
-                        other,
-                    )));
+                    return Err(WalletError::Network(unexpected_status(url, "", other)));
                 };
                 rec.outcome(
-                    &intent,
+                    intent,
                     &SubmissionOutcome::TransportAfterSend {
                         error: format!(
                             "the endpoint reported an unexpected transaction status: {}",
@@ -454,17 +496,22 @@ pub async fn submit_transaction_and_wait(
                 .await;
                 return Err(WalletError::Submission(SubmissionError::TxTimeout {
                     tx_hash: intent.tx_hash.clone(),
-                    seconds: timeout.as_secs(),
+                    seconds: timeout_secs,
                 }));
             }
         }
 
-        if started.elapsed() >= timeout {
-            return Err(record_timeout(recorder, &intent, timeout.as_secs()).await);
-        }
-
-        tokio::time::sleep(POLL_INTERVAL).await;
+        sleep_before_next_poll(POLL_INTERVAL, send_deadline).await;
     }
+}
+
+/// Sleeps `interval` before the next confirmation poll, or until `deadline`
+/// when that comes first.
+///
+/// A poll interval never carries a submission past its deadline: the loop
+/// that sleeps here checks the deadline before its next request.
+pub(crate) async fn sleep_before_next_poll(interval: Duration, deadline: tokio::time::Instant) {
+    tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + interval)).await;
 }
 
 /// Settles the record for a submission whose confirmation never arrived, and
@@ -1075,6 +1122,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::poll_test_support::{answer, assert_answer_wins_at_deadline};
     use crate::redact::rpc_error_fixtures::{
         ENDPOINT, ENDPOINT_AUTHORITY, ERROR_OBJECTS, assert_scrubbed, call_client_error,
         call_error, xdr_error,
@@ -1471,5 +1519,142 @@ mod tests {
             ),
             "TxFeeBumpInnerSuccess must NOT map to FeeBumpInnerRejected, got: {err:?}"
         );
+    }
+
+    // ── Confirmation poll deadline ───────────────────────────────────────────
+
+    /// A recorder that keeps every outcome it is handed, in order.
+    #[derive(Default)]
+    struct Outcomes(std::sync::Mutex<Vec<SubmissionOutcome>>);
+
+    #[async_trait::async_trait]
+    impl SubmissionRecorder for Outcomes {
+        async fn pre_send(&self, _intent: &SubmissionIntent) -> Result<(), WalletError> {
+            Ok(())
+        }
+
+        async fn outcome(&self, _intent: &SubmissionIntent, outcome: &SubmissionOutcome) {
+            self.0.lock().unwrap().push(outcome.clone());
+        }
+    }
+
+    fn poll_intent() -> SubmissionIntent {
+        SubmissionIntent {
+            envelope_hash: "ab".repeat(32),
+            tx_hash: "cd".repeat(32),
+            source: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
+            sequence: 1,
+            max_time: 0,
+            submission_ledger: 1,
+        }
+    }
+
+    /// An answer that becomes ready only at the deadline is not accepted: the
+    /// poll records the timeout whatever the answer says, and returns
+    /// `submission.tx_timeout`.
+    ///
+    /// Deterministic through the poll seam and a paused clock. The scripted
+    /// request completes on the deadline's own timer tick, and Tokio polls the
+    /// request before its deadline timer, so the answer comes back through
+    /// `timeout_at` as a completed result; the premise check below shows this.
+    /// Only the deadline check after the await keeps it from being read.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_ready_only_at_the_deadline_is_not_accepted() {
+        assert_answer_wins_at_deadline().await;
+
+        for status in ["SUCCESS", "FAILED"] {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let intent = poll_intent();
+            let recorder = Outcomes::default();
+            let polls = std::sync::atomic::AtomicU32::new(0);
+
+            let result = poll_for_confirmation(
+                || {
+                    polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        tokio::time::sleep_until(deadline).await;
+                        Ok(answer(status))
+                    }
+                },
+                "http://127.0.0.1:9",
+                deadline,
+                1,
+                &intent,
+                Some(&recorder),
+                None,
+            )
+            .await;
+
+            match result {
+                Err(WalletError::Submission(SubmissionError::TxTimeout { tx_hash, seconds })) => {
+                    assert_eq!(tx_hash, intent.tx_hash, "{status}");
+                    assert_eq!(seconds, 1, "{status}");
+                }
+                other => panic!("{status} at the deadline must time out; got {other:?}"),
+            }
+            assert_eq!(
+                *recorder.0.lock().unwrap(),
+                vec![SubmissionOutcome::Timeout {
+                    tx_hash: intent.tx_hash.clone(),
+                }],
+                "{status}: the timeout is recorded and nothing else"
+            );
+            assert_eq!(
+                polls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{status}: one request, then the deadline"
+            );
+        }
+    }
+
+    async fn assert_no_poll_after_deadline(transient: bool) {
+        let intent = poll_intent();
+        let recorder = Outcomes::default();
+        let polls = std::cell::Cell::new(0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let result = poll_for_confirmation(
+            || {
+                polls.set(polls.get() + 1);
+                std::future::ready(if transient {
+                    Err(stellar_rpc_client::Error::JsonRpc(
+                        jsonrpsee_core::ClientError::Custom("transient".into()),
+                    ))
+                } else {
+                    Ok(answer("NOT_FOUND"))
+                })
+            },
+            ENDPOINT,
+            deadline,
+            1,
+            &intent,
+            Some(&recorder),
+            None,
+        )
+        .await;
+        assert_eq!(polls.get(), 1, "no poll starts after the clamped sleep");
+        assert!(
+            matches!(result,
+                Err(WalletError::Submission(SubmissionError::TxTimeout { ref tx_hash, seconds: 1 }))
+                    if tx_hash == &intent.tx_hash
+            ),
+            "the poll ends with the deadline outcome: {result:?}"
+        );
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            vec![SubmissionOutcome::Timeout {
+                tx_hash: intent.tx_hash,
+            }]
+        );
+        assert_eq!(tokio::time::Instant::now(), deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_poll_starts_after_the_not_found_sleep_reaches_the_deadline() {
+        assert_no_poll_after_deadline(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_poll_starts_after_the_transient_sleep_reaches_the_deadline() {
+        assert_no_poll_after_deadline(true).await;
     }
 }

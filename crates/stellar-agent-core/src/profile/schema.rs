@@ -64,6 +64,14 @@ use super::name::{OWNER_KEY_SERVICE_PREFIX, windows_reserved_device_refusal};
 /// constant is `10_000_000_000` (10^10 stroops = 1 000 XLM).
 pub const MINIMUM_FLOOR: u64 = 10_000_000_000; // 1 000 XLM in stroops
 
+/// The submit timeout, in seconds, of a profile whose
+/// [`Profile::submit_timeout_seconds`] is unset.
+///
+/// Every surface that reads the profile field resolves it through
+/// [`Profile::submit_timeout`], so an unset field means the same budget on
+/// each of them.
+pub const DEFAULT_SUBMIT_TIMEOUT_SECS: u64 = 60;
+
 // Compile-time assertion: locks MINIMUM_FLOOR to the correct value so that an
 // accidental change to the constant fails the build immediately rather than
 // silently raising the cross-check threshold and making it unreachable.
@@ -680,7 +688,8 @@ pub struct Profile {
     /// Submit timeout in seconds.
     ///
     /// The wallet polls for transaction confirmation up to this duration.
-    /// Defaults to 60 seconds when absent from the profile TOML.
+    /// Defaults to [`DEFAULT_SUBMIT_TIMEOUT_SECS`] when absent from the
+    /// profile TOML; [`Profile::submit_timeout`] resolves the effective value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submit_timeout_seconds: Option<u64>,
 
@@ -1461,6 +1470,31 @@ impl Profile {
     #[must_use]
     pub fn effective_cross_check_threshold_stroops(&self) -> u64 {
         self.cross_check_threshold_stroops.max(MINIMUM_FLOOR)
+    }
+
+    /// Returns the submit timeout: the configured
+    /// [`submit_timeout_seconds`](Self::submit_timeout_seconds), or
+    /// [`DEFAULT_SUBMIT_TIMEOUT_SECS`] when the field is unset.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use stellar_agent_core::profile::schema::Profile;
+    ///
+    /// let mut p = Profile::builder_testnet("svc", "acct", "nonce-svc", "nonce-acct").build();
+    /// p.submit_timeout_seconds = None;
+    /// assert_eq!(p.submit_timeout(), Duration::from_secs(60));
+    ///
+    /// p.submit_timeout_seconds = Some(15);
+    /// assert_eq!(p.submit_timeout(), Duration::from_secs(15));
+    /// ```
+    #[must_use]
+    pub fn submit_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.submit_timeout_seconds
+                .unwrap_or(DEFAULT_SUBMIT_TIMEOUT_SECS),
+        )
     }
 
     /// Checks the three endpoint fields against the endpoint rule of
@@ -2802,6 +2836,19 @@ mod tests {
 
         let restored: Profile = toml::from_str(&toml_str).unwrap();
         assert_eq!(restored.submit_timeout_seconds, Some(120));
+    }
+
+    /// An unset submit timeout resolves to the 60-second default and a
+    /// configured one to its own value.
+    #[test]
+    fn submit_timeout_resolves_the_default_and_the_configured_value() {
+        let mut p = make_testnet_profile();
+        p.submit_timeout_seconds = None;
+        assert_eq!(DEFAULT_SUBMIT_TIMEOUT_SECS, 60);
+        assert_eq!(p.submit_timeout(), std::time::Duration::from_secs(60));
+
+        p.submit_timeout_seconds = Some(7);
+        assert_eq!(p.submit_timeout(), std::time::Duration::from_secs(7));
     }
 
     #[test]

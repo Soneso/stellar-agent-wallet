@@ -391,7 +391,7 @@ where
     }
     let client = StellarRpcClient::new(&context.rpc_url)?;
     client
-        .verify_network_passphrase(
+        .endpoint_identity(
             context.network_passphrase(),
             tokio::time::Instant::now() + Duration::from_secs(30),
         )

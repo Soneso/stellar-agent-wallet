@@ -10,6 +10,8 @@ mod balances_integration;
 mod balances_live;
 #[path = "network/connection_counter_control.rs"]
 mod connection_counter_control;
+#[path = "network/endpoint_identity.rs"]
+mod endpoint_identity;
 #[path = "network/fee_bump_coverage.rs"]
 mod fee_bump_coverage;
 #[path = "network/fee_bump_idempotent_integration.rs"]
@@ -44,6 +46,8 @@ mod pay_integration;
 mod pay_live;
 #[path = "network/redaction_audit.rs"]
 mod redaction_audit;
+#[path = "network/retention_poll_deadline.rs"]
+mod retention_poll_deadline;
 #[path = "network/retry_backoff_integration.rs"]
 mod retry_backoff_integration;
 #[path = "network/rpc_error_text_redaction.rs"]

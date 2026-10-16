@@ -40,6 +40,7 @@ pub mod builder;
 pub mod client;
 pub mod context;
 pub mod counterparty;
+pub mod endpoint_identity;
 pub mod fee_bump;
 pub mod fee_bump_retry;
 pub mod fees;
@@ -49,6 +50,8 @@ pub mod keyring;
 pub mod memo;
 pub mod policy_state;
 pub mod policy_view;
+#[cfg(test)]
+mod poll_test_support;
 pub mod redact;
 pub mod retry;
 pub mod sep29;
@@ -77,6 +80,9 @@ pub use account::{
 pub use builder::{Asset, ClassicOpBuilder};
 pub use client::{StellarRpcClient, TransactionStatusView};
 pub use context::NetworkContext;
+pub use endpoint_identity::{
+    EndpointIdentity, SUPPORTED_PROTOCOL_VERSIONS, check_protocol_version,
+};
 pub use fee_bump::{FeeBumpError, build_and_sign_fee_bump};
 pub use fee_bump_retry::submit_fee_bump_idempotent;
 #[cfg(any(test, feature = "test-loopback"))]

@@ -1267,11 +1267,12 @@ async fn sign_envelope(
 // Submit helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Asks `--rpc-url` which network it serves and requires it to be the one
-/// `--network` names.
+/// Asks `--rpc-url` which network it serves and which protocol it runs, and
+/// requires the network to be the one `--network` names.
 ///
-/// `--sign-only` does not call this: it sends nothing, so no endpoint answers
-/// for it.
+/// The check runs on a client of its own under its own deadline; the submit
+/// layer checks the sending client again. `--sign-only` does not call this:
+/// it sends nothing, so no endpoint answers for it.
 async fn probe_endpoint_network(
     context: &NetworkContext,
     args: &ClaimArgs,
@@ -1279,8 +1280,9 @@ async fn probe_endpoint_network(
     let client = StellarRpcClient::new(&context.rpc_url)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout_seconds);
     client
-        .verify_network_passphrase(context.network_passphrase(), deadline)
-        .await
+        .endpoint_identity(context.network_passphrase(), deadline)
+        .await?;
+    Ok(())
 }
 
 async fn submit_envelope(

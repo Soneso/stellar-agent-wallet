@@ -8,6 +8,8 @@
 //! [`KeyedLedgerEntriesResponder`] keeps the same parity for flows that issue
 //! several `getLedgerEntries` requests for different keys.
 //!
+//! [`rpc_request_count`] counts the recorded requests for one RPC method.
+//!
 //! Used by consumer crates' wiremock integration tests that exercise wallet
 //! flows through a mocked Stellar RPC endpoint.
 
@@ -15,6 +17,29 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use wiremock::{Request, Respond, ResponseTemplate};
+
+/// Counts recorded JSON-RPC requests for `rpc` on a mock server.
+///
+/// # Panics
+///
+/// Panics if request recording is disabled on `server`.
+#[expect(
+    clippy::expect_used,
+    reason = "tests require wiremock request recording"
+)]
+pub async fn rpc_request_count(server: &wiremock::MockServer, rpc: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("request recording is enabled")
+        .iter()
+        .filter(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .is_some_and(|body| body["method"] == rpc)
+        })
+        .count()
+}
 
 /// A wiremock responder that wraps a fixed `result` in a JSON-RPC envelope.
 ///

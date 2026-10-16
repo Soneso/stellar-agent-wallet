@@ -9,15 +9,17 @@ use jsonrpsee_core::ClientError;
 use jsonrpsee_core::client::ClientT;
 use jsonrpsee_core::params::ObjectParams;
 use stellar_agent_core::error::{NetworkError, WalletError};
+use stellar_agent_core::profile::caip2::Caip2;
 use stellar_rpc_client::{
     Client, GetHealthResponse, GetLedgerEntriesResponse, GetTransactionResponseRaw,
 };
 use stellar_xdr::LedgerKey;
 use tokio::time::Instant;
 
+use crate::endpoint_identity::{EndpointIdentity, check_protocol_version};
 use crate::fees::FeeStatsView;
 use crate::redact::{redact_rpc_error, redact_rpc_error_display, redact_url_authority};
-use crate::retry::{RetryPolicy, is_retryable_send_error, retry_with_backoff};
+use crate::retry::{RetryPolicy, is_retryable_identity_error, retry_with_backoff};
 use crate::submit::MAINNET_PASSPHRASE;
 use crate::transaction_record::TransactionRecord;
 
@@ -240,70 +242,82 @@ impl StellarRpcClient {
         Ok(TransactionRecord::from_raw(raw))
     }
 
-    /// Asks the endpoint which network it serves and requires the answer to be
-    /// `expected`.
+    /// Asks the endpoint which network it serves and which protocol it runs,
+    /// and returns that identity once it passes every check.
     ///
-    /// This is the endpoint-identity probe every write path runs before it
-    /// sends: the target network is a property of the endpoint, not of the
-    /// caller's declaration, so the two must be shown to agree before an
-    /// envelope is submitted.  The probe runs on the same client instance that
-    /// will send, so no second connection can answer for a different endpoint.
+    /// This serves the paths that sign or send: the target network is a
+    /// property of the endpoint, not of the caller's declaration, so the two
+    /// must be shown to agree first. The submit layer runs it on the client
+    /// instance that sends, so no second connection can answer for a
+    /// different endpoint.
     ///
-    /// Transport failures are retried with bounded exponential backoff under
-    /// `deadline`, the caller's own submission deadline, using the same
-    /// retryability classification as `sendTransaction`
-    /// ([`is_retryable_send_error`]).  A passphrase mismatch is not retried.
+    /// One `getNetwork` request answers both questions. Transport failures
+    /// are retried with bounded exponential backoff under `deadline`, the
+    /// caller's own deadline, using the classification of `sendTransaction`
+    /// ([`is_retryable_send_error`](crate::retry::is_retryable_send_error))
+    /// with one exception: an answer whose body does not deserialize, for
+    /// example one without `protocolVersion`, is not retried. A passphrase
+    /// mismatch is not retried either.
     ///
-    /// The probe is fail-closed: an endpoint whose identity cannot be
-    /// established refuses the submission rather than falling back to the
-    /// caller's declaration.
+    /// The checks run in this order: an endpoint reporting the mainnet
+    /// passphrase is refused whatever `expected_passphrase` is, then a
+    /// passphrase other than `expected_passphrase` is refused, then the
+    /// protocol rule of [`check_protocol_version`] applies. While mainnet
+    /// writes are refused, a mainnet endpoint never reaches the protocol rule,
+    /// so its mainnet branch is not reachable through this method.
+    ///
+    /// The check is fail-closed: an endpoint whose identity cannot be
+    /// established is refused rather than replaced by the caller's
+    /// declaration.
     ///
     /// # Errors
     ///
+    /// - [`NetworkError::EndpointIdentityUnavailable`] if the request does not
+    ///   complete within `deadline`, fails for any reason other than a
+    ///   passphrase verdict, or returns a body that does not deserialize.
     /// - [`NetworkError::MainnetWriteForbidden`] if the endpoint reports the
-    ///   mainnet passphrase, whatever `expected` is.
+    ///   mainnet passphrase, whatever `expected_passphrase` is.
     /// - [`NetworkError::EndpointNetworkMismatch`] if the endpoint reports any
-    ///   other passphrase that differs from `expected`.
-    /// - [`NetworkError::EndpointIdentityUnavailable`] if the probe does not
-    ///   complete within `deadline`, or fails for any reason other than a
-    ///   passphrase mismatch.
-    pub async fn verify_network_passphrase(
+    ///   other passphrase that differs from `expected_passphrase`.
+    /// - [`NetworkError::UnsupportedProtocolVersion`] if
+    ///   [`check_protocol_version`] refuses the reported version.
+    pub async fn endpoint_identity(
         &self,
-        expected: &str,
+        expected_passphrase: &str,
         deadline: Instant,
-    ) -> Result<(), WalletError> {
+    ) -> Result<EndpointIdentity, WalletError> {
         let policy = RetryPolicy::default();
-        let outcome = retry_with_backoff(&policy, deadline, is_retryable_send_error, || async {
-            self.inner.verify_network_passphrase(Some(expected)).await
-        })
-        .await;
-
-        match outcome {
-            // The endpoint agreed with `expected`. A mainnet endpoint is
-            // refused here as well: agreement with a mainnet declaration is
-            // still a mainnet write.
-            Ok(server) => {
-                if server == MAINNET_PASSPHRASE {
-                    Err(WalletError::Network(NetworkError::MainnetWriteForbidden))
-                } else {
-                    Ok(())
-                }
-            }
-            Err(stellar_rpc_client::Error::InvalidNetworkPassphrase { expected, server }) => {
-                if server == MAINNET_PASSPHRASE {
-                    Err(WalletError::Network(NetworkError::MainnetWriteForbidden))
-                } else {
-                    Err(WalletError::Network(
-                        NetworkError::EndpointNetworkMismatch { expected, server },
-                    ))
-                }
-            }
-            Err(_) => Err(WalletError::Network(
-                NetworkError::EndpointIdentityUnavailable {
+        let network =
+            retry_with_backoff(&policy, deadline, is_retryable_identity_error, || async {
+                self.inner.get_network().await
+            })
+            .await
+            .map_err(|_| {
+                WalletError::Network(NetworkError::EndpointIdentityUnavailable {
                     url: self.redacted_url(),
-                },
-            )),
+                })
+            })?;
+
+        // Agreement with a mainnet declaration is still a mainnet write.
+        if network.passphrase == MAINNET_PASSPHRASE {
+            return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
         }
+        if network.passphrase != expected_passphrase {
+            return Err(WalletError::Network(
+                NetworkError::EndpointNetworkMismatch {
+                    expected: expected_passphrase.to_owned(),
+                    server: network.passphrase,
+                },
+            ));
+        }
+
+        let chain_id = Caip2::from_passphrase(&network.passphrase);
+        check_protocol_version(chain_id, network.protocol_version).map_err(WalletError::Network)?;
+        Ok(EndpointIdentity::checked(
+            chain_id,
+            network.protocol_version,
+            self.redacted_url(),
+        ))
     }
 
     /// Returns the RPC endpoint URL redacted to authority-only form

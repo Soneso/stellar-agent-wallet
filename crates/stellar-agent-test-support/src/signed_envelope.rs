@@ -79,12 +79,15 @@ pub fn account_id_for_seed(seed: [u8; 32]) -> String {
 }
 
 /// Returns a `getNetwork` JSON-RPC result body reporting `passphrase`.
+///
+/// The body reports protocol version 29, a version the wallet supports, so a
+/// submit-path test passes the protocol rule without a warning.
 #[must_use]
 pub fn get_network_result(passphrase: &str) -> Value {
     json!({
         "friendbotUrl": "https://friendbot.stellar.org",
         "passphrase": passphrase,
-        "protocolVersion": 23
+        "protocolVersion": 29
     })
 }
 

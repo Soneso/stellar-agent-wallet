@@ -329,14 +329,14 @@ The HMAC key is the profile's `mcp_nonce_key_alias` keyring entry, stored as URL
 
 ## Submit-layer network binding
 
-A Stellar signature commits to a network: the SEP-23 `TransactionSignaturePayload` the signer hashes carries `network_id = SHA-256(network_passphrase)`, so the same transaction signed for two networks produces two different signatures. Nothing in the wire format records which network a signature was made for; it can only be recovered by re-deriving the payload under a candidate network id and checking the signature against it. The check lives in `crates/stellar-agent-network/src/signing/verify_binding.rs`; the endpoint probe it rests on is `StellarRpcClient::verify_network_passphrase`.
+A Stellar signature commits to a network: the SEP-23 `TransactionSignaturePayload` the signer hashes carries `network_id = SHA-256(network_passphrase)`, so the same transaction signed for two networks produces two different signatures. Nothing in the wire format records which network a signature was made for; it can only be recovered by re-deriving the payload under a candidate network id and checking the signature against it. The check lives in `crates/stellar-agent-network/src/signing/verify_binding.rs`; the endpoint check it rests on is `StellarRpcClient::endpoint_identity`.
 
 ### Order of operations at every submit entry point
 
 1. A caller-declared mainnet network passphrase is refused with `network.mainnet_write_forbidden`. Zero RPC calls.
 2. An RPC URL matching a known mainnet host is refused the same way. Zero RPC calls.
 3. The envelope is decoded locally. A malformed envelope, or a legacy `TxV0` envelope, is refused with no round trip: V0 is not part of the SEP-23 tagged-transaction set, so neither the signing path nor this one can construct a payload for it.
-4. The endpoint is asked which network it serves (`getNetwork`), on the same client instance that will send.
+4. The endpoint is asked which network it serves and which protocol it runs (`getNetwork`), on the same client instance that will send.
 5. The ed25519 signer sets of the accounts whose authority the transaction invokes are fetched in one `getLedgerEntries` call.
 6. Every decorated signature is verified under the network id the endpoint reported.
 7. `sendTransaction`, then poll `getTransaction`.
@@ -345,13 +345,32 @@ Steps 4 and 5 are two reads ahead of the send, so every submission makes two rou
 
 ### Endpoint identity is authoritative
 
-The declaration states which network the caller intends; the probe states which network the endpoint is, and the second decides. Transport failures are retried with bounded exponential backoff under the caller's own submission deadline, using the same retryability classification as `sendTransaction`. A passphrase mismatch is a verdict rather than a transport fault and is not retried. The probe is fail closed: it never falls back to the declaration.
+The declaration states which network the caller intends; the probe states which network the endpoint is, and the second decides. Transport failures are retried with bounded exponential backoff under the caller's own submission deadline, using the retryability classification of `sendTransaction` with one exception. An answer whose body does not deserialize, such as one without `protocolVersion` or with a value of the wrong type, is not retried. The endpoint answered, and a retry would only spend the deadline on the same answer. A passphrase mismatch is a verdict rather than a transport fault and is not retried. The probe is fail closed: it never falls back to the declaration.
 
+The outcomes, in the order the check reaches them:
+
+- identity not established within the submission timeout, or an answer that does not deserialize: `network.endpoint_identity_unavailable`
 - endpoint reports the mainnet passphrase: `network.mainnet_write_forbidden`, the one mainnet refusal that costs a round trip
 - endpoint reports a different network than the caller declared: `network.endpoint_network_mismatch`
-- identity not established within the submission timeout: `network.endpoint_identity_unavailable`
+- protocol version outside the supported range on mainnet: `network.unsupported_protocol_version`
+
+The same answer carries the endpoint's protocol version, which the protocol rule checks against `SUPPORTED_PROTOCOL_VERSIONS`, protocol 29 in this release. A release adds a version to the range only after its testnet acceptance tests ran against that version. On testnet, and on any other network whose passphrase matches the declaration, a version outside the range passes with one logged warning that carries the version and the range. On mainnet the same version is refused. While mainnet writes are refused, an endpoint that reports mainnet is refused with `network.mainnet_write_forbidden` first, so the mainnet branch of the protocol rule does not fire.
 
 The probe runs on the client instance that will carry `sendTransaction`, not on a fresh one, so the identity that was established is the identity of the connection the transaction goes out on.
+
+### Retries, deadlines, and failover
+
+The identity check, the signer-set fetch, and `sendTransaction` share one retry policy:
+
+- Up to 5 attempts.
+- After failed attempt n, counted from 0, a random sleep in `0..=min(8 s, 500 ms × 2^n)` precedes the next attempt. The four sleep caps are 0.5, 1, 2, and 4 s.
+- Each attempt and each sleep ends at the deadline of the invocation that started it. A sleep that reaches the deadline ends the retries with the last error.
+
+The confirmation poll asks `getTransaction` every 2 s under the same deadline. No poll request and no sleep between polls runs past it. An answer that arrives after it is not accepted. The caller gets the timeout outcome and reconciles the hash with `tx status`. The retention-aware poll of the idempotent path makes one exception. At the deadline it runs one final `getHealth` retention check, bounded to 2 s, so it returns within the deadline plus 2 s.
+
+A standalone identity check, such as the `pay --submit-only` probe or an MCP commit tool's check, runs under its own deadline. The submission that follows starts a fresh deadline. Inside a submission, the identity check shares the submission's deadline.
+
+The wallet has no automatic failover: the secondary and oracle endpoints verify reads and never send a transaction. It has no circuit breaker either, because the CLI runs one command per process.
 
 ### Which accounts answer for which signatures
 

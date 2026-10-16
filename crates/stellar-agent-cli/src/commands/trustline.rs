@@ -85,8 +85,9 @@ use crate::commands::policy_engine::{
 };
 
 use stellar_agent_network::{
-    AccountView, Asset, ClassicOpBuilder, StellarRpcClient, SubmissionSignerKind,
-    enrolled_keyring_signer, fetch_account, init_platform_keyring_store, parse_classic_fee_choice,
+    AccountView, Asset, ClassicOpBuilder, StellarRpcClient, SubmissionRecorder,
+    SubmissionSignerKind, enrolled_keyring_signer, fetch_account, init_platform_keyring_store,
+    parse_classic_fee_choice,
     policy_view::AccountViewAdapter,
     resolve_classic_fee_selection,
     signing::envelope_signing::attach_signature,
@@ -652,19 +653,22 @@ where
 
     // ── Report every later stage in one envelope carrying the preview ────────
     let preview_view = trustline_preview_view(&preview);
-    let outcome = sign_and_submit(GatedTrustline {
-        args,
-        profile: &profile,
-        profile_name: &profile_name,
-        rpc_client: &rpc_client,
-        network_passphrase,
-        chain_id,
-        resolved: &resolved,
-        source_sequence,
-        effects: trustline_effects.as_ref(),
-        audit_writer: &audit_writer,
-        now_ms,
-    })
+    let outcome = sign_and_submit(
+        GatedTrustline {
+            args,
+            profile: &profile,
+            profile_name: &profile_name,
+            rpc_client: &rpc_client,
+            network_passphrase,
+            chain_id,
+            resolved: &resolved,
+            source_sequence,
+            effects: trustline_effects.as_ref(),
+            audit_writer: &audit_writer,
+            now_ms,
+        },
+        submit_transaction_and_wait,
+    )
     .await;
     render_trustline_outcome(out, preview_view, outcome)
 }
@@ -704,9 +708,26 @@ struct TrustlineSubmitted {
 /// Resolves the fee, then builds, signs, records, and submits the
 /// `ChangeTrust` envelope.
 ///
+/// `submit_and_wait` is the submission step, with the signature of
+/// [`submit_transaction_and_wait`], which production passes. It receives the
+/// profile's [`Profile::submit_timeout`].
+///
 /// Renders nothing: the caller reports the returned payload or failure
 /// envelope in the one envelope that carries the preview.
-async fn sign_and_submit(gated: GatedTrustline<'_>) -> Result<TrustlineSubmitted, Envelope<()>> {
+async fn sign_and_submit<S>(
+    gated: GatedTrustline<'_>,
+    submit_and_wait: S,
+) -> Result<TrustlineSubmitted, Envelope<()>>
+where
+    S: AsyncFnOnce(
+        &StellarRpcClient,
+        &str,
+        std::time::Duration,
+        &str,
+        Option<SubmissionSignerKind>,
+        Option<&dyn SubmissionRecorder>,
+    ) -> Result<SubmissionResult, WalletError>,
+{
     let GatedTrustline {
         args,
         profile,
@@ -805,13 +826,12 @@ async fn sign_and_submit(gated: GatedTrustline<'_>) -> Result<TrustlineSubmitted
     )
     .map_err(submission_failure)?;
 
-    let timeout = std::time::Duration::from_secs(profile.submit_timeout_seconds.unwrap_or(90));
     let SubmissionResult {
         tx_hash, ledger, ..
-    } = submit_transaction_and_wait(
+    } = submit_and_wait(
         rpc_client,
         &signed_xdr,
-        timeout,
+        profile.submit_timeout(),
         network_passphrase,
         Some(SubmissionSignerKind::Keyring),
         Some(&recorder),
@@ -1446,6 +1466,120 @@ mod tests {
                 .iter()
                 .any(|m| m == "getFeeStats" || m == "sendTransaction"),
             "the fee parse fails before any later request: {methods:?}"
+        );
+    }
+
+    // ── Submit timeout ────────────────────────────────────────────────────────
+
+    /// Runs the stages after the preview for a `USDC` trustline of profile
+    /// `name` from a seeded keyring signer, with a submission step that
+    /// records the timeout it is handed and refuses, and returns that timeout.
+    ///
+    /// The fee comes from the profile default, so no request reaches the
+    /// unroutable endpoint the client names. Each call takes its own profile
+    /// name: the process-wide audit registry and the keyring tip anchor bind a
+    /// profile name to one audit log.
+    async fn forwarded_submit_timeout(name: &str, configured: Option<u64>) -> std::time::Duration {
+        const SEED: [u8; 32] = [0x5c; 32];
+
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let from = stellar_agent_test_support::signed_envelope::account_id_for_seed(SEED);
+        let mut profile =
+            Profile::builder_testnet_named(name, "svc-submit-timeout", &from, "n", "a")
+                .with_noop_engine()
+                .build();
+        profile.audit_log_path = home.path().join("audit").join(format!("{name}.jsonl"));
+        profile.submit_timeout_seconds = configured;
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let audit_key = &profile.audit_log_hash_chain_key_id;
+        KeyringEntry::new(&audit_key.service, &audit_key.account)
+            .unwrap()
+            .set_password(&URL_SAFE_NO_PAD.encode([0x3a; 32]))
+            .unwrap();
+        let signer = &profile.mcp_signer_default;
+        KeyringEntry::new(&signer.service, &signer.account)
+            .unwrap()
+            .set_password(
+                &stellar_agent_test_support::testnet_strkeys::strkey_from_seed(
+                    stellar_agent_test_support::testnet_strkeys::VERSION_PRIVATE_KEY,
+                    &SEED,
+                ),
+            )
+            .unwrap();
+        let audit_writer =
+            crate::commands::value_audit::require_value_audit_writer(&profile, name).unwrap();
+
+        let args = TrustlineArgs {
+            profile: Some(name.to_owned()),
+            from: from.clone(),
+            asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
+            limit_stroops: None,
+            classic_base: None,
+        };
+        let resolved = resolve_denomination(
+            DenominationInput::CodeAndIssuer {
+                code: "USDC".to_owned(),
+                issuer: ONE_ENVELOPE_ISSUER.to_owned(),
+            },
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+        )
+        .unwrap();
+        let rpc_client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+
+        let forwarded = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&forwarded);
+        let outcome = sign_and_submit(
+            GatedTrustline {
+                args: &args,
+                profile: &profile,
+                profile_name: name,
+                rpc_client: &rpc_client,
+                network_passphrase: stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                chain_id: "stellar:testnet",
+                resolved: &resolved,
+                source_sequence: 1,
+                effects: None,
+                audit_writer: &audit_writer,
+                now_ms: stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+            },
+            async move |_client: &StellarRpcClient,
+                        _envelope: &str,
+                        timeout: std::time::Duration,
+                        _passphrase: &str,
+                        _signer_kind: Option<SubmissionSignerKind>,
+                        _recorder: Option<&dyn SubmissionRecorder>| {
+                *seen.lock().unwrap() = Some(timeout);
+                Err(WalletError::Network(
+                    stellar_agent_core::error::NetworkError::EndpointIdentityUnavailable {
+                        url: "http://127.0.0.1:9".to_owned(),
+                    },
+                ))
+            },
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "the submission step refused, so the stage must fail"
+        );
+        let forwarded = *forwarded.lock().unwrap();
+        forwarded.expect("the stages must reach the submission step")
+    }
+
+    /// An unset `submit_timeout_seconds` hands the submission the 60-second
+    /// default, and a configured one hands it its own value.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sign_and_submit_forwards_the_profile_submit_timeout() {
+        assert_eq!(
+            forwarded_submit_timeout("trustline-timeout-unset", None).await,
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            forwarded_submit_timeout("trustline-timeout-set", Some(17)).await,
+            std::time::Duration::from_secs(17)
         );
     }
 }
