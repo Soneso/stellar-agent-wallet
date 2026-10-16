@@ -14,8 +14,10 @@
 //!
 //! The wire code, never the exit code: a run that accepted the profile and
 //! then failed on the unreachable endpoint also exits 1.
-//! `network.rpc_unreachable` means the run got PAST profile access, which is
-//! what the control tests assert; `profile.name_mismatch` means it refused.
+//! `network.endpoint_identity_unavailable`, the refusal of the endpoint check
+//! every verb runs before its first read, means the run got PAST profile
+//! access, which is what the control tests assert; `profile.name_mismatch`
+//! means it refused.
 //!
 //! # The engine must not matter
 //!
@@ -188,9 +190,10 @@ fn assert_mismatch_refusal(run: &Run, verb: &str) {
 /// Each validates its own operands first, so an argument shape that refused
 /// earlier would make these pass without ever exercising the reconciliation —
 /// hence real strkeys, a well-formed balance id, and parseable amounts.
-/// The third element is the code a run that got PAST profile access ends on:
-/// each verb reports its own unreachable-endpoint failure, and asserting the
-/// exact one keeps the control from passing for any non-mismatch outcome.
+/// The third element is the code a run that got PAST profile access ends on.
+/// Each verb reports the endpoint check's failure on the unreachable endpoint.
+/// Asserting the exact code keeps the control from passing for any
+/// non-mismatch outcome.
 const SIGNING_VERBS: &[(&str, &[&str], &str)] = &[
     (
         "pay",
@@ -204,7 +207,7 @@ const SIGNING_VERBS: &[(&str, &[&str], &str)] = &[
             "--rpc-url",
             UNREACHABLE_RPC,
         ],
-        "network.rpc_unreachable",
+        "network.endpoint_identity_unavailable",
     ),
     (
         "claim",
@@ -217,7 +220,7 @@ const SIGNING_VERBS: &[(&str, &[&str], &str)] = &[
             "--rpc-url",
             UNREACHABLE_RPC,
         ],
-        "network.rpc_unreachable",
+        "network.endpoint_identity_unavailable",
     ),
     (
         "accounts create",
@@ -232,15 +235,15 @@ const SIGNING_VERBS: &[(&str, &[&str], &str)] = &[
             "--rpc-url",
             UNREACHABLE_RPC,
         ],
-        "network.rpc_unreachable",
+        "network.endpoint_identity_unavailable",
     ),
     (
         "trustline",
         &["trustline", "--from", SOURCE_G, "--asset", "USDC"],
         // `trustline` takes its endpoint from `profile.rpc_url`, which the
-        // fixture points at an unreachable port, and fails closed on the
-        // issuer-flag fetch.
-        "trustline.source_account_fetch_failed",
+        // fixture points at an unreachable port, and its endpoint check finds
+        // no answer there.
+        "network.endpoint_identity_unavailable",
     ),
 ];
 

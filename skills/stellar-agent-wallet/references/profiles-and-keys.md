@@ -288,10 +288,12 @@ below mint the actual keys. The engine choice governs the policy layer only:
 every mainnet write is additionally refused at the network layer
 (`network.mainnet_write_forbidden`) in this alpha, on `noop` and `v1` alike.
 That layer binds each submission to the network the RPC endpoint reports it
-serves, not to the profile's declared `network_passphrase`, so a profile whose
+serves, not to the profile's declared `network_passphrase`. A profile whose
 `rpc_url` and network do not name the same chain is refused before anything is
-sent (`network.endpoint_network_mismatch`). The same answer carries the
-endpoint's protocol version, checked against the supported range as
+sent (`network.endpoint_network_mismatch`). The classic payment, sponsored
+account creation, trustline, claim, and pool paths refuse it before their
+first read. The same answer carries the endpoint's protocol version, checked
+against the supported range as
 [cli-reference.md](cli-reference.md#submit-layer-network-binding) describes.
 MPP refuses mainnet with `mpp.network_forbidden` instead of
 `network.mainnet_write_forbidden`.

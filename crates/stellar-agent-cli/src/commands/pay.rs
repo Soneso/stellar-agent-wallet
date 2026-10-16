@@ -26,6 +26,16 @@
 //! - Submit layer: `submit_transaction_and_wait` rejects mainnet-looking URLs
 //!   as a defence-in-depth measure.
 //!
+//! # Endpoint identity
+//!
+//! A stage that reads from the endpoint builds one client and asks the
+//! endpoint which network it serves before its first read. Every later read
+//! and the send use that same client. The full pipeline and `--submit-only`
+//! check before the reservation reconcile, and `--build-only` before the fee
+//! and sequence reads. `--sign-only` checks before the account reads of an
+//! envelope it can decode, and signs an envelope it cannot decode without any
+//! request. The submit layer checks the sending client again before the send.
+//!
 //! # Secret-material policy
 //!
 //! `--secret-env VAR` reads the secret key from the environment variable
@@ -112,8 +122,8 @@ use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::source::signer_from_ledger;
 use stellar_agent_network::{
-    ClassicFeeSelection, StellarRpcClient, SubmissionResult, SubmissionSignerKind,
-    init_platform_keyring_store, parse_classic_fee_choice, parse_memo_fields,
+    ClassicFeeChoice, ClassicFeeSelection, StellarRpcClient, SubmissionResult,
+    SubmissionSignerKind, init_platform_keyring_store, parse_classic_fee_choice, parse_memo_fields,
     resolve_classic_fee_selection, submit_transaction_and_wait,
 };
 
@@ -122,7 +132,8 @@ use crate::commands::policy_engine::{
     pay_policy_args,
 };
 use crate::common::network::{
-    EndpointFlags, EndpointUrlFlag, TargetNetwork, network_context_for_command,
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity,
+    network_context_for_command,
 };
 use crate::common::profile_access::{
     ProfileOrigin, injected_profile_load, load_profile_or_synthesize_testnet_with,
@@ -332,7 +343,8 @@ pub struct PayArgs {
     #[arg(long, default_value_t = OutputFormat::DEFAULT, value_name = "FORMAT")]
     pub output: OutputFormat,
 
-    /// Submission timeout in seconds. Default: 60.
+    /// Timeout in seconds for the endpoint check and, separately, for the
+    /// submission. Default: 60.
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
     pub timeout_seconds: u64,
 
@@ -522,7 +534,11 @@ where
         return 1;
     }
 
-    match build_unsigned_envelope(context, args).await {
+    let built = match checked_client_and_build_inputs(context, args).await {
+        Ok((client, inputs)) => build_unsigned_envelope(&client, context, args, inputs).await,
+        Err(e) => Err(e),
+    };
+    match built {
         Ok(built) => {
             let chain_id = context.chain_id.caip2_str();
             // Build-only: gate but do not submit, so the gate-sized effects are
@@ -567,16 +583,8 @@ where
         Ok(()) => (),
         Err(code) => return code,
     };
-    let chain_id = context.chain_id.caip2_str();
-    if let Err(code) = evaluate_staged_pay_policy(
-        context,
-        args,
-        unsigned_xdr,
-        chain_id,
-        profile,
-        &resolved.name,
-    )
-    .await
+    if let Err(code) =
+        evaluate_staged_pay_policy(None, context, args, unsigned_xdr, profile, &resolved.name).await
     {
         return code;
     }
@@ -635,14 +643,18 @@ where
         Err(code) => return code,
     };
     // Establish which network `--rpc-url` actually serves before anything
-    // else runs. The staged gate evaluates under the chain id derived from
-    // `--network`, so that flag has to describe the endpoint the envelope will
-    // reach; the probe is what makes it so, and a mismatch refuses here rather
-    // than after a policy decision taken for the wrong chain.
-    if let Err(e) = probe_endpoint_network(context, args).await {
-        print_error(&Envelope::<()>::err(&e), args.output);
-        return 1;
-    }
+    // else runs, on the client that reconciles, reads the gate's account
+    // views, and sends. The staged gate evaluates under the chain id derived
+    // from `--network`, so that flag has to describe the endpoint the
+    // envelope will reach. The check makes it so, and a mismatch refuses here
+    // rather than after a policy decision taken for the wrong chain.
+    let client = match checked_client(context, args).await {
+        Ok(client) => client,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
+    };
 
     // Settle the spending-window reservations that have stood long enough to
     // be settleable, before the gate below counts them. A reservation the
@@ -658,25 +670,23 @@ where
             return 1;
         }
     };
-    if let Ok(reconcile_client) = StellarRpcClient::new(&context.rpc_url) {
-        crate::commands::submission_record::reconcile_open_reservations(
-            profile,
-            &resolved.name,
-            origin,
-            &reconcile_client,
-            now_ms,
-        )
-        .await;
-    }
+    crate::commands::submission_record::reconcile_open_reservations(
+        profile,
+        &resolved.name,
+        origin,
+        &client,
+        now_ms,
+    )
+    .await;
 
     let chain_id = context.chain_id.caip2_str();
     // The envelope arrives pre-signed, but broadcasting it still spends
     // funds — gate here even though signing already happened elsewhere.
     let pay_effects = match evaluate_staged_pay_policy(
+        Some(&client),
         context,
         args,
         signed_xdr,
-        chain_id,
         profile,
         &resolved.name,
     )
@@ -727,7 +737,7 @@ where
         }
     };
 
-    match submit_envelope(context, args, signed_xdr, Some(&recorder)).await {
+    match submit_envelope(&client, context, args, signed_xdr, Some(&recorder)).await {
         Ok((signed_xdr, sub_result)) => {
             let result = PayResult {
                 envelope_xdr: signed_xdr,
@@ -812,14 +822,21 @@ where
 /// (`Some` when the envelope decoded into a sized shape, `None` for the
 /// no-op engine or an opaque allow); returns `Err(exit_code)` — with the
 /// refusal envelope already rendered — on any refusal.
+///
+/// `sending_client` is the checked client `--submit-only` sends through, and
+/// the views are read on it. `--sign-only` passes `None`: it builds a client
+/// and checks its endpoint only when the envelope decodes, so an envelope the
+/// decoder cannot classify reaches the opaque-signing posture without any
+/// request.
 async fn evaluate_staged_pay_policy(
+    sending_client: Option<&StellarRpcClient>,
     context: &NetworkContext,
     args: &PayArgs,
     envelope_xdr: &str,
-    chain_id: &str,
     profile: &Profile,
     profile_name: &str,
 ) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
+    let chain_id = context.chain_id.caip2_str();
     let policy_engine =
         match build_v1_policy_engine("pay", &profile.policy.engine, profile, profile_name) {
             Ok(pe) => pe,
@@ -846,12 +863,19 @@ async fn evaluate_staged_pay_policy(
     let mut source_view_holder = None;
     let mut dest_view_holder = None;
     if let Ok(ref authoritative_args) = decode_result {
-        let client = match StellarRpcClient::new(&context.rpc_url) {
-            Ok(c) => c,
-            Err(e) => {
-                print_error(&Envelope::<()>::err(&e), args.output);
-                return Err(1);
-            }
+        let checked;
+        let client = match sending_client {
+            Some(client) => client,
+            None => match checked_client(context, args).await {
+                Ok(client) => {
+                    checked = client;
+                    &checked
+                }
+                Err(e) => {
+                    print_error(&Envelope::<()>::err(&e), args.output);
+                    return Err(1);
+                }
+            },
         };
         let source = authoritative_args
             .get("source")
@@ -862,8 +886,7 @@ async fn evaluate_staged_pay_policy(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
 
-        source_view_holder = match stellar_agent_network::fetch_account(&client, source, &[]).await
-        {
+        source_view_holder = match stellar_agent_network::fetch_account(client, source, &[]).await {
             Ok(v) => Some(v),
             Err(e) => {
                 print_error(&Envelope::<()>::err(&e), args.output);
@@ -871,7 +894,7 @@ async fn evaluate_staged_pay_policy(
             }
         };
         // Destination fetch is non-fatal, matching `evaluate_pay_policy`.
-        dest_view_holder = stellar_agent_network::fetch_account(&client, destination, &[])
+        dest_view_holder = stellar_agent_network::fetch_account(client, destination, &[])
             .await
             .ok();
     }
@@ -1018,19 +1041,32 @@ where
             return 1;
         }
     };
-    if let Ok(reconcile_client) = StellarRpcClient::new(&context.rpc_url) {
-        crate::commands::submission_record::reconcile_open_reservations(
-            profile,
-            &resolved.name,
-            origin,
-            &reconcile_client,
-            now_ms,
-        )
-        .await;
-    }
+    // The endpoint check precedes the reconcile, the first request whose
+    // answer shapes the policy decision; the same client carries the build
+    // reads and the send. The reconcile settles reservations whatever the
+    // build arguments say, so the `--source` and `--fee` checks follow it.
+    let client = match checked_client(context, args).await {
+        Ok(client) => client,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
+    };
+    crate::commands::submission_record::reconcile_open_reservations(
+        profile,
+        &resolved.name,
+        origin,
+        &client,
+        now_ms,
+    )
+    .await;
 
     // 1. Build (includes SEP-29 check).
-    let built = match build_unsigned_envelope(context, args).await {
+    let built = match build_inputs(args) {
+        Ok(inputs) => build_unsigned_envelope(&client, context, args, inputs).await,
+        Err(e) => Err(e),
+    };
+    let built = match built {
         Ok(built) => built,
         Err(e) => {
             let envelope = Envelope::<()>::err(&e);
@@ -1107,7 +1143,7 @@ where
         }
     };
 
-    match submit_envelope(context, args, &signed_xdr, Some(&recorder)).await {
+    match submit_envelope(&client, context, args, &signed_xdr, Some(&recorder)).await {
         Ok((xdr, sub_result)) => {
             let result = PayResult {
                 envelope_xdr: xdr,
@@ -1135,28 +1171,86 @@ where
 // Build helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Constructs and returns the unsigned transaction envelope XDR.
+/// The build arguments a stage checks before its first request.
+#[derive(Debug, Clone, Copy)]
+struct BuildInputs<'a> {
+    /// The `--source` account.
+    source: &'a str,
+    /// The parsed `--fee` choice.
+    fee_choice: ClassicFeeChoice,
+}
+
+/// Checks the build arguments that need no request: `--source` is present and
+/// `--fee` parses.
 ///
-/// Runs SEP-29 memo-required check before building.
-async fn build_unsigned_envelope(
-    context: &NetworkContext,
-    args: &PayArgs,
-) -> Result<BuiltPaymentEnvelope, WalletError> {
+/// # Errors
+///
+/// Returns `validation.address_invalid` when `--source` is absent, or the
+/// refusal of [`parse_classic_fee_choice`].
+fn build_inputs(args: &PayArgs) -> Result<BuildInputs<'_>, WalletError> {
     let source = args.source.as_deref().ok_or_else(|| {
         WalletError::Validation(stellar_agent_core::error::ValidationError::AddressInvalid {
             input: "--source is required for building a transaction".to_owned(),
         })
     })?;
-
-    let client = StellarRpcClient::new(&context.rpc_url)?;
     let fee_choice = parse_classic_fee_choice(args.fee.as_deref())?;
+    Ok(BuildInputs { source, fee_choice })
+}
+
+/// Builds the client a stage reads and sends through, and checks that its
+/// endpoint serves the network of `context`, under a fresh budget of
+/// `--timeout-seconds`.
+///
+/// # Errors
+///
+/// Returns the construction failure or the refusal of
+/// [`check_endpoint_identity`].
+async fn checked_client(
+    context: &NetworkContext,
+    args: &PayArgs,
+) -> Result<StellarRpcClient, WalletError> {
+    let client = StellarRpcClient::new(&context.rpc_url)?;
+    check_endpoint_identity(&client, context, Duration::from_secs(args.timeout_seconds)).await?;
+    Ok(client)
+}
+
+/// Checks the build arguments, then builds and checks the client of
+/// `--build-only`.
+///
+/// The argument checks need no request, and `--build-only` has no reconcile,
+/// so they keep their place ahead of the endpoint check.
+///
+/// # Errors
+///
+/// Returns the refusal of [`build_inputs`] or of [`checked_client`].
+async fn checked_client_and_build_inputs<'a>(
+    context: &NetworkContext,
+    args: &'a PayArgs,
+) -> Result<(StellarRpcClient, BuildInputs<'a>), WalletError> {
+    let inputs = build_inputs(args)?;
+    let client = checked_client(context, args).await?;
+    Ok((client, inputs))
+}
+
+/// Constructs and returns the unsigned transaction envelope XDR.
+///
+/// Reads the fee, the source sequence, the SEP-29 data entry, and the
+/// destination view through `client`, whose endpoint the caller has checked.
+/// Runs SEP-29 memo-required check before building.
+async fn build_unsigned_envelope(
+    client: &StellarRpcClient,
+    context: &NetworkContext,
+    args: &PayArgs,
+    inputs: BuildInputs<'_>,
+) -> Result<BuiltPaymentEnvelope, WalletError> {
+    let BuildInputs { source, fee_choice } = inputs;
     let fee_selection =
-        resolve_classic_fee_selection(&client, DEFAULT_FEE_STROOPS, fee_choice).await?;
+        resolve_classic_fee_selection(client, DEFAULT_FEE_STROOPS, fee_choice).await?;
 
     // Fetch source account to get sequence number and verify it exists.
     // Pass empty slice: pay only needs the account sequence number (native balance
     // is sufficient); no trustlines are queried here.
-    let source_account = stellar_agent_network::fetch_account(&client, source, &[]).await?;
+    let source_account = stellar_agent_network::fetch_account(client, source, &[]).await?;
     // Pass the current on-chain sequence directly; `stellar_baselib::TransactionBuilder::build`
     // calls `Account::increment_sequence_number` internally. An explicit +1
     // here would produce CURRENT+2 → TxBadSeq.
@@ -1183,7 +1277,7 @@ async fn build_unsigned_envelope(
     // CLI has no secondary/oracle RPC — pass `None`; cross-RPC consistency is
     // the MCP simulate-path responsibility.
     stellar_agent_network::sep29::check_memo_required(
-        &client,
+        client,
         None,
         &args.destination,
         memo_present,
@@ -1210,7 +1304,7 @@ async fn build_unsigned_envelope(
     // source fetch above), and a failed destination fetch is non-fatal
     // (`None`) — a not-yet-created destination legitimately has no on-chain
     // state to resolve `home_domain` from.
-    let dest_account_view = stellar_agent_network::fetch_account(&client, &args.destination, &[])
+    let dest_account_view = stellar_agent_network::fetch_account(client, &args.destination, &[])
         .await
         .ok();
 
@@ -1370,35 +1464,19 @@ async fn sign_envelope(
 // Submit helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Asks `--rpc-url` which network it serves and which protocol it runs, and
-/// requires the network to be the one `--network` names.
-///
-/// The check runs on a client of its own under its own deadline; the submit
-/// layer checks the sending client again. `--sign-only` does not call this:
-/// it sends nothing, so no endpoint answers for it.
-async fn probe_endpoint_network(
-    context: &NetworkContext,
-    args: &PayArgs,
-) -> Result<(), WalletError> {
-    let client = StellarRpcClient::new(&context.rpc_url)?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout_seconds);
-    client
-        .endpoint_identity(context.network_passphrase(), deadline)
-        .await?;
-    Ok(())
-}
-
+/// Submits `signed_xdr` through `client`, the client the stage checked and
+/// read through, under a fresh budget of `--timeout-seconds`.
 async fn submit_envelope(
+    client: &StellarRpcClient,
     context: &NetworkContext,
     args: &PayArgs,
     signed_xdr: &str,
     recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>,
 ) -> Result<(String, SubmissionResult), WalletError> {
-    let client = StellarRpcClient::new(&context.rpc_url)?;
     let timeout = Duration::from_secs(args.timeout_seconds);
     let passphrase = context.network_passphrase();
     let result = submit_transaction_and_wait(
-        &client,
+        client,
         signed_xdr,
         timeout,
         passphrase,
@@ -1544,6 +1622,7 @@ mod tests {
         EnrolledPin, assert_enrolled_outcome, enrolled_mainnet_profile, enrolled_test_g,
         enrolled_test_secret,
     };
+    use crate::test_rpc::{EnvSigner, absent_profile_file, zero_config};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
 
     const SOURCE_G: &str = "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI";
@@ -1580,6 +1659,9 @@ mod tests {
                 .unwrap_or("");
 
             let result = match method {
+                "getNetwork" => stellar_agent_test_support::signed_envelope::get_network_result(
+                    stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                ),
                 "getFeeStats" => (*self.fee_stats).clone(),
                 "getLedgerEntries" => {
                     let body = String::from_utf8_lossy(&request.body);
@@ -1694,6 +1776,17 @@ mod tests {
         } else {
             0
         }
+    }
+
+    /// Builds the envelope through a client of its own, without the endpoint
+    /// check a stage runs first: these tests are about what the build reads
+    /// and produces.
+    async fn build_with_client(
+        context: &NetworkContext,
+        args: &PayArgs,
+    ) -> Result<BuiltPaymentEnvelope, WalletError> {
+        let client = StellarRpcClient::new(&context.rpc_url)?;
+        build_unsigned_envelope(&client, context, args, build_inputs(args)?).await
     }
 
     async fn mount_pay_build_rpc(p95: &str) -> MockServer {
@@ -2038,7 +2131,7 @@ mod tests {
         args.fee = Some("250".to_owned());
         args.rpc_url = Some(server.uri());
 
-        let built = build_unsigned_envelope(&flag_context(&args), &args)
+        let built = build_with_client(&flag_context(&args), &args)
             .await
             .expect("explicit fee build succeeds");
         assert_eq!(built.fee_selection.per_op_stroops, 250);
@@ -2090,7 +2183,7 @@ mod tests {
         args.amount = "1 XLM".to_owned();
         args.rpc_url = Some(server.uri());
 
-        let built = build_unsigned_envelope(&flag_context(&args), &args)
+        let built = build_with_client(&flag_context(&args), &args)
             .await
             .expect("default fee build succeeds");
         assert_eq!(built.fee_selection.per_op_stroops, DEFAULT_FEE_STROOPS);
@@ -2115,16 +2208,32 @@ mod tests {
         .build();
         profile.rpc_url = primary.uri();
         let context = NetworkContext::from_profile(&profile);
-        build_unsigned_envelope(&context, &args)
+        let (client, inputs) = checked_client_and_build_inputs(&context, &args)
+            .await
+            .expect("the context endpoint passes the endpoint check");
+        build_unsigned_envelope(&client, &context, &args, inputs)
             .await
             .expect("context endpoint builds");
-        let requests = primary.received_requests().await.unwrap();
-        assert!(
-            requests.iter().any(|request| {
+        let methods: Vec<String> = primary
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
                 serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["method"]
-                    == "getLedgerEntries"
-            }),
-            "the context endpoint must receive the account fetch"
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            methods.first().map(String::as_str),
+            Some("getNetwork"),
+            "the context endpoint must answer the endpoint check first: {methods:?}"
+        );
+        assert!(
+            methods.iter().any(|m| m == "getLedgerEntries"),
+            "the context endpoint must receive the account fetch: {methods:?}"
         );
         assert!(
             ignored.received_requests().await.unwrap().is_empty(),
@@ -2142,7 +2251,7 @@ mod tests {
         args.fee = Some("auto".to_owned());
         args.rpc_url = Some(server.uri());
 
-        let built = build_unsigned_envelope(&flag_context(&args), &args)
+        let built = build_with_client(&flag_context(&args), &args)
             .await
             .expect("auto fee build succeeds");
         assert_eq!(built.fee_selection.per_op_stroops, 333);
@@ -2431,54 +2540,6 @@ mod tests {
 
     // ── Zero-config quickstart e2e: the synthesized profile stays fail-open ──
 
-    /// Isolation every zero-config test needs, as one value.
-    ///
-    /// The synthesized profile is named by the RESOLVED name, which with no
-    /// flag and no variable is the literal `default`. Its `audit_log_path` and
-    /// its audit chain-root keyring coordinate are therefore the real
-    /// `default` profile's, so without this the test would read and write the
-    /// operator's own audit log and — on a host where
-    /// `stellar-agent-audit-default` exists — acquire a writer instead of
-    /// exercising the fail-open branch, passing vacuously.
-    ///
-    /// Bundles the redirected data root, the in-memory keyring store, and a
-    /// cleared `STELLAR_AGENT_PROFILE` (the resolver reads the ambient
-    /// environment, so an exported value would make the name explicit and the
-    /// run refuse). Callers MUST be `#[serial]`: all three are process-global.
-    struct ZeroConfigIsolation {
-        _home: stellar_agent_test_support::StellarAgentHomeGuard,
-        _profile_var: stellar_agent_test_support::ProfileEnvVarGuard,
-        _dir: tempfile::TempDir,
-    }
-
-    fn isolate_zero_config() -> ZeroConfigIsolation {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
-        let profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
-        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
-        ZeroConfigIsolation {
-            _home: home,
-            _profile_var: profile_var,
-            _dir: dir,
-        }
-    }
-
-    /// An injected loader reporting that the profile file does not exist.
-    ///
-    /// Whether that becomes a synthesized profile or a refusal is decided by
-    /// the caller of the injected closure, keyed on the resolved name's
-    /// provenance — never by this closure.
-    fn absent_profile_file(
-        name: &str,
-    ) -> Result<Profile, stellar_agent_core::profile::loader::ProfileLoadError> {
-        Err(
-            stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
-                name: name.to_owned(),
-                path: std::path::PathBuf::from("/nonexistent"),
-            },
-        )
-    }
-
     /// Generates a fresh ed25519 keypair and returns `(G-strkey, S-strkey)`.
     fn fresh_keypair_strkeys() -> (String, String) {
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
@@ -2510,7 +2571,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn zero_config_synthesized_profile_sign_only_succeeds_with_unminted_audit_key() {
-        let _isolation = isolate_zero_config();
+        let _isolation = zero_config();
         let (source_g, source_s) = fresh_keypair_strkeys();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2528,7 +2589,7 @@ mod tests {
         args.amount = "1 XLM".to_owned();
         args.rpc_url = Some(server.uri());
 
-        let built = build_unsigned_envelope(&flag_context(&args), &args)
+        let built = build_with_client(&flag_context(&args), &args)
             .await
             .expect("build must succeed against the mocked RPC");
 
@@ -2578,7 +2639,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn zero_config_synthesized_profile_sign_only_succeeds_when_keyring_init_fails() {
-        let _isolation = isolate_zero_config();
+        let _isolation = zero_config();
         let (source_g, source_s) = fresh_keypair_strkeys();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2596,7 +2657,7 @@ mod tests {
         args.amount = "1 XLM".to_owned();
         args.rpc_url = Some(server.uri());
 
-        let built = build_unsigned_envelope(&flag_context(&args), &args)
+        let built = build_with_client(&flag_context(&args), &args)
             .await
             .expect("build must succeed against the mocked RPC");
 
@@ -2984,7 +3045,7 @@ mod tests {
         args.destination = DEST_G.into();
         args.secret_env = Some(var.into());
         args.fee = Some("100".into());
-        let built = build_unsigned_envelope(&context, &args)
+        let built = build_with_client(&context, &args)
             .await
             .expect("build against mock");
         let result =
@@ -3011,5 +3072,201 @@ mod tests {
     #[serial_test::serial]
     async fn enrolled_signing_mismatch() {
         enrolled_signing_case(EnrolledPin::Other).await;
+    }
+
+    // ── Endpoint identity: one client per stage, checked before its reads ──
+
+    /// Arguments for a 1 XLM payment from `signer` to `DEST_G` through the
+    /// endpoint at `rpc_url`.
+    fn signed_payment_args(signer: &EnvSigner, rpc_url: &str) -> PayArgs {
+        let mut args = minimal_args();
+        args.source = Some(signer.g.clone());
+        args.destination = DEST_G.to_owned();
+        args.amount = "1 XLM".to_owned();
+        args.secret_env = Some(signer.var.to_owned());
+        args.rpc_url = Some(rpc_url.to_owned());
+        args
+    }
+
+    /// An unsigned payment envelope from `signer`, built against an endpoint
+    /// of its own so the endpoint under test sees only the stage's requests.
+    async fn unsigned_payment_from(signer: &EnvSigner) -> String {
+        let fixture = crate::test_rpc::ClassicRpc::testnet(&[&signer.g])
+            .serve()
+            .await;
+        let args = signed_payment_args(signer, &fixture.uri());
+        build_with_client(&flag_context(&args), &args)
+            .await
+            .expect("fixture build")
+            .envelope_xdr
+    }
+
+    /// The full pipeline builds one client: the endpoint check is its first
+    /// request, and the build reads and the send go through it. The submit
+    /// layer checks it again before the send, so two `getNetwork` requests.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_full_pipeline_checks_the_endpoint_first_and_sends_through_one_client() {
+        for fee in [None, Some("auto")] {
+            let _isolation = zero_config();
+            let signer = EnvSigner::new([0x61; 32], "PAY_ONE_CLIENT_FULL_SK");
+            let server = crate::test_rpc::ClassicRpc::testnet(&[&signer.g, DEST_G])
+                .serve()
+                .await;
+            let mut args = signed_payment_args(&signer, &server.uri());
+            args.fee = fee.map(str::to_owned);
+
+            let (code, built) = crate::test_rpc::clients_built_by(run_with_dependencies(
+                &args,
+                absent_profile_file,
+                || Ok(()),
+            ))
+            .await;
+            let methods = crate::test_rpc::methods(&server).await;
+
+            assert_eq!(code, 0, "fee {fee:?}: {methods:?}");
+            assert_eq!(built, 1, "fee {fee:?}: one client reads and sends");
+            assert_eq!(methods.first().map(String::as_str), Some("getNetwork"));
+            assert_eq!(crate::test_rpc::network_checks(&methods), 2, "{methods:?}");
+            assert!(
+                methods.iter().any(|m| m == "sendTransaction"),
+                "{methods:?}"
+            );
+        }
+    }
+
+    /// `--build-only` builds one client and checks its endpoint once, before
+    /// the fee and sequence reads.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn build_only_checks_the_endpoint_once_on_its_one_client() {
+        for fee in [None, Some("auto")] {
+            let _isolation = zero_config();
+            let signer = EnvSigner::new([0x62; 32], "PAY_ONE_CLIENT_BUILD_SK");
+            let server = crate::test_rpc::ClassicRpc::testnet(&[&signer.g, DEST_G])
+                .serve()
+                .await;
+            let mut args = signed_payment_args(&signer, &server.uri());
+            args.fee = fee.map(str::to_owned);
+            args.build_only = true;
+
+            let (code, built) = crate::test_rpc::clients_built_by(run_with_dependencies(
+                &args,
+                absent_profile_file,
+                || Ok(()),
+            ))
+            .await;
+            let methods = crate::test_rpc::methods(&server).await;
+
+            assert_eq!(code, 0, "fee {fee:?}: {methods:?}");
+            assert_eq!(built, 1, "fee {fee:?}");
+            assert_eq!(methods.first().map(String::as_str), Some("getNetwork"));
+            assert_eq!(crate::test_rpc::network_checks(&methods), 1, "{methods:?}");
+        }
+    }
+
+    /// `--sign-only` with an envelope it decodes builds one client and checks
+    /// its endpoint once, before the account reads its gate takes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sign_only_of_a_decoded_envelope_checks_the_endpoint_once() {
+        let _isolation = zero_config();
+        let signer = EnvSigner::new([0x63; 32], "PAY_ONE_CLIENT_SIGN_SK");
+        let envelope = unsigned_payment_from(&signer).await;
+        let server = crate::test_rpc::ClassicRpc::testnet(&[&signer.g, DEST_G])
+            .serve()
+            .await;
+        let mut args = signed_payment_args(&signer, &server.uri());
+        args.sign_only = Some(envelope);
+
+        let (code, built) = crate::test_rpc::clients_built_by(run_with_dependencies(
+            &args,
+            absent_profile_file,
+            || Ok(()),
+        ))
+        .await;
+        let methods = crate::test_rpc::methods(&server).await;
+
+        assert_eq!(code, 0, "{methods:?}");
+        assert_eq!(built, 1);
+        assert_eq!(methods.first().map(String::as_str), Some("getNetwork"));
+        assert_eq!(crate::test_rpc::network_checks(&methods), 1, "{methods:?}");
+    }
+
+    /// `--sign-only` with an envelope the decoder cannot classify signs it
+    /// under the opaque-signing posture without building a client or making
+    /// any request.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sign_only_of_an_opaque_envelope_makes_no_request() {
+        let _isolation = zero_config();
+        let signer = EnvSigner::new([0x64; 32], "PAY_ONE_CLIENT_OPAQUE_SK");
+        let server = crate::test_rpc::ClassicRpc::testnet(&[&signer.g, DEST_G])
+            .serve()
+            .await;
+        let mut args = signed_payment_args(&signer, &server.uri());
+        args.sign_only = Some(build_envelope_b64(
+            &signer.g,
+            Operation {
+                source_account: None,
+                body: OperationBody::CreateAccount(CreateAccountOp {
+                    destination: g_to_account_id(DEST_G),
+                    starting_balance: 10_000_000,
+                }),
+            },
+        ));
+
+        let (code, built) = crate::test_rpc::clients_built_by(run_with_dependencies(
+            &args,
+            absent_profile_file,
+            || Ok(()),
+        ))
+        .await;
+
+        assert_eq!(code, 0, "the opaque envelope is signed");
+        assert_eq!(
+            built, 0,
+            "no client for an envelope the gate reads nothing for"
+        );
+        assert!(
+            crate::test_rpc::methods(&server).await.is_empty(),
+            "an opaque envelope is signed without any request"
+        );
+    }
+
+    /// `--submit-only` builds one client: the endpoint check is its first
+    /// request, the reconcile and the gate reads follow, and the send goes
+    /// through it. The submit layer checks it again before the send.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn submit_only_checks_the_endpoint_first_and_sends_through_one_client() {
+        let _isolation = zero_config();
+        let envelope = stellar_agent_test_support::SignedTestEnvelope::for_source([0x61; 32]);
+        let server =
+            crate::test_rpc::ClassicRpc::testnet(&[envelope.source(), envelope.destination()])
+                .serve()
+                .await;
+        let mut args = minimal_args();
+        args.source = Some(envelope.source().to_owned());
+        args.destination = envelope.destination().to_owned();
+        args.rpc_url = Some(server.uri());
+        args.submit_only = Some(envelope.envelope_xdr().to_owned());
+
+        let (code, built) = crate::test_rpc::clients_built_by(run_with_dependencies(
+            &args,
+            absent_profile_file,
+            || Ok(()),
+        ))
+        .await;
+        let methods = crate::test_rpc::methods(&server).await;
+
+        assert_eq!(code, 0, "{methods:?}");
+        assert_eq!(built, 1, "one client reads and sends");
+        assert_eq!(methods.first().map(String::as_str), Some("getNetwork"));
+        assert_eq!(crate::test_rpc::network_checks(&methods), 2, "{methods:?}");
+        assert!(
+            methods.iter().any(|m| m == "sendTransaction"),
+            "{methods:?}"
+        );
     }
 }

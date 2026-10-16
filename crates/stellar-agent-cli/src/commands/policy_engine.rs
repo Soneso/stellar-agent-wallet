@@ -979,6 +979,11 @@ mod tests {
             .respond_with(move |request: &wiremock::Request| {
                 let body: Value = serde_json::from_slice(&request.body).expect("JSON-RPC");
                 let result = match body["method"].as_str().expect("method") {
+                    "getNetwork" => {
+                        stellar_agent_test_support::signed_envelope::get_network_result(
+                            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                        )
+                    }
                     "getLedgerEntries" => {
                         let keys = body["params"]["keys"].as_array().expect("ledger keys");
                         let found: Vec<_> = entries

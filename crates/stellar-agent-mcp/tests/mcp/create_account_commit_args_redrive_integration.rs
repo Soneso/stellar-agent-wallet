@@ -16,16 +16,16 @@
 //! 2. `envelope_xdr` that is valid XDR but encodes a `CreateAccount` to
 //!    `G_REAL_DEST` while caller args supply `destination = G_ATTACKER` →
 //!    the policy engine sees `G_REAL_DEST` from the XDR, not `G_ATTACKER`.
-//!    With `NoopPolicyEngine::testnet` the call proceeds to the nonce
-//!    verification step, which fails with `nonce.expired` because the nonce
-//!    ("dGVzdA") is a trivially-invalid stub — NOT `policy.engine_required`
-//!    or a `policy.deny`.
+//!    An engine that records what it evaluates shows the destination it saw,
+//!    and the call proceeds to the nonce step, which fails with
+//!    `nonce.expired` because the nonce ("dGVzdA") is a trivially-invalid
+//!    stub.
 //!
 //! 3. Caller supplies `starting_balance = "999 XLM"` while the XDR encodes
 //!    `starting_balance = 1 XLM` (10_000_000 stroops) → the policy engine
 //!    receives the XDR-authoritative `starting_balance_stroops = 10_000_000`,
-//!    not the attacker-inflated caller value.  Same outcome: `nonce.expired`
-//!    not `simulation.divergence` or a policy cap denial.
+//!    not the attacker-inflated caller value. The recording engine shows the
+//!    balance it saw; the outcome is again `nonce.expired`.
 //!
 //! # Keyring isolation
 //!
@@ -43,11 +43,16 @@ use serial_test::serial;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::{StellarCreateAccountCommitArgs, WalletServer};
 use stellar_agent_test_support::keyring_mock;
+use stellar_agent_test_support::xdr_fixtures::{
+    account_entry_xdr_with_seq, account_ledger_key_xdr,
+};
 use stellar_xdr::{
     AccountId, Asset, CreateAccountOp, Limits, Memo, MuxedAccount, Operation, OperationBody,
     PaymentOp, Preconditions, PublicKey, SequenceNumber, Transaction, TransactionEnvelope,
     TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixture constants
@@ -153,6 +158,30 @@ fn testnet_profile() -> Profile {
         .build()
 }
 
+/// A server on a local endpoint that reports testnet and answers for the
+/// funded `SOURCE_G` account, with an engine that allows and records what it
+/// evaluates. Returns the endpoint too, which must outlive the calls.
+async fn recording_server() -> (
+    WalletServer,
+    crate::common::policy_mock::CapturingPolicyEngine,
+    MockServer,
+) {
+    let endpoint = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(crate::common::TimeoutRpc::new(vec![(
+            account_ledger_key_xdr(SOURCE_G),
+            account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
+        )]))
+        .mount(&endpoint)
+        .await;
+    let mut profile = testnet_profile();
+    profile.rpc_url = endpoint.uri();
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    let engine = crate::common::policy_mock::CapturingPolicyEngine::new();
+    server.set_policy_engine_for_test(std::sync::Arc::new(engine.clone()));
+    (server, engine, endpoint)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Test 1: Payment XDR presented to stellar_create_account_commit →
 // simulation.divergence
@@ -212,7 +241,7 @@ async fn create_account_commit_with_payment_xdr_returns_simulation_divergence() 
 #[serial]
 async fn create_account_commit_policy_engine_sees_xdr_destination_not_caller_destination() {
     keyring_mock::install().expect("mock keyring store init");
-    let server = WalletServer::new(testnet_profile()).expect("WalletServer::new");
+    let (server, engine, _endpoint) = recording_server().await;
 
     // envelope_xdr encodes G_REAL_DEST; caller args claim G_ATTACKER.
     let envelope_xdr = create_account_envelope_b64(G_REAL_DEST, 10_000_000);
@@ -229,44 +258,25 @@ async fn create_account_commit_policy_engine_sees_xdr_destination_not_caller_des
         approval_attestation: None,
     };
 
-    let result = server.call_stellar_create_account_commit(args).await;
-    // The call must either:
-    // (a) Fail at nonce parse with nonce.expired (policy gate passed with XDR args), OR
-    // (b) Return Ok with a tool-level error for some downstream reason.
-    //
-    // It must NOT fail with policy.engine_required or simulation.divergence at
-    // the re-derivation step (the XDR is a valid CreateAccount to G_REAL_DEST).
-    match result {
-        Err(err) => {
-            let msg = err.to_string();
-            assert!(
-                msg.contains("nonce.expired") || msg.contains("nonce."),
-                "after policy gate, must fail at nonce step; got: {msg}"
-            );
-            assert!(
-                !msg.contains("simulation.divergence"),
-                "must NOT return simulation.divergence for valid CreateAccount XDR; got: {msg}"
-            );
-            assert!(
-                !msg.contains("policy.engine_required"),
-                "must NOT return policy gate error for testnet; got: {msg}"
-            );
-        }
-        Ok(tool_result) => {
-            // If for some reason it returns Ok (e.g. tool-level error result),
-            // the is_error flag distinguishes it from a success.
-            // We accept any outcome that isn't simulation.divergence or policy rejection.
-            let json_str = tool_result
-                .content
-                .first()
-                .and_then(|c| c.as_text())
-                .map_or_else(String::new, |raw| raw.text.clone());
-            assert!(
-                !json_str.contains("simulation.divergence"),
-                "must NOT return simulation.divergence for valid CreateAccount XDR; got: {json_str}"
-            );
-        }
-    }
+    let result = server
+        .call_stellar_create_account_commit(args)
+        .await
+        .expect("the nonce refusal is a tool result, not a protocol error");
+    let (code, _message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "nonce.expired",
+        "the call passes the gate and fails at the nonce step: {text}"
+    );
+    let evaluated = engine.arguments_for("stellar_create_account_commit");
+    assert_eq!(
+        evaluated.len(),
+        1,
+        "the gate evaluates the commit once: {evaluated:?}"
+    );
+    assert_eq!(
+        evaluated[0]["destination"], G_REAL_DEST,
+        "the gate evaluates the destination the envelope encodes, not the caller's: {evaluated:?}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -286,7 +296,7 @@ async fn create_account_commit_policy_engine_sees_xdr_destination_not_caller_des
 #[serial]
 async fn create_account_commit_policy_engine_sees_xdr_balance_not_caller_balance() {
     keyring_mock::install().expect("mock keyring store init");
-    let server = WalletServer::new(testnet_profile()).expect("WalletServer::new");
+    let (server, engine, _endpoint) = recording_server().await;
 
     // XDR encodes 1 XLM (10_000_000 stroops) as the starting balance.
     let envelope_xdr = create_account_envelope_b64(G_REAL_DEST, 10_000_000);
@@ -304,36 +314,23 @@ async fn create_account_commit_policy_engine_sees_xdr_balance_not_caller_balance
         approval_attestation: None,
     };
 
-    let result = server.call_stellar_create_account_commit(args).await;
-    // Policy engine must see 10_000_000 stroops (XDR value), not 9_990_000_000.
-    // NoopPolicyEngine allows all amounts on testnet, so the call proceeds to
-    // nonce verification which fails with nonce.expired for the stub nonce.
-    match result {
-        Err(err) => {
-            let msg = err.to_string();
-            assert!(
-                msg.contains("nonce.expired") || msg.contains("nonce."),
-                "after policy gate, must fail at nonce step; got: {msg}"
-            );
-            assert!(
-                !msg.contains("simulation.divergence"),
-                "must NOT return simulation.divergence for valid CreateAccount XDR; got: {msg}"
-            );
-            assert!(
-                !msg.contains("policy.engine_required"),
-                "must NOT return policy gate error for testnet; got: {msg}"
-            );
-        }
-        Ok(tool_result) => {
-            let json_str = tool_result
-                .content
-                .first()
-                .and_then(|c| c.as_text())
-                .map_or_else(String::new, |raw| raw.text.clone());
-            assert!(
-                !json_str.contains("simulation.divergence"),
-                "must NOT return simulation.divergence for valid CreateAccount XDR; got: {json_str}"
-            );
-        }
-    }
+    let result = server
+        .call_stellar_create_account_commit(args)
+        .await
+        .expect("the nonce refusal is a tool result, not a protocol error");
+    let (code, _message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "nonce.expired",
+        "the call passes the gate and fails at the nonce step: {text}"
+    );
+    let evaluated = engine.arguments_for("stellar_create_account_commit");
+    assert_eq!(
+        evaluated.len(),
+        1,
+        "the gate evaluates the commit once: {evaluated:?}"
+    );
+    assert_eq!(
+        evaluated[0]["starting_balance_stroops"], "10000000",
+        "the gate evaluates the balance the envelope encodes, not the caller's: {evaluated:?}"
+    );
 }

@@ -167,7 +167,9 @@ stellar-agent-toolsets-runtime = { path = "../stellar-agent-toolsets-runtime", f
 # and is stripped from the published manifest like every internal dev-dependency.
 stellar-agent-mcp = { path = ".", features = ["test-helpers"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
-stellar-agent-network = { path = "../stellar-agent-network", features = ["test-loopback"] }
+# test-hooks counts StellarRpcClient constructions, so the tool tests can show
+# which clients a prepare or commit call builds.
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-loopback", "test-hooks"] }
 stellar-agent-nonce = { path = "../stellar-agent-nonce", features = ["test-helpers"] }
 tempfile                   = { workspace = true }
 tokio                      = { workspace = true, features = ["rt-multi-thread", "process", "io-util", "time", "sync", "test-util"] }

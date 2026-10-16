@@ -36,6 +36,12 @@ const HEADLESS_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
 struct State {
     home: PathBuf,
+    /// The passphrase `getNetwork` reports.
+    network: &'static str,
+    /// How long `getNetwork` takes to answer.
+    network_delay: Option<std::time::Duration>,
+    /// Every JSON-RPC method the endpoint received, in order.
+    methods: Vec<String>,
     fail_funder: bool,
     /// Refuses the transport on `sendTransaction`, so the endpoint accepts no
     /// submission and `send_count` does not move.
@@ -57,8 +63,19 @@ impl Respond for Rpc {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         let mut state = self.0.lock().unwrap();
+        state
+            .methods
+            .push(body["method"].as_str().unwrap().to_owned());
         let result = match body["method"].as_str().unwrap() {
-            "getNetwork" => get_network_result(PASSPHRASE),
+            "getNetwork" => {
+                let answer = ResponseTemplate::new(200).set_body_json(
+                    json!({"jsonrpc":"2.0","id":body["id"],"result":get_network_result(state.network)}),
+                );
+                return match state.network_delay {
+                    Some(delay) => answer.set_delay(delay),
+                    None => answer,
+                };
+            }
             "getHealth" => {
                 let oldest = state.oldest_ledger;
                 json!({"status":"healthy","latestLedger":2000,"oldestLedger":oldest,
@@ -243,6 +260,9 @@ async fn fixture() -> (tempfile::TempDir, MockServer, Rpc) {
     let server = MockServer::start().await;
     let state = Rpc(Arc::new(Mutex::new(State {
         home: home.path().to_owned(),
+        network: PASSPHRASE,
+        network_delay: None,
+        methods: Vec::new(),
         fail_funder: false,
         refuse_send: false,
         block_completion: false,
@@ -288,6 +308,9 @@ async fn fixture() -> (tempfile::TempDir, MockServer, Rpc) {
 }
 
 fn start(home: &Path) -> (i32, Value) {
+    start_with_timeout(home, "2")
+}
+fn start_with_timeout(home: &Path, timeout_seconds: &str) -> (i32, Value) {
     cli(
         home,
         &[
@@ -296,7 +319,7 @@ fn start(home: &Path) -> (i32, Value) {
             "--size",
             "2",
             "--timeout-seconds",
-            "2",
+            timeout_seconds,
             "--profile",
             NAME,
         ],
@@ -399,8 +422,15 @@ async fn confirmed_initialization_finishes_without_a_second_send() {
     assert_eq!(seed(home.path()), before);
     assert_eq!(rpc.0.lock().unwrap().send_count, 1);
     assert_eq!(event_count(home.path(), "channel_pool_initialised"), 1);
+    // A completed pool resumes from the profile alone.
+    let requests_before = rpc.0.lock().unwrap().methods.len();
     assert_eq!(resume(home.path()).0, 0);
     assert_eq!(rpc.0.lock().unwrap().send_count, 1);
+    assert_eq!(
+        rpc.0.lock().unwrap().methods.len(),
+        requests_before,
+        "a completed pool resumes without any request"
+    );
 }
 
 /// A pending seed cannot be replaced, even under an explicit force request.
@@ -488,8 +518,16 @@ async fn completion_audit_is_not_duplicated_after_restart() {
         toml::Value::try_from(checkpoint).unwrap(),
     );
     std::fs::write(&path, toml::to_string_pretty(&doc).unwrap()).unwrap();
+    // The checkpoint records the completion ledger, so the resume completes
+    // from it without any request.
+    let requests_before = rpc.0.lock().unwrap().methods.len();
     let (code, output) = resume(home.path());
     assert_eq!(code, 0, "{output}");
+    assert_eq!(
+        rpc.0.lock().unwrap().methods.len(),
+        requests_before,
+        "a checkpoint with its completion ledger resumes without any request"
+    );
     assert_eq!(event_count(home.path(), "channel_pool_initialised"), 1);
     assert_eq!(rpc.0.lock().unwrap().send_count, 1);
     assert!(profile(home.path()).pool_initialization.is_none());
@@ -703,4 +741,99 @@ async fn ambiguous_attempt_is_retried_only_after_an_operator_clears_it() {
     })
     .await
     .expect("operator-acknowledged recovery must remain bounded");
+}
+
+/// A fresh `pool init` and a `--resume` that would send each refuse an
+/// endpoint serving another network before any other request, with the
+/// mismatch code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn fresh_and_sending_resume_check_the_endpoint_before_any_read() {
+    const FUTURENET: &str = "Test SDF Future Network ; October 2022";
+    let (home, _server, rpc) = fixture().await;
+    rpc.0.lock().unwrap().network = FUTURENET;
+    let (code, output) = start(home.path());
+    assert_eq!(code, 1, "{output}");
+    assert_eq!(
+        output["error"]["code"], "network.endpoint_network_mismatch",
+        "{output}"
+    );
+    assert_eq!(rpc.0.lock().unwrap().methods, ["getNetwork"]);
+
+    // The refused start left its seed and channels checkpointed with nothing
+    // submitted, so a resume sends.
+    let pending = profile(home.path()).pool_initialization.unwrap();
+    assert!(pending.seed_ready);
+    assert!(pending.submission.is_none());
+    let requests_before = rpc.0.lock().unwrap().methods.len();
+    let (code, output) = resume(home.path());
+    assert_eq!(code, 1, "{output}");
+    assert_eq!(
+        output["error"]["code"], "network.endpoint_network_mismatch",
+        "{output}"
+    );
+    assert_eq!(
+        rpc.0.lock().unwrap().methods[requests_before..],
+        ["getNetwork"],
+        "the resume checks the endpoint before the channel reads"
+    );
+    assert_eq!(rpc.0.lock().unwrap().send_count, 0);
+
+    // On the profile's network the same resume sends.
+    rpc.0.lock().unwrap().network = PASSPHRASE;
+    let (code, output) = resume(home.path());
+    assert_eq!(code, 0, "{output}");
+    assert_eq!(rpc.0.lock().unwrap().send_count, 1);
+}
+
+/// The endpoint check runs under `--timeout-seconds`. With `getNetwork`
+/// answering after 6 seconds, a 2-second flag refuses the check and sends
+/// nothing, and a 10-second flag passes it and the run sends.
+///
+/// The 19-second watchdog on the refusing case is the test's own bound for a
+/// run that hangs; the outcome of each case is what the flag decides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn the_endpoint_check_runs_under_the_timeout_flag() {
+    const DELAY: std::time::Duration = std::time::Duration::from_secs(6);
+
+    let (home, _server, rpc) = fixture().await;
+    rpc.0.lock().unwrap().network_delay = Some(DELAY);
+    let task_home = home.path().to_owned();
+    let (code, output) = tokio::time::timeout(
+        std::time::Duration::from_secs(19),
+        tokio::task::spawn_blocking(move || start_with_timeout(&task_home, "2")),
+    )
+    .await
+    .expect("the refused check must end within the watchdog")
+    .unwrap();
+    assert_eq!(code, 1, "{output}");
+    assert_eq!(
+        output["error"]["code"], "network.endpoint_identity_unavailable",
+        "a 2-second flag refuses a 6-second answer: {output}"
+    );
+    assert_eq!(rpc.0.lock().unwrap().methods, ["getNetwork"]);
+    assert_eq!(rpc.0.lock().unwrap().send_count, 0);
+
+    let (home, _server, rpc) = fixture().await;
+    rpc.0.lock().unwrap().network_delay = Some(DELAY);
+    let task_home = home.path().to_owned();
+    let (code, output) = tokio::task::spawn_blocking(move || start_with_timeout(&task_home, "10"))
+        .await
+        .unwrap();
+    assert_eq!(
+        code, 0,
+        "a 10-second flag passes a 6-second answer: {output}"
+    );
+    let state = rpc.0.lock().unwrap();
+    assert_eq!(
+        state.methods.first().map(String::as_str),
+        Some("getNetwork")
+    );
+    assert!(
+        state.methods.len() > 1,
+        "the run reads past the check: {:?}",
+        state.methods
+    );
+    assert_eq!(state.send_count, 1);
 }

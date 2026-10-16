@@ -146,6 +146,7 @@ impl ToolCatalogue for PayCommitCatalogue {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Kept local: single-caller scope and approval-specific response shape.
+// `getNetwork` reports testnet; every other request receives the account.
 struct AccountLedgerResponder {
     account_key_xdr: String,
     account_xdr: String,
@@ -154,18 +155,28 @@ struct AccountLedgerResponder {
 #[async_trait]
 impl Respond for AccountLedgerResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
-        let req_id = serde_json::from_slice::<serde_json::Value>(&request.body)
-            .ok()
+        let request_value = serde_json::from_slice::<serde_json::Value>(&request.body).ok();
+        let req_id = request_value
+            .as_ref()
             .and_then(|v| v.get("id").cloned())
             .unwrap_or(serde_json::json!(1));
-        let body = serde_json::json!({
-            "entries": [{
-                "key": self.account_key_xdr,
-                "xdr": self.account_xdr,
-                "lastModifiedLedgerSeq": 1000
-            }],
-            "latestLedger": 1001
-        });
+        let is_network_check = request_value
+            .as_ref()
+            .and_then(|v| v.get("method"))
+            .and_then(serde_json::Value::as_str)
+            == Some("getNetwork");
+        let body = if is_network_check {
+            crate::common::EndpointNetwork::testnet().result()
+        } else {
+            serde_json::json!({
+                "entries": [{
+                    "key": self.account_key_xdr,
+                    "xdr": self.account_xdr,
+                    "lastModifiedLedgerSeq": 1000
+                }],
+                "latestLedger": 1001
+            })
+        };
         ResponseTemplate::new(200)
             .set_body_json(serde_json::json!({
                 "jsonrpc": "2.0",
@@ -736,10 +747,10 @@ async fn property4c_expired_approval_entry_returns_approval_required() {
 /// The three failure-mode tests above pin the rejection envelope; none exercises
 /// the gate's accept path. This seeds the attestation key, inserts a live
 /// `PaymentSimulated` entry, computes the HMAC blob the operator's `approve`
-/// surfaces, and asserts the commit proceeds *past* the attestation gate. Past
-/// the gate the commit fails at a later stage (no signer key is seeded), which
-/// is out of scope here — the point is the failure is NOT the approval-required
-/// gate error, i.e. the surfaced blob is accepted.
+/// surfaces, and asserts the commit proceeds *past* the attestation gate. The
+/// audit key is seeded and the nonce verifies, so the commit reaches the
+/// signer load, which refuses because no signer key is seeded. That refusal,
+/// three stages past the gate, is the proof the surfaced blob was accepted.
 #[tokio::test]
 #[serial]
 async fn valid_attestation_passes_gate() {
@@ -777,6 +788,7 @@ async fn valid_attestation_passes_gate() {
         .with_noop_engine()
         .build();
     profile.rpc_url = mock.uri();
+    crate::common::install_test_audit_key(&mut profile);
 
     let (server, envelope_xdr, nonce_b64, expiry_ms) =
         build_scaffold(profile, temp.path().to_path_buf()).await;
@@ -840,23 +852,18 @@ async fn valid_attestation_passes_gate() {
         })
         .await;
 
-    // The gate must ACCEPT the valid blob. Any failure past the gate is a
-    // different error; assert we did not bounce off the approval-required gate.
-    match result {
-        // A success is trivially past the gate (stronger evidence still).
-        Ok(_) => {}
-        Err(err) => {
-            assert_ne!(
-                err.message, POLICY_APPROVAL_REQUIRED_MSG,
-                "valid attestation must pass the gate, not return the approval-required error"
-            );
-            assert!(
-                !err.message.starts_with("policy.approval_required"),
-                "valid attestation must pass the gate; got gate error: {}",
-                err.message
-            );
-        }
-    }
+    // The gate must ACCEPT the valid blob: the commit passes it, the audit
+    // pre-flight, and the nonce verification, and stops at the signer load.
+    let result = result.expect("a refusal past the gate is a tool result");
+    let (code, message, text) = crate::common::assert_business_envelope(&result);
+    assert_ne!(
+        message, POLICY_APPROVAL_REQUIRED_MSG,
+        "valid attestation must pass the gate, not return the approval-required error"
+    );
+    assert_eq!(
+        code, "auth.keyring_not_found",
+        "valid attestation must pass the gate and reach the signer load: {text}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

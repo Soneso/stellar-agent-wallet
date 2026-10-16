@@ -376,6 +376,20 @@ impl WalletServer {
             }
         };
 
+        // Establish which network the endpoint serves before the first read
+        // on this client. The values read here feed the envelope the commit
+        // signs and the policy gate, so an endpoint serving another network
+        // answers none of them.
+        if let Err(e) = crate::tools::common::probe_endpoint_network(
+            &client,
+            &self.context,
+            crate::tools::common::submit_timeout(&self.profile),
+        )
+        .await
+        {
+            return Ok(crate::tools::common::endpoint_refusal_result(&e));
+        }
+
         let account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
             &self.sequence_floor,
             &client,
@@ -823,6 +837,21 @@ impl WalletServer {
             }
         };
 
+        // Establish which network the endpoint serves before the first read
+        // on this client, which also sends. The sequence read below feeds the
+        // rebuilt envelope that is signed, and the account views feed the
+        // policy gate. A refusal here consumes no nonce, so the caller can
+        // correct the endpoint and retry with the same approval.
+        if let Err(e) = crate::tools::common::probe_endpoint_network(
+            &client,
+            &self.context,
+            crate::tools::common::submit_timeout(&self.profile),
+        )
+        .await
+        {
+            return Ok(crate::tools::common::endpoint_refusal_result(&e));
+        }
+
         let account_view = match crate::sequence_floor::fetch_account_with_sequence_catchup(
             &self.sequence_floor,
             &client,
@@ -1114,20 +1143,6 @@ impl WalletServer {
                 return Ok(result);
             }
         };
-
-        // Establish which network the endpoint serves before the nonce is
-        // consumed. A commit aimed at the wrong network is a configuration
-        // error the caller can correct and retry; burning the nonce first
-        // would cost them the approval as well.
-        if let Err(e) = crate::tools::common::probe_endpoint_network(
-            &client,
-            &self.context,
-            crate::tools::common::submit_timeout(&self.profile),
-        )
-        .await
-        {
-            return Ok(crate::tools::common::commit_refusal_result(&e));
-        }
 
         // Delegates to `commit_envelope_and_verify_nonce` in `tools/common.rs`.
         // That helper encapsulates the HMAC + spawn_blocking + replay-window

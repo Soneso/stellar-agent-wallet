@@ -143,13 +143,17 @@ There are no consent-gated mainnet write exceptions: every write surface refuses
 mainnet structurally. Friendbot funding is scoped to `testnet` and `futurenet`
 and refuses `mainnet` with `network.friendbot_mainnet_forbidden`.
 
-The gate does not rest on the declared network alone. Before it sends, the
-submit layer asks the RPC endpoint which network it serves and treats that
-answer as authoritative: an endpoint reporting mainnet is refused with
-`network.mainnet_write_forbidden` even when the caller declared testnet, an
-endpoint reporting a different network than declared with
-`network.endpoint_network_mismatch`, and an endpoint whose identity cannot be
-established within the submission timeout with
+The gate does not rest on the declared network alone. The classic payment,
+sponsored account creation, trustline, claim, and pool paths ask the RPC
+endpoint which network it serves before the first read whose answer they sign
+or gate on. They ask on the client that sends, and the MCP simulate tools ask
+on their own client. Before it sends, the submit layer asks again on the
+sending client.
+Both treat the answer as authoritative. An endpoint reporting mainnet is
+refused with `network.mainnet_write_forbidden` even when the caller declared
+testnet. An endpoint reporting a different network than declared is refused
+with `network.endpoint_network_mismatch`. An endpoint whose identity cannot be
+established within the timeout is refused with
 `network.endpoint_identity_unavailable`. The same answer carries the endpoint's
 protocol version. This release supports protocol 29: outside it, testnet and
 other networks log a warning, and a mainnet endpoint is refused with

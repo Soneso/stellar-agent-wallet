@@ -140,6 +140,35 @@ pub(crate) fn mainnet_write_refusal(chain: Caip2) -> Option<WalletError> {
     }
 }
 
+/// Asks the endpoint of `client` which network it serves, and requires it to
+/// be the network of `context`.
+///
+/// A value verb reads the fee, the sequence, and the policy views it signs
+/// against through one client, and sends through that same client. It runs
+/// this check on that client before the first such read, so an endpoint
+/// serving another network never supplies a value the verb signs. The submit
+/// layer checks the sending client again before the send. Each check gets its
+/// own budget, `timeout` from the moment it starts.
+///
+/// # Errors
+///
+/// Returns the refusal of
+/// [`StellarRpcClient::endpoint_identity`](stellar_agent_network::StellarRpcClient::endpoint_identity):
+/// `network.endpoint_network_mismatch`, `network.mainnet_write_forbidden`,
+/// `network.endpoint_identity_unavailable`, or
+/// `network.unsupported_protocol_version`.
+pub(crate) async fn check_endpoint_identity(
+    client: &stellar_agent_network::StellarRpcClient,
+    context: &stellar_agent_network::NetworkContext,
+    timeout: std::time::Duration,
+) -> Result<(), WalletError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    client
+        .endpoint_identity(context.network_passphrase(), deadline)
+        .await?;
+    Ok(())
+}
+
 /// Parses an RPC URL flag without echoing credentials in errors.
 #[derive(Clone)]
 pub(crate) struct EndpointUrlFlag;

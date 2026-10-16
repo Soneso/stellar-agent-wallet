@@ -134,6 +134,9 @@ stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers
 # test-helpers enables VerifierAllowlistEntry::new_for_test in advisory tests;
 # the production [dependencies] entry uses deploy-cli only.
 stellar-agent-smart-account = { path = "../stellar-agent-smart-account", features = ["deploy-cli", "test-helpers"] }
+# test-hooks counts StellarRpcClient constructions, so the command tests can
+# show that one client carries a command's reads and its send.
+stellar-agent-network = { path = "../stellar-agent-network", features = ["test-hooks"] }
 # Deterministic mocked RPC responses in pay.rs / accounts/create.rs tests.
 wiremock = { workspace = true }
 # wiremock::Respond impls in command-module unit tests.

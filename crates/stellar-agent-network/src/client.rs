@@ -80,6 +80,8 @@ impl StellarRpcClient {
     /// assert!(client.is_ok());
     /// ```
     pub fn new(url: &str) -> Result<Self, WalletError> {
+        #[cfg(feature = "test-hooks")]
+        CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
         let inner = Client::new(url).map_err(|e| construction_failure(url, &e))?;
         Ok(Self {
             inner,
@@ -331,6 +333,29 @@ impl StellarRpcClient {
     }
 }
 
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    /// Calls to [`StellarRpcClient::new`] on this thread, failed ones included.
+    static CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns how many times [`StellarRpcClient::new`] has run on the calling
+/// thread, failed constructions included.
+///
+/// A test reads it before and after one command or tool call on a
+/// current-thread runtime. The difference is the number of clients that call
+/// built, which shows whether its reads and its send shared one instance. The
+/// count is per thread, so tests running in parallel do not disturb each other.
+///
+/// Only compiled when the `test-hooks` Cargo feature is enabled. Never include
+/// `test-hooks` in production or release builds.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[must_use]
+pub fn constructions_on_this_thread() -> usize {
+    CONSTRUCTIONS.with(std::cell::Cell::get)
+}
+
 /// Builds the error for a transport that refuses to construct for `url`.
 ///
 /// The `url` field carries the authority form (scheme://host\[:port\]). Credentials
@@ -454,6 +479,31 @@ mod tests {
         let (url, reason) = unreachable_parts(err);
         assert_eq!(url, ENDPOINT_AUTHORITY);
         assert_scrubbed("construction", &reason);
+    }
+
+    /// Every call to the constructor counts on the calling thread, a refused
+    /// URL included, and on no other thread.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn every_construction_counts_on_the_calling_thread_only() {
+        let before = constructions_on_this_thread();
+        let _built = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+        let _refused = StellarRpcClient::new("https://archive example.com/rpc");
+        assert_eq!(constructions_on_this_thread() - before, 2);
+
+        let elsewhere = std::thread::spawn(|| {
+            let before = constructions_on_this_thread();
+            let _built = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+            constructions_on_this_thread() - before
+        })
+        .join()
+        .unwrap();
+        assert_eq!(elsewhere, 1);
+        assert_eq!(
+            constructions_on_this_thread() - before,
+            2,
+            "another thread's construction does not count here"
+        );
     }
 
     /// A URL the transport refuses to parse fails construction with the

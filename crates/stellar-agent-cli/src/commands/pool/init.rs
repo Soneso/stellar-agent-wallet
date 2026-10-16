@@ -45,11 +45,12 @@ use stellar_agent_sep5::Sep5Wallet;
 use zeroize::Zeroizing;
 
 use crate::commands::submission_record::{SubmitRecord, build_recorder, write_settled_row};
-use crate::common::network::mainnet_write_refusal;
+use crate::common::network::{check_endpoint_identity, mainnet_write_refusal};
 use crate::common::profile_access::load_profile_reconciled;
 use crate::common::{render::render_json, resolve_profile_name};
 
-/// Default confirmation deadline for the creation transaction, in seconds.
+/// Default deadline for the endpoint check and for confirming the creation
+/// transaction, in seconds.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 
 /// Arguments for sponsored pool creation and recovery.
@@ -73,7 +74,8 @@ pub struct PoolInitArgs {
     /// Complete an interrupted initialization using its persisted seed.
     #[arg(long)]
     pub resume: bool,
-    /// Confirmation deadline for the creation transaction, in seconds.
+    /// Deadline in seconds for the endpoint check and, separately, for
+    /// confirming the creation transaction.
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS, value_name = "SECONDS")]
     pub timeout_seconds: u64,
     /// Output format.
@@ -389,13 +391,10 @@ where
     if pending.completion_ledger.is_some() {
         return complete(&profile, name, &master, &pending, &audit);
     }
+    // The endpoint check precedes the channel observations and runs on the
+    // client that later sends, under its own budget of `--timeout-seconds`.
     let client = StellarRpcClient::new(&context.rpc_url)?;
-    client
-        .endpoint_identity(
-            context.network_passphrase(),
-            tokio::time::Instant::now() + Duration::from_secs(30),
-        )
-        .await?;
+    check_endpoint_identity(&client, &context, Duration::from_secs(args.timeout_seconds)).await?;
     let mut present = 0;
     for channel in &pending.channels {
         match fetch_account(&client, &channel.public_key, &[]).await {
@@ -1029,6 +1028,84 @@ mod tests {
             counter.accepted().unwrap(),
             0,
             "a resumed mainnet pool init must open no connection"
+        );
+    }
+
+    /// A fresh `pool init` builds one client: the endpoint check is its first
+    /// request, the channel and funder reads follow, and the creation is sent
+    /// through it, whose submit layer checks it again. A `--resume` once the
+    /// pool is complete answers from the profile and builds no client.
+    #[tokio::test]
+    #[serial]
+    async fn a_fresh_init_sends_through_one_checked_client_and_a_completed_resume_makes_no_request()
+    {
+        use base64::Engine as _;
+        const NAME: &str = "pool-one-client";
+        const FUNDER_SEED: [u8; 32] = [0x91; 32];
+        let funder = stellar_agent_test_support::signed_envelope::account_id_for_seed(FUNDER_SEED);
+        let server = crate::test_rpc::ClassicRpc::testnet(&[&funder])
+            .serve()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let profile =
+            Profile::builder_testnet("pool-one-signer", &funder, "pool-one-nonce", "default")
+                .with_profile_name(NAME)
+                .rpc_url(server.uri())
+                .audit_log_path(dir.path().join(format!("audit/{NAME}.jsonl")))
+                .build();
+        loader::save_to_dir(NAME, &profile, &dir.path().join("profiles")).unwrap();
+        KeyringEntry::new(
+            &profile.mcp_signer_default.service,
+            &profile.mcp_signer_default.account,
+        )
+        .unwrap()
+        .set_password(
+            stellar_strkey::ed25519::PrivateKey(FUNDER_SEED)
+                .as_unredacted()
+                .to_string()
+                .as_str(),
+        )
+        .unwrap();
+        KeyringEntry::new(
+            &profile.audit_log_hash_chain_key_id.service,
+            &profile.audit_log_hash_chain_key_id.account,
+        )
+        .unwrap()
+        .set_password(&URL_SAFE_NO_PAD.encode([0x3a; 32]))
+        .unwrap();
+        let mut args = PoolInitArgs {
+            size: Some(2),
+            profile: Some(NAME.to_owned()),
+            force: false,
+            resume: false,
+            timeout_seconds: 5,
+            output: OutputFormat::Json,
+        };
+
+        let (created, built) = crate::test_rpc::clients_built_by(execute(&args, || Ok(()))).await;
+        created.expect("the fresh initialization completes");
+        let methods = crate::test_rpc::methods(&server).await;
+        assert_eq!(built, 1, "one client reads and sends: {methods:?}");
+        assert_eq!(methods.first().map(String::as_str), Some("getNetwork"));
+        assert_eq!(crate::test_rpc::network_checks(&methods), 2, "{methods:?}");
+        assert!(
+            methods.iter().any(|m| m == "sendTransaction"),
+            "{methods:?}"
+        );
+
+        args.size = None;
+        args.resume = true;
+        let (resumed, built) = crate::test_rpc::clients_built_by(execute(&args, || Ok(()))).await;
+        let resumed = resumed.expect("a completed pool resumes from the profile");
+        assert_eq!(resumed["initialised"], true, "{resumed}");
+        assert_eq!(built, 0, "a completed resume builds no client");
+        assert_eq!(
+            crate::test_rpc::methods(&server).await.len(),
+            methods.len(),
+            "a completed resume makes no request"
         );
     }
 

@@ -13,13 +13,15 @@
 //!    `simulation`.
 //! 2. Invalid source G-strkey — returns `invalid_params`.
 //! 3. Invalid destination G-strkey — returns `invalid_params`.
-//! 4. `chain_id` mismatch — returns `invalid_params`.
+//! 4. `chain_id` mismatch: returns `invalid_params` once the endpoint check
+//!    and the account reads pass.
 //! 5. Bad asset format — returns `invalid_params`.
 //! 6. Non-native asset happy path.
 //! 7. SEP-29 — destination with `MemoRequired` + no memo → `validation.memo_required`.
 //! 8. SEP-29 — destination with `MemoRequired` + memo provided → ok.
 //! 9. Multiple memo variants — returns `validation.memo_mutually_exclusive`.
-//! 10. Simulate allowed on mainnet (non-destructive step).
+//! 10. An endpoint serving another network, or mainnet, refuses the simulate
+//!     before any read, as an `is_error` envelope.
 //! 11. Native XLM pre-flight: source with zero balance + 10 XLM payment →
 //!     `ledger.insufficient_balance` BEFORE nonce mint.
 //!
@@ -57,8 +59,7 @@ use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::{StellarPayArgs, StellarPayCommitArgs, WalletServer};
 use stellar_agent_test_support::keyring_mock;
 use stellar_agent_test_support::xdr_fixtures::{
-    EchoIdResponder, account_entry_xdr_with_balance, account_entry_xdr_with_seq,
-    account_ledger_key_xdr,
+    account_entry_xdr_with_balance, account_entry_xdr_with_seq, account_ledger_key_xdr,
 };
 use stellar_agent_test_support::{CaptureWriter, RedactionStrictSubscriber};
 use tracing::instrument::WithSubscriber as _;
@@ -125,6 +126,7 @@ impl Respond for PayFeeRpcResponder {
             .unwrap_or("");
 
         let result = match method {
+            "getNetwork" => crate::common::EndpointNetwork::testnet().result(),
             "getFeeStats" => (*self.fee_stats).clone(),
             "getLedgerEntries" => {
                 let body = String::from_utf8_lossy(&request.body);
@@ -228,19 +230,34 @@ fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
     p
 }
 
-/// Builds a mainnet profile with `engine = Noop`.
-///
-/// Used by the mainnet simulate test and by Property A. Because
-/// `PolicyEngineKind::default()` is `V1`, `Noop` is set explicitly so
-/// `WalletServer::new` succeeds without a signed policy file on disk.
-fn mainnet_profile() -> Profile {
-    mainnet_profile_with_rpc("https://rpc.example.invalid")
+/// Starts a local endpoint that reports testnet and answers for the funded
+/// `SOURCE_G` and `DEST_G` accounts. A call passes the endpoint check and the
+/// account reads and reaches the step a test is about.
+async fn funded_accounts_endpoint() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(crate::common::TimeoutRpc::new(vec![
+            (
+                account_ledger_key_xdr(SOURCE_G),
+                account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000_000),
+            ),
+            (
+                account_ledger_key_xdr(DEST_G),
+                account_entry_xdr_with_balance(DEST_G, 100_000_000_000),
+            ),
+        ]))
+        .mount(&server)
+        .await;
+    server
 }
 
-/// `mainnet_profile` with a caller-supplied `rpc_url`.
+/// Builds a mainnet profile with `engine = Noop` and a caller-supplied
+/// `rpc_url`.
 ///
-/// Property A points `rpc_url` at a local wiremock server and asserts that the
-/// commit refusal sends it no request.
+/// Because `PolicyEngineKind::default()` is `V1`, `Noop` is set explicitly so
+/// `WalletServer::new` succeeds without a signed policy file on disk. The
+/// mainnet simulate test and Property A point `rpc_url` at a local wiremock
+/// server and assert which requests it receives.
 fn mainnet_profile_with_rpc(rpc_url: &str) -> Profile {
     Profile::builder_mainnet(rpc_url, "svc", "acct", "n-svc", "n-acct")
         .with_noop_engine()
@@ -362,7 +379,8 @@ async fn simulate_rejects_invalid_destination_strkey() {
 async fn simulate_rejects_chain_id_mismatch() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
-    let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
+    let endpoint = funded_accounts_endpoint().await;
+    let profile = testnet_profile_with_rpc(&endpoint.uri());
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     let args = StellarPayArgs {
@@ -384,6 +402,11 @@ async fn simulate_rejects_chain_id_mismatch() {
     assert!(
         err.to_string().contains("chain_id mismatch"),
         "error must mention chain_id mismatch, got: {err}"
+    );
+    assert_eq!(
+        crate::common::received_methods(&endpoint).await,
+        ["getNetwork", "getLedgerEntries", "getLedgerEntries"],
+        "the chain check runs after the endpoint check and the account reads"
     );
 }
 
@@ -523,22 +546,11 @@ async fn simulate_invalid_memo_hash_does_not_log_memo_content() {
     );
 }
 
-/// Simulate step with a mainnet profile is ALLOWED (simulate is NOT destructive).
-///
-/// Only tools with `destructive_hint = true` are refused on mainnet.  The
-/// simulate step has `destructive_hint = false`.
-#[tokio::test]
-#[serial]
-async fn simulate_allowed_on_mainnet_profile() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().expect("mock keyring store init");
-    let mut profile = mainnet_profile();
-    profile.rpc_url = "http://127.0.0.1:1".to_owned(); // non-routable
-
-    let server = WalletServer::new(profile).expect("WalletServer::new");
-
-    let args = StellarPayArgs {
-        chain_id: "stellar:mainnet".to_owned(),
+/// The simulate arguments for a 10 XLM native payment from `SOURCE_G` on
+/// `chain_id`, with `classic_base` as the fee choice.
+fn simulate_args_on(chain_id: &str, classic_base: Option<&str>) -> StellarPayArgs {
+    StellarPayArgs {
+        chain_id: chain_id.to_owned(),
         source: SOURCE_G.to_owned(),
         destination: DEST_G.to_owned(),
         amount: Some(serde_json::from_str(r#""10 XLM""#).unwrap()),
@@ -548,18 +560,133 @@ async fn simulate_allowed_on_mainnet_profile() {
         memo_id: None,
         memo_hash_hex: None,
         memo_return_hex: None,
-        classic_base: None,
-    };
-    let result = server.call_stellar_pay(args).await;
-    match result {
-        Err(err) => {
-            let msg = err.to_string();
-            assert!(
-                !msg.contains("policy.engine_required"),
-                "simulate must NOT be refused by policy gate on mainnet, got: {msg}"
-            );
-        }
-        Ok(_) => { /* passed to network layer; acceptable */ }
+        classic_base: classic_base.map(str::to_owned),
+    }
+}
+
+/// A simulate whose endpoint serves another network is refused before any
+/// read, with the fixed fee and with the automatic fee, as an `is_error`
+/// envelope rather than a protocol error.
+///
+/// The endpoint answers the account reads and the fee statistics, so a check
+/// placed after any of them would leave that read in the trace.
+#[tokio::test]
+#[serial]
+async fn simulate_refuses_an_endpoint_serving_another_network_before_any_read() {
+    for classic_base in [None, Some("auto")] {
+        let _data_root = crate::common::isolated_data_root();
+        keyring_mock::install().expect("mock keyring store init");
+        install_test_nonce_key(14);
+        let network =
+            crate::common::EndpointNetwork::reporting(crate::common::FUTURENET_PASSPHRASE);
+        let endpoint = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                crate::common::TimeoutRpc::new(vec![(
+                    account_ledger_key_xdr(SOURCE_G),
+                    account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000_000),
+                )])
+                .with_network(network),
+            )
+            .mount(&endpoint)
+            .await;
+        let server = WalletServer::new(testnet_profile_with_rpc(&endpoint.uri()))
+            .expect("WalletServer::new");
+
+        let (result, built) = crate::common::clients_built_by(
+            server.call_stellar_pay(simulate_args_on("stellar:testnet", classic_base)),
+        )
+        .await;
+        let result = result.expect("the refusal is a tool result, not a protocol error");
+        let (code, _message, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(
+            code, "network.endpoint_network_mismatch",
+            "fee {classic_base:?}: {text}"
+        );
+        assert_eq!(
+            crate::common::received_methods(&endpoint).await,
+            ["getNetwork"],
+            "fee {classic_base:?}: the endpoint check precedes every read"
+        );
+        assert_eq!(
+            built, 1,
+            "fee {classic_base:?}: one client for the simulate"
+        );
+    }
+}
+
+/// A simulate on a mainnet profile whose endpoint reports mainnet is refused
+/// with `network.mainnet_write_forbidden` before any read, as an `is_error`
+/// envelope: the simulate step reads the values its commit signs.
+#[tokio::test]
+#[serial]
+async fn simulate_refuses_an_endpoint_reporting_mainnet() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    let endpoint = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            crate::common::TimeoutRpc::new(vec![(
+                account_ledger_key_xdr(SOURCE_G),
+                account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000_000),
+            )])
+            .with_network(crate::common::EndpointNetwork::reporting(
+                stellar_agent_test_support::signed_envelope::MAINNET_PASSPHRASE,
+            )),
+        )
+        .mount(&endpoint)
+        .await;
+    let server =
+        WalletServer::new(mainnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+
+    let result = server
+        .call_stellar_pay(simulate_args_on("stellar:mainnet", None))
+        .await
+        .expect("the refusal is a tool result, not a protocol error");
+    let (code, _message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "network.mainnet_write_forbidden", "{text}");
+    assert_eq!(
+        crate::common::received_methods(&endpoint).await,
+        ["getNetwork"],
+        "the endpoint check precedes every read"
+    );
+}
+
+/// An endpoint refusal precedes the simulate's own post-read validations: a
+/// `chain_id` that does not match the profile, which otherwise ends in an
+/// `invalid_params` protocol error, and a fee above the profile's cap.
+#[tokio::test]
+#[serial]
+async fn simulate_endpoint_refusal_precedes_the_chain_and_fee_checks() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    let endpoint = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            crate::common::TimeoutRpc::new(vec![(
+                account_ledger_key_xdr(SOURCE_G),
+                account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000_000),
+            )])
+            .with_network(crate::common::EndpointNetwork::reporting(
+                crate::common::FUTURENET_PASSPHRASE,
+            )),
+        )
+        .mount(&endpoint)
+        .await;
+    let mut profile = testnet_profile_with_rpc(&endpoint.uri());
+    profile.classic_max_fee_per_op_stroops = Some(100);
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    for args in [
+        simulate_args_on("stellar:mainnet", None),
+        simulate_args_on("stellar:testnet", Some("500")),
+    ] {
+        let result = server
+            .call_stellar_pay(args)
+            .await
+            .expect("the endpoint refusal is a tool result, not a protocol error");
+        let (code, _message, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, "network.endpoint_network_mismatch", "{text}");
     }
 }
 
@@ -586,16 +713,7 @@ async fn simulate_rejects_native_payment_on_insufficient_balance() {
     let key_xdr = account_ledger_key_xdr(SOURCE_G);
 
     Mock::given(method("POST"))
-        .respond_with(EchoIdResponder::new(serde_json::json!({
-            "entries": [
-                {
-                    "key": key_xdr,
-                    "xdr": account_xdr,
-                    "lastModifiedLedgerSeq": 1000
-                }
-            ],
-            "latestLedger": 1001
-        })))
+        .respond_with(crate::common::TimeoutRpc::new(vec![(key_xdr, account_xdr)]))
         .mount(&mock_server)
         .await;
 
@@ -1267,7 +1385,8 @@ async fn policy_v1_engine_explicit_deny_emits_wire_code() {
 async fn commit_returns_nonce_expired_on_bad_nonce() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
-    let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
+    let endpoint = funded_accounts_endpoint().await;
+    let profile = testnet_profile_with_rpc(&endpoint.uri());
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     let args = StellarPayCommitArgs {
@@ -1306,7 +1425,8 @@ async fn commit_returns_nonce_expired_on_bad_nonce() {
 async fn commit_returns_nonce_expired_on_wrong_length_nonce() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
-    let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
+    let endpoint = funded_accounts_endpoint().await;
+    let profile = testnet_profile_with_rpc(&endpoint.uri());
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     use base64::Engine;
@@ -1365,9 +1485,10 @@ async fn commit_returns_nonce_expired_on_wrong_length_nonce() {
 ///   8. divergence check
 ///   9. HMAC
 ///
-/// This test exercises path up to step 7/8 by using a mock RPC that fails
-/// at step 7 (account not found), meaning the divergence check is NOT reached
-/// here — the test confirms we at least pass validation and reach the RPC.
+/// This test exercises the path up to step 7/8. Its mock RPC passes the
+/// endpoint check and then answers the account fetch with a JSON-RPC error,
+/// so the divergence check is NOT reached here. The test confirms the commit
+/// passes validation and the endpoint check and fails on the account fetch.
 #[tokio::test]
 #[serial]
 async fn commit_handles_rpc_error_during_rebuild() {
@@ -1376,11 +1497,24 @@ async fn commit_handles_rpc_error_during_rebuild() {
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "error": { "code": -32600, "message": "account not found" }
-        })))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).unwrap_or(serde_json::json!({}));
+            let reply = if body["method"] == "getNetwork" {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": crate::common::EndpointNetwork::testnet().result(),
+                })
+            } else {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "error": { "code": -32600, "message": "account not found" }
+                })
+            };
+            ResponseTemplate::new(200).set_body_json(reply)
+        })
         .mount(&mock_server)
         .await;
 
@@ -1410,37 +1544,22 @@ async fn commit_handles_rpc_error_during_rebuild() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let result = server.call_stellar_pay_commit(args).await;
-    // The mock returns an RPC error so the account fetch fails before divergence.
-    // Expect a tool-level error (is_error=true), NOT a policy/strkey/asset error.
-    match result {
-        Ok(tool_result) => {
-            assert_eq!(
-                tool_result.is_error,
-                Some(true),
-                "RPC error during rebuild must produce is_error=true"
-            );
-            let json_str = tool_result
-                .content
-                .first()
-                .and_then(|c| c.as_text())
-                .map(|t| t.text.as_str())
-                .unwrap_or("");
-            assert!(
-                !json_str.contains("policy.engine_required"),
-                "must not be policy gate error, got: {json_str}"
-            );
-        }
-        Err(err) => {
-            let msg = err.to_string();
-            assert!(
-                !msg.contains("policy.engine_required")
-                    && !msg.contains("invalid source")
-                    && !msg.contains("invalid destination"),
-                "error must come from RPC layer, not input validation, got: {msg}"
-            );
-        }
-    }
+    let result = server
+        .call_stellar_pay_commit(args)
+        .await
+        .expect("the account-fetch failure is a tool result, not a protocol error");
+    // The endpoint check passes; the account fetch then fails before
+    // divergence, as the account fetch's own refusal.
+    let (code, _message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "network.rpc_unreachable",
+        "the RPC error during the rebuild's account fetch must surface: {text}"
+    );
+    assert_eq!(
+        crate::common::received_methods(&mock_server).await,
+        ["getNetwork", "getLedgerEntries"],
+        "the account fetch follows the endpoint check and ends the commit"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1458,7 +1577,8 @@ async fn commit_handles_rpc_error_during_rebuild() {
 async fn indistinguishability_expired_and_parse_fail_produce_same_wire_code() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
-    let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
+    let endpoint = funded_accounts_endpoint().await;
+    let profile = testnet_profile_with_rpc(&endpoint.uri());
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     // Path A: bad base64
@@ -2006,7 +2126,19 @@ async fn pay_commit_high_value_cross_check_passes_on_match() {
         approval_attestation: None,
     };
 
-    let result = server.call_stellar_pay_commit(args).await;
+    let (result, built) =
+        crate::common::clients_built_by(server.call_stellar_pay_commit(args)).await;
+    // The commit's own client, and one oracle client for the one rebuild
+    // attempt a matching oracle needs.
+    assert_eq!(built, 2, "the commit client and one oracle rebuild client");
+    assert_eq!(
+        crate::common::received_methods(&primary_mock)
+            .await
+            .first()
+            .map(String::as_str),
+        Some("getNetwork"),
+        "the commit checks its endpoint before its first read"
+    );
     // Cross-check must pass (envelopes match).  The zero-byte nonce will fail
     // at HMAC verification → `nonce.expired`, NOT `simulation.divergence`.
     match result {
@@ -3419,16 +3551,20 @@ async fn commit_once(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `stellar_pay_commit` refuses with `network.endpoint_network_mismatch` when
-/// the endpoint serves a network other than the profile's, and the nonce it
-/// was handed survives that refusal.
+/// the endpoint serves a network other than the profile's, before any other
+/// request, and the nonce it was handed survives that refusal.
+///
+/// The simulate runs while the endpoint reports testnet, since the simulate
+/// checks the endpoint too. The endpoint then reports a third network for the
+/// refused commit, whose only request is the endpoint check.
 ///
 /// The survival proof is the second commit: the endpoint's reported identity
-/// is swapped to the profile's network and the SAME nonce is committed again,
-/// which submits. A nonce recorded in the replay window by the first call
-/// would instead return `nonce.replayed` there. Repeating the refused call and
-/// asserting the mismatch code again would discriminate nothing, because the
-/// probe precedes the nonce gate and answers identically whether or not the
-/// nonce was consumed.
+/// is swapped back to the profile's network and the SAME nonce is committed
+/// again, which submits. A nonce recorded in the replay window by the first
+/// call would instead return `nonce.replayed` there. Repeating the refused
+/// call and asserting the mismatch code again would discriminate nothing,
+/// because the check precedes the nonce gate and answers identically whether
+/// or not the nonce was consumed.
 #[tokio::test]
 #[serial]
 async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
@@ -3446,9 +3582,8 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
 
-    // The endpoint starts out serving a third network while the profile below
-    // declares testnet.
-    let network = crate::common::EndpointNetwork::reporting(crate::common::FUTURENET_PASSPHRASE);
+    // The endpoint serves the profile's testnet for the simulate.
+    let network = crate::common::EndpointNetwork::testnet();
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(PaySubmitSuccessRpcResponder {
@@ -3522,6 +3657,8 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
     };
 
     // ── Commit against the wrong network ───────────────────────────────────
+    network.set(crate::common::FUTURENET_PASSPHRASE);
+    let before_commit = crate::common::received_methods(&mock_server).await.len();
     let refused = server
         .call_stellar_pay_commit(commit_args.clone())
         .await
@@ -3531,6 +3668,11 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         code, "network.endpoint_network_mismatch",
         "a commit whose endpoint serves a different network must carry the \
          mismatch code, got: {code}"
+    );
+    assert_eq!(
+        crate::common::received_methods(&mock_server).await[before_commit..],
+        ["getNetwork"],
+        "the refused commit's endpoint check is its first and only request"
     );
 
     // ── Commit again once the endpoint serves the profile's network ────────
@@ -4316,10 +4458,14 @@ async fn transaction_status_releases_a_submission_the_chain_never_took() {
 /// That is what a sibling process does: this server's gate read the window,
 /// found room, and built and signed a transaction; the other caller reserved
 /// before this one did. The write lands on the endpoint round trip the submit
-/// path makes after the gate and before it takes its own reservation.
+/// path makes after the gate and before it takes its own reservation. That is
+/// the second `getNetwork` of the commit; the first is the commit's own
+/// endpoint check ahead of the gate.
 struct CompetingReservationResponder {
     inner: PaySubmitSuccessRpcResponder,
     armed: Arc<std::sync::atomic::AtomicBool>,
+    /// `getNetwork` calls seen while armed.
+    network_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// Endpoint calls seen while armed, in order, for the failure message.
     seen: Arc<std::sync::Mutex<Vec<String>>>,
     injected: Arc<std::sync::atomic::AtomicBool>,
@@ -4387,12 +4533,16 @@ impl Respond for CompetingReservationResponder {
                 .lock()
                 .expect("method log")
                 .push(rpc_method.clone());
-            // The submit path opens with an endpoint identity probe. That
-            // probe is the first `getNetwork` of the commit: the gate's
-            // account reads come before it, and the signature-binding read and
-            // the reservation write come after, so writing here puts the
-            // competing reservation exactly in the window the change closes.
-            if rpc_method == "getNetwork" && !self.injected.swap(true, Ordering::SeqCst) {
+            // The commit opens with its endpoint check, ahead of the gate's
+            // account reads. The submit path then opens with its own check:
+            // the second `getNetwork` of the commit. The gate comes before
+            // that one, and the signature-binding read and the reservation
+            // write come after, so writing here puts the competing
+            // reservation exactly in the window the change closes.
+            if rpc_method == "getNetwork"
+                && self.network_calls.fetch_add(1, Ordering::SeqCst) == 1
+                && !self.injected.swap(true, Ordering::SeqCst)
+            {
                 self.write_competing_reservation();
             }
         }
@@ -4439,6 +4589,7 @@ async fn pay_commit_refused_at_the_reservation_reports_the_gate_code_and_sends_n
     let amount_stroops: i128 = 600_000_000;
 
     let armed = Arc::new(AtomicBool::new(false));
+    let network_calls = Arc::new(AtomicUsize::new(0));
     let injected = Arc::new(AtomicBool::new(false));
     let sends = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -4451,6 +4602,7 @@ async fn pay_commit_refused_at_the_reservation_reports_the_gate_code_and_sends_n
                 network: crate::common::EndpointNetwork::testnet(),
             },
             armed: Arc::clone(&armed),
+            network_calls: Arc::clone(&network_calls),
             seen: Arc::clone(&seen),
             injected: Arc::clone(&injected),
             sends: Arc::clone(&sends),
@@ -4562,4 +4714,371 @@ async fn pay_commit_refused_at_the_reservation_reports_the_gate_code_and_sends_n
         0,
         "a refused submission sends nothing; endpoint calls: {observed:?}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Endpoint identity: one check per call, ahead of every read, on one client
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Starts an endpoint for a full simulate and commit round trip of a payment
+/// from the account of `seed`, reporting what `network` reports, and seeds
+/// that account's key as the profile's signer.
+async fn round_trip_endpoint(
+    seed: [u8; 32],
+    network: crate::common::EndpointNetwork,
+) -> MockServer {
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            crate::common::TimeoutRpc::new(vec![(
+                account_ledger_key_xdr(&source_g),
+                account_entry_xdr_with_balance(&source_g, 100_000_000_000_000),
+            )])
+            .confirming_in(1005)
+            .with_network(network),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+/// The simulate's result data, from a successful `stellar_pay` call.
+fn simulated_commit_args(
+    sim: &rmcp::model::CallToolResult,
+    args: &StellarPayArgs,
+) -> StellarPayCommitArgs {
+    let sim_json = call_result_json(sim);
+    assert_ne!(
+        sim.is_error,
+        Some(true),
+        "simulate must succeed: {sim_json}"
+    );
+    let data = sim_json.get("data").expect("simulate carries data");
+    StellarPayCommitArgs {
+        chain_id: args.chain_id.clone(),
+        source: args.source.clone(),
+        destination: args.destination.clone(),
+        amount: args.amount.clone(),
+        amount_in_stroops: args.amount_in_stroops.clone(),
+        asset: args.asset.clone(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        nonce: data["nonce"].as_str().expect("nonce").to_owned(),
+        expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().expect("expires"),
+        envelope_xdr: data["envelope_xdr"].as_str().expect("envelope").to_owned(),
+        approval_nonce: None,
+        approval_attestation: None,
+    }
+}
+
+/// A simulate and its commit each build one client and check its endpoint
+/// first: one `getNetwork` at the simulate, and two at the commit, its own
+/// check and the submit layer's, three in all.
+///
+/// The profile's `Noop` engine keeps no window state, so the gate builds no
+/// reconcile client, and no oracle is configured, so neither the SEP-29
+/// secondary nor the oracle rebuild client is built.
+#[tokio::test]
+#[serial]
+async fn simulate_and_commit_each_check_the_endpoint_first_on_one_client() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(231);
+    let seed = [0x56_u8; 32];
+    let endpoint = round_trip_endpoint(seed, crate::common::EndpointNetwork::testnet()).await;
+    let server =
+        WalletServer::new(testnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+    let args = pay_args(&gstrkey_for_seed(seed), "1000000000");
+
+    let (sim, simulate_clients) =
+        crate::common::clients_built_by(server.call_stellar_pay(args.clone())).await;
+    let sim = sim.expect("simulate must not error");
+    let commit_args = simulated_commit_args(&sim, &args);
+    let simulate_methods = crate::common::received_methods(&endpoint).await;
+
+    let (committed, commit_clients) =
+        crate::common::clients_built_by(server.call_stellar_pay_commit(commit_args)).await;
+    let committed = committed.expect("commit must not error");
+    let committed_json = call_result_json(&committed);
+    assert_ne!(committed.is_error, Some(true), "{committed_json}");
+    assert!(
+        committed_json["data"]["tx_hash"].as_str().is_some(),
+        "{committed_json}"
+    );
+
+    let all_methods = crate::common::received_methods(&endpoint).await;
+    let commit_methods = &all_methods[simulate_methods.len()..];
+    let network_checks = |methods: &[String]| {
+        methods
+            .iter()
+            .filter(|m| m.as_str() == "getNetwork")
+            .count()
+    };
+    assert_eq!(
+        simulate_methods.first().map(String::as_str),
+        Some("getNetwork")
+    );
+    assert_eq!(network_checks(&simulate_methods), 1, "{simulate_methods:?}");
+    assert_eq!(
+        commit_methods.first().map(String::as_str),
+        Some("getNetwork")
+    );
+    assert_eq!(network_checks(commit_methods), 2, "{commit_methods:?}");
+    assert_eq!(network_checks(&all_methods), 3, "{all_methods:?}");
+    assert_eq!(simulate_clients, 1, "the simulate reads through one client");
+    assert_eq!(
+        commit_clients, 1,
+        "the commit reads and sends through one client"
+    );
+}
+
+/// Under a V1 engine that keeps window state, the gate settles reservations
+/// on a reconcile client of its own, which reads but never sends. The
+/// simulate and the commit each build their own client and that one.
+#[tokio::test]
+#[serial]
+async fn the_gate_reconcile_client_is_the_only_other_client_a_v1_round_trip_builds() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(232);
+    let seed = [0x57_u8; 32];
+    let endpoint = round_trip_endpoint(seed, crate::common::EndpointNetwork::testnet()).await;
+    let mut server =
+        WalletServer::new(testnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+    let profile_name = server.profile_name_for_approval();
+    server.set_policy_engine_for_test(Arc::new(per_period_cap_engine(
+        &["stellar_pay", "stellar_pay_commit"],
+        &profile_name,
+        10_000_000_000,
+        "1d",
+    )));
+    let args = pay_args(&gstrkey_for_seed(seed), "1000000000");
+
+    let (sim, simulate_clients) =
+        crate::common::clients_built_by(server.call_stellar_pay(args.clone())).await;
+    let commit_args = simulated_commit_args(&sim.expect("simulate must not error"), &args);
+    let (committed, commit_clients) =
+        crate::common::clients_built_by(server.call_stellar_pay_commit(commit_args)).await;
+    let committed = committed.expect("commit must not error");
+    assert_ne!(
+        committed.is_error,
+        Some(true),
+        "{}",
+        call_result_text(&committed)
+    );
+
+    assert_eq!(
+        simulate_clients, 2,
+        "the simulate client and the gate's reconcile client"
+    );
+    assert_eq!(
+        commit_clients, 2,
+        "the commit client and the gate's reconcile client"
+    );
+}
+
+/// Runs `commit` against `endpoint` twice. While the endpoint reports testnet,
+/// the commit ends on `competing_code`. While it reports a third network, the
+/// endpoint refusal wins, and the commit's only request is the endpoint
+/// check.
+async fn assert_endpoint_refusal_precedes(
+    server: &WalletServer,
+    endpoint: &MockServer,
+    network: &crate::common::EndpointNetwork,
+    commit: StellarPayCommitArgs,
+    competing_code: &str,
+) {
+    network.set(stellar_agent_test_support::signed_envelope::TESTNET_PASSPHRASE);
+    let reached = server
+        .call_stellar_pay_commit(commit.clone())
+        .await
+        .expect("the competing refusal is a tool result");
+    let (code, _message, text) = crate::common::assert_business_envelope(&reached);
+    assert_eq!(
+        code, competing_code,
+        "the commit reaches the competing refusal: {text}"
+    );
+
+    network.set(crate::common::FUTURENET_PASSPHRASE);
+    let before = crate::common::received_methods(endpoint).await.len();
+    let refused = server
+        .call_stellar_pay_commit(commit)
+        .await
+        .expect("the endpoint refusal is a tool result");
+    let (code, _message, text) = crate::common::assert_business_envelope(&refused);
+    assert_eq!(
+        code, "network.endpoint_network_mismatch",
+        "the endpoint refusal precedes `{competing_code}`: {text}"
+    );
+    assert_eq!(
+        crate::common::received_methods(endpoint).await[before..],
+        ["getNetwork"],
+        "the endpoint refusal precedes `{competing_code}` and every read"
+    );
+}
+
+/// A commit with a valid envelope for `SOURCE_G` and a nonce that never
+/// verifies.
+fn unverifiable_commit() -> StellarPayCommitArgs {
+    use base64::Engine;
+    StellarPayCommitArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: SOURCE_G.to_owned(),
+        destination: DEST_G.to_owned(),
+        amount: Some(serde_json::from_str(r#""10 XLM""#).unwrap()),
+        amount_in_stroops: None,
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        nonce: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 48]),
+        expires_at_unix_ms: 3_000_000_000_000,
+        envelope_xdr: valid_payment_envelope_b64(),
+        approval_nonce: None,
+        approval_attestation: None,
+    }
+}
+
+/// The isolation and the local endpoint a commit precedence test needs: the
+/// endpoint answers for `SOURCE_G` at sequence 100 and reports what the
+/// returned `EndpointNetwork` reports.
+async fn precedence_endpoint() -> (
+    crate::common::IsolatedDataRoot,
+    MockServer,
+    crate::common::EndpointNetwork,
+) {
+    let data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(233);
+    let network = crate::common::EndpointNetwork::testnet();
+    let endpoint = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            crate::common::TimeoutRpc::new(vec![(
+                account_ledger_key_xdr(SOURCE_G),
+                account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
+            )])
+            .with_network(network.clone()),
+        )
+        .mount(&endpoint)
+        .await;
+    (data_root, endpoint, network)
+}
+
+/// An endpoint refusal precedes a policy denial on the commit.
+#[tokio::test]
+#[serial]
+async fn commit_endpoint_refusal_precedes_a_policy_denial() {
+    let (_data_root, endpoint, network) = precedence_endpoint().await;
+    let server =
+        testnet_server_with_engine_and_rpc(MockPolicyEngine::deny_explicit_rule(), &endpoint.uri());
+    let deny_code = format!("policy.deny.{}", DenyReason::ExplicitRuleDeny.code());
+    assert_endpoint_refusal_precedes(
+        &server,
+        &endpoint,
+        &network,
+        unverifiable_commit(),
+        &deny_code,
+    )
+    .await;
+}
+
+/// An endpoint refusal precedes an approval refusal on the commit.
+#[tokio::test]
+#[serial]
+async fn commit_endpoint_refusal_precedes_an_approval_refusal() {
+    let (_data_root, endpoint, network) = precedence_endpoint().await;
+    let server =
+        testnet_server_with_engine_and_rpc(MockPolicyEngine::require_approval(), &endpoint.uri());
+    assert_endpoint_refusal_precedes(
+        &server,
+        &endpoint,
+        &network,
+        unverifiable_commit(),
+        "policy.approval_required",
+    )
+    .await;
+}
+
+/// An endpoint refusal precedes a rebuild divergence on the commit. The
+/// caller's amount differs from the envelope's, so the rebuild from the
+/// caller's fields diverges from the presented envelope.
+#[tokio::test]
+#[serial]
+async fn commit_endpoint_refusal_precedes_a_rebuild_divergence() {
+    let (_data_root, endpoint, network) = precedence_endpoint().await;
+    let server =
+        WalletServer::new(testnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+    let mut divergent = unverifiable_commit();
+    divergent.amount = Some(serde_json::from_str(r#""5 XLM""#).unwrap());
+    assert_endpoint_refusal_precedes(
+        &server,
+        &endpoint,
+        &network,
+        divergent,
+        "simulation.divergence",
+    )
+    .await;
+}
+
+/// An endpoint refusal precedes a malformed nonce on the commit.
+#[tokio::test]
+#[serial]
+async fn commit_endpoint_refusal_precedes_a_malformed_nonce() {
+    let (_data_root, endpoint, network) = precedence_endpoint().await;
+    let server =
+        WalletServer::new(testnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+    let mut malformed = unverifiable_commit();
+    malformed.nonce = "!!invalid-base64!!".to_owned();
+    assert_endpoint_refusal_precedes(&server, &endpoint, &network, malformed, "nonce.expired")
+        .await;
+}
+
+/// An endpoint refusal precedes the audit pre-flight's refusal on a commit
+/// whose profile has no audit chain-root key.
+#[tokio::test]
+#[serial]
+async fn commit_endpoint_refusal_precedes_the_audit_preflight() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(234);
+    let network = crate::common::EndpointNetwork::testnet();
+    let endpoint = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            crate::common::TimeoutRpc::new(vec![(
+                account_ledger_key_xdr(SOURCE_G),
+                account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
+            )])
+            .with_network(network.clone()),
+        )
+        .mount(&endpoint)
+        .await;
+    let mut profile = Profile::builder_testnet(
+        "svc-endpoint-audit",
+        "acct-endpoint-audit",
+        "n-svc",
+        "n-acct",
+    )
+    .with_noop_engine()
+    .build();
+    profile.rpc_url = endpoint.uri();
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    assert_endpoint_refusal_precedes(
+        &server,
+        &endpoint,
+        &network,
+        unverifiable_commit(),
+        "audit.chain_key_unavailable",
+    )
+    .await;
 }

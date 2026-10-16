@@ -72,9 +72,13 @@ this alpha.
 Before it sends, the submit layer asks the RPC endpoint which network it serves
 and which protocol it runs, and binds the submission to that answer, not to the
 declared network or `chain_id`. It then verifies every signature on the envelope
-against the network the endpoint reports. On the two-phase commit tools this
-runs before the single-use nonce is burned, so a refusal here leaves the nonce
-usable.
+against the network the endpoint reports. The classic payment, sponsored
+account creation, trustline, claim, and pool paths ask the same question
+earlier, before their first read. They ask on the client that sends, and the
+MCP simulate tools ask on their own client. The pay, create-account, trustline,
+and claim commit tools ask it before the single-use nonce is burned, so a
+refusal at that check leaves the nonce usable. A refusal by the submit layer's
+own check comes after the nonce is consumed.
 
 | Code | Meaning | Agent action |
 |---|---|---|

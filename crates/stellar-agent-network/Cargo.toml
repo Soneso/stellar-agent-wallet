@@ -22,9 +22,11 @@ test-loopback = []
 
 # Exposes `keyring::PANIC_AFTER_LOAD` and `keyring::DROP_COUNTER` for integration
 # tests that exercise the panic-injection path inside
-# `sign_payload_verifying_pubkey`. These `pub` statics are gated on this feature
-# and never included in non-test builds. Enable only in `[dev-dependencies]` or
-# via `cargo test --features test-hooks`.
+# `sign_payload_verifying_pubkey`, and `client::constructions_on_this_thread`,
+# the per-thread count of `StellarRpcClient` constructions that shows whether a
+# command reads and sends through one client. These items are gated on this
+# feature and never included in non-test builds. Enable only in
+# `[dev-dependencies]` or via `cargo test --features test-hooks`.
 test-hooks = []
 
 # Exposes test-only public helpers (e.g. `cache::read_cache_entry`,

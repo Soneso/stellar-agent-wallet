@@ -13,10 +13,10 @@
 //!    contains `envelope_xdr`, `nonce`, `expires_at_unix_ms`, `simulation`.
 //! 2. Invalid source G-strkey — returns `invalid_params`.
 //! 3. Invalid destination G-strkey — returns `invalid_params`.
-//! 4. `chain_id` mismatch — returns `invalid_params`.
-//! 5. Policy gate (mainnet profile + simulate step) — simulate is NOT
-//!    destructive so it is ALLOWED even on mainnet (confirm the mainnet
-//!    destructive-tool rule does not over-block).
+//! 4. `chain_id` mismatch: returns `invalid_params` once the endpoint check
+//!    and the source read pass.
+//! 5. An endpoint serving another network, or mainnet, refuses the simulate
+//!    before any read, as an `is_error` envelope.
 //!
 //! ## Commit step (`stellar_create_account_commit`)
 //!
@@ -90,19 +90,13 @@ fn testnet_profile_with_rpc(rpc_url: &str) -> Profile {
     p
 }
 
-/// Builds a mainnet profile with `engine = Noop`.
+/// Builds a mainnet profile with `engine = Noop` and a caller-supplied
+/// `rpc_url`.
 ///
-/// Used by the mainnet simulate test and by Property A. Because
-/// `PolicyEngineKind::default()` is `V1`, `Noop` is set explicitly so
-/// `WalletServer::new` succeeds without a signed policy file on disk.
-fn mainnet_profile() -> Profile {
-    mainnet_profile_with_rpc("https://rpc.example.invalid")
-}
-
-/// `mainnet_profile` with a caller-supplied `rpc_url`.
-///
-/// Property A points `rpc_url` at a local wiremock server and asserts that the
-/// commit refusal sends it no request.
+/// Because `PolicyEngineKind::default()` is `V1`, `Noop` is set explicitly so
+/// `WalletServer::new` succeeds without a signed policy file on disk. The
+/// mainnet simulate test and Property A point `rpc_url` at a local wiremock
+/// server and assert which requests it receives.
 fn mainnet_profile_with_rpc(rpc_url: &str) -> Profile {
     Profile::builder_mainnet(rpc_url, "svc", "acct", "n-svc", "n-acct")
         .with_noop_engine()
@@ -140,6 +134,7 @@ impl Respond for CreateAccountFeeRpcResponder {
             .unwrap_or("");
 
         let result = match method {
+            "getNetwork" => crate::common::EndpointNetwork::testnet().result(),
             "getFeeStats" => (*self.fee_stats).clone(),
             "getLedgerEntries" => {
                 let body = String::from_utf8_lossy(&request.body);
@@ -170,6 +165,24 @@ impl Respond for CreateAccountFeeRpcResponder {
             }))
             .insert_header("content-type", "application/json")
     }
+}
+
+/// Starts a local endpoint that reports what `network` reports and answers
+/// for the funded `SOURCE_G` account. A call passes the endpoint check and
+/// the source read and reaches the step a test is about.
+async fn funded_source_endpoint(network: crate::common::EndpointNetwork) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            crate::common::TimeoutRpc::new(vec![(
+                account_ledger_key_xdr(SOURCE_G),
+                account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
+            )])
+            .with_network(network),
+        )
+        .mount(&server)
+        .await;
+    server
 }
 
 fn fee_stat_json(p95: &str, p99: &str) -> serde_json::Value {
@@ -347,7 +360,8 @@ async fn simulate_rejects_invalid_destination_strkey() {
 async fn simulate_rejects_chain_id_mismatch() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
-    let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
+    let endpoint = funded_source_endpoint(crate::common::EndpointNetwork::testnet()).await;
+    let profile = testnet_profile_with_rpc(&endpoint.uri());
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     let args = StellarCreateAccountArgs {
@@ -364,52 +378,88 @@ async fn simulate_rejects_chain_id_mismatch() {
         err.to_string().contains("chain_id mismatch"),
         "error must mention chain_id mismatch, got: {err}"
     );
+    assert_eq!(
+        crate::common::received_methods(&endpoint).await,
+        ["getNetwork", "getLedgerEntries"],
+        "the chain check runs after the endpoint check and the source read"
+    );
 }
 
-/// Simulate step with a mainnet profile is ALLOWED (simulate is NOT destructive).
-///
-/// Only tools with `destructive_hint = true` are refused on mainnet.  The
-/// simulate step has `destructive_hint = false`.
-#[tokio::test]
-#[serial]
-async fn simulate_allowed_on_mainnet_profile() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().expect("mock keyring store init");
-    // Mainnet profile — chain_id = stellar:mainnet
-    let mut profile = mainnet_profile();
-    // Override chain_id argument to match the mainnet profile so we can reach
-    // the RPC call (which will fail because there is no live RPC).
-    profile.rpc_url = "https://soroban-testnet.stellar.org".to_owned(); // won't actually connect
-
-    let server = WalletServer::new(profile).expect("WalletServer::new");
-
-    let args = StellarCreateAccountArgs {
-        chain_id: "stellar:mainnet".to_owned(),
+/// The simulate arguments for a 1 XLM account creation by `SOURCE_G` on
+/// `chain_id`, with `classic_base` as the fee choice.
+fn simulate_args_on(chain_id: &str, classic_base: Option<&str>) -> StellarCreateAccountArgs {
+    StellarCreateAccountArgs {
+        chain_id: chain_id.to_owned(),
         source: SOURCE_G.to_owned(),
         destination: DEST_G.to_owned(),
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
-        classic_base: None,
-    };
-    // The policy gate should NOT block this (simulate is not destructive).
-    // The call will fail at the RPC step (network unreachable), but it should
-    // NOT fail with policy.engine_required.
-    let result = server.call_stellar_create_account(args).await;
-    // Either Ok (unlikely without network) or a tool-level Err (is_error=true)
-    // from the RPC step.  Either way, NOT a JSON-RPC Err from policy gate.
-    match result {
-        Err(err) => {
-            // The only acceptable Err from here is a raw JSON-RPC error.
-            // It must NOT be policy.engine_required.
-            let msg = err.to_string();
-            assert!(
-                !msg.contains("policy.engine_required"),
-                "simulate must NOT be refused by policy gate on mainnet, got: {msg}"
-            );
-        }
-        Ok(_) => {
-            // Passed all the way to network (unexpected in unit test but not wrong).
-        }
+        classic_base: classic_base.map(str::to_owned),
     }
+}
+
+/// A simulate whose endpoint serves another network is refused before any
+/// read, with the fixed fee and with the automatic fee, as an `is_error`
+/// envelope rather than a protocol error. A `chain_id` that does not match
+/// the profile, which otherwise ends in an `invalid_params` protocol error
+/// after the source read, is refused the same way.
+#[tokio::test]
+#[serial]
+async fn simulate_refuses_an_endpoint_serving_another_network_before_any_read() {
+    for args in [
+        simulate_args_on("stellar:testnet", None),
+        simulate_args_on("stellar:testnet", Some("auto")),
+        simulate_args_on("stellar:mainnet", None),
+    ] {
+        let _data_root = crate::common::isolated_data_root();
+        keyring_mock::install().expect("mock keyring store init");
+        let endpoint = funded_source_endpoint(crate::common::EndpointNetwork::reporting(
+            crate::common::FUTURENET_PASSPHRASE,
+        ))
+        .await;
+        let server = WalletServer::new(testnet_profile_with_rpc(&endpoint.uri()))
+            .expect("WalletServer::new");
+        let label = format!("{} fee {:?}", args.chain_id, args.classic_base);
+
+        let (result, built) =
+            crate::common::clients_built_by(server.call_stellar_create_account(args)).await;
+        let result = result.expect("the refusal is a tool result, not a protocol error");
+        let (code, _message, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, "network.endpoint_network_mismatch", "{label}: {text}");
+        assert_eq!(
+            crate::common::received_methods(&endpoint).await,
+            ["getNetwork"],
+            "{label}: the endpoint check precedes every read"
+        );
+        assert_eq!(built, 1, "{label}: one client for the simulate");
+    }
+}
+
+/// A simulate on a mainnet profile whose endpoint reports mainnet is refused
+/// with `network.mainnet_write_forbidden` before any read, as an `is_error`
+/// envelope: the simulate step reads the values its commit signs.
+#[tokio::test]
+#[serial]
+async fn simulate_refuses_an_endpoint_reporting_mainnet() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    let endpoint = funded_source_endpoint(crate::common::EndpointNetwork::reporting(
+        stellar_agent_test_support::signed_envelope::MAINNET_PASSPHRASE,
+    ))
+    .await;
+    let server =
+        WalletServer::new(mainnet_profile_with_rpc(&endpoint.uri())).expect("WalletServer::new");
+
+    let result = server
+        .call_stellar_create_account(simulate_args_on("stellar:mainnet", None))
+        .await
+        .expect("the refusal is a tool result, not a protocol error");
+    let (code, _message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "network.mainnet_write_forbidden", "{text}");
+    assert_eq!(
+        crate::common::received_methods(&endpoint).await,
+        ["getNetwork"],
+        "the endpoint check precedes every read"
+    );
 }
 
 #[tokio::test]
@@ -772,7 +822,8 @@ async fn policy_v1_engine_explicit_deny_emits_wire_code() {
 async fn commit_returns_nonce_expired_on_bad_nonce() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
-    let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
+    let endpoint = funded_source_endpoint(crate::common::EndpointNetwork::testnet()).await;
+    let profile = testnet_profile_with_rpc(&endpoint.uri());
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     // Supply valid CreateAccount XDR so the re-derivation step succeeds
@@ -806,7 +857,8 @@ async fn commit_returns_nonce_expired_on_bad_nonce() {
 async fn commit_returns_nonce_expired_on_wrong_length_nonce() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
-    let profile = testnet_profile_with_rpc("https://soroban-testnet.stellar.org");
+    let endpoint = funded_source_endpoint(crate::common::EndpointNetwork::testnet()).await;
+    let profile = testnet_profile_with_rpc(&endpoint.uri());
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     // 20 bytes of base64 decodes to fewer than 48 bytes.
@@ -1044,132 +1096,73 @@ async fn nonce_mint_hmac_mismatch_via_corrupted_nonce() {
 // Commit step: envelope divergence
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Commit step handles RPC error during envelope re-build gracefully.
+/// An RPC error during the commit's rebuild ends the commit as the account
+/// fetch's own refusal, and nothing is sent.
 ///
-/// The mock RPC returns an "account not found" error so `fetch_account` fails
-/// before the divergence check runs.  This test exercises the "RPC error during
-/// commit re-build" error path, not the divergence path.
-///
-/// The genuine `simulation.divergence` path requires a valid `AccountEntry`
-/// XDR fixture so `fetch_account` succeeds and the handler can re-build an
-/// envelope that differs from the presented one.
-///
-/// This test verifies:
-/// - The commit handler returns a tool-level error (not a panic) when the
-///   RPC call during re-build returns an error.
-/// - The response does NOT contain a `tx_hash` (no transaction was submitted).
+/// The endpoint reports testnet and answers every other method with a
+/// JSON-RPC error. The commit carries a valid create-account envelope, so it
+/// passes the decode and the endpoint check. Its source read then fails.
 #[tokio::test]
 #[serial]
 async fn commit_handles_rpc_error_during_rebuild() {
     let _data_root = crate::common::isolated_data_root();
     keyring_mock::install().expect("mock keyring store init");
 
-    // A mock RPC server that handles getLedgerEntries.
     let mock_server = MockServer::start().await;
-    let profile = testnet_profile_with_rpc(&mock_server.uri());
-    helpers::setup_nonce_key(&profile, 3);
-    let server = WalletServer::new(profile.clone()).expect("WalletServer::new");
-
-    // We need to mint a nonce for a fake envelope (since the divergence check
-    // compares the re-built envelope against what we present, and the handler
-    // will re-build using the current source account state from the mock RPC).
-    // The simulate step would also call the mock RPC, so here we skip it and
-    // construct the nonce directly with a placeholder envelope.
-    let mint = helpers::mint_for(&profile);
-
-    // Use a fixed timestamp rather than the SystemTime::now() pattern.
-    // This test calls server.call_stellar_create_account_commit, which reads
-    // the real clock internally via now_unix_ms().  We need expiry_ms to be
-    // in the real future so the commit handler does not reject the nonce as
-    // expired.  3_000_000_000_000 ms = 2065-01-24 (far future, stable).
-    // TTL = 120_000ms is within [MIN, MAX].
-    let now_ms: u64 = 3_000_000_000_000;
-    let expiry_ms = now_ms + 120_000;
-    // Use a placeholder envelope_xdr that the handler won't re-build.
-    let mismatched_xdr = "MISMATCHED_BASE64==";
-
-    let nonce = mint
-        .mint(
-            &AnyTool,
-            mismatched_xdr.as_bytes(),
-            now_ms,
-            expiry_ms,
-            "stellar_create_account_commit",
-            "stellar:testnet",
-        )
-        .expect("mint");
-
-    // Mock the RPC server to return a well-funded account so fetch_account
-    // succeeds and re-build proceeds.  The re-built envelope will differ from
-    // `mismatched_xdr`, triggering the divergence check.
-    //
-    // The stellar-rpc-client sends JSON-RPC requests; we match all POST requests
-    // and return a failure response so fetch_account returns an error (which
-    // also surfaces as a tool-level error, not `simulation.divergence`).
-    // To reach the divergence check we need fetch_account to SUCCEED.
-    //
-    // Since constructing a valid AccountEntry XDR in a unit test without a full
-    // XDR encoder is expensive, we fall back to testing the divergence check at
-    // the nonce-verify level: when the envelope presented mismatches the one that
-    // was nonce-bound, the HMAC verify will fail (not divergence).
-    //
-    // The `simulation.divergence` path is tested end-to-end in the binary smoke
-    // test.  Here we document the coverage gap and verify that when the commit
-    // step DOES receive a valid nonce but a mismatched envelope_xdr, it at
-    // minimum does not panic and returns a tool error.
-    //
-    // This matches the honest test coverage disclosure model: unit tests cover
-    // what is feasible without XDR fixtures; smoke tests cover the rest.
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "error": {
-                "code": -32001,
-                "message": "account not found"
-            }
-        })))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).unwrap_or(serde_json::json!({}));
+            let reply = if body["method"] == "getNetwork" {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": crate::common::EndpointNetwork::testnet().result(),
+                })
+            } else {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "error": { "code": -32600, "message": "account not found" }
+                })
+            };
+            ResponseTemplate::new(200).set_body_json(reply)
+        })
         .mount(&mock_server)
         .await;
+
+    let profile = testnet_profile_with_rpc(&mock_server.uri());
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    // A validly encoded 48-byte nonce; the commit ends before it is parsed.
+    use base64::Engine;
+    let zero_nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 48]);
 
     let args = StellarCreateAccountCommitArgs {
         chain_id: "stellar:testnet".to_owned(),
         source: SOURCE_G.to_owned(),
         destination: DEST_G.to_owned(),
         starting_balance: serde_json::from_str(r#""1 XLM""#).unwrap(),
-        nonce: nonce.to_base64(),
-        expires_at_unix_ms: expiry_ms,
-        envelope_xdr: mismatched_xdr.to_owned(),
+        nonce: zero_nonce,
+        expires_at_unix_ms: 3_000_000_000_000,
+        envelope_xdr: valid_create_account_envelope_b64(),
         approval_nonce: None,
         approval_attestation: None,
     };
-
-    // With a mock RPC returning an error, fetch_account will fail and the
-    // handler will return a tool-level error (is_error=true), not a JSON-RPC error.
-    let result = server.call_stellar_create_account_commit(args).await;
-    // Must not panic; any result shape is acceptable here.
-    match result {
-        Ok(tool_result) => {
-            // If we get Ok, the tool result itself should have is_error=true
-            // OR contain a divergence or nonce error message.
-            // Just verify it doesn't silently succeed without a tx_hash.
-            let content = &tool_result.content;
-            if let Some(first) = content.first() {
-                let text = first.as_text().map(|t| t.text.as_str()).unwrap_or("");
-                // Should not contain a tx_hash if we supplied a mismatched envelope.
-                // (A mismatched envelope that somehow gets past all checks is a bug.)
-                assert!(
-                    !text.contains(r#""tx_hash""#),
-                    "commit with mismatched envelope must not return a tx_hash, got: {text}"
-                );
-            }
-        }
-        Err(err) => {
-            // JSON-RPC level error is also acceptable (e.g. from policy gate if
-            // the test environment changed).  Just verify no panic.
-            let _ = err.to_string();
-        }
-    }
+    let result = server
+        .call_stellar_create_account_commit(args)
+        .await
+        .expect("the account-fetch failure is a tool result, not a protocol error");
+    let (code, _message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "network.rpc_unreachable",
+        "the RPC error during the rebuild's account fetch must surface: {text}"
+    );
+    assert_eq!(
+        crate::common::received_methods(&mock_server).await,
+        ["getNetwork", "getLedgerEntries"],
+        "the account fetch follows the endpoint check and ends the commit"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1913,11 +1906,12 @@ async fn create_account_commit_full_round_trip_succeeds_with_string_encoded_amou
         starting_balance: serde_json::from_str(r#""100 XLM""#).expect("parse amount"),
         classic_base: None,
     };
-    let sim_result = server
-        .call_stellar_create_account(simulate_args.clone())
-        .await
-        .expect("simulate must not error");
+    let (sim_result, simulate_clients) =
+        crate::common::clients_built_by(server.call_stellar_create_account(simulate_args.clone()))
+            .await;
+    let sim_result = sim_result.expect("simulate must not error");
     assert_ne!(sim_result.is_error, Some(true), "simulate must succeed");
+    let simulate_methods = crate::common::received_methods(&mock_server).await;
     let sim_json = call_result_json(&sim_result);
     let sim_data = sim_json.get("data").expect("simulate success carries data");
 
@@ -1954,10 +1948,10 @@ async fn create_account_commit_full_round_trip_succeeds_with_string_encoded_amou
         approval_nonce: None,
         approval_attestation: None,
     };
-    let commit_result = server
-        .call_stellar_create_account_commit(commit_args)
-        .await
-        .expect("commit must not error");
+    let (commit_result, commit_clients) =
+        crate::common::clients_built_by(server.call_stellar_create_account_commit(commit_args))
+            .await;
+    let commit_result = commit_result.expect("commit must not error");
     let commit_json = call_result_json(&commit_result);
     assert_ne!(
         commit_result.is_error,
@@ -1980,6 +1974,34 @@ async fn create_account_commit_full_round_trip_succeeds_with_string_encoded_amou
             .and_then(serde_json::Value::as_u64),
         Some(1005),
         "committed response must carry the submitted ledger: {commit_data}"
+    );
+
+    // The simulate and the commit each check their endpoint before their
+    // first read, on the one client each builds; the submit layer checks the
+    // commit's client again. The `Noop` engine builds no reconcile client and
+    // no oracle is configured.
+    let all_methods = crate::common::received_methods(&mock_server).await;
+    let commit_methods = &all_methods[simulate_methods.len()..];
+    let network_checks = |methods: &[String]| {
+        methods
+            .iter()
+            .filter(|m| m.as_str() == "getNetwork")
+            .count()
+    };
+    assert_eq!(
+        simulate_methods.first().map(String::as_str),
+        Some("getNetwork")
+    );
+    assert_eq!(
+        commit_methods.first().map(String::as_str),
+        Some("getNetwork")
+    );
+    assert_eq!(network_checks(&simulate_methods), 1, "{simulate_methods:?}");
+    assert_eq!(network_checks(commit_methods), 2, "{commit_methods:?}");
+    assert_eq!(simulate_clients, 1, "the simulate reads through one client");
+    assert_eq!(
+        commit_clients, 1,
+        "the commit reads and sends through one client"
     );
 }
 
@@ -2251,16 +2273,20 @@ mod helpers {
 
 /// `stellar_create_account_commit` refuses with
 /// `network.endpoint_network_mismatch` when the endpoint serves a network
-/// other than the profile's, and the nonce it was handed survives that
-/// refusal.
+/// other than the profile's, before any other request, and the nonce it was
+/// handed survives that refusal.
+///
+/// The simulate runs while the endpoint reports testnet, since the simulate
+/// checks the endpoint too. The endpoint then reports a third network for the
+/// refused commit, whose only request is the endpoint check.
 ///
 /// The survival proof is the second commit: the endpoint's reported identity
-/// is swapped to the profile's network and the SAME nonce is committed again,
-/// which submits. A nonce recorded in the replay window by the first call
-/// would instead return `nonce.replayed` there. Repeating the refused call and
-/// asserting the mismatch code again would discriminate nothing, because the
-/// probe precedes the nonce gate and answers identically whether or not the
-/// nonce was consumed.
+/// is swapped back to the profile's network and the SAME nonce is committed
+/// again, which submits. A nonce recorded in the replay window by the first
+/// call would instead return `nonce.replayed` there. Repeating the refused
+/// call and asserting the mismatch code again would discriminate nothing,
+/// because the check precedes the nonce gate and answers identically whether
+/// or not the nonce was consumed.
 #[tokio::test]
 #[serial]
 async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
@@ -2278,9 +2304,8 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
 
-    // The endpoint starts out serving a third network while the profile below
-    // declares testnet.
-    let network = crate::common::EndpointNetwork::reporting(crate::common::FUTURENET_PASSPHRASE);
+    // The endpoint serves the profile's testnet for the simulate.
+    let network = crate::common::EndpointNetwork::testnet();
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(CreateAccountSubmitSuccessRpcResponder {
@@ -2342,6 +2367,8 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
     };
 
     // ── Commit against the wrong network ───────────────────────────────────
+    network.set(crate::common::FUTURENET_PASSPHRASE);
+    let before_commit = crate::common::received_methods(&mock_server).await.len();
     let refused = server
         .call_stellar_create_account_commit(commit_args.clone())
         .await
@@ -2351,6 +2378,11 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         code, "network.endpoint_network_mismatch",
         "a commit whose endpoint serves a different network must carry the \
          mismatch code, got: {code}"
+    );
+    assert_eq!(
+        crate::common::received_methods(&mock_server).await[before_commit..],
+        ["getNetwork"],
+        "the refused commit's endpoint check is its first and only request"
     );
 
     // ── Commit again once the endpoint serves the profile's network ────────

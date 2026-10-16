@@ -237,11 +237,11 @@ async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
         limit_stroops: Some("1000000000".to_owned()), // 100 USDC at 7 decimals
         classic_base: None,
     };
-    let sim_result = server
-        .call_stellar_trustline(simulate_args.clone())
-        .await
-        .expect("simulate must not error");
+    let (sim_result, simulate_clients) =
+        crate::common::clients_built_by(server.call_stellar_trustline(simulate_args.clone())).await;
+    let sim_result = sim_result.expect("simulate must not error");
     assert_ne!(sim_result.is_error, Some(true), "simulate must succeed");
+    let simulate_methods = crate::common::received_methods(&mock_server).await;
     let sim_json = call_result_json(&sim_result);
     let sim_data = sim_json.get("data").expect("simulate success carries data");
 
@@ -281,10 +281,9 @@ async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    let commit_result = server
-        .call_stellar_trustline_commit(commit_args)
-        .await
-        .expect("commit must not error");
+    let (commit_result, commit_clients) =
+        crate::common::clients_built_by(server.call_stellar_trustline_commit(commit_args)).await;
+    let commit_result = commit_result.expect("commit must not error");
     let commit_json = call_result_json(&commit_result);
     assert_ne!(
         commit_result.is_error,
@@ -307,6 +306,33 @@ async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
             .and_then(serde_json::Value::as_u64),
         Some(1005),
         "committed response must carry the submitted ledger: {commit_data}"
+    );
+
+    // The simulate and the commit each check their endpoint before their
+    // first read, on the one client each builds; the submit layer checks the
+    // commit's client again. The `Noop` engine builds no reconcile client.
+    let all_methods = crate::common::received_methods(&mock_server).await;
+    let commit_methods = &all_methods[simulate_methods.len()..];
+    let network_checks = |methods: &[String]| {
+        methods
+            .iter()
+            .filter(|m| m.as_str() == "getNetwork")
+            .count()
+    };
+    assert_eq!(
+        simulate_methods.first().map(String::as_str),
+        Some("getNetwork")
+    );
+    assert_eq!(
+        commit_methods.first().map(String::as_str),
+        Some("getNetwork")
+    );
+    assert_eq!(network_checks(&simulate_methods), 1, "{simulate_methods:?}");
+    assert_eq!(network_checks(commit_methods), 2, "{commit_methods:?}");
+    assert_eq!(simulate_clients, 1, "the simulate reads through one client");
+    assert_eq!(
+        commit_clients, 1,
+        "the commit reads and sends through one client"
     );
 }
 
@@ -558,16 +584,20 @@ async fn commit_rejects_invalid_from_strkey_before_any_rpc_call() {
 
 /// `stellar_trustline_commit` refuses with
 /// `network.endpoint_network_mismatch` when the endpoint serves a network
-/// other than the profile's, and the nonce it was handed survives that
-/// refusal.
+/// other than the profile's, before any other request, and the nonce it was
+/// handed survives that refusal.
+///
+/// The simulate runs while the endpoint reports testnet, since the simulate
+/// checks the endpoint too. The endpoint then reports a third network for the
+/// refused commit, whose only request is the endpoint check.
 ///
 /// The survival proof is the second commit: the endpoint's reported identity
-/// is swapped to the profile's network and the SAME nonce is committed again,
-/// which submits. A nonce recorded in the replay window by the first call
-/// would instead return `nonce.replayed` there. Repeating the refused call and
-/// asserting the mismatch code again would discriminate nothing, because the
-/// probe precedes the nonce gate and answers identically whether or not the
-/// nonce was consumed.
+/// is swapped back to the profile's network and the SAME nonce is committed
+/// again, which submits. A nonce recorded in the replay window by the first
+/// call would instead return `nonce.replayed` there. Repeating the refused
+/// call and asserting the mismatch code again would discriminate nothing,
+/// because the check precedes the nonce gate and answers identically whether
+/// or not the nonce was consumed.
 #[tokio::test]
 #[serial]
 async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
@@ -587,9 +617,8 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
     let issuer_key_xdr = account_ledger_key_xdr(USDC_TESTNET_ISSUER);
     let issuer_xdr = account_entry_xdr_with_balance(USDC_TESTNET_ISSUER, 100_000_000_000_000);
 
-    // The endpoint starts out serving a third network while the profile below
-    // declares testnet.
-    let network = crate::common::EndpointNetwork::reporting(crate::common::FUTURENET_PASSPHRASE);
+    // The endpoint serves the profile's testnet for the simulate.
+    let network = crate::common::EndpointNetwork::testnet();
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(TrustlineSubmitSuccessRpcResponder {
@@ -650,6 +679,8 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
     };
 
     // ── Commit against the wrong network ───────────────────────────────────
+    network.set(crate::common::FUTURENET_PASSPHRASE);
+    let before_commit = crate::common::received_methods(&mock_server).await.len();
     let refused = server
         .call_stellar_trustline_commit(commit_args.clone())
         .await
@@ -659,6 +690,11 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         code, "network.endpoint_network_mismatch",
         "a commit whose endpoint serves a different network must carry the \
          mismatch code, got: {code}"
+    );
+    assert_eq!(
+        crate::common::received_methods(&mock_server).await[before_commit..],
+        ["getNetwork"],
+        "the refused commit's endpoint check is its first and only request"
     );
 
     // ── Commit again once the endpoint serves the profile's network ────────
@@ -679,4 +715,60 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         committed_json["data"]["tx_hash"].as_str().is_some(),
         "the retry must report an on-chain tx_hash: {committed_json}"
     );
+}
+
+/// A simulate whose endpoint serves another network is refused before the
+/// issuer read and every later read, with the fixed fee and with the
+/// automatic fee. The refusal is an `is_error` envelope, not a protocol error.
+#[tokio::test]
+#[serial]
+async fn simulate_refuses_an_endpoint_serving_another_network_before_any_read() {
+    for classic_base in [None, Some("auto")] {
+        let _data_root = crate::common::isolated_data_root();
+        keyring_mock::install().expect("mock keyring store init");
+        let source_g = gstrkey_for_seed([0x59_u8; 32]);
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(TrustlineSubmitSuccessRpcResponder {
+                source_key_xdr: account_ledger_key_xdr(&source_g),
+                source_xdr: account_entry_xdr_with_balance(&source_g, 100_000_000_000_000),
+                issuer_key_xdr: account_ledger_key_xdr(USDC_TESTNET_ISSUER),
+                issuer_xdr: account_entry_xdr_with_balance(
+                    USDC_TESTNET_ISSUER,
+                    100_000_000_000_000,
+                ),
+                network: crate::common::EndpointNetwork::reporting(
+                    crate::common::FUTURENET_PASSPHRASE,
+                ),
+            })
+            .mount(&mock_server)
+            .await;
+        let server = WalletServer::new(testnet_profile_with_rpc(&mock_server.uri()))
+            .expect("WalletServer::new");
+
+        let (result, built) =
+            crate::common::clients_built_by(server.call_stellar_trustline(StellarTrustlineArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                from: source_g.clone(),
+                asset: "USDC".to_owned(),
+                limit_stroops: None,
+                classic_base: classic_base.map(str::to_owned),
+            }))
+            .await;
+        let result = result.expect("the refusal is a tool result, not a protocol error");
+        let (code, _message, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(
+            code, "network.endpoint_network_mismatch",
+            "fee {classic_base:?}: {text}"
+        );
+        assert_eq!(
+            crate::common::received_methods(&mock_server).await,
+            ["getNetwork"],
+            "fee {classic_base:?}: the endpoint check precedes every read"
+        );
+        assert_eq!(
+            built, 1,
+            "fee {classic_base:?}: one client for the simulate"
+        );
+    }
 }

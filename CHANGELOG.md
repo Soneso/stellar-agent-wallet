@@ -31,6 +31,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `SUCCESS` or `FAILED` status that arrives after the submission deadline is
   not accepted. The submission reports its timeout, and `tx status` settles the
   transaction hash.
+- `pay`, `claim`, sponsored `accounts create`, `trustline`, and `pool init`, and
+  the MCP commit tools for pay, create-account, trustline, and claim, check the
+  RPC endpoint on the client that sends. The check runs before the fee,
+  sequence, or claim entry they sign is read.
+- The MCP simulate tools for pay, create-account, trustline, and claim check
+  the endpoint before their first read and refuse an endpoint that reports
+  mainnet with `network.mainnet_write_forbidden`.
+- `pay` and `claim` `--build-only` and `--sign-only` refuse an endpoint that
+  fails the check when they read from it. A `--sign-only` envelope the command
+  cannot decode is signed without any request.
+- An endpoint that cannot be reached or identified refuses `pay`, `claim`,
+  sponsored `accounts create`, `trustline`, and the MCP simulate tools with
+  `network.endpoint_identity_unavailable`. On `pay`, `claim`, and sponsored
+  `accounts create`, `--timeout-seconds` bounds that check, on `--build-only`
+  and `--sign-only` too. On `trustline` and the MCP tools, the profile's
+  `submit_timeout_seconds` bounds it.
+- An endpoint check failure precedes a missing account or claim entry, a policy
+  denial, an approval refusal, a rebuild divergence, the audit pre-flight, and
+  a malformed nonce. It also precedes the chain, fee, asset, and amount checks
+  that follow a read, and the reservation reconcile. Two refusals need no
+  request and come first: the audit pre-flight of `pool init`, and the approval
+  request of a toolset-gated MCP pay commit that carries no approval. On the MCP
+  tools an endpoint failure returns an error result where a later check returns
+  an `invalid_params` error. A `claim` or `trustline` refused at the early check
+  carries no preview. On the MCP pay, create-account, and claim commits, the
+  check's time counts toward the nonce's expiry.
+- `pool init` checks the endpoint under `--timeout-seconds` (default 120).
 
 ### Removed
 

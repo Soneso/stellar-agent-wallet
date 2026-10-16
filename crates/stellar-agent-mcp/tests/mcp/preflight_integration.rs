@@ -31,7 +31,9 @@
 //!
 //! Tests build minimal `LedgerEntryData::Account` XDR with the desired
 //! `num_sub_entries` and `balance` and serve it from a `wiremock::MockServer`,
-//! matching the pattern established in `pay_integration.rs`.
+//! matching the pattern established in `pay_integration.rs`. A separate mock
+//! answers the endpoint check ahead of the others, so the account mocks
+//! answer only the reads they are for.
 //!
 //! # Keyring isolation
 //!
@@ -231,6 +233,7 @@ async fn run_create_account_preflight(
     let account_xdr = account_entry_xdr(SOURCE_G, balance_stroops, subentry_count);
     let key_xdr = account_ledger_key_xdr(SOURCE_G);
 
+    crate::common::mount_testnet_identity(mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(serde_json::json!({
             "entries": [
@@ -429,6 +432,7 @@ async fn pay_nonnative_preflight_trustline_missing() {
     let account_key = account_ledger_key_xdr(SOURCE_G);
 
     // Mock returns ONLY the account entry — no trustline.
+    crate::common::mount_testnet_identity(&mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(mock_result_account_only(
             &account_xdr,
@@ -471,6 +475,7 @@ async fn pay_nonnative_preflight_trustline_balance_insufficient() {
     let tl_xdr = trustline_entry_xdr(SOURCE_G, "USDC", USDC_ISSUER_G, 5_000_000);
     let tl_key = trustline_ledger_key_xdr(SOURCE_G, "USDC", USDC_ISSUER_G);
 
+    crate::common::mount_testnet_identity(&mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(mock_result_with_trustline(
             &account_xdr,
@@ -518,6 +523,7 @@ async fn pay_nonnative_preflight_xlm_fee_insufficient() {
     let tl_xdr = trustline_entry_xdr(SOURCE_G, "USDC", USDC_ISSUER_G, 100_000_000);
     let tl_key = trustline_ledger_key_xdr(SOURCE_G, "USDC", USDC_ISSUER_G);
 
+    crate::common::mount_testnet_identity(&mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(mock_result_with_trustline(
             &account_xdr,
@@ -598,6 +604,7 @@ async fn run_pay_native_preflight(
 
     // First call: getLedgerEntries for the source account (pre-flight balance check).
     // Limited to one response so the SEP-29 check picks up the second mock.
+    crate::common::mount_testnet_identity(mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(serde_json::json!({
             "entries": [
@@ -661,6 +668,7 @@ async fn run_pay_native_preflight_with_profile_fee(
     let account_xdr = account_entry_xdr(SOURCE_G, 100_000_000, 0);
     let key_xdr = account_ledger_key_xdr(SOURCE_G);
 
+    crate::common::mount_testnet_identity(&mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(serde_json::json!({
             "entries": [
@@ -864,6 +872,7 @@ async fn pay_nonnative_preflight_succeeds_when_trustline_balance_sufficient_and_
 
     // First call: getLedgerEntries for account + trustline (pre-flight balance check).
     // Limited to one response so the SEP-29 check picks up the second mock.
+    crate::common::mount_testnet_identity(&mock_server).await;
     Mock::given(method("POST"))
         .respond_with(EchoIdResponder::new(mock_result_with_trustline(
             &account_xdr,

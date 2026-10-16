@@ -134,7 +134,7 @@ An existing pool seed requires `--force` for replacement. Replacing a completed 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
 | `--size <N>` | Number of channel accounts to create (`1..=19`) | Required for a new initialization | none |
-| `--timeout-seconds <N>` | Confirmation deadline for the creation transaction | Optional | `120` |
+| `--timeout-seconds <N>` | Deadline for the endpoint identity check and, separately, for confirming the creation transaction | Optional | `120` |
 | `--resume` | Complete pending initialization using the saved seed; excludes `--size` and `--force` | Optional | `false` |
 | `--profile <NAME>` | Profile for the funder key and RPC endpoint | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--force` | Replace a completed pool seed; refuses while pending | Optional | `false` |
