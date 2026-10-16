@@ -1,17 +1,19 @@
 //! `mpp charge authorize` previews the authorization the mpp library prepares.
 //!
 //! The binary reads, decodes, and prepares its input in `commands/mpp.rs`,
-//! which no other crate can call. This suite runs that code in a child process
-//! and compares the preview it prints with one the library computes in-process
-//! from the typed input, so a transformation of the input on the CLI path
-//! changes the printed preview and fails the comparison.
+//! which no other crate can call. This suite runs that code in a child process.
+//! It compares the printed preview with one the library computes in-process
+//! from the typed input, so a rewrite of the input on the CLI path fails the
+//! comparison.
 //!
 //! # Hermetic fixtures
 //!
 //! `STELLAR_AGENT_HOME` redirects the profile, policy, approval, MPP state,
 //! audit, and headless keyring paths, and is set on the child only. The child
-//! uses the headless keyring backend over a store file this test seeds. The
-//! profile's `rpc_url` points at a wiremock responder that answers
+//! uses the headless keyring backend over a store file this test seeds.
+//! `IsolatedHome::command` also removes the caller's profile overrides, such as
+//! `STELLAR_AGENT_RPC_URL`, from the child's environment. The profile's
+//! `rpc_url` points at a wiremock responder that answers
 //! `simulateTransaction` with the payer's authorization entry.
 
 #![allow(
@@ -22,12 +24,10 @@
 )]
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer as _, SigningKey};
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -55,6 +55,8 @@ use stellar_xdr::{
 use wiremock::matchers::{body_partial_json, method};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
+use crate::v1_ceremony::IsolatedHome;
+
 /// The profile the child and the in-process preparation both serve under.
 const PROFILE: &str = "mpp-preview-cli";
 
@@ -64,12 +66,9 @@ const CONTRACT: &str = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA
 /// Charge recipient.
 const RECIPIENT: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
-/// A `SorobanTransactionData` body the preparation decodes and bounds. Its
-/// footprint names another contract, which nothing on the prepare path reads.
+/// Soroban transaction data for the mock RPC response. Preparation checks that
+/// the encoded value is nonempty and within its size limit.
 const TRANSACTION_DATA: &str = "AAAAAAAAAAIAAAAGAAAAAcwD/nT9D7Dc2LxRdab+2vEUF8B+XoN7mQW21oxPT8ALAAAAFAAAAAEAAAAHy8vNUZ8vyZ2ybPHW0XbSrRtP7gEWsJ6zDzcfY9P8z88AAAABAAAABgAAAAHMA/50/Q+w3Ni8UXWm/trxFBfAfl6De5kFttaMT0/ACwAAABAAAAABAAAAAgAAAA8AAAAHQ291bnRlcgAAAAASAAAAAAAAAAAg4dbAxsGAGICfBG3iT2cKGYQ6hK4sJWzZ6or1C5v6GAAAAAEAHfKyAAAFiAAAAIgAAAAAAAAAAw==";
-
-/// Protection key of the headless keyring store the child reads.
-const KEYRING_PROTECTION_KEY: [u8; 32] = [0x5a; 32];
 
 fn g_strkey(key: &SigningKey) -> String {
     stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes())
@@ -158,9 +157,10 @@ reason = "Operator review"
     .expect("write policy");
 }
 
-/// A tagged MCP challenge whose realm, operation, and arguments carry case
-/// and whitespace, so a CLI path that rewrites them prints a different
-/// preview. The explicit expiry fixes the effective expiry across both runs.
+/// A tagged MCP challenge whose realm, server identity, and target carry
+/// surrounding whitespace and mixed case, so a CLI path that trims or
+/// case-folds them prints a different preview. The explicit expiry fixes the
+/// effective expiry across both runs.
 fn challenge_input() -> ChallengeInput {
     let now_seconds = now_unix_ms().expect("clock") / 1_000;
     ChallengeInput::Mcp {
@@ -196,18 +196,18 @@ fn take_approval_id(preview: &mut Value) -> String {
         .expect("preview object")
         .remove("approval_id")
         .and_then(|id| id.as_str().map(str::to_owned))
-        .unwrap_or_else(|| panic!("a preview that requires approval carries an approval_id"))
+        .expect("a preview that requires approval carries an approval_id")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn cli_authorize_preview_matches_the_library_preview() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = IsolatedHome::new();
     let keyring: Arc<keyring_core::CredentialStore> =
         Arc::new(stellar_agent_headless_keyring::store::HeadlessStore::new(
-            home.path().join("headless-keyring").join("store.keyring"),
+            home.keyring_path(),
             stellar_agent_headless_keyring::crypto::ProtectionMode::EnvKey(Arc::new(
-                zeroize::Zeroizing::new(KEYRING_PROTECTION_KEY),
+                zeroize::Zeroizing::new(home.headless_key()),
             )),
         ));
     keyring_core::set_default_store(keyring);
@@ -223,25 +223,20 @@ async fn cli_authorize_preview_matches_the_library_preview() {
         .mount(&rpc)
         .await;
 
-    let mut profile =
+    let profile =
         Profile::builder_testnet_named(PROFILE, "mpp-preview-signer", &payer, "n-svc", "n-acct")
+            .policy_engine(PolicyEngineKind::V1)
             .rpc_url(rpc.uri())
             .audit_log_path(home.path().join("audit").join(format!("{PROFILE}.jsonl")))
             .build();
-    profile.policy.engine = PolicyEngineKind::V1;
     save_new_to_dir(PROFILE, &profile, &home.path().join("profiles")).expect("save profile");
-    for (coordinate, value) in [
-        (
-            &profile.audit_log_hash_chain_key_id,
-            URL_SAFE_NO_PAD.encode([0x24; 32]),
-        ),
-        (&profile.policy_owner_key_id, g_strkey(&owner)),
-    ] {
-        keyring_core::Entry::new(&coordinate.service, &coordinate.account)
-            .expect("keyring entry")
-            .set_password(&value)
-            .expect("seed keyring entry");
-    }
+    keyring_core::Entry::new(
+        &profile.policy_owner_key_id.service,
+        &profile.policy_owner_key_id.account,
+    )
+    .expect("keyring entry")
+    .set_password(&g_strkey(&owner))
+    .expect("seed the policy owner key");
     write_signed_policy(home.path(), &owner);
 
     let input = challenge_input();
@@ -252,20 +247,10 @@ async fn cli_authorize_preview_matches_the_library_preview() {
     )
     .expect("write challenge input");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-        .args(["mpp", "charge", "authorize", "--input-file"])
+    let output = home
+        .command(&["mpp", "charge", "authorize", "--input-file"])
         .arg(&input_path)
         .args(["--profile", PROFILE])
-        .env("STELLAR_AGENT_HOME", home.path())
-        .env_remove("STELLAR_AGENT_PROFILE")
-        .env(
-            stellar_agent_headless_keyring::BACKEND_ENV_VAR,
-            "headless-env",
-        )
-        .env(
-            stellar_agent_headless_keyring::ENV_KEY_VAR,
-            URL_SAFE_NO_PAD.encode(KEYRING_PROTECTION_KEY),
-        )
         .stdin(Stdio::null())
         .output()
         .expect("stellar-agent binary must run");
