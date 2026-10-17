@@ -1015,6 +1015,9 @@ exception allows `LGPL-3.0-or-later` for `nacl`, a wasm32-only transitive of
 builds. The advisories section denies yanked crates and active security
 advisories, with one unmaintained-class advisory ignored (RUSTSEC-2024-0436, on
 the `paste` macro helper pulled deep through the OpenZeppelin Stellar contract
-crates), which has no fixed release. One yanked crate is accepted: `zip` 8.6.0,
-a build dependency of `libsodium-sys-stable`, which has no release that accepts
-an unyanked `zip`. Unknown registries and unknown git sources are denied.
+crates), which has no fixed release. Three advisories on `zip` 8.6.0 are
+accepted (RUSTSEC-2026-0367, RUSTSEC-2026-0368, and RUSTSEC-2026-0369). `zip` is
+a build dependency of `libsodium-sys-stable` that only unpacks the
+signature-verified prebuilt libsodium archive on Windows MSVC targets, and no
+`libsodium-sys-stable` release accepts `zip` 9. Unknown registries and unknown
+git sources are denied.
