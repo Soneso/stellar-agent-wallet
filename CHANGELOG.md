@@ -24,8 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `network.unsupported_protocol_version`; while mainnet writes are refused, a
   mainnet endpoint is refused with `network.mainnet_write_forbidden` first.
 - `StellarRpcClient::simulate_transaction_envelope` sends an envelope to
-  `simulateTransaction` without `authMode` and returns the answer as received.
-  A failed request reports `network.rpc_unreachable` with a scrubbed reason.
+  `simulateTransaction` without `authMode` and returns the answer as received,
+  with its `error` string scrubbed. A failed request reports
+  `network.rpc_unreachable` with a scrubbed reason.
 - `StellarRpcClient::get_health_within` reads `getHealth` and retries a failed
   attempt until a deadline, with the classification of the endpoint check.
 - `stellar_agent_x402::exact::validate_requirements` runs the local checks of
@@ -47,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the wallet refuses and an endpoint that answers the network identity request
   with HTTP 401 or 403. The audit key purpose `rpc_credential` records a
   credential write.
+- `stellar_agent_network::quote_server_text`, `escape_server_text`, and
+  `MAX_SERVER_TEXT_CHARS` render server-derived text.
+  `stellar_agent_x402::wire::describe_json_error` describes a JSON decode
+  failure by its class and position, without its values.
 
 ### Changed
 
@@ -126,6 +131,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `x402.payment_build_failed`.
 - An x402 payment call with invalid requirements and a wrong `chain_id` answers
   the requirement's code, not the invalid-params error.
+- `NetworkError::EndpointNetworkMismatch.server` is a `ReportedPassphrase` that
+  keeps only the passphrase class, so its `Debug` output shows the class.
+- `X402Error::UnsupportedScheme` and `X402Error::UnsupportedNetwork` store the
+  rejected value quoted, escaped, and cut at 200 characters.
+- `Sep10Session::parse` refuses a token longer than 8192 bytes, a token with an
+  empty header or payload segment, and a token with a character outside the
+  base64url alphabet, with `sep10.jwt_parse_error`.
 
 ### Removed
 
@@ -148,6 +160,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `auth.keyring_not_found`, a store failure `auth.keyring_platform_error`.
 - The Friendbot refusal names the starting-balance rule: Friendbot funds an
   account only when its balance is below the Friendbot starting balance.
+- A SEP-10 challenge with another network passphrase reports the passphrase
+  class: the testnet or mainnet passphrase, or `<other network>`. A
+  multi-byte character in the server's passphrase cannot panic the client.
 - The MCP simulate steps for pay, create-account, trustline, and claim, and MPP
   charge prepare, record a pending approval when policy requires approval only
   for the paired commit tool. Such rulesets reach an approvable request.
@@ -171,7 +186,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each JSON-escaped form of these URLs, loses its scheme, userinfo, path, and
   query. Such a URL reaches a CLI or MCP error envelope or a wallet log line as
   host and port. The endpoint field of a network error keeps its scheme, host,
-  and port.
+  and port. The text then has whitespace runs collapsed, every other control
+  character and every non-ASCII character escaped, and is cut at 200
+  characters and quoted. The `error` string of a simulation answer gets the
+  same scrub.
+- A SEP-10 challenge or token answer with a non-2xx status reports the HTTP
+  method, the status, and the web-auth endpoint's host. The wallet does not
+  read the answer body. A transport failure reports its class and no URL.
+- The x402 identity gate quotes SEP-10 and stellar.toml failure text and
+  reports a stellar.toml syntax error by line and column. A web-auth answer
+  that does not parse reports a fixed text. The counterparty CLI reports a
+  stellar.toml syntax error by line and column.
+- The x402 tools quote and bound the `scheme`, `network`, `amount`, `asset`,
+  and `payTo` values an error names. They report a header that does not decode
+  by its JSON error class and position. `stellar_x402_parse_receipt` escapes
+  and bounds the receipt fields it returns.
+- `fund_with_friendbot`, and with it the `friendbot` command,
+  `accounts create --fund-with-friendbot`, and `stellar_friendbot`, accepts a
+  Friendbot `hash` of exactly 64 hex characters and refuses any other answer
+  with `network.rpc_unreachable`.
 - x402 `create_payment` refuses, before signing, a simulation whose payer
   authorization differs from the SAC `transfer` it built or carries nested
   calls. It also refuses a re-simulation that returns authorization entries

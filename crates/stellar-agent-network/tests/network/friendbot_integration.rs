@@ -248,3 +248,81 @@ async fn fund_with_friendbot_missing_hash_field_returns_error() {
 
     mock_server.verify().await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Friendbot returns 200 with a hash of the wrong shape
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A `hash` that is not exactly 64 hex characters is refused with the fixed
+/// reason, before any funding poll, so a mirror's text never reaches the
+/// result. A hash of 64 hex characters in upper case passes.
+#[tokio::test]
+async fn fund_with_friendbot_refuses_a_hash_that_is_not_64_hex() {
+    for hash in [
+        "\u{1b}[2Jhash https://user:SECRET@leak.example/x".to_owned(),
+        "ab".repeat(31),
+        "ab".repeat(33),
+        format!("{}g", "a".repeat(63)),
+        format!("{} ", "a".repeat(63)),
+        String::new(),
+    ] {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "_links": {},
+                "hash": hash,
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let err = fund_with_friendbot(
+            &mock_server.uri(),
+            TEST_ACCOUNT,
+            TESTNET_PASSPHRASE,
+            &mock_server.uri(),
+        )
+        .await
+        .expect_err("a hash of the wrong shape refuses");
+
+        match err {
+            WalletError::Network(NetworkError::RpcUnreachable { url, reason }) => {
+                assert_eq!(url, mock_server.uri());
+                assert_eq!(
+                    reason, "Friendbot response hash is not 64 hex characters",
+                    "{hash:?}"
+                );
+            }
+            other => panic!("{hash:?}: expected RpcUnreachable, got {other:?}"),
+        }
+        mock_server.verify().await;
+        let polls = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .count();
+        assert_eq!(polls, 0, "{hash:?}: no funding poll follows a refused hash");
+    }
+
+    let mock_server = MockServer::start().await;
+    let upper = "AB01".repeat(16);
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "_links": {},
+            "hash": upper,
+        })))
+        .mount(&mock_server)
+        .await;
+    mount_account_present(&mock_server, TEST_ACCOUNT).await;
+    let funded = fund_with_friendbot(
+        &mock_server.uri(),
+        TEST_ACCOUNT,
+        TESTNET_PASSPHRASE,
+        &mock_server.uri(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(funded.tx_hash, upper);
+}

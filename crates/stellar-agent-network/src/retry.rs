@@ -55,51 +55,6 @@ use std::time::Duration;
 use rand_core::{OsRng, RngCore};
 use tokio::time::Instant;
 
-use crate::client::RpcEndpoint;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Error-display truncation helper
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Maximum number of characters to log from a server error display string.
-///
-/// Stellar RPC errors can contain verbose server-controlled response bodies
-/// (particularly `JsonRpc` / `TransactionSubmissionFailed` variants).  Logging
-/// the full display unbounded creates two risks: log-spam from a hostile
-/// endpoint and potential disclosure of internal server-state details.
-///
-/// 200 chars is sufficient to identify the error class for operational
-/// triage without echoing an entire server response body into the log stream.
-const MAX_ERROR_DISPLAY_CHARS: usize = 200;
-
-/// Returns at most the first `MAX_ERROR_DISPLAY_CHARS` characters of the
-/// display of `e`, scrubbed with [`RpcEndpoint::scrub`] for the endpoint that
-/// produced it, for safe structured-log emission.
-///
-/// Used at log sites and for the diagnostic text a
-/// [`SubmissionOutcome`](crate::submission_record::SubmissionOutcome) carries.
-/// A server-controlled `JsonRpc` body therefore cannot produce unbounded log
-/// entries.
-/// The scrub runs before the cut, so neither a credential nor a URL the
-/// server echoed survives in part where it straddles the bound.
-///
-/// Not crypto-sensitive: no envelope XDR or signing material appears in
-/// `stellar_rpc_client::Error` display output.
-pub(crate) fn truncate_error_display(
-    endpoint: &RpcEndpoint,
-    e: &stellar_rpc_client::Error,
-) -> String {
-    let s = endpoint.scrub_display(e);
-    if s.chars().count() <= MAX_ERROR_DISPLAY_CHARS {
-        s
-    } else {
-        // Take the first MAX_ERROR_DISPLAY_CHARS characters and append an
-        // ellipsis so log consumers know the message was truncated.
-        let truncated: String = s.chars().take(MAX_ERROR_DISPLAY_CHARS).collect();
-        format!("{truncated}…")
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // RetryPolicy
 // ─────────────────────────────────────────────────────────────────────────────
@@ -713,45 +668,6 @@ mod tests {
 
     use super::*;
 
-    /// A URL the server echoed into an error reaches the log as host and port,
-    /// and the scrubbed text keeps the length bound.
-    #[test]
-    fn truncate_error_display_scrubs_a_url_before_the_cut() {
-        let text = format!(
-            "upstream https://user:SECRET@archive.example.com:8443/rpc?token=SECRET refused {}",
-            "x".repeat(300)
-        );
-        let e = stellar_rpc_client::Error::TransactionSubmissionFailed(text);
-        assert!(
-            e.to_string().chars().count() > MAX_ERROR_DISPLAY_CHARS,
-            "the fixture must exceed the bound"
-        );
-
-        let out = truncate_error_display(&RpcEndpoint::plain("https://rpc.example.com"), &e);
-
-        assert_eq!(
-            out.chars().count(),
-            MAX_ERROR_DISPLAY_CHARS + 1,
-            "the bound plus the ellipsis: {out}"
-        );
-        assert!(
-            out.ends_with('…'),
-            "a cut display ends with an ellipsis: {out}"
-        );
-        assert!(
-            out.starts_with(
-                "transaction submission failed: upstream archive.example.com:8443 refused x"
-            ),
-            "the URL keeps host and port: {out}"
-        );
-        for leaked in ["SECRET", "token=", "user:", "https://"] {
-            assert!(
-                !out.contains(leaked),
-                "{leaked} reached the log text: {out}"
-            );
-        }
-    }
-
     // ─── is_retryable_send_error ─────────────────────────────────────────────
 
     #[test]
@@ -1301,26 +1217,6 @@ mod tests {
             rejected_status(&stellar_rpc_client::Error::InvalidResponse),
             None
         );
-    }
-
-    /// The truncation removes the credential forms of its endpoint before
-    /// the cut, a value placed bare in the text included.
-    #[test]
-    fn truncate_error_display_scrubs_the_credential_before_the_cut() {
-        let endpoint = RpcEndpoint::credentialed(
-            "https://rpc.example.com",
-            zeroize::Zeroizing::new("k3y+/%25 v".to_owned()),
-            &stellar_agent_core::profile::schema::RpcCredentialPlacement::Query {
-                name: "apikey".to_owned(),
-            },
-        );
-        let text = format!("echo k3y+/%25 v and k3y%2B%2F%2525+v {}", "x".repeat(300));
-        let out = truncate_error_display(
-            &endpoint,
-            &stellar_rpc_client::Error::TransactionSubmissionFailed(text),
-        );
-        assert!(!out.contains("k3y"), "{out}");
-        assert!(out.contains("echo [redacted] and [redacted] x"), "{out}");
     }
 
     #[tokio::test(start_paused = true)]

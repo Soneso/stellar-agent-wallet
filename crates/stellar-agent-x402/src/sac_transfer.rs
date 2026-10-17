@@ -19,6 +19,8 @@ use stellar_strkey::Strkey;
 use stellar_xdr::ScVal;
 use stellar_xdr::{ContractId, InvokeContractArgs, ScAddress};
 
+use stellar_agent_network::quote_server_text;
+
 use crate::X402Error;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,7 +42,7 @@ fn strkey_to_sc_address(strkey: &str) -> Result<ScAddress, X402Error> {
     use stellar_xdr::{AccountId, Hash, PublicKey, Uint256};
 
     let parsed = Strkey::from_string(strkey).map_err(|e| X402Error::InvalidAssetAddress {
-        detail: format!("strkey parse failed for {strkey:?}: {e}"),
+        detail: format!("strkey parse failed for {}: {e}", quote_server_text(strkey)),
     })?;
     match parsed {
         Strkey::PublicKeyEd25519(pk) => {
@@ -52,8 +54,11 @@ fn strkey_to_sc_address(strkey: &str) -> Result<ScAddress, X402Error> {
             // ID.  ScAddress::Contract wraps ContractId(Hash([u8; 32])).
             Ok(ScAddress::Contract(ContractId(Hash(c.0))))
         }
-        other => Err(X402Error::InvalidAssetAddress {
-            detail: format!("strkey {strkey:?} is not a G- or C-strkey (got {other:?})"),
+        _ => Err(X402Error::InvalidAssetAddress {
+            detail: format!(
+                "strkey {} is not a G- or C-strkey",
+                quote_server_text(strkey)
+            ),
         }),
     }
 }
@@ -72,7 +77,10 @@ pub(crate) fn strkey_to_recipient_sc_address(strkey: &str) -> Result<ScAddress, 
     use stellar_xdr::{AccountId, ContractId, Hash, MuxedEd25519Account, PublicKey, Uint256};
 
     let parsed = Strkey::from_string(strkey).map_err(|e| X402Error::InvalidRecipientAddress {
-        detail: format!("recipient strkey parse failed for {strkey:?}: {e}"),
+        detail: format!(
+            "recipient strkey parse failed for {}: {e}",
+            quote_server_text(strkey)
+        ),
     })?;
     match parsed {
         Strkey::PublicKeyEd25519(pk) => Ok(ScAddress::Account(AccountId(
@@ -83,9 +91,10 @@ pub(crate) fn strkey_to_recipient_sc_address(strkey: &str) -> Result<ScAddress, 
             id: m.id,
             ed25519: Uint256(m.ed25519),
         })),
-        other => Err(X402Error::InvalidRecipientAddress {
+        _ => Err(X402Error::InvalidRecipientAddress {
             detail: format!(
-                "recipient strkey {strkey:?} is not a G-, C-, or M-strkey (got {other:?})"
+                "recipient strkey {} is not a G-, C-, or M-strkey",
+                quote_server_text(strkey)
             ),
         }),
     }
@@ -162,7 +171,10 @@ pub fn build_sac_transfer_invoke(
 
     let ScAddress::Contract(contract) = contract_address else {
         return Err(X402Error::InvalidAssetAddress {
-            detail: format!("asset {sac_contract:?} is not a contract address"),
+            detail: format!(
+                "asset {} is not a contract address",
+                quote_server_text(sac_contract)
+            ),
         });
     };
 

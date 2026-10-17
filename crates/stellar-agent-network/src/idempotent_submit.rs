@@ -102,7 +102,6 @@ use crate::StellarRpcClient;
 use crate::client::{RpcEndpoint, STALE_PENDING_RECOVERY, rpc_unreachable, unexpected_status};
 use crate::retry::{
     RetryPolicy, is_retryable_poll_error, is_retryable_send_error, retry_with_backoff,
-    truncate_error_display,
 };
 // bytes_to_hex: canonical pub(crate) definition from submit.rs.
 use crate::submit::{SubmissionResult, bytes_to_hex, map_failed_record, redact_tx_hash};
@@ -1205,14 +1204,14 @@ where
             Ok(r) => r,
             Err(ref e) if is_retryable_poll_error(e) => {
                 // Treat transient transport error as NOT_FOUND: log at debug
-                // and poll again after the interval. Truncate error display to
-                // bound log volume from a hostile endpoint.
+                // and poll again after the interval. The scrub bounds the error
+                // display, which limits log volume from a hostile endpoint.
                 let url_authority = url.authority();
                 tracing::debug!(
                     envelope_hash = %redacted,
                     tx_hash = %redacted_tx,
                     rpc_url = %url_authority,
-                    error = %truncate_error_display(url, e),
+                    error = %url.scrub_display(e),
                     "submit_with_retention_poll: transient getTransaction error \
                      (treating as NOT_FOUND, continuing poll)"
                 );

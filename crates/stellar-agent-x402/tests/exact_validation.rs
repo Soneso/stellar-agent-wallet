@@ -12,7 +12,8 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
-    reason = "test-only; unwraps acceptable in unit tests"
+    clippy::panic,
+    reason = "test-only; unwraps and panics acceptable in unit tests"
 )]
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -422,4 +423,117 @@ fn wallet_chain_and_x402_network_spellings_stay_distinct() {
         Caip2::Mainnet
     );
     assert!(x402_network_to_caip2("stellar:mainnet").is_err());
+}
+
+/// A 402 value a hostile server could send: control and bidi characters, a
+/// credential-bearing URL, quotes, and a thousand characters.
+fn hostile_value() -> String {
+    format!(
+        "x\u{1b}[2J\u{202e} https://user:PWSECRET@leak.example/p?k=QSECRET \"q\" {}",
+        "v".repeat(1000)
+    )
+}
+
+/// Asserts that `text` holds `value` only in its quoted, escaped, bounded
+/// form, and none of its raw characters or URL parts.
+fn assert_holds_the_quoted_value(text: &str, value: &str) {
+    let quoted = stellar_agent_network::quote_server_text(value);
+    assert!(quoted.ends_with("\"..."), "the fixture exceeds the bound");
+    assert!(
+        quoted.starts_with(r#""x\u{001b}[2J\u{202e} leak.example \"q\" vvv"#),
+        "{quoted}"
+    );
+    assert!(text.contains(&quoted), "{text}");
+    for leaked in ["\u{1b}", "\u{202e}", "PWSECRET", "QSECRET", "https:", "/p?"] {
+        assert!(!text.contains(leaked), "{leaked:?} survived: {text}");
+    }
+    assert!(!text.contains(&"v".repeat(300)), "{text}");
+}
+
+/// The rejected `scheme` and `network` values are stored quoted, escaped, and
+/// bounded, and the error texts print them that way.
+#[test]
+fn scheme_and_network_values_are_quoted_and_bounded() {
+    let value = hostile_value();
+
+    let req = requirements_with(&value, X402_STELLAR_TESTNET, AMOUNT, true.into());
+    let err = validate_requirements(&req, TESTNET_PASSPHRASE, UNUSED_RPC_URL).unwrap_err();
+    let X402Error::UnsupportedScheme { scheme } = &err else {
+        panic!("expected UnsupportedScheme, got {err:?}");
+    };
+    assert_eq!(scheme, &stellar_agent_network::quote_server_text(&value));
+    assert_holds_the_quoted_value(&err.to_string(), &value);
+    let debug = format!("{err:?}");
+    for leaked in ["\u{1b}", "\u{202e}", "PWSECRET", "QSECRET"] {
+        assert!(!debug.contains(leaked), "{leaked:?} survived: {debug}");
+    }
+
+    let req = requirements_with("exact", &value, AMOUNT, true.into());
+    let err = validate_requirements(&req, TESTNET_PASSPHRASE, UNUSED_RPC_URL).unwrap_err();
+    let X402Error::UnsupportedNetwork { network } = &err else {
+        panic!("expected UnsupportedNetwork, got {err:?}");
+    };
+    assert_eq!(network, &stellar_agent_network::quote_server_text(&value));
+    assert_holds_the_quoted_value(&err.to_string(), &value);
+}
+
+/// The `amount`, `asset`, and `payTo` values an error names appear quoted,
+/// escaped, and bounded, without the decoded strkey's `Debug` form.
+#[test]
+fn amount_asset_and_pay_to_values_are_quoted_and_bounded() {
+    let value = hostile_value();
+
+    let req = requirements_with("exact", X402_STELLAR_TESTNET, &value, true.into());
+    let err = validate_requirements(&req, TESTNET_PASSPHRASE, UNUSED_RPC_URL).unwrap_err();
+    assert!(
+        matches!(err, X402Error::AmountConversion { .. }),
+        "expected AmountConversion, got {err:?}"
+    );
+    assert_holds_the_quoted_value(&err.to_string(), &value);
+
+    let mut req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
+    req.asset = value.clone();
+    let err = validate_requirements(&req, TESTNET_PASSPHRASE, UNUSED_RPC_URL).unwrap_err();
+    assert!(
+        matches!(err, X402Error::InvalidAssetAddress { .. }),
+        "expected InvalidAssetAddress, got {err:?}"
+    );
+    assert_holds_the_quoted_value(&err.to_string(), &value);
+
+    // A well-formed strkey of another type is named quoted, without the
+    // decoded value's `Debug` form.
+    let mut req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
+    req.asset = PAYER.to_owned();
+    let err = validate_requirements(&req, TESTNET_PASSPHRASE, UNUSED_RPC_URL).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "invalid SAC asset address: expected C-strkey (contract), got non-contract \
+             strkey: \"{PAYER}\""
+        )
+    );
+
+    let mut req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
+    req.pay_to = value.clone();
+    let err = validate_requirements(&req, TESTNET_PASSPHRASE, UNUSED_RPC_URL).unwrap_err();
+    assert!(
+        matches!(err, X402Error::InvalidRecipientAddress { .. }),
+        "expected InvalidRecipientAddress, got {err:?}"
+    );
+    assert_holds_the_quoted_value(&err.to_string(), &value);
+
+    let pre_auth = stellar_strkey::Strkey::PreAuthTx(stellar_strkey::PreAuthTx([7u8; 32]))
+        .to_string()
+        .as_str()
+        .to_owned();
+    let mut req = requirements_with("exact", X402_STELLAR_TESTNET, AMOUNT, true.into());
+    req.pay_to = pre_auth.clone();
+    let err = validate_requirements(&req, TESTNET_PASSPHRASE, UNUSED_RPC_URL).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "invalid recipient address: recipient strkey \"{pre_auth}\" is not a G-, C-, \
+             or M-strkey"
+        )
+    );
 }

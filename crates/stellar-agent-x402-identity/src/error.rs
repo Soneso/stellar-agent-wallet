@@ -61,14 +61,14 @@ pub enum IdentityError {
     /// failed the structural validation (e.g. oversized body, invalid UTF-8,
     /// non-string field type).
     ///
-    /// The `reason` field carries a sanitised parse-error summary; it never
-    /// embeds raw attacker-controlled TOML scalar values (the parser's own
-    /// `sanitize_invalid_value` guards that boundary).
+    /// The `reason` field carries the parser's error through
+    /// `stellar_agent_network::quote_server_text`; a TOML syntax error is
+    /// reported by line and column, never by its line.
     #[error("x402-identity: stellar.toml parse failed (authority: {authority}): {reason}")]
     TomlFetchFailed {
         /// Redacted URL authority (`host[:port]`), safe to log.
         authority: String,
-        /// Sanitised parse-error reason, safe to log.
+        /// The parser's error through `quote_server_text`, or a fixed text.
         reason: String,
     },
 
@@ -124,12 +124,16 @@ pub enum IdentityError {
     /// HTTP errors on the challenge GET, challenge validation failures (wrong
     /// server key, expired window, bad nonce, etc.), and JWT parse failures.
     ///
-    /// The `reason` field carries a machine-readable summary safe to log.  It
-    /// NEVER contains the JWT string (there is no JWT on failure).
+    /// The `reason` field carries the SEP-10 failure through
+    /// `stellar_agent_network::quote_server_text`; a failed exchange also
+    /// names the web-auth endpoint's host and port. A refused challenge or
+    /// token reports the method and the HTTP status; an answer that does not
+    /// parse reports a fixed text. It never holds a response body, a path or
+    /// query, or the JWT.
     #[error("x402-identity: SEP-10 counterparty authentication failed: {reason}")]
     Sep10AuthFailed {
-        /// Sanitised failure reason from [`stellar_agent_sep10::Sep10Error`],
-        /// safe to log.
+        /// The [`stellar_agent_sep10::Sep10Error`] through `quote_server_text`
+        /// or a fixed text, and the web-auth endpoint's host and port.
         reason: String,
     },
 }

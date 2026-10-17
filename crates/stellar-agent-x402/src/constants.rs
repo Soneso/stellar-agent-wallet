@@ -113,7 +113,7 @@ pub fn x402_network_to_caip2(network: &str) -> Result<Caip2, X402Error> {
         X402_STELLAR_PUBNET => Ok(Caip2::Mainnet),
         X402_STELLAR_TESTNET => Ok(Caip2::Testnet),
         other => Err(X402Error::UnsupportedNetwork {
-            network: other.to_owned(),
+            network: stellar_agent_network::quote_server_text(other),
         }),
     }
 }

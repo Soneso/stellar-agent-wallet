@@ -55,6 +55,7 @@ use tokio::time::Instant;
 
 use stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL;
 use stellar_agent_network::StellarRpcClient;
+use stellar_agent_network::quote_server_text;
 use stellar_agent_network::refuse_mainnet_write;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_sep43::signing::sign_soroban_auth_entry;
@@ -222,7 +223,7 @@ pub fn validate_requirements(
 ) -> Result<i128, X402Error> {
     if requirements.scheme != "exact" {
         return Err(X402Error::UnsupportedScheme {
-            scheme: requirements.scheme.clone(),
+            scheme: quote_server_text(&requirements.scheme),
         });
     }
 
@@ -262,8 +263,8 @@ pub fn validate_requirements(
             .parse::<i128>()
             .map_err(|e| X402Error::AmountConversion {
                 detail: format!(
-                    "wire amount {:?} is not a valid i128: {e}",
-                    requirements.amount
+                    "wire amount {} is not a valid i128: {e}",
+                    quote_server_text(&requirements.amount)
                 ),
             })?;
     if amount <= 0 {
@@ -1252,10 +1253,13 @@ fn validate_c_strkey(strkey: &str) -> Result<(), X402Error> {
     match Strkey::from_string(strkey) {
         Ok(Strkey::Contract(_)) => Ok(()),
         Ok(_other) => Err(X402Error::InvalidAssetAddress {
-            detail: format!("expected C-strkey (contract), got non-contract strkey: {strkey:?}"),
+            detail: format!(
+                "expected C-strkey (contract), got non-contract strkey: {}",
+                quote_server_text(strkey)
+            ),
         }),
         Err(e) => Err(X402Error::InvalidAssetAddress {
-            detail: format!("strkey parse failed for {strkey:?}: {e}"),
+            detail: format!("strkey parse failed for {}: {e}", quote_server_text(strkey)),
         }),
     }
 }

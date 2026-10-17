@@ -233,7 +233,7 @@ pub fn parse_minimal_sep1(body: &str) -> Result<MinimalSep1, CounterpartyError> 
     let doc: DocumentMut =
         body.parse()
             .map_err(|e: toml_edit::TomlError| CounterpartyError::TomlInvalid {
-                detail: format!("stellar.toml: TOML parse error: {e}"),
+                detail: toml_error_position(body, e.span().map(|span| span.start)),
             })?;
 
     log_unknown_top_level_fields(&doc);
@@ -427,11 +427,36 @@ fn validate_stellar_public_key(raw: &str, field: &str) -> Result<(), Counterpart
         })
 }
 
+/// The detail of a TOML syntax error that starts at byte `start` of `body`.
+///
+/// The detail names the position and never the text: `TOML parse error at
+/// line {l}, column {c}`. The line is the number of newlines before `start`
+/// plus one, and the column is the number of characters after the last of
+/// them plus one. An error without a start, or with a start that is not a
+/// character boundary of `body`, gives `TOML parse error`. The `Display` of
+/// the parser's error prints the offending line, which is the server's text,
+/// so it is not used.
+fn toml_error_position(body: &str, start: Option<usize>) -> String {
+    let Some(prefix) = start.and_then(|start| body.get(..start)) else {
+        return "TOML parse error".to_owned();
+    };
+    let line = prefix.matches('\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, tail)| tail)
+        .chars()
+        .count()
+        + 1;
+    format!("TOML parse error at line {line}, column {column}")
+}
+
 fn log_unknown_top_level_fields(doc: &DocumentMut) {
     for (key, _) in doc.iter() {
         if !KNOWN_TOP_LEVEL_FIELDS.contains(&key) {
+            // A quoted TOML key can hold any character, so the key is the
+            // server's text and is logged escaped and bounded.
             tracing::debug!(
-                field = %key,
+                field = %crate::redact::escape_server_text(key),
                 "unknown SEP-1 top-level stellar.toml field ignored"
             );
         }
@@ -955,6 +980,114 @@ FUTURE_SEP1_FIELD = "forward-compatible"
             parsed.federation_server.as_deref(),
             Some("https://fed.example.com/federation")
         );
+    }
+
+    /// An unknown top-level key with a control character and a thousand
+    /// characters reaches the debug log escaped and bounded.
+    #[test]
+    fn unknown_top_level_key_is_logged_escaped() {
+        use stellar_agent_test_support::CaptureWriter;
+
+        let key = format!("K\u{1b}[31m{}", "x".repeat(1000));
+        let body = format!(
+            "\"K\\u001b[31m{}\" = 1\nFEDERATION_SERVER = \"https://fed.example.com/f\"\n",
+            "x".repeat(1000)
+        );
+        let writer = CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        let parsed = parse_minimal_sep1(&body).unwrap();
+        drop(guard);
+        assert_eq!(
+            parsed.federation_server.as_deref(),
+            Some("https://fed.example.com/f")
+        );
+
+        let logs = writer.captured_str();
+        let expected = crate::redact::escape_server_text(&key);
+        assert!(
+            expected.starts_with("K\\u{001b}[31mxxx") && expected.ends_with("x..."),
+            "{expected}"
+        );
+        assert!(logs.contains(&format!("field={expected}")), "{logs}");
+        assert!(!logs.contains('\u{1b}'), "{logs}");
+        assert!(!logs.contains(&"x".repeat(300)), "{logs}");
+    }
+
+    /// The first line of the parser's own error text for a TOML body.
+    fn toml_edit_first_line(body: &str) -> String {
+        let err = body.parse::<DocumentMut>().unwrap_err();
+        err.to_string().lines().next().unwrap().to_owned()
+    }
+
+    /// A syntax error in the middle of an ASCII line reports the line and the
+    /// column toml_edit itself computes, and no part of the offending line.
+    #[test]
+    fn toml_error_position_matches_the_display_line() {
+        let body = "NETWORK_PASSPHRASE = \"x\"\nACCOUNTS = [\"a\"]\n\
+                    SECRET_MARKER = TOMLSECRET here\n";
+        let err = parse_minimal_sep1(body).unwrap_err();
+        let CounterpartyError::TomlInvalid { detail } = &err else {
+            panic!("expected TomlInvalid, got {err:?}");
+        };
+        assert_eq!(detail, &toml_edit_first_line(body), "{err}");
+        assert_eq!(detail, "TOML parse error at line 3, column 17");
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains("TOMLSECRET"), "{rendered}");
+        assert!(!rendered.contains("SECRET_MARKER"), "{rendered}");
+
+        // The column counts characters, and the line counts the newlines
+        // before the error start.
+        assert_eq!(
+            toml_error_position("a\n\u{e9}\u{e9}bc", Some(7)),
+            "TOML parse error at line 2, column 4"
+        );
+        // An error at the end of the body starts at its length and is placed
+        // after its last character.
+        let eof_body = "a = 1\nb = ";
+        let eof_err = eof_body.parse::<DocumentMut>().unwrap_err();
+        assert_eq!(
+            eof_err.span().map(|span| span.start),
+            Some(eof_body.len()),
+            "{eof_err}"
+        );
+        let err = parse_minimal_sep1(eof_body).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CounterpartyError::TomlInvalid { ref detail }
+                    if detail == "TOML parse error at line 2, column 5"
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// An error without a span, and an error start inside a character,
+    /// report the fixed text without a position.
+    #[test]
+    fn toml_error_without_a_span_reports_the_fixed_text() {
+        // toml_edit reports a dotted key of more than 80 segments as a
+        // recursion limit without a span.
+        let body = format!("{} = 1\n", vec!["a"; 81].join("."));
+        let toml_err = body.parse::<DocumentMut>().unwrap_err();
+        assert_eq!(toml_err.span(), None, "{toml_err}");
+        let err = parse_minimal_sep1(&body).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CounterpartyError::TomlInvalid { ref detail } if detail == "TOML parse error"
+            ),
+            "{err:?}"
+        );
+
+        assert_eq!(toml_error_position("abc", None), "TOML parse error");
+        assert_eq!(toml_error_position("a\u{e9}b", Some(2)), "TOML parse error");
+        assert_eq!(toml_error_position("abc", Some(4)), "TOML parse error");
     }
 
     #[test]

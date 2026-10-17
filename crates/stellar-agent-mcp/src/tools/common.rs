@@ -603,7 +603,9 @@ pub(crate) fn redacted_wallet_error_envelope(
 /// # Errors
 ///
 /// - [`stellar_agent_x402::X402Error::InvalidPaymentRequired`] when both
-///   base64+JSON and direct-JSON parsing fail.
+///   base64+JSON and direct-JSON parsing fail. An input that decodes as
+///   base64 reports the JSON failure of its decoded payload; any other input
+///   reports the raw-JSON failure.
 ///
 /// # Panics
 ///
@@ -611,17 +613,34 @@ pub(crate) fn redacted_wallet_error_envelope(
 pub(crate) fn decode_payment_required_input(
     input: &str,
 ) -> Result<stellar_agent_x402::wire::PaymentRequirements, stellar_agent_x402::X402Error> {
+    use base64::Engine as _;
     use stellar_agent_x402::wire::decode_payment_required;
 
     // Try the crate's canonical base64 decode (RFC 4648 §4 standard alphabet).
-    if let Ok(parsed) = decode_payment_required(input) {
-        return Ok(parsed);
+    let base64_error = match decode_payment_required(input) {
+        Ok(parsed) => return Ok(parsed),
+        Err(e) => e,
+    };
+
+    // An input that decodes as base64 is not raw JSON, because `{` and `[`
+    // are outside the alphabet, so the failure of its decoded payload is the
+    // one to report. That detail names the JSON error class and position.
+    if base64::engine::general_purpose::STANDARD
+        .decode(input.trim())
+        .is_ok()
+    {
+        return Err(base64_error);
     }
 
     // Fall back: parse as raw JSON string (caller-supplied unencoded JSON).
+    // The detail names the JSON error class and position only, because the
+    // decoder's own text quotes the offending value.
     serde_json::from_str::<stellar_agent_x402::wire::PaymentRequirements>(input).map_err(|e| {
         stellar_agent_x402::X402Error::InvalidPaymentRequired {
-            detail: format!("not valid base64+JSON or raw JSON PaymentRequirements: {e}"),
+            detail: format!(
+                "the PaymentRequirements input {}",
+                stellar_agent_x402::wire::describe_json_error(&e)
+            ),
         }
     })
 }
@@ -2511,6 +2530,45 @@ mod tests {
         atomic::{AtomicBool, AtomicU32, Ordering},
     };
     use stellar_agent_core::AuthError;
+
+    // ── decode_payment_required_input ───────────────────────────────────────────
+
+    /// Raw-JSON requirements whose field has the wrong type report the JSON
+    /// error class and position; the marker value never reaches the detail.
+    #[test]
+    fn decode_payment_required_input_fallback_drops_decoded_values() {
+        let input = r#"{"scheme":"exact","maxTimeoutSeconds":"MARKERSECRET"}"#;
+        let err = decode_payment_required_input(input).unwrap_err();
+        let stellar_agent_x402::X402Error::InvalidPaymentRequired { detail } = &err else {
+            panic!("expected InvalidPaymentRequired, got {err:?}");
+        };
+        assert_eq!(
+            detail,
+            "the PaymentRequirements input has a missing field or a field of the wrong type \
+             or value (line 1, column 52)"
+        );
+        assert!(!format!("{err} {err:?}").contains("MARKER"), "{err:?}");
+    }
+
+    /// A base64 input whose decoded payload has a field of the wrong type
+    /// reports that payload's failure by class and position, not the raw-JSON
+    /// failure of the base64 text, and without the field's value.
+    #[test]
+    fn decode_payment_required_input_reports_the_base64_payload_error() {
+        use base64::Engine as _;
+        let input = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"scheme":"exact","maxTimeoutSeconds":"MARKERSECRET"}"#);
+        let err = decode_payment_required_input(&input).unwrap_err();
+        let stellar_agent_x402::X402Error::InvalidPaymentRequired { detail } = &err else {
+            panic!("expected InvalidPaymentRequired, got {err:?}");
+        };
+        assert_eq!(
+            detail,
+            "the PAYMENT-REQUIRED payload has a missing field or a field of the wrong type \
+             or value (line 1, column 52)"
+        );
+        assert!(!format!("{err} {err:?}").contains("MARKER"), "{err:?}");
+    }
 
     // ── submit_timeout ──────────────────────────────────────────────────────────
 

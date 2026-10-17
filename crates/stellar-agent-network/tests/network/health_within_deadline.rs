@@ -136,7 +136,7 @@ async fn a_401_or_403_answer_is_not_retried() {
 
         assert_eq!(
             unreachable_reason(err),
-            format!("getHealth failed: Request rejected `{status}`")
+            format!("getHealth failed: \"Request rejected `{status}`\"")
         );
         assert_eq!(rpc_request_count(&server, "getHealth").await, 1, "{status}");
     }

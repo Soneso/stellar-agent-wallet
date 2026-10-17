@@ -5,7 +5,9 @@
 //! way a proxy or upstream node can. Its `data` carries a second
 //! credential-bearing URL with each slash JSON-escaped. Each error test drives
 //! one public entry point through the real RPC client. It asserts that the text
-//! field of the resulting error keeps only the host and port of both URLs.
+//! field of the resulting error keeps only the host and port of both URLs, with
+//! the server's quotes escaped, or that the bound cut the text before the
+//! second URL.
 //!
 //! The status tests instead serve a success-shaped `getTransaction` answer
 //! whose `status` holds the request URL, and assert that the resulting text
@@ -104,9 +106,22 @@ impl EchoingEndpoint {
             .await;
     }
 
-    /// Asserts that `field` keeps the host and port of both echoed URLs and
-    /// none of their scheme, userinfo, path, or query.
+    /// Asserts that `field` keeps the host and port of both echoed URLs, with
+    /// the quotes of the data escaped, and none of their scheme, userinfo,
+    /// path, or query.
     fn assert_scrubbed(&self, field: &str) {
+        assert!(
+            field.contains(r#"{\"url\":\"archive.example.com:8443\"}"#),
+            "the escaped URL in the data must keep its host and port: {field}"
+        );
+        self.assert_scrubbed_and_cut_before_the_data(field, false);
+    }
+
+    /// Asserts that `field` keeps the host and port of the echoed request URL
+    /// and no part of either echoed URL's scheme, userinfo, path, or query.
+    /// With `cut`, the field also ends with the closing quote and the cut
+    /// marker, so the bound stopped the text before the data's URL.
+    fn assert_scrubbed_and_cut_before_the_data(&self, field: &str, cut: bool) {
         assert!(
             field.contains(&format!(
                 "upstream rejected {} for this caller",
@@ -114,19 +129,13 @@ impl EchoingEndpoint {
             )),
             "the echoed request URL must keep its host and port: {field}"
         );
-        assert!(
-            field.contains(r#"{"url":"archive.example.com:8443"}"#),
-            "the escaped URL in the data must keep its host and port: {field}"
-        );
-        for leaked in [
-            "SECRET",
-            "token=",
-            "user:",
-            "https://",
-            r"https:\/",
-            "/?",
-            "/rpc",
-        ] {
+        if cut {
+            assert!(
+                field.ends_with("\"..."),
+                "the bound cuts the text before the data: {field}"
+            );
+        }
+        for leaked in ["SECRET", "token=", "user:", "https:", "/?", "/rpc"] {
             assert!(
                 !field.contains(leaked),
                 "{leaked} survived the scrub: {field}"
@@ -457,8 +466,8 @@ async fn send_failure_reports_a_scrubbed_malformed_transaction() {
         panic!("expected TxMalformed, got {err:?}");
     };
     assert!(
-        detail.starts_with("No status yet:"),
-        "the detail keeps the client's wording without a prefix: {detail}"
+        detail.starts_with("\"No status yet: "),
+        "the detail quotes the client's wording without a prefix: {detail}"
     );
     endpoint.assert_scrubbed(&detail);
     assert!(
@@ -544,7 +553,7 @@ async fn unexpected_transaction_status_enters_the_reason_scrubbed() {
     assert_eq!(
         reason,
         format!(
-            "unexpected getTransaction status: PROXIED {}",
+            "unexpected getTransaction status: \"PROXIED {}\"",
             endpoint.authority()
         )
     );
@@ -570,7 +579,7 @@ async fn unexpected_transaction_status_enters_the_reason_scrubbed() {
         *log.outcomes.lock().unwrap(),
         vec![SubmissionOutcome::TransportAfterSend {
             error: format!(
-                "the endpoint reported an unexpected transaction status: PROXIED {}",
+                "the endpoint reported an unexpected transaction status: \"PROXIED {}\"",
                 endpoint.authority()
             ),
         }],
@@ -616,10 +625,10 @@ async fn idempotent_send_failure_reports_a_scrubbed_reason() {
         "the endpoint keeps its authority"
     );
     assert!(
-        reason.starts_with("transaction submission failed: No status yet:"),
-        "the reason is the send failure: {reason}"
+        reason.starts_with("\"transaction submission failed: No status yet: "),
+        "the reason quotes the send failure: {reason}"
     );
-    endpoint.assert_scrubbed(&reason);
+    endpoint.assert_scrubbed_and_cut_before_the_data(&reason, true);
     assert!(
         !reason.contains("http://"),
         "no scheme survives in the reason: {reason}"
@@ -655,8 +664,110 @@ async fn idempotent_unexpected_status_enters_the_reason_scrubbed() {
     assert_eq!(
         reason,
         format!(
-            "unexpected getTransaction status: PROXIED {}",
+            "unexpected getTransaction status: \"PROXIED {}\"",
             endpoint.authority()
         )
     );
+}
+
+/// Asserts that `text` is one quoted body of exactly the server-text bound
+/// followed by the cut marker, and returns the body.
+fn cut_body(text: &str) -> &str {
+    let body = text
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix("\"..."))
+        .unwrap_or_else(|| panic!("a cut text is quoted and ends with ...: {text}"));
+    assert_eq!(
+        body.chars().count(),
+        stellar_agent_network::MAX_SERVER_TEXT_CHARS,
+        "the body holds the bound: {text}"
+    );
+    body
+}
+
+/// A simulation answer's `error` string from a plain client reaches the
+/// caller with the echoed URL as host and port, control characters, `"`
+/// and `\` escaped, quoted, and cut at the bound.
+#[tokio::test]
+async fn simulate_answer_error_is_scrubbed_bounded_and_quoted() {
+    use stellar_xdr::ReadXdr as _;
+
+    let envelope = stellar_xdr::TransactionEnvelope::from_xdr_base64(
+        SignedTestEnvelope::for_source(SOURCE_SEED).envelope_xdr(),
+        stellar_xdr::Limits::none(),
+    )
+    .expect("the fixture envelope decodes");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "simulateTransaction"})))
+        .respond_with(EchoIdResponder::new(json!({
+            "latestLedger": 7,
+            "error": format!(
+                "host https://user:SECRET@archive.example.com:8443/rpc?token=SECRET \
+                 said \"no\" at C:\\x\u{1b}[2J\r\n{}",
+                "z".repeat(1000)
+            )
+        })))
+        .mount(&server)
+        .await;
+
+    let answer = StellarRpcClient::new(&server.uri())
+        .unwrap()
+        .simulate_transaction_envelope(&envelope)
+        .await
+        .expect("the endpoint answers the simulation");
+
+    let error = answer.error.expect("the answer carries its error");
+    let body = cut_body(&error);
+    assert!(
+        body.starts_with(r#"host archive.example.com:8443 said \"no\" at C:\\x\u{001b}[2J zzz"#),
+        "{error}"
+    );
+    for leaked in [
+        "SECRET", "token=", "user:", "https:", "/rpc", "\u{1b}", "\r", "\n",
+    ] {
+        assert!(!error.contains(leaked), "{leaked:?} survived: {error}");
+    }
+}
+
+/// A `getHealth` error object of thousands of characters reaches the reason
+/// quoted and cut at the bound after the fixed prefix. The client renders the
+/// object's `message` with `Debug`, which escapes the control characters with
+/// a backslash; the scrub then escapes each `"` and `\` of that rendering.
+#[tokio::test]
+async fn rpc_unreachable_reason_is_bounded_and_quoted() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getHealth"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32000,
+                "message": format!("node \\ said \"down\"\u{1b}]8;;\u{7}{}", "y".repeat(5000))
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let err = StellarRpcClient::new(&server.uri())
+        .unwrap()
+        .get_health()
+        .await
+        .expect_err("the endpoint answers with an error object");
+
+    let (_, reason) = unreachable_parts(err);
+    let quoted = reason
+        .strip_prefix("getHealth failed: ")
+        .unwrap_or_else(|| panic!("the prefix stays: {reason}"));
+    let body = cut_body(quoted);
+    assert!(
+        body.contains(r#"node \\\\ said \\\"down\\\"\\u{1b}]8;;\\u{7}yyy"#),
+        "{reason}"
+    );
+    for raw in ["\u{1b}", "\u{7}"] {
+        assert!(!reason.contains(raw), "{raw:?} survived: {reason}");
+    }
 }

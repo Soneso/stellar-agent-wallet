@@ -72,7 +72,10 @@ pub use counterparty::{
     StellarTomlResolver, is_valid_ldh_home_domain, parse_minimal_sep1,
 };
 pub use memo::parse_memo_fields;
-pub use redact::{redact_rpc_error, redact_rpc_error_display, redact_url_authority};
+pub use redact::{
+    MAX_SERVER_TEXT_CHARS, escape_server_text, quote_server_text, redact_rpc_error,
+    redact_rpc_error_display, redact_url_authority,
+};
 
 pub use account::{
     AccountView, AssetView, BASE_RESERVE_STROOPS, BalanceView, SignerView, ThresholdsView,

@@ -212,8 +212,12 @@ pub struct X402AuthenticatedPaymentArgs {
 /// Maps [`IdentityError`] to the standard business-error envelope with
 /// `isError = true`, carrying the `identity.<reason>` wire code.
 ///
-/// No JWT material, no full URLs — the `IdentityError::Display` is already
-/// redaction-safe (authority-only URLs, no JWT).
+/// The gate passes server-derived text in `IdentityError::Display` that it
+/// does not validate to a fixed shape through
+/// `stellar_agent_network::quote_server_text`. A value validated to a fixed
+/// shape, such as the LDH endpoint host, is printed as validated. Endpoints
+/// are named by host and port, and the text carries no JWT and no response
+/// body.
 fn identity_error_to_tool_result(err: &IdentityError) -> CallToolResult {
     crate::tools::common::business_error_result(err.wire_code(), err.to_string())
 }

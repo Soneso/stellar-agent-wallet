@@ -36,9 +36,10 @@ pub enum X402Error {
     /// The `scheme` field was not `"exact"`.
     ///
     /// Only the `exact` scheme is supported by this crate.
-    #[error("unsupported x402 scheme: {scheme:?}; only \"exact\" is supported")]
+    #[error("unsupported x402 scheme: {scheme}; only \"exact\" is supported")]
     UnsupportedScheme {
-        /// The scheme value that was rejected.
+        /// The rejected scheme value, stored quoted, escaped, and bounded by
+        /// `stellar_agent_network::quote_server_text`.
         scheme: String,
     },
 
@@ -47,11 +48,12 @@ pub enum X402Error {
     /// Only `"stellar:pubnet"` and `"stellar:testnet"` are valid x402 Stellar
     /// network identifiers.
     #[error(
-        "unsupported x402 network: {network:?}; \
+        "unsupported x402 network: {network}; \
          accepted values are \"stellar:pubnet\" and \"stellar:testnet\""
     )]
     UnsupportedNetwork {
-        /// The network string that was rejected.
+        /// The rejected network value, stored quoted, escaped, and bounded by
+        /// `stellar_agent_network::quote_server_text`.
         network: String,
     },
 
@@ -277,19 +279,21 @@ pub mod test_helpers {
         }
     }
 
-    /// Constructs [`X402Error::UnsupportedScheme`] with the given scheme.
+    /// Constructs [`X402Error::UnsupportedScheme`] with the given scheme,
+    /// stored quoted the way the validation stores it.
     #[must_use]
-    pub fn unsupported_scheme(scheme: impl Into<String>) -> X402Error {
+    pub fn unsupported_scheme(scheme: impl AsRef<str>) -> X402Error {
         X402Error::UnsupportedScheme {
-            scheme: scheme.into(),
+            scheme: stellar_agent_network::quote_server_text(scheme.as_ref()),
         }
     }
 
-    /// Constructs [`X402Error::UnsupportedNetwork`] with the given network.
+    /// Constructs [`X402Error::UnsupportedNetwork`] with the given network,
+    /// stored quoted the way the validation stores it.
     #[must_use]
-    pub fn unsupported_network(network: impl Into<String>) -> X402Error {
+    pub fn unsupported_network(network: impl AsRef<str>) -> X402Error {
         X402Error::UnsupportedNetwork {
-            network: network.into(),
+            network: stellar_agent_network::quote_server_text(network.as_ref()),
         }
     }
 
@@ -472,7 +476,9 @@ mod tests {
             (
                 WalletError::Network(NetworkError::EndpointNetworkMismatch {
                     expected: "Test SDF Network ; September 2015".to_owned(),
-                    server: "Test SDF Future Network ; October 2022".to_owned(),
+                    server: stellar_agent_core::error::ReportedPassphrase::from_reported(
+                        "Test SDF Future Network ; October 2022",
+                    ),
                 }),
                 "network.endpoint_network_mismatch",
             ),
@@ -517,9 +523,9 @@ mod tests {
         assert!(matches!(e, X402Error::FeesNotSponsored));
 
         let e = test_helpers::unsupported_scheme("upto");
-        assert!(matches!(e, X402Error::UnsupportedScheme { scheme } if scheme == "upto"));
+        assert!(matches!(e, X402Error::UnsupportedScheme { scheme } if scheme == "\"upto\""));
 
         let e = test_helpers::unsupported_network("evm:1");
-        assert!(matches!(e, X402Error::UnsupportedNetwork { network } if network == "evm:1"));
+        assert!(matches!(e, X402Error::UnsupportedNetwork { network } if network == "\"evm:1\""));
     }
 }

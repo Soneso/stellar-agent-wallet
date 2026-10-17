@@ -100,10 +100,10 @@ async fn balances_envelope_keeps_only_host_and_port_of_echoed_urls() {
         "the echoed request URL keeps its host and port: {message}"
     );
     assert!(
-        message.contains(r#"{"url":"archive.example.com:8443"}"#),
-        "the escaped URL in the data keeps its host and port: {message}"
+        message.contains(r#"{\"url\":\"archive.example.com:8443\"}"#),
+        "the escaped URL in the data keeps its host and port, its quotes escaped: {message}"
     );
-    for leaked in ["SECRET", "token=", "user:", "https://", r"https:\/", "/rpc"] {
+    for leaked in ["SECRET", "token=", "user:", "https:", "/rpc"] {
         assert!(
             !message.contains(leaked),
             "{leaked} reached the envelope message: {message}"
