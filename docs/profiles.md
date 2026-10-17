@@ -30,8 +30,9 @@ A profile is selected by name (the file stem). Both binaries resolve the name
 the same way: an explicit `--profile <NAME>`, then the `STELLAR_AGENT_PROFILE`
 environment variable, then `default`. When no name was given and no
 `default.toml` exists yet, both fall back to an in-memory testnet
-configuration. The MCP server can still serve read-only requests, and the CLI
-can run `pay`, `claim`, and `accounts create` before any profile is authored. This fallback is never written to disk. A profile that WAS named but
+configuration. The fallback lets the MCP server serve read-only requests and
+the CLI run `pay`, `claim`, and `accounts create` before any profile is
+authored. This fallback is never written to disk. A profile that WAS named but
 has no file is refused by both binaries rather than replaced by that fallback:
 the fallback is a testnet, no-policy-engine configuration, so substituting it
 for a profile you named would answer on the wrong network under a governance
@@ -40,7 +41,8 @@ setting you did not choose.
 A profile file is bound to its name by its keyring coordinates: renaming or
 copying `<a>.toml` to `<b>.toml` does not make it profile `b`. Both binaries
 refuse it under the new name. The MCP server refuses it at startup, and the CLI
-refuses it at every command that loads a profile, with the wire code `profile.name_mismatch`. The
+refuses it at every command that loads a profile, with the wire code
+`profile.name_mismatch`. The
 refusal names both profiles and quotes the offending
 `policy_owner_key_id.service`. Recover by creating the second profile with
 `profile init --profile <name>`, or by correcting that field to
@@ -78,15 +80,15 @@ to UTF-16LE, which the loader refuses. The surfaced code depends on the command:
 
 ## Profile names
 
-A profile name becomes a path component for the profile file itself, the
-per-profile audit log, and the policy-window state files derived from it. Both
+A profile name becomes a path component of the profile file itself and of the
+per-profile audit log and policy-window state files derived from it, so both
 binaries validate it before building any path. A name must be:
 
 - 1 to 64 printable ASCII characters (`0x20`-`0x7E`), no control characters;
 - free of `/`, `\`, `:`, and `..`, and not `.` or `..` itself;
 - not beginning with `-`;
-- not a Windows reserved device name. This includes `CON`, `PRN`, `AUX`, `NUL`,
-  `COM1`-`COM9`, and `LPT1`-`LPT9`, in any letter case. Windows reduces a name to
+- not a Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`,
+  `COM1`-`COM9`, `LPT1`-`LPT9`) in any letter case. Windows reduces a name to
   the device it names by cutting it at the first `.` and then dropping trailing
   spaces, so `NUL.toml`, `nul `, and `nul .toml` all name the NUL device and are
   all refused. `COM0`, `COM10`, and `LPT0` are not reserved and stay valid names.
@@ -105,8 +107,8 @@ An unusable name is refused before the profile path is built: the CLI exits `1`
 with a typed refusal quoting the name and the rule it broke, and
 `stellar-agent-mcp` exits `2` before serving anything.
 
-A profile file that already carries such a name, which is possible on Unix where
-both classes are legal file names, can no longer be selected. The clean recovery is
+A profile file that already carries such a name (possible on Unix, where both
+classes are legal file names) can no longer be selected. The clean recovery is
 `stellar-agent profile init --profile <new-name>` followed by the enrollment
 steps that command prints. Renaming the file works too, but the name is part of
 the profile's identity: correct `policy_owner_key_id.service` to
@@ -263,8 +265,9 @@ actual keys (see [Migration and key rotation](#migration-and-key-rotation)).
 
 These controls apply to every CLI seed read, including `pay`, `claim`, and `accounts create`. The zero-config testnet profile uses the `"warn"` posture and a 30-second TTL.
 
-Controls the [unlock window](concepts.md). This is the short, TTL-bounded period during
-which the 32-byte signing seed is resident in pinned, zeroize-on-drop memory.
+Controls the [unlock window](concepts.md). This is the short, TTL-bounded period
+during which the 32-byte signing seed is resident in pinned, zeroize-on-drop
+memory.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -307,8 +310,8 @@ deployment.
 | `display_name` | string | no | unset (no name) | The name the served pages announce, in the page title and above each page's heading. At most 64 characters; a longer value is refused at load. An empty or whitespace-only value means no name. HTML-escaped wherever it renders. |
 | `show_project_mark` | bool | no | `false` | Renders the project mark on the served pages. Set by the project's own demo and documentation captures; a third-party deployment has no reason to. |
 
-The page DESIGN, including layout, palette, typography, and the decision page's
-hierarchy, is not configurable, and neither is anything the approval page says
+The page DESIGN (layout, palette, typography, and the decision page's
+hierarchy) is not configurable, and neither is anything the approval page says
 about a transaction. The approval page is a consent surface: its purpose is the
 faithful display of what is about to be signed, so the amount, the destination,
 the facts grid, the approve and reject controls, the caution line, and the
@@ -403,8 +406,8 @@ keyring. What happens to `[mcp_signer_default] account` depends on its current
 value: a profile fresh from `profile init` (and a v1-migrated profile that
 still carries it) holds the
 placeholder `"default"`, which enrollment overwrites in place with the derived
-address; a profile whose `account` already pins a G-strkey from a prior
-enrollment or set by hand is left untouched, and enrollment refuses if the
+address; a profile whose `account` already pins a G-strkey (from a prior
+enrollment, or set by hand) is left untouched, and enrollment refuses if the
 seed does not derive to that exact address (printing the address to set
 `account` to). Without an enrolled seed, the MCP tools and the
 keyring-signing CLI verbs (`trustline`, `trade`, `vault`) fail with
