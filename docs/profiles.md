@@ -30,9 +30,8 @@ A profile is selected by name (the file stem). Both binaries resolve the name
 the same way: an explicit `--profile <NAME>`, then the `STELLAR_AGENT_PROFILE`
 environment variable, then `default`. When no name was given and no
 `default.toml` exists yet, both fall back to an in-memory testnet
-configuration — the MCP server so it can still serve read-only requests, and
-the CLI so `pay`, `claim`, and `accounts create` work before any profile is
-authored. This fallback is never written to disk. A profile that WAS named but
+configuration. The MCP server can still serve read-only requests, and the CLI
+can run `pay`, `claim`, and `accounts create` before any profile is authored. This fallback is never written to disk. A profile that WAS named but
 has no file is refused by both binaries rather than replaced by that fallback:
 the fallback is a testnet, no-policy-engine configuration, so substituting it
 for a profile you named would answer on the wrong network under a governance
@@ -40,8 +39,8 @@ setting you did not choose.
 
 A profile file is bound to its name by its keyring coordinates: renaming or
 copying `<a>.toml` to `<b>.toml` does not make it profile `b`. Both binaries
-refuse it under the new name — the MCP server at startup, the CLI at every
-command that loads a profile — with the wire code `profile.name_mismatch`. The
+refuse it under the new name. The MCP server refuses it at startup, and the CLI
+refuses it at every command that loads a profile, with the wire code `profile.name_mismatch`. The
 refusal names both profiles and quotes the offending
 `policy_owner_key_id.service`. Recover by creating the second profile with
 `profile init --profile <name>`, or by correcting that field to
@@ -58,7 +57,7 @@ pointing at a store file that does not exist, so every value-moving command
 refuses until `profile reset-window-state <name>` re-baselines it; a copy
 without the field starts a fresh, empty window and the original's spend does
 not count against it. Neither is a way to inherit or reset a spend window on
-purpose — use `profile init` for a new profile and `profile reset-window-state`
+purpose. Use `profile init` for a new profile and `profile reset-window-state`
 for a deliberate reset. Amount caps size outbound value, so a vault withdrawal,
 which returns underlying assets and burns the wallet's shares, reserves no
 amount against them.
@@ -79,15 +78,15 @@ to UTF-16LE, which the loader refuses. The surfaced code depends on the command:
 
 ## Profile names
 
-A profile name becomes a path component — the profile file itself, and the
-per-profile audit log and policy-window state files derived from it — so both
+A profile name becomes a path component for the profile file itself, the
+per-profile audit log, and the policy-window state files derived from it. Both
 binaries validate it before building any path. A name must be:
 
 - 1 to 64 printable ASCII characters (`0x20`-`0x7E`), no control characters;
 - free of `/`, `\`, `:`, and `..`, and not `.` or `..` itself;
 - not beginning with `-`;
-- not a Windows reserved device name — `CON`, `PRN`, `AUX`, `NUL`,
-  `COM1`-`COM9`, `LPT1`-`LPT9` — in any letter case. Windows reduces a name to
+- not a Windows reserved device name. This includes `CON`, `PRN`, `AUX`, `NUL`,
+  `COM1`-`COM9`, and `LPT1`-`LPT9`, in any letter case. Windows reduces a name to
   the device it names by cutting it at the first `.` and then dropping trailing
   spaces, so `NUL.toml`, `nul `, and `nul .toml` all name the NUL device and are
   all refused. `COM0`, `COM10`, and `LPT0` are not reserved and stay valid names.
@@ -106,13 +105,13 @@ An unusable name is refused before the profile path is built: the CLI exits `1`
 with a typed refusal quoting the name and the rule it broke, and
 `stellar-agent-mcp` exits `2` before serving anything.
 
-A profile file that already carries such a name — possible on Unix, where both
-classes are legal file names — can no longer be selected. The clean recovery is
+A profile file that already carries such a name, which is possible on Unix where
+both classes are legal file names, can no longer be selected. The clean recovery is
 `stellar-agent profile init --profile <new-name>` followed by the enrollment
 steps that command prints. Renaming the file works too, but the name is part of
 the profile's identity: correct `policy_owner_key_id.service` to
 `stellar-agent-owner-<new-name>`, and on a `v1` profile also re-run `profile
-enroll-owner-key` and `profile sign-policy` under the new name — the owner key
+enroll-owner-key` and `profile sign-policy` under the new name. The owner key
 is stored under `stellar-agent-owner-<old-name>` and the signed policy file
 carries the old name in its signed scope, so neither is usable under the new
 one.
@@ -194,12 +193,12 @@ materialised into the stored file.
 
 Every profile carries a top-level `version` field. The loader dispatches on it:
 
-- `version = 2` — the current schema; loads directly.
-- `version = 1` — **not** loaded directly. The loader fails fast and the file
+- `version = 2`: the current schema; loads directly.
+- `version = 1`: **not** loaded directly. The loader fails fast and the file
   must first be migrated with
   `stellar-agent profile migrate <name>` (see
   [Migration and key rotation](#migration-and-key-rotation)).
-- `version > 2` — refused. A profile written by a newer wallet is rejected so an
+- `version > 2`: refused. A profile written by a newer wallet is rejected so an
   older wallet never silently applies stale defaults.
 
 ## Field reference
@@ -213,8 +212,8 @@ secret.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `version` | integer | yes | — | Schema version. Must be `2`. |
-| `chain_id` | string (CAIP-2) | yes | — | `stellar:testnet` or `stellar:mainnet`. Drives passphrase resolution and the mainnet-write gate. |
+| `version` | integer | yes | none | Schema version. Must be `2`. |
+| `chain_id` | string (CAIP-2) | yes | none | `stellar:testnet` or `stellar:mainnet`. Drives passphrase resolution and the mainnet-write gate. |
 | `rpc_url` | string (URL) | on mainnet | testnet endpoint | Profile endpoint used by transaction commands. Omitted testnet values use `https://soroban-testnet.stellar.org`. Mainnet has no default endpoint, so a mainnet profile must set this field. Follows the endpoint rule in [Loader source order](#loader-source-order): `http` or `https`, and on mainnet `https` with no username or password. Mainnet endpoint flags and overlays are refused. |
 | `network_passphrase` | string | resolved | from `chain_id` | The Stellar network passphrase. Resolved from `chain_id`; **not overridable** from the TOML or overlays. Surfaced for callers. |
 
@@ -222,14 +221,14 @@ secret.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `[mcp_signer_default]` | keyring ref | yes | — | Keyring entry for the default MCP signer seed. Its `account` is the signer identity: `signer_from_keyring` verifies the loaded seed derives to it, so `account` must be the signer's G-strkey (public address), not a placeholder. Populate the entry with [`profile enroll-signer`](cli-reference/profile-and-governance.md#profile-enroll-signer). |
-| `[mcp_nonce_key_alias]` | keyring ref | yes | — | Keyring entry for the HMAC nonce key. Here `account` is only a coordinate label. |
+| `[mcp_signer_default]` | keyring ref | yes | none | Keyring entry for the default MCP signer seed. Its `account` is the signer identity: `signer_from_keyring` verifies the loaded seed derives to it, so `account` must be the signer's G-strkey (public address), not a placeholder. Populate the entry with [`profile enroll-signer`](cli-reference/profile-and-governance.md#profile-enroll-signer). |
+| `[mcp_nonce_key_alias]` | keyring ref | yes | none | Keyring entry for the HMAC nonce key. Here `account` is only a coordinate label. |
 
 ### Thresholds and fees
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `cross_check_threshold_stroops` | integer (stroops) | no | `0` | High-value cross-check threshold. The effective value is `max(cross_check_threshold_stroops, 10_000_000_000)`; the floor of 1000 XLM (10^10 stroops) cannot be configured lower, so a profile with `cross_check_threshold_stroops = 0` behaves as if it were the floor. Transactions at or above the effective threshold trigger the independent-RPC cross-check when `oracle_provider_url` is set. The legacy key `usd_threshold` is still accepted on load; do not set both keys (across the file, environment, and CLI sources) — the load is refused as a duplicate field. |
+| `cross_check_threshold_stroops` | integer (stroops) | no | `0` | High-value cross-check threshold. The effective value is `max(cross_check_threshold_stroops, 10_000_000_000)`; the floor of 1000 XLM (10^10 stroops) cannot be configured lower, so a profile with `cross_check_threshold_stroops = 0` behaves as if it were the floor. Transactions at or above the effective threshold trigger the independent-RPC cross-check when `oracle_provider_url` is set. The legacy key `usd_threshold` is still accepted on load; do not set both keys (across the file, environment, and CLI sources). The load is refused as a duplicate field. |
 | `classic_fee_per_op_stroops` | integer | no | unset (protocol default) | Per-operation base fee for classic transactions, in stroops. When unset, classic tools use the built-in default. |
 | `classic_max_fee_per_op_stroops` | integer | no | unset (no cap) | Per-operation fee cap, in stroops. When set, classic tools fail before envelope construction if the selected fee exceeds the cap. This is a guardrail, not a silent clamp. |
 | `submit_timeout_seconds` | integer | no | `60` | How long the wallet polls for transaction confirmation. |
@@ -264,7 +263,7 @@ actual keys (see [Migration and key rotation](#migration-and-key-rotation)).
 
 These controls apply to every CLI seed read, including `pay`, `claim`, and `accounts create`. The zero-config testnet profile uses the `"warn"` posture and a 30-second TTL.
 
-Controls the [unlock window](concepts.md) — the short, TTL-bounded period during
+Controls the [unlock window](concepts.md). This is the short, TTL-bounded period during
 which the 32-byte signing seed is resident in pinned, zeroize-on-drop memory.
 
 | Field | Type | Required | Default | Description |
@@ -276,24 +275,24 @@ which the 32-byte signing seed is resident in pinned, zeroize-on-drop memory.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `engine` | string | yes (in v2) | — | `"noop"` or `"v1"`. `noop`: testnet allow-all; mainnet read-only allowed; mainnet destructive operations refused with `policy.engine_required`; `smart-account multicall` refused on testnet with `policy.engine_required`, since mainnet refuses it earlier with `network.mainnet_write_forbidden`. `v1`: signature-verified typed-criteria engine, first-match default-deny. Newly minted profiles default to `v1`; a profile migrated from v1 is set to `noop` explicitly. |
+| `engine` | string | yes (in v2) | none | `"noop"` or `"v1"`. `noop`: testnet allow-all; mainnet read-only allowed; mainnet destructive operations refused with `policy.engine_required`; `smart-account multicall` refused on testnet with `policy.engine_required`, since mainnet refuses it earlier with `network.mainnet_write_forbidden`. `v1`: signature-verified typed-criteria engine, first-match default-deny. Newly minted profiles default to `v1`; a profile migrated from v1 is set to `noop` explicitly. |
 
 ### `[remote_approval]` block
 
-Optional; absent by default. Enables `approve serve --remote` — see
+Optional; absent by default. Enables `approve serve --remote`; see
 [Remote approval](remote-approval.md) for the full setup walkthrough.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `enabled` | bool | no | `false` | Must be `true`, together with the CLI's `--confirm-remote-exposure` flag, for `--remote` to take effect. The profile block alone does not start remote mode. |
-| `bind` | string | yes (if block present) | — | Socket address to bind, e.g. `"0.0.0.0:8443"`. Must parse as a valid address; validated fail-closed before any TLS provisioning or bind attempt. |
-| `rp_id` | string | yes (if block present) | — | The WebAuthn Relying Party ID — a DNS hostname that resolves to this host from the approving device. Must NOT be an IP literal (WebAuthn Level 2 §5.1.2 forbids IP-literal Relying Party IDs); rejected fail-closed if it is one. |
+| `bind` | string | yes (if block present) | none | Socket address to bind, e.g. `"0.0.0.0:8443"`. Must parse as a valid address; validated fail-closed before any TLS provisioning or bind attempt. |
+| `rp_id` | string | yes (if block present) | none | The WebAuthn Relying Party ID, a DNS hostname that resolves to this host from the approving device. Must NOT be an IP literal (WebAuthn Level 2 §5.1.2 forbids IP-literal Relying Party IDs); rejected fail-closed if it is one. |
 | `allowed_credentials` | array of strings | no | `[]` | Base64url WebAuthn credential IDs authorized to approve or reject. A credential enrolled via `approve operator enroll` but absent from this list is refused identically to an unknown credential. |
 
 ### `[served_pages]` block
 
 Optional; absent by default. Names this deployment on the operator-facing web
-pages the wallet serves — the approval inbox and detail pages, the local and
+pages the wallet serves: the approval inbox and detail pages, the local and
 remote approval surfaces, the passkey ceremony pages, and the
 operator-enrollment page.
 
@@ -308,8 +307,8 @@ deployment.
 | `display_name` | string | no | unset (no name) | The name the served pages announce, in the page title and above each page's heading. At most 64 characters; a longer value is refused at load. An empty or whitespace-only value means no name. HTML-escaped wherever it renders. |
 | `show_project_mark` | bool | no | `false` | Renders the project mark on the served pages. Set by the project's own demo and documentation captures; a third-party deployment has no reason to. |
 
-The page DESIGN — layout, palette, typography, and the decision page's
-hierarchy — is not configurable, and neither is anything the approval page says
+The page DESIGN, including layout, palette, typography, and the decision page's
+hierarchy, is not configurable, and neither is anything the approval page says
 about a transaction. The approval page is a consent surface: its purpose is the
 faithful display of what is about to be signed, so the amount, the destination,
 the facts grid, the approve and reject controls, the caution line, and the
@@ -379,7 +378,7 @@ on error.
 | `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. All cached `stellar.toml` entries are invalidated and re-fetched on next use. |
 | `stellar-agent profile rotate-nonce-key <name>` | `mcp_nonce_key_alias` | Fresh 32-byte HMAC key. Outstanding nonces minted with the old key are invalidated. |
 | `stellar-agent profile rotate-policy-state-key <name>` | `policy_window_state_key_id` | Fresh 32-byte HMAC key. Unlike the other rotations, the accumulated window-state store is re-signed under the new key, so `per_period_cap` / `rate_limit` history is preserved, not invalidated. |
-| `stellar-agent profile reset-window-state <name> --reason <reason>` | `policy_window_state_key_id` (mints if absent) | Re-initialises the window-state store to empty. Recovery path for an unreadable, tampered, or unparseable store — the affected criteria fail closed until reset. Discards accumulated history; the reset is audited. |
+| `stellar-agent profile reset-window-state <name> --reason <reason>` | `policy_window_state_key_id` (mints if absent) | Re-initialises the window-state store to empty. Recovery path for an unreadable, tampered, or unparseable store. The affected criteria fail closed until reset. Discards accumulated history; the reset is audited. |
 
 ### Enroll the MCP signer
 
@@ -404,8 +403,8 @@ keyring. What happens to `[mcp_signer_default] account` depends on its current
 value: a profile fresh from `profile init` (and a v1-migrated profile that
 still carries it) holds the
 placeholder `"default"`, which enrollment overwrites in place with the derived
-address; a profile whose `account` already pins a G-strkey — from a prior
-enrollment, or set by hand — is left untouched, and enrollment refuses if the
+address; a profile whose `account` already pins a G-strkey from a prior
+enrollment or set by hand is left untouched, and enrollment refuses if the
 seed does not derive to that exact address (printing the address to set
 `account` to). Without an enrolled seed, the MCP tools and the
 keyring-signing CLI verbs (`trustline`, `trade`, `vault`) fail with
@@ -438,7 +437,7 @@ engine = "v1"
 
 Until this is done, a migrated profile continues to run under `noop`, which
 refuses mainnet destructive operations with `policy.engine_required`. Opting in
-to `v1` changes the policy layer only — mainnet writes stay structurally
+to `v1` changes the policy layer only. Mainnet writes stay structurally
 refused at the network layer in this alpha. For the governance flow that V1
 enforces, see
 [cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md).
