@@ -283,11 +283,13 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   ask the same question earlier, before the first read whose answer they sign
   or gate on. They ask on the client that sends, and the MCP simulate tools ask
   on their own client.
-  Six codes carry those refusals:
+  Seven codes carry those refusals:
   - `network.endpoint_network_mismatch`: the endpoint serves a different
     network than declared.
   - `network.endpoint_identity_unavailable`: the endpoint identity cannot be
     established in time.
+  - `network.rpc_credential_refused`: the endpoint answered the identity
+    request with HTTP 401 or 403, or the stored RPC credential is unusable.
   - `network.unsupported_protocol_version`: a mainnet endpoint reports a version
     outside the supported range. While mainnet writes are refused, a mainnet
     endpoint is refused before this check.
@@ -372,7 +374,9 @@ three codes for mainnet refusals.
 layer asks the RPC endpoint which network it serves and binds the submission to
 that answer. An endpoint serving a different network than the profile declares
 is `network.endpoint_network_mismatch`; an endpoint whose identity cannot be
-established in time is `network.endpoint_identity_unavailable`. The same answer
+established in time is `network.endpoint_identity_unavailable`; one that
+answers the identity request with HTTP 401 or 403 is
+`network.rpc_credential_refused`. The same answer
 carries the endpoint's protocol version: this release supports protocol 29.
 Outside it, testnet logs a warning and continues; on mainnet the rule refuses
 with `network.unsupported_protocol_version`, which a mainnet endpoint never

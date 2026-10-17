@@ -154,7 +154,9 @@ refused with `network.mainnet_write_forbidden` even when the caller declared
 testnet. An endpoint reporting a different network than declared is refused
 with `network.endpoint_network_mismatch`. An endpoint whose identity cannot be
 established within the timeout is refused with
-`network.endpoint_identity_unavailable`. The same answer carries the endpoint's
+`network.endpoint_identity_unavailable`. An endpoint that answers the identity
+request with HTTP 401 or 403 is refused with `network.rpc_credential_refused`,
+without a retry. The same answer carries the endpoint's
 protocol version. This release supports protocol 29: outside it, testnet and
 other networks log a warning, and a mainnet endpoint is refused with
 `network.unsupported_protocol_version`. While mainnet writes are refused, a

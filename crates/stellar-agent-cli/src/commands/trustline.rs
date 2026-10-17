@@ -91,7 +91,7 @@ use crate::commands::policy_engine::{
 use stellar_agent_network::{
     AccountView, Asset, ClassicOpBuilder, StellarRpcClient, SubmissionRecorder,
     SubmissionSignerKind, enrolled_keyring_signer, fetch_account, init_platform_keyring_store,
-    parse_classic_fee_choice,
+    is_credential_error, parse_classic_fee_choice,
     policy_view::AccountViewAdapter,
     resolve_classic_fee_selection,
     signing::envelope_signing::attach_signature,
@@ -280,7 +280,6 @@ where
         return write_envelope(out, &Envelope::<()>::err(&e), 1);
     }
 
-    let rpc_url = context.rpc_url.as_str();
     let network_passphrase = context.network_passphrase();
     let chain_id = context.chain_id.caip2_str();
 
@@ -317,8 +316,13 @@ where
     };
 
     // ── GATE 2: Live issuer account fetch ──────────────────────────────────────
-    let rpc_client = match StellarRpcClient::new(rpc_url) {
+    // A credential failure keeps its own code; a transport refusal of the
+    // URL keeps the trustline code.
+    let rpc_client = match context.primary_client() {
         Ok(c) => c,
+        Err(e) if is_credential_error(&e) => {
+            return write_envelope(out, &Envelope::<()>::err(&e), 1);
+        }
         Err(e) => {
             return write_envelope(
                 out,

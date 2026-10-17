@@ -223,6 +223,78 @@ async fn a_failing_endpoint_is_retried_five_times_then_unavailable() {
     assert_eq!(rpc_request_count(&server, "getNetwork").await, 5);
 }
 
+/// An identity answer of HTTP 401 or 403 is final: one request, the
+/// credential refusal code, and a text with the status and the authority but
+/// no part of the body or the URL's path and query.
+#[tokio::test]
+async fn identity_401_and_403_report_the_status_and_authority() {
+    for status in [401u16, 403] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "getNetwork"})))
+            .respond_with(ResponseTemplate::new(status).set_body_string("BODY_SENTINEL"))
+            .mount(&server)
+            .await;
+        let client = StellarRpcClient::new(&format!(
+            "{}/PATH_SENTINEL?key=QUERY_SENTINEL",
+            server.uri()
+        ))
+        .unwrap();
+        let error = client
+            .endpoint_identity(
+                TESTNET_PASSPHRASE,
+                tokio::time::Instant::now() + GENEROUS_DEADLINE,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "network.rpc_credential_refused", "{status}");
+        match &error {
+            WalletError::Network(NetworkError::RpcCredentialRejected { url, status: got }) => {
+                assert_eq!(url, &server.uri());
+                assert_eq!(*got, status);
+            }
+            other => panic!("{status}: expected a credential refusal, got {other:?}"),
+        }
+        let text = error.to_string();
+        assert_eq!(
+            text,
+            format!(
+                "RPC endpoint '{}' answered the network identity request with HTTP {status}; \
+                 check the credential the profile configures for this endpoint",
+                server.uri()
+            )
+        );
+        for leaked in ["BODY_SENTINEL", "PATH_SENTINEL", "QUERY_SENTINEL"] {
+            assert!(!format!("{text} {error:?}").contains(leaked), "{leaked}");
+        }
+        assert_eq!(
+            rpc_request_count(&server, "getNetwork").await,
+            1,
+            "{status}"
+        );
+    }
+}
+
+/// A rate limit and a server error are still retried to the policy's five
+/// attempts and end as an unavailable identity.
+#[tokio::test]
+async fn identity_429_and_500_are_still_retried() {
+    for status in [429u16, 500] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "getNetwork"})))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        expect_unavailable(identity(&server, TESTNET_PASSPHRASE).await, &server);
+        assert_eq!(
+            rpc_request_count(&server, "getNetwork").await,
+            5,
+            "{status}"
+        );
+    }
+}
+
 /// A network other than testnet and mainnet whose passphrase matches the
 /// expected one yields no chain. At a supported version it passes without a
 /// warning; outside the range it passes with one warning.

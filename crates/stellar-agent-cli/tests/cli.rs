@@ -54,6 +54,8 @@ mod profile_show_load_failure_codes;
 mod profile_show_profile_flag_equivalence;
 #[path = "cli/reconcile_pass_discipline.rs"]
 mod reconcile_pass_discipline;
+#[path = "cli/rpc_credential_cli.rs"]
+mod rpc_credential_cli;
 #[path = "cli/rpc_error_text_redaction.rs"]
 mod rpc_error_text_redaction;
 #[path = "cli/smart_account_signer_free.rs"]

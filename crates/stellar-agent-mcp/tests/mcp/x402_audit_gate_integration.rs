@@ -1810,3 +1810,60 @@ async fn x402_chain_arguments_preserve_refusal_order() {
         "network.mainnet_write_forbidden"
     );
 }
+
+/// Both x402 tools send the profile's primary credential on every request,
+/// the identity request first; without it the endpoint refuses that request
+/// with HTTP 401 and the tool ends there with the credential code.
+#[tokio::test]
+#[serial]
+async fn x402_tools_send_the_primary_credential() {
+    use stellar_agent_core::profile::schema::ProviderRole;
+    for (tool, name, seed, bare_name, bare_seed) in [
+        (
+            Tool::CreatePayment,
+            "x402-credential-cp",
+            0x85,
+            "x402-credential-cp-bare",
+            0x86,
+        ),
+        (
+            Tool::AuthenticatedPayment,
+            "x402-credential-ap",
+            0x87,
+            "x402-credential-ap-bare",
+            0x88,
+        ),
+    ] {
+        let keyed = fixture_with_profile(
+            name,
+            [seed; 32],
+            |_| {},
+            |profile| {
+                crate::common::bind_rpc_credential(profile, ProviderRole::Primary, true);
+            },
+        )
+        .await;
+        crate::common::require_rpc_credential(&keyed.mock).await;
+        let result = call(&keyed, tool).await;
+        let envelope = result_json(&result);
+        assert_ne!(result.is_error, Some(true), "{tool:?}: {envelope}");
+        let trace = crate::common::credential_trace(&keyed.mock).await;
+        assert_eq!(
+            trace.first().map(|(method, _)| method.as_str()),
+            Some("getNetwork"),
+            "{tool:?}: {trace:?}"
+        );
+        assert!(trace.iter().all(|(_, keyed)| *keyed), "{tool:?}: {trace:?}");
+
+        let bare = fixture(bare_name, [bare_seed; 32], |_| {}).await;
+        crate::common::require_rpc_credential(&bare.mock).await;
+        let result = call(&bare, tool).await;
+        let (code, _message, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, "network.rpc_credential_refused", "{tool:?}: {text}");
+        assert_eq!(
+            crate::common::credential_trace(&bare.mock).await,
+            [("getNetwork".to_owned(), false)],
+            "{tool:?}"
+        );
+    }
+}

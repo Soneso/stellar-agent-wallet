@@ -12,7 +12,7 @@ use serde_json::json;
 use stellar_agent_mcp_macros::mcp_tool_router;
 
 use crate::server::WalletServer;
-use crate::tools::common::{redact_rpc_error_detail, redacted_wallet_error_envelope};
+use crate::tools::common::redacted_wallet_error_envelope;
 use stellar_agent_network::{Asset, fetch_account};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -251,20 +251,13 @@ impl WalletServer {
             }
         }
 
-        // ── Resolve RPC URL from profile ─────────────────────────────────────
-        // The profile's rpc_url takes precedence over the chain_id argument's
-        // default RPC.  The chain_id was validated above.
-        let rpc_url = self.context.rpc_url.as_str();
-
         // ── Fetch account state ──────────────────────────────────────────────
-        let client = match stellar_agent_network::StellarRpcClient::new(rpc_url) {
+        // The client reads the profile's rpc_url, which takes precedence over
+        // the chain_id argument's default RPC; the chain_id was validated
+        // above. It carries the profile's primary credential, if any.
+        let client = match self.context.primary_client() {
             Ok(c) => c,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    redact_rpc_error_detail("rpc_client_error", &err),
-                    None,
-                ));
-            }
+            Err(err) => return crate::tools::common::rpc_client_failure(&err),
         };
 
         match fetch_account(&client, &args.account_id, &trustline_assets).await {

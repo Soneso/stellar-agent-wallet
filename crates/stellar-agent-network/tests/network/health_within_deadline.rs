@@ -116,6 +116,32 @@ async fn an_answer_that_does_not_parse_is_not_retried() {
     assert_eq!(rpc_request_count(&server, "getHealth").await, 1);
 }
 
+/// An HTTP 401 or 403 answer is not retried: the endpoint refused the
+/// request's credential, and the read fails after one request.
+#[tokio::test]
+async fn a_401_or_403_answer_is_not_retried() {
+    for status in [401u16, 403] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "getHealth"})))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+
+        let err = StellarRpcClient::new(&server.uri())
+            .unwrap()
+            .get_health_within(tokio::time::Instant::now() + GENEROUS_DEADLINE)
+            .await
+            .expect_err("a refused request fails the read");
+
+        assert_eq!(
+            unreachable_reason(err),
+            format!("getHealth failed: Request rejected `{status}`")
+        );
+        assert_eq!(rpc_request_count(&server, "getHealth").await, 1, "{status}");
+    }
+}
+
 /// An endpoint that always answers with an error object is read until the
 /// deadline, then the read fails with the last error.
 #[tokio::test]

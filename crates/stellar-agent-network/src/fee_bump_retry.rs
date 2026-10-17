@@ -225,7 +225,7 @@ pub async fn submit_fee_bump_idempotent(
     //
     // Ahead of the decode, the receipt fast path, `try_begin`, and the signer:
     // a mainnet submission reads no receipt, writes none, and signs nothing.
-    refuse_mainnet_write(network_passphrase, &client.url).map_err(WalletError::Network)?;
+    refuse_mainnet_write(network_passphrase, client.url.as_str()).map_err(WalletError::Network)?;
 
     // ── Step 1: decode inner, compute inner tx hash and inner_key ─────────────
     //

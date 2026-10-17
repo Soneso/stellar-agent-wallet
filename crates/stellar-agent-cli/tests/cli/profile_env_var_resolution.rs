@@ -1091,7 +1091,7 @@ fn credentialed_rpc_flag_is_a_usage_error_without_echoing_credentials() {
         "--profile",
         "mainnet",
         "--rpc-url",
-        "https://user:SENTINEL@rpc.example",
+        "https://loginsentinel:SENTINEL@rpc.example",
     ]);
     let run = run_cli(home.path(), None, &args);
     assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
@@ -1099,7 +1099,7 @@ fn credentialed_rpc_flag_is_a_usage_error_without_echoing_credentials() {
     assert!(run.stderr.is_empty(), "{}", run.stderr);
     for stream in [&run.stdout, &run.stderr] {
         assert!(!stream.contains("SENTINEL"), "{stream}");
-        assert!(!stream.contains("user"), "{stream}");
+        assert!(!stream.contains("loginsentinel"), "{stream}");
     }
 }
 
@@ -1775,10 +1775,11 @@ fn multicall_registry_error_precedes_writer_and_signer() {
 
 #[test]
 fn provider_records_show_and_refuse_overlays() {
-    use stellar_agent_core::profile::schema::ProviderRecord;
+    use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
     for mainnet in [false, true] {
         let home = tempfile::tempdir().unwrap();
         let builder = if mainnet {
+            // A mainnet profile with a second endpoint names its primary too.
             Profile::builder_mainnet_named(
                 "providers",
                 "https://primary.example",
@@ -1787,6 +1788,10 @@ fn provider_records_show_and_refuse_overlays() {
                 "n",
                 "a",
             )
+            .primary_provider(PrimaryProviderRecord::new(
+                "Primary operator",
+                "primary.example",
+            ))
         } else {
             Profile::builder_testnet_named("providers", "s", "a", "n", "a")
         };
@@ -1816,6 +1821,12 @@ fn provider_records_show_and_refuse_overlays() {
             run.json()["data"]["providers"]["secondary"]["independent_of_primary"],
             true
         );
+        if mainnet {
+            assert_eq!(
+                run.json()["data"]["providers"]["primary"]["operator"],
+                "Primary operator"
+            );
+        }
         for value in ["{}", "malformed", "{secondary={host=changed.example}}"] {
             let run = run_cli_with_env(
                 home.path(),

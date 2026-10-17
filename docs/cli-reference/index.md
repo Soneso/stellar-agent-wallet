@@ -59,10 +59,12 @@ Transaction commands read the chain from the resolved profile. An unnamed, missi
 `--rpc-url <URL>` and `--secondary-rpc-url <URL>` are optional. Without a flag, each endpoint comes from the profile.
 On testnet, a flag replaces its profile field. On mainnet, either flag refuses with `profile.non_overlayable_field`, including an equal value. The same code refuses environment and programmatic overlays outside their classes; see [Loader source order](../profiles.md#loader-source-order).
 RPC URL flags refuse credentials. Configure credentialed endpoints in the profile.
+An overriding URL gets the keyring credential only when it equals the profile's `rpc_url`.
+Store a provider key with `profile enroll-rpc-credential` (see [Provider credentials](../profiles.md#provider-credentials)).
 
 Smart-account rule commands use the effective secondary for cross-RPC checks. `smart-account multicall` requires a secondary endpoint.
 The signers manager and timelock commands use the primary when no secondary is configured.
-A configured mainnet secondary requires `providers.secondary` and a host distinct from the primary; the fallback provides no independent provider.
+A configured mainnet secondary requires `providers.secondary`, a host distinct from the primary, and a `[providers.primary]` record; the fallback provides no independent provider.
 `balances` keeps its testnet endpoint default. Standalone `friendbot` derives its endpoint from its network selector.
 `fees stats --profile` applies the endpoint rules above and keeps its flag allowlist. Without `--profile`, it uses `--rpc-url`, else the testnet endpoint.
 
@@ -141,6 +143,7 @@ The submit layer does not take the declared network on trust. Before sending, it
 - the endpoint reports mainnet: `network.mainnet_write_forbidden`;
 - the endpoint reports a different network than the one declared: `network.endpoint_network_mismatch`;
 - the endpoint's identity cannot be established within the submission timeout: `network.endpoint_identity_unavailable`;
+- the endpoint answers the identity request with HTTP 401 or 403: `network.rpc_credential_refused`, which is not retried;
 - a mainnet endpoint runs a protocol version outside the supported range: `network.unsupported_protocol_version`.
 
 The probe is retried with bounded exponential backoff inside the caller's own timeout and is fail-closed: it never falls back to the declared network. An answer that does not parse, for example one without `protocolVersion`, is not retried and reports `network.endpoint_identity_unavailable`. The endpoint check is the one mainnet refusal that costs a round trip. [Retries, deadlines, and failover](../maintainers/security-internals.md#retries-deadlines-and-failover) gives the retry numbers and the deadlines.

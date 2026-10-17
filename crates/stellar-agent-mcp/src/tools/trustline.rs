@@ -62,7 +62,7 @@ use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::{
-    AccountView, Asset, ClassicOpBuilder, StellarRpcClient,
+    AccountView, Asset, ClassicOpBuilder,
     account::AccountFlagsView,
     fetch_account,
     keyring::enrolled_keyring_signer,
@@ -82,8 +82,8 @@ use crate::server::WalletServer;
 use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
     commit_path_error_result, enforce_classic_fee_cap, ledger_err_result, nonce_id_prefix,
-    redact_rpc_error_detail, redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops,
-    submit_timeout, total_classic_fee_stroops, verify_attestation_gate,
+    redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops, submit_timeout,
+    total_classic_fee_stroops, verify_attestation_gate,
 };
 
 /// Redacts an asset input string (`CODE:ISSUER`, or `native`/`XLM`) for logging:
@@ -447,15 +447,9 @@ impl WalletServer {
             };
 
         // ── Step 2: Live issuer account fetch ─────────────────────────────────
-        let rpc_url = self.context.rpc_url.as_str();
-        let client = match StellarRpcClient::new(rpc_url) {
+        let client = match self.context.primary_client() {
             Ok(c) => c,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    redact_rpc_error_detail("rpc_client_error", &err),
-                    None,
-                ));
-            }
+            Err(err) => return crate::tools::common::rpc_client_failure(&err),
         };
 
         // Establish which network the endpoint serves before the first read
@@ -1094,15 +1088,9 @@ impl WalletServer {
 
         // ── Re-fetch source + issuer accounts (feed the policy gate's views;
         // sequence number also consumed by the rebuild below) ────────────────
-        let rpc_url = self.context.rpc_url.as_str();
-        let client = match StellarRpcClient::new(rpc_url) {
+        let client = match self.context.primary_client() {
             Ok(c) => c,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    redact_rpc_error_detail("rpc_client_error", &err),
-                    None,
-                ));
-            }
+            Err(err) => return crate::tools::common::rpc_client_failure(&err),
         };
 
         // Establish which network the endpoint serves before the first read

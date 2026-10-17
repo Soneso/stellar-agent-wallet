@@ -55,6 +55,9 @@ struct State {
     next_status: &'static str,
     send_count: usize,
     sent: HashMap<String, &'static str>,
+    /// When set, a request without the `X-API-Key` header holding this value
+    /// gets HTTP 401.
+    credential: Option<&'static str>,
 }
 
 #[derive(Clone)]
@@ -66,6 +69,14 @@ impl Respond for Rpc {
         state
             .methods
             .push(body["method"].as_str().unwrap().to_owned());
+        if let Some(credential) = state.credential
+            && request
+                .headers
+                .get("X-API-Key")
+                .is_none_or(|value| value.as_bytes() != credential.as_bytes())
+        {
+            return ResponseTemplate::new(401);
+        }
         let result = match body["method"].as_str().unwrap() {
             "getNetwork" => {
                 let answer = ResponseTemplate::new(200).set_body_json(
@@ -271,6 +282,7 @@ async fn fixture() -> (tempfile::TempDir, MockServer, Rpc) {
         next_status: "SUCCESS",
         send_count: 0,
         sent: HashMap::new(),
+        credential: None,
     })));
     Mock::given(method("POST"))
         .respond_with(state.clone())
@@ -784,6 +796,56 @@ async fn fresh_and_sending_resume_check_the_endpoint_before_any_read() {
     let (code, output) = resume(home.path());
     assert_eq!(code, 0, "{output}");
     assert_eq!(rpc.0.lock().unwrap().send_count, 1);
+}
+
+/// A fresh `pool init` sends the primary credential the profile names on
+/// every request, and without it the endpoint refuses the identity request
+/// and the run ends there with the credential code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pool_init_sends_the_primary_credential() {
+    const VALUE: &str = "Bearer pool-credential-0123";
+    let (home, _server, rpc) = fixture().await;
+    rpc.0.lock().unwrap().credential = Some(VALUE);
+    let (code, output) = start(home.path());
+    assert_eq!(code, 1, "{output}");
+    assert_eq!(
+        output["error"]["code"], "network.rpc_credential_refused",
+        "{output}"
+    );
+    assert_eq!(rpc.0.lock().unwrap().methods, ["getNetwork"]);
+
+    let (home, _server, rpc) = fixture().await;
+    rpc.0.lock().unwrap().credential = Some(VALUE);
+    let path = profile_path(home.path());
+    let mut document: toml::Value =
+        toml::from_str(&std::fs::read_to_string(&path).unwrap()).expect("the profile must parse");
+    document.as_table_mut().unwrap().insert(
+        "providers".to_owned(),
+        toml::Value::try_from(json!({"primary": {
+            "operator": "Primary RPC",
+            "host": "127.0.0.1",
+            "credential": {"service": "stellar-agent-rpc-pool-lifecycle", "account": "primary"},
+            "placement": {"kind": "header", "name": "X-API-Key"}
+        }}))
+        .unwrap(),
+    );
+    std::fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+    keyring_core::Entry::new("stellar-agent-rpc-pool-lifecycle", "primary")
+        .unwrap()
+        .set_password(VALUE)
+        .unwrap();
+    let (code, output) = start(home.path());
+    assert_eq!(code, 0, "{output}");
+    let state = rpc.0.lock().unwrap();
+    assert_eq!(
+        state.methods.first().map(String::as_str),
+        Some("getNetwork")
+    );
+    assert_eq!(
+        state.send_count, 1,
+        "every request passed the credential check"
+    );
 }
 
 /// The endpoint check runs under `--timeout-seconds`. With `getNetwork`

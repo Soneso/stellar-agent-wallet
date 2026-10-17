@@ -55,6 +55,8 @@ mod profile_selection_integration;
 mod registry_walk;
 #[path = "mcp/resource_no_secrets.rs"]
 mod resource_no_secrets;
+#[path = "mcp/rpc_credential_integration.rs"]
+mod rpc_credential_integration;
 #[path = "mcp/sep48_sep47_envelope_shape.rs"]
 mod sep48_sep47_envelope_shape;
 #[path = "mcp/toolset_args_validation_integration.rs"]

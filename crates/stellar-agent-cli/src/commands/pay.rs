@@ -1209,7 +1209,7 @@ async fn checked_client(
     context: &NetworkContext,
     args: &PayArgs,
 ) -> Result<StellarRpcClient, WalletError> {
-    let client = StellarRpcClient::new(&context.rpc_url)?;
+    let client = context.primary_client()?;
     check_endpoint_identity(&client, context, Duration::from_secs(args.timeout_seconds)).await?;
     Ok(client)
 }

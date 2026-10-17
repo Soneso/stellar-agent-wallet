@@ -371,7 +371,41 @@ impl KeyringEntryRef {
             "default",
         )
     }
+
+    /// Constructs the default keyring entry reference of an RPC provider
+    /// credential for one role of a profile.
+    ///
+    /// Entry name: `stellar-agent-rpc-<profile>` / `<role>`. The three roles
+    /// share the service and differ in the account. The `rpc` kind is no
+    /// prefix of another `stellar-agent-<kind>-` service, and no other kind is
+    /// a prefix of it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::profile::schema::{KeyringEntryRef, ProviderRole};
+    ///
+    /// let r = KeyringEntryRef::default_rpc_credential("alice", ProviderRole::Oracle);
+    /// assert_eq!(r.service, "stellar-agent-rpc-alice");
+    /// assert_eq!(r.account, "oracle");
+    /// ```
+    #[must_use]
+    pub fn default_rpc_credential(profile_name: &str, role: ProviderRole) -> Self {
+        Self::new(
+            format!("{RPC_CREDENTIAL_SERVICE_PREFIX}{profile_name}"),
+            role.as_str(),
+        )
+    }
 }
+
+/// The service prefix of RPC provider credential entries.
+///
+/// A provider credential reference may name a service in the
+/// `stellar-agent-` namespace only under this prefix.
+const RPC_CREDENTIAL_SERVICE_PREFIX: &str = "stellar-agent-rpc-";
+
+/// The namespace of the wallet's own keyring services.
+const WALLET_SERVICE_NAMESPACE: &str = "stellar-agent-";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PolicyEngineKind
@@ -665,7 +699,8 @@ pub struct Profile {
     /// and cannot be configured below this value. Native-XLM payments and
     /// sponsored account creations at or above the effective threshold trigger
     /// the MCP cross-check when `oracle_provider_url` is configured.
-    /// Mainnet requires the matching provider attestation.
+    /// Mainnet requires the matching provider attestation and a
+    /// `[providers.primary]` record.
     #[serde(alias = "usd_threshold")]
     pub cross_check_threshold_stroops: u64,
 
@@ -761,7 +796,8 @@ pub struct Profile {
 
     /// Oracle RPC endpoint for high-value native-XLM rebuilds and MCP SEP-29 reads.
     /// Mainnet requires a matching `providers.oracle` record asserting independent
-    /// administration and a host distinct from the primary.
+    /// administration and a host distinct from the primary, and a
+    /// `[providers.primary]` record.
     /// An absent URL skips these second-endpoint checks.
     /// A high-value rebuild mismatch reports `simulation.divergence`.
     ///
@@ -770,8 +806,9 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle_provider_url: Option<Url>,
 
-    /// File-only provider attestations for the optional RPC endpoints.
-    /// Operator and host are public metadata and must contain no credentials.
+    /// File-only provider records for the three RPC roles. Operator, host,
+    /// credential reference, and placement are public metadata. The
+    /// credential value lives only in the keyring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub providers: Option<Providers>,
 
@@ -835,7 +872,7 @@ pub struct Profile {
     /// [`crate::profile::loader::ProfileLoadError::MulticallRequiresSecondaryRpc`].
     ///
     /// Mainnet requires `providers.secondary`, its independence assertion,
-    /// and a host distinct from the primary.
+    /// and a host distinct from the primary, and a `[providers.primary]` record.
     /// Host difference is a naming convention; the operator attests separate administration.
     /// The loader applies [`check_endpoint_url`] and reads mainnet URLs from the file only.
     /// Debug redacts the URL.
@@ -1365,7 +1402,54 @@ impl std::fmt::Debug for Profile {
     }
 }
 
+/// The profile fields that hold the wallet's own keyring entry references,
+/// in the order [`Profile::wallet_key_references`] yields them.
+///
+/// The reserved-entry rule of provider credentials compares a credential
+/// reference with each of them, read from the loaded profile and, by these
+/// names, from the profile file alone.
+pub(crate) const WALLET_KEY_REFERENCE_FIELDS: [&str; 8] = [
+    "mcp_signer_default",
+    "mcp_nonce_key_alias",
+    "audit_log_hash_chain_key_id",
+    "policy_owner_key_id",
+    "attestation_key_id",
+    "counterparty_cache_key_id",
+    "pool_master_key_id",
+    "policy_window_state_key_id",
+];
+
 impl Profile {
+    /// The endpoint URL of `role`: `rpc_url`, `secondary_rpc_url`, or
+    /// `oracle_provider_url`, as the profile holds it. `None` when the role
+    /// has no URL.
+    #[must_use]
+    pub fn role_url(&self, role: ProviderRole) -> Option<&str> {
+        match role {
+            ProviderRole::Primary => Some(self.rpc_url.as_str()),
+            ProviderRole::Secondary => self.secondary_rpc_url.as_deref(),
+            ProviderRole::Oracle => self.oracle_provider_url.as_ref().map(Url::as_str),
+        }
+    }
+
+    /// The wallet key references of the profile, one per field of
+    /// [`WALLET_KEY_REFERENCE_FIELDS`] and in that order; `None` for an unset
+    /// `pool_master_key_id`.
+    pub(crate) fn wallet_key_references(
+        &self,
+    ) -> [Option<&KeyringEntryRef>; WALLET_KEY_REFERENCE_FIELDS.len()] {
+        [
+            Some(&self.mcp_signer_default),
+            Some(&self.mcp_nonce_key_alias),
+            Some(&self.audit_log_hash_chain_key_id),
+            Some(&self.policy_owner_key_id),
+            Some(&self.attestation_key_id),
+            Some(&self.counterparty_cache_key_id),
+            self.pool_master_key_id.as_ref(),
+            Some(&self.policy_window_state_key_id),
+        ]
+    }
+
     /// Returns the operator-facing view with URL credentials and paths removed.
     #[must_use]
     pub fn redacted(&self) -> RedactedProfile {
@@ -1782,8 +1866,164 @@ pub fn same_provider_host(left: &str, right: &str) -> bool {
     )
 }
 
+/// The RPC role an endpoint and its provider record serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ProviderRole {
+    /// The endpoint of `rpc_url`, which every command reads and sends through.
+    Primary,
+    /// The endpoint of `secondary_rpc_url`, the trust anchor of cross-RPC checks.
+    Secondary,
+    /// The endpoint of `oracle_provider_url`, read by the high-value
+    /// cross-check and the SEP-29 memo check.
+    Oracle,
+}
+
+impl ProviderRole {
+    /// The role's name: `primary`, `secondary`, or `oracle`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Secondary => "secondary",
+            Self::Oracle => "oracle",
+        }
+    }
+
+    /// The profile field holding the role's endpoint URL.
+    #[must_use]
+    pub const fn url_field(self) -> &'static str {
+        match self {
+            Self::Primary => "rpc_url",
+            Self::Secondary => "secondary_rpc_url",
+            Self::Oracle => "oracle_provider_url",
+        }
+    }
+
+    /// The profile table holding the role's provider record.
+    #[must_use]
+    pub const fn record_field(self) -> &'static str {
+        match self {
+            Self::Primary => "providers.primary",
+            Self::Secondary => "providers.secondary",
+            Self::Oracle => "providers.oracle",
+        }
+    }
+
+    /// The record's `operator` field.
+    #[must_use]
+    pub(crate) const fn operator_field(self) -> &'static str {
+        match self {
+            Self::Primary => "providers.primary.operator",
+            Self::Secondary => "providers.secondary.operator",
+            Self::Oracle => "providers.oracle.operator",
+        }
+    }
+
+    /// The record's `host` field.
+    #[must_use]
+    pub(crate) const fn host_field(self) -> &'static str {
+        match self {
+            Self::Primary => "providers.primary.host",
+            Self::Secondary => "providers.secondary.host",
+            Self::Oracle => "providers.oracle.host",
+        }
+    }
+
+    /// The record's `independent_of_primary` field.
+    #[must_use]
+    pub(crate) const fn independence_field(self) -> &'static str {
+        match self {
+            Self::Primary => "providers.primary.independent_of_primary",
+            Self::Secondary => "providers.secondary.independent_of_primary",
+            Self::Oracle => "providers.oracle.independent_of_primary",
+        }
+    }
+
+    /// The record's `credential` field.
+    #[must_use]
+    pub(crate) const fn credential_field(self) -> &'static str {
+        match self {
+            Self::Primary => "providers.primary.credential",
+            Self::Secondary => "providers.secondary.credential",
+            Self::Oracle => "providers.oracle.credential",
+        }
+    }
+
+    /// The record's `placement` field.
+    #[must_use]
+    pub(crate) const fn placement_field(self) -> &'static str {
+        match self {
+            Self::Primary => "providers.primary.placement",
+            Self::Secondary => "providers.secondary.placement",
+            Self::Oracle => "providers.oracle.placement",
+        }
+    }
+
+    /// The `name` key of the record's `placement`.
+    #[must_use]
+    pub(crate) const fn placement_name_field(self) -> &'static str {
+        match self {
+            Self::Primary => "providers.primary.placement.name",
+            Self::Secondary => "providers.secondary.placement.name",
+            Self::Oracle => "providers.oracle.placement.name",
+        }
+    }
+}
+
+impl fmt::Display for ProviderRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Where an RPC request carries the provider credential.
+///
+/// The TOML form is a table with a `kind` key:
+/// `{ kind = "header", name = "X-API-Key" }`, `{ kind = "query", name = "apikey" }`,
+/// or `{ kind = "path" }`. A key other than the ones of its kind refuses.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::profile::schema::RpcCredentialPlacement;
+///
+/// let placement: RpcCredentialPlacement =
+///     toml::from_str(r#"kind = "header"
+/// name = "X-API-Key""#).unwrap();
+/// assert_eq!(placement, RpcCredentialPlacement::Header { name: "X-API-Key".to_owned() });
+/// assert!(toml::from_str::<RpcCredentialPlacement>(r#"kind = "path"
+/// name = "key""#).is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum RpcCredentialPlacement {
+    /// The stored value is the value of the request header `name`, a scheme
+    /// prefix included, for example `Bearer abc` for `Authorization`.
+    Header {
+        /// The header name.
+        name: String,
+    },
+    /// The stored value is appended to the endpoint URL's query as the
+    /// parameter `name`, form-urlencoded.
+    Query {
+        /// The query parameter name.
+        name: String,
+    },
+    /// The stored value is appended to the endpoint URL's path as one
+    /// percent-encoded segment. A configured path ending in `/`, a bare host
+    /// included, keeps its trailing slash after the segment.
+    //
+    // A struct variant without fields, not a unit variant: serde ignores the
+    // remaining keys of an internally tagged unit variant even under
+    // `deny_unknown_fields`, so only this form refuses `name` beside it.
+    Path {},
+}
+
 /// An operator's statement about the organization administering an endpoint.
-/// These public metadata fields must contain no credentials.
+/// Operator, host, credential reference, and placement are public metadata;
+/// the credential value lives only in the keyring.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
@@ -1794,10 +2034,17 @@ pub struct ProviderRecord {
     pub host: String,
     /// Whether the operator attests separate administration from the primary.
     pub independent_of_primary: bool,
+    /// Keyring entry holding the credential the endpoint requires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<KeyringEntryRef>,
+    /// Where requests to the endpoint carry the credential.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: Option<RpcCredentialPlacement>,
 }
 
 impl ProviderRecord {
-    /// Constructs a provider statement. The profile loader validates it.
+    /// Constructs a provider statement without a credential. The profile
+    /// loader validates it.
     #[must_use]
     pub fn new(
         operator: impl Into<String>,
@@ -1808,21 +2055,449 @@ impl ProviderRecord {
             operator: operator.into(),
             host: host.into(),
             independent_of_primary,
+            credential: None,
+            placement: None,
         }
+    }
+
+    /// Names the keyring entry of the endpoint's credential and where
+    /// requests carry it.
+    #[must_use]
+    pub fn with_credential(
+        mut self,
+        credential: KeyringEntryRef,
+        placement: RpcCredentialPlacement,
+    ) -> Self {
+        self.credential = Some(credential);
+        self.placement = Some(placement);
+        self
     }
 }
 
-/// File-only attestations for optional RPC roles.
+/// The operator's statement about the organization administering the
+/// primary endpoint, `rpc_url`.
+///
+/// It has no independence assertion, which has no meaning for the primary.
+/// Operator, host, credential reference, and placement are public metadata;
+/// the credential value lives only in the keyring.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct PrimaryProviderRecord {
+    /// Organization administering the endpoint.
+    pub operator: String,
+    /// Endpoint host, normalized for comparison during profile loading.
+    pub host: String,
+    /// Keyring entry holding the credential the endpoint requires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<KeyringEntryRef>,
+    /// Where requests to the endpoint carry the credential.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: Option<RpcCredentialPlacement>,
+}
+
+impl PrimaryProviderRecord {
+    /// Constructs a primary provider statement without a credential. The
+    /// profile loader validates it.
+    #[must_use]
+    pub fn new(operator: impl Into<String>, host: impl Into<String>) -> Self {
+        Self {
+            operator: operator.into(),
+            host: host.into(),
+            credential: None,
+            placement: None,
+        }
+    }
+
+    /// Names the keyring entry of the endpoint's credential and where
+    /// requests carry it.
+    #[must_use]
+    pub fn with_credential(
+        mut self,
+        credential: KeyringEntryRef,
+        placement: RpcCredentialPlacement,
+    ) -> Self {
+        self.credential = Some(credential);
+        self.placement = Some(placement);
+        self
+    }
+}
+
+/// File-only provider records for the three RPC roles.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Providers {
+    /// Record for `rpc_url`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary: Option<PrimaryProviderRecord>,
     /// Attestation for `secondary_rpc_url`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secondary: Option<ProviderRecord>,
     /// Attestation for `oracle_provider_url`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oracle: Option<ProviderRecord>,
+}
+
+impl Providers {
+    /// The record of `role`, or `None` when the profile has none.
+    #[must_use]
+    pub fn record_for(&self, role: ProviderRole) -> Option<ProviderRecordView<'_>> {
+        match role {
+            ProviderRole::Primary => self.primary.as_ref().map(ProviderRecordView::from),
+            ProviderRole::Secondary => self.secondary.as_ref().map(ProviderRecordView::from),
+            ProviderRole::Oracle => self.oracle.as_ref().map(ProviderRecordView::from),
+        }
+    }
+
+    /// Returns the credential reference and placement the role's record
+    /// names, or `None` when the record is absent or names no credential.
+    #[must_use]
+    pub fn credential(
+        &self,
+        role: ProviderRole,
+    ) -> Option<(&KeyringEntryRef, &RpcCredentialPlacement)> {
+        let record = self.record_for(role)?;
+        Some((record.credential?, record.placement?))
+    }
+}
+
+/// The credential fields every role's provider record holds, borrowed from
+/// a [`PrimaryProviderRecord`] or a [`ProviderRecord`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ProviderRecordView<'a> {
+    /// Keyring entry holding the credential the endpoint requires.
+    pub credential: Option<&'a KeyringEntryRef>,
+    /// Where requests to the endpoint carry the credential.
+    pub placement: Option<&'a RpcCredentialPlacement>,
+}
+
+impl<'a> From<&'a PrimaryProviderRecord> for ProviderRecordView<'a> {
+    fn from(record: &'a PrimaryProviderRecord) -> Self {
+        Self {
+            credential: record.credential.as_ref(),
+            placement: record.placement.as_ref(),
+        }
+    }
+}
+
+impl<'a> From<&'a ProviderRecord> for ProviderRecordView<'a> {
+    fn from(record: &'a ProviderRecord) -> Self {
+        Self {
+            credential: record.credential.as_ref(),
+            placement: record.placement.as_ref(),
+        }
+    }
+}
+
+/// Compares two provider operator names after trimming Unicode white space
+/// and folding case.
+///
+/// The fold is an upper-case pass followed by a lower-case pass, so `ß`
+/// equals `SS` and ligatures expand. It applies no Unicode normalization and
+/// keeps internal white space and punctuation: `Example Inc.` differs from
+/// `Example`. Equal names are a strong sign of one operator; different names
+/// prove no independence, which the operator attests.
+#[must_use]
+pub fn same_provider_operator(left: &str, right: &str) -> bool {
+    let fold = |name: &str| name.trim().to_uppercase().to_lowercase();
+    fold(left) == fold(right)
+}
+
+/// The most bytes an RPC credential value may hold.
+pub const MAX_RPC_CREDENTIAL_BYTES: usize = 1024;
+
+/// Why an RPC credential value, or its use with an endpoint, is refused.
+///
+/// No variant holds any part of the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RpcCredentialDefect {
+    /// The value is empty.
+    #[error("is empty")]
+    Empty,
+    /// The value holds more than [`MAX_RPC_CREDENTIAL_BYTES`] bytes.
+    #[error("is longer than 1024 bytes")]
+    TooLong,
+    /// The value holds a byte below 0x20 or the byte 0x7F.
+    #[error("holds a control character")]
+    ControlCharacter,
+    /// The placement breaks the name rules of
+    /// [`check_rpc_credential_placement`].
+    #[error("names an invalid placement")]
+    Placement,
+    /// The endpoint URL carries a username or password.
+    #[error("would travel with a username or password in the URL")]
+    Userinfo,
+}
+
+/// Checks an RPC credential value: not empty, at most
+/// [`MAX_RPC_CREDENTIAL_BYTES`] bytes, and no byte below 0x20 or equal to
+/// 0x7F, checked in that order.
+///
+/// # Errors
+///
+/// Returns the first [`RpcCredentialDefect`] the value has:
+/// [`RpcCredentialDefect::Empty`], [`RpcCredentialDefect::TooLong`], or
+/// [`RpcCredentialDefect::ControlCharacter`].
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::profile::schema::{RpcCredentialDefect, check_rpc_credential_value};
+///
+/// assert!(check_rpc_credential_value("Bearer abc").is_ok());
+/// assert_eq!(check_rpc_credential_value(""), Err(RpcCredentialDefect::Empty));
+/// assert_eq!(check_rpc_credential_value("a\tb"), Err(RpcCredentialDefect::ControlCharacter));
+/// ```
+pub fn check_rpc_credential_value(value: &str) -> Result<(), RpcCredentialDefect> {
+    if value.is_empty() {
+        return Err(RpcCredentialDefect::Empty);
+    }
+    if value.len() > MAX_RPC_CREDENTIAL_BYTES {
+        return Err(RpcCredentialDefect::TooLong);
+    }
+    if value.bytes().any(|byte| byte < 0x20 || byte == 0x7F) {
+        return Err(RpcCredentialDefect::ControlCharacter);
+    }
+    Ok(())
+}
+
+/// Header names a credential placement may not use, compared ASCII
+/// case-insensitively.
+///
+/// The JSON-RPC transport sets `Content-Type` and `Accept` and lets an added
+/// header replace them. A `Host` header would route the request to another
+/// virtual host than the attested one. The rest frame the HTTP message.
+const TRANSPORT_HEADER_NAMES: [&str; 10] = [
+    "host",
+    "content-type",
+    "content-length",
+    "accept",
+    "connection",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    "keep-alive",
+];
+
+/// Whether `byte` is an RFC 9110 token character.
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+/// Checks the name of a credential placement.
+///
+/// A header name is non-empty, consists of RFC 9110 token characters, and is
+/// none of the transport header names (`Host`, `Content-Type`,
+/// `Content-Length`, `Accept`, `Connection`, `Transfer-Encoding`, `TE`,
+/// `Trailer`, `Upgrade`, `Keep-Alive`, in any case). `Authorization` is
+/// allowed. A query parameter name is non-empty and consists of ASCII
+/// letters, digits, `-`, `.`, `_`, and `~`. A path placement has no name.
+///
+/// # Errors
+///
+/// Returns [`ProviderAttestationRejection::InvalidHeaderName`] or
+/// [`ProviderAttestationRejection::InvalidQueryParameterName`].
+pub fn check_rpc_credential_placement(
+    placement: &RpcCredentialPlacement,
+) -> Result<(), ProviderAttestationRejection> {
+    match placement {
+        RpcCredentialPlacement::Header { name } => {
+            let valid = !name.is_empty()
+                && name.bytes().all(is_token_byte)
+                && !TRANSPORT_HEADER_NAMES
+                    .iter()
+                    .any(|reserved| reserved.eq_ignore_ascii_case(name));
+            if valid {
+                Ok(())
+            } else {
+                Err(ProviderAttestationRejection::InvalidHeaderName)
+            }
+        }
+        RpcCredentialPlacement::Query { name } => {
+            let valid = !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-._~".contains(&byte));
+            if valid {
+                Ok(())
+            } else {
+                Err(ProviderAttestationRejection::InvalidQueryParameterName)
+            }
+        }
+        RpcCredentialPlacement::Path {} => Ok(()),
+    }
+}
+
+/// Checks the `service` and `account` of a credential reference: each is a
+/// non-empty string of printable ASCII (bytes 0x20 to 0x7E) whose first and
+/// last byte is not a space.
+///
+/// A space inside is allowed, because a profile name may contain one. The
+/// rule keeps out control characters and non-ASCII letters that a credential
+/// store could fold onto an ASCII name.
+///
+/// # Errors
+///
+/// Returns [`ProviderAttestationRejection::InvalidCredential`].
+pub(crate) fn check_rpc_credential_entry(
+    entry: &KeyringEntryRef,
+) -> Result<(), ProviderAttestationRejection> {
+    let printable = |part: &str| {
+        let bytes = part.as_bytes();
+        !bytes.is_empty()
+            && bytes.iter().all(|byte| (0x20..=0x7E).contains(byte))
+            && bytes.first() != Some(&b' ')
+            && bytes.last() != Some(&b' ')
+    };
+    if printable(&entry.service) && printable(&entry.account) {
+        Ok(())
+    } else {
+        Err(ProviderAttestationRejection::InvalidCredential)
+    }
+}
+
+/// Whether a credential reference names a keyring entry another wallet key
+/// uses or that lies in a wallet key namespace.
+///
+/// `wallet_refs` are the profile's wallet key references. The entry is
+/// reserved when any of these holds:
+///
+/// - its ASCII-lowercased `account.service` equals that form of a wallet key
+///   reference, which covers a store that names an entry by joining account
+///   and service with a `.`;
+/// - its service equals a wallet key reference's service, ASCII
+///   case-insensitively, which covers accounts derived from that service;
+/// - a `.`-separated part of the lowercased `account.service`, trimmed of
+///   spaces, starts with `stellar-agent-` but not with `stellar-agent-rpc-`.
+///
+/// Another provider record's credential is no wallet key reference, so two
+/// roles may name the same entry.
+#[must_use]
+pub(crate) fn rpc_credential_entry_is_reserved(
+    entry: &KeyringEntryRef,
+    wallet_refs: &[&KeyringEntryRef],
+) -> bool {
+    let joined = |r: &KeyringEntryRef| format!("{}.{}", r.account, r.service).to_ascii_lowercase();
+    let candidate = joined(entry);
+    if wallet_refs.iter().any(|wallet| joined(wallet) == candidate) {
+        return true;
+    }
+    if wallet_refs
+        .iter()
+        .any(|wallet| wallet.service.eq_ignore_ascii_case(&entry.service))
+    {
+        return true;
+    }
+    candidate
+        .split('.')
+        .map(|part| part.trim_matches(' '))
+        .any(|part| {
+            part.starts_with(WALLET_SERVICE_NAMESPACE)
+                && !part.starts_with(RPC_CREDENTIAL_SERVICE_PREFIX)
+        })
+}
+
+/// Whether the URL's host is a loopback address: `localhost`, an IPv4
+/// address in `127.0.0.0/8`, or `[::1]`.
+fn is_loopback_endpoint(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+/// Checks the endpoint URL of a role whose record names a credential, in
+/// this order: the URL carries no username and no password, it uses
+/// `https` unless its host is a loopback address, and a query placement's
+/// name repeats no parameter of the URL's query, compared byte for byte
+/// after decoding.
+///
+/// # Errors
+///
+/// Returns [`ProviderAttestationRejection::UserinfoWithCredential`] or
+/// [`ProviderAttestationRejection::InsecureCredentialEndpoint`] on the role's
+/// URL field, or [`ProviderAttestationRejection::InvalidQueryParameterName`]
+/// on the placement name. A URL that does not parse refuses as insecure.
+pub(crate) fn check_rpc_credential_endpoint(
+    role: ProviderRole,
+    url: &str,
+    placement: &RpcCredentialPlacement,
+) -> Result<(), ProviderAttestationError> {
+    let reject = |field, reason| ProviderAttestationError { field, reason };
+    // Both callers parse the URL before: the loader through its endpoint
+    // checks, the write check through the loaded profile's merged URL. The
+    // branch is defensive, and it reports the insecure-endpoint reason
+    // because a URL that does not parse cannot show that it uses https.
+    let Ok(parsed) = Url::parse(url) else {
+        return Err(reject(
+            role.url_field(),
+            ProviderAttestationRejection::InsecureCredentialEndpoint,
+        ));
+    };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(reject(
+            role.url_field(),
+            ProviderAttestationRejection::UserinfoWithCredential,
+        ));
+    }
+    if parsed.scheme() != "https" && !is_loopback_endpoint(&parsed) {
+        return Err(reject(
+            role.url_field(),
+            ProviderAttestationRejection::InsecureCredentialEndpoint,
+        ));
+    }
+    if let RpcCredentialPlacement::Query { name } = placement
+        && parsed.query_pairs().any(|(key, _)| key == name.as_str())
+    {
+        return Err(reject(
+            role.placement_name_field(),
+            ProviderAttestationRejection::InvalidQueryParameterName,
+        ));
+    }
+    Ok(())
+}
+
+/// Runs the profile loader's credential checks for a provider record of
+/// `role` that names `credential` and `placement`, against the role's
+/// endpoint URL `role_url` and the profile's wallet key references
+/// `wallet_refs`.
+///
+/// The checks run in the loader's order: the reference bytes
+/// ([`check_rpc_credential_entry`]), the placement name
+/// ([`check_rpc_credential_placement`]), the reserved-entry rule
+/// ([`rpc_credential_entry_is_reserved`]), and the endpoint rules
+/// ([`check_rpc_credential_endpoint`]). A command that writes a record runs
+/// this first, so it never writes a record the loader refuses.
+///
+/// # Errors
+///
+/// Returns the first refusal as a [`ProviderAttestationError`] naming the
+/// field.
+pub(crate) fn check_provider_credential(
+    role: ProviderRole,
+    credential: &KeyringEntryRef,
+    placement: &RpcCredentialPlacement,
+    role_url: &str,
+    wallet_refs: &[&KeyringEntryRef],
+) -> Result<(), ProviderAttestationError> {
+    let reject = |field, reason| ProviderAttestationError { field, reason };
+    check_rpc_credential_entry(credential)
+        .map_err(|reason| reject(role.credential_field(), reason))?;
+    check_rpc_credential_placement(placement)
+        .map_err(|reason| reject(role.placement_name_field(), reason))?;
+    if rpc_credential_entry_is_reserved(credential, wallet_refs) {
+        return Err(reject(
+            role.credential_field(),
+            ProviderAttestationRejection::ReservedCredentialEntry,
+        ));
+    }
+    check_rpc_credential_endpoint(role, role_url, placement)
 }
 
 /// A refused provider field and its repair, containing no rejected values.
@@ -1841,19 +2516,60 @@ pub struct ProviderAttestationError {
 pub enum ProviderAttestationRejection {
     /// The container is malformed or holds an unsupported role.
     #[error(
-        "must hold only the `secondary` and `oracle` tables; remove any other key \
-         under `providers` in the profile file"
+        "must hold only the `primary`, `secondary`, and `oracle` tables; remove any other \
+         key under `providers` in the profile file"
     )]
     InvalidContainer,
     /// A role record has unknown fields or incorrect field types.
     #[error(
-        "has an invalid provider record; correct the table and its operator, host, \
-         and independent_of_primary fields in the profile file"
+        "must be a table holding only this record's fields; correct the table and its \
+         fields in the profile file"
     )]
     InvalidShape,
-    /// The primary role is unsupported.
-    #[error("is not a supported provider role; remove this table from the profile file")]
-    PrimaryReserved,
+    /// The primary record carries an independence assertion.
+    #[error("does not apply to the primary record; remove it from the profile file")]
+    PrimaryIndependence,
+    /// A record names a credential without a placement, or the reverse.
+    #[error(
+        "needs `{missing_field}` in the same record; add it, or remove this field, in the \
+         profile file"
+    )]
+    IncompleteCredential {
+        /// Static name of the absent sibling field.
+        missing_field: &'static str,
+    },
+    /// The credential reference is not a well-formed keyring entry name.
+    #[error(
+        "must be a table with exactly the keys `service` and `account`, each a non-empty \
+         string of printable ASCII without leading or trailing spaces; correct it in the \
+         profile file"
+    )]
+    InvalidCredential,
+    /// The placement table is malformed.
+    #[error(
+        "must be a table with kind = \"header\" or kind = \"query\" and a `name`, or \
+         kind = \"path\" alone; correct it in the profile file"
+    )]
+    InvalidPlacement,
+    /// A header placement names an invalid or transport-owned header.
+    #[error(
+        "must be an HTTP header name of letters, digits, and !#$%&'*+-.^_`|~ that the \
+         transport does not set itself; correct it in the profile file"
+    )]
+    InvalidHeaderName,
+    /// A query placement names an invalid or repeated parameter.
+    #[error(
+        "must use only ASCII letters, digits, '-', '.', '_', and '~' and must not repeat a \
+         parameter of the endpoint URL; correct it in the profile file"
+    )]
+    InvalidQueryParameterName,
+    /// The credential reference names a wallet key's keyring entry.
+    #[error(
+        "names a keyring entry that another wallet key uses or that lies in a wallet key \
+         namespace; choose a service and account of their own, for example a service \
+         starting with `stellar-agent-rpc-`, in the profile file"
+    )]
+    ReservedCredentialEntry,
     /// A record has no corresponding endpoint.
     #[error(
         "has no configured endpoint; set `{url_field}` or remove this provider table \
@@ -1887,6 +2603,18 @@ pub enum ProviderAttestationRejection {
         /// Static name of the endpoint field.
         url_field: &'static str,
     },
+    /// An endpoint whose record names a credential carries userinfo.
+    #[error(
+        "carries a username or password while its provider record names a credential; \
+         remove one of them in the profile file or the environment overlay"
+    )]
+    UserinfoWithCredential,
+    /// An endpoint whose record names a credential uses plain http.
+    #[error(
+        "must use https while its provider record names a credential (a loopback host may \
+         use http); correct the URL in the profile file or the environment overlay"
+    )]
+    InsecureCredentialEndpoint,
     /// A mainnet record does not attest independence.
     #[error(
         "must be true on mainnet; confirm separate administration from the primary, \
@@ -1902,6 +2630,18 @@ pub enum ProviderAttestationRejection {
         /// Static name of the provider table.
         record_field: &'static str,
     },
+    /// A mainnet profile with a second endpoint has no primary record.
+    #[error(
+        "is required on mainnet while `secondary_rpc_url` or `oracle_provider_url` is set; \
+         add this table with operator and host in the profile file"
+    )]
+    PrimaryRecordRequired,
+    /// A mainnet secondary or oracle record names the primary's operator.
+    #[error(
+        "names the operator of the primary endpoint; on mainnet this endpoint needs another \
+         operator: choose such an endpoint, or correct the operator, in the profile file"
+    )]
+    SharedOperator,
 }
 
 /// A profile endpoint field that breaks the endpoint rule of
@@ -2171,24 +2911,39 @@ impl ProfileBuilder {
         self
     }
 
-    /// Sets or clears the secondary provider attestation, preserving the other role.
-    pub fn secondary_provider(mut self, record: impl Into<Option<ProviderRecord>>) -> Self {
+    /// Sets or clears the primary provider record, preserving the other roles.
+    pub fn primary_provider(mut self, record: impl Into<Option<PrimaryProviderRecord>>) -> Self {
         let providers = self.providers.get_or_insert_with(Providers::default);
-        providers.secondary = record.into();
-        if providers.secondary.is_none() && providers.oracle.is_none() {
-            self.providers = None;
-        }
+        providers.primary = record.into();
+        self.clear_empty_providers();
         self
     }
 
-    /// Sets or clears the oracle provider attestation, preserving the other role.
+    /// Sets or clears the secondary provider attestation, preserving the other roles.
+    pub fn secondary_provider(mut self, record: impl Into<Option<ProviderRecord>>) -> Self {
+        let providers = self.providers.get_or_insert_with(Providers::default);
+        providers.secondary = record.into();
+        self.clear_empty_providers();
+        self
+    }
+
+    /// Sets or clears the oracle provider attestation, preserving the other roles.
     pub fn oracle_provider(mut self, record: impl Into<Option<ProviderRecord>>) -> Self {
         let providers = self.providers.get_or_insert_with(Providers::default);
         providers.oracle = record.into();
-        if providers.secondary.is_none() && providers.oracle.is_none() {
+        self.clear_empty_providers();
+        self
+    }
+
+    /// Drops the provider container once no role holds a record.
+    fn clear_empty_providers(&mut self) {
+        if self.providers.as_ref().is_some_and(|providers| {
+            providers.primary.is_none()
+                && providers.secondary.is_none()
+                && providers.oracle.is_none()
+        }) {
             self.providers = None;
         }
-        self
     }
 
     /// Builds the [`Profile`], using the default audit-log path if not set.
@@ -2683,6 +3438,128 @@ mod tests {
             "test-profile",
         )
         .build()
+    }
+
+    /// The top-level profile fields that hold a keyring entry reference are
+    /// exactly the wallet key reference fields, and `wallet_key_references`
+    /// yields each field's value at that field's position.
+    #[test]
+    fn wallet_key_reference_fields_match_the_profile() {
+        let distinct = |name: &str| KeyringEntryRef::new(name, format!("{name}-account"));
+        let mut profile = make_testnet_profile();
+        profile.mcp_signer_default = distinct("signer");
+        profile.mcp_nonce_key_alias = distinct("nonce");
+        profile.audit_log_hash_chain_key_id = distinct("audit");
+        profile.policy_owner_key_id = distinct("owner");
+        profile.attestation_key_id = distinct("attestation");
+        profile.counterparty_cache_key_id = distinct("counterparty");
+        profile.pool_master_key_id = Some(distinct("pool"));
+        profile.policy_window_state_key_id = distinct("window");
+        profile.providers = Some(Providers {
+            primary: Some(
+                PrimaryProviderRecord::new("Primary", "primary.example")
+                    .with_credential(distinct("rpc"), RpcCredentialPlacement::Path {}),
+            ),
+            ..Providers::default()
+        });
+
+        // No `..`: a field added to `Profile` fails to compile here until its
+        // author binds it as a wallet key reference or ignores it with `_`.
+        let Profile {
+            version: _,
+            chain_id: _,
+            rpc_url: _,
+            network_passphrase: _,
+            mcp_signer_default,
+            mcp_nonce_key_alias,
+            cross_check_threshold_stroops: _,
+            classic_fee_per_op_stroops: _,
+            classic_max_fee_per_op_stroops: _,
+            submit_timeout_seconds: _,
+            audit_log_path: _,
+            mcp_disabled: _,
+            audit_log_hash_chain_key_id,
+            policy_owner_key_id,
+            attestation_key_id,
+            counterparty_cache_key_id,
+            oracle_provider_url: _,
+            providers: _,
+            policy: _,
+            wallet: _,
+            smart_account_max_context_rule_scan_id: _,
+            session_rule_max_horizon_ledgers: _,
+            secondary_rpc_url: _,
+            pool_master_key_id,
+            pool_config: _,
+            pool_initialization: _,
+            remote_approval: _,
+            served_pages: _,
+            policy_window_state_key_id,
+        } = &profile;
+        assert_eq!(
+            [
+                Some(mcp_signer_default),
+                Some(mcp_nonce_key_alias),
+                Some(audit_log_hash_chain_key_id),
+                Some(policy_owner_key_id),
+                Some(attestation_key_id),
+                Some(counterparty_cache_key_id),
+                pool_master_key_id.as_ref(),
+                Some(policy_window_state_key_id),
+            ],
+            profile.wallet_key_references()
+        );
+
+        let serialized = serde_json::to_value(&profile).unwrap();
+        let fields = serialized.as_object().unwrap();
+        let reference_fields: std::collections::BTreeSet<&str> = fields
+            .iter()
+            .filter(|(_, value)| {
+                serde_json::from_value::<KeyringEntryRef>((*value).clone()).is_ok()
+            })
+            .map(|(field, _)| field.as_str())
+            .collect();
+        assert_eq!(
+            reference_fields,
+            WALLET_KEY_REFERENCE_FIELDS.into_iter().collect()
+        );
+        for (field, reference) in WALLET_KEY_REFERENCE_FIELDS
+            .into_iter()
+            .zip(profile.wallet_key_references())
+        {
+            let stored: KeyringEntryRef = serde_json::from_value(fields[field].clone()).unwrap();
+            assert_eq!(reference, Some(&stored), "{field}");
+        }
+
+        profile.pool_master_key_id = None;
+        let position = WALLET_KEY_REFERENCE_FIELDS
+            .iter()
+            .position(|field| *field == "pool_master_key_id")
+            .unwrap();
+        assert_eq!(profile.wallet_key_references()[position], None);
+    }
+
+    /// `role_url` returns each role's URL as the profile holds it.
+    #[test]
+    fn role_url_follows_the_role() {
+        let mut profile = make_testnet_profile();
+        profile.rpc_url = "https://primary.example/rpc".to_owned();
+        assert_eq!(profile.role_url(ProviderRole::Secondary), None);
+        assert_eq!(profile.role_url(ProviderRole::Oracle), None);
+        profile.secondary_rpc_url = Some("https://secondary.example".to_owned());
+        profile.oracle_provider_url = Some(Url::parse("https://oracle.example").unwrap());
+        assert_eq!(
+            profile.role_url(ProviderRole::Primary),
+            Some("https://primary.example/rpc")
+        );
+        assert_eq!(
+            profile.role_url(ProviderRole::Secondary),
+            Some("https://secondary.example")
+        );
+        assert_eq!(
+            profile.role_url(ProviderRole::Oracle),
+            Some("https://oracle.example/")
+        );
     }
 
     #[test]
@@ -4225,18 +5102,90 @@ mod tests {
         assert!(!toml.contains("[providers.secondary]"));
     }
 
+    /// `record_for` borrows each role's record, and `credential` reads the
+    /// reference and placement through it only when the record names both.
     #[test]
-    fn provider_builder_setters_preserve_and_clear_roles() {
+    fn provider_records_are_read_per_role() {
+        let entry = |role: &str| KeyringEntryRef::new("stellar-agent-rpc-p", role);
+        let providers = Providers {
+            primary: Some(
+                PrimaryProviderRecord::new("Primary", "primary.example")
+                    .with_credential(entry("primary"), RpcCredentialPlacement::Path {}),
+            ),
+            secondary: Some(ProviderRecord::new("Secondary", "secondary.example", true)),
+            oracle: Some(
+                ProviderRecord::new("Oracle", "oracle.example", true).with_credential(
+                    entry("oracle"),
+                    RpcCredentialPlacement::Query {
+                        name: "apikey".to_owned(),
+                    },
+                ),
+            ),
+        };
+        let primary = providers.record_for(ProviderRole::Primary).unwrap();
+        assert_eq!(
+            (primary.credential, primary.placement),
+            (
+                Some(&entry("primary")),
+                Some(&RpcCredentialPlacement::Path {})
+            )
+        );
+        let secondary = providers.record_for(ProviderRole::Secondary).unwrap();
+        assert_eq!((secondary.credential, secondary.placement), (None, None));
+        let oracle = providers.record_for(ProviderRole::Oracle).unwrap();
+        assert_eq!(
+            (oracle.credential, oracle.placement),
+            (
+                Some(&entry("oracle")),
+                Some(&RpcCredentialPlacement::Query {
+                    name: "apikey".to_owned()
+                })
+            )
+        );
+        assert_eq!(
+            providers.credential(ProviderRole::Primary),
+            Some((&entry("primary"), &RpcCredentialPlacement::Path {}))
+        );
+        assert_eq!(providers.credential(ProviderRole::Secondary), None);
+        assert_eq!(
+            providers.credential(ProviderRole::Oracle),
+            Some((
+                &entry("oracle"),
+                &RpcCredentialPlacement::Query {
+                    name: "apikey".to_owned()
+                }
+            ))
+        );
+        let empty = Providers::default();
+        for role in [
+            ProviderRole::Primary,
+            ProviderRole::Secondary,
+            ProviderRole::Oracle,
+        ] {
+            assert_eq!(empty.record_for(role), None, "{role}");
+            assert_eq!(empty.credential(role), None, "{role}");
+        }
+    }
+
+    #[test]
+    fn provider_builder_sets_and_clears_three_roles() {
+        let primary = PrimaryProviderRecord::new("Primary operator", "primary.example")
+            .with_credential(
+                KeyringEntryRef::new("stellar-agent-rpc-p", "primary"),
+                RpcCredentialPlacement::Path {},
+            );
         for builder in [
             Profile::builder_testnet("s", "a", "n", "a"),
             Profile::builder_mainnet("https://primary.example", "s", "a", "n", "a"),
         ] {
             let record = ProviderRecord::new("Operator", "rpc.example", true);
             let profile = builder
+                .primary_provider(primary.clone())
                 .secondary_provider(record.clone())
                 .oracle_provider(record.clone())
                 .build();
             let providers = profile.providers.unwrap();
+            assert_eq!(providers.primary, Some(primary.clone()));
             assert_eq!(providers.secondary, Some(record.clone()));
             assert_eq!(providers.oracle, Some(record));
         }
@@ -4245,13 +5194,32 @@ mod tests {
             Profile::builder_mainnet("https://primary.example", "s", "a", "n", "a"),
         ] {
             let profile = builder
+                .primary_provider(PrimaryProviderRecord::default())
                 .secondary_provider(ProviderRecord::default())
                 .oracle_provider(ProviderRecord::default())
                 .secondary_provider(None)
                 .oracle_provider(None)
+                .primary_provider(None)
                 .build();
             assert!(profile.providers.is_none());
         }
+        let primary_only = Profile::builder_testnet("s", "a", "n", "a")
+            .primary_provider(primary.clone())
+            .oracle_provider(ProviderRecord::default())
+            .oracle_provider(None)
+            .build();
+        assert_eq!(
+            primary_only.providers.unwrap().primary,
+            Some(primary.clone())
+        );
+        let without_primary = Profile::builder_testnet("s", "a", "n", "a")
+            .primary_provider(primary)
+            .secondary_provider(ProviderRecord::default())
+            .primary_provider(None)
+            .build();
+        let providers = without_primary.providers.unwrap();
+        assert_eq!(providers.primary, None);
+        assert_eq!(providers.secondary, Some(ProviderRecord::default()));
         let record = ProviderRecord::new("Operator", "rpc.example", true);
         let secondary_only = Profile::builder_testnet("s", "a", "n", "a")
             .secondary_provider(record.clone())
@@ -4268,6 +5236,138 @@ mod tests {
             .secondary_provider(None)
             .build();
         assert_eq!(oracle_only.providers.unwrap().oracle, Some(record));
+    }
+
+    #[test]
+    fn default_rpc_credential_names_profile_and_role() {
+        for (role, account) in [
+            (ProviderRole::Primary, "primary"),
+            (ProviderRole::Secondary, "secondary"),
+            (ProviderRole::Oracle, "oracle"),
+        ] {
+            assert_eq!(
+                KeyringEntryRef::default_rpc_credential("alice.main", role),
+                KeyringEntryRef::new("stellar-agent-rpc-alice.main", account)
+            );
+            assert_eq!(role.as_str(), account);
+            assert_eq!(role.to_string(), account);
+        }
+        assert_eq!(ProviderRole::Primary.url_field(), "rpc_url");
+        assert_eq!(ProviderRole::Secondary.url_field(), "secondary_rpc_url");
+        assert_eq!(ProviderRole::Oracle.url_field(), "oracle_provider_url");
+        assert_eq!(
+            ProviderRole::Oracle.placement_name_field(),
+            "providers.oracle.placement.name"
+        );
+    }
+
+    /// The reference and the placement are public metadata and print in
+    /// `Debug`, in the redacted view, and in its serialization.
+    #[test]
+    fn profile_debug_prints_credential_reference_and_placement() {
+        let profile = Profile::builder_testnet("s", "a", "n", "a")
+            .primary_provider(
+                PrimaryProviderRecord::new("Primary operator", "primary.example").with_credential(
+                    KeyringEntryRef::new("SERVICE_SENTINEL", "ACCOUNT_SENTINEL"),
+                    RpcCredentialPlacement::Header {
+                        name: "HEADER_SENTINEL".to_owned(),
+                    },
+                ),
+            )
+            .oracle_provider(
+                ProviderRecord::new("Oracle operator", "oracle.example", true).with_credential(
+                    KeyringEntryRef::new("ORACLE_SERVICE", "oracle"),
+                    RpcCredentialPlacement::Query {
+                        name: "QUERY_SENTINEL".to_owned(),
+                    },
+                ),
+            )
+            .build();
+        for rendered in [
+            format!("{profile:?}"),
+            format!("{:?}", profile.redacted()),
+            serde_json::to_string(&profile.redacted()).unwrap(),
+        ] {
+            for expected in [
+                "SERVICE_SENTINEL",
+                "ACCOUNT_SENTINEL",
+                "HEADER_SENTINEL",
+                "ORACLE_SERVICE",
+                "QUERY_SENTINEL",
+            ] {
+                assert!(rendered.contains(expected), "{expected}: {rendered}");
+            }
+        }
+    }
+
+    /// Programmatic deserialization of a placement refuses a key its kind
+    /// does not have, `name` beside `kind = "path"` included.
+    #[test]
+    fn rpc_credential_placement_serde_refuses_extra_keys() {
+        for (text, expected) in [
+            (
+                "kind = \"header\"\nname = \"X-API-Key\"",
+                RpcCredentialPlacement::Header {
+                    name: "X-API-Key".to_owned(),
+                },
+            ),
+            (
+                "kind = \"query\"\nname = \"apikey\"",
+                RpcCredentialPlacement::Query {
+                    name: "apikey".to_owned(),
+                },
+            ),
+            ("kind = \"path\"", RpcCredentialPlacement::Path {}),
+        ] {
+            assert_eq!(
+                toml::from_str::<RpcCredentialPlacement>(text).unwrap(),
+                expected
+            );
+            let serialized = toml::to_string(&expected).unwrap();
+            assert_eq!(
+                toml::from_str::<RpcCredentialPlacement>(&serialized).unwrap(),
+                expected
+            );
+        }
+        for text in [
+            "kind = \"path\"\nname = \"key\"",
+            "kind = \"header\"\nname = \"X\"\nextra = 1",
+            "kind = \"header\"",
+            "kind = \"cookie\"\nname = \"X\"",
+            "name = \"X\"",
+        ] {
+            assert!(
+                toml::from_str::<RpcCredentialPlacement>(text).is_err(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_credential_value_rules_apply_in_order() {
+        assert_eq!(
+            check_rpc_credential_value(""),
+            Err(RpcCredentialDefect::Empty)
+        );
+        assert_eq!(check_rpc_credential_value(&"a".repeat(1024)), Ok(()));
+        assert_eq!(
+            check_rpc_credential_value(&"a".repeat(1025)),
+            Err(RpcCredentialDefect::TooLong)
+        );
+        assert_eq!(
+            check_rpc_credential_value(&format!("{}\n", "a".repeat(1100))),
+            Err(RpcCredentialDefect::TooLong)
+        );
+        for value in ["a\nb", "a\tb", "\u{7f}", "a\u{0}", "\r"] {
+            assert_eq!(
+                check_rpc_credential_value(value),
+                Err(RpcCredentialDefect::ControlCharacter),
+                "{value:?}"
+            );
+        }
+        for value in ["Bearer abc", "k\u{e9}y", "a b+c/d%e", "~"] {
+            assert_eq!(check_rpc_credential_value(value), Ok(()), "{value:?}");
+        }
     }
 
     #[test]

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_network::NetworkContext;
-use stellar_agent_network::{StellarRpcClient, fetch_account};
+use stellar_agent_network::fetch_account;
 use stellar_agent_pool::PoolError;
 
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
@@ -111,7 +111,7 @@ pub async fn run(args: &PoolListArgs) -> i32 {
     };
 
     let context = NetworkContext::from_profile(&profile);
-    let client = match StellarRpcClient::new(&context.rpc_url) {
+    let client = match context.primary_client() {
         Ok(c) => c,
         Err(e) => {
             render_json(&Envelope::<()>::err(&e));

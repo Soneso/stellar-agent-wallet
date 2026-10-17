@@ -107,6 +107,9 @@ url = { workspace = true }
 # Atomic temp-file + fsync + rename when writing the signed policy file
 # (profile/sign_policy.rs); also used by profile/{show,migrate}.rs tests.
 tempfile = { workspace = true }
+# Hidden terminal input of an RPC provider credential
+# (profile/enroll_rpc_credential.rs).
+rpassword = { workspace = true }
 
 [dev-dependencies]
 # WalletServer::call_stellar_pay for the CLI and MCP policy parity test.

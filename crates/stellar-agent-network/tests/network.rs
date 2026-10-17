@@ -52,6 +52,8 @@ mod redaction_audit;
 mod retention_poll_deadline;
 #[path = "network/retry_backoff_integration.rs"]
 mod retry_backoff_integration;
+#[path = "network/rpc_credential_placement.rs"]
+mod rpc_credential_placement;
 #[path = "network/rpc_error_text_redaction.rs"]
 mod rpc_error_text_redaction;
 #[path = "network/sep29_cross_rpc_integration.rs"]

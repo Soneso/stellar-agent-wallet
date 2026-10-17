@@ -110,9 +110,12 @@ After merging, the loader resolves derived fields and validates:
   exception for a loopback address. A value that breaks the rule fails the
   load with `validation.config_invalid`, and the message names the field, not
   the URL. A local development endpoint over plain HTTP belongs on a testnet
-  profile.
+  profile. A provider key in the URL path or query passes this rule and stays
+  in the file; a `credential` in the role's provider record keeps it in the
+  keyring (see [Provider credentials](#provider-credentials)).
 - Provider records must match their role's URL and satisfy the chain's
-  independence rules in [Provider attestations](#provider-attestations).
+  independence rules in [Provider attestations](#provider-attestations) and
+  the credential rules in [Provider credentials](#provider-credentials).
 - `audit_log_path` defaults to the OS-conventional PER-PROFILE location
   (`<data root>/audit/<name>.jsonl`) when omitted; profiles never share an
   audit file unless one is configured explicitly. The first keyed audit write
@@ -151,7 +154,7 @@ secret.
 |-------|------|----------|---------|-------------|
 | `version` | integer | yes | — | Schema version. Must be `2`. |
 | `chain_id` | string (CAIP-2) | yes | — | `stellar:testnet` or `stellar:mainnet`. Drives passphrase resolution and the mainnet-write gate. |
-| `rpc_url` | string (URL) | on mainnet | testnet endpoint | Profile endpoint used by transaction commands. Omitted testnet values use `https://soroban-testnet.stellar.org`. Mainnet has no default endpoint, so a mainnet profile must set this field. Follows the endpoint rule in [Loader source order](#loader-source-order): `http` or `https`, and on mainnet `https` with no username or password. Mainnet endpoint flags and overlays are refused. |
+| `rpc_url` | string (URL) | on mainnet | testnet endpoint | Profile endpoint used by transaction commands. Omitted testnet values use `https://soroban-testnet.stellar.org`. Mainnet has no default endpoint, so a mainnet profile must set this field. Follows the endpoint rule in [Loader source order](#loader-source-order): `http` or `https`, and on mainnet `https` with no username or password. Mainnet endpoint flags and overlays are refused. `[providers.primary]` names its operator and host and can name a keyring credential for this endpoint. |
 | `network_passphrase` | string | resolved | from `chain_id` | The Stellar network passphrase. Resolved from `chain_id`; not overridable from the TOML or overlays. Surfaced for callers. |
 
 ### Signer and nonce references
@@ -165,7 +168,7 @@ secret.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `cross_check_threshold_stroops` | integer (stroops) | no | `0` | High-value cross-check threshold. The effective value is `max(cross_check_threshold_stroops, 10_000_000_000)`; the floor of 1000 XLM (10^10 stroops) cannot be configured lower, so a profile with `cross_check_threshold_stroops = 0` behaves as if it were the floor. Native-XLM payments and sponsored account creations at or above the effective threshold run the MCP commit cross-check when `oracle_provider_url` is set. Mainnet requires its provider record and a host distinct from the primary. The legacy key `usd_threshold` is still accepted on load; do not set both keys (across the file, environment, and CLI sources) — the load is refused as a duplicate field. |
+| `cross_check_threshold_stroops` | integer (stroops) | no | `0` | High-value cross-check threshold. The effective value is `max(cross_check_threshold_stroops, 10_000_000_000)`; the floor of 1000 XLM (10^10 stroops) cannot be configured lower, so a profile with `cross_check_threshold_stroops = 0` behaves as if it were the floor. Native-XLM payments and sponsored account creations at or above the effective threshold run the MCP commit cross-check when `oracle_provider_url` is set. Mainnet requires its provider record, a host distinct from the primary, and a `[providers.primary]` record. The legacy key `usd_threshold` is still accepted on load; do not set both keys (across the file, environment, and CLI sources). The load is refused as a duplicate field. |
 | `classic_fee_per_op_stroops` | integer | no | unset (protocol default) | Per-operation base fee for classic transactions, in stroops. When unset, classic tools use the built-in default. |
 | `classic_max_fee_per_op_stroops` | integer | no | unset (no cap) | Per-operation fee cap, in stroops. When set, classic tools fail before envelope construction if the selected fee exceeds the cap. A guardrail, not a silent clamp. |
 | `submit_timeout_seconds` | integer | no | `60` | How long the wallet polls for transaction confirmation. |
@@ -188,19 +191,22 @@ but mints no key material; the rotation commands mint the actual keys (see
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `oracle_provider_url` | string (URL) | no | unset (cross-check off) | Oracle endpoint for MCP high-value rebuilds and the `stellar_pay` SEP-29 second read. When absent, those second-endpoint checks are skipped. Mainnet requires `providers.oracle` and a host distinct from `rpc_url`. The endpoint rule and URL redaction apply. |
+| `oracle_provider_url` | string (URL) | no | unset (cross-check off) | Oracle endpoint for MCP high-value rebuilds and the `stellar_pay` SEP-29 second read. When absent, those second-endpoint checks are skipped. Mainnet requires `providers.oracle`, a host distinct from `rpc_url`, and a `[providers.primary]` record. The endpoint rule and URL redaction apply. `providers.oracle` can name a keyring credential for it. |
 | `mcp_disabled` | bool | no | `false` | When `true`, the `stellar-agent-mcp` server refuses to start with error `mcp.disabled_per_profile`. |
 | `audit_log_path` | string (path) | no | OS-conventional | Path to the per-profile audit log. |
-| `secondary_rpc_url` | string (URL) | no | unset | Secondary endpoint for cross-RPC checks. `smart-account multicall` requires an effective secondary from the profile or a testnet flag. Follows the endpoint rule in [Loader source order](#loader-source-order). Mainnet reads this field from the file only and requires `providers.secondary`, its independence assertion, and a host distinct from the primary. Debug output is redacted. |
+| `secondary_rpc_url` | string (URL) | no | unset | Secondary endpoint for cross-RPC checks. `smart-account multicall` requires an effective secondary from the profile or a testnet flag. Follows the endpoint rule in [Loader source order](#loader-source-order). Mainnet reads this field from the file only and requires `providers.secondary`, its independence assertion, a host distinct from the primary, and a `[providers.primary]` record. Debug output is redacted. `providers.secondary` can name a keyring credential; the smart-account and DeFi commands that read this endpoint send none. |
 | `smart_account_max_context_rule_scan_id` | integer | no | engine default | Override for the maximum rule-id scan bound. Rejected at load when above `10000`. |
 | `session_rule_max_horizon_ledgers` | integer | no | engine default | Override for the maximum session-rule lookahead window, in ledgers. Rejected at load when above `10000`. |
 
 ### Provider attestations
 
 Edit the profile file to configure the optional URLs and provider records.
-No CLI flag or command sets them.
+No CLI flag sets them.
+`profile enroll-rpc-credential` adds `credential` and `placement` to an existing record and changes nothing else.
+A file with mixed line endings is written with LF endings.
 On mainnet, each configured secondary or oracle URL requires its matching record,
 a true independence assertion, and a host distinct from the primary.
+On mainnet, a configured secondary or oracle URL also requires a `[providers.primary]` record.
 On every chain, a record asserting `independent_of_primary = true` needs a host distinct from the primary.
 Secondary and oracle may share a host and operator; each role keeps its own record.
 
@@ -209,6 +215,10 @@ Secondary and oracle may share a host and operator; each role keeps its own reco
 rpc_url = "https://primary.example/rpc"
 secondary_rpc_url = "https://independent.example/secondary"
 oracle_provider_url = "https://independent.example/oracle"
+
+[providers.primary]
+operator = "Primary RPC Organization"
+host = "primary.example"
 
 [providers.secondary]
 operator = "Independent RPC Organization"
@@ -233,13 +243,60 @@ The host predicate is a naming convention, not a proof; the operator attestation
 On testnet, records may be absent or assert false; present records still need an operator and matching host.
 Environment and programmatic URL overlays are checked against a present file record.
 Changing such an overlay to another host requires updating the file record.
-CLI flags and the MCP secondary input override after loading and are not checked against these records.
+CLI flags and the `stellar_fee_stats` `rpc_url` input override after loading, are not checked against these records, and get the primary credential only when the value equals the profile's `rpc_url`.
+The `--secondary-rpc-url` flag and the MCP secondary input send no credential.
 Remove a role's record when removing its URL; URLs absent together with their records remain allowed.
 Provider records are file-only on every chain and appear in `profile show` and `Debug` because operator and host are not secrets.
 Do not put credentials in these metadata fields.
-`providers.primary` is unsupported and refused.
+`[providers.primary]` names the operator and host of `rpc_url` and may carry a credential; it takes no `independent_of_primary`.
+On mainnet, a secondary or oracle record naming the primary's operator, compared after trimming and case folding, refuses.
 Provider refusals use `validation.provider_attestation_invalid`; the message identifies the field and its repair.
-On testnet, a high-value oracle sharing the primary host emits the degraded-verification warning, even when its path or query differs.
+On testnet, a high-value oracle sharing the primary host emits the degraded-verification warning, even when its path or query differs, or when its record names the primary's operator.
+
+### Provider credentials
+
+A provider record can name the keyring entry that holds the provider's key for its endpoint, and where requests carry the key.
+The key itself lives only in the keyring; the reference and the placement are public metadata and print in `profile show`.
+
+```toml
+[providers.primary]
+operator = "Example RPC Ltd"
+host = "rpc.example.com"
+credential = { service = "stellar-agent-rpc-prod", account = "primary" }
+placement = { kind = "header", name = "X-API-Key" }
+# placement = { kind = "query", name = "apikey" }
+# placement = { kind = "path" }
+```
+
+The loader checks a record that names a credential:
+
+- `credential` and `placement` come together.
+- `credential` holds exactly `service` and `account`, each printable ASCII without leading or trailing spaces.
+- `credential` names no entry another wallet key of the profile uses, and no service in the `stellar-agent-` namespace except under `stellar-agent-rpc-`.
+- A header placement sends the stored value as the header value, a scheme such as `Bearer ` included. The name follows the HTTP token rule; `Host`, `Content-Type`, `Content-Length`, `Accept`, `Connection`, `Transfer-Encoding`, `TE`, `Trailer`, `Upgrade`, and `Keep-Alive` refuse, and `Authorization` is allowed.
+- A query placement appends `name=value`, form-urlencoded. The name uses ASCII letters, digits, `-`, `.`, `_`, and `~`, and repeats no parameter of the endpoint URL.
+- A path placement appends the value as one percent-encoded path segment. A path ending in `/`, a bare host included, keeps the trailing slash: `https://h/` becomes `https://h/KEY/`, and `https://h/v2` becomes `https://h/v2/KEY`.
+- The role's URL uses `https` unless its host is a loopback address (`localhost`, `127.0.0.0/8`, or `[::1]`), and it carries no username or password.
+
+Look up the header or parameter name in your provider's documentation.
+Store the key with `stellar-agent profile enroll-rpc-credential`; see [the CLI reference](cli-reference.md).
+The stored value is at most 1024 bytes and holds no control character.
+
+A client reads the key from the keyring when it is built for the role's URL from the profile.
+A URL that differs by any byte, such as a CLI flag or the `stellar_fee_stats` `rpc_url` input, gets no credential, and no keyring entry is opened.
+A testnet environment overlay of the role's URL keeps the credential, because the loader checked the record against the merged URL.
+
+These commands send the primary credential: `pay`, `claim`, `accounts create --sponsor`, `trustline`, `pool init`, `pool list`, `tx status`, `tx receipt clear`, and `fees stats --profile`.
+The MCP classic tools send it too: `stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim` and their commits, `stellar_balances`, `stellar_transaction_status`, `stellar_fee_stats`, and the x402 tools.
+The MCP high-value cross-check and the `stellar_pay` SEP-29 read send the oracle credential.
+`balances` takes `--rpc-url` without a profile and sends none.
+The Friendbot path of `accounts create`, `stellar_friendbot`, `stellar_sep43_sign_and_submit_transaction`, and the smart-account, DeFi, and MPP commands and tools send none either.
+
+A missing entry reports `auth.keyring_not_found` naming `service/account`.
+A stored value that is empty, longer than 1024 bytes, or holds a control character reports `network.rpc_credential_refused`.
+An endpoint that answers the network identity request with HTTP 401 or 403 reports the same code, and the request is not retried.
+The client removes the stored value and the form it sends from every error text it returns, before it shortens URLs to host and port.
+A key the endpoint re-encodes, truncates, or splits is not caught.
 
 ### `[wallet]` block
 
@@ -294,8 +351,11 @@ nonce reference are `KeyringEntryRef` values that only name a keyring entry.
 
 Consequences:
 
-- The profile TOML is safe to back up and to copy between hosts. The keyring
-  backend is the actual defence for secret material.
+- The profile TOML holds no secret when no endpoint URL embeds a key; it is
+  then safe to back up and to copy between hosts. Keep provider keys in the
+  keyring through `providers.<role>.credential` (see
+  [Provider credentials](#provider-credentials)). The keyring backend is the
+  actual defence for secret material.
 - `rpc_url`, `secondary_rpc_url`, and `oracle_provider_url` are redacted in
   debug output because URLs may embed credentials. `profile show` prints them
   as scheme, host, and port. A mainnet profile whose endpoint URL carries a

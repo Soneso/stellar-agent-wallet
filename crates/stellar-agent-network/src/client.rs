@@ -5,24 +5,147 @@
 //! and transaction submissions.  Horizon REST is not used; all data access
 //! routes through Stellar RPC.
 
+use http::{HeaderMap, HeaderName, HeaderValue};
 use jsonrpsee_core::ClientError;
 use jsonrpsee_core::client::ClientT;
 use jsonrpsee_core::params::ObjectParams;
 use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
+use stellar_agent_core::profile::schema::{
+    RpcCredentialDefect, RpcCredentialPlacement, check_rpc_credential_placement,
+    check_rpc_credential_value,
+};
 use stellar_rpc_client::{
     Client, GetHealthResponse, GetLedgerEntriesResponse, GetTransactionResponseRaw,
     SimulateTransactionResponse,
 };
 use stellar_xdr::{LedgerKey, TransactionEnvelope};
 use tokio::time::Instant;
+use url::Url;
+use zeroize::Zeroizing;
 
 use crate::endpoint_identity::{EndpointIdentity, check_protocol_version};
 use crate::fees::FeeStatsView;
-use crate::redact::{redact_rpc_error, redact_rpc_error_display, redact_url_authority};
-use crate::retry::{RetryPolicy, is_retryable_identity_error, retry_with_backoff};
+use crate::redact::{redact_rpc_error, redact_url_authority};
+use crate::retry::{RetryPolicy, is_retryable_identity_error, rejected_status, retry_with_backoff};
 use crate::submit::MAINNET_PASSPHRASE;
 use crate::transaction_record::TransactionRecord;
+
+/// The text that replaces a credential in an error or log text.
+const REDACTED_CREDENTIAL: &str = "[redacted]";
+
+/// The shortest token after a header value's scheme prefix that the scrub
+/// removes on its own. Shorter tokens are common words that would garble
+/// unrelated text.
+const MIN_SCRUBBED_HEADER_TOKEN_BYTES: usize = 8;
+
+/// The endpoint a client sends to: the configured URL, which never holds the
+/// keyring credential, and the forms of that credential that the client's
+/// error texts must not carry.
+///
+/// Every error the client builds from transport or server text passes
+/// [`RpcEndpoint::scrub`]: each credential form is replaced first, then every
+/// URL keeps only its host and port. The forms are the stored value, the
+/// form-urlencoded value of a query placement, the percent-encoded segment of
+/// a path placement, and for a header value with a scheme prefix the token
+/// after the first space when it holds at least
+/// [`MIN_SCRUBBED_HEADER_TOKEN_BYTES`] bytes. Each form lives in a
+/// [`Zeroizing`] holder.
+pub(crate) struct RpcEndpoint {
+    url: String,
+    secrets: Vec<Zeroizing<String>>,
+}
+
+impl RpcEndpoint {
+    /// An endpoint without a credential.
+    pub(crate) fn plain(url: &str) -> Self {
+        Self {
+            url: url.to_owned(),
+            secrets: Vec::new(),
+        }
+    }
+
+    /// An endpoint whose requests carry `value` at `placement`. The value
+    /// itself is kept as one of the credential forms.
+    pub(crate) fn credentialed(
+        url: &str,
+        value: Zeroizing<String>,
+        placement: &RpcCredentialPlacement,
+    ) -> Self {
+        let mut secrets = Vec::with_capacity(2);
+        match placement {
+            RpcCredentialPlacement::Query { .. } => secrets.push(Zeroizing::new(
+                url::form_urlencoded::byte_serialize(value.as_bytes()).collect(),
+            )),
+            RpcCredentialPlacement::Path {} => {
+                if let Some(segment) = encoded_path_segment(&value) {
+                    secrets.push(segment);
+                }
+            }
+            RpcCredentialPlacement::Header { .. } => {
+                if let Some((_, token)) = value.split_once(' ')
+                    && token.len() >= MIN_SCRUBBED_HEADER_TOKEN_BYTES
+                {
+                    secrets.push(Zeroizing::new(token.to_owned()));
+                }
+            }
+            // A placement kind this client does not build refuses in
+            // `with_credential`, so only the stored value applies.
+            _ => {}
+        }
+        secrets.push(value);
+        // Longer forms first, so a shorter form inside a longer one never
+        // leaves a fragment of the longer one behind.
+        secrets.sort_by_key(|form| std::cmp::Reverse(form.len()));
+        secrets.dedup();
+        Self {
+            url: url.to_owned(),
+            secrets,
+        }
+    }
+
+    /// The configured endpoint URL, without the keyring credential.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.url
+    }
+
+    /// The configured URL redacted to scheme, host, and port.
+    pub(crate) fn authority(&self) -> String {
+        redact_url_authority(&self.url)
+    }
+
+    /// Replaces every credential form in `text`, leaving URLs as they are.
+    pub(crate) fn redact_credential(&self, text: &str) -> String {
+        let mut out = Zeroizing::new(text.to_owned());
+        for secret in &self.secrets {
+            if out.contains(secret.as_str()) {
+                out = Zeroizing::new(out.replace(secret.as_str(), REDACTED_CREDENTIAL));
+            }
+        }
+        out.as_str().to_owned()
+    }
+
+    /// Replaces every credential form in `text`, then keeps only host and
+    /// port of every URL in it.
+    pub(crate) fn scrub(&self, text: &str) -> String {
+        redact_rpc_error(&self.redact_credential(text))
+    }
+
+    /// [`Self::scrub`] applied to the display of `error`.
+    pub(crate) fn scrub_display(&self, error: &impl std::fmt::Display) -> String {
+        self.scrub(&Zeroizing::new(error.to_string()))
+    }
+}
+
+/// The percent-encoded form the URL path takes for `value` as one segment.
+fn encoded_path_segment(value: &str) -> Option<Zeroizing<String>> {
+    let mut probe = Url::parse("http://segment.invalid/").ok()?;
+    probe.path_segments_mut().ok()?.clear().push(value);
+    let encoded = Zeroizing::new(String::from(probe));
+    encoded
+        .strip_prefix("http://segment.invalid/")
+        .map(|segment| Zeroizing::new(segment.to_owned()))
+}
 
 /// What the endpoint reports about one transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,8 +167,13 @@ pub struct TransactionStatusView {
 /// # Construction
 ///
 /// Use [`StellarRpcClient::new`] with the full RPC URL (e.g.
-/// `"https://soroban-testnet.stellar.org"`). The URL is validated at
-/// construction time.
+/// `"https://soroban-testnet.stellar.org"`), or
+/// [`StellarRpcClient::with_credential`] for an endpoint that requires a
+/// provider credential. The URL is validated at construction time.
+///
+/// The type implements neither `Debug` nor `Clone`: the inner transport
+/// prints its target URL, which holds a query or path credential, and a
+/// credential is never copied out of the client.
 ///
 /// # Examples
 ///
@@ -58,7 +186,7 @@ pub struct TransactionStatusView {
 #[non_exhaustive]
 pub struct StellarRpcClient {
     pub(crate) inner: Client,
-    pub(crate) url: String,
+    pub(crate) url: RpcEndpoint,
 }
 
 impl StellarRpcClient {
@@ -83,27 +211,122 @@ impl StellarRpcClient {
     pub fn new(url: &str) -> Result<Self, WalletError> {
         #[cfg(feature = "test-hooks")]
         CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
-        let inner = Client::new(url).map_err(|e| construction_failure(url, &e))?;
+        let endpoint = RpcEndpoint::plain(url);
+        let inner = Client::new(url).map_err(|e| construction_failure(&endpoint, &e))?;
         Ok(Self {
             inner,
-            url: url.to_owned(),
+            url: endpoint,
         })
     }
 
-    /// Returns the RPC endpoint URL this client is connected to.
+    /// Constructs a client whose every request carries the provider
+    /// credential `value` at `placement`.
+    ///
+    /// The value and the placement are checked again here: the value with
+    /// [`check_rpc_credential_value`], the placement with
+    /// [`check_rpc_credential_placement`]. The transport sends a URL password
+    /// as Basic authentication, so a URL with a username or password is
+    /// refused.
+    ///
+    /// - A header placement sends `value` as the value of the named header,
+    ///   marked sensitive so that its `Debug` form hides it, on the URL as
+    ///   given.
+    /// - A query placement appends `name=value` to the query, form-urlencoded.
+    /// - A path placement appends `value` to the path as one percent-encoded
+    ///   segment. A configured path ending in `/`, a bare host included,
+    ///   keeps a trailing slash after the segment: `https://h/` becomes
+    ///   `https://h/KEY/` and `https://h/v2` becomes `https://h/v2/KEY`.
+    ///
+    /// [`Self::url`] returns `url` as given, never the URL with the
+    /// credential. Every error the client returns has the credential forms
+    /// replaced before URLs are redacted (see the type's error contract).
+    ///
+    /// # Errors
+    ///
+    /// - [`NetworkError::RpcCredentialUnusable`] when the value or the
+    ///   placement breaks its rules, or `url` carries a username or password.
+    /// - [`NetworkError::RpcUnreachable`] when `url` does not parse as an
+    ///   HTTP or HTTPS URL. The error carries only the URL's authority.
+    pub fn with_credential(
+        url: &str,
+        placement: &RpcCredentialPlacement,
+        value: Zeroizing<String>,
+    ) -> Result<Self, WalletError> {
+        #[cfg(feature = "test-hooks")]
+        CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+        let unusable =
+            |reason| WalletError::Network(NetworkError::RpcCredentialUnusable { reason });
+        check_rpc_credential_value(&value).map_err(unusable)?;
+        check_rpc_credential_placement(placement)
+            .map_err(|_| unusable(RpcCredentialDefect::Placement))?;
+        let invalid_url = |reason: String| {
+            WalletError::Network(NetworkError::RpcUnreachable {
+                url: redact_url_authority(url),
+                reason,
+            })
+        };
+        let parsed = Url::parse(url).map_err(|e| invalid_url(format!("invalid URL: {e}")))?;
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(unusable(RpcCredentialDefect::Userinfo));
+        }
+        let built = match placement {
+            RpcCredentialPlacement::Header { name } => {
+                let name = HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| unusable(RpcCredentialDefect::Placement))?;
+                let mut header = HeaderValue::from_str(&value)
+                    .map_err(|_| unusable(RpcCredentialDefect::ControlCharacter))?;
+                header.set_sensitive(true);
+                let mut headers = HeaderMap::new();
+                headers.insert(name, header);
+                Client::new_with_headers(url, headers)
+            }
+            RpcCredentialPlacement::Query { name } => {
+                let mut target = parsed;
+                target.query_pairs_mut().append_pair(name, &value);
+                let target = Zeroizing::new(String::from(target));
+                Client::new(&target)
+            }
+            RpcCredentialPlacement::Path {} => {
+                let trailing_slash = parsed.path().ends_with('/');
+                let mut target = parsed;
+                {
+                    let mut segments = target.path_segments_mut().map_err(|()| {
+                        invalid_url("the URL has no path to carry the credential".to_owned())
+                    })?;
+                    segments.pop_if_empty().push(&value);
+                    if trailing_slash {
+                        segments.push("");
+                    }
+                }
+                let target = Zeroizing::new(String::from(target));
+                Client::new(&target)
+            }
+            _ => return Err(unusable(RpcCredentialDefect::Placement)),
+        };
+        let endpoint = RpcEndpoint::credentialed(url, value, placement);
+        let inner = built.map_err(|e| construction_failure(&endpoint, &e))?;
+        Ok(Self {
+            inner,
+            url: endpoint,
+        })
+    }
+
+    /// Returns the configured RPC endpoint URL of this client.
+    ///
+    /// This is the URL passed to the constructor, never a URL with a keyring
+    /// credential interpolated into its query or path.
     ///
     /// # Examples
     ///
     /// ```
     /// use stellar_agent_network::StellarRpcClient;
     ///
-    /// // The rpc-client normalises the URL to include the explicit port.
     /// let client = StellarRpcClient::new("https://soroban-testnet.stellar.org").unwrap();
-    /// assert!(client.url().contains("soroban-testnet.stellar.org"));
+    /// assert_eq!(client.url(), "https://soroban-testnet.stellar.org");
     /// ```
     #[must_use]
     pub fn url(&self) -> &str {
-        &self.url
+        self.url.as_str()
     }
 
     /// Fetches one or more ledger entries by key via `getLedgerEntries`.
@@ -168,9 +391,9 @@ impl StellarRpcClient {
     /// [`Self::endpoint_identity`]: a transport failure or a JSON-RPC error
     /// object is retried with bounded exponential backoff under `deadline`,
     /// the caller's own deadline. An answer whose body does not deserialize,
-    /// for example one without `ledgerRetentionWindow`, is not retried. The
-    /// answer is returned as received; judging its `status` is the caller's
-    /// part.
+    /// for example one without `ledgerRetentionWindow`, is not retried, and
+    /// neither is an HTTP 401 or 403 answer. The answer is returned as
+    /// received; judging its `status` is the caller's part.
     ///
     /// # Errors
     ///
@@ -206,10 +429,17 @@ impl StellarRpcClient {
         &self,
         envelope: &TransactionEnvelope,
     ) -> Result<SimulateTransactionResponse, NetworkError> {
-        self.inner
+        let mut response = self
+            .inner
             .simulate_transaction_envelope(envelope, None)
             .await
-            .map_err(|e| rpc_unreachable(&self.url, SIMULATE_TRANSACTION_FAILED, &e))
+            .map_err(|e| rpc_unreachable(&self.url, SIMULATE_TRANSACTION_FAILED, &e))?;
+        // The answer's `error` is the endpoint's own text and reaches callers
+        // as received apart from the credential.
+        if let Some(error) = response.error.as_mut() {
+            *error = self.url.redact_credential(error);
+        }
+        Ok(response)
     }
 
     /// Asks the endpoint what became of one transaction.
@@ -309,8 +539,9 @@ impl StellarRpcClient {
     /// are retried with bounded exponential backoff under `deadline`, the
     /// caller's own deadline, using the classification of `sendTransaction`
     /// ([`is_retryable_send_error`](crate::retry::is_retryable_send_error))
-    /// with one exception: an answer whose body does not deserialize, for
-    /// example one without `protocolVersion`, is not retried. A passphrase
+    /// with two exceptions: an answer whose body does not deserialize, for
+    /// example one without `protocolVersion`, is not retried, and neither is
+    /// an HTTP 401 or 403 answer, which no retry changes. A passphrase
     /// mismatch is not retried either.
     ///
     /// The checks run in this order: an endpoint reporting the mainnet
@@ -326,9 +557,12 @@ impl StellarRpcClient {
     ///
     /// # Errors
     ///
+    /// - [`NetworkError::RpcCredentialRejected`] if the endpoint answers
+    ///   HTTP 401 or 403, with that status and the endpoint's authority.
     /// - [`NetworkError::EndpointIdentityUnavailable`] if the request does not
     ///   complete within `deadline`, fails for any reason other than a
-    ///   passphrase verdict, or returns a body that does not deserialize.
+    ///   passphrase verdict or a 401 or 403 answer, or returns a body that
+    ///   does not deserialize.
     /// - [`NetworkError::MainnetWriteForbidden`] if the endpoint reports the
     ///   mainnet passphrase, whatever `expected_passphrase` is.
     /// - [`NetworkError::EndpointNetworkMismatch`] if the endpoint reports any
@@ -346,9 +580,15 @@ impl StellarRpcClient {
                 self.inner.get_network().await
             })
             .await
-            .map_err(|_| {
-                WalletError::Network(NetworkError::EndpointIdentityUnavailable {
-                    url: self.redacted_url(),
+            .map_err(|e| {
+                WalletError::Network(match rejected_status(&e) {
+                    Some(status @ (401 | 403)) => NetworkError::RpcCredentialRejected {
+                        url: self.redacted_url(),
+                        status,
+                    },
+                    _ => NetworkError::EndpointIdentityUnavailable {
+                        url: self.redacted_url(),
+                    },
                 })
             })?;
 
@@ -381,18 +621,20 @@ impl StellarRpcClient {
     /// leaking credentials that may be embedded in the full URL
     /// (e.g. `https://user:token@rpc.example.com`).
     fn redacted_url(&self) -> String {
-        redact_url_authority(&self.url)
+        self.url.authority()
     }
 }
 
 #[cfg(feature = "test-hooks")]
 thread_local! {
-    /// Calls to [`StellarRpcClient::new`] on this thread, failed ones included.
+    /// Calls to [`StellarRpcClient::new`] and [`StellarRpcClient::with_credential`]
+    /// on this thread, failed ones included.
     static CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Returns how many times [`StellarRpcClient::new`] has run on the calling
-/// thread, failed constructions included.
+/// Returns how many times [`StellarRpcClient::new`] or
+/// [`StellarRpcClient::with_credential`] has run on the calling thread, failed
+/// constructions included.
 ///
 /// A test reads it before and after one command or tool call on a
 /// current-thread runtime. The difference is the number of clients that call
@@ -408,14 +650,14 @@ pub fn constructions_on_this_thread() -> usize {
     CONSTRUCTIONS.with(std::cell::Cell::get)
 }
 
-/// Builds the error for a transport that refuses to construct for `url`.
+/// Builds the error for a transport that refuses to construct for `endpoint`.
 ///
 /// The `url` field carries the authority form (scheme://host\[:port\]). Credentials
 /// embedded in a URL, for example `https://user:token@rpc.example.com`, therefore
 /// reach no log or error message. The reason goes through the same scrub as
 /// every other RPC failure.
-fn construction_failure(url: &str, e: &stellar_rpc_client::Error) -> WalletError {
-    WalletError::Network(rpc_unreachable(url, "", e))
+fn construction_failure(endpoint: &RpcEndpoint, e: &stellar_rpc_client::Error) -> WalletError {
+    WalletError::Network(rpc_unreachable(endpoint, "", e))
 }
 
 /// The reason prefix of a failed `getLedgerEntries` call.
@@ -434,37 +676,39 @@ const SIMULATE_TRANSACTION_FAILED: &str = "simulateTransaction failed: ";
 /// pending receipt.
 pub(crate) const STALE_PENDING_RECOVERY: &str = "stale-Pending recovery: ";
 
-/// Builds [`NetworkError::RpcUnreachable`] for a failed call to the RPC
-/// endpoint at `url`.
+/// Builds [`NetworkError::RpcUnreachable`] for a failed call to `endpoint`.
 ///
 /// The `url` field holds only the endpoint's scheme, host, and port. The
 /// reason is `prefix` followed by the display of `e`, scrubbed with
-/// [`redact_rpc_error_display`]. That display carries the server's JSON-RPC
-/// error `message` and raw `data`. A server or proxy can echo the
+/// [`RpcEndpoint::scrub`]. That display carries the server's JSON-RPC error
+/// `message` and raw `data`. A server or proxy can echo the credential or the
 /// credential-bearing request URL there.
 pub(crate) fn rpc_unreachable(
-    url: &str,
+    endpoint: &RpcEndpoint,
     prefix: &str,
     e: &stellar_rpc_client::Error,
 ) -> NetworkError {
     NetworkError::RpcUnreachable {
-        url: redact_url_authority(url),
-        reason: format!("{prefix}{}", redact_rpc_error_display(e)),
+        url: endpoint.authority(),
+        reason: format!("{prefix}{}", endpoint.scrub_display(e)),
     }
 }
 
 /// Builds [`NetworkError::RpcUnreachable`] for a `getTransaction` answer from
-/// the endpoint at `url` whose status is none of `SUCCESS`, `FAILED`, and
-/// `NOT_FOUND`.
+/// `endpoint` whose status is none of `SUCCESS`, `FAILED`, and `NOT_FOUND`.
 ///
 /// The status is the endpoint's own text, so it enters the reason scrubbed
-/// with [`redact_rpc_error`], after `prefix`.
-pub(crate) fn unexpected_status(url: &str, prefix: &str, status: &str) -> NetworkError {
+/// with [`RpcEndpoint::scrub`], after `prefix`.
+pub(crate) fn unexpected_status(
+    endpoint: &RpcEndpoint,
+    prefix: &str,
+    status: &str,
+) -> NetworkError {
     NetworkError::RpcUnreachable {
-        url: redact_url_authority(url),
+        url: endpoint.authority(),
         reason: format!(
             "{prefix}unexpected getTransaction status: {}",
-            redact_rpc_error(status)
+            endpoint.scrub(status)
         ),
     }
 }
@@ -503,8 +747,11 @@ mod tests {
         ];
         for prefix in prefixes {
             for (case, raw) in ERROR_OBJECTS {
-                let (url, reason) =
-                    unreachable_parts(rpc_unreachable(ENDPOINT, prefix, &call_error(raw)));
+                let (url, reason) = unreachable_parts(rpc_unreachable(
+                    &RpcEndpoint::plain(ENDPOINT),
+                    prefix,
+                    &call_error(raw),
+                ));
                 assert_eq!(
                     url, ENDPOINT_AUTHORITY,
                     "{case}: the endpoint keeps its authority"
@@ -529,7 +776,8 @@ mod tests {
     #[test]
     fn construction_failure_scrubs_its_reason() {
         let e = stellar_rpc_client::Error::InvalidUrl(format!("refused {ECHOED_URL}"));
-        let WalletError::Network(err) = construction_failure(ENDPOINT, &e) else {
+        let WalletError::Network(err) = construction_failure(&RpcEndpoint::plain(ENDPOINT), &e)
+        else {
             panic!("a construction failure is a network error");
         };
         let (url, reason) = unreachable_parts(err);
@@ -579,13 +827,256 @@ mod tests {
         }
     }
 
+    /// A value with a space, `+`, `/`, and `%`, so that its query and path
+    /// forms differ from the raw one.
+    const VALUE: &str = "k3y +/%2F v4lue";
+
+    fn header() -> RpcCredentialPlacement {
+        RpcCredentialPlacement::Header {
+            name: "X-API-Key".to_owned(),
+        }
+    }
+
+    fn query() -> RpcCredentialPlacement {
+        RpcCredentialPlacement::Query {
+            name: "apikey".to_owned(),
+        }
+    }
+
+    fn secret(value: &str) -> Zeroizing<String> {
+        Zeroizing::new(value.to_owned())
+    }
+
+    fn credentialed(url: &str, placement: &RpcCredentialPlacement) -> StellarRpcClient {
+        StellarRpcClient::with_credential(url, placement, Zeroizing::new(VALUE.to_owned())).unwrap()
+    }
+
+    /// `url()` and every authority the client reports are the configured
+    /// URL's, for each placement; the credential reaches only the transport
+    /// target of a query or path placement.
+    #[test]
+    fn with_credential_keeps_url_credential_free() {
+        for url in [
+            "https://rpc.example.com/v1/",
+            "http://127.0.0.1:9",
+            "https://h",
+        ] {
+            for placement in [header(), query(), RpcCredentialPlacement::Path {}] {
+                let client = credentialed(url, &placement);
+                assert_eq!(client.url(), url);
+                assert_eq!(client.url.authority(), redact_url_authority(url));
+                let target = client.inner.base_url();
+                match placement {
+                    RpcCredentialPlacement::Header { .. } => {
+                        assert!(!target.contains("k3y"), "{target}");
+                    }
+                    RpcCredentialPlacement::Query { .. } => {
+                        assert!(
+                            target.ends_with("?apikey=k3y+%2B%2F%252F+v4lue"),
+                            "{target}"
+                        );
+                    }
+                    _ => assert!(target.contains("/k3y%20+%2F%252F%20v4lue"), "{target}"),
+                }
+            }
+        }
+    }
+
+    /// A URL with a username or a password refuses before anything is built.
+    #[test]
+    fn with_credential_refuses_a_userinfo_url() {
+        for url in [
+            "https://user:pass@rpc.example.com",
+            "https://user@rpc.example.com/rpc",
+            "https://:pass@rpc.example.com",
+        ] {
+            for placement in [header(), query(), RpcCredentialPlacement::Path {}] {
+                let err = StellarRpcClient::with_credential(
+                    url,
+                    &placement,
+                    Zeroizing::new(VALUE.to_owned()),
+                )
+                .err()
+                .unwrap();
+                assert!(
+                    matches!(
+                        err,
+                        WalletError::Network(NetworkError::RpcCredentialUnusable {
+                            reason: RpcCredentialDefect::Userinfo
+                        })
+                    ),
+                    "{url}: {err:?}"
+                );
+                assert_eq!(err.code(), "network.rpc_credential_refused");
+            }
+        }
+    }
+
+    /// The value and the placement are checked again at construction.
+    #[test]
+    fn with_credential_refuses_a_bad_value_or_placement() {
+        for (value, defect) in [
+            (String::new(), RpcCredentialDefect::Empty),
+            ("a".repeat(1025), RpcCredentialDefect::TooLong),
+            ("a\nb".to_owned(), RpcCredentialDefect::ControlCharacter),
+        ] {
+            let err = StellarRpcClient::with_credential(
+                "https://rpc.example.com",
+                &header(),
+                Zeroizing::new(value),
+            )
+            .err()
+            .unwrap();
+            assert!(
+                matches!(
+                    err,
+                    WalletError::Network(NetworkError::RpcCredentialUnusable { reason })
+                        if reason == defect
+                ),
+                "{err:?}"
+            );
+        }
+        for placement in [
+            RpcCredentialPlacement::Header {
+                name: "Host".to_owned(),
+            },
+            RpcCredentialPlacement::Header {
+                name: "X Key".to_owned(),
+            },
+            RpcCredentialPlacement::Query {
+                name: "a&b".to_owned(),
+            },
+            RpcCredentialPlacement::Query {
+                name: String::new(),
+            },
+        ] {
+            let err = StellarRpcClient::with_credential(
+                "https://rpc.example.com",
+                &placement,
+                Zeroizing::new(VALUE.to_owned()),
+            )
+            .err()
+            .unwrap();
+            assert!(
+                matches!(
+                    err,
+                    WalletError::Network(NetworkError::RpcCredentialUnusable {
+                        reason: RpcCredentialDefect::Placement
+                    })
+                ),
+                "{placement:?}: {err:?}"
+            );
+        }
+    }
+
+    /// A URL that does not parse refuses with the stable transport code and
+    /// carries neither the credential nor the URL's secret parts.
+    #[test]
+    fn with_credential_reports_an_unparseable_url_without_its_parts() {
+        let err = StellarRpcClient::with_credential(
+            "https://archive example.com/rpc?token=SECRET",
+            &header(),
+            Zeroizing::new(VALUE.to_owned()),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.code(), "network.rpc_unreachable");
+        let rendered = format!("{err} {err:?}");
+        for leaked in ["SECRET", "token=", "k3y"] {
+            assert!(!rendered.contains(leaked), "{leaked}: {rendered}");
+        }
+    }
+
+    /// Each credential form, placed bare in a server text and inside an
+    /// echoed URL, is gone from every error the mapping helpers build, and
+    /// the URL scrub still runs after it.
+    #[test]
+    fn credential_value_is_scrubbed_from_every_mapped_error() {
+        let query_form = "k3y+%2B%2F%252F+v4lue";
+        let path_form = "k3y%20+%2F%252F%20v4lue";
+        for (placement, wire) in [
+            (header(), VALUE),
+            (query(), query_form),
+            (RpcCredentialPlacement::Path {}, path_form),
+        ] {
+            let endpoint = RpcEndpoint::credentialed(ENDPOINT, secret(VALUE), &placement);
+            let text = format!(
+                "bad key {VALUE} sent as {wire} via \
+                 https://user:SECRET@archive.example.com:8443/rpc/{wire}"
+            );
+            let raw = serde_json::json!({"code": -32000, "message": text}).to_string();
+            for prefix in ["", GET_LEDGER_ENTRIES_FAILED, SIMULATE_TRANSACTION_FAILED] {
+                let (url, reason) =
+                    unreachable_parts(rpc_unreachable(&endpoint, prefix, &call_error(&raw)));
+                assert_eq!(url, ENDPOINT_AUTHORITY);
+                assert!(
+                    reason.contains("bad key [redacted] sent as [redacted] via"),
+                    "{reason}"
+                );
+                assert_scrubbed(&format!("{placement:?}"), &reason);
+                for form in [VALUE, query_form, path_form, "k3y"] {
+                    assert!(!reason.contains(form), "{form}: {reason}");
+                }
+            }
+            let (_, reason) = unreachable_parts(unexpected_status(&endpoint, "", &text));
+            assert!(!reason.contains("k3y"), "{reason}");
+            assert_eq!(
+                endpoint.redact_credential(&format!("simulation refused {wire}")),
+                "simulation refused [redacted]"
+            );
+        }
+    }
+
+    /// A construction failure whose text holds the credential loses it.
+    #[test]
+    fn construction_failure_scrubs_the_credential() {
+        for placement in [header(), query(), RpcCredentialPlacement::Path {}] {
+            let endpoint = RpcEndpoint::credentialed(ENDPOINT, secret(VALUE), &placement);
+            let e =
+                stellar_rpc_client::Error::InvalidUrl(format!("refused {VALUE} at {ECHOED_URL}"));
+            let WalletError::Network(err) = construction_failure(&endpoint, &e) else {
+                panic!("a construction failure is a network error");
+            };
+            let (url, reason) = unreachable_parts(err);
+            assert_eq!(url, ENDPOINT_AUTHORITY);
+            assert!(!reason.contains("k3y"), "{reason}");
+            assert_scrubbed("construction", &reason);
+        }
+    }
+
+    /// The token after a header value's scheme is scrubbed on its own from
+    /// eight bytes on; a shorter one stays, the full value never does.
+    #[test]
+    fn header_scheme_token_is_scrubbed_from_eight_bytes() {
+        for (value, token, scrubbed) in [
+            ("Bearer abcdefg", "abcdefg", false),
+            ("Bearer abcdefgh", "abcdefgh", true),
+            ("Api-Key 0123456789abcdef", "0123456789abcdef", true),
+        ] {
+            let endpoint = RpcEndpoint::credentialed(ENDPOINT, secret(value), &header());
+            let echoed = endpoint.redact_credential(&format!("token {token}; full {value}"));
+            assert!(echoed.ends_with("full [redacted]"), "{echoed}");
+            assert_eq!(
+                echoed.starts_with("token [redacted]"),
+                scrubbed,
+                "{value}: {echoed}"
+            );
+        }
+        let query_endpoint =
+            RpcEndpoint::credentialed(ENDPOINT, secret("Bearer abcdefgh"), &query());
+        assert_eq!(
+            query_endpoint.redact_credential("token abcdefgh"),
+            "token abcdefgh"
+        );
+    }
+
     /// A status the endpoint invented enters the reason scrubbed, after the
     /// prefix and the fixed wording.
     #[test]
     fn unexpected_status_scrubs_the_status_text() {
         for prefix in ["", STALE_PENDING_RECOVERY] {
             let (url, reason) = unreachable_parts(unexpected_status(
-                ENDPOINT,
+                &RpcEndpoint::plain(ENDPOINT),
                 prefix,
                 &format!("PENDING {ECHOED_URL}"),
             ));

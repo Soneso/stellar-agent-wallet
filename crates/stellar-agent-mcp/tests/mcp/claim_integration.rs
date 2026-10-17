@@ -1482,6 +1482,98 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
     );
 }
 
+/// The prepare and the commit send the profile's primary credential on
+/// every request, and the claim submits; without the credential each tool
+/// ends on the endpoint's 401 with the credential code.
+#[tokio::test]
+#[serial]
+async fn prepare_and_commit_send_the_primary_credential() {
+    use stellar_agent_core::profile::schema::ProviderRole;
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key();
+    let seed = [0x5d_u8; 32];
+    let claimant_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+    let id = test_balance_id();
+    let mock_server = MockServer::start().await;
+    crate::common::require_rpc_credential(&mock_server).await;
+    Mock::given(method("POST"))
+        .respond_with(ClaimSubmitSuccessRpcResponder {
+            cb_key_xdr: claim_key_xdr(&id),
+            entry_xdr: claim_entry_xdr(
+                &id,
+                &claimant_g,
+                stellar_xdr::ClaimPredicate::Unconditional,
+                CLAIM_AMOUNT_STROOPS,
+            ),
+            account_key_xdr: account_ledger_key_xdr(&claimant_g),
+            account_xdr: account_entry_xdr_with_seq(
+                &claimant_g,
+                SOURCE_BALANCE_STROOPS,
+                0,
+                SOURCE_SEQ,
+            ),
+            network: crate::common::EndpointNetwork::testnet(),
+        })
+        .mount(&mock_server)
+        .await;
+    let mut profile = testnet_profile_with_rpc(&mock_server.uri());
+    crate::common::bind_rpc_credential(&mut profile, ProviderRole::Primary, true);
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let simulate_args = StellarClaimArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        balance_id: "ab".repeat(32),
+        source_account: Some(claimant_g.clone()),
+    };
+    let sim_result = server
+        .call_stellar_claim(simulate_args.clone())
+        .await
+        .expect("simulate must not error");
+    assert_ne!(
+        sim_result.is_error,
+        Some(true),
+        "{}",
+        call_result_text(&sim_result)
+    );
+    let (nonce, expires_at_unix_ms, envelope_xdr) = extract_commit_triple(&sim_result);
+    let commit_args = StellarClaimCommitArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        balance_id: "ab".repeat(32),
+        source_account: Some(claimant_g),
+        nonce,
+        expires_at_unix_ms,
+        envelope_xdr,
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    let committed = server
+        .call_stellar_claim_commit(commit_args.clone())
+        .await
+        .expect("the commit must not error");
+    let committed_json = call_result_json(&committed);
+    assert!(
+        committed_json["data"]["tx_hash"].is_string(),
+        "{committed_json}"
+    );
+    crate::common::assert_every_request_carried_the_credential(&mock_server).await;
+
+    let bare =
+        WalletServer::new(testnet_profile_with_rpc(&mock_server.uri())).expect("WalletServer::new");
+    crate::common::assert_credential_refusals(
+        &mock_server,
+        vec![
+            bare.call_stellar_claim(simulate_args).await,
+            bare.call_stellar_claim_commit(commit_args).await,
+        ],
+    )
+    .await;
+}
+
 /// A simulate whose endpoint serves another network is refused before the
 /// claim-entry read and every later read, as an `is_error` envelope rather
 /// than a protocol error. The claim simulate takes its fee from the profile,

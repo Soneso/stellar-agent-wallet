@@ -820,7 +820,7 @@ where
     // Its endpoint is checked first, under a fresh budget of
     // `--timeout-seconds`, so no value the sponsor signs comes from an
     // endpoint serving another network.
-    let client = match StellarRpcClient::new(&context.rpc_url) {
+    let client = match context.primary_client() {
         Ok(c) => c,
         Err(e) => {
             print_error(&Envelope::<()>::err(&e), args.output);

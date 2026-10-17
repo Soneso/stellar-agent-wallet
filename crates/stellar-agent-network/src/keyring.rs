@@ -105,9 +105,9 @@ use stellar_agent_core::{
         KeyedAuditAccess, TipAnchor, TipAnchorStore, TipAnchorStoreError,
         reanchor_count_account_for_digest, tip_anchor_account_for_digest,
     },
-    error::{AuthError, InternalError, ValidationError, WalletError},
+    error::{AuthError, InternalError, NetworkError, ValidationError, WalletError},
     observability::redact_strkey_first5_last5,
-    profile::schema::{KeyringEntryRef, Profile},
+    profile::schema::{KeyringEntryRef, Profile, check_rpc_credential_value},
 };
 use zeroize::Zeroizing;
 
@@ -238,6 +238,122 @@ pub fn init_platform_keyring_store() -> Result<(), WalletError> {
     Err(platform_store_init_failure(
         "unsupported-platform credential store initialization failed",
     ))
+}
+
+/// Registers the platform keyring store, as [`init_platform_keyring_store`]
+/// does, only when no default store is registered yet.
+///
+/// A store that is already registered is kept: the one the MCP server
+/// registers at startup, a headless store, or a test's mock store.
+///
+/// # Errors
+///
+/// The errors of [`init_platform_keyring_store`], when it runs.
+pub(crate) fn ensure_platform_keyring_store() -> Result<(), WalletError> {
+    if keyring_core::get_default_store().is_some() {
+        return Ok(());
+    }
+    init_platform_keyring_store()
+}
+
+/// The diagnostic label of an RPC credential entry: `service/account`.
+///
+/// The three roles of a profile share one default service, so the account
+/// is what tells their entries apart.
+fn rpc_credential_label(entry: &KeyringEntryRef) -> String {
+    format!("{}/{}", entry.service, entry.account)
+}
+
+/// Opens the RPC credential entry `entry`, classifying a failure under its
+/// `service/account` label.
+fn open_rpc_credential_entry(entry: &KeyringEntryRef) -> Result<KeyringEntry, WalletError> {
+    KeyringEntry::new(&entry.service, &entry.account).map_err(|e| {
+        map_keyring_operation_error(
+            &e,
+            KeyringOperation::Construct,
+            &rpc_credential_label(entry),
+        )
+    })
+}
+
+/// Reads the RPC provider credential stored at `entry`.
+///
+/// Registers the platform store first when none is registered, keeping a
+/// store that is already registered. The value goes into a [`Zeroizing`]
+/// holder as it is read, then passes [`check_rpc_credential_value`].
+///
+/// # Errors
+///
+/// - [`AuthError::KeyringNotFound`] naming `service/account` when the entry
+///   does not exist; the other keyring codes for store failures.
+/// - [`NetworkError::RpcCredentialInvalid`] when the stored value is empty,
+///   longer than 1024 bytes, or holds a control character.
+pub fn read_rpc_credential(entry: &KeyringEntryRef) -> Result<Zeroizing<String>, WalletError> {
+    ensure_platform_keyring_store()?;
+    let label = rpc_credential_label(entry);
+    let value = Zeroizing::new(
+        open_rpc_credential_entry(entry)?
+            .get_password()
+            .map_err(|e| map_keyring_operation_error(&e, KeyringOperation::Read, &label))?,
+    );
+    check_rpc_credential_value(&value).map_err(|reason| {
+        WalletError::Network(NetworkError::RpcCredentialInvalid {
+            entry: label,
+            reason,
+        })
+    })?;
+    Ok(value)
+}
+
+/// Stores `value` as the RPC provider credential at `entry`, replacing any
+/// current value.
+///
+/// The value passes [`check_rpc_credential_value`] before the keyring is
+/// touched. The caller registers the store.
+///
+/// # Errors
+///
+/// - [`NetworkError::RpcCredentialInvalid`] when the value breaks the value
+///   rules; nothing is written.
+/// - The keyring codes of a failed write.
+pub fn write_rpc_credential(
+    entry: &KeyringEntryRef,
+    value: &Zeroizing<String>,
+) -> Result<(), WalletError> {
+    let label = rpc_credential_label(entry);
+    check_rpc_credential_value(value).map_err(|reason| {
+        WalletError::Network(NetworkError::RpcCredentialInvalid {
+            entry: label.clone(),
+            reason,
+        })
+    })?;
+    open_rpc_credential_entry(entry)?
+        .set_password(value)
+        .map_err(|e| map_keyring_operation_error(&e, KeyringOperation::Write, &label))
+}
+
+/// Reports whether an RPC provider credential is stored at `entry`.
+///
+/// The keyring has no probe that leaves the value unread, so the value is
+/// read into a [`Zeroizing`] holder and dropped at once. The caller
+/// registers the store.
+///
+/// # Errors
+///
+/// The keyring codes of a failed read other than a missing entry.
+pub fn rpc_credential_present(entry: &KeyringEntryRef) -> Result<bool, WalletError> {
+    match open_rpc_credential_entry(entry)?.get_password() {
+        Ok(value) => {
+            drop(Zeroizing::new(value));
+            Ok(true)
+        }
+        Err(keyring_core::Error::NoEntry) => Ok(false),
+        Err(e) => Err(map_keyring_operation_error(
+            &e,
+            KeyringOperation::Read,
+            &rpc_credential_label(entry),
+        )),
+    }
 }
 
 fn platform_store_init_failure(label: &str) -> WalletError {
@@ -2302,5 +2418,157 @@ mod tests {
             )),
         );
         assert_eq!(by_path.anchor_entry_ref(), by_digest.anchor_entry_ref());
+    }
+
+    use stellar_agent_core::profile::schema::RpcCredentialDefect;
+
+    fn rpc_entry() -> KeyringEntryRef {
+        KeyringEntryRef::new("stellar-agent-rpc-unit", "primary")
+    }
+
+    fn store_raw(entry: &KeyringEntryRef, value: &str) {
+        KeyringEntry::new(&entry.service, &entry.account)
+            .unwrap()
+            .set_password(value)
+            .unwrap();
+    }
+
+    /// A stored value of exactly 1024 bytes reads back whole; 1025 bytes
+    /// refuse with the entry label and no part of the value.
+    #[test]
+    #[serial_test::serial]
+    fn rpc_credential_cap_is_1024_bytes() {
+        let _restore = RestoreStore::new();
+        keyring_mock::install().unwrap();
+        let entry = rpc_entry();
+        let exact = "k".repeat(1024);
+        store_raw(&entry, &exact);
+        assert_eq!(read_rpc_credential(&entry).unwrap().as_str(), exact);
+        store_raw(&entry, &format!("{exact}k"));
+        let error = read_rpc_credential(&entry).err().unwrap();
+        assert!(
+            matches!(
+                &error,
+                WalletError::Network(NetworkError::RpcCredentialInvalid { entry, reason })
+                    if entry == "stellar-agent-rpc-unit/primary"
+                        && *reason == RpcCredentialDefect::TooLong
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.code(), "network.rpc_credential_refused");
+        assert!(!format!("{error} {error:?}").contains("kkkk"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn empty_rpc_credential_refuses() {
+        let _restore = RestoreStore::new();
+        keyring_mock::install().unwrap();
+        let entry = rpc_entry();
+        store_raw(&entry, "");
+        let error = read_rpc_credential(&entry).err().unwrap();
+        assert!(
+            matches!(
+                error,
+                WalletError::Network(NetworkError::RpcCredentialInvalid {
+                    reason: RpcCredentialDefect::Empty,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn control_character_rpc_credential_refuses() {
+        let _restore = RestoreStore::new();
+        keyring_mock::install().unwrap();
+        let entry = rpc_entry();
+        for value in ["SENTINEL\n", "SENTINEL\t", "SENTINEL\u{7f}"] {
+            store_raw(&entry, value);
+            let error = read_rpc_credential(&entry).err().unwrap();
+            assert!(
+                matches!(
+                    error,
+                    WalletError::Network(NetworkError::RpcCredentialInvalid {
+                        reason: RpcCredentialDefect::ControlCharacter,
+                        ..
+                    })
+                ),
+                "{error:?}"
+            );
+            assert!(!format!("{error} {error:?}").contains("SENTINEL"));
+        }
+    }
+
+    /// A missing entry reports `auth.keyring_not_found` naming both the
+    /// service and the account, which tell the three roles apart.
+    #[test]
+    #[serial_test::serial]
+    fn missing_rpc_credential_names_service_and_account() {
+        let _restore = RestoreStore::new();
+        keyring_mock::install().unwrap();
+        let error = read_rpc_credential(&KeyringEntryRef::new("stellar-agent-rpc-unit", "oracle"))
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), "auth.keyring_not_found");
+        assert!(
+            error
+                .to_string()
+                .contains("'stellar-agent-rpc-unit/oracle'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rpc_credential_platform_error_keeps_its_code() {
+        let _restore = RestoreStore::new();
+        keyring_mock::install().unwrap();
+        let entry = rpc_entry();
+        store_raw(&entry, "value");
+        keyring_mock::inject_error(
+            &entry.service,
+            &entry.account,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("SENTINEL"))),
+        )
+        .unwrap();
+        let error = read_rpc_credential(&entry).err().unwrap();
+        assert_eq!(error.code(), "auth.keyring_platform_error");
+        assert!(!error.to_string().contains("SENTINEL"), "{error}");
+    }
+
+    /// The write applies the value rules before the keyring is touched; the
+    /// presence probe reports a written entry and a missing one.
+    #[test]
+    #[serial_test::serial]
+    fn rpc_credential_write_checks_the_value_first() {
+        let _restore = RestoreStore::new();
+        keyring_mock::install().unwrap();
+        let entry = rpc_entry();
+        assert!(!rpc_credential_present(&entry).unwrap());
+        for value in ["", "a\rb"] {
+            let error = write_rpc_credential(&entry, &Zeroizing::new(value.to_owned()))
+                .err()
+                .unwrap();
+            assert_eq!(error.code(), "network.rpc_credential_refused");
+            assert!(!rpc_credential_present(&entry).unwrap());
+        }
+        write_rpc_credential(&entry, &Zeroizing::new("Bearer abc".to_owned())).unwrap();
+        assert!(rpc_credential_present(&entry).unwrap());
+        assert_eq!(read_rpc_credential(&entry).unwrap().as_str(), "Bearer abc");
+    }
+
+    /// A registered store is kept: the helper registers nothing over it.
+    #[test]
+    #[serial_test::serial]
+    fn ensure_platform_keyring_store_keeps_a_registered_store() {
+        let _restore = RestoreStore::new();
+        keyring_mock::install().unwrap();
+        let entry = rpc_entry();
+        store_raw(&entry, "kept");
+        ensure_platform_keyring_store().unwrap();
+        assert_eq!(read_rpc_credential(&entry).unwrap().as_str(), "kept");
     }
 }

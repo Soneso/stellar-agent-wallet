@@ -14,7 +14,7 @@ Several flags recur across the commands on this page with the same meaning. Thei
 
 - `--profile <NAME>`: selects the [profile](../concepts.md). Every command on this page that loads a profile resolves it in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `accounts create`, `pay`, and `claim` a profile that resolves to no file is synthesised only when no name was given. For these commands, a name you supplied through the flag or the variable is refused if its file does not exist. `accounts deploy-c` resolves its network from the profile and opens its writer only with `--profile`. `fees stats` loads a profile only with `--profile`. Each command's table states its own default.
 - `--network <NETWORK>`: optional assertion of the loaded profile's chain; a mismatch refuses before signing.
-- `--rpc-url <URL>`: optional testnet endpoint override; mainnet profiles refuse its presence. Without it, the profile endpoint applies. Credentials are refused.
+- `--rpc-url <URL>`: optional testnet endpoint override; mainnet profiles refuse its presence. Without it, the profile endpoint applies. Credentials are refused. An overriding URL gets the keyring credential only when it equals the profile's `rpc_url`.
 - `--output <FORMAT>`: `json` (default) or `table`.
 - `--timeout-seconds <SECONDS>`: bounds submission. On sponsored `accounts create`, `pay`, and `claim`, it also bounds the [endpoint identity check](index.md#endpoint-identity-before-the-first-read), which gets a budget of its own. Default `60`.
 - Signer source: `--secret-env <VAR>` / `--deployer-secret-env <VAR>` (an env-var name, never the secret) or `--sign-with-ledger`, with `--account-index <INDEX>` for the Ledger derivation path (default `0`).

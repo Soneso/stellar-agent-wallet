@@ -423,9 +423,10 @@ fn next_steps(profile_name: &str, engine: PolicyEngineKind, network: TargetNetwo
         ));
         if network == TargetNetwork::Mainnet {
             steps.push(
-                "Set `oracle_provider_url` and `[providers.oracle]` in the profile file \
-                 before relying on mainnet high-value cross-checks. Choose an independently \
-                 administered endpoint on a different host; the cross-check is skipped while its URL is unset."
+                "Set `oracle_provider_url`, `[providers.oracle]`, and `[providers.primary]` in \
+                 the profile file before relying on mainnet high-value cross-checks. Choose an \
+                 independently administered endpoint on a different host; the cross-check is \
+                 skipped while its URL is unset."
                     .to_owned(),
             );
         }
@@ -976,6 +977,7 @@ mod tests {
         assert_eq!(steps.len(), 8, "{steps:#?}");
         assert!(steps[7].contains("`oracle_provider_url`"), "{}", steps[7]);
         assert!(steps[7].contains("`[providers.oracle]`"), "{}", steps[7]);
+        assert!(steps[7].contains("`[providers.primary]`"), "{}", steps[7]);
         assert!(steps[7].contains("different host"), "{}", steps[7]);
     }
 }

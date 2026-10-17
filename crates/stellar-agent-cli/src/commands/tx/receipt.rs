@@ -68,7 +68,6 @@ use stellar_agent_core::audit_log::AuditEntry;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::profile::receipt::ReceiptStore;
 use stellar_agent_network::NetworkContext;
-use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::policy_state::PersistedWindowStore;
 
 use crate::common::profile_access::{ProfileOrigin, load_profile_or_synthesize_testnet};
@@ -266,7 +265,7 @@ async fn run_clear(args: &ClearArgs) -> i32 {
     // that cannot answer is not a licence to clear: a transaction in flight is
     // exactly the case the operator would be wrong about.
     let context = NetworkContext::from_profile(&profile);
-    let client = match StellarRpcClient::new(&context.rpc_url) {
+    let client = match context.primary_client() {
         Ok(c) => c,
         Err(e) => {
             render_json(&Envelope::<()>::err(&e));

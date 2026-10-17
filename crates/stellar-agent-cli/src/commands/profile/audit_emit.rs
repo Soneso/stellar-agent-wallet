@@ -4,9 +4,10 @@
 //! keyring records a `KeyringKeyWritten` row after the write succeeds. Emission
 //! is non-fatal: the key write has already committed, so a row-write failure
 //! logs a warning and never changes the command's outcome or exit code. The row
-//! records only WHICH key slot was written, its keyring coordinates, and — for
-//! the two enroll commands — a redacted public address. It NEVER carries a key
-//! value, seed, base64 key material, or any derived secret.
+//! records only WHICH key slot was written, its keyring coordinates, and, for
+//! the signer and owner-key enroll commands, a redacted public address. It
+//! NEVER carries a key value, seed, base64 key material, an RPC credential, or
+//! any derived secret.
 
 use stellar_agent_network::keyring::keyed_audit_access;
 use zeroize::Zeroizing;
@@ -23,8 +24,9 @@ use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
 ///
 /// Non-fatal: any failure to load the audit chain key, open the writer, or
 /// append the row logs a `tracing::warn!` and returns without disturbing the
-/// command result. `public_address` is `Some` only for the two enroll commands
-/// (redacted at the call site); HMAC-key rotations pass `None`.
+/// command result. `public_address` is `Some` only for the signer and
+/// owner-key enroll commands (redacted at the call site); the RPC credential
+/// enrollment and the HMAC-key rotations pass `None`.
 ///
 /// For `rotate-audit-key` this MUST be called AFTER the audit chain key has been
 /// rotated AND the per-file chain-root sidecars re-signed: the helper opens the

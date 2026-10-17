@@ -27,9 +27,9 @@ Unset the `STELLAR_AGENT_*` variable the refusal names. On every chain that cove
 
 The `profile` group creates, lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) binding a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no secrets; it only names keyring entries.
 
-The seven key-writing commands — `enroll-signer`, `enroll-owner-key`, and the five key-rotation subcommands — each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `reset-window-state` writes the same row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
+The eight key-writing commands (`enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and the five key-rotation subcommands) each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `reset-window-state` writes the same row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
 
-`profile list` lists all profile names and takes no profile selector. Every other `profile` subcommand accepts `--profile <NAME>`. For `init`, `enroll-signer`, `enroll-owner-key`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, and `reset-mpp-state`, supply exactly one positional `<NAME>` or `--profile <NAME>`. These commands require an explicit selection. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
+`profile list` lists all profile names and takes no profile selector. Every other `profile` subcommand accepts `--profile <NAME>`. For `init`, `enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, and `reset-mpp-state`, supply exactly one positional `<NAME>` or `--profile <NAME>`. These commands require an explicit selection. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
 
 The name itself becomes a path component and is validated before any path is built — charset, length, no leading `-`, and no Windows reserved device name. The rules and the recovery path for a file that already carries a refused name are in [Profile names](../profiles.md#profile-names).
 
@@ -87,7 +87,7 @@ stellar-agent profile show default
 
 URL fields (`rpc_url`, `secondary_rpc_url`, `oracle_provider_url`) are printed as scheme, host, and port only.
 
-Read-only. Loads the named profile (applying any environment-variable overlays) and prints its resolved configuration as a JSON envelope. Keyring entry references appear as opaque `{service, account}` objects; the secret material they name is never read or printed.
+Read-only. Loads the named profile (applying any environment-variable overlays) and prints its resolved configuration as a JSON envelope. Keyring entry references appear as opaque `{service, account}` objects; the secret material they name is never read or printed. Provider records print in full, including `credential` references and `placement`; the credential value is never read.
 
 - `<NAME>` (positional) or `--profile <NAME>` — the profile to display. Supply exactly one; supplying both, or neither, is a usage error.
 
@@ -160,6 +160,38 @@ Exits `1` on refusal:
 - `enroll_signer.expected_address_mismatch`: `--expected-address` does not match.
 - `enroll_signer.entry_exists`: an entry exists without `--force`.
 - A keyring error: the platform keyring is unavailable.
+
+### `profile enroll-rpc-credential`
+
+```bash
+stellar-agent profile enroll-rpc-credential --profile default --role primary --header X-API-Key
+```
+
+Stores an RPC provider key in the keyring for one provider role and names it in the role's provider record. Without `--stdin`, the command prompts for the key on the terminal without echo and writes the prompt to standard error. With `--stdin`, it reads the key from standard input and removes one trailing line end. The key is never printed, logged, or written to the audit row.
+
+- `--role <primary|secondary|oracle>` (required): the provider role.
+- `--header <NAME>`, `--query <NAME>`, or `--path`: where requests carry the key; see [Provider credentials](../profiles.md#provider-credentials). Required when the record names no placement; when it names one, a flag must equal it.
+- `--stdin`: read the key from standard input.
+- `--force`: replace a key already stored at the entry.
+- `--profile <NAME>`: the profile (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
+
+The role's endpoint URL and its provider record must already be in the profile file. The entry is the record's `credential`, or the default `stellar-agent-rpc-<profile>` / `<role>` when the record names none. Before anything is written, the command runs the loader's credential checks on the record it would write, against the role's endpoint URL. It then refuses an existing entry without `--force`, before reading the key. The key is at most 1024 bytes and holds no control character. A record without a reference gains `credential` and `placement` before the keyring write, and nothing else in the file changes. A file with mixed line endings is written with LF endings. A keyring write that fails after that leaves the record patched; a re-run retries the write.
+
+```json
+{"ok":true,"data":{"profile":"default","role":"primary","keyring_service":"stellar-agent-rpc-default","keyring_account":"primary","placement":{"kind":"header","name":"X-API-Key"},"replaced":false,"record_patched":true},"request_id":"..."}
+```
+
+Exits `1` on refusal. Every refusal before the keyring write leaves the file and the keyring unchanged:
+
+- `enroll_rpc_credential.record_missing`: the role has no endpoint URL or no provider record.
+- `enroll_rpc_credential.placement_required`: neither the record nor a flag names a placement.
+- `enroll_rpc_credential.placement_mismatch`: the flag differs from the record's placement.
+- `validation.provider_attestation_invalid`: the record would break a loader rule; the message names the field.
+- `enroll_rpc_credential.entry_exists`: a key is stored at the entry and `--force` is absent.
+- `enroll_rpc_credential.terminal_required`: standard input is not a terminal and `--stdin` is absent.
+- `enroll_rpc_credential.input_unreadable`: the input could not be read, or the standard input is not UTF-8 text.
+- `network.rpc_credential_refused`: the key is empty, longer than 1024 bytes, or holds a control character.
+- A keyring error: the platform keyring is unavailable or refused the write.
 
 ### `profile enroll-owner-key`
 

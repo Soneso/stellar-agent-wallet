@@ -47,7 +47,6 @@ use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore, SubmissionReceipt};
 use stellar_agent_network::NetworkContext;
-use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::policy_state::PersistedWindowStore;
 
 use crate::common::profile_access::load_profile_or_synthesize_testnet;
@@ -177,7 +176,7 @@ pub async fn run(args: &StatusArgs) -> i32 {
     };
 
     let context = NetworkContext::from_profile(&profile);
-    let client = match StellarRpcClient::new(&context.rpc_url) {
+    let client = match context.primary_client() {
         Ok(c) => c,
         Err(e) => {
             render_json(&Envelope::<()>::err(&e));
