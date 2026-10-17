@@ -1941,3 +1941,50 @@ async fn a_failed_simulation_request_carries_a_phase_prefix_and_no_credentials()
         );
     }
 }
+
+/// A simulation answer's `error` string reaches the refusal detail of both
+/// phases scrubbed: the echoed URL as host and port, the control character
+/// and the quotes escaped, quoted, and cut at the bound.
+#[tokio::test]
+async fn a_simulation_answer_error_reaches_the_detail_scrubbed() {
+    fn hostile() -> String {
+        format!(
+            "host https://user:PWSECRET@leak.example/rpc?k=QSECRET said \"no\"\u{1b}[2J {}",
+            "e".repeat(1000)
+        )
+    }
+    let expected_body = format!(
+        "{}{}",
+        r#"host leak.example said \"no\"\u{001b}[2J "#,
+        "e".repeat(stellar_agent_network::MAX_SERVER_TEXT_CHARS - 41)
+    );
+    assert_eq!(
+        expected_body.chars().count(),
+        stellar_agent_network::MAX_SERVER_TEXT_CHARS
+    );
+    let quoted = format!("\"{expected_body}\"...");
+
+    let first = run(Scenario::honest().with_first(answer_with(
+        &[honest_entry()],
+        "error",
+        serde_json::json!(hostile()),
+    )))
+    .await;
+    assert_refusal(
+        &first.result,
+        "x402.rpc_simulate_failed",
+        &format!("simulate returned error: {quoted}"),
+    );
+    assert_eq!(
+        first.signing_calls, 0,
+        "nothing is signed on a refused simulation"
+    );
+
+    let second =
+        pay_with_resimulation(|_| answer_with(&[], "error", serde_json::json!(hostile()))).await;
+    assert_refusal(
+        &second.result,
+        "x402.rpc_simulate_failed",
+        &format!("re-simulate returned error: {quoted}"),
+    );
+}

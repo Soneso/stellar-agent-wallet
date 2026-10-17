@@ -111,6 +111,7 @@ All write and signing paths are testnet-only in this alpha. Every signing comman
   - That entry's root invocation must equal the SAC `transfer` the wallet built, contract and every argument included, with no nested calls. Any other answer refuses before signing.
   - The signed re-simulation must return a decodable result whose authorization entries are empty or equal to the signed entry. Any other answer refuses, and no payment payload is returned.
   - The requirements are validated before any request. The checks cover the scheme, the network and the profile passphrase, the mainnet refusal, and a C-strkey asset. They also cover a strict `areFeesSponsored: true`, a positive amount, a G-, C-, or M-strkey `payTo`, and a `maxTimeoutSeconds` of at least one.
+  - Header fields named in an error are escaped and cut at 200 characters. A header that does not decode reports the JSON error class and position, not its values.
   - Every request of one payment goes to one client built from the operator's profile. Its first request is `getNetwork`: an endpoint serving another network, reporting mainnet, or not identified before the caller's deadline refuses with its `network.*` code before any simulation.
   - `maxTimeoutSeconds` is clamped to 300 seconds as input; the requirement names a maximum, so a shorter validity meets it. With the five-second ledger estimate, the clamped value gives a window of `ceil(min(t, 300) / 5)` ledgers, from 1 to 60. The window counts ledger advances, not a guaranteed wall-clock lifetime.
   - The expiration ledger is the unsigned simulation's latest ledger plus the window; an overflow refuses. A `getHealth` read on the same endpoint must report `healthy`.
@@ -131,6 +132,9 @@ All write and signing paths are testnet-only in this alpha. Every signing comman
   - The identity is bound only as an HTTP-layer companion (`Authorization: Bearer <jwt>`). The Soroban transaction XDR, the SAC auth-entry, and the payment memo are never mutated to carry the JWT.
   - The ephemeral SEP-10 key is unfunded and is not the payment funding signer.
   - No SEP-45, no payee or facilitator logic, no caching or session reuse (a fresh ephemeral key per call), no on-chain submission.
+  - A refused challenge or token answer reports the HTTP method, the status, and the web-auth endpoint's host. The wallet does not read the answer body.
+  - A stellar.toml syntax error reports its line and column.
+  - The token must be a compact JWT of at most 8192 bytes, with base64url characters in every segment. Any other token refuses.
 
 ## Machine Payments Protocol (MPP)
 

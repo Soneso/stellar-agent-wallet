@@ -105,6 +105,24 @@ fn redact_jwt_for_debug(jwt: &str) -> String {
     format!("{first}...{last}")
 }
 
+/// The longest token, in bytes, that [`Sep10Session::parse`] accepts.
+///
+/// A SEP-10 token carries a handful of short claims; the bound keeps a
+/// server-chosen token from growing without limit on its way into a tool
+/// result.
+const MAX_JWT_BYTES: usize = 8192;
+
+/// The detail of a token that is not in compact JWT form.
+const NOT_A_COMPACT_JWT: &str = "token answer is not a compact JWT";
+
+/// Whether `segment` holds only base64url characters (`A-Z`, `a-z`, `0-9`,
+/// `-`, `_`), the alphabet of a compact JWT segment.
+fn is_base64url_segment(segment: &str) -> bool {
+    segment
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Internal serde struct for JWT payload claim extraction.
 ///
 /// All fields are `Option` except `sub`, `iss`, `iat`, `exp` which are
@@ -132,8 +150,17 @@ impl Sep10Session {
     /// be called with JWTs obtained from any source that is not a direct
     /// TLS-authenticated SEP-10 server response.
     ///
+    /// The token must be in compact form: at most 8192 bytes, a
+    /// non-empty header and payload segment, and only base64url characters in
+    /// every segment. The stored token therefore holds only those characters
+    /// and the two dots.
+    ///
     /// # Errors
     ///
+    /// - [`Sep10Error::JwtParseError`] with the detail `token answer is not a
+    ///   compact JWT` if the token is longer than 8192 bytes, has an
+    ///   empty header or payload segment, or has a character outside the
+    ///   base64url alphabet in any segment.
     /// - [`Sep10Error::JwtParseError`] if the JWT does not have exactly 3
     ///   base64-separated segments (header.payload.signature).
     /// - [`Sep10Error::JwtParseError`] if the payload segment cannot be
@@ -168,6 +195,11 @@ impl Sep10Session {
     /// assert!(session.is_expired(2001));
     /// ```
     pub fn parse(jwt: &str) -> Result<Self, Sep10Error> {
+        if jwt.len() > MAX_JWT_BYTES {
+            return Err(Sep10Error::JwtParseError {
+                detail: NOT_A_COMPACT_JWT.to_owned(),
+            });
+        }
         // Split into exactly 3 segments: header.payload.signature.
         let parts: Vec<&str> = jwt.splitn(4, '.').collect();
         if parts.len() != 3 {
@@ -176,6 +208,16 @@ impl Sep10Session {
                     "JWT must have exactly 3 dot-separated segments; got {}",
                     parts.len()
                 ),
+            });
+        }
+        // The signature segment may be empty (an unsecured JWT); the header
+        // and the payload may not.
+        if parts[0].is_empty()
+            || parts[1].is_empty()
+            || !parts.iter().all(|segment| is_base64url_segment(segment))
+        {
+            return Err(Sep10Error::JwtParseError {
+                detail: NOT_A_COMPACT_JWT.to_owned(),
             });
         }
         let payload_b64 = parts[1];
@@ -451,9 +493,96 @@ mod tests {
     fn reject_malformed_jwt_non_base64_payload() {
         let err = Sep10Session::parse("header.!!!invalid_base64!!!.sig").unwrap_err();
         assert!(
-            matches!(err, Sep10Error::JwtParseError { .. }),
-            "expected JwtParseError got {err:?}"
+            matches!(
+                err,
+                Sep10Error::JwtParseError { ref detail }
+                    if detail == "token answer is not a compact JWT"
+            ),
+            "expected the compact-JWT refusal, got {err:?}"
         );
+    }
+
+    /// A payload segment made only of base64url characters that still does
+    /// not decode (a single character cannot encode a byte) is refused by
+    /// the decoder, not by the alphabet check.
+    #[test]
+    fn payload_in_the_alphabet_that_does_not_decode_is_refused() {
+        let err = Sep10Session::parse("aGVhZA.A.sig").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Sep10Error::JwtParseError { ref detail }
+                    if detail.starts_with("JWT payload base64-url decode failed")
+            ),
+            "expected the payload decode refusal, got {err:?}"
+        );
+    }
+
+    /// A token whose signature segment holds a control character is refused
+    /// with the fixed text; a valid token with an empty signature passes.
+    #[test]
+    fn token_with_a_non_base64url_segment_is_refused() {
+        let valid = build_jwt("GABC", 9_999_999_999);
+        let (head, _signature) = valid.rsplit_once('.').unwrap();
+        for bad in [
+            format!("{head}.sig\u{1b}[2Jnature"),
+            format!("{head}.sig nature"),
+            format!("{head}.sig+/="),
+            format!("{head}.sig\u{e9}"),
+            format!("hd\u{202e}r.{}", valid.split('.').nth(1).unwrap()) + ".sig",
+        ] {
+            let err = Sep10Session::parse(&bad).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Sep10Error::JwtParseError { ref detail }
+                        if detail == "token answer is not a compact JWT"
+                ),
+                "{bad:?}: {err:?}"
+            );
+        }
+        let header = valid.split('.').next().unwrap();
+        let payload = valid.split('.').nth(1).unwrap();
+        for empty in [
+            format!(".{payload}.sig"),
+            format!("{header}..sig"),
+            "..".to_owned(),
+        ] {
+            let err = Sep10Session::parse(&empty).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Sep10Error::JwtParseError { ref detail }
+                        if detail == "token answer is not a compact JWT"
+                ),
+                "{empty:?}: {err:?}"
+            );
+        }
+        let unsigned = format!("{head}.");
+        assert_eq!(Sep10Session::parse(&unsigned).unwrap().sub, "GABC");
+    }
+
+    /// A token of more than 8192 bytes is refused with the fixed text, even
+    /// when its segments are well formed; a token at the bound is parsed.
+    #[test]
+    fn token_over_8192_bytes_is_refused() {
+        let valid = build_jwt("GABC", 9_999_999_999);
+        let (head, _signature) = valid.rsplit_once('.').unwrap();
+        let at_bound = format!("{head}.{}", "s".repeat(MAX_JWT_BYTES - head.len() - 1));
+        assert_eq!(at_bound.len(), MAX_JWT_BYTES);
+        assert!(Sep10Session::parse(&at_bound).is_ok());
+
+        let over = format!("{at_bound}s");
+        let err = Sep10Session::parse(&over).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Sep10Error::JwtParseError { ref detail }
+                    if detail == "token answer is not a compact JWT"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(MAX_JWT_BYTES, 8192);
     }
 
     #[test]

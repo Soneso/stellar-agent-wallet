@@ -9,7 +9,7 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use jsonrpsee_core::ClientError;
 use jsonrpsee_core::client::ClientT;
 use jsonrpsee_core::params::ObjectParams;
-use stellar_agent_core::error::{NetworkError, WalletError};
+use stellar_agent_core::error::{NetworkError, ReportedPassphrase, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::profile::schema::{
     RpcCredentialDefect, RpcCredentialPlacement, check_rpc_credential_placement,
@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 
 use crate::endpoint_identity::{EndpointIdentity, check_protocol_version};
 use crate::fees::FeeStatsView;
-use crate::redact::{redact_rpc_error, redact_url_authority};
+use crate::redact::{quote_server_text, redact_url_authority};
 use crate::retry::{RetryPolicy, is_retryable_identity_error, rejected_status, retry_with_backoff};
 use crate::submit::MAINNET_PASSPHRASE;
 use crate::transaction_record::TransactionRecord;
@@ -43,14 +43,17 @@ const MIN_SCRUBBED_HEADER_TOKEN_BYTES: usize = 8;
 /// keyring credential, and the forms of that credential that the client's
 /// error texts must not carry.
 ///
+/// The credential forms are the stored value, the form-urlencoded value of a
+/// query placement, and the percent-encoded segment of a path placement. A
+/// header value with a scheme prefix adds the token after the first space
+/// when it holds at least [`MIN_SCRUBBED_HEADER_TOKEN_BYTES`] bytes. Each
+/// form lives in a [`Zeroizing`] holder.
+///
 /// Every error the client builds from transport or server text passes
-/// [`RpcEndpoint::scrub`]: each credential form is replaced first, then every
-/// URL keeps only its host and port. The forms are the stored value, the
-/// form-urlencoded value of a query placement, the percent-encoded segment of
-/// a path placement, and for a header value with a scheme prefix the token
-/// after the first space when it holds at least
-/// [`MIN_SCRUBBED_HEADER_TOKEN_BYTES`] bytes. Each form lives in a
-/// [`Zeroizing`] holder.
+/// [`RpcEndpoint::scrub`]: each credential form is replaced first, then the
+/// text goes through [`quote_server_text`]. That step keeps only the host and
+/// port of every URL, escapes control and non-ASCII characters, cuts the text
+/// at [`crate::redact::MAX_SERVER_TEXT_CHARS`] characters, and quotes it.
 pub(crate) struct RpcEndpoint {
     url: String,
     secrets: Vec<Zeroizing<String>>,
@@ -125,10 +128,14 @@ impl RpcEndpoint {
         out.as_str().to_owned()
     }
 
-    /// Replaces every credential form in `text`, then keeps only host and
-    /// port of every URL in it.
+    /// Replaces every credential form in `text`, then renders the result
+    /// with [`quote_server_text`].
+    ///
+    /// The credential forms go first, so the bound of [`quote_server_text`]
+    /// never cuts a credential or a URL in half and leaves the other half
+    /// behind.
     pub(crate) fn scrub(&self, text: &str) -> String {
-        redact_rpc_error(&self.redact_credential(text))
+        quote_server_text(&self.redact_credential(text))
     }
 
     /// [`Self::scrub`] applied to the display of `error`.
@@ -417,7 +424,9 @@ impl StellarRpcClient {
     ///
     /// The request carries the envelope as given and no `authMode` field, so
     /// the endpoint applies its own default mode. The answer is returned as
-    /// received; every check of its content is the caller's part.
+    /// received, except that its `error` string holds the scrubbed form of the
+    /// endpoint's text (see [`quote_server_text`]); every check of its content
+    /// is the caller's part.
     ///
     /// # Errors
     ///
@@ -434,10 +443,11 @@ impl StellarRpcClient {
             .simulate_transaction_envelope(envelope, None)
             .await
             .map_err(|e| rpc_unreachable(&self.url, SIMULATE_TRANSACTION_FAILED, &e))?;
-        // The answer's `error` is the endpoint's own text and reaches callers
-        // as received apart from the credential.
+        // The answer's `error` is the endpoint's own text. It reaches callers
+        // scrubbed: no credential form, each URL as host and port, control and
+        // non-ASCII characters escaped, bounded, and quoted.
         if let Some(error) = response.error.as_mut() {
-            *error = self.url.redact_credential(error);
+            *error = self.url.scrub(error);
         }
         Ok(response)
     }
@@ -600,7 +610,7 @@ impl StellarRpcClient {
             return Err(WalletError::Network(
                 NetworkError::EndpointNetworkMismatch {
                     expected: expected_passphrase.to_owned(),
-                    server: network.passphrase,
+                    server: ReportedPassphrase::from_reported(&network.passphrase),
                 },
             ));
         }
@@ -1084,9 +1094,86 @@ mod tests {
             assert_eq!(
                 reason,
                 format!(
-                    "{prefix}unexpected getTransaction status: PENDING archive.example.com:8443"
+                    "{prefix}unexpected getTransaction status: \
+                     \"PENDING archive.example.com:8443\""
                 )
             );
         }
+    }
+
+    /// The scrub replaces the credential first, then keeps the echoed URL's
+    /// host and port, escapes control characters, `"` and `\`, and quotes the
+    /// result.
+    #[test]
+    fn scrub_replaces_the_credential_then_quotes() {
+        for placement in [header(), query(), RpcCredentialPlacement::Path {}] {
+            let endpoint = RpcEndpoint::credentialed(ENDPOINT, secret(VALUE), &placement);
+            let text =
+                format!("bad key {VALUE}\u{1b}[2J at {ECHOED_URL} said \"no\" C:\\x\r\nnext");
+            assert_eq!(
+                endpoint.scrub(&text),
+                "\"bad key [redacted]\\u{001b}[2J at archive.example.com:8443 said \\\"no\\\" \
+                 C:\\\\x next\"",
+                "{placement:?}"
+            );
+        }
+    }
+
+    /// A URL the server echoed into an error keeps host and port, and the
+    /// scrubbed display holds at most the bound between its quotes, followed
+    /// by the cut marker.
+    #[test]
+    fn scrub_display_scrubs_a_url_before_the_cut() {
+        let text = format!(
+            "upstream https://user:SECRET@archive.example.com:8443/rpc?token=SECRET refused {}",
+            "x".repeat(300)
+        );
+        let e = stellar_rpc_client::Error::TransactionSubmissionFailed(text);
+        assert!(
+            e.to_string().chars().count() > crate::redact::MAX_SERVER_TEXT_CHARS,
+            "the fixture must exceed the bound"
+        );
+
+        let out = RpcEndpoint::plain("https://rpc.example.com").scrub_display(&e);
+
+        let body = out
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix("\"..."))
+            .unwrap_or_else(|| panic!("a cut display is quoted and ends with ...: {out}"));
+        assert_eq!(
+            body.chars().count(),
+            crate::redact::MAX_SERVER_TEXT_CHARS,
+            "the body holds the bound: {out}"
+        );
+        assert!(
+            body.starts_with(
+                "transaction submission failed: upstream archive.example.com:8443 refused x"
+            ),
+            "the URL keeps host and port: {out}"
+        );
+        for leaked in ["SECRET", "token=", "user:", "https://"] {
+            assert!(
+                !out.contains(leaked),
+                "{leaked} reached the log text: {out}"
+            );
+        }
+    }
+
+    /// The scrubbed display removes the credential forms of its endpoint
+    /// before the cut, a value placed bare in the text included.
+    #[test]
+    fn scrub_display_scrubs_the_credential_before_the_cut() {
+        let endpoint =
+            RpcEndpoint::credentialed("https://rpc.example.com", secret("k3y+/%25 v"), &query());
+        let text = format!("echo k3y+/%25 v and k3y%2B%2F%2525+v {}", "x".repeat(300));
+        let out = endpoint.scrub_display(&stellar_rpc_client::Error::TransactionSubmissionFailed(
+            text,
+        ));
+        assert!(!out.contains("k3y"), "{out}");
+        assert!(
+            out.starts_with("\"transaction submission failed: echo [redacted] and [redacted] x"),
+            "{out}"
+        );
+        assert!(out.ends_with("\"..."), "{out}");
     }
 }

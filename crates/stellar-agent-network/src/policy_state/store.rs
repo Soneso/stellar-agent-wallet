@@ -1103,7 +1103,7 @@ impl PersistedWindowStore {
             Err(e) => {
                 tracing::debug!(
                     tx_hash = %crate::submit::redact_tx_hash(&reservation.tx_hash),
-                    error = %crate::retry::truncate_error_display(&client.url, &e),
+                    error = %client.url.scrub_display(&e),
                     "window reconcile: getTransaction failed; reservation stands"
                 );
                 return Ok(Settlement::KeptPending);
@@ -1256,7 +1256,7 @@ impl PersistedWindowStore {
         {
             Ok(record) => record,
             Err(e) => {
-                tracing::debug!(error = %crate::retry::truncate_error_display(&client.url, &e),
+                tracing::debug!(error = %client.url.scrub_display(&e),
                     "window reconcile: confirmation query failed; reservation stands");
                 return Ok(Settlement::KeptPending);
             }

@@ -695,6 +695,349 @@ async fn gate_abort_challenge_not_signed_by_signing_key() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// SERVER-TEXT SCRUB TESTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// A refused-answer body that would leak through any relay of the server's
+/// text: a marker, a credential-bearing URL, and a terminal escape.
+const HOSTILE_BODY: &str = "BODYSECRET https://user:PWSECRET@leak.example/x?k=QSECRET \u{1b}[2J";
+
+/// Serves `toml_body` as the stellar.toml of `mock_server`.
+async fn mount_toml(mock_server: &MockServer, toml_body: String) {
+    Mock::given(method("GET"))
+        .and(path("/.well-known/stellar.toml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/plain")
+                .set_body_string(toml_body),
+        )
+        .mount(mock_server)
+        .await;
+}
+
+/// Serves a stellar.toml naming `server_key` and the `https` form of the
+/// mock's SEP-10 endpoint, and runs the gate with `web_auth_override`.
+async fn run_gate(
+    mock_server: &MockServer,
+    server_key: &SigningKey,
+    web_auth_override: &str,
+) -> Result<stellar_agent_x402_identity::VerifiedCounterpartySession, IdentityError> {
+    let mock_host = server_host_port(mock_server);
+    let toml_web_auth = format!("https://{mock_host}{SEP10_AUTH_PATH}");
+    mount_toml(
+        mock_server,
+        build_stellar_toml(&pubkey_to_gstrkey(server_key), &toml_web_auth),
+    )
+    .await;
+    let http = test_http_client();
+    resolve_and_verify_counterparty_at(
+        &mock_host,
+        TESTNET_PASSPHRASE,
+        &mock_server.uri(),
+        &http,
+        Some(web_auth_override),
+    )
+    .await
+}
+
+/// Mounts the dynamic SEP-10 challenge responder for `server_key` and returns
+/// the account cell it fills.
+async fn mount_valid_challenge(
+    mock_server: &MockServer,
+    server_key: &SigningKey,
+) -> Arc<Mutex<String>> {
+    let captured_account: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    Mock::given(method("GET"))
+        .and(path(SEP10_AUTH_PATH))
+        .respond_with(Sep10ChallengeResponder {
+            server_key: SigningKey::from_bytes(&server_key.to_bytes()),
+            home_domain: server_host_port(mock_server),
+            web_auth_domain_value: server_host(mock_server),
+            network_passphrase: TESTNET_PASSPHRASE.to_owned(),
+            captured_account: Arc::clone(&captured_account),
+        })
+        .mount(mock_server)
+        .await;
+    captured_account
+}
+
+/// Asserts that `err` is `Sep10AuthFailed` with exactly `reason`, and that
+/// no part of the hostile body or the endpoint's path and query reaches its
+/// `Display` or `Debug`.
+fn assert_sep10_reason(result: Result<impl std::fmt::Debug, IdentityError>, reason: &str) {
+    let err = result.expect_err("the gate must refuse");
+    let rendered = format!("{err} {err:?}");
+    match &err {
+        IdentityError::Sep10AuthFailed { reason: actual } => assert_eq!(actual, reason),
+        other => panic!("expected Sep10AuthFailed, got {other:?}"),
+    }
+    for leaked in [
+        "BODYSECRET",
+        "PWSECRET",
+        "QSECRET",
+        "PATHSECRET",
+        "SECRETMEMO",
+        "leak.example",
+        "\u{1b}",
+        "/sep10",
+        "account=",
+    ] {
+        assert!(!rendered.contains(leaked), "{leaked:?} leaked: {rendered}");
+    }
+}
+
+/// A refused challenge request reports the method, the status, and the
+/// endpoint's host and port; the answer body is not read.
+#[tokio::test]
+async fn refused_challenge_reports_status_and_authority_only() {
+    let mock_server = MockServer::start().await;
+    let server_key = gen_keypair();
+    Mock::given(method("GET"))
+        .and(path(SEP10_AUTH_PATH))
+        .respond_with(ResponseTemplate::new(503).set_body_string(HOSTILE_BODY))
+        .mount(&mock_server)
+        .await;
+    let mock_host = server_host_port(&mock_server);
+    let endpoint = format!("http://{mock_host}{SEP10_AUTH_PATH}?tok=QSECRET");
+
+    let result = run_gate(&mock_server, &server_key, &endpoint).await;
+
+    assert_sep10_reason(
+        result,
+        &format!("\"HTTP error: GET returned HTTP 503\" (authority: {mock_host})"),
+    );
+}
+
+/// A refused token request reports the method, the status, and the endpoint's
+/// host and port.
+#[tokio::test]
+async fn refused_token_reports_status_and_authority_only() {
+    let mock_server = MockServer::start().await;
+    let server_key = gen_keypair();
+    let _account = mount_valid_challenge(&mock_server, &server_key).await;
+    Mock::given(method("POST"))
+        .and(path(SEP10_AUTH_PATH))
+        .respond_with(ResponseTemplate::new(401).set_body_string(HOSTILE_BODY))
+        .mount(&mock_server)
+        .await;
+    let mock_host = server_host_port(&mock_server);
+    let endpoint = format!("http://{mock_host}{SEP10_AUTH_PATH}");
+
+    let result = run_gate(&mock_server, &server_key, &endpoint).await;
+
+    assert_sep10_reason(
+        result,
+        &format!("\"HTTP error: POST returned HTTP 401\" (authority: {mock_host})"),
+    );
+}
+
+/// A web-auth endpoint on a closed port reports the connection class and the
+/// endpoint's host and port, never its path or query.
+///
+/// The port is released before the request, so a server of a parallel test
+/// can take it; an answer with an HTTP status then gets a fresh port, at most
+/// three attempts in all.
+#[tokio::test]
+async fn unreachable_web_auth_endpoint_reports_no_path_or_query() {
+    const ATTEMPTS: usize = 3;
+    let mock_server = MockServer::start().await;
+    let server_key = gen_keypair();
+    let mut answered = Vec::new();
+    for _ in 0..ATTEMPTS {
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let endpoint = format!("http://127.0.0.1:{closed}/auth PATHSECRET?tok=QSECRET");
+
+        let result = run_gate(&mock_server, &server_key, &endpoint).await;
+
+        if let Err(IdentityError::Sep10AuthFailed { reason }) = &result
+            && reason.contains(" returned HTTP ")
+        {
+            answered.push(reason.clone());
+            continue;
+        }
+        assert_sep10_reason(
+            result,
+            &format!("\"HTTP error: GET connection failed\" (authority: 127.0.0.1:{closed})"),
+        );
+        return;
+    }
+    panic!("every one of {ATTEMPTS} closed ports answered with a status: {answered:?}");
+}
+
+/// A challenge answer that is not SEP-10 JSON reports the fixed text and the
+/// endpoint's host and port, never the answer or the endpoint's path.
+#[tokio::test]
+async fn undecodable_challenge_answer_reports_fixed_text() {
+    let mock_server = MockServer::start().await;
+    let server_key = gen_keypair();
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex("^/sep10/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(HOSTILE_BODY))
+        .mount(&mock_server)
+        .await;
+    let mock_host = server_host_port(&mock_server);
+    let endpoint = format!("http://{mock_host}/sep10/auth PATHSECRET?tok=QSECRET");
+
+    let result = run_gate(&mock_server, &server_key, &endpoint).await;
+
+    assert_sep10_reason(
+        result,
+        &format!(
+            "the web-auth answer does not parse as a SEP-10 challenge or token \
+             (authority: {mock_host})"
+        ),
+    );
+}
+
+/// A token whose `sub` claim carries a malformed memo reports the fixed text;
+/// the decoded memo never reaches the reason.
+#[tokio::test]
+async fn undecodable_token_reports_fixed_text() {
+    let mock_server = MockServer::start().await;
+    let server_key = gen_keypair();
+    let account = mount_valid_challenge(&mock_server, &server_key).await;
+    Mock::given(method("POST"))
+        .and(path(SEP10_AUTH_PATH))
+        .respond_with(move |_request: &Request| {
+            let sub = format!("{}:SECRETMEMO", account.lock().unwrap());
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"sub": sub, "iss": "test", "iat": 0, "exp": 9_999_999_999_u64})
+                    .to_string()
+                    .as_bytes(),
+            );
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "token": format!("header.{payload}.sig") }))
+        })
+        .mount(&mock_server)
+        .await;
+    let mock_host = server_host_port(&mock_server);
+    let endpoint = format!("http://{mock_host}{SEP10_AUTH_PATH}");
+
+    let result = run_gate(&mock_server, &server_key, &endpoint).await;
+
+    assert_sep10_reason(
+        result,
+        &format!(
+            "the web-auth answer does not parse as a SEP-10 challenge or token \
+             (authority: {mock_host})"
+        ),
+    );
+}
+
+/// A stellar.toml syntax error reports its line and column, quoted; the
+/// offending line never reaches the reason.
+///
+/// The expected column is the one the parser computes for the same body, so
+/// the test does not depend on where the TOML library places the error
+/// within the line. That column must fall inside the offending line.
+#[tokio::test]
+async fn stellar_toml_syntax_error_reports_line_and_column_only() {
+    let mock_server = MockServer::start().await;
+    let server_key = gen_keypair();
+    let broken_line = "BROKEN = TOMLSECRET \u{1b}[2J";
+    let body = format!(
+        "SIGNING_KEY = \"{}\"\n{broken_line}\n",
+        pubkey_to_gstrkey(&server_key)
+    );
+    let detail = match stellar_agent_network::counterparty::parse_minimal_sep1(&body) {
+        Err(stellar_agent_network::counterparty::CounterpartyError::TomlInvalid { detail }) => {
+            detail
+        }
+        other => panic!("expected TomlInvalid from the parser, got {other:?}"),
+    };
+    let column: usize = detail
+        .strip_prefix("TOML parse error at line 2, column ")
+        .and_then(|column| column.parse().ok())
+        .unwrap_or_else(|| panic!("expected a line-2 position, got {detail:?}"));
+    assert!(
+        (1..=broken_line.chars().count() + 1).contains(&column),
+        "column {column} is outside the offending line"
+    );
+    mount_toml(&mock_server, body).await;
+    let mock_host = server_host_port(&mock_server);
+    let http = test_http_client();
+
+    let result = resolve_and_verify_counterparty_at(
+        &mock_host,
+        TESTNET_PASSPHRASE,
+        &mock_server.uri(),
+        &http,
+        None,
+    )
+    .await;
+
+    let err = result.expect_err("a syntax error refuses");
+    let rendered = format!("{err} {err:?}");
+    match &err {
+        IdentityError::TomlFetchFailed { authority, reason } => {
+            assert_eq!(authority, &mock_host);
+            assert_eq!(
+                reason,
+                &format!("\"counterparty stellar.toml parse failed: {detail}\"")
+            );
+        }
+        other => panic!("expected TomlFetchFailed, got {other:?}"),
+    }
+    for leaked in ["TOMLSECRET", "BROKEN", "\u{1b}"] {
+        assert!(!rendered.contains(leaked), "{leaked:?} leaked: {rendered}");
+    }
+}
+
+/// An unknown currency kind with control and bidi characters and a thousand
+/// characters reaches the reason escaped, quoted, and cut at the bound.
+#[tokio::test]
+async fn stellar_toml_unknown_currency_kind_is_quoted_and_bounded() {
+    let mock_server = MockServer::start().await;
+    let server_key = gen_keypair();
+    mount_toml(
+        &mock_server,
+        format!(
+            "SIGNING_KEY = \"{}\"\n[[CURRENCIES]]\nkind = \"K\\u001b[2J\\u202Eevil{}\"\n",
+            pubkey_to_gstrkey(&server_key),
+            "k".repeat(1000)
+        ),
+    )
+    .await;
+    let mock_host = server_host_port(&mock_server);
+    let http = test_http_client();
+
+    let result = resolve_and_verify_counterparty_at(
+        &mock_host,
+        TESTNET_PASSPHRASE,
+        &mock_server.uri(),
+        &http,
+        None,
+    )
+    .await;
+
+    let err = result.expect_err("an unknown kind refuses");
+    let rendered = format!("{err} {err:?}");
+    let IdentityError::TomlFetchFailed { reason, .. } = &err else {
+        panic!("expected TomlFetchFailed, got {err:?}");
+    };
+    let body = reason
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix("\"..."))
+        .unwrap_or_else(|| panic!("the reason is quoted and cut: {reason}"));
+    assert_eq!(
+        body.chars().count(),
+        stellar_agent_network::MAX_SERVER_TEXT_CHARS,
+        "{reason}"
+    );
+    assert!(
+        body.starts_with("unknown counterparty kind: K\\u{001b}[2J\\u{202e}evilkkk"),
+        "{reason}"
+    );
+    for raw in ["\u{1b}", "\u{202e}"] {
+        assert!(!rendered.contains(raw), "{raw:?} leaked: {rendered}");
+    }
+    assert!(!rendered.contains(&"k".repeat(300)), "{rendered}");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // 302 REDIRECT ABORT TEST
 // ═════════════════════════════════════════════════════════════════════════════
 

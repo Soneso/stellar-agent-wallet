@@ -561,7 +561,7 @@ that `stellar_sep24_interactive_url` consumes; it has no standalone tool. See
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_x402_create_payment` | Construct and sign an x402 v2 Exact Stellar `PAYMENT-SIGNATURE` from a `PaymentRequirements` object; return the payment signature and its fields. The wallet does not submit. | Signs the payment authorization entry; does not submit. |
-| `stellar_x402_parse_receipt` | Decode an x402 v2 `PAYMENT-RESPONSE` into a structured settlement receipt. | Read-only; no keyring, no network. No `chain_id`. |
+| `stellar_x402_parse_receipt` | Decode an x402 v2 `PAYMENT-RESPONSE` into a structured settlement receipt. Text fields are escaped and cut at 200 characters. | Read-only; no keyring, no network. No `chain_id`. |
 | `stellar_x402_authenticated_payment` | Run a SEP-10 identity gate against a `home_domain` (stellar.toml, SSRF bind, ephemeral challenge/response, JWT), then construct the `PAYMENT-SIGNATURE`. Any identity failure aborts before payment. | Signs the payment authorization entry; does not submit. |
 
 The `chain_id` argument of both payment tools takes the wallet's spelling,

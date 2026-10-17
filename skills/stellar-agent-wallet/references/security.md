@@ -187,6 +187,15 @@ values, at any log level. The same redaction discipline applies to wire output:
 - The `envelope_hash` is recorded unredacted because it is a SHA-256 digest
   carrying no user data.
 
+On the classic and x402 paths, server-derived text that the wallet does not
+validate to a fixed shape reaches an error, a tool result, or a log line
+scrubbed. Values validated to a fixed shape (an LDH endpoint host, strkeys, the
+network, amounts) are printed as validated. The scrub covers RPC errors, the
+simulation `error`, SEP-10 and stellar.toml answers, and x402 header fields.
+Each URL keeps its host and port, and each whitespace run becomes one space.
+Other control characters and non-ASCII characters become `\u{...}` escapes, and
+the text is cut at 200 characters. An error quotes the text.
+
 At the MCP boundary, account, strkey, and contract-id fields inside a deny reason
 are redacted before they cross the wire. Policy deny states that an attacker could
 otherwise probe are collapsed: the commit-path verifier maps the internal

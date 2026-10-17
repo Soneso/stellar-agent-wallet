@@ -456,7 +456,8 @@ async fn verify_funding_landed_with(
 ///   the Friendbot HTTP endpoint is unreachable or returns any other error
 ///   status.
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcUnreachable`] if
-///   the Friendbot response cannot be parsed or lacks a string `hash` field.
+///   the Friendbot response cannot be parsed, lacks a string `hash` field, or
+///   has a `hash` that is not exactly 64 hex characters.
 /// - [`WalletError::Network`] wrapping [`NetworkError::FriendbotFundingNotConfirmed`]
 ///   if the funded account never becomes queryable on `rpc_url` within the
 ///   verification window.
@@ -558,6 +559,15 @@ pub async fn fund_with_friendbot(
             })
         })?
         .to_owned();
+
+    // The hash is the Friendbot's text and is printed as received, so only
+    // the transaction-hash shape is accepted.
+    if tx_hash.len() != 64 || !tx_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(WalletError::Network(NetworkError::RpcUnreachable {
+            url: redact_url_authority(friendbot_url),
+            reason: "Friendbot response hash is not 64 hex characters".to_owned(),
+        }));
+    }
 
     let confirmed_after = verify_funding_landed(rpc_url, account_id).await?;
 

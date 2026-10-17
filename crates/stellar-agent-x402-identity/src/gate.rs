@@ -68,8 +68,9 @@ use stellar_agent_network::counterparty::{
     CounterpartyError, fetch::fetch_stellar_toml, parser::parse_minimal_sep1,
     validation::is_valid_ldh_home_domain,
 };
-use stellar_agent_sep10::Sep10Client;
+use stellar_agent_network::quote_server_text;
 use stellar_agent_sep10::ephemeral::auth_with_ephemeral_key;
+use stellar_agent_sep10::{Sep10Client, Sep10Error};
 
 use crate::error::{IdentityError, authority_hint};
 
@@ -412,10 +413,11 @@ async fn run_gate_with_override(
                 // Forward-compatibility fallback: `CounterpartyError` is
                 // `#[non_exhaustive]`. For the current `fetch_stellar_toml`, only
                 // `HomeDomainInvalid` and `FetchFailed` (handled above) are
-                // produced; any future variant maps to a fetch failure.
-                other => IdentityError::TomlFetchFailed {
+                // produced; any future variant maps to a fetch failure with a
+                // fixed reason, so no text of an unknown variant is relayed.
+                _ => IdentityError::TomlFetchFailed {
                     authority: auth.clone(),
-                    reason: other.to_string(),
+                    reason: "unexpected stellar.toml failure".to_owned(),
                 },
             }
         })?;
@@ -423,11 +425,15 @@ async fn run_gate_with_override(
     };
 
     // ── Step 2: Parse stellar.toml ────────────────────────────────────────────
+    // Every parse error goes through the same quote: a TOML syntax error
+    // carries only its line and column, and the other variants (an unknown
+    // currency kind, an invalid field value) can carry the server's text,
+    // which the quote escapes and bounds.
     let sep1 = parse_minimal_sep1(&body).map_err(|e| {
         warn!(authority = %toml_authority, "x402-identity: stellar.toml parse failed");
         IdentityError::TomlFetchFailed {
             authority: toml_authority.clone(),
-            reason: e.to_string(),
+            reason: quote_server_text(&e.to_string()),
         }
     })?;
 
@@ -493,7 +499,7 @@ async fn run_gate_with_override(
     let sep10_client = Sep10Client::new(network_passphrase).map_err(|e| {
         warn!("x402-identity: Sep10Client::new failed: {e}");
         IdentityError::Sep10AuthFailed {
-            reason: e.to_string(),
+            reason: quote_server_text(&e.to_string()),
         }
     })?;
     #[cfg(any(test, feature = "test-helpers"))]
@@ -502,14 +508,14 @@ async fn run_gate_with_override(
         Sep10Client::new_for_unit_test(network_passphrase).map_err(|e| {
             warn!("x402-identity[test]: Sep10Client::new_for_unit_test failed: {e}");
             IdentityError::Sep10AuthFailed {
-                reason: e.to_string(),
+                reason: quote_server_text(&e.to_string()),
             }
         })?
     } else {
         Sep10Client::new(network_passphrase).map_err(|e| {
             warn!("x402-identity: Sep10Client::new failed: {e}");
             IdentityError::Sep10AuthFailed {
-                reason: e.to_string(),
+                reason: quote_server_text(&e.to_string()),
             }
         })?
     };
@@ -529,14 +535,14 @@ async fn run_gate_with_override(
     )
     .await
     .map_err(|e| {
-        // Sep10Error Display is redaction-safe (no key material, no JWT in errors).
+        // The reason quotes the failure and names the endpoint by host and port.
         warn!(
             authority = %authority_hint(&web_auth_endpoint),
             home_domain = %home_domain,
             "x402-identity: SEP-10 auth failed",
         );
         IdentityError::Sep10AuthFailed {
-            reason: e.to_string(),
+            reason: sep10_failure_reason(&e, &web_auth_endpoint),
         }
     })?;
 
@@ -555,6 +561,30 @@ async fn run_gate_with_override(
         // Empty when stellar.toml omits ACCOUNTS — see field rustdoc.
         accounts: sep1_accounts,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SEP-10 failure reason
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The [`IdentityError::Sep10AuthFailed`] reason for a failed SEP-10 exchange
+/// with `web_auth_endpoint`.
+///
+/// A [`Sep10Error::JwtParseError`] can carry decoded token text, so it gets a
+/// fixed text. Every other variant is quoted with [`quote_server_text`], which
+/// escapes and bounds whatever server text a challenge check names. Both end
+/// with the endpoint's host and port, never its path or query.
+fn sep10_failure_reason(error: &Sep10Error, web_auth_endpoint: &str) -> String {
+    let failure = match error {
+        Sep10Error::JwtParseError { .. } => {
+            "the web-auth answer does not parse as a SEP-10 challenge or token".to_owned()
+        }
+        other => quote_server_text(&other.to_string()),
+    };
+    format!(
+        "{failure} (authority: {})",
+        authority_hint(web_auth_endpoint)
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -722,6 +752,42 @@ mod tests {
     )]
 
     use super::*;
+
+    /// A challenge check that names server text has it escaped inside the
+    /// quotes, followed by the endpoint's host and port; a token that does not
+    /// parse gets the fixed text.
+    #[test]
+    fn sep10_failure_reason_escapes_and_names_the_authority() {
+        let endpoint = "https://auth.example.com:8443/auth/PATHSECRET?tok=QSECRET";
+        let mismatch = Sep10Error::WebAuthDomainMismatch {
+            found: "\u{e9}vil.example\u{1b}[2J".to_owned(),
+            expected: "auth.example.com".to_owned(),
+        };
+        let reason = sep10_failure_reason(&mismatch, endpoint);
+        assert!(reason.starts_with('"'), "{reason}");
+        // The variant renders `found` with `Debug`, which writes ESC as
+        // `\u{1b}`; the quote escapes that backslash and the non-ASCII `é`.
+        assert!(
+            reason.contains(r#"found \"\u{00e9}vil.example\\u{1b}[2J\""#),
+            "{reason}"
+        );
+        assert!(
+            reason.ends_with("\" (authority: auth.example.com:8443)"),
+            "{reason}"
+        );
+        for leaked in ["\u{e9}", "\u{1b}", "PATHSECRET", "QSECRET", "/auth"] {
+            assert!(!reason.contains(leaked), "{leaked:?}: {reason}");
+        }
+
+        let unparsed = Sep10Error::JwtParseError {
+            detail: "malformed memo in sub claim: \"SECRETSUB\"".to_owned(),
+        };
+        assert_eq!(
+            sep10_failure_reason(&unparsed, endpoint),
+            "the web-auth answer does not parse as a SEP-10 challenge or token \
+             (authority: auth.example.com:8443)"
+        );
+    }
 
     #[test]
     fn debug_redacts_jwt() {

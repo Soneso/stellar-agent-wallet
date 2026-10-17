@@ -286,7 +286,7 @@ async fn credential_is_scrubbed_from_json_rpc_transport_and_simulate_errors() {
             .unwrap();
         let error = answer.error.unwrap();
         assert_eq!(
-            error, "host refused [redacted] ([redacted]) at https://h.example/[redacted]",
+            error, "\"host refused [redacted] ([redacted]) at h.example\"",
             "{case}"
         );
 

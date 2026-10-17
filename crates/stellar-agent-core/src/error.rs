@@ -1722,17 +1722,19 @@ pub enum NetworkError {
     /// Both passphrases are redacted on the way to `Display`: only the two
     /// canonical public constants are shown verbatim; any other value renders
     /// as `<other network>`, so a private or custom-network passphrase never
-    /// reaches an error surface.
+    /// reaches an error surface. `server` holds only that class of the
+    /// endpoint's passphrase, so `Debug` never renders the endpoint's value
+    /// either.
     #[error(
         "the RPC endpoint serves network '{}' but '{}' was declared; refusing to submit",
-        render_network_passphrase(.server),
+        .server,
         render_network_passphrase(.expected)
     )]
     EndpointNetworkMismatch {
         /// The network passphrase the caller declared.
         expected: String,
-        /// The network passphrase the endpoint reported.
-        server: String,
+        /// The class of the network passphrase the endpoint reported.
+        server: ReportedPassphrase,
     },
 
     /// The RPC endpoint's network identity could not be determined within the
@@ -1852,6 +1854,36 @@ pub enum NetworkError {
         /// The HTTP status of the answer, 401 or 403.
         status: u16,
     },
+}
+
+/// The class of a network passphrase an endpoint reported: the testnet
+/// passphrase, the mainnet passphrase, or `<other network>`.
+///
+/// It keeps no other part of the reported value, so neither `Display` nor the
+/// derived `Debug` can render a private or server-chosen passphrase.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReportedPassphrase(&'static str);
+
+impl ReportedPassphrase {
+    /// The class of `passphrase`: the canonical testnet or mainnet constant,
+    /// or `<other network>` for any other value.
+    #[must_use]
+    pub fn from_reported(passphrase: &str) -> Self {
+        Self(render_network_passphrase(passphrase))
+    }
+
+    /// The class as text: one of the two canonical passphrases, or
+    /// `<other network>`.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ReportedPassphrase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
 }
 
 /// Renders a network passphrase for inclusion in an error message.
@@ -3345,7 +3377,7 @@ mod tests {
             (
                 NetworkError::EndpointNetworkMismatch {
                     expected: crate::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
-                    server: "Some Private Network ; 2026".to_owned(),
+                    server: ReportedPassphrase::from_reported("Some Private Network ; 2026"),
                 },
                 "network.endpoint_network_mismatch",
             ),
@@ -4031,7 +4063,7 @@ mod tests {
             WalletError::Network(NetworkError::HorizonUnavailable { status: 503 }),
             WalletError::Network(NetworkError::EndpointNetworkMismatch {
                 expected: crate::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
-                server: "Some Private Network ; 2026".to_owned(),
+                server: ReportedPassphrase::from_reported("Some Private Network ; 2026"),
             }),
             WalletError::Network(NetworkError::EndpointIdentityUnavailable {
                 url: "https://rpc.example.com".to_owned(),
@@ -4108,7 +4140,7 @@ mod tests {
 
         let err = WalletError::Network(NetworkError::EndpointNetworkMismatch {
             expected: crate::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
-            server: PRIVATE.to_owned(),
+            server: ReportedPassphrase::from_reported(PRIVATE),
         });
         let msg = err.message();
         assert!(
@@ -4128,7 +4160,7 @@ mod tests {
         // reading this message needs to see which public network answered.
         let err = WalletError::Network(NetworkError::EndpointNetworkMismatch {
             expected: PRIVATE.to_owned(),
-            server: crate::profile::caip2::MAINNET_PASSPHRASE.to_owned(),
+            server: ReportedPassphrase::from_reported(crate::profile::caip2::MAINNET_PASSPHRASE),
         });
         let msg = err.message();
         assert!(
@@ -4138,6 +4170,41 @@ mod tests {
         assert!(
             !msg.contains(PRIVATE),
             "a non-public declared passphrase must not render verbatim: {msg}"
+        );
+    }
+
+    /// The `Debug` output of the variant, and of a `WalletError` that holds
+    /// it, renders the class of the endpoint's passphrase and never the value.
+    #[test]
+    fn endpoint_network_mismatch_debug_renders_the_class() {
+        const PRIVATE: &str = "Operator Private Chain ; March 2026";
+
+        let variant = NetworkError::EndpointNetworkMismatch {
+            expected: crate::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
+            server: ReportedPassphrase::from_reported(PRIVATE),
+        };
+        let variant_debug = format!("{variant:?}");
+        let wallet_debug = format!("{:?}", WalletError::Network(variant));
+        for debug in [variant_debug, wallet_debug] {
+            assert!(!debug.contains(PRIVATE), "{debug}");
+            assert!(!debug.contains("Operator"), "{debug}");
+            assert!(
+                debug.contains(r#"server: ReportedPassphrase("<other network>")"#),
+                "{debug}"
+            );
+        }
+
+        for public in [
+            crate::profile::caip2::TESTNET_PASSPHRASE,
+            crate::profile::caip2::MAINNET_PASSPHRASE,
+        ] {
+            let reported = ReportedPassphrase::from_reported(public);
+            assert_eq!(reported.as_str(), public);
+            assert_eq!(reported.to_string(), public);
+        }
+        assert_eq!(
+            ReportedPassphrase::from_reported("").as_str(),
+            "<other network>"
         );
     }
 

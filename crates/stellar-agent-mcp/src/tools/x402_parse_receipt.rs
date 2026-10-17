@@ -25,6 +25,7 @@ use rmcp::{
 };
 use serde_json::json;
 use stellar_agent_mcp_macros::mcp_tool_router;
+use stellar_agent_network::escape_server_text;
 
 use crate::server::WalletServer;
 use crate::tools::common::x402_error_to_tool_result;
@@ -63,21 +64,40 @@ pub struct X402ParseReceiptArgs {
 ///
 /// # Errors
 ///
-/// - [`stellar_agent_x402::X402Error::ReceiptParseFailed`] when both paths fail.
+/// - [`stellar_agent_x402::X402Error::ReceiptParseFailed`] when both paths
+///   fail. An input that decodes as base64 reports the JSON failure of its
+///   decoded payload; any other input reports the raw-JSON failure.
 fn decode_payment_response_input(
     input: &str,
 ) -> Result<stellar_agent_x402::wire::SettleResponse, stellar_agent_x402::X402Error> {
+    use base64::Engine as _;
     use stellar_agent_x402::wire::decode_payment_response;
 
     // Try the crate's canonical base64 decode (RFC 4648 §4 standard alphabet).
-    if let Ok(parsed) = decode_payment_response(input) {
-        return Ok(parsed);
+    let base64_error = match decode_payment_response(input) {
+        Ok(parsed) => return Ok(parsed),
+        Err(e) => e,
+    };
+
+    // An input that decodes as base64 is not raw JSON, because `{` and `[`
+    // are outside the alphabet, so the failure of its decoded payload is the
+    // one to report. That detail names the JSON error class and position.
+    if base64::engine::general_purpose::STANDARD
+        .decode(input.trim())
+        .is_ok()
+    {
+        return Err(base64_error);
     }
 
     // Fall back: parse as raw JSON string (caller-supplied unencoded JSON).
+    // The detail names the JSON error class and position only, because the
+    // decoder's own text quotes the offending value.
     serde_json::from_str::<stellar_agent_x402::wire::SettleResponse>(input).map_err(|e| {
         stellar_agent_x402::X402Error::ReceiptParseFailed {
-            detail: format!("not valid base64+JSON or raw JSON SettleResponse: {e}"),
+            detail: format!(
+                "the SettleResponse input {}",
+                stellar_agent_x402::wire::describe_json_error(&e)
+            ),
         }
     })
 }
@@ -166,18 +186,20 @@ impl WalletServer {
 
         tracing::debug!(
             success = receipt.success,
-            network = %receipt.network,
+            network = %escape_server_text(&receipt.network),
             "x402_parse_receipt: decoded",
         );
 
         // ── Build response ────────────────────────────────────────────────────
-        // `payer` and `errorReason` may be null when absent.
+        // Every text field is the facilitator's text, so each is escaped and
+        // bounded before it reaches the agent. `payer` and `errorReason` may
+        // be null when absent.
         let response = json!({
             "success": receipt.success,
-            "transaction": receipt.transaction,
-            "payer": receipt.payer,
-            "network": receipt.network,
-            "errorReason": receipt.error_reason,
+            "transaction": escape_server_text(&receipt.transaction),
+            "payer": receipt.payer.as_deref().map(escape_server_text),
+            "network": escape_server_text(&receipt.network),
+            "errorReason": receipt.error_reason.as_deref().map(escape_server_text),
         });
         let envelope = stellar_agent_core::envelope::Envelope::ok(response);
         let json_str = envelope
@@ -281,6 +303,110 @@ mod tests {
             ),
             "invalid input must return ReceiptParseFailed; got {result:?}"
         );
+    }
+
+    /// A raw-JSON receipt whose field has the wrong type reports the JSON
+    /// error class and position; the marker value never reaches the detail.
+    #[test]
+    fn fallback_error_drops_decoded_values() {
+        let err = decode_payment_response_input(r#"{"success":"MARKERSECRET"}"#).unwrap_err();
+        let stellar_agent_x402::X402Error::ReceiptParseFailed { detail } = &err else {
+            panic!("expected ReceiptParseFailed, got {err:?}");
+        };
+        assert_eq!(
+            detail,
+            "the SettleResponse input has a missing field or a field of the wrong type or \
+             value (line 1, column 25)"
+        );
+        assert!(!format!("{err} {err:?}").contains("MARKER"), "{err:?}");
+    }
+
+    /// A base64 input whose decoded payload has a field of the wrong type
+    /// reports that payload's failure by class and position, not the raw-JSON
+    /// failure of the base64 text, and without the field's value.
+    #[test]
+    fn decode_payment_response_input_reports_the_base64_payload_error() {
+        use base64::Engine as _;
+        let input =
+            base64::engine::general_purpose::STANDARD.encode(r#"{"success":"MARKERSECRET"}"#);
+        let err = decode_payment_response_input(&input).unwrap_err();
+        let stellar_agent_x402::X402Error::ReceiptParseFailed { detail } = &err else {
+            panic!("expected ReceiptParseFailed, got {err:?}");
+        };
+        assert_eq!(
+            detail,
+            "the PAYMENT-RESPONSE payload has a missing field or a field of the wrong type \
+             or value (line 1, column 25)"
+        );
+        assert!(!format!("{err} {err:?}").contains("MARKER"), "{err:?}");
+    }
+
+    /// The tool result carries every receipt text field escaped and bounded:
+    /// a URL as host and port, control and bidi characters as escapes, `"`
+    /// escaped, and the long reason cut at the bound. A 64-hex transaction
+    /// hash passes unchanged.
+    #[tokio::test]
+    async fn receipt_fields_are_escaped_and_bounded() {
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "stellar-agent-signer-receipt",
+            "default",
+            "stellar-agent-nonce-receipt",
+            "default",
+        )
+        .with_noop_engine()
+        .build();
+        let server = WalletServer::new(profile).unwrap();
+        let hash = "ab01".repeat(16);
+        let long_reason = format!(
+            "refused https://user:PWSECRET@leak.example/x?k=QSECRET \u{1b}[2J {}",
+            "r".repeat(1000)
+        );
+
+        for (error_reason, expected_reason) in [
+            ("a\"b".to_owned(), "a\\\"b".to_owned()),
+            (
+                long_reason,
+                format!(
+                    "refused leak.example \\u{{001b}}[2J {}...",
+                    "r".repeat(stellar_agent_network::MAX_SERVER_TEXT_CHARS - 33)
+                ),
+            ),
+        ] {
+            let receipt = SettleResponse {
+                success: false,
+                error_reason: Some(error_reason),
+                error_message: None,
+                payer: Some("G\u{202e}PAYER\n".to_owned()),
+                transaction: hash.clone(),
+                network: "stellar:\u{200b}testnet".to_owned(),
+                amount: None,
+                extensions: None,
+                extra: None,
+            };
+            let result = server
+                .call_stellar_x402_parse_receipt(X402ParseReceiptArgs {
+                    payment_response: serde_json::to_string(&receipt).unwrap(),
+                })
+                .await
+                .unwrap();
+            let text = result
+                .content
+                .first()
+                .and_then(|content| content.as_text())
+                .map(|text| text.text.clone())
+                .unwrap();
+            let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let data = &envelope["data"];
+            assert_eq!(data["transaction"], hash.as_str(), "{text}");
+            assert_eq!(data["payer"], "G\\u{202e}PAYER", "{text}");
+            assert_eq!(data["network"], "stellar:\\u{200b}testnet", "{text}");
+            assert_eq!(data["errorReason"], expected_reason.as_str(), "{text}");
+            for leaked in [
+                "PWSECRET", "QSECRET", "https:", "\u{1b}", "\u{202e}", "\u{200b}",
+            ] {
+                assert!(!text.contains(leaked), "{leaked:?} survived: {text}");
+            }
+        }
     }
 
     #[test]

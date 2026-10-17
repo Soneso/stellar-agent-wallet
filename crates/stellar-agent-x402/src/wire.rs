@@ -185,7 +185,7 @@ pub fn decode_payment_required(header: &str) -> Result<PaymentRequirements, X402
                 detail: format!("base64 decode failed: {e}"),
             })?;
     serde_json::from_slice(&bytes).map_err(|e| X402Error::InvalidPaymentRequired {
-        detail: format!("JSON deserialise failed: {e}"),
+        detail: format!("the PAYMENT-REQUIRED payload {}", describe_json_error(&e)),
     })
 }
 
@@ -206,8 +206,42 @@ pub fn decode_payment_response(header: &str) -> Result<SettleResponse, X402Error
                 detail: format!("base64 decode failed: {e}"),
             })?;
     serde_json::from_slice(&bytes).map_err(|e| X402Error::ReceiptParseFailed {
-        detail: format!("JSON deserialise failed: {e}"),
+        detail: format!("the PAYMENT-RESPONSE payload {}", describe_json_error(&e)),
     })
+}
+
+/// Describes a JSON decode failure by its class and position, without any
+/// value from the input.
+///
+/// The text is `{what} (line {l}, column {c})`. `what` follows the error's
+/// [`serde_json::error::Category`]: `is not valid JSON`, `ends before the
+/// value is complete`, `has a missing field or a field of the wrong type or
+/// value`, or `could not be read`. The `Display` of the error is not used,
+/// because it quotes the offending value, which is the server's text. A caller
+/// puts the subject in front, as in `the PAYMENT-REQUIRED payload is not valid
+/// JSON (line 1, column 5)`.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_x402::wire::describe_json_error;
+///
+/// let error = serde_json::from_str::<u8>("\"MARKER\"").unwrap_err();
+/// assert_eq!(
+///     describe_json_error(&error),
+///     "has a missing field or a field of the wrong type or value (line 1, column 8)"
+/// );
+/// ```
+#[must_use]
+pub fn describe_json_error(error: &serde_json::Error) -> String {
+    use serde_json::error::Category;
+    let what = match error.classify() {
+        Category::Syntax => "is not valid JSON",
+        Category::Eof => "ends before the value is complete",
+        Category::Data => "has a missing field or a field of the wrong type or value",
+        Category::Io => "could not be read",
+    };
+    format!("{what} (line {}, column {})", error.line(), error.column())
 }
 
 #[cfg(test)]
@@ -291,6 +325,57 @@ mod tests {
             result,
             Err(X402Error::InvalidPaymentRequired { .. })
         ));
+    }
+
+    /// The decode detail names the subject, the JSON error class, and the
+    /// position; a marker value of the wrong type never reaches it.
+    #[test]
+    fn json_decode_failures_name_class_and_position_without_values() {
+        let wrong_type = br#"{"scheme":"exact","maxTimeoutSeconds":"MARKERSECRET"}"#;
+        let required = [
+            (
+                &wrong_type[..],
+                "the PAYMENT-REQUIRED payload has a missing field or a field of the wrong \
+                 type or value (line 1, column 52)",
+            ),
+            (
+                b"{ MARKERSECRET }",
+                "the PAYMENT-REQUIRED payload is not valid JSON (line 1, column 3)",
+            ),
+            (
+                br#"{"scheme":"MARKERSECRET"#,
+                "the PAYMENT-REQUIRED payload ends before the value is complete \
+                 (line 1, column 23)",
+            ),
+        ];
+        for (json, expected) in required {
+            let err = decode_payment_required(&BASE64_STANDARD.encode(json)).unwrap_err();
+            let X402Error::InvalidPaymentRequired { detail } = &err else {
+                panic!("expected InvalidPaymentRequired, got {err:?}");
+            };
+            assert_eq!(detail, expected);
+            assert!(!format!("{err} {err:?}").contains("MARKER"), "{err:?}");
+        }
+
+        let receipt = [
+            (
+                &br#"{"success":"MARKERSECRET"}"#[..],
+                "the PAYMENT-RESPONSE payload has a missing field or a field of the wrong \
+                 type or value (line 1, column 25)",
+            ),
+            (
+                b"[MARKERSECRET]",
+                "the PAYMENT-RESPONSE payload is not valid JSON (line 1, column 2)",
+            ),
+        ];
+        for (json, expected) in receipt {
+            let err = decode_payment_response(&BASE64_STANDARD.encode(json)).unwrap_err();
+            let X402Error::ReceiptParseFailed { detail } = &err else {
+                panic!("expected ReceiptParseFailed, got {err:?}");
+            };
+            assert_eq!(detail, expected);
+            assert!(!format!("{err} {err:?}").contains("MARKER"), "{err:?}");
+        }
     }
 
     #[test]

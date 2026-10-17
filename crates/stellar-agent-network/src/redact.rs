@@ -126,6 +126,108 @@ pub fn redact_rpc_error_display<E: std::fmt::Display + ?Sized>(err: &E) -> Strin
     redact_rpc_error(&err.to_string())
 }
 
+/// The most characters the escaped body of a server-derived text holds.
+///
+/// [`escape_server_text`] and [`quote_server_text`] cut the body at this
+/// bound, so an error, a tool result, or a log line that carries a server's
+/// text stays short however much text the server sends.
+pub const MAX_SERVER_TEXT_CHARS: usize = 200;
+
+/// The marker that follows a server-derived text cut at
+/// [`MAX_SERVER_TEXT_CHARS`].
+const CUT_MARKER: &str = "...";
+
+/// Renders server-derived text for a JSON field value or a log field.
+///
+/// The steps run in this order:
+///
+/// 1. [`redact_rpc_error`] keeps only the host and port of each URL.
+/// 2. Each run of ASCII whitespace (space, tab, line feed, carriage return,
+///    vertical tab, form feed) becomes one space; leading and trailing runs
+///    are trimmed.
+/// 3. `"` becomes `\"` and `\` becomes `\\`. The space and the bytes `0x21`
+///    to `0x7E` pass. Every other character, which covers the control
+///    characters and every non-ASCII character including bidi and zero-width
+///    ones, becomes `\u{hex}` with at least four lowercase hex digits.
+/// 4. The escaped body holds at most [`MAX_SERVER_TEXT_CHARS`] characters. A
+///    cut never splits an escape, never ends the body with a space, and
+///    appends `...`.
+///
+/// The result adds no quotes, because the JSON value or the log field that
+/// carries it already delimits it. Error texts use [`quote_server_text`].
+#[must_use]
+pub fn escape_server_text(text: &str) -> String {
+    let (mut body, cut) = render_server_text(text);
+    if cut {
+        body.push_str(CUT_MARKER);
+    }
+    body
+}
+
+/// Renders server-derived text for an error or a refusal reason.
+///
+/// The body is the one [`escape_server_text`] builds, wrapped in `"`. A body
+/// cut at [`MAX_SERVER_TEXT_CHARS`] gets `...` after the closing quote, so the
+/// reader sees where the server's text ends. Empty text gives `""`.
+#[must_use]
+pub fn quote_server_text(text: &str) -> String {
+    let (body, cut) = render_server_text(text);
+    let mut out = String::with_capacity(body.len() + 2 + CUT_MARKER.len());
+    out.push('"');
+    out.push_str(&body);
+    out.push('"');
+    if cut {
+        out.push_str(CUT_MARKER);
+    }
+    out
+}
+
+/// The escaped, bounded body of `text` and whether the bound cut it.
+fn render_server_text(text: &str) -> (String, bool) {
+    // Whitespace is matched explicitly: `char::is_ascii_whitespace` omits the
+    // vertical tab, which a terminal also treats as a line break.
+    fn is_collapsed_whitespace(ch: char) -> bool {
+        matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}')
+    }
+
+    let scrubbed = redact_rpc_error(text);
+    let mut body = String::new();
+    let mut body_chars = 0_usize;
+    let mut pending_space = false;
+    let mut escape = String::new();
+    for ch in scrubbed.trim_matches(is_collapsed_whitespace).chars() {
+        if is_collapsed_whitespace(ch) {
+            pending_space = true;
+            continue;
+        }
+        escape.clear();
+        match ch {
+            '"' => escape.push_str("\\\""),
+            '\\' => escape.push_str("\\\\"),
+            '!'..='~' => escape.push(ch),
+            _ => {
+                use std::fmt::Write as _;
+                // Writing to a `String` cannot fail.
+                let _ = write!(escape, "\\u{{{:04x}}}", u32::from(ch));
+            }
+        }
+        // A collapsed space is written only together with the escape after
+        // it, so a cut never leaves a space before the closing quote or the
+        // cut marker.
+        let space = usize::from(std::mem::take(&mut pending_space));
+        // Every escape is ASCII, so its byte length is its character count.
+        if body_chars + space + escape.len() > MAX_SERVER_TEXT_CHARS {
+            return (body, true);
+        }
+        if space == 1 {
+            body.push(' ');
+        }
+        body.push_str(&escape);
+        body_chars += space + escape.len();
+    }
+    (body, false)
+}
+
 /// RPC errors that carry a credential-bearing URL in server-provided text, for
 /// the unit tests of the modules that map such errors.
 #[cfg(test)]
@@ -192,7 +294,7 @@ pub(crate) mod rpc_error_fixtures {
             field.contains("archive.example.com:8443"),
             "{case}: the echoed host and port must remain: {field}"
         );
-        for leaked in ["SECRET", "token=", "user:", "https://", "https:\\/", "/rpc"] {
+        for leaked in ["SECRET", "token=", "user:", "https:", "/rpc"] {
             assert!(
                 !field.contains(leaked),
                 "{case}: {leaked} survived the scrub: {field}"
@@ -205,7 +307,117 @@ pub(crate) mod rpc_error_fixtures {
 mod tests {
     use stellar_agent_core::error::NetworkError;
 
-    use super::{redact_rpc_error, redact_rpc_error_display, redact_url_authority};
+    use super::{
+        MAX_SERVER_TEXT_CHARS, escape_server_text, quote_server_text, redact_rpc_error,
+        redact_rpc_error_display, redact_url_authority,
+    };
+
+    #[test]
+    fn quote_server_text_escapes_control_and_non_ascii_characters() {
+        let raw = "a\u{1b}[31mb\u{0}c\u{7f}d\u{202e}e\u{200b}f\u{e9}g\"h\\i\u{85}j\u{1f600}";
+        assert_eq!(
+            quote_server_text(raw),
+            "\"a\\u{001b}[31mb\\u{0000}c\\u{007f}d\\u{202e}e\\u{200b}f\\u{00e9}g\\\"h\\\\i\
+             \\u{0085}j\\u{1f600}\""
+        );
+    }
+
+    #[test]
+    fn quote_server_text_collapses_whitespace_runs() {
+        let raw = " \r\n\tfirst \t\r\n line\u{0b}\u{0c}second\n\n ";
+        assert_eq!(quote_server_text(raw), "\"first line second\"");
+        assert_eq!(quote_server_text(" \t\r\n\u{0b}\u{0c} "), "\"\"");
+    }
+
+    #[test]
+    fn quote_server_text_cuts_at_the_bound_between_escapes() {
+        let exact = "x".repeat(MAX_SERVER_TEXT_CHARS);
+        assert_eq!(quote_server_text(&exact), format!("\"{exact}\""));
+
+        let over = "x".repeat(MAX_SERVER_TEXT_CHARS + 1);
+        assert_eq!(quote_server_text(&over), format!("\"{exact}\"..."));
+
+        // The escape of ESC is eight characters; with 195 characters before
+        // it the escape would end at 203, so the cut falls before it.
+        let edge = format!("{}\u{1b}", "y".repeat(MAX_SERVER_TEXT_CHARS - 5));
+        let quoted = quote_server_text(&edge);
+        assert_eq!(
+            quoted,
+            format!("\"{}\"...", "y".repeat(MAX_SERVER_TEXT_CHARS - 5))
+        );
+
+        // A two-character escape at the edge is not split either.
+        let quote_edge = format!("{}\"", "z".repeat(MAX_SERVER_TEXT_CHARS - 1));
+        assert_eq!(
+            quote_server_text(&quote_edge),
+            format!("\"{}\"...", "z".repeat(MAX_SERVER_TEXT_CHARS - 1))
+        );
+
+        // An escape that fits exactly is kept and nothing is cut.
+        let fits = format!("{}\u{1b}", "w".repeat(MAX_SERVER_TEXT_CHARS - 8));
+        assert_eq!(
+            quote_server_text(&fits),
+            format!("\"{}\\u{{001b}}\"", "w".repeat(MAX_SERVER_TEXT_CHARS - 8))
+        );
+
+        // A space that would be the last character before the cut is dropped
+        // with the character after it, so no body ends with a space.
+        let at_bound = "v".repeat(MAX_SERVER_TEXT_CHARS - 1);
+        for raw in [format!("{at_bound} tail"), format!("{at_bound}\t\n\u{1b}")] {
+            let quoted = quote_server_text(&raw);
+            assert_eq!(quoted, format!("\"{at_bound}\"..."), "{raw:?}");
+            assert!(!quoted.contains(" \""), "{quoted}");
+            let escaped = escape_server_text(&raw);
+            assert_eq!(escaped, format!("{at_bound}..."), "{raw:?}");
+            assert!(!escaped.contains(" ..."), "{escaped}");
+        }
+        let before_escape = format!("{} \u{1b}", "u".repeat(MAX_SERVER_TEXT_CHARS - 8));
+        assert_eq!(
+            quote_server_text(&before_escape),
+            format!("\"{}\"...", "u".repeat(MAX_SERVER_TEXT_CHARS - 8))
+        );
+
+        // A space and the character after it that fit together are both kept.
+        let space_fits = format!("{} t", "s".repeat(MAX_SERVER_TEXT_CHARS - 2));
+        assert_eq!(quote_server_text(&space_fits), format!("\"{space_fits}\""));
+    }
+
+    #[test]
+    fn quote_server_text_scrubs_a_url_that_straddles_the_bound() {
+        let raw = format!(
+            "{} https://user:SECRET@archive.example.com:8443/rpc?token=SECRET tail",
+            "p".repeat(MAX_SERVER_TEXT_CHARS - 10)
+        );
+        let quoted = quote_server_text(&raw);
+        assert!(quoted.ends_with("\"..."), "{quoted}");
+        assert!(quoted.contains(" archive."), "{quoted}");
+        for leaked in ["SECRET", "user", "https", "/rpc", "token"] {
+            assert!(!quoted.contains(leaked), "{leaked} survived: {quoted}");
+        }
+    }
+
+    #[test]
+    fn quote_server_text_quotes_text_without_a_url() {
+        assert_eq!(
+            quote_server_text("decode error: missing entry"),
+            "\"decode error: missing entry\""
+        );
+        assert_eq!(quote_server_text(""), "\"\"");
+    }
+
+    #[test]
+    fn escape_server_text_adds_no_quotes() {
+        assert_eq!(escape_server_text(""), "");
+        assert_eq!(
+            escape_server_text("a\"b\tc https://h.example/p?k=SECRET \u{1b}"),
+            "a\\\"b c h.example \\u{001b}"
+        );
+        let over = "q".repeat(MAX_SERVER_TEXT_CHARS + 50);
+        assert_eq!(
+            escape_server_text(&over),
+            format!("{}...", "q".repeat(MAX_SERVER_TEXT_CHARS))
+        );
+    }
 
     #[test]
     fn rpc_unreachable_and_timeout_display_store_authority_only_url() {

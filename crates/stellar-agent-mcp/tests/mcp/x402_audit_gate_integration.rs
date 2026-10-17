@@ -55,6 +55,8 @@ enum FirstSimulate {
     Ok,
     /// An RPC error: `create_payment` fails before any signature exists.
     Error,
+    /// An RPC error whose text is [`hostile_simulation_error`].
+    HostileError,
     /// The payer's entry for a transfer of another amount than the one the
     /// wallet built.
     OtherAmount,
@@ -288,6 +290,12 @@ impl Respond for X402Rpc {
                 return simulate_result(
                     req_id,
                     serde_json::json!({"error": "host invocation failed", "latestLedger": 1000}),
+                );
+            }
+            if self.first == FirstSimulate::HostileError {
+                return simulate_result(
+                    req_id,
+                    serde_json::json!({"error": hostile_simulation_error(), "latestLedger": 1000}),
                 );
             }
             let mut invoke = invoke;
@@ -841,6 +849,72 @@ async fn an_error_before_the_gate_writes_no_row(tool: Tool, profile_name: &str, 
         vec![false],
         "{tool:?}: only the unsigned simulate was sent"
     );
+}
+
+/// A simulation `error` a hostile endpoint could send: a credential-bearing
+/// URL, quotes, a terminal escape, and a thousand characters.
+fn hostile_simulation_error() -> String {
+    format!(
+        "host https://user:PWSECRET@leak.example/rpc?k=QSECRET said \"no\"\u{1b}[2J {}",
+        "e".repeat(1000)
+    )
+}
+
+/// The simulation `error` reaches the tool result scrubbed: the URL as host
+/// and port, the quotes and the escape escaped, quoted, and cut at the bound.
+async fn a_simulation_error_reaches_the_tool_result_scrubbed(
+    tool: Tool,
+    profile_name: &str,
+    seed: u8,
+    expected_code: &str,
+) {
+    let fixture = fixture(profile_name, [seed; 32], |rpc| {
+        rpc.first = FirstSimulate::HostileError;
+    })
+    .await;
+    let result = call(&fixture, tool).await;
+    let (code, message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, expected_code, "{tool:?}: {text}");
+    let quoted = format!(
+        "\"{}{}\"...",
+        r#"host leak.example said \"no\"\u{001b}[2J "#,
+        "e".repeat(stellar_agent_network::MAX_SERVER_TEXT_CHARS - 41)
+    );
+    assert!(
+        message.ends_with(&format!("simulate returned error: {quoted}")),
+        "{tool:?}: {message}"
+    );
+    for leaked in ["PWSECRET", "QSECRET", "https:", "/rpc", "\u{1b}"] {
+        assert!(
+            !text.contains(leaked),
+            "{tool:?}: {leaked:?} survived: {text}"
+        );
+    }
+    assert!(!message.contains(&"e".repeat(300)), "{tool:?}: {message}");
+}
+
+#[tokio::test]
+#[serial]
+async fn create_payment_simulation_error_reaches_the_tool_result_scrubbed() {
+    a_simulation_error_reaches_the_tool_result_scrubbed(
+        Tool::CreatePayment,
+        "x402-gate-scrub-cp",
+        0x4a,
+        "x402.rpc_simulate_failed",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn authenticated_payment_simulation_error_reaches_the_tool_result_scrubbed() {
+    a_simulation_error_reaches_the_tool_result_scrubbed(
+        Tool::AuthenticatedPayment,
+        "x402-gate-scrub-ap",
+        0x4b,
+        "x402.payment_build_failed",
+    )
+    .await;
 }
 
 #[tokio::test]

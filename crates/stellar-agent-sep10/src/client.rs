@@ -11,6 +11,15 @@
 //!
 //! Both methods are fail-closed on non-200 HTTP status and on JSON parse failure.
 //!
+//! # Error texts
+//!
+//! A transport failure, a non-2xx answer, or an answer that is not SEP-10 JSON
+//! is reported by method and class, without the endpoint URL, its query, or
+//! the answer body. A challenge that fails validation or a token whose claims
+//! do not parse can name a decoded field; a caller that relays these texts
+//! bounds them. A network passphrase appears only as its class: the testnet or
+//! mainnet passphrase, or `<other network>`.
+//!
 //! # Wire protocol
 //!
 //! Per SEP-10 v3.4.1:
@@ -339,27 +348,14 @@ impl Sep10Client {
             .query(&params)
             .send()
             .await
-            .map_err(|e| Sep10Error::HttpError {
-                detail: format!("GET {web_auth_endpoint}: {e}"),
-            })?;
+            .map_err(|e| transport_failure("GET", e))?;
 
         let status = response.status();
         if !status.is_success() {
-            // char-boundary-safe truncation: use .chars().take(512) rather than
-            // &body[..512] to avoid a panic at a multi-byte UTF-8 char boundary
-            // when a server-controlled error body has a multi-byte sequence at
-            // byte 512.
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_owned());
-            let truncated = if body.chars().count() > 512 {
-                format!("{}…", body.chars().take(512).collect::<String>())
-            } else {
-                body
-            };
+            // The body of a refused answer is the server's text and is not
+            // read; the method and the status are enough to triage.
             return Err(Sep10Error::HttpError {
-                detail: format!("GET {web_auth_endpoint} returned HTTP {status}: {truncated}"),
+                detail: format!("GET returned HTTP {}", status.as_u16()),
             });
         }
 
@@ -367,19 +363,16 @@ impl Sep10Client {
             response
                 .json()
                 .await
-                .map_err(|e| Sep10Error::JwtParseError {
-                    detail: format!("GET {web_auth_endpoint}: failed to parse JSON response: {e}"),
+                .map_err(|_| Sep10Error::JwtParseError {
+                    detail: "challenge answer is not SEP-10 JSON".to_owned(),
                 })?;
 
         if challenge_response.network_passphrase != self.network_passphrase {
             return Err(Sep10Error::InvalidServerSignature {
                 detail: format!(
-                    "server returned network_passphrase {:?} but client expected {:?}",
-                    // Truncate to first 16 chars: sufficient for diagnosis without
-                    // echoing the full passphrase in error detail.
-                    &challenge_response.network_passphrase
-                        [..challenge_response.network_passphrase.len().min(16)],
-                    &self.network_passphrase[..self.network_passphrase.len().min(16)],
+                    "server returned network passphrase '{}' but the client expects '{}'",
+                    passphrase_class(&challenge_response.network_passphrase),
+                    passphrase_class(&self.network_passphrase),
                 ),
             });
         }
@@ -431,24 +424,13 @@ impl Sep10Client {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Sep10Error::HttpError {
-                detail: format!("POST {web_auth_endpoint}: {e}"),
-            })?;
+            .map_err(|e| transport_failure("POST", e))?;
 
         let status = response.status();
         if !status.is_success() {
-            // char-boundary-safe truncation (see fetch_challenge).
-            let body_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_owned());
-            let truncated = if body_text.chars().count() > 512 {
-                format!("{}…", body_text.chars().take(512).collect::<String>())
-            } else {
-                body_text
-            };
+            // The body of a refused answer is not read (see fetch_challenge).
             return Err(Sep10Error::HttpError {
-                detail: format!("POST {web_auth_endpoint} returned HTTP {status}: {truncated}"),
+                detail: format!("POST returned HTTP {}", status.as_u16()),
             });
         }
 
@@ -456,13 +438,13 @@ impl Sep10Client {
             response
                 .json()
                 .await
-                .map_err(|e| Sep10Error::JwtParseError {
-                    detail: format!("POST {web_auth_endpoint}: failed to parse JSON response: {e}"),
+                .map_err(|_| Sep10Error::JwtParseError {
+                    detail: "token answer is not SEP-10 JSON".to_owned(),
                 })?;
 
         if token_response.token.is_empty() {
             return Err(Sep10Error::JwtParseError {
-                detail: format!("POST {web_auth_endpoint}: response 'token' field is empty"),
+                detail: "token answer has an empty token".to_owned(),
             });
         }
 
@@ -484,11 +466,51 @@ impl std::fmt::Debug for Sep10Client {
         f.debug_struct("Sep10Client")
             .field(
                 "network_passphrase",
-                // Truncate to avoid emitting full passphrase in debug output.
-                &&self.network_passphrase[..self.network_passphrase.len().min(16)],
+                &passphrase_class(&self.network_passphrase),
             )
             .finish()
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Error-text helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The testnet network passphrase, a public protocol constant.
+const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+
+/// The mainnet network passphrase, a public protocol constant.
+const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
+
+/// The class of a network passphrase for an error or `Debug` text.
+///
+/// The two public passphrases render verbatim, so an operator can read a
+/// mismatch directly; any other value, whether a private network's or one a
+/// server chose, renders as `<other network>`.
+fn passphrase_class(passphrase: &str) -> &'static str {
+    match passphrase {
+        TESTNET_PASSPHRASE => TESTNET_PASSPHRASE,
+        MAINNET_PASSPHRASE => MAINNET_PASSPHRASE,
+        _ => "<other network>",
+    }
+}
+
+/// The [`Sep10Error::HttpError`] for a request with `method` that failed
+/// before an answer arrived.
+///
+/// The detail names the method and a fixed class: a timeout, a failed
+/// connection, or the transport's error kind. The URL the transport would
+/// append is removed first, so neither the endpoint's path nor its query (the
+/// account and the home domain) reaches the text.
+fn transport_failure(method: &str, error: reqwest::Error) -> Sep10Error {
+    let detail = if error.is_timeout() {
+        format!("{method} request timed out")
+    } else if error.is_connect() {
+        format!("{method} connection failed")
+    } else {
+        format!("{method} request failed: {}", error.without_url())
+    };
+    Sep10Error::HttpError { detail }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -519,6 +541,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
 
@@ -559,12 +582,46 @@ mod tests {
         assert_eq!(client.network_passphrase(), TEST_PASSPHRASE);
     }
 
+    /// `Debug` renders a private passphrase as its class and never the value;
+    /// a public passphrase renders verbatim.
     #[test]
     fn debug_does_not_echo_full_passphrase() {
+        const PRIVATE: &str = "Operator Private Chain ; March 2026";
+        let client = Sep10Client::new(PRIVATE).unwrap();
+        let debug = format!("{client:?}");
+        assert!(!debug.contains(PRIVATE), "{debug}");
+        assert!(!debug.contains("Operator"), "{debug}");
+        assert!(debug.contains("<other network>"), "{debug}");
+
         let client = Sep10Client::new(TEST_PASSPHRASE).unwrap();
         let debug = format!("{client:?}");
-        assert!(!debug.contains(TEST_PASSPHRASE));
-        assert!(debug.contains("Test SDF Network"));
+        assert!(debug.contains(TEST_PASSPHRASE), "{debug}");
+    }
+
+    /// The class names the two public passphrases verbatim and nothing else.
+    #[test]
+    fn passphrase_class_names_only_the_two_public_networks() {
+        assert_eq!(TESTNET_PASSPHRASE, "Test SDF Network ; September 2015");
+        assert_eq!(
+            MAINNET_PASSPHRASE,
+            "Public Global Stellar Network ; September 2015"
+        );
+        assert_eq!(
+            passphrase_class("Test SDF Network ; September 2015"),
+            "Test SDF Network ; September 2015"
+        );
+        assert_eq!(
+            passphrase_class("Public Global Stellar Network ; September 2015"),
+            "Public Global Stellar Network ; September 2015"
+        );
+        for other in [
+            "",
+            "Test SDF Future Network ; October 2022",
+            "Test SDF Network ; September 2015 ",
+            "aaaaaaaaaaaaaaa\u{20ac}x",
+        ] {
+            assert_eq!(passphrase_class(other), "<other network>", "{other:?}");
+        }
     }
 
     // ── HTTPS-only enforcement ────────────────────────────────────────────────
@@ -676,6 +733,133 @@ mod tests {
         );
     }
 
+    /// A refused challenge request reports the method and the status; the
+    /// answer body, the endpoint path, and the query stay out of the detail.
+    #[tokio::test]
+    async fn fetch_challenge_non_2xx_reports_method_and_status_only() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth/QPATHSECRET"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_string("BODYSECRET https://user:pw@leak.example/x \u{1b}[2J"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = Sep10Client::new_for_unit_test(TEST_PASSPHRASE).unwrap();
+        let endpoint = format!("{}/auth/QPATHSECRET?tok=QSECRET", mock_server.uri());
+        let err = client
+            .fetch_challenge(simple_request(&endpoint, Some("example.com")))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Sep10Error::HttpError { ref detail } if detail == "GET returned HTTP 503"
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A refused token request reports the method and the status only.
+    #[tokio::test]
+    async fn submit_non_2xx_reports_method_and_status_only() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/QPATHSECRET"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("BODYSECRET"))
+            .mount(&mock_server)
+            .await;
+
+        let client = Sep10Client::new_for_unit_test(TEST_PASSPHRASE).unwrap();
+        let endpoint = format!("{}/auth/QPATHSECRET?tok=QSECRET", mock_server.uri());
+        let err = client
+            .submit_signed_challenge(&endpoint, "FAKEXDR")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Sep10Error::HttpError { ref detail } if detail == "POST returned HTTP 401"
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The detail of an error that carries an HTTP status, which a closed
+    /// port cannot produce: the port was taken by another listener between
+    /// its release and the request.
+    fn answered_with_a_status(err: &Sep10Error) -> Option<&str> {
+        match err {
+            Sep10Error::HttpError { detail } if detail.contains(" returned HTTP ") => Some(detail),
+            _ => None,
+        }
+    }
+
+    /// A request to a closed loopback port reports the method and the
+    /// connection class; neither the endpoint's host, path, or query nor the
+    /// account parameter reaches the detail.
+    ///
+    /// The port is released before the request, so a server of a parallel
+    /// test can take it; an answer with an HTTP status then gets a fresh
+    /// port, at most three attempts in all.
+    #[tokio::test]
+    async fn transport_failure_detail_names_the_class_and_no_url() {
+        const ATTEMPTS: usize = 3;
+        let client = Sep10Client::new_for_unit_test(TEST_PASSPHRASE).unwrap();
+        let mut answered = Vec::new();
+        let mut refused = None;
+        for _ in 0..ATTEMPTS {
+            let port = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let endpoint = format!("http://127.0.0.1:{port}/auth/QPATHSECRET?tok=QSECRET");
+            let fetch = client
+                .fetch_challenge(simple_request(&endpoint, Some("example.com")))
+                .await
+                .unwrap_err();
+            let submit = client
+                .submit_signed_challenge(&endpoint, "FAKEXDR")
+                .await
+                .unwrap_err();
+            let statuses: Vec<String> = [&fetch, &submit]
+                .into_iter()
+                .filter_map(|err| answered_with_a_status(err).map(str::to_owned))
+                .collect();
+            if statuses.is_empty() {
+                refused = Some((fetch, submit));
+                break;
+            }
+            answered.extend(statuses);
+        }
+        let Some((fetch, submit)) = refused else {
+            panic!("every one of {ATTEMPTS} closed ports answered with a status: {answered:?}");
+        };
+
+        for (err, expected) in [
+            (fetch, "GET connection failed"),
+            (submit, "POST connection failed"),
+        ] {
+            let Sep10Error::HttpError { ref detail } = err else {
+                panic!("expected HttpError, got {err:?}");
+            };
+            assert_eq!(detail, expected);
+            let rendered = format!("{err} {err:?}");
+            for leaked in [
+                "QPATHSECRET",
+                "QSECRET",
+                "account=",
+                "GABC",
+                "127.0.0.1",
+                "/auth",
+            ] {
+                assert!(!rendered.contains(leaked), "{leaked}: {rendered}");
+            }
+        }
+    }
+
     // ── Malformed JSON response ───────────────────────────────────────────────
 
     #[tokio::test]
@@ -694,7 +878,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, Sep10Error::JwtParseError { .. }),
+            matches!(
+                err,
+                Sep10Error::JwtParseError { ref detail }
+                    if detail == "challenge answer is not SEP-10 JSON"
+            ),
             "expected JwtParseError for malformed JSON, got {err:?}"
         );
     }
@@ -715,8 +903,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, Sep10Error::JwtParseError { .. }),
+            matches!(
+                err,
+                Sep10Error::JwtParseError { ref detail }
+                    if detail == "token answer is not SEP-10 JSON"
+            ),
             "expected JwtParseError for missing token field, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_signed_challenge_rejects_an_empty_token() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"token":""}"#))
+            .mount(&mock_server)
+            .await;
+
+        let client = Sep10Client::new_for_unit_test(TEST_PASSPHRASE).unwrap();
+        let endpoint = format!("{}/auth", mock_server.uri());
+        let err = client
+            .submit_signed_challenge(&endpoint, "FAKEXDR")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Sep10Error::JwtParseError { ref detail }
+                    if detail == "token answer has an empty token"
+            ),
+            "{err:?}"
         );
     }
 
@@ -859,8 +1076,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, Sep10Error::InvalidServerSignature { .. }),
+            matches!(
+                err,
+                Sep10Error::InvalidServerSignature { ref detail }
+                    if detail == "server returned network passphrase \
+                                  'Public Global Stellar Network ; September 2015' but the \
+                                  client expects 'Test SDF Network ; September 2015'"
+            ),
             "expected InvalidServerSignature for passphrase mismatch, got {err:?}"
+        );
+    }
+
+    /// A server passphrase with a multi-byte character across byte 16 renders
+    /// as its class and does not panic.
+    #[tokio::test]
+    async fn a_multibyte_server_passphrase_renders_the_class() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "transaction": "bad_xdr",
+                "network_passphrase": "aaaaaaaaaaaaaaa\u{20ac}x",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = Sep10Client::new_for_unit_test(TEST_PASSPHRASE).unwrap();
+        let endpoint = format!("{}/auth", mock_server.uri());
+        let err = client
+            .fetch_challenge(simple_request(&endpoint, Some("example.com")))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Sep10Error::InvalidServerSignature { ref detail }
+                    if detail == "server returned network passphrase '<other network>' \
+                                  but the client expects 'Test SDF Network ; September 2015'"
+            ),
+            "{err:?}"
         );
     }
 

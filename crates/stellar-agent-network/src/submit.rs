@@ -53,7 +53,6 @@ use stellar_xdr::{
 use crate::client::{RpcEndpoint, StellarRpcClient, rpc_unreachable, unexpected_status};
 use crate::retry::{
     RetryPolicy, is_retryable_poll_error, is_retryable_send_error, retry_with_backoff,
-    truncate_error_display,
 };
 use crate::signing::verify_binding::{reject_v0_envelope, verify_signature_network_binding};
 use crate::submission_record::{SubmissionIntent, SubmissionOutcome, SubmissionRecorder};
@@ -393,13 +392,13 @@ where
             Ok(r) => r,
             Err(ref e) if is_retryable_poll_error(e) => {
                 // Treat transient transport error as NOT_FOUND: log at debug
-                // and poll again after the interval. Truncate error display to
-                // bound log volume from a hostile endpoint.
+                // and poll again after the interval. The scrub bounds the error
+                // display, which limits log volume from a hostile endpoint.
                 let url_authority = url.authority();
                 tracing::debug!(
                     tx_hash = %redacted,
                     rpc_url = %url_authority,
-                    error = %truncate_error_display(url, e),
+                    error = %url.scrub_display(e),
                     "submit_transaction_and_wait: transient getTransaction error \
                      (treating as NOT_FOUND, continuing poll)"
                 );
@@ -420,7 +419,7 @@ where
                     &SubmissionOutcome::TransportAfterSend {
                         error: format!(
                             "the confirmation poll could not reach the endpoint: {}",
-                            truncate_error_display(url, &e)
+                            url.scrub_display(&e)
                         ),
                     },
                 )
@@ -572,7 +571,7 @@ async fn handle_send_failure(
             intent,
             &SubmissionOutcome::Rejected {
                 code: mapped.code().to_owned(),
-                error: truncate_error_display(url, error),
+                error: url.scrub_display(error),
             },
         )
         .await;
@@ -584,7 +583,7 @@ async fn handle_send_failure(
         &SubmissionOutcome::TransportAfterSend {
             error: format!(
                 "the send did not complete and the endpoint's answer is unknown: {}",
-                truncate_error_display(url, error)
+                url.scrub_display(error)
             ),
         },
     )
@@ -1142,8 +1141,8 @@ mod tests {
             match map_send_error(&e, &RpcEndpoint::plain(ENDPOINT), 30) {
                 WalletError::Submission(SubmissionError::TxMalformed { detail }) => {
                     assert!(
-                        detail.starts_with(SEND_NO_RESPONSE_MARKER),
-                        "{case}: the detail keeps the message without a prefix: {detail}"
+                        detail.starts_with(&format!("\"{SEND_NO_RESPONSE_MARKER} ")),
+                        "{case}: the detail quotes the message without a prefix: {detail}"
                     );
                     assert_scrubbed(case, &detail);
                 }

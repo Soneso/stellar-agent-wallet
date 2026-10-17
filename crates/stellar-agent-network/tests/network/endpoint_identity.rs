@@ -150,16 +150,20 @@ async fn testnet_at_a_supported_version_yields_the_identity_with_a_bare_authorit
 }
 
 /// An endpoint serving another network than the expected one is refused with
-/// both passphrases.
+/// the declared passphrase and the class of the reported one; no rendering of
+/// the error holds the reported value.
 #[tokio::test]
 async fn another_network_than_expected_is_a_mismatch() {
     const OTHER: &str = "Some Other Network ; 2015";
     let server = serve_get_network(network(OTHER, 29)).await;
 
-    match identity(&server, TESTNET_PASSPHRASE).await {
+    let result = identity(&server, TESTNET_PASSPHRASE).await;
+    let debug = format!("{result:?}");
+    assert!(!debug.contains(OTHER), "{debug}");
+    match result {
         Err(WalletError::Network(NetworkError::EndpointNetworkMismatch { expected, server })) => {
             assert_eq!(expected, TESTNET_PASSPHRASE);
-            assert_eq!(server, OTHER);
+            assert_eq!(server.as_str(), "<other network>");
         }
         other => panic!("expected network.endpoint_network_mismatch; got {other:?}"),
     }
@@ -366,7 +370,7 @@ async fn a_mismatch_is_refused_before_the_protocol_rule() {
     match identity(&server, MAINNET_PASSPHRASE).await {
         Err(WalletError::Network(NetworkError::EndpointNetworkMismatch { expected, server })) => {
             assert_eq!(expected, MAINNET_PASSPHRASE);
-            assert_eq!(server, TESTNET_PASSPHRASE);
+            assert_eq!(server.as_str(), TESTNET_PASSPHRASE);
         }
         other => panic!("expected network.endpoint_network_mismatch; got {other:?}"),
     }
