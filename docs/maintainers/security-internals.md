@@ -356,7 +356,7 @@ Checks that need no request keep their place ahead of the endpoint check: argume
 
 Every refusal that follows a read comes after the endpoint check. Those are account and claim-entry errors, policy denial, approval refusal, rebuild divergence, the audit pre-flight, a malformed nonce, and the chain, fee, asset, and amount checks. The reservation reconcile and its settlement come after it too. A CLI `claim` or `trustline` refused at the early check carries no preview.
 
-Three clients are exempt because they read but never send. The MCP dispatch gate reconciles reservations on a client of its own. The oracle rebuild of the high-value cross-check uses the oracle endpoint. The SEP-29 secondary read uses the secondary endpoint. On the CLI, the reconcile runs on the primary client.
+Both the high-value oracle rebuild and MCP `stellar_pay` SEP-29 second read use `oracle_provider_url` and check its endpoint identity before reading. The oracle must serve the primary's chain. Identity and rebuilding share each cross-check attempt's deadline. The SEP-29 identity check shares the prepare action's deadline with the primary identity check. One client remains exempt: the MCP dispatch gate reconciles reservations on a client of its own. On the CLI, the reconcile runs on the primary client.
 
 An MCP commit's early check refuses without consuming the nonce. The commit reads the clock for the nonce's expiry after the check, so the check's time counts toward that expiry. A refusal by the submit layer's own check comes after the nonce is consumed.
 

@@ -109,9 +109,10 @@ impl ProfileAccessError {
     /// The wire code for this failure on the surfaces that render a raw code.
     ///
     /// Refused overlays, implicit mainnet selections, a mainnet profile
-    /// without `rpc_url`, and an endpoint URL that breaks the endpoint rule
-    /// keep the codes [`ProfileLoadError::to_validation_error`] assigns them,
-    /// so the raw and typed routes agree.
+    /// without `rpc_url`, an invalid provider attestation, and an endpoint URL
+    /// that breaks the endpoint rule keep their typed codes.
+    /// These codes come from [`ProfileLoadError::to_validation_error`], so the
+    /// raw and typed routes agree.
     /// Other load failures keep `profile.load_failed`.
     /// A name mismatch reports `profile.name_mismatch`.
     ///
@@ -130,6 +131,9 @@ impl ProfileAccessError {
             }
             Self::Load(profile_loader::ProfileLoadError::InvalidEndpointUrl { .. }) => {
                 "validation.config_invalid"
+            }
+            Self::Load(profile_loader::ProfileLoadError::InvalidProviderAttestation { .. }) => {
+                "validation.provider_attestation_invalid"
             }
             Self::Load(_) => "profile.load_failed",
             Self::NameMismatch(_) => PROFILE_NAME_MISMATCH_CODE,
@@ -178,8 +182,9 @@ impl ProfileAccessError {
     ///
     /// These refusals reach the caller of an optional read, so a profile whose
     /// selection, overlay, or endpoint configuration is wrong never reads as
-    /// absent or neutral. They include a mainnet profile without `rpc_url` and
-    /// an endpoint URL that breaks the endpoint rule.
+    /// absent or neutral. They include a mainnet profile without `rpc_url`,
+    /// an endpoint URL that breaks the endpoint rule, and an invalid provider
+    /// attestation.
     pub(crate) fn requires_refusal(&self) -> bool {
         matches!(
             self,
@@ -190,6 +195,7 @@ impl ProfileAccessError {
                         | profile_loader::ProfileLoadError::MainnetRequiresExplicitProfile { .. }
                         | profile_loader::ProfileLoadError::MainnetRpcUrlRequired { .. }
                         | profile_loader::ProfileLoadError::InvalidEndpointUrl { .. }
+                        | profile_loader::ProfileLoadError::InvalidProviderAttestation { .. }
                 )
         )
     }
@@ -301,9 +307,11 @@ fn reconcile(
 /// Some verbs render a raw code instead: `pay`, `claim`, `accounts create`,
 /// `accounts deploy-c`, `trade`, `vault`, `trustline`, and the four
 /// `smart-account deploy-*` commands. They share the Load half only for the
-/// refusals [`ProfileAccessError::code`] keeps typed: a refused overlay, an
-/// implicit mainnet selection, a mainnet profile without `rpc_url`, and an
-/// endpoint URL that breaks the endpoint rule. Every other loader failure
+/// refusals [`ProfileAccessError::code`] keeps typed.
+/// These are a refused overlay, an implicit mainnet selection, a mainnet
+/// profile without `rpc_url`, an endpoint URL that breaks the endpoint rule,
+/// and an invalid provider attestation.
+/// Every other loader failure
 /// collapses to `profile.load_failed` (`trustline` to
 /// `trustline.profile_load_failed`). The mismatch code is uniform across both
 /// paths.
@@ -436,9 +444,21 @@ where
 /// profile read must preserve.
 #[cfg(test)]
 pub(crate) fn protected_load_errors_for_test() -> Vec<ProfileAccessError> {
-    use stellar_agent_core::profile::schema::{EndpointUrlError, EndpointUrlRejection};
+    use stellar_agent_core::profile::schema::{
+        EndpointUrlError, EndpointUrlRejection, ProviderAttestationError,
+        ProviderAttestationRejection,
+    };
 
     vec![
+        ProfileAccessError::Load(
+            profile_loader::ProfileLoadError::InvalidProviderAttestation {
+                name: "mainnet".to_owned(),
+                source: ProviderAttestationError {
+                    field: "providers.oracle",
+                    reason: ProviderAttestationRejection::InvalidShape,
+                },
+            },
+        ),
         ProfileAccessError::Load(profile_loader::ProfileLoadError::NonOverlayableField {
             field: "chain_id",
         }),
@@ -502,6 +522,17 @@ mod tests {
     fn protected_load_errors_require_refusal() {
         let protected = protected_load_errors_for_test();
         for (label, present) in [
+            (
+                "InvalidProviderAttestation",
+                protected.iter().any(|error| {
+                    matches!(
+                        error,
+                        ProfileAccessError::Load(
+                            profile_loader::ProfileLoadError::InvalidProviderAttestation { .. }
+                        )
+                    )
+                }),
+            ),
             (
                 "MainnetRpcUrlRequired",
                 protected.iter().any(|error| {

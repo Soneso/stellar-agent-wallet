@@ -1772,3 +1772,96 @@ fn multicall_registry_error_precedes_writer_and_signer() {
     assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
     assert_eq!(run.error_code(), "io.multicall_registry_load");
 }
+
+#[test]
+fn provider_records_show_and_refuse_overlays() {
+    use stellar_agent_core::profile::schema::ProviderRecord;
+    for mainnet in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let builder = if mainnet {
+            Profile::builder_mainnet_named(
+                "providers",
+                "https://primary.example",
+                "s",
+                "a",
+                "n",
+                "a",
+            )
+        } else {
+            Profile::builder_testnet_named("providers", "s", "a", "n", "a")
+        };
+        let profile = builder
+            .secondary_rpc_url("https://secondary.example".to_owned())
+            .secondary_provider(ProviderRecord::new(
+                "OPERATOR_SENTINEL",
+                "SECONDARY.example.",
+                true,
+            ))
+            .audit_log_path(home.path().join("audit.jsonl"))
+            .with_noop_engine()
+            .build();
+        save_new_to_dir("providers", &profile, &home.path().join("profiles")).unwrap();
+        let args = ["profile", "show", "providers"];
+        let run = run_cli(home.path(), None, &args);
+        assert_eq!(run.code, 0, "{} {}", run.stdout, run.stderr);
+        assert_eq!(
+            run.json()["data"]["providers"]["secondary"]["operator"],
+            "OPERATOR_SENTINEL"
+        );
+        assert_eq!(
+            run.json()["data"]["providers"]["secondary"]["host"],
+            "SECONDARY.example."
+        );
+        assert_eq!(
+            run.json()["data"]["providers"]["secondary"]["independent_of_primary"],
+            true
+        );
+        for value in ["{}", "malformed", "{secondary={host=changed.example}}"] {
+            let run = run_cli_with_env(
+                home.path(),
+                None,
+                &args,
+                &[("STELLAR_AGENT_PROVIDERS", value)],
+            );
+            assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+            assert_eq!(run.json()["error"]["code"], "profile.non_overlayable_field");
+            assert!(run.stdout.contains("providers"));
+        }
+    }
+}
+
+#[test]
+fn testnet_environment_url_overlay_revalidates_provider_host() {
+    use stellar_agent_core::profile::schema::ProviderRecord;
+    let home = tempfile::tempdir().unwrap();
+    let profile = Profile::builder_testnet_named("providers", "s", "a", "n", "a")
+        .secondary_rpc_url("https://secondary.example".to_owned())
+        .secondary_provider(ProviderRecord::new(
+            "Independent organization",
+            "secondary.example",
+            true,
+        ))
+        .audit_log_path(home.path().join("audit.jsonl"))
+        .with_noop_engine()
+        .build();
+    save_new_to_dir("providers", &profile, &home.path().join("profiles")).unwrap();
+    let run = run_cli_with_env(
+        home.path(),
+        None,
+        &["profile", "show", "providers"],
+        &[("STELLAR_AGENT_SECONDARY_RPC_URL", "https://changed.example")],
+    );
+    assert_eq!(run.code, 1, "{} {}", run.stdout, run.stderr);
+    let json = run.json();
+    assert_eq!(
+        json["error"]["code"],
+        "validation.provider_attestation_invalid"
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`providers.secondary.host` must equal the host of `secondary_rpc_url`"),
+        "{json}"
+    );
+}

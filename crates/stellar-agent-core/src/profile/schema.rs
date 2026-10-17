@@ -662,9 +662,10 @@ pub struct Profile {
     /// reading this field directly.
     ///
     /// The floor ([`MINIMUM_FLOOR`]) is 1 000 XLM (10^10 stroops)
-    /// and cannot be configured below this value.  Transactions at or above
-    /// the effective threshold trigger the high-value independent-RPC
-    /// cross-check when `oracle_provider_url` is configured.
+    /// and cannot be configured below this value. Native-XLM payments and
+    /// sponsored account creations at or above the effective threshold trigger
+    /// the MCP cross-check when `oracle_provider_url` is configured.
+    /// Mainnet requires the matching provider attestation.
     #[serde(alias = "usd_threshold")]
     pub cross_check_threshold_stroops: u64,
 
@@ -758,25 +759,21 @@ pub struct Profile {
     /// `rotate-counterparty-key`.
     pub counterparty_cache_key_id: KeyringEntryRef,
 
-    /// Optional independent RPC endpoint URL for high-value cross-check.
+    /// Oracle RPC endpoint for high-value native-XLM rebuilds and MCP SEP-29 reads.
+    /// Mainnet requires a matching `providers.oracle` record asserting independent
+    /// administration and a host distinct from the primary.
+    /// An absent URL skips these second-endpoint checks.
+    /// A high-value rebuild mismatch reports `simulation.divergence`.
     ///
-    /// Used by the commit path when the transaction value exceeds
-    /// `cross_check_threshold_stroops` to re-simulate against a second
-    /// independent RPC endpoint.  Mismatch surfaces as
-    /// `simulation.divergence`.
-    ///
-    /// When this field is `None`, the high-value cross-check is skipped.
-    /// Operators MUST set this field before enabling `policy.engine = "v1"` for
-    /// mainnet high-value flows.
-    ///
-    /// Default: `None` (cross-check disabled).  In TOML, omit the field when
-    /// unset; when configured, use `oracle_provider_url = "https://example.org"`.
-    ///
-    /// The loader checks a configured value with [`check_endpoint_url`].  On
-    /// mainnet the value is read from the profile file only: an environment
-    /// or programmatic overlay naming this field is refused.
+    /// The loader checks a configured value with [`check_endpoint_url`].
+    /// Mainnet reads it from the profile file only. Debug redacts the URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle_provider_url: Option<Url>,
+
+    /// File-only provider attestations for the optional RPC endpoints.
+    /// Operator and host are public metadata and must contain no credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<Providers>,
 
     /// Policy-engine selection and configuration.
     ///
@@ -832,27 +829,16 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_rule_max_horizon_ledgers: Option<u32>,
 
-    /// Secondary Soroban RPC endpoint URL for multicall cross-RPC trust-anchor check.
-    ///
-    /// Required when a multicall router is registered for the profile's network.
-    /// The profile loader validates that this field is set when a multicall registry
-    /// entry exists for `network_passphrase` via
+    /// Secondary endpoint for cross-RPC trust-anchor checks.
+    /// Required when the loader's multicall registry hook finds an entry for
+    /// the profile's network; absence returns
     /// [`crate::profile::loader::ProfileLoadError::MulticallRequiresSecondaryRpc`].
     ///
-    /// # Security
-    ///
-    /// This URL is used for the cross-RPC 4-way equality check.  It MUST point
-    /// to an independent Soroban RPC node — not the same node as `rpc_url` —
-    /// so that a compromised primary RPC cannot forge the trust-anchor equality.
-    ///
-    /// The loader checks a configured value with [`check_endpoint_url`].  On
-    /// mainnet the value is read from the profile file only.
-    ///
-    /// # Debug redaction
-    ///
-    /// The `Debug` implementation for `Profile` redacts this field to
-    /// `"[redacted]"` to prevent accidental log emission of RPC credentials
-    /// that may be embedded in the URL.
+    /// Mainnet requires `providers.secondary`, its independence assertion,
+    /// and a host distinct from the primary.
+    /// Host difference is a naming convention; the operator attests separate administration.
+    /// The loader applies [`check_endpoint_url`] and reads mainnet URLs from the file only.
+    /// Debug redacts the URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_rpc_url: Option<String>,
 
@@ -982,6 +968,9 @@ pub struct RedactedProfile {
     /// Scheme, host, and port of [`Profile::oracle_provider_url`], or `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oracle_provider_url: Option<String>,
+    /// Operator-facing value of [`Profile::providers`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub providers: Option<Providers>,
     /// Operator-facing value of [`Profile::policy`].
     pub policy: PolicyConfig,
     /// Operator-facing value of [`Profile::wallet`].
@@ -1348,6 +1337,7 @@ impl std::fmt::Debug for Profile {
                 "oracle_provider_url",
                 &self.oracle_provider_url.as_ref().map(|_| "[redacted]"),
             )
+            .field("providers", &self.providers)
             .field("policy", &self.policy)
             .field("wallet", &self.wallet)
             .field(
@@ -1398,6 +1388,7 @@ impl Profile {
             attestation_key_id,
             counterparty_cache_key_id,
             oracle_provider_url,
+            providers,
             policy,
             wallet,
             smart_account_max_context_rule_scan_id,
@@ -1430,6 +1421,7 @@ impl Profile {
             oracle_provider_url: oracle_provider_url
                 .as_ref()
                 .map(|url| crate::redact::redact_url_authority(url.as_str())),
+            providers: providers.clone(),
             policy: policy.clone(),
             wallet: wallet.clone(),
             smart_account_max_context_rule_scan_id: *smart_account_max_context_rule_scan_id,
@@ -1591,6 +1583,7 @@ impl Profile {
                 &derived_name,
             ),
             oracle_provider_url: None,
+            providers: None,
             policy: PolicyConfig::default(),
             wallet: WalletConfig::default(),
             smart_account_max_context_rule_scan_id: None,
@@ -1672,6 +1665,7 @@ impl Profile {
                 &derived_name,
             ),
             oracle_provider_url: None,
+            providers: None,
             policy: PolicyConfig::default(),
             wallet: WalletConfig::default(),
             smart_account_max_context_rule_scan_id: None,
@@ -1768,6 +1762,148 @@ pub fn check_endpoint_url(
     Ok(url)
 }
 
+/// Returns the URL crate's host with exactly one trailing dot removed.
+/// Invalid URLs, hostless URLs, and empty hosts have no provider host.
+pub(crate) fn provider_host(raw: &str) -> Option<String> {
+    let url = Url::parse(raw).ok()?;
+    let host = url.host_str()?;
+    let host = host.strip_suffix('.').unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_owned())
+}
+
+/// Compares normalized URL hosts, ignoring all other URL components.
+/// Subdomains remain distinct. Invalid or hostless URLs never compare equal.
+/// This naming convention does not establish independent administration.
+#[must_use]
+pub fn same_provider_host(left: &str, right: &str) -> bool {
+    matches!(
+        (provider_host(left), provider_host(right)),
+        (Some(left), Some(right)) if left == right
+    )
+}
+
+/// An operator's statement about the organization administering an endpoint.
+/// These public metadata fields must contain no credentials.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ProviderRecord {
+    /// Organization administering the endpoint.
+    pub operator: String,
+    /// Endpoint host, normalized for comparison during profile loading.
+    pub host: String,
+    /// Whether the operator attests separate administration from the primary.
+    pub independent_of_primary: bool,
+}
+
+impl ProviderRecord {
+    /// Constructs a provider statement. The profile loader validates it.
+    #[must_use]
+    pub fn new(
+        operator: impl Into<String>,
+        host: impl Into<String>,
+        independent_of_primary: bool,
+    ) -> Self {
+        Self {
+            operator: operator.into(),
+            host: host.into(),
+            independent_of_primary,
+        }
+    }
+}
+
+/// File-only attestations for optional RPC roles.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Providers {
+    /// Attestation for `secondary_rpc_url`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<ProviderRecord>,
+    /// Attestation for `oracle_provider_url`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle: Option<ProviderRecord>,
+}
+
+/// A refused provider field and its repair, containing no rejected values.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("profile field `{field}` {reason}")]
+pub struct ProviderAttestationError {
+    /// Static name of the refused field.
+    pub field: &'static str,
+    /// The failed check and its repair.
+    pub reason: ProviderAttestationRejection,
+}
+
+/// Provider validation failures containing only fixed field names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProviderAttestationRejection {
+    /// The container is malformed or holds an unsupported role.
+    #[error(
+        "must hold only the `secondary` and `oracle` tables; remove any other key \
+         under `providers` in the profile file"
+    )]
+    InvalidContainer,
+    /// A role record has unknown fields or incorrect field types.
+    #[error(
+        "has an invalid provider record; correct the table and its operator, host, \
+         and independent_of_primary fields in the profile file"
+    )]
+    InvalidShape,
+    /// The primary role is unsupported.
+    #[error("is not a supported provider role; remove this table from the profile file")]
+    PrimaryReserved,
+    /// A record has no corresponding endpoint.
+    #[error(
+        "has no configured endpoint; set `{url_field}` or remove this provider table \
+         in the profile file"
+    )]
+    UrlRequired {
+        /// Static name of the endpoint field.
+        url_field: &'static str,
+    },
+    /// A mainnet endpoint has no corresponding record.
+    #[error(
+        "is required on mainnet while `{url_field}` is set; add this table with \
+         operator, host, and independent_of_primary = true in the profile file"
+    )]
+    MissingRecord {
+        /// Static name of the endpoint field.
+        url_field: &'static str,
+    },
+    /// The operator is absent or whitespace-only.
+    #[error(
+        "must name the organization that runs the endpoint; set a non-empty operator \
+         in the profile file"
+    )]
+    EmptyOperator,
+    /// The record's host differs from its endpoint's host.
+    #[error(
+        "must equal the host of `{url_field}`; correct the host in the profile file, \
+         or the endpoint URL where it is set"
+    )]
+    HostMismatch {
+        /// Static name of the endpoint field.
+        url_field: &'static str,
+    },
+    /// A mainnet record does not attest independence.
+    #[error(
+        "must be true on mainnet; confirm separate administration from the primary, \
+         then set this field in the profile file"
+    )]
+    IndependenceRequired,
+    /// An asserted independent role shares the primary host.
+    #[error(
+        "has the same provider host as `rpc_url`; choose an independently \
+         administered endpoint on another host and update `{record_field}` in the profile file"
+    )]
+    SamePrimaryHost {
+        /// Static name of the provider table.
+        record_field: &'static str,
+    },
+}
+
 /// A profile endpoint field that breaks the endpoint rule of
 /// [`check_endpoint_url`].
 ///
@@ -1834,6 +1970,7 @@ pub struct ProfileBuilder {
     counterparty_cache_key_id: KeyringEntryRef,
     policy_window_state_key_id: KeyringEntryRef,
     oracle_provider_url: Option<Url>,
+    providers: Option<Providers>,
     policy: PolicyConfig,
     wallet: WalletConfig,
     smart_account_max_context_rule_scan_id: Option<u32>,
@@ -2034,6 +2171,26 @@ impl ProfileBuilder {
         self
     }
 
+    /// Sets or clears the secondary provider attestation, preserving the other role.
+    pub fn secondary_provider(mut self, record: impl Into<Option<ProviderRecord>>) -> Self {
+        let providers = self.providers.get_or_insert_with(Providers::default);
+        providers.secondary = record.into();
+        if providers.secondary.is_none() && providers.oracle.is_none() {
+            self.providers = None;
+        }
+        self
+    }
+
+    /// Sets or clears the oracle provider attestation, preserving the other role.
+    pub fn oracle_provider(mut self, record: impl Into<Option<ProviderRecord>>) -> Self {
+        let providers = self.providers.get_or_insert_with(Providers::default);
+        providers.oracle = record.into();
+        if providers.secondary.is_none() && providers.oracle.is_none() {
+            self.providers = None;
+        }
+        self
+    }
+
     /// Builds the [`Profile`], using the default audit-log path if not set.
     ///
     /// If `audit_log_path` was not supplied via [`ProfileBuilder::audit_log_path`],
@@ -2067,6 +2224,7 @@ impl ProfileBuilder {
             attestation_key_id: self.attestation_key_id,
             counterparty_cache_key_id: self.counterparty_cache_key_id,
             oracle_provider_url: self.oracle_provider_url,
+            providers: self.providers,
             policy: self.policy,
             wallet: self.wallet,
             smart_account_max_context_rule_scan_id: self.smart_account_max_context_rule_scan_id,
@@ -3963,5 +4121,202 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), constructors.len() * names.len());
+    }
+
+    #[test]
+    fn provider_host_idna_and_case() {
+        for url in ["https://BÜCHER.Example", "http://XN--BCHER-KVA.Example"] {
+            assert_eq!(provider_host(url).as_deref(), Some("xn--bcher-kva.example"));
+        }
+    }
+
+    #[test]
+    fn provider_host_removes_one_trailing_dot() {
+        assert_eq!(
+            provider_host("https://rpc.example.").as_deref(),
+            Some("rpc.example")
+        );
+        assert_eq!(
+            provider_host("https://rpc.example..").as_deref(),
+            Some("rpc.example.")
+        );
+    }
+
+    #[test]
+    fn provider_host_canonicalizes_ip_text() {
+        for url in ["https://127.1", "http://127.0.0.1"] {
+            assert_eq!(provider_host(url).as_deref(), Some("127.0.0.1"));
+        }
+        for url in ["https://[2001:0DB8:0:0:0:0:0:1]", "http://[2001:db8::1]"] {
+            assert_eq!(provider_host(url).as_deref(), Some("[2001:db8::1]"));
+        }
+    }
+
+    #[test]
+    fn same_provider_keeps_subdomains_distinct() {
+        for other in [
+            "https://example.com",
+            "https://b.example.com",
+            "https://child.a.example.com",
+        ] {
+            assert!(!same_provider_host("https://a.example.com", other));
+        }
+    }
+
+    #[test]
+    fn same_provider_ignores_non_host_components() {
+        for other in [
+            "http://rpc.example",
+            "https://rpc.example:443",
+            "https://rpc.example:8443",
+            "https://user:pass@rpc.example",
+            "https://rpc.example/other",
+            "https://rpc.example?key=other",
+            "https://rpc.example#fragment",
+        ] {
+            assert!(same_provider_host("https://rpc.example", other), "{other}");
+        }
+    }
+
+    #[test]
+    fn same_provider_requires_two_hosts() {
+        for invalid in [
+            "not a URL",
+            "mailto:operator@example.com",
+            "file:///tmp/path",
+            "https://.",
+        ] {
+            assert_eq!(provider_host(invalid), None, "{invalid}");
+            assert!(!same_provider_host(invalid, invalid));
+            assert!(!same_provider_host(invalid, "https://rpc.example"));
+            assert!(!same_provider_host("https://rpc.example", invalid));
+        }
+    }
+
+    #[test]
+    fn provider_records_round_trip_and_omit_unset_roles() {
+        let secondary = ProviderRecord::new("Secondary operator", "secondary.example", true);
+        let oracle = ProviderRecord::new("Oracle operator", "oracle.example", false);
+        let profile = Profile::builder_testnet("s", "a", "n", "a")
+            .secondary_provider(secondary.clone())
+            .oracle_provider(oracle.clone())
+            .build();
+        let toml = toml::to_string(&profile).unwrap();
+        let decoded: Profile = toml::from_str(&toml).unwrap();
+        assert_eq!(
+            decoded.providers.as_ref().unwrap().secondary,
+            Some(secondary)
+        );
+        assert_eq!(decoded.providers.as_ref().unwrap().oracle, Some(oracle));
+        let bare = Profile::builder_testnet("s", "a", "n", "a").build();
+        let toml = toml::to_string(&bare).unwrap();
+        assert!(!toml.contains("providers"));
+        assert!(
+            toml::from_str::<Profile>(&toml)
+                .unwrap()
+                .providers
+                .is_none()
+        );
+        let single = Profile::builder_testnet("s", "a", "n", "a")
+            .oracle_provider(ProviderRecord::default())
+            .build();
+        let toml = toml::to_string(&single).unwrap();
+        assert!(toml.contains("[providers.oracle]"));
+        assert!(!toml.contains("[providers.secondary]"));
+    }
+
+    #[test]
+    fn provider_builder_setters_preserve_and_clear_roles() {
+        for builder in [
+            Profile::builder_testnet("s", "a", "n", "a"),
+            Profile::builder_mainnet("https://primary.example", "s", "a", "n", "a"),
+        ] {
+            let record = ProviderRecord::new("Operator", "rpc.example", true);
+            let profile = builder
+                .secondary_provider(record.clone())
+                .oracle_provider(record.clone())
+                .build();
+            let providers = profile.providers.unwrap();
+            assert_eq!(providers.secondary, Some(record.clone()));
+            assert_eq!(providers.oracle, Some(record));
+        }
+        for builder in [
+            Profile::builder_testnet("s", "a", "n", "a"),
+            Profile::builder_mainnet("https://primary.example", "s", "a", "n", "a"),
+        ] {
+            let profile = builder
+                .secondary_provider(ProviderRecord::default())
+                .oracle_provider(ProviderRecord::default())
+                .secondary_provider(None)
+                .oracle_provider(None)
+                .build();
+            assert!(profile.providers.is_none());
+        }
+        let record = ProviderRecord::new("Operator", "rpc.example", true);
+        let secondary_only = Profile::builder_testnet("s", "a", "n", "a")
+            .secondary_provider(record.clone())
+            .oracle_provider(record.clone())
+            .oracle_provider(None)
+            .build();
+        assert_eq!(
+            secondary_only.providers.unwrap().secondary,
+            Some(record.clone())
+        );
+        let oracle_only = Profile::builder_mainnet("https://primary.example", "s", "a", "n", "a")
+            .oracle_provider(record.clone())
+            .secondary_provider(record.clone())
+            .secondary_provider(None)
+            .build();
+        assert_eq!(oracle_only.providers.unwrap().oracle, Some(record));
+    }
+
+    #[test]
+    fn provider_metadata_is_visible_in_show_and_debug() {
+        let profile = Profile::builder_testnet("s", "a", "n", "a")
+            .rpc_url(concat!(
+                "https://USER_SECRET:PASS_SECRET@primary.example/",
+                "PATH_SECRET?QUERY_SECRET#FRAGMENT_SECRET",
+            ))
+            .secondary_provider(ProviderRecord::new(
+                "OPERATOR_SENTINEL",
+                "secondary.example",
+                false,
+            ))
+            .oracle_provider(ProviderRecord::new(
+                "ORACLE_OPERATOR_SENTINEL",
+                "oracle.example",
+                true,
+            ))
+            .build();
+        let providers = profile.providers.as_ref().unwrap();
+        for (rendered, flag) in [
+            (
+                serde_json::to_string(&profile.redacted()).unwrap(),
+                r#""independent_of_primary":false"#,
+            ),
+            (format!("{profile:?}"), "independent_of_primary: false"),
+            (
+                format!("{:?}", profile.redacted()),
+                "independent_of_primary: false",
+            ),
+            (format!("{providers:?}"), "independent_of_primary: false"),
+            (
+                format!("{:?}", providers.secondary.as_ref().unwrap()),
+                "independent_of_primary: false",
+            ),
+        ] {
+            assert!(rendered.contains("OPERATOR_SENTINEL"), "{rendered}");
+            assert!(rendered.contains("independent_of_primary"), "{rendered}");
+            assert!(rendered.contains(flag), "{rendered}");
+            for secret in [
+                "USER_SECRET",
+                "PASS_SECRET",
+                "PATH_SECRET",
+                "QUERY_SECRET",
+                "FRAGMENT_SECRET",
+            ] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+        }
     }
 }

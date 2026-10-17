@@ -722,3 +722,23 @@ fn protected_environment_overlay_reports_wire_code() {
         "{stderr}"
     );
 }
+
+#[test]
+fn provider_attestation_refusal_reports_wire_code() {
+    let home = ProfileHome::new();
+    let file = noop_profile_toml("mainnet", "stellar:mainnet", "https://primary.example").replacen(
+        "version = 2",
+        "version = 2\noracle_provider_url = 'https://oracle.example'",
+        1,
+    );
+    home.write_profile("mainnet", &file);
+    let stderr = assert_refused_with(
+        &run_with_initialize(home.command(&["--profile", "mainnet"])),
+        1,
+    );
+    assert!(
+        stderr.contains("validation.provider_attestation_invalid"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("providers.oracle"), "{stderr}");
+}

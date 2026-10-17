@@ -398,6 +398,55 @@ fn resolve_payment_amount(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// WalletServer — SEP-29 oracle helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SEP29_DEADLINE_EXHAUSTED_DETAIL: &str =
+    "SEP-29 oracle_provider_url endpoint identity failed: action deadline exhausted";
+
+impl WalletServer {
+    /// Checks the oracle's identity within the payment's remaining action budget.
+    ///
+    /// Returns `None` when no oracle URL is configured, the checked client on success,
+    /// and the refusal result on failure.
+    async fn sep29_oracle_client(
+        &self,
+        pay_deadline: tokio::time::Instant,
+    ) -> Result<Option<StellarRpcClient>, CallToolResult> {
+        let Some(url) = self.profile.oracle_provider_url.as_ref() else {
+            return Ok(None);
+        };
+        let refuse = |context| {
+            crate::tools::common::endpoint_refusal_result(
+                &stellar_agent_core::error::NetworkError::RpcDivergence { context }.into(),
+            )
+        };
+        if tokio::time::Instant::now() >= pay_deadline {
+            return Err(refuse(SEP29_DEADLINE_EXHAUSTED_DETAIL.to_owned()));
+        }
+        let oracle = match StellarRpcClient::new(url.as_str()) {
+            Ok(client) => client,
+            Err(err) => {
+                return Err(refuse(redact_rpc_error_detail(
+                    "SEP-29 oracle_provider_url client construction failed",
+                    &err,
+                )));
+            }
+        };
+        if let Err(err) = oracle
+            .endpoint_identity(self.context.network_passphrase(), pay_deadline)
+            .await
+        {
+            return Err(refuse(redact_rpc_error_detail(
+                "SEP-29 oracle_provider_url endpoint identity failed",
+                &err,
+            )));
+        }
+        Ok(Some(oracle))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // WalletServer — approval-spine helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -569,6 +618,9 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<StellarPayArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Starting at entry makes both identity checks consume the same action budget.
+        let pay_deadline: tokio::time::Instant =
+            tokio::time::Instant::now() + submit_timeout(&self.profile);
         // ── Dispatch gate ─────────────────────────────────────────────────────
         let payment_amount =
             resolve_payment_amount(args.amount.clone(), args.amount_in_stroops.clone())?;
@@ -634,12 +686,9 @@ impl WalletServer {
         // on this client. The values read here feed the envelope the commit
         // signs and the policy gate, so an endpoint serving another network
         // answers none of them.
-        if let Err(e) = crate::tools::common::probe_endpoint_network(
-            &client,
-            &self.context,
-            crate::tools::common::submit_timeout(&self.profile),
-        )
-        .await
+        if let Err(e) = client
+            .endpoint_identity(self.context.network_passphrase(), pay_deadline)
+            .await
         {
             return Ok(crate::tools::common::endpoint_refusal_result(&e));
         }
@@ -840,17 +889,16 @@ impl WalletServer {
         // requirement without having to attempt a commit.  The commit step
         // does NOT re-check SEP-29 (see `StellarPayCommitArgs` rustdoc).
         //
-        // Cross-RPC: when `profile.oracle_provider_url` is set, both RPCs are
-        // consulted and a mismatch returns `network.rpc_divergence`.
-        // If the secondary RPC URL is the same as the primary (degraded profile),
-        // a duplicate StellarRpcClient is constructed here; that is harmless
-        // (both see the same ledger state) and consistent with how
-        // `high_value_cross_check` handles the same condition.
-        let sep29_secondary_client = self
-            .profile
-            .oracle_provider_url
-            .as_ref()
-            .and_then(|u| StellarRpcClient::new(u.as_str()).ok());
+        // The checked oracle supplies the second SEP-29 read. Testnet permits
+        // both roles on one host when no record asserts independence.
+        let sep29_secondary_client = if !memo_present {
+            match self.sep29_oracle_client(pay_deadline).await {
+                Ok(client) => client,
+                Err(refusal) => return Ok(refusal),
+            }
+        } else {
+            None
+        };
         if let Err(err) = check_memo_required(
             &client,
             sep29_secondary_client.as_ref(),
@@ -1550,7 +1598,7 @@ impl WalletServer {
 
             if let Err(result) = high_value_cross_check(
                 &self.profile,
-                &self.context.rpc_url,
+                &self.context,
                 &rebuilt_envelope_xdr,
                 &args.source,
                 asset_is_native,

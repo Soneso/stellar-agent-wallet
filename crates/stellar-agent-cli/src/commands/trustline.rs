@@ -242,7 +242,8 @@ where
     // A load failure keeps this verb's own `trustline.profile_load_failed`
     // code. The protected refusals keep their typed codes: a protected
     // overlay, an implicit mainnet selection, a mainnet profile without
-    // `rpc_url`, and an endpoint URL that breaks the endpoint rule.
+    // `rpc_url`, an endpoint URL that breaks the endpoint rule, or an invalid
+    // provider attestation.
     // A name mismatch reports the shared `profile.name_mismatch`, the same
     // code every other CLI surface emits for it.
     let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
