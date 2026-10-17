@@ -23,7 +23,9 @@ use stellar_agent_core::policy::{
     ApprovalRequest, BuildRegistryError, Decision, DenyReason, McpToolRegistration, ToolDescriptor,
 };
 use stellar_agent_core::profile::caip2::validate_chain_id_matches_profile;
-use stellar_agent_core::profile::schema::{Profile, same_provider_host};
+use stellar_agent_core::profile::schema::{
+    Profile, ProviderRole, same_provider_host, same_provider_operator,
+};
 use stellar_agent_network::NetworkContext;
 use stellar_agent_nonce::{
     Nonce, NonceError, NonceMint, NonceVerifyHmacOnlyRequest, ReplayWindow, ToolCatalogue,
@@ -848,10 +850,33 @@ fn redact_deny_reason(reason: &DenyReason) -> DenyReason {
 /// authority-only RPC-URL redactor so no scheme/userinfo/path/query/fragment of
 /// the configured RPC endpoint leaks into an MCP wire error.
 ///
-/// Used at the `StellarRpcClient::new` construction-failure sites across the MCP
-/// tools (RPC endpoint redaction).
+/// Used at the RPC client construction-failure sites across the MCP tools
+/// (RPC endpoint redaction).
 pub(crate) fn redact_rpc_error_detail(prefix: &str, err: &impl std::fmt::Display) -> String {
     stellar_agent_network::redact_rpc_error(&format!("{prefix}: {err}"))
+}
+
+/// Maps a failed RPC client construction to a tool outcome.
+///
+/// A credential failure (a missing or unreadable keyring entry, a stored
+/// value the wallet refuses, or a credential the client cannot send) is an
+/// error tool result with its own code, such as `auth.keyring_not_found`,
+/// because only a configuration change fixes it. A transport refusal of the
+/// URL stays the protocol-level `rpc_client_error`.
+///
+/// # Errors
+///
+/// Returns the `rpc_client_error` internal error for a transport refusal.
+pub(crate) fn rpc_client_failure(
+    err: &stellar_agent_core::error::WalletError,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    if stellar_agent_network::is_credential_error(err) {
+        return Ok(endpoint_refusal_result(err));
+    }
+    Err(rmcp::ErrorData::internal_error(
+        redact_rpc_error_detail("rpc_client_error", err),
+        None,
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1303,7 +1328,7 @@ impl WalletServer {
             tracing::debug!("window reconcile: system clock unavailable; reservations stand");
             return;
         };
-        let Ok(client) = stellar_agent_network::StellarRpcClient::new(&self.context.rpc_url) else {
+        let Ok(client) = self.context.primary_client() else {
             return;
         };
         let profile_name = self.profile_name_for_approval();
@@ -2260,8 +2285,6 @@ where
     F: Fn(stellar_agent_network::StellarRpcClient) -> Fut,
     Fut: std::future::Future<Output = Result<String, ErrorData>>,
 {
-    use stellar_agent_network::StellarRpcClient;
-
     // Guard 1: only native-XLM payments trigger the cross-check.
     if !asset_is_native {
         return Ok(CrossCheckOutcome::Skipped);
@@ -2301,6 +2324,20 @@ where
             "oracle_provider_url shares the provider host of rpc_url; cross-check is degraded to single-RPC verification"
         );
     }
+    // A mainnet profile refuses an oracle record naming the primary's
+    // operator at load; on testnet it loads and the check runs degraded.
+    if let Some(providers) = profile.providers.as_ref()
+        && let (Some(primary), Some(oracle)) = (&providers.primary, &providers.oracle)
+        && same_provider_operator(&oracle.operator, &primary.operator)
+    {
+        tracing::warn!(
+            target: "policy.cross_check",
+            tool = tool_name,
+            source_prefix = redact_account_id_value(source_account),
+            "oracle provider record names the primary's operator; cross-check is degraded \
+             to single-RPC verification"
+        );
+    }
 
     // Canonical wire body for non-mismatch cross-check failure modes.  The
     // byte-mismatch arm below emits a more actionable operator diagnostic
@@ -2323,7 +2360,17 @@ where
     let mut rebuild_attempt: u32 = 0;
     let oracle_xdr = loop {
         let attempt_deadline = tokio::time::Instant::now() + timing.attempt_budget;
-        let oracle_client = StellarRpcClient::new(oracle_provider_url.as_str()).map_err(|e| {
+        let oracle_client = stellar_agent_network::profile_rpc_client(
+            profile,
+            ProviderRole::Oracle,
+            oracle_provider_url.as_str(),
+        )
+        .map_err(|e| {
+            // A credential failure keeps its own code: the configuration is
+            // wrong, not the endpoints in disagreement.
+            if stellar_agent_network::is_credential_error(&e) {
+                return endpoint_refusal_result(&e);
+            }
             // Construction and rebuild failures use the common recovery text.
             // Identity refusals identify the endpoint configuration to repair.
             tracing::debug!(
@@ -3540,6 +3587,178 @@ mod tests {
                 "oracle_provider_url shares the provider host of rpc_url; cross-check is degraded to single-RPC verification"
             ),
             "same-URL warning must be emitted: {captured}"
+        );
+    }
+
+    /// Names a header credential in the profile's oracle record and, when
+    /// `stored`, stores `value` at its entry under the installed mock store.
+    fn bind_oracle_credential(profile: &mut Profile, value: Option<&str>) {
+        use stellar_agent_core::profile::schema::{
+            KeyringEntryRef, ProviderRecord, Providers, RpcCredentialPlacement,
+        };
+        let entry = KeyringEntryRef::new("stellar-agent-rpc-cross-check", "oracle");
+        profile
+            .providers
+            .get_or_insert_with(Providers::default)
+            .oracle = Some(
+            ProviderRecord::new("Oracle RPC", "127.0.0.1", true).with_credential(
+                entry.clone(),
+                RpcCredentialPlacement::Header {
+                    name: "X-API-Key".to_owned(),
+                },
+            ),
+        );
+        if let Some(value) = value {
+            keyring_core::Entry::new(&entry.service, &entry.account)
+                .unwrap()
+                .set_password(value)
+                .unwrap();
+        }
+    }
+
+    /// Answers HTTP 401 to every request on `server` without the header
+    /// `X-API-Key: <value>`, ahead of the server's other mocks.
+    async fn require_header(server: &wiremock::MockServer, value: &'static str) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(move |request: &wiremock::Request| {
+                request
+                    .headers
+                    .get("X-API-Key")
+                    .is_none_or(|got| got.as_bytes() != value.as_bytes())
+            })
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn run_cross_check(
+        profile: &Profile,
+    ) -> Result<CrossCheckOutcome, rmcp::model::CallToolResult> {
+        high_value_cross_check_with_timing(
+            profile,
+            &NetworkContext::from_profile(profile),
+            "same-envelope-xdr",
+            "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
+            true,
+            i64::try_from(profile.effective_cross_check_threshold_stroops()).unwrap(),
+            |_client| async { Ok("same-envelope-xdr".to_owned()) },
+            "stellar_pay_commit",
+            CROSS_CHECK_TEST_TIMING,
+        )
+        .await
+    }
+
+    /// The oracle client carries the oracle record's credential.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    async fn high_value_cross_check_sends_the_oracle_credential() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+        let (mut profile, oracle) = cross_check_fixture().await;
+        require_header(&oracle, "oracle-credential-0123").await;
+        bind_oracle_credential(&mut profile, Some("oracle-credential-0123"));
+        let outcome = run_cross_check(&profile)
+            .await
+            .expect("the cross-check passes");
+        assert!(matches!(outcome, CrossCheckOutcome::Passed), "{outcome:?}");
+        assert_eq!(oracle_methods(&oracle).await, ["getNetwork"]);
+    }
+
+    /// A missing oracle credential reports the keyring code as the tool
+    /// result, not a divergence, and contacts no endpoint.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    async fn high_value_cross_check_missing_oracle_credential_reports_keyring_not_found() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring");
+        let (mut profile, oracle) = cross_check_fixture().await;
+        bind_oracle_credential(&mut profile, None);
+        let err = run_cross_check(&profile)
+            .await
+            .expect_err("the credential is missing");
+        let (is_err, code, message) = error_envelope_parts(&err);
+        assert!(is_err);
+        assert_eq!(code, "auth.keyring_not_found");
+        assert!(
+            message.contains("stellar-agent-rpc-cross-check/oracle"),
+            "{message}"
+        );
+        assert!(oracle_methods(&oracle).await.is_empty());
+    }
+
+    /// An oracle identity answer of HTTP 401 keeps the divergence code, and
+    /// the detail names the status and the oracle's authority.
+    #[tokio::test(flavor = "current_thread")]
+    async fn high_value_cross_check_oracle_401_names_the_status_and_authority() {
+        let (profile, oracle) = cross_check_fixture().await;
+        require_header(&oracle, "never-sent").await;
+        let err = run_cross_check(&profile)
+            .await
+            .expect_err("the oracle refuses");
+        let (_is_err, code, message) = error_envelope_parts(&err);
+        assert_eq!(code, "simulation.divergence");
+        assert!(message.contains("HTTP 401"), "{message}");
+        let authority = oracle.uri().replace("http://", "");
+        assert!(
+            message.contains(&format!("RPC endpoint '{authority}' answered")),
+            "{message}"
+        );
+        assert!(!message.contains("key=oracle"), "{message}");
+        assert_eq!(oracle_methods(&oracle).await, ["getNetwork"]);
+    }
+
+    /// On testnet, an oracle record naming the primary's operator loads, and
+    /// the cross-check warns that it runs degraded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn high_value_cross_check_warns_on_shared_operator_on_testnet() {
+        use stellar_agent_core::profile::schema::{
+            PrimaryProviderRecord, ProviderRecord, Providers,
+        };
+        use stellar_agent_test_support::CaptureWriter;
+        use tracing::instrument::WithSubscriber as _;
+
+        let (mut profile, oracle) = cross_check_fixture().await;
+        let providers = profile.providers.get_or_insert_with(Providers::default);
+        providers.primary = Some(PrimaryProviderRecord::new(" Shared RPC ", "127.0.0.1"));
+        providers.oracle = Some(ProviderRecord::new("shared rpc", "127.0.0.1", true));
+        let capture = CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let outcome = run_cross_check(&profile)
+            .with_subscriber(subscriber)
+            .await
+            .expect("the degraded cross-check still passes");
+        assert!(matches!(outcome, CrossCheckOutcome::Passed), "{outcome:?}");
+        assert_eq!(oracle_methods(&oracle).await, ["getNetwork"]);
+        let captured = capture.captured_str();
+        assert!(
+            captured.contains(
+                "oracle provider record names the primary's operator; cross-check is degraded \
+                 to single-RPC verification"
+            ),
+            "{captured}"
+        );
+
+        let distinct = CaptureWriter::new();
+        let providers = profile.providers.as_mut().unwrap();
+        providers.oracle = Some(ProviderRecord::new("Other RPC", "127.0.0.1", true));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(distinct.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        run_cross_check(&profile)
+            .with_subscriber(subscriber)
+            .await
+            .expect("the cross-check passes");
+        assert!(
+            !distinct
+                .captured_str()
+                .contains("names the primary's operator"),
+            "{}",
+            distinct.captured_str()
         );
     }
 

@@ -54,6 +54,7 @@ pub mod policy_view;
 mod poll_test_support;
 pub mod redact;
 pub mod retry;
+pub mod rpc_endpoint;
 pub mod sep29;
 pub mod sep41;
 pub mod sequence_floor;
@@ -98,9 +99,11 @@ pub use friendbot::{
 };
 pub use idempotent_submit::{reconcile_receipt, submit_transaction_idempotent};
 pub use keyring::{
-    KeyringSignHandle, enrolled_keyring_signer, init_platform_keyring_store, signer_from_keyring,
+    KeyringSignHandle, enrolled_keyring_signer, init_platform_keyring_store, read_rpc_credential,
+    rpc_credential_present, signer_from_keyring, write_rpc_credential,
 };
 pub use retry::RetryPolicy;
+pub use rpc_endpoint::{is_credential_error, profile_rpc_client};
 pub use sequence_floor::{
     CATCHUP_MAX_POLLS, CATCHUP_POLL_INTERVAL, SequenceFloorHook,
     fetch_account_with_sequence_catchup,

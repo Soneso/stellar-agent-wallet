@@ -215,12 +215,13 @@ The emission layer differs by surface. The CLI `pay`, `claim`, `accounts create`
 
 ### Key-write emission sites
 
-Each profile command that writes long-lived key material to the keyring records a `keyring_key_written` row after the write succeeds, naming the key slot (`key_purpose`) and the keyring coordinates. The two enroll commands additionally record a redacted (first-5-last-5) public address; HMAC-key rotations record none. The row NEVER carries a key value, seed, base64 material, or any derived secret.
+Each profile command that writes long-lived key material to the keyring records a `keyring_key_written` row after the write succeeds, naming the key slot (`key_purpose`) and the keyring coordinates. The signer and owner-key enroll commands additionally record a redacted (first-5-last-5) public address; the RPC credential enrollment and the HMAC-key rotations record none. The row NEVER carries a key value, seed, base64 material, or any derived secret.
 
 | Command | `key_purpose` | Public address |
 | --- | --- | --- |
 | `profile enroll-signer` | `mcp_signer_seed` | redacted derived address |
 | `profile enroll-owner-key` | `owner_public_key` | redacted owner address |
+| `profile enroll-rpc-credential` | `rpc_credential` | none |
 | `profile rotate-nonce-key` | `nonce_hmac` | none |
 | `profile rotate-attestation-key` | `attestation_hmac` | none |
 | `profile rotate-counterparty-key` | `counterparty_cache_hmac` | none |
@@ -362,10 +363,11 @@ An MCP commit's early check refuses without consuming the nonce. The commit read
 
 ### Endpoint identity is authoritative
 
-The declaration states which network the caller intends; the probe states which network the endpoint is, and the second decides. Transport failures are retried with bounded exponential backoff under the caller's own submission deadline, using the retryability classification of `sendTransaction` with one exception. An answer whose body does not deserialize, such as one without `protocolVersion` or with a value of the wrong type, is not retried. The endpoint answered, and a retry would only spend the deadline on the same answer. A passphrase mismatch is a verdict rather than a transport fault and is not retried. The probe is fail closed: it never falls back to the declaration.
+The declaration states which network the caller intends; the probe states which network the endpoint is, and the second decides. Transport failures are retried with bounded exponential backoff under the caller's own submission deadline, using the retryability classification of `sendTransaction` with one exception. An answer whose body does not deserialize, such as one without `protocolVersion` or with a value of the wrong type, is not retried. The endpoint answered, and a retry would only spend the deadline on the same answer. A passphrase mismatch is a verdict rather than a transport fault and is not retried. An HTTP 401 or 403 answer is not retried either: the endpoint refused the request's credential, and the same request gets the same answer. `get_health_within` shares this classification. The probe is fail closed: it never falls back to the declaration.
 
 The outcomes, in the order the check reaches them:
 
+- endpoint answers HTTP 401 or 403: `network.rpc_credential_refused`, not retried, with the status and the endpoint's authority
 - identity not established within the submission timeout, or an answer that does not deserialize: `network.endpoint_identity_unavailable`
 - endpoint reports the mainnet passphrase: `network.mainnet_write_forbidden`, the one mainnet refusal that costs a round trip
 - endpoint reports a different network than the caller declared: `network.endpoint_network_mismatch`
@@ -374,6 +376,28 @@ The outcomes, in the order the check reaches them:
 The same answer carries the endpoint's protocol version, which the protocol rule checks against `SUPPORTED_PROTOCOL_VERSIONS`, protocol 29 in this release. A release adds a version to the range only after its testnet acceptance tests ran against that version. On testnet, and on any other network whose passphrase matches the declaration, a version outside the range passes with one logged warning that carries the version and the range. On mainnet the same version is refused. While mainnet writes are refused, an endpoint that reports mainnet is refused with `network.mainnet_write_forbidden` first, so the mainnet branch of the protocol rule does not fire.
 
 The probe runs on the client instance that will carry `sendTransaction`, not on a fresh one, so the identity that was established is the identity of the connection the transaction goes out on.
+
+### Provider credentials on the RPC client
+
+A provider record can name a keyring entry and a placement for its role's endpoint ([Provider credentials](../profiles.md#provider-credentials)). The loader opens no keyring entry. `Profile::role_url` maps a role to its URL and `Providers::record_for` to its record; `RpcCredentialBinding::for_role` pairs the two, and `rpc_endpoint::rpc_client` reads the credential when a client is built:
+
+- The credential is read only when the URL the caller sends to equals the profile's URL for the role byte for byte. Any other URL, such as a CLI flag or an agent's tool input, gets a client without a credential, and no keyring entry is opened. An agent therefore cannot move a provider key to a host of its choice.
+- `NetworkContext::from_profile` binds the primary credential. `NetworkContext::primary_client` builds the clients of the CLI classic verbs, their MCP prepare and commit tools, the x402 tools, and the classic read sites, CLI `fees stats` only with `--profile`. MCP `stellar_fee_stats` builds its client with `profile_rpc_client` instead, so a differing `rpc_url` input gets none. The MCP high-value cross-check and the SEP-29 read build the oracle client with `profile_rpc_client`. The Friendbot path of `accounts create`, the MCP `stellar_friendbot` tool, `stellar_sep43_sign_and_submit_transaction`, and the smart-account, DeFi, and MPP clients carry no credential.
+- The value goes from the keyring into a `Zeroizing<String>` and from there to the transport. A header value is marked sensitive, so its `Debug` form hides it. A query or path placement interpolates the value into the transport target; the client's `url()` returns the configured URL without it.
+- `StellarRpcClient` implements neither `Debug` nor `Clone`, because the inner transport prints its target URL.
+- Every error the client builds from transport or server text replaces the stored value and the form it sends with `[redacted]` before the URL scrub. For a header value with a scheme prefix, the token after the first space is replaced too when it holds at least 8 bytes. The `error` field of a simulation answer gets the value replacement only. A value the server splits, truncates, or re-encodes is not caught.
+- The transport's own copies of the value, in the header map and the interpolated target, are not zeroized and live until the client drops.
+
+The reserved-entry rule keeps a credential reference off the entries of the wallet's own keys, so an edited profile cannot make the wallet send a seed or HMAC key to an endpoint. It compares the reference with the wallet key references of the profile being loaded, taken from the merged profile and from the file alone, because a testnet overlay can replace `mcp_signer_default`:
+
+- The ASCII-lowercased `account.service` must differ from that form of every wallet key reference. The Windows store names an entry by joining account and service with a `.`, and both may contain one.
+- The service must differ, ASCII case-insensitively, from every wallet key reference's service, which covers accounts derived from that service.
+- No `.`-separated part of the lowercased `account.service`, trimmed of spaces, may start with `stellar-agent-` unless it starts with `stellar-agent-rpc-`.
+- `service` and `account` hold only printable ASCII without leading or trailing spaces, so no store can fold a non-ASCII letter onto an ASCII name.
+
+The `stellar-agent-` namespace is always covered. A wallet entry with a custom name is covered only as long as the file still names it, and only for the references of the profile being loaded.
+
+`release_max_level_info` keeps `tracing` events above INFO out of release builds. Records from the `log` facade, such as keyring-core's, pass through the `tracing` bridge and are filtered at runtime. A test drives a credentialed identity request with every `tracing` level enabled, the `log` bridge installed, and no redacting formatter, for each placement, and asserts that no log line holds the value. It covers debug builds over HTTP/1.1.
 
 ### Retries, deadlines, and failover
 

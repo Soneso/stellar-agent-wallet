@@ -68,7 +68,7 @@ Commit step: verifies the nonce, re-builds the envelope for divergence check, si
 
 **Submission record:** Before the transaction is sent, the wallet records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. The record is settled by what the network answers; a submission whose outcome never comes back keeps it. See "Unresolved submissions" below.
 
-**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`, `policy.approval_consumed`, `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`, `network.envelope_unsigned`, `submission.tx_timeout`, `submission.tx_already_submitted`, `submission.hash_mismatch`, `submission.record_unavailable`.
+**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`, `policy.approval_consumed`, `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`, `auth.keyring_not_found`, `network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`, `network.envelope_unsigned`, `submission.tx_timeout`, `submission.tx_already_submitted`, `submission.hash_mismatch`, `submission.record_unavailable`.
 
 ## stellar_pay
 
@@ -117,7 +117,7 @@ Commit step: verifies the nonce, re-builds the Payment envelope for divergence c
 
 **Submission record:** Before the transaction is sent, the wallet records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. The record is settled by what the network answers; a submission whose outcome never comes back keeps it. See "Unresolved submissions" below.
 
-**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`, `policy.approval_consumed`, `validation.memo_required`, `validation.memo_mutually_exclusive`, `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`, `network.envelope_unsigned`, `submission.tx_timeout`, `submission.tx_already_submitted`, `submission.hash_mismatch`, `submission.record_unavailable`.
+**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`, `policy.approval_consumed`, `validation.memo_required`, `validation.memo_mutually_exclusive`, `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`, `auth.keyring_not_found`, `network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`, `network.envelope_unsigned`, `submission.tx_timeout`, `submission.tx_already_submitted`, `submission.hash_mismatch`, `submission.record_unavailable`.
 
 ## stellar_claim_commit
 

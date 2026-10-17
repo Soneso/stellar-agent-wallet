@@ -15,9 +15,9 @@ use crate::server::WalletServer;
 use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
     commit_envelope_and_verify_nonce, commit_path_error_result, enforce_classic_fee_cap,
-    high_value_cross_check, ledger_err_result, nonce_id_prefix, redact_rpc_error_detail,
-    redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops, submit_timeout,
-    total_classic_fee_stroops, validate_g_strkey, verify_attestation_gate,
+    high_value_cross_check, ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope,
+    resolve_classic_fee_per_op_stroops, submit_timeout, total_classic_fee_stroops,
+    validate_g_strkey, verify_attestation_gate,
 };
 use stellar_agent_core::amount::McpAmountArgument;
 use stellar_agent_core::approval::retry::{
@@ -29,7 +29,7 @@ use stellar_agent_core::envelope_decode::decode_authoritative_args;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_core::wallet::Wallet;
 use stellar_agent_network::{
-    BASE_RESERVE_STROOPS, ClassicOpBuilder, StellarRpcClient, fetch_account,
+    BASE_RESERVE_STROOPS, ClassicOpBuilder, fetch_account,
     keyring::enrolled_keyring_signer,
     parse_classic_fee_choice, resolve_classic_fee_selection,
     signing::envelope_signing::attach_signature,
@@ -365,15 +365,9 @@ impl WalletServer {
         validate_g_strkey(&args.destination, "destination")?;
 
         // ── Fetch source account state ────────────────────────────────────────
-        let rpc_url = self.context.rpc_url.as_str();
-        let client = match StellarRpcClient::new(rpc_url) {
+        let client = match self.context.primary_client() {
             Ok(c) => c,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    redact_rpc_error_detail("rpc_client_error", &err),
-                    None,
-                ));
-            }
+            Err(err) => return crate::tools::common::rpc_client_failure(&err),
         };
 
         // Establish which network the endpoint serves before the first read
@@ -826,15 +820,9 @@ impl WalletServer {
         // Policy evaluates the account state that also supplies the rebuild's
         // sequence number. No nonce consumption, approval write or signing
         // occurs before the gate.
-        let rpc_url = self.context.rpc_url.as_str();
-        let client = match StellarRpcClient::new(rpc_url) {
+        let client = match self.context.primary_client() {
             Ok(c) => c,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    redact_rpc_error_detail("rpc_client_error", &err),
-                    None,
-                ));
-            }
+            Err(err) => return crate::tools::common::rpc_client_failure(&err),
         };
 
         // Establish which network the endpoint serves before the first read

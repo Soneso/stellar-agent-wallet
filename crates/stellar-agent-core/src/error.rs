@@ -1804,6 +1804,54 @@ pub enum NetworkError {
     /// before sending.
     #[error("the envelope carries no signatures; sign it before submitting")]
     EnvelopeUnsigned,
+
+    /// The RPC credential read from or written to the keyring breaks the
+    /// value rules: empty, longer than 1024 bytes, or holding a control
+    /// character.
+    ///
+    /// `entry` names the keyring entry as `service/account`, public
+    /// metadata. No field holds any part of the value.
+    #[error(
+        "the RPC credential in keyring entry '{entry}' {reason}; store the provider's key, \
+         at most 1024 bytes and without control characters, with \
+         `stellar-agent profile enroll-rpc-credential`"
+    )]
+    RpcCredentialInvalid {
+        /// The keyring entry as `service/account`.
+        entry: String,
+        /// The rule the value breaks.
+        reason: crate::profile::schema::RpcCredentialDefect,
+    },
+
+    /// An RPC client cannot carry the credential: the value breaks the value
+    /// rules, the placement breaks the name rules, or the endpoint URL
+    /// carries a username or password.
+    ///
+    /// No field holds any part of the value or the URL.
+    #[error(
+        "the RPC credential {reason}, so it cannot be sent; correct the stored value with \
+         `stellar-agent profile enroll-rpc-credential`, or the placement or the endpoint \
+         URL in the profile file"
+    )]
+    RpcCredentialUnusable {
+        /// The defect that prevents sending the credential.
+        reason: crate::profile::schema::RpcCredentialDefect,
+    },
+
+    /// The RPC endpoint answered the network identity request with HTTP 401
+    /// or 403, which no retry changes.
+    ///
+    /// `url` is authority-only (scheme://host\[:port\]).
+    #[error(
+        "RPC endpoint '{url}' answered the network identity request with HTTP {status}; \
+         check the credential the profile configures for this endpoint"
+    )]
+    RpcCredentialRejected {
+        /// The RPC endpoint URL, redacted to authority-only form.
+        url: String,
+        /// The HTTP status of the answer, 401 or 403.
+        status: u16,
+    },
 }
 
 /// Renders a network passphrase for inclusion in an error message.
@@ -1847,6 +1895,9 @@ impl NetworkError {
             Self::EnvelopeSignedForMainnet => "network.envelope_signed_for_mainnet",
             Self::EnvelopeSignatureUnverifiable { .. } => "network.envelope_signature_unverifiable",
             Self::EnvelopeUnsigned => "network.envelope_unsigned",
+            Self::RpcCredentialInvalid { .. }
+            | Self::RpcCredentialUnusable { .. }
+            | Self::RpcCredentialRejected { .. } => "network.rpc_credential_refused",
         }
     }
 }
@@ -3329,6 +3380,26 @@ mod tests {
                 },
                 "network.friendbot_account_already_funded",
             ),
+            (
+                NetworkError::RpcCredentialInvalid {
+                    entry: "stellar-agent-rpc-p/primary".to_owned(),
+                    reason: crate::profile::schema::RpcCredentialDefect::TooLong,
+                },
+                "network.rpc_credential_refused",
+            ),
+            (
+                NetworkError::RpcCredentialUnusable {
+                    reason: crate::profile::schema::RpcCredentialDefect::Userinfo,
+                },
+                "network.rpc_credential_refused",
+            ),
+            (
+                NetworkError::RpcCredentialRejected {
+                    url: "https://rpc.example.com".to_owned(),
+                    status: 401,
+                },
+                "network.rpc_credential_refused",
+            ),
         ];
 
         assert_code_round_trips!(cases);
@@ -3338,6 +3409,60 @@ mod tests {
         // reports `ErrorCategory::Network`.
         let wallet_err = WalletError::Network(NetworkError::FriendbotMainnetForbidden);
         assert_eq!(wallet_err.category(), ErrorCategory::Network);
+    }
+
+    /// Each credential refusal names its entry, or the endpoint authority and
+    /// status, the defect, and the repair, and nothing else.
+    #[test]
+    fn rpc_credential_refusals_render_the_defect_and_the_repair() {
+        use crate::profile::schema::RpcCredentialDefect as Defect;
+        for (reason, text) in [
+            (Defect::Empty, "is empty"),
+            (Defect::TooLong, "is longer than 1024 bytes"),
+            (Defect::ControlCharacter, "holds a control character"),
+        ] {
+            let error = NetworkError::RpcCredentialInvalid {
+                entry: "stellar-agent-rpc-p/oracle".to_owned(),
+                reason,
+            };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "the RPC credential in keyring entry 'stellar-agent-rpc-p/oracle' {text}; \
+                     store the provider's key, at most 1024 bytes and without control \
+                     characters, with `stellar-agent profile enroll-rpc-credential`"
+                )
+            );
+        }
+        for (reason, text) in [
+            (Defect::Empty, "is empty"),
+            (Defect::TooLong, "is longer than 1024 bytes"),
+            (Defect::ControlCharacter, "holds a control character"),
+            (Defect::Placement, "names an invalid placement"),
+            (
+                Defect::Userinfo,
+                "would travel with a username or password in the URL",
+            ),
+        ] {
+            assert_eq!(
+                NetworkError::RpcCredentialUnusable { reason }.to_string(),
+                format!(
+                    "the RPC credential {text}, so it cannot be sent; correct the stored value \
+                     with `stellar-agent profile enroll-rpc-credential`, or the placement or \
+                     the endpoint URL in the profile file"
+                )
+            );
+        }
+        assert_eq!(
+            NetworkError::RpcCredentialRejected {
+                url: "https://rpc.example.com:8443".to_owned(),
+                status: 403,
+            }
+            .to_string(),
+            "RPC endpoint 'https://rpc.example.com:8443' answered the network identity \
+             request with HTTP 403; check the credential the profile configures for this \
+             endpoint"
+        );
     }
 
     // ── Auth errors ──────────────────────────────────────────────────────────

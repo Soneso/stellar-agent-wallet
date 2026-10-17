@@ -160,6 +160,8 @@ clap = { version = "=4.6.1", default-features = false, features = ["std", "deriv
 # GHSA-2ph8-5cr8-hr33 argument-injection advisory belongs to, beyond the >=1.2.2
 # tokenization fix itself.
 webbrowser = { version = "=1.2.4", default-features = false, features = ["hardened"] }
+# rpassword: terminal input without echo for `profile enroll-rpc-credential`.
+rpassword = { version = "=7.5.4", default-features = false }
 stellar-agent-pool = { path = "crates/stellar-agent-pool", version = "0.1.0-alpha.12" }
 stellar-agent-cli = { path = "crates/stellar-agent-cli", version = "0.1.0-alpha.12" }
 stellar-agent-claimable = { path = "crates/stellar-agent-claimable", version = "0.1.0-alpha.12" }

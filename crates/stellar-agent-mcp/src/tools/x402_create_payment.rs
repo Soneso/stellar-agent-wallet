@@ -167,7 +167,13 @@ pub struct X402CreatePaymentArgs {
 /// `ErrorData` from the dispatch gate. The endpoint identity refusals carry
 /// their `network.*` code: `network.endpoint_network_mismatch`,
 /// `network.endpoint_identity_unavailable`, `network.mainnet_write_forbidden`,
-/// and `network.rpc_unreachable` for a client that cannot be built. The audit
+/// and `network.rpc_credential_refused` for an HTTP 401 or 403 answer. A
+/// client that cannot be built refuses with `network.rpc_unreachable`, with
+/// `network.rpc_credential_refused` for a stored provider credential the
+/// wallet refuses or cannot send, or with the keyring code of the credential
+/// read: `auth.keyring_not_found`, `auth.keyring_platform_error`,
+/// `auth.keyring_interactive_session_required`, or
+/// `auth.keyring_config_invalid`. The audit
 /// refusals carry their `audit.*` code: the pre-flight before the signer load,
 /// and the `x402_payment_authorized` row the transmit gate writes before the
 /// signed authorization leaves the wallet.
@@ -207,7 +213,6 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use std::sync::Arc;
 
-        use stellar_agent_network::StellarRpcClient;
         use stellar_agent_network::keyring::enrolled_keyring_signer;
         use stellar_agent_x402::exact::{create_payment, validate_requirements};
         use stellar_agent_x402::wire::encode_payment_signature;
@@ -361,7 +366,7 @@ impl WalletServer {
         // The URL is operator-controlled, never facilitator-supplied. Every
         // request of the payment goes to this client, and `create_payment`
         // makes the endpoint identity check its first request.
-        let client = match StellarRpcClient::new(&self.context.rpc_url) {
+        let client = match self.context.primary_client() {
             Ok(client) => client,
             Err(err) => return Ok(crate::tools::common::endpoint_refusal_result(&err)),
         };

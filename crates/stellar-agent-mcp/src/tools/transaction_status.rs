@@ -25,11 +25,10 @@ use serde_json::json;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore, SubmissionReceipt};
 use stellar_agent_mcp_macros::mcp_tool_router;
-use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::policy_state::PersistedWindowStore;
 
 use crate::server::WalletServer;
-use crate::tools::common::{business_error_result, redact_rpc_error_detail};
+use crate::tools::common::business_error_result;
 
 /// Arguments for the `stellar_transaction_status` MCP tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -108,9 +107,10 @@ impl WalletServer {
             }
         };
 
-        let client = StellarRpcClient::new(&self.context.rpc_url).map_err(|err| {
-            rmcp::ErrorData::internal_error(redact_rpc_error_detail("rpc_client_error", &err), None)
-        })?;
+        let client = match self.context.primary_client() {
+            Ok(client) => client,
+            Err(err) => return crate::tools::common::rpc_client_failure(&err),
+        };
 
         let receipts = match ReceiptStore::open(&profile_name) {
             Ok(store) => store,

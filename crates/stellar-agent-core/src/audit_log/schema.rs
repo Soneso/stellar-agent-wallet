@@ -540,6 +540,8 @@ pub enum KeyPurpose {
     CounterpartyCacheHmac,
     /// The policy-window-state HMAC key (`profile rotate-policy-state-key`).
     PolicyWindowStateHmac,
+    /// An RPC provider credential (`profile enroll-rpc-credential`).
+    RpcCredential,
 }
 
 impl std::fmt::Display for KeyPurpose {
@@ -552,6 +554,7 @@ impl std::fmt::Display for KeyPurpose {
             Self::AuditHashChainHmac => "audit_hash_chain_hmac",
             Self::CounterpartyCacheHmac => "counterparty_cache_hmac",
             Self::PolicyWindowStateHmac => "policy_window_state_hmac",
+            Self::RpcCredential => "rpc_credential",
         };
         f.write_str(s)
     }
@@ -2975,11 +2978,11 @@ pub enum EventKind {
     ///
     /// # Field redaction
     ///
-    /// - `public_address` — present only for the two enroll commands: the
-    ///   redacted first-5-last-5 account strkey, the same [`RedactedStrkey`]
-    ///   convention as
+    /// - `public_address`: present only for the signer and owner-key enroll
+    ///   commands: the redacted first-5-last-5 account strkey, the same
+    ///   [`RedactedStrkey`] convention as
     ///   [`Self::SaExternalExecuteSubmitted::smart_account_redacted`]. Absent
-    ///   for HMAC keys, which have no public address.
+    ///   for HMAC keys and RPC credentials, which have no public address.
     ///
     /// # Schema additivity
     ///
@@ -2991,8 +2994,8 @@ pub enum EventKind {
         keyring_service: String,
         /// Keyring entry name the key was written under.
         keyring_entry: String,
-        /// Redacted first-5-last-5 public account strkey, for the two enroll
-        /// commands; absent for HMAC keys.
+        /// Redacted first-5-last-5 public account strkey, for the signer and
+        /// owner-key enroll commands; absent for HMAC keys and RPC credentials.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         public_address: Option<RedactedStrkey>,
     },
@@ -5742,6 +5745,7 @@ mod tests {
                 KeyPurpose::PolicyWindowStateHmac,
                 "policy_window_state_hmac",
             ),
+            (KeyPurpose::RpcCredential, "rpc_credential"),
         ];
         for (purpose, wire) in cases {
             let s = serde_json::to_string(&purpose).unwrap();

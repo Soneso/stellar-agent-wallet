@@ -32,6 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an x402 payment without a request and returns its atomic amount.
 - `X402Error::EndpointIdentity` carries a refusal of the endpoint check. Its
   wire code is the code of the network error it carries.
+- Profiles accept a `[providers.primary]` record with the primary's operator
+  and host. Each provider record can name a keyring `credential` and a
+  `placement` for its endpoint: a request header, a query parameter, or a path
+  segment. Core exposes `Profile::role_url`, `Providers::record_for`, and
+  `ProviderRecordView`.
+- `stellar-agent profile enroll-rpc-credential` stores an RPC provider key in
+  the keyring from a hidden prompt or standard input. It adds the reference and
+  the placement to a provider record that names none.
+- `StellarRpcClient::with_credential`, `NetworkContext::primary_client`, and
+  `rpc_endpoint::profile_rpc_client` build clients that send the configured
+  credential. `url()` stays the configured URL, without the credential.
+- The error code `network.rpc_credential_refused` reports a stored credential
+  the wallet refuses and an endpoint that answers the network identity request
+  with HTTP 401 or 403. The audit key purpose `rpc_credential` records a
+  credential write.
 
 ### Changed
 
@@ -44,6 +59,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A SEP-29 oracle construction failure refuses with `network.rpc_divergence`.
 - The high-value cross-check's degraded-verification warning fires when oracle
   and primary hosts match, including different paths, queries, or ports.
+- A mainnet profile refuses a secondary or oracle record whose operator equals
+  the primary record's operator after trimming and case folding. On testnet
+  such a record loads, and the cross-check warns that it runs degraded.
+- A mainnet profile with a secondary or oracle URL requires a
+  `[providers.primary]` record.
+- A provider record that names a credential refuses an endpoint URL with a
+  username or password, and a plain `http` URL to a non-loopback host. It also
+  refuses a query placement that repeats a parameter of the URL.
+- The endpoint identity check treats an HTTP 401 or 403 answer as final and
+  reports `network.rpc_credential_refused` with the status and the endpoint's
+  authority.
+- `StellarRpcClient::get_health_within` does not retry an HTTP 401 or 403
+  answer.
 
 - `trustline` waits 60 seconds for its submission when the profile leaves
   `submit_timeout_seconds` unset, the default the MCP commit tools use.
@@ -103,6 +131,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `StellarRpcClient::verify_network_passphrase`, replaced by
   `StellarRpcClient::endpoint_identity`.
+- `ProviderAttestationRejection::PrimaryReserved`. A `[providers.primary]`
+  record loads.
 
 ### Fixed
 
@@ -132,6 +162,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- The RPC client removes the stored credential, and the form it sends, from
+  every error text it returns, before the URL scrub.
+- A credential reference that names the keyring entry of another wallet key,
+  or a service in the wallet's key namespace, refuses at load.
 - The network crate scrubs server-provided RPC error text before the text enters
   a network error. Each `http`, `https`, `ws`, or `wss` URL in the text, and
   each JSON-escaped form of these URLs, loses its scheme, userinfo, path, and

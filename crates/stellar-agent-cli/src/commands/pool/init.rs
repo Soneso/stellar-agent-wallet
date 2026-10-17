@@ -393,7 +393,7 @@ where
     }
     // The endpoint check precedes the channel observations and runs on the
     // client that later sends, under its own budget of `--timeout-seconds`.
-    let client = StellarRpcClient::new(&context.rpc_url)?;
+    let client = context.primary_client()?;
     check_endpoint_identity(&client, &context, Duration::from_secs(args.timeout_seconds)).await?;
     let mut present = 0;
     for channel in &pending.channels {

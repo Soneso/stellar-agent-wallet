@@ -10,6 +10,8 @@
 //! - [`enroll_signer`] — import an operator-held ed25519 seed into the
 //!   profile's MCP signer keyring entry.
 //! - [`enroll_owner_key`] — enroll the policy-file owner ed25519 PUBLIC key.
+//! - [`enroll_rpc_credential`]: store an RPC provider key in the keyring and
+//!   name it in the role's provider record.
 //! - [`sign_policy`] — sign a V1 policy file with the owner key.
 //! - [`rotate_nonce_key`] — rotate the HMAC nonce key for a profile.
 //! - [`rotate_attestation_key`] — rotate the approval-spine attestation HMAC
@@ -27,6 +29,7 @@
 
 pub mod audit_emit;
 pub mod enroll_owner_key;
+pub mod enroll_rpc_credential;
 pub mod enroll_signer;
 pub mod init;
 pub mod key_ops;
@@ -62,9 +65,10 @@ pub enum ProfileSubcommand {
     /// Mints a version-2 profile with per-profile-derived keyring entry
     /// references and writes it to `<profile_dir>/<name>.toml`. Mints no key
     /// material and emits no audit row; the key-writing commands
-    /// (`enroll-signer`, `enroll-owner-key`, the `rotate-*` subcommands) do
-    /// that. Refuses if the named profile already exists, or if `--network
-    /// mainnet` is selected without an explicit `--rpc-url`.
+    /// (`enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, the
+    /// `rotate-*` subcommands) do that. Refuses if the named profile already
+    /// exists, or if `--network mainnet` is selected without an explicit
+    /// `--rpc-url`.
     Init(init::InitArgs),
     /// List known profile names.
     ///
@@ -98,6 +102,14 @@ pub enum ProfileSubcommand {
     /// policy engine verifies against.  The seed is never stored; the operator
     /// keeps it offline and signs policy files with `sign-policy`.
     EnrollOwnerKey(enroll_owner_key::EnrollOwnerKeyArgs),
+    /// Store an RPC provider key in the keyring for one provider role.
+    ///
+    /// Reads the key from a hidden terminal prompt, or from standard input
+    /// with `--stdin`, and stores it at the keyring entry the role's provider
+    /// record names. A record without a reference gains the default reference
+    /// and the placement; nothing else in the profile file changes. The key is
+    /// never printed.
+    EnrollRpcCredential(enroll_rpc_credential::EnrollRpcCredentialArgs),
     /// Sign a V1 policy file with the owner key.
     ///
     /// Computes the canonical digest the engine verifies, signs it with the
@@ -175,6 +187,7 @@ pub async fn run(args: &ProfileArgs) -> i32 {
         ProfileSubcommand::Migrate(a) => migrate::run(a).await,
         ProfileSubcommand::EnrollSigner(a) => enroll_signer::run(a).await,
         ProfileSubcommand::EnrollOwnerKey(a) => enroll_owner_key::run(a).await,
+        ProfileSubcommand::EnrollRpcCredential(a) => enroll_rpc_credential::run(a),
         ProfileSubcommand::SignPolicy(a) => sign_policy::run(a).await,
         ProfileSubcommand::RotateNonceKey(a) => rotate_nonce_key::run(a).await,
         ProfileSubcommand::RotateAttestationKey(a) => rotate_attestation_key::run(a).await,
@@ -204,6 +217,7 @@ impl ProfileArgs {
             ProfileSubcommand::Init(a) => a.profile.as_deref(),
             ProfileSubcommand::EnrollSigner(a) => a.profile.as_deref(),
             ProfileSubcommand::EnrollOwnerKey(a) => a.profile.as_deref(),
+            ProfileSubcommand::EnrollRpcCredential(a) => a.profile.as_deref(),
             ProfileSubcommand::SignPolicy(a) => a.profile.as_deref(),
             ProfileSubcommand::List(_) => None,
             ProfileSubcommand::Show(a) => Some(a.profile_name()),

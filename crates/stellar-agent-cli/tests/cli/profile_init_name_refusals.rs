@@ -199,7 +199,7 @@ fn profile_init_refuses_credentialed_rpc_before_creating_file() {
             "--network",
             "mainnet",
             "--rpc-url",
-            "https://user:SENTINEL@mainnet.example",
+            "https://loginsentinel:SENTINEL@mainnet.example",
         ])
         .env("STELLAR_AGENT_HOME", home.path())
         .env_remove("STELLAR_AGENT_PROFILE")
@@ -216,7 +216,7 @@ fn profile_init_refuses_credentialed_rpc_before_creating_file() {
     assert!(stderr.is_empty(), "{stderr}");
     for stream in [&stdout, &stderr] {
         assert!(
-            !stream.contains("user") && !stream.contains("SENTINEL"),
+            !stream.contains("loginsentinel") && !stream.contains("SENTINEL"),
             "{stream}"
         );
     }

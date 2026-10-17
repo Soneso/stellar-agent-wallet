@@ -1,8 +1,14 @@
 //! Network identity shared by a command's transaction stages.
 
-use stellar_agent_core::profile::{caip2::Caip2, schema::Profile};
+use stellar_agent_core::error::WalletError;
+use stellar_agent_core::profile::{
+    caip2::Caip2,
+    schema::{Profile, ProviderRole},
+};
 
+use crate::client::StellarRpcClient;
 use crate::redact_url_authority;
+use crate::rpc_endpoint::{RpcCredentialBinding, rpc_client};
 
 /// The network identity resolved once at command entry and passed to stages
 /// that build, simulate, sign, or submit.
@@ -18,24 +24,50 @@ pub struct NetworkContext {
     pub rpc_url: String,
     /// The secondary RPC endpoint selected by the command.
     pub secondary_rpc_url: Option<String>,
+    /// The keyring credential the profile configures for its primary
+    /// endpoint, bound to the profile's `rpc_url`.
+    primary_credential: Option<RpcCredentialBinding>,
 }
 
 impl NetworkContext {
-    /// Copies the chain identity and both endpoints from the profile.
+    /// Copies the chain identity and both endpoints from the profile, and
+    /// binds the credential its primary provider record names, if any.
     #[must_use]
     pub fn from_profile(profile: &Profile) -> Self {
-        Self::new(profile.chain_id, profile.rpc_url.clone())
-            .with_secondary(profile.secondary_rpc_url.clone())
+        let mut context = Self::new(profile.chain_id, profile.rpc_url.clone())
+            .with_secondary(profile.secondary_rpc_url.clone());
+        context.primary_credential = RpcCredentialBinding::for_role(profile, ProviderRole::Primary);
+        context
     }
 
-    /// A context from its chain identity and primary endpoint; the secondary endpoint starts unset.
+    /// A context from its chain identity and primary endpoint; the secondary
+    /// endpoint starts unset and no credential is bound.
     #[must_use]
     pub fn new(chain_id: Caip2, rpc_url: String) -> Self {
         Self {
             chain_id,
             rpc_url,
             secondary_rpc_url: None,
+            primary_credential: None,
         }
+    }
+
+    /// Builds the client for the primary endpoint, [`Self::rpc_url`].
+    ///
+    /// The client carries the profile's primary credential only while
+    /// `rpc_url` still equals the profile's `rpc_url` byte for byte; a
+    /// command that overrode the endpoint gets a client without one, and no
+    /// keyring entry is opened.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`crate::profile_rpc_client`]: a keyring code such as
+    /// `auth.keyring_not_found`, `network.rpc_credential_refused` for a
+    /// stored value the wallet refuses or a credential the client cannot
+    /// send, and `network.rpc_unreachable` when the transport refuses the
+    /// URL.
+    pub fn primary_client(&self) -> Result<StellarRpcClient, WalletError> {
+        rpc_client(&self.rpc_url, self.primary_credential.as_ref())
     }
 
     /// Sets or clears the secondary endpoint selected by the command.
@@ -61,12 +93,18 @@ impl std::fmt::Debug for NetworkContext {
                 "secondary_rpc_url",
                 &self.secondary_rpc_url.as_deref().map(redact_url_authority),
             )
+            .field("primary_credential", &self.primary_credential)
             .finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "test-only; unwraps are acceptable in unit tests"
+    )]
+
     use super::*;
     use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
 
@@ -96,6 +134,39 @@ mod tests {
                 None
             );
         }
+    }
+
+    /// The primary credential of the profile binds to its `rpc_url`; a
+    /// context from `new` and a profile without a record bind none.
+    #[test]
+    fn from_profile_binds_the_primary_credential() {
+        use stellar_agent_core::profile::schema::{
+            KeyringEntryRef, PrimaryProviderRecord, RpcCredentialPlacement,
+        };
+        let entry = KeyringEntryRef::new("stellar-agent-rpc-context", "primary");
+        for chain in [Caip2::Testnet, Caip2::Mainnet] {
+            let mut profile = profile(chain);
+            assert_eq!(
+                NetworkContext::from_profile(&profile).primary_credential,
+                None
+            );
+            profile.providers = Some(stellar_agent_core::profile::schema::Providers::default());
+            profile.providers.as_mut().unwrap().primary = Some(
+                PrimaryProviderRecord::new("Primary", "primary.example")
+                    .with_credential(entry.clone(), RpcCredentialPlacement::Path {}),
+            );
+            let context = NetworkContext::from_profile(&profile);
+            let binding = context.primary_credential.as_ref().unwrap();
+            assert_eq!(binding.url, profile.rpc_url);
+            assert_eq!(binding.entry, entry);
+            assert_eq!(binding.placement, RpcCredentialPlacement::Path {});
+            assert!(format!("{context:?}").contains("stellar-agent-rpc-context"));
+        }
+        assert_eq!(
+            NetworkContext::new(Caip2::Testnet, "https://primary.example".to_owned())
+                .primary_credential,
+            None
+        );
     }
 
     #[test]

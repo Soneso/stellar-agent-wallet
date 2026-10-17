@@ -424,8 +424,17 @@ impl WalletServer {
         if tokio::time::Instant::now() >= pay_deadline {
             return Err(refuse(SEP29_DEADLINE_EXHAUSTED_DETAIL.to_owned()));
         }
-        let oracle = match StellarRpcClient::new(url.as_str()) {
+        // A credential failure keeps its own code; it says the configuration
+        // is wrong, not that the endpoints disagree.
+        let oracle = match stellar_agent_network::profile_rpc_client(
+            &self.profile,
+            stellar_agent_core::profile::schema::ProviderRole::Oracle,
+            url.as_str(),
+        ) {
             Ok(client) => client,
+            Err(err) if stellar_agent_network::is_credential_error(&err) => {
+                return Err(crate::tools::common::endpoint_refusal_result(&err));
+            }
             Err(err) => {
                 return Err(refuse(redact_rpc_error_detail(
                     "SEP-29 oracle_provider_url client construction failed",
@@ -671,15 +680,9 @@ impl WalletServer {
         // ── Fetch source account state ────────────────────────────────────────
         // For non-native payments, also fetch the source trustline in the SAME
         // batched getLedgerEntries call (one RPC round-trip for account + trustline).
-        let rpc_url = self.context.rpc_url.as_str();
-        let client = match StellarRpcClient::new(rpc_url) {
+        let client = match self.context.primary_client() {
             Ok(c) => c,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    redact_rpc_error_detail("rpc_client_error", &err),
-                    None,
-                ));
-            }
+            Err(err) => return crate::tools::common::rpc_client_failure(&err),
         };
 
         // Establish which network the endpoint serves before the first read
@@ -1295,15 +1298,9 @@ impl WalletServer {
         // Policy evaluates the account state that also supplies the rebuild's
         // sequence number. No nonce consumption, approval write or signing
         // occurs before the gate.
-        let rpc_url = self.context.rpc_url.as_str();
-        let client = match StellarRpcClient::new(rpc_url) {
+        let client = match self.context.primary_client() {
             Ok(c) => c,
-            Err(err) => {
-                return Err(rmcp::ErrorData::internal_error(
-                    redact_rpc_error_detail("rpc_client_error", &err),
-                    None,
-                ));
-            }
+            Err(err) => return crate::tools::common::rpc_client_failure(&err),
         };
 
         // Establish which network the endpoint serves before the first read

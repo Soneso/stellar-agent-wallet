@@ -833,11 +833,11 @@ mod secondary_rule_tests {
             Some("https://file-secondary.example")
         );
         let err = server
-            .secondary_override(Some("https://user:SENTINEL@rpc.example"))
+            .secondary_override(Some("https://loginsentinel:SENTINEL@rpc.example"))
             .unwrap_err();
         assert!(err.message.contains("never carries credentials"));
         assert!(!err.message.contains("SENTINEL"));
-        assert!(!err.message.contains("user"));
+        assert!(!err.message.contains("loginsentinel"));
     }
 
     /// [`server`] with both context endpoints on the mock, so every request a

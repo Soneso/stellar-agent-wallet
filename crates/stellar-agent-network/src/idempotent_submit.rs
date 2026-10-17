@@ -99,8 +99,7 @@ use stellar_rpc_client::GetHealthResponse;
 use stellar_xdr::{Limits, Preconditions, ReadXdr, TransactionEnvelope};
 
 use crate::StellarRpcClient;
-use crate::client::{STALE_PENDING_RECOVERY, rpc_unreachable, unexpected_status};
-use crate::redact::{redact_rpc_error, redact_url_authority};
+use crate::client::{RpcEndpoint, STALE_PENDING_RECOVERY, rpc_unreachable, unexpected_status};
 use crate::retry::{
     RetryPolicy, is_retryable_poll_error, is_retryable_send_error, retry_with_backoff,
     truncate_error_display,
@@ -193,7 +192,7 @@ pub async fn submit_transaction_idempotent(
     // before the decode, the receipt-store read, and `try_begin` keeps a
     // refused mainnet submission from writing a Pending receipt or issuing
     // any RPC read; the inner write paths repeat the guards defence-in-depth.
-    crate::submit::refuse_mainnet_write(network_passphrase, &client.url)
+    crate::submit::refuse_mainnet_write(network_passphrase, client.url.as_str())
         .map_err(WalletError::Network)?;
 
     // ── Step 1: decode XDR and compute idempotency key ─────────────────────
@@ -552,7 +551,7 @@ async fn handle_stale_pending(
             );
         }
         return Err(WalletError::Network(NetworkError::RpcUnreachable {
-            url: redact_url_authority(&client.url),
+            url: client.url.authority(),
             reason: "transaction status ambiguous: stale Pending with unknown tx_hash \
                      (V1 guard should prevent this in normal operation)"
                 .to_owned(),
@@ -638,7 +637,7 @@ async fn handle_stale_pending(
                         )
                     })?;
                 return Err(WalletError::Network(NetworkError::RpcUnreachable {
-                    url: redact_url_authority(&client.url),
+                    url: client.url.authority(),
                     reason: "transaction status ambiguous: NOT_FOUND after max_time elapsed"
                         .to_owned(),
                 }));
@@ -866,7 +865,7 @@ async fn pre_send_checks(
     // passphrase comparison is the primary check; the URL heuristic is the
     // defence-in-depth layer. Every write path carries both, before the
     // envelope decode and before any RPC call.
-    crate::submit::refuse_mainnet_write(network_passphrase, &client.url)
+    crate::submit::refuse_mainnet_write(network_passphrase, client.url.as_str())
         .map_err(WalletError::Network)?;
 
     // The envelope is caller-supplied and untrusted; bounded limits prevent a
@@ -1104,8 +1103,8 @@ const FINAL_RETENTION_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 struct RetentionPoll<'a> {
     /// The store holding the submission's receipt.
     store: &'a ReceiptStore,
-    /// The endpoint URL, for error construction; redacted before use.
-    url: &'a str,
+    /// The endpoint, for error construction; redacted before use.
+    url: &'a RpcEndpoint,
     /// The idempotency key of the receipt.
     envelope_hash: &'a str,
     /// The locally computed transaction hash, 64 lowercase hex characters.
@@ -1208,12 +1207,12 @@ where
                 // Treat transient transport error as NOT_FOUND: log at debug
                 // and poll again after the interval. Truncate error display to
                 // bound log volume from a hostile endpoint.
-                let url_authority = redact_url_authority(url);
+                let url_authority = url.authority();
                 tracing::debug!(
                     envelope_hash = %redacted,
                     tx_hash = %redacted_tx,
                     rpc_url = %url_authority,
-                    error = %truncate_error_display(e),
+                    error = %truncate_error_display(url, e),
                     "submit_with_retention_poll: transient getTransaction error \
                      (treating as NOT_FOUND, continuing poll)"
                 );
@@ -1299,7 +1298,7 @@ where
                             );
                         }
                         return Err(WalletError::Network(NetworkError::RpcUnreachable {
-                            url: redact_url_authority(url),
+                            url: url.authority(),
                             reason: format!(
                                 "transaction status ambiguous: NOT_FOUND and submission \
                                  (recorded_at_ledger={recorded_at_ledger}) predates the RPC \
@@ -1326,7 +1325,7 @@ where
 /// What a retention poll needs to settle at its deadline.
 struct DeadlineExit<'a> {
     store: &'a ReceiptStore,
-    url: &'a str,
+    url: &'a RpcEndpoint,
     envelope_hash: &'a str,
     redacted: &'a str,
     redacted_tx: &'a str,
@@ -1378,7 +1377,7 @@ impl DeadlineExit<'_> {
                 );
             }
             return WalletError::Network(NetworkError::RpcUnreachable {
-                url: redact_url_authority(url),
+                url: url.authority(),
                 reason: format!(
                     "transaction status ambiguous: timeout with transient poll error \
                      (resubmit safely after max_time={max_time})"
@@ -1404,7 +1403,7 @@ impl DeadlineExit<'_> {
                     );
                 }
                 WalletError::Network(NetworkError::RpcUnreachable {
-                    url: redact_url_authority(url),
+                    url: url.authority(),
                     reason: format!(
                         "transaction status ambiguous: timeout + submission predates \
                          retention floor (oldest_ledger={oldest_ledger}). Resubmit \
@@ -1434,7 +1433,7 @@ impl DeadlineExit<'_> {
                     );
                 }
                 WalletError::Network(NetworkError::RpcUnreachable {
-                    url: redact_url_authority(url),
+                    url: url.authority(),
                     reason: format!(
                         "transaction status ambiguous: not confirmed within {s}s \
                          (still within retention window; resubmit safely after \
@@ -1925,7 +1924,7 @@ pub async fn reconcile_receipt(
             // log and return the current status unchanged.
             tracing::warn!(
                 envelope_hash = %redact_envelope_hash(envelope_hash),
-                status = %redact_rpc_error(other),
+                status = %client.url.scrub(other),
                 "reconcile_receipt: unexpected getTransaction status for a Success \
                  receipt; returning current status unchanged"
             );
@@ -1934,14 +1933,14 @@ pub async fn reconcile_receipt(
     }
 }
 
-/// Maps an RPC call that failed against the endpoint at `url` to
+/// Maps an RPC call that failed against `endpoint` to
 /// [`NetworkError::RpcUnreachable`], with the server text scrubbed.
 ///
 /// The stale-Pending recovery read, the send, the non-retryable confirmation
 /// poll, and the reconciliation read all report their transport failures this
 /// way.
-fn transport_failure(url: &str, e: &stellar_rpc_client::Error) -> WalletError {
-    WalletError::Network(rpc_unreachable(url, "", e))
+fn transport_failure(endpoint: &RpcEndpoint, e: &stellar_rpc_client::Error) -> WalletError {
+    WalletError::Network(rpc_unreachable(endpoint, "", e))
 }
 
 /// Decodes a 64-character lowercase hex string to a 32-byte array.
@@ -1999,7 +1998,7 @@ mod tests {
             )),
         ));
         for (case, e) in errors {
-            match transport_failure(ENDPOINT, &e) {
+            match transport_failure(&RpcEndpoint::plain(ENDPOINT), &e) {
                 WalletError::Network(NetworkError::RpcUnreachable { url, reason }) => {
                     assert_eq!(url, ENDPOINT_AUTHORITY, "{case}");
                     assert_scrubbed(case, &reason);
@@ -2568,6 +2567,7 @@ mod tests {
     struct PendingReceipt {
         store: ReceiptStore,
         envelope_hash: String,
+        endpoint: RpcEndpoint,
         _dir: tempfile::TempDir,
     }
 
@@ -2582,6 +2582,7 @@ mod tests {
             Self {
                 store,
                 envelope_hash,
+                endpoint: RpcEndpoint::plain(ENDPOINT),
                 _dir: dir,
             }
         }
@@ -2591,7 +2592,7 @@ mod tests {
         fn poll(&self, deadline: tokio::time::Instant) -> RetentionPoll<'_> {
             RetentionPoll {
                 store: &self.store,
-                url: ENDPOINT,
+                url: &self.endpoint,
                 envelope_hash: &self.envelope_hash,
                 tx_hash_hex: "cd".repeat(32),
                 recorded_at_ledger: 100,

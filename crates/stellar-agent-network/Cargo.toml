@@ -49,6 +49,13 @@ stellar-agent-xdr-limits = { workspace = true }
 # one crate instance and the `From` impl on `stellar_rpc_client::Error`
 # applies; otherwise two distinct `ClientError` types exist in the binary.
 jsonrpsee-core = { version = "=0.26.0", features = ["client"] }
+# The HTTP transport's own error type, which carries the status of a rejected
+# answer inside jsonrpsee's boxed transport error. Same pin and instance as the
+# one stellar-rpc-client resolves; no transport feature is enabled here.
+jsonrpsee-http-client = { version = "=0.26.0", default-features = false }
+# Header names and values for a provider credential sent as a request header.
+# The same `http` instance stellar-rpc-client takes its `HeaderMap` from.
+http = "=1.4.2"
 # Opt-in headless keyring store: init_platform_keyring_store dispatches
 # here when STELLAR_AGENT_KEYRING_BACKEND is set.
 stellar-agent-headless-keyring = { workspace = true }
@@ -112,6 +119,8 @@ wiremock = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "test-util"] }
 # CaptureWriter-backed subscriber in tests/network/redaction_audit.rs.
 tracing-subscriber = { workspace = true }
+# The `log` bridge of the trace probe in tests/network/rpc_credential_placement.rs.
+tracing-log = { workspace = true }
 # ledger-apdu provides the APDUAnswer / APDUCommand types used in hardware
 # signing tests. Pinned to the version stellar-ledger resolves (via
 # ledger-transport 0.10) so the types are one instance, not two.

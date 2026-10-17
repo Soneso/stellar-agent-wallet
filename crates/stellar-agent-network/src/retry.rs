@@ -40,7 +40,8 @@
 //! - [`is_retryable_send_error`] for `send_transaction`.
 //! - [`is_retryable_poll_error`] for `get_transaction` / `get_health`.
 //! - `is_retryable_identity_error` for `getNetwork`. It matches the send
-//!   classifier except that `JsonRpc(ParseError(_))` is not retryable.
+//!   classifier except that `JsonRpc(ParseError(_))` and an HTTP 401 or 403
+//!   answer are not retryable.
 //!
 //! ## Jitter source
 //!
@@ -54,7 +55,7 @@ use std::time::Duration;
 use rand_core::{OsRng, RngCore};
 use tokio::time::Instant;
 
-use crate::redact::redact_rpc_error_display;
+use crate::client::RpcEndpoint;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error-display truncation helper
@@ -72,20 +73,23 @@ use crate::redact::redact_rpc_error_display;
 const MAX_ERROR_DISPLAY_CHARS: usize = 200;
 
 /// Returns at most the first `MAX_ERROR_DISPLAY_CHARS` characters of the
-/// display of `e`, scrubbed with [`redact_rpc_error_display`], for safe
-/// structured-log emission.
+/// display of `e`, scrubbed with [`RpcEndpoint::scrub`] for the endpoint that
+/// produced it, for safe structured-log emission.
 ///
 /// Used at log sites and for the diagnostic text a
 /// [`SubmissionOutcome`](crate::submission_record::SubmissionOutcome) carries.
 /// A server-controlled `JsonRpc` body therefore cannot produce unbounded log
 /// entries.
-/// The scrub runs before the cut, so a URL the server echoed reaches the log
-/// as host and port even when it straddles the bound.
+/// The scrub runs before the cut, so neither a credential nor a URL the
+/// server echoed survives in part where it straddles the bound.
 ///
 /// Not crypto-sensitive: no envelope XDR or signing material appears in
 /// `stellar_rpc_client::Error` display output.
-pub(crate) fn truncate_error_display(e: &stellar_rpc_client::Error) -> String {
-    let s = redact_rpc_error_display(e);
+pub(crate) fn truncate_error_display(
+    endpoint: &RpcEndpoint,
+    e: &stellar_rpc_client::Error,
+) -> String {
+    let s = endpoint.scrub_display(e);
     if s.chars().count() <= MAX_ERROR_DISPLAY_CHARS {
         s
     } else {
@@ -290,11 +294,34 @@ pub fn is_retryable_send_error(e: &stellar_rpc_client::Error) -> bool {
 /// `protocolVersion`, or with a value of the wrong type, is one. The endpoint
 /// did answer, and a further attempt would only spend the caller's deadline
 /// on the same answer.
+///
+/// An HTTP 401 or 403 answer is not retried either: the endpoint refused the
+/// request's credential, and the same request gets the same answer.
 pub(crate) fn is_retryable_identity_error(e: &stellar_rpc_client::Error) -> bool {
     !matches!(
         e,
         stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::ParseError(_))
-    ) && is_retryable_send_error(e)
+    ) && !matches!(rejected_status(e), Some(401 | 403))
+        && is_retryable_send_error(e)
+}
+
+/// Returns the HTTP status of an answer the transport rejected for its
+/// non-success status, or `None` for any other error.
+///
+/// The HTTP transport turns a non-2xx answer into its own `Rejected` error,
+/// without reading the body, and the JSON-RPC client carries that error boxed
+/// as a transport error.
+pub(crate) fn rejected_status(e: &stellar_rpc_client::Error) -> Option<u16> {
+    let stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Transport(source)) = e
+    else {
+        return None;
+    };
+    match source.downcast_ref::<jsonrpsee_http_client::transport::Error>() {
+        Some(jsonrpsee_http_client::transport::Error::Rejected { status_code }) => {
+            Some(*status_code)
+        }
+        _ => None,
+    }
 }
 
 /// Returns `true` if a `getTransaction` or `getHealth` RPC error is worth
@@ -700,7 +727,7 @@ mod tests {
             "the fixture must exceed the bound"
         );
 
-        let out = truncate_error_display(&e);
+        let out = truncate_error_display(&RpcEndpoint::plain("https://rpc.example.com"), &e);
 
         assert_eq!(
             out.chars().count(),
@@ -1239,6 +1266,61 @@ mod tests {
         for (error, retryable) in cases {
             assert_eq!(is_retryable_identity_error(&error), retryable, "{error:?}");
         }
+    }
+
+    fn rejected(status_code: u16) -> stellar_rpc_client::Error {
+        stellar_rpc_client::Error::JsonRpc(jsonrpsee_core::ClientError::Transport(Box::new(
+            jsonrpsee_http_client::transport::Error::Rejected { status_code },
+        )))
+    }
+
+    /// An identity answer of HTTP 401 or 403 ends the retries; a rate limit
+    /// and a server error are still retried. The status reads back from the
+    /// boxed transport error, and no other error has one.
+    #[test]
+    fn identity_classifier_stops_on_401_and_403() {
+        for (status, retryable) in [(401, false), (403, false), (429, true), (500, true)] {
+            let error = rejected(status);
+            assert_eq!(rejected_status(&error), Some(status));
+            assert_eq!(is_retryable_identity_error(&error), retryable, "{status}");
+            assert!(is_retryable_send_error(&error), "{status}");
+        }
+        assert_eq!(
+            rejected_status(&stellar_rpc_client::Error::JsonRpc(
+                jsonrpsee_core::ClientError::Custom("Request rejected `401`".into())
+            )),
+            None
+        );
+        assert_eq!(
+            rejected_status(&stellar_rpc_client::Error::JsonRpc(
+                jsonrpsee_core::ClientError::Transport(Box::new(std::io::Error::other("401")))
+            )),
+            None
+        );
+        assert_eq!(
+            rejected_status(&stellar_rpc_client::Error::InvalidResponse),
+            None
+        );
+    }
+
+    /// The truncation removes the credential forms of its endpoint before
+    /// the cut, a value placed bare in the text included.
+    #[test]
+    fn truncate_error_display_scrubs_the_credential_before_the_cut() {
+        let endpoint = RpcEndpoint::credentialed(
+            "https://rpc.example.com",
+            zeroize::Zeroizing::new("k3y+/%25 v".to_owned()),
+            &stellar_agent_core::profile::schema::RpcCredentialPlacement::Query {
+                name: "apikey".to_owned(),
+            },
+        );
+        let text = format!("echo k3y+/%25 v and k3y%2B%2F%2525+v {}", "x".repeat(300));
+        let out = truncate_error_display(
+            &endpoint,
+            &stellar_rpc_client::Error::TransactionSubmissionFailed(text),
+        );
+        assert!(!out.contains("k3y"), "{out}");
+        assert!(out.contains("echo [redacted] and [redacted] x"), "{out}");
     }
 
     #[tokio::test(start_paused = true)]

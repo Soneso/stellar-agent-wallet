@@ -50,8 +50,7 @@ use stellar_xdr::{
     TransactionEnvelope, TransactionResult, TransactionResultResult,
 };
 
-use crate::client::{StellarRpcClient, rpc_unreachable, unexpected_status};
-use crate::redact::{redact_rpc_error, redact_rpc_error_display, redact_url_authority};
+use crate::client::{RpcEndpoint, StellarRpcClient, rpc_unreachable, unexpected_status};
 use crate::retry::{
     RetryPolicy, is_retryable_poll_error, is_retryable_send_error, retry_with_backoff,
     truncate_error_display,
@@ -193,7 +192,7 @@ pub async fn submit_transaction_and_wait(
     // Mainnet write is structurally forbidden at the submit layer: the
     // passphrase comparison is the primary check and the URL heuristic the
     // defence-in-depth layer, both before any decode or RPC call.
-    refuse_mainnet_write(network_passphrase, &client.url).map_err(WalletError::Network)?;
+    refuse_mainnet_write(network_passphrase, client.url.as_str()).map_err(WalletError::Network)?;
 
     // Decode the base64 XDR envelope. The envelope is caller-supplied and
     // untrusted; bounded limits prevent a deeply nested auth-invocation tree
@@ -362,7 +361,7 @@ pub async fn submit_transaction_and_wait(
 /// the deadline or retryable-error treatment here must be mirrored there.
 async fn poll_for_confirmation<P, F>(
     mut poll: P,
-    url: &str,
+    url: &RpcEndpoint,
     send_deadline: tokio::time::Instant,
     timeout_secs: u64,
     intent: &SubmissionIntent,
@@ -396,11 +395,11 @@ where
                 // Treat transient transport error as NOT_FOUND: log at debug
                 // and poll again after the interval. Truncate error display to
                 // bound log volume from a hostile endpoint.
-                let url_authority = redact_url_authority(url);
+                let url_authority = url.authority();
                 tracing::debug!(
                     tx_hash = %redacted,
                     rpc_url = %url_authority,
-                    error = %truncate_error_display(e),
+                    error = %truncate_error_display(url, e),
                     "submit_transaction_and_wait: transient getTransaction error \
                      (treating as NOT_FOUND, continuing poll)"
                 );
@@ -421,7 +420,7 @@ where
                     &SubmissionOutcome::TransportAfterSend {
                         error: format!(
                             "the confirmation poll could not reach the endpoint: {}",
-                            truncate_error_display(&e)
+                            truncate_error_display(url, &e)
                         ),
                     },
                 )
@@ -489,7 +488,7 @@ where
                     &SubmissionOutcome::TransportAfterSend {
                         error: format!(
                             "the endpoint reported an unexpected transaction status: {}",
-                            redact_rpc_error(other)
+                            url.scrub(other)
                         ),
                     },
                 )
@@ -558,7 +557,7 @@ async fn handle_send_failure(
     recorder: Option<&dyn SubmissionRecorder>,
     intent: &SubmissionIntent,
     error: &stellar_rpc_client::Error,
-    url: &str,
+    url: &RpcEndpoint,
     timeout_secs: u64,
 ) -> WalletError {
     let mapped = map_send_error(error, url, timeout_secs);
@@ -573,7 +572,7 @@ async fn handle_send_failure(
             intent,
             &SubmissionOutcome::Rejected {
                 code: mapped.code().to_owned(),
-                error: truncate_error_display(error),
+                error: truncate_error_display(url, error),
             },
         )
         .await;
@@ -585,7 +584,7 @@ async fn handle_send_failure(
         &SubmissionOutcome::TransportAfterSend {
             error: format!(
                 "the send did not complete and the endpoint's answer is unknown: {}",
-                truncate_error_display(error)
+                truncate_error_display(url, error)
             ),
         },
     )
@@ -853,23 +852,27 @@ pub fn redact_tx_hash(hash: &str) -> String {
 /// `timeout_secs` is the actual caller-configured timeout, used in the
 /// `RpcTimeout` variant so the value is accurate rather than hardcoded.
 ///
-/// Every text field is scrubbed with [`redact_rpc_error`] before it enters the
-/// error, because the client's submission-failure message and the error
+/// Every text field is scrubbed with [`RpcEndpoint::scrub`] before it enters
+/// the error, because the client's submission-failure message and the error
 /// display both carry server text.
-fn map_send_error(e: &stellar_rpc_client::Error, url: &str, timeout_secs: u64) -> WalletError {
+fn map_send_error(
+    e: &stellar_rpc_client::Error,
+    url: &RpcEndpoint,
+    timeout_secs: u64,
+) -> WalletError {
     use stellar_rpc_client::Error as RpcErr;
     match e {
         RpcErr::TransactionSubmissionFailed(msg) => {
             WalletError::Submission(SubmissionError::TxMalformed {
-                detail: redact_rpc_error(msg),
+                detail: url.scrub(msg),
             })
         }
         RpcErr::TransactionSubmissionTimeout => WalletError::Network(NetworkError::RpcTimeout {
-            url: redact_url_authority(url),
+            url: url.authority(),
             timeout_secs,
         }),
         RpcErr::Xdr(_) => WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: redact_rpc_error_display(e),
+            detail: url.scrub_display(e),
         }),
         _ => WalletError::Network(rpc_unreachable(url, "", e)),
     }
@@ -881,20 +884,20 @@ fn map_send_error(e: &stellar_rpc_client::Error, url: &str, timeout_secs: u64) -
 /// `RpcTimeout` variant so the value is accurate rather than hardcoded.
 ///
 /// Every text field takes the error display scrubbed with
-/// [`redact_rpc_error_display`], because that display can carry server text.
+/// [`RpcEndpoint::scrub`], because that display can carry server text.
 fn map_rpc_error_generic(
     e: &stellar_rpc_client::Error,
-    url: &str,
+    url: &RpcEndpoint,
     timeout_secs: u64,
 ) -> WalletError {
     use stellar_rpc_client::Error as RpcErr;
     match e {
         RpcErr::TransactionSubmissionTimeout => WalletError::Network(NetworkError::RpcTimeout {
-            url: redact_url_authority(url),
+            url: url.authority(),
             timeout_secs,
         }),
         RpcErr::Xdr(_) => WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: redact_rpc_error_display(e),
+            detail: url.scrub_display(e),
         }),
         _ => WalletError::Network(rpc_unreachable(url, "", e)),
     }
@@ -1136,7 +1139,7 @@ mod tests {
         for (case, raw) in ERROR_OBJECTS {
             let msg = format!("No status yet:\n {:#?}", call_client_error(raw));
             let e = stellar_rpc_client::Error::TransactionSubmissionFailed(msg);
-            match map_send_error(&e, ENDPOINT, 30) {
+            match map_send_error(&e, &RpcEndpoint::plain(ENDPOINT), 30) {
                 WalletError::Submission(SubmissionError::TxMalformed { detail }) => {
                     assert!(
                         detail.starts_with(SEND_NO_RESPONSE_MARKER),
@@ -1152,7 +1155,7 @@ mod tests {
     /// An XDR error on the send step keeps only the echoed host and port.
     #[test]
     fn map_send_error_scrubs_an_xdr_error() {
-        match map_send_error(&xdr_error(), ENDPOINT, 30) {
+        match map_send_error(&xdr_error(), &RpcEndpoint::plain(ENDPOINT), 30) {
             WalletError::Protocol(ProtocolError::XdrCodecFailed { detail }) => {
                 assert_scrubbed("xdr", &detail);
             }
@@ -1165,7 +1168,7 @@ mod tests {
     #[test]
     fn map_send_error_scrubs_a_json_rpc_error_object() {
         for (case, raw) in ERROR_OBJECTS {
-            match map_send_error(&call_error(raw), ENDPOINT, 30) {
+            match map_send_error(&call_error(raw), &RpcEndpoint::plain(ENDPOINT), 30) {
                 WalletError::Network(NetworkError::RpcUnreachable { url, reason }) => {
                     assert_eq!(url, ENDPOINT_AUTHORITY, "{case}");
                     assert_scrubbed(case, &reason);
@@ -1178,7 +1181,7 @@ mod tests {
     /// An XDR error on the poll step keeps only the echoed host and port.
     #[test]
     fn map_rpc_error_generic_scrubs_an_xdr_error() {
-        match map_rpc_error_generic(&xdr_error(), ENDPOINT, 30) {
+        match map_rpc_error_generic(&xdr_error(), &RpcEndpoint::plain(ENDPOINT), 30) {
             WalletError::Protocol(ProtocolError::XdrCodecFailed { detail }) => {
                 assert_scrubbed("xdr", &detail);
             }
@@ -1191,7 +1194,7 @@ mod tests {
     #[test]
     fn map_rpc_error_generic_scrubs_a_json_rpc_error_object() {
         for (case, raw) in ERROR_OBJECTS {
-            match map_rpc_error_generic(&call_error(raw), ENDPOINT, 30) {
+            match map_rpc_error_generic(&call_error(raw), &RpcEndpoint::plain(ENDPOINT), 30) {
                 WalletError::Network(NetworkError::RpcUnreachable { url, reason }) => {
                     assert_eq!(url, ENDPOINT_AUTHORITY, "{case}");
                     assert_scrubbed(case, &reason);
@@ -1576,7 +1579,7 @@ mod tests {
                         Ok(answer(status))
                     }
                 },
-                "http://127.0.0.1:9",
+                &RpcEndpoint::plain("http://127.0.0.1:9"),
                 deadline,
                 1,
                 &intent,
@@ -1623,7 +1626,7 @@ mod tests {
                     Ok(answer("NOT_FOUND"))
                 })
             },
-            ENDPOINT,
+            &RpcEndpoint::plain(ENDPOINT),
             deadline,
             1,
             &intent,

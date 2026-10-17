@@ -274,7 +274,14 @@ fn payment_build_error_result(detail: &str) -> CallToolResult {
 /// - `WEB_AUTH_ENDPOINT` or `SIGNING_KEY` absent from stellar.toml.
 /// - `WEB_AUTH_ENDPOINT` host != `home_domain` (SSRF bind rejected).
 /// - SEP-10 challenge/response fails.
-/// - The RPC endpoint fails the identity check: its own `network.*` code.
+/// - The RPC endpoint fails the identity check: its own `network.*` code,
+///   `network.rpc_credential_refused` for an HTTP 401 or 403 answer.
+/// - The RPC client cannot be built: `network.rpc_unreachable`,
+///   `network.rpc_credential_refused` for a stored provider credential the
+///   wallet refuses or cannot send, or the keyring code of the credential
+///   read (`auth.keyring_not_found`, `auth.keyring_platform_error`,
+///   `auth.keyring_interactive_session_required`, or
+///   `auth.keyring_config_invalid`).
 /// - Any other x402 `create_payment` error: `x402.payment_build_failed`.
 ///
 /// A `chain_id` that does not match the active profile returns a JSON-RPC
@@ -322,7 +329,6 @@ impl WalletServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use std::sync::Arc;
 
-        use stellar_agent_network::StellarRpcClient;
         use stellar_agent_network::keyring::enrolled_keyring_signer;
         use stellar_agent_x402::exact::{create_payment, validate_requirements};
         use stellar_agent_x402::wire::encode_payment_signature;
@@ -519,7 +525,7 @@ impl WalletServer {
         // The URL is operator-controlled, never facilitator-supplied. Every
         // request of the payment goes to this client, and `create_payment`
         // makes the endpoint identity check its first request.
-        let client = match StellarRpcClient::new(&self.context.rpc_url) {
+        let client = match self.context.primary_client() {
             Ok(client) => client,
             Err(err) => return Ok(crate::tools::common::endpoint_refusal_result(&err)),
         };

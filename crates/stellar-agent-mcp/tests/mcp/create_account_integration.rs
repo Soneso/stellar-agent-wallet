@@ -2409,6 +2409,91 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
     );
 }
 
+/// The prepare and the commit send the profile's primary credential on
+/// every request, and the creation submits; without the credential each
+/// tool ends on the endpoint's 401 with the credential code.
+#[tokio::test]
+#[serial]
+async fn prepare_and_commit_send_the_primary_credential() {
+    use stellar_agent_core::profile::schema::ProviderRole;
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(203);
+    let seed = [0x5c_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+    let mock_server = MockServer::start().await;
+    crate::common::require_rpc_credential(&mock_server).await;
+    Mock::given(method("POST"))
+        .respond_with(CreateAccountSubmitSuccessRpcResponder {
+            account_key_xdr: account_ledger_key_xdr(&source_g),
+            account_xdr: account_entry_xdr_with_balance(&source_g, 100_000_000_000_000),
+            network: crate::common::EndpointNetwork::testnet(),
+        })
+        .mount(&mock_server)
+        .await;
+    let mut profile = testnet_profile_with_rpc(&mock_server.uri());
+    crate::common::bind_rpc_credential(&mut profile, ProviderRole::Primary, true);
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let simulate_args = StellarCreateAccountArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: source_g.clone(),
+        destination: DEST_G.to_owned(),
+        starting_balance: serde_json::from_str(r#""100 XLM""#).expect("parse amount"),
+        classic_base: None,
+    };
+    let sim_result = server
+        .call_stellar_create_account(simulate_args.clone())
+        .await
+        .expect("simulate must not error");
+    assert_ne!(
+        sim_result.is_error,
+        Some(true),
+        "{}",
+        call_result_text(&sim_result)
+    );
+    let sim_data = call_result_json(&sim_result)["data"].clone();
+    let commit_args = StellarCreateAccountCommitArgs {
+        chain_id: simulate_args.chain_id.clone(),
+        source: simulate_args.source.clone(),
+        destination: simulate_args.destination.clone(),
+        starting_balance: simulate_args.starting_balance.clone(),
+        nonce: sim_data["nonce"].as_str().expect("nonce").to_owned(),
+        expires_at_unix_ms: sim_data["expires_at_unix_ms"].as_u64().expect("expiry"),
+        envelope_xdr: sim_data["envelope_xdr"]
+            .as_str()
+            .expect("envelope")
+            .to_owned(),
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    let committed = server
+        .call_stellar_create_account_commit(commit_args.clone())
+        .await
+        .expect("the commit must not error");
+    let committed_json = call_result_json(&committed);
+    assert!(
+        committed_json["data"]["tx_hash"].is_string(),
+        "{committed_json}"
+    );
+    crate::common::assert_every_request_carried_the_credential(&mock_server).await;
+
+    let bare =
+        WalletServer::new(testnet_profile_with_rpc(&mock_server.uri())).expect("WalletServer::new");
+    crate::common::assert_credential_refusals(
+        &mock_server,
+        vec![
+            bare.call_stellar_create_account(simulate_args).await,
+            bare.call_stellar_create_account_commit(commit_args).await,
+        ],
+    )
+    .await;
+}
+
 #[tokio::test]
 #[serial]
 async fn create_account_commit_oracle_identity_refusal_blocks_rebuild() {

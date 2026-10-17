@@ -155,8 +155,9 @@ pub(crate) fn mainnet_write_refusal(chain: Caip2) -> Option<WalletError> {
 /// Returns the refusal of
 /// [`StellarRpcClient::endpoint_identity`](stellar_agent_network::StellarRpcClient::endpoint_identity):
 /// `network.endpoint_network_mismatch`, `network.mainnet_write_forbidden`,
-/// `network.endpoint_identity_unavailable`, or
-/// `network.unsupported_protocol_version`.
+/// `network.endpoint_identity_unavailable`,
+/// `network.unsupported_protocol_version`, or
+/// `network.rpc_credential_refused` when the endpoint answers HTTP 401 or 403.
 pub(crate) async fn check_endpoint_identity(
     client: &stellar_agent_network::StellarRpcClient,
     context: &stellar_agent_network::NetworkContext,
@@ -464,8 +465,8 @@ mod flag_rules_tests {
     fn endpoint_url_flag_refuses_userinfo_without_echoing_it() {
         use clap::builder::TypedValueParser;
         for value in [
-            "https://user:secret@rpc.example",
-            "https://user@rpc.example",
+            "https://loginsentinel:secret@rpc.example",
+            "https://loginsentinel@rpc.example",
         ] {
             let error = EndpointUrlFlag
                 .parse_ref(
@@ -475,7 +476,7 @@ mod flag_rules_tests {
                 )
                 .unwrap_err()
                 .to_string();
-            assert!(!error.contains("user"));
+            assert!(!error.contains("loginsentinel"));
             assert!(!error.contains("secret"));
             assert!(error.contains("`--rpc-url` never carries credentials"));
         }

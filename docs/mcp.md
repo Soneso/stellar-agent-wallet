@@ -247,9 +247,11 @@ authoritative. An endpoint reporting mainnet is refused with
 `network.mainnet_write_forbidden`. One reporting a different network than the
 profile declares is refused with `network.endpoint_network_mismatch`. One whose
 identity cannot be established within the submission timeout is refused with
-`network.endpoint_identity_unavailable`. The probe is retried with bounded
-exponential backoff inside the caller's timeout and never falls back to the
-declaration; an answer that does not parse is not retried.
+`network.endpoint_identity_unavailable`. One that answers the identity request
+with HTTP 401 or 403 is refused with `network.rpc_credential_refused`. The
+probe is retried with bounded exponential backoff inside the caller's timeout
+and never falls back to the declaration; an answer that does not parse, and a
+401 or 403 answer, is not retried.
 [Retries, deadlines, and failover](maintainers/security-internals.md#retries-deadlines-and-failover)
 gives the numbers. This release supports protocol version 29. On testnet and
 other networks, a version outside that range is logged as a warning. On mainnet
@@ -577,16 +579,18 @@ Both payment tools run in this order:
    is a JSON-RPC invalid-params error, which invalid requirements never reach.
 4. The audit pre-flight runs, then the SEP-10 gate for the authenticated tool,
    then the signer load.
-5. The tool builds one RPC client from the profile's `rpc_url`. A URL the
-   transport cannot parse refuses with `network.rpc_unreachable`.
+5. The tool builds one RPC client from the profile's `rpc_url`, with the
+   primary credential the profile names. A URL the transport cannot parse
+   refuses with `network.rpc_unreachable`; a credential the keyring cannot
+   supply refuses with its keyring code or `network.rpc_credential_refused`.
 6. The payment is admitted against the spending window.
 7. The payment is built on that client. Its first request is the endpoint
    identity check, under the profile's `submit_timeout_seconds` (default 60
    seconds); `maxTimeoutSeconds` never sets this deadline.
 
 An identity refusal answers `network.endpoint_network_mismatch`,
-`network.endpoint_identity_unavailable`, or `network.mainnet_write_forbidden`
-through both tools. The authenticated tool answers every other build failure
+`network.endpoint_identity_unavailable`, `network.rpc_credential_refused`, or
+`network.mainnet_write_forbidden` through both tools. The authenticated tool answers every other build failure
 with `x402.payment_build_failed`. Admission comes before the identity check, so
 a refusal there, or any later failure, keeps the admitted spend.
 

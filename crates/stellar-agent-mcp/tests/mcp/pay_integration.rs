@@ -4888,6 +4888,59 @@ async fn the_gate_reconcile_client_is_the_only_other_client_a_v1_round_trip_buil
     );
 }
 
+/// The gate's reconcile client carries the primary credential too: a V1
+/// simulate builds two clients, its own and the reconcile's, and each reads
+/// the credential once.
+#[tokio::test]
+#[serial]
+async fn the_gate_reconcile_client_reads_the_primary_credential() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use stellar_agent_core::profile::schema::ProviderRole;
+    let _data_root = crate::common::isolated_data_root();
+    let entry = crate::common::rpc_credential_entry(ProviderRole::Primary);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&reads);
+    keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+        &entry.service,
+        &entry.account,
+        Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }),
+    )])
+    .expect("hooked mock keyring store init");
+    install_test_nonce_key(236);
+    let seed = [0x5b_u8; 32];
+    let endpoint = round_trip_endpoint(seed, crate::common::EndpointNetwork::testnet()).await;
+    crate::common::require_rpc_credential(&endpoint).await;
+    let mut profile = testnet_profile_with_rpc(&endpoint.uri());
+    crate::common::bind_rpc_credential(&mut profile, ProviderRole::Primary, true);
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    let profile_name = server.profile_name_for_approval();
+    server.set_policy_engine_for_test(Arc::new(per_period_cap_engine(
+        &["stellar_pay", "stellar_pay_commit"],
+        &profile_name,
+        10_000_000_000,
+        "1d",
+    )));
+    let (sim, clients) = crate::common::clients_built_by(
+        server.call_stellar_pay(pay_args(&gstrkey_for_seed(seed), "1000000000")),
+    )
+    .await;
+    let sim = sim.expect("simulate must not error");
+    assert_ne!(sim.is_error, Some(true), "{}", call_result_text(&sim));
+    assert_eq!(
+        clients, 2,
+        "the simulate client and the gate's reconcile client"
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "each client reads the credential"
+    );
+    let trace = crate::common::credential_trace(&endpoint).await;
+    assert!(trace.iter().all(|(_, keyed)| *keyed), "{trace:?}");
+}
+
 /// Runs `commit` against `endpoint` twice. While the endpoint reports testnet,
 /// the commit ends on `competing_code`. While it reports a third network, the
 /// endpoint refusal wins, and the commit's only request is the endpoint
@@ -4926,6 +4979,104 @@ async fn assert_endpoint_refusal_precedes(
         ["getNetwork"],
         "the endpoint refusal precedes `{competing_code}` and every read"
     );
+}
+
+/// The prepare and the commit send the profile's primary credential on
+/// every request, and the payment submits. On a profile without the
+/// credential, the endpoint refuses each tool's identity request with HTTP
+/// 401 and the tool ends there with the credential code.
+#[tokio::test]
+#[serial]
+async fn prepare_and_commit_send_the_primary_credential() {
+    use stellar_agent_core::profile::schema::ProviderRole;
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(235);
+    let seed = [0x5f_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+    let mock_server = MockServer::start().await;
+    crate::common::require_rpc_credential(&mock_server).await;
+    Mock::given(method("POST"))
+        .respond_with(PaySubmitSuccessRpcResponder {
+            account_key_xdr: account_ledger_key_xdr(&source_g),
+            account_xdr: account_entry_xdr_with_balance(&source_g, 100_000_000_000_000),
+            network: crate::common::EndpointNetwork::testnet(),
+        })
+        .mount(&mock_server)
+        .await;
+    let mut profile = testnet_profile_with_rpc(&mock_server.uri());
+    crate::common::bind_rpc_credential(&mut profile, ProviderRole::Primary, true);
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let simulate_args = StellarPayArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: source_g.clone(),
+        destination: DEST_G.to_owned(),
+        amount: None,
+        amount_in_stroops: Some("1000000000".to_owned()),
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        classic_base: None,
+    };
+    let sim_result = server
+        .call_stellar_pay(simulate_args.clone())
+        .await
+        .expect("simulate must not error");
+    assert_ne!(
+        sim_result.is_error,
+        Some(true),
+        "{}",
+        call_result_text(&sim_result)
+    );
+    let sim_data = call_result_json(&sim_result)["data"].clone();
+    let commit_args = StellarPayCommitArgs {
+        chain_id: simulate_args.chain_id.clone(),
+        source: simulate_args.source.clone(),
+        destination: simulate_args.destination.clone(),
+        amount: None,
+        amount_in_stroops: simulate_args.amount_in_stroops.clone(),
+        asset: simulate_args.asset.clone(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        nonce: sim_data["nonce"].as_str().expect("nonce").to_owned(),
+        expires_at_unix_ms: sim_data["expires_at_unix_ms"].as_u64().expect("expiry"),
+        envelope_xdr: sim_data["envelope_xdr"]
+            .as_str()
+            .expect("envelope")
+            .to_owned(),
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    let committed = server
+        .call_stellar_pay_commit(commit_args.clone())
+        .await
+        .expect("the commit must not error");
+    let committed_json = call_result_json(&committed);
+    assert!(
+        committed_json["data"]["tx_hash"].is_string(),
+        "{committed_json}"
+    );
+    crate::common::assert_every_request_carried_the_credential(&mock_server).await;
+
+    let bare =
+        WalletServer::new(testnet_profile_with_rpc(&mock_server.uri())).expect("WalletServer::new");
+    crate::common::assert_credential_refusals(
+        &mock_server,
+        vec![
+            bare.call_stellar_pay(simulate_args).await,
+            bare.call_stellar_pay_commit(commit_args).await,
+        ],
+    )
+    .await;
 }
 
 /// A commit with a valid envelope for `SOURCE_G` and a nonce that never
@@ -5259,6 +5410,108 @@ async fn simulate_sep29_oracle_identity_refusals_are_divergence() {
     assert_eq!(
         crate::common::assert_business_envelope(&result).0,
         "network.rpc_divergence"
+    );
+}
+
+/// The SEP-29 oracle client carries the credential of the oracle record on
+/// both of its requests; the primary endpoint gets none of it.
+#[tokio::test]
+#[serial]
+async fn simulate_sep29_oracle_sends_the_oracle_credential() {
+    use stellar_agent_core::profile::schema::ProviderRole;
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    install_test_nonce_key(241);
+    let primary = sep29_primary().await;
+    let oracle = sep29_primary().await;
+    crate::common::require_rpc_credential(&oracle).await;
+    let mut profile = testnet_profile_with_rpc(&primary.uri());
+    profile.submit_timeout_seconds = Some(1);
+    profile.oracle_provider_url = Some(url::Url::parse(&oracle.uri()).unwrap());
+    crate::common::bind_rpc_credential(&mut profile, ProviderRole::Oracle, true);
+    let server = WalletServer::new(profile).unwrap();
+    let result = server
+        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
+        .await
+        .unwrap();
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "{:?}",
+        call_result_json(&result)
+    );
+    assert_eq!(
+        crate::common::credential_trace(&oracle).await,
+        [
+            ("getNetwork".to_owned(), true),
+            ("getLedgerEntries".to_owned(), true)
+        ]
+    );
+    assert!(
+        crate::common::credential_trace(&primary)
+            .await
+            .iter()
+            .all(|(_, keyed)| !keyed)
+    );
+}
+
+/// A missing oracle credential reports the keyring code, not a divergence,
+/// and the oracle endpoint is never contacted.
+#[tokio::test]
+#[serial]
+async fn simulate_sep29_missing_oracle_credential_reports_keyring_not_found() {
+    use stellar_agent_core::profile::schema::ProviderRole;
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    install_test_nonce_key(242);
+    let primary = sep29_primary().await;
+    let oracle = sep29_primary().await;
+    let mut profile = testnet_profile_with_rpc(&primary.uri());
+    profile.oracle_provider_url = Some(url::Url::parse(&oracle.uri()).unwrap());
+    crate::common::bind_rpc_credential(&mut profile, ProviderRole::Oracle, false);
+    let server = WalletServer::new(profile).unwrap();
+    let result = server
+        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
+        .await
+        .unwrap();
+    let (code, message, _text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "auth.keyring_not_found");
+    assert!(
+        message.contains("stellar-agent-rpc-mcp-test/oracle"),
+        "{message}"
+    );
+    assert!(crate::common::received_methods(&oracle).await.is_empty());
+}
+
+/// An oracle that answers its identity request with HTTP 401 keeps the
+/// divergence code, and the detail names the status and the oracle's
+/// authority.
+#[tokio::test]
+#[serial]
+async fn simulate_sep29_oracle_401_names_the_status_and_authority() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    install_test_nonce_key(243);
+    let primary = sep29_primary().await;
+    let oracle = MockServer::start().await;
+    crate::common::require_rpc_credential(&oracle).await;
+    let server = sep29_server(&primary, Some(&format!("{}/PATH-SENTINEL", oracle.uri())));
+    let result = server
+        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
+        .await
+        .unwrap();
+    let (code, message, _text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "network.rpc_divergence");
+    assert!(message.contains("HTTP 401"), "{message}");
+    let authority = oracle.uri().replace("http://", "");
+    assert!(
+        message.contains(&format!("RPC endpoint '{authority}' answered")),
+        "{message}"
+    );
+    assert!(!message.contains("PATH-SENTINEL"), "{message}");
+    assert_eq!(
+        crate::common::received_methods(&oracle).await,
+        ["getNetwork"]
     );
 }
 

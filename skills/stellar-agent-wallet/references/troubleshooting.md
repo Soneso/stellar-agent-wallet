@@ -84,6 +84,7 @@ own check comes after the nonce is consumed.
 |---|---|---|
 | `network.endpoint_network_mismatch` | The endpoint serves a different network than the one declared (an RPC URL and a `chain_id` / network passphrase that disagree). | Do not retry as-is. Report to the operator: the profile's `rpc_url` and its network do not name the same chain. |
 | `network.endpoint_identity_unavailable` | The endpoint's network identity could not be established within the submission timeout, or its `getNetwork` answer did not parse. A transport failure is retried with bounded backoff; an answer that does not parse is not retried. The probe never falls back to the declared network. | Nothing was sent. Treat the endpoint as unusable and surface it to the operator; do not switch to a different endpoint on your own. |
+| `network.rpc_credential_refused` | The stored RPC credential is empty, over 1024 bytes, or holds a control character, or the endpoint answered the identity request with HTTP 401 or 403, which is not retried. | Nothing was sent. Not agent-recoverable. Report to the operator: re-run `stellar-agent profile enroll-rpc-credential --role <role> --force` and check the placement against the provider's documentation. |
 | `network.unsupported_protocol_version` | A mainnet endpoint runs a protocol version outside the range this release supports (protocol 29). The message names the version and the range. While mainnet writes are refused, a mainnet endpoint is refused with `network.mainnet_write_forbidden` before this check. On testnet and other networks the same version is a logged warning, not a refusal. | Nothing was sent. Report the version to the operator; do not switch to a different endpoint on your own. |
 | `network.envelope_signed_for_mainnet` | A signature on the envelope was made for mainnet, not for the network the endpoint serves. | Do not retry; the envelope cannot be relayed onto this chain. Re-run the simulate step for the intended network. |
 | `network.envelope_signature_unverifiable` | A signature verifies under neither the endpoint's network nor mainnet, or no eligible ed25519 signer accounts for it (hash-x and pre-auth-tx signers contribute no ed25519 key). | Do not retry the same envelope. Re-run the simulate step and sign with a key the source account lists as a signer. |
@@ -215,7 +216,9 @@ A missing or empty **signer** keyring entry on a single-shot SEP-43 sign tool
 surfaces as `sep43.wallet_unlock_failed` under the standard envelope, not a
 `keyring.*` code. At the auth layer a missing keyring entry maps to
 `auth.keyring_not_found`. In every case the operator must enroll the secret for
-the active profile.
+the active profile. An RPC credential entry reports `auth.keyring_not_found`
+with its `service/account`; the operator stores it with
+`stellar-agent profile enroll-rpc-credential`.
 
 Keyring failures on the attestation key during a commit do not surface as a
 keyring code: they are folded into the uniform `policy.approval_required` so the
@@ -287,7 +290,7 @@ detail.
 
 | Code | Meaning | Agent action |
 |---|---|---|
-| `validation.provider_attestation_invalid` | A provider record is missing, malformed, or disagrees with its endpoint or independence assertion. | Correct the named field in the profile file. Mainnet requires a record for each configured secondary or oracle URL. |
+| `validation.provider_attestation_invalid` | A provider record is missing, malformed, or disagrees with its endpoint or independence assertion. A credential reference or placement is malformed, names a wallet key's keyring entry, or meets an insecure endpoint, a URL with userinfo, or a repeated query parameter. A mainnet secondary or oracle record names the primary's operator. | Correct the named field in the profile file. Mainnet requires a record for each configured secondary or oracle URL, and a `[providers.primary]` record. |
 | `network.rpc_divergence` | The SEP-29 oracle cannot be constructed, fails endpoint identity, or disagrees with the primary memo data. | Correct `oracle_provider_url`, confirm it serves the primary's chain, and re-simulate. |
 | `profile.load_failed` | The profile the operator NAMED through `--profile` or `STELLAR_AGENT_PROFILE` could not be loaded. Most often no such file exists. On the value-moving verbs (`pay`, `claim`, `accounts create`, `accounts deploy-c`, `trade`, `vault`, and the four `smart-account deploy-*` commands; `trustline` uses `trustline.profile_load_failed`) a malformed TOML or an unsupported schema version produces this same code with a different cause in the message. Every other command reports those two as `validation.config_invalid` and an absent file as `validation.profile_not_found`; the smart-account verbs report both, and an absent file, as `io.audit_writer_setup`. Do not treat this code as the only shape a load failure takes. On every command, a mainnet profile without `rpc_url` reports `validation.mainnet_rpc_url_required`, and an endpoint URL that breaks the endpoint rule reports `validation.config_invalid`. An invalid provider attestation reports `validation.provider_attestation_invalid`. `pay`, `claim`, and `accounts create` substitute the in-memory zero-config profile ONLY when no name was given at all. So a named profile is never silently replaced by it, including `--profile default` on a host with no `default.toml`. | Not agent-recoverable by retry. Report the name in the message to the operator. Either it is a typo (or a stale `STELLAR_AGENT_PROFILE`) and the correct name should be used. Or the profile has not been created yet and the operator must run `stellar-agent profile init --profile <name>`. Do not re-run without a name to make the error go away. That silently switches which policy engine governs the call. |
 | `profile.non_overlayable_field` | A profile field was supplied outside the file (an environment variable, an overlay, or a command-line flag) that its class does not allow there, including a value equal to the file's. Overlays may set `submit_timeout_seconds` on every chain; `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, `mcp_signer_default`, the threshold, fee, and scan-bound keys on testnet only; and `mcp_disabled` only to `true`. Every other key, keyring coordinates and `audit_log_path` included, comes from the file only. The message names the field. | Not agent-recoverable by retry. Drop the flag or input that supplies the field; the value comes from the profile file only. Report an environment variable or overlay to the operator. |
@@ -370,7 +373,7 @@ query authorization status and reconcile any known server transaction.
   `network.mainnet_write_forbidden`): do not retry; only the operator can change
   policy or network posture.
 - Network binding refusal (`network.endpoint_network_mismatch`,
-  `network.endpoint_identity_unavailable`,
+  `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`,
   `network.unsupported_protocol_version`, `network.envelope_signed_for_mainnet`,
   `network.envelope_signature_unverifiable`, `network.envelope_unsigned`,
   `network.account_not_found`): nothing was sent. Do not resubmit the same

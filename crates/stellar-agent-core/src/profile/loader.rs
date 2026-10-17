@@ -59,9 +59,12 @@ use figment::{
 
 use super::name::validate_path_component_ascii_safe;
 use super::schema::{
-    MAX_SERVED_PAGE_DISPLAY_NAME_CHARS, Profile, ProviderAttestationError,
-    ProviderAttestationRejection, ProviderRecord, Providers, check_endpoint_url,
-    default_audit_log_path_for, provider_host, same_provider_host,
+    KeyringEntryRef, MAX_SERVED_PAGE_DISPLAY_NAME_CHARS, PrimaryProviderRecord, Profile,
+    ProviderAttestationError, ProviderAttestationRejection, ProviderRecord, ProviderRole,
+    Providers, RpcCredentialPlacement, WALLET_KEY_REFERENCE_FIELDS, check_endpoint_url,
+    check_provider_credential, check_rpc_credential_endpoint, check_rpc_credential_entry,
+    check_rpc_credential_placement, default_audit_log_path_for, provider_host,
+    rpc_credential_entry_is_reserved, same_provider_host, same_provider_operator,
 };
 pub use super::schema::{default_approval_dir, default_policy_dir, default_profile_dir};
 use crate::profile::caip2::Caip2;
@@ -886,19 +889,11 @@ fn load_from_path_with_overlays(
         .transpose()
         .map_err(invalid_endpoint)?;
 
-    let providers = validate_providers(
-        partial.providers.as_ref(),
-        chain_id,
-        &rpc_url,
-        partial.secondary_rpc_url.as_deref(),
-        partial.oracle_provider_url.as_deref(),
-    )
-    .map_err(|source| ProfileLoadError::InvalidProviderAttestation {
-        name: name.to_owned(),
-        source,
-    })?;
-
-    let profile = Profile {
+    // The provider credential rules compare against the wallet key references
+    // of the merged profile and of the file alone, because a testnet overlay
+    // can replace `mcp_signer_default`.
+    let file_key_refs = file_wallet_key_references(name, path)?;
+    let mut profile = Profile {
         version: partial.version,
         chain_id,
         rpc_url,
@@ -916,7 +911,7 @@ fn load_from_path_with_overlays(
         attestation_key_id: partial.attestation_key_id,
         counterparty_cache_key_id: partial.counterparty_cache_key_id,
         oracle_provider_url,
-        providers,
+        providers: None,
         policy,
         wallet: partial.wallet,
         smart_account_max_context_rule_scan_id: partial.smart_account_max_context_rule_scan_id,
@@ -929,6 +924,21 @@ fn load_from_path_with_overlays(
         served_pages: partial.served_pages,
         policy_window_state_key_id,
     };
+    let providers = validate_providers(
+        partial.providers.as_ref(),
+        chain_id,
+        &RoleUrls {
+            primary: &profile.rpc_url,
+            secondary: profile.secondary_rpc_url.as_deref(),
+            oracle: partial.oracle_provider_url.as_deref(),
+        },
+        &wallet_refs_with_file(&profile, &file_key_refs),
+    )
+    .map_err(|source| ProfileLoadError::InvalidProviderAttestation {
+        name: name.to_owned(),
+        source,
+    })?;
+    profile.providers = providers;
 
     // ── Step 6: multicall guard.  When the caller wires in a
     // `MulticallRegistryHook` and the registry has an entry for the profile's
@@ -1327,10 +1337,7 @@ pub fn pin_signer_account_on_disk(
     );
 
     let toml_str = toml::to_string_pretty(&doc).map_err(ProfileSaveError::Serialize)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(ProfileSaveError::Io)?;
-    std::io::Write::write_all(&mut tmp, toml_str.as_bytes()).map_err(ProfileSaveError::Io)?;
-    tmp.persist(&dest)
-        .map_err(|e| ProfileSaveError::Io(e.error))?;
+    write_profile_document_atomically(dir, &dest, &toml_str)?;
     Ok(dest)
 }
 
@@ -1390,16 +1397,194 @@ pub fn set_pool_state_on_disk(
     );
 
     let toml_str = toml::to_string_pretty(&doc).map_err(ProfileSaveError::Serialize)?;
+    write_profile_document_atomically(dir, &dest, &toml_str)?;
+    Ok(dest)
+}
+
+/// Canonical-directory wrapper for [`set_provider_credential_on_disk`].
+///
+/// # Errors
+///
+/// See [`set_provider_credential_on_disk`]; additionally
+/// [`ProfileSaveError::NoStateDir`] when the OS-conventional profile
+/// directory cannot be determined.
+pub fn set_provider_credential(
+    name: &str,
+    role: ProviderRole,
+    credential: &KeyringEntryRef,
+    placement: &RpcCredentialPlacement,
+) -> Result<PathBuf, ProfileSaveError> {
+    set_provider_credential_on_disk(
+        name,
+        &default_profile_dir().map_err(ProfileSaveError::NoStateDir)?,
+        role,
+        credential,
+        placement,
+    )
+}
+
+/// Adds ONLY `credential` and `placement` to the `[providers.<role>]` table
+/// of the profile's on-disk TOML document, keeping the rest of the file
+/// verbatim, and writes the result atomically.
+///
+/// This is the persistence half of `profile enroll-rpc-credential`. Like
+/// [`set_pool_state_on_disk`], it does not round-trip through [`load`] and
+/// [`save`], so no environment overlay or derived default reaches the file.
+/// The record is patched in the parsed document itself. The two keys follow
+/// the record's last key as inline tables: `credential = { service = "...",
+/// account = "..." }` and `placement = { kind = "...", name = "..." }`, with
+/// no `name` for a path placement. Apart from the line endings, every
+/// comment, key order, and layout of the rest of the file stays byte for
+/// byte.
+///
+/// The line endings follow the file. When every line of the file ends in
+/// CRLF, every written line does too. Any other file is written as
+/// `toml_edit` renders it, which ends every line in LF.
+///
+/// The record may be a `[providers.<role>]` table or an inline table. It
+/// must exist and hold neither key: the command adds a reference to a record
+/// the operator wrote and never replaces one.
+///
+/// # Errors
+///
+/// - [`ProfileSaveError::InvalidName`] when `name` is not safe as a path
+///   component; refused before the destination path is built.
+/// - [`ProfileSaveError::Io`] when the file cannot be read, parsed, or
+///   written, when it has no `[providers.<role>]` table, or when that table
+///   already holds `credential` or `placement` (all surfaced as
+///   `InvalidData`); the file is unchanged on every refusal.
+pub fn set_provider_credential_on_disk(
+    name: &str,
+    dir: &Path,
+    role: ProviderRole,
+    credential: &KeyringEntryRef,
+    placement: &RpcCredentialPlacement,
+) -> Result<PathBuf, ProfileSaveError> {
+    guard_name_for_save(name)?;
+    let dest = dir.join(format!("{name}.toml"));
+    let invalid = |detail: String| {
+        ProfileSaveError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, detail))
+    };
+    let raw = std::fs::read_to_string(&dest).map_err(ProfileSaveError::Io)?;
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .map_err(|e| invalid(format!("failed to parse '{}': {e}", dest.display())))?;
+    let record = doc
+        .get_mut("providers")
+        .and_then(|providers| providers.get_mut(role.as_str()))
+        .filter(|record| record.is_table_like())
+        .ok_or_else(|| {
+            invalid(format!(
+                "'{}' has no [{}] table",
+                dest.display(),
+                role.record_field()
+            ))
+        })?;
+    let names_credential = record
+        .as_table_like()
+        .is_some_and(|table| table.contains_key("credential") || table.contains_key("placement"));
+    if names_credential {
+        return Err(invalid(format!(
+            "'{}' [{}] already names a credential or a placement",
+            dest.display(),
+            role.record_field()
+        )));
+    }
+    let credential = credential_inline_table(credential);
+    let placement = placement_inline_table(placement);
+    if let Some(inline) = record.as_inline_table_mut() {
+        // The space before an inline table's closing brace is the suffix of
+        // its last value; it moves to the new last value so the existing
+        // pairs keep their exact text.
+        let closing = inline.iter_mut().last().and_then(|(_, value)| {
+            let decor = value.decor_mut();
+            let suffix = decor.suffix().cloned();
+            decor.set_suffix("");
+            suffix
+        });
+        inline.insert("credential", credential.into());
+        inline.insert("placement", placement.into());
+        if let (Some(closing), Some(last)) = (closing, inline.get_mut("placement")) {
+            last.decor_mut().set_suffix(closing);
+        }
+    } else if let Some(table) = record.as_table_like_mut() {
+        table.insert("credential", toml_edit::value(credential));
+        table.insert("placement", toml_edit::value(placement));
+    }
+    let rendered = doc.to_string();
+    let text = if uses_crlf_throughout(&raw) {
+        // `toml_edit` 0.25.12 drops every CR of the parsed text and ends each
+        // line it writes in LF. The first replace guards against a renderer
+        // that keeps a CR, so no line becomes CR CR LF.
+        rendered.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        rendered
+    };
+    write_profile_document_atomically(dir, &dest, &text)?;
+    Ok(dest)
+}
+
+/// Whether `text` holds at least one CRLF and no LF without a CR before it.
+fn uses_crlf_throughout(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut saw_crlf = false;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            if index == 0 || bytes[index - 1] != b'\r' {
+                return false;
+            }
+            saw_crlf = true;
+        }
+    }
+    saw_crlf
+}
+
+/// A credential reference as the inline table the loader decodes:
+/// `{ service = "...", account = "..." }`.
+fn credential_inline_table(credential: &KeyringEntryRef) -> toml_edit::InlineTable {
+    let mut table = toml_edit::InlineTable::new();
+    table.insert("service", credential.service.as_str().into());
+    table.insert("account", credential.account.as_str().into());
+    table
+}
+
+/// A placement as the inline table of its serde form: `kind`, then `name`
+/// for a header or query placement.
+fn placement_inline_table(placement: &RpcCredentialPlacement) -> toml_edit::InlineTable {
+    let (kind, name) = match placement {
+        RpcCredentialPlacement::Header { name } => ("header", Some(name)),
+        RpcCredentialPlacement::Query { name } => ("query", Some(name)),
+        RpcCredentialPlacement::Path {} => ("path", None),
+    };
+    let mut table = toml_edit::InlineTable::new();
+    table.insert("kind", kind.into());
+    if let Some(name) = name {
+        table.insert("name", name.as_str().into());
+    }
+    table
+}
+
+/// Writes `text` to the profile file `dest` in the directory `dir`
+/// atomically.
+///
+/// The text goes into a temporary file in `dir`, which is flushed to disk and
+/// renamed over `dest`, so a reader sees either the old file or the new one.
+/// On Unix the directory is flushed as well, so the rename survives a crash.
+fn write_profile_document_atomically(
+    dir: &Path,
+    dest: &Path,
+    text: &str,
+) -> Result<(), ProfileSaveError> {
     let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(ProfileSaveError::Io)?;
-    std::io::Write::write_all(&mut tmp, toml_str.as_bytes()).map_err(ProfileSaveError::Io)?;
+    std::io::Write::write_all(&mut tmp, text.as_bytes()).map_err(ProfileSaveError::Io)?;
     tmp.as_file().sync_all().map_err(ProfileSaveError::Io)?;
-    tmp.persist(&dest)
+    tmp.persist(dest)
         .map_err(|e| ProfileSaveError::Io(e.error))?;
     #[cfg(unix)]
     std::fs::File::open(dir)
         .and_then(|file| file.sync_all())
         .map_err(ProfileSaveError::Io)?;
-    Ok(dest)
+    Ok(())
 }
 
 /// Errors produced when saving a profile.
@@ -1631,23 +1816,151 @@ struct OnDiskChainId {
     chain_id: Caip2,
 }
 
-struct RoleFields<'a> {
-    role: &'static str,
-    record_field: &'static str,
-    operator_field: &'static str,
-    host_field: &'static str,
-    independence_field: &'static str,
-    url_field: &'static str,
-    url: Option<&'a str>,
-    slot: &'a mut Option<ProviderRecord>,
+/// Reads the wallet key references the profile file names, without overlays.
+///
+/// Each field of [`WALLET_KEY_REFERENCE_FIELDS`] is decoded on its own and a
+/// malformed one is skipped, so this read never refuses a file the merged
+/// extraction accepts.
+fn file_wallet_key_references(
+    name: &str,
+    path: &Path,
+) -> Result<Vec<KeyringEntryRef>, ProfileLoadError> {
+    let fields: serde_json::Map<String, serde_json::Value> = Figment::new()
+        .merge(Toml::file(path))
+        .extract()
+        .map_err(|e| ProfileLoadError::Figment {
+            name: name.to_owned(),
+            source: Box::new(e),
+        })?;
+    Ok(WALLET_KEY_REFERENCE_FIELDS
+        .iter()
+        .filter_map(|field| fields.get(*field))
+        .filter_map(|value| serde_json::from_value(value.clone()).ok())
+        .collect())
 }
 
+/// The wallet key references the provider credential rules compare against:
+/// those of `profile` followed by those the file alone names.
+fn wallet_refs_with_file<'a>(
+    profile: &'a Profile,
+    file_refs: &'a [KeyringEntryRef],
+) -> Vec<&'a KeyringEntryRef> {
+    profile
+        .wallet_key_references()
+        .into_iter()
+        .flatten()
+        .chain(file_refs)
+        .collect()
+}
+
+/// Canonical-directory wrapper for [`check_provider_credential_for_write_in_dir`].
+///
+/// # Errors
+///
+/// See [`check_provider_credential_for_write_in_dir`]; additionally
+/// [`ProfileLoadError::NoStateDir`] when the OS-conventional profile directory
+/// cannot be determined.
+pub fn check_provider_credential_for_write(
+    name: &str,
+    profile: &Profile,
+    role: ProviderRole,
+    credential: &KeyringEntryRef,
+    placement: &RpcCredentialPlacement,
+) -> Result<(), ProfileLoadError> {
+    check_provider_credential_for_write_in_dir(
+        name,
+        &default_profile_dir()?,
+        profile,
+        role,
+        credential,
+        placement,
+    )
+}
+
+/// Runs the loader's credential checks on a provider record of `role` that a
+/// caller is about to write into the profile file `name` in `dir`.
+///
+/// `profile` is the loaded profile. The checks are the loader's credential
+/// checks in the loader's order, against the role's merged endpoint URL and
+/// the wallet key references of both the loaded profile and the file alone,
+/// the same references the loader compares. A record that passes loads.
+///
+/// # Errors
+///
+/// - [`ProfileLoadError::InvalidName`] when `name` is not safe as a path
+///   component.
+/// - [`ProfileLoadError::Figment`] when the file cannot be read.
+/// - [`ProfileLoadError::InvalidProviderAttestation`] with the refused field,
+///   including [`ProviderAttestationRejection::UrlRequired`] when the role has
+///   no endpoint URL.
+pub fn check_provider_credential_for_write_in_dir(
+    name: &str,
+    dir: &Path,
+    profile: &Profile,
+    role: ProviderRole,
+    credential: &KeyringEntryRef,
+    placement: &RpcCredentialPlacement,
+) -> Result<(), ProfileLoadError> {
+    guard_name_for_load(name)?;
+    let file_refs = file_wallet_key_references(name, &dir.join(format!("{name}.toml")))?;
+    let invalid = |source| ProfileLoadError::InvalidProviderAttestation {
+        name: name.to_owned(),
+        source,
+    };
+    let url = profile.role_url(role).ok_or_else(|| {
+        invalid(ProviderAttestationError {
+            field: role.record_field(),
+            reason: ProviderAttestationRejection::UrlRequired {
+                url_field: role.url_field(),
+            },
+        })
+    })?;
+    check_provider_credential(
+        role,
+        credential,
+        placement,
+        url,
+        &wallet_refs_with_file(profile, &file_refs),
+    )
+    .map_err(invalid)
+}
+
+/// The merged endpoint URLs of the three roles.
+struct RoleUrls<'a> {
+    primary: &'a str,
+    secondary: Option<&'a str>,
+    oracle: Option<&'a str>,
+}
+
+/// One provider record as the file states it, before the role checks.
+struct DecodedRecord {
+    operator: String,
+    host: String,
+    independent_of_primary: bool,
+    credential: Option<KeyringEntryRef>,
+    placement: Option<RpcCredentialPlacement>,
+}
+
+/// Checks the `providers` table and returns the validated records.
+///
+/// The checks run in a fixed order and the first refusal wins:
+///
+/// 1. The container is a table with no key besides `primary`, `secondary`,
+///    and `oracle`.
+/// 2. The primary record: its decode, the credential pairing, the
+///    reserved-entry rule, its operator, its host against `rpc_url`, and the
+///    credential endpoint rules.
+/// 3. For the secondary, then the oracle record: its decode, the credential
+///    pairing, the reserved-entry rule, the endpoint presence, its operator,
+///    its host, the credential endpoint rules, the mainnet independence
+///    assertion, and the distinct primary host.
+/// 4. On mainnet, a primary record when a secondary or oracle URL is set.
+/// 5. On mainnet, a secondary or oracle operator other than the primary's.
 fn validate_providers(
     raw: Option<&serde_json::Value>,
     chain: Caip2,
-    primary_url: &str,
-    secondary_url: Option<&str>,
-    oracle_url: Option<&str>,
+    urls: &RoleUrls<'_>,
+    wallet_refs: &[&KeyringEntryRef],
 ) -> Result<Option<Providers>, ProviderAttestationError> {
     use ProviderAttestationRejection as Reason;
     let reject = |field, reason| ProviderAttestationError { field, reason };
@@ -1658,108 +1971,280 @@ fn validate_providers(
                 .ok_or_else(|| reject("providers", Reason::InvalidContainer))
         })
         .transpose()?;
-    if let Some(table) = table {
-        if table.contains_key("primary") {
-            return Err(reject("providers.primary", Reason::PrimaryReserved));
-        }
-        if table
+    if let Some(table) = table
+        && table
             .keys()
-            .any(|key| !matches!(key.as_str(), "secondary" | "oracle"))
-        {
-            return Err(reject("providers", Reason::InvalidContainer));
-        }
+            .any(|key| !matches!(key.as_str(), "primary" | "secondary" | "oracle"))
+    {
+        return Err(reject("providers", Reason::InvalidContainer));
     }
-    let mut providers = Providers::default();
-    for RoleFields {
-        role,
-        record_field,
-        operator_field,
-        host_field,
-        independence_field,
-        url_field,
-        url,
-        slot,
-    } in [
-        RoleFields {
-            role: "secondary",
-            record_field: "providers.secondary",
-            operator_field: "providers.secondary.operator",
-            host_field: "providers.secondary.host",
-            independence_field: "providers.secondary.independent_of_primary",
-            url_field: "secondary_rpc_url",
-            url: secondary_url,
-            slot: &mut providers.secondary,
-        },
-        RoleFields {
-            role: "oracle",
-            record_field: "providers.oracle",
-            operator_field: "providers.oracle.operator",
-            host_field: "providers.oracle.host",
-            independence_field: "providers.oracle.independent_of_primary",
-            url_field: "oracle_provider_url",
-            url: oracle_url,
-            slot: &mut providers.oracle,
-        },
+    let record_of = |role: ProviderRole| {
+        table
+            .and_then(|table| table.get(role.as_str()))
+            .map(|value| decode_provider_record(value, role))
+            .transpose()
+    };
+
+    let mut primary = None;
+    if let Some(record) = record_of(ProviderRole::Primary)? {
+        check_record_credential(&record, ProviderRole::Primary, wallet_refs)?;
+        check_record_endpoint(&record, ProviderRole::Primary, urls.primary)?;
+        primary = Some(PrimaryProviderRecord {
+            operator: record.operator,
+            host: record.host,
+            credential: record.credential,
+            placement: record.placement,
+        });
+    }
+
+    let mut providers = Providers {
+        primary,
+        ..Providers::default()
+    };
+    for (role, url, slot) in [
+        (
+            ProviderRole::Secondary,
+            urls.secondary,
+            &mut providers.secondary,
+        ),
+        (ProviderRole::Oracle, urls.oracle, &mut providers.oracle),
     ] {
-        let record = table
-            .and_then(|table| table.get(role))
-            .map(|value| {
-                decode_provider_record(value)
-                    .ok_or_else(|| reject(record_field, Reason::InvalidShape))
-            })
-            .transpose()?;
+        let record = record_of(role)?;
+        if let Some(record) = &record {
+            check_record_credential(record, role, wallet_refs)?;
+        }
+        let url_field = role.url_field();
         let (record, url) = match (record, url) {
             (None, None) => continue,
-            (Some(_), None) => return Err(reject(record_field, Reason::UrlRequired { url_field })),
+            (Some(_), None) => {
+                return Err(reject(
+                    role.record_field(),
+                    Reason::UrlRequired { url_field },
+                ));
+            }
             (None, Some(_)) if chain.is_mainnet() => {
-                return Err(reject(record_field, Reason::MissingRecord { url_field }));
+                return Err(reject(
+                    role.record_field(),
+                    Reason::MissingRecord { url_field },
+                ));
             }
             (None, Some(_)) => continue,
             (Some(record), Some(url)) => (record, url),
         };
-        if record.operator.trim().is_empty() {
-            return Err(reject(operator_field, Reason::EmptyOperator));
-        }
-        if !matches!(
-            (normalized_record_host(&record.host), provider_host(url)),
-            (Some(record_host), Some(url_host)) if record_host == url_host
-        ) {
-            return Err(reject(host_field, Reason::HostMismatch { url_field }));
-        }
+        check_record_endpoint(&record, role, url)?;
         if chain.is_mainnet() && !record.independent_of_primary {
-            return Err(reject(independence_field, Reason::IndependenceRequired));
+            return Err(reject(
+                role.independence_field(),
+                Reason::IndependenceRequired,
+            ));
         }
-        if record.independent_of_primary && same_provider_host(url, primary_url) {
-            return Err(reject(url_field, Reason::SamePrimaryHost { record_field }));
+        if record.independent_of_primary && same_provider_host(url, urls.primary) {
+            return Err(reject(
+                url_field,
+                Reason::SamePrimaryHost {
+                    record_field: role.record_field(),
+                },
+            ));
         }
-        *slot = Some(record);
+        *slot = Some(ProviderRecord {
+            operator: record.operator,
+            host: record.host,
+            independent_of_primary: record.independent_of_primary,
+            credential: record.credential,
+            placement: record.placement,
+        });
+    }
+
+    if chain.is_mainnet() {
+        let Some(primary) = &providers.primary else {
+            if urls.secondary.is_some() || urls.oracle.is_some() {
+                return Err(reject("providers.primary", Reason::PrimaryRecordRequired));
+            }
+            return Ok(raw.map(|_| providers));
+        };
+        for (role, record) in [
+            (ProviderRole::Secondary, &providers.secondary),
+            (ProviderRole::Oracle, &providers.oracle),
+        ] {
+            if let Some(record) = record
+                && same_provider_operator(&record.operator, &primary.operator)
+            {
+                return Err(reject(role.operator_field(), Reason::SharedOperator));
+            }
+        }
     }
     Ok(raw.map(|_| providers))
 }
 
-// Decode each member without carrying serde's input-bearing diagnostics.
-fn decode_provider_record(value: &serde_json::Value) -> Option<ProviderRecord> {
-    let table = value.as_object()?;
-    if table
-        .keys()
-        .any(|key| !matches!(key.as_str(), "operator" | "host" | "independent_of_primary"))
-    {
-        return None;
+/// Checks that a record names a credential and a placement together, and
+/// that the credential is no wallet key's entry.
+fn check_record_credential(
+    record: &DecodedRecord,
+    role: ProviderRole,
+    wallet_refs: &[&KeyringEntryRef],
+) -> Result<(), ProviderAttestationError> {
+    use ProviderAttestationRejection as Reason;
+    let reject = |field, reason| ProviderAttestationError { field, reason };
+    match (&record.credential, &record.placement) {
+        (Some(_), None) => Err(reject(
+            role.credential_field(),
+            Reason::IncompleteCredential {
+                missing_field: "placement",
+            },
+        )),
+        (None, Some(_)) => Err(reject(
+            role.placement_field(),
+            Reason::IncompleteCredential {
+                missing_field: "credential",
+            },
+        )),
+        (Some(credential), Some(_))
+            if rpc_credential_entry_is_reserved(credential, wallet_refs) =>
+        {
+            Err(reject(
+                role.credential_field(),
+                Reason::ReservedCredentialEntry,
+            ))
+        }
+        _ => Ok(()),
     }
-    Some(ProviderRecord {
-        operator: match table.get("operator") {
-            Some(value) => value.as_str()?.to_owned(),
-            None => String::new(),
-        },
-        host: match table.get("host") {
-            Some(value) => value.as_str()?.to_owned(),
-            None => String::new(),
-        },
-        independent_of_primary: match table.get("independent_of_primary") {
-            Some(value) => value.as_bool()?,
-            None => false,
-        },
+}
+
+/// Checks a record's operator and host against the role's endpoint URL, then
+/// the endpoint rules of a record that names a credential.
+fn check_record_endpoint(
+    record: &DecodedRecord,
+    role: ProviderRole,
+    url: &str,
+) -> Result<(), ProviderAttestationError> {
+    use ProviderAttestationRejection as Reason;
+    let reject = |field, reason| ProviderAttestationError { field, reason };
+    if record.operator.trim().is_empty() {
+        return Err(reject(role.operator_field(), Reason::EmptyOperator));
+    }
+    if !matches!(
+        (normalized_record_host(&record.host), provider_host(url)),
+        (Some(record_host), Some(url_host)) if record_host == url_host
+    ) {
+        return Err(reject(
+            role.host_field(),
+            Reason::HostMismatch {
+                url_field: role.url_field(),
+            },
+        ));
+    }
+    if let (Some(_), Some(placement)) = (&record.credential, &record.placement) {
+        check_rpc_credential_endpoint(role, url, placement)?;
+    }
+    Ok(())
+}
+
+// Decode each member without carrying serde's input-bearing diagnostics.
+fn decode_provider_record(
+    value: &serde_json::Value,
+    role: ProviderRole,
+) -> Result<DecodedRecord, ProviderAttestationError> {
+    use ProviderAttestationRejection as Reason;
+    let reject = |field, reason| ProviderAttestationError { field, reason };
+    let shape = || reject(role.record_field(), Reason::InvalidShape);
+    let table = value.as_object().ok_or_else(shape)?;
+    if table.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "operator" | "host" | "independent_of_primary" | "credential" | "placement"
+        )
+    }) {
+        return Err(shape());
+    }
+    let text = |key: &str| match table.get(key) {
+        Some(value) => value.as_str().map(str::to_owned).ok_or_else(shape),
+        None => Ok(String::new()),
+    };
+    let operator = text("operator")?;
+    let host = text("host")?;
+    let independent_of_primary = match (role, table.get("independent_of_primary")) {
+        (_, None) => false,
+        (ProviderRole::Primary, Some(_)) => {
+            return Err(reject(
+                role.independence_field(),
+                Reason::PrimaryIndependence,
+            ));
+        }
+        (_, Some(value)) => value.as_bool().ok_or_else(shape)?,
+    };
+    let credential = table
+        .get("credential")
+        .map(|value| {
+            decode_credential(value).map_err(|reason| reject(role.credential_field(), reason))
+        })
+        .transpose()?;
+    let placement = table
+        .get("placement")
+        .map(|value| {
+            decode_placement(value).map_err(|reason| reject(role.placement_field(), reason))
+        })
+        .transpose()?;
+    if let Some(placement) = &placement {
+        check_rpc_credential_placement(placement)
+            .map_err(|reason| reject(role.placement_name_field(), reason))?;
+    }
+    Ok(DecodedRecord {
+        operator,
+        host,
+        independent_of_primary,
+        credential,
+        placement,
     })
+}
+
+/// Decodes a credential reference: a table with exactly the string keys
+/// `service` and `account`, both passing [`check_rpc_credential_entry`].
+fn decode_credential(
+    value: &serde_json::Value,
+) -> Result<KeyringEntryRef, ProviderAttestationRejection> {
+    let invalid = || ProviderAttestationRejection::InvalidCredential;
+    let table = value.as_object().ok_or_else(invalid)?;
+    if table.len() != 2 {
+        return Err(invalid());
+    }
+    let text = |key: &str| {
+        table
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid)
+    };
+    let entry = KeyringEntryRef::new(text("service")?, text("account")?);
+    check_rpc_credential_entry(&entry)?;
+    Ok(entry)
+}
+
+/// Decodes a placement: `kind = "header"` or `kind = "query"` with a string
+/// `name`, or `kind = "path"` alone.
+fn decode_placement(
+    value: &serde_json::Value,
+) -> Result<RpcCredentialPlacement, ProviderAttestationRejection> {
+    let invalid = || ProviderAttestationRejection::InvalidPlacement;
+    let table = value.as_object().ok_or_else(invalid)?;
+    let kind = table
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    let name = || {
+        if table.len() != 2 {
+            return Err(invalid());
+        }
+        table
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(invalid)
+    };
+    match kind {
+        "header" => Ok(RpcCredentialPlacement::Header { name: name()? }),
+        "query" => Ok(RpcCredentialPlacement::Query { name: name()? }),
+        "path" if table.len() == 1 => Ok(RpcCredentialPlacement::Path {}),
+        _ => Err(invalid()),
+    }
 }
 
 fn normalized_record_host(raw: &str) -> Option<String> {
@@ -3117,6 +3602,7 @@ account = "default"
             }}))
             .unwrap(),
         );
+        let file = with_primary_record(&file, "127.0.0.1");
         let (dir, name) = write_profile(&file);
         let profile = load_from_dir(&name, dir.path(), None).unwrap();
         assert_eq!(profile.rpc_url, "https://127.0.0.1:8443");
@@ -4645,6 +5131,12 @@ account = "a"
         serde_json::json!({"operator": "Independent organization", "host": host, "independent_of_primary": independent})
     }
 
+    /// Appends a `[providers.primary]` record for `host` under an operator of
+    /// its own, which a mainnet profile with a second endpoint requires.
+    fn with_primary_record(file: &str, host: &str) -> String {
+        format!("{file}\n[providers.primary]\noperator = \"Primary operator\"\nhost = \"{host}\"\n")
+    }
+
     fn provider_file(
         chain: &str,
         primary: &str,
@@ -4778,11 +5270,9 @@ account = "a"
                 }
                 let mut record = provider_record("other.example", true);
                 record["operator"] = "  Meaningful organization  ".into();
-                let loaded = load_provider_file(&role_file(
-                    chain,
-                    role,
-                    Some("https://other.example"),
-                    Some(record),
+                let loaded = load_provider_file(&with_primary_record(
+                    &role_file(chain, role, Some("https://other.example"), Some(record)),
+                    "primary.example",
                 ))
                 .unwrap();
                 let providers = loaded.providers.unwrap();
@@ -4811,11 +5301,9 @@ account = "a"
                     ("https://127.0.0.1", "127.1"),
                     ("https://[2001:db8::1]", "[2001:0DB8::1]"),
                 ] {
-                    let loaded = load_provider_file(&role_file(
-                        chain,
-                        role,
-                        Some(url),
-                        Some(provider_record(host, true)),
+                    let loaded = load_provider_file(&with_primary_record(
+                        &role_file(chain, role, Some(url), Some(provider_record(host, true))),
+                        "primary.example",
                     ))
                     .unwrap();
                     let providers = loaded.providers.unwrap();
@@ -4993,14 +5481,14 @@ account = "a"
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for role in ["secondary", "oracle"] {
                 for host in ["other.example", "child.primary.example"] {
+                    let file = role_file(
+                        chain,
+                        role,
+                        Some(&format!("https://{host}")),
+                        Some(provider_record(host, true)),
+                    );
                     assert!(
-                        load_provider_file(&role_file(
-                            chain,
-                            role,
-                            Some(&format!("https://{host}")),
-                            Some(provider_record(host, true))
-                        ))
-                        .is_ok()
+                        load_provider_file(&with_primary_record(&file, "primary.example")).is_ok()
                     );
                 }
             }
@@ -5011,16 +5499,14 @@ account = "a"
     fn secondary_and_oracle_may_share_a_provider() {
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             let record = provider_record("shared.example", true);
-            assert!(
-                load_provider_file(&provider_file(
-                    chain,
-                    "https://primary.example",
-                    Some("https://shared.example/secondary"),
-                    Some("https://shared.example/oracle"),
-                    Some(serde_json::json!({"secondary": record, "oracle": record}))
-                ))
-                .is_ok()
+            let file = provider_file(
+                chain,
+                "https://primary.example",
+                Some("https://shared.example/secondary"),
+                Some("https://shared.example/oracle"),
+                Some(serde_json::json!({"secondary": record, "oracle": record})),
             );
+            assert!(load_provider_file(&with_primary_record(&file, "primary.example")).is_ok());
         }
     }
 
@@ -5065,29 +5551,6 @@ account = "a"
     }
 
     #[test]
-    fn provider_primary_is_reserved() {
-        for chain in ["stellar:testnet", "stellar:mainnet"] {
-            for record in [
-                serde_json::json!({}),
-                serde_json::json!({"SECRET_SENTINEL": "SECRET_SENTINEL"}),
-                serde_json::json!("SECRET_SENTINEL"),
-            ] {
-                assert_provider_refusal(
-                    &provider_file(
-                        chain,
-                        "https://primary.example",
-                        None,
-                        None,
-                        Some(serde_json::json!({"primary": record})),
-                    ),
-                    "providers.primary",
-                    ProviderAttestationRejection::PrimaryReserved,
-                );
-            }
-        }
-    }
-
-    #[test]
     fn provider_shape_errors_name_fields_without_values() {
         for chain in ["stellar:testnet", "stellar:mainnet"] {
             for value in [
@@ -5102,7 +5565,7 @@ account = "a"
                     ProviderAttestationRejection::InvalidContainer,
                 );
             }
-            for role in ["secondary", "oracle"] {
+            for role in ["primary", "secondary", "oracle"] {
                 for record in [
                     serde_json::json!("SECRET_SENTINEL"),
                     serde_json::json!({"SECRET_SENTINEL": 1}),
@@ -5110,6 +5573,9 @@ account = "a"
                     serde_json::json!({"host": ["SECRET_SENTINEL"]}),
                     serde_json::json!({"independent_of_primary": "SECRET_SENTINEL"}),
                 ] {
+                    if role == "primary" && record.get("independent_of_primary").is_some() {
+                        continue;
+                    }
                     assert_provider_refusal(
                         &role_file(
                             chain,
@@ -5141,8 +5607,8 @@ account = "a"
         let file = file.replace("http://primary.example", "https://primary.example");
         assert_provider_refusal(
             &file,
-            "providers.primary",
-            ProviderAttestationRejection::PrimaryReserved,
+            "providers.primary.operator",
+            ProviderAttestationRejection::EmptyOperator,
         );
         let file = provider_file(
             "stellar:mainnet",
@@ -5193,7 +5659,19 @@ account = "a"
         for reason in [
             R::InvalidContainer,
             R::InvalidShape,
-            R::PrimaryReserved,
+            R::PrimaryIndependence,
+            R::IncompleteCredential {
+                missing_field: "placement",
+            },
+            R::InvalidCredential,
+            R::InvalidPlacement,
+            R::InvalidHeaderName,
+            R::InvalidQueryParameterName,
+            R::ReservedCredentialEntry,
+            R::UserinfoWithCredential,
+            R::InsecureCredentialEndpoint,
+            R::PrimaryRecordRequired,
+            R::SharedOperator,
             R::UrlRequired {
                 url_field: "oracle_provider_url",
             },
@@ -5293,6 +5771,1732 @@ account = "a"
                     ..
                 })
             ));
+        }
+    }
+
+    /// Provider records of all three roles that name a keyring credential, the
+    /// primary record, and the mainnet operator rule.
+    mod provider_credentials {
+        use super::*;
+
+        const CHAINS: [&str; 2] = ["stellar:testnet", "stellar:mainnet"];
+        const ROLES: [&str; 3] = ["primary", "secondary", "oracle"];
+
+        fn url_field(role: &str) -> &'static str {
+            match role {
+                "primary" => "rpc_url",
+                "secondary" => "secondary_rpc_url",
+                _ => "oracle_provider_url",
+            }
+        }
+
+        fn field(role: &str, suffix: &str) -> String {
+            if suffix.is_empty() {
+                format!("providers.{role}")
+            } else {
+                format!("providers.{role}.{suffix}")
+            }
+        }
+
+        fn header(name: &str) -> serde_json::Value {
+            serde_json::json!({"kind": "header", "name": name})
+        }
+
+        fn query(name: &str) -> serde_json::Value {
+            serde_json::json!({"kind": "query", "name": name})
+        }
+
+        fn entry(service: &str, account: &str) -> serde_json::Value {
+            serde_json::json!({"service": service, "account": account})
+        }
+
+        fn default_entry(role: &str) -> serde_json::Value {
+            entry("stellar-agent-rpc-test-profile", role)
+        }
+
+        /// A record for `role` on `host` naming `credential` and `placement`.
+        fn credential_record(
+            role: &str,
+            host: &str,
+            credential: serde_json::Value,
+            placement: serde_json::Value,
+        ) -> serde_json::Value {
+            let mut record = provider_record(host, true);
+            if role == "primary" {
+                record
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("independent_of_primary");
+            }
+            record["credential"] = credential;
+            record["placement"] = placement;
+            record
+        }
+
+        /// A profile on `chain` whose `role` endpoint is `url` and whose `role`
+        /// record is `record`. Secondary and oracle files use the primary
+        /// endpoint `https://primary.example` with a primary record of
+        /// another operator.
+        fn role_credential_file(
+            chain: &str,
+            role: &str,
+            url: Option<&str>,
+            record: serde_json::Value,
+        ) -> String {
+            let mut providers = serde_json::Map::new();
+            providers.insert(role.to_owned(), record);
+            if role == "primary" {
+                return provider_file(
+                    chain,
+                    url.unwrap(),
+                    None,
+                    None,
+                    Some(serde_json::Value::Object(providers)),
+                );
+            }
+            providers.insert(
+                "primary".to_owned(),
+                serde_json::json!({"operator": "Primary operator", "host": "primary.example"}),
+            );
+            provider_file(
+                chain,
+                "https://primary.example",
+                if role == "secondary" { url } else { None },
+                if role == "oracle" { url } else { None },
+                Some(serde_json::Value::Object(providers)),
+            )
+        }
+
+        /// The endpoint URL of `role` in the fixtures: the primary on
+        /// `primary.example`, the others on `other.example`.
+        fn role_host(role: &str) -> &'static str {
+            if role == "primary" {
+                "primary.example"
+            } else {
+                "other.example"
+            }
+        }
+
+        /// Rewrites a profile file through `edit` on its parsed TOML.
+        fn edit_file(file: &str, edit: impl FnOnce(&mut toml::Value)) -> String {
+            let mut value: toml::Value = toml::from_str(file).unwrap();
+            edit(&mut value);
+            toml::to_string(&value).unwrap()
+        }
+
+        /// Sets the `[mcp_signer_default]` reference of a profile file.
+        fn with_signer(file: &str, service: &str, account: &str) -> String {
+            edit_file(file, |value| {
+                value["mcp_signer_default"] =
+                    toml::Value::try_from(entry(service, account)).unwrap();
+            })
+        }
+
+        fn load_named(name: &str, file: &str) -> Result<Profile, ProfileLoadError> {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(format!("{name}.toml")), file).unwrap();
+            load_from_dir(name, dir.path(), None)
+        }
+
+        fn refusal(
+            result: Result<Profile, ProfileLoadError>,
+        ) -> (&'static str, ProviderAttestationRejection) {
+            match result {
+                Err(ProfileLoadError::InvalidProviderAttestation { source, .. }) => {
+                    (source.field, source.reason)
+                }
+                other => panic!("expected a provider refusal, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn primary_record_loads_on_both_chains() {
+            for chain in CHAINS {
+                let file = provider_file(
+                    chain,
+                    "https://primary.example/rpc",
+                    None,
+                    None,
+                    Some(serde_json::json!({"primary": {
+                        "operator": "Primary RPC Ltd",
+                        "host": "PRIMARY.example."
+                    }})),
+                );
+                let providers = load_provider_file(&file).unwrap().providers.unwrap();
+                assert_eq!(
+                    providers.primary,
+                    Some(PrimaryProviderRecord::new(
+                        "Primary RPC Ltd",
+                        "PRIMARY.example."
+                    ))
+                );
+                assert_eq!(providers.secondary, None);
+                assert_eq!(providers.oracle, None);
+
+                let record = credential_record(
+                    "primary",
+                    "primary.example",
+                    default_entry("primary"),
+                    header("X-API-Key"),
+                );
+                let file =
+                    role_credential_file(chain, "primary", Some("https://primary.example"), record);
+                let primary = load_provider_file(&file)
+                    .unwrap()
+                    .providers
+                    .unwrap()
+                    .primary
+                    .unwrap();
+                assert_eq!(
+                    primary,
+                    PrimaryProviderRecord::new("Independent organization", "primary.example")
+                        .with_credential(
+                            KeyringEntryRef::new("stellar-agent-rpc-test-profile", "primary"),
+                            RpcCredentialPlacement::Header {
+                                name: "X-API-Key".to_owned()
+                            },
+                        )
+                );
+            }
+        }
+
+        #[test]
+        fn primary_record_host_must_match_rpc_url() {
+            let record =
+                serde_json::json!({"operator": "Primary RPC Ltd", "host": "primary.example"});
+            for chain in CHAINS {
+                for url in ["https://other.example", "https://child.primary.example"] {
+                    assert_provider_refusal(
+                        &provider_file(
+                            chain,
+                            url,
+                            None,
+                            None,
+                            Some(serde_json::json!({"primary": record})),
+                        ),
+                        "providers.primary.host",
+                        ProviderAttestationRejection::HostMismatch {
+                            url_field: "rpc_url",
+                        },
+                    );
+                }
+            }
+
+            // A testnet file without `rpc_url` checks against the default endpoint.
+            let mut defaulted: toml::Value = toml::from_str(&endpoint_toml(
+                "stellar:testnet",
+                Endpoints {
+                    rpc_url: None,
+                    secondary_rpc_url: None,
+                    oracle_provider_url: None,
+                },
+            ))
+            .unwrap();
+            defaulted.as_table_mut().unwrap().insert(
+                "providers".into(),
+                toml::Value::try_from(serde_json::json!({"primary": record})).unwrap(),
+            );
+            assert_provider_refusal(
+                &toml::to_string(&defaulted).unwrap(),
+                "providers.primary.host",
+                ProviderAttestationRejection::HostMismatch {
+                    url_field: "rpc_url",
+                },
+            );
+            let default_host = url::Url::parse(Caip2::Testnet.default_rpc_url().unwrap())
+                .unwrap()
+                .host_str()
+                .unwrap()
+                .to_owned();
+            defaulted["providers"]["primary"]["host"] = toml::Value::String(default_host);
+            assert!(load_provider_file(&toml::to_string(&defaulted).unwrap()).is_ok());
+
+            // A testnet overlay of `rpc_url` is checked against the record.
+            let file = provider_file(
+                "stellar:testnet",
+                "https://primary.example",
+                None,
+                None,
+                Some(serde_json::json!({"primary": record})),
+            );
+            assert!(
+                provider_load(
+                    &file,
+                    "rpc_url",
+                    serde_json::json!("https://primary.example/v2")
+                )
+                .is_ok()
+            );
+            assert_eq!(
+                refusal(provider_load(
+                    &file,
+                    "rpc_url",
+                    serde_json::json!("https://changed.example")
+                )),
+                (
+                    "providers.primary.host",
+                    ProviderAttestationRejection::HostMismatch {
+                        url_field: "rpc_url"
+                    }
+                )
+            );
+        }
+
+        #[test]
+        fn primary_record_requires_an_operator() {
+            for chain in CHAINS {
+                for operator in [None, Some(""), Some(" \t\n")] {
+                    let mut record = serde_json::json!({"host": "primary.example"});
+                    if let Some(operator) = operator {
+                        record["operator"] = operator.into();
+                    }
+                    assert_provider_refusal(
+                        &provider_file(
+                            chain,
+                            "https://primary.example",
+                            None,
+                            None,
+                            Some(serde_json::json!({"primary": record})),
+                        ),
+                        "providers.primary.operator",
+                        ProviderAttestationRejection::EmptyOperator,
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn primary_record_refuses_independent_of_primary() {
+            for chain in CHAINS {
+                for value in [
+                    serde_json::json!(true),
+                    serde_json::json!(false),
+                    serde_json::json!("SECRET_SENTINEL"),
+                ] {
+                    let record = serde_json::json!({
+                        "operator": "Primary RPC Ltd",
+                        "host": "primary.example",
+                        "independent_of_primary": value
+                    });
+                    assert_provider_refusal(
+                        &provider_file(
+                            chain,
+                            "https://primary.example",
+                            None,
+                            None,
+                            Some(serde_json::json!({"primary": record})),
+                        ),
+                        "providers.primary.independent_of_primary",
+                        ProviderAttestationRejection::PrimaryIndependence,
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn primary_record_is_required_on_mainnet() {
+            let secondary = provider_record("secondary.example", true);
+            let oracle = provider_record("oracle.example", true);
+            for (secondary_url, oracle_url, providers) in [
+                (
+                    Some("https://secondary.example"),
+                    None,
+                    serde_json::json!({"secondary": secondary}),
+                ),
+                (
+                    None,
+                    Some("https://oracle.example"),
+                    serde_json::json!({"oracle": oracle}),
+                ),
+                (
+                    Some("https://secondary.example"),
+                    Some("https://oracle.example"),
+                    serde_json::json!({"secondary": secondary, "oracle": oracle}),
+                ),
+            ] {
+                for chain in CHAINS {
+                    let file = provider_file(
+                        chain,
+                        "https://primary.example",
+                        secondary_url,
+                        oracle_url,
+                        Some(providers.clone()),
+                    );
+                    if chain == "stellar:mainnet" {
+                        assert_provider_refusal(
+                            &file,
+                            "providers.primary",
+                            ProviderAttestationRejection::PrimaryRecordRequired,
+                        );
+                    } else {
+                        assert!(load_provider_file(&file).is_ok());
+                    }
+                    assert!(
+                        load_provider_file(&with_primary_record(&file, "primary.example")).is_ok()
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn provider_credential_and_placement_come_together() {
+            for chain in CHAINS {
+                for role in ROLES {
+                    let url = format!("https://{}", role_host(role));
+                    let mut record = credential_record(
+                        role,
+                        role_host(role),
+                        default_entry(role),
+                        header("X-API-Key"),
+                    );
+                    record.as_object_mut().unwrap().remove("placement");
+                    assert_provider_refusal(
+                        &role_credential_file(chain, role, Some(&url), record),
+                        &field(role, "credential"),
+                        ProviderAttestationRejection::IncompleteCredential {
+                            missing_field: "placement",
+                        },
+                    );
+                    let mut record = credential_record(
+                        role,
+                        role_host(role),
+                        default_entry(role),
+                        header("X-API-Key"),
+                    );
+                    record.as_object_mut().unwrap().remove("credential");
+                    assert_provider_refusal(
+                        &role_credential_file(chain, role, Some(&url), record),
+                        &field(role, "placement"),
+                        ProviderAttestationRejection::IncompleteCredential {
+                            missing_field: "credential",
+                        },
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn provider_credential_reference_shape_is_exact() {
+            for chain in CHAINS {
+                for role in ROLES {
+                    let url = format!("https://{}", role_host(role));
+                    for credential in [
+                        serde_json::json!("stellar-agent-rpc-test-profile"),
+                        serde_json::json!({"service": "stellar-agent-rpc-test-profile"}),
+                        serde_json::json!({"account": "primary"}),
+                        serde_json::json!({"service": 1, "account": "primary"}),
+                        serde_json::json!({"service": "stellar-agent-rpc-p", "account": true}),
+                        serde_json::json!({
+                            "service": "stellar-agent-rpc-p",
+                            "account": "primary",
+                            "extra": "x"
+                        }),
+                        serde_json::json!({"service": "stellar-agent-rpc-p", "extra": "x"}),
+                        entry("", "primary"),
+                        entry("stellar-agent-rpc-p", ""),
+                    ] {
+                        assert_provider_refusal(
+                            &role_credential_file(
+                                chain,
+                                role,
+                                Some(&url),
+                                credential_record(
+                                    role,
+                                    role_host(role),
+                                    credential,
+                                    header("X-API-Key"),
+                                ),
+                            ),
+                            &field(role, "credential"),
+                            ProviderAttestationRejection::InvalidCredential,
+                        );
+                    }
+                }
+            }
+        }
+
+        /// The reference bytes are printable ASCII without a leading or
+        /// trailing space; a space inside is allowed.
+        #[test]
+        fn provider_credential_reference_is_printable_ascii() {
+            for role in ROLES {
+                let url = format!("https://{}", role_host(role));
+                for credential in [
+                    entry("\u{17f}tellar-agent-signer-p", "default"),
+                    entry("stellar-agent-rpc-p", "prim\u{131}ry"),
+                    entry("stellar-agent-rpc-p", "prim\u{7}ary"),
+                    entry("stellar-agent-rpc-p", "primary\u{7f}"),
+                    entry("stellar-agent-rpc-p\n", "primary"),
+                    entry(" stellar-agent-rpc-p", "primary"),
+                    entry("stellar-agent-rpc-p ", "primary"),
+                    entry("stellar-agent-rpc-p", " primary"),
+                    entry("stellar-agent-rpc-p", "primary "),
+                    entry(" ", "primary"),
+                ] {
+                    assert_provider_refusal(
+                        &role_credential_file(
+                            "stellar:testnet",
+                            role,
+                            Some(&url),
+                            credential_record(role, role_host(role), credential, header("X-Key")),
+                        ),
+                        &field(role, "credential"),
+                        ProviderAttestationRejection::InvalidCredential,
+                    );
+                }
+                let file = role_credential_file(
+                    "stellar:testnet",
+                    role,
+                    Some(&url),
+                    credential_record(
+                        role,
+                        role_host(role),
+                        entry("stellar-agent-rpc-my prod", role),
+                        header("X-Key"),
+                    ),
+                );
+                assert!(load_provider_file(&file).is_ok());
+            }
+        }
+
+        #[test]
+        fn provider_placement_shapes_are_exact() {
+            for chain in CHAINS {
+                for role in ROLES {
+                    let url = format!("https://{}", role_host(role));
+                    for placement in [
+                        serde_json::json!("header"),
+                        serde_json::json!({"name": "X-API-Key"}),
+                        serde_json::json!({"kind": 1, "name": "X-API-Key"}),
+                        serde_json::json!({"kind": "cookie", "name": "X-API-Key"}),
+                        serde_json::json!({"kind": "header"}),
+                        serde_json::json!({"kind": "query"}),
+                        serde_json::json!({"kind": "header", "name": 1}),
+                        serde_json::json!({"kind": "path", "name": "key"}),
+                        serde_json::json!({"kind": "path", "extra": true}),
+                        serde_json::json!({"kind": "query", "name": "apikey", "extra": 1}),
+                        serde_json::json!({"kind": "header", "value": "X-API-Key"}),
+                    ] {
+                        assert_provider_refusal(
+                            &role_credential_file(
+                                chain,
+                                role,
+                                Some(&url),
+                                credential_record(
+                                    role,
+                                    role_host(role),
+                                    default_entry(role),
+                                    placement,
+                                ),
+                            ),
+                            &field(role, "placement"),
+                            ProviderAttestationRejection::InvalidPlacement,
+                        );
+                    }
+                    for placement in [
+                        header("X-API-Key"),
+                        query("apikey"),
+                        serde_json::json!({"kind": "path"}),
+                    ] {
+                        let file = role_credential_file(
+                            chain,
+                            role,
+                            Some(&url),
+                            credential_record(
+                                role,
+                                role_host(role),
+                                default_entry(role),
+                                placement,
+                            ),
+                        );
+                        assert!(load_provider_file(&file).is_ok(), "{file}");
+                    }
+                }
+            }
+        }
+
+        fn assert_placement_name(placement: &serde_json::Value, refused: bool) {
+            for role in ROLES {
+                let url = format!("https://{}", role_host(role));
+                let file = role_credential_file(
+                    "stellar:mainnet",
+                    role,
+                    Some(&url),
+                    credential_record(
+                        role,
+                        role_host(role),
+                        default_entry(role),
+                        placement.clone(),
+                    ),
+                );
+                if !refused {
+                    assert!(load_provider_file(&file).is_ok(), "{placement}");
+                    continue;
+                }
+                let reason = if placement["kind"] == "header" {
+                    ProviderAttestationRejection::InvalidHeaderName
+                } else {
+                    ProviderAttestationRejection::InvalidQueryParameterName
+                };
+                assert_provider_refusal(&file, &field(role, "placement.name"), reason);
+            }
+        }
+
+        #[test]
+        fn provider_header_names_follow_the_token_rule() {
+            for name in [
+                "",
+                "X API",
+                "X:Key",
+                "X-K\u{e9}y",
+                "X(Key)",
+                "X/Key",
+                "X\"Key",
+            ] {
+                assert_placement_name(&header(name), true);
+            }
+            for name in [
+                "X-API-Key",
+                "Authorization",
+                "x-token",
+                "Drpc-Key",
+                "a!#$%&'*+.^_`|~9",
+            ] {
+                assert_placement_name(&header(name), false);
+            }
+        }
+
+        #[test]
+        fn provider_header_names_refuse_transport_headers() {
+            for name in [
+                "HOST",
+                "Content-Type",
+                "content-LENGTH",
+                "Accept",
+                "Connection",
+                "Transfer-Encoding",
+                "TE",
+                "Trailer",
+                "Upgrade",
+                "Keep-Alive",
+            ] {
+                assert_placement_name(&header(name), true);
+            }
+        }
+
+        #[test]
+        fn provider_query_names_are_unreserved_characters() {
+            for name in ["a b", "a&b", "=", "", "\u{e4}", "a+b", "a%20b", "a#b"] {
+                assert_placement_name(&query(name), true);
+            }
+            for name in ["apikey", "x_Api-key.1~"] {
+                assert_placement_name(&query(name), false);
+            }
+        }
+
+        /// A query placement repeats no parameter of the endpoint URL,
+        /// compared byte for byte after decoding.
+        #[test]
+        fn query_placement_must_not_repeat_a_url_parameter() {
+            for chain in CHAINS {
+                for role in ROLES {
+                    let host = role_host(role);
+                    for url in [
+                        format!("https://{host}/?apikey=old"),
+                        format!("https://{host}/v1?x=1&apikey"),
+                        format!("https://{host}/?api%6Bey=1"),
+                    ] {
+                        assert_provider_refusal(
+                            &role_credential_file(
+                                chain,
+                                role,
+                                Some(&url),
+                                credential_record(role, host, default_entry(role), query("apikey")),
+                            ),
+                            &field(role, "placement.name"),
+                            ProviderAttestationRejection::InvalidQueryParameterName,
+                        );
+                    }
+                    for (url, placement) in [
+                        (format!("https://{host}/?APIKEY=1"), query("apikey")),
+                        (format!("https://{host}/?x=apikey"), query("apikey")),
+                        (format!("https://{host}/?apikey=1"), header("apikey")),
+                        (
+                            format!("https://{host}/?apikey=1"),
+                            serde_json::json!({"kind": "path"}),
+                        ),
+                    ] {
+                        let file = role_credential_file(
+                            chain,
+                            role,
+                            Some(&url),
+                            credential_record(role, host, default_entry(role), placement),
+                        );
+                        assert!(load_provider_file(&file).is_ok(), "{file}");
+                    }
+                }
+            }
+        }
+
+        /// A record that names a credential needs an https endpoint unless
+        /// the host is a loopback address, from the file and from a testnet
+        /// overlay alike.
+        #[test]
+        fn credential_endpoint_must_use_https() {
+            for role in ROLES {
+                let role_url = format!("http://{}:8000/rpc", role_host(role));
+                for (url, host) in [
+                    (role_url.as_str(), role_host(role)),
+                    ("http://localhost.example", "localhost.example"),
+                    ("http://127.example", "127.example"),
+                    ("http://[::2]:8000", "[::2]"),
+                ] {
+                    assert_provider_refusal(
+                        &role_credential_file(
+                            "stellar:testnet",
+                            role,
+                            Some(url),
+                            credential_record(role, host, default_entry(role), header("X-Key")),
+                        ),
+                        url_field(role),
+                        ProviderAttestationRejection::InsecureCredentialEndpoint,
+                    );
+                    let mut plain = credential_record(role, host, default_entry(role), header("X"));
+                    plain.as_object_mut().unwrap().remove("credential");
+                    plain.as_object_mut().unwrap().remove("placement");
+                    assert!(
+                        load_provider_file(&role_credential_file(
+                            "stellar:testnet",
+                            role,
+                            Some(url),
+                            plain
+                        ))
+                        .is_ok()
+                    );
+                }
+                for (url, host) in [
+                    ("http://localhost:8000", "localhost"),
+                    ("http://127.0.0.2:8000/rpc", "127.0.0.2"),
+                    ("http://[::1]:8000", "[::1]"),
+                ] {
+                    let file = role_credential_file(
+                        "stellar:testnet",
+                        role,
+                        Some(url),
+                        credential_record(role, host, default_entry(role), header("X-Key")),
+                    );
+                    assert!(load_provider_file(&file).is_ok(), "{file}");
+                }
+                let host = role_host(role);
+                let file = role_credential_file(
+                    "stellar:testnet",
+                    role,
+                    Some(&format!("https://{host}")),
+                    credential_record(role, host, default_entry(role), header("X-Key")),
+                );
+                assert!(load_provider_file(&file).is_ok());
+                assert!(
+                    provider_load(
+                        &file,
+                        url_field(role),
+                        serde_json::json!(format!("https://{host}:8443/v2"))
+                    )
+                    .is_ok()
+                );
+                assert_eq!(
+                    refusal(provider_load(
+                        &file,
+                        url_field(role),
+                        serde_json::json!(format!("http://{host}:8080"))
+                    )),
+                    (
+                        url_field(role),
+                        ProviderAttestationRejection::InsecureCredentialEndpoint
+                    )
+                );
+            }
+        }
+
+        /// A record that names a credential refuses an endpoint URL with a
+        /// username or password: on testnet through this rule, on mainnet
+        /// through the endpoint rule, which runs first.
+        #[test]
+        fn credential_endpoint_refuses_userinfo() {
+            for role in ROLES {
+                let host = role_host(role);
+                for url in [
+                    format!("https://user:SECRET_SENTINEL@{host}"),
+                    format!("https://SECRET_SENTINEL@{host}/rpc"),
+                    format!("https://:SECRET_SENTINEL@{host}"),
+                ] {
+                    let record =
+                        credential_record(role, host, default_entry(role), header("X-Key"));
+                    assert_provider_refusal(
+                        &role_credential_file("stellar:testnet", role, Some(&url), record.clone()),
+                        url_field(role),
+                        ProviderAttestationRejection::UserinfoWithCredential,
+                    );
+                    let error = load_provider_file(&role_credential_file(
+                        "stellar:mainnet",
+                        role,
+                        Some(&url),
+                        record,
+                    ))
+                    .unwrap_err();
+                    let ProfileLoadError::InvalidEndpointUrl { source, .. } = error else {
+                        panic!("expected the endpoint rule, got {error:?}");
+                    };
+                    assert_eq!(source.field, url_field(role));
+                    assert_eq!(source.reason, EndpointUrlRejection::MainnetCredentialInUrl);
+                    let mut plain = provider_record(host, true);
+                    if role == "primary" {
+                        plain
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("independent_of_primary");
+                    }
+                    assert!(
+                        load_provider_file(&role_credential_file(
+                            "stellar:testnet",
+                            role,
+                            Some(&url),
+                            plain
+                        ))
+                        .is_ok()
+                    );
+                }
+            }
+        }
+
+        /// The service namespace of the wallet's own keys is reserved, in any
+        /// ASCII case and in any `.`-separated part; the RPC namespace is not.
+        #[test]
+        fn provider_credentials_refuse_the_wallet_key_namespace() {
+            for chain in CHAINS {
+                for role in ROLES {
+                    let url = format!("https://{}", role_host(role));
+                    for credential in [
+                        entry("stellar-agent-signer-p", "default"),
+                        entry("Stellar-Agent-Signer-p", "default"),
+                        entry("STELLAR-AGENT-OWNER-p", "x"),
+                        entry("stellar-agent-", "x"),
+                        entry("main", "GABC.stellar-agent-signer-alice"),
+                        entry("x.stellar-agent-audit-q", "y"),
+                        entry("x. stellar-agent-audit-q", "y"),
+                    ] {
+                        assert_provider_refusal(
+                            &role_credential_file(
+                                chain,
+                                role,
+                                Some(&url),
+                                credential_record(
+                                    role,
+                                    role_host(role),
+                                    credential,
+                                    header("X-Key"),
+                                ),
+                            ),
+                            &field(role, "credential"),
+                            ProviderAttestationRejection::ReservedCredentialEntry,
+                        );
+                    }
+                    for credential in [
+                        entry("stellar-agent-rpc-p", "primary"),
+                        entry("Stellar-Agent-RPC-p", "oracle"),
+                        entry("acme-keys", "x"),
+                        entry("stellar-agentx", "y"),
+                    ] {
+                        let file = role_credential_file(
+                            chain,
+                            role,
+                            Some(&url),
+                            credential_record(role, role_host(role), credential, header("X-Key")),
+                        );
+                        assert!(load_provider_file(&file).is_ok(), "{file}");
+                    }
+                }
+            }
+        }
+
+        /// A credential with the service of a wallet key reference refuses,
+        /// outside the wallet key namespace too and in any ASCII case.
+        #[test]
+        fn provider_credentials_refuse_a_wallet_key_service() {
+            for chain in CHAINS {
+                for role in ROLES {
+                    let url = format!("https://{}", role_host(role));
+                    for credential in [
+                        entry("acme-wallet-keys", "primary"),
+                        entry("ACME-Wallet-Keys", "other"),
+                    ] {
+                        let file = edit_file(
+                            &role_credential_file(
+                                chain,
+                                role,
+                                Some(&url),
+                                credential_record(
+                                    role,
+                                    role_host(role),
+                                    credential,
+                                    header("X-Key"),
+                                ),
+                            ),
+                            |value| {
+                                value["audit_log_hash_chain_key_id"]["service"] =
+                                    "acme-wallet-keys".into();
+                            },
+                        );
+                        assert_provider_refusal(
+                            &file,
+                            &field(role, "credential"),
+                            ProviderAttestationRejection::ReservedCredentialEntry,
+                        );
+                    }
+                }
+            }
+        }
+
+        /// A credential whose `account.service` form equals a wallet key's
+        /// refuses, so a store that joins the two with a `.` cannot be
+        /// pointed at the wallet key under a dotted profile name.
+        #[test]
+        fn provider_credentials_refuse_a_dotted_alias_of_a_wallet_key() {
+            for (signer_service, alias) in [
+                (
+                    "stellar-agent-signer-alice.main",
+                    entry("main", "GABC.stellar-agent-signer-alice"),
+                ),
+                ("acme-signer.main", entry("main", "GABC.acme-signer")),
+                ("acme-signer.main", entry("MAIN", "gabc.ACME-signer")),
+                ("acme.signer.main", entry("signer.main", "GABC.acme")),
+            ] {
+                for role in ROLES {
+                    let url = format!("https://{}", role_host(role));
+                    let file = with_signer(
+                        &role_credential_file(
+                            "stellar:testnet",
+                            role,
+                            Some(&url),
+                            credential_record(
+                                role,
+                                role_host(role),
+                                alias.clone(),
+                                header("X-Key"),
+                            ),
+                        ),
+                        signer_service,
+                        "GABC",
+                    );
+                    let (refused, reason) = refusal(load_named("alice.main", &file));
+                    assert_eq!(refused, field(role, "credential"));
+                    assert_eq!(
+                        reason,
+                        ProviderAttestationRejection::ReservedCredentialEntry
+                    );
+                }
+            }
+        }
+
+        /// The wallet key references are taken from the file as well as from
+        /// the merged profile, so a testnet overlay of `mcp_signer_default`
+        /// does not free the file's signer entry.
+        #[test]
+        fn provider_credentials_refuse_the_file_signer_under_an_overlay() {
+            for role in ROLES {
+                let url = format!("https://{}", role_host(role));
+                let file = with_signer(
+                    &role_credential_file(
+                        "stellar:testnet",
+                        role,
+                        Some(&url),
+                        credential_record(
+                            role,
+                            role_host(role),
+                            entry("acme-signer", "GABC"),
+                            header("X-Key"),
+                        ),
+                    ),
+                    "acme-signer",
+                    "GABC",
+                );
+                assert_eq!(
+                    refusal(load_provider_file(&file)).1,
+                    ProviderAttestationRejection::ReservedCredentialEntry
+                );
+                assert_eq!(
+                    refusal(provider_load(
+                        &file,
+                        "mcp_signer_default",
+                        serde_json::json!({"service": "other-signer", "account": "x"})
+                    ))
+                    .1,
+                    ProviderAttestationRejection::ReservedCredentialEntry
+                );
+            }
+        }
+
+        /// Default references load under dotted profile names and profile
+        /// names with a space, and all three roles may name one entry.
+        #[test]
+        fn provider_credentials_allow_the_default_entries() {
+            for name in ["a.b", "alice.main", "my prod", "Alice.Main"] {
+                let service = format!("stellar-agent-rpc-{name}");
+                for chain in CHAINS {
+                    let file = |accounts: [&str; 3]| {
+                        let mut primary = credential_record(
+                            "primary",
+                            "primary.example",
+                            entry(&service, accounts[0]),
+                            header("X-API-Key"),
+                        );
+                        primary["operator"] = "Primary operator".into();
+                        let secondary = credential_record(
+                            "secondary",
+                            "secondary.example",
+                            entry(&service, accounts[1]),
+                            query("apikey"),
+                        );
+                        let oracle = credential_record(
+                            "oracle",
+                            "oracle.example",
+                            entry(&service, accounts[2]),
+                            serde_json::json!({"kind": "path"}),
+                        );
+                        provider_file(
+                            chain,
+                            "https://primary.example",
+                            Some("https://secondary.example"),
+                            Some("https://oracle.example"),
+                            Some(serde_json::json!({
+                                "primary": primary,
+                                "secondary": secondary,
+                                "oracle": oracle
+                            })),
+                        )
+                    };
+                    let providers = load_named(name, &file(["primary", "secondary", "oracle"]))
+                        .unwrap()
+                        .providers
+                        .unwrap();
+                    for role in [
+                        ProviderRole::Primary,
+                        ProviderRole::Secondary,
+                        ProviderRole::Oracle,
+                    ] {
+                        assert_eq!(
+                            providers.credential(role).unwrap().0,
+                            &KeyringEntryRef::new(service.clone(), role.as_str())
+                        );
+                    }
+                    assert!(load_named(name, &file(["primary", "primary", "primary"])).is_ok());
+                }
+            }
+        }
+
+        #[test]
+        fn mainnet_secondary_and_oracle_operators_differ_from_primary() {
+            for role in ["secondary", "oracle"] {
+                for operator in ["Primary operator", "  primary OPERATOR\t"] {
+                    let mut record = provider_record("other.example", true);
+                    record["operator"] = operator.into();
+                    assert_provider_refusal(
+                        &role_credential_file(
+                            "stellar:mainnet",
+                            role,
+                            Some("https://other.example"),
+                            record,
+                        ),
+                        &field(role, "operator"),
+                        ProviderAttestationRejection::SharedOperator,
+                    );
+                }
+            }
+            let shared = provider_record("shared.example", true);
+            let file = provider_file(
+                "stellar:mainnet",
+                "https://primary.example",
+                Some("https://shared.example/a"),
+                Some("https://shared.example/b"),
+                Some(serde_json::json!({"secondary": shared, "oracle": shared})),
+            );
+            assert_provider_refusal(
+                &file,
+                "providers.primary",
+                ProviderAttestationRejection::PrimaryRecordRequired,
+            );
+            assert!(load_provider_file(&with_primary_record(&file, "primary.example")).is_ok());
+        }
+
+        #[test]
+        fn provider_operator_comparison_trims_and_folds_case() {
+            for (primary, other, shared) in [
+                ("  Example RPC ", "EXAMPLE rpc", true),
+                ("Stra\u{df}e", "STRASSE", true),
+                ("\u{fb01}ne RPC", "FINE rpc", true),
+                ("Example Inc.", "Example", false),
+                ("Example  RPC", "Example RPC", false),
+            ] {
+                let mut record = provider_record("other.example", true);
+                record["operator"] = other.into();
+                let file = edit_file(
+                    &role_credential_file(
+                        "stellar:mainnet",
+                        "secondary",
+                        Some("https://other.example"),
+                        record,
+                    ),
+                    |value| value["providers"]["primary"]["operator"] = primary.into(),
+                );
+                if shared {
+                    assert_provider_refusal(
+                        &file,
+                        "providers.secondary.operator",
+                        ProviderAttestationRejection::SharedOperator,
+                    );
+                } else {
+                    assert!(load_provider_file(&file).is_ok(), "{file}");
+                }
+            }
+        }
+
+        #[test]
+        fn testnet_shared_operator_loads() {
+            for role in ["secondary", "oracle"] {
+                let mut record = provider_record("other.example", true);
+                record["operator"] = "Primary operator".into();
+                let file = role_credential_file(
+                    "stellar:testnet",
+                    role,
+                    Some("https://other.example"),
+                    record,
+                );
+                let providers = load_provider_file(&file).unwrap().providers.unwrap();
+                assert_eq!(providers.primary.unwrap().operator, "Primary operator");
+            }
+        }
+
+        /// A file with several defects reports them in the loader's order:
+        /// decode, pairing, reserved entry, endpoint presence, operator, host,
+        /// userinfo, insecure endpoint, repeated query name, then the mainnet
+        /// rules.
+        #[test]
+        fn provider_credential_checks_follow_record_checks() {
+            use ProviderAttestationRejection as R;
+            let reserved = entry("stellar-agent-signer-p", "default");
+            for chain in CHAINS {
+                let mainnet = chain == "stellar:mainnet";
+                for role in ROLES {
+                    let host = role_host(role);
+                    let mut record = credential_record(
+                        role,
+                        "wrong.example",
+                        serde_json::json!("bad"),
+                        serde_json::json!("bad"),
+                    );
+                    record["operator"] = "".into();
+                    record["SECRET_SENTINEL"] = 1.into();
+                    let bad_url = if mainnet {
+                        format!("https://{host}/?apikey=1")
+                    } else {
+                        format!("http://user@{host}/?apikey=1")
+                    };
+                    let mut steps: Vec<(serde_json::Value, String, R)> = Vec::new();
+                    let mut step = |record: &serde_json::Value, suffix: &str, reason: R| {
+                        steps.push((record.clone(), field(role, suffix), reason));
+                    };
+                    step(&record, "", R::InvalidShape);
+                    record.as_object_mut().unwrap().remove("SECRET_SENTINEL");
+                    if role == "primary" {
+                        record["independent_of_primary"] = true.into();
+                        step(&record, "independent_of_primary", R::PrimaryIndependence);
+                        record
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("independent_of_primary");
+                    }
+                    step(&record, "credential", R::InvalidCredential);
+                    record.as_object_mut().unwrap().remove("placement");
+                    step(&record, "credential", R::InvalidCredential);
+                    record["credential"] = reserved.clone();
+                    step(
+                        &record,
+                        "credential",
+                        R::IncompleteCredential {
+                            missing_field: "placement",
+                        },
+                    );
+                    record["placement"] = serde_json::json!("bad");
+                    step(&record, "placement", R::InvalidPlacement);
+                    record["placement"] = header("Host");
+                    step(&record, "placement.name", R::InvalidHeaderName);
+                    record["placement"] = query("apikey");
+                    step(&record, "credential", R::ReservedCredentialEntry);
+                    record["credential"] = default_entry(role);
+                    if role != "primary" {
+                        let file = role_credential_file(chain, role, None, record.clone());
+                        assert_provider_refusal(
+                            &file,
+                            &field(role, ""),
+                            R::UrlRequired {
+                                url_field: url_field(role),
+                            },
+                        );
+                    }
+                    step(&record, "operator", R::EmptyOperator);
+                    record["operator"] = "Independent organization".into();
+                    step(
+                        &record,
+                        "host",
+                        R::HostMismatch {
+                            url_field: url_field(role),
+                        },
+                    );
+                    record["host"] = host.into();
+                    for (record, field, reason) in steps {
+                        assert_provider_refusal(
+                            &role_credential_file(chain, role, Some(&bad_url), record),
+                            &field,
+                            reason,
+                        );
+                    }
+                    let file = |url: &str, record: &serde_json::Value| {
+                        role_credential_file(chain, role, Some(url), record.clone())
+                    };
+                    if !mainnet {
+                        assert_provider_refusal(
+                            &file(&format!("http://user@{host}/?apikey=1"), &record),
+                            url_field(role),
+                            R::UserinfoWithCredential,
+                        );
+                        assert_provider_refusal(
+                            &file(&format!("http://{host}/?apikey=1"), &record),
+                            url_field(role),
+                            R::InsecureCredentialEndpoint,
+                        );
+                    }
+                    assert_provider_refusal(
+                        &file(&format!("https://{host}/?apikey=1"), &record),
+                        &field(role, "placement.name"),
+                        R::InvalidQueryParameterName,
+                    );
+                    let good_url = format!("https://{host}/?x=1");
+                    if mainnet && role != "primary" {
+                        record["independent_of_primary"] = false.into();
+                        record["operator"] = "Primary operator".into();
+                        assert_provider_refusal(
+                            &file(&good_url, &record),
+                            &field(role, "independent_of_primary"),
+                            R::IndependenceRequired,
+                        );
+                        record["independent_of_primary"] = true.into();
+                        assert_provider_refusal(
+                            &file(&good_url, &record),
+                            &field(role, "operator"),
+                            R::SharedOperator,
+                        );
+                        record["operator"] = "Independent organization".into();
+                    }
+                    assert!(load_provider_file(&file(&good_url, &record)).is_ok());
+                }
+            }
+        }
+
+        /// No refusal echoes a value of the file: header and query names,
+        /// service, account, operator, and URL parts stay out of every
+        /// rendering, and the code stays the provider attestation code.
+        #[test]
+        fn provider_credential_errors_echo_no_file_value() {
+            use ProviderAttestationRejection as R;
+            for chain in CHAINS {
+                for role in ROLES {
+                    let host = role_host(role);
+                    let url = format!("https://{host}/?SECRET_SENTINEL=1");
+                    let cases = [
+                        (
+                            credential_record(
+                                role,
+                                host,
+                                default_entry(role),
+                                header("SECRET_SENTINEL:"),
+                            ),
+                            "placement.name",
+                            R::InvalidHeaderName,
+                        ),
+                        (
+                            credential_record(
+                                role,
+                                host,
+                                default_entry(role),
+                                query("SECRET_SENTINEL&"),
+                            ),
+                            "placement.name",
+                            R::InvalidQueryParameterName,
+                        ),
+                        (
+                            credential_record(
+                                role,
+                                host,
+                                default_entry(role),
+                                query("SECRET_SENTINEL"),
+                            ),
+                            "placement.name",
+                            R::InvalidQueryParameterName,
+                        ),
+                        (
+                            credential_record(
+                                role,
+                                host,
+                                entry("\u{17f}SECRET_SENTINEL", "a"),
+                                header("X-Key"),
+                            ),
+                            "credential",
+                            R::InvalidCredential,
+                        ),
+                        (
+                            credential_record(
+                                role,
+                                host,
+                                entry("svc", "SECRET_SENTINEL\u{1}"),
+                                header("X-Key"),
+                            ),
+                            "credential",
+                            R::InvalidCredential,
+                        ),
+                        (
+                            credential_record(
+                                role,
+                                host,
+                                entry("stellar-agent-signer-SECRET_SENTINEL", "a"),
+                                header("X-Key"),
+                            ),
+                            "credential",
+                            R::ReservedCredentialEntry,
+                        ),
+                        (
+                            credential_record(
+                                role,
+                                host,
+                                default_entry(role),
+                                serde_json::json!({"kind": "SECRET_SENTINEL"}),
+                            ),
+                            "placement",
+                            R::InvalidPlacement,
+                        ),
+                    ];
+                    for (record, suffix, reason) in cases {
+                        assert_provider_refusal(
+                            &role_credential_file(chain, role, Some(&url), record),
+                            &field(role, suffix),
+                            reason,
+                        );
+                    }
+                }
+                if chain == "stellar:mainnet" {
+                    let mut record = provider_record("other.example", true);
+                    record["operator"] = "SECRET_SENTINEL Ops".into();
+                    let file = edit_file(
+                        &role_credential_file(
+                            chain,
+                            "oracle",
+                            Some("https://other.example"),
+                            record,
+                        ),
+                        |value| {
+                            value["providers"]["primary"]["operator"] =
+                                " SECRET_SENTINEL OPS ".into();
+                        },
+                    );
+                    assert_provider_refusal(&file, "providers.oracle.operator", R::SharedOperator);
+                } else {
+                    let record = credential_record(
+                        "primary",
+                        "primary.example",
+                        default_entry("primary"),
+                        header("X-Key"),
+                    );
+                    assert_provider_refusal(
+                        &role_credential_file(
+                            chain,
+                            "primary",
+                            Some(concat!(
+                                "http://SECRET_SENTINEL:SECRET_SENTINEL@",
+                                "primary.example/SECRET_SENTINEL"
+                            )),
+                            record,
+                        ),
+                        "rpc_url",
+                        R::UserinfoWithCredential,
+                    );
+                }
+            }
+        }
+
+        /// A testnet profile file whose oracle record has comments before
+        /// and inside it, a trailing comment, uneven spacing, and tables
+        /// after it. It is split into the text before the record, the
+        /// record, and the text after it.
+        fn oracle_record_fixture() -> (String, &'static str, String) {
+            let base = endpoint_toml(
+                "stellar:testnet",
+                Endpoints {
+                    rpc_url: Some("https://primary.example"),
+                    secondary_rpc_url: None,
+                    oracle_provider_url: Some("https://other.example"),
+                },
+            );
+            let (head, tail) = base.split_at(base.find("[mcp_signer_default]").unwrap());
+            let record = "# The oracle provider, attested by the operator.\n\
+                          [providers.oracle]\n\
+                          operator = \"Oracle operator\"\n\
+                          # Reviewed with the provider's operations team.\n\
+                          host   =   \"other.example\"  # the host of oracle_provider_url\n\
+                          independent_of_primary = false\n";
+            (head.to_owned(), record, tail.to_owned())
+        }
+
+        /// The two lines the patch adds for the default oracle reference of
+        /// the profile `p` with a path placement.
+        const ORACLE_PATH_RECORD_LINES: &str = concat!(
+            "credential = { service = \"stellar-agent-rpc-p\", account = \"oracle\" }\n",
+            "placement = { kind = \"path\" }\n",
+        );
+
+        /// The on-disk patch adds the reference and the placement after the
+        /// record's last key and keeps every other byte of the file. It
+        /// refuses a missing record, or one that already names either key,
+        /// without touching the file.
+        #[test]
+        fn set_provider_credential_patches_only_the_record() {
+            let (head, record, tail) = oracle_record_fixture();
+            let file = format!("{head}{record}\n{tail}");
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("p.toml");
+            std::fs::write(&path, &file).unwrap();
+            let credential = KeyringEntryRef::default_rpc_credential("p", ProviderRole::Oracle);
+            let placement = RpcCredentialPlacement::Path {};
+
+            let missing = set_provider_credential_on_disk(
+                "p",
+                dir.path(),
+                ProviderRole::Primary,
+                &credential,
+                &placement,
+            )
+            .unwrap_err();
+            assert!(matches!(missing, ProfileSaveError::Io(_)), "{missing}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), file);
+
+            set_provider_credential_on_disk(
+                "p",
+                dir.path(),
+                ProviderRole::Oracle,
+                &credential,
+                &placement,
+            )
+            .unwrap();
+            let written = std::fs::read_to_string(&path).unwrap();
+            let expected_text = format!("{head}{record}{ORACLE_PATH_RECORD_LINES}\n{tail}");
+            assert_eq!(written, expected_text);
+
+            let patched: toml::Value = toml::from_str(&written).unwrap();
+            let mut expected: toml::Value = toml::from_str(&file).unwrap();
+            let oracle = expected["providers"]["oracle"].as_table_mut().unwrap();
+            oracle.insert(
+                "credential".into(),
+                toml::Value::try_from(&credential).unwrap(),
+            );
+            oracle.insert(
+                "placement".into(),
+                toml::Value::try_from(&placement).unwrap(),
+            );
+            assert_eq!(patched, expected);
+            let loaded = load_from_dir("p", dir.path(), None).unwrap();
+            assert_eq!(
+                loaded.providers.unwrap().credential(ProviderRole::Oracle),
+                Some((&credential, &placement))
+            );
+
+            let before = std::fs::read_to_string(&path).unwrap();
+            let again = set_provider_credential_on_disk(
+                "p",
+                dir.path(),
+                ProviderRole::Oracle,
+                &credential,
+                &placement,
+            )
+            .unwrap_err();
+            assert!(matches!(again, ProfileSaveError::Io(_)), "{again}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert!(matches!(
+                set_provider_credential_on_disk(
+                    "../p",
+                    dir.path(),
+                    ProviderRole::Oracle,
+                    &credential,
+                    &placement
+                ),
+                Err(ProfileSaveError::InvalidName { .. })
+            ));
+        }
+
+        /// A file whose lines all end in CRLF keeps CRLF on every line: the
+        /// patch yields the original text with the two record lines
+        /// inserted, each ending in CRLF, and the result loads.
+        #[test]
+        fn set_provider_credential_keeps_crlf_line_endings() {
+            let (head, record, tail) = oracle_record_fixture();
+            let crlf = |text: &str| text.replace('\n', "\r\n");
+            let file = crlf(&format!("{head}{record}\n{tail}"));
+            assert!(!file.replace("\r\n", "").contains('\n'));
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("p.toml");
+            std::fs::write(&path, &file).unwrap();
+            let credential = KeyringEntryRef::default_rpc_credential("p", ProviderRole::Oracle);
+            let placement = RpcCredentialPlacement::Path {};
+
+            set_provider_credential_on_disk(
+                "p",
+                dir.path(),
+                ProviderRole::Oracle,
+                &credential,
+                &placement,
+            )
+            .unwrap();
+            let written = std::fs::read_to_string(&path).unwrap();
+            let expected_text = crlf(&format!("{head}{record}{ORACLE_PATH_RECORD_LINES}\n{tail}"));
+            assert_eq!(written, expected_text);
+            let loaded = load_from_dir("p", dir.path(), None).unwrap();
+            assert_eq!(
+                loaded.providers.unwrap().credential(ProviderRole::Oracle),
+                Some((&credential, &placement))
+            );
+        }
+
+        /// A text uses CRLF throughout only when it holds a CRLF and every
+        /// LF in it follows a CR.
+        #[test]
+        fn uses_crlf_throughout_requires_crlf_on_every_line() {
+            assert!(uses_crlf_throughout("a\r\nb\r\n"));
+            assert!(!uses_crlf_throughout("a\r\nb\n"));
+            assert!(!uses_crlf_throughout("\na\r\n"));
+            assert!(!uses_crlf_throughout("a\nb\n"));
+            assert!(!uses_crlf_throughout(""));
+        }
+
+        /// A record written as an inline table gains the two keys inside
+        /// that inline table, in the form the loader reads, and each
+        /// placement kind is written in its serde form.
+        #[test]
+        fn set_provider_credential_patches_an_inline_record() {
+            let base = endpoint_toml(
+                "stellar:testnet",
+                Endpoints {
+                    rpc_url: Some("https://primary.example"),
+                    secondary_rpc_url: None,
+                    oracle_provider_url: None,
+                },
+            );
+            let (head, tail) = base.split_at(base.find("[mcp_signer_default]").unwrap());
+            let file = format!(
+                "{head}[providers]\n\
+                 primary = {{ operator = \"Primary operator\", host = \"primary.example\" }}\n\n\
+                 {tail}"
+            );
+            for (placement, rendered) in [
+                (
+                    RpcCredentialPlacement::Header {
+                        name: "X-API-Key".to_owned(),
+                    },
+                    "{ kind = \"header\", name = \"X-API-Key\" }",
+                ),
+                (
+                    RpcCredentialPlacement::Query {
+                        name: "apikey".to_owned(),
+                    },
+                    "{ kind = \"query\", name = \"apikey\" }",
+                ),
+                (RpcCredentialPlacement::Path {}, "{ kind = \"path\" }"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("p.toml");
+                std::fs::write(&path, &file).unwrap();
+                let credential =
+                    KeyringEntryRef::default_rpc_credential("p", ProviderRole::Primary);
+                set_provider_credential_on_disk(
+                    "p",
+                    dir.path(),
+                    ProviderRole::Primary,
+                    &credential,
+                    &placement,
+                )
+                .unwrap();
+                let written = std::fs::read_to_string(&path).unwrap();
+                let expected_text = format!(
+                    "{head}[providers]\n\
+                     primary = {{ operator = \"Primary operator\", host = \"primary.example\", \
+                     credential = {{ service = \"stellar-agent-rpc-p\", account = \"primary\" }}, \
+                     placement = {rendered} }}\n\n\
+                     {tail}"
+                );
+                assert_eq!(written, expected_text, "{placement:?}");
+                let loaded = load_from_dir("p", dir.path(), None).unwrap();
+                assert_eq!(
+                    loaded.providers.unwrap().credential(ProviderRole::Primary),
+                    Some((&credential, &placement))
+                );
+            }
+        }
+
+        /// The write-side check runs the loader's credential rules against
+        /// the loaded profile and the file's own wallet key references.
+        #[test]
+        fn write_check_applies_the_loader_rules() {
+            let file = with_signer(
+                &provider_file(
+                    "stellar:testnet",
+                    "http://primary.example/?apikey=1",
+                    None,
+                    None,
+                    Some(serde_json::json!({"primary": {
+                        "operator": "Primary operator",
+                        "host": "primary.example"
+                    }})),
+                ),
+                "acme-signer",
+                "GABC",
+            );
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("p.toml"), &file).unwrap();
+            let profile = provider_load(
+                &file,
+                "mcp_signer_default",
+                serde_json::json!({"service": "other-signer", "account": "x"}),
+            )
+            .unwrap();
+            let check = |credential: &KeyringEntryRef, placement: &RpcCredentialPlacement| {
+                match check_provider_credential_for_write_in_dir(
+                    "p",
+                    dir.path(),
+                    &profile,
+                    ProviderRole::Primary,
+                    credential,
+                    placement,
+                ) {
+                    Ok(()) => None,
+                    Err(ProfileLoadError::InvalidProviderAttestation { source, .. }) => {
+                        Some((source.field, source.reason))
+                    }
+                    Err(other) => panic!("{other:?}"),
+                }
+            };
+            let header = RpcCredentialPlacement::Header {
+                name: "X-Key".to_owned(),
+            };
+            let default = KeyringEntryRef::default_rpc_credential("p", ProviderRole::Primary);
+            assert_eq!(
+                check(&default, &header),
+                Some((
+                    "rpc_url",
+                    ProviderAttestationRejection::InsecureCredentialEndpoint
+                ))
+            );
+            assert_eq!(
+                check(&KeyringEntryRef::new("acme-signer", "GABC"), &header),
+                Some((
+                    "providers.primary.credential",
+                    ProviderAttestationRejection::ReservedCredentialEntry
+                ))
+            );
+            assert_eq!(
+                check(&KeyringEntryRef::new("other-signer", "x"), &header),
+                Some((
+                    "providers.primary.credential",
+                    ProviderAttestationRejection::ReservedCredentialEntry
+                ))
+            );
+            assert_eq!(
+                check(&KeyringEntryRef::new(" svc", "a"), &header),
+                Some((
+                    "providers.primary.credential",
+                    ProviderAttestationRejection::InvalidCredential
+                ))
+            );
+            assert_eq!(
+                check(
+                    &default,
+                    &RpcCredentialPlacement::Header {
+                        name: "Host".to_owned()
+                    }
+                ),
+                Some((
+                    "providers.primary.placement.name",
+                    ProviderAttestationRejection::InvalidHeaderName
+                ))
+            );
+            assert_eq!(
+                check_provider_credential_for_write_in_dir(
+                    "p",
+                    dir.path(),
+                    &profile,
+                    ProviderRole::Secondary,
+                    &default,
+                    &header,
+                )
+                .map_err(|error| error.to_string()),
+                Err(
+                    "profile 'p': profile field `providers.secondary` has no configured \
+                     endpoint; set `secondary_rpc_url` or remove this provider table in the \
+                     profile file"
+                        .to_owned()
+                )
+            );
+        }
+
+        /// All three placements serialize as tables with a `kind` key and
+        /// load back equal.
+        #[test]
+        fn provider_credentials_round_trip_through_toml() {
+            let providers = Providers {
+                primary: Some(
+                    PrimaryProviderRecord::new("Primary RPC Ltd", "primary.example")
+                        .with_credential(
+                            KeyringEntryRef::new("stellar-agent-rpc-test-profile", "primary"),
+                            RpcCredentialPlacement::Header {
+                                name: "Authorization".to_owned(),
+                            },
+                        ),
+                ),
+                secondary: Some(
+                    ProviderRecord::new("Secondary RPC Ltd", "secondary.example", true)
+                        .with_credential(
+                            KeyringEntryRef::new("stellar-agent-rpc-test-profile", "secondary"),
+                            RpcCredentialPlacement::Query {
+                                name: "apikey".to_owned(),
+                            },
+                        ),
+                ),
+                oracle: Some(
+                    ProviderRecord::new("Oracle RPC Ltd", "oracle.example", true).with_credential(
+                        KeyringEntryRef::new("acme-keys", "oracle"),
+                        RpcCredentialPlacement::Path {},
+                    ),
+                ),
+            };
+            let serialized = toml::to_string(&serde_json::json!({"providers": providers})).unwrap();
+            for line in ["kind = \"header\"", "kind = \"query\"", "kind = \"path\""] {
+                assert!(serialized.contains(line), "{serialized}");
+            }
+            let file = provider_file(
+                "stellar:mainnet",
+                "https://primary.example",
+                Some("https://secondary.example/v1"),
+                Some("https://oracle.example/"),
+                Some(serde_json::to_value(&providers).unwrap()),
+            );
+            assert_eq!(
+                load_provider_file(&file).unwrap().providers,
+                Some(providers)
+            );
         }
     }
 }

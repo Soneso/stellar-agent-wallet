@@ -530,7 +530,7 @@ where
         Ok(id) => id,
         Err(error) => return ClaimOutcome::failed(claim_error_envelope(&error)),
     };
-    let client = match StellarRpcClient::new(&context.rpc_url) {
+    let client = match context.primary_client() {
         Ok(client) => client,
         Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
     };
@@ -929,7 +929,7 @@ where
         Ok(id) => id,
         Err(error) => return ClaimOutcome::failed(claim_error_envelope(&error)),
     };
-    let client = match StellarRpcClient::new(&context.rpc_url) {
+    let client = match context.primary_client() {
         Ok(client) => client,
         Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
     };
@@ -1352,7 +1352,7 @@ async fn checked_client(
     context: &NetworkContext,
     args: &ClaimArgs,
 ) -> Result<StellarRpcClient, WalletError> {
-    let client = StellarRpcClient::new(&context.rpc_url)?;
+    let client = context.primary_client()?;
     check_endpoint_identity(&client, context, Duration::from_secs(args.timeout_seconds)).await?;
     Ok(client)
 }

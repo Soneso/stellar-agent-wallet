@@ -79,8 +79,8 @@ pub fn redact_url_userinfo(url: &str) -> String {
 /// The text quotes no part of the refused value, so the credentials never
 /// reach an error message. Only a testnet profile file accepts an endpoint URL
 /// with userinfo; a mainnet profile refuses one at load.
-pub const CREDENTIALED_URL_INPUT_REFUSAL: &str =
-    "never carries credentials; only a testnet profile file may hold a credentialed endpoint";
+pub const CREDENTIALED_URL_INPUT_REFUSAL: &str = "never carries credentials; only a testnet \
+     profile file may hold an endpoint URL with a username or password";
 
 #[cfg(test)]
 mod tests {

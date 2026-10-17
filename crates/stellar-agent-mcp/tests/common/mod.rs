@@ -561,3 +561,193 @@ pub fn rows_of_kind<'a>(rows: &'a [serde_json::Value], kind: &str) -> Vec<&'a se
         .filter(|row| row.get("kind").and_then(serde_json::Value::as_str) == Some(kind))
         .collect()
 }
+
+/// The provider credential the credential tests store and require, sent as
+/// the value of [`RPC_CREDENTIAL_HEADER`].
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub const RPC_CREDENTIAL: &str = "Bearer mcp-rpc-credential-0123456789";
+
+/// The header that carries [`RPC_CREDENTIAL`].
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub const RPC_CREDENTIAL_HEADER: &str = "X-API-Key";
+
+/// Whether `request` carries [`RPC_CREDENTIAL`] in [`RPC_CREDENTIAL_HEADER`].
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+#[must_use]
+pub fn carries_rpc_credential(request: &wiremock::Request) -> bool {
+    request
+        .headers
+        .get(RPC_CREDENTIAL_HEADER)
+        .is_some_and(|value| value.as_bytes() == RPC_CREDENTIAL.as_bytes())
+}
+
+/// Matches a request without [`RPC_CREDENTIAL`].
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+struct LacksRpcCredential;
+
+impl wiremock::Match for LacksRpcCredential {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        !carries_rpc_credential(request)
+    }
+}
+
+/// Answers every request on `server` that lacks [`RPC_CREDENTIAL`] with HTTP
+/// 401, ahead of the server's other mocks.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub async fn require_rpc_credential(server: &wiremock::MockServer) {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(LacksRpcCredential)
+        .respond_with(wiremock::ResponseTemplate::new(401))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// The keyring entry [`bind_rpc_credential`] stores the credential at.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+#[must_use]
+pub fn rpc_credential_entry(
+    role: stellar_agent_core::profile::schema::ProviderRole,
+) -> stellar_agent_core::profile::schema::KeyringEntryRef {
+    stellar_agent_core::profile::schema::KeyringEntryRef::new(
+        "stellar-agent-rpc-mcp-test",
+        role.as_str(),
+    )
+}
+
+/// Names a keyring credential with a header placement in the profile's
+/// record for `role` and, when `stored`, stores [`RPC_CREDENTIAL`] there under
+/// the installed mock store. A secondary or oracle record gets independence
+/// asserted.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub fn bind_rpc_credential(
+    profile: &mut stellar_agent_core::profile::schema::Profile,
+    role: stellar_agent_core::profile::schema::ProviderRole,
+    stored: bool,
+) {
+    use stellar_agent_core::profile::schema::{
+        PrimaryProviderRecord, ProviderRecord, ProviderRole, Providers, RpcCredentialPlacement,
+    };
+    let entry = rpc_credential_entry(role);
+    let placement = RpcCredentialPlacement::Header {
+        name: RPC_CREDENTIAL_HEADER.to_owned(),
+    };
+    let providers = profile.providers.get_or_insert_with(Providers::default);
+    match role {
+        ProviderRole::Primary => {
+            providers.primary = Some(
+                PrimaryProviderRecord::new("Primary RPC", "127.0.0.1")
+                    .with_credential(entry.clone(), placement),
+            );
+        }
+        ProviderRole::Secondary => {
+            providers.secondary = Some(
+                ProviderRecord::new("Secondary RPC", "127.0.0.1", true)
+                    .with_credential(entry.clone(), placement),
+            );
+        }
+        _ => {
+            providers.oracle = Some(
+                ProviderRecord::new("Oracle RPC", "127.0.0.1", true)
+                    .with_credential(entry.clone(), placement),
+            );
+        }
+    }
+    if stored {
+        keyring_core::Entry::new(&entry.service, &entry.account)
+            .expect("Entry::new for the RPC credential")
+            .set_password(RPC_CREDENTIAL)
+            .expect("set_password for the RPC credential");
+    }
+}
+
+/// The JSON-RPC methods `server` received, each with whether it carried
+/// [`RPC_CREDENTIAL`].
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub async fn credential_trace(server: &wiremock::MockServer) -> Vec<(String, bool)> {
+    server
+        .received_requests()
+        .await
+        .expect("wiremock records requests")
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            (
+                body["method"].as_str().unwrap_or_default().to_owned(),
+                carries_rpc_credential(request),
+            )
+        })
+        .collect()
+}
+
+/// Asserts that a prepare and a commit with the profile's primary credential
+/// sent it on every request to `server`, up to and including a send.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub async fn assert_every_request_carried_the_credential(server: &wiremock::MockServer) {
+    let trace = credential_trace(server).await;
+    assert_eq!(
+        trace.first().map(|(method, _)| method.as_str()),
+        Some("getNetwork"),
+        "{trace:?}"
+    );
+    assert!(
+        trace.iter().any(|(method, _)| method == "sendTransaction"),
+        "{trace:?}"
+    );
+    assert!(trace.iter().all(|(_, keyed)| *keyed), "{trace:?}");
+}
+
+/// Asserts that every result is the credential refusal and that `server`
+/// received exactly one bare `getNetwork` per result.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub async fn assert_credential_refusals(
+    server: &wiremock::MockServer,
+    results: Vec<Result<CallToolResult, rmcp::ErrorData>>,
+) {
+    let count = results.len();
+    for result in results {
+        let result = result.expect("the refusal is a tool result");
+        let (code, _message, text) = assert_business_envelope(&result);
+        assert_eq!(code, "network.rpc_credential_refused", "{text}");
+    }
+    let bare: Vec<(String, bool)> = credential_trace(server)
+        .await
+        .into_iter()
+        .filter(|(_, keyed)| !keyed)
+        .collect();
+    assert_eq!(
+        bare,
+        vec![("getNetwork".to_owned(), false); count],
+        "each refused tool made the identity request alone"
+    );
+}
