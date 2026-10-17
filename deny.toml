@@ -12,13 +12,17 @@ ignore = [
     # There is no fixed release and no way to drop them without abandoning the
     # on-chain ABI types the smart-account encoding is verified against.
     "RUSTSEC-2024-0436", # paste: unmaintained
-    # Dependency path: stellar-baselib 0.6.0 -> libsodium-sys-stable -> zip, as
-    # a build dependency. zip runs only in the libsodium-sys-stable build script
-    # on Windows MSVC targets, where it unpacks the prebuilt libsodium archive
-    # after the script verifies its minisign signature against a fixed key. zip
-    # is not linked into the binaries. Remove this entry once a
-    # libsodium-sys-stable release accepts an unyanked zip.
-    { crate = "zip@8.6.0", reason = "Build dependency of libsodium-sys-stable, whose releases accept only the yanked zip 8.x line." },
+    # Dependency path: stellar-baselib 0.6.0 -> libsodium-sys-stable 1.24.0 ->
+    # zip 8.6.0, as a build dependency. Every libsodium-sys-stable release
+    # through 1.24.3 requires zip ^8.6, while the fix for these advisories is in
+    # zip 9. zip runs only in the libsodium-sys-stable build script on Windows
+    # MSVC targets. There it extracts the prebuilt libsodium archive after the
+    # script verifies its minisign signature against a fixed key, so the archive
+    # is not attacker-controlled. zip is not linked into the binaries. Remove
+    # these entries once a libsodium-sys-stable release accepts zip 9.
+    "RUSTSEC-2026-0367", # zip: SUID and SGID bits preserved on extraction
+    "RUSTSEC-2026-0368", # zip: symlink targets outside the extraction directory
+    "RUSTSEC-2026-0369", # zip: permissions applied through extracted symlinks
 ]
 
 [licenses]

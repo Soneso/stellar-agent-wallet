@@ -1103,6 +1103,16 @@ pub enum ValidationError {
         name: String,
     },
 
+    /// A provider attestation requires correction in the profile file.
+    #[error("profile '{name}': {source}")]
+    ProviderAttestationInvalid {
+        /// Profile name supplied by the caller.
+        name: String,
+        /// Static field name and repair text, with no rejected values.
+        #[source]
+        source: crate::profile::schema::ProviderAttestationError,
+    },
+
     /// A profile-creation command refused to overwrite an existing profile
     /// file.
     ///
@@ -1514,6 +1524,7 @@ impl ValidationError {
             // the subsystem (audit.*) while the category stays Validation.
             Self::AuditLogNotFound { .. } => "audit.log_not_found",
             Self::MainnetRpcUrlRequired { .. } => "validation.mainnet_rpc_url_required",
+            Self::ProviderAttestationInvalid { .. } => "validation.provider_attestation_invalid",
             Self::ProfileAlreadyExists { .. } => "validation.profile_already_exists",
             // Profile taxonomy code on a validation-class variant: the code
             // names the subsystem (profile.*) while the category stays
@@ -2908,6 +2919,17 @@ mod tests {
                 "audit.log_not_found",
             ),
             (
+                ValidationError::ProviderAttestationInvalid {
+                    name: "mainnet".into(),
+                    source: crate::profile::schema::ProviderAttestationError {
+                        field: "providers",
+                        reason:
+                            crate::profile::schema::ProviderAttestationRejection::InvalidContainer,
+                    },
+                },
+                "validation.provider_attestation_invalid",
+            ),
+            (
                 ValidationError::MainnetRpcUrlRequired {
                     name: "mainnet".to_owned(),
                 },
@@ -3123,6 +3145,12 @@ mod tests {
                 }
                 ValidationError::AuditLogNotFound { path } => {
                     ValidationError::AuditLogNotFound { path: path.clone() }
+                }
+                ValidationError::ProviderAttestationInvalid { name, source } => {
+                    ValidationError::ProviderAttestationInvalid {
+                        name: name.clone(),
+                        source: source.clone(),
+                    }
                 }
                 ValidationError::MainnetRpcUrlRequired { name } => {
                     ValidationError::MainnetRpcUrlRequired { name: name.clone() }

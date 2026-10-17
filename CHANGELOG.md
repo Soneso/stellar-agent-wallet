@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Profiles support file-only secondary and oracle provider attestations containing
+  operator, host, and independence from the primary. Core exposes `same_provider_host`.
+
 - `StellarRpcClient::endpoint_identity` returns the checked `EndpointIdentity`,
   with its chain, protocol version, and authority. `check_protocol_version` and
   `SUPPORTED_PROTOCOL_VERSIONS` state the protocol rule.
@@ -31,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wire code is the code of the network error it carries.
 
 ### Changed
+
+- Mainnet profile loading requires a matching independence attestation and a host
+  distinct from the primary for each configured secondary or oracle endpoint.
+  Invalid attestations refuse with `validation.provider_attestation_invalid`.
+- MCP high-value cross-checks compare provider hosts and check oracle endpoint
+  identity within each attempt's timeout. The SEP-29 oracle check shares the
+  `stellar_pay` identity deadline and reports identity failures as `network.rpc_divergence`.
+- A SEP-29 oracle construction failure refuses with `network.rpc_divergence`.
+- The high-value cross-check's degraded-verification warning fires when oracle
+  and primary hosts match, including different paths, queries, or ports.
 
 - `trustline` waits 60 seconds for its submission when the profile leaves
   `submit_timeout_seconds` unset, the default the MCP commit tools use.

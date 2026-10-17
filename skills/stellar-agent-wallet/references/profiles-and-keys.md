@@ -90,7 +90,7 @@ the file only:
 | Tighten only, every chain | `mcp_disabled`, and only to `true` |
 
 Every other key (`chain_id`, `version`, every `*_key_id` coordinate,
-`mcp_nonce_key_alias`, `audit_log_path`, `policy`, `wallet`, `remote_approval`,
+`mcp_nonce_key_alias`, `audit_log_path`, `policy`, `wallet`, `providers`, `remote_approval`,
 `served_pages`, and the pool fields) is refused on every chain with
 `profile.non_overlayable_field`, even when the value equals the file. A
 `STELLAR_AGENT_*` variable that names no profile key, such as
@@ -111,6 +111,8 @@ After merging, the loader resolves derived fields and validates:
   load with `validation.config_invalid`, and the message names the field, not
   the URL. A local development endpoint over plain HTTP belongs on a testnet
   profile.
+- Provider records must match their role's URL and satisfy the chain's
+  independence rules in [Provider attestations](#provider-attestations).
 - `audit_log_path` defaults to the OS-conventional PER-PROFILE location
   (`<data root>/audit/<name>.jsonl`) when omitted; profiles never share an
   audit file unless one is configured explicitly. The first keyed audit write
@@ -163,7 +165,7 @@ secret.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `cross_check_threshold_stroops` | integer (stroops) | no | `0` | High-value cross-check threshold. The effective value is `max(cross_check_threshold_stroops, 10_000_000_000)`; the floor of 1000 XLM (10^10 stroops) cannot be configured lower, so a profile with `cross_check_threshold_stroops = 0` behaves as if it were the floor. Transactions at or above the effective threshold trigger the independent-RPC cross-check when `oracle_provider_url` is set. The legacy key `usd_threshold` is still accepted on load; do not set both keys (across the file, environment, and CLI sources) — the load is refused as a duplicate field. |
+| `cross_check_threshold_stroops` | integer (stroops) | no | `0` | High-value cross-check threshold. The effective value is `max(cross_check_threshold_stroops, 10_000_000_000)`; the floor of 1000 XLM (10^10 stroops) cannot be configured lower, so a profile with `cross_check_threshold_stroops = 0` behaves as if it were the floor. Native-XLM payments and sponsored account creations at or above the effective threshold run the MCP commit cross-check when `oracle_provider_url` is set. Mainnet requires its provider record and a host distinct from the primary. The legacy key `usd_threshold` is still accepted on load; do not set both keys (across the file, environment, and CLI sources) — the load is refused as a duplicate field. |
 | `classic_fee_per_op_stroops` | integer | no | unset (protocol default) | Per-operation base fee for classic transactions, in stroops. When unset, classic tools use the built-in default. |
 | `classic_max_fee_per_op_stroops` | integer | no | unset (no cap) | Per-operation fee cap, in stroops. When set, classic tools fail before envelope construction if the selected fee exceeds the cap. A guardrail, not a silent clamp. |
 | `submit_timeout_seconds` | integer | no | `60` | How long the wallet polls for transaction confirmation. |
@@ -186,12 +188,58 @@ but mints no key material; the rotation commands mint the actual keys (see
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `oracle_provider_url` | string (URL) | no | unset (cross-check off) | Independent RPC endpoint for re-simulating high-value transactions. When unset, the high-value cross-check is skipped. Set this before enabling V1 for mainnet high-value flows. Follows the endpoint rule in [Loader source order](#loader-source-order). Mainnet reads this field from the file only. Redacted in debug output. |
+| `oracle_provider_url` | string (URL) | no | unset (cross-check off) | Oracle endpoint for MCP high-value rebuilds and the `stellar_pay` SEP-29 second read. When absent, those second-endpoint checks are skipped. Mainnet requires `providers.oracle` and a host distinct from `rpc_url`. The endpoint rule and URL redaction apply. |
 | `mcp_disabled` | bool | no | `false` | When `true`, the `stellar-agent-mcp` server refuses to start with error `mcp.disabled_per_profile`. |
 | `audit_log_path` | string (path) | no | OS-conventional | Path to the per-profile audit log. |
-| `secondary_rpc_url` | string (URL) | no | unset | Secondary endpoint for cross-RPC checks. `smart-account multicall` requires an effective secondary from the profile or a testnet flag. Follows the endpoint rule in [Loader source order](#loader-source-order). Mainnet reads this field from the file only. Debug output is redacted. |
+| `secondary_rpc_url` | string (URL) | no | unset | Secondary endpoint for cross-RPC checks. `smart-account multicall` requires an effective secondary from the profile or a testnet flag. Follows the endpoint rule in [Loader source order](#loader-source-order). Mainnet reads this field from the file only and requires `providers.secondary`, its independence assertion, and a host distinct from the primary. Debug output is redacted. |
 | `smart_account_max_context_rule_scan_id` | integer | no | engine default | Override for the maximum rule-id scan bound. Rejected at load when above `10000`. |
 | `session_rule_max_horizon_ledgers` | integer | no | engine default | Override for the maximum session-rule lookahead window, in ledgers. Rejected at load when above `10000`. |
+
+### Provider attestations
+
+Edit the profile file to configure the optional URLs and provider records.
+No CLI flag or command sets them.
+On mainnet, each configured secondary or oracle URL requires its matching record,
+a true independence assertion, and a host distinct from the primary.
+On every chain, a record asserting `independent_of_primary = true` needs a host distinct from the primary.
+Secondary and oracle may share a host and operator; each role keeps its own record.
+
+```toml
+# Merge these root keys into an existing profile before any table header.
+rpc_url = "https://primary.example/rpc"
+secondary_rpc_url = "https://independent.example/secondary"
+oracle_provider_url = "https://independent.example/oracle"
+
+[providers.secondary]
+operator = "Independent RPC Organization"
+host = "independent.example"
+independent_of_primary = true
+
+[providers.oracle]
+operator = "Independent RPC Organization"
+host = "independent.example"
+independent_of_primary = true
+```
+
+Set `operator` to the organization administering the endpoint and `host` to its host.
+The loader normalizes both hosts for comparison and preserves the record as written.
+Normalization uses the URL crate's host, IDNA, canonical IP text, and one removed trailing dot.
+HTTP and HTTPS hosts are lowercase; IPv6 keeps brackets.
+A record host cannot include a scheme, port, userinfo, path, or whitespace.
+The check compares hosts only: scheme, port, userinfo, path, query, and fragment are ignored, and a different subdomain counts as a different host.
+One provider often serves several hostnames, so a different host does not show a different provider.
+The host predicate is a naming convention, not a proof; the operator attestation carries the responsibility.
+
+On testnet, records may be absent or assert false; present records still need an operator and matching host.
+Environment and programmatic URL overlays are checked against a present file record.
+Changing such an overlay to another host requires updating the file record.
+CLI flags and the MCP secondary input override after loading and are not checked against these records.
+Remove a role's record when removing its URL; URLs absent together with their records remain allowed.
+Provider records are file-only on every chain and appear in `profile show` and `Debug` because operator and host are not secrets.
+Do not put credentials in these metadata fields.
+`providers.primary` is unsupported and refused.
+Provider refusals use `validation.provider_attestation_invalid`; the message identifies the field and its repair.
+On testnet, a high-value oracle sharing the primary host emits the degraded-verification warning, even when its path or query differs.
 
 ### `[wallet]` block
 

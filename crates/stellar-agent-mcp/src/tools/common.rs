@@ -23,7 +23,8 @@ use stellar_agent_core::policy::{
     ApprovalRequest, BuildRegistryError, Decision, DenyReason, McpToolRegistration, ToolDescriptor,
 };
 use stellar_agent_core::profile::caip2::validate_chain_id_matches_profile;
-use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_core::profile::schema::{Profile, same_provider_host};
+use stellar_agent_network::NetworkContext;
 use stellar_agent_nonce::{
     Nonce, NonceError, NonceMint, NonceVerifyHmacOnlyRequest, ReplayWindow, ToolCatalogue,
 };
@@ -187,22 +188,9 @@ const _: () = {
 // Oracle RPC timeout — independent-RPC cross-check
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Maximum time allowed for the independent-RPC (oracle) rebuild call in
-/// [`high_value_cross_check`].
-///
-/// A slow or unresponsive oracle would otherwise block the user-visible commit
-/// for an unbounded duration.  Exceeding this limit is treated as
-/// `simulation.divergence` — the same as a rebuild failure — which is the
-/// fail-safe response: the wallet cannot confirm the envelope is safe to commit
-/// without a valid oracle comparison.
-///
-/// 15 s is a conservative upper bound for a hosted Stellar RPC endpoint; it is
-/// independent of [`submit_timeout`] (which governs transaction confirmation,
-/// not the pre-commit cross-check).
-///
-/// Operator note: if `profile.submit_timeout_seconds` is smaller than 15, the
-/// oracle timeout is not automatically reduced — the two timeouts have different
-/// semantics.
+/// Budget shared by oracle identity and rebuilding in each cross-check attempt.
+/// An elapsed deadline refuses with `simulation.divergence`.
+/// This budget is independent of [`submit_timeout`], which governs confirmation.
 pub(crate) const ORACLE_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Bound on rebuild attempts in [`high_value_cross_check`] before a rebuild
@@ -240,7 +228,8 @@ pub(crate) fn submit_timeout(profile: &Profile) -> std::time::Duration {
 ///
 /// The submit layer runs the same check on the same client before the send;
 /// a refusal there comes after the nonce is consumed. This check runs under
-/// its own deadline, `timeout` from now.
+/// its own deadline, `timeout` from now. `stellar_pay` is the exception: it
+/// calls the identity check directly under the shared pay deadline.
 ///
 /// # Errors
 ///
@@ -1885,29 +1874,6 @@ pub(crate) fn commit_path_error_result(err: impl std::fmt::Display) -> rmcp::mod
     nonce_verification_error_result(&NonceError::Expired)
 }
 
-fn rpc_urls_equivalent_for_cross_check(left: &str, right: &str) -> bool {
-    fn normalise(raw: &str) -> Option<(String, String, u16, String, Option<String>)> {
-        let url = url::Url::parse(raw).ok()?;
-        let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
-        let port = url.port_or_known_default()?;
-        let path = url.path().trim_end_matches('/').to_owned();
-        Some((
-            url.scheme().to_ascii_lowercase(),
-            host,
-            port,
-            path,
-            url.query().map(ToOwned::to_owned),
-        ))
-    }
-
-    match (normalise(left), normalise(right)) {
-        (Some(left), Some(right)) => left == right,
-        _ => left
-            .trim_end_matches('/')
-            .eq_ignore_ascii_case(right.trim_end_matches('/')),
-    }
-}
-
 fn nonce_replayed_error_result() -> rmcp::model::CallToolResult {
     business_error_result(
         "nonce.replayed",
@@ -2214,8 +2180,8 @@ pub(crate) enum CrossCheckOutcome {
 /// When condition 2 is met but `oracle_provider_url` is unset, the cross-check
 /// is **skipped with a [`tracing::warn!`]** (fail-open for the cross-check; the
 /// policy gate still runs on the primary rebuild).
-/// Operators MUST configure `oracle_provider_url` to activate the mandatory
-/// cross-check path for mainnet high-value flows.
+/// Mainnet requires the configured URL's provider record and a distinct host.
+/// Identity and rebuilding share one deadline per attempt.
 ///
 /// # Errors
 ///
@@ -2231,29 +2197,64 @@ pub(crate) enum CrossCheckOutcome {
 ///
 /// # Security
 ///
-/// The independent RPC is fetched against `profile.oracle_provider_url` — an
-/// operator-configured URL distinct from `profile.rpc_url`.  The cross-check
-/// defends against a compromised primary RPC returning stale or manipulated
-/// account state.
-///
-/// **Operator trust requirement:** `oracle_provider_url` MUST be independently
-/// administered from `rpc_url`.  A malicious operator that configures the same
-/// endpoint (or a colluding endpoint) for both fields reduces the cross-check
-/// to single-RPC verification and provides no defence against a compromised
-/// primary RPC.
+/// The operator attests that the oracle is administered independently of the primary.
+/// Mainnet loading requires that record and different normalized hosts.
+/// Hostnames alone do not prove independence. Testnet permits degraded
+/// verification and retains its warning.
 ///
 /// `source_account` is logged at `tracing::info!` level in first-5-last-5
 /// form (the full G-strkey is never logged).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn high_value_cross_check<F, Fut>(
     profile: &Profile,
-    primary_rpc_url: &str,
+    primary_context: &NetworkContext,
     primary_rebuilt_xdr: &str,
     source_account: &str,
     asset_is_native: bool,
     value_stroops: i64,
     oracle_rebuild_fn: F,
     tool_name: &'static str,
+) -> Result<CrossCheckOutcome, rmcp::model::CallToolResult>
+where
+    F: Fn(stellar_agent_network::StellarRpcClient) -> Fut,
+    Fut: std::future::Future<Output = Result<String, ErrorData>>,
+{
+    high_value_cross_check_with_timing(
+        profile,
+        primary_context,
+        primary_rebuilt_xdr,
+        source_account,
+        asset_is_native,
+        value_stroops,
+        oracle_rebuild_fn,
+        tool_name,
+        CrossCheckTiming {
+            attempt_budget: ORACLE_RPC_TIMEOUT,
+            retry_backoff: ORACLE_REBUILD_RETRY_BACKOFF,
+        },
+    )
+    .await
+}
+
+/// Tests inject millisecond budgets on a real clock; production passes the constants.
+#[derive(Clone, Copy)]
+struct CrossCheckTiming {
+    attempt_budget: std::time::Duration,
+    retry_backoff: std::time::Duration,
+}
+
+/// Runs with millisecond test budgets on a real clock or the production constants.
+#[allow(clippy::too_many_arguments)]
+async fn high_value_cross_check_with_timing<F, Fut>(
+    profile: &Profile,
+    primary_context: &NetworkContext,
+    primary_rebuilt_xdr: &str,
+    source_account: &str,
+    asset_is_native: bool,
+    value_stroops: i64,
+    oracle_rebuild_fn: F,
+    tool_name: &'static str,
+    timing: CrossCheckTiming,
 ) -> Result<CrossCheckOutcome, rmcp::model::CallToolResult>
 where
     F: Fn(stellar_agent_network::StellarRpcClient) -> Fut,
@@ -2292,12 +2293,12 @@ where
         return Ok(CrossCheckOutcome::Skipped);
     };
 
-    if rpc_urls_equivalent_for_cross_check(oracle_provider_url.as_str(), primary_rpc_url) {
+    if same_provider_host(oracle_provider_url.as_str(), &primary_context.rpc_url) {
         tracing::warn!(
             target: "policy.cross_check",
             tool = tool_name,
             source_prefix = redact_account_id_value(source_account),
-            "oracle_provider_url == rpc_url; cross-check is degraded to single-RPC verification"
+            "oracle_provider_url shares the provider host of rpc_url; cross-check is degraded to single-RPC verification"
         );
     }
 
@@ -2316,20 +2317,15 @@ where
         "high-value cross-check: re-building envelope against independent RPC"
     );
 
-    // Invoke the caller-supplied rebuild closure against a fresh oracle
-    // client, bounded by ORACLE_RPC_TIMEOUT per attempt. A rebuild FAILURE
-    // (as opposed to a byte mismatch) most often means the source account or
-    // entry has not yet propagated to the independent RPC — an
-    // environment-not-ready condition — so it gets ORACLE_REBUILD_RETRY_ATTEMPTS
-    // bounded attempts before being treated as divergence. A slow or
-    // unresponsive oracle (timeout) is treated as divergence immediately: it is
-    // a distinct failure mode from propagation lag and is not retried here.
+    // Each attempt checks identity on the client used for rebuilding.
+    // Both phases share the attempt's deadline. Only rebuild errors retry;
+    // identity failures and elapsed deadlines require a fresh simulation.
     let mut rebuild_attempt: u32 = 0;
     let oracle_xdr = loop {
+        let attempt_deadline = tokio::time::Instant::now() + timing.attempt_budget;
         let oracle_client = StellarRpcClient::new(oracle_provider_url.as_str()).map_err(|e| {
-            // Full error detail retained in debug logs for operator forensics only.
-            // The wire response is the canonical CROSS_CHECK_DIVERGENCE_DETAIL;
-            // indistinguishability discipline prohibits non-uniform wire bodies.
+            // Construction and rebuild failures use the common recovery text.
+            // Identity refusals identify the endpoint configuration to repair.
             tracing::debug!(
                 tool = tool_name,
                 error = %e,
@@ -2338,7 +2334,22 @@ where
             business_error_result("simulation.divergence", CROSS_CHECK_DIVERGENCE_DETAIL)
         })?;
 
-        match tokio::time::timeout(ORACLE_RPC_TIMEOUT, oracle_rebuild_fn(oracle_client)).await {
+        if let Err(err) = oracle_client
+            .endpoint_identity(primary_context.network_passphrase(), attempt_deadline)
+            .await
+        {
+            let detail =
+                redact_rpc_error_detail("oracle_provider_url endpoint identity failed", &err);
+            tracing::debug!(tool = tool_name, error = %detail, "oracle endpoint identity refused");
+            return Err(business_error_result(
+                "simulation.divergence",
+                format!(
+                    "independent-RPC cross-check failed: {detail}. Correct oracle_provider_url and re-simulate to obtain a fresh envelope"
+                ),
+            ));
+        }
+
+        match tokio::time::timeout_at(attempt_deadline, oracle_rebuild_fn(oracle_client)).await {
             Ok(Ok(xdr)) => break xdr,
             Ok(Err(_)) => {
                 rebuild_attempt += 1;
@@ -2359,12 +2370,12 @@ where
                     "oracle RPC rebuild failed; re-polling within the bounded window before \
                      treating as divergence"
                 );
-                tokio::time::sleep(ORACLE_REBUILD_RETRY_BACKOFF).await;
+                tokio::time::sleep(timing.retry_backoff).await;
             }
             Err(_elapsed) => {
                 tracing::warn!(
                     tool = tool_name,
-                    timeout_secs = ORACLE_RPC_TIMEOUT.as_secs(),
+                    timeout_secs = timing.attempt_budget.as_secs(),
                     "oracle RPC timeout; treating as divergence"
                 );
                 return Err(business_error_result(
@@ -2513,6 +2524,7 @@ mod tests {
         ApprovalRequest, Decision, DenyReason, PolicyEngine, PolicyError, ToolDescriptor,
     };
     use stellar_agent_core::profile::schema::Profile;
+    use stellar_agent_network::NetworkContext;
 
     // ── MockPolicyEngine — hand-rolled since mockall is not in workspace deps ──
 
@@ -3489,11 +3501,7 @@ mod tests {
         use stellar_agent_test_support::CaptureWriter;
         use tracing::instrument::WithSubscriber as _;
 
-        let mut profile =
-            Profile::builder_mainnet("https://rpc.example.com", "svc", "acct", "n-svc", "n-acct")
-                .with_noop_engine()
-                .build();
-        profile.oracle_provider_url = Some(url::Url::parse("https://RPC.example.com/").unwrap());
+        let (profile, oracle) = cross_check_fixture().await;
 
         let capture = CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
@@ -3502,15 +3510,16 @@ mod tests {
             .with_max_level(tracing::Level::WARN)
             .finish();
 
-        let outcome = high_value_cross_check(
+        let outcome = high_value_cross_check_with_timing(
             &profile,
-            &profile.rpc_url,
+            &NetworkContext::from_profile(&profile),
             "same-envelope-xdr",
             "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
             true,
             i64::try_from(profile.effective_cross_check_threshold_stroops()).unwrap(),
             |_client| async { Ok("same-envelope-xdr".to_owned()) },
             "stellar_pay_commit",
+            CROSS_CHECK_TEST_TIMING,
         )
         .with_subscriber(subscriber)
         .await
@@ -3520,6 +3529,7 @@ mod tests {
             matches!(outcome, CrossCheckOutcome::Passed),
             "same-XDR cross-check must pass, got {outcome:?}"
         );
+        assert_eq!(oracle_methods(&oracle).await, ["getNetwork"]);
         let captured = capture.captured_str();
         assert!(
             captured.contains("policy.cross_check"),
@@ -3527,7 +3537,7 @@ mod tests {
         );
         assert!(
             captured.contains(
-                "oracle_provider_url == rpc_url; cross-check is degraded to single-RPC verification"
+                "oracle_provider_url shares the provider host of rpc_url; cross-check is degraded to single-RPC verification"
             ),
             "same-URL warning must be emitted: {captured}"
         );
@@ -3538,16 +3548,7 @@ mod tests {
         use stellar_agent_test_support::CaptureWriter;
         use tracing::instrument::WithSubscriber as _;
 
-        let mut profile = Profile::builder_mainnet(
-            "https://primary.example.com",
-            "svc",
-            "acct",
-            "n-svc",
-            "n-acct",
-        )
-        .with_noop_engine()
-        .build();
-        profile.oracle_provider_url = Some(url::Url::parse("https://oracle.example.com").unwrap());
+        let (profile, oracle) = cross_check_fixture().await;
 
         let primary_xdr = transaction_envelope_xdr_with_sequence(100);
         let oracle_xdr = transaction_envelope_xdr_with_sequence(107);
@@ -3558,9 +3559,9 @@ mod tests {
             .with_max_level(tracing::Level::WARN)
             .finish();
 
-        let err = high_value_cross_check(
+        let err = high_value_cross_check_with_timing(
             &profile,
-            &profile.rpc_url,
+            &NetworkContext::from_profile(&profile),
             &primary_xdr,
             "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
             true,
@@ -3570,6 +3571,7 @@ mod tests {
                 async move { Ok(xdr) }
             },
             "stellar_pay_commit",
+            CROSS_CHECK_TEST_TIMING,
         )
         .with_subscriber(subscriber)
         .await
@@ -3594,6 +3596,7 @@ mod tests {
             "wire message must include sequence delta: {message}"
         );
 
+        assert_eq!(oracle_methods(&oracle).await, ["getNetwork"]);
         let captured = capture.captured_str();
         assert!(
             captured.contains("policy.cross_check"),
@@ -3615,25 +3618,16 @@ mod tests {
     /// `ORACLE_REBUILD_RETRY_ATTEMPTS - 1` attempts, succeeding on the last
     /// allowed attempt, must still pass — the environment-not-ready retry
     /// window absorbs transient rebuild failures.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tokio::test(flavor = "current_thread")]
     async fn high_value_cross_check_recovers_within_the_rebuild_retry_window() {
-        let mut profile = Profile::builder_mainnet(
-            "https://primary.example.com",
-            "svc",
-            "acct",
-            "n-svc",
-            "n-acct",
-        )
-        .with_noop_engine()
-        .build();
-        profile.oracle_provider_url = Some(url::Url::parse("https://oracle.example.com").unwrap());
+        let (profile, oracle) = cross_check_fixture().await;
 
         let calls = Arc::new(AtomicU32::new(0));
         let calls_for_closure = Arc::clone(&calls);
 
-        let outcome = high_value_cross_check(
+        let outcome = high_value_cross_check_with_timing(
             &profile,
-            &profile.rpc_url,
+            &NetworkContext::from_profile(&profile),
             "same-envelope-xdr",
             "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
             true,
@@ -3652,6 +3646,7 @@ mod tests {
                 }
             },
             "stellar_pay_commit",
+            CROSS_CHECK_TEST_TIMING,
         )
         .await
         .expect("recovery within the bounded retry window must pass");
@@ -3659,6 +3654,10 @@ mod tests {
         assert!(
             matches!(outcome, CrossCheckOutcome::Passed),
             "outcome must be Passed once the rebuild succeeds within the window, got {outcome:?}"
+        );
+        assert_eq!(
+            oracle_methods(&oracle).await,
+            ["getNetwork", "getNetwork", "getNetwork"]
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -3670,25 +3669,16 @@ mod tests {
     /// A rebuild that fails on EVERY attempt must still fail after exactly
     /// `ORACLE_REBUILD_RETRY_ATTEMPTS` attempts — the bounded window never
     /// converts a persistent rebuild failure into a pass.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tokio::test(flavor = "current_thread")]
     async fn high_value_cross_check_fails_after_exhausting_the_rebuild_retry_window() {
-        let mut profile = Profile::builder_mainnet(
-            "https://primary.example.com",
-            "svc",
-            "acct",
-            "n-svc",
-            "n-acct",
-        )
-        .with_noop_engine()
-        .build();
-        profile.oracle_provider_url = Some(url::Url::parse("https://oracle.example.com").unwrap());
+        let (profile, oracle) = cross_check_fixture().await;
 
         let calls = Arc::new(AtomicU32::new(0));
         let calls_for_closure = Arc::clone(&calls);
 
-        let err = high_value_cross_check(
+        let err = high_value_cross_check_with_timing(
             &profile,
-            &profile.rpc_url,
+            &NetworkContext::from_profile(&profile),
             "same-envelope-xdr",
             "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
             true,
@@ -3704,6 +3694,7 @@ mod tests {
                 }
             },
             "stellar_pay_commit",
+            CROSS_CHECK_TEST_TIMING,
         )
         .await
         .expect_err("a rebuild that never succeeds must fail");
@@ -3715,30 +3706,14 @@ mod tests {
             "exhausted-retry envelope code must be simulation.divergence"
         );
         assert_eq!(
+            oracle_methods(&oracle).await,
+            ["getNetwork", "getNetwork", "getNetwork"]
+        );
+        assert_eq!(
             calls.load(Ordering::SeqCst),
             ORACLE_REBUILD_RETRY_ATTEMPTS,
             "must attempt exactly ORACLE_REBUILD_RETRY_ATTEMPTS times, never more, never fewer"
         );
-    }
-
-    #[test]
-    fn rpc_urls_equivalent_for_cross_check_normalises_default_ports() {
-        assert!(rpc_urls_equivalent_for_cross_check(
-            "https://rpc.example.com",
-            "https://RPC.example.com:443/"
-        ));
-        assert!(rpc_urls_equivalent_for_cross_check(
-            "http://rpc.example.com",
-            "http://rpc.example.com:80/"
-        ));
-        assert!(!rpc_urls_equivalent_for_cross_check(
-            "https://rpc.example.com",
-            "https://rpc.example.com:8443"
-        ));
-        assert!(!rpc_urls_equivalent_for_cross_check(
-            "https://rpc.example.com/path?a=1",
-            "https://rpc.example.com/path?a=2"
-        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4754,6 +4729,271 @@ mod tests {
                 "{terminal}"
             );
         }
+    }
+
+    const CROSS_CHECK_TEST_TIMING: CrossCheckTiming = CrossCheckTiming {
+        attempt_budget: std::time::Duration::from_secs(1),
+        retry_backoff: std::time::Duration::from_millis(1),
+    };
+
+    async fn oracle_identity_mock(
+        result: serde_json::Value,
+        delay: std::time::Duration,
+    ) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["method"], "getNetwork");
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": body["id"], "result": result,
+                    }))
+                    .set_delay(delay)
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn cross_check_fixture() -> (Profile, wiremock::MockServer) {
+        let oracle = oracle_identity_mock(
+            stellar_agent_test_support::signed_envelope::get_network_result(
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            ),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .rpc_url(format!("{}/primary?key=primary", oracle.uri()))
+            .oracle_provider_url(
+                url::Url::parse(&format!("{}/oracle?key=oracle", oracle.uri())).unwrap(),
+            )
+            .with_noop_engine()
+            .build();
+        (profile, oracle)
+    }
+
+    async fn oracle_methods(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["method"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn high_value_cross_check_identity_refuses_before_rebuild() {
+        for result in [
+            stellar_agent_test_support::signed_envelope::get_network_result(
+                "PRIVATE_PASSPHRASE_SENTINEL",
+            ),
+            stellar_agent_test_support::signed_envelope::get_network_result(
+                stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            ),
+            serde_json::json!({"passphrase": 42}),
+        ] {
+            let oracle = oracle_identity_mock(result, std::time::Duration::ZERO).await;
+            let profile = Profile::builder_testnet("s", "a", "n", "a")
+                .oracle_provider_url(url::Url::parse(&oracle.uri()).unwrap())
+                .build();
+            let calls = AtomicU32::new(0);
+            let error = high_value_cross_check_with_timing(
+                &profile,
+                &NetworkContext::from_profile(&profile),
+                "xdr",
+                "source",
+                true,
+                i64::try_from(profile.effective_cross_check_threshold_stroops()).unwrap(),
+                |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { Ok("xdr".into()) }
+                },
+                "test",
+                CROSS_CHECK_TEST_TIMING,
+            )
+            .await
+            .unwrap_err();
+            let (_, code, message) = error_envelope_parts(&error);
+            assert_eq!(code, "simulation.divergence");
+            assert!(message.contains("oracle_provider_url endpoint identity failed"));
+            assert!(message.contains("Correct oracle_provider_url and re-simulate"));
+            assert!(!message.contains("PRIVATE_PASSPHRASE_SENTINEL"));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(oracle_methods(&oracle).await, ["getNetwork"]);
+        }
+        let oracle = oracle_identity_mock(
+            serde_json::json!({}),
+            std::time::Duration::from_millis(1500),
+        )
+        .await;
+        let profile = Profile::builder_testnet("s", "a", "n", "a")
+            .oracle_provider_url(url::Url::parse(&oracle.uri()).unwrap())
+            .build();
+        let error = high_value_cross_check_with_timing(
+            &profile,
+            &NetworkContext::from_profile(&profile),
+            "xdr",
+            "source",
+            true,
+            i64::try_from(profile.effective_cross_check_threshold_stroops()).unwrap(),
+            |_| async { panic!("identity failure must precede rebuild") },
+            "test",
+            CROSS_CHECK_TEST_TIMING,
+        )
+        .await
+        .unwrap_err();
+        let (_, code, message) = error_envelope_parts(&error);
+        assert_eq!(code, "simulation.divergence");
+        assert_eq!(
+            message,
+            format!(
+                "independent-RPC cross-check failed: oracle_provider_url endpoint identity failed: \
+                 the network identity of RPC endpoint '{}' could not be determined; \
+                 not submitting. \
+                 Correct oracle_provider_url and re-simulate to obtain a fresh envelope",
+                oracle.address(),
+            ),
+        );
+        assert_eq!(oracle_methods(&oracle).await, ["getNetwork"]);
+    }
+
+    #[tokio::test]
+    async fn high_value_cross_check_identity_uses_primary_context() {
+        let (mut profile, oracle) = cross_check_fixture().await;
+        let context = NetworkContext::from_profile(&profile);
+        profile.network_passphrase = "Profile fixture differs from resolved context".into();
+        let result = high_value_cross_check_with_timing(
+            &profile,
+            &context,
+            "xdr",
+            "source",
+            true,
+            i64::try_from(profile.effective_cross_check_threshold_stroops()).unwrap(),
+            |_| async { Ok("xdr".into()) },
+            "test",
+            CROSS_CHECK_TEST_TIMING,
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(CrossCheckOutcome::Passed)),
+            "{result:?}"
+        );
+        assert_eq!(oracle_methods(&oracle).await, ["getNetwork"]);
+    }
+
+    #[tokio::test]
+    async fn high_value_cross_check_identity_and_rebuild_share_deadline() {
+        let oracle = oracle_identity_mock(
+            stellar_agent_test_support::signed_envelope::get_network_result(
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            ),
+            std::time::Duration::from_millis(600),
+        )
+        .await;
+        let profile = Profile::builder_testnet("s", "a", "n", "a")
+            .oracle_provider_url(url::Url::parse(&oracle.uri()).unwrap())
+            .build();
+        let calls = AtomicU32::new(0);
+        let error = high_value_cross_check_with_timing(
+            &profile,
+            &NetworkContext::from_profile(&profile),
+            "xdr",
+            "source",
+            true,
+            i64::try_from(profile.effective_cross_check_threshold_stroops()).unwrap(),
+            |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                    Ok("xdr".into())
+                }
+            },
+            "test",
+            CROSS_CHECK_TEST_TIMING,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error_envelope_parts(&error).1, "simulation.divergence");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(oracle_methods(&oracle).await, ["getNetwork"]);
+    }
+
+    #[tokio::test]
+    async fn high_value_cross_check_rebuild_retry_shares_attempt_deadline() {
+        let oracle = oracle_identity_mock(
+            stellar_agent_test_support::signed_envelope::get_network_result(
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            ),
+            std::time::Duration::from_millis(600),
+        )
+        .await;
+        let profile = Profile::builder_testnet("s", "a", "n", "a")
+            .oracle_provider_url(url::Url::parse(&oracle.uri()).unwrap())
+            .build();
+        let calls = AtomicU32::new(0);
+        let result = high_value_cross_check_with_timing(
+            &profile,
+            &NetworkContext::from_profile(&profile),
+            "xdr",
+            "source",
+            true,
+            i64::try_from(profile.effective_cross_check_threshold_stroops()).unwrap(),
+            |_| {
+                let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        return Err(rmcp::ErrorData::internal_error("retry", None));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                    Ok("xdr".into())
+                }
+            },
+            "test",
+            CROSS_CHECK_TEST_TIMING,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error_envelope_parts(&result).1, "simulation.divergence");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(oracle_methods(&oracle).await, ["getNetwork", "getNetwork"]);
+    }
+
+    #[tokio::test]
+    async fn high_value_cross_check_skip_guards_make_no_oracle_request() {
+        let (profile, oracle) = cross_check_fixture().await;
+        for (native, amount, missing) in [
+            (false, i64::MAX, false),
+            (true, 1, false),
+            (true, i64::MAX, true),
+        ] {
+            let mut profile = profile.clone();
+            if missing {
+                profile.oracle_provider_url = None;
+            }
+            let outcome = high_value_cross_check_with_timing(
+                &profile,
+                &NetworkContext::from_profile(&profile),
+                "xdr",
+                "source",
+                native,
+                amount,
+                |_| async { panic!("skip must precede rebuild") },
+                "test",
+                CROSS_CHECK_TEST_TIMING,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, CrossCheckOutcome::Skipped));
+        }
+        assert!(oracle_methods(&oracle).await.is_empty());
     }
 }
 

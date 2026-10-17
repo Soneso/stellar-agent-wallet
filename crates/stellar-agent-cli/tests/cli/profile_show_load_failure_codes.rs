@@ -320,3 +320,30 @@ fn protected_overlay_has_its_own_code_on_both_surfaces() {
         assert_eq!(run.error_code(), "profile.non_overlayable_field");
     }
 }
+
+#[test]
+fn provider_attestation_has_its_own_code_on_both_surfaces() {
+    let home = tempfile::tempdir().unwrap();
+    let name = "provider-refusal";
+    let profile =
+        Profile::builder_mainnet_named(name, "https://primary.example", "s", "a", "n", "a")
+            .oracle_provider_url(url::Url::parse("https://oracle.example").unwrap())
+            .audit_log_path(home.path().join("audit.jsonl"))
+            .with_noop_engine()
+            .build();
+    save_new_to_dir(name, &profile, &home.path().join("profiles")).unwrap();
+    for args in [
+        vec!["profile", "show", name],
+        vec!["counterparty", "list", "--profile", name],
+    ] {
+        let run = run_cli(home.path(), &args);
+        assert_eq!(run.code, 1, "{}", run.stdout);
+        assert_eq!(
+            run.error_code(),
+            "validation.provider_attestation_invalid",
+            "{}",
+            run.stdout
+        );
+        assert!(run.stdout.contains("providers.oracle"));
+    }
+}

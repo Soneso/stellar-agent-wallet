@@ -715,6 +715,7 @@ pub(crate) fn open_audit_writer(
 /// `validation.mainnet_rpc_url_required` (a mainnet profile without
 /// `rpc_url`), and `validation.config_invalid` for an endpoint URL that
 /// breaks the endpoint rule keep their own wire codes.
+/// Invalid provider attestations keep `validation.provider_attestation_invalid`.
 /// Other load failures map to an audit-writer I/O error.
 pub(crate) fn map_access_error(
     err: &crate::common::profile_access::ProfileAccessError,
@@ -729,7 +730,8 @@ pub(crate) fn map_access_error(
             | ProfileLoadError::OverlayMayOnlyTighten { .. }
             | ProfileLoadError::MainnetRequiresExplicitProfile { .. }
             | ProfileLoadError::MainnetRpcUrlRequired { .. }
-            | ProfileLoadError::InvalidEndpointUrl { .. },
+            | ProfileLoadError::InvalidEndpointUrl { .. }
+            | ProfileLoadError::InvalidProviderAttestation { .. },
         ) => err.to_wallet_error(profile_name),
         ProfileAccessError::Load(_) => wallet_io_error(
             IoSource::AuditWriterSetup,
