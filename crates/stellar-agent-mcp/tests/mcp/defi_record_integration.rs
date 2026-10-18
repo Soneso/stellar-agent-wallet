@@ -277,20 +277,72 @@ fn assert_window_total(
     );
 }
 
-async fn exercise(tool: Tool, initially_confirmed: bool) {
+/// A signer-load failure a case puts at the profile's signer coordinate.
+#[derive(Clone, Copy)]
+enum SignerFault {
+    /// No entry at the coordinate.
+    Missing,
+    /// The entry holds the seed of another account.
+    OtherKey,
+    /// The credential store fails the read with backend text of its own.
+    StoreFailure,
+}
+
+impl SignerFault {
+    /// Added to the tool's seed byte. Each fault gets its own signer account,
+    /// so its audit log name stays distinct from every other case in the
+    /// process.
+    fn seed_offset(self) -> u8 {
+        match self {
+            Self::Missing => 6,
+            Self::OtherKey => 7,
+            Self::StoreFailure => 13,
+        }
+    }
+}
+
+/// Backend text the injected store failure carries; no envelope may echo it.
+const BACKEND_TEXT: &str = "backend-sentinel-never-render";
+
+/// The seed of the account whose secret the `OtherKey` fault stores.
+const OTHER_SEED: [u8; 32] = [0x2f; 32];
+
+fn secret_strkey(seed: [u8; 32]) -> String {
+    stellar_strkey::ed25519::PrivateKey(seed)
+        .as_unredacted()
+        .to_string()
+        .to_string()
+}
+
+async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFault>) {
     let _root = crate::common::isolated_data_root();
     keyring_mock::install().unwrap();
     install_test_nonce_key();
-    let seed = tool.seed(initially_confirmed);
+    let seed = match fault {
+        None => tool.seed(initially_confirmed),
+        Some(fault) => [tool.seed(initially_confirmed)[0] + fault.seed_offset(); 32],
+    };
     let source = account_id_for_seed(seed);
-    let signer_seed = stellar_strkey::ed25519::PrivateKey(seed)
-        .as_unredacted()
-        .to_string()
-        .to_string();
-    keyring_core::Entry::new("svc", &source)
-        .unwrap()
-        .set_password(&signer_seed)
+    let signer_seed = secret_strkey(seed);
+    let stored_seed = match fault {
+        None | Some(SignerFault::StoreFailure) => Some(signer_seed.clone()),
+        Some(SignerFault::OtherKey) => Some(secret_strkey(OTHER_SEED)),
+        Some(SignerFault::Missing) => None,
+    };
+    if let Some(stored_seed) = &stored_seed {
+        keyring_core::Entry::new("svc", &source)
+            .unwrap()
+            .set_password(stored_seed)
+            .unwrap();
+    }
+    if matches!(fault, Some(SignerFault::StoreFailure)) {
+        keyring_mock::inject_error(
+            "svc",
+            &source,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(BACKEND_TEXT))),
+        )
         .unwrap();
+    }
     let mock = MockServer::start().await;
     let confirming = Arc::new(AtomicBool::new(initially_confirmed));
     let sent = Arc::new(Mutex::new(Vec::new()));
@@ -347,6 +399,65 @@ async fn exercise(tool: Tool, initially_confirmed: bool) {
     let result = tool.call(&server).await;
     let response = result_json(&result);
     let sent = sent.lock().unwrap().clone();
+    if let Some(fault) = fault {
+        let (code, message, text) = crate::common::assert_business_envelope(&result);
+        let (expected_code, expected_message) = match fault {
+            SignerFault::Missing => (
+                "auth.keyring_not_found",
+                "keyring entry 'svc' was not found".to_owned(),
+            ),
+            SignerFault::OtherKey => (
+                "auth.signer_key_mismatch",
+                format!(
+                    "signing key public key '{}' does not match --source '{source}'",
+                    account_id_for_seed(OTHER_SEED)
+                ),
+            ),
+            SignerFault::StoreFailure => (
+                "auth.keyring_platform_error",
+                "keyring operation failed: read unknown credential store: \
+                 credential store operation failed"
+                    .to_owned(),
+            ),
+        };
+        assert_eq!(code, expected_code, "{}: {text}", tool.name());
+        assert_eq!(message, expected_message, "{}: {text}", tool.name());
+        assert!(response["error"].get("details").is_none(), "{text}");
+        if !matches!(fault, SignerFault::OtherKey) {
+            assert!(!text.contains(&source), "{text}");
+        }
+        assert!(!text.contains(&signer_seed), "{text}");
+        if let Some(stored_seed) = &stored_seed {
+            assert!(!text.contains(stored_seed.as_str()), "{text}");
+        }
+        assert!(!text.contains(BACKEND_TEXT), "{text}");
+        assert!(sent.is_empty(), "{} must not submit", tool.name());
+        // The vault tools read the pinned vault before the gate; nothing is
+        // simulated or sent once the signer fails to load.
+        let methods: Vec<String> = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                body["method"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        let reads_vault = !matches!(tool, Tool::Trade);
+        assert_eq!(
+            !methods.is_empty(),
+            reads_vault,
+            "{}: {methods:?}",
+            tool.name()
+        );
+        assert!(
+            methods.iter().all(|method| method == "getLedgerEntries"),
+            "{}: {methods:?}",
+            tool.name()
+        );
+        return;
+    }
     assert_eq!(sent.len(), 1, "{} must send once: {response}", tool.name());
     let (tx_hash, envelope_hash) = &sent[0];
     let receipts = ReceiptStore::open(&profile_name).unwrap();
@@ -447,30 +558,84 @@ async fn exercise(tool: Tool, initially_confirmed: bool) {
 #[tokio::test]
 #[serial]
 async fn trade_timeout_retains_and_settles_record() {
-    exercise(Tool::Trade, false).await;
+    exercise(Tool::Trade, false, None).await;
 }
 #[tokio::test]
 #[serial]
 async fn deposit_timeout_retains_and_settles_record() {
-    exercise(Tool::Deposit, false).await;
+    exercise(Tool::Deposit, false, None).await;
 }
 #[tokio::test]
 #[serial]
 async fn withdraw_timeout_retains_and_settles_record() {
-    exercise(Tool::Withdraw, false).await;
+    exercise(Tool::Withdraw, false, None).await;
 }
 #[tokio::test]
 #[serial]
 async fn trade_confirmation_settles_record() {
-    exercise(Tool::Trade, true).await;
+    exercise(Tool::Trade, true, None).await;
 }
 #[tokio::test]
 #[serial]
 async fn deposit_confirmation_settles_record() {
-    exercise(Tool::Deposit, true).await;
+    exercise(Tool::Deposit, true, None).await;
 }
 #[tokio::test]
 #[serial]
 async fn withdraw_confirmation_settles_record() {
-    exercise(Tool::Withdraw, true).await;
+    exercise(Tool::Withdraw, true, None).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trade_preserves_missing_signer_auth_error() {
+    exercise(Tool::Trade, false, Some(SignerFault::Missing)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn deposit_preserves_missing_signer_auth_error() {
+    exercise(Tool::Deposit, false, Some(SignerFault::Missing)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn withdraw_preserves_missing_signer_auth_error() {
+    exercise(Tool::Withdraw, false, Some(SignerFault::Missing)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trade_signer_key_mismatch_reports_auth_code() {
+    exercise(Tool::Trade, false, Some(SignerFault::OtherKey)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trade_keyring_platform_error_reports_auth_code() {
+    exercise(Tool::Trade, false, Some(SignerFault::StoreFailure)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn deposit_signer_key_mismatch_reports_auth_code() {
+    exercise(Tool::Deposit, false, Some(SignerFault::OtherKey)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn deposit_keyring_platform_error_reports_auth_code() {
+    exercise(Tool::Deposit, false, Some(SignerFault::StoreFailure)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn withdraw_signer_key_mismatch_reports_auth_code() {
+    exercise(Tool::Withdraw, false, Some(SignerFault::OtherKey)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn withdraw_keyring_platform_error_reports_auth_code() {
+    exercise(Tool::Withdraw, false, Some(SignerFault::StoreFailure)).await;
 }

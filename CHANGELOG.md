@@ -170,6 +170,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `stellar_dex_trade`, `stellar_defindex_vault_deposit`,
+  `stellar_defindex_vault_withdraw`, `stellar_x402_create_payment`, and
+  `stellar_x402_authenticated_payment` preserve keyring and signer-key errors
+  with their original `auth.*` codes and messages.
 - A confirmation poll request that the endpoint holds open ends at the
   submission deadline, and the sleep between polls ends there too. A submission
   returns within its timeout instead of waiting up to 60 seconds more. The

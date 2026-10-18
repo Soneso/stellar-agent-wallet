@@ -124,11 +124,15 @@ it. The command above is what the client is configured to run.
 
 **Windows deployment note:** Credential Manager requires an interactive logon
 session. Running the server as a Windows service, over SSH, or from a
-scheduled task means every keyring operation fails with
-`auth.keyring_interactive_session_required`. The server itself starts, but
-every signing tool refuses at the keyring step. Launch it from an interactive
-desktop session (including Remote Desktop), run it inside a container /
-Linux VM where the platform keyring backend has no such restriction, or set
+scheduled task prevents access to Credential Manager. The server itself starts,
+but every signing tool refuses at the keyring step. Most tools report
+`auth.keyring_interactive_session_required`.
+The SEP-43 sign tools report `sep43.wallet_unlock_failed`.
+`stellar_sep53_sign_message` reports `sep53.keyring_load_failed`, and
+`stellar_mpp_charge_commit` reports `mpp.signing_failed`.
+Launch it from an interactive desktop session (including Remote Desktop), or
+run it inside a container / Linux VM where the platform keyring backend has
+no such restriction. Alternatively, set
 `STELLAR_AGENT_KEYRING_BACKEND=headless-dpapi` on the process environment to
 opt into the headless file-backed keyring store with DPAPI CurrentUser scope.
 DPAPI needs access to the current user's master key and can fail in
@@ -159,11 +163,14 @@ The loaded profile therefore determines:
 - which keyring entries the signing tools resolve their seed from;
 - which policy engine evaluates each tool call.
 
-The synthesised testnet fallback profile carries placeholder keyring
+The synthesized testnet fallback profile carries placeholder keyring
 coordinates. Read-only tools and the simulate step of the two-phase signing
-verbs work under it, but any tool that touches the signer keyring returns a
-keyring-not-found error until a profile that names a populated signer keyring
-entry is in place. It applies only when no profile was named at all;
+verbs work under it. Signer keyring access fails until a profile names a
+populated signer entry. Most tools report `auth.keyring_not_found`.
+The SEP-43 sign tools report `sep43.wallet_unlock_failed`.
+`stellar_sep53_sign_message` reports `sep53.keyring_load_failed`, and
+`stellar_mpp_charge_commit` reports `mpp.signing_failed`.
+This fallback applies only when no profile was named at all;
 `--profile <NAME>` and `STELLAR_AGENT_PROFILE` always require a real profile
 file.
 
