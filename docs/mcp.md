@@ -60,7 +60,7 @@ stellar-agent-mcp --profile alice    # profile `alice`
 
 The profile is selected by `--profile <NAME>` (also spelled
 `--profile=<NAME>`), then by the `STELLAR_AGENT_PROFILE` environment variable,
-then by the name `default` — the same order the CLI uses. The selected profile
+then by the name `default`, the same order the CLI uses. The selected profile
 binds at startup and stays bound for the life of the process; there is no
 per-request profile switching. Any other argument is refused with a non-zero
 exit rather than ignored, so a mistyped flag cannot silently start the server on
@@ -102,8 +102,8 @@ On startup the process, in order:
 4. Initialises the platform keyring store. If the platform has no supported
    keyring backend, it logs a warning and continues: the read-only and simulate
    surface still works, and signing tools refuse at call time.
-5. Loads the selected profile. When no profile was named — neither `--profile`
-   nor `STELLAR_AGENT_PROFILE` — and no profile file exists yet, it synthesises
+5. Loads the selected profile. When no profile was named (neither `--profile`
+   nor `STELLAR_AGENT_PROFILE`) and no profile file exists yet, it synthesises
    a testnet fallback profile (the first-run case). A profile that WAS named but
    has no file is refused: the fallback is a testnet, `noop`-engine
    configuration, so substituting it would answer on the wrong network and
@@ -111,7 +111,7 @@ On startup the process, in order:
 6. Refuses to start if the active profile sets `mcp_disabled = true` (the
    operator kill-switch), exiting non-zero with `mcp.disabled_per_profile`.
 7. Refuses to start if the profile file's `policy_owner_key_id.service` names a
-   different profile than the one selected — the state a profile file renamed or
+   different profile than the one selected, the state a profile file renamed or
    copied from another profile is in. The server derives the name it uses for
    the signed policy file, the pending-approval store, and the policy-window
    state from that field, so a mismatch would read and write another profile's
@@ -124,7 +124,7 @@ it. The command above is what the client is configured to run.
 **Windows deployment note:** Credential Manager requires an interactive logon
 session. Running the server as a Windows service, over SSH, or from a
 scheduled task means every keyring operation fails with
-`auth.keyring_interactive_session_required` — the server itself starts, but
+`auth.keyring_interactive_session_required`. The server itself starts, but
 every signing tool refuses at the keyring step. Launch it from an interactive
 desktop session (including Remote Desktop), run it inside a container /
 Linux VM where the platform keyring backend has no such restriction, or set
@@ -207,14 +207,14 @@ After the client connects it issues an MCP `initialize`, then `tools/list` and
 
 The server exposes three MCP resources. None contains a secret.
 
-- `mcp-resource://usage.md` — tool usage documentation.
+- `mcp-resource://usage.md`: tool usage documentation.
 - `mcp-resource://profiles/<name>`: non-secret profile metadata (chain id, the RPC
   endpoint as scheme, host, and port, network passphrase, `mcp_disabled`, and
   the cross-check threshold in stroops).
   An agent passing this resource's `rpc_url` to `stellar_fee_stats` passes an
   authority-only URL; the allowlisted hosts have no path, so the call behaves
   the same.
-- `mcp-resource://accounts/<G>` — public account directory for the enrolled
+- `mcp-resource://accounts/<G>`: public account directory for the enrolled
   accounts across all configured profiles.
 
 ## How gating applies to every tool call
@@ -223,9 +223,9 @@ Every tool call is dispatched through the same gate before the tool's own logic
 runs. The gate looks up the tool's registry descriptor and calls
 `policy_engine.evaluate(...)`. The verdict is one of:
 
-- `Allow` — the tool proceeds.
-- `Deny` — the call is refused with wire code `policy.deny.<reason>`.
-- `RequireApproval` — an out-of-band operator approval is required.
+- `Allow`: the tool proceeds.
+- `Deny`: the call is refused with wire code `policy.deny.<reason>`.
+- `RequireApproval`: an out-of-band operator approval is required.
 
 Separately, the DeFi, sign-and-submit, commit, rule-commit, and sign-only tools
 and the toolset signing actions refuse a mainnet profile before this gate runs.
@@ -316,10 +316,10 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
   `policy.approval_required_unsupported`; the wallet never signs without a
   verified approval.
 - `stellar_rule_create` / `stellar_rule_create_commit` (Package D, GH issue
-  #8) is a two-phase pair with a DIFFERENT approval-block contract: unlike the
+  #8) is a two-phase pair with a DIFFERENT approval-block contract. Unlike the
   signing verbs above, there is no envelope fallback for the commit step to
   fall back on, so `stellar_rule_create` persists the pending approval
-  UNCONDITIONALLY — the `approval_nonce` in its response is always present.
+  UNCONDITIONALLY. The `approval_nonce` in its response is always present.
   A `requires_operator_approval` field reports the PROPOSE-time policy
   verdict, but this is informational only: `stellar_rule_create_commit`
   ALWAYS requires operator attestation, unconditionally, regardless of this
@@ -328,19 +328,19 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
   verdict on the commit tool does let the call proceed without an
   attestation): a payment `Allow` spends within an operator-configured
   budget, but a rule-create `Allow` would let the agent grant itself
-  permanent — potentially account-wide — authority, which this feature's
+  permanent, potentially account-wide authority, which this feature's
   contract forbids. The agent NEVER holds rule-write authority at any point
-  in this flow: `stellar_rule_create` only simulates and resolves the
-  definition (no signing, no submission);
+  in this flow. `stellar_rule_create` only simulates and resolves the
+  definition (no signing, no submission).
   `stellar_rule_create_commit` verifies the operator's attestation over the
   resolved definition through a DEDICATED gate
   (`PendingApprovalStore::verify_rule_proposal_gate`, distinct from the
   shared pay/claim attestation gate) and unconditionally recomputes the
-  digest from the stored snapshot before installing — a mismatch is
+  digest from the stored snapshot before installing. A mismatch is
   `simulation.divergence` regardless of the policy verdict. Every approval
   surface (CLI `approve`, the loopback inbox, the remote inbox) renders the
-  FULL resolved rule — context, every signer, every policy, the override
-  flags — so operator consent binds to exactly what gets installed, not to a
+  FULL resolved rule: context, every signer, every policy, and the override
+  flags, so operator consent binds to exactly what gets installed, not to a
   name or a hash. Both tools structurally refuse `chain_id=stellar:mainnet`
   (`network.mainnet_write_forbidden`), matching every other smart-account
   write surface: `stellar_rule_create` refuses at propose time,
@@ -365,7 +365,7 @@ submitted. `profile init` mints the audit-log keyring COORDINATE only, no key
 material, so a freshly-initialized profile refuses with
 `audit.chain_key_unavailable` until the operator runs
 `stellar-agent profile rotate-audit-key <name>`. Read-only tools and the
-simulate/build phases of the two-phase verbs above are unaffected — they
+simulate/build phases of the two-phase verbs above are unaffected. They
 never sign or submit, so they never reach this pre-flight; the MCP server's
 synthesized first-run fallback profile continues to serve them.
 `stellar_mpp_charge_commit` runs the same acquisition after it reads its
@@ -392,7 +392,7 @@ rename are checked. The file at the path is compared by identity against
 the handle the server holds; its tip is also checked. Every row the server appends is checked
 again, for identity and for the file still ending where the server left it, and
 a refused row is anchored so the refusal survives a restart. A log that simply moved FORWARD past its anchor
-is not a refusal — unkeyed writers append without moving it, and the next
+is not a refusal. Unkeyed writers append without moving it, and the next
 acquisition absorbs the gap and re-anchors. A log with no anchor at all is
 adopted on first use with no operator action, which is what happens on the first
 run after upgrading a wallet whose audit log predates the anchor. An adoption
@@ -466,12 +466,12 @@ A v1 rule set that names tools explicitly must include `stellar_transaction_stat
 | `stellar_rule_create_commit` | Testnet-only. Verify the operator's attestation over the resolved definition through a dedicated gate and recompute its digest from the stored snapshot. Operator attestation is always required, regardless of the policy verdict. Install and simulation refuse an invalid simple-threshold parameter with `sa.simple_threshold_install_refused`. A duplicate policy address or two simple-threshold policies refuse with `sa.deployment_failed` at phase `build`. An `external` entry whose `pubkey_data_hex` decodes to empty key data refuses with `sa.auth_entry_construction_failed`. Every non-zero `auth_rule_ids` entry first passes the pre-submission checks, and a refusal signs nothing. Baseline and comparison refusals are `sa.signer_set_missing_baseline`, `sa.signer_set_diverged`, `sa.audit_log`, and `network.rpc_divergence`. Lock timeout is `sa.auth_entry_construction_failed` at stage `rule_lock`. A deadline that elapses during the baseline read or the comparison uses that code at `baseline_read` or `signer_set_compare`. Pin refusals are `sa.verifier_hash_drift`, `sa.policy_hash_drift`, `sa.pinned_policy_absent`, `sa.pinned_verifier_absent`, and `sa.pin_check_unavailable`. A version 1 authorizing rule compares through its projection. Its own refusals are `sa.threshold_policy_not_installed`, `sa.threshold_policy_identification_failed`, and `sa.deployment_failed`. After the install confirms, the observed rule's signer identities and simple threshold must equal the proposal's. That observation is recorded as the rule's signer-set baseline. The name, context, expiry, and other policy attachments are not compared. Otherwise the rule stays on chain without a baseline, and the tool returns `sa.install_state_mismatch` or `sa.baseline_write_failed` with the transaction hash. | Signs and submits. Two-phase verb; approval spine. |
 
 `spending_limit`, `in_window_spent`, and `remaining_budget` are decimal
-strings (i128, stroops), not JSON numbers — a raw JSON number above `2^53`
+strings (i128, stroops), not JSON numbers. A raw JSON number above `2^53`
 cannot be represented exactly by an `f64`-backed parser. `in_window_spent`
 and `remaining_budget` are exact only as of `as_of_ledger`: forward ledger
 movement past that point only grows headroom (older spend entries fall out
 of the rolling window), but an intervening spend shrinks it. The numbers are
-a point-in-time estimate, not a guarantee for a future submission — a later
+a point-in-time estimate, not a guarantee for a future submission. A later
 write can still fail with `SpendingLimitExceeded`.
 
 Both tools are grantable to a toolset via the `read-rules` capability token,
@@ -485,14 +485,14 @@ an operator-run verb that submits one `CallContract` invocation signed by an
 agent's External-Ed25519 rule key. There is deliberately no MCP equivalent.
 
 Every signing-capable MCP tool in this catalog is a TYPED verb whose rendered
-preview is what the operator consents to — `stellar_pay_commit` renders a
+preview is what the operator consents to. `stellar_pay_commit` renders a
 payment, `stellar_rule_create_commit` renders a full rule definition, and so
 on. An arbitrary-invocation `execute` tool on the agent surface would have no
 such preview: it would sign whatever contract, function, and `ScVal` arguments
 the agent supplied, with nothing meaningful to show the operator before
 consenting. That contradicts the typed-tool consent model this catalog is
 built on. The CLI verb has no such conflict, because the CLI itself is
-operator authority — there is no separate consent step to bypass.
+operator authority: there is no separate consent step to bypass.
 
 This is a scope decision, not a permanent gap: a concrete agent use case that
 needs a typed, previewable, approval-spine-backed shape (for example, a
@@ -531,8 +531,9 @@ is carried inside `data` on success. Business and validation failures carry a
 `sep43.wallet_unlock_failed`, `sep43.invalid_network_passphrase`); the
 structural mainnet refusal shares the canonical `network.mainnet_write_forbidden`
 code used everywhere else in the wallet, rather than a SEP-43-specific code.
-A policy `RequireApproval` verdict — which every single-shot sign tool,
-SEP-43 included, refuses fail-closed — carries `policy.approval_required_unsupported`.
+A policy `RequireApproval` verdict (which every single-shot sign tool,
+including SEP-43, refuses fail-closed) carries
+`policy.approval_required_unsupported`.
 SEP-53 and x402 use the same standard envelope for every business error.
 
 ### SEP-45, SEP-47, SEP-48, SEP-53
@@ -635,7 +636,7 @@ before serving any request.
 
 Business errors return `{ "ok": false, "error": { "code", "message" }, "request_id" }`
 with `is_error` set; consumers branch on `error.code`. Every tool, including
-the SEP-43 family, uses this same envelope — see
+the SEP-43 family, uses this same envelope. See
 [The result envelope](agents.md#the-result-envelope).
 
 Three codes carry an additional `details` object on the error:
