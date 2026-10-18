@@ -113,6 +113,7 @@ impl WarningCapture {
 ///     .with_writer(capture.clone())
 ///     .finish();
 /// tracing::subscriber::with_default(subscriber, || {
+///     tracing::callsite::rebuild_interest_cache();
 ///     tracing::info!(message = "hello");
 /// });
 /// assert_no_secret_bytes(&capture.captured());
@@ -295,7 +296,10 @@ impl RedactionStrictSubscriber {
     where
         F: FnOnce() -> R,
     {
-        tracing::subscriber::with_default(self.subscriber_guard(), f)
+        tracing::subscriber::with_default(self.subscriber_guard(), || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        })
     }
 
     /// Builds a `tracing` subscriber that writes every formatted event to the

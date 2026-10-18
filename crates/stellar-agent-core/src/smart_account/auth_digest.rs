@@ -351,7 +351,10 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .with_writer(writer)
             .finish();
-        tracing::subscriber::with_default(subscriber, f);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f();
+        });
     }
 
     // These tests exercise the `debug!` call site inside `compute_auth_digest`.

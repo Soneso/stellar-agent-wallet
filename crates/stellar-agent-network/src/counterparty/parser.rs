@@ -1001,6 +1001,7 @@ FUTURE_SEP1_FIELD = "forward-compatible"
             .finish();
         let dispatch = tracing::Dispatch::new(subscriber);
         let guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
         let parsed = parse_minimal_sep1(&body).unwrap();
         drop(guard);
         assert_eq!(

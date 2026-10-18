@@ -705,6 +705,7 @@ mod tests {
             .finish();
         let dispatch = tracing::Dispatch::new(subscriber);
         let guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
 
         let error = fund_with_friendbot(
             &friendbot_url,

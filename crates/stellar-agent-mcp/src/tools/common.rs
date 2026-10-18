@@ -3257,6 +3257,7 @@ mod tests {
             .finish();
 
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
         let result = verify_attestation_gate(
             &server,
             &dispatch_outcome,
@@ -3572,6 +3573,7 @@ mod tests {
             .with_writer(capture.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
         let result = verify_attestation_gate(
             &server,
             &dispatch_outcome,
@@ -3688,6 +3690,7 @@ mod tests {
             .with_writer(capture.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
         assert_eq!(
             load_attestation_key(&server.profile).unwrap(),
             attestation_key
