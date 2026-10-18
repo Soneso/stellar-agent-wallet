@@ -2046,6 +2046,7 @@ mod tests {
             None,
             None,
             "req-pending",
+            None,
         )
     }
 
@@ -2061,6 +2062,7 @@ mod tests {
             None,
             None,
             "req-submitted",
+            None,
         )
     }
 
@@ -4891,6 +4893,8 @@ mod tests {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PendingValueAction {
+    /// Witness preserved from the pending row during reconciliation.
+    pub witness: Option<super::schema::CrossCheckRecord>,
     /// The verb that made the submission, as it appears on the outer entry.
     pub tool: String,
     /// CAIP-2 chain identifier from the outer entry.
@@ -4942,6 +4946,10 @@ pub fn submission_receipt_cleared_exists(log_path: &Path, envelope_hash: &str) -
 /// accounted for. Reconciliation is an operator-repeatable verb, and this is
 /// what keeps a second run from appending a second row for one spend.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one owned pending row preserves the recovery API"
+)]
 pub enum ValueActionSettlement {
     /// A pending row is in the active file and nothing has settled it. Its
     /// value legs are the ones the policy gate sized.
@@ -4991,11 +4999,13 @@ pub fn value_action_settlement(log_path: &Path, envelope_hash: &str) -> ValueAct
                 return ValueActionSettlement::Settled;
             }
             EventKind::ValueActionPending {
+                witness,
                 legs,
                 approval_nonce,
                 ..
             } => {
                 return ValueActionSettlement::Owed(PendingValueAction {
+                    witness: witness.clone(),
                     legs: legs.clone(),
                     tool: entry.tool,
                     chain_id: entry.chain_id,

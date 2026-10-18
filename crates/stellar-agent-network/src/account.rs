@@ -893,7 +893,9 @@ pub(crate) async fn fetch_account_signers(
 /// - `TrustLineAsset::PoolShare` → returns `WalletError::Protocol`; liquidity-pool
 ///   share trustlines are not supported.  Callers should never pass a `PoolShare`
 ///   asset to `fetch_account`.
-fn project_trustline_entry(tl: &stellar_xdr::TrustLineEntry) -> Result<BalanceView, WalletError> {
+pub(crate) fn project_trustline_entry(
+    tl: &stellar_xdr::TrustLineEntry,
+) -> Result<BalanceView, WalletError> {
     use stellar_xdr::TrustLineAsset;
 
     let asset_view = match &tl.asset {
@@ -1024,7 +1026,7 @@ fn account_id_to_strkey(account_id: &AccountId) -> String {
 }
 
 /// Projects an XDR `AccountEntry` into an [`AccountView`].
-fn project_account_entry(
+pub(crate) fn project_account_entry(
     account_id: &str,
     entry: &AccountEntry,
 ) -> Result<AccountView, WalletError> {

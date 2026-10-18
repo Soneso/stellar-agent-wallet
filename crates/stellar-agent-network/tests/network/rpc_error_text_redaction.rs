@@ -33,7 +33,6 @@ use stellar_agent_core::profile::receipt::ReceiptStore;
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::fetch_account;
 use stellar_agent_network::idempotent_submit::submit_transaction_idempotent;
-use stellar_agent_network::sep29::check_memo_required;
 use stellar_agent_network::submission_record::{
     SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
 };
@@ -371,38 +370,6 @@ async fn wasm_hash_fetch_carries_the_scrubbed_network_error() {
     let (_, reason) = unreachable_parts(source);
     endpoint.assert_scrubbed(&reason);
     endpoint.assert_scrubbed(&display);
-}
-
-/// A secondary endpoint that fails the SEP-29 cross-check reports a
-/// divergence whose context holds only host and port of the echoed URLs.
-#[tokio::test]
-async fn sep29_secondary_failure_reports_a_scrubbed_divergence() {
-    let primary_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .respond_with(EchoIdResponder::new(json!({
-            "entries": null,
-            "latestLedger": 1000
-        })))
-        .mount(&primary_server)
-        .await;
-    let primary = StellarRpcClient::new(&primary_server.uri()).unwrap();
-    let secondary = EchoingEndpoint::start().await;
-    secondary.mount_error_for_every_method().await;
-
-    let err = check_memo_required(&primary, Some(&secondary.client()), ACCOUNT, false)
-        .await
-        .expect_err("the secondary answers with an error object");
-
-    assert_eq!(err.code(), "network.rpc_divergence");
-    let WalletError::Network(NetworkError::RpcDivergence { context }) = err else {
-        panic!("expected RpcDivergence, got {err:?}");
-    };
-    assert!(
-        context.starts_with("SEP-29 config.memo_required secondary fetch failed: "),
-        "the context names the failed cross-check: {context}"
-    );
-    secondary.assert_scrubbed(&context);
 }
 
 /// Mounts the two reads every submit performs before it sends: the endpoint

@@ -15,7 +15,7 @@ use crate::server::WalletServer;
 use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
     commit_envelope_and_verify_nonce, commit_path_error_result, enforce_classic_fee_cap,
-    high_value_cross_check, ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope,
+    ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope,
     resolve_classic_fee_per_op_stroops, submit_timeout, total_classic_fee_stroops,
     validate_g_strkey, verify_attestation_gate,
 };
@@ -29,7 +29,7 @@ use stellar_agent_core::envelope_decode::decode_authoritative_args;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_core::wallet::Wallet;
 use stellar_agent_network::{
-    BASE_RESERVE_STROOPS, ClassicOpBuilder, fetch_account,
+    BASE_RESERVE_STROOPS, ClassicOpBuilder,
     keyring::enrolled_keyring_signer,
     parse_classic_fee_choice, resolve_classic_fee_selection,
     signing::envelope_signing::attach_signature,
@@ -766,7 +766,8 @@ impl WalletServer {
         description = "Sign and submit a CreateAccount transaction (commit step). \
                        Requires the nonce, expires_at_unix_ms, and envelope_xdr returned \
                        by stellar_create_account. Verifies the nonce, re-builds the envelope, \
-                       signs via keyring, and submits. Returns {tx_hash, ledger}. \
+                       obtains the cross-check witness, signs via keyring, and submits. \
+                       Returns {tx_hash, ledger, cross_check}. \
                        destructive_hint=true; read_only_hint=false.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
@@ -912,13 +913,6 @@ impl WalletServer {
             .ok_or_else(|| {
                 rmcp::ErrorData::internal_error("internal_error: operation count is zero", None)
             })?;
-        // Clone the starting balance before the primary rebuild consumes it;
-        // the clone is used by the oracle rebuild closure (if cross-check fires).
-        let starting_balance_for_oracle = args.starting_balance.clone();
-        // SAFETY-MIRROR: this builder configuration MUST match the oracle-rebuild
-        // closure below exactly.  Any change here that is not mirrored in the
-        // oracle closure below silently breaks the high-value cross-check.
-        // See also pay.rs primary rebuild (mirrored pair).
         let mut builder = ClassicOpBuilder::new(
             &args.source,
             source_sequence,
@@ -956,101 +950,41 @@ impl WalletServer {
             ));
         }
 
-        // ── High-value independent-RPC cross-check ───────────────────────────
-        //
-        // `CreateAccount` always transfers native XLM (the `starting_balance`).
-        // For transactions at or above
-        // `profile.effective_cross_check_threshold_stroops()`,
-        // re-builds the envelope against `profile.oracle_provider_url` and
-        // asserts byte-identity with the primary rebuild.
-        //
-        // Skip conditions: value below threshold, or `oracle_provider_url` unset
-        // (fail-open with tracing::warn!).
-        {
-            let starting_balance_stroops: i64 = match authoritative_args
-                .get("starting_balance_stroops")
-                .and_then(crate::tools::amount_wire::value_as_stroops_i64)
-            {
-                Some(v) => v,
-                None => {
-                    return Ok(crate::tools::common::business_error_result(
-                        "simulation.divergence",
-                        "authoritative_args missing required `starting_balance_stroops` field",
-                    ));
-                }
+        let source_observation =
+            match stellar_agent_network::cross_check::AccountObservation::from_view(&account_view) {
+                Ok(observation) => observation,
+                Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
             };
-            // CreateAccount always transfers native XLM.
-            let asset_is_native = true;
-            // Capture builder inputs needed for the oracle rebuild.
-            let oracle_source = args.source.clone();
-            let oracle_destination = args.destination.clone();
-            let oracle_network_passphrase = self.context.network_passphrase().to_owned();
-            let oracle_starting_balance = starting_balance_for_oracle;
-
-            if let Err(result) = high_value_cross_check(
-                &self.profile,
-                &self.context,
-                &rebuilt_envelope_xdr,
-                &args.source,
-                asset_is_native,
-                starting_balance_stroops,
-                |oracle_client| {
-                    // `high_value_cross_check` may invoke this closure more than
-                    // once within its bounded rebuild-retry window (the rebuild
-                    // may fail transiently while the independent RPC catches up),
-                    // so every non-`Copy` capture is cloned per-call rather than
-                    // moved once into the `async move` block.
-                    let oracle_source = oracle_source.clone();
-                    let oracle_destination = oracle_destination.clone();
-                    let oracle_network_passphrase = oracle_network_passphrase.clone();
-                    let oracle_starting_balance = oracle_starting_balance.clone();
-                    async move {
-                        // Re-fetch account state from the independent RPC.
-                        let oracle_account_view =
-                            fetch_account(&oracle_client, &oracle_source, &[])
-                                .await
-                                .map_err(|e| {
-                                    rmcp::ErrorData::internal_error(
-                                        format!("oracle_rpc_error: {e}"),
-                                        None,
-                                    )
-                                })?;
-                        // SAFETY-MIRROR: this builder configuration MUST match the
-                        // primary rebuild above exactly.  Any change here that is not
-                        // mirrored in the primary rebuild above silently breaks the
-                        // high-value cross-check.
-                        let mut oracle_builder = ClassicOpBuilder::new(
-                            &oracle_source,
-                            oracle_account_view.sequence_number,
-                            &oracle_network_passphrase,
-                            fee_per_op_stroops,
-                        );
-                        oracle_builder
-                            .create_account(
-                                &oracle_destination,
-                                oracle_starting_balance.into_stellar_amount(),
-                            )
-                            .map_err(|e| {
-                                rmcp::ErrorData::internal_error(
-                                    format!("oracle_build_error: {e}"),
-                                    None,
-                                )
-                            })?;
-                        oracle_builder.build().map_err(|e| {
-                            rmcp::ErrorData::internal_error(
-                                format!("oracle_build_error: {e}"),
-                                None,
-                            )
-                        })
-                    }
-                },
-                "stellar_create_account_commit",
-            )
-            .await
-            {
-                return Ok(result);
+        let starting_balance_stroops = match authoritative_args
+            .get("starting_balance_stroops")
+            .and_then(crate::tools::amount_wire::value_as_stroops_i64)
+        {
+            Some(value) => value,
+            None => {
+                return Ok(crate::tools::common::business_error_result(
+                    "simulation.divergence",
+                    "envelope contains an invalid starting balance",
+                ));
             }
-        }
+        };
+        let witness_inputs = stellar_agent_network::cross_check::CreateAccountWitnessInputs {
+            source: source_observation,
+        };
+        let cross_check = match stellar_agent_network::cross_check::obtain_classic_witness(
+            &self.profile,
+            &self.context,
+            stellar_agent_core::cross_check::CrossCheckValue::Amount {
+                asset: &stellar_agent_core::asset_id::CanonicalAsset::Native,
+                base_units: i128::from(starting_balance_stroops),
+            },
+            witness_inputs,
+            "stellar_create_account_commit",
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
+        };
 
         // ── Attestation verification gate ────────────────────────────────────
         //
@@ -1063,7 +997,7 @@ impl WalletServer {
         // fetch the source (+ pay's destination) account BEFORE the policy
         // dispatch gate, which consumes that on-chain state as
         // `account_view`/`identity_view`.  This attestation gate runs AFTER
-        // the high-value cross-check because `stellar_create_account_commit`
+        // the cross-check witness because `stellar_create_account_commit`
         // has no toolset-gated variant, so there is no test-bypass motivation
         // to hoist it above that work.  The ordering invariant holds: this
         // gate fires before nonce HMAC+replay in both tools.
@@ -1245,7 +1179,7 @@ impl WalletServer {
             },
             Some(&floor_hook),
         ) {
-            Ok(r) => r,
+            Ok(r) => r.with_witness(cross_check.witness()),
             Err(err) => {
                 return Ok(crate::tools::submission_record::submission_error_result(
                     &err,
@@ -1280,6 +1214,7 @@ impl WalletServer {
 
                 let view = json!({
                     "tx_hash": tx_hash,
+                    "cross_check": cross_check.view(),
                     "ledger": ledger,
                 });
                 let envelope = stellar_agent_core::envelope::Envelope::ok(view);

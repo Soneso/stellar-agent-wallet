@@ -205,6 +205,7 @@ pub struct ApprovalTombstone {
 /// MCP server owns, and the approval entry exists only on a commit path that
 /// presented one.
 pub struct WalletSubmissionRecorder<'a> {
+    witness: Option<stellar_agent_core::audit_log::CrossCheckRecord>,
     profile: &'a Profile,
     profile_name: String,
     tool: &'static str,
@@ -238,6 +239,13 @@ impl std::fmt::Debug for WalletSubmissionRecorder<'_> {
 }
 
 impl<'a> WalletSubmissionRecorder<'a> {
+    /// Carries a completed oracle comparison into the pending and submitted audit rows.
+    #[must_use]
+    pub fn with_witness(mut self, witness: Option<&crate::cross_check::CrossCheckWitness>) -> Self {
+        self.witness = witness.map(crate::cross_check::CrossCheckWitness::record);
+        self
+    }
+
     /// Builds a recorder for one submission.
     ///
     /// `window_entries` are the window entries the policy engine sized for this
@@ -285,6 +293,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
             sequence_floor: None,
             approval: None,
             caller_writes_confirmed_row: false,
+            witness: None,
         }
     }
 
@@ -363,6 +372,7 @@ impl<'a> WalletSubmissionRecorder<'a> {
                 .as_ref()
                 .map(|approval| approval.approval_nonce.clone()),
             &self.request_id,
+            self.witness.clone(),
         );
         let mut guard = writer.lock().map_err(|_| {
             record_unavailable(
@@ -590,6 +600,7 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
                             .as_ref()
                             .map(|approval| approval.approval_nonce.clone()),
                         &self.request_id,
+                        self.witness.clone(),
                     ));
                 }
                 self.settle_window(intent, WindowSettlement::Confirm(*created_at));
@@ -807,5 +818,79 @@ mod tests {
     fn record_unavailable_carries_the_wire_code() {
         let err = record_unavailable("receipt store is not writable");
         assert_eq!(err.code(), "submission.record_unavailable");
+    }
+}
+
+#[cfg(all(test, feature = "test-helpers"))]
+mod witness_tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions")]
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pending_and_submitted_rows_carry_the_witness() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = Profile::builder_testnet("signer", "witness", "nonce", "witness").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(Mutex::new(
+            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
+        ));
+        let witness = crate::cross_check::CrossCheckWitness::for_tests(
+            "https://oracle.example",
+            123,
+            [9; 32],
+            vec![stellar_agent_core::cross_check::WitnessEntry::SourceAccount],
+        );
+        let recorder = WalletSubmissionRecorder::new(
+            &profile,
+            "witness",
+            "stellar_pay_commit",
+            Some("stellar:testnet".to_owned()),
+            PolicyDecision::Allow,
+            vec![],
+            vec![],
+            ReceiptStore::open_at(dir.path(), "witness").unwrap(),
+            PersistedWindowStore::at_path(dir.path().join("window.json")),
+            Some(audit),
+            None,
+            "request",
+            1_000,
+        )
+        .with_witness(Some(&witness));
+        let intent = SubmissionIntent {
+            envelope_hash: "a".repeat(64),
+            tx_hash: "b".repeat(64),
+            source: stellar_strkey::ed25519::PublicKey([7; 32])
+                .to_string()
+                .to_string(),
+            sequence: 7,
+            max_time: 0,
+            submission_ledger: 123,
+        };
+        recorder.pre_send(&intent).await.unwrap();
+        recorder
+            .outcome(
+                &intent,
+                &SubmissionOutcome::Success {
+                    ledger: 124,
+                    created_at: Some(1),
+                },
+            )
+            .await;
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["kind"], "value_action_pending");
+        assert_eq!(rows[1]["kind"], "value_action_submitted");
+        for row in rows {
+            assert_eq!(
+                row["witness"],
+                serde_json::to_value(witness.record()).unwrap()
+            );
+        }
     }
 }

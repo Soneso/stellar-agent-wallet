@@ -571,6 +571,7 @@ impl<'a> X402AuthorizationAudit<'a> {
             authorization.scheme,
             PolicyDecision::Allow,
             &self.request_id,
+            None,
         );
         match emit_value_audit_row_strict(self.profile, &self.profile_name, self.binding, entry) {
             Ok(()) => {

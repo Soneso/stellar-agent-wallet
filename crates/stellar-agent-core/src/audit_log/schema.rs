@@ -451,6 +451,19 @@ impl From<crate::policy::v1::value::ActionKind> for ValueActionKind {
     }
 }
 
+/// Audit evidence of the oracle entries compared before signing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossCheckRecord {
+    /// Oracle authority, bounded to `RECORDED_STR_MAX` characters by the witness.
+    pub provider: String,
+    /// Ledger reported by the checked answer.
+    pub ledger: u32,
+    /// SHA-256 inputs digest as 64 lowercase hexadecimal characters.
+    pub inputs_digest: String,
+    /// Distinct compared entry kinds, at most eight.
+    pub kinds: Vec<crate::cross_check::WitnessEntry>,
+}
+
 /// Maximum recorded length for free-form identifier strings that may
 /// originate outside the wallet (x402 facilitator-supplied `network`/`scheme`,
 /// leg `asset`). Legitimate values are short (an asset is at most
@@ -2700,6 +2713,9 @@ pub enum EventKind {
     ///
     /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
     ValueActionSubmitted {
+        /// Independent oracle witness, when a comparison is required.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        witness: Option<CrossCheckRecord>,
         /// Approval nonce presented for this submission, when approval was required.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         approval_nonce: Option<String>,
@@ -2746,6 +2762,9 @@ pub enum EventKind {
     ///
     /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
     ValueActionPending {
+        /// Independent oracle witness, when a comparison is required.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        witness: Option<CrossCheckRecord>,
         /// Approval nonce presented for this submission, when approval was required.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         approval_nonce: Option<String>,
@@ -2838,6 +2857,9 @@ pub enum EventKind {
     ///
     /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
     X402PaymentAuthorized {
+        /// Independent oracle witness, when a comparison is required.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        witness: Option<CrossCheckRecord>,
         /// The value legs the policy gate sized for this authorization. Each
         /// leg's `destination_redacted` identifies the redacted `pay_to`
         /// recipient; the leg `asset` is the SAC token contract (a non-secret
@@ -5425,6 +5447,7 @@ mod tests {
     #[test]
     fn event_kind_value_action_submitted_round_trip() {
         let ev = EventKind::ValueActionSubmitted {
+            witness: None,
             approval_nonce: None,
             legs: vec![ValueLegRecord {
                 action: ValueActionKind::Payment,
@@ -5474,6 +5497,7 @@ mod tests {
         // The opaque shape: empty legs, opaque_reason Some — a raw submit the
         // policy could not size (e.g. sep43 sign-and-submit).
         let ev = EventKind::ValueActionSubmitted {
+            witness: None,
             approval_nonce: None,
             legs: vec![],
             opaque_reason: Some("opaque_sign".to_owned()),
@@ -5511,6 +5535,7 @@ mod tests {
     #[test]
     fn event_kind_x402_payment_authorized_round_trip() {
         let ev = EventKind::X402PaymentAuthorized {
+            witness: None,
             legs: vec![ValueLegRecord {
                 action: ValueActionKind::X402Payment,
                 amount: Some(2_500_000),
@@ -5917,5 +5942,105 @@ mod tests {
             bound_recorded_str(&multibyte).chars().count(),
             RECORDED_STR_MAX
         );
+    }
+
+    mod witness_tests {
+        #![allow(clippy::unwrap_used, reason = "test assertions")]
+        use super::super::*;
+
+        #[test]
+        fn pending_without_witness_serializes_unchanged() {
+            let event = EventKind::ValueActionPending {
+                witness: None,
+                approval_nonce: None,
+                legs: vec![],
+                transaction_hash_redacted: "hash".into(),
+                source_redacted: "source".into(),
+                sequence: 7,
+            };
+            assert_eq!(
+                serde_json::to_string(&event).unwrap(),
+                concat!(
+                    "{\"kind\":\"value_action_pending\",\"legs\":[],",
+                    "\"transaction_hash_redacted\":\"hash\",",
+                    "\"source_redacted\":\"source\",\"sequence\":7}"
+                )
+            );
+        }
+
+        #[test]
+        fn submitted_without_witness_serializes_unchanged() {
+            let event = EventKind::ValueActionSubmitted {
+                witness: None,
+                approval_nonce: None,
+                legs: vec![],
+                opaque_reason: None,
+                transaction_hash_redacted: "hash".into(),
+                ledger: 7,
+            };
+            assert_eq!(
+                serde_json::to_string(&event).unwrap(),
+                concat!(
+                    "{\"kind\":\"value_action_submitted\",\"legs\":[],",
+                    "\"transaction_hash_redacted\":\"hash\",\"ledger\":7}"
+                )
+            );
+        }
+
+        #[test]
+        fn x402_without_witness_serializes_unchanged() {
+            let event = EventKind::X402PaymentAuthorized {
+                witness: None,
+                legs: vec![],
+                network: "stellar:testnet".into(),
+                scheme: "exact".into(),
+            };
+            assert_eq!(
+                serde_json::to_string(&event).unwrap(),
+                concat!(
+                    "{\"kind\":\"x402_payment_authorized\",\"legs\":[],",
+                    "\"network\":\"stellar:testnet\",\"scheme\":\"exact\"}"
+                )
+            );
+        }
+        #[test]
+        fn pending_submitted_and_x402_with_witness_round_trip() {
+            let witness = CrossCheckRecord {
+                provider: "https://oracle.example".into(),
+                ledger: 123,
+                inputs_digest: "ab".repeat(32),
+                kinds: vec![crate::cross_check::WitnessEntry::SourceAccount],
+            };
+            let events = [
+                EventKind::ValueActionPending {
+                    witness: Some(witness.clone()),
+                    approval_nonce: None,
+                    legs: vec![],
+                    transaction_hash_redacted: "hash".into(),
+                    source_redacted: "source".into(),
+                    sequence: 7,
+                },
+                EventKind::ValueActionSubmitted {
+                    witness: Some(witness.clone()),
+                    approval_nonce: None,
+                    legs: vec![],
+                    opaque_reason: None,
+                    transaction_hash_redacted: "hash".into(),
+                    ledger: 7,
+                },
+                EventKind::X402PaymentAuthorized {
+                    witness: Some(witness.clone()),
+                    legs: vec![],
+                    network: "stellar:testnet".into(),
+                    scheme: "exact".into(),
+                },
+            ];
+            for event in events {
+                let json = serde_json::to_value(&event).unwrap();
+                assert_eq!(json["witness"], serde_json::to_value(&witness).unwrap());
+                let decoded: EventKind = serde_json::from_value(json.clone()).unwrap();
+                assert_eq!(serde_json::to_value(decoded).unwrap(), json);
+            }
+        }
     }
 }

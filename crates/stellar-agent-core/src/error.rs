@@ -1581,6 +1581,28 @@ impl ValidationError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NetworkError {
+    /// A required independent witness could not be obtained.
+    #[error("{reason}")]
+    WitnessUnavailable {
+        /// Safe reason, containing only validated identities or endpoint authorities.
+        reason: WitnessUnavailableReason,
+    },
+    /// The oracle disagrees with a ledger observation used by the action.
+    #[error(
+        "cross-check refused: the primary RPC and the oracle disagree on the {entry} \
+         {field}{delta}; the wallet did not sign or send. Retry the action; \
+         if the disagreement persists, investigate both endpoints",
+        delta = witness_delta(*entry, *field, *sequence_delta)
+    )]
+    WitnessDivergence {
+        /// Kind of ledger entry that disagrees.
+        entry: crate::cross_check::WitnessEntry,
+        /// Field that disagrees.
+        field: crate::cross_check::WitnessField,
+        /// Absolute sequence difference when comparing account sequences.
+        sequence_delta: Option<u64>,
+    },
+
     /// The RPC endpoint did not respond within the configured timeout.
     ///
     /// `url` holds the RPC endpoint URL.  `timeout_secs` holds the timeout
@@ -1840,12 +1862,12 @@ pub enum NetworkError {
         reason: crate::profile::schema::RpcCredentialDefect,
     },
 
-    /// The RPC endpoint answered the network identity request with HTTP 401
+    /// The RPC endpoint answered a request with HTTP 401
     /// or 403, which no retry changes.
     ///
     /// `url` is authority-only (scheme://host\[:port\]).
     #[error(
-        "RPC endpoint '{url}' answered the network identity request with HTTP {status}; \
+        "RPC endpoint '{url}' answered a request with HTTP {status}; \
          check the credential the profile configures for this endpoint"
     )]
     RpcCredentialRejected {
@@ -1854,6 +1876,112 @@ pub enum NetworkError {
         /// The HTTP status of the answer, 401 or 403.
         status: u16,
     },
+}
+
+/// Safe classifications of an unavailable cross-check witness.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WitnessUnavailableReason {
+    /// The profile has no oracle.
+    #[error(
+        "cross-check unavailable: this action requires the oracle endpoint and the profile \
+         sets no oracle_provider_url; set oracle_provider_url and [providers.oracle] in the \
+         profile file"
+    )]
+    OracleNotConfigured,
+    /// The asset has no threshold.
+    #[error(
+        "cross-check unavailable: the profile sets no cross-check threshold for asset \
+         '{asset}'; add it to [cross_check_thresholds] in the profile file"
+    )]
+    NoThresholdForAsset {
+        /// Canonical asset without a threshold.
+        asset: crate::asset_id::CanonicalAsset,
+    },
+    /// The oracle client could not be built from `oracle_provider_url`.
+    #[error(
+        "cross-check unavailable: the client for oracle '{authority}' could not be built; \
+         correct oracle_provider_url in the profile file"
+    )]
+    ClientConstruction {
+        /// Redacted oracle authority.
+        authority: String,
+    },
+    /// The oracle serves a network other than the profile's.
+    #[error(
+        "cross-check unavailable: oracle '{authority}' serves a network other than the \
+         profile's; correct oracle_provider_url in the profile file"
+    )]
+    IdentityNetworkMismatch {
+        /// Redacted oracle authority.
+        authority: String,
+    },
+    /// The oracle did not establish its network identity.
+    #[error(
+        "cross-check unavailable: oracle '{authority}' did not establish its network \
+         identity; check that the endpoint is reachable, then retry"
+    )]
+    IdentityUnavailable {
+        /// Redacted oracle authority.
+        authority: String,
+    },
+    /// The oracle advertises a protocol version outside the supported range.
+    #[error(
+        "cross-check unavailable: oracle '{authority}' runs an unsupported protocol \
+         version; choose another oracle endpoint"
+    )]
+    IdentityProtocolUnsupported {
+        /// Redacted oracle authority.
+        authority: String,
+    },
+    /// An oracle request did not complete within the attempt budget.
+    #[error(
+        "cross-check unavailable: oracle '{authority}' did not answer within {seconds}s; \
+         retry, or check the endpoint"
+    )]
+    DeadlineExhausted {
+        /// Redacted oracle authority.
+        authority: String,
+        /// Attempt budget in seconds.
+        seconds: u64,
+    },
+    /// Every read attempt ended in a transport fault.
+    #[error(
+        "cross-check unavailable: oracle '{authority}' could not be read after {attempts} \
+         attempts; retry, or check the endpoint"
+    )]
+    Transport {
+        /// Redacted oracle authority.
+        authority: String,
+        /// Completed read attempts.
+        attempts: u32,
+    },
+    /// The oracle answered with a body, an error object, or entries the wallet cannot use.
+    #[error(
+        "cross-check unavailable: oracle '{authority}' returned an answer the wallet could \
+         not use; choose another oracle endpoint"
+    )]
+    InvalidAnswer {
+        /// Redacted oracle authority.
+        authority: String,
+    },
+}
+
+fn witness_delta(
+    entry: crate::cross_check::WitnessEntry,
+    field: crate::cross_check::WitnessField,
+    delta: Option<u64>,
+) -> String {
+    use crate::cross_check::{WitnessEntry, WitnessField};
+    if matches!(
+        entry,
+        WitnessEntry::SourceAccount | WitnessEntry::FunderAccount
+    ) && field == WitnessField::Sequence
+        && let Some(n) = delta
+    {
+        return format!(" (sequence delta {n})");
+    }
+    String::new()
 }
 
 /// The class of a network passphrase an endpoint reported: the testnet
@@ -1909,6 +2037,8 @@ impl NetworkError {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
+            Self::WitnessUnavailable { .. } => "network.witness_unavailable",
+            Self::WitnessDivergence { .. } => "simulation.divergence",
             Self::RpcTimeout { .. } => "network.rpc_timeout",
             Self::RpcUnreachable { .. } => "network.rpc_unreachable",
             Self::FriendbotMainnetForbidden => "network.friendbot_mainnet_forbidden",
@@ -3339,8 +3469,60 @@ mod tests {
 
     // ── Network errors ───────────────────────────────────────────────────────
 
+    fn witness_errors() -> Vec<NetworkError> {
+        use crate::cross_check::{WitnessEntry, WitnessField};
+        let authority = crate::redact::redact_url_authority(
+            "https://user:credential-marker@oracle.example:8443/private-path?token=secret-marker",
+        );
+        assert_eq!(authority, "https://oracle.example:8443");
+        vec![
+            WitnessUnavailableReason::OracleNotConfigured,
+            WitnessUnavailableReason::NoThresholdForAsset {
+                asset: crate::asset_id::CanonicalAsset::Native,
+            },
+            WitnessUnavailableReason::ClientConstruction {
+                authority: authority.clone(),
+            },
+            WitnessUnavailableReason::IdentityNetworkMismatch {
+                authority: authority.clone(),
+            },
+            WitnessUnavailableReason::IdentityUnavailable {
+                authority: authority.clone(),
+            },
+            WitnessUnavailableReason::IdentityProtocolUnsupported {
+                authority: authority.clone(),
+            },
+            WitnessUnavailableReason::DeadlineExhausted {
+                authority: authority.clone(),
+                seconds: 15,
+            },
+            WitnessUnavailableReason::Transport {
+                authority: authority.clone(),
+                attempts: 3,
+            },
+            WitnessUnavailableReason::InvalidAnswer { authority },
+        ]
+        .into_iter()
+        .map(|reason| NetworkError::WitnessUnavailable { reason })
+        .chain([NetworkError::WitnessDivergence {
+            entry: WitnessEntry::SourceAccount,
+            field: WitnessField::Sequence,
+            sequence_delta: Some(5),
+        }])
+        .collect()
+    }
+
     #[test]
     fn network_code_round_trip() {
+        for error in witness_errors() {
+            let expected = if matches!(error, NetworkError::WitnessDivergence { .. }) {
+                "simulation.divergence"
+            } else {
+                "network.witness_unavailable"
+            };
+            assert_eq!(error.code(), expected);
+            assert_eq!(WalletError::Network(error).code(), expected);
+        }
         let cases: &[(NetworkError, &'static str)] = &[
             (
                 NetworkError::RpcTimeout {
@@ -3491,8 +3673,8 @@ mod tests {
                 status: 403,
             }
             .to_string(),
-            "RPC endpoint 'https://rpc.example.com:8443' answered the network identity \
-             request with HTTP 403; check the credential the profile configures for this \
+            "RPC endpoint 'https://rpc.example.com:8443' answered a request \
+             with HTTP 403; check the credential the profile configures for this \
              endpoint"
         );
     }
@@ -4046,6 +4228,30 @@ mod tests {
 
     #[test]
     fn display_no_secret_markers_network() {
+        for error in witness_errors() {
+            let text = error.to_string();
+            for forbidden in [
+                "private-path",
+                "token=",
+                "user:",
+                "credential-marker",
+                "secret-marker",
+            ] {
+                assert!(!text.contains(forbidden), "{text}");
+            }
+            let omits_endpoint = matches!(
+                error,
+                NetworkError::WitnessUnavailable {
+                    reason: WitnessUnavailableReason::OracleNotConfigured
+                        | WitnessUnavailableReason::NoThresholdForAsset { .. }
+                } | NetworkError::WitnessDivergence { .. }
+            );
+            assert_eq!(
+                text.contains("'https://oracle.example:8443'"),
+                !omits_endpoint,
+                "{text}"
+            );
+        }
         let cases = [
             WalletError::Network(NetworkError::RpcTimeout {
                 url: "https://rpc.example.com".to_owned(),

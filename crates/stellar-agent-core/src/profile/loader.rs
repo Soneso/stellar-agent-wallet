@@ -68,6 +68,30 @@ use super::schema::{
 };
 pub use super::schema::{default_approval_dir, default_policy_dir, default_profile_dir};
 use crate::profile::caip2::Caip2;
+use crate::{asset_id::CanonicalAsset, cross_check::CrossCheckThresholds};
+
+/// A safe reference to the part of `[cross_check_thresholds]` a refusal
+/// names, without any rejected input.
+#[derive(Debug, Clone)]
+pub enum Entry {
+    /// The field itself, when its value is not a table.
+    Field,
+    /// One-based position in lexicographic key order, for a key that did not
+    /// parse.
+    Position(usize),
+    /// The canonical identity of a key that parsed.
+    Asset(CanonicalAsset),
+}
+
+impl std::fmt::Display for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Field => f.write_str("the field"),
+            Self::Position(n) => write!(f, "entry {n} in key order"),
+            Self::Asset(asset) => write!(f, "entry '{asset}'"),
+        }
+    }
+}
 
 /// Mirror of `stellar_agent_smart_account::managers::rules::UPPER_BOUND_MAX_SCAN_ID`.
 ///
@@ -190,6 +214,7 @@ const OVERLAY_CLASSES: &[(&str, OverlayClass)] = &[
     ("mcp_signer_default", OverlayClass::TestnetOnly),
     ("mcp_nonce_key_alias", OverlayClass::Never),
     ("cross_check_threshold_stroops", OverlayClass::TestnetOnly),
+    ("cross_check_thresholds", OverlayClass::TestnetOnly),
     ("usd_threshold", OverlayClass::TestnetOnly),
     ("classic_fee_per_op_stroops", OverlayClass::TestnetOnly),
     ("classic_max_fee_per_op_stroops", OverlayClass::TestnetOnly),
@@ -272,6 +297,16 @@ fn check_overlay_keys(
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProfileLoadError {
+    /// A cross-check threshold has an invalid identity, value, or duplicate SAC.
+    #[error("profile '{name}': [cross_check_thresholds] {entry} {reason}")]
+    InvalidCrossCheckThreshold {
+        /// Validated profile name.
+        name: String,
+        /// Safe entry reference.
+        entry: Entry,
+        /// Fixed explanation containing no rejected input.
+        reason: String,
+    },
     /// An overlay names a field whose value belongs to the profile file.
     #[error(
         "profile field `{field}` is read from the profile file only; remove it from the environment, the overlay, or the command line"
@@ -603,6 +638,7 @@ impl ProfileLoadError {
             | Self::MainnetRpcUrlRequired { .. }
             | Self::InvalidEndpointUrl { .. }
             | Self::InvalidProviderAttestation { .. }
+            | Self::InvalidCrossCheckThreshold { .. }
             | Self::MissingPolicySection { .. }
             | Self::SignerRefUnreadable { .. }
             | Self::Figment { .. }
@@ -661,7 +697,7 @@ fn guard_name_for_save(name: &str) -> Result<(), ProfileSaveError> {
 ///    key against its class. `submit_timeout_seconds` is overlayable on every
 ///    chain. `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`,
 ///    `mcp_signer_default`, `cross_check_threshold_stroops` (alias
-///    `usd_threshold`), the two classic fee fields,
+///    `usd_threshold`), `cross_check_thresholds`, the two classic fee fields,
 ///    `smart_account_max_context_rule_scan_id`, and
 ///    `session_rule_max_horizon_ledgers` are overlayable on testnet only.
 ///    `mcp_disabled` accepts only `true`, refusing any other value with
@@ -901,6 +937,11 @@ fn load_from_path_with_overlays(
         mcp_signer_default: partial.mcp_signer_default,
         mcp_nonce_key_alias: partial.mcp_nonce_key_alias,
         cross_check_threshold_stroops: partial.cross_check_threshold_stroops,
+        cross_check_thresholds: parse_cross_check_thresholds(
+            name,
+            partial.cross_check_thresholds,
+            chain_id.network_passphrase(),
+        )?,
         classic_fee_per_op_stroops: partial.classic_fee_per_op_stroops,
         classic_max_fee_per_op_stroops: partial.classic_max_fee_per_op_stroops,
         submit_timeout_seconds: partial.submit_timeout_seconds,
@@ -2279,6 +2320,8 @@ struct PartialProfile {
     #[serde(default, alias = "usd_threshold")]
     cross_check_threshold_stroops: u64,
     #[serde(default)]
+    cross_check_thresholds: Option<figment::value::Value>,
+    #[serde(default)]
     classic_fee_per_op_stroops: Option<u32>,
     #[serde(default)]
     classic_max_fee_per_op_stroops: Option<u32>,
@@ -2356,6 +2399,7 @@ partial_profile_fields!(
     mcp_signer_default,
     mcp_nonce_key_alias,
     cross_check_threshold_stroops,
+    cross_check_thresholds,
     classic_fee_per_op_stroops,
     classic_max_fee_per_op_stroops,
     submit_timeout_seconds,
@@ -2379,6 +2423,69 @@ partial_profile_fields!(
     served_pages,
     policy_window_state_key_id,
 );
+
+fn parse_cross_check_thresholds(
+    name: &str,
+    raw: Option<figment::value::Value>,
+    passphrase: &str,
+) -> Result<CrossCheckThresholds, ProfileLoadError> {
+    use figment::value::Value;
+    let failure = |entry, reason: String| ProfileLoadError::InvalidCrossCheckThreshold {
+        name: name.to_owned(),
+        entry,
+        reason,
+    };
+    let Some(raw) = raw else {
+        return Ok(CrossCheckThresholds::default());
+    };
+    let Value::Dict(_, entries) = raw else {
+        return Err(failure(
+            Entry::Field,
+            "is not a table of asset identities and thresholds".to_owned(),
+        ));
+    };
+    let mut result = std::collections::BTreeMap::new();
+    for (position, (key, raw_value)) in entries.into_iter().enumerate() {
+        let asset = CanonicalAsset::parse_threshold_key(&key)
+            .map_err(|error| failure(Entry::Position(position + 1), error.to_string()))?;
+        let value_text = match raw_value {
+            Value::String(_, text) => Some(text),
+            Value::Num(_, num) => num.to_u128_lossy().map(|n| n.to_string()),
+            _ => None,
+        };
+        let value = value_text
+            .as_deref()
+            .filter(|text| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|text| text.parse::<i128>().ok())
+            .ok_or_else(|| {
+                failure(
+                    Entry::Asset(asset.clone()),
+                    "has a threshold that is not a non-negative integer".to_owned(),
+                )
+            })?;
+        result.insert(asset, value);
+    }
+    for asset in result.keys() {
+        if let CanonicalAsset::Contract(id) = asset {
+            if CanonicalAsset::Native.sac_contract_id(passphrase).as_ref() == Some(id) {
+                return Err(failure(
+                    Entry::Asset(asset.clone()),
+                    "names the native asset's contract; set cross_check_threshold_stroops instead"
+                        .to_owned(),
+                ));
+            }
+            for other in result.keys() {
+                if other.sac_contract_id(passphrase).as_ref() == Some(id) {
+                    return Err(failure(
+                        Entry::Asset(asset.clone()),
+                        format!("names the same asset as entry '{other}'"),
+                    ));
+                }
+            }
+        }
+    }
+    CrossCheckThresholds::new(result).map_err(|error| failure(Entry::Field, error.to_string()))
+}
 
 fn require_policy_section(
     policy: Option<super::schema::PolicyConfig>,
@@ -2406,6 +2513,153 @@ mod tests {
     use crate::profile::schema::sentinel::{self, assert_no_sentinel};
     use crate::profile::schema::{EndpointUrlError, EndpointUrlRejection, MINIMUM_FLOOR};
 
+    #[test]
+    fn thresholds_refuse_native_key() {
+        for key in ["native", "NATIVE", "xlm", "XlM"] {
+            let input = format!(
+                "{}\n[cross_check_thresholds]\n\"{key}\" = 1",
+                minimal_toml()
+            );
+            let (dir, name) = write_profile(&input);
+            let error = load_from_dir(&name, dir.path(), None).unwrap_err();
+            assert!(matches!(
+                error,
+                ProfileLoadError::InvalidCrossCheckThreshold { .. }
+            ));
+            assert!(error.to_string().contains("is the native asset"));
+        }
+    }
+
+    #[test]
+    fn thresholds_overlay_is_testnet_only() {
+        assert_eq!(
+            OVERLAY_CLASSES
+                .iter()
+                .find(|(key, _)| *key == "cross_check_thresholds")
+                .map(|(_, class)| *class),
+            Some(OverlayClass::TestnetOnly)
+        );
+        assert!(matches!(
+            provider_load(
+                &mainnet_toml(),
+                "cross_check_thresholds",
+                serde_json::json!({})
+            ),
+            Err(ProfileLoadError::NonOverlayableField {
+                field: "cross_check_thresholds"
+            })
+        ));
+    }
+
+    #[test]
+    fn thresholds_invalid_inputs_never_reach_operator_text() {
+        let issuer = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let key = format!("USD:{issuer}");
+        let hostile = "https://user:credential-marker@example.invalid/private?token=secret-marker";
+        let cases = [
+            format!("[cross_check_thresholds]\n\"{hostile}\" = 1"),
+            "[cross_check_thresholds]\n\"credential-marker\" = 1".to_owned(),
+            format!("[cross_check_thresholds]\n\"{key}\" = true"),
+            format!("[cross_check_thresholds]\n\"{key}\" = \"credential-marker\""),
+            "cross_check_thresholds = \"credential-marker\"".to_owned(),
+            "cross_check_thresholds = [\"credential-marker\"]".to_owned(),
+        ];
+        for input in cases {
+            let field_form = !input.starts_with('[');
+            let input = if field_form {
+                minimal_toml_with_extra(&input)
+            } else {
+                format!("{}\n{input}", minimal_toml())
+            };
+            let (dir, name) = write_profile(&input);
+            let error = load_from_dir(&name, dir.path(), None).unwrap_err();
+            assert!(
+                matches!(error, ProfileLoadError::InvalidCrossCheckThreshold { .. }),
+                "{error:?}"
+            );
+            if field_form {
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "profile '{name}': [cross_check_thresholds] the field is not a table \
+                         of asset identities and thresholds"
+                    )
+                );
+            }
+            let mapped = error.to_validation_error(&name);
+            assert_eq!(mapped.code(), "validation.config_invalid");
+            let text = mapped.to_string();
+            for forbidden in [
+                hostile,
+                "credential-marker",
+                "secret-marker",
+                "true",
+                "private?",
+            ] {
+                assert!(!text.contains(forbidden), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn thresholds_validate_values_and_sac_duplicates() {
+        let issuer = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        let classic = CanonicalAsset::classic("USD", &issuer).unwrap();
+        let other = stellar_strkey::Contract([9; 32]).to_string();
+        let input = format!(
+            "{}\n[cross_check_thresholds]\n\"{classic}\" = 5\n\
+            \"{other}\" = \"{}\"",
+            minimal_toml(),
+            i128::MAX
+        );
+        let (dir, name) = write_profile(&input);
+        let profile = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(profile.cross_check_thresholds.get(&classic), Some(5));
+        assert_eq!(
+            profile
+                .cross_check_thresholds
+                .get(&CanonicalAsset::contract(&other).unwrap()),
+            Some(i128::MAX)
+        );
+        for value in [
+            "-1",
+            "1.0",
+            "true",
+            "\"+1\"",
+            "\" 1\"",
+            "\"\"",
+            "\"170141183460469231731687303715884105728\"",
+        ] {
+            let input = format!(
+                "{}\n[cross_check_thresholds]\n\"{classic}\" = {value}",
+                minimal_toml()
+            );
+            let (dir, name) = write_profile(&input);
+            let error = load_from_dir(&name, dir.path(), None).unwrap_err();
+            assert!(matches!(
+                error,
+                ProfileLoadError::InvalidCrossCheckThreshold { .. }
+            ));
+            assert!(error.to_string().contains("not a non-negative integer"));
+        }
+        for (asset, reason) in [
+            (CanonicalAsset::Native, "names the native asset's contract"),
+            (classic.clone(), "names the same asset as entry"),
+        ] {
+            let sac = asset
+                .sac_contract_id(Caip2::Testnet.network_passphrase())
+                .unwrap();
+            let input = format!(
+                "{}\n[cross_check_thresholds]\n\"{classic}\" = 1\n\
+                \"{sac}\" = 2",
+                minimal_toml()
+            );
+            let (dir, name) = write_profile(&input);
+            let error = load_from_dir(&name, dir.path(), None).unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+    }
+
     /// One constructed value per [`ProfileLoadError`] variant.
     ///
     /// Adding a variant without extending this list leaves it unpinned, so the
@@ -2414,6 +2668,11 @@ mod tests {
     /// match already forces the classification decision at compile time.
     fn one_of_every_variant() -> Vec<ProfileLoadError> {
         vec![
+            ProfileLoadError::InvalidCrossCheckThreshold {
+                name: "p".to_owned(),
+                entry: Entry::Position(1),
+                reason: "invalid".to_owned(),
+            },
             ProfileLoadError::InvalidProviderAttestation {
                 name: "p".into(),
                 source: ProviderAttestationError {
@@ -2835,6 +3094,7 @@ mod tests {
                 serde_json::json!({"account": "overlay-account"}),
             ),
             ("cross_check_threshold_stroops", serde_json::json!(123_457)),
+            ("cross_check_thresholds", serde_json::json!({})),
             ("usd_threshold", serde_json::json!(765_431)),
             ("classic_fee_per_op_stroops", serde_json::json!(211)),
             ("classic_max_fee_per_op_stroops", serde_json::json!(5_011)),
@@ -2860,6 +3120,7 @@ mod tests {
             "cross_check_threshold_stroops" | "usd_threshold" => {
                 serde_json::json!(profile.cross_check_threshold_stroops)
             }
+            "cross_check_thresholds" => serde_json::json!(profile.cross_check_thresholds),
             "classic_fee_per_op_stroops" => serde_json::json!(profile.classic_fee_per_op_stroops),
             "classic_max_fee_per_op_stroops" => {
                 serde_json::json!(profile.classic_max_fee_per_op_stroops)

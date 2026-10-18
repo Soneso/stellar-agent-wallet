@@ -146,7 +146,10 @@ impl ToolCatalogue for PayCommitCatalogue {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Kept local: single-caller scope and approval-specific response shape.
-// `getNetwork` reports testnet; every other request receives the account.
+// `getNetwork` reports testnet. `getLedgerEntries` answers by requested key:
+// the account entry for the account key, and no entry for any other key, such
+// as the destination's SEP-29 `config.memo_required` data entry the commit
+// reads. Every other request receives the account.
 struct AccountLedgerResponder {
     account_key_xdr: String,
     account_xdr: String,
@@ -160,14 +163,22 @@ impl Respond for AccountLedgerResponder {
             .as_ref()
             .and_then(|v| v.get("id").cloned())
             .unwrap_or(serde_json::json!(1));
-        let is_network_check = request_value
+        let method = request_value
             .as_ref()
             .and_then(|v| v.get("method"))
-            .and_then(serde_json::Value::as_str)
-            == Some("getNetwork");
-        let body = if is_network_check {
+            .and_then(serde_json::Value::as_str);
+        let account_requested = method != Some("getLedgerEntries")
+            || request_value
+                .as_ref()
+                .and_then(|v| v.pointer("/params/keys"))
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|keys| {
+                    keys.iter()
+                        .any(|key| key.as_str() == Some(self.account_key_xdr.as_str()))
+                });
+        let body = if method == Some("getNetwork") {
             crate::common::EndpointNetwork::testnet().result()
-        } else {
+        } else if account_requested {
             serde_json::json!({
                 "entries": [{
                     "key": self.account_key_xdr,
@@ -176,6 +187,8 @@ impl Respond for AccountLedgerResponder {
                 }],
                 "latestLedger": 1001
             })
+        } else {
+            serde_json::json!({ "entries": [], "latestLedger": 1001 })
         };
         ResponseTemplate::new(200)
             .set_body_json(serde_json::json!({

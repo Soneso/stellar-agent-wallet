@@ -40,6 +40,7 @@ pub mod builder;
 pub mod client;
 pub mod context;
 pub mod counterparty;
+pub mod cross_check;
 pub mod endpoint_identity;
 pub mod fee_bump;
 pub mod fee_bump_retry;

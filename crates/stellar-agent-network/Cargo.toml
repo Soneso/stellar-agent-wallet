@@ -48,7 +48,10 @@ stellar-agent-xdr-limits = { workspace = true }
 # version stellar-rpc-client resolves (jsonrpsee 0.26) so the two resolve to
 # one crate instance and the `From` impl on `stellar_rpc_client::Error`
 # applies; otherwise two distinct `ClientError` types exist in the binary.
-jsonrpsee-core = { version = "=0.26.0", features = ["client"] }
+# `http-helpers` names `HttpError`, which the HTTP transport uses to report an
+# answer body that is not JSON or exceeds the size limit; jsonrpsee-http-client
+# enables the same feature on the same instance.
+jsonrpsee-core = { version = "=0.26.0", features = ["client", "http-helpers"] }
 # The HTTP transport's own error type, which carries the status of a rejected
 # answer inside jsonrpsee's boxed transport error. Same pin and instance as the
 # one stellar-rpc-client resolves; no transport feature is enabled here.

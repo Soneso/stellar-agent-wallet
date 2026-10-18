@@ -2154,6 +2154,7 @@ impl AuditEntry {
         nonce_id: Option<String>,
         approval_nonce: Option<String>,
         request_id: impl Into<String>,
+        witness: Option<super::schema::CrossCheckRecord>,
     ) -> Self {
         Self {
             ts: current_iso8601_utc(),
@@ -2168,6 +2169,7 @@ impl AuditEntry {
             decision_reason: None,
             request_id: request_id.into(),
             event_kind: EventKind::ValueActionSubmitted {
+                witness,
                 approval_nonce,
                 legs,
                 opaque_reason: None,
@@ -2206,6 +2208,7 @@ impl AuditEntry {
         nonce_id: Option<String>,
         approval_nonce: Option<String>,
         request_id: impl Into<String>,
+        witness: Option<super::schema::CrossCheckRecord>,
     ) -> Self {
         Self {
             ts: current_iso8601_utc(),
@@ -2220,6 +2223,7 @@ impl AuditEntry {
             decision_reason: None,
             request_id: request_id.into(),
             event_kind: EventKind::ValueActionPending {
+                witness,
                 approval_nonce,
                 legs,
                 transaction_hash_redacted: transaction_hash_redacted.into(),
@@ -2353,6 +2357,7 @@ impl AuditEntry {
             decision_reason: None,
             request_id: request_id.into(),
             event_kind: EventKind::ValueActionSubmitted {
+                witness: None,
                 approval_nonce: None,
                 legs: vec![],
                 opaque_reason: Some(opaque_reason.into()),
@@ -2408,6 +2413,7 @@ impl AuditEntry {
     /// token, or secret is recorded. `policy_decision` carries the gate's
     /// actual decision (`Allow` on this path).
     #[must_use]
+    #[allow(clippy::too_many_arguments, reason = "flat audit-field constructor")]
     pub fn new_x402_payment_authorized(
         tool: impl Into<String>,
         chain_id: impl IntoOptionalChainId,
@@ -2416,6 +2422,7 @@ impl AuditEntry {
         scheme: impl Into<String>,
         policy_decision: PolicyDecision,
         request_id: impl Into<String>,
+        witness: Option<super::schema::CrossCheckRecord>,
     ) -> Self {
         Self {
             ts: current_iso8601_utc(),
@@ -2433,6 +2440,7 @@ impl AuditEntry {
             // challenge; bound so a hostile counterparty cannot inflate
             // hash-chained rows.
             event_kind: EventKind::X402PaymentAuthorized {
+                witness,
                 legs,
                 network: super::schema::bound_recorded_str(&network.into()),
                 scheme: super::schema::bound_recorded_str(&scheme.into()),
@@ -7604,6 +7612,7 @@ mod tests {
             oversized,
             crate::audit_log::schema::PolicyDecision::Allow,
             "req-1",
+            None,
         );
         let EventKind::X402PaymentAuthorized {
             network, scheme, ..

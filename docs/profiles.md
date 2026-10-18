@@ -127,8 +127,13 @@ a fixed allowlist of operational fields, in three classes:
 | Class | Keys |
 | --- | --- |
 | Every chain | `submit_timeout_seconds` |
-| Testnet only | `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`, `mcp_signer_default`, `cross_check_threshold_stroops` and its alias `usd_threshold`, `classic_fee_per_op_stroops`, `classic_max_fee_per_op_stroops`, `smart_account_max_context_rule_scan_id`, `session_rule_max_horizon_ledgers` |
+| Testnet only | See the testnet overlay keys below. |
 | Tighten only, every chain | `mcp_disabled`, and only to `true` |
+
+Testnet overlay keys are `rpc_url`, `secondary_rpc_url`, `oracle_provider_url`,
+`mcp_signer_default`, `cross_check_threshold_stroops` (alias `usd_threshold`),
+`cross_check_thresholds`, `classic_fee_per_op_stroops`, `classic_max_fee_per_op_stroops`,
+`smart_account_max_context_rule_scan_id`, and `session_rule_max_horizon_ledgers`.
 
 Every other profile key is never overlayable, on any chain: `chain_id`,
 `version`, every `*_key_id` coordinate and `mcp_nonce_key_alias`,
@@ -235,10 +240,49 @@ secret.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `cross_check_threshold_stroops` | integer (stroops) | no | `0` | High-value cross-check threshold. The effective value is `max(cross_check_threshold_stroops, 10_000_000_000)`; the floor of 1000 XLM (10^10 stroops) cannot be configured lower, so a profile with `cross_check_threshold_stroops = 0` behaves as if it were the floor. Native-XLM payments and sponsored account creations at or above the effective threshold run the MCP commit cross-check when `oracle_provider_url` is set. Mainnet requires its provider record, a host distinct from the primary, and a `[providers.primary]` record. The legacy key `usd_threshold` is still accepted on load; do not set both keys (across the file, environment, and CLI sources). The load is refused as a duplicate field. |
+| `cross_check_threshold_stroops` | integer | no | `0` | Native threshold; see below. |
+| `[cross_check_thresholds]` | table | no | empty | Asset thresholds; testnet-only overlay. |
 | `classic_fee_per_op_stroops` | integer | no | unset (protocol default) | Per-operation base fee for classic transactions, in stroops. When unset, classic tools use the built-in default. |
 | `classic_max_fee_per_op_stroops` | integer | no | unset (no cap) | Per-operation fee cap, in stroops. When set, classic tools fail before envelope construction if the selected fee exceeds the cap. This is a guardrail, not a silent clamp. |
 | `submit_timeout_seconds` | integer | no | `60` | How long the wallet polls for transaction confirmation. |
+
+#### Witness thresholds
+
+The native threshold is `max(cross_check_threshold_stroops, 10_000_000_000)`
+stroops. The floor is 1000 XLM, so zero also means 1000 XLM.
+An MCP payment or account-creation commit at or above its threshold needs an
+oracle witness. A memo-less MCP payment needs a witness whenever an oracle is
+configured, even below threshold or without a testnet asset threshold.
+A mainnet profile without `oracle_provider_url` cannot run these required
+comparisons. Testnet continues with a warning when the oracle is absent.
+Mainnet writes remain structurally refused.
+
+The legacy key `usd_threshold` also sets the native threshold. Setting both
+names across the file, environment, or CLI sources refuses as a duplicate field.
+
+`[cross_check_thresholds]` sets per-asset thresholds in base units. Keys are
+case-sensitive `CODE:ISSUER` identities or canonical contract addresses (`C...`).
+Native aliases, including `native` and `xlm` in any case, are refused.
+Use `cross_check_threshold_stroops` for native XLM and its SAC.
+A classic key also covers its Stellar Asset Contract on the profile's network.
+Naming both identities for one asset refuses the load.
+Values are non-negative integers or ASCII digit strings within the `i128` range.
+The string form supports values above TOML's integer range.
+
+On mainnet, a missing asset threshold refuses with `network.witness_unavailable`,
+including a memo-less payment. On testnet, a payment with a memo and no asset
+threshold skips the comparison with reason `no_threshold_for_asset`.
+The memo-less rule above takes precedence on testnet.
+A skipped or not-required outcome makes no oracle comparison of any kind.
+
+This mainnet example sets thresholds for two different tokens: the classic
+EURC asset and the USDC Stellar Asset Contract.
+
+```toml
+[cross_check_thresholds]
+"EURC:GDHU6WRG4IEQXM5NZ4BMPKOXHW76MZM4Y2IEMFDVXBSDP6SJY4ITNPP2" = 5000000000
+"CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75" = "1000000000000000000000"
+```
 
 ### Security-substrate key references
 
@@ -259,12 +303,22 @@ actual keys (see [Migration and key rotation](#migration-and-key-rotation)).
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `oracle_provider_url` | string (URL) | no | unset (cross-check off) | Oracle endpoint for MCP high-value rebuilds and the `stellar_pay` SEP-29 second read. When absent, those second-endpoint checks are skipped. Mainnet requires `providers.oracle`, a host distinct from `rpc_url`, and a `[providers.primary]` record. The endpoint rule and URL redaction apply. `providers.oracle` can name a keyring credential for it. |
+| `oracle_provider_url` | URL | no | unset | Oracle witness endpoint; see below. |
 | `mcp_disabled` | bool | no | `false` | When `true`, the `stellar-agent-mcp` server refuses to start with error `mcp.disabled_per_profile`. |
 | `audit_log_path` | string (path) | no | OS-conventional | Path to the per-profile audit log. |
 | `secondary_rpc_url` | string (URL) | no | unset | Secondary endpoint for cross-RPC checks. `smart-account multicall` requires an effective secondary from the profile or a testnet flag. Follows the endpoint rule in [Loader source order](#loader-source-order). Mainnet reads this field from the file only and requires `providers.secondary`, its independence assertion, a host distinct from the primary, and a `[providers.primary]` record. Debug output is redacted. `providers.secondary` can name a keyring credential; the smart-account and DeFi commands that read this endpoint send none. |
 | `smart_account_max_context_rule_scan_id` | integer | no | engine default | Override for the maximum rule-id scan bound. Rejected at load when above `10000`. |
 | `session_rule_max_horizon_ledgers` | integer | no | engine default | Override for the maximum session-rule lookahead window, in ledgers. Rejected at load when above `10000`. |
+
+#### Oracle witness endpoint
+
+`oracle_provider_url` supplies the oracle for MCP payment and account-creation
+commits. Before signing, the oracle re-reads the ledger entries the decision used.
+When a required witness has no oracle, mainnet refuses and testnet warns.
+A mainnet profile requires `providers.oracle`, a host distinct from `rpc_url`,
+and a `[providers.primary]` record. Endpoint validation and URL redaction apply.
+`providers.oracle` can name a keyring credential for the endpoint.
+
 
 ### Provider attestations
 
@@ -319,7 +373,8 @@ Do not put credentials in these metadata fields.
 `[providers.primary]` names the operator and host of `rpc_url` and may carry a credential; it takes no `independent_of_primary`.
 On mainnet, a secondary or oracle record naming the primary's operator, compared after trimming and case folding, refuses.
 Provider refusals use `validation.provider_attestation_invalid`; the message identifies the field and its repair.
-On testnet, a high-value oracle sharing the primary host emits the degraded-verification warning, even when its path or query differs, or when its record names the primary's operator.
+On testnet, an oracle sharing the primary host emits the degraded-verification warning.
+This also applies when its path or query differs, or its record names the primary's operator.
 
 ### Provider credentials
 
@@ -356,13 +411,14 @@ A testnet environment overlay of the role's URL keeps the credential, because th
 
 These commands send the primary credential: `pay`, `claim`, `accounts create --sponsor`, `trustline`, `pool init`, `pool list`, `tx status`, `tx receipt clear`, and `fees stats --profile`.
 The MCP classic tools send it too: `stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim` and their commits, `stellar_balances`, `stellar_transaction_status`, `stellar_fee_stats`, and the x402 tools.
-The MCP high-value cross-check and the `stellar_pay` SEP-29 read send the oracle credential.
+The cross-check witness sends the oracle credential.
 `balances` takes `--rpc-url` without a profile and sends none.
 The Friendbot path of `accounts create`, `stellar_friendbot`, `stellar_sep43_sign_and_submit_transaction`, and the smart-account, DeFi, and MPP commands and tools send none either.
 
 A missing entry reports `auth.keyring_not_found` naming `service/account`.
 A stored value that is empty, longer than 1024 bytes, or holds a control character reports `network.rpc_credential_refused`.
-An endpoint that answers the network identity request with HTTP 401 or 403 reports the same code, and the request is not retried.
+An endpoint that answers a request with HTTP 401 or 403 reports the same code.
+That request is not retried.
 The client removes the stored value and the form it sends from every error text it returns, before it shortens URLs to host and port.
 A key the endpoint re-encodes, truncates, or splits is not caught.
 

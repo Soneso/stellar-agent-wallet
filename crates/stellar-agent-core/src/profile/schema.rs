@@ -29,6 +29,7 @@
 //! look up those entries.  The lookup itself happens in
 //! `stellar-agent-network::keyring`.
 
+use crate::cross_check::CrossCheckThresholds;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -688,7 +689,7 @@ pub struct Profile {
     /// location information.
     pub mcp_nonce_key_alias: KeyringEntryRef,
 
-    /// High-value cross-check threshold, in stroops.
+    /// Native cross-check threshold in stroops; the witness runs at or above the effective value.
     ///
     /// The effective threshold is `max(cross_check_threshold_stroops,
     /// MINIMUM_FLOOR)` — callers MUST call
@@ -696,13 +697,17 @@ pub struct Profile {
     /// reading this field directly.
     ///
     /// The floor ([`MINIMUM_FLOOR`]) is 1 000 XLM (10^10 stroops)
-    /// and cannot be configured below this value. Native-XLM payments and
-    /// sponsored account creations at or above the effective threshold trigger
-    /// the MCP cross-check when `oracle_provider_url` is configured.
-    /// Mainnet requires the matching provider attestation and a
-    /// `[providers.primary]` record.
+    /// and cannot be configured below this value. MCP payment and account-creation
+    /// commits at or above the threshold require a witness. Memo-less payments
+    /// with an oracle require one at any value. Testnet warns when the oracle is absent.
+    /// A required missing oracle refuses on mainnet, which also requires its
+    /// provider attestation and a `[providers.primary]` record.
     #[serde(alias = "usd_threshold")]
     pub cross_check_threshold_stroops: u64,
+
+    /// Per-asset witness thresholds in base units.
+    #[serde(default, skip_serializing_if = "CrossCheckThresholds::is_empty")]
+    pub cross_check_thresholds: CrossCheckThresholds,
 
     /// Optional classic-operation base fee override, in stroops per operation.
     ///
@@ -981,6 +986,10 @@ pub struct RedactedProfile {
     pub mcp_nonce_key_alias: KeyringEntryRef,
     /// Operator-facing value of [`Profile::cross_check_threshold_stroops`].
     pub cross_check_threshold_stroops: u64,
+
+    /// Per-asset witness thresholds in base units.
+    #[serde(default, skip_serializing_if = "CrossCheckThresholds::is_empty")]
+    pub cross_check_thresholds: CrossCheckThresholds,
     /// Operator-facing value of [`Profile::classic_fee_per_op_stroops`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classic_fee_per_op_stroops: Option<u32>,
@@ -1352,6 +1361,7 @@ impl std::fmt::Debug for Profile {
                 "cross_check_threshold_stroops",
                 &self.cross_check_threshold_stroops,
             )
+            .field("cross_check_thresholds", &self.cross_check_thresholds)
             .field(
                 "classic_fee_per_op_stroops",
                 &self.classic_fee_per_op_stroops,
@@ -1462,6 +1472,7 @@ impl Profile {
             mcp_signer_default,
             mcp_nonce_key_alias,
             cross_check_threshold_stroops,
+            cross_check_thresholds,
             classic_fee_per_op_stroops,
             classic_max_fee_per_op_stroops,
             submit_timeout_seconds,
@@ -1493,6 +1504,7 @@ impl Profile {
             mcp_signer_default: mcp_signer_default.clone(),
             mcp_nonce_key_alias: mcp_nonce_key_alias.clone(),
             cross_check_threshold_stroops: *cross_check_threshold_stroops,
+            cross_check_thresholds: cross_check_thresholds.clone(),
             classic_fee_per_op_stroops: *classic_fee_per_op_stroops,
             classic_max_fee_per_op_stroops: *classic_max_fee_per_op_stroops,
             submit_timeout_seconds: *submit_timeout_seconds,
@@ -1654,6 +1666,7 @@ impl Profile {
             mcp_signer_default: KeyringEntryRef::new(signer_service, signer_account),
             mcp_nonce_key_alias: KeyringEntryRef::new(nonce_service, nonce_account),
             cross_check_threshold_stroops: MINIMUM_FLOOR,
+            cross_check_thresholds: CrossCheckThresholds::default(),
             classic_fee_per_op_stroops: None,
             classic_max_fee_per_op_stroops: None,
             submit_timeout_seconds: None,
@@ -1736,6 +1749,7 @@ impl Profile {
             mcp_signer_default: KeyringEntryRef::new(signer_service, signer_account),
             mcp_nonce_key_alias: KeyringEntryRef::new(nonce_service, nonce_account),
             cross_check_threshold_stroops: MINIMUM_FLOOR,
+            cross_check_thresholds: CrossCheckThresholds::default(),
             classic_fee_per_op_stroops: None,
             classic_max_fee_per_op_stroops: None,
             submit_timeout_seconds: None,
@@ -2699,6 +2713,7 @@ pub struct ProfileBuilder {
     mcp_signer_default: KeyringEntryRef,
     mcp_nonce_key_alias: KeyringEntryRef,
     cross_check_threshold_stroops: u64,
+    cross_check_thresholds: CrossCheckThresholds,
     classic_fee_per_op_stroops: Option<u32>,
     classic_max_fee_per_op_stroops: Option<u32>,
     submit_timeout_seconds: Option<u64>,
@@ -2969,6 +2984,7 @@ impl ProfileBuilder {
             mcp_signer_default: self.mcp_signer_default,
             mcp_nonce_key_alias: self.mcp_nonce_key_alias,
             cross_check_threshold_stroops: self.cross_check_threshold_stroops,
+            cross_check_thresholds: self.cross_check_thresholds,
             classic_fee_per_op_stroops: self.classic_fee_per_op_stroops,
             classic_max_fee_per_op_stroops: self.classic_max_fee_per_op_stroops,
             submit_timeout_seconds: self.submit_timeout_seconds,
@@ -3473,6 +3489,7 @@ mod tests {
             mcp_signer_default,
             mcp_nonce_key_alias,
             cross_check_threshold_stroops: _,
+            cross_check_thresholds: _,
             classic_fee_per_op_stroops: _,
             classic_max_fee_per_op_stroops: _,
             submit_timeout_seconds: _,
@@ -5417,6 +5434,47 @@ mod tests {
             ] {
                 assert!(!rendered.contains(secret), "{rendered}");
             }
+        }
+    }
+    #[test]
+    fn cross_check_thresholds_are_visible_in_show_and_debug() {
+        use crate::asset_id::CanonicalAsset;
+        use crate::cross_check::CrossCheckThresholds;
+        let issuer = stellar_strkey::ed25519::PublicKey([7; 32])
+            .to_string()
+            .to_string();
+        let contract = stellar_strkey::Contract([9; 32]).to_string().to_string();
+        let classic = CanonicalAsset::classic("USD", &issuer).unwrap();
+        let token = CanonicalAsset::contract(&contract).unwrap();
+        let mut profile = Profile::builder_testnet("s", "a", "n", "a").build();
+        let shown = serde_json::to_value(profile.redacted()).unwrap();
+        assert!(shown.get("cross_check_thresholds").is_none(), "{shown}");
+        profile.cross_check_thresholds = CrossCheckThresholds::new(
+            [(classic.clone(), 5), (token.clone(), 70_000_000_000)]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        let shown = serde_json::to_value(profile.redacted()).unwrap();
+        assert_eq!(
+            shown["cross_check_thresholds"],
+            serde_json::json!({ classic.to_string(): "5", contract.clone(): "70000000000" })
+        );
+        let table = format!("{:?}", profile.cross_check_thresholds);
+        for part in [
+            issuer.as_str(),
+            "USD",
+            contract.as_str(),
+            "5",
+            "70000000000",
+        ] {
+            assert!(table.contains(part), "{table}");
+        }
+        for rendered in [format!("{profile:?}"), format!("{:?}", profile.redacted())] {
+            assert!(
+                rendered.contains(&format!("cross_check_thresholds: {table}")),
+                "{rendered}"
+            );
         }
     }
 }

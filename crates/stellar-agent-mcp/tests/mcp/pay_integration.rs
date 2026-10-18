@@ -57,11 +57,11 @@ use serial_test::serial;
 use stellar_agent_core::policy::DenyReason;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::{StellarPayArgs, StellarPayCommitArgs, WalletServer};
+use stellar_agent_test_support::RedactionStrictSubscriber;
 use stellar_agent_test_support::keyring_mock;
 use stellar_agent_test_support::xdr_fixtures::{
     account_entry_xdr_with_balance, account_entry_xdr_with_seq, account_ledger_key_xdr,
 };
-use stellar_agent_test_support::{CaptureWriter, RedactionStrictSubscriber};
 use tracing::instrument::WithSubscriber as _;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -2021,514 +2021,6 @@ impl Respond for AccountOnlyResponder {
             }))
             .insert_header("content-type", "application/json")
     }
-}
-
-/// High-value cross-check passes when both primary and oracle RPCs return the
-/// same account state.
-///
-/// Scenario: a native XLM payment of 2 000 XLM (above the 1 000 XLM
-/// `MINIMUM_FLOOR`).  Both the primary and oracle mock servers return
-/// `seq_num = 100`, so the rebuilt envelopes are byte-identical → no divergence.
-///
-/// The commit step reaches the nonce-HMAC gate and fails there (the zero-bytes
-/// nonce has an invalid HMAC) rather than at the cross-check gate.
-#[tokio::test]
-#[serial]
-async fn pay_commit_high_value_cross_check_passes_on_match() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().expect("mock keyring store init");
-    install_test_nonce_key(42);
-
-    // Primary RPC mock: seq 100, large balance.
-    let primary_mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(AccountOnlyResponder {
-            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
-            account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
-        })
-        .mount(&primary_mock)
-        .await;
-
-    // Oracle mock: same seq 100 → rebuild matches primary.
-    let oracle_mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(AccountOnlyResponder {
-            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
-            account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
-        })
-        .mount(&oracle_mock)
-        .await;
-
-    let mut profile = testnet_profile_with_rpc(&primary_mock.uri());
-    profile.oracle_provider_url = Some(url::Url::parse(&oracle_mock.uri()).unwrap());
-    // 2 000 XLM payment is above the 1 000 XLM MINIMUM_FLOOR threshold.
-    // cross_check_threshold_stroops = 0 → effective = MINIMUM_FLOOR = 10_000_000_000 stroops.
-    profile.cross_check_threshold_stroops = 0;
-    let server = WalletServer::new(profile).expect("WalletServer::new");
-
-    use base64::Engine;
-    // 2000 XLM = 20_000_000_000 stroops. Build an envelope with fee=100, seq=101.
-    let envelope_xdr = {
-        use stellar_xdr::{
-            Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
-            SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
-            TransactionV1Envelope, Uint256, VecM, WriteXdr,
-        };
-        fn g_bytes(g: &str) -> [u8; 32] {
-            stellar_strkey::ed25519::PublicKey::from_string(g)
-                .expect("valid G-strkey")
-                .0
-        }
-        let tx = Transaction {
-            source_account: MuxedAccount::Ed25519(Uint256(g_bytes(SOURCE_G))),
-            fee: 100,
-            seq_num: SequenceNumber(101),
-            cond: Preconditions::None,
-            memo: Memo::None,
-            operations: vec![Operation {
-                source_account: None,
-                body: OperationBody::Payment(PaymentOp {
-                    destination: MuxedAccount::Ed25519(Uint256(g_bytes(DEST_G))),
-                    asset: Asset::Native,
-                    amount: 20_000_000_000, // 2000 XLM
-                }),
-            }]
-            .try_into()
-            .expect("single-op vec"),
-            ext: TransactionExt::V0,
-        };
-        TransactionEnvelope::Tx(TransactionV1Envelope {
-            tx,
-            signatures: VecM::default(),
-        })
-        .to_xdr_base64(Limits::none())
-        .expect("XDR encode")
-    };
-
-    // Use a syntactically valid 48-byte nonce (all zeros — will fail HMAC, not cross-check).
-    let zero_nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 48]);
-
-    let args = StellarPayCommitArgs {
-        chain_id: "stellar:testnet".to_owned(),
-        source: SOURCE_G.to_owned(),
-        destination: DEST_G.to_owned(),
-        amount: Some(serde_json::from_str(r#""2000 XLM""#).expect("parse amount")),
-        amount_in_stroops: None,
-        asset: "native".to_owned(),
-        memo_text: None,
-        memo_id: None,
-        memo_hash_hex: None,
-        memo_return_hex: None,
-        nonce: zero_nonce,
-        expires_at_unix_ms: 3_000_000_000_000,
-        envelope_xdr,
-        approval_nonce: None,
-        approval_attestation: None,
-    };
-
-    let (result, built) =
-        crate::common::clients_built_by(server.call_stellar_pay_commit(args)).await;
-    // The commit's own client, and one oracle client for the one rebuild
-    // attempt a matching oracle needs.
-    assert_eq!(built, 2, "the commit client and one oracle rebuild client");
-    assert_eq!(
-        crate::common::received_methods(&primary_mock)
-            .await
-            .first()
-            .map(String::as_str),
-        Some("getNetwork"),
-        "the commit checks its endpoint before its first read"
-    );
-    // Cross-check must pass (envelopes match).  The zero-byte nonce will fail
-    // at HMAC verification → `nonce.expired`, NOT `simulation.divergence`.
-    match result {
-        Err(err) => {
-            assert!(
-                err.to_string().contains("nonce.expired")
-                    || err.to_string().contains("nonce.replayed"),
-                "cross-check passed; expected nonce gate error, got: {err}"
-            );
-            assert!(
-                !err.to_string().contains("simulation.divergence"),
-                "simulation.divergence must not appear when cross-check passes; got: {err}"
-            );
-        }
-        Ok(tool_result) => {
-            // A tool-level error with is_error=true is also acceptable (e.g. RPC
-            // submission failure after the nonce/attestation gates).
-            let json = call_result_json(&tool_result);
-            assert!(
-                !json.to_string().contains("simulation.divergence"),
-                "simulation.divergence must not appear when cross-check passes"
-            );
-        }
-    }
-    assert_eq!(
-        crate::common::received_methods(&oracle_mock).await,
-        ["getNetwork", "getLedgerEntries"]
-    );
-}
-
-/// High-value cross-check fails when the oracle RPC returns a different account
-/// state (different sequence number) → `simulation.divergence`.
-///
-/// Scenario: same 2 000 XLM payment as above.  Primary mock returns `seq_num = 100`;
-/// oracle mock returns `seq_num = 999`.  The oracle rebuild produces a different
-/// `seq_num = 1000` in the envelope → byte mismatch → `simulation.divergence`.
-#[tokio::test]
-#[serial]
-async fn pay_commit_high_value_cross_check_fails_on_mismatch() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().expect("mock keyring store init");
-    install_test_nonce_key(43);
-
-    // Primary RPC: seq 100.
-    let primary_mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(AccountOnlyResponder {
-            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
-            account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
-        })
-        .mount(&primary_mock)
-        .await;
-
-    // Oracle mock: seq 999 → different rebuild.
-    let oracle_mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(AccountOnlyResponder {
-            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
-            account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 999),
-        })
-        .mount(&oracle_mock)
-        .await;
-
-    let mut profile = testnet_profile_with_rpc(&primary_mock.uri());
-    profile.oracle_provider_url = Some(url::Url::parse(&oracle_mock.uri()).unwrap());
-    profile.cross_check_threshold_stroops = 0;
-    let server = WalletServer::new(profile).expect("WalletServer::new");
-
-    use base64::Engine;
-    let envelope_xdr = {
-        use stellar_xdr::{
-            Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
-            SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
-            TransactionV1Envelope, Uint256, VecM, WriteXdr,
-        };
-        fn g_bytes(g: &str) -> [u8; 32] {
-            stellar_strkey::ed25519::PublicKey::from_string(g)
-                .expect("valid G-strkey")
-                .0
-        }
-        let tx = Transaction {
-            source_account: MuxedAccount::Ed25519(Uint256(g_bytes(SOURCE_G))),
-            fee: 100,
-            seq_num: SequenceNumber(101),
-            cond: Preconditions::None,
-            memo: Memo::None,
-            operations: vec![Operation {
-                source_account: None,
-                body: OperationBody::Payment(PaymentOp {
-                    destination: MuxedAccount::Ed25519(Uint256(g_bytes(DEST_G))),
-                    asset: Asset::Native,
-                    amount: 20_000_000_000, // 2000 XLM
-                }),
-            }]
-            .try_into()
-            .expect("single-op vec"),
-            ext: TransactionExt::V0,
-        };
-        TransactionEnvelope::Tx(TransactionV1Envelope {
-            tx,
-            signatures: VecM::default(),
-        })
-        .to_xdr_base64(Limits::none())
-        .expect("XDR encode")
-    };
-
-    let zero_nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 48]);
-
-    let args = StellarPayCommitArgs {
-        chain_id: "stellar:testnet".to_owned(),
-        source: SOURCE_G.to_owned(),
-        destination: DEST_G.to_owned(),
-        amount: Some(serde_json::from_str(r#""2000 XLM""#).expect("parse amount")),
-        amount_in_stroops: None,
-        asset: "native".to_owned(),
-        memo_text: None,
-        memo_id: None,
-        memo_hash_hex: None,
-        memo_return_hex: None,
-        nonce: zero_nonce,
-        expires_at_unix_ms: 3_000_000_000_000,
-        envelope_xdr,
-        approval_nonce: None,
-        approval_attestation: None,
-    };
-
-    let result = server
-        .call_stellar_pay_commit(args)
-        .await
-        .expect("oracle divergence must return Ok(is_error) envelope");
-    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
-    assert_eq!(
-        code, "simulation.divergence",
-        "oracle mismatch must produce simulation.divergence, got: {code}"
-    );
-}
-
-/// High-value cross-check is skipped when `oracle_provider_url` is unset.
-///
-/// A warning is emitted and the commit proceeds to the nonce gate.
-/// The nonce gate fails first (zero-byte nonce → `nonce.expired`).
-#[tokio::test]
-#[serial]
-async fn pay_commit_high_value_cross_check_skips_when_oracle_url_unset() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().expect("mock keyring store init");
-    install_test_nonce_key(44);
-
-    // Primary RPC: seq 100.
-    let primary_mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(AccountOnlyResponder {
-            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
-            account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
-        })
-        .mount(&primary_mock)
-        .await;
-
-    let mut profile = testnet_profile_with_rpc(&primary_mock.uri());
-    // No oracle URL: cross-check skipped with tracing::warn!.
-    profile.oracle_provider_url = None;
-    profile.cross_check_threshold_stroops = 0;
-    let server = WalletServer::new(profile).expect("WalletServer::new");
-
-    use base64::Engine;
-    let envelope_xdr = {
-        use stellar_xdr::{
-            Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
-            SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
-            TransactionV1Envelope, Uint256, VecM, WriteXdr,
-        };
-        fn g_bytes(g: &str) -> [u8; 32] {
-            stellar_strkey::ed25519::PublicKey::from_string(g)
-                .expect("valid G-strkey")
-                .0
-        }
-        let tx = Transaction {
-            source_account: MuxedAccount::Ed25519(Uint256(g_bytes(SOURCE_G))),
-            fee: 100,
-            seq_num: SequenceNumber(101),
-            cond: Preconditions::None,
-            memo: Memo::None,
-            operations: vec![Operation {
-                source_account: None,
-                body: OperationBody::Payment(PaymentOp {
-                    destination: MuxedAccount::Ed25519(Uint256(g_bytes(DEST_G))),
-                    asset: Asset::Native,
-                    amount: 20_000_000_000, // 2000 XLM
-                }),
-            }]
-            .try_into()
-            .expect("single-op vec"),
-            ext: TransactionExt::V0,
-        };
-        TransactionEnvelope::Tx(TransactionV1Envelope {
-            tx,
-            signatures: VecM::default(),
-        })
-        .to_xdr_base64(Limits::none())
-        .expect("XDR encode")
-    };
-
-    let zero_nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 48]);
-
-    let args = StellarPayCommitArgs {
-        chain_id: "stellar:testnet".to_owned(),
-        source: SOURCE_G.to_owned(),
-        destination: DEST_G.to_owned(),
-        amount: Some(serde_json::from_str(r#""2000 XLM""#).expect("parse amount")),
-        amount_in_stroops: None,
-        asset: "native".to_owned(),
-        memo_text: None,
-        memo_id: None,
-        memo_hash_hex: None,
-        memo_return_hex: None,
-        nonce: zero_nonce,
-        expires_at_unix_ms: 3_000_000_000_000,
-        envelope_xdr,
-        approval_nonce: None,
-        approval_attestation: None,
-    };
-
-    // Cross-check is skipped (oracle_provider_url is unset).
-    // The nonce gate runs instead and fails (zero-byte HMAC).
-    let logs = CaptureWriter::new();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(logs.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    let result = server
-        .call_stellar_pay_commit(args)
-        .with_subscriber(subscriber)
-        .await;
-    match result {
-        Err(err) => {
-            assert!(
-                err.to_string().contains("nonce.expired")
-                    || err.to_string().contains("nonce.replayed"),
-                "cross-check skipped; expected nonce gate error, got: {err}"
-            );
-            assert!(
-                !err.to_string().contains("simulation.divergence"),
-                "simulation.divergence must not appear when cross-check is skipped; got: {err}"
-            );
-        }
-        Ok(tool_result) => {
-            let json = call_result_json(&tool_result);
-            assert!(
-                !json.to_string().contains("simulation.divergence"),
-                "simulation.divergence must not appear when cross-check is skipped"
-            );
-        }
-    }
-    let captured = logs.captured_str();
-    assert!(
-        captured.contains("high-value transaction without independent-RPC cross-check"),
-        "expected high-value cross-check skip warning, got: {captured}"
-    );
-}
-
-/// Below-threshold payments never trigger the cross-check, even when an oracle
-/// URL is configured.
-///
-/// Scenario: 999 XLM = 9 990 000 000 stroops.  The effective threshold is
-/// `MINIMUM_FLOOR = 10_000_000_000` stroops (1 000 XLM).  Since
-/// 9_990_000_000 < 10_000_000_000, the cross-check is skipped unconditionally —
-/// the oracle mock server never receives a request.
-#[tokio::test]
-#[serial]
-async fn pay_commit_below_threshold_skips_cross_check_unconditionally() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().expect("mock keyring store init");
-    install_test_nonce_key(45);
-
-    let primary_mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(AccountOnlyResponder {
-            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
-            account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
-        })
-        .mount(&primary_mock)
-        .await;
-
-    // Oracle mock: NOT mounted — if the handler queries it, the test panics
-    // because the response is invalid JSON (wiremock returns 404 by default for
-    // unregistered routes, which the RPC client treats as an error).
-    let oracle_mock = MockServer::start().await;
-    // No Mock registered → 404 for any request.
-
-    let mut profile = testnet_profile_with_rpc(&primary_mock.uri());
-    profile.oracle_provider_url = Some(url::Url::parse(&oracle_mock.uri()).unwrap());
-    // Force effective threshold to MINIMUM_FLOOR by setting
-    // cross_check_threshold_stroops = 0.
-    // 999 XLM = 9_990_000_000 stroops < 10_000_000_000 → below threshold.
-    profile.cross_check_threshold_stroops = 0;
-    let server = WalletServer::new(profile).expect("WalletServer::new");
-
-    use base64::Engine;
-    // 999 XLM = 9_990_000_000 stroops.
-    let envelope_xdr = {
-        use stellar_xdr::{
-            Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
-            SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
-            TransactionV1Envelope, Uint256, VecM, WriteXdr,
-        };
-        fn g_bytes(g: &str) -> [u8; 32] {
-            stellar_strkey::ed25519::PublicKey::from_string(g)
-                .expect("valid G-strkey")
-                .0
-        }
-        let tx = Transaction {
-            source_account: MuxedAccount::Ed25519(Uint256(g_bytes(SOURCE_G))),
-            fee: 100,
-            seq_num: SequenceNumber(101),
-            cond: Preconditions::None,
-            memo: Memo::None,
-            operations: vec![Operation {
-                source_account: None,
-                body: OperationBody::Payment(PaymentOp {
-                    destination: MuxedAccount::Ed25519(Uint256(g_bytes(DEST_G))),
-                    asset: Asset::Native,
-                    amount: 9_990_000_000, // 999 XLM
-                }),
-            }]
-            .try_into()
-            .expect("single-op vec"),
-            ext: TransactionExt::V0,
-        };
-        TransactionEnvelope::Tx(TransactionV1Envelope {
-            tx,
-            signatures: VecM::default(),
-        })
-        .to_xdr_base64(Limits::none())
-        .expect("XDR encode")
-    };
-
-    let zero_nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 48]);
-
-    let args = StellarPayCommitArgs {
-        chain_id: "stellar:testnet".to_owned(),
-        source: SOURCE_G.to_owned(),
-        destination: DEST_G.to_owned(),
-        // 999 XLM — below the 1000 XLM MINIMUM_FLOOR.
-        amount: Some(serde_json::from_str(r#""999 XLM""#).expect("parse amount")),
-        amount_in_stroops: None,
-        asset: "native".to_owned(),
-        memo_text: None,
-        memo_id: None,
-        memo_hash_hex: None,
-        memo_return_hex: None,
-        nonce: zero_nonce,
-        expires_at_unix_ms: 3_000_000_000_000,
-        envelope_xdr,
-        approval_nonce: None,
-        approval_attestation: None,
-    };
-
-    // Cross-check must be skipped (value below threshold).
-    // The nonce gate runs → fails with nonce.expired (zero-byte HMAC).
-    // Crucially, NO request should reach the oracle mock server.
-    let result = server.call_stellar_pay_commit(args).await;
-    match result {
-        Err(err) => {
-            assert!(
-                err.to_string().contains("nonce.expired")
-                    || err.to_string().contains("nonce.replayed"),
-                "below-threshold: expected nonce gate error, got: {err}"
-            );
-            assert!(
-                !err.to_string().contains("simulation.divergence"),
-                "simulation.divergence must not appear below threshold; got: {err}"
-            );
-        }
-        Ok(tool_result) => {
-            let json = call_result_json(&tool_result);
-            assert!(
-                !json.to_string().contains("simulation.divergence"),
-                "simulation.divergence must not appear below threshold"
-            );
-        }
-    }
-    // Verify the oracle mock received zero requests.
-    let oracle_requests = oracle_mock.received_requests().await.unwrap_or_default();
-    assert_eq!(
-        oracle_requests.len(),
-        0,
-        "oracle mock must receive 0 requests for below-threshold payment; received: {}",
-        oracle_requests.len()
-    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4770,10 +4262,10 @@ fn simulated_commit_args(
         amount: args.amount.clone(),
         amount_in_stroops: args.amount_in_stroops.clone(),
         asset: args.asset.clone(),
-        memo_text: None,
-        memo_id: None,
-        memo_hash_hex: None,
-        memo_return_hex: None,
+        memo_text: args.memo_text.clone(),
+        memo_id: args.memo_id,
+        memo_hash_hex: args.memo_hash_hex.clone(),
+        memo_return_hex: args.memo_return_hex.clone(),
         nonce: data["nonce"].as_str().expect("nonce").to_owned(),
         expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().expect("expires"),
         envelope_xdr: data["envelope_xdr"].as_str().expect("envelope").to_owned(),
@@ -4787,8 +4279,8 @@ fn simulated_commit_args(
 /// check and the submit layer's, three in all.
 ///
 /// The profile's `Noop` engine keeps no window state, so the gate builds no
-/// reconcile client, and no oracle is configured, so neither the SEP-29
-/// secondary nor the oracle rebuild client is built.
+/// reconcile client, and no oracle is configured, so neither call builds an
+/// oracle client.
 #[tokio::test]
 #[serial]
 async fn simulate_and_commit_each_check_the_endpoint_first_on_one_client() {
@@ -5238,562 +4730,448 @@ async fn commit_endpoint_refusal_precedes_the_audit_preflight() {
     .await;
 }
 
-fn sep29_memo_entry(body: &serde_json::Value) -> Option<ResponseTemplate> {
-    use stellar_xdr::{
-        DataEntry, DataEntryExt, DataValue, LedgerEntryData, LedgerKey, Limits, ReadXdr, WriteXdr,
-    };
-    if body["method"] != "getLedgerEntries" {
-        return None;
-    }
-    let key_b64 = body["params"]["keys"][0].as_str().unwrap();
-    let LedgerKey::Data(key) = LedgerKey::from_xdr_base64(key_b64, Limits::none()).unwrap() else {
-        return None;
-    };
-    let xdr = LedgerEntryData::Data(DataEntry {
-        account_id: key.account_id,
-        data_name: key.data_name,
-        data_value: DataValue(vec![b'1'].try_into().unwrap()),
+fn witness_memo_entry() -> (String, String) {
+    use stellar_xdr::*;
+    let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        stellar_strkey::ed25519::PublicKey::from_string(DEST_G)
+            .unwrap()
+            .0,
+    )));
+    let name: String64 = b"config.memo_required".to_vec().try_into().unwrap();
+    let key = LedgerKey::Data(LedgerKeyData {
+        account_id: account_id.clone(),
+        data_name: name.clone(),
+    });
+    let data = LedgerEntryData::Data(DataEntry {
+        account_id,
+        data_name: name,
+        data_value: b"1".to_vec().try_into().unwrap(),
         ext: DataEntryExt::V0,
-    })
-    .to_xdr_base64(Limits::none())
+    });
+    (
+        key.to_xdr_base64(Limits::none()).unwrap(),
+        data.to_xdr_base64(Limits::none()).unwrap(),
+    )
+}
+
+fn witness_trustline_entry(source: &str) -> (String, String) {
+    use stellar_xdr::*;
+    let id = |g: &str| {
+        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+            stellar_strkey::ed25519::PublicKey::from_string(g)
+                .unwrap()
+                .0,
+        )))
+    };
+    let asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+        asset_code: AssetCode4(*b"USD\0"),
+        issuer: id(DEST_G),
+    });
+    let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: id(source),
+        asset: asset.clone(),
+    });
+    let data = LedgerEntryData::Trustline(TrustLineEntry {
+        account_id: id(source),
+        asset,
+        balance: 100_000_000_000_000,
+        limit: i64::MAX,
+        flags: 1,
+        ext: TrustLineEntryExt::V0,
+    });
+    (
+        key.to_xdr_base64(Limits::none()).unwrap(),
+        data.to_xdr_base64(Limits::none()).unwrap(),
+    )
+}
+
+async fn witness_payment_case(
+    amount: &str,
+    memo: bool,
+    credit: bool,
+    threshold: bool,
+    mode: &str,
+    expected: &str,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _data_root = crate::common::isolated_data_root();
+    // The profile's own signer account gives it an audit log no other test
+    // writes, so the row counts below are the rows this commit appended.
+    let account = crate::common::own_signer_account("witness-pay");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let count = reads.clone();
+    keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+        "svc",
+        &account,
+        Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }),
+    )])
     .unwrap();
-    Some(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": body["id"],
-        "result": {
-            "entries": [{"key": key_b64, "xdr": xdr, "lastModifiedLedgerSeq": 1000}],
-            "latestLedger": 1001,
-        },
-    })))
-}
-
-fn sep29_response(
-    request: &Request,
-    body: &serde_json::Value,
-    identity: &serde_json::Value,
-    memo_required: bool,
-) -> ResponseTemplate {
-    if body["method"] == "getNetwork" {
-        return ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "jsonrpc": "2.0", "id": body["id"], "result": identity,
-        }));
+    install_test_nonce_key(244);
+    let seed = [0x74; 32];
+    let source = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", &account)
+        .unwrap()
+        .set_password(&sstrkey_for_seed(seed))
+        .unwrap();
+    let mut entries = vec![(
+        account_ledger_key_xdr(&source),
+        account_entry_xdr_with_balance(&source, 100_000_000_000_000),
+    )];
+    if credit {
+        entries.push(witness_trustline_entry(&source));
     }
-    if memo_required && let Some(response) = sep29_memo_entry(body) {
-        return response;
-    }
-    AccountOnlyResponder {
-        account_key_xdr: account_ledger_key_xdr(SOURCE_G),
-        account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
-    }
-    .respond(request)
-}
-
-async fn sep29_endpoint(
-    identity: serde_json::Value,
-    identity_delay: std::time::Duration,
-    read_delay: std::time::Duration,
-    memo_required: bool,
-) -> MockServer {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(move |request: &Request| {
-            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-            let delay = if body["method"] == "getNetwork" {
-                identity_delay
-            } else {
-                read_delay
-            };
-            sep29_response(request, &body, &identity, memo_required).set_delay(delay)
-        })
-        .mount(&server)
-        .await;
-    server
-}
-
-async fn sep29_primary() -> MockServer {
-    sep29_endpoint(
-        crate::common::EndpointNetwork::testnet().result(),
-        std::time::Duration::ZERO,
-        std::time::Duration::ZERO,
-        false,
-    )
-    .await
-}
-
-fn sep29_server(primary: &MockServer, oracle: Option<&str>) -> WalletServer {
-    let mut profile = testnet_profile_with_rpc(&primary.uri());
-    profile.submit_timeout_seconds = Some(1);
-    profile.oracle_provider_url = oracle.map(|url| url::Url::parse(url).unwrap());
-    WalletServer::new(profile).unwrap()
-}
-
-#[tokio::test]
-#[serial]
-async fn simulate_sep29_oracle_identity_precedes_second_read() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().unwrap();
-    install_test_nonce_key(240);
-    let primary = sep29_primary().await;
-    let oracle = sep29_primary().await;
-    let server = sep29_server(
-        &primary,
-        Some(&oracle.uri().replace("127.0.0.1", "localhost")),
-    );
-    let (result, built) = crate::common::clients_built_by(
-        server.call_stellar_pay(simulate_args_on("stellar:testnet", None)),
-    )
-    .await;
-    let result = result.unwrap();
-    assert_ne!(
-        result.is_error,
-        Some(true),
-        "{:?}",
-        call_result_json(&result)
-    );
-    assert_eq!(
-        crate::common::received_methods(&oracle).await,
-        ["getNetwork", "getLedgerEntries"]
-    );
-    assert_eq!(built, 2, "identity and reads share each role's client");
-}
-
-#[tokio::test]
-#[serial]
-async fn simulate_sep29_oracle_identity_refusals_are_divergence() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().unwrap();
-    let primary = sep29_primary().await;
-    for (identity, delay) in [
-        (
-            crate::common::EndpointNetwork::reporting("Alien network").result(),
-            std::time::Duration::ZERO,
-        ),
-        (
-            crate::common::EndpointNetwork::reporting(
-                stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
-            )
-            .result(),
-            std::time::Duration::ZERO,
-        ),
-        (
-            serde_json::json!({"passphrase": 42}),
-            std::time::Duration::ZERO,
-        ),
-        (
-            crate::common::EndpointNetwork::testnet().result(),
-            std::time::Duration::from_millis(1500),
-        ),
-    ] {
-        let oracle = sep29_endpoint(identity, delay, std::time::Duration::ZERO, false).await;
-        let server = sep29_server(&primary, Some(&oracle.uri()));
-        let result = server
-            .call_stellar_pay(simulate_args_on("stellar:testnet", None))
-            .await
-            .unwrap();
-        let (code, message, text) = crate::common::assert_business_envelope(&result);
-        assert_eq!(code, "network.rpc_divergence");
-        assert!(
-            message.contains("SEP-29 oracle_provider_url endpoint identity failed"),
-            "{message}"
-        );
-        assert!(!text.contains("\"nonce\""));
-        assert_eq!(
-            crate::common::received_methods(&oracle).await,
-            ["getNetwork"]
-        );
-    }
-    let server = sep29_server(&primary, Some("http://127.0.0.1:1"));
-    let result = server
-        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
-        .await
-        .unwrap();
-    assert_eq!(
-        crate::common::assert_business_envelope(&result).0,
-        "network.rpc_divergence"
-    );
-}
-
-/// The SEP-29 oracle client carries the credential of the oracle record on
-/// both of its requests; the primary endpoint gets none of it.
-#[tokio::test]
-#[serial]
-async fn simulate_sep29_oracle_sends_the_oracle_credential() {
-    use stellar_agent_core::profile::schema::ProviderRole;
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().unwrap();
-    install_test_nonce_key(241);
-    let primary = sep29_primary().await;
-    let oracle = sep29_primary().await;
-    crate::common::require_rpc_credential(&oracle).await;
-    let mut profile = testnet_profile_with_rpc(&primary.uri());
-    profile.submit_timeout_seconds = Some(1);
-    profile.oracle_provider_url = Some(url::Url::parse(&oracle.uri()).unwrap());
-    crate::common::bind_rpc_credential(&mut profile, ProviderRole::Oracle, true);
-    let server = WalletServer::new(profile).unwrap();
-    let result = server
-        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
-        .await
-        .unwrap();
-    assert_ne!(
-        result.is_error,
-        Some(true),
-        "{:?}",
-        call_result_json(&result)
-    );
-    assert_eq!(
-        crate::common::credential_trace(&oracle).await,
-        [
-            ("getNetwork".to_owned(), true),
-            ("getLedgerEntries".to_owned(), true)
-        ]
-    );
-    assert!(
-        crate::common::credential_trace(&primary)
-            .await
-            .iter()
-            .all(|(_, keyed)| !keyed)
-    );
-}
-
-/// A missing oracle credential reports the keyring code, not a divergence,
-/// and the oracle endpoint is never contacted.
-#[tokio::test]
-#[serial]
-async fn simulate_sep29_missing_oracle_credential_reports_keyring_not_found() {
-    use stellar_agent_core::profile::schema::ProviderRole;
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().unwrap();
-    install_test_nonce_key(242);
-    let primary = sep29_primary().await;
-    let oracle = sep29_primary().await;
-    let mut profile = testnet_profile_with_rpc(&primary.uri());
-    profile.oracle_provider_url = Some(url::Url::parse(&oracle.uri()).unwrap());
-    crate::common::bind_rpc_credential(&mut profile, ProviderRole::Oracle, false);
-    let server = WalletServer::new(profile).unwrap();
-    let result = server
-        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
-        .await
-        .unwrap();
-    let (code, message, _text) = crate::common::assert_business_envelope(&result);
-    assert_eq!(code, "auth.keyring_not_found");
-    assert!(
-        message.contains("stellar-agent-rpc-mcp-test/oracle"),
-        "{message}"
-    );
-    assert!(crate::common::received_methods(&oracle).await.is_empty());
-}
-
-/// An oracle that answers its identity request with HTTP 401 keeps the
-/// divergence code, and the detail names the status and the oracle's
-/// authority.
-#[tokio::test]
-#[serial]
-async fn simulate_sep29_oracle_401_names_the_status_and_authority() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().unwrap();
-    install_test_nonce_key(243);
-    let primary = sep29_primary().await;
-    let oracle = MockServer::start().await;
-    crate::common::require_rpc_credential(&oracle).await;
-    let server = sep29_server(&primary, Some(&format!("{}/PATH-SENTINEL", oracle.uri())));
-    let result = server
-        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
-        .await
-        .unwrap();
-    let (code, message, _text) = crate::common::assert_business_envelope(&result);
-    assert_eq!(code, "network.rpc_divergence");
-    assert!(message.contains("HTTP 401"), "{message}");
-    let authority = oracle.uri().replace("http://", "");
-    assert!(
-        message.contains(&format!("RPC endpoint '{authority}' answered")),
-        "{message}"
-    );
-    assert!(!message.contains("PATH-SENTINEL"), "{message}");
-    assert_eq!(
-        crate::common::received_methods(&oracle).await,
-        ["getNetwork"]
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn simulate_sep29_oracle_construction_failure_is_divergence() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().unwrap();
-    let primary = sep29_primary().await;
-    let server = sep29_server(&primary, Some("mailto:operator@example.com"));
-    let result = server
-        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
-        .await
-        .unwrap();
-    let (code, message, text) = crate::common::assert_business_envelope(&result);
-    assert_eq!(code, "network.rpc_divergence");
-    assert!(
-        message.contains("SEP-29 oracle_provider_url client construction failed"),
-        "{message}"
-    );
-    assert!(!text.contains("\"nonce\""));
-}
-
-#[tokio::test]
-#[serial]
-async fn simulate_sep29_oracle_uses_remaining_pay_deadline() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().unwrap();
-    let delay = std::time::Duration::from_millis(600);
-    let primary = sep29_endpoint(
-        crate::common::EndpointNetwork::testnet().result(),
-        delay,
-        delay,
-        false,
-    )
-    .await;
-    let oracle = sep29_primary().await;
-    let server = sep29_server(&primary, Some(&oracle.uri()));
-    let result = server
-        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
-        .await
-        .unwrap();
-    let (code, message, _) = crate::common::assert_business_envelope(&result);
-    assert_eq!(code, "network.rpc_divergence");
-    assert!(
-        message.contains(
-            "SEP-29 oracle_provider_url endpoint identity failed: action deadline exhausted"
-        ),
-        "{message}"
-    );
-    assert_eq!(
-        crate::common::received_methods(&primary).await,
-        ["getNetwork", "getLedgerEntries", "getLedgerEntries"]
-    );
-    assert!(crate::common::received_methods(&oracle).await.is_empty());
-}
-
-#[tokio::test]
-#[serial]
-async fn simulate_sep29_oracle_identity_uses_partial_pay_budget() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().unwrap();
-    install_test_nonce_key(242);
     let primary = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(|request: &Request| {
-            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-            // The source read and identity consume 600 ms; the destination read is immediate.
-            let delay = if body["method"] == "getNetwork"
-                || body["params"]["keys"][0] == account_ledger_key_xdr(SOURCE_G)
-            {
-                std::time::Duration::from_millis(300)
-            } else {
-                std::time::Duration::ZERO
-            };
-            sep29_response(
-                request,
-                &body,
-                &crate::common::EndpointNetwork::testnet().result(),
-                false,
-            )
-            .set_delay(delay)
-        })
+        .respond_with(crate::common::TimeoutRpc::new(entries.clone()).confirming_in(1005))
         .mount(&primary)
         .await;
-    let oracle = sep29_endpoint(
-        crate::common::EndpointNetwork::testnet().result(),
-        std::time::Duration::from_millis(600),
-        std::time::Duration::ZERO,
-        false,
-    )
-    .await;
-    let server = sep29_server(&primary, Some(&oracle.uri()));
-    let started = std::time::Instant::now();
-    let result = server
-        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
-        .await
-        .unwrap();
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
-    let (code, message, _) = crate::common::assert_business_envelope(&result);
-    assert_eq!(code, "network.rpc_divergence");
-    assert!(!message.contains("action deadline exhausted"));
-    assert!(
-        message.starts_with("SEP-29 oracle_provider_url endpoint identity failed"),
-        "{message}"
-    );
-    assert_eq!(
-        crate::common::received_methods(&primary).await,
-        ["getNetwork", "getLedgerEntries", "getLedgerEntries"]
-    );
-    assert_eq!(
-        crate::common::received_methods(&oracle).await,
-        ["getNetwork"]
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn simulate_sep29_skips_oracle_with_memo_or_without_url() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().unwrap();
-    install_test_nonce_key(241);
-    let primary = sep29_primary().await;
-    let oracle = sep29_endpoint(
-        crate::common::EndpointNetwork::reporting("Alien").result(),
-        std::time::Duration::ZERO,
-        std::time::Duration::ZERO,
-        false,
-    )
-    .await;
-    for url in [
-        oracle.uri(),
-        "http://127.0.0.1:1".into(),
-        "mailto:operator@example.com".into(),
-    ] {
-        let server = sep29_server(&primary, Some(&url));
-        let mut args = simulate_args_on("stellar:testnet", None);
-        args.memo_text = Some("memo".try_into().unwrap());
-        let (result, built) = crate::common::clients_built_by(server.call_stellar_pay(args)).await;
-        let result = result.unwrap();
-        assert_ne!(
-            result.is_error,
-            Some(true),
-            "{:?}",
-            call_result_json(&result)
-        );
-        assert_eq!(built, 1);
+    let oracle = MockServer::start().await;
+    if mode == "source" {
+        entries[0].1 = account_entry_xdr_with_seq(&source, 100_000_000_000_000, 0, 999);
     }
-    assert!(crate::common::received_methods(&oracle).await.is_empty());
-    let primary = sep29_endpoint(
-        crate::common::EndpointNetwork::testnet().result(),
-        std::time::Duration::ZERO,
-        std::time::Duration::ZERO,
-        true,
-    )
-    .await;
-    let result = sep29_server(&primary, None)
-        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
-        .await
-        .unwrap();
-    assert_eq!(
-        crate::common::assert_business_envelope(&result).0,
-        "validation.memo_required"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn simulate_sep29_oracle_identity_errors_do_not_echo_secrets() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().unwrap();
-    let primary = sep29_primary().await;
-    for passphrase in [
-        "PRIVATE_PASSPHRASE_SENTINEL",
-        concat!(
-            "https://USER_SENTINEL:PASS_SENTINEL@oracle.example/",
-            "PATH_SENTINEL?QUERY_SENTINEL#FRAGMENT_SENTINEL",
-        ),
-    ] {
-        let oracle = sep29_endpoint(
-            crate::common::EndpointNetwork::reporting(passphrase).result(),
-            std::time::Duration::ZERO,
-            std::time::Duration::ZERO,
-            false,
-        )
+    if mode == "memo" {
+        entries.push(witness_memo_entry());
+    }
+    let identity = if mode == "identity" {
+        crate::common::EndpointNetwork::reporting("hostile-identity-marker")
+    } else {
+        crate::common::EndpointNetwork::testnet()
+    };
+    Mock::given(method("POST"))
+        .respond_with(crate::common::TimeoutRpc::new(entries).with_network(identity))
+        .mount(&oracle)
         .await;
-        let server = sep29_server(&primary, Some(&oracle.uri()));
-        let capture = CaptureWriter::new();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
-            .finish();
-        let result = server
-            .call_stellar_pay(simulate_args_on("stellar:testnet", None))
-            .with_subscriber(subscriber)
-            .await
-            .unwrap();
-        let (code, _, text) = crate::common::assert_business_envelope(&result);
-        assert_eq!(code, "network.rpc_divergence");
-        assert!(!text.contains("SENTINEL"), "{text}");
-        assert!(!capture.captured_str().contains("SENTINEL"));
-        assert_eq!(
-            crate::common::received_methods(&oracle).await,
-            ["getNetwork"]
-        );
+    if mode == "401" {
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "method": "getLedgerEntries"})))
+            .respond_with(ResponseTemplate::new(401))
+            .with_priority(1)
+            .mount(&oracle)
+            .await;
     }
-}
-
-#[tokio::test]
-#[serial]
-async fn simulate_sep29_still_detects_memo_disagreement() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().unwrap();
-    let primary = sep29_primary().await;
-    let oracle = sep29_endpoint(
-        crate::common::EndpointNetwork::testnet().result(),
-        std::time::Duration::ZERO,
-        std::time::Duration::ZERO,
-        true,
-    )
-    .await;
-    let server = sep29_server(
-        &primary,
-        Some(&oracle.uri().replace("127.0.0.1", "localhost")),
-    );
-    let result = server
-        .call_stellar_pay(simulate_args_on("stellar:testnet", None))
-        .await
-        .unwrap();
-    let (code, message, _) = crate::common::assert_business_envelope(&result);
-    assert_eq!(code, "network.rpc_divergence");
-    assert!(message.contains("SEP-29 config.memo_required"));
-    assert_eq!(
-        crate::common::received_methods(&oracle).await,
-        ["getNetwork", "getLedgerEntries"]
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn pay_commit_oracle_identity_refusal_blocks_rebuild() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().unwrap();
-    install_test_nonce_key(242);
-    let seed = [0x72; 32];
-    let primary = round_trip_endpoint(seed, crate::common::EndpointNetwork::testnet()).await;
-    let identity = crate::common::EndpointNetwork::testnet();
-    let oracle = round_trip_endpoint(seed, identity.clone()).await;
-    let server = sep29_server(
-        &primary,
-        Some(&oracle.uri().replace("127.0.0.1", "localhost")),
-    );
-    let args = pay_args(&gstrkey_for_seed(seed), "20000000000");
+    let mut profile = crate::common::testnet_profile_for_account(&primary.uri(), &account);
+    profile.oracle_provider_url = if mode == "none" {
+        None
+    } else if mode == "construction" {
+        Some(url::Url::parse("ftp://oracle.example").unwrap())
+    } else {
+        Some(url::Url::parse(&oracle.uri()).unwrap())
+    };
+    let asset = format!("USD:{DEST_G}");
+    if threshold {
+        profile.cross_check_thresholds =
+            stellar_agent_core::cross_check::CrossCheckThresholds::new(
+                [(
+                    stellar_agent_core::asset_id::CanonicalAsset::parse_threshold_key(&asset)
+                        .unwrap(),
+                    amount.parse().unwrap(),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+    }
+    let server = WalletServer::new(profile.clone()).unwrap();
+    let mut args = pay_args(&source, amount);
+    if memo {
+        args.memo_text = Some(serde_json::from_value(serde_json::json!("invoice")).unwrap());
+    }
+    if credit {
+        args.asset = asset;
+    }
     let simulated = server.call_stellar_pay(args.clone()).await.unwrap();
+    assert!(crate::common::received_methods(&oracle).await.is_empty());
     let commit = simulated_commit_args(&simulated, &args);
-    let before = crate::common::received_methods(&oracle).await.len();
-    identity.set("PRIVATE_PASSPHRASE_SENTINEL");
-    let result = server
-        .call_stellar_pay_commit(commit.clone())
-        .await
-        .unwrap();
-    let (code, message, _) = crate::common::assert_business_envelope(&result);
-    assert_eq!(code, "simulation.divergence");
-    assert!(message.contains("oracle_provider_url endpoint identity failed"));
-    assert!(!message.contains("PRIVATE_PASSPHRASE_SENTINEL"));
-    assert_eq!(
-        &crate::common::received_methods(&oracle).await[before..],
-        ["getNetwork"]
-    );
+    if mode == "primary_memo" {
+        let memo_entry = witness_memo_entry();
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "method": "getLedgerEntries", "params": {"keys": [memo_entry.0.clone()]}})))
+            .respond_with(crate::common::TimeoutRpc::new(vec![memo_entry]))
+            .with_priority(1)
+            .mount(&primary)
+            .await;
+    }
+    let before = reads.load(Ordering::SeqCst);
+    let result = server.call_stellar_pay_commit(commit).await.unwrap();
+    let body = call_result_json(&result);
+    if expected.contains('.') {
+        let (code, text, _) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, expected, "{body}");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            before,
+            "refusal must precede signer access"
+        );
+        assert!(
+            !crate::common::received_methods(&primary)
+                .await
+                .iter()
+                .any(|m| m == "sendTransaction")
+        );
+        assert!(!text.contains("hostile-identity-marker"));
+        return;
+    }
+    assert_ne!(result.is_error, Some(true), "{body}");
+    assert_eq!(body["data"]["cross_check"]["status"], expected);
+    assert!(body["data"]["tx_hash"].is_string());
     assert!(
-        !crate::common::received_methods(&primary)
+        crate::common::received_methods(&primary)
             .await
             .iter()
-            .any(|method| method == "sendTransaction")
+            .any(|m| m == "sendTransaction")
     );
-    identity.set(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE);
-    let result = server.call_stellar_pay_commit(commit).await.unwrap();
+    let rows = audit_rows(&profile);
+    for kind in ["value_action_pending", "value_action_submitted"] {
+        let rows = rows_of_kind(&rows, kind);
+        assert_eq!(rows.len(), 1, "{kind}: {rows:?}");
+        if expected == "passed" {
+            assert_eq!(rows[0]["witness"]["provider"], oracle.uri());
+            assert_eq!(rows[0]["witness"]["ledger"], 1001);
+            assert_eq!(
+                rows[0]["witness"]["inputs_digest"].as_str().unwrap().len(),
+                64
+            );
+            assert_eq!(rows[0]["witness"]["kinds"][0], "source_account");
+        } else {
+            assert!(rows[0].get("witness").is_none());
+        }
+    }
+    if expected == "passed" {
+        assert_eq!(body["data"]["cross_check"]["provider"], oracle.uri());
+        assert_eq!(body["data"]["cross_check"]["ledger"], 1001);
+        assert_eq!(
+            crate::common::received_methods(&oracle).await,
+            ["getNetwork", "getLedgerEntries"]
+        );
+        assert_eq!(
+            rows_of_kind(&rows, "value_action_pending")[0]["witness"],
+            rows_of_kind(&rows, "value_action_submitted")[0]["witness"]
+        );
+    } else {
+        assert!(crate::common::received_methods(&oracle).await.is_empty());
+        assert_eq!(
+            body["data"]["cross_check"]["reason"],
+            if expected == "not_required" {
+                "below_threshold"
+            } else if credit {
+                "no_threshold_for_asset"
+            } else {
+                "oracle_not_configured"
+            }
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_rows_carry_witness() {
+    witness_payment_case("20000000000", false, false, false, "match", "passed").await;
+}
+
+/// A memo-less prepare reads the destination's SEP-29 flag on the primary and
+/// sends nothing to the oracle, also after a commit has used the oracle.
+#[tokio::test]
+#[serial]
+async fn pay_prepare_makes_no_oracle_request() {
+    let _data_root = crate::common::isolated_data_root();
+    let account = crate::common::own_signer_account("witness-prepare");
+    keyring_mock::install().unwrap();
+    install_test_nonce_key(246);
+    let seed = [0x76; 32];
+    let source = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", &account)
+        .unwrap()
+        .set_password(&sstrkey_for_seed(seed))
+        .unwrap();
+    let entries = vec![(
+        account_ledger_key_xdr(&source),
+        account_entry_xdr_with_balance(&source, 100_000_000_000_000),
+    )];
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(crate::common::TimeoutRpc::new(entries.clone()).confirming_in(1005))
+        .mount(&primary)
+        .await;
+    let oracle = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(crate::common::TimeoutRpc::new(entries))
+        .mount(&oracle)
+        .await;
+    let mut profile = crate::common::testnet_profile_for_account(&primary.uri(), &account);
+    profile.oracle_provider_url = Some(url::Url::parse(&oracle.uri()).unwrap());
+    let server = WalletServer::new(profile).unwrap();
+    let args = pay_args(&source, "10000000");
+    let memo_key = witness_memo_entry().0;
+    let reads_memo_key = |request: &wiremock::Request| {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        body["method"] == "getLedgerEntries"
+            && body["params"]["keys"]
+                .as_array()
+                .is_some_and(|keys| keys.iter().any(|key| key == memo_key.as_str()))
+    };
+
+    let simulated = server.call_stellar_pay(args.clone()).await.unwrap();
     assert_ne!(
-        result.is_error,
+        simulated.is_error,
         Some(true),
-        "{:?}",
-        call_result_json(&result)
+        "{}",
+        call_result_json(&simulated)
     );
+    let committed = server
+        .call_stellar_pay_commit(simulated_commit_args(&simulated, &args))
+        .await
+        .unwrap();
+    let committed = call_result_json(&committed);
+    assert_eq!(
+        committed["data"]["cross_check"]["status"], "passed",
+        "{committed}"
+    );
+    let oracle_before = oracle.received_requests().await.unwrap().len();
+    assert_eq!(oracle_before, 2, "the commit read the oracle");
+    let primary_before = primary.received_requests().await.unwrap().len();
+
+    let simulated = server.call_stellar_pay(args).await.unwrap();
+    assert_ne!(
+        simulated.is_error,
+        Some(true),
+        "{}",
+        call_result_json(&simulated)
+    );
+
+    assert_eq!(
+        oracle.received_requests().await.unwrap().len(),
+        oracle_before,
+        "the prepare sent no request to the oracle"
+    );
+    let primary_requests = primary.received_requests().await.unwrap();
+    assert!(
+        primary_requests[primary_before..]
+            .iter()
+            .any(reads_memo_key),
+        "the prepare read the SEP-29 flag on the primary"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_memoless_below_threshold_with_oracle_passes() {
+    witness_payment_case("10000000", false, false, false, "match", "passed").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_with_memo_below_threshold_is_not_required() {
+    witness_payment_case("9990000000", true, false, false, "match", "not_required").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_memoless_credit_without_threshold_passes_on_testnet() {
+    witness_payment_case("10000000", false, true, false, "match", "passed").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_with_memo_credit_without_threshold_skips_on_testnet() {
+    witness_payment_case("10000000", true, true, false, "match", "skipped").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_credit_at_threshold_requires_witness() {
+    witness_payment_case("10000000", true, true, true, "match", "passed").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_without_oracle_skips_on_testnet() {
+    witness_payment_case("20000000000", false, false, false, "none", "skipped").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_source_disagreement_refuses_simulation_divergence() {
+    witness_payment_case(
+        "20000000000",
+        false,
+        false,
+        false,
+        "source",
+        "simulation.divergence",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_memo_flag_disagreement_is_rpc_divergence() {
+    witness_payment_case(
+        "10000000",
+        false,
+        false,
+        false,
+        "memo",
+        "network.rpc_divergence",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_memo_required_refuses_at_commit() {
+    witness_payment_case(
+        "10000000",
+        false,
+        false,
+        false,
+        "primary_memo",
+        "validation.memo_required",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_oracle_identity_refusal_is_witness_unavailable() {
+    witness_payment_case(
+        "20000000000",
+        false,
+        false,
+        false,
+        "identity",
+        "network.witness_unavailable",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_oracle_construction_failure_is_witness_unavailable() {
+    witness_payment_case(
+        "20000000000",
+        false,
+        false,
+        false,
+        "construction",
+        "network.witness_unavailable",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_oracle_401_keeps_credential_code() {
+    witness_payment_case(
+        "20000000000",
+        false,
+        false,
+        false,
+        "401",
+        "network.rpc_credential_refused",
+    )
+    .await;
 }

@@ -1274,15 +1274,8 @@ async fn build_unsigned_envelope(
     let memo_present = !matches!(memo, Memo::None);
 
     // SEP-29: check memo-required BEFORE signing.
-    // CLI has no secondary/oracle RPC — pass `None`; cross-RPC consistency is
-    // the MCP simulate-path responsibility.
-    stellar_agent_network::sep29::check_memo_required(
-        client,
-        None,
-        &args.destination,
-        memo_present,
-    )
-    .await?;
+    stellar_agent_network::sep29::check_memo_required(client, &args.destination, memo_present)
+        .await?;
 
     // Build.
     let mut builder = ClassicOpBuilder::new(
