@@ -5269,6 +5269,7 @@ mod tests {
         );
         let network = TargetNetwork::Testnet;
         tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             tracing::info!(
                 command = "smart-account rules list",
                 account = tracing::field::display(&account_redacted),

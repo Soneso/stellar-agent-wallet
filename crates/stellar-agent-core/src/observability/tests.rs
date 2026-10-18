@@ -442,6 +442,7 @@ fn integration_secret_u64_field_is_redacted() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(secret = 12345u64);
     });
 
@@ -463,6 +464,7 @@ fn integration_secret_i64_field_is_redacted() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(entropy = -9999i64);
     });
 
@@ -484,6 +486,7 @@ fn integration_secret_f64_field_is_redacted() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(seed = 1.23456789f64);
     });
 
@@ -505,6 +508,7 @@ fn integration_secret_bool_field_is_redacted() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         // "key" is on the REDACT list.
         tracing::info!(key = true);
     });
@@ -527,6 +531,7 @@ fn integration_benign_u64_passes_through() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(block_count = 42u64);
     });
 
@@ -558,6 +563,7 @@ fn field_collector_drops_log_dot_fields() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         // Emit a benign field alongside a synthetic check via collector.
         // Because we can't inject log.* fields directly via tracing macros,
         // we test the collector's visit methods directly.
@@ -615,6 +621,7 @@ fn redaction_fired_target_event_is_formatted_not_dropped() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         // Emit a warn event directly using the REDACTION_FIRED_TARGET.
         // This is exactly what emit_redaction_warning() does.
         tracing::warn!(
@@ -657,6 +664,7 @@ fn integration_benign_account_passes_through() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(account = "GAAAA..ZZZZZ", operation = "sign");
     });
 
@@ -677,6 +685,7 @@ fn integration_secret_field_is_redacted() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(secret = "leak");
     });
 
@@ -699,6 +708,7 @@ fn integration_strkey_in_value_is_redacted() {
     let strkey_prefix = strkey[..6].to_owned();
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         // Field name "note" is not on any list; only the S-strkey scan fires.
         tracing::info!(note = %strkey);
     });
@@ -1004,6 +1014,7 @@ fn span_emission_includes_span_and_spans_keys() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         let span = tracing::info_span!("my_operation", tool = "stellar_pay_commit");
         let _guard = span.enter();
         tracing::info!(result = "ok");
@@ -1031,6 +1042,7 @@ fn span_keys_absent_when_no_span_context() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(result = "ok");
     });
 
@@ -1052,6 +1064,7 @@ fn nested_spans_appear_in_spans_array() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         let outer = tracing::info_span!("outer_span");
         let _og = outer.enter();
         let inner = tracing::info_span!("inner_span");
@@ -1084,6 +1097,7 @@ fn span_field_strkey_is_redacted() {
     let strkey_prefix = strkey[..6].to_owned();
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         // Embed the S-strkey in a span field.
         let span = tracing::info_span!("signing", key = %strkey);
         let _guard = span.enter();
@@ -1250,6 +1264,7 @@ fn truncated_field_emits_top_level_json_key() {
     }
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(data = ?OversizedDebug);
     });
 
@@ -1470,6 +1485,7 @@ fn write_json_str_escapes_double_quote_and_backslash() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         // Log a message field with embedded " and \.
         tracing::info!(message = "say \"hello\" and \\goodbye\\");
     });
@@ -1495,6 +1511,7 @@ fn write_json_str_escapes_newline_cr_tab() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(message = "line1\nline2\r\ttabbed");
     });
 
@@ -1514,6 +1531,7 @@ fn write_json_str_escapes_control_characters() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         // U+0001 (SOH) is a control character below U+0020.
         tracing::info!(message = "\x01ctrl");
     });
@@ -1542,6 +1560,7 @@ fn json_fields_are_sorted_lexicographically() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         // `zebra` would come after `alpha` in sorted order.
         tracing::info!(zebra = "last", alpha = "first", message = "sort-test");
     });
@@ -1568,6 +1587,7 @@ fn json_fields_non_string_types_are_bare_json_values() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(count = 99u64, delta = -7i64, ratio = 0.5f64, active = false);
     });
 
@@ -1620,6 +1640,7 @@ fn pretty_fields_message_written_without_key_prefix() {
     );
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(operation = "sign", "hello pretty");
     });
 
@@ -2045,6 +2066,7 @@ fn integration_benign_f64_passes_through() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(price = 1.5f64);
     });
 
@@ -2066,6 +2088,7 @@ fn integration_benign_bool_passes_through() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(active = true);
     });
 
@@ -2088,6 +2111,7 @@ fn json_output_schema_key_order_level_before_fields_before_target() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(message = "schema-order");
     });
 
@@ -2173,6 +2197,7 @@ fn redacting_json_formatter_new_has_timestamp_and_target() {
             .with_writer(writer_with_ts.clone()),
     );
     tracing::subscriber::with_default(sub_with_ts, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(message = "ts-test");
     });
     let out = writer_with_ts.captured_str();
@@ -2190,6 +2215,7 @@ fn redacting_json_formatter_without_time_omits_timestamp() {
     let writer = CaptureWriter::new();
     let subscriber = make_json_subscriber(writer.clone());
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(message = "no-ts");
     });
     let out = writer.captured_str();
@@ -2210,6 +2236,7 @@ fn integration_benign_i64_passes_through() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(sequence = -42i64);
     });
 
@@ -2243,6 +2270,7 @@ fn integration_multiple_sensitive_fields_all_redacted() {
     let subscriber = make_json_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(secret = "s1", password = "p1", operation = "tx");
     });
 

@@ -1253,6 +1253,7 @@ mod tests {
             .with_max_level(tracing::Level::WARN)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             emit_value_audit_row(&profile, "binding-warn-only", sample_row());
         });
         let logs = String::from_utf8(writer.captured()).expect("utf8");

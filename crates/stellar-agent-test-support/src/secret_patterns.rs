@@ -719,6 +719,7 @@ mod tests {
             .with_writer(capture.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             tracing::info!(operation = "test", status = "ok", "benign log event");
         });
         assert_no_secret_bytes(&capture.captured());

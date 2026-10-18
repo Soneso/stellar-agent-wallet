@@ -1495,6 +1495,7 @@ mod tests {
             .with_max_level(tracing::Level::WARN)
             .finish();
         let fetched = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             fetch_owner_pubkey_from_keyring("mcp-owner-write-error")
         });
         assert!(

@@ -1870,6 +1870,7 @@ mod tests {
         let subscriber = json_capture_subscriber(writer.clone());
         let dispatch = tracing::Dispatch::new(subscriber);
         let _guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
 
         let _handle = signer_from_keyring(&entry_ref, &expected_g).await.unwrap();
         drop(_guard);
@@ -1898,6 +1899,7 @@ mod tests {
         let subscriber = json_capture_subscriber(writer.clone());
         let dispatch = tracing::Dispatch::new(subscriber);
         let _guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
 
         let sig = handle.sign_tx_payload(&[0x01_u8; 32]).await.unwrap();
         drop(_guard);
@@ -1933,6 +1935,7 @@ mod tests {
         let subscriber = json_capture_subscriber(writer.clone());
         let dispatch = tracing::Dispatch::new(subscriber);
         let _guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
 
         let err = handle.sign_tx_payload(&[0x02_u8; 32]).await.unwrap_err();
         drop(_guard);

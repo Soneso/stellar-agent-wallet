@@ -78,6 +78,7 @@ fn build_path_does_not_leak_secret_key() {
     let subscriber = make_capture_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         let mut builder = ClassicOpBuilder::new(SRC_ACCOUNT, 101, TESTNET_PASSPHRASE, 100);
         builder
             .payment(
@@ -134,6 +135,7 @@ async fn signing_path_does_not_leak_secret_key() {
         let key = SoftwareSigningKey::new_from_bytes(TESTNET_FIXTURE_SEED);
 
         tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             // Inject the S-strkey to verify the subscriber intercepts it.
             tracing::info!(note = %s_strkey, "redaction test marker pre-sign");
 
@@ -166,6 +168,7 @@ fn bip39_mnemonic_is_redacted_in_captured_output() {
     let subscriber = make_capture_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         // Emit the mnemonic as a field value; the subscriber must redact it.
         tracing::info!(phrase = mnemonic, "bip39 redaction test");
     });
@@ -182,6 +185,7 @@ fn benign_event_passes_redaction_audit() {
     let subscriber = make_capture_subscriber(writer.clone());
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(
             operation = "stellar_pay_build",
             source = SRC_ACCOUNT,
@@ -279,6 +283,7 @@ async fn fetch_account_rpc_path_does_not_leak_secret_key() {
         let subscriber = make_capture_subscriber(writer.clone());
 
         tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -333,6 +338,7 @@ async fn counterparty_fetch_failed_does_not_leak_home_domain_in_log() {
 
     let captured = tokio::task::spawn_blocking(move || {
         tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -372,6 +378,7 @@ async fn counterparty_redaction_subscriber_scrubs_secret_strkey() {
     let secret_strkey = strkey_from_seed(VERSION_PRIVATE_KEY, &TESTNET_FIXTURE_SEED);
 
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         tracing::info!(value = %secret_strkey, "counterparty redaction probe");
     });
 

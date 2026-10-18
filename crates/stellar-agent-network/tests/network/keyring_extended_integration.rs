@@ -445,6 +445,7 @@ async fn signer_from_keyring_with_short_service_name_logs_unredacted() {
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);
     let _guard = tracing::dispatcher::set_default(&dispatch);
+    tracing::callsite::rebuild_interest_cache();
 
     let _handle = signer_from_keyring(&entry_ref, &expected_g)
         .await
@@ -503,6 +504,7 @@ async fn sign_tx_payload_platform_error_is_logged_as_keyring_platform_error() {
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);
     let _guard = tracing::dispatcher::set_default(&dispatch);
+    tracing::callsite::rebuild_interest_cache();
 
     let err = handle.sign_tx_payload(&[0u8; 32]).await.unwrap_err();
     drop(_guard);

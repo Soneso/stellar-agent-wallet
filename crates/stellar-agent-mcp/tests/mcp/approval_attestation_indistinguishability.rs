@@ -104,6 +104,26 @@ fn capture_subscriber(writer: CaptureWriter) -> impl tracing::Subscriber + Send 
         .finish()
 }
 
+/// Polls `operation` with `subscriber` as the thread's default subscriber and
+/// returns its output.
+///
+/// `tracing` caches each callsite's interest for the whole process, and a
+/// state computed while another subscriber (or none) was the default can
+/// suppress an event the capture subscriber accepts. The rebuild runs inside
+/// the instrumented future, where the capture subscriber is the default, and
+/// before `operation` emits anything.
+async fn run_captured<F: Future>(
+    subscriber: impl Into<tracing::Dispatch>,
+    operation: F,
+) -> F::Output {
+    async {
+        tracing::callsite::rebuild_interest_cache();
+        operation.await
+    }
+    .with_subscriber(subscriber)
+    .await
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MockPolicyEngine — always RequireApproval
 // ─────────────────────────────────────────────────────────────────────────────
@@ -532,8 +552,9 @@ async fn property4a_absent_attestation_returns_approval_required() {
 
     let logs = CaptureWriter::new();
     let subscriber = capture_subscriber(logs.clone());
-    let result = server
-        .call_stellar_pay_commit(StellarPayCommitArgs {
+    let result = run_captured(
+        subscriber,
+        server.call_stellar_pay_commit(StellarPayCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
             source: SOURCE.to_owned(),
             destination: DEST.to_owned(),
@@ -549,10 +570,10 @@ async fn property4a_absent_attestation_returns_approval_required() {
             envelope_xdr,
             approval_nonce: None,
             approval_attestation: None,
-        })
-        .with_subscriber(subscriber)
-        .await
-        .expect("absent attestation must return Ok(is_error) envelope");
+        }),
+    )
+    .await
+    .expect("absent attestation must return Ok(is_error) envelope");
     let (code, message, _text) = crate::common::assert_business_envelope(&result);
 
     assert_eq!(
@@ -606,8 +627,9 @@ async fn property4b_forged_attestation_returns_approval_required() {
 
     let logs = CaptureWriter::new();
     let subscriber = capture_subscriber(logs.clone());
-    let result = server
-        .call_stellar_pay_commit(StellarPayCommitArgs {
+    let result = run_captured(
+        subscriber,
+        server.call_stellar_pay_commit(StellarPayCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
             source: SOURCE.to_owned(),
             destination: DEST.to_owned(),
@@ -626,10 +648,10 @@ async fn property4b_forged_attestation_returns_approval_required() {
             approval_attestation: Some(
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xFFu8; 32]),
             ),
-        })
-        .with_subscriber(subscriber)
-        .await
-        .expect("forged attestation must return Ok(is_error) envelope");
+        }),
+    )
+    .await
+    .expect("forged attestation must return Ok(is_error) envelope");
     let (code, message, _text) = crate::common::assert_business_envelope(&result);
 
     assert_eq!(
@@ -712,8 +734,9 @@ async fn property4c_expired_approval_entry_returns_approval_required() {
 
     let logs = CaptureWriter::new();
     let subscriber = capture_subscriber(logs.clone());
-    let result = server
-        .call_stellar_pay_commit(StellarPayCommitArgs {
+    let result = run_captured(
+        subscriber,
+        server.call_stellar_pay_commit(StellarPayCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
             source: SOURCE.to_owned(),
             destination: DEST.to_owned(),
@@ -729,10 +752,10 @@ async fn property4c_expired_approval_entry_returns_approval_required() {
             envelope_xdr,
             approval_nonce: Some(approval_nonce_id),
             approval_attestation: Some(fake_attestation),
-        })
-        .with_subscriber(subscriber)
-        .await
-        .expect("expired entry must return Ok(is_error) envelope");
+        }),
+    )
+    .await
+    .expect("expired entry must return Ok(is_error) envelope");
     let (code, message, _text) = crate::common::assert_business_envelope(&result);
 
     assert_eq!(
@@ -959,8 +982,9 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
 
     let logs = CaptureWriter::new();
     let subscriber = capture_subscriber(logs.clone());
-    let result = server
-        .call_stellar_pay_commit(StellarPayCommitArgs {
+    let result = run_captured(
+        subscriber,
+        server.call_stellar_pay_commit(StellarPayCommitArgs {
             chain_id: "stellar:testnet".to_owned(),
             source: SOURCE.to_owned(),
             destination: DEST.to_owned(),
@@ -978,10 +1002,10 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
             approval_attestation: Some(
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob),
             ),
-        })
-        .with_subscriber(subscriber)
-        .await
-        .expect("an owner-key refusal returns an is_error envelope");
+        }),
+    )
+    .await
+    .expect("an owner-key refusal returns an is_error envelope");
     let (code, message, _text) = crate::common::assert_business_envelope(&result);
     assert_eq!(code, POLICY_APPROVAL_REQUIRED_CODE);
     assert_eq!(message, POLICY_APPROVAL_REQUIRED_MSG);
