@@ -314,7 +314,7 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
   `policy.approval_required_unsupported`; the wallet never signs without a
   verified approval.
 - `stellar_rule_create` / `stellar_rule_create_commit` (Package D, GH issue
-  #8) is a two-phase pair with a DIFFERENT approval-block contract: unlike the
+  #8) is a two-phase pair with a DIFFERENT approval-block contract. Unlike the
   signing verbs above, there is no envelope fallback for the commit step to
   fall back on, so `stellar_rule_create` persists the pending approval
   UNCONDITIONALLY. The `approval_nonce` in its response is always present.
@@ -328,8 +328,8 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
   budget, but a rule-create `Allow` would let the agent grant itself
   permanent, potentially account-wide authority, which this feature's
   contract forbids. The agent NEVER holds rule-write authority at any point
-  in this flow: `stellar_rule_create` only simulates and resolves the
-  definition (no signing, no submission);
+  in this flow. `stellar_rule_create` only simulates and resolves the
+  definition (no signing, no submission).
   `stellar_rule_create_commit` verifies the operator's attestation over the
   resolved definition through a DEDICATED gate
   (`PendingApprovalStore::verify_rule_proposal_gate`, distinct from the
@@ -529,8 +529,9 @@ is carried inside `data` on success. Business and validation failures carry a
 `sep43.wallet_unlock_failed`, `sep43.invalid_network_passphrase`); the
 structural mainnet refusal shares the canonical `network.mainnet_write_forbidden`
 code used everywhere else in the wallet, rather than a SEP-43-specific code.
-A policy `RequireApproval` verdict, which every single-shot sign tool,
-including SEP-43, refuses fail-closed, carries `policy.approval_required_unsupported`.
+A policy `RequireApproval` verdict (which every single-shot sign tool,
+including SEP-43, refuses fail-closed) carries
+`policy.approval_required_unsupported`.
 SEP-53 and x402 use the same standard envelope for every business error.
 
 ### SEP-45, SEP-47, SEP-48, SEP-53
