@@ -27,9 +27,6 @@
     "british-initialis": 3,
     "em-dash": 72
   },
-  "docs/cli-reference/smart-account.md": {
-    "em-dash": 53
-  },
   "docs/cli-reference/stellar-ops.md": {
     "british-recognis": 1
   },
