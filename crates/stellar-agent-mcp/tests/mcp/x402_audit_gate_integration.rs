@@ -597,23 +597,79 @@ fn x402_rows(profile: &Profile) -> (Vec<serde_json::Value>, Vec<serde_json::Valu
     (authorized, withheld)
 }
 
-async fn missing_signer_auth_error(tool: Tool, profile_name: &str, seed: u8, expected_code: &str) {
+/// A signer-load failure a case puts at the payer's signer coordinate.
+#[derive(Clone, Copy, Debug)]
+enum SignerFault {
+    /// No entry at the coordinate.
+    Missing,
+    /// The entry holds the seed of another account.
+    OtherKey,
+    /// The credential store fails the read with backend text of its own.
+    StoreFailure,
+}
+
+/// Backend text the injected store failure carries; no envelope may echo it.
+const BACKEND_TEXT: &str = "backend-sentinel-never-render";
+
+/// The seed of the account whose secret the `OtherKey` fault stores.
+const OTHER_SEED: [u8; 32] = [0x2f; 32];
+
+/// A signer-load auth error reaches the tool result with its own code and
+/// message, before any payment request or x402 row.
+async fn signer_load_auth_error(tool: Tool, profile_name: &str, seed: u8, fault: SignerFault) {
     let fixture = fixture(profile_name, [seed; 32], |_| {}).await;
     let account = &fixture.profile.mcp_signer_default.account;
-    keyring_core::Entry::new(SIGNER_SERVICE, account)
-        .expect("Entry::new")
-        .delete_credential()
-        .expect("remove only the signer");
+    let entry = keyring_core::Entry::new(SIGNER_SERVICE, account).expect("Entry::new");
+    let (expected_code, expected_message) = match fault {
+        SignerFault::Missing => {
+            entry.delete_credential().expect("remove only the signer");
+            (
+                "auth.keyring_not_found",
+                format!("keyring entry '{SIGNER_SERVICE}' was not found"),
+            )
+        }
+        SignerFault::OtherKey => {
+            entry
+                .set_password(&sstrkey_for_seed(OTHER_SEED))
+                .expect("store another account's seed");
+            (
+                "auth.signer_key_mismatch",
+                format!(
+                    "signing key public key '{}' does not match --source '{account}'",
+                    gstrkey_for_seed(OTHER_SEED)
+                ),
+            )
+        }
+        SignerFault::StoreFailure => {
+            keyring_mock::inject_error(
+                SIGNER_SERVICE,
+                account,
+                keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(BACKEND_TEXT))),
+            )
+            .expect("inject the store failure");
+            (
+                "auth.keyring_platform_error",
+                "keyring operation failed: read unknown credential store: \
+                 credential store operation failed"
+                    .to_owned(),
+            )
+        }
+    };
 
     let result = call(&fixture, tool).await;
     let (code, message, text) = crate::common::assert_business_envelope(&result);
     assert_eq!(code, expected_code, "{tool:?}: {text}");
-    assert_eq!(
-        message,
-        format!("keyring entry '{SIGNER_SERVICE}' was not found")
+    assert_eq!(message, expected_message, "{tool:?}: {text}");
+    assert!(
+        result_json(&result)["error"].get("details").is_none(),
+        "{text}"
     );
-    assert!(!text.contains(account), "{text}");
+    if !matches!(fault, SignerFault::OtherKey) {
+        assert!(!text.contains(account), "{text}");
+    }
     assert!(!text.contains(&sstrkey_for_seed([seed; 32])), "{text}");
+    assert!(!text.contains(&sstrkey_for_seed(OTHER_SEED)), "{text}");
+    assert!(!text.contains(BACKEND_TEXT), "{text}");
     assert!(!text.contains("paymentSignature"), "{text}");
     assert!(
         fixture.rpc.observed.lock().unwrap().methods.is_empty(),
@@ -626,11 +682,11 @@ async fn missing_signer_auth_error(tool: Tool, profile_name: &str, seed: u8, exp
 #[tokio::test]
 #[serial]
 async fn create_payment_preserves_missing_signer_auth_error() {
-    missing_signer_auth_error(
+    signer_load_auth_error(
         Tool::CreatePayment,
         "x402-missing-signer-cp",
         0xfa,
-        "auth.keyring_not_found",
+        SignerFault::Missing,
     )
     .await;
 }
@@ -638,11 +694,59 @@ async fn create_payment_preserves_missing_signer_auth_error() {
 #[tokio::test]
 #[serial]
 async fn authenticated_payment_preserves_missing_signer_auth_error() {
-    missing_signer_auth_error(
+    signer_load_auth_error(
         Tool::AuthenticatedPayment,
         "x402-missing-signer-ap",
         0xfb,
-        "auth.keyring_not_found",
+        SignerFault::Missing,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn create_payment_signer_key_mismatch_reports_auth_code() {
+    signer_load_auth_error(
+        Tool::CreatePayment,
+        "x402-key-mismatch-cp",
+        0xfc,
+        SignerFault::OtherKey,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn authenticated_payment_signer_key_mismatch_reports_auth_code() {
+    signer_load_auth_error(
+        Tool::AuthenticatedPayment,
+        "x402-key-mismatch-ap",
+        0xfd,
+        SignerFault::OtherKey,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn create_payment_keyring_platform_error_reports_auth_code() {
+    signer_load_auth_error(
+        Tool::CreatePayment,
+        "x402-store-failure-cp",
+        0xfe,
+        SignerFault::StoreFailure,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn authenticated_payment_keyring_platform_error_reports_auth_code() {
+    signer_load_auth_error(
+        Tool::AuthenticatedPayment,
+        "x402-store-failure-ap",
+        0xff,
+        SignerFault::StoreFailure,
     )
     .await;
 }
