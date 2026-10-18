@@ -277,20 +277,27 @@ fn assert_window_total(
     );
 }
 
-async fn exercise(tool: Tool, initially_confirmed: bool) {
+async fn exercise(tool: Tool, initially_confirmed: bool, missing_signer_code: Option<&str>) {
     let _root = crate::common::isolated_data_root();
     keyring_mock::install().unwrap();
     install_test_nonce_key();
-    let seed = tool.seed(initially_confirmed);
+    let with_signer = missing_signer_code.is_none();
+    let seed = if with_signer {
+        tool.seed(initially_confirmed)
+    } else {
+        [tool.seed(initially_confirmed)[0] + 6; 32]
+    };
     let source = account_id_for_seed(seed);
     let signer_seed = stellar_strkey::ed25519::PrivateKey(seed)
         .as_unredacted()
         .to_string()
         .to_string();
-    keyring_core::Entry::new("svc", &source)
-        .unwrap()
-        .set_password(&signer_seed)
-        .unwrap();
+    if with_signer {
+        keyring_core::Entry::new("svc", &source)
+            .unwrap()
+            .set_password(&signer_seed)
+            .unwrap();
+    }
     let mock = MockServer::start().await;
     let confirming = Arc::new(AtomicBool::new(initially_confirmed));
     let sent = Arc::new(Mutex::new(Vec::new()));
@@ -347,6 +354,15 @@ async fn exercise(tool: Tool, initially_confirmed: bool) {
     let result = tool.call(&server).await;
     let response = result_json(&result);
     let sent = sent.lock().unwrap().clone();
+    if let Some(expected_code) = missing_signer_code {
+        let (code, message, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, expected_code, "{}: {text}", tool.name());
+        assert_eq!(message, "keyring entry 'svc' was not found");
+        assert!(!text.contains(&source), "{text}");
+        assert!(!text.contains(&signer_seed), "{text}");
+        assert!(sent.is_empty(), "{} must not submit", tool.name());
+        return;
+    }
     assert_eq!(sent.len(), 1, "{} must send once: {response}", tool.name());
     let (tx_hash, envelope_hash) = &sent[0];
     let receipts = ReceiptStore::open(&profile_name).unwrap();
@@ -447,30 +463,48 @@ async fn exercise(tool: Tool, initially_confirmed: bool) {
 #[tokio::test]
 #[serial]
 async fn trade_timeout_retains_and_settles_record() {
-    exercise(Tool::Trade, false).await;
+    exercise(Tool::Trade, false, None).await;
 }
 #[tokio::test]
 #[serial]
 async fn deposit_timeout_retains_and_settles_record() {
-    exercise(Tool::Deposit, false).await;
+    exercise(Tool::Deposit, false, None).await;
 }
 #[tokio::test]
 #[serial]
 async fn withdraw_timeout_retains_and_settles_record() {
-    exercise(Tool::Withdraw, false).await;
+    exercise(Tool::Withdraw, false, None).await;
 }
 #[tokio::test]
 #[serial]
 async fn trade_confirmation_settles_record() {
-    exercise(Tool::Trade, true).await;
+    exercise(Tool::Trade, true, None).await;
 }
 #[tokio::test]
 #[serial]
 async fn deposit_confirmation_settles_record() {
-    exercise(Tool::Deposit, true).await;
+    exercise(Tool::Deposit, true, None).await;
 }
 #[tokio::test]
 #[serial]
 async fn withdraw_confirmation_settles_record() {
-    exercise(Tool::Withdraw, true).await;
+    exercise(Tool::Withdraw, true, None).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trade_preserves_missing_signer_auth_error() {
+    exercise(Tool::Trade, false, Some("auth.keyring_not_found")).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn deposit_preserves_missing_signer_auth_error() {
+    exercise(Tool::Deposit, false, Some("auth.keyring_not_found")).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn withdraw_preserves_missing_signer_auth_error() {
+    exercise(Tool::Withdraw, false, Some("auth.keyring_not_found")).await;
 }

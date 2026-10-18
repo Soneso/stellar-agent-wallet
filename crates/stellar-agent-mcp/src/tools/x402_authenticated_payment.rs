@@ -501,13 +501,7 @@ impl WalletServer {
         {
             Ok(h) => h,
             Err(err) => {
-                if matches!(
-                    &err,
-                    stellar_agent_core::error::WalletError::Auth(
-                        stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
-                            | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
-                    )
-                ) {
+                if matches!(&err, stellar_agent_core::error::WalletError::Auth(_)) {
                     return Ok(crate::tools::common::business_error_result(
                         err.code(),
                         err.to_string(),

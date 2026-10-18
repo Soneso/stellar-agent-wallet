@@ -597,6 +597,56 @@ fn x402_rows(profile: &Profile) -> (Vec<serde_json::Value>, Vec<serde_json::Valu
     (authorized, withheld)
 }
 
+async fn missing_signer_auth_error(tool: Tool, profile_name: &str, seed: u8, expected_code: &str) {
+    let fixture = fixture(profile_name, [seed; 32], |_| {}).await;
+    let account = &fixture.profile.mcp_signer_default.account;
+    keyring_core::Entry::new(SIGNER_SERVICE, account)
+        .expect("Entry::new")
+        .delete_credential()
+        .expect("remove only the signer");
+
+    let result = call(&fixture, tool).await;
+    let (code, message, text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, expected_code, "{tool:?}: {text}");
+    assert_eq!(
+        message,
+        format!("keyring entry '{SIGNER_SERVICE}' was not found")
+    );
+    assert!(!text.contains(account), "{text}");
+    assert!(!text.contains(&sstrkey_for_seed([seed; 32])), "{text}");
+    assert!(!text.contains("paymentSignature"), "{text}");
+    assert!(
+        fixture.rpc.observed.lock().unwrap().methods.is_empty(),
+        "{tool:?}: no payment request"
+    );
+    let (authorized, withheld) = x402_rows(&fixture.profile);
+    assert!(authorized.is_empty() && withheld.is_empty(), "{tool:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn create_payment_preserves_missing_signer_auth_error() {
+    missing_signer_auth_error(
+        Tool::CreatePayment,
+        "x402-missing-signer-cp",
+        0xfa,
+        "auth.keyring_not_found",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn authenticated_payment_preserves_missing_signer_auth_error() {
+    missing_signer_auth_error(
+        Tool::AuthenticatedPayment,
+        "x402-missing-signer-ap",
+        0xfb,
+        "auth.keyring_not_found",
+    )
+    .await;
+}
+
 /// The success path: the authorized row is in the log when the signed
 /// re-simulation arrives, and it is the only x402 row afterwards.
 async fn the_row_precedes_the_signed_resimulation(tool: Tool, profile_name: &str, seed: u8) {
