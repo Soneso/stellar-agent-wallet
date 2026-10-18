@@ -38,11 +38,11 @@ const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 /// 3. Decodes the resulting envelope and calls `assert_sandwich_structure`.
 async fn build_and_assert_sandwich(funder_strkey: &str, channel_strkeys: &[&str], funder_seq: i64) {
     let n = channel_strkeys.len();
+    // `ClassicOpBuilder::new` takes the per-operation fee, as `init_pool` passes it.
     let fee_per_op: u32 = 100;
-    let total_fee = fee_per_op * (n as u32 * 3);
 
     let mut builder =
-        ClassicOpBuilder::new(funder_strkey, funder_seq, TESTNET_PASSPHRASE, total_fee);
+        ClassicOpBuilder::new(funder_strkey, funder_seq, TESTNET_PASSPHRASE, fee_per_op);
 
     for channel_strkey in channel_strkeys {
         builder
@@ -108,7 +108,7 @@ async fn sandwich_op_count_is_n_times_3() {
 
     let n: usize = 2;
     let channels = &[CHANNEL_1, CHANNEL_2];
-    let mut builder = ClassicOpBuilder::new(FUNDER, 300, TESTNET_PASSPHRASE, 100 * 6);
+    let mut builder = ClassicOpBuilder::new(FUNDER, 300, TESTNET_PASSPHRASE, 100);
 
     for ch in channels {
         builder
@@ -170,7 +170,7 @@ fn assert_sandwich_structure_invalid_xdr_returns_err() {
 #[tokio::test]
 async fn assert_sandwich_structure_wrong_op_count_returns_err() {
     // Build a 1-channel sandwich.
-    let mut builder = ClassicOpBuilder::new(FUNDER, 100, TESTNET_PASSPHRASE, 300);
+    let mut builder = ClassicOpBuilder::new(FUNDER, 100, TESTNET_PASSPHRASE, 100);
     builder
         .begin_sponsoring_future_reserves(FUNDER, CHANNEL_1)
         .unwrap();
@@ -202,7 +202,7 @@ async fn assert_sandwich_structure_wrong_op_count_returns_err() {
 /// Build a 1-channel sandwich then claim the funder is a different key.
 #[tokio::test]
 async fn assert_sandwich_structure_wrong_begin_source_returns_err() {
-    let mut builder = ClassicOpBuilder::new(FUNDER, 100, TESTNET_PASSPHRASE, 300);
+    let mut builder = ClassicOpBuilder::new(FUNDER, 100, TESTNET_PASSPHRASE, 100);
     builder
         .begin_sponsoring_future_reserves(FUNDER, CHANNEL_1)
         .unwrap();
@@ -234,7 +234,7 @@ async fn assert_sandwich_structure_wrong_begin_source_returns_err() {
 /// CHANNEL_2 as the expected sponsored account.
 #[tokio::test]
 async fn assert_sandwich_structure_wrong_sponsored_id_returns_err() {
-    let mut builder = ClassicOpBuilder::new(FUNDER, 100, TESTNET_PASSPHRASE, 300);
+    let mut builder = ClassicOpBuilder::new(FUNDER, 100, TESTNET_PASSPHRASE, 100);
     builder
         .begin_sponsoring_future_reserves(FUNDER, CHANNEL_1)
         .unwrap();
@@ -268,7 +268,7 @@ async fn assert_sandwich_structure_wrong_sponsored_id_returns_err() {
 /// assertion expects CHANNEL_2.
 #[tokio::test]
 async fn assert_sandwich_structure_swapped_channels_returns_err() {
-    let mut builder = ClassicOpBuilder::new(FUNDER, 100, TESTNET_PASSPHRASE, 600);
+    let mut builder = ClassicOpBuilder::new(FUNDER, 100, TESTNET_PASSPHRASE, 100);
     builder
         .begin_sponsoring_future_reserves(FUNDER, CHANNEL_1)
         .unwrap();

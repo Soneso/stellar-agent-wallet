@@ -49,6 +49,13 @@ Simulate step: builds a CreateAccount transaction envelope and mints a single-us
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
 
+**Fee cap:** The resolved per-operation fee is checked against the profile's
+`classic_max_fee_per_op_stroops`. A fee above the cap returns
+`fees.percentile_exceeds_cap`; the message names an auto-selected fee and its
+percentile, an explicit `classic_base`, or the profile's
+`classic_fee_per_op_stroops`. A mainnet profile without the cap returns
+`validation.mainnet_fee_cap_required`.
+
 ## stellar_create_account_commit
 
 Commit step: verifies the nonce, re-builds the envelope for divergence check, signs via the profile keyring, and submits the transaction. Testnet-only — mainnet profiles are rejected by the policy gate. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
@@ -68,7 +75,14 @@ Commit step: verifies the nonce, re-builds the envelope for divergence check, si
 
 **Submission record:** Before the transaction is sent, the wallet records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. The record is settled by what the network answers; a submission whose outcome never comes back keeps it. See "Unresolved submissions" below.
 
+**Fee cap:** Before signing, the presented envelope's per-operation fee is
+checked against the profile's `classic_max_fee_per_op_stroops`. A fee above the
+cap returns `fees.percentile_exceeds_cap` with a message naming the envelope's
+fee; prepare the transaction again with a fee within the cap. A mainnet profile
+without the cap returns `validation.mainnet_fee_cap_required`.
+
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
+`fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
 `network.witness_unavailable`, `policy.engine_required`, `policy.approval_consumed`,
 `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`,
 `network.rpc_credential_refused`, `auth.keyring_not_found`,
@@ -102,6 +116,13 @@ Simulate step: builds a Payment transaction envelope for a native XLM or non-nat
 
 **SEP-29:** If the destination's `config.memo_required` data entry is set to `"1"` and no memo is provided, returns `validation.memo_required`.
 
+**Fee cap:** The resolved per-operation fee is checked against the profile's
+`classic_max_fee_per_op_stroops`. A fee above the cap returns
+`fees.percentile_exceeds_cap`; the message names an auto-selected fee and its
+percentile, an explicit `classic_base`, or the profile's
+`classic_fee_per_op_stroops`. A mainnet profile without the cap returns
+`validation.mainnet_fee_cap_required`.
+
 ## stellar_pay_commit
 
 Commit step: verifies the nonce, re-builds the Payment envelope for divergence check, signs via the profile keyring, and submits the transaction. Testnet-only — mainnet profiles are rejected by the policy gate. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
@@ -126,7 +147,17 @@ Commit step: verifies the nonce, re-builds the Payment envelope for divergence c
 
 **Submission record:** Before the transaction is sent, the wallet records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. The record is settled by what the network answers; a submission whose outcome never comes back keeps it. See "Unresolved submissions" below.
 
+**Destination read:** Only an absent destination account counts as absent; any
+other failed destination read refuses with the read's own code.
+
+**Fee cap:** Before signing, the presented envelope's per-operation fee is
+checked against the profile's `classic_max_fee_per_op_stroops`. A fee above the
+cap returns `fees.percentile_exceeds_cap` with a message naming the envelope's
+fee; prepare the transaction again with a fee within the cap. A mainnet profile
+without the cap returns `validation.mainnet_fee_cap_required`.
+
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
+`fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
 `network.witness_unavailable`, `network.rpc_divergence`, `validation.memo_required`,
 `policy.engine_required`, `policy.approval_consumed`,
 `validation.memo_mutually_exclusive`, `network.endpoint_network_mismatch`,
@@ -146,7 +177,14 @@ Commit step for `stellar_claim`: verifies the nonce, re-builds the `ClaimClaimab
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
+**Fee cap:** Before signing, the presented envelope's per-operation fee is
+checked against the profile's `classic_max_fee_per_op_stroops`. A fee above the
+cap returns `fees.percentile_exceeds_cap` with a message naming the envelope's
+fee; prepare the transaction again with a fee within the cap. A mainnet profile
+without the cap returns `validation.mainnet_fee_cap_required`.
+
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
+`fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
 `policy.engine_required`, `policy.approval_consumed`, `network.endpoint_network_mismatch`,
 `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`,
 `auth.keyring_not_found`, `network.envelope_signed_for_mainnet`,
@@ -162,7 +200,14 @@ Commit step for `stellar_trustline`: verifies the nonce, re-builds the `ChangeTr
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
+**Fee cap:** Before signing, the presented envelope's per-operation fee is
+checked against the profile's `classic_max_fee_per_op_stroops`. A fee above the
+cap returns `fees.percentile_exceeds_cap` with a message naming the envelope's
+fee; prepare the transaction again with a fee within the cap. A mainnet profile
+without the cap returns `validation.mainnet_fee_cap_required`.
+
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
+`fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
 `policy.engine_required`, `policy.approval_consumed`, `network.endpoint_network_mismatch`,
 `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`,
 `auth.keyring_not_found`, `network.envelope_signed_for_mainnet`,

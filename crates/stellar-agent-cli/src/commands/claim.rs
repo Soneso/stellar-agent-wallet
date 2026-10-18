@@ -84,6 +84,21 @@
 //! operator NAMED — through `--profile` or `STELLAR_AGENT_PROFILE` — but never
 //! authored is refused instead.
 //!
+//! # Fee cap and cross-check witness
+//!
+//! After the policy gate, every stage checks the per-operation fee against
+//! the profile's `classic_max_fee_per_op_stroops`: the selected fee in the
+//! full pipeline and `--build-only`, the decoded envelope fee in
+//! `--sign-only` and `--submit-only`. A mainnet profile without the cap
+//! refuses. The signing and submitting stages then obtain the cross-check
+//! witness, unvalued because a claim credits the source: the full pipeline
+//! compares the source account, the claimable-balance record as a whole, and
+//! the trustline of an issued asset; the staged stages compare the source
+//! account they re-read. Both checks refuse before the audit pre-flight, the
+//! signer, and the send; the outcome is the result's `cross_check` field and
+//! travels into the pending and submitted audit rows. `--build-only` obtains
+//! no witness.
+//!
 //! # Audit pre-flight (fail-closed for a persisted profile; fail-open for the
 //! synthesized zero-config profile)
 //!
@@ -121,12 +136,17 @@ use stellar_agent_core::policy::PolicyEngine;
 use stellar_agent_core::policy::v1::AccountReservesView;
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
 use stellar_agent_network::builder::ClassicOpBuilder;
+use stellar_agent_network::cross_check::{
+    AccountObservation, ClaimWitnessInputs, ClaimableBalanceObservation, CrossCheckOutcome,
+    CrossCheckView, TrustlineObservation, obtain_classic_witness,
+};
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::source::signer_from_ledger;
 use stellar_agent_network::{
-    BASE_RESERVE_STROOPS, ClassicFeeSelection, StellarRpcClient, SubmissionResult,
-    SubmissionSignerKind, fetch_account, init_platform_keyring_store, parse_classic_fee_choice,
+    BASE_RESERVE_STROOPS, CLASSIC_SINGLE_OPERATION_COUNT, ClassicFeeChoice, ClassicFeeSelection,
+    StellarRpcClient, SubmissionResult, SubmissionSignerKind, check_built_fee_cap,
+    check_classic_fee_cap, fetch_account, init_platform_keyring_store, parse_classic_fee_choice,
     resolve_classic_fee_selection, submit_transaction_and_wait,
 };
 
@@ -187,6 +207,13 @@ pub struct ClaimResult {
     /// sign-only and submit-only stages, which operate on an opaque envelope.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance_id_hex72: Option<String>,
+
+    /// Outcome of the cross-check witness a signing or submitting stage
+    /// obtained before it signed or sent.
+    ///
+    /// Absent for `--build-only`, which neither signs nor sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_check: Option<CrossCheckView>,
 }
 
 /// The unsigned envelope plus the metadata produced by the build stage.
@@ -194,8 +221,19 @@ pub struct ClaimResult {
 struct BuiltClaimEnvelope {
     envelope_xdr: String,
     balance_id_hex72: String,
-    #[allow(dead_code)]
+    /// The balance id the envelope claims.
+    id: BalanceId,
+    /// The resolved per-operation fee the envelope pays.
     fee_selection: ClassicFeeSelection,
+    /// The parsed `--fee` choice the selection came from; it names the fee's
+    /// source in a fee-cap refusal.
+    fee_choice: ClassicFeeChoice,
+    /// The claimable-balance record the preview and the guards read; the
+    /// witness compares it whole.
+    record: stellar_xdr::ClaimableBalanceEntry,
+    /// The raw trustline entry the trustline guard read for an issued
+    /// asset; `None` for a native balance or an absent trustline.
+    trustline: Option<stellar_xdr::TrustLineEntry>,
     /// The source account's fetched state — reused (not re-fetched) to feed
     /// the policy gate's `account_view`, mirroring the `stellar_claim` MCP
     /// twin's `AccountViewAdapter` wiring exactly.
@@ -428,8 +466,23 @@ where
             ));
         }
     };
+    claim_outcome_loaded(args, &resolved, &profile, origin, init_keyring).await
+}
+
+/// Runs the command on a loaded profile: the network context, the structural
+/// mainnet refusal, and the stage dispatch.
+async fn claim_outcome_loaded<InitKeyring>(
+    args: &ClaimArgs,
+    resolved: &ResolvedProfileName,
+    profile: &Profile,
+    origin: ProfileOrigin,
+    init_keyring: InitKeyring,
+) -> ClaimOutcome
+where
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
     let context = match network_context_for_command(
-        &profile,
+        profile,
         &resolved.name,
         EndpointFlags {
             network: args.network,
@@ -462,31 +515,13 @@ where
     // signing or broadcasting. All four stages therefore receive the loaded
     // profile and the keyring initialiser.
     if args.build_only {
-        run_build_only(&context, args, &resolved, &profile, init_keyring).await
+        run_build_only(&context, args, resolved, profile, init_keyring).await
     } else if let Some(ref xdr) = args.sign_only {
-        run_sign_only(
-            &context,
-            args,
-            &resolved,
-            xdr,
-            &profile,
-            origin,
-            init_keyring,
-        )
-        .await
+        run_sign_only(&context, args, resolved, xdr, profile, origin, init_keyring).await
     } else if let Some(ref xdr) = args.submit_only {
-        run_submit_only(
-            &context,
-            args,
-            &resolved,
-            xdr,
-            &profile,
-            origin,
-            init_keyring,
-        )
-        .await
+        run_submit_only(&context, args, resolved, xdr, profile, origin, init_keyring).await
     } else {
-        run_full_pipeline(&context, args, &resolved, &profile, origin, init_keyring).await
+        run_full_pipeline(&context, args, resolved, profile, origin, init_keyring).await
     }
 }
 
@@ -544,6 +579,13 @@ where
     if let Err(envelope) = evaluate_claim_policy(&built, chain_id, profile, &resolved.name) {
         return ClaimOutcome::failed_after_preview(built.preview, envelope);
     }
+    if let Err(e) = check_built_fee_cap(
+        built.fee_selection.per_op_stroops,
+        built.fee_choice,
+        profile,
+    ) {
+        return ClaimOutcome::failed_after_preview(built.preview, Envelope::<()>::err(&e));
+    }
     ClaimOutcome::succeeded(
         Some(built.preview),
         ClaimResult {
@@ -552,6 +594,7 @@ where
             ledger: None,
             stage: "build".to_owned(),
             balance_id_hex72: Some(built.balance_id_hex72),
+            cross_check: None,
         },
     )
 }
@@ -571,12 +614,31 @@ where
     if let Err(envelope) = init_keyring_for_origin(resolved, origin, init_keyring) {
         return ClaimOutcome::failed(envelope);
     }
-    if let Err(envelope) =
-        evaluate_staged_claim_policy(None, context, args, unsigned_xdr, profile, &resolved.name)
-            .await
+    let gate = match evaluate_staged_claim_policy(
+        None,
+        context,
+        args,
+        unsigned_xdr,
+        profile,
+        &resolved.name,
+    )
+    .await
     {
-        return ClaimOutcome::failed(envelope);
-    }
+        Ok(gate) => gate,
+        Err(envelope) => return ClaimOutcome::failed(envelope),
+    };
+    // A decoded claim's fee is checked against the cap and the oracle
+    // re-reads the source the gate read, before the audit pre-flight and the
+    // signer. An opaque envelope reads nothing and has no witness.
+    let cross_check = match &gate.claim {
+        Some(claim) => {
+            match witness_staged_claim(context, profile, claim, "stellar_claim_commit").await {
+                Ok(outcome) => Some(outcome),
+                Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
+            }
+        }
+        None => None,
+    };
     // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
     // policy gate (a denial is a clean refusal that signs nothing and needs
     // no audit setup) but BEFORE the signing key below is touched, for a
@@ -601,6 +663,7 @@ where
                 ledger: None,
                 stage: "sign".to_owned(),
                 balance_id_hex72: None,
+                cross_check: cross_check.as_ref().map(CrossCheckOutcome::view),
             },
         ),
         Err(e) => ClaimOutcome::failed(Envelope::<()>::err(&e)),
@@ -659,7 +722,7 @@ where
     let chain_id = context.chain_id.caip2_str();
     // The envelope arrives pre-signed, but broadcasting it still spends
     // funds — gate here even though signing already happened elsewhere.
-    let claim_effects = match evaluate_staged_claim_policy(
+    let gate = match evaluate_staged_claim_policy(
         Some(&client),
         context,
         args,
@@ -669,8 +732,21 @@ where
     )
     .await
     {
-        Ok(effects) => effects,
+        Ok(gate) => gate,
         Err(envelope) => return ClaimOutcome::failed(envelope),
+    };
+    let claim_effects = gate.effects;
+    // A decoded claim's fee is checked against the cap and the oracle
+    // re-reads the source the gate read, before the audit pre-flight and the
+    // send.
+    let cross_check = match &gate.claim {
+        Some(claim) => {
+            match witness_staged_claim(context, profile, claim, "stellar_claim_commit").await {
+                Ok(outcome) => Some(outcome),
+                Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
+            }
+        }
+        None => None,
     };
     // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
     // policy gate (a denial is a clean refusal that submits nothing and
@@ -701,7 +777,7 @@ where
             now_ms,
         },
     ) {
-        Ok(r) => r,
+        Ok(r) => r.with_witness(cross_check.as_ref().and_then(CrossCheckOutcome::witness)),
         Err(e) => {
             return ClaimOutcome::failed(crate::commands::submission_record::error_envelope(
                 &e, signed_xdr, "claim",
@@ -718,6 +794,7 @@ where
                 ledger: Some(sub_result.ledger),
                 stage: "submit".to_owned(),
                 balance_id_hex72: None,
+                cross_check: cross_check.as_ref().map(CrossCheckOutcome::view),
             },
         ),
         Err(e) => ClaimOutcome::failed(Envelope::<()>::err(&e)),
@@ -795,6 +872,8 @@ where
 ///
 /// Returns the refusal envelope when the engine cannot be built, the endpoint
 /// check refuses, the source account cannot be fetched, or the gate refuses.
+/// On allow, the gate carries the gate-sized effects and, for an envelope the
+/// decoder classifies, the decoded fee and the source view it read.
 async fn evaluate_staged_claim_policy(
     sending_client: Option<&StellarRpcClient>,
     context: &NetworkContext,
@@ -802,7 +881,7 @@ async fn evaluate_staged_claim_policy(
     envelope_xdr: &str,
     profile: &Profile,
     profile_name: &str,
-) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, Envelope<()>> {
+) -> Result<StagedClaimGate, Envelope<()>> {
     let chain_id = context.chain_id.caip2_str();
     let policy_engine =
         build_v1_policy_engine("claim", &profile.policy.engine, profile, profile_name)
@@ -843,7 +922,13 @@ async fn evaluate_staged_claim_policy(
         .as_ref()
         .map(stellar_agent_network::policy_view::AccountViewAdapter::new);
 
-    dispatch_staged_claim_gate(
+    let total_fee_stroops = decode_result
+        .as_ref()
+        .ok()
+        .and_then(|decoded| decoded.get("total_fee_stroops"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|fee| u32::try_from(fee).ok());
+    let effects = dispatch_staged_claim_gate(
         policy_engine.as_ref(),
         profile,
         chain_id,
@@ -851,7 +936,124 @@ async fn evaluate_staged_claim_policy(
         source_adapter
             .as_ref()
             .map(|a| a as &dyn AccountReservesView),
+    )?;
+    let claim = match (source_view_holder, total_fee_stroops) {
+        (Some(source_view), Some(total_fee_stroops)) => Some(StagedClaim {
+            source_view,
+            total_fee_stroops,
+        }),
+        (Some(_), None) => {
+            return Err(Envelope::<()>::err(&WalletError::Protocol(
+                stellar_agent_core::error::ProtocolError::XdrCodecFailed {
+                    detail: "the decoded claim carries no total_fee_stroops".to_owned(),
+                },
+            )));
+        }
+        (None, _) => None,
+    };
+    Ok(StagedClaimGate { effects, claim })
+}
+
+/// The staged claim gate's decision and what it read.
+struct StagedClaimGate {
+    /// The gate-sized effects (`None` for the no-op engine or an opaque allow).
+    effects: Option<stellar_agent_core::policy::v1::ValueEffects>,
+    /// The decoded claim and the source view; `None` for an opaque envelope,
+    /// which the gate reads nothing for.
+    claim: Option<StagedClaim>,
+}
+
+/// A decoded staged claim and the source view the gate evaluated.
+///
+/// The staged stages re-read only the source: the record and the trustline
+/// are checked by the chain at apply time.
+struct StagedClaim {
+    /// The source account view (decoded G account).
+    source_view: stellar_agent_network::AccountView,
+    /// The decoded transaction fee in stroops.
+    total_fee_stroops: u32,
+}
+
+/// Obtains the cross-check witness of a built claim: the source, the record
+/// the preview and the guards read (compared whole), and, for an issued
+/// asset, the source's trustline the trustline guard read.
+///
+/// A claim moves no value from the source, so the witness is unvalued.
+///
+/// # Errors
+///
+/// Returns `validation.asset_invalid` for a record asset outside the
+/// canonical classic alphabet, the observation build failure, and every
+/// refusal of [`obtain_classic_witness`].
+async fn witness_built_claim(
+    context: &NetworkContext,
+    profile: &Profile,
+    built: &BuiltClaimEnvelope,
+    tool: &'static str,
+) -> Result<CrossCheckOutcome, WalletError> {
+    let source = AccountObservation::from_view(&built.account_view)?;
+    let trustline = match (&built.preview.asset_code, &built.preview.asset_issuer) {
+        (Some(code), Some(issuer)) => {
+            let asset = stellar_agent_network::Asset::Credit {
+                code: code.clone(),
+                issuer: issuer.clone(),
+            }
+            .to_canonical()?;
+            Some(TrustlineObservation::from_entry(
+                &built.account_view.account_id,
+                asset,
+                built.trustline.as_ref(),
+            )?)
+        }
+        _ => None,
+    };
+    obtain_classic_witness(
+        profile,
+        context,
+        stellar_agent_core::cross_check::CrossCheckValue::Unvalued,
+        ClaimWitnessInputs {
+            source,
+            trustline,
+            balance: Some(ClaimableBalanceObservation {
+                balance_id: built.id.hash(),
+                entry: Some(built.record.clone()),
+            }),
+        },
+        tool,
     )
+    .await
+}
+
+/// Checks a staged claim's fee against the cap and obtains the witness of
+/// the source the gate read.
+///
+/// # Errors
+///
+/// Returns the fee-cap refusal, the observation build failure, and the
+/// refusals of [`obtain_classic_witness`].
+async fn witness_staged_claim(
+    context: &NetworkContext,
+    profile: &Profile,
+    claim: &StagedClaim,
+    tool: &'static str,
+) -> Result<CrossCheckOutcome, WalletError> {
+    check_classic_fee_cap(
+        claim.total_fee_stroops / CLASSIC_SINGLE_OPERATION_COUNT,
+        stellar_agent_core::error::FeeSource::Envelope,
+        profile,
+    )?;
+    obtain_classic_witness(
+        profile,
+        context,
+        stellar_agent_core::cross_check::CrossCheckValue::Unvalued,
+        ClaimWitnessInputs {
+            source: AccountObservation::from_view(&claim.source_view)?,
+            trustline: None,
+            balance: None,
+        },
+        tool,
+    )
+    .await
 }
 
 /// Pure post-decode dispatch for the staged `claim` gate: no network or
@@ -969,6 +1171,21 @@ where
         Err(envelope) => return failed(envelope),
     };
 
+    // The fee is checked against the profile cap, then the oracle re-reads
+    // the record, the source, and the trustline the decision used. Both
+    // refuse before the audit pre-flight, the signer, and the send.
+    if let Err(e) = check_built_fee_cap(
+        built.fee_selection.per_op_stroops,
+        built.fee_choice,
+        profile,
+    ) {
+        return failed(Envelope::<()>::err(&e));
+    }
+    let cross_check = match witness_built_claim(context, profile, &built, "stellar_claim").await {
+        Ok(outcome) => outcome,
+        Err(e) => return failed(Envelope::<()>::err(&e)),
+    };
+
     // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
     // policy gate (a denial is a clean refusal that signs nothing and needs
     // no audit setup) but BEFORE the signing key is touched below (step 2)
@@ -1009,7 +1226,7 @@ where
             now_ms,
         },
     ) {
-        Ok(r) => r,
+        Ok(r) => r.with_witness(cross_check.witness()),
         Err(e) => {
             return failed(crate::commands::submission_record::error_envelope(
                 &e,
@@ -1028,6 +1245,7 @@ where
                 ledger: Some(sub_result.ledger),
                 stage: "build+sign+submit".to_owned(),
                 balance_id_hex72: Some(built.balance_id_hex72),
+                cross_check: Some(cross_check.view()),
             },
         ),
         Err(e) => failed(crate::commands::submission_record::error_envelope(
@@ -1072,10 +1290,14 @@ async fn build_unsigned_envelope(
             preview: None,
         })?;
     match guard_and_build(client, context, args, &previewed).await {
-        Ok((envelope_xdr, fee_selection)) => Ok(BuiltClaimEnvelope {
-            envelope_xdr,
+        Ok(guarded) => Ok(BuiltClaimEnvelope {
+            envelope_xdr: guarded.envelope_xdr,
             balance_id_hex72: previewed.id.to_hex72(),
-            fee_selection,
+            id: previewed.id,
+            fee_selection: guarded.fee_selection,
+            fee_choice: guarded.fee_choice,
+            record: previewed.record,
+            trustline: guarded.trustline,
             account_view: previewed.account_view,
             preview: previewed.preview,
         }),
@@ -1091,6 +1313,8 @@ struct PreviewedClaim {
     id: BalanceId,
     account_view: stellar_agent_network::AccountView,
     preview: ClaimPreview,
+    /// The claimable-balance record the preview was built from.
+    record: stellar_xdr::ClaimableBalanceEntry,
 }
 
 /// Parses the balance id and validates the source G-strkey: the claim
@@ -1138,7 +1362,18 @@ async fn fetch_claim_preview(
         id,
         account_view,
         preview,
+        record: entry,
     })
+}
+
+/// What the guards read and the build produced.
+struct GuardedClaim {
+    envelope_xdr: String,
+    fee_selection: ClassicFeeSelection,
+    fee_choice: ClassicFeeChoice,
+    /// The raw trustline entry the trustline guard read; `None` for a native
+    /// balance or an absent trustline.
+    trustline: Option<stellar_xdr::TrustLineEntry>,
 }
 
 /// Runs the claim guards against the preview, resolves the fee, checks its
@@ -1148,26 +1383,29 @@ async fn guard_and_build(
     context: &NetworkContext,
     args: &ClaimArgs,
     previewed: &PreviewedClaim,
-) -> Result<(String, ClassicFeeSelection), ClaimError> {
+) -> Result<GuardedClaim, ClaimError> {
     let PreviewedClaim {
         id,
         account_view,
         preview,
+        ..
     } = previewed;
 
     // ── Claim guards, in order ────────────────────────────────────────────────
     require_claimant(preview, &args.source)?;
     require_predicate_satisfied(preview)?;
+    let mut trustline = None;
     if preview.asset_code.is_some() {
         let code = preview.asset_code.as_deref().unwrap_or_default();
         let issuer = preview.asset_issuer.as_deref().unwrap_or_default();
-        let state = fetch_trustline_state(client, &args.source, code, issuer).await?;
+        let (state, entry) = fetch_trustline_state(client, &args.source, code, issuer).await?;
         check_trustline(
             &state,
             preview.asset_code.as_deref(),
             preview.asset_issuer.as_deref(),
             preview.amount_stroops,
         )?;
+        trustline = entry;
     }
 
     // ── Fee resolution + affordability ────────────────────────────────────────
@@ -1211,7 +1449,12 @@ async fn guard_and_build(
     builder.claim_claimable_balance(&id.to_hex64())?;
     let envelope_xdr = builder.build()?;
 
-    Ok((envelope_xdr, fee_selection))
+    Ok(GuardedClaim {
+        envelope_xdr,
+        fee_selection,
+        fee_choice,
+        trustline,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1471,6 +1714,7 @@ fn render_claim_table(
                     redact_tx_hash(hash),
                     ledger
                 ));
+                lines.extend(result.cross_check.as_ref().map(CrossCheckView::text_line));
             }
             _ => {
                 let prefix: String = result.envelope_xdr.chars().take(32).collect();
@@ -1478,6 +1722,7 @@ fn render_claim_table(
                     "[{}] envelope_xdr (first 32 chars): {}...",
                     result.stage, prefix
                 ));
+                lines.extend(result.cross_check.as_ref().map(CrossCheckView::text_line));
             }
         },
         Err(envelope) => {
@@ -2540,6 +2785,7 @@ mod tests {
                     ledger: None,
                     stage: "build".to_owned(),
                     balance_id_hex72: None,
+                    cross_check: None,
                 },
             )
         };
@@ -2919,6 +3165,718 @@ mod tests {
                     "build-only {build_only}, {label}: {envelope}"
                 );
             }
+        }
+    }
+
+    /// The `cross_check` field is omitted when absent, round-trips when set,
+    /// and a result written without the field deserializes to `None`.
+    #[test]
+    fn claim_result_cross_check_field_shape() {
+        let mut result = ClaimResult {
+            envelope_xdr: "AAAA".to_owned(),
+            tx_hash: Some("ab".repeat(32)),
+            ledger: Some(7),
+            stage: "build+sign+submit".to_owned(),
+            balance_id_hex72: Some("00".repeat(36)),
+            cross_check: None,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.get("cross_check").is_none(), "{json}");
+
+        result.cross_check = Some(CrossCheckView {
+            status: "skipped".to_owned(),
+            reason: Some("oracle_not_configured".to_owned()),
+            provider: None,
+            ledger: None,
+        });
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            json["cross_check"],
+            serde_json::json!({"status": "skipped", "reason": "oracle_not_configured"})
+        );
+        let back: ClaimResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back.cross_check, result.cross_check);
+
+        let legacy = serde_json::json!({
+            "envelope_xdr": "AAAA",
+            "tx_hash": "ab".repeat(32),
+            "ledger": 7,
+            "stage": "build+sign+submit",
+            "balance_id_hex72": "00".repeat(36)
+        });
+        let legacy: ClaimResult =
+            serde_json::from_value(legacy).expect("a result without cross_check deserializes");
+        assert_eq!(legacy.cross_check, None);
+    }
+
+    /// The table renderer prints the cross-check line after the result line
+    /// when the outcome carries one.
+    #[test]
+    fn table_output_prints_the_cross_check_line() {
+        let outcome = ClaimOutcome::succeeded(
+            None,
+            ClaimResult {
+                envelope_xdr: "AAAA".to_owned(),
+                tx_hash: Some("ab".repeat(32)),
+                ledger: Some(7),
+                stage: "build+sign+submit".to_owned(),
+                balance_id_hex72: None,
+                cross_check: Some(CrossCheckView {
+                    status: "passed".to_owned(),
+                    reason: None,
+                    provider: Some("https://oracle.example".to_owned()),
+                    ledger: Some(1001),
+                }),
+            },
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            render_claim_outcome(&mut out, OutputFormat::Table, outcome),
+            0
+        );
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.last().copied(),
+            Some("Cross-check: passed (oracle https://oracle.example, ledger 1001)"),
+            "{text}"
+        );
+    }
+
+    /// A sign-stage result prints the cross-check line after the envelope line.
+    #[test]
+    fn sign_table_output_prints_the_cross_check_line() {
+        let outcome = ClaimOutcome::succeeded(
+            None,
+            ClaimResult {
+                envelope_xdr: "AAAA".to_owned(),
+                tx_hash: None,
+                ledger: None,
+                stage: "sign".to_owned(),
+                balance_id_hex72: None,
+                cross_check: Some(CrossCheckView {
+                    status: "passed".to_owned(),
+                    reason: None,
+                    provider: Some("https://oracle.example".to_owned()),
+                    ledger: Some(1001),
+                }),
+            },
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            render_claim_outcome(&mut out, OutputFormat::Table, outcome),
+            0
+        );
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.last().copied(),
+            Some("Cross-check: passed (oracle https://oracle.example, ledger 1001)"),
+            "{text}"
+        );
+    }
+
+    // ── Cross-check witness ──────────────────────────────────────────────────
+
+    mod witness {
+        use super::*;
+        use crate::test_rpc::{
+            ClassicRpc, account_key, account_xdr, assert_rows_carry_witness, audit_rows, methods,
+            profile_name_for, sent, signers_resolved_by, trustline_xdr, witness_profile,
+        };
+        use stellar_xdr::{
+            ClaimClaimableBalanceOp, ClaimPredicate, ClaimableBalanceEntry,
+            ClaimableBalanceEntryExt, Claimant, ClaimantV0, LedgerEntryData, LedgerKey,
+            LedgerKeyClaimableBalance, MuxedAccountMed25519,
+        };
+
+        /// The issuer of the USD balances.
+        const ISSUER: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+
+        struct Run {
+            code: i32,
+            envelope: serde_json::Value,
+            signers: usize,
+        }
+
+        async fn run_stage(args: &ClaimArgs, profile: &Profile) -> Run {
+            let (outcome, signers) = signers_resolved_by(claim_outcome_loaded(
+                args,
+                &resolve_profile_name(args.profile.as_deref()),
+                profile,
+                ProfileOrigin::Persisted,
+                || Ok(()),
+            ))
+            .await;
+            let mut out = Vec::new();
+            let code = render_claim_outcome(&mut out, args.output, outcome);
+            Run {
+                code,
+                envelope: crate::common::render::single_json_document(&out),
+                signers,
+            }
+        }
+
+        async fn assert_refused(run: &Run, code: &str, primary: &wiremock::MockServer) {
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.envelope["error"]["code"], code, "{}", run.envelope);
+            assert_eq!(run.signers, 0, "the refusal precedes the signer");
+            assert!(!sent(primary).await, "nothing is sent");
+        }
+
+        fn args_for(claimant: &EnvSigner, primary: &wiremock::MockServer) -> ClaimArgs {
+            let mut args = claim_args(claimant, &primary.uri());
+            args.profile = Some(profile_name_for(claimant));
+            args
+        }
+
+        fn profile_for(
+            claimant: &EnvSigner,
+            primary: &wiremock::MockServer,
+            oracle: Option<&wiremock::MockServer>,
+            audit: &tempfile::TempDir,
+        ) -> Profile {
+            witness_profile(
+                &profile_name_for(claimant),
+                &primary.uri(),
+                oracle.map(wiremock::MockServer::uri).as_deref(),
+                audit.path(),
+            )
+        }
+
+        /// A claimable balance of `amount` in `asset` with id `0xab..`, whose
+        /// one claimant is `claimant`.
+        fn record(claimant: &str, asset: stellar_xdr::Asset, amount: i64) -> (String, String) {
+            let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0xab; 32]));
+            let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+                balance_id: balance_id.clone(),
+            })
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+            let entry = LedgerEntryData::ClaimableBalance(ClaimableBalanceEntry {
+                balance_id,
+                claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+                    destination: g_to_account_id(claimant),
+                    predicate: ClaimPredicate::Unconditional,
+                })]
+                .try_into()
+                .unwrap(),
+                asset,
+                amount,
+                ext: ClaimableBalanceEntryExt::V0,
+            })
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+            (key, entry)
+        }
+
+        fn usd() -> stellar_xdr::Asset {
+            stellar_xdr::Asset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+                asset_code: stellar_xdr::AssetCode4(*b"USD\0"),
+                issuer: g_to_account_id(ISSUER),
+            })
+        }
+
+        /// The claimant's account and a native balance of 10 XLM.
+        fn native_ledger(claimant: &str, amount: i64) -> ClassicRpc {
+            let (key, entry) = record(claimant, stellar_xdr::Asset::Native, amount);
+            ClassicRpc::testnet(&[claimant]).with_entry(key, entry)
+        }
+
+        /// The claimant's account, a USD balance, and the claimant's USD
+        /// trustline with `balance`.
+        fn credit_ledger(claimant: &str, trustline_balance: i64) -> ClassicRpc {
+            let (key, entry) = record(claimant, usd(), 50_000_000);
+            let (tl_key, tl_entry) = trustline_xdr(
+                claimant,
+                "USD",
+                ISSUER,
+                trustline_balance,
+                10_000_000_000,
+                1,
+            );
+            ClassicRpc::testnet(&[claimant])
+                .with_entry(key, entry)
+                .with_entry(tl_key, tl_entry)
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_witness_passes_and_rows_carry_it() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xa1; 32], "CLAIM_WITNESS_FULL_PASS_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let oracle = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+
+            let run = run_stage(&args_for(&claimant, &primary), &profile).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let view = &run.envelope["data"]["cross_check"];
+            assert_eq!(view["status"], "passed", "{}", run.envelope);
+            assert_eq!(view["provider"], oracle.uri());
+            assert_eq!(methods(&oracle).await, ["getNetwork", "getLedgerEntries"]);
+            assert_rows_carry_witness(&profile, &oracle.uri());
+            let kinds = &audit_rows(&profile, "value_action_submitted")[0]["witness"]["kinds"];
+            assert_eq!(
+                *kinds,
+                serde_json::json!(["source_account", "claimable_balance"])
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_record_disagreement_refuses_before_the_signer() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xa2; 32], "CLAIM_WITNESS_FULL_RECORD_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let oracle = native_ledger(&claimant.g, 100_000_001).serve().await;
+            let profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+
+            let run = run_stage(&args_for(&claimant, &primary), &profile).await;
+
+            assert_refused(&run, "simulation.divergence", &primary).await;
+            let message = run.envelope["error"]["message"].as_str().unwrap();
+            assert!(message.contains("claimable balance record"), "{message}");
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_trustline_disagreement_refuses_before_the_signer() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xa3; 32], "CLAIM_WITNESS_FULL_TRUSTLINE_SK");
+            let primary = credit_ledger(&claimant.g, 1_000).serve().await;
+            let oracle = credit_ledger(&claimant.g, 1_001).serve().await;
+            let profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+
+            let run = run_stage(&args_for(&claimant, &primary), &profile).await;
+
+            assert_refused(&run, "simulation.divergence", &primary).await;
+            let message = run.envelope["error"]["message"].as_str().unwrap();
+            assert!(message.contains("source trustline balance"), "{message}");
+        }
+
+        /// A matching credit claim compares the trustline too.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_credit_witness_covers_the_trustline() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xa4; 32], "CLAIM_WITNESS_FULL_CREDIT_SK");
+            let primary = credit_ledger(&claimant.g, 1_000).serve().await;
+            let oracle = credit_ledger(&claimant.g, 1_000).serve().await;
+            let profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+
+            let run = run_stage(&args_for(&claimant, &primary), &profile).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let kinds = &audit_rows(&profile, "value_action_submitted")[0]["witness"]["kinds"];
+            assert_eq!(
+                *kinds,
+                serde_json::json!(["source_account", "source_trustline", "claimable_balance"])
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_without_oracle_skips_on_testnet() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xa5; 32], "CLAIM_WITNESS_FULL_SKIP_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let profile = profile_for(&claimant, &primary, None, &audit);
+
+            let run = run_stage(&args_for(&claimant, &primary), &profile).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(
+                run.envelope["data"]["cross_check"],
+                serde_json::json!({"status": "skipped", "reason": "oracle_not_configured"})
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_oracle_identity_refusal_is_witness_unavailable() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xa6; 32], "CLAIM_WITNESS_FULL_IDENTITY_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let oracle_rpc = native_ledger(&claimant.g, 100_000_000);
+            oracle_rpc.report("Test SDF Future Network ; October 2022");
+            let oracle = oracle_rpc.serve().await;
+            let profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+
+            let run = run_stage(&args_for(&claimant, &primary), &profile).await;
+
+            assert_refused(&run, "network.witness_unavailable", &primary).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_fee_above_cap_refuses_before_the_witness() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xa7; 32], "CLAIM_WITNESS_FULL_CAP_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let oracle = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let mut profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+            profile.classic_max_fee_per_op_stroops = Some(50);
+
+            let run = run_stage(&args_for(&claimant, &primary), &profile).await;
+
+            assert_refused(&run, "fees.percentile_exceeds_cap", &primary).await;
+            assert_eq!(
+                run.envelope["error"]["message"],
+                "the default per-operation fee 100 stroops exceeds the profile cap of 50 \
+                 stroops; pass an explicit fee within the cap or raise \
+                 classic_max_fee_per_op_stroops"
+            );
+            assert!(methods(&oracle).await.is_empty());
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn build_only_makes_no_oracle_request() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xa8; 32], "CLAIM_WITNESS_BUILD_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let oracle = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let mut profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+            let mut args = args_for(&claimant, &primary);
+            args.build_only = true;
+
+            let run = run_stage(&args, &profile).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert!(
+                run.envelope["data"].get("cross_check").is_none(),
+                "{}",
+                run.envelope
+            );
+            assert!(methods(&oracle).await.is_empty());
+
+            profile.classic_max_fee_per_op_stroops = Some(50);
+            args.fee = Some("auto:p90".to_owned());
+            let run = run_stage(&args, &profile).await;
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.envelope["error"]["code"], "fees.percentile_exceeds_cap");
+            assert!(
+                run.envelope["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("auto-selected per-operation fee 100 stroops (percentile p90)"),
+                "{}",
+                run.envelope
+            );
+            assert!(methods(&oracle).await.is_empty());
+        }
+
+        // ── staged ──
+
+        fn claim_envelope(source: MuxedAccount, fee: u32) -> String {
+            let tx = Transaction {
+                source_account: source,
+                fee,
+                seq_num: SequenceNumber(101),
+                cond: Preconditions::None,
+                memo: stellar_xdr::Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::ClaimClaimableBalance(ClaimClaimableBalanceOp {
+                        balance_id: ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0xab; 32])),
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: TransactionExt::V0,
+            };
+            TransactionEnvelope::Tx(TransactionV1Envelope {
+                tx,
+                signatures: VecM::default(),
+            })
+            .to_xdr_base64(Limits::none())
+            .unwrap()
+        }
+
+        async fn signed(xdr: &str, seed: [u8; 32]) -> String {
+            attach_signature(
+                xdr,
+                &stellar_agent_network::SoftwareSigningKey::new_from_bytes(seed),
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn sign_only(
+            claimant: &EnvSigner,
+            primary: &wiremock::MockServer,
+            profile: &Profile,
+            xdr: String,
+        ) -> Run {
+            let mut args = args_for(claimant, primary);
+            args.sign_only = Some(xdr);
+            run_stage(&args, profile).await
+        }
+
+        async fn submit_only(
+            claimant: &EnvSigner,
+            primary: &wiremock::MockServer,
+            profile: &Profile,
+            xdr: String,
+        ) -> Run {
+            let mut args = args_for(claimant, primary);
+            args.secret_env = None;
+            args.submit_only = Some(xdr);
+            run_stage(&args, profile).await
+        }
+
+        /// The staged stages re-read only the source; the oracle answers for
+        /// the source alone.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_witnesses_the_source_only() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xb1; 32], "CLAIM_WITNESS_SIGN_PASS_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let oracle = ClassicRpc::testnet(&[&claimant.g]).serve().await;
+            let profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+
+            let run = sign_only(
+                &claimant,
+                &primary,
+                &profile,
+                claim_envelope(g_to_muxed(&claimant.g), 100),
+            )
+            .await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(run.signers, 1);
+            assert_eq!(run.envelope["data"]["cross_check"]["status"], "passed");
+            assert_eq!(methods(&oracle).await, ["getNetwork", "getLedgerEntries"]);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_source_disagreement_refuses_before_signing() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xb2; 32], "CLAIM_WITNESS_SIGN_DIVERGE_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let oracle = ClassicRpc::testnet(&[])
+                .with_entry(
+                    account_key(&claimant.g),
+                    account_xdr(&claimant.g, 999, 0, ""),
+                )
+                .serve()
+                .await;
+            let profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+
+            let run = sign_only(
+                &claimant,
+                &primary,
+                &profile,
+                claim_envelope(g_to_muxed(&claimant.g), 100),
+            )
+            .await;
+
+            assert_refused(&run, "simulation.divergence", &primary).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_without_oracle_skips_on_testnet() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xb3; 32], "CLAIM_WITNESS_SIGN_SKIP_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let profile = profile_for(&claimant, &primary, None, &audit);
+
+            let run = sign_only(
+                &claimant,
+                &primary,
+                &profile,
+                claim_envelope(g_to_muxed(&claimant.g), 100),
+            )
+            .await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(
+                run.envelope["data"]["cross_check"],
+                serde_json::json!({"status": "skipped", "reason": "oracle_not_configured"})
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_oracle_construction_failure_is_witness_unavailable() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xb4; 32], "CLAIM_WITNESS_SIGN_CONSTRUCTION_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let mut profile = profile_for(&claimant, &primary, None, &audit);
+            profile.oracle_provider_url = Some(url::Url::parse("ftp://oracle.example").unwrap());
+
+            let run = sign_only(
+                &claimant,
+                &primary,
+                &profile,
+                claim_envelope(g_to_muxed(&claimant.g), 100),
+            )
+            .await;
+
+            assert_refused(&run, "network.witness_unavailable", &primary).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_fee_above_cap_refuses_before_the_witness() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xb5; 32], "CLAIM_WITNESS_SIGN_CAP_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let oracle = ClassicRpc::testnet(&[&claimant.g]).serve().await;
+            let mut profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+            profile.classic_max_fee_per_op_stroops = Some(400);
+
+            let run = sign_only(
+                &claimant,
+                &primary,
+                &profile,
+                claim_envelope(g_to_muxed(&claimant.g), 500),
+            )
+            .await;
+
+            assert_refused(&run, "fees.percentile_exceeds_cap", &primary).await;
+            assert_eq!(
+                run.envelope["error"]["message"],
+                "the envelope's per-operation fee 500 stroops exceeds the profile cap of 400 \
+                 stroops; prepare the transaction again with a fee within the cap"
+            );
+            assert!(methods(&oracle).await.is_empty());
+        }
+
+        /// A muxed staged source is witnessed on its G account.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_muxed_source_witnesses_the_g_account() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xb6; 32], "CLAIM_WITNESS_SIGN_MUXED_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let oracle = ClassicRpc::testnet(&[&claimant.g]).serve().await;
+            let profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+            let muxed = MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                id: 11,
+                ed25519: Uint256(g_to_bytes(&claimant.g)),
+            });
+
+            let run = sign_only(&claimant, &primary, &profile, claim_envelope(muxed, 100)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(run.envelope["data"]["cross_check"]["status"], "passed");
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn submit_only_witness_passes_and_rows_carry_it() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xb7; 32], "CLAIM_WITNESS_SUBMIT_PASS_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let oracle = ClassicRpc::testnet(&[&claimant.g]).serve().await;
+            let profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+            let xdr = signed(&claim_envelope(g_to_muxed(&claimant.g), 100), [0xb7; 32]).await;
+
+            let run = submit_only(&claimant, &primary, &profile, xdr).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(run.envelope["data"]["cross_check"]["status"], "passed");
+            assert!(sent(&primary).await);
+            assert_rows_carry_witness(&profile, &oracle.uri());
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn submit_only_source_disagreement_refuses_before_the_send() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xb8; 32], "CLAIM_WITNESS_SUBMIT_DIVERGE_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let oracle = ClassicRpc::testnet(&[])
+                .with_entry(
+                    account_key(&claimant.g),
+                    account_xdr(&claimant.g, 999, 0, ""),
+                )
+                .serve()
+                .await;
+            let profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+            let xdr = signed(&claim_envelope(g_to_muxed(&claimant.g), 100), [0xb8; 32]).await;
+
+            let run = submit_only(&claimant, &primary, &profile, xdr).await;
+
+            assert_refused(&run, "simulation.divergence", &primary).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn submit_only_without_oracle_skips_on_testnet() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xb9; 32], "CLAIM_WITNESS_SUBMIT_SKIP_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let profile = profile_for(&claimant, &primary, None, &audit);
+            let xdr = signed(&claim_envelope(g_to_muxed(&claimant.g), 100), [0xb9; 32]).await;
+
+            let run = submit_only(&claimant, &primary, &profile, xdr).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(
+                run.envelope["data"]["cross_check"],
+                serde_json::json!({"status": "skipped", "reason": "oracle_not_configured"})
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn submit_only_oracle_identity_refusal_is_witness_unavailable() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xba; 32], "CLAIM_WITNESS_SUBMIT_IDENTITY_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let oracle_rpc = ClassicRpc::testnet(&[&claimant.g]);
+            oracle_rpc.report("Test SDF Future Network ; October 2022");
+            let oracle = oracle_rpc.serve().await;
+            let profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+            let xdr = signed(&claim_envelope(g_to_muxed(&claimant.g), 100), [0xba; 32]).await;
+
+            let run = submit_only(&claimant, &primary, &profile, xdr).await;
+
+            assert_refused(&run, "network.witness_unavailable", &primary).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn submit_only_fee_above_cap_refuses_before_the_witness() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let claimant = EnvSigner::new([0xbb; 32], "CLAIM_WITNESS_SUBMIT_CAP_SK");
+            let primary = native_ledger(&claimant.g, 100_000_000).serve().await;
+            let oracle = ClassicRpc::testnet(&[&claimant.g]).serve().await;
+            let mut profile = profile_for(&claimant, &primary, Some(&oracle), &audit);
+            profile.classic_max_fee_per_op_stroops = Some(400);
+            let xdr = signed(&claim_envelope(g_to_muxed(&claimant.g), 500), [0xbb; 32]).await;
+
+            let run = submit_only(&claimant, &primary, &profile, xdr).await;
+
+            assert_refused(&run, "fees.percentile_exceeds_cap", &primary).await;
+            assert!(methods(&oracle).await.is_empty());
         }
     }
 }

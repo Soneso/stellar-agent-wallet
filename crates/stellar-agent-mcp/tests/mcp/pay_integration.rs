@@ -1139,10 +1139,61 @@ async fn simulate_fee_explicit_above_profile_cap_fails() {
         .call_stellar_pay(args)
         .await
         .expect("fee above cap must return Ok(is_error) envelope");
-    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
+    let (code, message, _text) = crate::common::assert_business_envelope(&result);
     assert_eq!(
         code, "fees.percentile_exceeds_cap",
         "expected fees.percentile_exceeds_cap, got: {code}"
+    );
+    assert_eq!(
+        message,
+        "the explicit per-operation fee 500 stroops exceeds the profile cap of 100 stroops; \
+         lower the fee or raise classic_max_fee_per_op_stroops"
+    );
+}
+
+/// An auto-selected fee above the cap names the percentile it was selected
+/// at.
+#[tokio::test]
+#[serial]
+async fn simulate_fee_auto_above_profile_cap_names_the_percentile() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(13);
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(PayFeeRpcResponder::new(
+            account_ledger_key_xdr(SOURCE_G),
+            account_entry_xdr_with_balance(SOURCE_G, 100_000_000_000),
+            fee_stats_result("333", "999"),
+        ))
+        .mount(&mock_server)
+        .await;
+
+    let mut profile = testnet_profile_with_rpc(&mock_server.uri());
+    profile.classic_max_fee_per_op_stroops = Some(500);
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let args = StellarPayArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        source: SOURCE_G.to_owned(),
+        destination: DEST_G.to_owned(),
+        amount: Some(serde_json::from_str(r#""1 XLM""#).unwrap()),
+        amount_in_stroops: None,
+        asset: "native".to_owned(),
+        memo_text: None,
+        memo_id: None,
+        memo_hash_hex: None,
+        memo_return_hex: None,
+        classic_base: Some("auto:p99".to_owned()),
+    };
+    let result = server.call_stellar_pay(args).await.unwrap();
+    let (code, message, _text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "fees.percentile_exceeds_cap");
+    assert_eq!(
+        message,
+        "auto-selected per-operation fee 999 stroops (percentile p99) exceeds the profile cap \
+         of 500 stroops; raise classic_max_fee_per_op_stroops or accept a lower fee percentile"
     );
 }
 
@@ -4755,6 +4806,10 @@ fn witness_memo_entry() -> (String, String) {
 }
 
 fn witness_trustline_entry(source: &str) -> (String, String) {
+    witness_trustline_entry_with_balance(source, 100_000_000_000_000)
+}
+
+fn witness_trustline_entry_with_balance(source: &str, balance: i64) -> (String, String) {
     use stellar_xdr::*;
     let id = |g: &str| {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
@@ -4774,7 +4829,7 @@ fn witness_trustline_entry(source: &str) -> (String, String) {
     let data = LedgerEntryData::Trustline(TrustLineEntry {
         account_id: id(source),
         asset,
-        balance: 100_000_000_000_000,
+        balance,
         limit: i64::MAX,
         flags: 1,
         ext: TrustLineEntryExt::V0,
@@ -4833,6 +4888,9 @@ async fn witness_payment_case(
     }
     if mode == "memo" {
         entries.push(witness_memo_entry());
+    }
+    if mode == "trustline" {
+        entries[1] = witness_trustline_entry_with_balance(&source, 100_000_000_000_001);
     }
     let identity = if mode == "identity" {
         crate::common::EndpointNetwork::reporting("hostile-identity-marker")
@@ -4895,6 +4953,25 @@ async fn witness_payment_case(
             .mount(&primary)
             .await;
     }
+    if mode == "destination_error" {
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "method": "getLedgerEntries",
+                "params": {"keys": [account_ledger_key_xdr(DEST_G)]}})))
+            .respond_with(ResponseTemplate::new(503))
+            .with_priority(1)
+            .mount(&primary)
+            .await;
+    }
+    // The prepare ran without a cap; the commit runs on a server whose
+    // profile caps the per-operation fee below the envelope's.
+    let server = if mode == "cap" {
+        let mut capped = profile.clone();
+        capped.classic_max_fee_per_op_stroops = Some(50);
+        WalletServer::new(capped).unwrap()
+    } else {
+        server
+    };
     let before = reads.load(Ordering::SeqCst);
     let result = server.call_stellar_pay_commit(commit).await.unwrap();
     let body = call_result_json(&result);
@@ -4913,6 +4990,19 @@ async fn witness_payment_case(
                 .any(|m| m == "sendTransaction")
         );
         assert!(!text.contains("hostile-identity-marker"));
+        if mode == "cap" {
+            assert_eq!(
+                text,
+                "the envelope's per-operation fee 100 stroops exceeds the profile cap of 50 \
+                 stroops; prepare the transaction again with a fee within the cap"
+            );
+        }
+        if matches!(mode, "cap" | "destination_error") {
+            assert!(
+                crate::common::received_methods(&oracle).await.is_empty(),
+                "the refusal precedes the witness"
+            );
+        }
         return;
     }
     assert_ne!(result.is_error, Some(true), "{body}");
@@ -5158,6 +5248,48 @@ async fn pay_commit_oracle_construction_failure_is_witness_unavailable() {
         false,
         "construction",
         "network.witness_unavailable",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_source_trustline_disagreement_refuses() {
+    witness_payment_case(
+        "10000000",
+        false,
+        true,
+        false,
+        "trustline",
+        "simulation.divergence",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_fee_above_cap_refuses_before_the_witness() {
+    witness_payment_case(
+        "20000000000",
+        false,
+        false,
+        false,
+        "cap",
+        "fees.percentile_exceeds_cap",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_commit_destination_read_error_refuses_with_its_code() {
+    witness_payment_case(
+        "20000000000",
+        false,
+        false,
+        false,
+        "destination_error",
+        "network.rpc_unreachable",
     )
     .await;
 }

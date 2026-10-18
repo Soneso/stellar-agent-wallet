@@ -266,3 +266,228 @@ impl Drop for EnvSigner {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-check witness fixtures
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A testnet profile named `name`, reading through `primary` and witnessing
+/// through `oracle`.
+///
+/// The audit log lives in `audit_dir`, and the profile's audit chain-root key
+/// is minted in the mock keyring [`zero_config`] installed, so a stage
+/// acquires its audit writer and records its pending and submitted rows. The
+/// audit writer registry is process-wide and keyed by profile name, so each
+/// test names its own profile.
+pub(crate) fn witness_profile(
+    name: &str,
+    primary: &str,
+    oracle: Option<&str>,
+    audit_dir: &std::path::Path,
+) -> Profile {
+    let profile = Profile::builder_testnet_named(
+        name,
+        "stellar-agent-signer",
+        name,
+        "stellar-agent-nonce",
+        name,
+    )
+    .policy_engine(stellar_agent_core::profile::schema::PolicyEngineKind::Noop)
+    .wallet({
+        let mut wallet = stellar_agent_core::profile::schema::WalletConfig::default();
+        wallet.mlock_required = stellar_agent_core::wallet::MlockRequired::Warn;
+        wallet.unlock_ttl_seconds = stellar_agent_core::wallet::DEFAULT_TTL_SECONDS;
+        wallet
+    })
+    .rpc_url(primary)
+    .oracle_provider_url(oracle.map(|url| url::Url::parse(url).unwrap()))
+    .audit_log_path(audit_dir.join("audit.jsonl"))
+    .build();
+    stellar_agent_network::keyring::rotate_keyring_secret_32(
+        &profile.audit_log_hash_chain_key_id.service,
+        &profile.audit_log_hash_chain_key_id.account,
+    )
+    .unwrap();
+    profile
+}
+
+/// The audit rows of `kind` in `profile`'s audit log.
+pub(crate) fn audit_rows(profile: &Profile, kind: &str) -> Vec<Value> {
+    std::fs::read_to_string(&profile.audit_log_path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|row| row["kind"] == kind)
+        .collect()
+}
+
+/// Asserts that the pending and submitted rows each carry the witness of
+/// `oracle` at the fixture ledger.
+pub(crate) fn assert_rows_carry_witness(profile: &Profile, oracle: &str) {
+    let pending = audit_rows(profile, "value_action_pending");
+    let submitted = audit_rows(profile, "value_action_submitted");
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(submitted.len(), 1, "{submitted:?}");
+    for row in [&pending[0], &submitted[0]] {
+        assert_eq!(row["witness"]["provider"], oracle, "{row}");
+        assert_eq!(row["witness"]["ledger"], 1001, "{row}");
+        assert_eq!(row["witness"]["inputs_digest"].as_str().unwrap().len(), 64);
+    }
+    assert_eq!(pending[0]["witness"], submitted[0]["witness"]);
+}
+
+/// The envelope a command printed last on this thread.
+pub(crate) fn last_rendered() -> Value {
+    crate::common::render::take_rendered_for_test()
+        .pop()
+        .expect("the command printed an envelope")
+}
+
+/// Account entry XDR with the fields a witness compares set explicitly.
+pub(crate) fn account_xdr(account: &str, seq: i64, flags: u32, home_domain: &str) -> String {
+    use stellar_xdr::{
+        AccountEntry, AccountEntryExt, AccountId, LedgerEntryData, Limits, PublicKey,
+        SequenceNumber, Thresholds, Uint256, WriteXdr,
+    };
+    let pk = stellar_strkey::ed25519::PublicKey::from_string(account).unwrap();
+    LedgerEntryData::Account(AccountEntry {
+        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk.0))),
+        balance: ACCOUNT_BALANCE_STROOPS,
+        seq_num: SequenceNumber(seq),
+        num_sub_entries: 0,
+        inflation_dest: None,
+        flags,
+        home_domain: home_domain.as_bytes().to_vec().try_into().unwrap(),
+        thresholds: Thresholds([1, 0, 0, 0]),
+        signers: vec![].try_into().unwrap(),
+        ext: AccountEntryExt::V0,
+    })
+    .to_xdr_base64(Limits::none())
+    .unwrap()
+}
+
+/// The ledger key of `account`'s account entry.
+pub(crate) fn account_key(account: &str) -> String {
+    account_ledger_key_xdr(account)
+}
+
+/// Trustline `(key, entry)` XDR of `account` for `code:issuer`.
+pub(crate) fn trustline_xdr(
+    account: &str,
+    code: &str,
+    issuer: &str,
+    balance: i64,
+    limit: i64,
+    flags: u32,
+) -> (String, String) {
+    use stellar_xdr::{
+        AccountId, AlphaNum4, AssetCode4, LedgerEntryData, LedgerKey, LedgerKeyTrustLine, Limits,
+        PublicKey, TrustLineAsset, TrustLineEntry, TrustLineEntryExt, Uint256, WriteXdr,
+    };
+    let id = |g: &str| {
+        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+            stellar_strkey::ed25519::PublicKey::from_string(g)
+                .unwrap()
+                .0,
+        )))
+    };
+    let mut bytes = [0u8; 4];
+    bytes[..code.len()].copy_from_slice(code.as_bytes());
+    let asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+        asset_code: AssetCode4(bytes),
+        issuer: id(issuer),
+    });
+    let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: id(account),
+        asset: asset.clone(),
+    });
+    let entry = LedgerEntryData::Trustline(TrustLineEntry {
+        account_id: id(account),
+        asset,
+        balance,
+        limit,
+        flags,
+        ext: TrustLineEntryExt::V0,
+    });
+    (
+        key.to_xdr_base64(Limits::none()).unwrap(),
+        entry.to_xdr_base64(Limits::none()).unwrap(),
+    )
+}
+
+/// The `config.memo_required = "1"` data entry `(key, entry)` of `account`.
+pub(crate) fn memo_required_xdr(account: &str) -> (String, String) {
+    use stellar_xdr::{
+        AccountId, DataEntry, DataEntryExt, LedgerEntryData, LedgerKey, LedgerKeyData, Limits,
+        PublicKey, String64, StringM, Uint256, WriteXdr,
+    };
+    let id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        stellar_strkey::ed25519::PublicKey::from_string(account)
+            .unwrap()
+            .0,
+    )));
+    let name: String64 = StringM::<64>::try_from(b"config.memo_required".to_vec())
+        .unwrap()
+        .into();
+    let key = LedgerKey::Data(LedgerKeyData {
+        account_id: id.clone(),
+        data_name: name.clone(),
+    });
+    let entry = LedgerEntryData::Data(DataEntry {
+        account_id: id,
+        data_name: name,
+        data_value: b"1".to_vec().try_into().unwrap(),
+        ext: DataEntryExt::V0,
+    });
+    (
+        key.to_xdr_base64(Limits::none()).unwrap(),
+        entry.to_xdr_base64(Limits::none()).unwrap(),
+    )
+}
+
+/// A threshold table holding `threshold` base units for `asset`.
+pub(crate) fn thresholds(
+    asset: &str,
+    threshold: i128,
+) -> stellar_agent_core::cross_check::CrossCheckThresholds {
+    stellar_agent_core::cross_check::CrossCheckThresholds::new(
+        [(
+            stellar_agent_core::asset_id::CanonicalAsset::parse_threshold_key(asset).unwrap(),
+            threshold,
+        )]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap()
+}
+
+/// Mounts, ahead of `server`'s other answers, an HTTP 503 for a
+/// `getLedgerEntries` request whose only key is `key`.
+pub(crate) async fn fail_read_of(server: &MockServer, key: &str) {
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(json!({
+            "method": "getLedgerEntries", "params": {"keys": [key]}
+        })))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// The profile name a witness test derives from its signer's variable.
+pub(crate) fn profile_name_for(signer: &EnvSigner) -> String {
+    signer.var.to_ascii_lowercase().replace('_', "-")
+}
+
+/// How many signing keys a call resolved, with its output.
+pub(crate) async fn signers_resolved_by<F: Future>(call: F) -> (F::Output, usize) {
+    let before = crate::common::signer_ceremony::signer_resolutions_on_this_thread();
+    let output = call.await;
+    let resolved = crate::common::signer_ceremony::signer_resolutions_on_this_thread() - before;
+    (output, resolved)
+}
+
+/// Whether `server` received a `sendTransaction`.
+pub(crate) async fn sent(server: &MockServer) -> bool {
+    methods(server).await.iter().any(|m| m == "sendTransaction")
+}

@@ -375,6 +375,11 @@ async fn init_pool_n2_success_submits_valid_sandwich() {
 
     assert_sandwich_structure(envelope_xdr, FUNDER_KEY.as_str(), &channel_strkeys)
         .expect("submitted envelope must have valid N=2 CAP-33 sandwich structure");
+    assert_eq!(
+        envelope_fee(envelope_xdr),
+        FEE_PER_OP * 6,
+        "the fee is the per-operation fee once per operation"
+    );
 }
 
 /// `init_pool` with N=1 against a mock RPC server succeeds and produces a
@@ -660,4 +665,164 @@ async fn timed_out_initialization_is_recorded_and_reconcilable() {
             .status,
         stellar_agent_core::profile::receipt::ReceiptStatus::Success
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Transaction fee of the submitted sandwich
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `Transaction.fee` of a base64 v1 envelope.
+fn envelope_fee(envelope_xdr: &str) -> u32 {
+    use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};
+    match TransactionEnvelope::from_xdr_base64(envelope_xdr, Limits::none()).unwrap() {
+        TransactionEnvelope::Tx(v1) => v1.tx.fee,
+        other => panic!("expected a v1 envelope, got {other:?}"),
+    }
+}
+
+/// Answers `sendTransaction` with the hash of the submitted transaction and
+/// keeps each submitted envelope.
+struct SendCapture {
+    sent: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl wiremock::Respond for SendCapture {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        self.sent
+            .lock()
+            .unwrap()
+            .push(body["params"]["transaction"].as_str().unwrap().to_owned());
+        ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": body["id"],
+            "result": {
+                "hash": stellar_agent_test_support::send_transaction_hash_hex(
+                    &body,
+                    TESTNET_PASSPHRASE
+                ),
+                "status": "PENDING",
+                "latestLedger": 1000,
+                "latestLedgerCloseTime": "1234567890"
+            }
+        }))
+    }
+}
+
+/// Runs production `init_pool` for `n` channels at `fee_per_op` against a
+/// loopback endpoint and returns the fee of the transaction it submitted.
+async fn submitted_fee(n: u8, fee_per_op: u32) -> u32 {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "getNetwork"})))
+        .respond_with(EchoIdResponder::new(get_network_result(TESTNET_PASSPHRASE)))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+        .respond_with(EchoIdResponder::new(ledger_entries_result_for(&[
+            FUNDER_KEY.as_str(),
+        ])))
+        .mount(&server)
+        .await;
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(SendCapture {
+            sent: std::sync::Arc::clone(&sent),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(SubmissionEchoResponder::new(
+            json!({"txHash": "", "status": "SUCCESS", "ledger": 1001}),
+            TESTNET_PASSPHRASE,
+        ))
+        .mount(&server)
+        .await;
+    let seeds: Vec<[u8; 32]> = (0..n).map(|i| [i + 2; 32]).collect();
+    let recording = crate::common::RecorderFixture::new();
+    let funder_signer = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
+    let params = InitParams {
+        attempt: 0,
+        timeout: stellar_agent_pool::init::INIT_SUBMIT_TIMEOUT,
+        recorder: &recording.recorder(),
+        funder_strkey: FUNDER_KEY.as_str(),
+        funder_sequence: 700,
+        funder_signer: &funder_signer as &dyn Signer,
+        channel_signers: seeds
+            .iter()
+            .map(|seed| SoftwareSigningKey::new_from_bytes(*seed))
+            .collect(),
+        channel_strkeys: seeds
+            .iter()
+            .map(|seed| account_id_for_seed(*seed))
+            .collect(),
+        channel_indices: (1..=u32::from(n)).collect(),
+        network_passphrase: TESTNET_PASSPHRASE,
+        fee_per_op,
+    };
+    init_pool(&StellarRpcClient::new(&server.uri()).unwrap(), params)
+        .await
+        .expect("init_pool must submit and confirm");
+    let sent = sent.lock().unwrap();
+    assert_eq!(sent.len(), 1, "exactly one sandwich is submitted");
+    envelope_fee(&sent[0])
+}
+
+/// One channel is three operations: the fee is the per-operation fee three times.
+#[tokio::test]
+async fn init_pool_fee_for_one_channel_is_three_operations() {
+    assert_eq!(submitted_fee(1, FEE_PER_OP).await, 300);
+}
+
+/// Nineteen channels, the maximum, are 57 operations.
+#[tokio::test]
+async fn init_pool_fee_for_nineteen_channels_is_fifty_seven_operations() {
+    assert_eq!(submitted_fee(19, FEE_PER_OP).await, 5_700);
+}
+
+/// A per-operation fee whose product with the operation count exceeds `u32`
+/// refuses before any request.
+#[tokio::test]
+async fn init_pool_fee_overflow_refuses_before_any_request() {
+    let server = MockServer::start().await;
+    let recording = std::sync::Arc::new(crate::common::RecorderFixture::new());
+    let task_recording = std::sync::Arc::clone(&recording);
+    let uri = server.uri();
+    let fee_per_op = u32::MAX / 3 + 1;
+    let completed = tokio::spawn(async move {
+        let funder_signer = SoftwareSigningKey::new_from_bytes(FUNDER_SEED);
+        let params = InitParams {
+            attempt: 0,
+            timeout: stellar_agent_pool::init::INIT_SUBMIT_TIMEOUT,
+            recorder: &task_recording.recorder(),
+            funder_strkey: FUNDER_KEY.as_str(),
+            funder_sequence: 700,
+            funder_signer: &funder_signer as &dyn Signer,
+            channel_signers: vec![SoftwareSigningKey::new_from_bytes(CHANNEL_SEED_1)],
+            channel_strkeys: vec![CHANNEL_KEY_1.clone()],
+            channel_indices: vec![1],
+            network_passphrase: TESTNET_PASSPHRASE,
+            fee_per_op,
+        };
+        init_pool(&StellarRpcClient::new(&uri).unwrap(), params).await
+    })
+    .await;
+    assert!(
+        completed.is_ok(),
+        "init_pool must complete without panicking"
+    );
+    let result = completed.unwrap().map(|_| ());
+    assert!(
+        matches!(result, Err(PoolError::FeeOverflow {
+            fee_per_op: reported,
+            op_count: 3,
+        }) if reported == fee_per_op),
+        "init_pool must return FeeOverflow with the selected fee and \
+         operation count; got {result:?}"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(recording.receipts.all().unwrap().is_empty());
 }

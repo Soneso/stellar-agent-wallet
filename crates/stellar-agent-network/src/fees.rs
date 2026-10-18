@@ -4,10 +4,15 @@
 //! resolution for transaction construction.
 
 use serde::{Deserialize, Serialize};
-use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
+use stellar_agent_core::error::{FeeSource, NetworkError, ValidationError, WalletError};
+use stellar_agent_core::profile::schema::Profile;
 use stellar_rpc_client::{FeeStat, GetFeeStatsResponse};
 
 use crate::client::StellarRpcClient;
+
+/// Operation count of the single-operation classic envelopes built by the
+/// CLI and MCP handlers and accepted by the staged decoder.
+pub const CLASSIC_SINGLE_OPERATION_COUNT: u32 = 1;
 
 /// Allowed public Stellar RPC host names for explicit RPC URL overrides.
 pub const ALLOWED_RPC_HOSTS: &[&str] = &[
@@ -302,6 +307,76 @@ pub async fn resolve_classic_fee_selection(
     }
 }
 
+/// Names the source of the per-operation fee a parsed choice resolves to,
+/// for the fee-cap refusal of [`check_classic_fee_cap`].
+///
+/// `default_source` is the source of the fee a [`ClassicFeeChoice::ProfileDefault`]
+/// choice resolves to: [`FeeSource::ProfileDefault`] for a stage that reads
+/// `classic_fee_per_op_stroops`, [`FeeSource::CommandDefault`] for a stage
+/// that uses its built-in default fee.
+#[must_use]
+pub fn classic_fee_source(choice: ClassicFeeChoice, default_source: FeeSource) -> FeeSource {
+    match choice {
+        ClassicFeeChoice::ProfileDefault => default_source,
+        ClassicFeeChoice::Explicit(_) => FeeSource::Explicit,
+        ClassicFeeChoice::Auto(percentile) => FeeSource::Selected {
+            percentile: percentile.label().to_owned(),
+        },
+    }
+}
+
+/// Checks a built CLI envelope's resolved fee against the profile cap.
+///
+/// A [`ClassicFeeChoice::ProfileDefault`] choice is reported as
+/// [`FeeSource::CommandDefault`], because the CLI build uses its built-in fee
+/// and does not read `classic_fee_per_op_stroops`.
+///
+/// # Errors
+///
+/// Returns the refusal of [`check_classic_fee_cap`].
+pub fn check_built_fee_cap(
+    per_op: u32,
+    choice: ClassicFeeChoice,
+    profile: &Profile,
+) -> Result<(), WalletError> {
+    check_classic_fee_cap(
+        per_op,
+        classic_fee_source(choice, FeeSource::CommandDefault),
+        profile,
+    )
+}
+
+/// Checks a classic per-operation fee against the profile's
+/// `classic_max_fee_per_op_stroops` before a stage signs or sends.
+///
+/// A fee equal to the cap passes. A profile without a cap passes on testnet;
+/// on mainnet the cap is required, so a fee never reaches the network
+/// unbounded there.
+///
+/// # Errors
+///
+/// - [`ValidationError::MainnetFeeCapRequired`] for a mainnet profile that
+///   sets no cap.
+/// - [`ValidationError::FeeAboveCap`] for a fee above the cap; its text names
+///   `fee_source`.
+pub fn check_classic_fee_cap(
+    per_op: u32,
+    fee_source: FeeSource,
+    profile: &Profile,
+) -> Result<(), WalletError> {
+    match profile.classic_max_fee_per_op_stroops {
+        None if profile.chain_id.is_mainnet() => Err(WalletError::Validation(
+            ValidationError::MainnetFeeCapRequired,
+        )),
+        Some(cap) if per_op > cap => Err(WalletError::Validation(ValidationError::FeeAboveCap {
+            per_op,
+            cap,
+            fee_source,
+        })),
+        _ => Ok(()),
+    }
+}
+
 /// Fetches fee stats through a [`StellarRpcClient`].
 ///
 /// # Errors
@@ -383,5 +458,112 @@ fn validate_rpc_url_inner(url: &str, allow_loopback: bool) -> Result<(), RpcUrlE
             host: host.to_owned(),
             allowed: ALLOWED_RPC_HOSTS.join(", "),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used, reason = "test assertions")]
+
+    use super::*;
+
+    fn testnet(cap: Option<u32>) -> Profile {
+        Profile::builder_testnet_named("fees", "signer", "fees", "nonce", "fees")
+            .classic_max_fee_per_op_stroops(cap)
+            .build()
+    }
+
+    fn mainnet(cap: Option<u32>) -> Profile {
+        Profile::builder_mainnet_named(
+            "fees",
+            "https://rpc.example",
+            "signer",
+            "fees",
+            "nonce",
+            "fees",
+        )
+        .classic_max_fee_per_op_stroops(cap)
+        .build()
+    }
+
+    fn above_cap_text(result: Result<(), WalletError>) -> String {
+        match result {
+            Err(WalletError::Validation(ValidationError::FeeAboveCap {
+                per_op: 501,
+                cap: 500,
+                ..
+            })) => result.unwrap_err().to_string(),
+            other => panic!("expected FeeAboveCap for 501 over 500, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mainnet_without_cap_refuses() {
+        let error = check_classic_fee_cap(100, FeeSource::Explicit, &mainnet(None)).unwrap_err();
+        assert_eq!(error.code(), "validation.mainnet_fee_cap_required");
+    }
+
+    #[test]
+    fn mainnet_with_cap_passes() {
+        assert!(check_classic_fee_cap(100, FeeSource::Explicit, &mainnet(Some(10_000))).is_ok());
+    }
+
+    #[test]
+    fn testnet_without_cap_passes() {
+        assert!(check_classic_fee_cap(u32::MAX, FeeSource::Explicit, &testnet(None)).is_ok());
+    }
+
+    #[test]
+    fn fee_equal_to_cap_passes() {
+        assert!(check_classic_fee_cap(500, FeeSource::Envelope, &testnet(Some(500))).is_ok());
+        assert!(check_classic_fee_cap(500, FeeSource::Envelope, &mainnet(Some(500))).is_ok());
+    }
+
+    #[test]
+    fn fee_above_cap_names_its_source() {
+        let profile = testnet(Some(500));
+        let selected = FeeSource::Selected {
+            percentile: "p95".to_owned(),
+        };
+        let check = |source| check_classic_fee_cap(501, source, &profile);
+        assert_eq!(
+            check(selected.clone()).unwrap_err().code(),
+            "fees.percentile_exceeds_cap"
+        );
+        assert!(above_cap_text(check(selected)).starts_with("auto-selected per-operation fee 501"));
+        assert!(above_cap_text(check(FeeSource::Explicit)).starts_with("the explicit"));
+        assert!(above_cap_text(check(FeeSource::ProfileDefault)).starts_with("the profile's"));
+        assert!(above_cap_text(check(FeeSource::CommandDefault)).starts_with("the default"));
+        assert!(above_cap_text(check(FeeSource::Envelope)).starts_with("the envelope's"));
+        let mainnet = mainnet(Some(500));
+        assert!(
+            above_cap_text(check_classic_fee_cap(501, FeeSource::Explicit, &mainnet))
+                .starts_with("the explicit")
+        );
+    }
+
+    #[test]
+    fn fee_source_follows_the_choice() {
+        assert_eq!(
+            classic_fee_source(ClassicFeeChoice::Explicit(5), FeeSource::CommandDefault),
+            FeeSource::Explicit
+        );
+        assert_eq!(
+            classic_fee_source(
+                ClassicFeeChoice::Auto(FeePercentile::P90),
+                FeeSource::ProfileDefault
+            ),
+            FeeSource::Selected {
+                percentile: "p90".to_owned()
+            }
+        );
+        assert_eq!(
+            classic_fee_source(ClassicFeeChoice::ProfileDefault, FeeSource::CommandDefault),
+            FeeSource::CommandDefault
+        );
+        assert_eq!(
+            classic_fee_source(ClassicFeeChoice::ProfileDefault, FeeSource::ProfileDefault),
+            FeeSource::ProfileDefault
+        );
     }
 }

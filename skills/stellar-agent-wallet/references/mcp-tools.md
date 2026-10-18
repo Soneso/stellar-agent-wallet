@@ -253,6 +253,16 @@ Example simulate then commit:
   "nonce": "<from simulate>", "expires_at_unix_ms": 1234567890000, "envelope_xdr": "<from simulate>" }
 ```
 
+The classic prepare tools check the per-operation fee they resolve, and the
+commit tools `stellar_pay_commit`, `stellar_create_account_commit`,
+`stellar_trustline_commit`, and `stellar_claim_commit` check the presented
+envelope's fee, against the profile's `classic_max_fee_per_op_stroops` before
+anything is signed. A fee above the cap returns `fees.percentile_exceeds_cap`,
+and the message names the fee's source; a mainnet profile without the cap
+returns `validation.mainnet_fee_cap_required`. `stellar_pay_commit` also
+witnesses the source trustline of an issued send asset, and refuses a failed
+destination read with that read's own code.
+
 ### stellar_create_account / stellar_create_account_commit arguments
 
 Simulate: `chain_id`, `source` (G-strkey funding account), `destination`

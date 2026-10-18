@@ -1627,3 +1627,146 @@ async fn simulate_refuses_an_endpoint_serving_another_network_before_any_read() 
     );
     assert_eq!(built, 1, "one client for the simulate");
 }
+
+/// Mounts the round-trip responder for a claim by the signer of `seed`.
+async fn claim_endpoint(seed: [u8; 32]) -> (MockServer, String) {
+    let claimant_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+    let id = test_balance_id();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ClaimSubmitSuccessRpcResponder {
+            cb_key_xdr: claim_key_xdr(&id),
+            entry_xdr: claim_entry_xdr(
+                &id,
+                &claimant_g,
+                stellar_xdr::ClaimPredicate::Unconditional,
+                CLAIM_AMOUNT_STROOPS,
+            ),
+            account_key_xdr: account_ledger_key_xdr(&claimant_g),
+            account_xdr: account_entry_xdr_with_seq(
+                &claimant_g,
+                SOURCE_BALANCE_STROOPS,
+                0,
+                SOURCE_SEQ,
+            ),
+            network: crate::common::EndpointNetwork::testnet(),
+        })
+        .mount(&server)
+        .await;
+    (server, claimant_g)
+}
+
+/// The claim prepare always uses the profile fee; above the cap it refuses
+/// with the profile-fee text.
+#[tokio::test]
+#[serial]
+async fn claim_prepare_fee_above_cap_refuses() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key();
+    let (rpc, claimant_g) = claim_endpoint([0x48; 32]).await;
+    let mut profile = testnet_profile_with_rpc(&rpc.uri());
+    profile.classic_fee_per_op_stroops = Some(500);
+    profile.classic_max_fee_per_op_stroops = Some(400);
+    let server = WalletServer::new(profile).expect("WalletServer::new");
+
+    let result = server
+        .call_stellar_claim(StellarClaimArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            balance_id: "ab".repeat(32),
+            source_account: Some(claimant_g),
+        })
+        .await
+        .unwrap();
+
+    let (code, message, _) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "fees.percentile_exceeds_cap");
+    assert_eq!(
+        message,
+        "the profile's per-operation fee 500 stroops (classic_fee_per_op_stroops) exceeds the \
+         profile cap of 400 stroops; lower classic_fee_per_op_stroops or raise \
+         classic_max_fee_per_op_stroops"
+    );
+}
+
+/// The commit refuses an envelope whose fee exceeds the cap, before it signs
+/// or sends.
+#[tokio::test]
+#[serial]
+async fn claim_commit_fee_above_cap_refuses() {
+    let _data_root = crate::common::isolated_data_root();
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let reads = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&reads);
+    keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+        "svc",
+        "acct",
+        Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }),
+    )])
+    .expect("mock keyring store init");
+    install_test_nonce_key();
+    let (rpc, claimant_g) = claim_endpoint([0x49; 32]).await;
+    let profile = testnet_profile_with_rpc(&rpc.uri());
+    let server = WalletServer::new(profile.clone()).expect("WalletServer::new");
+    let simulated = server
+        .call_stellar_claim(StellarClaimArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            balance_id: "ab".repeat(32),
+            source_account: Some(claimant_g.clone()),
+        })
+        .await
+        .unwrap();
+    assert_ne!(
+        simulated.is_error,
+        Some(true),
+        "{}",
+        call_result_text(&simulated)
+    );
+    let (nonce, expires_at_unix_ms, envelope_xdr) = extract_commit_triple(&simulated);
+    let mut capped = profile;
+    capped.classic_max_fee_per_op_stroops = Some(50);
+    let capped_server = WalletServer::new(capped).expect("WalletServer::new");
+
+    reads.store(0, Ordering::SeqCst);
+    let result = capped_server
+        .call_stellar_claim_commit(StellarClaimCommitArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            balance_id: "ab".repeat(32),
+            source_account: Some(claimant_g),
+            nonce,
+            expires_at_unix_ms,
+            envelope_xdr,
+            approval_nonce: None,
+            approval_attestation: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "refusal must precede signer access"
+    );
+    let (code, message, _) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "fees.percentile_exceeds_cap");
+    assert_eq!(
+        message,
+        "the envelope's per-operation fee 100 stroops exceeds the profile cap of 50 stroops; \
+         prepare the transaction again with a fee within the cap"
+    );
+    assert!(
+        !crate::common::received_methods(&rpc)
+            .await
+            .iter()
+            .any(|m| m == "sendTransaction")
+    );
+}

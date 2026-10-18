@@ -243,8 +243,21 @@ secret.
 | `cross_check_threshold_stroops` | integer | no | `0` | Native threshold; see below. |
 | `[cross_check_thresholds]` | table | no | empty | Asset thresholds; testnet-only overlay. |
 | `classic_fee_per_op_stroops` | integer | no | unset (protocol default) | Per-operation base fee for classic transactions, in stroops. When unset, classic tools use the built-in default. |
-| `classic_max_fee_per_op_stroops` | integer | no | unset (no cap) | Per-operation fee cap, in stroops. When set, classic tools fail before envelope construction if the selected fee exceeds the cap. This is a guardrail, not a silent clamp. |
+| `classic_max_fee_per_op_stroops` | integer | mainnet, at action time | unset (no cap) | Per-operation fee cap, in stroops; see below. |
 | `submit_timeout_seconds` | integer | no | `60` | How long the wallet polls for transaction confirmation. |
+
+CLI `pay` and `claim` check the cap in the full pipeline, `--build-only`,
+`--sign-only`, and `--submit-only`. MCP pay, create-account, trustline, and
+claim check it in both prepare and commit. No other stage checks it, including
+CLI `trustline`, sponsored `accounts create`, `pool init`, opaque staged
+envelopes, and the SEP-43 signing tools.
+
+The cap applies to the resolved auto-selected, explicit, profile, or command
+fee, or the decoded envelope fee. A fee equal to the cap passes. A fee above
+it refuses with `fees.percentile_exceeds_cap`, naming the fee's source.
+At these covered stages, a mainnet profile without the cap refuses with
+`validation.mainnet_fee_cap_required`. `profile init --network mainnet`
+writes `10000`. The cap refuses an excessive fee; it never lowers the bid.
 
 #### Witness thresholds
 

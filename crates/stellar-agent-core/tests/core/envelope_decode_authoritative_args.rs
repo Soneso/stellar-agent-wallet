@@ -457,3 +457,96 @@ fn envelope_source_account_refuses_fee_bump() {
         Err(EnvelopeDecodeError::NotTransactionV1)
     ));
 }
+
+fn payment_to(destination: MuxedAccount) -> Operation {
+    Operation {
+        source_account: None,
+        body: OperationBody::Payment(PaymentOp {
+            destination,
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    }
+}
+
+#[test]
+fn payment_memo_shape_reports_each_memo_kind() {
+    use stellar_agent_core::envelope_decode::{MemoKind, payment_memo_shape};
+    let text: StringM<28> = b"memo".as_slice().try_into().unwrap();
+    for (memo, expected) in [
+        (Memo::None, MemoKind::None),
+        (Memo::Text(text), MemoKind::Text),
+        (Memo::Id(7), MemoKind::Id),
+        (Memo::Hash(Hash([3; 32])), MemoKind::Hash),
+        (Memo::Return(Hash([4; 32])), MemoKind::Return),
+    ] {
+        let env = build_tx1_envelope(SOURCE_G, payment_to(g_to_muxed(DEST_G)), memo);
+        let shape = payment_memo_shape(&to_b64(&env), "stellar_pay_commit").unwrap();
+        assert_eq!(shape.memo, expected);
+        assert!(!shape.destination_muxed);
+    }
+}
+
+#[test]
+fn payment_memo_shape_reports_a_muxed_destination_of_each_payment_kind() {
+    use stellar_agent_core::envelope_decode::{MemoKind, payment_memo_shape};
+    use stellar_xdr::{PathPaymentStrictReceiveOp, PathPaymentStrictSendOp};
+    let muxed = || {
+        MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+            id: 42,
+            ed25519: Uint256(g_to_bytes(DEST_G)),
+        })
+    };
+    let bodies = [
+        OperationBody::Payment(PaymentOp {
+            destination: muxed(),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+        OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
+            send_asset: Asset::Native,
+            send_amount: 1,
+            destination: muxed(),
+            dest_asset: Asset::Native,
+            dest_min: 1,
+            path: VecM::default(),
+        }),
+        OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
+            send_asset: Asset::Native,
+            send_max: 1,
+            destination: muxed(),
+            dest_asset: Asset::Native,
+            dest_amount: 1,
+            path: VecM::default(),
+        }),
+    ];
+    for body in bodies {
+        let op = Operation {
+            source_account: None,
+            body,
+        };
+        let env = build_tx1_envelope(SOURCE_G, op, Memo::None);
+        let shape = payment_memo_shape(&to_b64(&env), "stellar_pay_commit").unwrap();
+        assert_eq!(shape.memo, MemoKind::None);
+        assert!(shape.destination_muxed);
+    }
+}
+
+#[test]
+fn payment_memo_shape_refuses_a_non_payment_operation() {
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination: g_to_account_id(DEST_G),
+            starting_balance: 10_000_000,
+        }),
+    };
+    let env = build_tx1_envelope(SOURCE_G, op, Memo::None);
+    assert!(matches!(
+        stellar_agent_core::envelope_decode::payment_memo_shape(&to_b64(&env), "stellar_pay"),
+        Err(EnvelopeDecodeError::OperationKindMismatch {
+            tool: "stellar_pay",
+            ..
+        })
+    ));
+}

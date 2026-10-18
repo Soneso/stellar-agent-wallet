@@ -267,6 +267,10 @@ fn event_count(home: &Path, kind: &str) -> usize {
 }
 
 async fn fixture() -> (tempfile::TempDir, MockServer, Rpc) {
+    fixture_with_fee(None).await
+}
+
+async fn fixture_with_fee(fee_per_op: Option<u32>) -> (tempfile::TempDir, MockServer, Rpc) {
     let home = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
     let state = Rpc(Arc::new(Mutex::new(State {
@@ -297,6 +301,7 @@ async fn fixture() -> (tempfile::TempDir, MockServer, Rpc) {
     .with_profile_name(NAME)
     .rpc_url(server.uri())
     .audit_log_path(home.path().join(format!("audit/{NAME}.jsonl")))
+    .classic_fee_per_op_stroops(fee_per_op)
     .build();
     loader::save_to_dir(NAME, &p, &home.path().join("profiles")).unwrap();
     keyring_core::set_default_store(Arc::new(HeadlessStore::new(
@@ -898,4 +903,35 @@ async fn the_endpoint_check_runs_under_the_timeout_flag() {
         state.methods
     );
     assert_eq!(state.send_count, 1);
+}
+
+/// A profile fee whose product with the sandwich's operation count exceeds
+/// the transaction fee field refuses with `validation.fee_total_overflow`, and
+/// nothing is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn fee_total_overflow_refuses_with_its_code() {
+    let (home, _server, rpc) = fixture_with_fee(Some(u32::MAX / 6 + 1)).await;
+    let (code, output) = start(home.path());
+    assert_eq!(code, 1, "{output}");
+    assert_eq!(
+        output["error"]["code"], "validation.fee_total_overflow",
+        "{output}"
+    );
+    assert!(
+        output["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("times 6 operations exceeds the transaction fee limit"),
+        "{output}"
+    );
+    assert_eq!(rpc.0.lock().unwrap().send_count, 0);
+    assert!(
+        !rpc.0
+            .lock()
+            .unwrap()
+            .methods
+            .iter()
+            .any(|method| method == "sendTransaction")
+    );
 }

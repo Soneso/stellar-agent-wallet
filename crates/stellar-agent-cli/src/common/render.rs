@@ -34,9 +34,36 @@ use stellar_agent_core::envelope::Envelope;
 ///
 /// Never panics.
 pub fn render_json<T: serde::Serialize>(envelope: &Envelope<T>) {
+    #[cfg(test)]
+    if let Ok(json) = envelope.to_json_compact() {
+        RENDERED.with(|rendered| rendered.borrow_mut().push(json));
+    }
     if let Err(e) = render_json_to(&mut std::io::stdout().lock(), envelope) {
         exit_on_output_failure(&e);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every envelope [`render_json`] printed on this thread, oldest first.
+    static RENDERED: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drains and returns the envelopes [`render_json`] printed on the calling
+/// thread, parsed, oldest first.
+///
+/// A command test on a current-thread runtime reads the envelope a command
+/// printed without capturing stdout.
+#[cfg(test)]
+pub(crate) fn take_rendered_for_test() -> Vec<serde_json::Value> {
+    RENDERED.with(|rendered| {
+        rendered
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|json| serde_json::from_str(&json).ok())
+            .collect()
+    })
 }
 
 /// Reports an output failure on stderr and ends the process with exit code

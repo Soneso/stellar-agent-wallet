@@ -286,6 +286,17 @@ consume the nonce. The submit layer's own check comes after the nonce is
 consumed. A commit reads the clock for the nonce's expiry after its check, so
 the check's time counts toward that expiry.
 
+The classic prepare tools check the per-operation fee they resolve against
+the profile's `classic_max_fee_per_op_stroops`. The commit tools
+`stellar_pay_commit`, `stellar_create_account_commit`,
+`stellar_trustline_commit`, and `stellar_claim_commit` check the fee of the
+presented envelope the same way, before anything is signed or sent. A fee
+above the cap returns `fees.percentile_exceeds_cap`. The message names where
+the fee came from: an auto-selected fee and its percentile, an explicit
+`classic_base`, the profile's `classic_fee_per_op_stroops`, or the envelope.
+A mainnet profile without the cap returns
+`validation.mainnet_fee_cap_required`.
+
 An endpoint refusal precedes a missing account or claim entry, a policy
 denial, an approval refusal, a rebuild divergence, the audit pre-flight, and a
 malformed nonce. It also precedes the chain, fee, asset, and amount checks that

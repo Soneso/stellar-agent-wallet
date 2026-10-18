@@ -69,6 +69,21 @@ pub enum PoolError {
         requested: usize,
     },
 
+    /// The per-operation fee times the sandwich's operation count does not
+    /// fit the transaction's `u32` fee field.
+    ///
+    /// Returned by `init_pool` before anything is built, signed, or sent.
+    #[error(
+        "pool.fee_overflow: per-operation fee {fee_per_op} stroops times {op_count} operations \
+         exceeds the transaction fee limit"
+    )]
+    FeeOverflow {
+        /// Per-operation fee in stroops.
+        fee_per_op: u32,
+        /// Operations in the sandwich transaction.
+        op_count: u32,
+    },
+
     /// Pool has not been initialised.
     ///
     /// Returned when acquire is called on a pool that has not been funded via

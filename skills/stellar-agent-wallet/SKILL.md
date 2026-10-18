@@ -298,7 +298,9 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   - `network.envelope_unsigned`: a required signature set is empty.
 
   `network.witness_unavailable` separately reports an unavailable required oracle
-  witness for MCP payment and account-creation commits.
+  witness for MCP payment and account-creation commits and for CLI `pay` and
+  `claim`. `fees.percentile_exceeds_cap` and
+  `validation.mainnet_fee_cap_required` report the classic fee cap.
   See references/troubleshooting.md.
 - These tools refuse `stellar:mainnet` structurally at handler entry with
   `network.mainnet_write_forbidden`, before the policy gate and regardless of

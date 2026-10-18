@@ -66,6 +66,23 @@ pub(crate) struct SignerCeremonyOutcome {
     pub(crate) mlock_degradation: Option<MlockDegradation>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Calls to [`resolve_software_signer_from_env`] on this thread.
+    static SIGNER_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times [`resolve_software_signer_from_env`] ran on the calling
+/// thread.
+///
+/// A command test on a current-thread runtime reads it before and after one
+/// command: an unchanged count proves the command refused before it loaded a
+/// signing key.
+#[cfg(test)]
+pub(crate) fn signer_resolutions_on_this_thread() -> usize {
+    SIGNER_RESOLUTIONS.with(std::cell::Cell::get)
+}
+
 /// Derives a software signer using the loaded profile's wallet controls.
 ///
 /// # Errors
@@ -75,6 +92,8 @@ pub(crate) async fn resolve_software_signer_from_env(
     wallet_label: &str,
     profile: &Profile,
 ) -> Result<SignerCeremonyOutcome, WalletError> {
+    #[cfg(test)]
+    SIGNER_RESOLUTIONS.with(|count| count.set(count.get() + 1));
     let mlock_required = profile.wallet.mlock_required;
     let ttl_seconds = profile.wallet.unlock_ttl_seconds;
 

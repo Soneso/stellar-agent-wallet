@@ -18,10 +18,9 @@ use stellar_agent_mcp_macros::mcp_tool_router;
 use crate::server::WalletServer;
 use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
-    commit_envelope_and_verify_nonce, commit_path_error_result, enforce_classic_fee_cap,
-    ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope,
-    resolve_classic_fee_per_op_stroops, submit_timeout, total_classic_fee_stroops,
-    verify_attestation_gate,
+    commit_envelope_and_verify_nonce, commit_path_error_result, ledger_err_result, nonce_id_prefix,
+    redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops, submit_timeout,
+    total_classic_fee_stroops, verify_attestation_gate,
 };
 use stellar_agent_claimable::entry::{fetch_claimable_balance_entry, fetch_trustline_state};
 use stellar_agent_claimable::error::ClaimError;
@@ -37,7 +36,7 @@ use stellar_agent_core::approval::{
 use stellar_agent_core::envelope_decode::decode_authoritative_args;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::{
-    BASE_RESERVE_STROOPS, BalanceView, ClassicOpBuilder,
+    BASE_RESERVE_STROOPS, BalanceView, ClassicOpBuilder, check_classic_fee_cap, classic_fee_source,
     keyring::enrolled_keyring_signer,
     parse_classic_fee_choice, resolve_classic_fee_selection,
     signing::envelope_signing::attach_signature,
@@ -406,8 +405,8 @@ impl WalletServer {
         if preview.asset_code.is_some() {
             let code = preview.asset_code.as_deref().unwrap_or_default();
             let issuer = preview.asset_issuer.as_deref().unwrap_or_default();
-            let state = match fetch_trustline_state(&client, &source, code, issuer).await {
-                Ok(s) => s,
+            let (state, _) = match fetch_trustline_state(&client, &source, code, issuer).await {
+                Ok(read) => read,
                 Err(err) => return Ok(claim_error_result(&err)),
             };
             if let Err(err) = check_trustline(
@@ -442,12 +441,15 @@ impl WalletServer {
                 ));
             }
         };
-        if let Err(r) = enforce_classic_fee_cap(
+        if let Err(err) = check_classic_fee_cap(
             fee_selection.per_op_stroops,
-            &fee_selection.selected_fee_percentile,
+            classic_fee_source(
+                fee_choice,
+                stellar_agent_core::error::FeeSource::ProfileDefault,
+            ),
             &self.profile,
         ) {
-            return Ok(r);
+            return Ok(ledger_err_result(&err));
         }
         let fee_per_op_stroops = fee_selection.per_op_stroops;
         let total_fee_stroops =
@@ -899,8 +901,12 @@ impl WalletServer {
         }
 
         // ── Fee cap ──────────────────────────────────────────────────────────
-        if let Err(r) = enforce_classic_fee_cap(fee_per_op_stroops, "envelope", &self.profile) {
-            return Ok(r);
+        if let Err(err) = check_classic_fee_cap(
+            fee_per_op_stroops,
+            stellar_agent_core::error::FeeSource::Envelope,
+            &self.profile,
+        ) {
+            return Ok(ledger_err_result(&err));
         }
 
         // Extract the gate-sized legs for the post-submit audit row: the SAME

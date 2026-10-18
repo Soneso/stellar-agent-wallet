@@ -72,7 +72,8 @@ pub struct InitParams<'a> {
     pub channel_indices: Vec<u32>,
     /// Stellar network passphrase.
     pub network_passphrase: &'a str,
-    /// Base fee in stroops per operation (total = fee × op_count).
+    /// Base fee in stroops per operation; the transaction fee is this fee
+    /// times the operation count (three operations per channel).
     pub fee_per_op: u32,
     /// Durable receipt and audit recorder, invoked before the transaction leaves.
     pub recorder: &'a dyn SubmissionRecorder,
@@ -104,6 +105,10 @@ pub struct InitResult {
 /// `> ChannelPool::MAX_SIZE` (currently 19 — bounded by the 20-signature `VecM`
 /// cap).
 ///
+/// Returns [`PoolError::FeeOverflow`] if `fee_per_op` times the operation
+/// count does not fit the transaction's `u32` fee field; nothing is built,
+/// signed, or sent.
+///
 /// Returns [`PoolError::InitFailed`] if the transaction is rejected or times
 /// out.
 ///
@@ -130,16 +135,22 @@ pub async fn init_pool(
         });
     }
 
-    // Each channel contributes 3 operations.
-    // Total fee = fee_per_op × (N × 3).
+    // Each channel contributes 3 operations. `ClassicOpBuilder::new` takes the
+    // per-operation fee and the built transaction's fee is that fee times the
+    // operation count, so the product must fit the u32 fee field.
     let op_count = n as u32 * 3;
-    let total_fee = params.fee_per_op.saturating_mul(op_count);
+    if params.fee_per_op.checked_mul(op_count).is_none() {
+        return Err(PoolError::FeeOverflow {
+            fee_per_op: params.fee_per_op,
+            op_count,
+        });
+    }
 
     let mut builder = ClassicOpBuilder::new(
         params.funder_strkey,
         params.funder_sequence,
         params.network_passphrase,
-        total_fee,
+        params.fee_per_op,
     );
 
     builder
