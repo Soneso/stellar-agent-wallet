@@ -20,7 +20,14 @@ The following operations have no structural refusal:
 - The read-only verbs (`smart-account rules get`, `smart-account rules get-spending-limit`, `smart-account rules list` / `smart-account list-rules`, `smart-account list-verifiers`, `smart-account timelock list-pending`) allow mainnet inspection.
 - `smart-account rules verify-pins`, `smart-account signers list`, and `smart-account signers refresh` load no signer, sign nothing, and write nothing on chain, so they accept a mainnet profile. They keep their local audit writes. On a persisted profile they need `profile rotate-audit-key` first, and otherwise refuse with `audit.chain_key_unavailable`. The mainnet endpoint rules above still apply.
 
-For the terms used here — [profile](../profiles.md), policy engine, approval spine, audit log, [context rule](../concepts.md), auth digest — see [concepts](../concepts.md). The shared flags (`--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`, and the signer-source group) are defined once on the [CLI reference index](index.md#global-conventions); this page names each flag a command takes and only describes the flags specific to that command.
+For the terms used here ([profile](../profiles.md), policy engine, approval
+spine, audit log, [context rule](../concepts.md), auth digest), see
+[concepts](../concepts.md).
+The shared flags (`--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`,
+`--timeout-seconds`, `--output`, and the signer-source group) are defined once
+on the [CLI reference index](index.md#global-conventions).
+This page names each flag a command takes and only describes the flags specific
+to that command.
 
 Every command prints one JSON envelope on stdout and returns exit code `0` on success, `1` on any error (see [output envelope and exit codes](index.md#output-envelope-and-exit-codes)).
 
@@ -81,7 +88,9 @@ The rows a confirmed verb writes, in order. A row that does not apply is skipped
 
 ---
 
-## `smart-account rules` — context-rule lifecycle
+<a id="smart-account-rules--context-rule-lifecycle"></a>
+
+## `smart-account rules`: context-rule lifecycle
 
 Manages the OpenZeppelin context rules on a smart-account. Each rule has a `rule_id` (a `u32`), a name (OZ cap: 20 bytes), an optional expiry ledger, a signer set (OZ cap: 15 signers), and up to 5 policy contracts.
 
@@ -132,9 +141,11 @@ Reads a single rule by id (OZ `get_context_rule`). Read-only; no signing, no sub
 
 Flags:
 
-- `--account <C_STRKEY>` (required) — smart-account contract address.
-- `--rule-id <U32>` (required) — rule index to fetch.
-- `--source-account <G_STRKEY>` (required) — any funded account on the target network; used only to assemble the simulation envelope. It is not debited and not signed for.
+- `--account <C_STRKEY>` (required): smart-account contract address.
+- `--rule-id <U32>` (required): rule index to fetch.
+- `--source-account <G_STRKEY>` (required): any funded account on the target
+  network; used only to assemble the simulation envelope. It is not debited and
+  not signed for.
 - Shared: `--profile`, `--network`, `--rpc-url`, `--timeout-seconds`, `--output`.
 
 ```bash
@@ -151,8 +162,8 @@ Renames a rule (OZ `update_context_rule_name`). Signs and submits. Testnet only.
 Flags:
 
 - `--account <C_STRKEY>` (required).
-- `--rule-id <U32>` (required) — rule to rename.
-- `--name <STRING>` (required) — new name; same 20-byte cap as `create`.
+- `--rule-id <U32>` (required): rule to rename.
+- `--name <STRING>` (required): new name; same 20-byte cap as `create`.
 - `--auth-rule-id <U32>` (optional): authorizing rule id; defaults to `--rule-id`. The authorizing rule passes the [pre-submission checks](#pre-submission-checks), its signer-set baseline included.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
@@ -171,8 +182,9 @@ Changes a rule's expiry (OZ `update_context_rule_valid_until`). Signs and submit
 Flags:
 
 - `--account <C_STRKEY>` (required).
-- `--rule-id <U32>` (required) — rule to update.
-- `--valid-until <LEDGER|none>` (required) — a ledger sequence sets explicit expiry; `none` clears it (permanent rule).
+- `--rule-id <U32>` (required): rule to update.
+- `--valid-until <LEDGER|none>` (required): a ledger sequence sets explicit
+  expiry; `none` clears it (permanent rule).
 - `--auth-rule-id <U32>` (optional): defaults to `--rule-id`. The authorizing rule passes the [pre-submission checks](#pre-submission-checks), its signer-set baseline included.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
@@ -191,7 +203,7 @@ Removes a rule (OZ `remove_context_rule`). Signs and submits. Testnet only.
 Flags:
 
 - `--account <C_STRKEY>` (required).
-- `--rule-id <U32>` (required) — rule to delete.
+- `--rule-id <U32>` (required): rule to delete.
 - `--auth-rule-id <U32>` (optional): defaults to `--rule-id`. The authorizing rule passes the [pre-submission checks](#pre-submission-checks), its signer-set baseline included.
 - Shared: `--profile`, signer-source group, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
@@ -216,7 +228,7 @@ A failed executable read reports `sa.deployment_failed` in `unavailable_reason`.
 Flags:
 
 - `--account <C_STRKEY>` (required).
-- `--rule-id <U32>` (required) — rule whose pins to verify.
+- `--rule-id <U32>` (required): rule whose pins to verify.
 - `--source-account <G_STRKEY>` (optional): an existing account to use as the simulation source. A malformed value refuses with `validation.address_invalid` before the audit log opens and before any RPC.
 - `--rpc-url <URL>`: optional testnet override; absent uses the profile endpoint. Mainnet profiles refuse the flag.
 - Shared: `--profile`, `--network`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
@@ -341,18 +353,37 @@ stellar-agent smart-account rules list --account CABC...WXYZ
 
 Reads an installed spending-limit policy's budget state: identifies the policy attached to `--rule-id` via wasm-hash allowlist lookup, reads its on-chain `get_spending_limit_data`, and computes the rolling-window budget snapshot. Read-only; no signing; no submission; no audit-log emission. `mainnet` is accepted.
 
-The returned `in_window_spent` and `remaining_budget` are exact only as of `as_of_ledger` — a point-in-time estimate, not a guarantee for a future submission. Forward ledger movement past that point only grows headroom (older spend entries fall out of the rolling window), but an intervening spend shrinks it; a later `set-spending-limit` or agent transfer can still cause `SpendingLimitExceeded`.
+The returned `in_window_spent` and `remaining_budget` are exact only as of
+`as_of_ledger`: a point-in-time estimate, not a guarantee for a future
+submission.
+Forward ledger movement past that point only grows headroom (older spend entries
+fall out of the rolling window), but an intervening spend shrinks it.
+A later `set-spending-limit` or agent transfer can still cause
+`SpendingLimitExceeded`.
 
-Trust boundary: this read consults a single RPC endpoint (no two-RPC cross-check) — an advisory view, not a signing input. The write verbs keep the full two-RPC consultation.
+Trust boundary: this read consults a single RPC endpoint (no two-RPC
+cross-check).
+It is an advisory view, not a signing input.
+The write verbs keep the full two-RPC consultation.
 
 Flags:
 
 - `--account <C_STRKEY>` (required).
-- `--rule-id <U32>` (required) — rule whose spending-limit policy to read.
-- `--source-account <G_STRKEY>` (required) — source account for the simulation envelope. Any funded account on the target network works (read-only path; no signing).
+- `--rule-id <U32>` (required): rule whose spending-limit policy to read.
+- `--source-account <G_STRKEY>` (required): source account for the simulation
+  envelope. Any funded account on the target network works (read-only path; no
+  signing).
 - Shared: `--profile`, `--network`, `--rpc-url`, `--timeout-seconds`, `--output`.
 
-Envelope: `{ smart_account, rule_id, policy_address, spending_limit, period_ledgers, in_window_spent, remaining_budget, as_of_ledger, window_cutoff_ledger, history_entries, cached_total_spent }`. `spending_limit`, `in_window_spent`, `remaining_budget`, and `cached_total_spent` are decimal strings (i128, stroops), not JSON numbers — a raw JSON number above `2^53` cannot be represented exactly by an `f64`-backed parser. `cached_total_spent` is the on-chain cached total verbatim, for transparency — it is NOT used to compute `in_window_spent` (the on-chain cache is not evicted on read, so it can include entries already outside the rolling window).
+Envelope:
+`{ smart_account, rule_id, policy_address, spending_limit, period_ledgers, in_window_spent, remaining_budget, as_of_ledger, window_cutoff_ledger, history_entries, cached_total_spent }`.
+`spending_limit`, `in_window_spent`, `remaining_budget`, and
+`cached_total_spent` are decimal strings (i128, stroops), not JSON numbers.
+A raw JSON number above `2^53` cannot be represented exactly by an `f64`-backed
+parser.
+`cached_total_spent` is the on-chain cached total verbatim, for transparency.
+It is NOT used to compute `in_window_spent` (the on-chain cache is not evicted
+on read, so it can include entries already outside the rolling window).
 
 ```bash
 stellar-agent smart-account rules get-spending-limit \
@@ -365,16 +396,23 @@ stellar-agent smart-account rules get-spending-limit \
 
 Retunes an installed spending-limit policy's limit (OZ `set_spending_limit`) without resetting the rolling spend history. Signs and submits. Testnet only.
 
-HONESTY CONSTRAINT: `set_spending_limit` mutates ONLY the limit; the period is immutable once installed. Retuning the period requires `remove-policy` followed by `add-policy --kind spending-limit`, which DOES reset the spend history (the OZ contract's `install` initializes empty history) — there is no way to change the period without that reset.
+HONESTY CONSTRAINT: `set_spending_limit` mutates ONLY the limit; the period is
+immutable once installed.
+Retuning the period requires `remove-policy` followed by
+`add-policy --kind spending-limit`, which DOES reset the spend history (the OZ
+contract's `install` initializes empty history).
+There is no way to change the period without that reset.
 
 Refused client-side before any network call when `--limit <= 0` (mirroring the on-chain `InvalidLimitOrPeriod` constraint). Pre-reads the current spending-limit data before submitting, both to report `old_limit` in the audit row and to fail closed early if no spending-limit policy is installed on the rule.
 
 Flags:
 
 - `--account <C_STRKEY>` (required).
-- `--rule-id <U32>` (required) — rule whose spending-limit policy to retune. This rule keys the policy's storage; it does NOT authorize the call.
+- `--rule-id <U32>` (required): rule whose spending-limit policy to retune. This
+  rule keys the policy's storage; it does NOT authorize the call.
 - `--auth-rule-id <U32>`: rule that authorizes the retune. Default `0` (the bootstrap rule), not `--rule-id`. The retune executes on the smart account itself. A CallContract-scoped target rule refuses that context on chain (`UnvalidatedContext`). Supply another admin-capable rule id when the bootstrap rule has been replaced. An authorizing rule other than `0` passes the [pre-submission checks](#pre-submission-checks).
-- `--limit <STROOPS>` (required) — new spending limit, in stroops. Must be positive.
+- `--limit <STROOPS>` (required): new spending limit, in stroops. Must be
+  positive.
 - Signer-source group (see [Signer source](#signer-source)); the signer must satisfy the `--auth-rule-id` rule.
 - Shared: `--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output`.
 
@@ -388,7 +426,9 @@ stellar-agent smart-account rules set-spending-limit \
 
 ---
 
-## `smart-account signers` — signer-set lifecycle
+<a id="smart-account-signers--signer-set-lifecycle"></a>
+
+## `smart-account signers`: signer-set lifecycle
 
 Manages the signer set and threshold of a context rule. All verbs take `--account <C_STRKEY>` and `--rule-id <U32>` (both required), `--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, and `--timeout-seconds`. None of these verbs accept `--output` (passing it is rejected). The verbs that sign take the signer-source group and structurally refuse `mainnet` (see the intro).
 
@@ -573,9 +613,17 @@ stellar-agent smart-account signers batch-add \
 
 ## `smart-account execute`
 
-Submits one `CallContract` invocation against an external contract, authorized by a named context rule and signed by an External-Ed25519 rule signer, with a separate fee-paying envelope signer. This is the delegation surface: an agent holding only its own ed25519 seed submits a call through its scoped rule — see [Agent delegation](../agent-delegation.md) for the full walkthrough. Signs and submits. Testnet only; structurally refuses `mainnet` before any RPC call or key-material access.
+Submits one `CallContract` invocation against an external contract, authorized
+by a named context rule and signed by an External-Ed25519 rule signer, with a
+separate fee-paying envelope signer.
+This is the delegation surface: an agent holding only its own ed25519 seed
+submits a call through its scoped rule.
+See [Agent delegation](../agent-delegation.md) for the full walkthrough.
+Signs and submits.
+Testnet only; structurally refuses `mainnet` before any RPC call or key-material
+access.
 
-Two distinct signers participate — neither is the other:
+Two distinct signers participate (neither is the other):
 
 - The **rule signer** (`--rule-signer-ed25519-secret-env`) authorizes the smart-account call. It is the agent's own key; it never needs a funded classic account.
 - The **fee-payer signer** (`--signer-secret-env` / `--sign-with-ledger`, the standard [signer source](index.md#signer-source) group) pays the transaction fee and signs the envelope.
@@ -674,15 +722,20 @@ Exactly one deployer source is required (mutually exclusive group): `--deployer-
 
 Flags:
 
-- `--deployer-secret-env <VAR>` — env-var name holding the deployer S-strkey. Mutually exclusive with `--sign-with-ledger`.
-- `--sign-with-ledger` — use a connected Ledger as the deployer.
-- `--account-index <INDEX>` — Ledger BIP-44 index. Default `0`.
+- `--deployer-secret-env <VAR>`: env-var name holding the deployer S-strkey.
+  Mutually exclusive with `--sign-with-ledger`.
+- `--sign-with-ledger`: use a connected Ledger as the deployer.
+- `--account-index <INDEX>`: Ledger BIP-44 index. Default `0`.
 - `--network <NETWORK>`: optional assertion that must match the profile chain.
 - `--rpc-url <URL>`: optional testnet override; absent uses the profile endpoint. Mainnet profiles refuse the flag.
-- `--fee <STROOPS|auto[:pNN]>` (optional) — explicit per-op stroop fee, or `auto` (p95), or `auto:p50` / `auto:p75` / `auto:p95` / `auto:p99`. Absent uses the profile default (100 stroops base; Soroban resource fees are added by simulation).
-- `--timeout-seconds <SECONDS>` — default `60`.
-- `--output <FORMAT>` — `json` (default) or `table`.
-- `--dry-run` — derive the verifier address with no network access or signing; returns `status: "dry_run"`.
+- `--fee <STROOPS|auto[:pNN]>` (optional): explicit per-op stroop fee, or `auto`
+  (p95), or `auto:p50` / `auto:p75` / `auto:p95` / `auto:p99`.
+  Absent uses the profile default (100 stroops base; Soroban resource fees are
+  added by simulation).
+- `--timeout-seconds <SECONDS>`: default `60`.
+- `--output <FORMAT>`: `json` (default) or `table`.
+- `--dry-run`: derive the verifier address with no network access or signing;
+  returns `status: "dry_run"`.
 
 This example reads the deployer seed from `DEPLOYER_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
 
@@ -694,7 +747,12 @@ stellar-agent smart-account deploy-webauthn-verifier --deployer-secret-env DEPLO
 
 `--profile <NAME>` selects the profile, followed by `STELLAR_AGENT_PROFILE`, then `default`. An explicitly named missing profile refuses.
 
-Deploys the OpenZeppelin Ed25519-verifier WASM and records its address in the verifier registry. Same idempotency, signer modes, and flags as `deploy-webauthn-verifier` above. This is the verifier bootstrap for first-class external Ed25519 signers (`smart-account signers add --signer-ed25519`) — see [Agent delegation](../agent-delegation.md).
+Deploys the OpenZeppelin Ed25519-verifier WASM and records its address in the
+verifier registry.
+Same idempotency, signer modes, and flags as `deploy-webauthn-verifier` above.
+This is the verifier bootstrap for first-class external Ed25519 signers
+(`smart-account signers add --signer-ed25519`).
+See [Agent delegation](../agent-delegation.md).
 
 This example reads the deployer seed from `DEPLOYER_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
 
@@ -722,10 +780,17 @@ Deploys any one of the three OpenZeppelin policy contracts through a single verb
 
 Extra flag:
 
-- `--kind <simple-threshold|spending-limit|weighted-threshold>` (required) — which policy contract to deploy.
-  - `simple-threshold` — signer-count-based threshold policy. Attach via [`rules add-policy --kind simple-threshold`](#smart-account-rules-add-policy).
-  - `spending-limit` — rolling-window spending-limit policy. Attach via [`rules add-policy --kind spending-limit`](#smart-account-rules-add-policy).
-  - `weighted-threshold` — weighted-signer quorum policy. Attach via [`rules add-policy --kind weighted-threshold`](#smart-account-rules-add-policy); tune via [`signers set-weighted-threshold`](#smart-account-signers-set-weighted-threshold) / [`signers set-signer-weight`](#smart-account-signers-set-signer-weight).
+- `--kind <simple-threshold|spending-limit|weighted-threshold>` (required):
+  which policy contract to deploy.
+  - `simple-threshold`: signer-count-based threshold policy. Attach via
+    [`rules add-policy --kind simple-threshold`](#smart-account-rules-add-policy).
+  - `spending-limit`: rolling-window spending-limit policy. Attach via
+    [`rules add-policy --kind spending-limit`](#smart-account-rules-add-policy).
+  - `weighted-threshold`: weighted-signer quorum policy. Attach via
+    [`rules add-policy --kind weighted-threshold`](#smart-account-rules-add-policy);
+    tune via
+    [`signers set-weighted-threshold`](#smart-account-signers-set-weighted-threshold)
+    / [`signers set-signer-weight`](#smart-account-signers-set-signer-weight).
 
 This example reads the deployer seed from `DEPLOYER_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
 
@@ -826,9 +891,10 @@ Registers a deployed multicall router address and its WASM hash in the local reg
 Flags:
 
 - `--network <NETWORK>`: optional assertion that must match the profile chain.
-- `--address <C_STRKEY>` (required) — deployed router contract address.
-- `--wasm-sha256 <HEX>` (required) — 64-char lowercase hex; must match the compiled-in router WASM hash.
-- `--profile <NAME>` — for the audit-log path.
+- `--address <C_STRKEY>` (required): deployed router contract address.
+- `--wasm-sha256 <HEX>` (required): 64-char lowercase hex; must match the
+  compiled-in router WASM hash.
+- `--profile <NAME>`: for the audit-log path.
 
 ```bash
 stellar-agent smart-account register-multicall \
@@ -845,15 +911,18 @@ The normal path validates the stored entry and removes it. The `--force` path is
 Flags:
 
 - `--network <NETWORK>`: optional assertion that must match the profile chain.
-- `--force` — corruption-recovery bypass.
-- `--yes-i-have-verified-the-prior-values` — suppress the confirmation prompt for `--force` on a non-TTY.
-- `--profile <NAME>` — for the audit-log path.
+- `--force`: corruption-recovery bypass.
+- `--yes-i-have-verified-the-prior-values`: suppress the confirmation prompt for
+  `--force` on a non-TTY.
+- `--profile <NAME>`: for the audit-log path.
 
 ```bash
 stellar-agent smart-account unregister-multicall --network testnet
 ```
 
-### `smart-account timelock` — OpenZeppelin upgrade timelock
+<a id="smart-account-timelock--openzeppelin-upgrade-timelock"></a>
+
+### `smart-account timelock`: OpenZeppelin upgrade timelock
 
 Schedule, cancel, execute, and list pending operations on an OpenZeppelin timelock contract. The signer must hold the appropriate timelock role for each write verb. All four share `--timelock <C_STRKEY>` (required), `--rpc-url`, `--secondary-rpc-url`, `--network`, and `--profile`; the write verbs add the signer-source group. The write verbs (`schedule`, `cancel`, `execute`) structurally refuse `mainnet`; `list-pending` is read-only and accepts `mainnet`.
 
@@ -861,9 +930,19 @@ Without `--secondary-rpc-url`, the profile secondary applies. A configured mainn
 
 #### `smart-account timelock schedule`
 
-Schedules an operation (PROPOSER role). Signs and submits. The operation salt is derived non-deterministically and is returned in the JSON output as the `salt` field (64-char lowercase hex). Record it immediately — it is required by the matching `execute` and `cancel` calls and cannot be recomputed later. On success the envelope also carries `operation_id_full_hex`.
+Schedules an operation (PROPOSER role). Signs and submits.
+The operation salt is derived non-deterministically and is returned in the JSON
+output as the `salt` field (64-char lowercase hex).
+Record it immediately: it is required by the matching `execute` and `cancel`
+calls and cannot be recomputed later.
+On success the envelope also carries `operation_id_full_hex`.
 
-Flags add: `--target <C_STRKEY>` (required) — the target contract; `--function <NAME>` (required) — the function to call on execute; `--delay-ledgers <N>` (required) — minimum delay in ledgers before execution; plus the signer-source group.
+Flags add:
+
+- `--target <C_STRKEY>` (required): the target contract.
+- `--function <NAME>` (required): the function to call on execute.
+- `--delay-ledgers <N>` (required): minimum delay in ledgers before execution.
+- Signer-source group.
 
 This example reads the proposer seed from `PROPOSER_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
 
@@ -874,14 +953,15 @@ stellar-agent smart-account timelock schedule \
   --function upgrade \
   --delay-ledgers 100 \
   --signer-secret-env PROPOSER_SK
-# Save the "salt" field from the JSON output — required for execute and cancel.
+# Save the "salt" field from the JSON output: required for execute and cancel.
 ```
 
 #### `smart-account timelock cancel`
 
 Cancels a pending operation (CANCELLER role). Signs and submits, then cross-confirms the on-chain cancellation event.
 
-Flags add: `--operation-id <HEX>` (required) — the 64-char hex id from `schedule`; plus the signer-source group.
+Flags add: `--operation-id <HEX>` (required): the 64-char hex id from
+`schedule`; plus the signer-source group.
 
 This example reads the canceller seed from `CANCELLER_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
 
@@ -896,7 +976,14 @@ stellar-agent smart-account timelock cancel \
 
 Executes a ready operation (EXECUTOR role, or open-execution mode). A pre-flight dual-RPC state check guards the ready-window race and fails closed if the operation is not ready. The `--target`, `--function`, `--operation-id`, and `--salt` must exactly match the scheduled operation, since OpenZeppelin re-derives the operation id from them.
 
-Flags add: `--target <C_STRKEY>` (required); `--function <NAME>` (required); `--operation-id <HEX>` (required); `--salt <HEX>` (required) — the 64-char lowercase hex `salt` field from the `schedule` command's JSON output; plus the signer-source group.
+Flags add:
+
+- `--target <C_STRKEY>` (required).
+- `--function <NAME>` (required).
+- `--operation-id <HEX>` (required).
+- `--salt <HEX>` (required): the 64-char lowercase hex `salt` field from the
+  `schedule` command's JSON output.
+- Signer-source group.
 
 This example reads the executor seed from `EXECUTOR_SK`; set it as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows, and unset it after the command.
 
@@ -924,7 +1011,11 @@ stellar-agent smart-account timelock list-pending --timelock CTLCK...WXYZ
 
 ## Related pages
 
-- [CLI reference index](index.md) — shared flags, output envelope, mainnet-write refusal.
-- [Concepts](../concepts.md) — context rules, auth digest, policy engine, approval spine, audit log.
-- [Profiles](../profiles.md) — profile schema, keyring entry references, thresholds.
-- [Agent delegation](../agent-delegation.md) — scoping an autonomous agent to one contract under a spending cap.
+- [CLI reference index](index.md): shared flags, output envelope, mainnet-write
+  refusal.
+- [Concepts](../concepts.md): context rules, auth digest, policy engine,
+  approval spine, audit log.
+- [Profiles](../profiles.md): profile schema, keyring entry references,
+  thresholds.
+- [Agent delegation](../agent-delegation.md): scoping an autonomous agent to one
+  contract under a spending cap.
