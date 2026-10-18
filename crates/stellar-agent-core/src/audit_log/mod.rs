@@ -139,8 +139,9 @@ pub use outbox::{AuditOutbox, OutboxInspection, drain_lock_is_held, inspect_outb
 pub use reader::{AuditLogIntegrityError, AuditReader, PinnedHashesRecord};
 pub use rotation::{SidecarResignError, resign_chain_root_sidecars};
 pub use schema::{
-    EVENT_KIND_VARIANT_COUNT, EventKind, ExecutableRefPin, KeyPurpose, PinsUpdateReason,
-    PolicyDecision, TipAnchorReason, ValueActionKind, ValueLegRecord, executable_refs_or_empty,
+    CrossCheckRecord, EVENT_KIND_VARIANT_COUNT, EventKind, ExecutableRefPin, KeyPurpose,
+    PinsUpdateReason, PolicyDecision, TipAnchorReason, ValueActionKind, ValueLegRecord,
+    executable_refs_or_empty,
 };
 pub use signer_set::{
     BaselineReason, DOMAIN_SA_ACCOUNT_ID_V1, DOMAIN_SA_SIGNER_SET_V1, DOMAIN_SA_SIGNER_SET_V2,

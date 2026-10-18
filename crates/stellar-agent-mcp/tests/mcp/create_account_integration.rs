@@ -1413,363 +1413,6 @@ impl wiremock::Respond for AccountOnlyResponder {
     }
 }
 
-/// Builds a minimal `CreateAccount` envelope with `fee=100`, `seq_num=101`,
-/// and `starting_balance = 20_000_000_000` (2000 XLM, above the floor).
-fn high_value_create_account_envelope_b64() -> String {
-    use stellar_xdr::{
-        AccountId, CreateAccountOp, Limits, Memo, MuxedAccount, Operation, OperationBody,
-        Preconditions, PublicKey, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
-        TransactionV1Envelope, Uint256, VecM, WriteXdr,
-    };
-    fn g_bytes(g: &str) -> [u8; 32] {
-        stellar_strkey::ed25519::PublicKey::from_string(g)
-            .expect("valid G-strkey")
-            .0
-    }
-    let tx = Transaction {
-        source_account: MuxedAccount::Ed25519(Uint256(g_bytes(SOURCE_G))),
-        fee: 100,
-        seq_num: SequenceNumber(101),
-        cond: Preconditions::None,
-        memo: Memo::None,
-        operations: vec![Operation {
-            source_account: None,
-            body: OperationBody::CreateAccount(CreateAccountOp {
-                destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(g_bytes(DEST_G)))),
-                starting_balance: 20_000_000_000, // 2000 XLM
-            }),
-        }]
-        .try_into()
-        .expect("single-op vec"),
-        ext: TransactionExt::V0,
-    };
-    TransactionEnvelope::Tx(TransactionV1Envelope {
-        tx,
-        signatures: VecM::default(),
-    })
-    .to_xdr_base64(Limits::none())
-    .expect("XDR encode")
-}
-
-/// Builds a minimal `CreateAccount` envelope with `starting_balance = 9_990_000_000`
-/// (999 XLM, below the 1000 XLM MINIMUM_FLOOR).
-fn below_threshold_create_account_envelope_b64() -> String {
-    use stellar_xdr::{
-        AccountId, CreateAccountOp, Limits, Memo, MuxedAccount, Operation, OperationBody,
-        Preconditions, PublicKey, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
-        TransactionV1Envelope, Uint256, VecM, WriteXdr,
-    };
-    fn g_bytes(g: &str) -> [u8; 32] {
-        stellar_strkey::ed25519::PublicKey::from_string(g)
-            .expect("valid G-strkey")
-            .0
-    }
-    let tx = Transaction {
-        source_account: MuxedAccount::Ed25519(Uint256(g_bytes(SOURCE_G))),
-        fee: 100,
-        seq_num: SequenceNumber(101),
-        cond: Preconditions::None,
-        memo: Memo::None,
-        operations: vec![Operation {
-            source_account: None,
-            body: OperationBody::CreateAccount(CreateAccountOp {
-                destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(g_bytes(DEST_G)))),
-                starting_balance: 9_990_000_000, // 999 XLM
-            }),
-        }]
-        .try_into()
-        .expect("single-op vec"),
-        ext: TransactionExt::V0,
-    };
-    TransactionEnvelope::Tx(TransactionV1Envelope {
-        tx,
-        signatures: VecM::default(),
-    })
-    .to_xdr_base64(Limits::none())
-    .expect("XDR encode")
-}
-
-/// High-value cross-check passes when both primary and oracle return the same
-/// account state for `stellar_create_account_commit`.
-///
-/// 2 000 XLM starting balance (above 1 000 XLM MINIMUM_FLOOR).  Both mocks return
-/// `seq_num = 100` → identical rebuild → cross-check passes.  The zero-byte
-/// nonce fails at the HMAC gate (not cross-check).
-#[tokio::test]
-#[serial]
-async fn create_account_commit_high_value_cross_check_passes_on_match() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().expect("mock keyring store init");
-    install_test_nonce_key(52);
-
-    let primary_mock = MockServer::start().await;
-    Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(AccountOnlyResponder {
-            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
-            account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
-        })
-        .mount(&primary_mock)
-        .await;
-
-    let oracle_mock = MockServer::start().await;
-    Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(AccountOnlyResponder {
-            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
-            account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
-        })
-        .mount(&oracle_mock)
-        .await;
-
-    let mut profile = testnet_profile_with_rpc(&primary_mock.uri());
-    profile.oracle_provider_url = Some(url::Url::parse(&oracle_mock.uri()).unwrap());
-    profile.cross_check_threshold_stroops = 0;
-    let server = WalletServer::new(profile).expect("WalletServer::new");
-
-    use base64::Engine;
-    let zero_nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 48]);
-
-    let args = StellarCreateAccountCommitArgs {
-        chain_id: "stellar:testnet".to_owned(),
-        source: SOURCE_G.to_owned(),
-        destination: DEST_G.to_owned(),
-        starting_balance: serde_json::from_str(r#""2000 XLM""#).expect("parse amount"),
-        nonce: zero_nonce,
-        expires_at_unix_ms: 3_000_000_000_000,
-        envelope_xdr: high_value_create_account_envelope_b64(),
-        approval_nonce: None,
-        approval_attestation: None,
-    };
-
-    let result = server.call_stellar_create_account_commit(args).await;
-    match result {
-        Err(err) => {
-            assert!(
-                err.to_string().contains("nonce.expired")
-                    || err.to_string().contains("nonce.replayed"),
-                "cross-check passed; expected nonce gate error, got: {err}"
-            );
-            assert!(
-                !err.to_string().contains("simulation.divergence"),
-                "simulation.divergence must not appear when cross-check passes; got: {err}"
-            );
-        }
-        Ok(tool_result) => {
-            let json = call_result_json(&tool_result);
-            assert!(
-                !json.to_string().contains("simulation.divergence"),
-                "simulation.divergence must not appear when cross-check passes"
-            );
-        }
-    }
-    assert_eq!(
-        crate::common::received_methods(&oracle_mock).await,
-        ["getNetwork", "getLedgerEntries"]
-    );
-}
-
-/// High-value cross-check fails when the oracle returns a different sequence
-/// number for `stellar_create_account_commit`.
-///
-/// Primary: `seq_num = 100`.  Oracle: `seq_num = 999` → oracle rebuild → seq 1000 →
-/// byte mismatch → `simulation.divergence`.
-#[tokio::test]
-#[serial]
-async fn create_account_commit_high_value_cross_check_fails_on_mismatch() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().expect("mock keyring store init");
-    install_test_nonce_key(53);
-
-    let primary_mock = MockServer::start().await;
-    Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(AccountOnlyResponder {
-            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
-            account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
-        })
-        .mount(&primary_mock)
-        .await;
-
-    let oracle_mock = MockServer::start().await;
-    Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(AccountOnlyResponder {
-            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
-            account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 999),
-        })
-        .mount(&oracle_mock)
-        .await;
-
-    let mut profile = testnet_profile_with_rpc(&primary_mock.uri());
-    profile.oracle_provider_url = Some(url::Url::parse(&oracle_mock.uri()).unwrap());
-    profile.cross_check_threshold_stroops = 0;
-    let server = WalletServer::new(profile).expect("WalletServer::new");
-
-    use base64::Engine;
-    let zero_nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 48]);
-
-    let args = StellarCreateAccountCommitArgs {
-        chain_id: "stellar:testnet".to_owned(),
-        source: SOURCE_G.to_owned(),
-        destination: DEST_G.to_owned(),
-        starting_balance: serde_json::from_str(r#""2000 XLM""#).expect("parse amount"),
-        nonce: zero_nonce,
-        expires_at_unix_ms: 3_000_000_000_000,
-        envelope_xdr: high_value_create_account_envelope_b64(),
-        approval_nonce: None,
-        approval_attestation: None,
-    };
-
-    let result = server
-        .call_stellar_create_account_commit(args)
-        .await
-        .expect("oracle divergence must return Ok(is_error) envelope");
-    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
-    assert_eq!(
-        code, "simulation.divergence",
-        "oracle mismatch must produce simulation.divergence, got: {code}"
-    );
-}
-
-/// High-value cross-check is skipped when `oracle_provider_url` is unset for
-/// `stellar_create_account_commit`.
-///
-/// A `tracing::warn!` is emitted but the commit proceeds to the nonce gate.
-#[tokio::test]
-#[serial]
-async fn create_account_commit_high_value_cross_check_skips_when_oracle_url_unset() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().expect("mock keyring store init");
-    install_test_nonce_key(54);
-
-    let primary_mock = MockServer::start().await;
-    Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(AccountOnlyResponder {
-            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
-            account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
-        })
-        .mount(&primary_mock)
-        .await;
-
-    let mut profile = testnet_profile_with_rpc(&primary_mock.uri());
-    profile.oracle_provider_url = None;
-    profile.cross_check_threshold_stroops = 0;
-    let server = WalletServer::new(profile).expect("WalletServer::new");
-
-    use base64::Engine;
-    let zero_nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 48]);
-
-    let args = StellarCreateAccountCommitArgs {
-        chain_id: "stellar:testnet".to_owned(),
-        source: SOURCE_G.to_owned(),
-        destination: DEST_G.to_owned(),
-        starting_balance: serde_json::from_str(r#""2000 XLM""#).expect("parse amount"),
-        nonce: zero_nonce,
-        expires_at_unix_ms: 3_000_000_000_000,
-        envelope_xdr: high_value_create_account_envelope_b64(),
-        approval_nonce: None,
-        approval_attestation: None,
-    };
-
-    let result = server.call_stellar_create_account_commit(args).await;
-    match result {
-        Err(err) => {
-            assert!(
-                err.to_string().contains("nonce.expired")
-                    || err.to_string().contains("nonce.replayed"),
-                "cross-check skipped; expected nonce gate error, got: {err}"
-            );
-            assert!(
-                !err.to_string().contains("simulation.divergence"),
-                "simulation.divergence must not appear when cross-check is skipped; got: {err}"
-            );
-        }
-        Ok(tool_result) => {
-            let json = call_result_json(&tool_result);
-            assert!(
-                !json.to_string().contains("simulation.divergence"),
-                "simulation.divergence must not appear when cross-check is skipped"
-            );
-        }
-    }
-}
-
-/// Below-threshold `stellar_create_account_commit` skips the cross-check
-/// unconditionally — the oracle mock server receives zero requests.
-///
-/// 999 XLM starting balance (9 990 000 000 stroops) < 10 000 000 000 MINIMUM_FLOOR.
-#[tokio::test]
-#[serial]
-async fn create_account_commit_below_threshold_skips_cross_check_unconditionally() {
-    let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().expect("mock keyring store init");
-    install_test_nonce_key(55);
-
-    let primary_mock = MockServer::start().await;
-    Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(AccountOnlyResponder {
-            account_key_xdr: account_ledger_key_xdr(SOURCE_G),
-            account_xdr: account_entry_xdr_with_seq(SOURCE_G, 100_000_000_000_000, 0, 100),
-        })
-        .mount(&primary_mock)
-        .await;
-
-    // Oracle mock: not mounted — any request here would produce an invalid response.
-    let oracle_mock = MockServer::start().await;
-
-    let mut profile = testnet_profile_with_rpc(&primary_mock.uri());
-    profile.oracle_provider_url = Some(url::Url::parse(&oracle_mock.uri()).unwrap());
-    profile.cross_check_threshold_stroops = 0;
-    let server = WalletServer::new(profile).expect("WalletServer::new");
-
-    use base64::Engine;
-    let zero_nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 48]);
-
-    let args = StellarCreateAccountCommitArgs {
-        chain_id: "stellar:testnet".to_owned(),
-        source: SOURCE_G.to_owned(),
-        destination: DEST_G.to_owned(),
-        // 999 XLM — below the 1000 XLM MINIMUM_FLOOR.
-        starting_balance: serde_json::from_str(r#""999 XLM""#).expect("parse amount"),
-        nonce: zero_nonce,
-        expires_at_unix_ms: 3_000_000_000_000,
-        envelope_xdr: below_threshold_create_account_envelope_b64(),
-        approval_nonce: None,
-        approval_attestation: None,
-    };
-
-    let result = server.call_stellar_create_account_commit(args).await;
-    match result {
-        Err(err) => {
-            assert!(
-                err.to_string().contains("nonce.expired")
-                    || err.to_string().contains("nonce.replayed"),
-                "below-threshold: expected nonce gate error, got: {err}"
-            );
-            assert!(
-                !err.to_string().contains("simulation.divergence"),
-                "simulation.divergence must not appear below threshold; got: {err}"
-            );
-        }
-        Ok(tool_result) => {
-            let json = call_result_json(&tool_result);
-            assert!(
-                !json.to_string().contains("simulation.divergence"),
-                "simulation.divergence must not appear below threshold"
-            );
-        }
-    }
-    let oracle_requests = oracle_mock.received_requests().await.unwrap_or_default();
-    assert_eq!(
-        oracle_requests.len(),
-        0,
-        "oracle must receive 0 requests for below-threshold create_account; received: {}",
-        oracle_requests.len()
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Full round trip: simulate → commit → submit succeeds; the decimal-string
-// wire encoding survives every hop, not just each phase in isolation.
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Derives the G-strkey for a 32-byte ed25519 seed.
 fn gstrkey_for_seed(seed: [u8; 32]) -> String {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
@@ -2494,41 +2137,61 @@ async fn prepare_and_commit_send_the_primary_credential() {
     .await;
 }
 
-#[tokio::test]
-#[serial]
-async fn create_account_commit_oracle_identity_refusal_blocks_rebuild() {
+async fn witness_create_case(amount: &str, mode: &str, expected: &str) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     let _data_root = crate::common::isolated_data_root();
-    keyring_mock::install().unwrap();
-    install_test_nonce_key(243);
-    let seed = [0x73; 32];
+    // The profile's own signer account gives it an audit log no other test
+    // writes, so the row counts below are the rows this commit appended.
+    let account = crate::common::own_signer_account("witness-create");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let count = reads.clone();
+    keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+        "svc",
+        &account,
+        Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }),
+    )])
+    .unwrap();
+    install_test_nonce_key(245);
+    let seed = [0x75; 32];
     let source = gstrkey_for_seed(seed);
-    keyring_core::Entry::new("svc", "acct")
+    keyring_core::Entry::new("svc", &account)
         .unwrap()
         .set_password(&sstrkey_for_seed(seed))
         .unwrap();
-    let identity = crate::common::EndpointNetwork::testnet();
     let primary = MockServer::start().await;
     let oracle = MockServer::start().await;
-    for (endpoint, network) in [
-        (&primary, crate::common::EndpointNetwork::testnet()),
-        (&oracle, identity.clone()),
+    for (endpoint, sequence) in [
+        (&primary, 100),
+        (&oracle, if mode == "source" { 999 } else { 100 }),
     ] {
+        let identity = if mode == "identity" && endpoint.uri() == oracle.uri() {
+            crate::common::EndpointNetwork::reporting("hostile-identity-marker")
+        } else {
+            crate::common::EndpointNetwork::testnet()
+        };
         Mock::given(method("POST"))
-            .respond_with(CreateAccountSubmitSuccessRpcResponder {
-                account_key_xdr: account_ledger_key_xdr(&source),
-                account_xdr: account_entry_xdr_with_balance(&source, 100_000_000_000_000),
-                network,
-            })
+            .respond_with(
+                crate::common::TimeoutRpc::new(vec![(
+                    account_ledger_key_xdr(&source),
+                    account_entry_xdr_with_seq(&source, 100_000_000_000_000, 0, sequence),
+                )])
+                .confirming_in(1005)
+                .with_network(identity),
+            )
             .mount(endpoint)
             .await;
     }
-    let mut profile = testnet_profile_with_rpc(&primary.uri());
-    profile.oracle_provider_url =
-        Some(url::Url::parse(&oracle.uri().replace("127.0.0.1", "localhost")).unwrap());
-    let server = WalletServer::new(profile).unwrap();
+    let mut profile = crate::common::testnet_profile_for_account(&primary.uri(), &account);
+    profile.oracle_provider_url = (mode != "none").then(|| url::Url::parse(&oracle.uri()).unwrap());
+    let server = WalletServer::new(profile.clone()).unwrap();
     let args = StellarCreateAccountArgs {
         source,
-        starting_balance: serde_json::from_str(r#""2000 XLM""#).unwrap(),
+        starting_balance: serde_json::from_value(serde_json::json!(amount)).unwrap(),
         ..simulate_args_on("stellar:testnet", None)
     };
     let simulated = server
@@ -2553,34 +2216,113 @@ async fn create_account_commit_oracle_identity_refusal_blocks_rebuild() {
         approval_nonce: None,
         approval_attestation: None,
     };
-    identity.set("PRIVATE_PASSPHRASE_SENTINEL");
-    let result = server
-        .call_stellar_create_account_commit(commit.clone())
-        .await
-        .unwrap();
-    let (code, message, _) = crate::common::assert_business_envelope(&result);
-    assert_eq!(code, "simulation.divergence");
-    assert!(message.contains("oracle_provider_url endpoint identity failed"));
-    assert!(!message.contains("PRIVATE_PASSPHRASE_SENTINEL"));
-    assert_eq!(
-        crate::common::received_methods(&oracle).await,
-        ["getNetwork"]
-    );
-    assert!(
-        !crate::common::received_methods(&primary)
-            .await
-            .iter()
-            .any(|method| method == "sendTransaction")
-    );
-    identity.set(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE);
+    assert!(crate::common::received_methods(&oracle).await.is_empty());
+    let before = reads.load(Ordering::SeqCst);
     let result = server
         .call_stellar_create_account_commit(commit)
         .await
         .unwrap();
-    assert_ne!(
-        result.is_error,
-        Some(true),
-        "{:?}",
-        call_result_json(&result)
+    let body = call_result_json(&result);
+    if expected.contains('.') {
+        let (code, text, _) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, expected, "{body}");
+        assert_eq!(reads.load(Ordering::SeqCst), before);
+        assert!(
+            !crate::common::received_methods(&primary)
+                .await
+                .iter()
+                .any(|m| m == "sendTransaction")
+        );
+        assert!(!text.contains("hostile-identity-marker"));
+        if mode == "identity" {
+            assert!(text.contains("serves a network other than the profile's"));
+            assert_eq!(
+                crate::common::received_methods(&oracle).await,
+                ["getNetwork"]
+            );
+        }
+        return;
+    }
+    assert_ne!(result.is_error, Some(true), "{body}");
+    assert_eq!(body["data"]["cross_check"]["status"], expected);
+    assert!(
+        crate::common::received_methods(&primary)
+            .await
+            .iter()
+            .any(|m| m == "sendTransaction")
     );
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let mut witnesses = Vec::new();
+    for kind in ["value_action_pending", "value_action_submitted"] {
+        let rows: Vec<_> = rows.iter().filter(|row| row["kind"] == kind).collect();
+        assert_eq!(rows.len(), 1, "{kind}: {rows:?}");
+        if expected == "passed" {
+            assert_eq!(rows[0]["witness"]["provider"], oracle.uri());
+            assert_eq!(rows[0]["witness"]["ledger"], 1001);
+            assert_eq!(
+                rows[0]["witness"]["inputs_digest"].as_str().unwrap().len(),
+                64
+            );
+            assert_eq!(
+                rows[0]["witness"]["kinds"],
+                serde_json::json!(["source_account"])
+            );
+            witnesses.push(rows[0]["witness"].clone());
+        } else {
+            assert!(rows[0].get("witness").is_none());
+        }
+    }
+    if expected == "passed" {
+        assert_eq!(witnesses[0], witnesses[1]);
+        assert_eq!(body["data"]["cross_check"]["provider"], oracle.uri());
+        assert_eq!(body["data"]["cross_check"]["ledger"], 1001);
+        assert_eq!(
+            crate::common::received_methods(&oracle).await,
+            ["getNetwork", "getLedgerEntries"]
+        );
+    } else {
+        assert!(crate::common::received_methods(&oracle).await.is_empty());
+        assert_eq!(
+            body["data"]["cross_check"]["reason"],
+            if expected == "not_required" {
+                "below_threshold"
+            } else {
+                "oracle_not_configured"
+            }
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn create_account_commit_rows_carry_witness() {
+    witness_create_case("2000 XLM", "match", "passed").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn create_account_commit_source_disagreement_refuses_simulation_divergence() {
+    witness_create_case("2000 XLM", "source", "simulation.divergence").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn create_account_commit_oracle_identity_refusal_is_witness_unavailable() {
+    witness_create_case("2000 XLM", "identity", "network.witness_unavailable").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn create_account_commit_without_oracle_skips_on_testnet() {
+    witness_create_case("2000 XLM", "none", "skipped").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn create_account_commit_below_threshold_is_not_required() {
+    witness_create_case("999 XLM", "match", "not_required").await;
 }

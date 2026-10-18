@@ -504,6 +504,50 @@ where
     (output, built)
 }
 
+/// Returns a signer account name that no other call in this test binary
+/// returns.
+///
+/// The signer account names the profile, and the profile name selects both the
+/// audit log file under the shared test directory and the process-wide audit
+/// writer. A test that counts the rows an action appends therefore needs an
+/// account of its own, or the rows of every earlier test with the same account
+/// are in its count.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub fn own_signer_account(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    format!("{prefix}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A testnet profile with the `Noop` engine under `account`, with the test
+/// audit key installed.
+///
+/// # Panics
+///
+/// Panics if the test audit key cannot be installed.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub fn testnet_profile_for_account(
+    rpc_url: &str,
+    account: &str,
+) -> stellar_agent_core::profile::schema::Profile {
+    let mut p = stellar_agent_core::profile::schema::Profile::builder_testnet(
+        "svc", account, "n-svc", "n-acct",
+    )
+    .with_noop_engine()
+    .build();
+    p.rpc_url = rpc_url.to_owned();
+    install_test_audit_key(&mut p);
+    p
+}
+
 /// A profile whose submissions time out after one second, under its own signer
 /// account so its audit log is not shared with another test in this binary.
 ///

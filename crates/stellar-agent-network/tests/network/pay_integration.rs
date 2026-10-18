@@ -240,7 +240,7 @@ async fn sep29_memo_present_fast_path_no_rpc() {
     // A localhost URL that would fail if any HTTP call is made.
     let client = StellarRpcClient::new("http://127.0.0.1:1").expect("URL parses");
     let result =
-        stellar_agent_network::sep29::check_memo_required(&client, None, DST_ACCOUNT, true).await;
+        stellar_agent_network::sep29::check_memo_required(&client, DST_ACCOUNT, true).await;
     assert!(
         result.is_ok(),
         "memo_present=true must return Ok without RPC: {result:?}"

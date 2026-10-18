@@ -6,10 +6,6 @@
 //! supplied a memo receive [`WalletError::Validation`] wrapping
 //! [`ValidationError::MemoRequired`].
 //!
-//! When a `secondary_rpc` is configured, both RPCs are consulted and their
-//! results are compared before the memo-required gate runs.  A mismatch returns
-//! [`NetworkError::RpcDivergence`].
-//!
 //! # Error propagation
 //!
 //! Transient RPC errors propagate to the caller (fail-closed). An absent
@@ -21,7 +17,8 @@
 //! `stellar.toml` home-domain SEP-29 hint path is not implemented; callers
 //! relying on that signal must handle it separately.
 
-use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
+use crate::cross_check::MemoObservation;
+use stellar_agent_core::error::{ValidationError, WalletError};
 
 use crate::account::fetch_data_entry;
 use crate::client::StellarRpcClient;
@@ -30,38 +27,17 @@ use crate::client::StellarRpcClient;
 ///
 /// Only ASCII `"1"` (`b"1"`) signals required per SEP-29; any other value
 /// (absent, unexpected bytes) is treated as not-required.
-fn normalise_memo_required(value: &Option<Vec<u8>>) -> bool {
+pub(crate) fn normalise_memo_required(value: &Option<Vec<u8>>) -> bool {
     matches!(value, Some(bytes) if bytes.as_slice() == b"1")
 }
 
 /// Checks whether the destination account requires a memo per SEP-29.
 ///
-/// Fetches the `config.memo_required` data entry from the destination
-/// account on-chain.  If `secondary_rpc` is `Some`, the same entry is
-/// fetched from both RPCs and the normalised results are compared before
-/// the memo-required gate runs.  A mismatch returns
-/// `WalletError::Network(NetworkError::RpcDivergence)` — the caller MUST
-/// re-simulate after the disagreement clears.
-///
-/// When the entry exists and equals ASCII `"1"`, and `memo_present` is
-/// `false`, returns
-/// `WalletError::Validation(ValidationError::MemoRequired)`.
-///
-/// Transient RPC errors propagate to the caller (fail-closed).
-/// An absent entry is fail-open: no memo is required.
-///
-/// `AccountNotFound` is surfaced by `fetch_data_entry` returning `None`
-/// (or an RPC error) when the account does not exist; the caller's own
-/// `fetch_account` call in the payment path handles the typed error surface.
+/// Reads the flag on the primary when the envelope carries no memo.
+/// The returned observation lets a commit witness compare the same decision.
 ///
 /// # Errors
-///
-/// - `WalletError::Network(NetworkError::RpcDivergence)` if `secondary_rpc`
-///   is configured and the two RPCs disagree on the memo-required flag.
-/// - [`WalletError::Validation`] wrapping [`ValidationError::MemoRequired`]
-///   if the destination requires a memo and none was supplied.
-/// - [`WalletError::Network`] or [`WalletError::Protocol`] for RPC or XDR
-///   failures (fail-closed; transient errors are not silenced).
+/// Refuses a required missing memo and propagates primary read or decode failures.
 ///
 /// # Examples
 ///
@@ -70,60 +46,24 @@ fn normalise_memo_required(value: &Option<Vec<u8>>) -> bool {
 ///
 /// # async fn run() -> Result<(), stellar_agent_core::WalletError> {
 /// let client = StellarRpcClient::new("https://soroban-testnet.stellar.org")?;
-/// check_memo_required(&client, None, "GABC...XYZ", false).await?;
+/// check_memo_required(&client, "GABC...XYZ", false).await?;
 /// # Ok(()) }
 /// ```
 pub async fn check_memo_required(
     client: &StellarRpcClient,
-    secondary_rpc: Option<&StellarRpcClient>,
     destination: &str,
     memo_present: bool,
-) -> Result<(), WalletError> {
+) -> Result<MemoObservation, WalletError> {
     // Fast-path: if a memo is already supplied, no check is needed regardless
     // of the data entry value.
     if memo_present {
-        return Ok(());
+        return Ok(MemoObservation::NotRead);
     }
 
     // `fetch_data_entry` returns `None` for absent entries including absent
     // accounts. The caller's own `fetch_account` call in the payment build
     // path surfaces the typed `AccountNotFound` error.
     let primary_value = fetch_data_entry(client, destination, "config.memo_required").await?;
-
-    // Cross-RPC consistency check: if a secondary RPC is configured, fetch
-    // the same entry from it and compare the normalised results.  A mismatch
-    // returns `NetworkError::RpcDivergence` — the divergence is fail-closed
-    // regardless of which RPC is more restrictive.
-    //
-    //   - Secondary RPC absent → skip cross-check (fail open).
-    //   - Secondary RPC fails → divergence error (cannot complete cross-check;
-    //     fail-closed rather than silently degrading to primary-only).
-    //   - Both agree → continue with the primary value.
-    if let Some(secondary) = secondary_rpc {
-        // A failing secondary RPC is classified as divergence: the cross-check
-        // cannot be completed, so the fail-closed direction refuses rather than
-        // silently degrading to primary-only.
-        let secondary_value = fetch_data_entry(secondary, destination, "config.memo_required")
-            .await
-            .map_err(|e| {
-                WalletError::Network(NetworkError::RpcDivergence {
-                    context: format!("SEP-29 config.memo_required secondary fetch failed: {e}"),
-                })
-            })?;
-        let primary_required = normalise_memo_required(&primary_value);
-        let secondary_required = normalise_memo_required(&secondary_value);
-        if primary_required != secondary_required {
-            tracing::warn!(
-                destination = %stellar_agent_core::observability::redact_strkey_first5_last5(destination),
-                primary_required = %primary_required,
-                secondary_required = %secondary_required,
-                "sep29: config.memo_required divergence between primary and secondary RPC"
-            );
-            return Err(WalletError::Network(NetworkError::RpcDivergence {
-                context: "SEP-29 config.memo_required".to_owned(),
-            }));
-        }
-    }
 
     match primary_value {
         Some(ref bytes) if bytes == b"1" => {
@@ -141,10 +81,10 @@ pub async fn check_memo_required(
                 "sep29: config.memo_required entry exists with unexpected value (not b\"1\"); \
                 treating as memo-not-required per SEP-29 spec"
             );
-            Ok(())
+            Ok(MemoObservation::Read(false))
         }
         // Entry absent — SEP-29 does not apply.
-        None => Ok(()),
+        None => Ok(MemoObservation::Read(false)),
     }
 }
 

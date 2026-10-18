@@ -49,6 +49,12 @@
 /// ([`approval::user_id::process_uid_for_attestation`]).
 pub mod approval;
 
+/// Canonical asset identities.
+pub mod asset_id;
+
+/// Cross-check requirements and witness labels.
+pub mod cross_check;
+
 /// Hash-chained structured audit log substrate.
 ///
 /// Provides [`audit_log::AuditWriter`] for appending entries, the hash-chain

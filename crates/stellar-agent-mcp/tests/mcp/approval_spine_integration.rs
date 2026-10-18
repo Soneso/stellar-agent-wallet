@@ -468,6 +468,10 @@ fn t7_account_ledger_key_xdr(account_id: &str) -> String {
 
 /// EchoIdResponder echoes the JSON-RPC request id back in the response.
 /// Required because the RPC client validates that the response id matches the request id.
+///
+/// A `getLedgerEntries` request receives only the configured entries whose key
+/// it names, so a read of a key the fixture does not hold, such as a SEP-29
+/// data entry, finds no entry.
 struct T7EchoIdResponder {
     result: std::sync::Arc<serde_json::Value>,
 }
@@ -483,14 +487,31 @@ impl T7EchoIdResponder {
 #[async_trait]
 impl Respond for T7EchoIdResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
-        let req_id = serde_json::from_slice::<serde_json::Value>(&request.body)
-            .ok()
+        let request_value = serde_json::from_slice::<serde_json::Value>(&request.body).ok();
+        let req_id = request_value
+            .as_ref()
             .and_then(|v| v.get("id").cloned())
             .unwrap_or(serde_json::json!(1));
+        let mut result = (*self.result).clone();
+        let requested_keys = request_value
+            .as_ref()
+            .filter(|v| {
+                v.get("method").and_then(serde_json::Value::as_str) == Some("getLedgerEntries")
+            })
+            .and_then(|v| v.pointer("/params/keys"))
+            .and_then(serde_json::Value::as_array);
+        if let (Some(keys), Some(entries)) = (
+            requested_keys,
+            result
+                .get_mut("entries")
+                .and_then(serde_json::Value::as_array_mut),
+        ) {
+            entries.retain(|entry| entry.get("key").is_some_and(|key| keys.contains(key)));
+        }
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": req_id,
-            "result": *self.result,
+            "result": result,
         });
         ResponseTemplate::new(200)
             .set_body_json(body)

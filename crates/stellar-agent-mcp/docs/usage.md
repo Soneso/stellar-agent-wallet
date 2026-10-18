@@ -62,13 +62,22 @@ Commit step: verifies the nonce, re-builds the envelope for divergence check, si
 - `expires_at_unix_ms` (number, required): Expiry from the simulate step.
 - `envelope_xdr` (string, required): Base64 envelope from the simulate step.
 
-**Returns:** `{tx_hash, ledger}` on success.
+**Returns:** `{tx_hash, ledger, cross_check}` on success.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
 **Submission record:** Before the transaction is sent, the wallet records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. The record is settled by what the network answers; a submission whose outcome never comes back keeps it. See "Unresolved submissions" below.
 
-**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`, `policy.approval_consumed`, `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`, `auth.keyring_not_found`, `network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`, `network.envelope_unsigned`, `submission.tx_timeout`, `submission.tx_already_submitted`, `submission.hash_mismatch`, `submission.record_unavailable`.
+**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
+`network.witness_unavailable`, `policy.engine_required`, `policy.approval_consumed`,
+`network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`,
+`network.rpc_credential_refused`, `auth.keyring_not_found`,
+`network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`,
+`network.envelope_unsigned`, `submission.tx_timeout`, `submission.tx_already_submitted`,
+`submission.hash_mismatch`, `submission.record_unavailable`.
+
+`cross_check` reports `passed` with `provider` and `ledger`, `skipped` with a
+reason, or `not_required` with reason `below_threshold`.
 
 ## stellar_pay
 
@@ -111,13 +120,23 @@ Commit step: verifies the nonce, re-builds the Payment envelope for divergence c
 - `expires_at_unix_ms` (number, required): Expiry from the simulate step.
 - `envelope_xdr` (string, required): Base64 envelope from the simulate step.
 
-**Returns:** `{tx_hash, ledger}` on success.
+**Returns:** `{tx_hash, ledger, cross_check}` on success.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
 **Submission record:** Before the transaction is sent, the wallet records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. The record is settled by what the network answers; a submission whose outcome never comes back keeps it. See "Unresolved submissions" below.
 
-**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`, `policy.engine_required`, `policy.approval_consumed`, `validation.memo_required`, `validation.memo_mutually_exclusive`, `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`, `auth.keyring_not_found`, `network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`, `network.envelope_unsigned`, `submission.tx_timeout`, `submission.tx_already_submitted`, `submission.hash_mismatch`, `submission.record_unavailable`.
+**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
+`network.witness_unavailable`, `network.rpc_divergence`, `validation.memo_required`,
+`policy.engine_required`, `policy.approval_consumed`,
+`validation.memo_mutually_exclusive`, `network.endpoint_network_mismatch`,
+`network.endpoint_identity_unavailable`, `network.rpc_credential_refused`,
+`auth.keyring_not_found`, `network.envelope_signed_for_mainnet`,
+`network.envelope_signature_unverifiable`, `network.envelope_unsigned`, `submission.tx_timeout`,
+`submission.tx_already_submitted`, `submission.hash_mismatch`, `submission.record_unavailable`.
+
+`cross_check` reports `passed` with `provider` and `ledger`, `skipped` with a
+reason, or `not_required` with reason `below_threshold`.
 
 ## stellar_claim_commit
 
@@ -127,7 +146,13 @@ Commit step for `stellar_claim`: verifies the nonce, re-builds the `ClaimClaimab
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
-**Error codes:** the same set as `stellar_pay_commit`, without the memo codes.
+**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
+`policy.engine_required`, `policy.approval_consumed`, `network.endpoint_network_mismatch`,
+`network.endpoint_identity_unavailable`, `network.rpc_credential_refused`,
+`auth.keyring_not_found`, `network.envelope_signed_for_mainnet`,
+`network.envelope_signature_unverifiable`, `network.envelope_unsigned`,
+`submission.tx_timeout`, `submission.tx_already_submitted`, `submission.hash_mismatch`,
+`submission.record_unavailable`.
 
 ## stellar_trustline_commit
 
@@ -137,7 +162,15 @@ Commit step for `stellar_trustline`: verifies the nonce, re-builds the `ChangeTr
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
-**Error codes:** the same set as `stellar_pay_commit`, without the memo codes, plus `policy.approval_required` when the issuer has clawback enabled and no operator opt-in is recorded.
+**Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
+`policy.engine_required`, `policy.approval_consumed`, `network.endpoint_network_mismatch`,
+`network.endpoint_identity_unavailable`, `network.rpc_credential_refused`,
+`auth.keyring_not_found`, `network.envelope_signed_for_mainnet`,
+`network.envelope_signature_unverifiable`, `network.envelope_unsigned`,
+`submission.tx_timeout`, `submission.tx_already_submitted`, `submission.hash_mismatch`,
+`submission.record_unavailable`.
+`policy.approval_required` also applies when the issuer has clawback enabled
+and no operator opt-in is recorded.
 
 ## stellar_transaction_status
 

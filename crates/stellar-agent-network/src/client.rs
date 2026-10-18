@@ -336,6 +336,18 @@ impl StellarRpcClient {
         self.url.as_str()
     }
 
+    /// Preserves the raw error for witness-specific refusal and retry classification.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the witness classifies the raw transport error before mapping it"
+    )]
+    pub(crate) async fn witness_ledger_entries(
+        &self,
+        keys: &[LedgerKey],
+    ) -> Result<GetLedgerEntriesResponse, stellar_rpc_client::Error> {
+        self.inner.get_ledger_entries(keys).await
+    }
+
     /// Fetches one or more ledger entries by key via `getLedgerEntries`.
     ///
     /// A thin public wrapper around `stellar_rpc_client::Client::get_ledger_entries`

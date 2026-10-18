@@ -263,7 +263,7 @@ pub(crate) fn write_settled_row(
 ) {
     use stellar_agent_core::audit_log::reader::ValueActionSettlement;
 
-    let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce) =
+    let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce, witness) =
         match stellar_agent_core::audit_log::reader::value_action_settlement(
             &profile.audit_log_path,
             envelope_hash,
@@ -278,6 +278,7 @@ pub(crate) fn write_settled_row(
                 pending.nonce_id,
                 pending.policy_decision,
                 pending.approval_nonce,
+                pending.witness,
             ),
             // The pending row has rotated out of the active file, so its sizing is
             // gone. The outcome still belongs in the log, under the name of the
@@ -288,6 +289,7 @@ pub(crate) fn write_settled_row(
                 Vec::new(),
                 None,
                 reconciliation_decision,
+                None,
                 None,
             ),
         };
@@ -307,6 +309,7 @@ pub(crate) fn write_settled_row(
                 nonce_id,
                 approval_nonce,
                 &request_id,
+                witness,
             )
         }
         ReceiptStatus::Failed { code } => {
@@ -1012,6 +1015,7 @@ mod tests {
                         None,
                         nonce.clone(),
                         "pending-request",
+                        None,
                     ))
                     .unwrap();
                 let status = if failed {
@@ -1048,5 +1052,58 @@ mod tests {
                 assert_eq!(rows[1]["tool"], "stellar_pay_commit");
             }
         }
+    }
+    #[test]
+    fn pending_witness_survives_cli_reconciliation() {
+        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = Profile::builder_testnet("signer", "witness", "nonce", "witness").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(Mutex::new(
+            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
+        ));
+        let witness = stellar_agent_core::audit_log::CrossCheckRecord {
+            provider: "https://oracle.example".to_owned(),
+            ledger: 123,
+            inputs_digest: "09".repeat(32),
+            kinds: vec![stellar_agent_core::cross_check::WitnessEntry::SourceAccount],
+        };
+        audit
+            .lock()
+            .unwrap()
+            .write_entry(AuditEntry::new_value_action_pending(
+                "stellar_pay_commit",
+                "stellar:testnet",
+                vec![],
+                "transaction",
+                "source",
+                7,
+                PolicyDecision::Allow,
+                Some("envelope".to_owned()),
+                None,
+                None,
+                "pending-request",
+                Some(witness.clone()),
+            ))
+            .unwrap();
+        write_settled_row(
+            &profile,
+            "witness",
+            &audit,
+            "envelope",
+            "transaction",
+            &ReceiptStatus::Success,
+            Some(124),
+            PolicyDecision::Allow,
+        );
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["kind"], "value_action_submitted");
+        assert_eq!(rows[1]["witness"], serde_json::to_value(&witness).unwrap());
+        assert_eq!(rows[0]["witness"], rows[1]["witness"]);
     }
 }

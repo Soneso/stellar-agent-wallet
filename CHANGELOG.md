@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- MCP payment and account-creation commits obtain an oracle witness before signing.
+  Results carry `cross_check`; pending and submitted audit rows carry passed witnesses.
+- Profiles accept `[cross_check_thresholds]` for per-asset thresholds in base units.
+- `network.witness_unavailable` reports a required witness the wallet cannot obtain.
+- Core exposes `CanonicalAsset`, `CrossCheckThresholds`, the requirement rule,
+  witness labels, `CrossCheckRecord`, and `WitnessUnavailableReason`.
+  `CrossCheckThresholds::new` refuses a native key or a negative value with
+  `InvalidCrossCheckThresholds`.
+  Network exposes classic witness inputs, outcomes, views, and `OracleEndpoint`.
+- `AuditEntry::new_value_action_pending`, `new_value_action_submitted`, and
+  `new_x402_payment_authorized` take an optional witness parameter.
+  `PendingValueAction.witness` preserves evidence during recovery.
+  `WalletSubmissionRecorder::with_witness` carries evidence into both submission rows.
+
 - Profiles support file-only secondary and oracle provider attestations containing
   operator, host, and independence from the primary. Core exposes `same_provider_host`.
 
@@ -45,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rpc_endpoint::profile_rpc_client` build clients that send the configured
   credential. `url()` stays the configured URL, without the credential.
 - The error code `network.rpc_credential_refused` reports a stored credential
-  the wallet refuses and an endpoint that answers the network identity request
+  the wallet refuses and an endpoint that answers a request
   with HTTP 401 or 403. The audit key purpose `rpc_credential` records a
   credential write.
 - `stellar_agent_network::quote_server_text`, `escape_server_text`, and
@@ -55,15 +69,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `stellar_pay` reads SEP-29 from the primary only. `stellar_pay_commit` re-reads
+  the flag and compares it on the oracle whenever an oracle is configured.
+- Oracle cross-check faults report `network.witness_unavailable`.
+  Cross-check `simulation.divergence` means a disagreement; envelope-decode producers remain.
+- `sep29::check_memo_required` takes the primary client only and returns a memo observation.
+- `network.rpc_credential_refused` names the request that received HTTP 401 or 403.
+- Rows without witnesses preserve their serialized bytes.
+  Older binaries refuse a log when a witness row has a following row or a tip anchor.
+  An older writer can append to an unanchored log ending in a witness row.
+  The newer binary then reports a broken chain.
+
 - Mainnet profile loading requires a matching independence attestation and a host
   distinct from the primary for each configured secondary or oracle endpoint.
   Invalid attestations refuse with `validation.provider_attestation_invalid`.
-- MCP high-value cross-checks compare provider hosts and check oracle endpoint
-  identity within each attempt's timeout. The SEP-29 oracle check shares the
-  `stellar_pay` identity deadline and reports identity failures as `network.rpc_divergence`.
-- A SEP-29 oracle construction failure refuses with `network.rpc_divergence`.
-- The high-value cross-check's degraded-verification warning fires when oracle
-  and primary hosts match, including different paths, queries, or ports.
+- Cross-check witnesses compare provider hosts and check oracle identity before reading.
+  The degraded-verification warning also covers matching hosts with different paths,
+  queries, or ports.
 - A mainnet profile refuses a secondary or oracle record whose operator equals
   the primary record's operator after trimming and case folding. On testnet
   such a record loads, and the cross-check warns that it runs degraded.

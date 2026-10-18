@@ -288,7 +288,7 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
     network than declared.
   - `network.endpoint_identity_unavailable`: the endpoint identity cannot be
     established in time.
-  - `network.rpc_credential_refused`: the endpoint answered the identity
+  - `network.rpc_credential_refused`: the endpoint answered a
     request with HTTP 401 or 403, or the stored RPC credential is unusable.
   - `network.unsupported_protocol_version`: a mainnet endpoint reports a version
     outside the supported range. While mainnet writes are refused, a mainnet
@@ -297,6 +297,8 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   - `network.envelope_signature_unverifiable`: a signature does not verify.
   - `network.envelope_unsigned`: a required signature set is empty.
 
+  `network.witness_unavailable` separately reports an unavailable required oracle
+  witness for MCP payment and account-creation commits.
   See references/troubleshooting.md.
 - These tools refuse `stellar:mainnet` structurally at handler entry with
   `network.mainnet_write_forbidden`, before the policy gate and regardless of

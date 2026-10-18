@@ -263,7 +263,7 @@ async fn identity_401_and_403_report_the_status_and_authority() {
         assert_eq!(
             text,
             format!(
-                "RPC endpoint '{}' answered the network identity request with HTTP {status}; \
+                "RPC endpoint '{}' answered a request with HTTP {status}; \
                  check the credential the profile configures for this endpoint",
                 server.uri()
             )

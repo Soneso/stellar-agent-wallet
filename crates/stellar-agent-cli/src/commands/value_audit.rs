@@ -546,6 +546,7 @@ mod tests {
             None,
             None,
             "req-e2e-1",
+            None,
         );
         emit_value_audit_row(&profile, "e2e-emit", entry);
 
@@ -626,6 +627,7 @@ mod tests {
             None,
             None,
             "req-require-1",
+            None,
         );
         emit_value_audit_row_with_writer(&writer, "require-seeded", entry);
 
@@ -735,6 +737,7 @@ mod tests {
             None,
             None,
             "req-origin-synth-1",
+            None,
         );
         emit_value_audit_row_with_writer(&writer, "origin-synth-seeded", entry);
 
@@ -964,6 +967,7 @@ mod tests {
                     None,
                     None,
                     "req-anchor-1",
+                    None,
                 ))
                 .expect("append");
         }
@@ -982,6 +986,7 @@ mod tests {
                     None,
                     None,
                     "req-anchor-2",
+                    None,
                 ))
                 .expect("append");
         }
@@ -1035,6 +1040,7 @@ mod tests {
                     None,
                     None,
                     "req-pre-anchor",
+                    None,
                 ))
                 .expect("append");
         }
@@ -1080,6 +1086,7 @@ mod tests {
             None,
             None,
             "req-binding",
+            None,
         )
     }
 

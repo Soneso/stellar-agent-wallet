@@ -74,8 +74,9 @@ The message names the selection source and the recovery command:
 An environment or programmatic overlay may set only operational fields.
 `submit_timeout_seconds` is overlayable on every chain. `rpc_url`,
 `secondary_rpc_url`, `oracle_provider_url`, `mcp_signer_default`,
-`cross_check_threshold_stroops` (alias `usd_threshold`), the two classic fee
-fields, `smart_account_max_context_rule_scan_id`, and
+`cross_check_threshold_stroops` (alias `usd_threshold`),
+`cross_check_thresholds`, the two classic fee fields,
+`smart_account_max_context_rule_scan_id`, and
 `session_rule_max_horizon_ledgers` are overlayable on testnet only.
 `mcp_disabled` accepts only `true`. Every other profile key, `chain_id` and
 every keyring coordinate included, comes from the file only. A refused overlay

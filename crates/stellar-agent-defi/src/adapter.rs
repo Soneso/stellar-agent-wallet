@@ -391,6 +391,7 @@ impl<'a> DefiAdapterCtx<'a> {
             None,
             None,
             request_id,
+            None,
         );
 
         match writer.lock() {

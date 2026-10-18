@@ -16,9 +16,9 @@ use crate::server::WalletServer;
 use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
     commit_envelope_and_verify_nonce, commit_path_error_result, enforce_classic_fee_cap,
-    hash_to_lower_hex, high_value_cross_check, ledger_err_result, nonce_id_prefix,
-    redact_rpc_error_detail, redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops,
-    submit_timeout, total_classic_fee_stroops, validate_g_strkey, verify_attestation_gate,
+    hash_to_lower_hex, ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope,
+    resolve_classic_fee_per_op_stroops, submit_timeout, total_classic_fee_stroops,
+    validate_g_strkey, verify_attestation_gate,
 };
 // McpAmountArgument import: kept as a single-line full path so the
 // amount-boundary lint does not treat the `amount:` token in a multi-line use
@@ -35,7 +35,7 @@ use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_core::wallet::Wallet;
 use stellar_agent_network::{
-    Asset, BASE_RESERVE_STROOPS, ClassicOpBuilder, StellarRpcClient, fetch_account,
+    Asset, BASE_RESERVE_STROOPS, ClassicOpBuilder, fetch_account,
     keyring::enrolled_keyring_signer,
     parse_classic_fee_choice, parse_memo_fields, resolve_classic_fee_selection,
     sep29::check_memo_required,
@@ -182,16 +182,9 @@ pub struct StellarPayArgs {
 ///
 /// # SEP-29 re-check at commit time
 ///
-/// The commit step does NOT re-run `check_memo_required` against the
-/// destination.  The simulate step enforces SEP-29 at the boundary where the
-/// agent learns; the HMAC binding ensures the envelope is not tampered with
-/// between simulate and commit.  Re-checking at commit would require an extra
-/// RPC round-trip for no incremental security gain: if the envelope was tampered
-/// the divergence check catches it, and if it was not tampered the SEP-29
-/// check would produce the same outcome as at simulate time.
-///
-/// This is a deliberate design choice; it is documented so a future reviewer
-/// does not add a redundant re-check.
+/// A memo-less commit re-reads the destination flag on the primary after the rebuild check.
+/// The oracle witness compares that observation whenever an oracle is configured.
+/// A changed memo requirement refuses before signing.
 ///
 /// # Examples
 ///
@@ -398,64 +391,6 @@ fn resolve_payment_amount(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WalletServer — SEP-29 oracle helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-const SEP29_DEADLINE_EXHAUSTED_DETAIL: &str =
-    "SEP-29 oracle_provider_url endpoint identity failed: action deadline exhausted";
-
-impl WalletServer {
-    /// Checks the oracle's identity within the payment's remaining action budget.
-    ///
-    /// Returns `None` when no oracle URL is configured, the checked client on success,
-    /// and the refusal result on failure.
-    async fn sep29_oracle_client(
-        &self,
-        pay_deadline: tokio::time::Instant,
-    ) -> Result<Option<StellarRpcClient>, CallToolResult> {
-        let Some(url) = self.profile.oracle_provider_url.as_ref() else {
-            return Ok(None);
-        };
-        let refuse = |context| {
-            crate::tools::common::endpoint_refusal_result(
-                &stellar_agent_core::error::NetworkError::RpcDivergence { context }.into(),
-            )
-        };
-        if tokio::time::Instant::now() >= pay_deadline {
-            return Err(refuse(SEP29_DEADLINE_EXHAUSTED_DETAIL.to_owned()));
-        }
-        // A credential failure keeps its own code; it says the configuration
-        // is wrong, not that the endpoints disagree.
-        let oracle = match stellar_agent_network::profile_rpc_client(
-            &self.profile,
-            stellar_agent_core::profile::schema::ProviderRole::Oracle,
-            url.as_str(),
-        ) {
-            Ok(client) => client,
-            Err(err) if stellar_agent_network::is_credential_error(&err) => {
-                return Err(crate::tools::common::endpoint_refusal_result(&err));
-            }
-            Err(err) => {
-                return Err(refuse(redact_rpc_error_detail(
-                    "SEP-29 oracle_provider_url client construction failed",
-                    &err,
-                )));
-            }
-        };
-        if let Err(err) = oracle
-            .endpoint_identity(self.context.network_passphrase(), pay_deadline)
-            .await
-        {
-            return Err(refuse(redact_rpc_error_detail(
-                "SEP-29 oracle_provider_url endpoint identity failed",
-                &err,
-            )));
-        }
-        Ok(Some(oracle))
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // WalletServer — approval-spine helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -616,7 +551,7 @@ impl WalletServer {
         name = "stellar_pay",
         description = "Build a Payment transaction envelope and mint a single-use nonce \
                        (simulate step). Supports native XLM and non-native assets. \
-                       Runs SEP-29 memo-required enforcement at simulate time. \
+                       Runs SEP-29 memo-required enforcement at simulate time on the primary RPC. \
                        Returns {envelope_xdr, nonce, expires_at_unix_ms, simulation}. \
                        The approval response includes profile and chain_id. \
                        Pass all three to stellar_pay_commit to sign and submit. \
@@ -627,7 +562,7 @@ impl WalletServer {
         &self,
         Parameters(args): Parameters<StellarPayArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // Starting at entry makes both identity checks consume the same action budget.
+        // Starting at entry bounds the primary identity check by the action budget.
         let pay_deadline: tokio::time::Instant =
             tokio::time::Instant::now() + submit_timeout(&self.profile);
         // ── Dispatch gate ─────────────────────────────────────────────────────
@@ -887,29 +822,8 @@ impl WalletServer {
             }
         }
 
-        // ── SEP-29 memo-required check (simulate time) ────────────────────────
-        // Run BEFORE building the envelope so the agent learns about the
-        // requirement without having to attempt a commit.  The commit step
-        // does NOT re-check SEP-29 (see `StellarPayCommitArgs` rustdoc).
-        //
-        // The checked oracle supplies the second SEP-29 read. Testnet permits
-        // both roles on one host when no record asserts independence.
-        let sep29_secondary_client = if !memo_present {
-            match self.sep29_oracle_client(pay_deadline).await {
-                Ok(client) => client,
-                Err(refusal) => return Ok(refusal),
-            }
-        } else {
-            None
-        };
-        if let Err(err) = check_memo_required(
-            &client,
-            sep29_secondary_client.as_ref(),
-            &args.destination,
-            memo_present,
-        )
-        .await
-        {
+        // Preparation applies the primary memo gate before building the envelope.
+        if let Err(err) = check_memo_required(&client, &args.destination, memo_present).await {
             let envelope = stellar_agent_core::envelope::Envelope::<()>::err(&err);
             let json = envelope
                 .to_json_pretty()
@@ -1150,8 +1064,8 @@ impl WalletServer {
     ///
     /// # SEP-29 at commit time
     ///
-    /// The commit step does NOT re-run `check_memo_required` (see
-    /// [`StellarPayCommitArgs`] rustdoc for the design rationale).
+    /// A memo-less commit applies the primary memo gate and compares its observation
+    /// through the oracle witness before signing.
     ///
     /// # Error code mapping (same as `stellar_create_account_commit`)
     ///
@@ -1205,7 +1119,9 @@ impl WalletServer {
         description = "Sign and submit a Payment transaction (commit step). \
                        Requires the nonce, expires_at_unix_ms, and envelope_xdr returned \
                        by stellar_pay. Verifies the nonce, re-builds the envelope, \
-                       signs via keyring, and submits. Returns {tx_hash, ledger}. \
+                       re-checks SEP-29, \
+                       obtains the cross-check witness, signs via keyring, and submits. \
+                       Returns {tx_hash, ledger, cross_check}. \
                        destructive_hint=true; read_only_hint=false.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
@@ -1430,7 +1346,7 @@ impl WalletServer {
         //       needing a live RPC.
         //
         // Ordering note: `stellar_create_account_commit` runs this gate AFTER its
-        // high-value cross-check (there is no toolset-gated variant to test without
+        // cross-check witness (there is no toolset-gated variant to test without
         // RPC, so no motivation to hoist it above that work).  The ordering
         // invariant is satisfied in both tools: this gate fires before nonce
         // HMAC+replay either way.
@@ -1527,13 +1443,6 @@ impl WalletServer {
             .ok_or_else(|| {
                 rmcp::ErrorData::internal_error("internal_error: operation count is zero", None)
             })?;
-        // Capture the amount before the primary rebuild consumes it; the copy
-        // is also used by the oracle rebuild closure (if cross-check fires).
-        let payment_amount_for_oracle = payment_amount;
-        // SAFETY-MIRROR: this builder configuration MUST match the oracle-rebuild
-        // closure below exactly.  Any change here that is not mirrored in the
-        // oracle closure below silently breaks the high-value cross-check.
-        // See also create_account.rs primary rebuild (mirrored pair).
         let mut builder = ClassicOpBuilder::new(
             &args.source,
             source_sequence,
@@ -1560,107 +1469,62 @@ impl WalletServer {
             ));
         }
 
-        // ── High-value independent-RPC cross-check ───────────────────────────
-        //
-        // For native-XLM payments at or above
-        // `profile.effective_cross_check_threshold_stroops()`, re-builds the
-        // envelope against `profile.oracle_provider_url` and asserts
-        // byte-identity with the primary rebuild.  A compromised primary RPC
-        // returning stale account state would produce a divergent envelope here.
-        //
-        // Skip conditions: non-native asset, value below threshold, or
-        // `oracle_provider_url` unset (fail-open with tracing::warn!).
+        let memo_observation = match check_memo_required(
+            &client,
+            &args.destination,
+            !matches!(memo, stellar_xdr::Memo::None),
+        )
+        .await
         {
-            let amount_stroops: i64 = match authoritative_args
-                .get("amount_stroops")
-                .and_then(crate::tools::amount_wire::value_as_stroops_i64)
-            {
-                Some(v) => v,
-                None => {
-                    return Ok(crate::tools::common::business_error_result(
-                        "simulation.divergence",
-                        "authoritative_args missing required `amount_stroops` field",
-                    ));
+            Ok(observation) => observation,
+            Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
+        };
+        // `Asset::parse` accepted the authoritative asset above under the same
+        // code and issuer rules, so these refusals answer with its code.
+        let unparseable_asset = || {
+            Ok(crate::tools::common::business_error_result(
+                "validation.asset_invalid",
+                "the asset in envelope_xdr could not be parsed as an asset identity",
+            ))
+        };
+        let witness_asset = match &asset {
+            Asset::Native => stellar_agent_core::asset_id::CanonicalAsset::Native,
+            Asset::Credit { code, issuer } => {
+                match stellar_agent_core::asset_id::CanonicalAsset::classic(code, issuer) {
+                    Ok(asset) => asset,
+                    Err(_) => return unparseable_asset(),
                 }
-            };
-            let asset_is_native = matches!(asset, Asset::Native);
-            // Capture all builder inputs for the oracle re-build closure.
-            let oracle_source = args.source.clone();
-            let oracle_destination = args.destination.clone();
-            let oracle_asset = asset.clone();
-            let oracle_memo = memo.clone();
-            let oracle_network_passphrase = self.context.network_passphrase().to_owned();
-            // Use the pre-captured payment amount (cloned before primary rebuild consumed it).
-            let oracle_payment_amount = payment_amount_for_oracle;
-
-            if let Err(result) = high_value_cross_check(
-                &self.profile,
-                &self.context,
-                &rebuilt_envelope_xdr,
-                &args.source,
-                asset_is_native,
-                amount_stroops,
-                |oracle_client| {
-                    // `high_value_cross_check` may invoke this closure more than
-                    // once within its bounded rebuild-retry window (the rebuild
-                    // may fail transiently while the independent RPC catches up),
-                    // so every non-`Copy` capture is cloned per-call rather than
-                    // moved once into the `async move` block.
-                    let oracle_source = oracle_source.clone();
-                    let oracle_destination = oracle_destination.clone();
-                    let oracle_asset = oracle_asset.clone();
-                    let oracle_memo = oracle_memo.clone();
-                    let oracle_network_passphrase = oracle_network_passphrase.clone();
-                    async move {
-                        // Re-fetch account state from the independent RPC.
-                        let oracle_account_view =
-                            fetch_account(&oracle_client, &oracle_source, &[])
-                                .await
-                                .map_err(|e| {
-                                    rmcp::ErrorData::internal_error(
-                                        format!("oracle_rpc_error: {e}"),
-                                        None,
-                                    )
-                                })?;
-                        // SAFETY-MIRROR: this builder configuration MUST match the
-                        // primary rebuild above exactly.  Any change here that is not
-                        // mirrored in the primary rebuild above silently breaks the
-                        // high-value cross-check.
-                        let mut oracle_builder = ClassicOpBuilder::new(
-                            &oracle_source,
-                            oracle_account_view.sequence_number,
-                            &oracle_network_passphrase,
-                            fee_per_op_stroops,
-                        );
-                        oracle_builder
-                            .payment(&oracle_destination, oracle_payment_amount, &oracle_asset)
-                            .map_err(|e| {
-                                rmcp::ErrorData::internal_error(
-                                    format!("oracle rebuild failed: {e}"),
-                                    None,
-                                )
-                            })?;
-                        oracle_builder.memo(&oracle_memo).map_err(|e| {
-                            rmcp::ErrorData::internal_error(
-                                format!("oracle rebuild failed: {e}"),
-                                None,
-                            )
-                        })?;
-                        oracle_builder.build().map_err(|e| {
-                            rmcp::ErrorData::internal_error(
-                                format!("oracle rebuild failed: {e}"),
-                                None,
-                            )
-                        })
-                    }
-                },
-                "stellar_pay_commit",
-            )
-            .await
-            {
-                return Ok(result);
             }
-        }
+            _ => return unparseable_asset(),
+        };
+        let source_observation =
+            match stellar_agent_network::cross_check::AccountObservation::from_view(&account_view) {
+                Ok(observation) => observation,
+                Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
+            };
+        let witness_inputs = stellar_agent_network::cross_check::PayWitnessInputs {
+            source: source_observation,
+            destination: stellar_agent_network::cross_check::DestinationObservation::from_view(
+                &args.destination,
+                dest_view.as_ref(),
+            ),
+            memo: memo_observation,
+        };
+        let cross_check = match stellar_agent_network::cross_check::obtain_classic_witness(
+            &self.profile,
+            &self.context,
+            stellar_agent_core::cross_check::CrossCheckValue::Amount {
+                asset: &witness_asset,
+                base_units: i128::from(payment_amount.as_stroops()),
+            },
+            witness_inputs,
+            "stellar_pay_commit",
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
+        };
 
         // ── Nonce verification + replay window ────────────────────────────────
         //
@@ -1822,7 +1686,7 @@ impl WalletServer {
             },
             Some(&floor_hook),
         ) {
-            Ok(r) => r,
+            Ok(r) => r.with_witness(cross_check.witness()),
             Err(err) => {
                 return Ok(crate::tools::submission_record::submission_error_result(
                     &err,
@@ -1855,6 +1719,7 @@ impl WalletServer {
 
                 let view = json!({
                     "tx_hash": tx_hash,
+                    "cross_check": cross_check.view(),
                     "ledger": ledger,
                 });
                 let envelope = stellar_agent_core::envelope::Envelope::ok(view);

@@ -357,9 +357,49 @@ Checks that need no request keep their place ahead of the endpoint check: argume
 
 Every refusal that follows a read comes after the endpoint check. Those are account and claim-entry errors, policy denial, approval refusal, rebuild divergence, the audit pre-flight, a malformed nonce, and the chain, fee, asset, and amount checks. The reservation reconcile and its settlement come after it too. A CLI `claim` or `trustline` refused at the early check carries no preview.
 
-Both the high-value oracle rebuild and MCP `stellar_pay` SEP-29 second read use `oracle_provider_url` and check its endpoint identity before reading. The oracle must serve the primary's chain. Identity and rebuilding share each cross-check attempt's deadline. The SEP-29 identity check shares the prepare action's deadline with the primary identity check. One client remains exempt: the MCP dispatch gate reconciles reservations on a client of its own. On the CLI, the reconcile runs on the primary client.
+The cross-check witness uses `oracle_provider_url` and checks its endpoint identity
+before reading. The oracle must serve the primary's chain. Identity and reads
+share a 15-second attempt deadline. Transport read failures retry up to three
+attempts, seven seconds apart. Disagreements, identity or credential refusals,
+invalid answers, and elapsed deadlines never retry.
+The MCP dispatch gate reconciles reservations on a client of its own.
+On the CLI, reconciliation uses the primary client.
 
 An MCP commit's early check refuses without consuming the nonce. The commit reads the clock for the nonce's expiry after the check, so the check's time counts toward that expiry. A refusal by the submit layer's own check comes after the nonce is consumed.
+
+### Cross-check witness
+
+`stellar_pay_commit` witnesses the source account, destination presence, projected
+home domain, authorization flags, and the memo requirement when read.
+`stellar_create_account_commit` witnesses its source account.
+The source comparison covers existence, sequence, native balance, subentry count,
+and four authorization flags. Sequence and native balance require exact equality;
+a change between reads refuses and requires retrying the action.
+
+The classic comparator also supports source trustline existence, balance, limit,
+and flags; issuer presence and flags; complete claimable-balance records and
+presence; absent pool channels; and funder account fields.
+Only the two MCP commits above call the witness, so tests alone exercise these
+input kinds.
+
+One oracle request reads every distinct key. The comparator associates answers
+by returned key XDR and validates each entry's embedded identity.
+Duplicate, unrequested, malformed, or inconsistent entries refuse as
+`network.witness_unavailable`. The witness records the oracle authority, ledger,
+SHA-256 digest of compared inputs, and entry kinds. Pending and submitted audit
+rows preserve this evidence, including when reconciliation writes the outcome.
+
+The chain enforces sequence, source balance, trustline existence, authorization,
+and limits; credit-payment destination existence; account-creation destination
+absence; the fee bid; and time bounds. An included transaction that fails an
+apply-time check can still cost its fee.
+The witness also protects policy reserve and balance views, destination identity,
+and SEP-29 decisions before signing.
+
+A skipped or not-required outcome makes no oracle comparison of any kind.
+With an oracle configured, a memo-less payment requires a comparison even below
+threshold. Mainnet missing asset thresholds refuse before this memo rule.
+Reservation reconciliation reads the primary alone.
 
 ### Endpoint identity is authoritative
 
@@ -382,7 +422,14 @@ The probe runs on the client instance that will carry `sendTransaction`, not on 
 A provider record can name a keyring entry and a placement for its role's endpoint ([Provider credentials](../profiles.md#provider-credentials)). The loader opens no keyring entry. `Profile::role_url` maps a role to its URL and `Providers::record_for` to its record; `RpcCredentialBinding::for_role` pairs the two, and `rpc_endpoint::rpc_client` reads the credential when a client is built:
 
 - The credential is read only when the URL the caller sends to equals the profile's URL for the role byte for byte. Any other URL, such as a CLI flag or an agent's tool input, gets a client without a credential, and no keyring entry is opened. An agent therefore cannot move a provider key to a host of its choice.
-- `NetworkContext::from_profile` binds the primary credential. `NetworkContext::primary_client` builds the clients of the CLI classic verbs, their MCP prepare and commit tools, the x402 tools, and the classic read sites, CLI `fees stats` only with `--profile`. MCP `stellar_fee_stats` builds its client with `profile_rpc_client` instead, so a differing `rpc_url` input gets none. The MCP high-value cross-check and the SEP-29 read build the oracle client with `profile_rpc_client`. The Friendbot path of `accounts create`, the MCP `stellar_friendbot` tool, `stellar_sep43_sign_and_submit_transaction`, and the smart-account, DeFi, and MPP clients carry no credential.
+- `NetworkContext::from_profile` binds the primary credential. `NetworkContext::primary_client`
+  builds the clients of the CLI classic verbs, their MCP prepare and commit tools, the x402
+  tools, and the classic read sites, CLI `fees stats` only with `--profile`. MCP
+  `stellar_fee_stats` builds its client with `profile_rpc_client` instead, so a differing
+  `rpc_url` input gets none. The cross-check witness builds the oracle client with
+  `profile_rpc_client`. The Friendbot path of `accounts create`, the MCP `stellar_friendbot`
+  tool, `stellar_sep43_sign_and_submit_transaction`, and the smart-account, DeFi, and MPP
+  clients carry no credential.
 - The value goes from the keyring into a `Zeroizing<String>` and from there to the transport. A header value is marked sensitive, so its `Debug` form hides it. A query or path placement interpolates the value into the transport target; the client's `url()` returns the configured URL without it.
 - `StellarRpcClient` implements neither `Debug` nor `Clone`, because the inner transport prints its target URL.
 - Every error the client builds from transport or server text replaces the stored value and the form it sends with `[redacted]` before the URL scrub. For a header value with a scheme prefix, the token after the first space is replaced too when it holds at least 8 bytes. The `error` field of a simulation answer gets the same scrub. A value the server splits, truncates, or re-encodes is not caught.

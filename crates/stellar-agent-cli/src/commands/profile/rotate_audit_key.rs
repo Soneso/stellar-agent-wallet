@@ -475,6 +475,7 @@ mod tests {
                     None,
                     None,
                     "req-pre",
+                    None,
                 );
                 writer.write_entry(entry).expect("write pre-rotation entry");
             }
@@ -605,6 +606,7 @@ mod tests {
                     None,
                     None,
                     "req-pre",
+                    None,
                 ))
                 .expect("append a pre-rotation row");
         }
@@ -690,6 +692,7 @@ mod tests {
                     None,
                     None,
                     "req-pre",
+                    None,
                 ))
                 .expect("append a pre-rotation row");
         }
@@ -775,6 +778,7 @@ mod tests {
                 None,
                 None,
                 request_id,
+                None,
             )
         };
         // Two anchored rows, with the file snapshotted between them, so the

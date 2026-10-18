@@ -250,10 +250,9 @@ mod tests {
             let memo_present = !matches!(memo, Memo::None);
             assert!(!memo_present);
 
-            let err =
-                crate::sep29::check_memo_required(&client, None, SEP29_TEST_ACCOUNT, memo_present)
-                    .await
-                    .expect_err("memo-required account must reject absent memo");
+            let err = crate::sep29::check_memo_required(&client, SEP29_TEST_ACCOUNT, memo_present)
+                .await
+                .expect_err("memo-required account must reject absent memo");
             assert!(
                 matches!(
                     err,
