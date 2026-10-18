@@ -369,18 +369,45 @@ An MCP commit's early check refuses without consuming the nonce. The commit read
 
 ### Cross-check witness
 
-`stellar_pay_commit` witnesses the source account, destination presence, projected
-home domain, authorization flags, and the memo requirement when read.
-`stellar_create_account_commit` witnesses its source account.
+Each witnessed stage compares the entries its decision read on the primary.
+The witness runs after the policy decision and the fee-cap check, and before
+the audit pre-flight, the signer, and the send.
+
+| Stage | Compared entries | Value |
+|---|---|---|
+| MCP `stellar_pay_commit` | Payment observations below | Source debit leg |
+| MCP `stellar_create_account_commit` | Source account | Starting balance in XLM |
+| CLI `pay`, full pipeline | Payment observations below | Source debit leg |
+| CLI `pay --sign-only` and `--submit-only` | Payment observations below | Source debit leg |
+| CLI `claim`, full pipeline | Source account, record, trustline (below) | Unvalued |
+| CLI `claim --sign-only` and `--submit-only` | Source account | Unvalued |
+
+Payment observations cover the source account and destination presence, home
+domain, and flags. They also cover the SEP-29 flag when read and the source
+trustline for an issued send asset. Staged payments use the decoded envelope.
+They read the SEP-29 flag only for a memo-less envelope paying a plain G account.
+
+A full claim compares the source account and the complete claimable-balance
+record. For an issued asset, it also compares the source trustline.
+
+The source debit leg is the send amount of a payment or strict-send path
+payment, and the send maximum of a strict-receive path payment. A muxed staged
+source or destination is witnessed on its G account. `--build-only` signs and
+sends nothing, so it has no witness. An envelope the staged decoder cannot
+classify has none either.
+
+Sponsored `accounts create`, `trustline`, and `pool init` on the CLI, and the
+MCP `stellar_trustline_commit` and `stellar_claim_commit`, do not yet call the
+witness. The comparator supports their input kinds, issuer presence and flags,
+absent pool channels, and funder account fields, and tests exercise them.
+
 The source comparison covers existence, sequence, native balance, subentry count,
 and four authorization flags. Sequence and native balance require exact equality;
-a change between reads refuses and requires retrying the action.
-
-The classic comparator also supports source trustline existence, balance, limit,
-and flags; issuer presence and flags; complete claimable-balance records and
-presence; absent pool channels; and funder account fields.
-Only the two MCP commits above call the witness, so tests alone exercise these
-input kinds.
+a change between reads refuses and requires retrying the action. A trustline
+comparison covers existence, balance, limit, and raw flags. Only an absent
+destination account counts as absent at the pay sites; any other failed read
+refuses with its own code, so a transient primary failure is never compared as
+an absence.
 
 One oracle request reads every distinct key. The comparator associates answers
 by returned key XDR and validates each entry's embedded identity.
@@ -400,6 +427,33 @@ A skipped or not-required outcome makes no oracle comparison of any kind.
 With an oracle configured, a memo-less payment requires a comparison even below
 threshold. Mainnet missing asset thresholds refuse before this memo rule.
 Reservation reconciliation reads the primary alone.
+
+### Classic fee cap
+
+The covered stages check the per-operation fee against
+`classic_max_fee_per_op_stroops` before obtaining a witness.
+CLI `pay` and `claim` check the cap in the full pipeline, `--build-only`,
+`--sign-only`, and `--submit-only`. MCP pay, create-account, trustline, and
+claim check it in both prepare and commit. No other stage checks it, including
+CLI `trustline`, sponsored `accounts create`, `pool init`, opaque staged
+envelopes, and the SEP-43 signing tools.
+
+The checked fee is the resolved auto-selected, explicit, profile, or command
+fee, or the fee decoded from a presented or staged envelope. A fee equal to the cap
+passes. A fee above it refuses with `fees.percentile_exceeds_cap`, whose text
+names the fee's source. On a mainnet profile the cap is required at action
+time, refusing with `validation.mainnet_fee_cap_required` when unset;
+`profile init --network mainnet` writes `10000`. The fee is not witnessed: the
+chain charges at most the bid.
+
+`pool init` passes the per-operation fee to the builder, which multiplies it by
+the operation count, three per channel. A fee whose total does not fit the
+transaction's fee field refuses with `validation.fee_total_overflow` before the
+sandwich is built.
+
+Mainnet writes stay refused structurally on every classic verb and commit, so
+the mainnet branches of the fee cap and of the witness are exercised by tests
+of the shared rules.
 
 ### Endpoint identity is authoritative
 

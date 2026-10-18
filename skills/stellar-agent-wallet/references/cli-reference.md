@@ -187,6 +187,27 @@ Under `policy.engine = "v1"` `pay` evaluates operator policy before signing. The
 
 `--submit-only` runs the endpoint identity check before the policy gate and before the audit-key pre-flight, on the client that later reconciles, reads the gate's account views, and sends. An `--rpc-url` pointing at a different network than `--network` is therefore refused early. The check reads the endpoint's protocol version too and applies the same protocol rule as the submit layer, under its own `--timeout-seconds` deadline; the submission then starts a fresh one. It also requires an already-signed envelope: handing it the unsigned XDR that `--build-only` emitted is refused with `network.envelope_unsigned` before anything is sent. `claim --submit-only` behaves the same way.
 
+After the policy gate every `pay` stage checks the per-operation fee against the
+profile's `classic_max_fee_per_op_stroops`: the selected fee in the full
+pipeline and `--build-only`, the decoded envelope fee in `--sign-only` and
+`--submit-only`. A fee above the cap exits 1 with `fees.percentile_exceeds_cap`,
+and the message names the fee's source and the remedy. A mainnet profile without
+the cap refuses with `validation.mainnet_fee_cap_required`.
+
+The full pipeline, `--sign-only`, and `--submit-only` then obtain the
+cross-check witness before the audit pre-flight, the signer, and the send. The
+oracle re-reads the source account, the destination, the SEP-29 flag when it was
+read, and the source trustline of an issued send asset, valued on the source
+debit leg. A disagreement exits 1 with `simulation.divergence`, or
+`network.rpc_divergence` for the SEP-29 flag; an oracle fault refuses with
+`network.witness_unavailable`. A credential refusal keeps
+`network.rpc_credential_refused`. The result carries `cross_check` (`passed`,
+`skipped`, or `not_required`), and `--output table` prints a `Cross-check:`
+line. `--build-only` has no witness and no `cross_check`. `--sign-only` and
+`--submit-only` read the destination's SEP-29 flag when the decoded transaction
+carries no memo and pays a plain G account. A destination that requires a memo
+refuses with `validation.memo_required` before signing or sending.
+
 Before the transaction is sent, `pay` records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. A submission whose confirmation does not arrive exits 1 with `submission.tx_timeout`, keeps that record, and carries the full transaction hash in `error.details`. Resolve it with `tx status <HASH>`, never by rebuilding and re-sending: a second submission for the same source account and sequence is refused with `submission.tx_already_submitted` while the first stands. The same applies to `claim`, `accounts create`, `trustline`, `trade` and `vault`.
 
 In the operator's terminal, run this line on its own, paste the source-account seed when prompted, and press Enter. The line reads the seed from the terminal, so the operator runs it, not the agent.
@@ -290,6 +311,13 @@ stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default
 | `--timeout-seconds` / `--rpc-url` / `--output` | shared | as above |
 
 Under `policy.engine = "v1"` `claim` evaluates operator policy before signing. The staged `--sign-only` / `--submit-only` stages gate too: they decode the supplied envelope and match rules under the `stellar_claim_commit` tool name, and deny `policy.deny.unsizable_value_effect` on an envelope the decoder cannot size unless the matched rule sets `allow_opaque_signing = true`.
+
+`claim` applies the same fee cap as `pay` in every stage. The full pipeline,
+`--sign-only`, and `--submit-only` obtain an unvalued cross-check witness before
+the audit pre-flight, the signer, and the send. The full pipeline compares the
+source account, the complete claimable-balance record, and the trustline of an
+issued asset. The staged stages compare the source account. The refusal codes
+and the `cross_check` field are those of `pay`.
 
 The build stage computes a typed preview (balance id, asset, amount, claimants, `is_claimant`, predicate verdict) before the guards run. The command prints one JSON envelope: the preview is in `data.preview` on success and in `error.details.preview` when a guard or any later step refuses, so the operator sees the balance disclosure either way. `--sign-only` and `--submit-only` build no preview.
 
@@ -446,7 +474,7 @@ Creates, lists, shows, and migrates profiles, and rotates the keyring-backed key
 
 | Verb | Form | Notes |
 |---|---|---|
-| `init` | `profile init --profile default --network testnet` | State-changing (writes the profile file). Creates a new profile TOML with per-profile-derived keyring refs (placeholder `"default"` signer/nonce accounts) and reports enrollment next steps. Mints no key material, emits no audit row. `--profile <NAME>` (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default`), `--network <testnet\|mainnet>` (default `testnet`), `--rpc-url <URL>` (optional for testnet; required for mainnet, which has no default endpoint), `--engine <v1\|noop>` selects the engine (default `v1`). On V1, the MCP server starts once the owner key is enrolled and the owner-signed policy loads; the rest of the [V1 setup](profiles-and-keys.md#opt-in-to-v1) gates approvals and signing. A testnet `noop` profile supports server startup and read access immediately. Mint the audit key with `profile rotate-audit-key` before `profile enroll-signer` so enrollment writes its audit row. Then run `profile rotate-nonce-key` before MCP payment simulation. The flag parser refuses a malformed `--rpc-url`, or one that carries credentials, with exit `1` and `validation.usage_error`. Refusals, in order, each exit `1` and write nothing. An unsafe `--profile`: `validation.config_invalid`. Mainnet without `--rpc-url`: `validation.mainnet_rpc_url_required`. An existing profile: `validation.profile_already_exists`. An `rpc_url` that breaks the endpoint rule: `validation.config_invalid`. The rule requires `http` or `https`, and on mainnet `https` with no username or password. A failed write exits `1` with an internal error. |
+| `init` | `profile init --profile default --network testnet` | Writes a profile; see below. |
 | `list` | `profile list` | Read-only. Returns known profile names sorted as a JSON array. Takes no profile selector. |
 | `show <NAME>` | `profile show default` | Read-only. URL fields (`rpc_url`, `secondary_rpc_url`, `oracle_provider_url`) show scheme, host, and port only. Resolved config; keyring refs appear as opaque `{service, account}`, secrets never read. Exits `1` with `validation.profile_not_found` when the profile does not exist. A mainnet file without `rpc_url` exits with `validation.mainnet_rpc_url_required`. An invalid provider attestation exits with `validation.provider_attestation_invalid`; correct the named field in the profile file. An endpoint URL that breaks the endpoint rule, an unsupported schema version, or another unreadable file exits with `validation.config_invalid`. |
 | `migrate <NAME>` | `profile migrate default` | State-changing (atomic temp+rename). No-op if already current (`status:"no_op"`); else `status:"migrated"` with `from_version`/`to_version`/`path`. A refused migration exits `1`, writes nothing, and leaves the v1 file unchanged. A missing profile file: `validation.profile_not_found`. A v1 mainnet file without `rpc_url`: `validation.mainnet_rpc_url_required`, because mainnet has no default endpoint; add `rpc_url` to the v1 file and run the command again. An endpoint URL that breaks the endpoint rule, or a file that cannot be read: `validation.config_invalid`. |
@@ -454,6 +482,34 @@ Creates, lists, shows, and migrates profiles, and rotates the keyring-backed key
 | `enroll-rpc-credential` | `profile enroll-rpc-credential --profile default --role primary --header X-API-Key` | State-changing (keyring, and the profile TOML when the record names no reference). Stores an RPC provider key at the keyring entry the role's provider record names, or at the default `stellar-agent-rpc-<profile>` / `<role>`, and adds `credential` and `placement` to a record without them. Reads the key from a hidden prompt, or from standard input with `--stdin`; the key is never printed. The role's URL and record must exist; the loader's credential checks run on the record before anything is written. `--role <primary\|secondary\|oracle>` (required), `--header <NAME>` \| `--query <NAME>` \| `--path` (required when the record names no placement), `--stdin`, `--force`. Refusals: `enroll_rpc_credential.record_missing`, `.placement_required`, `.placement_mismatch`, `.entry_exists`, `.terminal_required`, `.input_unreadable`, `validation.provider_attestation_invalid`, `network.rpc_credential_refused`. See [Provider credentials](profiles-and-keys.md#provider-credentials). |
 | `enroll-owner-key` | `profile enroll-owner-key --profile default --secret-env WALLET_OWNER_SK` | State-changing (keyring). Derives the owner ed25519 PUBLIC key from an operator `S...` seed and stores it at `policy_owner_key_id` (the key the V1 engine verifies against) as its G-strkey, a form no 32-byte symmetric-key loader accepts. Also rewrites every other profile's older-form (base64) owner entry. The seed is never stored. `--expected-address`, `--force`. |
 | `sign-policy` | `profile sign-policy --profile default --secret-env WALLET_OWNER_SK` | State-changing (writes the policy file, atomic). Signs `<state_dir>/policies/<profile>.toml` (or `--file`) with the owner seed and writes the `[signature]` table. Refuses if the seed does not match the enrolled owner key. |
+
+`profile init` writes a new profile TOML with per-profile keyring references.
+The signer and nonce accounts start as `"default"` placeholders. It reports
+enrollment next steps, mints no key material, and emits no audit row.
+
+`--profile <NAME>` resolves through `STELLAR_AGENT_PROFILE`, then `default`.
+`--network <testnet|mainnet>` defaults to `testnet`. `--rpc-url <URL>` is optional
+on testnet and required on mainnet, which has no default endpoint.
+`--engine <v1|noop>` defaults to `v1`. Mainnet profiles receive
+`classic_max_fee_per_op_stroops = 10000`.
+
+On V1, the MCP server starts once the owner key is enrolled and the
+owner-signed policy loads. The rest of the
+[V1 setup](profiles-and-keys.md#opt-in-to-v1) gates approvals and signing.
+A testnet `noop` profile supports server startup and read access immediately.
+Mint the audit key with `profile rotate-audit-key` before
+`profile enroll-signer` so enrollment writes its audit row. Then run
+`profile rotate-nonce-key` before MCP payment simulation.
+
+The flag parser refuses a malformed or credential-bearing `--rpc-url` with
+exit `1` and `validation.usage_error`. Later refusals also exit `1` and write
+nothing. In order, these are an unsafe profile name
+(`validation.config_invalid`), a missing mainnet endpoint
+(`validation.mainnet_rpc_url_required`), and an existing profile
+(`validation.profile_already_exists`). An endpoint that breaks the URL rule
+then refuses with `validation.config_invalid`. The rule requires `http` or
+`https`, and on mainnet `https` with no username or password. A failed write
+exits `1` with an internal error.
 
 `enroll-signer` reads the signer seed, and `enroll-owner-key` and `sign-policy` read the owner seed, from the environment of the shell that runs them. The operator supplies each seed as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows, only for those commands, and unsets it afterward. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment.
 

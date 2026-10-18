@@ -119,7 +119,17 @@ The channel pool is a set of channel accounts derived from a single pool master 
 
 ### `stellar-agent pool init`
 
-Create `N` channel accounts through a single CAP-33 sponsored-reserve transaction. The funder sponsors their reserves and pays the fee; each account starts with zero balance, so initialization has no transferred-balance legs or spending-cap entries. A receipt and a pending audit row record the transaction before transmission. Confirmation writes its settled row and the `channel_pool_initialised` event.
+Create `N` channel accounts through a single CAP-33 sponsored-reserve
+transaction. The funder sponsors their reserves and pays the fee: the profile's
+`classic_fee_per_op_stroops` (default 100) once per operation, three operations
+per channel, so each channel costs 300 stroops at the default. A per-operation
+fee whose total does not fit the transaction's fee field refuses with
+`validation.fee_total_overflow` before anything is built, signed, or sent.
+A run that already wrote its checkpoint resumes with `--resume` after the fee
+is lowered. Each account starts with zero balance, so initialization has no transferred-balance
+legs or spending-cap entries. A receipt and a pending audit row record the
+transaction before transmission. Confirmation writes its settled row and the
+`channel_pool_initialised` event.
 
 The funder signer comes from the keyring. The profile's audit chain key must be minted with `profile rotate-audit-key`; the command acquires the audit writer before generating the pool seed or submitting the transaction. It persists the seed in the keyring and a public `[pool_initialization]` checkpoint in the profile before any send. The profile stores channel identities and submission hashes, never seed bytes. Persistence patches only the pool keys (`pool_master_key_id`, `[pool_initialization]`, `[pool_config]`); other stored values are preserved and environment overrides remain transient.
 

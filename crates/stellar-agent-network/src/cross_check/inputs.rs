@@ -122,6 +122,37 @@ impl TrustlineObservation {
     }
 }
 
+impl TrustlineObservation {
+    /// Reads the raw trustline of `account_id` for the send asset on the
+    /// primary and builds the observation from it.
+    ///
+    /// A native send asset has no trustline and yields `None`; an issued asset
+    /// yields an observation whose state is `None` when the account holds no
+    /// trustline for it.
+    ///
+    /// # Errors
+    /// Refuses an asset outside the canonical classic alphabet with
+    /// `validation.asset_invalid`, and passes through the refusals of
+    /// [`crate::account::fetch_trustline_entry`] and [`Self::from_entry`].
+    pub async fn read_send_asset(
+        client: &crate::client::StellarRpcClient,
+        account_id: &str,
+        asset: &crate::builder::Asset,
+    ) -> Result<Option<Self>, WalletError> {
+        if matches!(asset, crate::builder::Asset::Native) {
+            return Ok(None);
+        }
+        let canonical = asset.to_canonical()?;
+        let entry = crate::account::fetch_trustline_entry(
+            client,
+            account_id,
+            &asset.to_xdr_trust_line_asset()?,
+        )
+        .await?;
+        Self::from_entry(account_id, canonical, entry.as_ref()).map(Some)
+    }
+}
+
 /// Claimable-balance identity and the complete record used by the claim guard.
 #[derive(Debug, Clone)]
 pub struct ClaimableBalanceObservation {
@@ -134,7 +165,8 @@ pub struct ClaimableBalanceObservation {
 /// Whether the primary read the SEP-29 flag for a memo-less envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoObservation {
-    /// The envelope carries a memo, so the flag was not read.
+    /// The flag was not read: the envelope carries a memo, or pays a muxed
+    /// destination whose id carries it.
     NotRead,
     /// Normalized primary flag.
     Read(bool),
@@ -149,6 +181,9 @@ pub struct PayWitnessInputs {
     pub destination: DestinationObservation,
     /// Primary SEP-29 observation.
     pub memo: MemoObservation,
+    /// The source's trustline for an issued send asset; `None` for a native
+    /// send asset.
+    pub trustline: Option<TrustlineObservation>,
 }
 
 /// Account creation observations used before signing.

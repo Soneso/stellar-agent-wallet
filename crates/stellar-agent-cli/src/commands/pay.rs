@@ -98,6 +98,22 @@
 //! it neither signs nor submits. Where a writer was acquired, it is reused
 //! (not re-acquired) for the post-confirm `value_action_submitted` row.
 //!
+//! # Fee cap and cross-check witness
+//!
+//! After the policy gate, every stage checks the per-operation fee against
+//! the profile's `classic_max_fee_per_op_stroops`: the selected fee in the
+//! full pipeline and `--build-only`, the decoded envelope fee in
+//! `--sign-only` and `--submit-only`. A mainnet profile without the cap
+//! refuses. The signing and submitting stages then obtain the cross-check
+//! witness: the oracle re-reads the source account, the destination, the
+//! SEP-29 flag when it was read, and the source trustline of an issued send
+//! asset, valued on the source debit leg. A staged envelope's SEP-29 flag is
+//! read on the primary only when the decoded transaction carries no memo and
+//! pays a plain G destination. Both checks refuse before the audit
+//! pre-flight, the signer, and the send; the outcome is the result's
+//! `cross_check` field and travels into the pending and submitted audit rows.
+//! `--build-only` obtains no witness.
+//!
 //! # Behavior
 //!
 //! All network calls go through Stellar RPC. SEP-29 on-chain data-entry
@@ -118,12 +134,17 @@ use stellar_xdr::Memo;
 
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
 use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
+use stellar_agent_network::cross_check::{
+    AccountObservation, CrossCheckOutcome, CrossCheckView, DestinationObservation, MemoObservation,
+    PayWitnessInputs, TrustlineObservation, obtain_classic_witness,
+};
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::source::signer_from_ledger;
 use stellar_agent_network::{
-    ClassicFeeChoice, ClassicFeeSelection, StellarRpcClient, SubmissionResult,
-    SubmissionSignerKind, init_platform_keyring_store, parse_classic_fee_choice, parse_memo_fields,
+    CLASSIC_SINGLE_OPERATION_COUNT, ClassicFeeChoice, ClassicFeeSelection, StellarRpcClient,
+    SubmissionResult, SubmissionSignerKind, check_built_fee_cap, check_classic_fee_cap,
+    init_platform_keyring_store, parse_classic_fee_choice, parse_memo_fields,
     resolve_classic_fee_selection, submit_transaction_and_wait,
 };
 
@@ -212,12 +233,28 @@ pub struct PayResult {
     /// Fee selection source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_fee_percentile: Option<String>,
+
+    /// Outcome of the cross-check witness a signing or submitting stage
+    /// obtained before it signed or sent.
+    ///
+    /// Absent for `--build-only`, which neither signs nor sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_check: Option<CrossCheckView>,
 }
 
 #[derive(Debug, Clone)]
 struct BuiltPaymentEnvelope {
     envelope_xdr: String,
     fee_selection: ClassicFeeSelection,
+    /// The parsed `--fee` choice the selection came from; it names the fee's
+    /// source in a fee-cap refusal.
+    fee_choice: ClassicFeeChoice,
+    /// The parsed asset the payment sends; the source debit leg the witness
+    /// values and keys the source trustline to.
+    asset: Asset,
+    /// The SEP-29 observation of the build: the destination's flag when the
+    /// payment carries no memo.
+    memo_observation: MemoObservation,
     /// Resolved payment amount in stroops. Feeds the policy gate's
     /// `amount_stroops` field — identical key and value the `stellar_pay` MCP
     /// tool's dispatch args carry.
@@ -236,9 +273,8 @@ struct BuiltPaymentEnvelope {
     source_account_view: stellar_agent_network::AccountView,
     /// The destination account's fetched state, if the destination exists on
     /// chain — feeds the policy gate's `identity_view`. `None` when the
-    /// destination fetch fails (not-yet-created account), mirroring the
-    /// `stellar_pay` MCP twin's `fetch_account(...).ok()` exactly (a failed
-    /// destination fetch is non-fatal, unlike a failed SOURCE fetch).
+    /// destination does not exist (a not-yet-created account); any other read
+    /// error refuses the build (see [`read_destination`]).
     dest_account_view: Option<stellar_agent_network::AccountView>,
 }
 
@@ -422,8 +458,23 @@ where
             return 1;
         }
     };
+    run_loaded(args, &resolved, &profile, origin, init_keyring).await
+}
+
+/// Runs the command on a loaded profile: the network context, the structural
+/// mainnet refusal, the relayer gate, and the stage dispatch.
+async fn run_loaded<InitKeyring>(
+    args: &PayArgs,
+    resolved: &ResolvedProfileName,
+    profile: &Profile,
+    origin: ProfileOrigin,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
     let context = match network_context_for_command(
-        &profile,
+        profile,
         &resolved.name,
         EndpointFlags {
             network: args.network,
@@ -471,31 +522,13 @@ where
     // signing or broadcasting. All four stages therefore receive the loaded
     // profile and the keyring initialiser.
     if args.build_only {
-        run_build_only(&context, args, &resolved, &profile, init_keyring).await
+        run_build_only(&context, args, resolved, profile, init_keyring).await
     } else if let Some(ref xdr) = args.sign_only {
-        run_sign_only(
-            &context,
-            args,
-            &resolved,
-            xdr,
-            &profile,
-            origin,
-            init_keyring,
-        )
-        .await
+        run_sign_only(&context, args, resolved, xdr, profile, origin, init_keyring).await
     } else if let Some(ref xdr) = args.submit_only {
-        run_submit_only(
-            &context,
-            args,
-            &resolved,
-            xdr,
-            &profile,
-            origin,
-            init_keyring,
-        )
-        .await
+        run_submit_only(&context, args, resolved, xdr, profile, origin, init_keyring).await
     } else {
-        run_full_pipeline(&context, args, &resolved, &profile, origin, init_keyring).await
+        run_full_pipeline(&context, args, resolved, profile, origin, init_keyring).await
     }
 }
 
@@ -547,6 +580,14 @@ where
             {
                 return code;
             }
+            if let Err(e) = check_built_fee_cap(
+                built.fee_selection.per_op_stroops,
+                built.fee_choice,
+                profile,
+            ) {
+                print_error(&Envelope::<()>::err(&e), args.output);
+                return 1;
+            }
             let result = PayResult {
                 envelope_xdr: built.envelope_xdr,
                 tx_hash: None,
@@ -554,6 +595,7 @@ where
                 stage: "build".to_owned(),
                 selected_fee_per_op_stroops: Some(built.fee_selection.per_op_stroops),
                 selected_fee_percentile: Some(built.fee_selection.selected_fee_percentile),
+                cross_check: None,
             };
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
@@ -583,11 +625,42 @@ where
         Ok(()) => (),
         Err(code) => return code,
     };
-    if let Err(code) =
-        evaluate_staged_pay_policy(None, context, args, unsigned_xdr, profile, &resolved.name).await
+    let gate = match evaluate_staged_pay_policy(
+        None,
+        context,
+        args,
+        unsigned_xdr,
+        profile,
+        &resolved.name,
+    )
+    .await
     {
-        return code;
-    }
+        Ok(gate) => gate,
+        Err(code) => return code,
+    };
+    // A decoded payment's fee is checked against the cap and the oracle
+    // re-reads what the gate read, before the audit pre-flight and the
+    // signer. An opaque envelope reads nothing and has no witness.
+    let cross_check = match &gate.payment {
+        Some(payment) => {
+            match witness_staged_payment(
+                context,
+                profile,
+                unsigned_xdr,
+                payment,
+                "stellar_pay_commit",
+            )
+            .await
+            {
+                Ok(outcome) => Some(outcome),
+                Err(e) => {
+                    print_error(&Envelope::<()>::err(&e), args.output);
+                    return 1;
+                }
+            }
+        }
+        None => None,
+    };
     // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
     // policy gate (a denial is a clean refusal that signs nothing and needs
     // no audit setup) but BEFORE the signing key below is touched, for a
@@ -613,6 +686,7 @@ where
                 stage: "sign".to_owned(),
                 selected_fee_per_op_stroops: None,
                 selected_fee_percentile: None,
+                cross_check: cross_check.as_ref().map(CrossCheckOutcome::view),
             };
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
@@ -649,7 +723,7 @@ where
     // envelope will reach. The check makes it so, and a mismatch refuses here
     // rather than after a policy decision taken for the wrong chain.
     let client = match checked_client(context, args).await {
-        Ok(client) => client,
+        Ok(client) => std::sync::Arc::new(client),
         Err(e) => {
             print_error(&Envelope::<()>::err(&e), args.output);
             return 1;
@@ -682,7 +756,7 @@ where
     let chain_id = context.chain_id.caip2_str();
     // The envelope arrives pre-signed, but broadcasting it still spends
     // funds — gate here even though signing already happened elsewhere.
-    let pay_effects = match evaluate_staged_pay_policy(
+    let gate = match evaluate_staged_pay_policy(
         Some(&client),
         context,
         args,
@@ -692,8 +766,29 @@ where
     )
     .await
     {
-        Ok(effects) => effects,
+        Ok(gate) => gate,
         Err(code) => return code,
+    };
+    let pay_effects = gate.effects;
+    // A decoded payment's fee is checked against the cap and the oracle
+    // re-reads what the gate read, before the audit pre-flight and the send.
+    let cross_check = match &gate.payment {
+        Some(payment) => match witness_staged_payment(
+            context,
+            profile,
+            signed_xdr,
+            payment,
+            "stellar_pay_commit",
+        )
+        .await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                print_error(&Envelope::<()>::err(&e), args.output);
+                return 1;
+            }
+        },
+        None => None,
     };
     // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
     // policy gate (a denial is a clean refusal that submits nothing and
@@ -727,7 +822,7 @@ where
             now_ms,
         },
     ) {
-        Ok(r) => r,
+        Ok(r) => r.with_witness(cross_check.as_ref().and_then(CrossCheckOutcome::witness)),
         Err(e) => {
             print_error(
                 &crate::commands::submission_record::error_envelope(&e, signed_xdr, "pay"),
@@ -746,6 +841,7 @@ where
                 stage: "submit".to_owned(),
                 selected_fee_per_op_stroops: None,
                 selected_fee_percentile: None,
+                cross_check: cross_check.as_ref().map(CrossCheckOutcome::view),
             };
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
@@ -818,24 +914,27 @@ where
 /// path uses ([`stellar_agent_core::decode_authoritative_args`]), fetches the account views the
 /// decoded fields need, and delegates the decision to
 /// [`dispatch_staged_pay_gate`] — the pure, network-free dispatch this
-/// function's tests exercise directly. Returns `Ok(effects)` on allow
-/// (`Some` when the envelope decoded into a sized shape, `None` for the
-/// no-op engine or an opaque allow); returns `Err(exit_code)` — with the
-/// refusal envelope already rendered — on any refusal.
+/// function's tests exercise directly. Returns `Ok(gate)` on allow: the
+/// gate-sized effects (`Some` when the envelope decoded into a sized shape,
+/// `None` for the no-op engine or an opaque allow) and, for an envelope the
+/// decoder classifies, the decoded payment with the views the gate read;
+/// returns `Err(exit_code)`, with the refusal envelope already rendered, on
+/// any refusal.
 ///
 /// `sending_client` is the checked client `--submit-only` sends through, and
 /// the views are read on it. `--sign-only` passes `None`: it builds a client
 /// and checks its endpoint only when the envelope decodes, so an envelope the
 /// decoder cannot classify reaches the opaque-signing posture without any
-/// request.
+/// request. The built client travels in the returned payment, so the stage's
+/// witness reads go through it too.
 async fn evaluate_staged_pay_policy(
-    sending_client: Option<&StellarRpcClient>,
+    sending_client: Option<&std::sync::Arc<StellarRpcClient>>,
     context: &NetworkContext,
     args: &PayArgs,
     envelope_xdr: &str,
     profile: &Profile,
     profile_name: &str,
-) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
+) -> Result<StagedPayGate, i32> {
     let chain_id = context.chain_id.caip2_str();
     let policy_engine =
         match build_v1_policy_engine("pay", &profile.policy.engine, profile, profile_name) {
@@ -862,21 +961,18 @@ async fn evaluate_staged_pay_policy(
     // call below.
     let mut source_view_holder = None;
     let mut dest_view_holder = None;
+    let mut built_client = None;
     if let Ok(ref authoritative_args) = decode_result {
-        let checked;
-        let client = match sending_client {
-            Some(client) => client,
+        let client = built_client.insert(match sending_client {
+            Some(client) => std::sync::Arc::clone(client),
             None => match checked_client(context, args).await {
-                Ok(client) => {
-                    checked = client;
-                    &checked
-                }
+                Ok(client) => std::sync::Arc::new(client),
                 Err(e) => {
                     print_error(&Envelope::<()>::err(&e), args.output);
                     return Err(1);
                 }
             },
-        };
+        });
         let source = authoritative_args
             .get("source")
             .and_then(serde_json::Value::as_str)
@@ -893,10 +989,15 @@ async fn evaluate_staged_pay_policy(
                 return Err(1);
             }
         };
-        // Destination fetch is non-fatal, matching `evaluate_pay_policy`.
-        dest_view_holder = stellar_agent_network::fetch_account(client, destination, &[])
-            .await
-            .ok();
+        // An absent destination is not an error, matching
+        // `evaluate_pay_policy`; any other read error refuses.
+        dest_view_holder = match read_destination(client, destination).await {
+            Ok(view) => view,
+            Err(e) => {
+                print_error(&Envelope::<()>::err(&e), args.output);
+                return Err(1);
+            }
+        };
     }
     let source_adapter = source_view_holder
         .as_ref()
@@ -905,7 +1006,8 @@ async fn evaluate_staged_pay_policy(
         .as_ref()
         .map(stellar_agent_network::policy_view::AccountViewAdapter::new);
 
-    match dispatch_staged_pay_gate(
+    let decoded = decode_result.as_ref().ok().cloned();
+    let effects = match dispatch_staged_pay_gate(
         policy_engine.as_ref(),
         profile,
         chain_id,
@@ -915,12 +1017,163 @@ async fn evaluate_staged_pay_policy(
             .map(|a| a as &dyn AccountReservesView),
         dest_adapter.as_ref().map(|a| a as &dyn AccountIdentityView),
     ) {
-        Ok(effects) => Ok(effects),
+        Ok(effects) => effects,
         Err(envelope) => {
             print_error(&envelope, args.output);
-            Err(1)
+            return Err(1);
         }
+    };
+    let payment = match (decoded, source_view_holder, built_client) {
+        (Some(decoded), Some(source_view), Some(client)) => {
+            match StagedPayment::from_decoded(&decoded, client, source_view, dest_view_holder) {
+                Ok(payment) => Some(payment),
+                Err(e) => {
+                    print_error(&Envelope::<()>::err(&e), args.output);
+                    return Err(1);
+                }
+            }
+        }
+        _ => None,
+    };
+    Ok(StagedPayGate { effects, payment })
+}
+
+/// The staged gate's decision and what it read.
+struct StagedPayGate {
+    /// The gate-sized effects (`None` for the no-op engine or an opaque allow).
+    effects: Option<stellar_agent_core::policy::v1::ValueEffects>,
+    /// The decoded payment and its primary views; `None` for an opaque
+    /// envelope, which the gate reads nothing for.
+    payment: Option<StagedPayment>,
+}
+
+/// A decoded staged payment and the primary views the gate evaluated.
+struct StagedPayment {
+    /// The client used for the gate's primary reads and the witness reads.
+    client: std::sync::Arc<StellarRpcClient>,
+    /// The source account view (decoded G account).
+    source_view: stellar_agent_network::AccountView,
+    /// The destination view, `None` when the destination does not exist.
+    dest_view: Option<stellar_agent_network::AccountView>,
+    /// The decoded destination G account.
+    destination: String,
+    /// The decoded send asset: the source debit leg.
+    asset: Asset,
+    /// The decoded source debit in the send asset's base units.
+    amount_stroops: i64,
+    /// The decoded transaction fee in stroops.
+    total_fee_stroops: u32,
+}
+
+impl StagedPayment {
+    /// Takes the decoded send leg, destination, and fee of a payment.
+    ///
+    /// # Errors
+    ///
+    /// Returns `protocol.xdr_codec_failed` when a decoded field is missing or
+    /// out of range, which the decoder never produces, and the refusal of
+    /// [`Asset::parse`] for the send asset.
+    fn from_decoded(
+        decoded: &serde_json::Value,
+        client: std::sync::Arc<StellarRpcClient>,
+        source_view: stellar_agent_network::AccountView,
+        dest_view: Option<stellar_agent_network::AccountView>,
+    ) -> Result<Self, WalletError> {
+        let field = |name: &str| {
+            decoded.get(name).ok_or_else(|| {
+                WalletError::Protocol(stellar_agent_core::error::ProtocolError::XdrCodecFailed {
+                    detail: format!("the decoded payment carries no {name}"),
+                })
+            })
+        };
+        let unusable = |name: &str| {
+            WalletError::Protocol(stellar_agent_core::error::ProtocolError::XdrCodecFailed {
+                detail: format!("the decoded payment's {name} is out of range"),
+            })
+        };
+        let destination = field("destination")?
+            .as_str()
+            .ok_or_else(|| unusable("destination"))?
+            .to_owned();
+        let asset = Asset::parse(field("asset")?.as_str().ok_or_else(|| unusable("asset"))?)?;
+        let amount_stroops = field("amount_stroops")?
+            .as_str()
+            .and_then(|amount| amount.parse::<i64>().ok())
+            .ok_or_else(|| unusable("amount_stroops"))?;
+        let total_fee_stroops = field("total_fee_stroops")?
+            .as_u64()
+            .and_then(|fee| u32::try_from(fee).ok())
+            .ok_or_else(|| unusable("total_fee_stroops"))?;
+        Ok(Self {
+            client,
+            source_view,
+            dest_view,
+            destination,
+            asset,
+            amount_stroops,
+            total_fee_stroops,
+        })
     }
+}
+
+/// Checks a staged payment's fee against the cap, reads the destination's
+/// SEP-29 flag when the envelope carries no memo, and obtains the witness.
+///
+/// The memo decision is taken from the decoded transaction: only `Memo::None`
+/// with a plain G destination reads the flag. A muxed destination carries
+/// its memo in the muxed id, so its flag is not read.
+///
+/// # Errors
+///
+/// Returns the fee-cap refusal, `validation.memo_required` when the
+/// destination requires a memo the envelope lacks, the primary read errors,
+/// and the refusals of [`witness_payment`].
+async fn witness_staged_payment(
+    context: &NetworkContext,
+    profile: &Profile,
+    envelope_xdr: &str,
+    payment: &StagedPayment,
+    tool: &'static str,
+) -> Result<CrossCheckOutcome, WalletError> {
+    let per_op = payment.total_fee_stroops / CLASSIC_SINGLE_OPERATION_COUNT;
+    check_classic_fee_cap(
+        per_op,
+        stellar_agent_core::error::FeeSource::Envelope,
+        profile,
+    )?;
+    let shape = stellar_agent_core::envelope_decode::payment_memo_shape(envelope_xdr, tool)
+        .map_err(|e| {
+            WalletError::Protocol(stellar_agent_core::error::ProtocolError::XdrCodecFailed {
+                detail: e.to_string(),
+            })
+        })?;
+    let memo = if shape.memo == stellar_agent_core::envelope_decode::MemoKind::None
+        && !shape.destination_muxed
+    {
+        stellar_agent_network::sep29::check_memo_required(
+            &payment.client,
+            &payment.destination,
+            false,
+        )
+        .await?
+    } else {
+        MemoObservation::NotRead
+    };
+    witness_payment(
+        &payment.client,
+        context,
+        profile,
+        PaymentObservations {
+            source_view: &payment.source_view,
+            destination: &payment.destination,
+            dest_view: payment.dest_view.as_ref(),
+            memo,
+            asset: &payment.asset,
+            amount_stroops: payment.amount_stroops,
+        },
+        tool,
+    )
+    .await
 }
 
 /// Pure post-decode dispatch for the staged `pay` gate: no network or
@@ -1083,6 +1336,40 @@ where
         Err(code) => return code,
     };
 
+    // The fee is checked against the profile cap, then the oracle re-reads
+    // the entries the decision used. Both refuse before the audit pre-flight,
+    // the signer, and the send.
+    if let Err(e) = check_built_fee_cap(
+        built.fee_selection.per_op_stroops,
+        built.fee_choice,
+        profile,
+    ) {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
+    let cross_check = match witness_payment(
+        &client,
+        context,
+        profile,
+        PaymentObservations {
+            source_view: &built.source_account_view,
+            destination: &built.destination,
+            dest_view: built.dest_account_view.as_ref(),
+            memo: built.memo_observation,
+            asset: &built.asset,
+            amount_stroops: built.amount_stroops,
+        },
+        "stellar_pay",
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
+    };
+
     // Origin-aware pre-flight: prove the audit writer is acquirable AFTER the
     // policy gate (a denial is a clean refusal that signs nothing and needs
     // no audit setup) but BEFORE the signing key is touched below (step 2)
@@ -1133,7 +1420,7 @@ where
             now_ms,
         },
     ) {
-        Ok(r) => r,
+        Ok(r) => r.with_witness(cross_check.witness()),
         Err(e) => {
             print_error(
                 &crate::commands::submission_record::error_envelope(&e, &signed_xdr, "pay"),
@@ -1152,6 +1439,7 @@ where
                 stage: "build+sign+submit".to_owned(),
                 selected_fee_per_op_stroops: Some(fee_selection.per_op_stroops),
                 selected_fee_percentile: Some(fee_selection.selected_fee_percentile),
+                cross_check: Some(cross_check.view()),
             };
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
@@ -1273,9 +1561,11 @@ async fn build_unsigned_envelope(
     let memo = parse_memo(args)?;
     let memo_present = !matches!(memo, Memo::None);
 
-    // SEP-29: check memo-required BEFORE signing.
-    stellar_agent_network::sep29::check_memo_required(client, &args.destination, memo_present)
-        .await?;
+    // SEP-29: check memo-required BEFORE signing. The observation feeds the
+    // witness, which compares the flag on the oracle.
+    let memo_observation =
+        stellar_agent_network::sep29::check_memo_required(client, &args.destination, memo_present)
+            .await?;
 
     // Build.
     let mut builder = ClassicOpBuilder::new(
@@ -1291,25 +1581,107 @@ async fn build_unsigned_envelope(
     let envelope_xdr = builder.build()?;
 
     // Destination-derived identity view for the policy gate's
-    // `home_domain_resolved` criterion, mirroring the `stellar_pay` MCP
-    // twin's `fetch_account(&client, &args.destination, &[]).await.ok()`
-    // exactly: reuses the SAME client (same RPC timeout budget as the
-    // source fetch above), and a failed destination fetch is non-fatal
-    // (`None`) — a not-yet-created destination legitimately has no on-chain
-    // state to resolve `home_domain` from.
-    let dest_account_view = stellar_agent_network::fetch_account(client, &args.destination, &[])
-        .await
-        .ok();
+    // `home_domain_resolved` criterion, read on the SAME client (same RPC
+    // timeout budget as the source fetch above). An absent destination is
+    // `None`: a not-yet-created destination has no on-chain state to resolve
+    // `home_domain` from.
+    let dest_account_view = read_destination(client, &args.destination).await?;
 
     Ok(BuiltPaymentEnvelope {
         envelope_xdr,
         fee_selection,
+        fee_choice,
+        asset,
+        memo_observation,
         amount_stroops: amount.as_stroops(),
         asset_raw: args.asset.clone(),
         destination: args.destination.clone(),
         source_account_view: source_account,
         dest_account_view,
     })
+}
+
+/// Reads the destination account on the primary.
+///
+/// Only `AccountNotFound` means absence; any other read error refuses with
+/// its own code, so a transient primary failure is never taken for an absent
+/// destination and compared against the oracle as such.
+///
+/// # Errors
+///
+/// Returns every read error other than `network.account_not_found`.
+async fn read_destination(
+    client: &StellarRpcClient,
+    destination: &str,
+) -> Result<Option<stellar_agent_network::AccountView>, WalletError> {
+    match stellar_agent_network::fetch_account(client, destination, &[]).await {
+        Ok(view) => Ok(Some(view)),
+        Err(WalletError::Network(NetworkError::AccountNotFound { .. })) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The primary observations a payment stage's decision used.
+struct PaymentObservations<'a> {
+    /// The source account view the build or the staged gate read.
+    source_view: &'a stellar_agent_network::AccountView,
+    /// The destination G account.
+    destination: &'a str,
+    /// The destination view, `None` when the destination does not exist.
+    dest_view: Option<&'a stellar_agent_network::AccountView>,
+    /// The SEP-29 observation.
+    memo: MemoObservation,
+    /// The asset the source sends.
+    asset: &'a Asset,
+    /// The source debit in the send asset's base units.
+    amount_stroops: i64,
+}
+
+/// Obtains the cross-check witness of a payment stage.
+///
+/// The witness is valued on the source debit leg, and for an issued send
+/// asset it reads the source's trustline on the primary and compares it with
+/// the oracle alongside the source, the destination, and the SEP-29 flag.
+///
+/// # Errors
+///
+/// Returns `validation.asset_invalid` for a send asset outside the canonical
+/// classic alphabet, the primary trustline read's refusal, and every refusal
+/// of [`obtain_classic_witness`].
+async fn witness_payment(
+    client: &StellarRpcClient,
+    context: &NetworkContext,
+    profile: &Profile,
+    observed: PaymentObservations<'_>,
+    tool: &'static str,
+) -> Result<CrossCheckOutcome, WalletError> {
+    let canonical = observed.asset.to_canonical()?;
+    let source = AccountObservation::from_view(observed.source_view)?;
+    let trustline = TrustlineObservation::read_send_asset(
+        client,
+        &observed.source_view.account_id,
+        observed.asset,
+    )
+    .await?;
+    obtain_classic_witness(
+        profile,
+        context,
+        stellar_agent_core::cross_check::CrossCheckValue::Amount {
+            asset: &canonical,
+            base_units: i128::from(observed.amount_stroops),
+        },
+        PayWitnessInputs {
+            source,
+            destination: DestinationObservation::from_view(
+                observed.destination,
+                observed.dest_view,
+            ),
+            memo: observed.memo,
+            trustline,
+        },
+        tool,
+    )
+    .await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1558,6 +1930,9 @@ fn print_success(envelope: &Envelope<PayResult>, format: OutputFormat) {
                             ledger,
                             selected_fee
                         );
+                        if let Some(cross_check) = &result.cross_check {
+                            println!("{}", cross_check.text_line());
+                        }
                     }
                     _ => {
                         // Build or sign stage. Use chars().take(32) to avoid a
@@ -1571,6 +1946,9 @@ fn print_success(envelope: &Envelope<PayResult>, format: OutputFormat) {
                             "[{}] envelope_xdr (first 32 chars): {}...\n{}",
                             result.stage, prefix, selected_fee
                         );
+                        if let Some(cross_check) = &result.cross_check {
+                            println!("{}", cross_check.text_line());
+                        }
                     }
                 }
             }
@@ -2138,6 +2516,7 @@ mod tests {
             stage: "build".to_owned(),
             selected_fee_per_op_stroops: Some(built.fee_selection.per_op_stroops),
             selected_fee_percentile: Some(built.fee_selection.selected_fee_percentile),
+            cross_check: None,
         };
         let json = serde_json::to_value(result).expect("PayResult serialises");
         assert_eq!(json["selected_fee_per_op_stroops"], "250");
@@ -2158,6 +2537,7 @@ mod tests {
             stage: "build".to_owned(),
             selected_fee_per_op_stroops: None,
             selected_fee_percentile: None,
+            cross_check: None,
         };
         let json = serde_json::to_value(&result).expect("PayResult serialises");
         assert!(json.get("selected_fee_per_op_stroops").is_none());
@@ -2165,6 +2545,51 @@ mod tests {
         let round_tripped: PayResult = serde_json::from_value(json)
             .expect("omitted selected_fee_per_op_stroops must deserialize back to None");
         assert_eq!(round_tripped.selected_fee_per_op_stroops, None);
+    }
+
+    /// The `cross_check` field is omitted when absent, round-trips when set,
+    /// and a result written without the field deserializes to `None`.
+    #[test]
+    fn pay_result_cross_check_field_shape() {
+        let mut result = PayResult {
+            envelope_xdr: "AAAA".to_owned(),
+            tx_hash: Some("ab".repeat(32)),
+            ledger: Some(7),
+            stage: "build+sign+submit".to_owned(),
+            selected_fee_per_op_stroops: Some(100),
+            selected_fee_percentile: Some("profile_default".to_owned()),
+            cross_check: None,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.get("cross_check").is_none(), "{json}");
+
+        result.cross_check = Some(CrossCheckView {
+            status: "passed".to_owned(),
+            reason: None,
+            provider: Some("https://oracle.example".to_owned()),
+            ledger: Some(1001),
+        });
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            json["cross_check"],
+            serde_json::json!({"status": "passed", "provider": "https://oracle.example",
+                "ledger": 1001})
+        );
+        let back: PayResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back.cross_check, result.cross_check);
+
+        let legacy = serde_json::json!({
+            "envelope_xdr": "AAAA",
+            "tx_hash": "ab".repeat(32),
+            "ledger": 7,
+            "stage": "build+sign+submit",
+            "selected_fee_per_op_stroops": "100",
+            "selected_fee_percentile": "profile_default"
+        });
+        let legacy: PayResult =
+            serde_json::from_value(legacy).expect("a result without cross_check deserializes");
+        assert_eq!(legacy.cross_check, None);
+        assert_eq!(legacy.ledger, Some(7));
     }
 
     #[tokio::test]
@@ -3261,5 +3686,1171 @@ mod tests {
             methods.iter().any(|m| m == "sendTransaction"),
             "{methods:?}"
         );
+    }
+
+    // ── Cross-check witness of the full pipeline ──────────────────────────────
+
+    mod witness_full {
+        use super::*;
+        use crate::test_rpc::{
+            ClassicRpc, account_key, account_xdr, assert_rows_carry_witness, audit_rows,
+            fail_read_of, last_rendered, memo_required_xdr, methods, profile_name_for, sent,
+            signers_resolved_by, thresholds, trustline_xdr, witness_profile,
+        };
+
+        /// The issuer of the credit asset the credit cases send.
+        pub(super) const ISSUER: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+
+        /// One full-pipeline run against `primary` and `oracle`.
+        pub(super) struct Run {
+            pub(super) code: i32,
+            pub(super) envelope: serde_json::Value,
+            pub(super) signers: usize,
+        }
+
+        pub(super) async fn run_stage(args: &PayArgs, profile: &Profile) -> Run {
+            crate::common::render::take_rendered_for_test();
+            let (code, signers) = signers_resolved_by(run_loaded(
+                args,
+                &crate::common::resolve_profile_name(args.profile.as_deref()),
+                profile,
+                ProfileOrigin::Persisted,
+                || Ok(()),
+            ))
+            .await;
+            Run {
+                code,
+                envelope: last_rendered(),
+                signers,
+            }
+        }
+
+        /// Asserts a refusal with `code` before any signing key was loaded and
+        /// before anything was sent.
+        pub(super) async fn assert_refused(run: &Run, code: &str, primary: &MockServer) {
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.envelope["error"]["code"], code, "{}", run.envelope);
+            assert_eq!(run.signers, 0, "the refusal precedes the signer");
+            assert!(!sent(primary).await, "nothing is sent");
+        }
+
+        /// A memo-less 1 XLM payment from `signer` to `DEST_G`, under the
+        /// profile named for `signer`.
+        pub(super) fn args(signer: &EnvSigner, primary: &MockServer) -> PayArgs {
+            let mut args = signed_payment_args(signer, &primary.uri());
+            args.profile = Some(profile_name_for(signer));
+            args
+        }
+
+        /// The witness profile named for `signer`.
+        pub(super) fn profile_for(
+            signer: &EnvSigner,
+            primary: &MockServer,
+            oracle: Option<&MockServer>,
+            audit: &tempfile::TempDir,
+        ) -> Profile {
+            witness_profile(
+                &profile_name_for(signer),
+                &primary.uri(),
+                oracle.map(MockServer::uri).as_deref(),
+                audit.path(),
+            )
+        }
+
+        fn credit(args: &mut PayArgs) {
+            args.asset = format!("USD:{ISSUER}");
+            args.amount = "5 XLM".to_owned();
+        }
+
+        /// The source's USD trustline as the primary reports it.
+        fn source_trustline(
+            signer: &EnvSigner,
+            balance: i64,
+            limit: i64,
+            flags: u32,
+        ) -> (String, String) {
+            trustline_xdr(&signer.g, "USD", ISSUER, balance, limit, flags)
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_witness_passes_and_rows_carry_it() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x71; 32], "PAY_WITNESS_FULL_PASS_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+
+            let run = run_stage(&args(&signer, &primary), &profile).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let view = &run.envelope["data"]["cross_check"];
+            assert_eq!(view["status"], "passed", "{}", run.envelope);
+            assert_eq!(view["provider"], oracle.uri());
+            assert_eq!(view["ledger"], 1001);
+            assert_eq!(methods(&oracle).await, ["getNetwork", "getLedgerEntries"]);
+            assert!(sent(&primary).await);
+            assert_rows_carry_witness(&profile, &oracle.uri());
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_source_disagreement_refuses_before_the_signer() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x72; 32], "PAY_WITNESS_FULL_DIVERGE_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let oracle = ClassicRpc::testnet(&[DEST_G])
+                .with_entry(account_key(&signer.g), account_xdr(&signer.g, 999, 0, ""))
+                .serve()
+                .await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+
+            let run = run_stage(&args(&signer, &primary), &profile).await;
+
+            assert_refused(&run, "simulation.divergence", &primary).await;
+            assert!(audit_rows(&profile, "value_action_pending").is_empty());
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_without_oracle_skips_on_testnet() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x73; 32], "PAY_WITNESS_FULL_SKIP_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let profile = profile_for(&signer, &primary, None, &audit);
+
+            let run = run_stage(&args(&signer, &primary), &profile).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(
+                run.envelope["data"]["cross_check"],
+                serde_json::json!({"status": "skipped", "reason": "oracle_not_configured"})
+            );
+            let pending = audit_rows(&profile, "value_action_pending");
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].get("witness").is_none(), "{}", pending[0]);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_oracle_identity_refusal_is_witness_unavailable() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x74; 32], "PAY_WITNESS_FULL_IDENTITY_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let oracle_rpc = ClassicRpc::testnet(&[&signer.g, DEST_G]);
+            oracle_rpc.report("Test SDF Future Network ; October 2022");
+            let oracle = oracle_rpc.serve().await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+
+            let run = run_stage(&args(&signer, &primary), &profile).await;
+
+            assert_refused(&run, "network.witness_unavailable", &primary).await;
+            assert_eq!(methods(&oracle).await, ["getNetwork"]);
+        }
+
+        /// The oracle reports the destination with `home_domain` and `flags`;
+        /// the primary reports neither.
+        async fn destination_disagreement(
+            seed: u8,
+            var: &'static str,
+            flags: u32,
+            domain: &str,
+            field: &str,
+        ) {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([seed; 32], var);
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let oracle = ClassicRpc::testnet(&[&signer.g])
+                .with_entry(account_key(DEST_G), account_xdr(DEST_G, 100, flags, domain))
+                .serve()
+                .await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+
+            let run = run_stage(&args(&signer, &primary), &profile).await;
+
+            assert_refused(&run, "simulation.divergence", &primary).await;
+            let message = run.envelope["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains(&format!("destination account {field}")),
+                "{message}"
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_destination_home_domain_disagreement_refuses() {
+            destination_disagreement(
+                0x75,
+                "PAY_WITNESS_FULL_DOMAIN_SK",
+                0,
+                "example.org",
+                "home domain",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_destination_flags_disagreement_refuses() {
+            destination_disagreement(0x76, "PAY_WITNESS_FULL_FLAGS_SK", 1, "", "flags").await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_memo_flag_disagreement_is_rpc_divergence() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x77; 32], "PAY_WITNESS_FULL_MEMO_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let (memo_key, memo_entry) = memo_required_xdr(DEST_G);
+            let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G])
+                .with_entry(memo_key, memo_entry)
+                .serve()
+                .await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+
+            let run = run_stage(&args(&signer, &primary), &profile).await;
+
+            assert_refused(&run, "network.rpc_divergence", &primary).await;
+        }
+
+        /// The primary and the oracle report the source's USD trustline with
+        /// different `(balance, limit, flags)`.
+        async fn trustline_disagreement(
+            seed: u8,
+            var: &'static str,
+            oracle_state: (i64, i64, u32),
+            field: &str,
+        ) {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([seed; 32], var);
+            let (key, entry) = source_trustline(&signer, 500_000_000, 10_000_000_000, 1);
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G])
+                .with_entry(key, entry)
+                .serve()
+                .await;
+            let (key, entry) =
+                source_trustline(&signer, oracle_state.0, oracle_state.1, oracle_state.2);
+            let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G])
+                .with_entry(key, entry)
+                .serve()
+                .await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+            let mut args = args(&signer, &primary);
+            credit(&mut args);
+
+            let run = run_stage(&args, &profile).await;
+
+            assert_refused(&run, "simulation.divergence", &primary).await;
+            let message = run.envelope["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains(&format!("source trustline {field}")),
+                "{message}"
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_source_trustline_balance_disagreement_refuses() {
+            trustline_disagreement(
+                0x78,
+                "PAY_WITNESS_FULL_TL_BALANCE_SK",
+                (500_000_001, 10_000_000_000, 1),
+                "balance",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_source_trustline_limit_disagreement_refuses() {
+            trustline_disagreement(
+                0x79,
+                "PAY_WITNESS_FULL_TL_LIMIT_SK",
+                (500_000_000, 9_000_000_000, 1),
+                "limit",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_source_trustline_flags_disagreement_refuses() {
+            trustline_disagreement(
+                0x7a,
+                "PAY_WITNESS_FULL_TL_FLAGS_SK",
+                (500_000_000, 10_000_000_000, 0),
+                "flags",
+            )
+            .await;
+        }
+
+        /// A payment with a memo is witnessed by value alone: the send leg in
+        /// USD reaches the USD threshold and needs the witness, and one base
+        /// unit less needs none.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_witness_values_the_send_leg() {
+            for (amount, expected, var) in [
+                ("5 XLM", "passed", "PAY_WITNESS_FULL_VALUE_AT_SK"),
+                (
+                    "4.9999999 XLM",
+                    "not_required",
+                    "PAY_WITNESS_FULL_VALUE_BELOW_SK",
+                ),
+            ] {
+                let _isolation = zero_config();
+                let audit = tempfile::tempdir().unwrap();
+                let signer = EnvSigner::new([0x7b; 32], var);
+                let (key, entry) = source_trustline(&signer, 500_000_000, 10_000_000_000, 1);
+                let primary = ClassicRpc::testnet(&[&signer.g, DEST_G])
+                    .with_entry(key.clone(), entry.clone())
+                    .serve()
+                    .await;
+                let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G])
+                    .with_entry(key, entry)
+                    .serve()
+                    .await;
+                let mut profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+                profile.cross_check_thresholds = thresholds(&format!("USD:{ISSUER}"), 50_000_000);
+                let mut args = args(&signer, &primary);
+                credit(&mut args);
+                args.amount = amount.to_owned();
+                args.memo_text = Some("invoice".to_owned());
+
+                let run = run_stage(&args, &profile).await;
+
+                assert_eq!(run.code, 0, "{amount}: {}", run.envelope);
+                assert_eq!(
+                    run.envelope["data"]["cross_check"]["status"], expected,
+                    "{amount}: {}",
+                    run.envelope
+                );
+                let oracle_methods = methods(&oracle).await;
+                if expected == "passed" {
+                    assert_eq!(oracle_methods, ["getNetwork", "getLedgerEntries"]);
+                } else {
+                    assert!(oracle_methods.is_empty(), "{oracle_methods:?}");
+                }
+            }
+        }
+
+        /// A fee above the cap refuses before the oracle is asked and before
+        /// the signer, with the command-default text when no fee is given.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_fee_above_cap_refuses_before_the_witness() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x7c; 32], "PAY_WITNESS_FULL_CAP_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let mut profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+            profile.classic_max_fee_per_op_stroops = Some(50);
+
+            let run = run_stage(&args(&signer, &primary), &profile).await;
+
+            assert_refused(&run, "fees.percentile_exceeds_cap", &primary).await;
+            assert_eq!(
+                run.envelope["error"]["message"],
+                "the default per-operation fee 100 stroops exceeds the profile cap of 50 \
+                 stroops; pass an explicit fee within the cap or raise \
+                 classic_max_fee_per_op_stroops"
+            );
+            assert!(
+                methods(&oracle).await.is_empty(),
+                "the cap precedes the witness"
+            );
+        }
+
+        /// An explicit fee above the cap names the explicit fee.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_explicit_fee_above_cap_names_the_explicit_fee() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x7d; 32], "PAY_WITNESS_FULL_CAP_EXPLICIT_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let mut profile = profile_for(&signer, &primary, None, &audit);
+            profile.classic_max_fee_per_op_stroops = Some(150);
+            let mut args = args(&signer, &primary);
+            args.fee = Some("200".to_owned());
+
+            let run = run_stage(&args, &profile).await;
+
+            assert_refused(&run, "fees.percentile_exceeds_cap", &primary).await;
+            assert!(
+                run.envelope["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("the explicit per-operation fee 200 stroops"),
+                "{}",
+                run.envelope
+            );
+        }
+
+        /// A destination read that fails refuses with the read's own code: the
+        /// destination is not taken for absent and compared with the oracle.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn full_destination_read_error_refuses_with_its_code() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x7e; 32], "PAY_WITNESS_FULL_READ_ERROR_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            fail_read_of(&primary, &account_key(DEST_G)).await;
+            let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+
+            let run = run_stage(&args(&signer, &primary), &profile).await;
+
+            assert_refused(&run, "network.rpc_unreachable", &primary).await;
+            assert!(methods(&oracle).await.is_empty());
+        }
+
+        /// `--build-only` neither asks the oracle nor reports a cross-check,
+        /// and an auto-selected fee above the cap names its percentile.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn build_only_makes_no_oracle_request() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x7f; 32], "PAY_WITNESS_BUILD_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let mut profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+            let mut args = args(&signer, &primary);
+            args.build_only = true;
+
+            let run = run_stage(&args, &profile).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert!(
+                run.envelope["data"].get("cross_check").is_none(),
+                "{}",
+                run.envelope
+            );
+            assert!(methods(&oracle).await.is_empty());
+
+            profile.classic_max_fee_per_op_stroops = Some(50);
+            args.fee = Some("auto".to_owned());
+            let run = run_stage(&args, &profile).await;
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.envelope["error"]["code"], "fees.percentile_exceeds_cap");
+            assert!(
+                run.envelope["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("auto-selected per-operation fee 100 stroops (percentile p95)"),
+                "{}",
+                run.envelope
+            );
+            assert!(methods(&oracle).await.is_empty());
+        }
+    }
+
+    // ── Cross-check witness of the staged stages ──────────────────────────────
+
+    mod witness_staged {
+        use super::witness_full::{ISSUER, Run, args, assert_refused, profile_for, run_stage};
+        use super::*;
+        use crate::test_rpc::{
+            ClassicRpc, account_key, account_xdr, assert_rows_carry_witness, fail_read_of,
+            memo_required_xdr, methods, sent, thresholds, trustline_xdr,
+        };
+        use stellar_xdr::{
+            AccountId as XdrAccountId, AlphaNum4, Asset as XdrAsset, AssetCode4, Hash, Limits,
+            Memo, MuxedAccount as XdrMuxed, MuxedAccountMed25519, Operation as XdrOperation,
+            OperationBody as XdrBody, PathPaymentStrictReceiveOp, PathPaymentStrictSendOp,
+            PaymentOp as XdrPaymentOp, Preconditions as XdrPreconditions, PublicKey as XdrPk,
+            SequenceNumber as XdrSeq, Transaction as XdrTransaction,
+            TransactionEnvelope as XdrEnvelope, TransactionExt as XdrTxExt,
+            TransactionV1Envelope as XdrV1, Uint256 as XdrUint256, VecM as XdrVecM, WriteXdr,
+        };
+
+        fn key_bytes(g: &str) -> [u8; 32] {
+            stellar_strkey::ed25519::PublicKey::from_string(g)
+                .unwrap()
+                .0
+        }
+
+        pub(super) fn plain(g: &str) -> XdrMuxed {
+            XdrMuxed::Ed25519(XdrUint256(key_bytes(g)))
+        }
+
+        pub(super) fn muxed(g: &str) -> XdrMuxed {
+            XdrMuxed::MuxedEd25519(MuxedAccountMed25519 {
+                id: 7,
+                ed25519: XdrUint256(key_bytes(g)),
+            })
+        }
+
+        fn usd() -> XdrAsset {
+            XdrAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: XdrAccountId(XdrPk::PublicKeyTypeEd25519(XdrUint256(key_bytes(ISSUER)))),
+            })
+        }
+
+        fn payment(destination: XdrMuxed, asset: XdrAsset, amount: i64) -> XdrBody {
+            XdrBody::Payment(XdrPaymentOp {
+                destination,
+                asset,
+                amount,
+            })
+        }
+
+        /// A single-operation v1 envelope from `source`.
+        pub(super) fn envelope(source: XdrMuxed, body: XdrBody, memo: Memo, fee: u32) -> String {
+            XdrEnvelope::Tx(XdrV1 {
+                tx: XdrTransaction {
+                    source_account: source,
+                    fee,
+                    seq_num: XdrSeq(101),
+                    cond: XdrPreconditions::None,
+                    memo,
+                    operations: vec![XdrOperation {
+                        source_account: None,
+                        body,
+                    }]
+                    .try_into()
+                    .unwrap(),
+                    ext: XdrTxExt::V0,
+                },
+                signatures: XdrVecM::default(),
+            })
+            .to_xdr_base64(Limits::none())
+            .unwrap()
+        }
+
+        /// A memo-less 1 XLM payment from the signer to `DEST_G`.
+        fn native_envelope(signer: &EnvSigner) -> String {
+            envelope(
+                plain(&signer.g),
+                payment(plain(DEST_G), XdrAsset::Native, 10_000_000),
+                Memo::None,
+                100,
+            )
+        }
+
+        async fn signed(xdr: &str, seed: [u8; 32]) -> String {
+            attach_signature(
+                xdr,
+                &stellar_agent_network::SoftwareSigningKey::new_from_bytes(seed),
+                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn sign_only(
+            signer: &EnvSigner,
+            primary: &MockServer,
+            profile: &Profile,
+            xdr: String,
+        ) -> Run {
+            let mut args = args(signer, primary);
+            args.sign_only = Some(xdr);
+            run_stage(&args, profile).await
+        }
+
+        async fn submit_only(
+            signer: &EnvSigner,
+            primary: &MockServer,
+            profile: &Profile,
+            xdr: String,
+        ) -> Run {
+            let mut args = args(signer, primary);
+            args.secret_env = None;
+            args.submit_only = Some(xdr);
+            run_stage(&args, profile).await
+        }
+
+        /// The base64 ledger keys of every `getLedgerEntries` `server` received.
+        async fn requested_keys(server: &MockServer) -> Vec<String> {
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+                .filter(|body| body["method"] == "getLedgerEntries")
+                .flat_map(|body| {
+                    body["params"]["keys"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|k| k.as_str().map(str::to_owned))
+                })
+                .collect()
+        }
+
+        // ── --sign-only ──
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_witness_passes_and_reports_it() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x81; 32], "PAY_WITNESS_SIGN_PASS_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+
+            let run = sign_only(&signer, &primary, &profile, native_envelope(&signer)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(run.signers, 1);
+            let view = &run.envelope["data"]["cross_check"];
+            assert_eq!(view["status"], "passed", "{}", run.envelope);
+            assert_eq!(view["provider"], oracle.uri());
+            assert_eq!(methods(&oracle).await, ["getNetwork", "getLedgerEntries"]);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_source_disagreement_refuses_before_signing() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x82; 32], "PAY_WITNESS_SIGN_DIVERGE_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let oracle = ClassicRpc::testnet(&[DEST_G])
+                .with_entry(account_key(&signer.g), account_xdr(&signer.g, 999, 0, ""))
+                .serve()
+                .await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+
+            let run = sign_only(&signer, &primary, &profile, native_envelope(&signer)).await;
+
+            assert_refused(&run, "simulation.divergence", &primary).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_without_oracle_skips_on_testnet() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x83; 32], "PAY_WITNESS_SIGN_SKIP_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let profile = profile_for(&signer, &primary, None, &audit);
+
+            let run = sign_only(&signer, &primary, &profile, native_envelope(&signer)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(
+                run.envelope["data"]["cross_check"],
+                serde_json::json!({"status": "skipped", "reason": "oracle_not_configured"})
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_oracle_construction_failure_is_witness_unavailable() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x84; 32], "PAY_WITNESS_SIGN_CONSTRUCTION_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let profile =
+                witness_profile_with_oracle_url(&signer, &primary, "ftp://oracle.example", &audit);
+
+            let run = sign_only(&signer, &primary, &profile, native_envelope(&signer)).await;
+
+            assert_refused(&run, "network.witness_unavailable", &primary).await;
+        }
+
+        /// A profile whose oracle URL the client cannot be built for.
+        fn witness_profile_with_oracle_url(
+            signer: &EnvSigner,
+            primary: &MockServer,
+            oracle: &str,
+            audit: &tempfile::TempDir,
+        ) -> Profile {
+            let mut profile = profile_for(signer, primary, None, audit);
+            profile.oracle_provider_url = Some(url::Url::parse(oracle).unwrap());
+            profile
+        }
+
+        async fn sign_only_disagreement(
+            seed: u8,
+            var: &'static str,
+            credit: bool,
+            oracle_rpc: impl FnOnce(&str) -> ClassicRpc,
+            code: &str,
+            message: Option<&str>,
+        ) {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([seed; 32], var);
+            let (tl_key, tl_entry) =
+                trustline_xdr(&signer.g, "USD", ISSUER, 500_000_000, 10_000_000_000, 1);
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G])
+                .with_entry(tl_key, tl_entry)
+                .serve()
+                .await;
+            let oracle = oracle_rpc(&signer.g).serve().await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+            let asset = if credit { usd() } else { XdrAsset::Native };
+            let xdr = envelope(
+                plain(&signer.g),
+                payment(plain(DEST_G), asset, 10_000_000),
+                Memo::None,
+                100,
+            );
+
+            let run = sign_only(&signer, &primary, &profile, xdr).await;
+
+            assert_refused(&run, code, &primary).await;
+            if let Some(expected) = message {
+                let text = run.envelope["error"]["message"].as_str().unwrap();
+                assert!(text.contains(expected), "{text}");
+            }
+        }
+
+        fn oracle_trustline(source: &str, balance: i64, limit: i64, flags: u32) -> ClassicRpc {
+            let (key, entry) = trustline_xdr(source, "USD", ISSUER, balance, limit, flags);
+            ClassicRpc::testnet(&[source, DEST_G]).with_entry(key, entry)
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_destination_home_domain_disagreement_refuses() {
+            sign_only_disagreement(
+                0x85,
+                "PAY_WITNESS_SIGN_DOMAIN_SK",
+                false,
+                |g| {
+                    ClassicRpc::testnet(&[g]).with_entry(
+                        account_key(DEST_G),
+                        account_xdr(DEST_G, 100, 0, "example.org"),
+                    )
+                },
+                "simulation.divergence",
+                Some("destination account home domain"),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_destination_flags_disagreement_refuses() {
+            sign_only_disagreement(
+                0x86,
+                "PAY_WITNESS_SIGN_FLAGS_SK",
+                false,
+                |g| {
+                    ClassicRpc::testnet(&[g])
+                        .with_entry(account_key(DEST_G), account_xdr(DEST_G, 100, 1, ""))
+                },
+                "simulation.divergence",
+                Some("destination account flags"),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_memo_flag_disagreement_is_rpc_divergence() {
+            sign_only_disagreement(
+                0x87,
+                "PAY_WITNESS_SIGN_MEMO_SK",
+                false,
+                |g| {
+                    let (key, entry) = memo_required_xdr(DEST_G);
+                    ClassicRpc::testnet(&[g, DEST_G]).with_entry(key, entry)
+                },
+                "network.rpc_divergence",
+                None,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_source_trustline_balance_disagreement_refuses() {
+            sign_only_disagreement(
+                0x88,
+                "PAY_WITNESS_SIGN_TL_BALANCE_SK",
+                true,
+                |g| oracle_trustline(g, 500_000_001, 10_000_000_000, 1),
+                "simulation.divergence",
+                Some("source trustline balance"),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_source_trustline_limit_disagreement_refuses() {
+            sign_only_disagreement(
+                0x89,
+                "PAY_WITNESS_SIGN_TL_LIMIT_SK",
+                true,
+                |g| oracle_trustline(g, 500_000_000, 9_000_000_000, 1),
+                "simulation.divergence",
+                Some("source trustline limit"),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_source_trustline_flags_disagreement_refuses() {
+            sign_only_disagreement(
+                0x8a,
+                "PAY_WITNESS_SIGN_TL_FLAGS_SK",
+                true,
+                |g| oracle_trustline(g, 500_000_000, 10_000_000_000, 0),
+                "simulation.divergence",
+                Some("source trustline flags"),
+            )
+            .await;
+        }
+
+        /// A staged path payment with a memo is witnessed on its send leg:
+        /// the USD debit reaches the USD threshold, while the receive leg is
+        /// one XLM, far below the native floor. One base unit below the USD
+        /// threshold needs no witness.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_witness_values_the_send_leg() {
+            let receive = |send_max: i64| {
+                XdrBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
+                    send_asset: usd(),
+                    send_max,
+                    destination: plain(DEST_G),
+                    dest_asset: XdrAsset::Native,
+                    dest_amount: 10_000_000,
+                    path: XdrVecM::default(),
+                })
+            };
+            let send = |send_amount: i64| {
+                XdrBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
+                    send_asset: usd(),
+                    send_amount,
+                    destination: plain(DEST_G),
+                    dest_asset: XdrAsset::Native,
+                    dest_min: 10_000_000,
+                    path: XdrVecM::default(),
+                })
+            };
+            for (body, expected, var) in [
+                (
+                    receive(50_000_000),
+                    "passed",
+                    "PAY_WITNESS_SIGN_VALUE_RECEIVE_SK",
+                ),
+                (send(50_000_000), "passed", "PAY_WITNESS_SIGN_VALUE_SEND_SK"),
+                (
+                    receive(49_999_999),
+                    "not_required",
+                    "PAY_WITNESS_SIGN_VALUE_BELOW_SK",
+                ),
+            ] {
+                let _isolation = zero_config();
+                let audit = tempfile::tempdir().unwrap();
+                let signer = EnvSigner::new([0x8b; 32], var);
+                let (key, entry) =
+                    trustline_xdr(&signer.g, "USD", ISSUER, 500_000_000, 10_000_000_000, 1);
+                let primary = ClassicRpc::testnet(&[&signer.g, DEST_G])
+                    .with_entry(key.clone(), entry.clone())
+                    .serve()
+                    .await;
+                let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G])
+                    .with_entry(key, entry)
+                    .serve()
+                    .await;
+                let mut profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+                profile.cross_check_thresholds = thresholds(&format!("USD:{ISSUER}"), 50_000_000);
+                let text: stellar_xdr::StringM<28> = b"invoice".to_vec().try_into().unwrap();
+                let xdr = envelope(plain(&signer.g), body, Memo::Text(text), 100);
+
+                let run = sign_only(&signer, &primary, &profile, xdr).await;
+
+                assert_eq!(run.code, 0, "{var}: {}", run.envelope);
+                assert_eq!(
+                    run.envelope["data"]["cross_check"]["status"], expected,
+                    "{var}: {}",
+                    run.envelope
+                );
+                let oracle_methods = methods(&oracle).await;
+                if expected == "passed" {
+                    assert_eq!(oracle_methods, ["getNetwork", "getLedgerEntries"]);
+                } else {
+                    assert!(oracle_methods.is_empty(), "{var}: {oracle_methods:?}");
+                }
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_fee_above_cap_refuses_before_the_witness() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x8c; 32], "PAY_WITNESS_SIGN_CAP_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let mut profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+            profile.classic_max_fee_per_op_stroops = Some(400);
+            let xdr = envelope(
+                plain(&signer.g),
+                payment(plain(DEST_G), XdrAsset::Native, 10_000_000),
+                Memo::None,
+                500,
+            );
+
+            let run = sign_only(&signer, &primary, &profile, xdr).await;
+
+            assert_refused(&run, "fees.percentile_exceeds_cap", &primary).await;
+            assert_eq!(
+                run.envelope["error"]["message"],
+                "the envelope's per-operation fee 500 stroops exceeds the profile cap of 400 \
+                 stroops; prepare the transaction again with a fee within the cap"
+            );
+            assert!(methods(&oracle).await.is_empty());
+        }
+
+        /// Only a memo-less envelope paying a plain G destination reads the
+        /// destination's SEP-29 flag; a text, id, hash, or return memo, and a
+        /// muxed destination, read nothing.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_reads_sep29_only_for_a_memo_less_g_destination() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x8d; 32], "PAY_WITNESS_SIGN_MEMO_KINDS_SK");
+            let setup = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let profile = profile_for(&signer, &setup, None, &audit);
+            let (memo_key, _) = memo_required_xdr(DEST_G);
+            let text: stellar_xdr::StringM<28> = b"memo".to_vec().try_into().unwrap();
+            for (label, destination, memo, reads) in [
+                ("none", plain(DEST_G), Memo::None, true),
+                ("text", plain(DEST_G), Memo::Text(text), false),
+                ("id", plain(DEST_G), Memo::Id(9), false),
+                ("hash", plain(DEST_G), Memo::Hash(Hash([1; 32])), false),
+                ("return", plain(DEST_G), Memo::Return(Hash([2; 32])), false),
+                ("none, muxed destination", muxed(DEST_G), Memo::None, false),
+            ] {
+                let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+                let xdr = envelope(
+                    plain(&signer.g),
+                    payment(destination, XdrAsset::Native, 10_000_000),
+                    memo,
+                    100,
+                );
+
+                let run = sign_only(&signer, &primary, &profile, xdr).await;
+
+                assert_eq!(run.code, 0, "{label}: {}", run.envelope);
+                assert_eq!(
+                    requested_keys(&primary).await.contains(&memo_key),
+                    reads,
+                    "{label}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_memo_required_refuses_before_signing() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x8e; 32], "PAY_WITNESS_SIGN_MEMO_REQUIRED_SK");
+            let (key, entry) = memo_required_xdr(DEST_G);
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G])
+                .with_entry(key, entry)
+                .serve()
+                .await;
+            let profile = profile_for(&signer, &primary, None, &audit);
+
+            let run = sign_only(&signer, &primary, &profile, native_envelope(&signer)).await;
+
+            assert_refused(&run, "validation.memo_required", &primary).await;
+        }
+
+        /// A muxed source and a muxed destination are witnessed on their G
+        /// accounts.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_muxed_accounts_witness_on_the_g_accounts() {
+            for (label, source_muxed, var) in [
+                ("muxed source", true, "PAY_WITNESS_SIGN_MUXED_SOURCE_SK"),
+                ("muxed destination", false, "PAY_WITNESS_SIGN_MUXED_DEST_SK"),
+            ] {
+                let _isolation = zero_config();
+                let audit = tempfile::tempdir().unwrap();
+                let signer = EnvSigner::new([0x8f; 32], var);
+                let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+                let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+                let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+                // The muxed destination carries its memo in the muxed id, so
+                // its payment is witnessed by value: 2000 XLM reaches the
+                // native floor.
+                let xdr = if source_muxed {
+                    envelope(
+                        muxed(&signer.g),
+                        payment(plain(DEST_G), XdrAsset::Native, 10_000_000),
+                        Memo::None,
+                        100,
+                    )
+                } else {
+                    envelope(
+                        plain(&signer.g),
+                        payment(muxed(DEST_G), XdrAsset::Native, 20_000_000_000),
+                        Memo::None,
+                        100,
+                    )
+                };
+
+                let run = sign_only(&signer, &primary, &profile, xdr).await;
+
+                assert_eq!(run.code, 0, "{label}: {}", run.envelope);
+                assert_eq!(
+                    run.envelope["data"]["cross_check"]["status"], "passed",
+                    "{label}: {}",
+                    run.envelope
+                );
+                let keys = requested_keys(&oracle).await;
+                assert!(keys.contains(&account_key(&signer.g)), "{label}");
+                assert!(keys.contains(&account_key(DEST_G)), "{label}");
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn sign_only_destination_read_error_refuses_with_its_code() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x90; 32], "PAY_WITNESS_SIGN_READ_ERROR_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            fail_read_of(&primary, &account_key(DEST_G)).await;
+            let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+
+            let run = sign_only(&signer, &primary, &profile, native_envelope(&signer)).await;
+
+            assert_refused(&run, "network.rpc_unreachable", &primary).await;
+            assert!(methods(&oracle).await.is_empty());
+        }
+
+        // ── --submit-only ──
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn submit_only_witness_passes_and_rows_carry_it() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x91; 32], "PAY_WITNESS_SUBMIT_PASS_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+            let xdr = signed(&native_envelope(&signer), [0x91; 32]).await;
+
+            let run = submit_only(&signer, &primary, &profile, xdr).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(run.envelope["data"]["cross_check"]["status"], "passed");
+            assert_eq!(
+                run.envelope["data"]["cross_check"]["provider"],
+                oracle.uri()
+            );
+            assert!(sent(&primary).await);
+            assert_rows_carry_witness(&profile, &oracle.uri());
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn submit_only_source_disagreement_refuses_before_the_send() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x92; 32], "PAY_WITNESS_SUBMIT_DIVERGE_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let oracle = ClassicRpc::testnet(&[DEST_G])
+                .with_entry(account_key(&signer.g), account_xdr(&signer.g, 999, 0, ""))
+                .serve()
+                .await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+            let xdr = signed(&native_envelope(&signer), [0x92; 32]).await;
+
+            let run = submit_only(&signer, &primary, &profile, xdr).await;
+
+            assert_refused(&run, "simulation.divergence", &primary).await;
+            assert!(crate::test_rpc::audit_rows(&profile, "value_action_pending").is_empty());
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn submit_only_without_oracle_skips_on_testnet() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x93; 32], "PAY_WITNESS_SUBMIT_SKIP_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let profile = profile_for(&signer, &primary, None, &audit);
+            let xdr = signed(&native_envelope(&signer), [0x93; 32]).await;
+
+            let run = submit_only(&signer, &primary, &profile, xdr).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(
+                run.envelope["data"]["cross_check"],
+                serde_json::json!({"status": "skipped", "reason": "oracle_not_configured"})
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn submit_only_oracle_identity_refusal_is_witness_unavailable() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x94; 32], "PAY_WITNESS_SUBMIT_IDENTITY_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let oracle_rpc = ClassicRpc::testnet(&[&signer.g, DEST_G]);
+            oracle_rpc.report("Test SDF Future Network ; October 2022");
+            let oracle = oracle_rpc.serve().await;
+            let profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+            let xdr = signed(&native_envelope(&signer), [0x94; 32]).await;
+
+            let run = submit_only(&signer, &primary, &profile, xdr).await;
+
+            assert_refused(&run, "network.witness_unavailable", &primary).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn submit_only_fee_above_cap_refuses_before_the_witness() {
+            let _isolation = zero_config();
+            let audit = tempfile::tempdir().unwrap();
+            let signer = EnvSigner::new([0x95; 32], "PAY_WITNESS_SUBMIT_CAP_SK");
+            let primary = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let oracle = ClassicRpc::testnet(&[&signer.g, DEST_G]).serve().await;
+            let mut profile = profile_for(&signer, &primary, Some(&oracle), &audit);
+            profile.classic_max_fee_per_op_stroops = Some(400);
+            let unsigned = envelope(
+                plain(&signer.g),
+                payment(plain(DEST_G), XdrAsset::Native, 10_000_000),
+                Memo::None,
+                500,
+            );
+            let xdr = signed(&unsigned, [0x95; 32]).await;
+
+            let run = submit_only(&signer, &primary, &profile, xdr).await;
+
+            assert_refused(&run, "fees.percentile_exceeds_cap", &primary).await;
+            assert!(
+                run.envelope["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("the envelope's per-operation fee 500 stroops"),
+                "{}",
+                run.envelope
+            );
+            assert!(methods(&oracle).await.is_empty());
+        }
     }
 }

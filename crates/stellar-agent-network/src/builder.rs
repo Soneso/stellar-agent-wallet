@@ -88,6 +88,26 @@ pub enum Asset {
 }
 
 impl Asset {
+    /// Converts this asset to the canonical identity used by cross-checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::AssetInvalid`] when the code is not 1 to 12
+    /// ASCII alphanumerics or the issuer is not a canonical G-strkey.
+    pub fn to_canonical(
+        &self,
+    ) -> Result<stellar_agent_core::asset_id::CanonicalAsset, WalletError> {
+        use stellar_agent_core::asset_id::CanonicalAsset;
+        match self {
+            Self::Native => Ok(CanonicalAsset::Native),
+            Self::Credit { code, issuer } => CanonicalAsset::classic(code, issuer).map_err(|_| {
+                WalletError::Validation(ValidationError::AssetInvalid {
+                    input: format!("{code}:{issuer}"),
+                })
+            }),
+        }
+    }
+
     /// Parses an asset descriptor string.
     ///
     /// Accepts:

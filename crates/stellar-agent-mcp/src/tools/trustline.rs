@@ -64,7 +64,7 @@ use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::{
     AccountView, Asset, ClassicOpBuilder,
     account::AccountFlagsView,
-    fetch_account,
+    check_classic_fee_cap, classic_fee_source, fetch_account,
     keyring::enrolled_keyring_signer,
     parse_classic_fee_choice, resolve_classic_fee_selection,
     signing::envelope_signing::attach_signature,
@@ -81,9 +81,9 @@ use zeroize::Zeroizing;
 use crate::server::WalletServer;
 use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
-    commit_path_error_result, enforce_classic_fee_cap, ledger_err_result, nonce_id_prefix,
-    redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops, submit_timeout,
-    total_classic_fee_stroops, verify_attestation_gate,
+    commit_path_error_result, ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope,
+    resolve_classic_fee_per_op_stroops, submit_timeout, total_classic_fee_stroops,
+    verify_attestation_gate,
 };
 
 /// Redacts an asset input string (`CODE:ISSUER`, or `native`/`XLM`) for logging:
@@ -798,12 +798,15 @@ impl WalletServer {
                 ));
             }
         };
-        if let Err(r) = enforce_classic_fee_cap(
+        if let Err(err) = check_classic_fee_cap(
             fee_selection.per_op_stroops,
-            &fee_selection.selected_fee_percentile,
+            classic_fee_source(
+                fee_choice,
+                stellar_agent_core::error::FeeSource::ProfileDefault,
+            ),
             &self.profile,
         ) {
-            return Ok(r);
+            return Ok(ledger_err_result(&err));
         }
         let fee_per_op_stroops = fee_selection.per_op_stroops;
         let total_fee_stroops =
@@ -1073,6 +1076,13 @@ impl WalletServer {
             .ok_or_else(|| {
                 rmcp::ErrorData::internal_error("internal_error: operation count is zero", None)
             })?;
+        if let Err(err) = check_classic_fee_cap(
+            fee_per_op_stroops,
+            stellar_agent_core::error::FeeSource::Envelope,
+            &self.profile,
+        ) {
+            return Ok(ledger_err_result(&err));
+        }
 
         // ── Validate G-strkey ─────────────────────────────────────────────────
         // Runs BEFORE the source-account fetch below: `fetch_account` itself

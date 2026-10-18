@@ -18,7 +18,12 @@ Several flags recur across the commands on this page with the same meaning. Thei
 - `--output <FORMAT>`: `json` (default) or `table`.
 - `--timeout-seconds <SECONDS>`: bounds submission. On sponsored `accounts create`, `pay`, and `claim`, it also bounds the [endpoint identity check](index.md#endpoint-identity-before-the-first-read), which gets a budget of its own. Default `60`.
 - Signer source: `--secret-env <VAR>` / `--deployer-secret-env <VAR>` (an env-var name, never the secret) or `--sign-with-ledger`, with `--account-index <INDEX>` for the Ledger derivation path (default `0`).
-- `--fee <STROOPS|auto[:pNN]>`: the classic per-operation fee. An integer sets an explicit stroop value; `auto` selects the p95 percentile from `getFeeStats`; `auto:pNN` selects an explicit percentile (`p50`, `p75`, `p95`, `p99`). When absent, the profile default (100 stroops) applies. For Soroban operations the resource fee is set by simulation and is additional to this base.
+- `--fee <STROOPS|auto[:pNN]>`: the classic per-operation fee. An integer sets
+  an explicit stroop value; `auto` selects the p95 percentile from
+  `getFeeStats`; `auto:pNN` selects an explicit percentile (`p50`, `p75`, `p95`,
+  `p99`). When absent, pay and claim use the command default of 100 stroops;
+  they do not read the profile fee. For Soroban operations the resource fee is
+  set by simulation and is additional to this base.
 
 Every command prints one JSON envelope on stdout by default and exits `0` on success, `1` on any error.
 
@@ -156,6 +161,41 @@ Sends a payment from a source account to a destination, enforcing SEP-29 memo-re
 - **Policy.** After the envelope is built and before signing (in both the full pipeline and `--build-only`), the amount/asset/destination are evaluated against `--profile`'s policy engine. This is the same evaluation the `stellar_pay` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized. So the command works without an authored profile file until an operator opts into `policy.engine = "v1"`. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`). A profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). The staged `--sign-only` and `--submit-only` flows are gated too. Each decodes the supplied envelope through the same decoder the MCP `stellar_pay_commit` path uses. It evaluates the decoded amount/asset/destination before signing (`--sign-only`) or before broadcasting (`--submit-only`). For `--submit-only`, the envelope arrives pre-signed, but broadcasting still spends funds. An envelope the decoder cannot classify into a sized shape follows the opaque-signing posture: under a matched value rule it denies `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. The staged flows match policy rules under the `stellar_pay_commit` tool name (the same name the MCP commit phase matches). A ruleset that names only `stellar_pay` default-denies them, so author rules for both names, or `tool = "*"`, for uniform behavior. Under `policy.engine = "noop"` the staged flows are ungated, matching the rest of the command. Every stage that reads from the endpoint checks its identity first, on the client that later reads and sends. An `--rpc-url` pointing at a different network than `--network` is therefore refused before the policy gate and before the audit-key pre-flight. See [Endpoint identity before the first read](index.md#endpoint-identity-before-the-first-read).
 - **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns `network.mainnet_write_forbidden` before any RPC call, with a submit-layer URL rejection as defence in depth. Beyond those two zero-RPC refusals, the submit layer asks the endpoint which network it serves and binds the submission to that answer rather than to `--network`, refusing a mainnet endpoint, a mismatch, an unestablishable endpoint identity, and any signature that was not made for the network the endpoint reported. The same answer carries the endpoint's protocol version. This release supports protocol 29. Outside it, testnet and other networks log a warning; mainnet refuses with `network.unsupported_protocol_version`, which a mainnet endpoint never reaches while mainnet writes are refused. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
 - **Submission record.** Before the transaction is sent, the command records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. A submission whose confirmation does not arrive exits 1 with `submission.tx_timeout` and keeps that record. Resolve it with `stellar-agent tx status <HASH>`, never by rebuilding and re-sending: a second submission for the same source account and sequence is refused with `submission.tx_already_submitted` while the first stands. `error.details` carries the full transaction hash and the envelope hash the operator verbs take. See [`stellar-agent tx`](#stellar-agent-tx).
+- **Fee cap.** After the policy gate, every stage checks the per-operation fee
+  against the profile's `classic_max_fee_per_op_stroops`. The full pipeline and
+  `--build-only` check the fee they selected: auto-selected with `--fee
+  auto[:pNN]`, explicit with `--fee <STROOPS>`, otherwise the command's default
+  of 100. `--sign-only` and `--submit-only` check the fee of the envelope they
+  decoded. A fee above the cap exits 1 with `fees.percentile_exceeds_cap`, and
+  the message names the fee's source and the remedy. A mainnet profile without
+  the cap refuses with `validation.mainnet_fee_cap_required`. An envelope the
+  decoder cannot classify is not checked.
+- **Cross-check witness.** The full pipeline, `--sign-only`, and `--submit-only`
+  obtain a cross-check witness after the fee check and before the audit
+  pre-flight, the signer, and the send. The oracle (`oracle_provider_url`)
+  re-reads the source account, the destination, the SEP-29 flag when it was
+  read, and the source's trustline for an issued send asset. The witness is
+  valued on the source debit leg: the send amount of a payment or strict-send
+  path payment, the send maximum of a strict-receive path payment. A
+  disagreement exits 1 with `simulation.divergence`, or `network.rpc_divergence`
+  for the SEP-29 flag. An oracle that cannot be built, identified, or read
+  refuses with `network.witness_unavailable`. A credential refusal keeps
+  `network.rpc_credential_refused`. On testnet without an oracle the
+  stage continues and reports the skip. The staged stages witness the entries
+  they re-read for the decoded envelope; a muxed source or destination is
+  witnessed on its G account. `--build-only` obtains no witness.
+- **Staged SEP-29.** `--sign-only` and `--submit-only` read the destination's
+  SEP-29 flag when the decoded transaction carries no memo and pays a plain G
+  account. A destination that requires a memo refuses with
+  `validation.memo_required` before signing or sending. A text, id, hash, or
+  return memo, and a muxed destination, read nothing.
+- **Destination read.** Only an absent destination account counts as absent. Any
+  other failed destination read refuses with the read's own code.
+- **Output.** The signing and submitting stages report the witness outcome as
+  `data.cross_check`: `status` is `passed`, `skipped`, or `not_required`, with
+  `reason`, `provider`, and `ledger` where they apply. `--output table` prints a
+  `Cross-check:` line after the result line. `--build-only` reports no
+  `cross_check`.
 - **Relayer.** `--use-oz-relayer` is not implemented in this build. Passing it emits an AGPL-3.0 disclosure to stderr and declines the operation rather than submitting.
 
 Argument groups (enforced by the parser):
@@ -181,7 +221,7 @@ Argument groups (enforced by the parser):
 | `--build-only` | Emit the unsigned envelope XDR and exit | stage group | `false` |
 | `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | none |
 | `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | none |
-| `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile default (100) |
+| `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | command default (100 stroops) |
 | `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
 | `--timeout-seconds <SECONDS>` | Endpoint check and submission timeout, each its own budget | optional | `60` |
 | `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
@@ -264,12 +304,29 @@ The respective refusals are `claim.not_claimant`, `claim.predicate_not_satisfied
 - **Timing.** The predicate is evaluated against the local clock; on-chain
   validation uses the apply-ledger close time, so a claim previewed near a
   time-bound boundary can still fail on submit.
+- **Fee cap.** After the policy gate, every stage checks the per-operation fee
+  against the profile's `classic_max_fee_per_op_stroops`, as `pay` does: the
+  selected fee in the full pipeline and `--build-only`, the decoded envelope
+  fee in `--sign-only` and `--submit-only`. A fee above the cap exits 1 with
+  `fees.percentile_exceeds_cap`; a mainnet profile without the cap refuses
+  with `validation.mainnet_fee_cap_required`.
+- **Cross-check witness.** The full pipeline, `--sign-only`, and
+  `--submit-only` obtain a cross-check witness after the fee check and before
+  the audit pre-flight, the signer, and the send. A claim credits the source,
+  so the witness is unvalued. The full pipeline compares the source account,
+  the claimable-balance record as a whole, and, for a non-native asset, the
+  source's trustline. The staged stages compare the source account they
+  re-read; a muxed source is witnessed on its G account. The refusal codes
+  are those of `pay`. `--build-only` obtains no witness.
 - **Output.** The command prints one JSON envelope. The build stage's typed
   preview is a nested `preview` object: in `data.preview` on success, and in
-  `error.details.preview` when a later step fails: a claim guard, the fee
-  resolution, the policy gate, the audit pre-flight, signing, or submission.
+  `error.details.preview` when a later step fails. Those steps include claim
+  guards, fee resolution, the policy gate, the fee cap, the witness, the audit
+  pre-flight, signing, and submission.
   `--sign-only` and `--submit-only` build no preview. `--output table` prints
-  a preview line before the result line.
+  a preview line before the result line. The signing and submitting stages
+  report the witness outcome as `data.cross_check`, and `--output table`
+  prints a `Cross-check:` line after the result line.
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
@@ -282,7 +339,7 @@ The respective refusals are `claim.not_claimant`, `claim.predicate_not_satisfied
 | `--build-only` | Emit the unsigned envelope XDR and exit | stage group | `false` |
 | `--sign-only <BASE64_XDR>` | Sign the given XDR, emit signed XDR | stage group | none |
 | `--submit-only <BASE64_XDR>` | Submit the given signed XDR | stage group | none |
-| `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | profile default (100) |
+| `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee | optional | command default (100 stroops) |
 | `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
 | `--timeout-seconds <SECONDS>` | Endpoint check and submission timeout, each its own budget | optional | `60` |
 | `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |

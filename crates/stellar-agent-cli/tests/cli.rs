@@ -14,6 +14,8 @@ mod audit_path_discipline;
 mod audit_verify_codes;
 #[path = "cli/consent_drain_source_order.rs"]
 mod consent_drain_source_order;
+#[path = "cli/cross_check_witness.rs"]
+mod cross_check_witness;
 #[path = "cli/endpoint_identity_ordering.rs"]
 mod endpoint_identity_ordering;
 #[path = "cli/fresh_v1_ceremony.rs"]

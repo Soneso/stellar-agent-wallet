@@ -192,6 +192,36 @@ Its message gives a safe reason and at most the oracle authority.
 The operator corrects `oracle_provider_url`, `[providers.oracle]`, or
 `[cross_check_thresholds]`. Retry after a transient failure.
 
+## Fee-cap codes
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `fees.percentile_exceeds_cap` | Fee exceeds cap. | Follow the remedy below. |
+| `validation.mainnet_fee_cap_required` | Mainnet cap missing. | Operator sets the cap. |
+| `validation.fee_total_overflow` | Pool fee overflows. | Lower fee; resume as below. |
+
+`fees.percentile_exceeds_cap` means the per-operation fee exceeds
+`classic_max_fee_per_op_stroops`. The message names the source: an auto-selected
+fee and percentile, an explicit fee, the profile's `classic_fee_per_op_stroops`,
+a command's default fee, or a presented or staged envelope's fee.
+Nothing was signed or sent.
+
+Follow the remedy in the message. Accept a lower percentile, lower the explicit
+fee, pass an explicit fee within the cap, or prepare again with a fee within
+the cap. Raising the cap or lowering `classic_fee_per_op_stroops` is an
+operator decision.
+
+`validation.mainnet_fee_cap_required` means a covered stage refused because a
+mainnet profile sets no `classic_max_fee_per_op_stroops`. Nothing was signed
+or sent. This is not agent-recoverable. The operator sets the cap in the
+profile file; `profile init --network mainnet` writes `10000`.
+
+`validation.fee_total_overflow` means the `pool init` per-operation fee times
+the operation count exceeds the transaction fee limit. Nothing was built,
+signed, or sent. This is not agent-recoverable. The operator lowers
+`classic_fee_per_op_stroops`. A run that already wrote its checkpoint resumes
+with `--resume` after the fee is lowered.
+
 ## Toolset codes
 
 `stellar_toolset_invoke` routes a toolset action to a registered tool through a

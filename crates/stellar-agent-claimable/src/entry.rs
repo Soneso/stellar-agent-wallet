@@ -22,8 +22,8 @@ use stellar_agent_core::error::{ProtocolError, ValidationError, WalletError};
 use stellar_agent_network::StellarRpcClient;
 use stellar_xdr::{
     AccountId, AlphaNum4, AlphaNum12, AssetCode4, AssetCode12, ClaimableBalanceEntry,
-    ClaimableBalanceId, Hash, LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance,
-    LedgerKeyTrustLine, PublicKey, ReadXdr, TrustLineAsset, Uint256,
+    ClaimableBalanceId, Hash, LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance, PublicKey,
+    ReadXdr, TrustLineAsset, TrustLineEntry, Uint256,
 };
 
 use crate::error::ClaimError;
@@ -101,12 +101,16 @@ impl TrustlineState {
 const AUTHORIZED_FLAG: u32 = 1;
 
 /// Fetches the trustline state for `(code, issuer)` on `account` via
-/// `getLedgerEntries`.
+/// `getLedgerEntries`, beside the raw entry it was projected from.
 ///
-/// Returns a [`TrustlineState`] with `exists: false` (not an error) when no
-/// trustline exists — callers combine this with
+/// Returns a [`TrustlineState`] with `exists: false` and no entry (not an
+/// error) when no trustline exists; callers combine the state with
 /// [`crate::preview::check_trustline`] to produce the specific
-/// `claim.trustline_*` refusal.
+/// `claim.trustline_*` refusal. The raw [`TrustLineEntry`] carries the fields
+/// a cross-check witness compares (balance, limit, and the raw flags).
+///
+/// The read goes through [`stellar_agent_network::fetch_trustline_entry`],
+/// which matches the answer by the requested key.
 ///
 /// # Errors
 ///
@@ -115,50 +119,37 @@ const AUTHORIZED_FLAG: u32 = 1;
 ///   [`ValidationError::AssetInvalid`] if `code` is empty or exceeds 12
 ///   bytes.
 /// - [`ClaimError::Wallet`] wrapping the network error on RPC failure, or a
-///   `protocol.xdr_codec_failed` error if the response XDR cannot be decoded.
+///   `protocol.xdr_codec_failed` error if the answer carries another key or
+///   an entry that does not decode to the requested trustline.
 pub async fn fetch_trustline_state(
     client: &StellarRpcClient,
     account: &str,
     code: &str,
     issuer: &str,
-) -> Result<TrustlineState, ClaimError> {
-    let account_pk = stellar_strkey::ed25519::PublicKey::from_string(account).map_err(|_| {
+) -> Result<(TrustlineState, Option<TrustLineEntry>), ClaimError> {
+    stellar_strkey::ed25519::PublicKey::from_string(account).map_err(|_| {
         WalletError::Validation(ValidationError::AddressInvalid {
             input: account.to_owned(),
         })
     })?;
-    let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_pk.0)));
-
     let asset = code_issuer_to_trust_line_asset(code, issuer)?;
+    let entry = stellar_agent_network::fetch_trustline_entry(client, account, &asset).await?;
+    let state = entry
+        .as_ref()
+        .map_or(TrustlineState::ABSENT, TrustlineState::from_entry);
+    Ok((state, entry))
+}
 
-    let key = LedgerKey::Trustline(LedgerKeyTrustLine { account_id, asset });
-
-    let response = client
-        .get_ledger_entries(std::slice::from_ref(&key))
-        .await
-        .map_err(WalletError::Network)?;
-
-    for e in response.entries.unwrap_or_default() {
-        let led = LedgerEntryData::from_xdr_base64(
-            &e.xdr,
-            stellar_agent_xdr_limits::untrusted_decode_limits(e.xdr.len()),
-        )
-        .map_err(|err| {
-            WalletError::Protocol(ProtocolError::XdrCodecFailed {
-                detail: format!("failed to decode trustline entry XDR: {err}"),
-            })
-        })?;
-        if let LedgerEntryData::Trustline(tl) = led {
-            return Ok(TrustlineState {
-                exists: true,
-                authorized: tl.flags & AUTHORIZED_FLAG != 0,
-                limit: tl.limit,
-                balance: tl.balance,
-            });
+impl TrustlineState {
+    /// Projects a present trustline entry to the claim guard's state.
+    fn from_entry(entry: &TrustLineEntry) -> Self {
+        Self {
+            exists: true,
+            authorized: entry.flags & AUTHORIZED_FLAG != 0,
+            limit: entry.limit,
+            balance: entry.balance,
         }
     }
-
-    Ok(TrustlineState::ABSENT)
 }
 
 /// Converts a `(code, issuer)` pair to a `stellar_xdr::TrustLineAsset` for
@@ -217,7 +208,7 @@ mod tests {
     use stellar_xdr::{
         AccountId as XdrAccountId, Asset, ClaimPredicate,
         ClaimableBalanceEntry as XdrClaimableBalanceEntry, ClaimableBalanceEntryExt, Claimant,
-        ClaimantV0, Limits, PublicKey as XdrPublicKey, TrustLineEntry, TrustLineEntryExt,
+        ClaimantV0, LedgerKeyTrustLine, Limits, PublicKey as XdrPublicKey, TrustLineEntryExt,
         Uint256 as XdrUint256, VecM, WriteXdr,
     };
     use wiremock::matchers::{method, path};
@@ -352,7 +343,7 @@ mod tests {
             flags: AUTHORIZED_FLAG,
             ext: TrustLineEntryExt::V0,
         };
-        let tl_xdr = LedgerEntryData::Trustline(tl)
+        let tl_xdr = LedgerEntryData::Trustline(tl.clone())
             .to_xdr_base64(Limits::none())
             .unwrap();
 
@@ -369,13 +360,17 @@ mod tests {
             .await;
 
         let client = StellarRpcClient::new(&mock_server.uri()).unwrap();
-        let state = fetch_trustline_state(&client, CLAIMANT_G, "USDC", ISSUER_G)
+        let (state, entry) = fetch_trustline_state(&client, CLAIMANT_G, "USDC", ISSUER_G)
             .await
             .unwrap();
         assert!(state.exists);
         assert!(state.authorized);
         assert_eq!(state.limit, 100_000_000);
         assert_eq!(state.balance, 10_000_000);
+        // The raw entry is the one the state was projected from.
+        let entry = entry.expect("a present trustline returns its raw entry");
+        assert_eq!(entry, tl);
+        assert_eq!(TrustlineState::from_entry(&entry), state);
     }
 
     #[tokio::test]
@@ -412,11 +407,12 @@ mod tests {
             .await;
 
         let client = StellarRpcClient::new(&mock_server.uri()).unwrap();
-        let state = fetch_trustline_state(&client, CLAIMANT_G, "USDC", ISSUER_G)
+        let (state, entry) = fetch_trustline_state(&client, CLAIMANT_G, "USDC", ISSUER_G)
             .await
             .unwrap();
         assert!(state.exists);
         assert!(!state.authorized);
+        assert_eq!(TrustlineState::from_entry(&entry.unwrap()), state);
     }
 
     // ─── fetch_trustline_state: miss ───────────────────────────────────────
@@ -434,9 +430,10 @@ mod tests {
             .await;
 
         let client = StellarRpcClient::new(&mock_server.uri()).unwrap();
-        let state = fetch_trustline_state(&client, CLAIMANT_G, "USDC", ISSUER_G)
+        let (state, entry) = fetch_trustline_state(&client, CLAIMANT_G, "USDC", ISSUER_G)
             .await
             .unwrap();
+        assert!(entry.is_none());
         assert!(!state.exists);
         assert!(!state.authorized);
         assert_eq!(state.limit, 0);

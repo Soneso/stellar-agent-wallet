@@ -1268,6 +1268,87 @@ pub async fn fetch_data_entry(
     }
 }
 
+/// Fetches the raw trustline entry of `account_id` for `asset` via
+/// `getLedgerEntries`.
+///
+/// The cross-check witness compares the trustline's balance, limit, and raw
+/// authorization flags, so the caller needs the entry itself rather than the
+/// balance projection of [`fetch_account`].
+///
+/// The answer is matched by the requested key: every returned entry must
+/// carry that key and decode to a trustline of the requested account and
+/// asset. No entry means the account holds no trustline for the asset.
+///
+/// # Errors
+///
+/// - [`ValidationError::AddressInvalid`] when `account_id` is not a G-strkey.
+/// - [`ProtocolError::XdrCodecFailed`] when the answer carries another key,
+///   the same key twice, entry data that does not decode, or a trustline
+///   whose account or asset differs from the request.
+/// - [`NetworkError::RpcUnreachable`] when the read fails; the reason carries
+///   the server text scrubbed of the endpoint's credential forms and of every
+///   URL part but host and port.
+pub async fn fetch_trustline_entry(
+    client: &StellarRpcClient,
+    account_id: &str,
+    asset: &stellar_xdr::TrustLineAsset,
+) -> Result<Option<stellar_xdr::TrustLineEntry>, WalletError> {
+    let pk = stellar_strkey::ed25519::PublicKey::from_string(account_id).map_err(|_| {
+        WalletError::Validation(ValidationError::AddressInvalid {
+            input: account_id.to_owned(),
+        })
+    })?;
+    let xdr_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk.0)));
+    let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: xdr_account_id.clone(),
+        asset: asset.clone(),
+    });
+    tracing::debug!(
+        account_id = %redact_account_id(account_id),
+        "fetch_trustline_entry: querying RPC"
+    );
+    let response = client
+        .get_ledger_entries(std::slice::from_ref(&key))
+        .await
+        .map_err(WalletError::Network)?;
+    let unusable = |detail: &str| {
+        WalletError::Protocol(ProtocolError::XdrCodecFailed {
+            detail: format!("trustline answer {detail}"),
+        })
+    };
+    let mut found = None;
+    for entry in response.entries.unwrap_or_default() {
+        let answered = LedgerKey::from_xdr_base64(
+            &entry.key,
+            stellar_agent_xdr_limits::untrusted_decode_limits(entry.key.len()),
+        )
+        .map_err(|_| unusable("carries a ledger key that does not decode"))?;
+        if answered != key {
+            return Err(unusable(
+                "carries a ledger key other than the requested one",
+            ));
+        }
+        if found.is_some() {
+            return Err(unusable("carries the requested ledger key twice"));
+        }
+        let data = LedgerEntryData::from_xdr_base64(
+            &entry.xdr,
+            stellar_agent_xdr_limits::untrusted_decode_limits(entry.xdr.len()),
+        )
+        .map_err(|_| unusable("carries entry data that does not decode"))?;
+        let LedgerEntryData::Trustline(trustline) = data else {
+            return Err(unusable("carries an entry that is not a trustline"));
+        };
+        if trustline.account_id != xdr_account_id || trustline.asset != *asset {
+            return Err(unusable(
+                "carries a trustline of another account or asset than the requested one",
+            ));
+        }
+        found = Some(trustline);
+    }
+    Ok(found)
+}
+
 /// Maps a generic `stellar_rpc_client::Error` to a [`WalletError`] without
 /// an account-ID context. Used by operations that are not account-specific
 /// (e.g. data-entry lookups that already validated the account separately).
@@ -1354,6 +1435,190 @@ mod tests {
                     assert_scrubbed(case, &reason);
                 }
                 other => panic!("{case}: expected RpcUnreachable, got {other:?}"),
+            }
+        }
+    }
+
+    // ─── fetch_trustline_entry ────────────────────────────────────────────────
+
+    mod trustline_entry {
+        use super::*;
+        use stellar_xdr::{
+            AlphaNum4, AssetCode4, TrustLineAsset, TrustLineEntry, TrustLineEntryExt,
+        };
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const OWNER: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        const OTHER: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+        const ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+
+        fn account(g: &str) -> AccountId {
+            let pk = stellar_strkey::ed25519::PublicKey::from_string(g).unwrap();
+            AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk.0)))
+        }
+
+        fn usd(issuer: &str) -> TrustLineAsset {
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: account(issuer),
+            })
+        }
+
+        fn key(owner: &str, asset: TrustLineAsset) -> String {
+            LedgerKey::Trustline(LedgerKeyTrustLine {
+                account_id: account(owner),
+                asset,
+            })
+            .to_xdr_base64(stellar_xdr::Limits::none())
+            .unwrap()
+        }
+
+        fn entry(owner: &str, asset: TrustLineAsset) -> TrustLineEntry {
+            TrustLineEntry {
+                account_id: account(owner),
+                asset,
+                balance: 25,
+                limit: 1_000,
+                flags: 1,
+                ext: TrustLineEntryExt::V0,
+            }
+        }
+
+        fn data(entry: TrustLineEntry) -> String {
+            LedgerEntryData::Trustline(entry)
+                .to_xdr_base64(stellar_xdr::Limits::none())
+                .unwrap()
+        }
+
+        async fn answer(entries: serde_json::Value) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                    serde_json::json!({ "entries": entries, "latestLedger": 7 }),
+                ))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        async fn read(server: &MockServer) -> Result<Option<TrustLineEntry>, WalletError> {
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            fetch_trustline_entry(&client, OWNER, &usd(ISSUER)).await
+        }
+
+        fn codec_detail(result: Result<Option<TrustLineEntry>, WalletError>) -> String {
+            match result {
+                Err(WalletError::Protocol(ProtocolError::XdrCodecFailed { detail })) => detail,
+                other => panic!("expected protocol.xdr_codec_failed, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn present_entry_is_returned() {
+            let server = answer(serde_json::json!([{
+                "key": key(OWNER, usd(ISSUER)),
+                "xdr": data(entry(OWNER, usd(ISSUER))),
+                "lastModifiedLedgerSeq": 6,
+            }]))
+            .await;
+            assert_eq!(
+                read(&server).await.unwrap(),
+                Some(entry(OWNER, usd(ISSUER)))
+            );
+        }
+
+        #[tokio::test]
+        async fn absent_entry_is_none() {
+            let server = answer(serde_json::json!([])).await;
+            assert_eq!(read(&server).await.unwrap(), None);
+        }
+
+        #[tokio::test]
+        async fn another_key_refuses() {
+            let server = answer(serde_json::json!([{
+                "key": key(OTHER, usd(ISSUER)),
+                "xdr": data(entry(OTHER, usd(ISSUER))),
+                "lastModifiedLedgerSeq": 6,
+            }]))
+            .await;
+            assert!(codec_detail(read(&server).await).contains("other than the requested"));
+        }
+
+        #[tokio::test]
+        async fn an_entry_of_another_account_or_asset_refuses() {
+            for wrong in [entry(OTHER, usd(ISSUER)), entry(OWNER, usd(OTHER))] {
+                let server = answer(serde_json::json!([{
+                    "key": key(OWNER, usd(ISSUER)),
+                    "xdr": data(wrong),
+                    "lastModifiedLedgerSeq": 6,
+                }]))
+                .await;
+                assert!(codec_detail(read(&server).await).contains("another account or asset"));
+            }
+        }
+
+        #[tokio::test]
+        async fn malformed_entry_data_refuses() {
+            let server = answer(serde_json::json!([{
+                "key": key(OWNER, usd(ISSUER)),
+                "xdr": "AAAA////",
+                "lastModifiedLedgerSeq": 6,
+            }]))
+            .await;
+            assert!(codec_detail(read(&server).await).contains("does not decode"));
+        }
+
+        #[tokio::test]
+        async fn a_duplicated_key_refuses() {
+            let one = serde_json::json!({
+                "key": key(OWNER, usd(ISSUER)),
+                "xdr": data(entry(OWNER, usd(ISSUER))),
+                "lastModifiedLedgerSeq": 6,
+            });
+            let server = answer(serde_json::json!([one.clone(), one])).await;
+            assert!(codec_detail(read(&server).await).contains("twice"));
+        }
+
+        /// A server error that echoes the credential and a credential-bearing
+        /// URL reaches the caller scrubbed: no credential form, and only the
+        /// echoed URL's host and port.
+        #[tokio::test]
+        async fn read_error_text_is_scrubbed() {
+            const CREDENTIAL: &str = "trustline-read-credential-value";
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "error": {
+                        "code": -32000,
+                        "message": format!(
+                            "upstream {} failed for {CREDENTIAL}",
+                            crate::redact::rpc_error_fixtures::ECHOED_URL
+                        ),
+                    },
+                })))
+                .mount(&server)
+                .await;
+            let client = StellarRpcClient::with_credential(
+                &server.uri(),
+                &stellar_agent_core::profile::schema::RpcCredentialPlacement::Query {
+                    name: "key".to_owned(),
+                },
+                zeroize::Zeroizing::new(CREDENTIAL.to_owned()),
+            )
+            .unwrap();
+            let error = fetch_trustline_entry(&client, OWNER, &usd(ISSUER))
+                .await
+                .unwrap_err();
+            let text = error.to_string();
+            assert!(!text.contains(CREDENTIAL), "{text}");
+            match error {
+                WalletError::Network(NetworkError::RpcUnreachable { reason, .. }) => {
+                    assert_scrubbed("trustline read", &reason);
+                }
+                other => panic!("expected RpcUnreachable, got {other:?}"),
             }
         }
     }

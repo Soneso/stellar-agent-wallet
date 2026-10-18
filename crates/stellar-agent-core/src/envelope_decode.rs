@@ -331,6 +331,79 @@ pub fn envelope_source_account(envelope_xdr_b64: &str) -> Result<String, Envelop
     decode_single_operation(envelope_xdr_b64).map(|(_, _, source)| source)
 }
 
+/// The kind of a transaction memo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoKind {
+    /// `Memo::None`: the transaction carries no memo.
+    None,
+    /// `Memo::Text`.
+    Text,
+    /// `Memo::Id`.
+    Id,
+    /// `Memo::Hash`.
+    Hash,
+    /// `Memo::Return`.
+    Return,
+}
+
+/// The memo kind of a single-payment envelope and the form of its
+/// destination.
+///
+/// [`decode_authoritative_args`] reports an id memo as `memo: null` and
+/// resolves a muxed destination to its G account, so neither the absence of a
+/// memo nor a muxed destination can be read from its output; this shape keeps
+/// both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PaymentMemoShape {
+    /// The transaction's memo kind.
+    pub memo: MemoKind,
+    /// Whether the payment's destination is a muxed (`M...`) account, which
+    /// carries its memo in the muxed id.
+    pub destination_muxed: bool,
+}
+
+/// Returns the memo kind and the destination form of a single-operation v1
+/// payment envelope: a plain payment or a strict-send or strict-receive path
+/// payment.
+///
+/// The decode is bounded like [`decode_authoritative_args`].
+///
+/// # Errors
+/// Returns an error for malformed XDR, other envelope kinds, operation counts
+/// other than one, or an operation that is not a payment.
+pub fn payment_memo_shape(
+    envelope_xdr_b64: &str,
+    tool: &'static str,
+) -> Result<PaymentMemoShape, EnvelopeDecodeError> {
+    use stellar_xdr::{Memo, MuxedAccount, OperationBody};
+    let (tx, op, _) = decode_single_operation(envelope_xdr_b64)?;
+    let destination = match &op.body {
+        OperationBody::Payment(p) => &p.destination,
+        OperationBody::PathPaymentStrictReceive(pp) => &pp.destination,
+        OperationBody::PathPaymentStrictSend(pp) => &pp.destination,
+        other => {
+            return Err(EnvelopeDecodeError::OperationKindMismatch {
+                tool,
+                expected: "Payment, PathPaymentStrictReceive, or PathPaymentStrictSend",
+                found: op_body_kind_name(other).to_owned(),
+            });
+        }
+    };
+    let memo = match tx.memo {
+        Memo::None => MemoKind::None,
+        Memo::Text(_) => MemoKind::Text,
+        Memo::Id(_) => MemoKind::Id,
+        Memo::Hash(_) => MemoKind::Hash,
+        Memo::Return(_) => MemoKind::Return,
+    };
+    Ok(PaymentMemoShape {
+        memo,
+        destination_muxed: matches!(destination, MuxedAccount::MuxedEd25519(_)),
+    })
+}
+
 fn decode_single_operation(
     envelope_xdr_b64: &str,
 ) -> Result<(stellar_xdr::Transaction, stellar_xdr::Operation, String), EnvelopeDecodeError> {

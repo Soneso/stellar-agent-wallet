@@ -62,6 +62,12 @@
 //! username or password. `init` therefore never writes a file the loader
 //! would refuse.
 //!
+//! # Fee cap
+//!
+//! A mainnet profile is written with `classic_max_fee_per_op_stroops = 10000`,
+//! because a mainnet classic stage refuses to sign or send without a
+//! per-operation fee cap. A testnet profile is written without one.
+//!
 //! # Refusal order
 //!
 //! The flag parser refuses a malformed `--rpc-url`, and one that carries
@@ -250,6 +256,13 @@ fn init_refusal(args: &InitArgs, profile_name: &str, profile_dir: &Path) -> Opti
     None
 }
 
+/// The per-operation classic fee cap `init` writes into a mainnet profile.
+///
+/// A mainnet classic stage refuses to sign or send without a cap, so a
+/// freshly initialized mainnet profile carries one; the operator raises or
+/// lowers it in the profile file.
+const MAINNET_CLASSIC_MAX_FEE_PER_OP_STROOPS: u32 = 10_000;
+
 /// Builds the profile `init` writes and checks its endpoints against the
 /// endpoint rule the loader applies.
 ///
@@ -298,6 +311,7 @@ fn build_profile(args: &InitArgs, profile_name: &str) -> Result<Profile, WalletE
                 &nonce.service,
                 &nonce.account,
             )
+            .classic_max_fee_per_op_stroops(Some(MAINNET_CLASSIC_MAX_FEE_PER_OP_STROOPS))
         }
     };
     if args.engine == PolicyEngineKind::Noop {
@@ -827,6 +841,36 @@ mod tests {
         let loaded = load_from_dir("mainnet-ok", dir.path(), None).unwrap();
         assert_eq!(loaded.chain_id.caip2_str(), "stellar:mainnet");
         assert_eq!(loaded.rpc_url, "https://mainnet.example.com/rpc");
+    }
+
+    /// A mainnet profile is written with the per-operation fee cap; a testnet
+    /// profile without one.
+    #[test]
+    #[serial_test::serial]
+    fn profile_init_mainnet_writes_fee_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = args("mainnet-cap");
+        a.network = TargetNetwork::Mainnet;
+        a.rpc_url = Some("https://mainnet.example.com/rpc".to_owned());
+        assert_eq!(run_with_dependencies(&a, dir.path()), 0);
+
+        let raw = std::fs::read_to_string(dir.path().join("mainnet-cap.toml")).unwrap();
+        assert!(
+            raw.lines()
+                .any(|line| line.trim() == "classic_max_fee_per_op_stroops = 10000"),
+            "raw toml:\n{raw}"
+        );
+        let loaded = load_from_dir("mainnet-cap", dir.path(), None).unwrap();
+        assert_eq!(loaded.classic_max_fee_per_op_stroops, Some(10_000));
+
+        assert_eq!(run_with_dependencies(&args("testnet-cap"), dir.path()), 0);
+        let raw = std::fs::read_to_string(dir.path().join("testnet-cap.toml")).unwrap();
+        assert!(
+            !raw.contains("classic_max_fee_per_op_stroops"),
+            "raw toml:\n{raw}"
+        );
+        let loaded = load_from_dir("testnet-cap", dir.path(), None).unwrap();
+        assert_eq!(loaded.classic_max_fee_per_op_stroops, None);
     }
 
     #[test]

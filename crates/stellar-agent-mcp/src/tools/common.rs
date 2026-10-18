@@ -300,8 +300,7 @@ pub(crate) fn validate_g_strkey(value: &str, field_label: &str) -> Result<(), Er
 // call sites compile without change.
 pub(crate) use stellar_agent_core::DEFAULT_CLASSIC_FEE_STROOPS;
 
-/// Current classic MCP handlers build one-operation transactions.
-pub(crate) const CLASSIC_SINGLE_OPERATION_COUNT: u32 = 1;
+pub(crate) use stellar_agent_network::CLASSIC_SINGLE_OPERATION_COUNT;
 
 /// Resolves the per-operation classic fee for MCP classic-operation handlers.
 #[must_use]
@@ -322,35 +321,6 @@ pub(crate) fn total_classic_fee_stroops(
     per_op_stroops
         .checked_mul(operation_count)
         .ok_or_else(|| ErrorData::internal_error("internal_error: classic fee overflow", None))
-}
-
-/// Enforces the optional profile classic per-operation fee cap.
-///
-/// # Errors
-///
-/// Returns the `fees.percentile_exceeds_cap` business-error envelope (as an
-/// `Err(CallToolResult)`) when the auto-selected per-operation fee exceeds the
-/// profile's configured cap. The selected fee, the cap, and the selected
-/// percentile are carried in the message (an agent branches on the code and
-/// can raise the cap or accept a lower percentile).
-pub(crate) fn enforce_classic_fee_cap(
-    per_op_stroops: u32,
-    selected_percentile: &str,
-    profile: &Profile,
-) -> Result<(), rmcp::model::CallToolResult> {
-    if let Some(cap) = profile.classic_max_fee_per_op_stroops
-        && per_op_stroops > cap
-    {
-        return Err(business_error_result(
-            "fees.percentile_exceeds_cap",
-            format!(
-                "auto-selected per-operation fee {per_op_stroops} stroops \
-                 (percentile {selected_percentile}) exceeds the profile cap of {cap} stroops; \
-                 raise classic_max_fee_per_op_stroops or accept a lower fee percentile"
-            ),
-        ));
-    }
-    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

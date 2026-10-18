@@ -12,7 +12,7 @@ use crate::{
     retry::rejected_status,
     rpc_endpoint::{is_credential_error, profile_rpc_client},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use stellar_agent_core::{
     audit_log::CrossCheckRecord,
@@ -140,8 +140,8 @@ impl CrossCheckOutcome {
             Self::NotRequired => ("not_required", Some("below_threshold"), None, None),
         };
         CrossCheckView {
-            status,
-            reason,
+            status: status.to_owned(),
+            reason: reason.map(str::to_owned),
             provider,
             ledger,
         }
@@ -149,18 +149,21 @@ impl CrossCheckOutcome {
 }
 
 /// JSON and text view of a cross-check outcome.
-#[derive(Debug, Clone, Serialize)]
+///
+/// The view owns its strings, so a result that carries it deserializes from
+/// its own JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossCheckView {
     /// `passed`, `skipped`, or `not_required`.
-    pub status: &'static str,
+    pub status: String,
     /// Why no comparison took place.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<&'static str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Redacted oracle authority when the comparison passed.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     /// Checked oracle ledger.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger: Option<u32>,
 }
 
@@ -169,8 +172,8 @@ impl CrossCheckView {
     #[must_use]
     pub fn text_line(&self) -> String {
         match (
-            self.status,
-            self.reason,
+            self.status.as_str(),
+            self.reason.as_deref(),
             self.provider.as_deref(),
             self.ledger,
         ) {
@@ -526,6 +529,9 @@ mod tests {
             let view = outcome.view();
             assert_eq!(view.text_line(), line);
             assert_eq!(serde_json::to_value(&view).unwrap(), json);
+            let back: CrossCheckView = serde_json::from_value(json).unwrap();
+            assert_eq!(back, view);
+            assert_eq!(back.text_line(), line);
             assert_eq!(
                 outcome.witness().is_some(),
                 matches!(outcome, CrossCheckOutcome::Passed(_))

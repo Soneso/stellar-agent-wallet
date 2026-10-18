@@ -557,10 +557,20 @@ where
         },
     )
     .await
-    .map_err(|error| {
-        WalletError::Internal(InternalError::UnexpectedState {
-            detail: format!("{error}; run 'stellar-agent pool init --resume --profile {name}'"),
-        })
+    .map_err(|error| match error {
+        // Nothing was built, signed, or sent: the operator lowers the fee.
+        PoolError::FeeOverflow {
+            fee_per_op,
+            op_count,
+        } => WalletError::Validation(
+            stellar_agent_core::error::ValidationError::FeeTotalOverflow {
+                per_op: fee_per_op,
+                op_count,
+            },
+        ),
+        other => WalletError::Internal(InternalError::UnexpectedState {
+            detail: format!("{other}; run 'stellar-agent pool init --resume --profile {name}'"),
+        }),
     })?;
     pending = recorder
         .pending

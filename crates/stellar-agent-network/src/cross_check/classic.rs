@@ -43,6 +43,18 @@ fn account_key(id: &str) -> Result<LedgerKey, WalletError> {
     }))
 }
 
+fn trustline_observation(t: &TrustlineObservation) -> Result<Observation, WalletError> {
+    let asset = Asset::parse(&t.asset.to_string())?.to_xdr_trust_line_asset()?;
+    Ok(Observation {
+        kind: WitnessEntry::SourceTrustline,
+        key: LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: account_id(&t.account_id)?,
+            asset,
+        }),
+        value: Observed::Trustline(t.clone()),
+    })
+}
+
 impl ClassicInputs {
     pub(super) fn observations(&self) -> Result<Vec<Observation>, WalletError> {
         use WitnessEntry as K;
@@ -84,6 +96,9 @@ impl ClassicInputs {
                         value: Observed::Memo(required),
                     });
                 }
+                if let Some(t) = &v.trustline {
+                    out.push(trustline_observation(t)?);
+                }
             }
             Self::CreateAccount(_) => {}
             Self::Trustline(v) => out.push(Observation {
@@ -93,15 +108,7 @@ impl ClassicInputs {
             }),
             Self::Claim(v) => {
                 if let Some(t) = &v.trustline {
-                    let asset = Asset::parse(&t.asset.to_string())?.to_xdr_trust_line_asset()?;
-                    out.push(Observation {
-                        kind: K::SourceTrustline,
-                        key: LedgerKey::Trustline(LedgerKeyTrustLine {
-                            account_id: account_id(&t.account_id)?,
-                            asset,
-                        }),
-                        value: Observed::Trustline(t.clone()),
-                    });
+                    out.push(trustline_observation(t)?);
                 }
                 if let Some(b) = &v.balance {
                     out.push(Observation {
@@ -367,6 +374,7 @@ mod tests {
                 Some(&project_account_entry(&address(8), &account(8)).unwrap()),
             ),
             memo: MemoObservation::Read(false),
+            trustline: None,
         }
         .into()
     }
@@ -680,6 +688,86 @@ mod tests {
     async fn classic_disagreement_trustline_flags() {
         trustline_disagrees(WitnessField::Flags).await;
     }
+    fn pay_with_trustline() -> (ClassicInputs, TrustLineEntry) {
+        let (claim_inputs, trustline, _) = claim();
+        let ClassicInputs::Claim(ClaimWitnessInputs {
+            trustline: Some(observation),
+            ..
+        }) = claim_inputs
+        else {
+            panic!("claim fixture carries a trustline");
+        };
+        let inputs = PayWitnessInputs {
+            source: source(7),
+            destination: DestinationObservation::from_view(
+                &address(8),
+                Some(&project_account_entry(&address(8), &account(8)).unwrap()),
+            ),
+            memo: MemoObservation::NotRead,
+            trustline: Some(observation),
+        }
+        .into();
+        (inputs, trustline)
+    }
+    fn pay_trustline_answer(
+        inputs: &ClassicInputs,
+        trustline: Option<TrustLineEntry>,
+    ) -> serde_json::Value {
+        let observations = inputs.observations().unwrap();
+        let mut entries = vec![account_answer(7), account_answer(8)];
+        if let Some(t) = trustline {
+            let key = &observations
+                .iter()
+                .find(|o| o.kind == WitnessEntry::SourceTrustline)
+                .unwrap()
+                .key;
+            entries.push(entry(key, LedgerEntryData::Trustline(t)));
+        }
+        answer(entries)
+    }
+    async fn pay_trustline_disagrees(field: WitnessField) {
+        let (inputs, mut trustline) = pay_with_trustline();
+        match field {
+            WitnessField::Balance => trustline.balance += 1,
+            WitnessField::Limit => trustline.limit += 1,
+            WitnessField::Flags => trustline.flags ^= 2,
+            _ => {}
+        }
+        let trustline = (field != WitnessField::Existence).then_some(trustline);
+        let body = pay_trustline_answer(&inputs, trustline);
+        disagrees(inputs, body, WitnessEntry::SourceTrustline, field).await;
+    }
+    #[tokio::test]
+    async fn classic_pay_trustline_match_covers_the_trustline() {
+        let (inputs, trustline) = pay_with_trustline();
+        let server = oracle(network()).await;
+        read_mock(&server, pay_trustline_answer(&inputs, Some(trustline))).await;
+        let outcome = run(&server, inputs).await.unwrap();
+        assert_eq!(
+            outcome.witness().unwrap().kinds(),
+            [
+                WitnessEntry::SourceAccount,
+                WitnessEntry::SourceTrustline,
+                WitnessEntry::DestinationAccount
+            ]
+        );
+    }
+    #[tokio::test]
+    async fn classic_pay_trustline_disagreement_existence() {
+        pay_trustline_disagrees(WitnessField::Existence).await;
+    }
+    #[tokio::test]
+    async fn classic_pay_trustline_disagreement_balance() {
+        pay_trustline_disagrees(WitnessField::Balance).await;
+    }
+    #[tokio::test]
+    async fn classic_pay_trustline_disagreement_limit() {
+        pay_trustline_disagrees(WitnessField::Limit).await;
+    }
+    #[tokio::test]
+    async fn classic_pay_trustline_disagreement_flags() {
+        pay_trustline_disagrees(WitnessField::Flags).await;
+    }
     #[tokio::test]
     async fn classic_disagreement_claimable_record() {
         let (inputs, trustline, mut balance) = claim();
@@ -767,6 +855,7 @@ mod tests {
                 Some(&project_account_entry(&address(8), &destination).unwrap()),
             ),
             memo: MemoObservation::Read(false),
+            trustline: None,
         }
         .into();
         let server = oracle(network()).await;
@@ -811,6 +900,7 @@ mod tests {
                 Some(&project_account_entry(&address(7), &account(7)).unwrap()),
             ),
             memo: MemoObservation::NotRead,
+            trustline: None,
         };
         assert!(
             run(&server, inputs.into())

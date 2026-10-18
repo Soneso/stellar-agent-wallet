@@ -48,6 +48,15 @@ State-changing (writes the profile file; no network, no keyring). Creates and pe
 - `--rpc-url <URL>`: optional on testnet, where an omitted value takes the testnet endpoint; required with `--network mainnet`, which has no default endpoint. The URL must use `http` or `https`, and `https` on mainnet. The flag parser refuses credentials.
 - `--engine <v1|noop>`: policy engine (default `v1`). See the `[policy]` block in [profiles.md](../profiles.md). On a V1 profile, the MCP server starts once the owner key is enrolled and the owner-signed policy loads; the rest of the [V1 setup](../profiles.md#opt-in-to-v1) gates approvals and signing. For V1, `next_steps` adds `profile enroll-owner-key`, `profile rotate-attestation-key`, a step to [create the policy file](../profiles.md#create-the-v1-policy-file) `policies/<name>.toml`, then `profile sign-policy`. A testnet `noop` profile supports server startup and read access immediately. Mint the audit key with `profile rotate-audit-key` before `profile enroll-signer` so enrollment writes its audit row. Then run `profile rotate-nonce-key` before MCP payment simulation.
 
+A mainnet profile is written with `classic_max_fee_per_op_stroops = 10000`.
+A testnet profile is written without a cap.
+
+CLI `pay` and `claim` check the cap in the full pipeline, `--build-only`,
+`--sign-only`, and `--submit-only`. MCP pay, create-account, trustline, and
+claim check it in both prepare and commit. No other stage checks it, including
+CLI `trustline`, sponsored `accounts create`, `pool init`, opaque staged
+envelopes, and the SEP-43 signing tools.
+
 The signer and nonce keyring coordinates are named `stellar-agent-signer-<name>` / `stellar-agent-nonce-<name>`, each seeded with the placeholder account `"default"` — the signer's eventual G-strkey is not known until a seed is enrolled (see `profile enroll-signer` below). The five security-substrate references (`audit_log_hash_chain_key_id`, `policy_owner_key_id`, `attestation_key_id`, `counterparty_cache_key_id`, `policy_window_state_key_id`) are derived from the profile name the same way `profile migrate` derives them.
 
 `init` writes the `audit_log_hash_chain_key_id` coordinate; `profile rotate-audit-key <name>` mints the key material. On both engines, `next_steps` lists `rotate-audit-key`, then `enroll-signer`, then `rotate-nonce-key`. The audit key must exist before the first key-writing command so its audit row is written. Every value-moving signing verb requires the audit key before signing or submitting, refusing `audit.chain_key_unavailable` otherwise. MCP payment simulation requires the commit-nonce key.

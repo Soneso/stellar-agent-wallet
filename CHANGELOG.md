@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- CLI `pay` and `claim` obtain the oracle witness before signing or sending,
+  in the full pipeline, `--sign-only`, and `--submit-only`. Payments are
+  witnessed on the source debit leg and compare the source trustline of an
+  issued send asset; a full claim compares the claimable-balance record and the
+  trustline. Results carry `cross_check`, `--output table` prints a
+  `Cross-check:` line, and the pending and submitted audit rows carry the
+  witness. `--build-only` obtains no witness.
+- The per-operation fee cap is checked before signing or sending.
+  CLI `pay` and `claim` check the cap in the full pipeline, `--build-only`,
+  `--sign-only`, and `--submit-only`. MCP pay, create-account, trustline, and
+  claim check it in both prepare and commit. No other stage checks it, including
+  CLI `trustline`, sponsored `accounts create`, `pool init`, opaque staged
+  envelopes, and the SEP-43 signing tools.
+  At these covered stages, a mainnet profile without
+  `classic_max_fee_per_op_stroops` refuses with
+  `validation.mainnet_fee_cap_required`.
+- Core exposes `FeeSource`, `MemoKind`, and `payment_memo_shape`.
+  Network exposes `check_classic_fee_cap`, `check_built_fee_cap`,
+  `classic_fee_source`, `CLASSIC_SINGLE_OPERATION_COUNT`, `Asset::to_canonical`,
+  and `fetch_trustline_entry`.
+- `profile init --network mainnet` writes `classic_max_fee_per_op_stroops = 10000`.
 - MCP payment and account-creation commits obtain an oracle witness before signing.
   Results carry `cross_check`; pending and submitted audit rows carry passed witnesses.
 - Profiles accept `[cross_check_thresholds]` for per-asset thresholds in base units.
@@ -22,10 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `new_x402_payment_authorized` take an optional witness parameter.
   `PendingValueAction.witness` preserves evidence during recovery.
   `WalletSubmissionRecorder::with_witness` carries evidence into both submission rows.
-
 - Profiles support file-only secondary and oracle provider attestations containing
   operator, host, and independence from the primary. Core exposes `same_provider_host`.
-
 - `StellarRpcClient::endpoint_identity` returns the checked `EndpointIdentity`,
   with its chain, protocol version, and authority. `check_protocol_version` and
   `SUPPORTED_PROTOCOL_VERSIONS` state the protocol rule.
@@ -69,6 +88,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The fee-cap refusal `fees.percentile_exceeds_cap` names the fee's source and
+  its remedy: an auto-selected fee and its percentile, an explicit fee, the
+  profile's `classic_fee_per_op_stroops`, a command's default fee, or a
+  presented or staged envelope's fee.
+- At `stellar_pay_commit` and CLI `pay`, only an absent destination account
+  counts as absent; any other failed destination read refuses with its own
+  code.
+- CLI `pay` and `claim` results carry an optional `cross_check` field; a
+  result written without it still deserializes.
+- `pay --sign-only` and `pay --submit-only` read the destination's SEP-29 flag
+  when the decoded transaction carries no memo and pays a plain G account.
+  They refuse with `validation.memo_required` before signing or sending when
+  the destination requires a memo.
+- Public Rust changes: `stellar_agent_claimable::entry::fetch_trustline_state`
+  returns the raw `TrustLineEntry` beside `TrustlineState`; `CrossCheckView`
+  owns its `status` and `reason` strings and implements `Deserialize`;
+  `PayWitnessInputs` has a `trustline` field.
 - `stellar_pay` reads SEP-29 from the primary only. `stellar_pay_commit` re-reads
   the flag and compares it on the oracle whenever an oracle is configured.
 - Oracle cross-check faults report `network.witness_unavailable`.
@@ -174,6 +210,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar_defindex_vault_withdraw`, `stellar_x402_create_payment`, and
   `stellar_x402_authenticated_payment` preserve keyring and signer-key errors
   with their original `auth.*` codes and messages.
+- `pool init` charges the per-operation fee once per operation, three per
+  channel. A fee whose total does not fit the transaction's fee field refuses
+  with the new code `validation.fee_total_overflow` before anything is built.
+- The SEP-29 warning for an unexpected `config.memo_required` value logs the
+  value's length and the entry kind, not the bytes the endpoint returned.
 - A confirmation poll request that the endpoint holds open ends at the
   submission deadline, and the sleep between polls ends there too. A submission
   returns within its timeout instead of waiting up to 60 seconds more. The

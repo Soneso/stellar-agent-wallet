@@ -80,7 +80,7 @@ pub use redact::{
 
 pub use account::{
     AccountView, AssetView, BASE_RESERVE_STROOPS, BalanceView, SignerView, ThresholdsView,
-    fetch_account, fetch_data_entry,
+    fetch_account, fetch_data_entry, fetch_trustline_entry,
 };
 pub use builder::{Asset, ClassicOpBuilder};
 pub use client::{StellarRpcClient, TransactionStatusView};
@@ -93,8 +93,9 @@ pub use fee_bump_retry::submit_fee_bump_idempotent;
 #[cfg(any(test, feature = "test-loopback"))]
 pub use fees::validate_rpc_url_allowing_loopback;
 pub use fees::{
-    ALLOWED_RPC_HOSTS, ClassicFeeChoice, ClassicFeeSelection, FeeDistribution, FeePercentile,
-    FeeStatsView, RpcUrlError, fetch_fee_stats, parse_classic_fee_choice,
+    ALLOWED_RPC_HOSTS, CLASSIC_SINGLE_OPERATION_COUNT, ClassicFeeChoice, ClassicFeeSelection,
+    FeeDistribution, FeePercentile, FeeStatsView, RpcUrlError, check_built_fee_cap,
+    check_classic_fee_cap, classic_fee_source, fetch_fee_stats, parse_classic_fee_choice,
     resolve_classic_fee_selection, validate_rpc_url,
 };
 pub use friendbot::{

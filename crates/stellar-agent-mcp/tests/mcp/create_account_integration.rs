@@ -599,10 +599,9 @@ async fn simulate_create_account_fee_explicit_above_profile_cap_fails() {
     );
     assert_eq!(
         message,
-        "auto-selected per-operation fee 500 stroops (percentile explicit) \
-         exceeds the profile cap of 100 stroops; raise classic_max_fee_per_op_stroops \
-         or accept a lower fee percentile",
-        "cap-exceeded detail must carry the selected fee, percentile, and cap; got: {message}"
+        "the explicit per-operation fee 500 stroops exceeds the profile cap of 100 stroops; \
+         lower the fee or raise classic_max_fee_per_op_stroops",
+        "cap-exceeded detail must carry the explicit fee and the cap; got: {message}"
     );
 }
 
@@ -2217,6 +2216,15 @@ async fn witness_create_case(amount: &str, mode: &str, expected: &str) {
         approval_attestation: None,
     };
     assert!(crate::common::received_methods(&oracle).await.is_empty());
+    // The prepare ran without a cap; the commit runs on a server whose
+    // profile caps the per-operation fee below the envelope's.
+    let server = if mode == "cap" {
+        let mut capped = profile.clone();
+        capped.classic_max_fee_per_op_stroops = Some(50);
+        WalletServer::new(capped).unwrap()
+    } else {
+        server
+    };
     let before = reads.load(Ordering::SeqCst);
     let result = server
         .call_stellar_create_account_commit(commit)
@@ -2239,6 +2247,17 @@ async fn witness_create_case(amount: &str, mode: &str, expected: &str) {
             assert_eq!(
                 crate::common::received_methods(&oracle).await,
                 ["getNetwork"]
+            );
+        }
+        if mode == "cap" {
+            assert_eq!(
+                text,
+                "the envelope's per-operation fee 100 stroops exceeds the profile cap of 50 \
+                 stroops; prepare the transaction again with a fee within the cap"
+            );
+            assert!(
+                crate::common::received_methods(&oracle).await.is_empty(),
+                "the cap precedes the witness"
             );
         }
         return;
@@ -2325,4 +2344,10 @@ async fn create_account_commit_without_oracle_skips_on_testnet() {
 #[serial]
 async fn create_account_commit_below_threshold_is_not_required() {
     witness_create_case("999 XLM", "match", "not_required").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn create_commit_fee_above_cap_refuses_before_the_witness() {
+    witness_create_case("2000 XLM", "cap", "fees.percentile_exceeds_cap").await;
 }

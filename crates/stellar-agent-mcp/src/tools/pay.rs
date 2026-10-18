@@ -15,8 +15,8 @@ use stellar_xdr::Memo;
 use crate::server::WalletServer;
 use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
-    commit_envelope_and_verify_nonce, commit_path_error_result, enforce_classic_fee_cap,
-    hash_to_lower_hex, ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope,
+    commit_envelope_and_verify_nonce, commit_path_error_result, hash_to_lower_hex,
+    ledger_err_result, nonce_id_prefix, redacted_wallet_error_envelope,
     resolve_classic_fee_per_op_stroops, submit_timeout, total_classic_fee_stroops,
     validate_g_strkey, verify_attestation_gate,
 };
@@ -35,7 +35,8 @@ use stellar_agent_core::profile::schema::default_approval_dir;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_core::wallet::Wallet;
 use stellar_agent_network::{
-    Asset, BASE_RESERVE_STROOPS, ClassicOpBuilder, fetch_account,
+    Asset, BASE_RESERVE_STROOPS, ClassicOpBuilder, check_classic_fee_cap, classic_fee_source,
+    fetch_account,
     keyring::enrolled_keyring_signer,
     parse_classic_fee_choice, parse_memo_fields, resolve_classic_fee_selection,
     sep29::check_memo_required,
@@ -717,12 +718,15 @@ impl WalletServer {
                 ));
             }
         };
-        if let Err(r) = enforce_classic_fee_cap(
+        if let Err(err) = check_classic_fee_cap(
             fee_selection.per_op_stroops,
-            &fee_selection.selected_fee_percentile,
+            classic_fee_source(
+                fee_choice,
+                stellar_agent_core::error::FeeSource::ProfileDefault,
+            ),
             &self.profile,
         ) {
-            return Ok(r);
+            return Ok(ledger_err_result(&err));
         }
         let fee_per_op_stroops = fee_selection.per_op_stroops;
         let total_fee_stroops =
@@ -1255,10 +1259,18 @@ impl WalletServer {
         };
         let source_sequence = account_view.sequence_number;
 
-        // Destination fetch is non-fatal (matches `stellar_pay`'s simulate
-        // phase): a not-yet-created destination has no `home_domain`, so
-        // `identity_view` is simply `None`.
-        let dest_view = fetch_account(&client, &args.destination, &[]).await.ok();
+        // An absent destination is not an error (matches `stellar_pay`'s
+        // simulate phase): a not-yet-created destination has no
+        // `home_domain`, so `identity_view` is `None`. Any other read error
+        // refuses with its own code, so a transient primary failure is never
+        // taken for absence and compared against the oracle as such.
+        let dest_view = match fetch_account(&client, &args.destination, &[]).await {
+            Ok(view) => Some(view),
+            Err(stellar_agent_core::WalletError::Network(
+                stellar_agent_core::error::NetworkError::AccountNotFound { .. },
+            )) => None,
+            Err(err) => return Ok(ledger_err_result(&err)),
+        };
         let source_adapter = crate::policy_adapter::AccountViewAdapter::new(&account_view);
         let dest_adapter = dest_view
             .as_ref()
@@ -1443,6 +1455,13 @@ impl WalletServer {
             .ok_or_else(|| {
                 rmcp::ErrorData::internal_error("internal_error: operation count is zero", None)
             })?;
+        if let Err(err) = check_classic_fee_cap(
+            fee_per_op_stroops,
+            stellar_agent_core::error::FeeSource::Envelope,
+            &self.profile,
+        ) {
+            return Ok(ledger_err_result(&err));
+        }
         let mut builder = ClassicOpBuilder::new(
             &args.source,
             source_sequence,
@@ -1487,20 +1506,25 @@ impl WalletServer {
                 "the asset in envelope_xdr could not be parsed as an asset identity",
             ))
         };
-        let witness_asset = match &asset {
-            Asset::Native => stellar_agent_core::asset_id::CanonicalAsset::Native,
-            Asset::Credit { code, issuer } => {
-                match stellar_agent_core::asset_id::CanonicalAsset::classic(code, issuer) {
-                    Ok(asset) => asset,
-                    Err(_) => return unparseable_asset(),
-                }
-            }
-            _ => return unparseable_asset(),
+        let witness_asset = match asset.to_canonical() {
+            Ok(asset) => asset,
+            Err(_) => return unparseable_asset(),
         };
         let source_observation =
             match stellar_agent_network::cross_check::AccountObservation::from_view(&account_view) {
                 Ok(observation) => observation,
                 Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
+            };
+        let trustline =
+            match stellar_agent_network::cross_check::TrustlineObservation::read_send_asset(
+                &client,
+                &args.source,
+                &asset,
+            )
+            .await
+            {
+                Ok(trustline) => trustline,
+                Err(err) => return Ok(ledger_err_result(&err)),
             };
         let witness_inputs = stellar_agent_network::cross_check::PayWitnessInputs {
             source: source_observation,
@@ -1509,6 +1533,7 @@ impl WalletServer {
                 dest_view.as_ref(),
             ),
             memo: memo_observation,
+            trustline,
         };
         let cross_check = match stellar_agent_network::cross_check::obtain_classic_witness(
             &self.profile,

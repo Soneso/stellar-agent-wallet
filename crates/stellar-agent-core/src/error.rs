@@ -1485,6 +1485,112 @@ pub enum ValidationError {
         /// accepts. Non-secret text.
         detail: String,
     },
+
+    /// A mainnet profile sets no per-operation classic fee cap.
+    ///
+    /// A classic stage on a mainnet profile checks its per-operation fee
+    /// against `classic_max_fee_per_op_stroops` before it signs or sends, and
+    /// refuses when the profile sets no cap, so no fee reaches the network
+    /// unbounded.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.mainnet_fee_cap_required"`.
+    #[error(
+        "the mainnet profile sets no classic_max_fee_per_op_stroops; set the per-operation fee \
+         cap in the profile file"
+    )]
+    MainnetFeeCapRequired,
+
+    /// A classic per-operation fee exceeds the profile's
+    /// `classic_max_fee_per_op_stroops`.
+    ///
+    /// The text names where the fee came from, because the remedy differs:
+    /// a lower percentile, a lower explicit fee, a lower profile fee, an
+    /// explicit fee in place of the command default, or a freshly prepared
+    /// envelope.
+    ///
+    /// # Wire code
+    ///
+    /// `"fees.percentile_exceeds_cap"`.
+    #[error("{}", fee_above_cap_text(*per_op, *cap, fee_source))]
+    FeeAboveCap {
+        /// Per-operation fee in stroops the stage would sign or send.
+        per_op: u32,
+        /// The profile's per-operation cap in stroops.
+        cap: u32,
+        /// Where the per-operation fee came from.
+        fee_source: FeeSource,
+    },
+
+    /// A per-operation fee multiplied by the operation count does not fit
+    /// the transaction's `u32` fee field.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.fee_total_overflow"`.
+    #[error(
+        "per-operation fee {per_op} stroops times {op_count} operations exceeds the \
+         transaction fee limit; lower classic_fee_per_op_stroops"
+    )]
+    FeeTotalOverflow {
+        /// Per-operation fee in stroops.
+        per_op: u32,
+        /// Operations in the transaction.
+        op_count: u32,
+    },
+}
+
+/// Where a classic per-operation fee came from.
+///
+/// Carried by [`ValidationError::FeeAboveCap`] so its text names the remedy
+/// that fits the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FeeSource {
+    /// Selected from the fee statistics at a percentile.
+    Selected {
+        /// Percentile label, such as `p95`.
+        percentile: String,
+    },
+    /// Given explicitly by the caller.
+    Explicit,
+    /// The profile's `classic_fee_per_op_stroops`, or the wallet default when
+    /// the profile sets none.
+    ProfileDefault,
+    /// The command's built-in default, used when no fee is given; it does
+    /// not read the profile's fee.
+    CommandDefault,
+    /// Decoded from a presented or staged envelope.
+    Envelope,
+}
+
+fn fee_above_cap_text(per_op: u32, cap: u32, fee_source: &FeeSource) -> String {
+    match fee_source {
+        FeeSource::Selected { percentile } => format!(
+            "auto-selected per-operation fee {per_op} stroops (percentile {percentile}) exceeds \
+             the profile cap of {cap} stroops; raise classic_max_fee_per_op_stroops or accept a \
+             lower fee percentile"
+        ),
+        FeeSource::Explicit => format!(
+            "the explicit per-operation fee {per_op} stroops exceeds the profile cap of {cap} \
+             stroops; lower the fee or raise classic_max_fee_per_op_stroops"
+        ),
+        FeeSource::ProfileDefault => format!(
+            "the profile's per-operation fee {per_op} stroops (classic_fee_per_op_stroops) \
+             exceeds the profile cap of {cap} stroops; lower classic_fee_per_op_stroops or \
+             raise classic_max_fee_per_op_stroops"
+        ),
+        FeeSource::CommandDefault => format!(
+            "the default per-operation fee {per_op} stroops exceeds the profile cap of {cap} \
+             stroops; pass an explicit fee within the cap or raise \
+             classic_max_fee_per_op_stroops"
+        ),
+        FeeSource::Envelope => format!(
+            "the envelope's per-operation fee {per_op} stroops exceeds the profile cap of {cap} \
+             stroops; prepare the transaction again with a fee within the cap"
+        ),
+    }
 }
 
 impl ValidationError {
@@ -1562,6 +1668,11 @@ impl ValidationError {
             Self::SecretEnvNotSet { .. } => "validation.secret_env_not_set",
             Self::SecretEnvInvalid { .. } => "validation.secret_env_invalid",
             Self::SignerSourceRequired { .. } => "validation.signer_source_required",
+            Self::MainnetFeeCapRequired => "validation.mainnet_fee_cap_required",
+            // Fee taxonomy code on a validation-class variant: the code names
+            // the subsystem (fees.*) while the category stays Validation.
+            Self::FeeAboveCap { .. } => "fees.percentile_exceeds_cap",
+            Self::FeeTotalOverflow { .. } => "validation.fee_total_overflow",
         }
     }
 }
@@ -3254,6 +3365,25 @@ mod tests {
                 },
                 "validation.signer_source_required",
             ),
+            (
+                ValidationError::MainnetFeeCapRequired,
+                "validation.mainnet_fee_cap_required",
+            ),
+            (
+                ValidationError::FeeAboveCap {
+                    per_op: 500,
+                    cap: 400,
+                    fee_source: FeeSource::Envelope,
+                },
+                "fees.percentile_exceeds_cap",
+            ),
+            (
+                ValidationError::FeeTotalOverflow {
+                    per_op: u32::MAX,
+                    op_count: 3,
+                },
+                "validation.fee_total_overflow",
+            ),
         ];
 
         for (variant, expected_code) in cases {
@@ -3456,6 +3586,22 @@ mod tests {
                         detail: detail.clone(),
                     }
                 }
+                ValidationError::MainnetFeeCapRequired => ValidationError::MainnetFeeCapRequired,
+                ValidationError::FeeAboveCap {
+                    per_op,
+                    cap,
+                    fee_source,
+                } => ValidationError::FeeAboveCap {
+                    per_op: *per_op,
+                    cap: *cap,
+                    fee_source: fee_source.clone(),
+                },
+                ValidationError::FeeTotalOverflow { per_op, op_count } => {
+                    ValidationError::FeeTotalOverflow {
+                        per_op: *per_op,
+                        op_count: *op_count,
+                    }
+                }
             });
             assert_eq!(
                 wallet_err.code(),
@@ -3465,6 +3611,63 @@ mod tests {
             );
             assert_eq!(wallet_err.category(), ErrorCategory::Validation);
         }
+    }
+
+    /// Each fee source names its own remedy, and the mainnet and overflow
+    /// refusals carry their fixed texts.
+    #[test]
+    fn fee_cap_texts_name_the_fee_source() {
+        let text = |fee_source: FeeSource| {
+            ValidationError::FeeAboveCap {
+                per_op: 500,
+                cap: 400,
+                fee_source,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            text(FeeSource::Selected {
+                percentile: "p95".to_owned()
+            }),
+            "auto-selected per-operation fee 500 stroops (percentile p95) exceeds the profile \
+             cap of 400 stroops; raise classic_max_fee_per_op_stroops or accept a lower fee \
+             percentile"
+        );
+        assert_eq!(
+            text(FeeSource::Explicit),
+            "the explicit per-operation fee 500 stroops exceeds the profile cap of 400 stroops; \
+             lower the fee or raise classic_max_fee_per_op_stroops"
+        );
+        assert_eq!(
+            text(FeeSource::ProfileDefault),
+            "the profile's per-operation fee 500 stroops (classic_fee_per_op_stroops) exceeds \
+             the profile cap of 400 stroops; lower classic_fee_per_op_stroops or raise \
+             classic_max_fee_per_op_stroops"
+        );
+        assert_eq!(
+            text(FeeSource::CommandDefault),
+            "the default per-operation fee 500 stroops exceeds the profile cap of 400 stroops; \
+             pass an explicit fee within the cap or raise classic_max_fee_per_op_stroops"
+        );
+        assert_eq!(
+            text(FeeSource::Envelope),
+            "the envelope's per-operation fee 500 stroops exceeds the profile cap of 400 \
+             stroops; prepare the transaction again with a fee within the cap"
+        );
+        assert_eq!(
+            ValidationError::MainnetFeeCapRequired.to_string(),
+            "the mainnet profile sets no classic_max_fee_per_op_stroops; set the per-operation \
+             fee cap in the profile file"
+        );
+        assert_eq!(
+            ValidationError::FeeTotalOverflow {
+                per_op: 75_400_000,
+                op_count: 57,
+            }
+            .to_string(),
+            "per-operation fee 75400000 stroops times 57 operations exceeds the transaction fee \
+             limit; lower classic_fee_per_op_stroops"
+        );
     }
 
     // ── Network errors ───────────────────────────────────────────────────────
