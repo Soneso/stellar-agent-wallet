@@ -25,13 +25,14 @@
 
 #![cfg(feature = "test-helpers")]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_smart_account::error::SaError;
@@ -56,14 +57,6 @@ const PINNED_VERIFIER_FIRST8: &str = "4242424242424242";
 
 fn verifier() -> ScAddress {
     ScAddress::Contract(ContractId(Hash([0x2a; 32])))
-}
-
-fn read_audit_entries(log_path: &Path) -> Vec<AuditEntry> {
-    std::fs::read_to_string(log_path)
-        .expect("audit log must be readable")
-        .lines()
-        .filter_map(|line| serde_json::from_str::<AuditEntry>(line).ok())
-        .collect()
 }
 
 /// A signers manager over `rpc_url` on both endpoints with `timeout`.
@@ -131,7 +124,7 @@ async fn a_missing_baseline_refuses_before_the_drift_check_reads_the_chain() {
     let manager = signers_manager(
         &server.uri(),
         Arc::clone(&audit_writer),
-        audit_log_path.clone(),
+        audit_log_path,
         Duration::from_secs(5),
     );
     let credentials =
@@ -175,7 +168,7 @@ async fn a_missing_baseline_refuses_before_the_drift_check_reads_the_chain() {
             .is_empty(),
         "no RPC precedes the baseline read"
     );
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
     assert!(
         !entries.iter().any(|entry| matches!(
             entry.event_kind,
@@ -293,7 +286,7 @@ async fn a_changed_signer_set_refuses_at_the_comparison() {
     let manager = signers_manager(
         &server.uri(),
         Arc::clone(&audit_writer),
-        audit_log_path.clone(),
+        audit_log_path,
         Duration::from_secs(5),
     );
     let credentials =
@@ -330,7 +323,7 @@ async fn a_changed_signer_set_refuses_at_the_comparison() {
         other => panic!("expected SignerSetDivergence; got {other:?}"),
     }
     assert!(!ceremony_started.load(Ordering::SeqCst));
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
     let diverged: Vec<&AuditEntry> = entries
         .iter()
         .filter(|entry| {

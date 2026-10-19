@@ -90,11 +90,11 @@
 #![cfg(feature = "test-helpers")]
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::managers::signers::ObservedExecutable;
 use stellar_agent_smart_account::managers::verifiers::test_helpers;
@@ -125,24 +125,6 @@ fn first8_hex(hash: &[u8; 32]) -> String {
     hash[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Reads all non-empty JSONL lines from the audit log file.
-fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
-    let file = std::fs::File::open(log_path).expect("audit log must be readable");
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<AuditEntry>(trimmed) {
-            entries.push(entry);
-        }
-    }
-    entries
-}
-
 // ── Test: byte-identical no-drift contract + idempotence ──────────────────────
 
 /// When the mock RPC returns the same wasm-hash bytes that were pinned at
@@ -170,11 +152,7 @@ async fn wasm_hash_canonicalisation_parity_byte_identical_no_drift_and_idempoten
         .await;
 
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let manager = manager_one_url(
-        &server.uri(),
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    );
+    let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
 
     // ── Step 2: Write SaContextRuleCreated with pinned_first8 matching mock ──
     let rule_id: u32 = 1;
@@ -239,7 +217,7 @@ async fn wasm_hash_canonicalisation_parity_byte_identical_no_drift_and_idempoten
     );
 
     // ── Step 5: No SaVerifierHashDrift audit row must have been emitted ───────
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
     let drift_rows: Vec<_> = entries
         .iter()
         .filter(|e| {

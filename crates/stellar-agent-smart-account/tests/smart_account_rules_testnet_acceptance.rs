@@ -66,7 +66,6 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -77,6 +76,7 @@ use rand_core::OsRng;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EventKind, PinsUpdateReason, SaInvocationResult};
 use stellar_agent_core::audit_log::signer_set::BaselineReason;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::{Signer, SoftwareSigningKey};
@@ -217,23 +217,6 @@ fn fresh_manager_uncapped(
         .with_session_rule_max_horizon_ledgers(u32::MAX),
     )
     .expect("manager construction must succeed")
-}
-
-/// Reads every non-empty JSONL line from `log_path` into a `Vec<AuditEntry>`.
-fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
-    let file = std::fs::File::open(log_path).expect("audit log file must be readable");
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) {
-            entries.push(entry);
-        }
-    }
-    entries
 }
 
 /// Deploys a fresh smart-account whose constructor-rule signer is
@@ -596,7 +579,7 @@ async fn e1_install_rule_emits_audit_rows_via_self_audit_writer() {
     // AuditWriter per-entry fsync(2) makes the JSONL file
     // durable by the time install_rule's await returns; no explicit flush needed.
 
-    let entries = read_audit_entries(&log_path);
+    let entries = verified_audit_entries(&audit_arc);
     assert!(
         !entries.is_empty(),
         "audit log must contain at least one entry after install_rule; log is empty"
@@ -793,7 +776,7 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
         .expect("update_valid_until(None) must succeed");
 
     drop(manager);
-    let entries = read_audit_entries(&log_path);
+    let entries = verified_audit_entries(&audit_arc);
 
     // ── Typed name row: present once, redacted, correlated ──────────────────
     let name_rows: Vec<_> = entries
@@ -827,7 +810,7 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
         row_rid, &rename_request_id,
         "name row must carry the rename call's request_id"
     );
-    let log_text = std::fs::read_to_string(&log_path).expect("audit log must be readable");
+    let log_text = serde_json::to_string(&entries).expect("verified audit rows must serialize");
     assert!(
         !log_text.contains("e2-renamed"),
         "the verbatim rule name must never appear in the audit log"
@@ -986,7 +969,7 @@ async fn e3_self_authorized_rename_through_the_production_manager_shape() {
 
     // The install recorded exactly one baseline for the rule, from the
     // confirmed chain state.
-    let install_baselines: Vec<BaselineReason> = read_audit_entries(&log_path)
+    let install_baselines: Vec<BaselineReason> = verified_audit_entries(&audit_arc)
         .into_iter()
         .filter_map(|e| match e.event_kind {
             EventKind::SaSignerSetBaselinedV2 {
@@ -1035,7 +1018,7 @@ async fn e3_self_authorized_rename_through_the_production_manager_shape() {
         .await
         .expect("a rename authorized by the rule itself must pass both checks and confirm");
 
-    let entries = read_audit_entries(&log_path);
+    let entries = verified_audit_entries(&audit_arc);
 
     let (created_smart_account, created_verifier_pins, created_policy_pins) = entries
         .iter()
@@ -1144,7 +1127,7 @@ async fn e3_self_authorized_rename_through_the_production_manager_shape() {
     eprintln!("e3: rename {drift_request_id} under rule {rule_id} refused: {err}");
 
     drop(manager);
-    let entries = read_audit_entries(&log_path);
+    let entries = verified_audit_entries(&audit_arc);
     let policy_drift_rows: Vec<_> = entries
         .iter()
         .filter(|e| matches!(&e.event_kind, EventKind::SaPolicyHashDrift { .. }))

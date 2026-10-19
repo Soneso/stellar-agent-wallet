@@ -21,12 +21,13 @@
 //! `SaRawInvocation(PreSubmissionRefused)` audit row carrying the original
 //! `request_id`. No signing or submission occurs.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EventKind, SaInvocationResult};
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
+use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::signing::{Signer, SoftwareSigningKey};
 use stellar_agent_smart_account::error::SaError;
@@ -58,7 +59,7 @@ struct DivergenceFixture {
     signer: Box<dyn Signer + Send + Sync>,
     signer_address: ScAddress,
     smart_account: ScAddress,
-    audit_log_path: PathBuf,
+    audit_writer: Arc<Mutex<AuditWriter>>,
     _dir: tempfile::TempDir,
     primary_server: MockServer,
     secondary_server: MockServer,
@@ -139,7 +140,7 @@ async fn build_fixture() -> DivergenceFixture {
         &primary_server.uri(),
         &secondary_server.uri(),
         Arc::clone(&audit_writer),
-        audit_log_path.clone(),
+        audit_log_path,
     ));
     let manager = ContextRuleManager::new(
         ContextRuleManagerConfig::new(
@@ -149,7 +150,7 @@ async fn build_fixture() -> DivergenceFixture {
             CHAIN_ID.to_owned(),
         )
         .with_signers_manager(signers_manager)
-        .with_audit_writer(audit_writer),
+        .with_audit_writer(Arc::clone(&audit_writer)),
     )
     .expect("ContextRuleManager::new must succeed");
 
@@ -158,7 +159,7 @@ async fn build_fixture() -> DivergenceFixture {
         signer: Box::new(signer),
         signer_address,
         smart_account: zero_sc_address(),
-        audit_log_path,
+        audit_writer,
         _dir: dir,
         primary_server,
         secondary_server,
@@ -189,19 +190,11 @@ fn row_kind(entry: &AuditEntry) -> String {
         .to_owned()
 }
 
-fn read_audit_entries(log_path: &Path) -> Vec<AuditEntry> {
-    let content = std::fs::read_to_string(log_path).expect("audit log JSONL must be readable");
-    content
-        .lines()
-        .filter_map(|line| serde_json::from_str::<AuditEntry>(line).ok())
-        .collect()
-}
-
 /// Asserts the refusal's rows: the diverged row, then exactly one
 /// `SaRawInvocation(PreSubmissionRefused)` row with the divergence code, each
 /// carrying `request_id`; and that nothing was sent.
 async fn assert_divergence_rows(fixture: &DivergenceFixture, request_id: &str, op: &str) {
-    let entries = read_audit_entries(&fixture.audit_log_path);
+    let entries = verified_audit_entries(&fixture.audit_writer);
     let kinds: Vec<String> = entries
         .iter()
         .filter(|entry| entry.request_id == request_id)
@@ -213,11 +206,10 @@ async fn assert_divergence_rows(fixture: &DivergenceFixture, request_id: &str, o
         "{op}: the diverged row precedes the raw invocation row"
     );
     assert_eq!(fixture.sends().await, 0, "{op}: nothing is sent");
-    assert_divergence_raw_row(&fixture.audit_log_path, request_id, op);
+    assert_divergence_raw_row(&entries, request_id, op);
 }
 
-fn assert_divergence_raw_row(log_path: &Path, request_id: &str, op: &str) {
-    let entries = read_audit_entries(log_path);
+fn assert_divergence_raw_row(entries: &[AuditEntry], request_id: &str, op: &str) {
     let raw_rows: Vec<&AuditEntry> = entries
         .iter()
         .filter(|entry| {

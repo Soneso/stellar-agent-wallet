@@ -110,6 +110,8 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
+use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 use stellar_agent_network::{Asset, StellarRpcClient, fetch_account};
 use zeroize::Zeroizing;
 
@@ -562,26 +564,22 @@ async fn profile_init_then_enroll_signer_enables_a_real_signing_operation() {
 
     // ── Audit-log proof: the confirmed submit recorded a value_action_submitted
     // row (the fail-closed pre-flight guards exactly this row) ───────────────
-    let audit_log_raw = std::fs::read_to_string(&audit_log_path).unwrap_or_else(|e| {
-        panic!(
-            "audit log must exist at the profile's (redirected) audit_log_path \
-             {}: {e}",
-            audit_log_path.display()
-        )
-    });
+    let audit_entries = verified_audit_entries_from_path(&audit_log_path);
     let redacted_tx_hash = stellar_agent_network::submit::redact_tx_hash(tx_hash);
-    let found_row = audit_log_raw.lines().any(|line| {
-        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
-            return false;
-        };
-        row["kind"].as_str() == Some("value_action_submitted")
-            && row["tool"].as_str() == Some("stellar_trustline")
-            && row["transaction_hash_redacted"].as_str() == Some(redacted_tx_hash.as_str())
+    let found_row = audit_entries.iter().any(|entry| {
+        entry.tool == "stellar_trustline"
+            && matches!(
+                &entry.event_kind,
+                EventKind::ValueActionSubmitted {
+                    transaction_hash_redacted,
+                    ..
+                } if transaction_hash_redacted == &redacted_tx_hash
+            )
     });
     assert!(
         found_row,
         "the audit log at {} must contain a value_action_submitted row for \
-         stellar_trustline with transaction_hash_redacted {redacted_tx_hash}: {audit_log_raw}",
+         stellar_trustline with transaction_hash_redacted {redacted_tx_hash}: {audit_entries:?}",
         audit_log_path.display()
     );
 }

@@ -77,7 +77,7 @@ stellar-agent-smart-account = { workspace = true, optional = true, features = ["
 # Live-network helpers: Friendbot funding, contract upload, source-account
 # invocation, SAC funding. keyring_mock seeds the in-memory keyring store.
 stellar-agent-test-support = { workspace = true, optional = true, features = ["testnet-helpers"] }
-stellar-agent-core = { workspace = true, optional = true }
+stellar-agent-core = { workspace = true, optional = true, features = ["test-helpers"] }
 stellar-agent-network = { workspace = true, optional = true }
 # WebAuthn ceremony (rules_webauthn and the ergonomics passkey test): the
 # bridge listener, the CDP virtual-authenticator client, StreamExt for its

@@ -96,7 +96,6 @@
     reason = "test-only; panics are acceptable in testnet acceptance tests"
 )]
 
-use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -107,6 +106,7 @@ use rand_core::OsRng;
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{ContractKind, EventKind};
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
@@ -213,23 +213,6 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
     let path = dir.path().join("audit.jsonl");
     let writer = AuditWriter::open(path.clone(), None).expect("AuditWriter::open must succeed");
     (Arc::new(Mutex::new(writer)), path, dir)
-}
-
-/// Reads every non-empty JSONL line from `log_path` into `Vec<AuditEntry>`.
-fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
-    let file = std::fs::File::open(log_path).expect("audit log file must be readable");
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) {
-            entries.push(entry);
-        }
-    }
-    entries
 }
 
 /// Constructs a `SignersManager` using the same testnet endpoint for both
@@ -634,7 +617,7 @@ async fn pin_and_install_with_canonical_oz_threshold_policy_no_drift() {
     drop(manager);
     drop(sm);
 
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
     assert!(
         !entries.is_empty(),
         "audit log must contain at least one entry after install_rule"
@@ -970,26 +953,10 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
     }
 
     // ── Scan audit log for the two drift rows ─────────────────────────────────
-    let log_path = {
-        let guard = audit_writer.lock().expect("audit writer lock for path");
-        guard.path().to_path_buf()
-    };
-
-    let file =
-        std::fs::File::open(&log_path).expect("audit log file must exist after sign attempt");
-    let reader = BufReader::new(file);
-
     let mut drift_entry: Option<AuditEntry> = None;
     let mut assertion_entry: Option<AuditEntry> = None;
 
-    for line_result in reader.lines() {
-        let Ok(line) = line_result else { continue };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) else {
-            continue;
-        };
+    for entry in verified_audit_entries(&audit_writer) {
         match &entry.event_kind {
             EventKind::SaPolicyHashDrift { rule_id: rid, .. } if *rid == rule_id => {
                 drift_entry = Some(entry);
@@ -1146,7 +1113,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
     // (already allowlist-checked by `pin_referenced_contracts`).  This is what
     // The real hash is read from the install-time pin row here.
     let smart_account_redacted = redact_strkey_first5_last5(&sa_strkey);
-    let install_entries = read_audit_entries(&audit_log_path);
+    let install_entries = verified_audit_entries(&audit_writer);
     let install_pin_row = install_entries
         .iter()
         .find(|e| {
@@ -1318,7 +1285,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
 
     // ── Verify audit rows from the drift-firing attempt ───────────────────────
 
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
 
     let drift_entry = entries.iter().rev().find(|e| {
         matches!(
@@ -1535,7 +1502,7 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
     );
 
     // ── Assert: PasskeyAssertion(failure:drift_check_unavailable) emitted ─────
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
 
     let assertion_entry = entries.iter().rev().find(|e| {
         matches!(
@@ -1764,7 +1731,7 @@ async fn install_rule_refuses_mutable_verifier_without_override() {
     drop(manager);
     drop(sm);
 
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
     assert_failed_install_wrote_no_override_row(&entries, &request_id, "sa.verifier_mutable");
 }
 
@@ -1884,7 +1851,7 @@ async fn accept_mutable_verifier_override_writes_no_row_for_a_failed_install() {
     }
 
     // ── The failed install writes no override row ────────────────────────────
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
     assert_failed_install_wrote_no_override_row(&entries, &request_id, "sa.deployment_failed");
 
     // ── The pin check alone returns both overrides pending ───────────────────
@@ -1924,7 +1891,7 @@ async fn accept_mutable_verifier_override_writes_no_row_for_a_failed_install() {
     drop(manager);
     drop(sm);
     assert_eq!(
-        read_audit_entries(&audit_log_path).len(),
+        verified_audit_entries(&audit_writer).len(),
         entries.len(),
         "the pin check writes no audit row"
     );
@@ -2043,7 +2010,7 @@ async fn accept_unknown_verifier_override_writes_no_row_for_a_failed_install() {
     }
 
     // ── The failed install writes no override row ────────────────────────────
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
     assert_failed_install_wrote_no_override_row(&entries, &request_id, "sa.deployment_failed");
 
     // ── The pin check alone returns the unknown-hash override pending ────────
@@ -2079,7 +2046,7 @@ async fn accept_unknown_verifier_override_writes_no_row_for_a_failed_install() {
     drop(manager);
     drop(sm);
     assert_eq!(
-        read_audit_entries(&audit_log_path).len(),
+        verified_audit_entries(&audit_writer).len(),
         entries.len(),
         "the pin check writes no audit row"
     );

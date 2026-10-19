@@ -75,7 +75,7 @@ use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_core::audit_log::signer_set::{
     BaselineReason, ObservedSignerSet, SignerIdentityV2, SignerPubkey, SignerSetView,
 };
-use stellar_agent_core::audit_log::verify::verify_log;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
@@ -205,20 +205,6 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
     (Arc::new(Mutex::new(writer)), path, dir)
 }
 
-/// Returns every audit row in chain order after verifying the complete chain.
-fn verified_audit_entries(audit_writer: &Arc<Mutex<AuditWriter>>) -> Vec<AuditEntry> {
-    let writer = audit_writer.lock().expect("audit writer lock");
-    let verified = verify_log(writer.path(), None).expect("audit log must verify");
-    let mut entries = Vec::new();
-    for file in verified.per_file {
-        let contents = std::fs::read_to_string(file.path).expect("audit log must be readable");
-        for line in contents.lines().filter(|line| !line.trim().is_empty()) {
-            entries.push(serde_json::from_str(line).expect("audit row must parse"));
-        }
-    }
-    entries
-}
-
 /// Counts `(SaSignerRemovedV2, SaThresholdChangedV2)` rows across the verified audit chain.
 fn signer_mutation_counts(audit_writer: &Arc<Mutex<AuditWriter>>) -> (usize, usize) {
     let mut signer_removed_count = 0;
@@ -231,6 +217,84 @@ fn signer_mutation_counts(audit_writer: &Arc<Mutex<AuditWriter>>) -> (usize, usi
         }
     }
     (signer_removed_count, threshold_changed_count)
+}
+
+/// Asserts that the added signer's full identity appears under its assigned id.
+fn assert_external_signer_added(
+    audit_writer: &Arc<Mutex<AuditWriter>>,
+    rule_id: u32,
+    new_signer_id: u32,
+    verifier_strkey: &str,
+    key_data: &[u8],
+) {
+    let verifier_id = stellar_strkey::Contract::from_string(verifier_strkey)
+        .expect("verifier C-strkey must parse")
+        .0;
+    let expected_identity = SignerIdentityV2::External {
+        verifier: verifier_id,
+        key_data_sha256: Sha256::digest(key_data).into(),
+        key_data_len: u32::try_from(key_data.len()).expect("key data length fits u32"),
+    };
+    let mut found = false;
+    for entry in verified_audit_entries(audit_writer) {
+        if let EventKind::SaSignerAddedV2 {
+            rule_id: row_rule_id,
+            signer_id: row_id,
+            snapshot,
+            ..
+        } = &entry.event_kind
+            && *row_rule_id == rule_id
+            && *row_id == new_signer_id
+        {
+            assert!(
+                snapshot
+                    .signers
+                    .iter()
+                    .any(|e| e.id == new_signer_id && e.identity == expected_identity),
+                "the snapshot must hold the added External signer on verifier \
+                 {verifier_strkey} under id {new_signer_id}"
+            );
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "SaSignerAddedV2 audit row for rule_id={rule_id}, \
+         signer_id={new_signer_id} must be emitted"
+    );
+}
+
+/// Records a newer version-1 baseline whose threshold diverges from the rule.
+fn inject_divergent_baseline(
+    audit_writer: &Arc<Mutex<AuditWriter>>,
+    rule_id: u32,
+    smart_account_redacted: &str,
+) {
+    let fabricated_state = ObservedSignerSet {
+        signer_count: 1,
+        threshold: 2,
+        signer_ids: vec![0],
+        signer_pubkeys: vec![SignerPubkey::Ed25519 {
+            pubkey: [0xaau8; 32],
+        }],
+    };
+    let mut writer = audit_writer.lock().expect("audit writer lock for inject");
+    let prev_chain_tip = writer.current_chain_tip();
+    let entry = AuditEntry::new_sa_signer_set_baselined(
+        rule_id,
+        &fabricated_state,
+        vec!["aaaaaaaaaaaaaaaa".to_owned()],
+        0,
+        BaselineReason::first_observation(),
+        prev_chain_tip,
+        RedactedStrkey::from_already_redacted(smart_account_redacted),
+        CHAIN_ID,
+        rid(),
+    );
+    writer
+        .write_entry(entry)
+        .expect("baseline inject must succeed");
 }
 
 /// Constructs a `ContextRuleManager` for testnet whose installs record their
@@ -881,32 +945,7 @@ async fn b3_divergence_detection_via_injected_baseline() {
     // injected row is newer than the baseline the install recorded, so it is
     // the row the check compares with.
     let smart_account_redacted = redact_strkey_first5_last5(&sa_strkey);
-    let fabricated_state = ObservedSignerSet {
-        signer_count: 1,
-        threshold: 2, // diverges from on-chain threshold=1
-        signer_ids: vec![0],
-        signer_pubkeys: vec![SignerPubkey::Ed25519 {
-            pubkey: [0xaau8; 32],
-        }],
-    };
-    let fabricated_pubkeys_first8 = vec!["aaaaaaaaaaaaaaaa".to_owned()];
-
-    {
-        let mut writer = audit_writer.lock().expect("audit writer lock");
-        let prev_chain_tip = writer.current_chain_tip();
-        let entry = AuditEntry::new_sa_signer_set_baselined(
-            rule_id,
-            &fabricated_state,
-            fabricated_pubkeys_first8,
-            0, // observed_at_unix_ms (sentinel)
-            BaselineReason::first_observation(),
-            prev_chain_tip,
-            RedactedStrkey::from_already_redacted(smart_account_redacted.as_str()),
-            CHAIN_ID,
-            rid(),
-        );
-        writer.write_entry(entry).expect("audit write must succeed");
-    }
+    inject_divergent_baseline(&audit_writer, rule_id, &smart_account_redacted);
 
     // Verify: audit log claims threshold=2; on-chain has threshold=1 → SignerSetDiverged.
     let req_id = rid();
@@ -1174,45 +1213,13 @@ async fn b7_add_external_signer_to_existing_rule() {
     // SaSignerAddedV2 carries `signer_id` (the assigned on-chain ID) and the
     // resulting `snapshot`. We verify `signer_id == new_signer_id` and that the
     // snapshot holds the added signer's full identity under that id.
-    let verifier_id = stellar_strkey::Contract::from_string(&verifier_strkey)
-        .expect("verifier C-strkey must parse")
-        .0;
-    let expected_identity = SignerIdentityV2::External {
-        verifier: verifier_id,
-        key_data_sha256: Sha256::digest(&key_data).into(),
-        key_data_len: u32::try_from(key_data.len()).expect("key data length fits u32"),
-    };
-    {
-        let mut found = false;
-        for entry in verified_audit_entries(&audit_writer) {
-            if let EventKind::SaSignerAddedV2 {
-                rule_id: row_rule_id,
-                signer_id: row_id,
-                snapshot,
-                ..
-            } = &entry.event_kind
-                && *row_rule_id == rule_id
-                && *row_id == new_signer_id
-            {
-                // The snapshot holds the added signer's full identity under
-                // the new id.
-                assert!(
-                    snapshot
-                        .signers
-                        .iter()
-                        .any(|e| e.id == new_signer_id && e.identity == expected_identity),
-                    "the snapshot must hold the added External signer under id {new_signer_id}"
-                );
-                found = true;
-                break;
-            }
-        }
-        assert!(
-            found,
-            "SaSignerAddedV2 audit row for rule_id={rule_id}, \
-             signer_id={new_signer_id} must be emitted"
-        );
-    }
+    assert_external_signer_added(
+        &audit_writer,
+        rule_id,
+        new_signer_id,
+        &verifier_strkey,
+        &key_data,
+    );
 }
 
 // ── WebAuthn signer add ───────────────────────────────────────────────────────
@@ -1413,44 +1420,13 @@ async fn b8_add_webauthn_signer_to_existing_rule() {
     // verifier and whose key data is the whole `pubkey_65 || credential_id`.
     // A WebAuthn signer reads back as `External` because the on-chain OZ
     // `Signer` type has no `WebAuthn` variant.
-    let verifier_id = stellar_strkey::Contract::from_string(&verifier_strkey)
-        .expect("verifier C-strkey must parse")
-        .0;
-    let expected_identity = SignerIdentityV2::External {
-        verifier: verifier_id,
-        key_data_sha256: Sha256::digest(&key_data).into(),
-        key_data_len: u32::try_from(key_data.len()).expect("key data length fits u32"),
-    };
-    {
-        let mut found = false;
-        for entry in verified_audit_entries(&audit_writer) {
-            if let EventKind::SaSignerAddedV2 {
-                rule_id: row_rule_id,
-                signer_id: row_id,
-                snapshot,
-                ..
-            } = &entry.event_kind
-                && *row_rule_id == rule_id
-                && *row_id == new_signer_id
-            {
-                assert!(
-                    snapshot
-                        .signers
-                        .iter()
-                        .any(|e| e.id == new_signer_id && e.identity == expected_identity),
-                    "the snapshot must hold the added WebAuthn signer as an External \
-                     identity on verifier {verifier_strkey} under id {new_signer_id}"
-                );
-                found = true;
-                break;
-            }
-        }
-        assert!(
-            found,
-            "SaSignerAddedV2 audit row for rule_id={rule_id}, \
-             signer_id={new_signer_id} must be emitted"
-        );
-    }
+    assert_external_signer_added(
+        &audit_writer,
+        rule_id,
+        new_signer_id,
+        &verifier_strkey,
+        &key_data,
+    );
 }
 
 /// Returns `true` when `s` matches the canonical `<16hex>...<16hex>` format
@@ -1692,7 +1668,7 @@ async fn b5_a_policyless_rule_baselines_without_a_threshold() {
 /// (from the outer `sign_with_passkey_rule` wrapper) — that share the SAME
 /// `request_id` UUID.
 ///
-/// Forensic-correlation invariant: both rows MUST land in the same JSONL file
+/// Forensic-correlation invariant: both rows MUST land in the same audit chain
 /// (single shared writer) and carry the same `request_id` so operators can
 /// correlate the divergence event with the signing attempt that triggered it.
 ///
@@ -1700,7 +1676,7 @@ async fn b5_a_policyless_rule_baselines_without_a_threshold() {
 ///
 /// `CredentialsManager::sign_with_passkey_rule` and `SignersManager` share the
 /// same `Arc<Mutex<AuditWriter>>` so there is no second open and both rows land
-/// in the same file.
+/// in the same audit chain.
 ///
 /// # Setup
 ///
@@ -1755,32 +1731,7 @@ async fn b6_audit_log_request_id_pairing_across_divergence_emit() {
     // the passkey path's check compares the chain with it.
 
     let smart_account_redacted = redact_strkey_first5_last5(&sa_strkey);
-    let fabricated_state = ObservedSignerSet {
-        signer_count: 1,
-        threshold: 2, // diverges from on-chain threshold=1
-        signer_ids: vec![0],
-        signer_pubkeys: vec![SignerPubkey::Ed25519 {
-            pubkey: [0xaau8; 32],
-        }],
-    };
-    {
-        let mut writer = audit_writer.lock().expect("audit writer lock for inject");
-        let prev_chain_tip = writer.current_chain_tip();
-        let entry = AuditEntry::new_sa_signer_set_baselined(
-            rule_id,
-            &fabricated_state,
-            vec!["aaaaaaaaaaaaaaaa".to_owned()],
-            0,
-            BaselineReason::first_observation(),
-            prev_chain_tip,
-            RedactedStrkey::from_already_redacted(smart_account_redacted.as_str()),
-            CHAIN_ID,
-            rid(),
-        );
-        writer
-            .write_entry(entry)
-            .expect("baseline inject must succeed");
-    }
+    inject_divergent_baseline(&audit_writer, rule_id, &smart_account_redacted);
 
     // ── Call sign_with_passkey_rule ───────────────────────────────────────────
     //

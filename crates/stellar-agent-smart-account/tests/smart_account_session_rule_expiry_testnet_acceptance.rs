@@ -45,15 +45,13 @@
     reason = "test-only; panics and diagnostic output are acceptable in testnet acceptance tests"
 )]
 
-use std::io::BufRead as _;
-use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
-use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EventKind, SaInvocationResult};
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_smart_account::SaError;
@@ -230,22 +228,6 @@ fn tmp_audit_writer() -> (
     (Arc::new(Mutex::new(writer)), path, dir)
 }
 
-fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
-    let file = std::fs::File::open(log_path).expect("audit log file must be readable");
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) {
-            entries.push(entry);
-        }
-    }
-    entries
-}
-
 /// A testnet rule manager writing to `audit_writer`, with a signers manager
 /// over the same writer, whose log is `audit_log_path`. Rule install and the
 /// policy verbs require the signers manager.
@@ -395,7 +377,7 @@ async fn h_1_revocation_audit_log_timeline() {
     eprintln!("revocation submitted successfully");
 
     // ── Step 5: Verify audit log records the revocation timeline ──────────────
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
 
     // Expect at minimum: install rows + revocation SaRawInvocation.
     // `SaRawInvocation` carries `wire_code` and `result`; there is no `op` field —
