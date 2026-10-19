@@ -76,7 +76,7 @@ use rand_core::OsRng;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EventKind, PinsUpdateReason, SaInvocationResult};
 use stellar_agent_core::audit_log::signer_set::BaselineReason;
-use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
+use stellar_agent_core::audit_log::test_helpers::{verified_audit_entries, verified_audit_lines};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::{Signer, SoftwareSigningKey};
@@ -810,9 +810,10 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
         row_rid, &rename_request_id,
         "name row must carry the rename call's request_id"
     );
-    let log_text = serde_json::to_string(&entries).expect("verified audit rows must serialize");
     assert!(
-        !log_text.contains("e2-renamed"),
+        verified_audit_lines(&audit_arc)
+            .iter()
+            .all(|line| !line.contains("e2-renamed")),
         "the verbatim rule name must never appear in the audit log"
     );
 
