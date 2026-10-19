@@ -46,7 +46,6 @@
     reason = "test-only; panics and diagnostic output are acceptable in testnet acceptance tests"
 )]
 
-use std::io::{BufRead as _, BufReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +56,7 @@ use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_core::audit_log::signer_set::ThresholdObservation;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::{
@@ -150,25 +150,9 @@ async fn fund_via_friendbot(g_strkey: &str) {
     );
 }
 
-fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
-    let file = std::fs::File::open(log_path).expect("audit log file must be readable");
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) {
-            entries.push(entry);
-        }
-    }
-    entries
-}
-
-/// The audit rows written under `request_id`, in log order.
-fn rows_for_request(log_path: &std::path::Path, request_id: &str) -> Vec<AuditEntry> {
-    read_audit_entries(log_path)
+/// The verified audit rows written under `request_id`, in chain order.
+fn rows_for_request(manager: &ContextRuleManager, request_id: &str) -> Vec<AuditEntry> {
+    verified_audit_entries(&manager.audit_writer().expect("manager has an audit writer"))
         .into_iter()
         .filter(|entry| entry.request_id == request_id)
         .collect()
@@ -537,7 +521,7 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
     let signer_addr =
         parse_g_strkey_to_signer_address(&signer_g).expect("[h3] signer G-strkey must parse");
 
-    let (rule_manager, signers_manager, audit_log_path, _audit_dir) = fresh_managers();
+    let (rule_manager, signers_manager, _audit_log_path, _audit_dir) = fresh_managers();
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
         "h3-add-policy-test".to_owned(),
@@ -618,7 +602,7 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
     eprintln!("[h3] post-add_policy policy_count = {count_after}");
 
     // ── Step 8: Assert the attach's audit rows ────────────────────────────────
-    let entries = rows_for_request(&audit_log_path, &request_id);
+    let entries = rows_for_request(&rule_manager, &request_id);
     assert!(
         !entries.is_empty(),
         "[h3] audit log must contain the attach's rows"
@@ -746,7 +730,7 @@ async fn h3_add_policy_increments_count_and_emits_audit_row() {
         matches!(second, SaError::ThresholdPolicyIdentificationFailed { .. }),
         "[h3] expected ThresholdPolicyIdentificationFailed; got {second:?}"
     );
-    let second_entries = rows_for_request(&audit_log_path, &second_request_id);
+    let second_entries = rows_for_request(&rule_manager, &second_request_id);
     assert!(
         !second_entries
             .iter()
@@ -822,7 +806,7 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
     let signer_addr =
         parse_g_strkey_to_signer_address(&signer_g).expect("[h4] signer G-strkey must parse");
 
-    let (rule_manager, signers_manager, audit_log_path, _audit_dir) = fresh_managers();
+    let (rule_manager, signers_manager, _audit_log_path, _audit_dir) = fresh_managers();
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
         "h4-rm-policy-test".to_owned(),
@@ -924,7 +908,7 @@ async fn h4_remove_policy_decrements_count_and_emits_audit_row() {
     eprintln!("[h4] post-remove_policy policy_count = {count_after}");
 
     // ── Step 8: Assert the detach's audit rows ────────────────────────────────
-    let entries = rows_for_request(&audit_log_path, &request_id);
+    let entries = rows_for_request(&rule_manager, &request_id);
     assert!(
         !entries.is_empty(),
         "[h4] audit log must contain the removal's rows"
@@ -1122,7 +1106,7 @@ async fn h5_add_policy_type_mismatched_install_param_no_success_audit() {
     let signer_addr =
         parse_g_strkey_to_signer_address(&signer_g).expect("[h5] signer G-strkey must parse");
 
-    let (rule_manager, _signers_manager, audit_log_path, _audit_dir) = fresh_managers();
+    let (rule_manager, _signers_manager, _audit_log_path, _audit_dir) = fresh_managers();
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
         "h5-type-mismatch".to_owned(),
@@ -1197,7 +1181,7 @@ async fn h5_add_policy_type_mismatched_install_param_no_success_audit() {
     }
 
     // ── Step 8: Assert NO SaPolicyAdded audit row ─────────────────────────────
-    let entries = rows_for_request(&audit_log_path, &request_id);
+    let entries = rows_for_request(&rule_manager, &request_id);
 
     let policy_added_count = entries
         .iter()

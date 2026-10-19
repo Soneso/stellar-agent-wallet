@@ -108,7 +108,6 @@
 #[path = "../../stellar-agent-smart-account/tests/common/mod.rs"]
 mod common;
 
-use std::io::BufRead;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -126,8 +125,8 @@ use futures::StreamExt as _;
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::approval::store::PendingApprovalStore;
-use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::is_loopback_http_url;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
@@ -250,23 +249,6 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
     let path = dir.path().join("audit.jsonl");
     let writer = AuditWriter::open(path.clone(), None).expect("AuditWriter::open must succeed");
     (Arc::new(Mutex::new(writer)), path, dir)
-}
-
-/// Reads back every `AuditEntry` from a JSONL audit log.
-fn read_audit_entries(log_path: &Path) -> Vec<AuditEntry> {
-    let file = std::fs::File::open(log_path).expect("audit log file must be readable");
-    let reader = std::io::BufReader::new(file);
-    let mut entries = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) {
-            entries.push(entry);
-        }
-    }
-    entries
 }
 
 /// Constructs a `ContextRuleManager` against testnet over `signers_manager`
@@ -957,7 +939,7 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
     .expect("weighted-threshold install param must build");
 
     let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
-    let signers_mgr = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
+    let signers_mgr = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path);
     let rule_manager = fresh_rule_manager(&signers_mgr, &audit_writer);
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
@@ -1104,7 +1086,7 @@ async fn weighted_threshold_enforcement_proof_testnet_acceptance() {
         "signer B's weight must be 2 after the bump"
     );
 
-    let entries_after_bump = read_audit_entries(&audit_log_path);
+    let entries_after_bump = verified_audit_entries(&audit_writer);
     let weight_changed_entry = entries_after_bump.iter().find_map(|e| match &e.event_kind {
         EventKind::SaSignerWeightChanged {
             rule_id: entry_rule_id,
@@ -1443,7 +1425,7 @@ async fn batch_add_delegated_signers_testnet_acceptance() {
 
     let admin_sc = parse_g_strkey_to_signer_address(&admin_g).expect("admin G-strkey must parse");
     let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
-    let signers_mgr = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
+    let signers_mgr = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path);
     let rule_manager = fresh_rule_manager(&signers_mgr, &audit_writer);
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,
@@ -1541,7 +1523,7 @@ async fn batch_add_delegated_signers_testnet_acceptance() {
 
     // One SaSignerAddedV2 audit row per new signer, each naming one of the
     // returned IDs.
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
     let signer_added_ids: Vec<u32> = entries
         .iter()
         .filter_map(|e| match &e.event_kind {

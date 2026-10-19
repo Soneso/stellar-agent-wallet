@@ -54,15 +54,14 @@
     reason = "test-only; panics and diagnostic output are acceptable in testnet acceptance tests"
 )]
 
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
-use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_smart_account::error::{SaError, TimelockExecuteFailureReason};
 use stellar_agent_smart_account::timelock::{
@@ -162,29 +161,6 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, tempfile::TempDir) {
     (Arc::new(Mutex::new(writer)), path, dir)
 }
 
-/// Reads all `AuditEntry` lines from a JSONL audit log file.
-///
-/// Uses `BufReader::lines()` + `serde_json::from_str` to parse one JSON
-/// object per line.
-fn read_audit_entries(path: &PathBuf) -> Vec<AuditEntry> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return vec![],
-    };
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) {
-            entries.push(entry);
-        }
-    }
-    entries
-}
-
 /// Deploys the OZ timelock-controller v0.7.2 WASM to testnet and returns the
 /// contract C-strkey.
 ///
@@ -275,7 +251,7 @@ async fn t1_schedule_cancel_lifecycle() {
     let (signer_g, seed_bytes, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
-    let (audit_writer, audit_log_path, _tmpdir) = tmp_audit_writer();
+    let (audit_writer, _audit_log_path, _tmpdir) = tmp_audit_writer();
     let request_id_schedule = uuid::Uuid::new_v4().to_string();
     let request_id_cancel = uuid::Uuid::new_v4().to_string();
 
@@ -311,7 +287,7 @@ async fn t1_schedule_cancel_lifecycle() {
 
     // Verify SaTimelockScheduled audit row is present.
     {
-        let entries = read_audit_entries(&audit_log_path);
+        let entries = verified_audit_entries(&audit_writer);
         let scheduled_rows: Vec<_> = entries
             .iter()
             .filter(|e| {
@@ -352,7 +328,7 @@ async fn t1_schedule_cancel_lifecycle() {
 
     // Step 3: Verify SaTimelockCancelled audit row.
     {
-        let entries = read_audit_entries(&audit_log_path);
+        let entries = verified_audit_entries(&audit_writer);
         let cancelled_rows: Vec<_> = entries
             .iter()
             .filter(|e| {
@@ -682,7 +658,7 @@ async fn t5_schedule_emits_audit_row() {
     let (signer_g, seed_bytes, signer_box) = fresh_signer();
     fund_via_friendbot(&signer_g).await;
 
-    let (audit_writer, audit_log_path, _tmpdir) = tmp_audit_writer();
+    let (audit_writer, _audit_log_path, _tmpdir) = tmp_audit_writer();
     let request_id = uuid::Uuid::new_v4().to_string();
 
     let timelock_strkey = deploy_timelock_controller(&signer_g, seed_bytes, &signer_g, 5).await;
@@ -712,7 +688,7 @@ async fn t5_schedule_emits_audit_row() {
 
     eprintln!("[T-5] scheduled: {}", operation_id.redacted());
 
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
 
     let matching: Vec<_> = entries
         .iter()

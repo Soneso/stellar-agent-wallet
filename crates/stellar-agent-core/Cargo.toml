@@ -62,8 +62,8 @@ keyring-core = { workspace = true }
 stellar-agent-windows-identity = { workspace = true }
 
 [features]
-# Exposes proptest strategy generators to downstream integration-test crates,
-# which do not receive cfg(test) and so cannot reach test-only items.
+# Exposes policy strategies and verified audit reads to integration tests,
+# which do not receive cfg(test).
 test-helpers = ["dep:proptest", "dep:stellar-agent-test-support"]
 
 [dev-dependencies]

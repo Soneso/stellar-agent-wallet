@@ -15,13 +15,13 @@
 
 #![cfg(feature = "test-helpers")]
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
@@ -109,14 +109,6 @@ impl Respond for SequencedLedgerResponder {
     }
 }
 
-fn read_audit_entries(log_path: &Path) -> Vec<AuditEntry> {
-    std::fs::read_to_string(log_path)
-        .expect("audit log must be readable")
-        .lines()
-        .filter_map(|line| serde_json::from_str::<AuditEntry>(line).ok())
-        .collect()
-}
-
 #[tokio::test]
 async fn policy_rpc_divergence_routes_to_drift_check_unavailable() {
     let (audit_writer, audit_log_path, dir) = tmp_audit_writer();
@@ -190,7 +182,7 @@ async fn policy_rpc_divergence_routes_to_drift_check_unavailable() {
         &primary.uri(),
         &secondary.uri(),
         Arc::clone(&audit_writer),
-        audit_log_path.clone(),
+        audit_log_path,
     ));
     let manager =
         CredentialsManager::new(dir.path().join("passkeys"), "default", "localhost", None);
@@ -222,7 +214,7 @@ async fn policy_rpc_divergence_routes_to_drift_check_unavailable() {
         }
     }
 
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
     assert!(
         !entries.iter().any(|entry| matches!(
             entry.event_kind,

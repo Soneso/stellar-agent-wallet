@@ -1242,6 +1242,8 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
     use base64::Engine as _;
     use stellar_agent_core::audit_log::AuditWriter;
     use stellar_agent_core::audit_log::reader::{ValueActionSettlement, value_action_settlement};
+    use stellar_agent_core::audit_log::schema::EventKind;
+    use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 
     let mut fx = fixture("record-admission");
     let audit_path = fx._dir.path().join("audit").join("log.jsonl");
@@ -1370,6 +1372,8 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
         1,
         "only the admitted submission's reservation stands"
     );
+    drop(first_recorder);
+    drop(second_recorder);
     drop(audit);
     assert!(
         matches!(
@@ -1381,14 +1385,17 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
     // The row that closes the pending row names the refusal that stopped the
     // submission, so the audit log records a cap refusal as the policy denial
     // it is.
-    let closing_code = std::fs::read_to_string(&audit_path)
-        .unwrap()
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|row| {
-            row["envelope_hash"] == second_hash.as_str() && row["kind"] == "value_action_failed"
+    let closing_code = verified_audit_entries_from_path(&audit_path)
+        .into_iter()
+        .find_map(|entry| {
+            if entry.envelope_hash.as_deref() != Some(second_hash.as_str()) {
+                return None;
+            }
+            match entry.event_kind {
+                EventKind::ValueActionFailed { code, .. } => Some(code),
+                _ => None,
+            }
         })
-        .map(|row| row["code"].as_str().unwrap_or_default().to_owned())
         .expect("the closing row for the refused submission");
     assert_eq!(
         closing_code, "policy.deny.per_period_cap_exceeded",

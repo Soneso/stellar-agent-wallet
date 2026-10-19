@@ -80,6 +80,7 @@ testnet-acceptance = ["test-helpers", "stellar-agent-mcp/test-helpers", "stellar
 operator-enroll-browser-acceptance = ["test-helpers"]
 
 [dev-dependencies]
+stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 serial_test = { workspace = true }
 keyring-core = { workspace = true }

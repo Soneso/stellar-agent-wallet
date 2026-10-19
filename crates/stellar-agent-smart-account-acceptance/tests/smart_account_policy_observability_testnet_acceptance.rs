@@ -64,7 +64,6 @@
 #[path = "../../stellar-agent-smart-account/tests/common/mod.rs"]
 mod common;
 
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -78,8 +77,8 @@ use common::{
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest as _, Sha256};
-use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
@@ -211,23 +210,6 @@ fn tmp_audit_writer() -> (Arc<Mutex<AuditWriter>>, PathBuf, TempDir) {
     let path = dir.path().join("audit.jsonl");
     let writer = AuditWriter::open(path.clone(), None).expect("AuditWriter::open must succeed");
     (Arc::new(Mutex::new(writer)), path, dir)
-}
-
-/// Reads back every `AuditEntry` from a JSONL audit log.
-fn read_audit_entries(log_path: &Path) -> Vec<AuditEntry> {
-    let file = std::fs::File::open(log_path).expect("audit log file must be readable");
-    let reader = std::io::BufReader::new(file);
-    let mut entries = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) {
-            entries.push(entry);
-        }
-    }
-    entries
 }
 
 /// Constructs a `ContextRuleManager` against testnet with a signers manager,
@@ -744,7 +726,7 @@ async fn policy_observability_full_flow_testnet_acceptance() {
 
     // ── Step 2: `get` before any spend — limit, period, empty history, full remaining ──
     let (audit_writer, audit_log_path, _audit_dir) = tmp_audit_writer();
-    let signers_mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path.clone());
+    let signers_mgr = fresh_signers_manager(audit_writer.clone(), audit_log_path);
 
     let identified_policy = signers_mgr
         .identify_spending_limit_policy(smart_account_sc.clone(), rule_id, Some(&operator_g), rid())
@@ -919,7 +901,7 @@ async fn policy_observability_full_flow_testnet_acceptance() {
     );
 
     // Audit row: SaSpendingLimitRetuned with old_limit == L, new_limit == L2.
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
     let retune_entry = entries.iter().find_map(|e| match &e.event_kind {
         EventKind::SaSpendingLimitRetuned {
             rule_id: entry_rule_id,

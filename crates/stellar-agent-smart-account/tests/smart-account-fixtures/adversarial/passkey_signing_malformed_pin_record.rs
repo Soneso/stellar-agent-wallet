@@ -17,7 +17,6 @@
 
 #![cfg(feature = "test-helpers")]
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -25,6 +24,7 @@ use std::time::Duration;
 use stellar_agent_core::audit_log::AuditLogIntegrityError;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EventKind, ExecutableRefPin};
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
@@ -42,14 +42,6 @@ fn pin() -> ExecutableRefPin {
         &[0x42u8; 32],
     )
     .expect("pin builds")
-}
-
-fn read_audit_entries(log_path: &Path) -> Vec<AuditEntry> {
-    std::fs::read_to_string(log_path)
-        .expect("audit log must be readable")
-        .lines()
-        .filter_map(|line| serde_json::from_str::<AuditEntry>(line).ok())
-        .collect()
 }
 
 /// Each malformed pin record aborts passkey signing with the typed integrity
@@ -102,7 +94,7 @@ async fn malformed_pin_record_routes_to_drift_check_unavailable() {
             let signers_manager = Arc::new(manager_one_url(
                 "http://127.0.0.1:1",
                 Arc::clone(&audit_writer),
-                audit_log_path.clone(),
+                audit_log_path,
             ));
             let manager =
                 CredentialsManager::new(dir.path().join("passkeys"), "default", "localhost", None);
@@ -138,7 +130,7 @@ async fn malformed_pin_record_routes_to_drift_check_unavailable() {
                 "{label}: no signing ceremony may start"
             );
 
-            let entries = read_audit_entries(&audit_log_path);
+            let entries = verified_audit_entries(&audit_writer);
             assert!(
                 entries.iter().any(|entry| matches!(
                     &entry.event_kind,

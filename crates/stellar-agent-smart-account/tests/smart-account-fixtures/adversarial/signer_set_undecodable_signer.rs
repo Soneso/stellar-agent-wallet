@@ -18,6 +18,8 @@
 
 use std::sync::Arc;
 
+use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_smart_account::error::SaError;
 use stellar_xdr::ScAddress;
 use uuid::Uuid;
@@ -100,7 +102,7 @@ async fn list_signers_refuses_a_rule_with_an_undecodable_signer() {
         &primary_server.uri(),
         &secondary_server.uri(),
         Arc::clone(&audit_writer),
-        audit_log_path.clone(),
+        audit_log_path,
     );
 
     let result = manager
@@ -112,15 +114,16 @@ async fn list_signers_refuses_a_rule_with_an_undecodable_signer() {
         )
         .await;
 
-    let audit_log = std::fs::read_to_string(&audit_log_path).unwrap_or_default();
-    let signer_set_rows: Vec<&str> = audit_log
-        .lines()
-        .filter(|line| {
-            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|row| {
-                row["kind"] == "sa_signer_set_baselined"
-                    || row["kind"] == "sa_signer_set_baselined_v2"
-                    || row["kind"] == "sa_signer_set_diverged"
-            })
+    let entries = verified_audit_entries(&audit_writer);
+    let signer_set_rows: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.event_kind,
+                EventKind::SaSignerSetBaselined { .. }
+                    | EventKind::SaSignerSetBaselinedV2 { .. }
+                    | EventKind::SaSignerSetDiverged { .. }
+            )
         })
         .collect();
     assert!(

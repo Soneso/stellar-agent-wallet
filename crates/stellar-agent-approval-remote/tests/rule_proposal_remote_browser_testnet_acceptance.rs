@@ -118,6 +118,8 @@ use stellar_agent_core::approval::operator_credentials::{
 };
 use stellar_agent_core::approval::store::{PendingApproval, PendingApprovalStore};
 use stellar_agent_core::approval::{ApprovalKind, DEFAULT_TTL_MS, process_uid_for_attestation};
+use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::policy::v1::{
     AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,
@@ -990,7 +992,7 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
     )
     .await;
     let base_url = format!("https://{TEST_RP_ID}:{}", handle.local_addr().port());
-    let _serve_guard = RemoteServeGuard(Some(handle));
+    let mut serve_guard = RemoteServeGuard(Some(handle));
 
     // ── 7. Login ─────────────────────────────────────────────────────────────
     page.goto(&base_url)
@@ -1133,8 +1135,19 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
     );
     drop(store);
 
+    // Stop browser requests and the audit writer before verifying the chain.
+    handler_task.abort();
+    drop(browser_guard);
+    serve_guard
+        .0
+        .take()
+        .expect("remote server must run")
+        .shutdown()
+        .await
+        .expect("remote server must stop before reading the audit chain");
+
     let audit_path = audit_log_path(&approval_dir);
-    let audit_text = std::fs::read_to_string(&audit_path).expect("audit log must be readable");
+    let audit_entries = verified_audit_entries_from_path(&audit_path);
     let expected_pseudonym = {
         let digest = Sha256::digest(credential_id_b64url.as_bytes());
         hex::encode(&digest[..4])
@@ -1143,25 +1156,23 @@ async fn rule_proposal_remote_browser_drives_real_rule_install() {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let found_remote_row = audit_text.lines().any(|line| {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            return false;
-        };
-        value["kind"] == "approval_attested_remote"
-            && value["operator_credential_id_redacted"] == expected_pseudonym
-            && value["envelope_sha256_hex"] == recomputed_digest_hex
+    let found_remote_row = audit_entries.iter().any(|entry| {
+        matches!(
+            &entry.event_kind,
+            EventKind::ApprovalAttestedRemote {
+                operator_credential_id_redacted,
+                envelope_sha256_hex: Some(envelope_sha256_hex),
+                ..
+            } if operator_credential_id_redacted == &expected_pseudonym
+                && envelope_sha256_hex == &recomputed_digest_hex
+        )
     });
     assert!(
         found_remote_row,
         "the audit log must contain an ApprovalAttestedRemote row whose envelope_sha256_hex \
-         equals the recomputed proposal digest {recomputed_digest_hex:?}; log contents:\n\
-         {audit_text}"
+         equals the recomputed proposal digest {recomputed_digest_hex:?}; log entries:\n\
+         {audit_entries:?}"
     );
-
-    // Tear down browser + server before the on-chain commit.
-    handler_task.abort();
-    drop(browser_guard);
-    drop(_serve_guard);
 
     // ── 11. Commit on-chain with the browser-minted attestation ──────────────
     let commit = server

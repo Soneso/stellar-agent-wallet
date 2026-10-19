@@ -26,11 +26,11 @@
 #![cfg(feature = "test-helpers")]
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::signers::ObservedExecutable;
@@ -55,26 +55,6 @@ fn verifier_addr() -> ScAddress {
     ScAddress::Contract(ContractId(Hash([0x20u8; 32])))
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Reads all non-empty JSONL lines from the audit log file.
-fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
-    let file = std::fs::File::open(log_path).expect("audit log must be readable");
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<AuditEntry>(trimmed) {
-            entries.push(entry);
-        }
-    }
-    entries
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// When the pinned verifier wasm hash in the audit log does not match the live
@@ -97,11 +77,7 @@ async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
         .await;
 
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let manager = manager_one_url(
-        &server.uri(),
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    );
+    let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
 
     // ── Step 2: Write a fake SaContextRuleCreated row with a DIFFERENT pinned hash
     // Pinned sentinel: "0101010101010101" — will not match live_wasm_hash's first-8.
@@ -157,7 +133,7 @@ async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
     );
 
     // The SaVerifierHashDrift audit row must be emitted.
-    let entries = read_audit_entries(&audit_log_path);
+    let entries = verified_audit_entries(&audit_writer);
     let drift_row = entries.iter().find(|e| {
         matches!(
             &e.event_kind,
