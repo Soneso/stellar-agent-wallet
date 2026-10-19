@@ -31,8 +31,14 @@
 //! - The payment requirements are validated in full before the dispatch gate
 //!   and the SEP-10 gate. Invalid requirements answer their own `x402.*` code
 //!   and never reach the spending window.
-//! - One RPC client serves the whole payment. Its first request is the
-//!   endpoint identity check, under the profile's `submit_timeout_seconds`.
+//! - One RPC client serves the payment. Its first request is the endpoint
+//!   identity check, under the profile's `submit_timeout_seconds`.
+//! - Before the signer is read, the cross-check rule decides from the
+//!   transfer amount, in the asset's atomic units, and the profile's
+//!   thresholds and oracle whether the payment needs the independent-RPC
+//!   witness. When it does, a second client to the profile's
+//!   `oracle_provider_url` simulates the same unsigned transfer before the
+//!   payer signs, and a disagreement refuses.
 //! - Signer is loaded from the platform keyring at call time.
 //! - The SEP-10 ephemeral key is NOT the payment signer and NOT persisted.
 //! - JWT: NEVER logged.  Returned in `authorization` field (the Bearer token
@@ -41,7 +47,7 @@
 //! # Output
 //!
 //! Returns `{ paymentSignature, authorization, payer, asset, amount, payTo,
-//! home_domain, network, payto_anchored }`:
+//! home_domain, network, payto_anchored, cross_check }`:
 //!
 //! - `paymentSignature` — base64 `PAYMENT-SIGNATURE` header value.
 //! - `authorization` — `Bearer <jwt>` string for `Authorization:` header.
@@ -59,6 +65,8 @@
 //!   determination can be made.  This is a **display signal only** — the tool
 //!   does NOT hard-deny on `"not_anchored"` (SEP-1 `ACCOUNTS` does not reliably
 //!   enumerate SAC payment destinations).
+//! - `cross_check`: the witness outcome, which is `passed` with the oracle and
+//!   its ledger, `skipped` with the reason, or `not_required`.
 //!
 use rmcp::{
     handler::server::wrapper::Parameters,
@@ -67,14 +75,16 @@ use rmcp::{
 };
 use serde_json::json;
 use stellar_agent_core::audit_log::ValueLegRecord;
+use stellar_agent_core::cross_check::CrossCheckValue;
 use stellar_agent_core::policy::v1::ValueClass;
 use stellar_agent_mcp_macros::mcp_tool_router;
+use stellar_agent_network::cross_check::SorobanCrossCheck;
 
 use stellar_agent_x402_identity::{IdentityError, resolve_and_verify_counterparty};
 
 use crate::server::WalletServer;
 use crate::tools::common::{
-    decode_payment_required_input, x402_error_to_tool_result, x402_value_leg,
+    decode_payment_required_input, x402_canonical_asset, x402_error_to_tool_result, x402_value_leg,
 };
 use crate::tools::x402_create_payment::{X402AuthorizationAudit, X402Failure};
 
@@ -239,11 +249,12 @@ fn payment_build_error_result(detail: &str) -> CallToolResult {
 ///
 /// Runs the SEP-10 counterparty-identity gate (home domain → stellar.toml →
 /// WEB_AUTH_ENDPOINT + SIGNING_KEY → SSRF bind → ephemeral SEP-10
-/// challenge/response → JWT) and THEN calls `create_payment`.  Any gate
-/// failure aborts before the payment is built.
+/// challenge/response → JWT) and THEN calls `create_payment`, which obtains
+/// the cross-check witness before it signs.  Any gate failure aborts before
+/// the payment is built.
 ///
 /// Returns `{ paymentSignature, authorization, payer, asset, amount, payTo,
-/// home_domain, network, payto_anchored }` on success.  Errors return the
+/// home_domain, network, payto_anchored, cross_check }` on success.  Errors return the
 /// standard business-error envelope `{ ok: false, error: { code, message },
 /// request_id }` with `isError = true`; `error.code` is the per-variant
 /// `x402.<reason>` wire code (the mainnet refusal uses
@@ -286,6 +297,11 @@ fn payment_build_error_result(detail: &str) -> CallToolResult {
 ///   read (`auth.keyring_not_found`, `auth.keyring_platform_error`,
 ///   `auth.keyring_interactive_session_required`, or
 ///   `auth.keyring_config_invalid`).
+/// - The cross-check witness refuses with its own code before the payer signs.
+///   Credential failures keep `network.rpc_credential_refused` or the oracle
+///   credential read's keyring code (`auth.keyring_*`). Disagreement returns
+///   `simulation.divergence`. Other failures to obtain the witness or build
+///   the oracle client return `network.witness_unavailable`.
 /// - Any other x402 `create_payment` error: `x402.payment_build_failed`.
 ///
 /// A `chain_id` that does not match the active profile returns a JSON-RPC
@@ -315,10 +331,12 @@ impl WalletServer {
         description = "Authenticate with a counterparty via SEP-10 and construct an x402 v2 \
                        PAYMENT-SIGNATURE payload. Runs the SEP-10 identity gate (home_domain → \
                        stellar.toml → WEB_AUTH_ENDPOINT + SIGNING_KEY → SSRF bind → \
-                       ephemeral challenge/response → JWT) then calls create_payment. Any gate \
-                       failure aborts BEFORE the payment is built. \
+                       ephemeral challenge/response → JWT) then calls create_payment, which \
+                       obtains the cross-check witness before signing. Any gate failure aborts \
+                       BEFORE the payment is built. \
                        Returns { paymentSignature, authorization (Bearer JWT for Authorization header), \
-                       payer, asset, amount, payTo, home_domain, network, payto_anchored }. \
+                       payer, asset, amount, payTo, home_domain, network, payto_anchored, \
+                       cross_check }. \
                        payto_anchored is \"anchored\" | \"not_anchored\" | \"unknown\": whether payTo \
                        appears in the verified domain's stellar.toml ACCOUNTS list. \
                        not_anchored is a display warning only — the tool does NOT deny on it. \
@@ -491,6 +509,28 @@ impl WalletServer {
             return Ok(x402_error_to_tool_result(&err));
         }
 
+        // ── Cross-check requirement, before the signer is read ───────────────
+        // The value is the transfer amount in the asset's atomic units, under
+        // the asset's canonical contract identity. A required witness builds
+        // its oracle client here, without a request.
+        // A construction failure refuses before the signer entry is read.
+        let asset = match x402_canonical_asset(&requirements) {
+            Ok(asset) => asset,
+            Err(refusal) => return Ok(refusal),
+        };
+        let cross_check = match SorobanCrossCheck::prepare(
+            &self.profile,
+            &self.context,
+            CrossCheckValue::Amount {
+                asset: &asset,
+                base_units: amount,
+            },
+            "stellar_x402_authenticated_payment",
+        ) {
+            Ok(cross_check) => cross_check,
+            Err(err) => return Ok(crate::tools::common::endpoint_refusal_result(&err)),
+        };
+
         // ── Step 3: Load signer from keyring ─────────────────────────────────
         let signer_handle = match enrolled_keyring_signer(
             &self.profile_name_for_approval(),
@@ -522,7 +562,8 @@ impl WalletServer {
         // ── Step 4: One RPC client for the payment, from the active profile ──
         // The URL is operator-controlled, never facilitator-supplied. Every
         // request of the payment goes to this client, and `create_payment`
-        // makes the endpoint identity check its first request.
+        // makes the endpoint identity check its first request. The witness
+        // requests go to the oracle client prepared above.
         let client = match self.context.primary_client() {
             Ok(client) => client,
             Err(err) => return Ok(crate::tools::common::endpoint_refusal_result(&err)),
@@ -562,13 +603,14 @@ impl WalletServer {
             &requirements,
             signer.as_ref(),
             &client,
+            &cross_check,
             network_passphrase,
             identity_deadline,
             |authorization| audit.before_transmit(authorization),
         )
         .await;
-        let payment_payload = match created {
-            Ok(p) => p,
+        let created = match created {
+            Ok(created) => created,
             Err(source) => {
                 tracing::warn!(
                     "x402_authenticated_payment: create_payment failed after identity gate",
@@ -583,6 +625,12 @@ impl WalletServer {
                 if let stellar_agent_x402::X402Error::EndpointIdentity(refusal) = &source {
                     return Ok(crate::tools::common::endpoint_refusal_result(refusal));
                 }
+                // A cross-check refusal answers the witness's own code: a
+                // disagreement, an unavailable witness, or a refused oracle
+                // credential is not a payment-build failure.
+                if let stellar_agent_x402::X402Error::CrossCheck(refusal) = &source {
+                    return Ok(crate::tools::common::endpoint_refusal_result(refusal));
+                }
                 audit.record_withheld(X402Failure::CreatePayment(&source));
                 // Surface a uniform single-pipeline error envelope. The
                 // X402Error Display is redaction-safe (authority-only, no secrets).
@@ -591,7 +639,7 @@ impl WalletServer {
         };
 
         // ── Step 6: Encode PAYMENT-SIGNATURE ─────────────────────────────────
-        let payment_signature = match encode_payment_signature(&payment_payload) {
+        let payment_signature = match encode_payment_signature(&created.payload) {
             Ok(sig) => sig,
             Err(source) => {
                 audit.record_withheld(X402Failure::Encoding);
@@ -633,6 +681,7 @@ impl WalletServer {
             "home_domain": session.home_domain,
             "network": requirements.network,
             "payto_anchored": payto_anchored.as_str(),
+            "cross_check": created.cross_check.view(),
         });
         let envelope = stellar_agent_core::envelope::Envelope::ok(response);
         let json_str = envelope

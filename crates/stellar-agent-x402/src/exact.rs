@@ -7,18 +7,20 @@
 //! 1. Validate requirements (validate_requirements)
 //! 2. Endpoint identity: getNetwork on the caller's client, the first request
 //! 3. Build SAC transfer InvokeHostFunction
-//! 4. simulateTransaction: restoration, fee bounds, transaction data, and the
-//!    payer authorization against the built transfer; harvest the nonce and
-//!    latest_ledger
-//! 5. Compute signature_expiration_ledger (window of 1 to 60 ledgers);
-//!    getHealth on the same client; ledger consistency
+//! 4. simulateTransaction: restoration, fee bounds, transaction data, exactly
+//!    one result, and the payer authorization against the built transfer;
+//!    harvest the nonce and latest_ledger; compute signature_expiration_ledger
+//!    (window of 1 to 60 ledgers)
+//! 5. Cross-check witness: when the caller's prepared cross-check requires it,
+//!    the oracle simulates the same unsigned envelope and the answers are
+//!    compared; getHealth on the caller's client; ledger consistency
 //! 6. Set expiration on auth entry; sign via sep43 (single auth-signing call site)
 //! 7. Transmit gate: the caller's `before_transmit` runs; an error stops here
 //! 8. Re-simulate with signed auth (mandatory footprint refresh): restoration,
 //!    fee bounds, transaction data, no authorization other than the signed
 //!    entry, ledger consistency
 //! 9. Build + serialize final TransactionEnvelope to base64 XDR
-//! 10. Wrap in PaymentPayload
+//! 10. Wrap in PaymentPayload; return it with the cross-check outcome
 //! ```
 //!
 //! The flow matches the @x402/stellar reference implementation. Auth-entry
@@ -28,13 +30,23 @@
 //! configured RPC. The transmit gate in step 7 is the last point at which the
 //! caller can withhold it.
 //!
-//! Every request goes to the one client the caller passes, and the endpoint
-//! identity check is its first request. The simulation answers come from that
-//! endpoint. Nothing is signed unless the first answer holds exactly one
-//! unsigned payer authorization for the transfer built in step 3, with no
+//! Every request of the payment goes to the client the caller passes, and the
+//! endpoint identity check is its first request. The simulation answers come
+//! from that endpoint. Nothing is signed unless the first answer holds exactly
+//! one unsigned payer authorization for the transfer built in step 3, with no
 //! nested calls. The nonce, the `latest_ledger`, the resource data, and the fee
-//! still come from that endpoint. The checks on them are local consistency
-//! checks against the same endpoint, not independent evidence of freshness.
+//! come from that endpoint.
+//!
+//! When the payment's value requires the cross-check witness, the caller's
+//! prepared [`SorobanCrossCheck`] holds an oracle client built from the
+//! operator's profile, and the crate builds none itself. The oracle simulates
+//! the same unsigned envelope before anything is signed. Its answer must hold
+//! the same authorization entries apart from the nonce and the expiration, a
+//! resource fee within the ceiling, and a ledger no more than two behind the
+//! primary's and before the signature expiration. That is independent evidence
+//! that the transfer simulates and that the ledger the expiration derives from
+//! is current. The oracle's answer is never signed and never replaces the
+//! primary's; the payload carries the primary's nonce and resource data.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -55,6 +67,9 @@ use tokio::time::Instant;
 
 use stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL;
 use stellar_agent_network::StellarRpcClient;
+use stellar_agent_network::cross_check::{
+    CrossCheckOutcome, CrossCheckWitness, SorobanCrossCheck, SorobanWitnessInputs,
+};
 use stellar_agent_network::quote_server_text;
 use stellar_agent_network::refuse_mainnet_write;
 use stellar_agent_network::signing::Signer;
@@ -148,6 +163,20 @@ pub struct AuthorizationToTransmit<'a> {
     pub amount: i128,
     /// Ledger after which the signed authorization stops being valid.
     pub signature_expiration_ledger: u32,
+    /// The cross-check witness obtained before signing, when the payment's
+    /// value required one.
+    pub cross_check: Option<&'a CrossCheckWitness>,
+}
+
+/// A signed payment and the cross-check outcome of its construction.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CreatedPayment {
+    /// The signed x402 payment payload.
+    pub payload: PaymentPayload,
+    /// The cross-check outcome: passed with the oracle's witness, skipped,
+    /// or not required.
+    pub cross_check: CrossCheckOutcome,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -296,11 +325,13 @@ pub fn validate_requirements(
 /// Implements the step flow below, wire-compatible with the @x402/stellar
 /// reference implementation.
 ///
-/// Every request goes to `client`. A caller passes a client it built for this
-/// payment from the operator's profile, never from the payment-required body.
-/// The first request is the endpoint identity check, so a client whose
-/// endpoint serves another network, or whose identity cannot be established
-/// before `identity_deadline`, sends nothing else.
+/// Every request of the payment goes to `client`, and every request of the
+/// cross-check witness goes to the oracle client `cross_check` holds. A caller
+/// builds both for this payment from the operator's profile, never from the
+/// payment-required body; the crate builds no client. The first request on
+/// `client` is the endpoint identity check, so a client whose endpoint serves
+/// another network, or whose identity cannot be established before
+/// `identity_deadline`, sends nothing else.
 ///
 /// A mainnet network passphrase or a mainnet-pattern `client.url()` is refused
 /// with [`X402Error::MainnetSigningForbidden`] before any signing call and any
@@ -321,17 +352,20 @@ pub fn validate_requirements(
 /// 4. `simulateTransaction`. The answer carries no error and no restore
 ///    preamble. Its `min_resource_fee` lies in `1..=10_000_000` stroops, and
 ///    its transaction data decodes, lists no archived entries to restore, and
-///    embeds a resource fee in `0..=min_resource_fee`. Its first result holds
-///    exactly one authorization entry, with legacy `Address` credentials for
-///    the payer. The entry carries a zero `signature_expiration_ledger`, a
-///    `Void` signature, and a root invocation equal to the step 3 transfer
-///    with no nested calls.
-/// 5. Compute `signature_expiration_ledger` as `L + ceil(min(t, 300) / 5)`,
-///    with `L` the answer's `latest_ledger` and `t` the requirement's
-///    `maxTimeoutSeconds`; an overflow refuses. Read `getHealth` on `client`
-///    under `identity_deadline`. The status is `healthy`, `L` is above zero,
-///    `L` is at most one ledger ahead of the health ledger `H`, and `H` lies
-///    before the expiration ledger.
+///    embeds a resource fee in `0..=min_resource_fee`. It holds exactly one
+///    result, and that result holds exactly one authorization entry, with
+///    legacy `Address` credentials for the payer. The entry carries a zero
+///    `signature_expiration_ledger`, a `Void` signature, and a root invocation
+///    equal to the step 3 transfer with no nested calls. Compute
+///    `signature_expiration_ledger` as `L + ceil(min(t, 300) / 5)`, with `L`
+///    the answer's `latest_ledger` and `t` the requirement's
+///    `maxTimeoutSeconds`; an overflow refuses.
+/// 5. Obtain the cross-check witness through `cross_check`: when it requires
+///    a witness, the oracle simulates the step 4 envelope and its answer is
+///    compared with the first answer. Then read `getHealth` on `client` under
+///    `identity_deadline`. The status is `healthy`, `L` is above zero, `L` is
+///    at most one ledger ahead of the health ledger `H`, and `H` lies before
+///    the expiration ledger.
 /// 6. Set `signature_expiration_ledger` on the payer's credentials and sign
 ///    the built `transfer` invocation via
 ///    `stellar_agent_sep43::sign_soroban_auth_entry` (the single auth-signing
@@ -348,7 +382,8 @@ pub fn validate_requirements(
 /// 9. Build the final `TransactionEnvelope` with the re-simulation's
 ///    transaction data and a fee of 100 stroops plus its `min_resource_fee`,
 ///    and serialize it to base64 XDR.
-/// 10. Wrap in a [`PaymentPayload`].
+/// 10. Wrap in a [`PaymentPayload`] and return it with the cross-check
+///     outcome as a [`CreatedPayment`].
 ///
 /// The step 4 check accepts the answer of an honest recording simulation for a
 /// G-account payer distinct from the placeholder source. That answer holds one
@@ -356,10 +391,15 @@ pub fn validate_requirements(
 /// muxed recipient included. The step 8 check accepts the empty or unchanged
 /// entries of an honest enforcing simulation.
 ///
-/// The ledger checks of steps 5 and 8 compare answers of one endpoint with each
-/// other. They tolerate one ledger of skew between load-balanced backends and
-/// bound the signed window at 60 ledger advances plus that skew. They do not
-/// establish that the endpoint's ledgers are current.
+/// The ledger checks of steps 5 and 8 compare answers of `client`'s endpoint
+/// with each other. They tolerate one ledger of skew between load-balanced
+/// backends and bound the signed window at 60 ledger advances plus that skew.
+/// The cross-check witness of step 5 compares the first answer's ledger with
+/// the oracle's, which establishes that it is current when a witness is
+/// required.
+///
+/// The health read keeps the absolute `identity_deadline`, so a witness that
+/// runs past it refuses at the health read, before anything is signed.
 ///
 /// The wallet has no restore path. An answer that asks for a restoration, by a
 /// restore preamble or by archived entries in its transaction data, refuses.
@@ -374,6 +414,8 @@ pub fn validate_requirements(
 /// - `signer`: signer implementation providing the payer's key.
 /// - `client`: the Stellar RPC client for this payment, built from the
 ///   operator's profile and never from the payment-required body.
+/// - `cross_check`: the prepared [`SorobanCrossCheck`] for this payment's
+///   value; it holds the oracle client when a witness is required.
 /// - `profile_passphrase`: the network passphrase from the operator's profile,
 ///   checked against `requirements.network` and against the endpoint.
 /// - `identity_deadline`: the absolute deadline of the endpoint identity check
@@ -387,11 +429,15 @@ pub fn validate_requirements(
 /// - Every error of [`validate_requirements`].
 /// - [`X402Error::EndpointIdentity`]: the endpoint identity check refused. The
 ///   wire code is the check's own `network.*` code.
+/// - [`X402Error::CrossCheck`]: the cross-check witness refused before
+///   anything was signed: `simulation.divergence`,
+///   `network.witness_unavailable`, or `network.rpc_credential_refused`.
 /// - [`X402Error::RpcSimulateFailed`]: a simulation request or answer failed
-///   a check of step 4, 5, or 8 other than the authorization checks. The
-///   variant also covers a failed health read, a status other than `healthy`,
-///   and a signer public key that could not be read. A failed request's
-///   detail carries the scrubbed network error after a phase prefix.
+///   a check of step 4, 5, or 8 other than the authorization checks, or the
+///   first answer held no result or more than one. The variant also covers a
+///   failed health read, a status other than `healthy`, and a signer public
+///   key that could not be read. A failed request's detail carries the
+///   scrubbed network error after a phase prefix.
 /// - [`X402Error::UnexpectedAuthEntries`]: the first simulation's
 ///   authorization is not the single unsigned payer entry for the built
 ///   `transfer` that step 4 requires, or the re-simulation returned
@@ -415,10 +461,11 @@ pub async fn create_payment(
     requirements: &PaymentRequirements,
     signer: &(dyn Signer + Send + Sync),
     client: &StellarRpcClient,
+    cross_check: &SorobanCrossCheck,
     profile_passphrase: &str,
     identity_deadline: Instant,
     before_transmit: impl FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error>,
-) -> Result<PaymentPayload, X402Error> {
+) -> Result<CreatedPayment, X402Error> {
     // ── Step 1: Validate ──────────────────────────────────────────────────────
     let amount = validate_requirements(requirements, profile_passphrase, client.url())?;
     // `validate_requirements` holds the requirement's passphrase equal to the
@@ -499,16 +546,21 @@ pub async fn create_payment(
         &FIRST_SIMULATION,
     )?;
 
-    // Extract the auth entry containing the simulated nonce.
-    let first_result = sim_response
+    // Extract the auth entry containing the simulated nonce. The transfer is
+    // one host function call, so the answer holds exactly one result.
+    let results = sim_response
         .results()
         .map_err(|e| X402Error::RpcSimulateFailed {
             detail: format!("simulate results decode failed: {e}"),
-        })?
-        .into_iter()
-        .next()
-        .ok_or_else(|| X402Error::RpcSimulateFailed {
-            detail: "simulate returned no result entry".to_owned(),
+        })?;
+    let [first_result] =
+        <[_; 1]>::try_from(results).map_err(|results: Vec<_>| X402Error::RpcSimulateFailed {
+            detail: if results.is_empty() {
+                "simulate returned no result entry"
+            } else {
+                "simulation returned more than one result"
+            }
+            .to_owned(),
         })?;
 
     // The answer decides what the payer would sign, so it is checked before
@@ -519,7 +571,6 @@ pub async fn create_payment(
         select_payer_auth_entry(first_result.auth, &payer_sc_address)?;
     check_payer_auth_entry(&payer_credentials, &simulated_invocation, &invoke_args)?;
 
-    // ── Step 5: Expiration ledger and ledger consistency ──────────────────────
     // The x402 Exact Stellar formula, with the window clamped to 60 ledgers.
     let simulation_ledger = sim_response.latest_ledger;
     let signature_expiration_ledger =
@@ -529,6 +580,19 @@ pub async fn create_payment(
                          expiration window"
                     .to_owned(),
             })?;
+
+    // ── Step 5: Cross-check witness and ledger consistency ────────────────────
+    // The oracle simulates the envelope the primary simulated, before anything
+    // is signed. A refusal returns here; the payer's key is never used.
+    let cross_check = cross_check
+        .witness(SorobanWitnessInputs {
+            envelope: &sim_envelope,
+            primary: &sim_response,
+            expiration_ledger: signature_expiration_ledger,
+            resource_fee_ceiling: u64::from(MAX_RESOURCE_FEE_STROOPS),
+        })
+        .await
+        .map_err(X402Error::CrossCheck)?;
 
     // The health read runs on the same client under the identity deadline, so
     // the ledgers it compares come from the endpoint the identity check named.
@@ -665,6 +729,7 @@ pub async fn create_payment(
         asset: &requirements.asset,
         amount,
         signature_expiration_ledger,
+        cross_check: cross_check.witness(),
     })?;
 
     // ── Step 8: Re-simulate with signed auth (MANDATORY) ─────────────────────
@@ -753,14 +818,17 @@ pub async fn create_payment(
             })?;
 
     // ── Step 10: Wrap in PaymentPayload ───────────────────────────────────────
-    Ok(PaymentPayload {
-        x402_version: 2,
-        resource: None,
-        accepted: requirements.clone(),
-        payload: ExactStellarPayloadV2 {
-            transaction: transaction_xdr,
+    Ok(CreatedPayment {
+        payload: PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: requirements.clone(),
+            payload: ExactStellarPayloadV2 {
+                transaction: transaction_xdr,
+            },
+            extensions: None,
         },
-        extensions: None,
+        cross_check,
     })
 }
 

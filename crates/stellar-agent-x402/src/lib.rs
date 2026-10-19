@@ -1,8 +1,8 @@
 //! Rust-native x402 Exact Stellar payment scheme — payer side.
 //!
 //! Constructs and signs x402 v2 `PAYMENT-SIGNATURE` payloads for the Exact
-//! Stellar scheme via a multi-step validate → build → simulate → sign →
-//! re-simulate → finalize flow, wire-compatible with the published
+//! Stellar scheme via a multi-step validate → build → simulate → cross-check →
+//! sign → re-simulate → finalize flow, wire-compatible with the published
 //! `@x402/stellar` package.
 //!
 //! # Role
@@ -11,7 +11,10 @@
 //! [`exact::create_payment`]. A host integration (for example an MCP `x402`
 //! tool) delivers the payload over HTTP; the payee/facilitator settles it
 //! on-chain. Every request of one payment goes to the client the host passes,
-//! and the first is an endpoint identity check. The signed authorization first
+//! and the first is an endpoint identity check. When the payment's value
+//! requires the cross-check witness, the host also passes a prepared oracle
+//! client, which simulates the same unsigned transfer before anything is
+//! signed; the crate builds no client of its own. The signed authorization first
 //! leaves the wallet in the RPC re-simulation, and `create_payment` runs the
 //! caller's transmit gate immediately before that request, so a host can
 //! record the authorization durably or withhold it.

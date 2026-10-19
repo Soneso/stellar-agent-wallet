@@ -236,7 +236,8 @@ pub fn cross_check_requirement(
     }
 }
 
-/// Ledger observation kinds. Discriminants are digest tags and remain stable.
+/// Witness observation kinds: the classic ledger entries and the Soroban
+/// simulation. Discriminants are digest tags and remain stable.
 ///
 /// The derived `Ord` follows the declaration order, and the digest orders its
 /// observations by it; the variants are therefore declared in ascending tag
@@ -261,6 +262,8 @@ pub enum WitnessEntry {
     PoolChannelAccount = 7,
     /// Pool funder account.
     FunderAccount = 8,
+    /// The simulation of an unsigned Soroban transaction.
+    SorobanSimulation = 9,
 }
 
 impl fmt::Display for WitnessEntry {
@@ -274,6 +277,7 @@ impl fmt::Display for WitnessEntry {
             Self::MemoRequirement => "memo requirement",
             Self::PoolChannelAccount => "pool channel account",
             Self::FunderAccount => "funder account",
+            Self::SorobanSimulation => "soroban simulation",
         })
     }
 }
@@ -302,6 +306,24 @@ pub enum WitnessField {
     Record,
     /// Normalized memo requirement.
     Value,
+    /// Simulation outcome: an error or a restore preamble.
+    SimulationResult,
+    /// Number of results and of authorization entries in a simulation.
+    AuthorizationCount,
+    /// Credential kind of a simulated authorization entry.
+    Credentials,
+    /// Address of a simulated authorization entry.
+    Address,
+    /// Signature of a simulated authorization entry.
+    Signature,
+    /// Root invocation of a simulated authorization entry.
+    Invocation,
+    /// Minimum resource fee of a simulation against the wallet's ceiling.
+    ResourceFee,
+    /// Distance between the simulation ledgers of the two endpoints.
+    LedgerSkew,
+    /// Simulation ledger against the signature expiration ledger.
+    Expiration,
 }
 
 impl fmt::Display for WitnessField {
@@ -317,6 +339,15 @@ impl fmt::Display for WitnessField {
             Self::HomeDomain => "home domain",
             Self::Record => "record",
             Self::Value => "value",
+            Self::SimulationResult => "result",
+            Self::AuthorizationCount => "authorization count",
+            Self::Credentials => "credentials",
+            Self::Address => "address",
+            Self::Signature => "signature",
+            Self::Invocation => "invocation",
+            Self::ResourceFee => "resource fee ceiling",
+            Self::LedgerSkew => "ledger skew",
+            Self::Expiration => "expiration",
         })
     }
 }
@@ -553,5 +584,60 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn soroban_simulation_kind_has_its_wire_name_tag_and_label() {
+        assert_eq!(
+            serde_json::to_value(WitnessEntry::SorobanSimulation).unwrap(),
+            serde_json::json!("soroban_simulation")
+        );
+        assert_eq!(
+            serde_json::from_value::<WitnessEntry>(serde_json::json!("soroban_simulation"))
+                .unwrap(),
+            WitnessEntry::SorobanSimulation
+        );
+        assert_eq!(WitnessEntry::SorobanSimulation as u8, 9);
+        assert!(WitnessEntry::FunderAccount < WitnessEntry::SorobanSimulation);
+        assert_eq!(
+            WitnessEntry::SorobanSimulation.to_string(),
+            "soroban simulation"
+        );
+    }
+
+    #[test]
+    fn soroban_simulation_fields_have_their_labels() {
+        for (field, label) in [
+            (WitnessField::SimulationResult, "result"),
+            (WitnessField::AuthorizationCount, "authorization count"),
+            (WitnessField::Credentials, "credentials"),
+            (WitnessField::Address, "address"),
+            (WitnessField::Signature, "signature"),
+            (WitnessField::Invocation, "invocation"),
+            (WitnessField::ResourceFee, "resource fee ceiling"),
+            (WitnessField::LedgerSkew, "ledger skew"),
+            (WitnessField::Expiration, "expiration"),
+        ] {
+            assert_eq!(field.to_string(), label);
+        }
+    }
+
+    #[test]
+    fn soroban_divergence_names_the_simulation_and_the_field() {
+        let error = NetworkError::WitnessDivergence {
+            entry: WitnessEntry::SorobanSimulation,
+            field: WitnessField::AuthorizationCount,
+            sequence_delta: None,
+        };
+        assert_eq!(
+            error.to_string(),
+            "cross-check refused: the primary RPC and the oracle disagree on the soroban \
+             simulation authorization count; the wallet did not sign or send. Retry the \
+             action; if the disagreement persists, investigate both endpoints"
+        );
+        assert_eq!(
+            crate::error::WalletError::from(error).code(),
+            "simulation.divergence"
+        );
     }
 }

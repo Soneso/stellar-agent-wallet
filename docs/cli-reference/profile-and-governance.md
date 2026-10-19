@@ -61,8 +61,11 @@ tools remain outside this coverage.
 The classic witness covers CLI `pay`, `claim`, sponsored `accounts create`,
 `trustline`, and every sending `pool init` path. It also covers MCP
 `stellar_pay_commit`, `stellar_create_account_commit`, `stellar_trustline_commit`,
-and `stellar_claim_commit`. Opaque staged envelopes and the SEP-43 signing
-tools remain uncovered.
+and `stellar_claim_commit`. The x402 payment tools `stellar_x402_create_payment`
+and `stellar_x402_authenticated_payment` are covered by a second simulation on
+the oracle: before the payer signs, the oracle simulates the same unsigned
+transfer, and the answers are compared. Opaque staged envelopes and the SEP-43
+signing tools remain uncovered.
 
 The signer and nonce keyring coordinates are named `stellar-agent-signer-<name>` / `stellar-agent-nonce-<name>`, each seeded with the placeholder account `"default"` — the signer's eventual G-strkey is not known until a seed is enrolled (see `profile enroll-signer` below). The five security-substrate references (`audit_log_hash_chain_key_id`, `policy_owner_key_id`, `attestation_key_id`, `counterparty_cache_key_id`, `policy_window_state_key_id`) are derived from the profile name the same way `profile migrate` derives them.
 

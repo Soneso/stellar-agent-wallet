@@ -211,6 +211,15 @@ pub enum X402Error {
     #[error("RPC endpoint identity check failed: {0}")]
     EndpointIdentity(WalletError),
 
+    /// The cross-check witness of [`crate::exact::create_payment`] refused
+    /// before anything was signed.
+    ///
+    /// The oracle's simulation disagrees with the primary's, the witness could
+    /// not be obtained, or the oracle refused the credential. The inner error
+    /// is the witness's own, unchanged, and so are its code and its text.
+    #[error(transparent)]
+    CrossCheck(WalletError),
+
     /// The transmit gate of [`crate::exact::create_payment`] refused, so the
     /// signed authorization was never sent.
     ///
@@ -230,13 +239,14 @@ impl X402Error {
     /// The x402 tools surface errors through the documented result envelope
     /// (`{ ok: false, error: { code, message }, request_id }`); this method
     /// supplies the `error.code`. Codes follow the `x402.<snake_variant>`
-    /// taxonomy so an agent can branch on the specific failure, with two
+    /// taxonomy so an agent can branch on the specific failure, with these
     /// deliberate exceptions. [`X402Error::MainnetSigningForbidden`] returns the
     /// canonical `network.mainnet_write_forbidden` code so the refusal correlates
     /// with the CLI, submit-layer, and SEP-43/SEP-53 signing guards across every
-    /// surface. [`X402Error::EndpointIdentity`] returns the code of the wallet
-    /// error it carries, such as `network.endpoint_network_mismatch`, the code
-    /// every other signing path answers for the same endpoint.
+    /// surface. [`X402Error::EndpointIdentity`] and [`X402Error::CrossCheck`]
+    /// return the code of the wallet error they carry, such as
+    /// `network.endpoint_network_mismatch` or `simulation.divergence`, the code
+    /// every other signing path answers for the same refusal.
     #[must_use]
     pub fn wire_code(&self) -> &'static str {
         match self {
@@ -257,7 +267,7 @@ impl X402Error {
             X402Error::UnexpectedAuthEntries { .. } => "x402.unexpected_auth_entries",
             X402Error::KeyringLoadFailed { .. } => "x402.keyring_load_failed",
             X402Error::TransmitGateRefused { .. } => "x402.transmit_gate_refused",
-            X402Error::EndpointIdentity(inner) => inner.code(),
+            X402Error::EndpointIdentity(inner) | X402Error::CrossCheck(inner) => inner.code(),
         }
     }
 }
@@ -467,6 +477,35 @@ mod tests {
         let d = err.to_string();
         assert!(d.contains("transmit gate refused"));
         assert!(d.contains("audit row not written"));
+    }
+
+    #[test]
+    fn cross_check_carries_the_wire_code_and_text_of_its_wallet_error() {
+        use stellar_agent_core::cross_check::{WitnessEntry, WitnessField};
+        use stellar_agent_core::error::{NetworkError, WitnessUnavailableReason};
+        let cases = [
+            WalletError::Network(NetworkError::WitnessDivergence {
+                entry: WitnessEntry::SorobanSimulation,
+                field: WitnessField::Expiration,
+                sequence_delta: None,
+            }),
+            WalletError::Network(NetworkError::WitnessUnavailable {
+                reason: WitnessUnavailableReason::InvalidAnswer {
+                    authority: "https://oracle.example".to_owned(),
+                },
+            }),
+            WalletError::Network(NetworkError::RpcCredentialRejected {
+                url: "https://oracle.example".to_owned(),
+                status: 401,
+            }),
+        ];
+        for inner in cases {
+            let code = inner.code();
+            let text = inner.to_string();
+            let err = X402Error::CrossCheck(inner);
+            assert_eq!(err.wire_code(), code);
+            assert_eq!(err.to_string(), text);
+        }
     }
 
     #[test]

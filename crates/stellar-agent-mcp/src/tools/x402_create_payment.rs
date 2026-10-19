@@ -33,14 +33,21 @@
 //!   the x402 `network` field and the profile passphrase is a hard error.
 //! - The payment requirements are validated in full before the dispatch gate,
 //!   so invalid requirements never reach the spending window.
-//! - One RPC client serves the whole payment. Its first request is the
-//!   endpoint identity check, under the profile's `submit_timeout_seconds`.
+//! - One RPC client serves the payment. Its first request is the endpoint
+//!   identity check, under the profile's `submit_timeout_seconds`.
+//! - Before the signer is read, the cross-check rule decides from the
+//!   transfer amount, in the asset's atomic units, and the profile's
+//!   thresholds and oracle whether the payment needs the independent-RPC
+//!   witness. When it does, a second client to the profile's
+//!   `oracle_provider_url` simulates the same unsigned transfer before the
+//!   payer signs, and a disagreement refuses.
 //! - Signer is loaded from the platform keyring at call time; the keypair is
 //!   never held in memory between calls.
 //!
 //! # Output
 //!
-//! Returns `{ paymentSignature, payer, asset, amount, payTo, network }`:
+//! Returns `{ paymentSignature, payer, asset, amount, payTo, network,
+//! cross_check }`:
 //!
 //! - `paymentSignature` — standard-base64 `PAYMENT-SIGNATURE` header value.
 //! - `payer` — payer address (G-strkey), redacted in telemetry.
@@ -48,6 +55,8 @@
 //! - `amount` — atomic-unit amount string from `PaymentRequirements`.
 //! - `payTo` — recipient address from `PaymentRequirements`.
 //! - `network` — x402 CAIP-2 network string from `PaymentRequirements`.
+//! - `cross_check`: the witness outcome, which is `passed` with the oracle and
+//!   its ledger, `skipped` with the reason, or `not_required`.
 
 use rmcp::{
     handler::server::wrapper::Parameters,
@@ -56,12 +65,15 @@ use rmcp::{
 };
 use serde_json::json;
 use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision, ValueLegRecord};
+use stellar_agent_core::cross_check::CrossCheckValue;
 use stellar_agent_core::policy::v1::ValueClass;
 use stellar_agent_mcp_macros::mcp_tool_router;
+use stellar_agent_network::cross_check::{CrossCheckWitness, SorobanCrossCheck};
 
 use crate::server::WalletServer;
 use crate::tools::common::{
-    business_error_result, decode_payment_required_input, x402_error_to_tool_result, x402_value_leg,
+    business_error_result, decode_payment_required_input, x402_canonical_asset,
+    x402_error_to_tool_result, x402_value_leg,
 };
 use crate::tools::value_audit::emit_value_audit_row_strict;
 
@@ -119,16 +131,17 @@ pub struct X402CreatePaymentArgs {
 ///
 /// Accepts a `PaymentRequirements` object (as the base64-encoded
 /// `PAYMENT-REQUIRED` header value OR raw JSON), performs the
-/// validate → build-SAC-transfer → simulate → sign-auth-entry →
-/// re-simulate → serialize flow, and returns the standard-base64
-/// `PAYMENT-SIGNATURE` value ready for the `PAYMENT-SIGNATURE` HTTP header.
+/// validate → build-SAC-transfer → simulate → cross-check witness →
+/// sign-auth-entry → re-simulate → serialize flow, and returns the
+/// standard-base64 `PAYMENT-SIGNATURE` value ready for the
+/// `PAYMENT-SIGNATURE` HTTP header.
 ///
 /// The wallet is the payment **payer**.  The MCP host is responsible for
 /// the actual HTTP-402 request/retry cycle; this tool only produces the
 /// signed payload.
 ///
-/// Returns `{ paymentSignature, payer, asset, amount, payTo, network }` on
-/// success.  Errors return the standard business-error envelope
+/// Returns `{ paymentSignature, payer, asset, amount, payTo, network,
+/// cross_check }` on success.  Errors return the standard business-error envelope
 /// `{ ok: false, error: { code, message }, request_id }` with `isError = true`;
 /// `error.code` is the per-variant `x402.<reason>` wire code (the mainnet
 /// refusal uses `network.mainnet_write_forbidden`).
@@ -162,6 +175,12 @@ pub struct X402CreatePaymentArgs {
 /// - A Soroban RPC simulation, its answer, the health read, or the ledger and
 ///   fee bounds fail.
 /// - The auth-entry signing step fails.
+///
+/// The cross-check witness refuses with its own code before the payer signs.
+/// Credential failures keep `network.rpc_credential_refused` or the oracle
+/// credential read's keyring code (`auth.keyring_*`). Disagreement returns
+/// `simulation.divergence`. Other failures to obtain the witness or build
+/// the oracle client return `network.witness_unavailable`.
 ///
 /// A `chain_id` that does not match the active profile returns a JSON-RPC
 /// `ErrorData` from the dispatch gate. The endpoint identity refusals carry
@@ -200,8 +219,10 @@ impl WalletServer {
         name = "stellar_x402_create_payment",
         description = "Construct and sign an x402 v2 PAYMENT-SIGNATURE payload for the Exact Stellar scheme. \
                        Accepts a PaymentRequirements object (base64 PAYMENT-REQUIRED header or raw JSON), \
-                       validates, simulates, signs the SAC transfer auth-entry, re-simulates, and returns \
-                       { paymentSignature: string, payer: string, asset: string, amount: string, payTo: string, network: string }. \
+                       validates, simulates, obtains the cross-check witness, signs the SAC \
+                       transfer auth-entry, re-simulates, and returns { paymentSignature: string, \
+                       payer: string, asset: string, amount: string, payTo: string, \
+                       network: string, cross_check: object }. \
                        RPC URL and passphrase come from the active profile (never from input). \
                        The wallet is a payer; the MCP host performs the HTTP 402 request. \
                        read_only_hint=false; destructive_hint=false.",
@@ -329,6 +350,28 @@ impl WalletServer {
             return Ok(x402_error_to_tool_result(&err));
         }
 
+        // ── Cross-check requirement, before the signer is read ───────────────
+        // The value is the transfer amount in the asset's atomic units, under
+        // the asset's canonical contract identity. A required witness builds
+        // its oracle client here, without a request.
+        // A construction failure refuses before the signer entry is read.
+        let asset = match x402_canonical_asset(&requirements) {
+            Ok(asset) => asset,
+            Err(refusal) => return Ok(refusal),
+        };
+        let cross_check = match SorobanCrossCheck::prepare(
+            &self.profile,
+            &self.context,
+            CrossCheckValue::Amount {
+                asset: &asset,
+                base_units: amount,
+            },
+            "stellar_x402_create_payment",
+        ) {
+            Ok(cross_check) => cross_check,
+            Err(err) => return Ok(crate::tools::common::endpoint_refusal_result(&err)),
+        };
+
         // ── Load signer from keyring ──────────────────────────────────────────
         let signer_handle = match enrolled_keyring_signer(
             &self.profile_name_for_approval(),
@@ -359,7 +402,8 @@ impl WalletServer {
         // ── One RPC client for the payment, from the active profile ──────────
         // The URL is operator-controlled, never facilitator-supplied. Every
         // request of the payment goes to this client, and `create_payment`
-        // makes the endpoint identity check its first request.
+        // makes the endpoint identity check its first request. The witness
+        // requests go to the oracle client prepared above.
         let client = match self.context.primary_client() {
             Ok(client) => client,
             Err(err) => return Ok(crate::tools::common::endpoint_refusal_result(&err)),
@@ -402,13 +446,14 @@ impl WalletServer {
             &requirements,
             signer.as_ref(),
             &client,
+            &cross_check,
             profile_passphrase,
             identity_deadline,
             |authorization| audit.before_transmit(authorization),
         )
         .await;
-        let payment_payload = match created {
-            Ok(p) => p,
+        let created = match created {
+            Ok(created) => created,
             Err(ref err) => {
                 // Log error class without secret bleed (X402Error::Display is redaction-safe).
                 tracing::warn!(
@@ -421,13 +466,16 @@ impl WalletServer {
                 if let stellar_agent_x402::X402Error::EndpointIdentity(refusal) = err {
                     return Ok(crate::tools::common::endpoint_refusal_result(refusal));
                 }
+                // A cross-check refusal precedes the transmit gate, so no row
+                // is written; the fallback below carries its own code and
+                // text, as `X402Error::CrossCheck` answers its wallet error's.
                 audit.record_withheld(X402Failure::CreatePayment(err));
                 return Ok(x402_error_to_tool_result(err));
             }
         };
 
         // ── Encode PAYMENT-SIGNATURE ──────────────────────────────────────────
-        let payment_signature = match encode_payment_signature(&payment_payload) {
+        let payment_signature = match encode_payment_signature(&created.payload) {
             Ok(sig) => sig,
             Err(ref err) => {
                 audit.record_withheld(X402Failure::Encoding);
@@ -454,6 +502,7 @@ impl WalletServer {
             "amount": requirements.amount,
             "payTo": requirements.pay_to,
             "network": requirements.network,
+            "cross_check": created.cross_check.view(),
         });
         let envelope = stellar_agent_core::envelope::Envelope::ok(response);
         let json_str = envelope
@@ -565,7 +614,7 @@ impl<'a> X402AuthorizationAudit<'a> {
             authorization.scheme,
             PolicyDecision::Allow,
             &self.request_id,
-            None,
+            authorization.cross_check.map(CrossCheckWitness::record),
         );
         match emit_value_audit_row_strict(self.profile, &self.profile_name, self.binding, entry) {
             Ok(()) => {
@@ -672,6 +721,7 @@ fn classify_x402_error(err: &stellar_agent_x402::X402Error) -> &'static str {
         X402Error::UnexpectedAuthEntries { .. } => "unexpected_auth_entries",
         X402Error::TransmitGateRefused { .. } => "transmit_gate_refused",
         X402Error::EndpointIdentity(_) => "endpoint_identity",
+        X402Error::CrossCheck(_) => "cross_check",
         _ => "x402_error",
     }
 }
@@ -821,7 +871,15 @@ mod tests {
             X402Error::EndpointIdentity(stellar_agent_core::error::WalletError::Network(
                 stellar_agent_core::error::NetworkError::MainnetWriteForbidden,
             )),
+            X402Error::CrossCheck(stellar_agent_core::error::WalletError::Network(
+                stellar_agent_core::error::NetworkError::WitnessDivergence {
+                    entry: stellar_agent_core::cross_check::WitnessEntry::SorobanSimulation,
+                    field: stellar_agent_core::cross_check::WitnessField::Address,
+                    sequence_delta: None,
+                },
+            )),
         ];
+        assert_eq!(classify_x402_error(&cases[cases.len() - 1]), "cross_check");
         for err in cases {
             let class = classify_x402_error(err);
             assert!(!class.is_empty());

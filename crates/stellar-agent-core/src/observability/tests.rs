@@ -2294,3 +2294,36 @@ fn integration_multiple_sensitive_fields_all_redacted() {
         "raw secret values must not appear: {out}"
     );
 }
+
+/// Whether `filter` enables a TRACE event on the RPC client's raw transport
+/// target and on a wallet target.
+fn raw_and_own_trace_enabled(filter: EnvFilter) -> (bool, bool) {
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(filter), || {
+        tracing::callsite::rebuild_interest_cache();
+        (
+            tracing::enabled!(target: "jsonrpsee", tracing::Level::TRACE),
+            tracing::enabled!(target: "stellar_agent_network::client", tracing::Level::TRACE),
+        )
+    })
+}
+
+/// No `STELLAR_AGENT_LOG` or `RUST_LOG` value turns the raw transport target
+/// on, while a value that enables TRACE keeps the wallet's own events.
+#[test]
+fn resolved_filter_keeps_raw_transport_logging_off() {
+    for (value, own) in [
+        ("trace", true),
+        ("jsonrpsee=trace", false),
+        ("trace,jsonrpsee=trace", true),
+        ("jsonrpsee=trace,stellar_agent_network=trace", true),
+    ] {
+        for (stellar_agent_log, rust_log) in [(Some(value), None), (None, Some(value))] {
+            let filter = resolve_env_filter_from(stellar_agent_log, rust_log).unwrap();
+            assert_eq!(
+                raw_and_own_trace_enabled(filter),
+                (false, own),
+                "{stellar_agent_log:?} {rust_log:?}"
+            );
+        }
+    }
+}

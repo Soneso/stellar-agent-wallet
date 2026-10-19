@@ -1,6 +1,9 @@
 //! Witness digest byte layout, version 1.
 //!
 //! SHA-256 starts with `b"stellar-agent/cross-check/v1\0"`.
+//! A classic witness digests ledger observations; a Soroban witness digests
+//! one simulation, as the last paragraph below describes.
+//!
 //! Observations follow in ascending explicit `WitnessEntry` tag order.
 //! Equal kinds retain input field order, including the pool's channel order.
 //! Each observation contributes its one-byte tag and length-prefixed `LedgerKey` XDR.
@@ -14,6 +17,14 @@
 //! Issuers encode presence and optional flags; memo observations encode one boolean.
 //! Claimable balances encode presence and length-prefixed complete entry XDR.
 //! Absent pool channels encode a zero presence byte.
+//!
+//! A Soroban simulation contributes its one-byte tag, then, in place of a
+//! ledger key, the length-prefixed SHA-256 of the unsigned envelope's XDR.
+//! Each of the primary's authorization entries follows in order as
+//! length-prefixed XDR, normalized to a zero nonce, a zero signature
+//! expiration ledger, and a `Void` signature, so the digest names what was
+//! simulated and not what the endpoint chose. The primary's simulation ledger
+//! ends the payload as a u32.
 
 use super::{
     classic::{Observation, Observed},
@@ -21,8 +32,13 @@ use super::{
 };
 use crate::account::AccountFlagsView;
 use sha2::{Digest, Sha256};
-use stellar_agent_core::error::WalletError;
-use stellar_xdr::{Limits, WriteXdr};
+use stellar_agent_core::{cross_check::WitnessEntry, error::WalletError};
+use stellar_xdr::{
+    Limits, ScVal, SorobanAuthorizationEntry, SorobanCredentials, TransactionEnvelope, WriteXdr,
+};
+
+/// Domain prefix of every witness digest.
+const PREFIX: &[u8] = b"stellar-agent/cross-check/v1\0";
 
 fn bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<(), WalletError> {
     let len = u32::try_from(value.len()).map_err(|_| invalid_observation())?;
@@ -44,7 +60,7 @@ fn flags(out: &mut Vec<u8>, value: &Option<AccountFlagsView>) {
 }
 
 pub(super) fn inputs_digest(observations: &[Observation]) -> Result<[u8; 32], WalletError> {
-    let mut out = b"stellar-agent/cross-check/v1\0".to_vec();
+    let mut out = PREFIX.to_vec();
     for observation in observations {
         out.push(observation.kind as u8);
         bytes(
@@ -101,5 +117,36 @@ pub(super) fn inputs_digest(observations: &[Observation]) -> Result<[u8; 32], Wa
             Observed::Absent => out.push(0),
         }
     }
+    Ok(Sha256::digest(out).into())
+}
+
+/// Digests one Soroban simulation: the unsigned envelope, the primary's
+/// normalized authorization entries, and the primary's simulation ledger.
+pub(super) fn soroban_inputs_digest(
+    envelope: &TransactionEnvelope,
+    primary_auth: &[SorobanAuthorizationEntry],
+    primary_ledger: u32,
+) -> Result<[u8; 32], WalletError> {
+    let mut out = PREFIX.to_vec();
+    out.push(WitnessEntry::SorobanSimulation as u8);
+    let envelope_xdr = envelope
+        .to_xdr(Limits::none())
+        .map_err(|_| invalid_observation())?;
+    bytes(&mut out, &Sha256::digest(envelope_xdr))?;
+    for entry in primary_auth {
+        let mut entry = entry.clone();
+        if let SorobanCredentials::Address(credentials) = &mut entry.credentials {
+            credentials.nonce = 0;
+            credentials.signature_expiration_ledger = 0;
+            credentials.signature = ScVal::Void;
+        }
+        bytes(
+            &mut out,
+            &entry
+                .to_xdr(Limits::none())
+                .map_err(|_| invalid_observation())?,
+        )?;
+    }
+    out.extend_from_slice(&primary_ledger.to_be_bytes());
     Ok(Sha256::digest(out).into())
 }

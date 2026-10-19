@@ -374,7 +374,8 @@ envelope hash is left intact (it is a SHA-256 digest carrying no user data).
 The log records `value_action_submitted` on every
 confirmed value-moving submit (carrying the gate-sized value legs) and
 `keyring_key_written` on each key-writing profile command. It records
-`x402_payment_authorized` before a signed x402 authorization leaves the wallet
+`x402_payment_authorized`, with a passed cross-check witness when the payment
+required one, before a signed x402 authorization leaves the wallet
 in the RPC re-simulation. When that payment then fails, it records
 `x402_authorization_withheld` with the same request id and a `failure_stage`
 of `resimulation`, `response_processing`, or `encoding`. MPP adds

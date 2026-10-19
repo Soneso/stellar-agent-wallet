@@ -22,6 +22,10 @@
 //!   verifies, and the expiration lies sixty ledgers after the simulation's.
 //! - The leg records the endpoint protocol and the ledgers `L`, `H`, and
 //!   `R` the payment checked. A build failure fails the leg; it never skips.
+//! - A native-SAC payment of the native threshold floor, with the profile's
+//!   oracle set, passes the cross-check witness: the result reports
+//!   `cross_check.status == "passed"` with the oracle's ledger, and the
+//!   `x402_payment_authorized` row carries the witness.
 //! - Negative: invalid scheme in `payment_required` returns `isError = true`.
 //! - Negative: `chain_id` mismatch returns `rmcp::ErrorData`.
 //!
@@ -126,6 +130,17 @@ fn build_test_server(
     seed: &Zeroizing<[u8; 32]>,
     signer_service: &str,
 ) -> WalletServer {
+    build_test_server_with(g_strkey, seed, signer_service, |_| {}).0
+}
+
+/// [`build_test_server`] with `configure` applied to the profile before the
+/// server is built; returns the server and the profile.
+fn build_test_server_with(
+    g_strkey: &str,
+    seed: &Zeroizing<[u8; 32]>,
+    signer_service: &str,
+    configure: impl FnOnce(&mut Profile),
+) -> (WalletServer, Profile) {
     keyring_mock::install().expect("mock keyring store init");
 
     let mut profile =
@@ -133,6 +148,7 @@ fn build_test_server(
             .with_noop_engine()
             .build();
     profile.rpc_url = TESTNET_RPC_URL.to_owned();
+    configure(&mut profile);
 
     // Store the signing key in the mock keyring under the profile's signer entry.
     let signer_ref = &profile.mcp_signer_default;
@@ -159,7 +175,9 @@ fn build_test_server(
         .set_password(&audit_key_b64)
         .expect("set audit chain-root key");
 
-    WalletServer::new(profile).expect("WalletServer::new must succeed with mock keyring")
+    let server = WalletServer::new(profile.clone())
+        .expect("WalletServer::new must succeed with mock keyring");
+    (server, profile)
 }
 
 /// Extracts the first text item from a `CallToolResult`.
@@ -191,13 +209,18 @@ const NATIVE_AMOUNT_STROOPS: u64 = 1_000_000;
 /// Signature window of a 300-second requirement, in ledgers.
 const WINDOW_LEDGERS: u64 = 60;
 
-/// `PaymentRequirements` JSON for a native-SAC payment to `pay_to`.
-fn native_requirements(pay_to: &str) -> String {
+/// Atomic amount of the payment that requires the cross-check witness: the
+/// native threshold floor, 1000 XLM. A Friendbot-funded account holds more.
+const WITNESS_AMOUNT_STROOPS: u64 = stellar_agent_core::profile::schema::MINIMUM_FLOOR;
+
+/// `PaymentRequirements` JSON for a native-SAC payment of `amount` stroops to
+/// `pay_to`.
+fn native_requirements(pay_to: &str, amount: u64) -> String {
     serde_json::json!({
         "scheme": "exact",
         "network": "stellar:testnet",
         "asset": NATIVE_SAC_TESTNET,
-        "amount": NATIVE_AMOUNT_STROOPS.to_string(),
+        "amount": amount.to_string(),
         "payTo": pay_to,
         "maxTimeoutSeconds": 300,
         "extra": { "areFeesSponsored": true }
@@ -345,6 +368,7 @@ fn assert_payer_authorization(
     entries: &[stellar_xdr::SorobanAuthorizationEntry],
     payer: &str,
     recipient: &str,
+    amount: u64,
     expiration: u64,
 ) {
     use stellar_xdr::{
@@ -370,10 +394,7 @@ fn assert_payer_authorization(
         args: vec![
             ScVal::Address(account_sc_address(payer)),
             ScVal::Address(account_sc_address(recipient)),
-            ScVal::I128(Int128Parts {
-                hi: 0,
-                lo: NATIVE_AMOUNT_STROOPS,
-            }),
+            ScVal::I128(Int128Parts { hi: 0, lo: amount }),
         ]
         .try_into()
         .unwrap(),
@@ -472,7 +493,7 @@ async fn a6_create_payment_returns_signed_payload() {
     let (capture, _guard) = LedgerCapture::install();
     let result = server
         .call_stellar_x402_create_payment(X402CreatePaymentArgs {
-            payment_required: native_requirements(&recipient),
+            payment_required: native_requirements(&recipient, NATIVE_AMOUNT_STROOPS),
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             address: None,
         })
@@ -503,9 +524,106 @@ async fn a6_create_payment_returns_signed_payload() {
         &entries,
         &g_strkey,
         &recipient,
+        NATIVE_AMOUNT_STROOPS,
         expiration,
     );
     eprintln!("PASS: create_payment returned the payer's verified authorization");
+}
+
+/// create_payment with the cross-check witness.
+///
+/// A native-SAC payment of exactly the native threshold floor requires the
+/// witness. The profile's oracle is the acceptance endpoint itself, so the
+/// same-host WARN fires, and the witness still runs on a second client: the
+/// oracle simulates the unsigned transfer before the payer signs. The result
+/// reports the passed witness with the oracle's ledger, and the
+/// `x402_payment_authorized` row carries it.
+#[tokio::test]
+#[serial]
+async fn a6_create_payment_with_witness_passes() {
+    let (g_strkey, seed) = fresh_keypair();
+    let (recipient, _recipient_seed) = fresh_keypair();
+    fund_via_friendbot(&g_strkey).await;
+    fund_via_friendbot(&recipient).await;
+    wait_until_visible(&g_strkey).await;
+    wait_until_visible(&recipient).await;
+    let (server, profile) =
+        build_test_server_with(&g_strkey, &seed, "x402-test-signer-witness", |profile| {
+            profile.oracle_provider_url = Some(
+                TESTNET_RPC_URL
+                    .parse()
+                    .expect("the acceptance endpoint URL"),
+            );
+        });
+
+    let (capture, _guard) = LedgerCapture::install();
+    let result = server
+        .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            payment_required: native_requirements(&recipient, WITNESS_AMOUNT_STROOPS),
+            chain_id: TESTNET_CHAIN_ID.to_owned(),
+            address: None,
+        })
+        .await
+        .expect("dispatch_gate must not return ErrorData for a valid chain_id");
+
+    let is_err = result.is_error == Some(true);
+    let text = extract_text(result);
+    assert!(
+        !is_err,
+        "[FAIL] create_payment with the witness errored: {text}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&text).expect("result must be valid JSON");
+    let data = &value["data"];
+    assert_eq!(
+        data["amount"],
+        WITNESS_AMOUNT_STROOPS.to_string(),
+        "{value}"
+    );
+    let cross_check = &data["cross_check"];
+    assert_eq!(cross_check["status"], "passed", "{value}");
+    assert_eq!(cross_check["provider"], TESTNET_RPC_URL, "{value}");
+    let oracle_ledger = cross_check["ledger"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the witness names the oracle's ledger: {value}"));
+    assert!(oracle_ledger > 0, "{value}");
+
+    let payment_signature = data["paymentSignature"]
+        .as_str()
+        .unwrap_or_else(|| panic!("paymentSignature must be a string: {value}"));
+    let (_payload, entries) = decode_payment(payment_signature);
+    let expiration = capture.check_and_record("a6 create_payment with witness");
+    assert!(
+        oracle_ledger < expiration,
+        "the oracle's ledger lies before the signature expiration"
+    );
+    assert_payer_authorization(
+        "a6 create_payment with witness",
+        &entries,
+        &g_strkey,
+        &recipient,
+        WITNESS_AMOUNT_STROOPS,
+        expiration,
+    );
+
+    let rows: Vec<serde_json::Value> =
+        stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path(
+            &profile.audit_log_path,
+        )
+        .iter()
+        .map(|entry| serde_json::to_value(entry).expect("an audit entry serializes"))
+        .filter(|row| row["kind"] == "x402_payment_authorized")
+        .collect();
+    let [row] = rows.as_slice() else {
+        panic!("one x402_payment_authorized row, got {rows:?}");
+    };
+    assert_eq!(row["witness"]["provider"], TESTNET_RPC_URL, "{row}");
+    assert_eq!(row["witness"]["ledger"], oracle_ledger, "{row}");
+    assert_eq!(
+        row["witness"]["kinds"],
+        serde_json::json!(["soroban_simulation"]),
+        "{row}"
+    );
+    eprintln!("PASS: create_payment passed the cross-check witness at ledger {oracle_ledger}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

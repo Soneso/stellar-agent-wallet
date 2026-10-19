@@ -208,8 +208,11 @@ Mainnet writes remain structurally refused.
 The classic witness covers CLI `pay`, `claim`, sponsored `accounts create`,
 `trustline`, and every sending `pool init` path. It also covers MCP
 `stellar_pay_commit`, `stellar_create_account_commit`, `stellar_trustline_commit`,
-and `stellar_claim_commit`. Opaque staged envelopes and the SEP-43 signing
-tools remain uncovered.
+and `stellar_claim_commit`. The x402 payment tools `stellar_x402_create_payment`
+and `stellar_x402_authenticated_payment` are covered by a second simulation on
+the oracle: before the payer signs, the oracle simulates the same unsigned
+transfer, and the answers are compared. Opaque staged envelopes and the SEP-43
+signing tools remain uncovered.
 
 The legacy key `usd_threshold` also sets the native threshold. Setting both
 names across the file, environment, or CLI sources refuses as a duplicate field.
@@ -268,6 +271,9 @@ but mints no key material; the rotation commands mint the actual keys (see
 `oracle_provider_url` supplies the oracle for MCP payment and account-creation
 commits. Before signing, the oracle re-reads the ledger entries the decision used.
 When a required witness has no oracle, mainnet refuses and testnet warns.
+For the x402 payment tools, the oracle simulates the same unsigned transfer the
+primary simulated, and the answers are compared before the payer signs.
+The x402 tools refuse a mainnet profile before the cross-check requirement rule runs.
 A mainnet profile requires `providers.oracle`, a host distinct from `rpc_url`,
 and a `[providers.primary]` record. Endpoint validation and URL redaction apply.
 `providers.oracle` can name a keyring credential for the endpoint.

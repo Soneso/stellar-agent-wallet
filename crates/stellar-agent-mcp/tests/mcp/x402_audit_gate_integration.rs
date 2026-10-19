@@ -119,6 +119,7 @@ struct X402Rpc {
     payer: ScAddress,
     log_path: PathBuf,
     first: FirstSimulate,
+    simulation_ledger: u32,
     resimulation: Resimulation,
     network: NetworkAnswer,
     /// Bytes the unsigned simulate writes over the log, once: a rollback that
@@ -136,6 +137,7 @@ impl X402Rpc {
             payer: payer_sc_address(payer),
             log_path,
             first: FirstSimulate::Ok,
+            simulation_ledger: LEDGER,
             resimulation: Resimulation::Ok,
             network: NetworkAnswer::Passphrase(TESTNET_PASSPHRASE),
             roll_back_to: Arc::new(Mutex::new(None)),
@@ -178,8 +180,11 @@ const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015
 /// A network that is neither testnet nor mainnet.
 const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
 
-/// Latest ledger of every answer, and the health ledger.
+/// The primary's simulation and health ledger.
 const LEDGER: u32 = 1000;
+
+/// The oracle's simulation ledger, within the witness bounds.
+const ORACLE_LEDGER: u32 = LEDGER + 1;
 
 /// A minimum resource fee one stroop above the wallet's ceiling.
 const FEE_ABOVE_CEILING: &str = "10000001";
@@ -330,7 +335,7 @@ impl Respond for X402Rpc {
                         "auth": [entry.to_xdr_base64(Limits::none()).expect("entry encodes")],
                         "xdr": void_xdr(),
                     }],
-                    "latestLedger": 1000,
+                    "latestLedger": self.simulation_ledger,
                 }),
             );
         }
@@ -502,10 +507,25 @@ async fn fixture_with_profile(
     configure: impl FnOnce(&mut X402Rpc),
     configure_profile: impl FnOnce(&mut Profile),
 ) -> Fixture {
+    build_fixture(profile_name, seed, configure, configure_profile, |_| {
+        keyring_mock::install().expect("mock keyring");
+    })
+    .await
+}
+
+/// [`fixture_with_profile`] with the keyring store `install_keyring` installs
+/// for the payer's address.
+async fn build_fixture(
+    profile_name: &str,
+    seed: [u8; 32],
+    configure: impl FnOnce(&mut X402Rpc),
+    configure_profile: impl FnOnce(&mut Profile),
+    install_keyring: impl FnOnce(&str),
+) -> Fixture {
     let home = tempfile::tempdir().expect("temp home");
     let home_guard = StellarAgentHomeGuard::new(home.path());
-    keyring_mock::install().expect("mock keyring");
     let payer = gstrkey_for_seed(seed);
+    install_keyring(&payer);
     keyring_core::Entry::new(SIGNER_SERVICE, &payer)
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
@@ -1161,6 +1181,7 @@ async fn the_transmit_gate_sees_the_authorization_the_resimulation_carries() {
         &requirements,
         &signer,
         &client,
+        &stellar_agent_network::cross_check::SorobanCrossCheck::NotRequired,
         &fixture.profile.network_passphrase,
         tokio::time::Instant::now() + std::time::Duration::from_secs(60),
         |authorization| {
@@ -2092,6 +2113,551 @@ async fn x402_tools_send_the_primary_credential() {
             crate::common::credential_trace(&bare.mock).await,
             [("getNetwork".to_owned(), false)],
             "{tool:?}"
+        );
+    }
+}
+
+// ── Cross-check witness through both tools ───────────────────────────────────
+
+/// The payment amount `payment_required` names, in the asset's atomic units.
+const PAYMENT_AMOUNT: i128 = 10_000_000;
+
+/// A payment whose profile names an oracle and a threshold for the payment
+/// asset, with the reads of the payer's signer entry counted.
+struct WitnessFixture {
+    fixture: Fixture,
+    oracle: MockServer,
+    oracle_rpc: X402Rpc,
+    signer_reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl WitnessFixture {
+    fn signer_reads(&self) -> usize {
+        self.signer_reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The methods the oracle received, in order.
+    async fn oracle_methods(&self) -> Vec<String> {
+        crate::common::received_methods(&self.oracle).await
+    }
+}
+
+/// Builds a [`WitnessFixture`]: the oracle answers as `configure_oracle` sets
+/// its mock, the profile's threshold for the payment asset is `threshold`,
+/// and `oracle_url` replaces the oracle's URL in the profile when set.
+async fn witness_fixture(
+    profile_name: &str,
+    seed: u8,
+    threshold: i128,
+    oracle_url: Option<&str>,
+    configure_oracle: impl FnOnce(&mut X402Rpc),
+) -> WitnessFixture {
+    let payer = gstrkey_for_seed([seed; 32]);
+    let oracle = MockServer::start().await;
+    let mut oracle_rpc = X402Rpc::new(&payer, PathBuf::from("oracle-writes-no-row"));
+    oracle_rpc.simulation_ledger = ORACLE_LEDGER;
+    configure_oracle(&mut oracle_rpc);
+    Mock::given(method("POST"))
+        .respond_with(oracle_rpc.clone())
+        .mount(&oracle)
+        .await;
+    let oracle_url = oracle_url.map_or_else(|| oracle.uri(), str::to_owned);
+    let signer_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::clone(&signer_reads);
+    let fixture = build_fixture(
+        profile_name,
+        [seed; 32],
+        |_| {},
+        |profile| {
+            profile.oracle_provider_url = Some(oracle_url.parse().expect("an oracle URL"));
+            profile.cross_check_thresholds =
+                stellar_agent_core::cross_check::CrossCheckThresholds::new(
+                    [(
+                        stellar_agent_core::asset_id::CanonicalAsset::contract(ASSET)
+                            .expect("the payment asset is a contract"),
+                        threshold,
+                    )]
+                    .into_iter()
+                    .collect(),
+                )
+                .expect("a valid threshold table");
+        },
+        move |payer| {
+            keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+                SIGNER_SERVICE,
+                payer,
+                Arc::new(move || {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+            )])
+            .expect("mock keyring with a read hook");
+        },
+    )
+    .await;
+    WitnessFixture {
+        fixture,
+        oracle,
+        oracle_rpc,
+        signer_reads,
+    }
+}
+
+/// The x402 rows of the verified audit chain: `x402_payment_authorized` and
+/// `x402_authorization_withheld`. A payment that wrote no row leaves no log.
+fn verified_x402_rows(profile: &Profile) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    if !profile.audit_log_path.exists() {
+        return (Vec::new(), Vec::new());
+    }
+    let rows: Vec<serde_json::Value> =
+        stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path(
+            &profile.audit_log_path,
+        )
+        .iter()
+        .map(|entry| serde_json::to_value(entry).expect("an audit entry serializes"))
+        .collect();
+    let of_kind = |kind: &str| {
+        crate::common::rows_of_kind(&rows, kind)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    (
+        of_kind("x402_payment_authorized"),
+        of_kind("x402_authorization_withheld"),
+    )
+}
+
+/// The `cross_check` of a passed witness on the oracle at `oracle_uri`.
+fn passed_view(oracle_uri: &str) -> serde_json::Value {
+    serde_json::json!({"status": "passed", "provider": oracle_uri, "ledger": ORACLE_LEDGER})
+}
+
+/// Drives `tool` through a payment below the asset's threshold and one at it:
+/// below, the witness is not required, no oracle client is built, and the
+/// oracle receives nothing; at the threshold, the oracle client is built
+/// beside the primary and simulates once.
+async fn value_wiring(tool: Tool, seeds: [u8; 2]) {
+    let below = witness_fixture(
+        &format!("x402-witness-below-{}", tool.name()),
+        seeds[0],
+        PAYMENT_AMOUNT + 1,
+        None,
+        |_| {},
+    )
+    .await;
+    let (result, built) = crate::common::clients_built_by(call(&below.fixture, tool)).await;
+    let envelope = result_json(&result);
+    assert_ne!(result.is_error, Some(true), "{tool:?}: {envelope}");
+    assert_eq!(
+        envelope["data"]["cross_check"],
+        serde_json::json!({"status": "not_required", "reason": "below_threshold"}),
+        "{tool:?}"
+    );
+    assert_eq!(built, 1, "{tool:?}: no oracle client below the threshold");
+    assert!(below.oracle_methods().await.is_empty(), "{tool:?}");
+
+    let at = witness_fixture(
+        &format!("x402-witness-at-{}", tool.name()),
+        seeds[1],
+        PAYMENT_AMOUNT,
+        None,
+        |_| {},
+    )
+    .await;
+    let (result, built) = crate::common::clients_built_by(call(&at.fixture, tool)).await;
+    let envelope = result_json(&result);
+    assert_ne!(result.is_error, Some(true), "{tool:?}: {envelope}");
+    assert_eq!(
+        envelope["data"]["cross_check"],
+        passed_view(&at.oracle.uri()),
+        "{tool:?}"
+    );
+    assert_eq!(built, 2, "{tool:?}: the primary and the oracle client");
+    assert_eq!(
+        at.oracle_methods().await,
+        ["getNetwork", "simulateTransaction"],
+        "{tool:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn x402_value_wiring_create_payment() {
+    value_wiring(Tool::CreatePayment, [0x12, 0x13]).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn x402_value_wiring_authenticated_payment() {
+    value_wiring(Tool::AuthenticatedPayment, [0x14, 0x15]).await;
+}
+
+/// A passed witness reaches the tool result and the `x402_payment_authorized`
+/// row, and the signed authorization reaches only the primary.
+#[tokio::test]
+#[serial]
+async fn x402_authorized_row_carries_witness() {
+    for (tool, seed) in [
+        (Tool::CreatePayment, 0x16),
+        (Tool::AuthenticatedPayment, 0x17),
+    ] {
+        let witness = witness_fixture(
+            &format!("x402-witness-row-{}", tool.name()),
+            seed,
+            PAYMENT_AMOUNT,
+            None,
+            |_| {},
+        )
+        .await;
+        let result = call(&witness.fixture, tool).await;
+        let envelope = result_json(&result);
+        assert_ne!(result.is_error, Some(true), "{tool:?}: {envelope}");
+        assert!(envelope["data"]["paymentSignature"].is_string());
+        assert_eq!(
+            envelope["data"]["cross_check"],
+            passed_view(&witness.oracle.uri())
+        );
+        let (authorized, withheld) = verified_x402_rows(&witness.fixture.profile);
+        assert!(withheld.is_empty(), "{tool:?}: {withheld:?}");
+        let [row] = authorized.as_slice() else {
+            panic!("{tool:?}: one authorized row: {authorized:?}");
+        };
+        assert_eq!(row["tool"], tool.name());
+        assert_eq!(row["witness"]["provider"], witness.oracle.uri());
+        assert_eq!(row["witness"]["ledger"], ORACLE_LEDGER);
+        assert_eq!(
+            row["witness"]["kinds"],
+            serde_json::json!(["soroban_simulation"])
+        );
+        let digest = row["witness"]["inputs_digest"].as_str().unwrap();
+        assert_eq!(digest.len(), 64, "{digest}");
+        assert!(
+            digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+        assert_eq!(
+            witness.oracle_rpc.observed.lock().unwrap().signed,
+            [false],
+            "{tool:?}: the oracle simulates the unsigned transfer only"
+        );
+        assert_eq!(
+            witness.fixture.rpc.observed.lock().unwrap().signed,
+            [false, true],
+            "{tool:?}"
+        );
+    }
+}
+
+/// Asserts that a witness refusal reached the tool result as `code` and
+/// `message` and nothing else, before the payer signed: one read of the
+/// signer entry (its load), the primary's unsigned simulation only, and no
+/// x402 row.
+async fn assert_witness_refusal(
+    witness: &WitnessFixture,
+    tool: Tool,
+    result: &rmcp::model::CallToolResult,
+    code: &str,
+    message: &str,
+) {
+    let (got_code, got_message, text) = crate::common::assert_business_envelope(result);
+    assert_eq!(got_code, code, "{tool:?}: {text}");
+    assert_eq!(got_message, message, "{tool:?}: {text}");
+    let mut envelope = result_json(result);
+    envelope
+        .as_object_mut()
+        .expect("an envelope object")
+        .remove("request_id");
+    assert_eq!(
+        envelope,
+        serde_json::json!({"ok": false, "error": {"code": code, "message": message}}),
+        "{tool:?}"
+    );
+    assert_eq!(witness.signer_reads(), 1, "{tool:?}: the signer load only");
+    let observed = witness.fixture.rpc.observed.lock().unwrap();
+    assert_eq!(observed.signed, [false], "{tool:?}: nothing signed is sent");
+    assert_eq!(
+        observed.methods,
+        ["getNetwork", "simulateTransaction"],
+        "{tool:?}: the refusal precedes the health read"
+    );
+    drop(observed);
+    let (authorized, withheld) = verified_x402_rows(&witness.fixture.profile);
+    assert!(
+        authorized.is_empty() && withheld.is_empty(),
+        "{tool:?}: no x402 row: {authorized:?} {withheld:?}"
+    );
+}
+
+/// An oracle whose simulation disagrees with the primary's refuses through
+/// both tools with `simulation.divergence`, before signing and without a row.
+#[tokio::test]
+#[serial]
+async fn x402_cross_check_refusal_writes_no_authorized_row() {
+    for (tool, seed) in [
+        (Tool::CreatePayment, 0x18),
+        (Tool::AuthenticatedPayment, 0x19),
+    ] {
+        let witness = witness_fixture(
+            &format!("x402-witness-diverges-{}", tool.name()),
+            seed,
+            PAYMENT_AMOUNT,
+            None,
+            |oracle| oracle.first = FirstSimulate::OtherAmount,
+        )
+        .await;
+        let result = call(&witness.fixture, tool).await;
+        assert_witness_refusal(
+            &witness,
+            tool,
+            &result,
+            "simulation.divergence",
+            "cross-check refused: the primary RPC and the oracle disagree on the soroban \
+             simulation invocation; the wallet did not sign or send. Retry the action; if the \
+             disagreement persists, investigate both endpoints",
+        )
+        .await;
+    }
+}
+
+/// An oracle that serves another network refuses through both tools with
+/// `network.witness_unavailable`, before signing and without a row.
+#[tokio::test]
+#[serial]
+async fn x402_witness_unavailable_writes_no_authorized_row() {
+    for (tool, seed) in [
+        (Tool::CreatePayment, 0x1a),
+        (Tool::AuthenticatedPayment, 0x1b),
+    ] {
+        let witness = witness_fixture(
+            &format!("x402-witness-unavailable-{}", tool.name()),
+            seed,
+            PAYMENT_AMOUNT,
+            None,
+            |oracle| oracle.network = NetworkAnswer::Passphrase(FUTURENET_PASSPHRASE),
+        )
+        .await;
+        let result = call(&witness.fixture, tool).await;
+        let expected = stellar_agent_core::error::WalletError::from(
+            stellar_agent_core::error::NetworkError::WitnessUnavailable {
+                reason:
+                    stellar_agent_core::error::WitnessUnavailableReason::IdentityNetworkMismatch {
+                        authority: witness.oracle.uri(),
+                    },
+            },
+        )
+        .to_string();
+        assert_witness_refusal(
+            &witness,
+            tool,
+            &result,
+            "network.witness_unavailable",
+            &expected,
+        )
+        .await;
+        assert_eq!(witness.oracle_methods().await, ["getNetwork"], "{tool:?}");
+    }
+}
+
+/// An oracle that refuses the credential refuses through both tools with
+/// `network.rpc_credential_refused`, before signing and without a row.
+#[tokio::test]
+#[serial]
+async fn x402_oracle_credential_refusal_writes_no_authorized_row() {
+    for (tool, seed) in [
+        (Tool::CreatePayment, 0x1c),
+        (Tool::AuthenticatedPayment, 0x1d),
+    ] {
+        let witness = witness_fixture(
+            &format!("x402-witness-credential-{}", tool.name()),
+            seed,
+            PAYMENT_AMOUNT,
+            None,
+            |_| {},
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"method": "simulateTransaction"}),
+            ))
+            .respond_with(ResponseTemplate::new(401))
+            .with_priority(1)
+            .mount(&witness.oracle)
+            .await;
+        let result = call(&witness.fixture, tool).await;
+        assert_witness_refusal(
+            &witness,
+            tool,
+            &result,
+            "network.rpc_credential_refused",
+            &format!(
+                "RPC endpoint '{}' answered a request with HTTP 401; check the credential \
+                 the profile configures for this endpoint",
+                witness.oracle.uri()
+            ),
+        )
+        .await;
+        assert_eq!(
+            witness.oracle_methods().await,
+            ["getNetwork", "simulateTransaction"],
+            "{tool:?}: no retry after a credential refusal"
+        );
+    }
+}
+
+/// An oracle client that cannot be built refuses through both tools before
+/// the signer entry is read and before any payment request.
+#[tokio::test]
+#[serial]
+async fn x402_oracle_client_construction_refuses_before_the_signer() {
+    for (tool, seed) in [
+        (Tool::CreatePayment, 0x1e),
+        (Tool::AuthenticatedPayment, 0x1f),
+    ] {
+        let witness = witness_fixture(
+            &format!("x402-witness-construction-{}", tool.name()),
+            seed,
+            PAYMENT_AMOUNT,
+            Some("ftp://oracle.example/private-path"),
+            |_| {},
+        )
+        .await;
+        let (result, built) = crate::common::clients_built_by(call(&witness.fixture, tool)).await;
+        let (code, message, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, "network.witness_unavailable", "{tool:?}: {text}");
+        assert_eq!(
+            message,
+            "cross-check unavailable: the client for oracle 'ftp://oracle.example' could not \
+             be built; correct oracle_provider_url in the profile file",
+            "{tool:?}"
+        );
+        assert_eq!(
+            built, 1,
+            "{tool:?}: the failed oracle construction only; the primary client is never built"
+        );
+        assert_eq!(witness.signer_reads(), 0, "{tool:?}: no signer read");
+        assert!(
+            witness
+                .fixture
+                .rpc
+                .observed
+                .lock()
+                .unwrap()
+                .methods
+                .is_empty(),
+            "{tool:?}: no payment request"
+        );
+        let (authorized, withheld) = verified_x402_rows(&witness.fixture.profile);
+        assert!(authorized.is_empty() && withheld.is_empty(), "{tool:?}");
+    }
+}
+
+/// With a required witness both tools build the primary client and the
+/// oracle client, and every payment request goes to the primary.
+#[tokio::test]
+#[serial]
+async fn mcp_x402_tools_build_the_oracle_client_beside_the_primary() {
+    for (tool, seed) in [
+        (Tool::CreatePayment, 0x20),
+        (Tool::AuthenticatedPayment, 0x21),
+    ] {
+        let witness = witness_fixture(
+            &format!("x402-witness-clients-{}", tool.name()),
+            seed,
+            PAYMENT_AMOUNT,
+            None,
+            |_| {},
+        )
+        .await;
+        let (result, built) = crate::common::clients_built_by(call(&witness.fixture, tool)).await;
+        let envelope = result_json(&result);
+        assert_ne!(result.is_error, Some(true), "{tool:?}: {envelope}");
+        assert_eq!(built, 2, "{tool:?}: the primary and the oracle");
+        assert_eq!(
+            witness.fixture.rpc.observed.lock().unwrap().methods,
+            PAYMENT_METHODS,
+            "{tool:?}"
+        );
+    }
+}
+
+/// The oracle's simulation error text and a JSON-RPC error text reach neither
+/// the tool result nor the wallet's log.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn x402_oracle_texts_reach_no_tool_result_or_log() {
+    use stellar_agent_core::observability::{FormatChoice, SubscriberConfig, subscriber_for_tests};
+    use tracing::instrument::WithSubscriber as _;
+    let cases = [
+        (Tool::CreatePayment, 0x23, false, "simulation.divergence"),
+        (
+            Tool::AuthenticatedPayment,
+            0x24,
+            false,
+            "simulation.divergence",
+        ),
+        (
+            Tool::CreatePayment,
+            0x25,
+            true,
+            "network.witness_unavailable",
+        ),
+        (
+            Tool::AuthenticatedPayment,
+            0x26,
+            true,
+            "network.witness_unavailable",
+        ),
+    ];
+    for (tool, seed, rpc_error, code) in cases {
+        let witness = witness_fixture(
+            &format!("x402-witness-texts-{seed:x}"),
+            seed,
+            PAYMENT_AMOUNT,
+            None,
+            |oracle| oracle.first = FirstSimulate::HostileError,
+        )
+        .await;
+        if rpc_error {
+            Mock::given(method("POST"))
+                .and(wiremock::matchers::body_partial_json(
+                    serde_json::json!({"method": "simulateTransaction"}),
+                ))
+                .respond_with(|request: &Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": body["id"],
+                        "error": {"code": -32603, "message": hostile_simulation_error()},
+                    }))
+                })
+                .with_priority(1)
+                .mount(&witness.oracle)
+                .await;
+        }
+        let capture = stellar_agent_test_support::CaptureWriter::new();
+        let writer = capture.clone();
+        let subscriber = subscriber_for_tests(
+            SubscriberConfig::default()
+                .with_filter_override(Some(tracing_subscriber::EnvFilter::new("trace")))
+                .with_format_override(Some(FormatChoice::Pretty))
+                .with_writer_factory(Some(Box::new(move || Box::new(writer.clone())))),
+        )
+        .expect("the wallet subscriber builds");
+        let inert = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let dispatch = tracing::Dispatch::new(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let result = call(&witness.fixture, tool).with_subscriber(dispatch).await;
+        drop(inert);
+        let logs = capture.captured_str();
+        let (got, _message, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(got, code, "{tool:?}: {text}");
+        for forbidden in ["PWSECRET", "QSECRET", "leak.example", "eeeeeeeeee"] {
+            assert!(!text.contains(forbidden), "{tool:?}: {text}");
+            assert!(!logs.contains(forbidden), "{tool:?}: {logs}");
+        }
+        assert!(
+            logs.contains("x402"),
+            "{tool:?}: the capture holds the tool's own events: {logs}"
         );
     }
 }

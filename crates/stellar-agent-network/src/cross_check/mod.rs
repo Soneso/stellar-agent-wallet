@@ -1,8 +1,10 @@
-//! Independent oracle witnesses for classic transaction decisions.
+//! Independent oracle witnesses for classic transaction decisions and for
+//! Soroban simulations.
 
 mod classic;
 mod digest;
 pub mod inputs;
+mod soroban;
 pub use inputs::*;
 
 use crate::{
@@ -13,7 +15,7 @@ use crate::{
     rpc_endpoint::{is_credential_error, profile_rpc_client},
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 use stellar_agent_core::{
     audit_log::CrossCheckRecord,
     cross_check::{
@@ -26,6 +28,8 @@ use stellar_agent_core::{
         schema::{Profile, ProviderRole, same_provider_host, same_provider_operator},
     },
 };
+use stellar_rpc_client::SimulateTransactionResponse;
+use stellar_xdr::TransactionEnvelope;
 use tokio::time::{Instant, sleep, timeout_at};
 
 const WITNESS_ATTEMPT_BUDGET: Duration = Duration::from_secs(15);
@@ -33,7 +37,7 @@ const WITNESS_READ_ATTEMPTS: u32 = 3;
 const WITNESS_RETRY_BACKOFF: Duration = Duration::from_secs(7);
 
 /// Evidence of a completed comparison against an identified oracle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossCheckWitness {
     authority: String,
     oracle_ledger: u32,
@@ -344,12 +348,53 @@ pub(crate) async fn obtain_classic_witness_with_timing(
     )? {
         CrossCheckRequirement::NotRequired => return Ok(CrossCheckOutcome::NotRequired),
         CrossCheckRequirement::Skipped(reason) => {
-            tracing::warn!(target: "policy.cross_check", tool, ?reason,
-                "cross-check skipped; configure the oracle and asset threshold in the profile");
+            warn_skipped(tool, reason);
             return Ok(CrossCheckOutcome::Skipped(reason));
         }
         CrossCheckRequirement::Required => {}
     }
+    let oracle = required_oracle(profile, context, tool)?;
+    let observations = inputs.observations()?;
+    let keys = classic::keys(&observations);
+    let client = &oracle.client;
+    let keys = keys.as_slice();
+    let answer = read_with_retries(&oracle, context, timing, tool, move || {
+        client.witness_ledger_entries(keys)
+    })
+    .await?;
+    let ledger = classic::compare_answer(&observations, keys, answer, &oracle.authority)?;
+    let mut kinds: Vec<_> = observations.iter().map(|o| o.kind).collect();
+    kinds.dedup();
+    let inputs_digest = digest::inputs_digest(&observations)?;
+    Ok(CrossCheckOutcome::Passed(CrossCheckWitness {
+        authority: oracle.authority,
+        oracle_ledger: ledger,
+        inputs_digest,
+        kinds,
+    }))
+}
+
+/// Logs a skipped witness on the `policy.cross_check` target.
+fn warn_skipped(tool: &'static str, reason: CrossCheckSkip) {
+    tracing::warn!(target: "policy.cross_check", tool, ?reason,
+        "cross-check skipped; configure the oracle and asset threshold in the profile");
+}
+
+/// Builds the oracle of a required witness and logs a shared provider.
+///
+/// The oracle shares the primary's provider host, or its provider record names
+/// the primary's operator: the witness still runs on a second client, and the
+/// WARN on the `policy.cross_check` target says that it is degraded to
+/// single-RPC verification.
+///
+/// # Errors
+/// [`OracleEndpoint::from_profile`]'s refusal, or
+/// `network.witness_unavailable` when the profile names no oracle.
+fn required_oracle(
+    profile: &Profile,
+    context: &NetworkContext,
+    tool: &'static str,
+) -> Result<OracleEndpoint, WalletError> {
     let oracle = OracleEndpoint::from_profile(profile)?
         .ok_or_else(|| unavailable(Reason::OracleNotConfigured))?;
     if same_provider_host(
@@ -371,8 +416,34 @@ pub(crate) async fn obtain_classic_witness_with_timing(
             "oracle provider record names the primary's operator; cross-check is degraded \
              to single-RPC verification");
     }
-    let observations = inputs.observations()?;
-    let keys = classic::keys(&observations);
+    Ok(oracle)
+}
+
+/// Identifies the oracle, then runs `read` on it under the witness attempt
+/// policy, and returns the first answer.
+///
+/// The identity check runs once, before the first read, inside the first
+/// attempt's budget. Each attempt has its own deadline. A transport fault is
+/// retried up to the attempt limit after the backoff; a credential refusal
+/// and an unusable answer end the loop at once, and an elapsed deadline
+/// refuses. The answer is returned unjudged: a comparison that disagrees
+/// never repeats the read.
+///
+/// # Errors
+/// `network.witness_unavailable` with the identity, deadline, transport, or
+/// answer reason; `network.rpc_credential_refused` for HTTP 401 or 403;
+/// the identity check's mainnet refusal on a mainnet profile.
+async fn read_with_retries<T, F, Fut>(
+    oracle: &OracleEndpoint,
+    context: &NetworkContext,
+    timing: WitnessTiming,
+    tool: &'static str,
+    mut read: F,
+) -> Result<T, WalletError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, stellar_rpc_client::Error>>,
+{
     let mut deadline = Instant::now() + timing.attempt_budget;
     oracle
         .client
@@ -381,49 +452,36 @@ pub(crate) async fn obtain_classic_witness_with_timing(
         .map_err(|error| identity_error(error, &oracle.authority, context.chain_id))?;
     let mut attempt = 1;
     loop {
-        let response = timeout_at(deadline, oracle.client.witness_ledger_entries(&keys))
-            .await
-            .map_err(|_| {
-                unavailable(Reason::DeadlineExhausted {
-                    authority: oracle.authority.clone(),
-                    seconds: timing.attempt_budget.as_secs(),
-                })
-            })?;
+        let response = timeout_at(deadline, read()).await.map_err(|_| {
+            unavailable(Reason::DeadlineExhausted {
+                authority: oracle.authority.clone(),
+                seconds: timing.attempt_budget.as_secs(),
+            })
+        })?;
         let error = match response {
-            Ok(answer) => {
-                let ledger =
-                    classic::compare_answer(&observations, &keys, answer, &oracle.authority)?;
-                let mut kinds: Vec<_> = observations.iter().map(|o| o.kind).collect();
-                kinds.dedup();
-                return Ok(CrossCheckOutcome::Passed(CrossCheckWitness {
-                    authority: oracle.authority,
-                    oracle_ledger: ledger,
-                    inputs_digest: digest::inputs_digest(&observations)?,
-                    kinds,
-                }));
-            }
+            Ok(answer) => return Ok(answer),
             Err(error) => error,
         };
         let failure = classify_read(&error);
         let status = rejected_status(&error);
-        tracing::debug!(authority = %oracle.authority, classification = failure.label(),
+        tracing::debug!(tool, authority = %oracle.authority, classification = failure.label(),
             ?status, attempt, "oracle witness read failed");
         match failure {
             ReadFailure::Credential(status) => {
                 return Err(NetworkError::RpcCredentialRejected {
-                    url: oracle.authority,
+                    url: oracle.authority.clone(),
                     status,
                 }
                 .into());
             }
             ReadFailure::InvalidAnswer => {
                 return Err(unavailable(Reason::InvalidAnswer {
-                    authority: oracle.authority,
+                    authority: oracle.authority.clone(),
                 }));
             }
             ReadFailure::Transport if attempt >= WITNESS_READ_ATTEMPTS => {
                 return Err(unavailable(Reason::Transport {
-                    authority: oracle.authority,
+                    authority: oracle.authority.clone(),
                     attempts: attempt,
                 }));
             }
@@ -432,6 +490,145 @@ pub(crate) async fn obtain_classic_witness_with_timing(
         sleep(timing.retry_backoff).await;
         attempt += 1;
         deadline = Instant::now() + timing.attempt_budget;
+    }
+}
+
+/// The witness requirement of one Soroban payment, prepared before the
+/// signer is read.
+///
+/// A `Required` value holds the oracle client, built from the profile without
+/// a request, so a payment flow that receives it builds no client of its own.
+/// The variants carry the outcome without a request where no comparison runs.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one value per payment, built once and borrowed by the flow; a box adds an \
+              allocation and no saving"
+)]
+pub enum SorobanCrossCheck {
+    /// The value is below its threshold.
+    NotRequired,
+    /// Testnet continues without a comparison for this reason.
+    Skipped(CrossCheckSkip),
+    /// The oracle simulates the payment before it is signed.
+    Required {
+        /// The oracle client and its safe authority.
+        oracle: OracleEndpoint,
+        /// The chain and the passphrase the oracle's identity is checked
+        /// against.
+        context: NetworkContext,
+        /// Tool name for the log events of the witness.
+        tool: &'static str,
+    },
+}
+
+/// The primary's simulation of one unsigned Soroban transaction, which the
+/// oracle simulates again.
+#[derive(Clone, Copy)]
+pub struct SorobanWitnessInputs<'a> {
+    /// The unsigned envelope the primary simulated.
+    pub envelope: &'a TransactionEnvelope,
+    /// The primary's answer. It holds exactly one result, and its
+    /// `latest_ledger` is the ledger the payment's expiration derives from.
+    pub primary: &'a SimulateTransactionResponse,
+    /// The signature expiration ledger derived from the primary's ledger.
+    pub expiration_ledger: u32,
+    /// The highest minimum resource fee the flow accepts, in stroops.
+    pub resource_fee_ceiling: u64,
+}
+
+impl SorobanCrossCheck {
+    /// Applies the requirement rule to `value` and builds the oracle client
+    /// when the witness is required, without sending a request.
+    ///
+    /// A skipped witness logs its reason, and a required one logs an oracle
+    /// that shares the primary's provider, on the `policy.cross_check` target.
+    ///
+    /// # Errors
+    /// The rule's mainnet refusals; `network.witness_unavailable` with
+    /// `ClientConstruction` for an oracle client that cannot be built; a
+    /// credential error of the oracle's provider record with its own code.
+    pub fn prepare(
+        profile: &Profile,
+        context: &NetworkContext,
+        value: CrossCheckValue<'_>,
+        tool: &'static str,
+    ) -> Result<Self, WalletError> {
+        match cross_check_requirement(
+            context.chain_id,
+            value,
+            &ThresholdSet::from_profile(profile),
+            profile.oracle_provider_url.is_some(),
+            false,
+        )? {
+            CrossCheckRequirement::NotRequired => Ok(Self::NotRequired),
+            CrossCheckRequirement::Skipped(reason) => {
+                warn_skipped(tool, reason);
+                Ok(Self::Skipped(reason))
+            }
+            CrossCheckRequirement::Required => Ok(Self::Required {
+                oracle: required_oracle(profile, context, tool)?,
+                context: context.clone(),
+                tool,
+            }),
+        }
+    }
+
+    /// Obtains the witness: the oracle simulates the same unsigned envelope,
+    /// and its answer is compared with the primary's.
+    ///
+    /// `NotRequired` and `Skipped` return their outcome without a request.
+    /// The oracle's answer is never signed and never replaces the primary's.
+    ///
+    /// # Errors
+    /// `simulation.divergence` when the answers disagree;
+    /// `network.witness_unavailable` and `network.rpc_credential_refused` as
+    /// the classic witness reports them.
+    pub async fn witness(
+        &self,
+        inputs: SorobanWitnessInputs<'_>,
+    ) -> Result<CrossCheckOutcome, WalletError> {
+        self.witness_with_timing(
+            inputs,
+            WitnessTiming {
+                attempt_budget: WITNESS_ATTEMPT_BUDGET,
+                retry_backoff: WITNESS_RETRY_BACKOFF,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn witness_with_timing(
+        &self,
+        inputs: SorobanWitnessInputs<'_>,
+        timing: WitnessTiming,
+    ) -> Result<CrossCheckOutcome, WalletError> {
+        let (oracle, context, tool) = match self {
+            Self::NotRequired => return Ok(CrossCheckOutcome::NotRequired),
+            Self::Skipped(reason) => return Ok(CrossCheckOutcome::Skipped(*reason)),
+            Self::Required {
+                oracle,
+                context,
+                tool,
+            } => (oracle, context, *tool),
+        };
+        let primary = soroban::Primary::decode(&inputs)?;
+        let client = &oracle.client;
+        let envelope = inputs.envelope;
+        let answer = read_with_retries(oracle, context, timing, tool, move || {
+            client.witness_simulate(envelope)
+        })
+        .await?;
+        soroban::compare(&primary, &inputs, &answer, &oracle.authority)?;
+        Ok(CrossCheckOutcome::Passed(CrossCheckWitness {
+            authority: oracle.authority.clone(),
+            oracle_ledger: answer.latest_ledger,
+            inputs_digest: digest::soroban_inputs_digest(
+                inputs.envelope,
+                &primary.auth,
+                inputs.primary.latest_ledger,
+            )?,
+            kinds: vec![WitnessEntry::SorobanSimulation],
+        }))
     }
 }
 
