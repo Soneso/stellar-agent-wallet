@@ -125,8 +125,7 @@ transaction. The funder sponsors their reserves and pays the fee: the profile's
 per channel, so each channel costs 300 stroops at the default. A per-operation
 fee whose total does not fit the transaction's fee field refuses with
 `validation.fee_total_overflow` before anything is built, signed, or sent.
-A run that already wrote its checkpoint resumes with `--resume` after the fee
-is lowered. Each account starts with zero balance, so initialization has no transferred-balance
+Each account starts with zero balance, so initialization has no transferred-balance
 legs or spending-cap entries. A receipt and a pending audit row record the
 transaction before transmission. Confirmation writes its settled row and the
 `channel_pool_initialised` event.
@@ -157,6 +156,29 @@ stellar-agent pool init --size 5 --profile default
 ```
 
 The success result reports the channel count, the channel records (BIP-44 index plus public G-strkey), a redacted transaction hash when a submission was recorded, the confirmation or account-observation ledger, a redacted funder address, and the keyring service and account where the master seed is stored. No seed bytes appear in the output.
+
+The profile's per-operation fee is capped before a sending path obtains its
+unvalued witness. The total fee is that fee times three operations per channel.
+On a fresh run, the cap and `validation.fee_total_overflow` checks precede the
+funder identity load and any `[pool_initialization]` checkpoint.
+
+The fresh identity load verifies the enrolled funder before RPC. Seed recovery
+and receipt settlement on resume precede the fee check. The funder read and
+witness precede the signer load that sends, including on retries.
+The witness compares the funder and every channel observed absent on the primary.
+A disagreement refuses `simulation.divergence`; an unavailable required oracle
+refuses `network.witness_unavailable`. Credential refusals retain their own code.
+
+A fresh witness refusal leaves a resumable checkpoint. Every refusal that leaves
+a checkpoint carries `error.details.resume_with` with the resume command.
+Resume rechecks the fee, funder, and witness.
+An over-cap retry consumes no attempt. A witness refusal after retry admission
+leaves the incremented attempt persisted, with its prior submission cleared.
+The next resume uses that attempt.
+
+A sending result includes `cross_check`, and both submission rows carry a passed
+witness. A resume that finishes without signing obtains no witness and checks
+no cap. The result has no `cross_check` field.
 
 ### `stellar-agent pool list`
 

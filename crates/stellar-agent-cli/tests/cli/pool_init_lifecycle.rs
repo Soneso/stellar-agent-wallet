@@ -912,6 +912,11 @@ async fn the_endpoint_check_runs_under_the_timeout_flag() {
 #[serial]
 async fn fee_total_overflow_refuses_with_its_code() {
     let (home, _server, rpc) = fixture_with_fee(Some(u32::MAX / 6 + 1)).await;
+    let p = profile(home.path());
+    keyring_core::Entry::new(&p.mcp_signer_default.service, &p.mcp_signer_default.account)
+        .unwrap()
+        .delete_credential()
+        .unwrap();
     let (code, output) = start(home.path());
     assert_eq!(code, 1, "{output}");
     assert_eq!(
@@ -934,4 +939,75 @@ async fn fee_total_overflow_refuses_with_its_code() {
             .iter()
             .any(|method| method == "sendTransaction")
     );
+    assert!(profile(home.path()).pool_initialization.is_none());
+}
+
+async fn divergent_pool_oracle() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "getNetwork" => get_network_result(PASSPHRASE),
+                "getLedgerEntries" => {
+                    let mut result =
+                        ledger_entries_result_for(&[&account_id_for_seed(FUNDER_SEED)]);
+                    for entry in result["entries"].as_array_mut().unwrap() {
+                        let mut data = stellar_xdr::LedgerEntryData::from_xdr_base64(
+                            entry["xdr"].as_str().unwrap(),
+                            Limits::none(),
+                        )
+                        .unwrap();
+                        if let stellar_xdr::LedgerEntryData::Account(account) = &mut data {
+                            account.seq_num.0 += 1;
+                        }
+                        entry["xdr"] = json!(data.to_xdr_base64(Limits::none()).unwrap());
+                    }
+                    result
+                }
+                other => panic!("unexpected oracle method {other}"),
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+        })
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn witness_refusal_leaves_a_checkpoint_and_retry_needs_no_signer() {
+    let (home, _server, rpc) = fixture().await;
+    let oracle = divergent_pool_oracle().await;
+    let mut p = profile(home.path());
+    p.oracle_provider_url = Some(url::Url::parse(&oracle.uri()).unwrap());
+    loader::save_to_dir(NAME, &p, &home.path().join("profiles")).unwrap();
+    let (code, output) = start(home.path());
+    assert_eq!(code, 1, "{output}");
+    assert_eq!(output["error"]["code"], "simulation.divergence", "{output}");
+    assert!(output["error"]["details"]["resume_with"].is_string());
+    assert_eq!(rpc.0.lock().unwrap().send_count, 0);
+    let mut p = profile(home.path());
+    let pending = p.pool_initialization.as_mut().unwrap();
+    assert!(pending.seed_ready);
+    pending.submission = Some(stellar_agent_core::profile::schema::PoolInitSubmission {
+        envelope_hash: "ab".repeat(32),
+        tx_hash: "cd".repeat(32),
+        sequence: 1,
+        send_started: false,
+    });
+    loader::save_to_dir(NAME, &p, &home.path().join("profiles")).unwrap();
+    seed(home.path()).unwrap();
+    keyring_core::Entry::new(&p.mcp_signer_default.service, &p.mcp_signer_default.account)
+        .unwrap()
+        .delete_credential()
+        .unwrap();
+    let (code, output) = resume(home.path());
+    assert_eq!(code, 1, "{output}");
+    assert_eq!(output["error"]["code"], "simulation.divergence", "{output}");
+    let pending = profile(home.path()).pool_initialization.unwrap();
+    assert_eq!(pending.attempt, 1);
+    assert!(pending.submission.is_none());
+    assert_eq!(rpc.0.lock().unwrap().send_count, 0);
 }

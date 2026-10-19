@@ -24,12 +24,19 @@ use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 use stellar_agent_core::profile::loader::ProfileLoadError;
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_test_support::signed_envelope::{get_network_result, send_transaction_hash_hex};
-use stellar_agent_test_support::xdr_fixtures::{account_entry_xdr, account_ledger_key_xdr};
+use stellar_agent_test_support::xdr_fixtures::{
+    account_entry_xdr_with_seq, account_ledger_key_xdr,
+};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// The native balance every account the endpoint reports holds: 10 000 XLM.
 const ACCOUNT_BALANCE_STROOPS: i64 = 100_000_000_000;
+
+/// The sequence number of every account [`ClassicRpc::testnet`] reports. An
+/// oracle fixture that agrees with such a primary builds its account entry
+/// with [`account_xdr`] at this sequence.
+pub(crate) const ACCOUNT_SEQUENCE: i64 = 100;
 
 /// A mocked endpoint for the classic value verbs.
 #[derive(Clone)]
@@ -51,7 +58,12 @@ impl ClassicRpc {
                     .map(|account| {
                         (
                             account_ledger_key_xdr(account),
-                            account_entry_xdr(account, ACCOUNT_BALANCE_STROOPS, 0),
+                            account_entry_xdr_with_seq(
+                                account,
+                                ACCOUNT_BALANCE_STROOPS,
+                                0,
+                                ACCOUNT_SEQUENCE,
+                            ),
                         )
                     })
                     .collect(),
@@ -469,6 +481,69 @@ pub(crate) async fn fail_read_of(server: &MockServer, key: &str) {
             "method": "getLedgerEntries", "params": {"keys": [key]}
         })))
         .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// The credential [`credential_primary`] configures for the primary endpoint.
+pub(crate) const PRIMARY_CREDENTIAL: &str = "Bearer cli-rpc-credential-0123456789";
+
+/// The part of [`PRIMARY_CREDENTIAL`] that names the secret.
+pub(crate) const PRIMARY_CREDENTIAL_TOKEN: &str = "cli-rpc-credential-0123456789";
+
+/// Names a keyring credential with a header placement for `profile`'s primary
+/// endpoint and stores [`PRIMARY_CREDENTIAL`] there in the installed mock
+/// keyring store.
+pub(crate) fn credential_primary(profile: &mut Profile) {
+    use stellar_agent_core::profile::schema::{
+        KeyringEntryRef, PrimaryProviderRecord, Providers, RpcCredentialPlacement,
+    };
+    let entry = KeyringEntryRef::new("stellar-agent-rpc-cli-test", "primary");
+    profile
+        .providers
+        .get_or_insert_with(Providers::default)
+        .primary = Some(
+        PrimaryProviderRecord::new("Primary RPC", "127.0.0.1").with_credential(
+            entry.clone(),
+            RpcCredentialPlacement::Header {
+                name: "X-API-Key".to_owned(),
+            },
+        ),
+    );
+    keyring_core::Entry::new(&entry.service, &entry.account)
+        .unwrap()
+        .set_password(PRIMARY_CREDENTIAL)
+        .unwrap();
+}
+
+/// Answers with a JSON-RPC error object whose `message` is the given server
+/// text, under the request's own id.
+struct RpcErrorText(String);
+
+impl Respond for RpcErrorText {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let id = serde_json::from_slice::<Value>(&request.body)
+            .ok()
+            .and_then(|body| body.get("id").cloned())
+            .unwrap_or_else(|| json!(1));
+        ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32000, "message": self.0},
+        }))
+    }
+}
+
+/// Mounts, ahead of `server`'s other answers, a JSON-RPC error object whose
+/// `message` is `text` for a `getLedgerEntries` request whose only key is
+/// `key`.
+pub(crate) async fn fail_read_of_with_text(server: &MockServer, key: &str, text: String) {
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(json!({
+            "method": "getLedgerEntries", "params": {"keys": [key]}
+        })))
+        .respond_with(RpcErrorText(text))
         .with_priority(1)
         .mount(server)
         .await;

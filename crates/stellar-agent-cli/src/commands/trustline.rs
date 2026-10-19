@@ -29,8 +29,13 @@
 //!    from the wallet-controlled `PendingApprovalStore` (NOT a CLI flag).
 //! 8. `TrustlinePreview::build`: the typed preview of the trustline.
 //! 9. `RefuseWithWarning` / `Refuse` gate decisions → early return (exit 1).
-//! 10. Build `ChangeTrust` envelope via `ClassicOpBuilder::change_trust`.
-//! 11. Sign via keyring → submit → wait for confirmation. The submit layer
+//! 10. Fee resolution and the classic fee cap, with the profile's
+//!     per-operation fee as the default source.
+//! 11. Cross-check witness of the source account and the issuer, before the
+//!     signer loads. A disagreement refuses `simulation.divergence`; an
+//!     oracle that cannot serve refuses `network.witness_unavailable`.
+//! 12. Build `ChangeTrust` envelope via `ClassicOpBuilder::change_trust`.
+//! 13. Sign via keyring → submit → wait for confirmation. The submit layer
 //!     checks the endpoint of the sending client again before the send.
 //!
 //! # Policy engine
@@ -53,9 +58,10 @@
 //! The typed preview from step 8 is rendered once, as a nested `preview`
 //! object, after the step 9 gate decision passes. It sits in `data.preview`
 //! beside the submission result on success. It sits in
-//! `error.details.preview` when a later stage fails: fee resolution, envelope
-//! build, signing, or submission. A refusal up to and including the step 9
-//! gate decision carries no preview.
+//! `error.details.preview` when a later stage fails: fee resolution, the fee
+//! cap, the witness, envelope build, signing, or submission. The fee cap and
+//! witness refusals keep their own codes. A refusal up to and including the
+//! step 9 gate decision carries no preview.
 //!
 //! # Behavior
 //!
@@ -78,11 +84,17 @@ use stellar_agent_core::approval::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, DEFAULT_TTL_MS, open_with_retry,
 };
 use stellar_agent_core::audit_log::AuditWriter;
+use stellar_agent_core::cross_check::CrossCheckValue;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::WalletError;
+use stellar_agent_core::error::{FeeSource, NetworkError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::schema::{Profile, default_approval_dir};
+use stellar_agent_network::cross_check::{
+    AccountObservation, CrossCheckView, IssuerObservation, TrustlineWitnessInputs,
+    obtain_classic_witness,
+};
+use stellar_agent_network::fees::{check_classic_fee_cap, classic_fee_source};
 
 use crate::commands::policy_engine::{
     build_v1_policy_engine, evaluate_value_moving_policy, trustline_policy_args,
@@ -139,10 +151,12 @@ fn redact_asset_for_log(asset: &str) -> String {
 /// 1. Operator policy evaluation (V1 / Noop).
 /// 2. `resolve_denomination` — USDT refusal + lookalike denylist +
 ///    pinned-issuer-mismatch + unpinned-bare-code.
-/// 3. Live issuer-flag fetch.  Fetch failure fail-closes.
+/// 3. Live issuer account fetch. An issuer read error refuses with its own
+///    code; an absent issuer yields the gate's `Refuse`.
 /// 4. `clawback_gate` — wallet-controlled approval store opt-in lookup.
 /// 5. Typed preview, reported in the one output envelope.
-/// 6. Build → sign → submit.
+/// 6. Fee cap and cross-check witness.
+/// 7. Build → sign → submit.
 ///
 /// # Asset grammar
 ///
@@ -200,8 +214,8 @@ pub struct TrustlineArgs {
 ///
 /// # Errors
 ///
-/// Returns `1` on any gate failure, denomination error, flag-fetch failure,
-/// build error, sign error, or submit error.
+/// Returns `1` on any gate failure, denomination error, issuer read error,
+/// fee cap or witness refusal, build error, sign error, or submit error.
 pub async fn run(args: &TrustlineArgs) -> i32 {
     run_with_dependencies(
         args,
@@ -360,16 +374,8 @@ where
                 );
                 Some(account_view)
             }
-            Err(e) => {
-                // Fetch failure fail-closes the gate.
-                tracing::info!(
-                    subcommand = "trustline",
-                    issuer = %redact_strkey_first5_last5(&resolved.issuer),
-                    error = %e,
-                    "issuer flag fetch failed — fail-closing gate"
-                );
-                None
-            }
+            Err(WalletError::Network(NetworkError::AccountNotFound { .. })) => None,
+            Err(error) => return write_envelope(out, &Envelope::<()>::err(&error), 1),
         };
     let issuer_flags: Option<AccountFlagsView> = issuer_account_view
         .as_ref()
@@ -387,7 +393,6 @@ where
             );
         }
     };
-    let source_sequence = source_account_view.sequence_number;
 
     // Settle the spending-window reservations that have stood long enough to
     // be settleable, before the gate below counts them. A reservation the
@@ -674,11 +679,13 @@ where
             args,
             profile: &profile,
             profile_name: &profile_name,
+            context: &context,
             rpc_client: &rpc_client,
             network_passphrase,
             chain_id,
             resolved: &resolved,
-            source_sequence,
+            source: &source_account_view,
+            issuer: IssuerObservation::from_view(&resolved.issuer, issuer_account_view.as_ref()),
             effects: trustline_effects.as_ref(),
             audit_writer: &audit_writer,
             now_ms,
@@ -698,11 +705,13 @@ struct GatedTrustline<'a> {
     args: &'a TrustlineArgs,
     profile: &'a Profile,
     profile_name: &'a str,
+    context: &'a NetworkContext,
     rpc_client: &'a StellarRpcClient,
     network_passphrase: &'a str,
     chain_id: &'a str,
     resolved: &'a ResolvedAsset,
-    source_sequence: i64,
+    source: &'a AccountView,
+    issuer: IssuerObservation,
     effects: Option<&'a stellar_agent_core::policy::v1::ValueEffects>,
     audit_writer: &'a Arc<Mutex<AuditWriter>>,
     now_ms: u64,
@@ -719,10 +728,13 @@ struct TrustlineSubmitted {
     is_pinned: bool,
     tx_hash: String,
     ledger: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cross_check: Option<CrossCheckView>,
 }
 
-/// Resolves the fee, then builds, signs, records, and submits the
-/// `ChangeTrust` envelope.
+/// Resolves and caps the fee, obtains the cross-check witness of the source
+/// and the issuer, then builds, signs, records, and submits the `ChangeTrust`
+/// envelope.
 ///
 /// `submit_and_wait` is the submission step, with the signature of
 /// [`submit_transaction_and_wait`], which production passes. It receives the
@@ -748,11 +760,13 @@ where
         args,
         profile,
         profile_name,
+        context,
         rpc_client,
         network_passphrase,
         chain_id,
         resolved,
-        source_sequence,
+        source,
+        issuer,
         effects,
         audit_writer,
         now_ms,
@@ -773,14 +787,37 @@ where
         .await
         .map_err(|e| Envelope::<()>::err_raw("trustline.fee_resolution_failed", e.to_string()))?;
     let fee_per_op = fee_selection.per_op_stroops;
+    check_classic_fee_cap(
+        fee_per_op,
+        classic_fee_source(fee_choice, FeeSource::ProfileDefault),
+        profile,
+    )
+    .map_err(|error| Envelope::<()>::err(&error))?;
+    let cross_check = obtain_classic_witness(
+        profile,
+        context,
+        CrossCheckValue::Unvalued,
+        TrustlineWitnessInputs {
+            source: AccountObservation::from_view(source)
+                .map_err(|error| Envelope::<()>::err(&error))?,
+            issuer,
+        },
+        "stellar_trustline",
+    )
+    .await
+    .map_err(|error| Envelope::<()>::err(&error))?;
 
     // ── Build unsigned ChangeTrust envelope ───────────────────────────────────
     let asset = Asset::from_code_and_issuer(&resolved.code, &resolved.issuer)
         .map_err(|e| Envelope::<()>::err_raw("trustline.asset_build_failed", e.to_string()))?;
     let envelope_build_failed =
         |e: WalletError| Envelope::<()>::err_raw("trustline.envelope_build_failed", e.to_string());
-    let mut builder =
-        ClassicOpBuilder::new(&args.from, source_sequence, network_passphrase, fee_per_op);
+    let mut builder = ClassicOpBuilder::new(
+        &args.from,
+        source.sequence_number,
+        network_passphrase,
+        fee_per_op,
+    );
     builder
         .change_trust(&asset, args.limit_stroops)
         .map_err(envelope_build_failed)?;
@@ -840,7 +877,8 @@ where
             now_ms,
         },
     )
-    .map_err(submission_failure)?;
+    .map_err(submission_failure)?
+    .with_witness(cross_check.witness());
 
     let SubmissionResult {
         tx_hash, ledger, ..
@@ -875,6 +913,7 @@ where
         is_pinned: resolved.is_pinned,
         tx_hash,
         ledger,
+        cross_check: Some(cross_check.view()),
     })
 }
 
@@ -1347,6 +1386,7 @@ mod tests {
             is_pinned: preview.is_pinned,
             tx_hash: "ab".repeat(32),
             ledger: 7,
+            cross_check: None,
         }
     }
 
@@ -1366,6 +1406,7 @@ mod tests {
         assert_eq!(data["status"], "submitted", "{envelope}");
         assert_eq!(data["tx_hash"], "ab".repeat(32), "{envelope}");
         assert_eq!(data["ledger"], 7, "{envelope}");
+        assert!(data.get("cross_check").is_none());
         assert_eq!(data["preview"]["code"], "USDC", "{envelope}");
         assert_eq!(data["preview"]["issuer"], ONE_ENVELOPE_ISSUER, "{envelope}");
         assert_eq!(
@@ -1543,6 +1584,7 @@ mod tests {
         )
         .unwrap();
         let rpc_client = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+        let context = NetworkContext::from_profile(&profile);
 
         let forwarded = Arc::new(Mutex::new(None));
         let seen = Arc::clone(&forwarded);
@@ -1551,11 +1593,28 @@ mod tests {
                 args: &args,
                 profile: &profile,
                 profile_name: name,
+                context: &context,
                 rpc_client: &rpc_client,
                 network_passphrase: stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
                 chain_id: "stellar:testnet",
                 resolved: &resolved,
-                source_sequence: 1,
+                source: &AccountView::new(
+                    from.clone(),
+                    1,
+                    0,
+                    vec![stellar_agent_network::BalanceView::new(
+                        stellar_agent_network::AssetView::native(),
+                        "100.0000000".to_owned(),
+                        None,
+                        "0.0000000".to_owned(),
+                        "0.0000000".to_owned(),
+                    )],
+                    stellar_agent_network::ThresholdsView::new(1, 0, 0, 0),
+                    vec![],
+                    None,
+                    None,
+                ),
+                issuer: IssuerObservation::from_view(ONE_ENVELOPE_ISSUER, None),
                 effects: None,
                 audit_writer: &audit_writer,
                 now_ms: stellar_agent_core::timefmt::now_unix_ms().unwrap(),
@@ -1722,208 +1781,456 @@ mod tests {
             std::time::Duration::from_secs(17)
         );
     }
-}
 
-#[cfg(test)]
-mod enrolled_failure_tests {
-    use super::*;
-    use stellar_agent_core::error::{AuthError, NetworkError};
+    mod enrolled_failure_tests {
+        use super::*;
+        use stellar_agent_core::error::{AuthError, NetworkError};
 
-    #[test]
-    fn signer_load_failure_codes() {
-        let cases: [(WalletError, &str); 5] = [
-            (
-                WalletError::Auth(AuthError::EnrolledSignerUnpinned {
-                    profile: "mainnet".into(),
-                    reason: "placeholder",
-                }),
-                "auth.enrolled_signer_unpinned",
-            ),
-            (
-                WalletError::Auth(AuthError::EnrolledSignerMismatch {
-                    profile: "mainnet".into(),
-                    enrolled: "A".into(),
-                    derived: "B".into(),
-                }),
-                "auth.enrolled_signer_mismatch",
-            ),
-            (
-                WalletError::Auth(AuthError::KeyringNotFound {
-                    name: "missing".into(),
-                }),
-                "auth.keyring_not_found",
-            ),
-            (
-                WalletError::Auth(AuthError::KeyringPlatformError {
-                    detail: "credential store unavailable".into(),
-                }),
-                "auth.keyring_platform_error",
-            ),
-            (
-                WalletError::Network(NetworkError::AccountNotFound {
-                    account_id: "missing".into(),
-                }),
-                "trustline.signer_load_failed",
-            ),
-        ];
-        for (e, code) in cases {
-            assert_eq!(signer_load_failure_parts(&e), (code, e.to_string()));
+        #[test]
+        fn signer_load_failure_codes() {
+            let cases: [(WalletError, &str); 5] = [
+                (
+                    WalletError::Auth(AuthError::EnrolledSignerUnpinned {
+                        profile: "mainnet".into(),
+                        reason: "placeholder",
+                    }),
+                    "auth.enrolled_signer_unpinned",
+                ),
+                (
+                    WalletError::Auth(AuthError::EnrolledSignerMismatch {
+                        profile: "mainnet".into(),
+                        enrolled: "A".into(),
+                        derived: "B".into(),
+                    }),
+                    "auth.enrolled_signer_mismatch",
+                ),
+                (
+                    WalletError::Auth(AuthError::KeyringNotFound {
+                        name: "missing".into(),
+                    }),
+                    "auth.keyring_not_found",
+                ),
+                (
+                    WalletError::Auth(AuthError::KeyringPlatformError {
+                        detail: "credential store unavailable".into(),
+                    }),
+                    "auth.keyring_platform_error",
+                ),
+                (
+                    WalletError::Network(NetworkError::AccountNotFound {
+                        account_id: "missing".into(),
+                    }),
+                    "trustline.signer_load_failed",
+                ),
+            ];
+            for (e, code) in cases {
+                assert_eq!(signer_load_failure_parts(&e), (code, e.to_string()));
+            }
+        }
+
+        // ── A consent row queued after the pre-flight ────────────────────────────
+
+        /// A consent row queued after the audit pre-flight, while the verb reads
+        /// the clawback opt-in, is in the log before the signing key loads.
+        ///
+        /// The writer is cached in-process by an earlier keyed call. A read hook at
+        /// the attestation key queues the row during the opt-in read; a read hook
+        /// at the signer coordinate records whether the row is in the log when the
+        /// signing key loads. No signer is seeded, so the verb refuses there.
+        #[tokio::test]
+        #[serial_test::serial]
+        #[allow(clippy::unwrap_used, reason = "test-only fixture construction")]
+        async fn trustline_logs_a_consent_row_queued_after_its_pre_flight_before_the_signer_loads()
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{Arc, Mutex};
+
+            use base64::Engine as _;
+            use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox, AuditWriterRegistry};
+            use stellar_agent_test_support::keyring_mock::{ReadHook, install_with_read_hooks};
+
+            const NAME: &str = "trustline-drain";
+            const FROM: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+            const ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+            let home = tempfile::tempdir().unwrap();
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+            let rpc = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(|request: &wiremock::Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    let result = match body["method"].as_str().unwrap_or("") {
+                        "getLedgerEntries" => {
+                            stellar_agent_test_support::signed_envelope::ledger_entries_result_for(
+                                &[FROM, ISSUER],
+                            )
+                        }
+                        "getNetwork" => {
+                            stellar_agent_test_support::signed_envelope::get_network_result(
+                                stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                            )
+                        }
+                        "getFeeStats" => serde_json::json!({}),
+                        _ => serde_json::json!({}),
+                    };
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "result": result,
+                    }))
+                })
+                .mount(&rpc)
+                .await;
+            let mut profile = Profile::builder_testnet_named(
+                NAME,
+                "svc-trustline-drain",
+                FROM,
+                "n-svc",
+                "n-acct",
+            )
+            .with_noop_engine()
+            .build();
+            profile.rpc_url = rpc.uri();
+            profile.audit_log_path = home.path().join("audit").join(format!("{NAME}.jsonl"));
+            let log_path = profile.audit_log_path.clone();
+
+            let queued = Arc::new(AtomicBool::new(false));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let queue_hook = {
+                let queued = Arc::clone(&queued);
+                let log_path = log_path.clone();
+                Arc::new(move || {
+                    if queued.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    AuditOutbox::for_log(&log_path)
+                        .append(&AuditEntry::new_approval_attested(
+                            "TrustlineClawbackOptIn",
+                            "stellar_trustline_commit",
+                            None,
+                            "queued-trustline-consent",
+                            "cli",
+                            "queued-consent",
+                        ))
+                        .unwrap();
+                }) as Arc<dyn Fn() + Send + Sync>
+            };
+            let signer_hook = {
+                let seen = Arc::clone(&seen);
+                let log_path = log_path.clone();
+                Arc::new(move || {
+                    seen.lock().unwrap().push(
+                        std::fs::read_to_string(&log_path)
+                            .unwrap_or_default()
+                            .contains(r#""kind":"approval_attested""#),
+                    );
+                }) as Arc<dyn Fn() + Send + Sync>
+            };
+            install_with_read_hooks(vec![
+                ReadHook::new(
+                    &profile.attestation_key_id.service,
+                    &profile.attestation_key_id.account,
+                    queue_hook,
+                ),
+                ReadHook::new(
+                    &profile.mcp_signer_default.service,
+                    &profile.mcp_signer_default.account,
+                    signer_hook,
+                ),
+            ])
+            .unwrap();
+            for coord in [
+                &profile.audit_log_hash_chain_key_id,
+                &profile.attestation_key_id,
+            ] {
+                keyring_core::Entry::new(&coord.service, &coord.account)
+                    .unwrap()
+                    .set_password(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x3a; 32]),
+                    )
+                    .unwrap();
+            }
+
+            // An earlier keyed call caches the writer in this process.
+            let _cached = AuditWriterRegistry::get_or_open_keyed(
+                NAME,
+                &log_path,
+                stellar_agent_network::keyring::keyed_audit_access(
+                    &profile,
+                    NAME,
+                    stellar_agent_core::audit_log::BindingCheck::Enforce,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+            let args = TrustlineArgs {
+                profile: Some(NAME.to_owned()),
+                from: FROM.to_owned(),
+                asset: format!("USDC:{ISSUER}"),
+                limit_stroops: None,
+                classic_base: None,
+            };
+            let loaded = profile.clone();
+            let code = run_with_dependencies(
+                &args,
+                move |_| Ok(loaded.clone()),
+                || Ok(()),
+                &mut std::io::sink(),
+            )
+            .await;
+            assert_eq!(code, 1, "no signer is seeded");
+            assert!(
+                queued.load(Ordering::SeqCst),
+                "the opt-in read loaded the attestation key"
+            );
+            let seen = seen.lock().unwrap().clone();
+            assert!(!seen.is_empty(), "the verb reached the signer load");
+            assert!(
+                seen.iter().all(|in_log| *in_log),
+                "the consent row must be in the log when the signing key loads: {seen:?}"
+            );
         }
     }
 
-    // ── A consent row queued after the pre-flight ────────────────────────────
-
-    /// A consent row queued after the audit pre-flight, while the verb reads
-    /// the clawback opt-in, is in the log before the signing key loads.
-    ///
-    /// The writer is cached in-process by an earlier keyed call. A read hook at
-    /// the attestation key queues the row during the opt-in read; a read hook
-    /// at the signer coordinate records whether the row is in the log when the
-    /// signing key loads. No signer is seeded, so the verb refuses there.
-    #[tokio::test]
-    #[serial_test::serial]
-    #[allow(clippy::unwrap_used, reason = "test-only fixture construction")]
-    async fn trustline_logs_a_consent_row_queued_after_its_pre_flight_before_the_signer_loads() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, Mutex};
-
-        use base64::Engine as _;
-        use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox, AuditWriterRegistry};
+    mod witness {
+        use super::*;
+        use crate::test_rpc::{
+            ACCOUNT_SEQUENCE, ClassicRpc, PRIMARY_CREDENTIAL, PRIMARY_CREDENTIAL_TOKEN,
+            account_key, account_xdr, assert_rows_carry_witness, credential_primary,
+            fail_read_of_with_text, methods, sent,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use stellar_agent_test_support::keyring_mock::{ReadHook, install_with_read_hooks};
 
-        const NAME: &str = "trustline-drain";
-        const FROM: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
-        const ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
-
-        let home = tempfile::tempdir().unwrap();
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
-        let rpc = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(|request: &wiremock::Request| {
-                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-                let result = match body["method"].as_str().unwrap_or("") {
-                    "getLedgerEntries" => {
-                        stellar_agent_test_support::signed_envelope::ledger_entries_result_for(&[
-                            FROM, ISSUER,
-                        ])
-                    }
-                    "getNetwork" => {
-                        stellar_agent_test_support::signed_envelope::get_network_result(
-                            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
-                        )
-                    }
-                    "getFeeStats" => serde_json::json!({}),
-                    _ => serde_json::json!({}),
-                };
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": body["id"],
-                    "result": result,
-                }))
-            })
-            .mount(&rpc)
-            .await;
-        let mut profile =
-            Profile::builder_testnet_named(NAME, "svc-trustline-drain", FROM, "n-svc", "n-acct")
-                .with_noop_engine()
-                .build();
-        profile.rpc_url = rpc.uri();
-        profile.audit_log_path = home.path().join("audit").join(format!("{NAME}.jsonl"));
-        let log_path = profile.audit_log_path.clone();
-
-        let queued = Arc::new(AtomicBool::new(false));
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let queue_hook = {
-            let queued = Arc::clone(&queued);
-            let log_path = log_path.clone();
-            Arc::new(move || {
-                if queued.swap(true, Ordering::SeqCst) {
-                    return;
-                }
-                AuditOutbox::for_log(&log_path)
-                    .append(&AuditEntry::new_approval_attested(
-                        "TrustlineClawbackOptIn",
-                        "stellar_trustline_commit",
-                        None,
-                        "queued-trustline-consent",
-                        "cli",
-                        "queued-consent",
-                    ))
-                    .unwrap();
-            }) as Arc<dyn Fn() + Send + Sync>
-        };
-        let signer_hook = {
-            let seen = Arc::clone(&seen);
-            let log_path = log_path.clone();
-            Arc::new(move || {
-                seen.lock().unwrap().push(
-                    std::fs::read_to_string(&log_path)
-                        .unwrap_or_default()
-                        .contains(r#""kind":"approval_attested""#),
-                );
-            }) as Arc<dyn Fn() + Send + Sync>
-        };
-        install_with_read_hooks(vec![
-            ReadHook::new(
-                &profile.attestation_key_id.service,
-                &profile.attestation_key_id.account,
-                queue_hook,
-            ),
-            ReadHook::new(
-                &profile.mcp_signer_default.service,
-                &profile.mcp_signer_default.account,
-                signer_hook,
-            ),
-        ])
-        .unwrap();
-        for coord in [
-            &profile.audit_log_hash_chain_key_id,
-            &profile.attestation_key_id,
-        ] {
-            keyring_core::Entry::new(&coord.service, &coord.account)
-                .unwrap()
-                .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x3a; 32]))
-                .unwrap();
+        #[derive(Debug)]
+        enum Case {
+            Pass,
+            Source,
+            Issuer,
+            Unavailable,
+            Invalid,
+            Skipped,
+            Cap,
+            Transport,
+            Absent,
         }
 
-        // An earlier keyed call caches the writer in this process.
-        let _cached = AuditWriterRegistry::get_or_open_keyed(
-            NAME,
-            &log_path,
-            stellar_agent_network::keyring::keyed_audit_access(
-                &profile,
-                NAME,
-                stellar_agent_core::audit_log::BindingCheck::Enforce,
+        async fn exercise(case: Case) {
+            let from = stellar_agent_test_support::signed_envelope::account_id_for_seed([0x5d; 32]);
+            let primary_rpc = ClassicRpc::testnet(&[&from]);
+            let primary_rpc = if matches!(case, Case::Absent) {
+                primary_rpc
+            } else {
+                primary_rpc.with_entry(
+                    account_key(ONE_ENVELOPE_ISSUER),
+                    account_xdr(ONE_ENVELOPE_ISSUER, 0, 0, ""),
+                )
+            };
+            let primary = primary_rpc.serve().await;
+            let oracle_rpc = ClassicRpc::testnet(&[])
+                .with_entry(
+                    account_key(&from),
+                    account_xdr(
+                        &from,
+                        if matches!(case, Case::Source) {
+                            ACCOUNT_SEQUENCE + 9
+                        } else {
+                            ACCOUNT_SEQUENCE
+                        },
+                        0,
+                        "",
+                    ),
+                )
+                .with_entry(
+                    account_key(ONE_ENVELOPE_ISSUER),
+                    account_xdr(
+                        ONE_ENVELOPE_ISSUER,
+                        0,
+                        if matches!(case, Case::Issuer) { 2 } else { 0 },
+                        "",
+                    ),
+                );
+            if matches!(case, Case::Unavailable) {
+                oracle_rpc.report(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE);
+            }
+            let oracle = oracle_rpc.serve().await;
+            let name = format!("trustline-witness-{case:?}").to_ascii_lowercase();
+            let (mut profile, from, _dir, _home) = seeded_trustline_profile(&name, &primary.uri());
+            profile.oracle_provider_url = if matches!(case, Case::Skipped) {
+                None
+            } else {
+                Some(url::Url::parse(&oracle.uri()).unwrap())
+            };
+            if matches!(case, Case::Invalid) {
+                profile.oracle_provider_url = Some(url::Url::parse("ftp://oracle.test").unwrap());
+            }
+            if matches!(case, Case::Cap) {
+                profile.classic_fee_per_op_stroops = Some(101);
+                profile.classic_max_fee_per_op_stroops = Some(100);
+            }
+            let reads = Arc::new(AtomicUsize::new(0));
+            let count = reads.clone();
+            install_with_read_hooks(vec![ReadHook::new(
+                &profile.mcp_signer_default.service,
+                &profile.mcp_signer_default.account,
+                Arc::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }),
+            )])
+            .unwrap();
+            if matches!(case, Case::Transport) {
+                // The primary carries a configured credential, and the issuer
+                // read fails with server text that echoes it beside a URL with
+                // a path; the scrub is what keeps both out of the output.
+                credential_primary(&mut profile);
+                fail_read_of_with_text(
+                    &primary,
+                    &account_key(ONE_ENVELOPE_ISSUER),
+                    format!(
+                        "upstream {PRIMARY_CREDENTIAL} refused at https://rpc.test/private-route"
+                    ),
+                )
+                .await;
+            }
+            KeyringEntry::new(
+                &profile.audit_log_hash_chain_key_id.service,
+                &profile.audit_log_hash_chain_key_id.account,
             )
-            .unwrap(),
-        )
-        .unwrap();
+            .unwrap()
+            .set_password(&URL_SAFE_NO_PAD.encode([0x3a; 32]))
+            .unwrap();
+            KeyringEntry::new(
+                &profile.mcp_signer_default.service,
+                &profile.mcp_signer_default.account,
+            )
+            .unwrap()
+            .set_password(
+                stellar_strkey::ed25519::PrivateKey([0x5d; 32])
+                    .as_unredacted()
+                    .to_string()
+                    .as_str(),
+            )
+            .unwrap();
+            let args = TrustlineArgs {
+                profile: Some(name),
+                from,
+                asset: format!("USDC:{ONE_ENVELOPE_ISSUER}"),
+                limit_stroops: None,
+                classic_base: None,
+            };
+            let mut out = Vec::new();
+            let rc =
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || Ok(()), &mut out).await;
+            let value = crate::common::render::single_json_document(&out);
+            let refusal = match case {
+                Case::Source | Case::Issuer => Some("simulation.divergence"),
+                Case::Unavailable | Case::Invalid => Some("network.witness_unavailable"),
+                Case::Cap => Some("fees.percentile_exceeds_cap"),
+                Case::Transport => Some("network.rpc_unreachable"),
+                Case::Absent => Some("trustline.gate_refused"),
+                _ => None,
+            };
+            if let Some(code) = refusal {
+                assert_eq!(rc, 1, "{value}");
+                assert_eq!(value["error"]["code"], code, "{value}");
+                assert_eq!(reads.load(Ordering::SeqCst), 0);
+                assert!(!sent(&primary).await);
+                if !matches!(case, Case::Transport | Case::Absent) {
+                    assert_eq!(value["error"]["details"]["preview"]["code"], "USDC");
+                }
+                let message = value["error"]["message"].as_str().unwrap();
+                if matches!(case, Case::Source) {
+                    assert!(
+                        message.contains("source account sequence (sequence delta 9)"),
+                        "{message}"
+                    );
+                }
+                if matches!(case, Case::Issuer) {
+                    assert!(message.contains("issuer account flags"), "{message}");
+                }
+                if matches!(case, Case::Cap) {
+                    assert!(methods(&oracle).await.is_empty());
+                    assert!(
+                        value["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("profile's per-operation fee")
+                    );
+                }
+                if matches!(case, Case::Transport) {
+                    let rendered = value.to_string();
+                    assert!(!rendered.contains(PRIMARY_CREDENTIAL_TOKEN), "{rendered}");
+                    assert!(!rendered.contains("private-route"), "{rendered}");
+                    // The echoed host remains: the server text reached the
+                    // refusal, and the scrub removed the rest.
+                    assert!(message.contains("rpc.test"), "{message}");
+                }
+            } else {
+                assert_eq!(rc, 0, "{value}");
+                // The signer entry is read twice, both after the witness: once
+                // when the signer loads and once when it signs.
+                assert_eq!(reads.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    value["data"]["cross_check"]["status"],
+                    if matches!(case, Case::Skipped) {
+                        "skipped"
+                    } else {
+                        "passed"
+                    }
+                );
+                if matches!(case, Case::Pass) {
+                    assert_rows_carry_witness(&profile, &oracle.uri());
+                } else {
+                    assert!(methods(&oracle).await.is_empty());
+                }
+            }
+        }
 
-        let args = TrustlineArgs {
-            profile: Some(NAME.to_owned()),
-            from: FROM.to_owned(),
-            asset: format!("USDC:{ISSUER}"),
-            limit_stroops: None,
-            classic_base: None,
-        };
-        let loaded = profile.clone();
-        let code = run_with_dependencies(
-            &args,
-            move |_| Ok(loaded.clone()),
-            || Ok(()),
-            &mut std::io::sink(),
-        )
-        .await;
-        assert_eq!(code, 1, "no signer is seeded");
-        assert!(
-            queued.load(Ordering::SeqCst),
-            "the opt-in read loaded the attestation key"
-        );
-        let seen = seen.lock().unwrap().clone();
-        assert!(!seen.is_empty(), "the verb reached the signer load");
-        assert!(
-            seen.iter().all(|in_log| *in_log),
-            "the consent row must be in the log when the signing key loads: {seen:?}"
-        );
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn trustline_witness_records_result_and_rows() {
+            exercise(Case::Pass).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn source_disagreement_precedes_signer() {
+            exercise(Case::Source).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn issuer_disagreement_keeps_preview() {
+            exercise(Case::Issuer).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn unavailable_oracle_precedes_signer() {
+            exercise(Case::Unavailable).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn invalid_oracle_precedes_signer() {
+            exercise(Case::Invalid).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn no_oracle_reports_skipped() {
+            exercise(Case::Skipped).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn profile_fee_cap_keeps_preview_before_witness() {
+            exercise(Case::Cap).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn issuer_transport_error_is_scrubbed() {
+            exercise(Case::Transport).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn absent_issuer_refuses_gate() {
+            exercise(Case::Absent).await;
+        }
     }
 }

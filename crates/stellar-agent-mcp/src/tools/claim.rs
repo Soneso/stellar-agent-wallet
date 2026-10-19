@@ -618,6 +618,10 @@ impl WalletServer {
     ///    against fresh on-chain state.
     /// 5. Envelope divergence check: the rebuilt envelope must byte-equal the
     ///    presented `envelope_xdr`, else `simulation.divergence`.
+    /// 6. Cross-check witness: after the fee cap and before the audit
+    ///    pre-flight, the nonce and the signer, the oracle witnesses the source
+    ///    account and the claimable-balance record. The nonce is verified
+    ///    against the clock read after the witness.
     ///
     /// # Tool annotations
     ///
@@ -643,8 +647,10 @@ impl WalletServer {
         description = "Sign and submit a ClaimClaimableBalance transaction (commit step). \
                        Requires the nonce, expires_at_unix_ms, and envelope_xdr returned by \
                        stellar_claim. Re-derives authoritative args from the envelope, \
-                       re-fetches and re-checks the entry, verifies the nonce, re-builds the \
-                       envelope, signs via keyring, and submits. Returns {tx_hash, ledger}. \
+                       re-fetches and re-checks the entry, re-builds the envelope, \
+                       obtains the cross-check witness, verifies the nonce, signs via \
+                       keyring, and submits. \
+                       Returns {tx_hash, ledger, cross_check}. \
                        destructive_hint=true; read_only_hint=false.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
@@ -832,9 +838,9 @@ impl WalletServer {
             Ok(e) => e,
             Err(err) => return Ok(claim_error_result(&err)),
         };
-        let now_ms = now_unix_ms()
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
-        let now_secs = now_ms / 1000;
+        let now_secs = now_unix_ms()
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?
+            / 1000;
         let preview = match ClaimPreview::build(&entry, &source, now_secs) {
             Ok(p) => p,
             Err(err) => return Ok(claim_error_result(&err)),
@@ -909,6 +915,33 @@ impl WalletServer {
             return Ok(ledger_err_result(&err));
         }
 
+        let source_observation =
+            match stellar_agent_network::cross_check::AccountObservation::from_view(&account_view) {
+                Ok(source) => source,
+                Err(err) => return Ok(ledger_err_result(&err)),
+            };
+        let cross_check = match stellar_agent_network::cross_check::obtain_classic_witness(
+            &self.profile,
+            &self.context,
+            stellar_agent_core::cross_check::CrossCheckValue::Unvalued,
+            stellar_agent_network::cross_check::ClaimWitnessInputs {
+                source: source_observation,
+                trustline: None,
+                balance: Some(
+                    stellar_agent_network::cross_check::ClaimableBalanceObservation {
+                        balance_id: id.hash(),
+                        entry: Some(entry.clone()),
+                    },
+                ),
+            },
+            "stellar_claim_commit",
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
+        };
+
         // Extract the gate-sized legs for the post-submit audit row: the SAME
         // ValueEffects the gate evaluated (single-derivation invariant). Empty on
         // any non-value allow path.
@@ -949,6 +982,11 @@ impl WalletServer {
         };
 
         // ── Nonce verification + replay window ───────────────────────────────
+        // The clock is read again here: the witness above waits on the
+        // oracle, and a nonce that expired during that wait must not
+        // authorize signing. The record guards above keep the earlier reading.
+        let now_ms = now_unix_ms()
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
         if let Err(e) = commit_envelope_and_verify_nonce(
             &self.nonce_mint,
             &self.replay_window,
@@ -1037,7 +1075,7 @@ impl WalletServer {
             },
             Some(&floor_hook),
         ) {
-            Ok(r) => r,
+            Ok(r) => r.with_witness(cross_check.witness()),
             Err(err) => {
                 return Ok(crate::tools::submission_record::submission_error_result(
                     &err,
@@ -1071,6 +1109,7 @@ impl WalletServer {
                 let view = json!({
                     "tx_hash": tx_hash,
                     "ledger": ledger,
+                    "cross_check": cross_check.view(),
                 });
                 let envelope = stellar_agent_core::envelope::Envelope::ok(view);
                 let json_out = envelope

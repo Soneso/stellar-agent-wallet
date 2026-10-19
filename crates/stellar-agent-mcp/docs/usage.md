@@ -173,7 +173,14 @@ reason, or `not_required` with reason `below_threshold`.
 
 Commit step for `stellar_claim`: verifies the nonce, re-builds the `ClaimClaimableBalance` envelope for the divergence check, signs via the profile keyring, and submits. Testnet-only. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
 
-**Returns:** `{tx_hash, ledger}` on success.
+**Returns:** `{tx_hash, ledger, cross_check}` on success.
+
+`stellar_claim_commit` witnesses the source account and complete fresh
+claimable-balance record. It does not re-read the source trustline at commit.
+
+The commit obtains its unvalued witness before nonce consumption and signer
+loading. `cross_check` reports `passed` with provider and ledger, or `skipped`
+with a reason. A witness refusal keeps the nonce usable.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
@@ -185,7 +192,8 @@ without the cap returns `validation.mainnet_fee_cap_required`.
 
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
-`policy.engine_required`, `policy.approval_consumed`, `network.endpoint_network_mismatch`,
+`network.witness_unavailable`, `policy.engine_required`, `policy.approval_consumed`,
+`network.endpoint_network_mismatch`,
 `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`,
 `auth.keyring_not_found`, `network.envelope_signed_for_mainnet`,
 `network.envelope_signature_unverifiable`, `network.envelope_unsigned`,
@@ -196,7 +204,20 @@ without the cap returns `validation.mainnet_fee_cap_required`.
 
 Commit step for `stellar_trustline`: verifies the nonce, re-builds the `ChangeTrust` envelope for the divergence check, signs via the profile keyring, and submits. Testnet-only. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
 
-**Returns:** `{tx_hash, ledger}` on success.
+**Returns:** `{tx_hash, ledger, cross_check}` on success.
+
+`stellar_trustline_commit` reads the issuer again and verifies the stored
+clawback opt-in for that trustline. An absent issuer refuses `trustline.gate_refused`.
+Other issuer read errors keep their own codes and scrubbed messages.
+Clawback without a current, verified opt-in refuses
+`trustline.clawback_opt_in_required`, including when the issuer enables clawback
+after prepare. Nothing is signed and no new approval is minted.
+Re-invoke `stellar_trustline` to obtain a new opt-in request.
+A verified opt-in permits the commit to continue to its witness.
+
+The commit obtains its unvalued witness before nonce consumption and signer
+loading. `cross_check` reports `passed` with provider and ledger, or `skipped`
+with a reason. A witness refusal keeps the nonce usable.
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
@@ -208,14 +229,15 @@ without the cap returns `validation.mainnet_fee_cap_required`.
 
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
-`policy.engine_required`, `policy.approval_consumed`, `network.endpoint_network_mismatch`,
+`network.witness_unavailable`, `policy.engine_required`, `policy.approval_consumed`,
+`network.endpoint_network_mismatch`,
 `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`,
 `auth.keyring_not_found`, `network.envelope_signed_for_mainnet`,
 `network.envelope_signature_unverifiable`, `network.envelope_unsigned`,
 `submission.tx_timeout`, `submission.tx_already_submitted`, `submission.hash_mismatch`,
 `submission.record_unavailable`.
-`policy.approval_required` also applies when the issuer has clawback enabled
-and no operator opt-in is recorded.
+Clawback re-check refusals use `trustline.gate_refused` or
+`trustline.clawback_opt_in_required`, as described above.
 
 ## stellar_transaction_status
 

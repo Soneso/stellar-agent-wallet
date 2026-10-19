@@ -74,7 +74,9 @@ pub struct TrustlinePreview {
 
     /// Live issuer flag disclosure.
     ///
-    /// `None` when the flag fetch failed (the `gate_decision` will be `Refuse`).
+    /// `None` when the issuer account is absent (the `gate_decision` is
+    /// `Refuse`). The caller refuses every other issuer read error with its
+    /// own code before building the preview.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issuer_flags: Option<AccountFlagsView>,
 
@@ -99,7 +101,7 @@ pub enum GateDecisionView {
         /// The warning text.
         warning: String,
     },
-    /// Trustline refused unconditionally (flag-fetch failure or similar).
+    /// Trustline refused unconditionally because the issuer account is absent.
     Refuse {
         /// Human-readable reason.
         reason: String,
@@ -129,7 +131,9 @@ impl TrustlinePreview {
     /// - `limit_stroops`: optional explicit trustline limit in stroops.  `None`
     ///   means the wallet will use `i64::MAX` (the Stellar default unlimited trustline).
     /// - `flags`: live issuer flag projection from `AccountView.account_flags: Option<AccountFlagsView>`.
-    ///   `None` when the flag fetch failed (gate fail-closes).
+    ///   `None` means the issuer account is absent; the caller refuses every
+    ///   other issuer read error with its own code before calling this. An
+    ///   absent issuer yields a `Refuse` gate decision.
     /// - `opt_in_present`: whether a wallet-controlled
     ///   `ApprovalKind::TrustlineClawbackOptIn` record exists.
     ///

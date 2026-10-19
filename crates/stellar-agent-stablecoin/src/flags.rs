@@ -7,9 +7,11 @@
 //!
 //! # Fail-closed invariant
 //!
-//! A flag-fetch failure (the caller passes `flags = None`) MUST fail-close the
-//! gate: the wallet cannot confirm the issuer is clawback-safe, so it refuses.
-//! A dropped RPC query can never downgrade a trustline to "assumed safe."
+//! `flags = None` means the issuer account is absent; the caller refuses
+//! every other issuer read error with its own code before calling the gate.
+//! An absent issuer yields `Refuse`, because the wallet cannot confirm that
+//! the issuer is clawback-safe. No outcome of the issuer read downgrades a
+//! trustline to "assumed safe."
 //!
 //! # Disclosure policy
 //!
@@ -55,11 +57,10 @@ pub enum GateDecision {
         warning: &'static str,
     },
 
-    /// Refuse unconditionally — the flag state could not be confirmed
-    /// (flag-fetch failure; fail-closed).
+    /// Refuse unconditionally because the issuer account is absent.
     ///
-    /// The wallet caller must surface this as a hard error (not just a warning)
-    /// because a dropped RPC query cannot be treated as "assumed safe."
+    /// The caller refuses every other issuer read error with its own code
+    /// before calling the gate.
     Refuse {
         /// Human-readable reason for the unconditional refusal.
         reason: &'static str,
@@ -75,17 +76,19 @@ pub enum GateDecision {
 /// # Parameters
 ///
 /// - `flags`: the issuer's live flag projection from `AccountView.account_flags`.
-///   `None` means the flag fetch FAILED — the gate fail-closes unconditionally.
-/// - `opt_in_present`: whether a wallet-controlled
-///   `ApprovalKind::TrustlineClawbackOptIn` record exists for this trustline.
-///   This is NOT an agent-suppliable bool; it must be derived from the approval
-///   store by the verb handler.
+///   `None` means the issuer account is absent; the caller refuses every
+///   other issuer read error with its own code before calling the gate. An
+///   absent issuer yields `Refuse`.
+/// - `opt_in_present`: whether a current, verified
+///   `ApprovalKind::TrustlineClawbackOptIn` record covers this trustline.
+///   The verb handler verifies its attestation in the approval store.
+///   The agent cannot supply this bool.
 ///
 /// # Decision table
 ///
 /// | flags | opt_in_present | decision |
 /// |-------|---------------|----------|
-/// | `None` (fetch failed) | any | `Refuse { reason: … }` (fail-closed) |
+/// | `None` (issuer absent) | any | `Refuse { reason: … }` (fail-closed) |
 /// | `auth_clawback_enabled = false` | any | `Proceed` |
 /// | `auth_clawback_enabled = true` | `false` | `RefuseWithWarning { CLAWBACK_WARNING }` |
 /// | `auth_clawback_enabled = true` | `true` | `Proceed` |
@@ -118,14 +121,14 @@ pub enum GateDecision {
 /// // Clawback enabled, opt-in present — proceed.
 /// assert_eq!(clawback_gate(Some(&flags_cb), true), GateDecision::Proceed);
 ///
-/// // Fetch failed — fail-closed unconditionally.
+/// // An absent issuer refuses unconditionally.
 /// assert!(matches!(clawback_gate(None, false), GateDecision::Refuse { .. }));
 /// ```
 #[must_use]
 pub fn clawback_gate(flags: Option<&AccountFlagsView>, opt_in_present: bool) -> GateDecision {
     match flags {
         None => GateDecision::Refuse {
-            reason: "issuer flag fetch failed — cannot confirm clawback safety (fail-closed)",
+            reason: "issuer account is absent; cannot confirm clawback safety",
         },
         Some(f) => {
             if f.auth_clawback_enabled {
@@ -218,17 +221,19 @@ mod tests {
     // ── clawback_gate truth table ─────────────────────────────────────────────
 
     #[test]
-    fn gate_fetch_failed_refuse_regardless_of_opt_in_false() {
-        // Fetch failed, no opt-in → fail-closed Refuse.
-        assert!(matches!(
+    fn gate_absent_issuer_refuses_regardless_of_opt_in_false() {
+        // An absent issuer refuses without an opt-in.
+        assert_eq!(
             clawback_gate(None, false),
-            GateDecision::Refuse { .. }
-        ));
+            GateDecision::Refuse {
+                reason: "issuer account is absent; cannot confirm clawback safety"
+            },
+        );
     }
 
     #[test]
-    fn gate_fetch_failed_refuse_regardless_of_opt_in_true() {
-        // Fetch failed, opt-in present → still fail-closed Refuse.
+    fn gate_absent_issuer_refuses_regardless_of_opt_in_true() {
+        // An absent issuer refuses even with an opt-in.
         assert!(matches!(
             clawback_gate(None, true),
             GateDecision::Refuse { .. }
