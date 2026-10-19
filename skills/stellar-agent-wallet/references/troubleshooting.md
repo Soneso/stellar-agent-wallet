@@ -176,6 +176,12 @@ fresh rebuild before signing.
 
 ## Simulation cross-check
 
+The classic witness covers CLI `pay`, `claim`, sponsored `accounts create`,
+`trustline`, and every sending `pool init` path. It also covers MCP
+`stellar_pay_commit`, `stellar_create_account_commit`, `stellar_trustline_commit`,
+and `stellar_claim_commit`. Opaque staged envelopes and the SEP-43 signing
+tools remain uncovered.
+
 | Code | Meaning | Agent action |
 |---|---|---|
 | `simulation.divergence` | Entry or envelope disagreement. | Re-simulate; see below. |
@@ -198,7 +204,7 @@ The operator corrects `oracle_provider_url`, `[providers.oracle]`, or
 |---|---|---|
 | `fees.percentile_exceeds_cap` | Fee exceeds cap. | Follow the remedy below. |
 | `validation.mainnet_fee_cap_required` | Mainnet cap missing. | Operator sets the cap. |
-| `validation.fee_total_overflow` | Pool fee overflows. | Lower fee; resume as below. |
+| `validation.fee_total_overflow` | Pool fee overflows. | Lower the profile fee. |
 
 `fees.percentile_exceeds_cap` means the per-operation fee exceeds
 `classic_max_fee_per_op_stroops`. The message names the source: an auto-selected
@@ -219,8 +225,8 @@ profile file; `profile init --network mainnet` writes `10000`.
 `validation.fee_total_overflow` means the `pool init` per-operation fee times
 the operation count exceeds the transaction fee limit. Nothing was built,
 signed, or sent. This is not agent-recoverable. The operator lowers
-`classic_fee_per_op_stroops`. A run that already wrote its checkpoint resumes
-with `--resume` after the fee is lowered.
+`classic_fee_per_op_stroops`. A fresh refusal leaves no initialization checkpoint.
+An existing checkpoint remains resumable, without consuming a retry attempt.
 
 ## Toolset codes
 

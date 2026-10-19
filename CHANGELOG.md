@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- CLI sponsored `accounts create`, `trustline`, and sending `pool init` paths
+  obtain a witness before signing. MCP trustline and claim commits do the same.
+  Results carry `cross_check`; pending and submitted rows carry a passed witness.
+  Sponsored-create table output prints the witness line.
+
 - CLI `pay` and `claim` obtain the oracle witness before signing or sending,
   in the full pipeline, `--sign-only`, and `--submit-only`. Payments are
   witnessed on the source debit leg and compare the source trustline of an
@@ -19,9 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The per-operation fee cap is checked before signing or sending.
   CLI `pay` and `claim` check the cap in the full pipeline, `--build-only`,
   `--sign-only`, and `--submit-only`. MCP pay, create-account, trustline, and
-  claim check it in both prepare and commit. No other stage checks it, including
-  CLI `trustline`, sponsored `accounts create`, `pool init`, opaque staged
-  envelopes, and the SEP-43 signing tools.
+  claim check it in both prepare and commit. CLI sponsored `accounts create`,
+  `trustline`, and every sending `pool init` path also check the cap.
+  Opaque, fee-bump, and multi-operation staged envelopes and the SEP-43 signing
+  tools remain outside this coverage.
   At these covered stages, a mainnet profile without
   `classic_max_fee_per_op_stroops` refuses with
   `validation.mainnet_fee_cap_required`.
@@ -87,6 +93,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure by its class and position, without its values.
 
 ### Changed
+
+- Sponsored create, trustline, and pool init cap the selected per-operation fee
+  before the witness. Pool fee overflow refuses before a fresh checkpoint or
+  signer load, through the shared `stellar_agent_pool::init::total_init_fee`.
+- CLI trustline and MCP trustline prepare and commit distinguish an absent issuer
+  from other read errors, preserving each error's code and scrubbed text.
+- MCP trustline commit re-reads issuer flags and rechecks a verified clawback
+  opt-in. A refusal consumes no nonce and mints no approval.
 
 - The fee-cap refusal `fees.percentile_exceeds_cap` names the fee's source and
   its remedy: an auto-selected fee and its percentile, an explicit fee, the
@@ -205,6 +219,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record loads.
 
 ### Fixed
+
+- Failed sponsored creation preserves signed bytes for submission error details.
+  A confirmation timeout reports the envelope hash without exposing the envelope.
 
 - `stellar_dex_trade`, `stellar_defindex_vault_deposit`,
   `stellar_defindex_vault_withdraw`, `stellar_x402_create_payment`, and

@@ -8,7 +8,9 @@
 //!   issuer flags, runs the clawback gate, builds the unsigned
 //!   `ChangeTrust` envelope, mints a nonce, and returns the preview.
 //! - `stellar_trustline_commit` (commit) — re-derives authoritative args from
-//!   the nonce-bound XDR, verifies the nonce + attestation, signs, and submits.
+//!   the nonce-bound XDR, re-reads the issuer and re-runs the clawback gate,
+//!   obtains the cross-check witness, verifies the nonce + attestation, signs,
+//!   and submits.
 //!
 //! # Gate order on the live path (fail-closed at every step)
 //!
@@ -118,8 +120,9 @@ fn redact_asset_for_log(asset: &str) -> String {
 /// - Known lookalike `(code, issuer)` pairs are refused.
 /// - Pinned codes with a non-canonical issuer are refused.
 /// - Bare codes with no pin row are refused.
-/// - Issuer flag fetch failure **fail-closes** the gate;
-///   the tool never assumes "safe" when the RPC is unreachable.
+/// - An issuer read error refuses with its own code before the gate runs; an
+///   absent issuer yields `Refuse`. The tool never assumes "safe" when the
+///   issuer cannot be read.
 /// - `opt_in_present` is NOT a caller-supplied argument; it is derived from
 ///   the wallet-controlled `PendingApprovalStore`.
 ///
@@ -273,6 +276,41 @@ fn parse_denomination_input(asset: &str) -> DenominationInput {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl WalletServer {
+    /// Whether a current clawback opt-in whose attestation verifies covers
+    /// `code:issuer` on this network at `now_ms`.
+    ///
+    /// Every failure on the way (the attestation key, the approval directory,
+    /// the store) reads as no opt-in, so a clawback-enabled issuer refuses.
+    fn verified_clawback_opt_in(&self, code: &str, issuer: &str, now_ms: u64) -> bool {
+        let key = match crate::tools::common::load_attestation_key(&self.profile) {
+            Ok(key) => Zeroizing::new(key),
+            Err(_) => {
+                tracing::debug!(
+                    "attestation key load failed; treating clawback opt-in as absent (fail-closed)"
+                );
+                return false;
+            }
+        };
+        let Ok(dir) = self.resolve_approval_dir() else {
+            return false;
+        };
+        let profile_name = self.profile_name_for_approval();
+        let path = dir.join(format!("{profile_name}.toml"));
+        let Ok(store) = open_with_retry(&path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
+        else {
+            return false;
+        };
+        let network = self.context.chain_id.caip2_str();
+        store.verify_attested_trustline_clawback_opt_in(
+            &key,
+            &stellar_agent_core::approval::AttestationBinding::new(&profile_name, network),
+            network,
+            code,
+            issuer,
+            now_ms,
+        )
+    }
+
     /// Persists a [`PendingApproval`] entry for a `stellar_trustline` simulate call.
     ///
     /// Records the holder, asset issuer, and optional limit as a trustline change.
@@ -356,7 +394,8 @@ impl WalletServer {
     /// 1. `dispatch_gate` — policy engine.
     /// 2. `resolve_denomination` — USDT refusal + lookalike denylist +
     ///    pinned-issuer-mismatch + unpinned-bare-code.
-    /// 3. Live issuer-flag fetch → `IssuerFlagsView`.  Fetch failure = `Refuse`.
+    /// 3. Live issuer account fetch → `AccountFlagsView`. An issuer read error
+    ///    refuses with its own code; an absent issuer yields `Refuse`.
     /// 4. `clawback_gate` — wallet-controlled opt-in check (NOT agent-suppliable).
     /// 5. `TrustlinePreview::build` — typed JSON preview.
     /// 6. `RefuseWithWarning` / `Refuse` gate → early return.
@@ -494,18 +533,10 @@ impl WalletServer {
                 );
                 Some(account_view)
             }
-            Err(err) => {
-                // Fetch failure fail-closes the gate.  Log at INFO so the
-                // operator can diagnose; do NOT log issuer strkey beyond
-                // first-5-last-5.
-                tracing::info!(
-                    tool = "stellar_trustline",
-                    issuer = %redact_strkey_first5_last5(&resolved.issuer),
-                    error = %err,
-                    "issuer flag fetch failed — fail-closing gate"
-                );
-                None
-            }
+            Err(stellar_agent_core::WalletError::Network(
+                stellar_agent_core::error::NetworkError::AccountNotFound { .. },
+            )) => None,
+            Err(err) => return Ok(ledger_err_result(&err)),
         };
         let issuer_flags: Option<AccountFlagsView> = issuer_account_view
             .as_ref()
@@ -580,51 +611,8 @@ impl WalletServer {
         let now_ms = now_unix_ms()
             .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
         let network_key = self.context.chain_id.caip2_str();
-        let opt_in_present = {
-            // Load the attestation key for HMAC verification.  Fail-closed on
-            // any keyring error — the gate then fires RefuseWithWarning for
-            // clawback-enabled issuers, and the operator runs `approve --id <nonce> --profile <name>`.
-            let key_result = crate::tools::common::load_attestation_key(&self.profile);
-            match key_result {
-                Ok(key_bytes) => {
-                    let attestation_key = Zeroizing::new(key_bytes);
-                    let approvals_dir = default_approval_dir().ok();
-                    let profile_name = self.profile_name_for_approval();
-                    approvals_dir
-                        .map(|dir| {
-                            let store_path = dir.join(format!("{profile_name}.toml"));
-                            open_with_retry(
-                                &store_path,
-                                DEFAULT_RETRY_ATTEMPTS,
-                                DEFAULT_RETRY_BACKOFF,
-                            )
-                            .map(|store| {
-                                store.verify_attested_trustline_clawback_opt_in(
-                                    &attestation_key,
-                                    &stellar_agent_core::approval::AttestationBinding::new(
-                                        &self.profile_name_for_approval(),
-                                        self.context.chain_id.caip2_str(),
-                                    ),
-                                    network_key,
-                                    &resolved.code,
-                                    &resolved.issuer,
-                                    now_ms,
-                                )
-                            })
-                            .unwrap_or(false)
-                        })
-                        .unwrap_or(false)
-                }
-                Err(_) => {
-                    // Keyring unavailable — fail-closed: treat opt-in as absent.
-                    tracing::debug!(
-                        tool = "stellar_trustline",
-                        "attestation key load failed; treating clawback opt-in as absent (fail-closed)"
-                    );
-                    false
-                }
-            }
-        };
+        let opt_in_present =
+            self.verified_clawback_opt_in(&resolved.code, &resolved.issuer, now_ms);
 
         // ── Step 6: Build trustline preview (includes clawback gate decision) ─
         let preview = TrustlinePreview::build(
@@ -982,9 +970,17 @@ impl WalletServer {
     ///    the HMAC-bound `envelope_xdr` and extracts `(asset_code, asset_issuer,
     ///    limit_stroops)`.  Those values are presented to the policy engine — NOT
     ///    the caller-supplied args.
-    /// 2. **Nonce verification:** HMAC-verified before signing.
-    /// 3. **Replay prevention:** nonce recorded in the `ReplayWindow`.
-    /// 4. **Mainnet refusal:** `destructive_hint = true`.
+    /// 2. **Issuer re-read and clawback re-check:** the issuer is read again on
+    ///    the primary and the clawback gate runs with the fresh flags and the
+    ///    verified opt-in. An absent issuer refuses `trustline.gate_refused`;
+    ///    clawback without a verified opt-in refuses
+    ///    `trustline.clawback_opt_in_required`.
+    /// 3. **Cross-check witness:** the oracle witnesses the source and the
+    ///    issuer after the fee cap and before the audit pre-flight, the nonce
+    ///    and the signer. A refusal up to here consumes no nonce.
+    /// 4. **Nonce verification:** HMAC-verified before signing.
+    /// 5. **Replay prevention:** nonce recorded in the `ReplayWindow`.
+    /// 6. **Mainnet refusal:** `destructive_hint = true`.
     #[mcp_tool_item(
         name = "stellar_trustline_commit",
         destructive_hint = true,
@@ -996,8 +992,10 @@ impl WalletServer {
         name = "stellar_trustline_commit",
         description = "Sign and submit a ChangeTrust transaction (commit step). \
                        Requires the nonce, expires_at_unix_ms, and envelope_xdr returned \
-                       by stellar_trustline. Verifies the nonce, re-builds the envelope, \
-                       signs via keyring, and submits. Returns {tx_hash, ledger}. \
+                       by stellar_trustline. Re-builds the envelope, re-reads the issuer \
+                       and re-runs the clawback gate, obtains the cross-check witness, \
+                       verifies the nonce, signs via keyring, and submits. \
+                       Returns {tx_hash, ledger, cross_check}. \
                        destructive_hint=true; read_only_hint=false.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
@@ -1208,6 +1206,64 @@ impl WalletServer {
             ));
         }
 
+        let issuer_account_view = match fetch_account(&client, &auth_asset_issuer, &[]).await {
+            Ok(view) => Some(view),
+            Err(stellar_agent_core::WalletError::Network(
+                stellar_agent_core::error::NetworkError::AccountNotFound { .. },
+            )) => None,
+            Err(err) => return Ok(ledger_err_result(&err)),
+        };
+        let now_ms = now_unix_ms()
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
+        let opt_in = self.verified_clawback_opt_in(&auth_asset_code, &auth_asset_issuer, now_ms);
+        match stellar_agent_stablecoin::flags::clawback_gate(
+            issuer_account_view
+                .as_ref()
+                .and_then(|view| view.account_flags.as_ref()),
+            opt_in,
+        ) {
+            stellar_agent_stablecoin::flags::GateDecision::Proceed => {}
+            stellar_agent_stablecoin::flags::GateDecision::Refuse { reason } => {
+                return Ok(crate::tools::common::business_error_result(
+                    "trustline.gate_refused",
+                    reason,
+                ));
+            }
+            stellar_agent_stablecoin::flags::GateDecision::RefuseWithWarning { .. } => {
+                return Ok(crate::tools::common::business_error_result(
+                    "trustline.clawback_opt_in_required",
+                    "no verified clawback opt-in covers this trustline (missing, expired or \
+                     not verifiable), or the issuer enabled clawback after prepare. \
+                     Nothing was signed. Re-invoke stellar_trustline to obtain a new \
+                     opt-in request.",
+                ));
+            }
+        }
+        let source = match stellar_agent_network::cross_check::AccountObservation::from_view(
+            &source_account_view,
+        ) {
+            Ok(source) => source,
+            Err(err) => return Ok(ledger_err_result(&err)),
+        };
+        let cross_check = match stellar_agent_network::cross_check::obtain_classic_witness(
+            &self.profile,
+            &self.context,
+            stellar_agent_core::cross_check::CrossCheckValue::Unvalued,
+            stellar_agent_network::cross_check::TrustlineWitnessInputs {
+                source,
+                issuer: stellar_agent_network::cross_check::IssuerObservation::from_view(
+                    &auth_asset_issuer,
+                    issuer_account_view.as_ref(),
+                ),
+            },
+            "stellar_trustline_commit",
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
+        };
+
         // ── Audit pre-flight (fail-closed) ────────────────────────────────────
         // Proves the profile's audit chain-root key is acquirable BEFORE the
         // nonce below is consumed, the signer is loaded, or the transaction is
@@ -1340,7 +1396,7 @@ impl WalletServer {
             },
             Some(&floor_hook),
         ) {
-            Ok(r) => r,
+            Ok(r) => r.with_witness(cross_check.witness()),
             Err(err) => {
                 return Ok(crate::tools::submission_record::submission_error_result(
                     &err,
@@ -1377,6 +1433,7 @@ impl WalletServer {
                 let view = json!({
                     "tx_hash": tx_hash,
                     "ledger": ledger,
+                    "cross_check": cross_check.view(),
                 });
                 let envelope = stellar_agent_core::envelope::Envelope::ok(view);
                 let json_out = envelope
@@ -1478,5 +1535,77 @@ mod tests {
         // A short string starting with C is NOT a SAC address.
         let input = parse_denomination_input("CUPS");
         assert!(matches!(input, DenominationInput::BareCode(_)));
+    }
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn verified_opt_in_uses_the_override_and_rejects_expiry_and_forgery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use stellar_agent_core::approval::{
+            AttestationBinding,
+            attestation::{compute_attestation, compute_trustline_clawback_opt_in_digest},
+            store::PendingApprovalStore,
+        };
+        use stellar_agent_core::profile::schema::Profile;
+        let home = tempfile::tempdir()?;
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        stellar_agent_test_support::keyring_mock::install()?;
+        let profile = Profile::builder_testnet_named(
+            "verified-opt-in",
+            "opt-in-signer",
+            "default",
+            "opt-in-nonce",
+            "default",
+        )
+        .with_noop_engine()
+        .build();
+        let key = [0x42; 32];
+        keyring_core::Entry::new(
+            &profile.attestation_key_id.service,
+            &profile.attestation_key_id.account,
+        )?
+        .set_password(&URL_SAFE_NO_PAD.encode(key))?;
+        let mut server = WalletServer::new(profile)?;
+        let dir = home.path().join("override");
+        server.set_approval_dir_for_test(dir.clone());
+        let issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+        let now = now_unix_ms()?;
+        assert!(!server.verified_clawback_opt_in("USDC", issuer, now));
+        let name = server.profile_name_for_approval();
+        let mut store = PendingApprovalStore::open(dir.join(format!("{name}.toml")))?;
+        let entry = PendingApproval::new_trustline_clawback_opt_in_pending(
+            "stellar:testnet".to_owned(),
+            "USDC".to_owned(),
+            issuer.to_owned(),
+            "1000".to_owned(),
+            APPROVAL_TTL_MS,
+        )?;
+        let expiry = entry.expires_at_unix_ms;
+        let nonce = entry.approval_nonce.clone();
+        let digest = compute_trustline_clawback_opt_in_digest("stellar:testnet", "USDC", issuer);
+        let blob = compute_attestation(
+            &key,
+            &AttestationBinding::new(&name, "stellar:testnet"),
+            &nonce,
+            &digest,
+            &entry.process_uid,
+        );
+        store.insert(entry, now)?;
+        store.record_trustline_clawback_opt_in_attestation(&nonce, blob)?;
+        drop(store);
+        assert!(server.verified_clawback_opt_in("USDC", issuer, now));
+        assert!(!server.verified_clawback_opt_in("USDC", issuer, expiry + 1));
+        assert!(!server.verified_clawback_opt_in("EURC", issuer, now));
+        let path = dir.join(format!("{name}.toml"));
+        let content = std::fs::read_to_string(&path)?;
+        std::fs::write(
+            &path,
+            content.replace(
+                &URL_SAFE_NO_PAD.encode(blob),
+                &URL_SAFE_NO_PAD.encode([0x99; 32]),
+            ),
+        )?;
+        assert!(!server.verified_clawback_opt_in("USDC", issuer, now));
+        Ok(())
     }
 }

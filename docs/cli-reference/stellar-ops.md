@@ -60,12 +60,27 @@ Argument groups (enforced by the parser):
 | `--fund-with-friendbot` | Fund the account via Friendbot (testnet only) | one of the mode group | `false` |
 | `--friendbot-url <URL>` | Friendbot endpoint URL (Friendbot mode) | optional | `https://friendbot.stellar.org` |
 | `--network <NETWORK>` | Must match the profile chain | optional | profile chain |
-| `--fee <STROOPS\|auto[:pNN]>` | Classic per-op fee (sponsored mode) | optional | profile default (100) |
+| `--fee <STROOPS\|auto[:pNN]>` | Sponsored per-op fee | optional | command default (100) |
 | `--timeout-seconds <SECONDS>` | Endpoint check and submission timeout, each its own budget (sponsored mode) | optional | `60` |
 | `--rpc-url <URL>` | Testnet RPC override; refused on mainnet | optional | profile endpoint |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
-The sponsor's public key must match the public key derived from the signer; a mismatch fails before submission.
+The sponsor's public key must match the signer. A mismatch fails before submission.
+
+Sponsored creation checks its selected fee against
+`classic_max_fee_per_op_stroops` before the witness. The default is the command's
+100 stroops; an explicit or automatic fee keeps its own source in a cap refusal.
+One sponsor observation on the primary feeds policy, the witness, and the
+envelope sequence. The submission separately reads the sponsor's signer set to
+verify the signature binding. The starting balance determines whether the
+witness is required, with a native floor of 1000 XLM.
+
+The result includes `cross_check` with `passed`, `skipped`, or `not_required`.
+Table output prints its witness line. Friendbot results omit the field.
+Pending and submitted audit rows carry a passed witness.
+A sponsored confirmation timeout reports `error.details.envelope_hash` from the
+signed envelope, without returning the envelope. A failure before signing has
+no envelope hash.
 
 Example: generate a new keypair and create it under a sponsor. Run this line on its own, paste the sponsor seed when prompted, and press Enter. [Pass a secret seed](../getting-started.md#pass-a-secret-seed) covers other shells.
 
@@ -392,7 +407,20 @@ Creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust g
 - **USDT is hard-refused.** The denomination resolver rejects USDT outright; the command cannot create a USDT trustline.
 - **Limit.** `--limit-stroops 0` removes the trustline. When absent the Stellar default (`i64::MAX`, unlimited) applies.
 - **Asset grammar.** A bare code such as `USDC` resolves through the pin table; `CODE:ISSUER` names an explicit issuer; a 56-char `C...` SAC address is deferred and returns a typed error.
-- **Output.** The command prints one JSON envelope. Once the clawback gate passes, the typed preview is a nested `preview` object with the code, issuer, limit, pin status, issuer flags, and gate decision. It sits in `data.preview` beside the submission result on success, and in `error.details.preview` when the fee resolution, envelope build, signing, or submission fails.
+- **Output.** The command prints one JSON envelope. The typed preview contains
+  the code, issuer, limit, pin status, issuer flags, and gate decision.
+  After the gate proceeds, success carries it in `data.preview` beside the result.
+  Fee resolution, cap, witness, build, signing, and submission refusals carry it
+  in `error.details.preview`.
+
+After the preview gate proceeds, the command resolves and caps the fee, then
+obtains an unvalued witness of the source and issuer flags before loading the
+signer. Its default fee comes from `classic_fee_per_op_stroops`, or 100 when
+unset. Cap refusals identify that profile default.
+Only an absent issuer produces `trustline.gate_refused`; other issuer read
+errors retain their own codes and scrubbed messages.
+The JSON result includes `cross_check`; pending and submitted rows carry a
+passed witness.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|

@@ -123,6 +123,21 @@ stellar-agent accounts create --generate --sponsor GABC...WXYZ \
 unset SPONSOR_SK
 ```
 
+Sponsored creation checks its selected fee against
+`classic_max_fee_per_op_stroops` before the witness. The default is the command's
+100 stroops; an explicit or automatic fee keeps its own source in a cap refusal.
+One sponsor observation on the primary feeds policy, the witness, and the
+envelope sequence. The submission separately reads the sponsor's signer set to
+verify the signature binding. The starting balance determines whether the
+witness is required, with a native floor of 1000 XLM.
+
+The result includes `cross_check` with `passed`, `skipped`, or `not_required`.
+Table output prints its witness line. Friendbot results omit the field.
+Pending and submitted audit rows carry a passed witness.
+A sponsored confirmation timeout reports `error.details.envelope_hash` from the
+signed envelope, without returning the envelope. A failure before signing has
+no envelope hash.
+
 ### `accounts deploy-c [flags]`
 
 Deploys a new OpenZeppelin smart-account (C-account) contract via `CreateContractV2`; the genesis signer is installed through the contract `__constructor`. Signs source-account credentials with the deployer key (except `--dry-run`, which derives the C-strkey deterministically with no signing or RPC). `mainnet` parses but is structurally refused for writes.
@@ -200,7 +215,9 @@ oracle re-reads the source account, the destination, the SEP-29 flag when it was
 read, and the source trustline of an issued send asset, valued on the source
 debit leg. A disagreement exits 1 with `simulation.divergence`, or
 `network.rpc_divergence` for the SEP-29 flag; an oracle fault refuses with
-`network.witness_unavailable`. A credential refusal keeps
+`network.witness_unavailable`. Sponsored create, trustline, and sending pool
+initialization also use `simulation.divergence` and `network.witness_unavailable`.
+A credential refusal keeps
 `network.rpc_credential_refused`. The result carries `cross_check` (`passed`,
 `skipped`, or `not_required`), and `--output table` prints a `Cross-check:`
 line. `--build-only` has no witness and no `cross_check`. `--sign-only` and
@@ -275,6 +292,16 @@ stellar-agent balances --account GABC...WXYZ \
 ## trustline
 
 `trustline [flags]` — creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust gate (operator policy, denomination resolution with USDT hard-refusal plus a known-lookalike denylist and pinned-issuer checks, live issuer-flag fetch that fail-closes, clawback gate, typed preview). Builds, signs, submits, waits atomically — no staged pipeline. Network derives from the profile; there is no `--network` flag. USDT cannot be trusted.
+
+After the preview gate proceeds, the command resolves and caps the fee, then
+obtains an unvalued witness of the source and issuer flags before loading the
+signer. Its default fee comes from `classic_fee_per_op_stroops`, or 100 when
+unset. Cap refusals identify that profile default.
+Only an absent issuer produces `trustline.gate_refused`; other issuer read
+errors retain their own codes and scrubbed messages.
+The JSON result includes `cross_check`; pending and submitted rows carry a
+passed witness.
+Fee-cap and witness refusals carry `error.details.preview` after preview approval.
 
 | Flag | Meaning | Default |
 |---|---|---|

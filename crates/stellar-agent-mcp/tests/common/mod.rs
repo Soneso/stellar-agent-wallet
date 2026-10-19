@@ -315,6 +315,8 @@ pub struct TimeoutRpc {
     confirm_in_ledger: Option<u32>,
     /// The identity `getNetwork` reports.
     network: EndpointNetwork,
+    /// When set, every answer is held back this long.
+    delay: Option<std::time::Duration>,
 }
 
 #[allow(
@@ -330,6 +332,7 @@ impl TimeoutRpc {
             simulate: None,
             confirm_in_ledger: None,
             network: EndpointNetwork::testnet(),
+            delay: None,
         }
     }
 
@@ -353,6 +356,13 @@ impl TimeoutRpc {
     #[must_use]
     pub fn with_simulate(mut self, simulate: serde_json::Value) -> Self {
         self.simulate = Some(simulate);
+        self
+    }
+
+    /// Holds every answer back for `delay` before it is sent.
+    #[must_use]
+    pub fn with_delay(mut self, delay: std::time::Duration) -> Self {
+        self.delay = Some(delay);
         self
     }
 }
@@ -430,11 +440,55 @@ impl wiremock::Respond for TimeoutRpc {
             _ => serde_json::json!({}),
         };
 
-        wiremock::ResponseTemplate::new(200)
+        let template = wiremock::ResponseTemplate::new(200)
             .set_body_json(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": result,
+            }))
+            .insert_header("content-type", "application/json");
+        match self.delay {
+            Some(delay) => template.set_delay(delay),
+            None => template,
+        }
+    }
+}
+
+/// Answers every request with a JSON-RPC error object whose `message` is the
+/// given server text, under the request's own id.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub struct RpcErrorAnswer {
+    message: String,
+}
+
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+impl RpcErrorAnswer {
+    /// Answers with `message` as the error object's server text.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl wiremock::Respond for RpcErrorAnswer {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let req_id = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|body| body.get("id").cloned())
+            .unwrap_or_else(|| serde_json::json!(1));
+        wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32000, "message": self.message},
             }))
             .insert_header("content-type", "application/json")
     }

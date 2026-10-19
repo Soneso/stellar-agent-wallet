@@ -206,14 +206,34 @@ persisted and are re-derived on demand. The `pool` subcommands accept
 
 ### `stellar-agent pool init`
 
-Fund `N` channel accounts on-chain via a single CAP-33 sponsored-reserve sandwich
-transaction. Signing command: the funder signer is loaded from the keyring. The
-pool master seed is generated in memory and written to the OS keyring only after
-the on-chain transaction confirms; the public `PoolConfig` bookkeeping is then
-persisted to the profile TOML. A failure before confirmation leaves no keyring
-entry and no config, so a clean retry needs no `--force`. Before the channel
-reads, `pool init` asks the endpoint which network it serves, on the client
-that later sends, under its own `--timeout-seconds` budget.
+Create `N` channel accounts in one sponsored-reserve transaction. The funder
+signs from the keyring. The seed is persisted before sending, with a public
+`[pool_initialization]` checkpoint in the profile. The checkpoint contains
+channel identities and submission hashes, never seed bytes.
+Use `--resume` to recover it; `--force` cannot replace a pending initialization.
+
+The profile's per-operation fee is capped before a sending path obtains its
+unvalued witness. The total fee is that fee times three operations per channel.
+On a fresh run, the cap and `validation.fee_total_overflow` checks precede the
+funder identity load and any `[pool_initialization]` checkpoint.
+
+The fresh identity load verifies the enrolled funder before RPC. Seed recovery
+and receipt settlement on resume precede the fee check. The funder read and
+witness precede the signer load that sends, including on retries.
+The witness compares the funder and every channel observed absent on the primary.
+A disagreement refuses `simulation.divergence`; an unavailable required oracle
+refuses `network.witness_unavailable`. Credential refusals retain their own code.
+
+A fresh witness refusal leaves a resumable checkpoint. Every refusal that leaves
+a checkpoint carries `error.details.resume_with` with the resume command.
+Resume rechecks the fee, funder, and witness.
+An over-cap retry consumes no attempt. A witness refusal after retry admission
+leaves the incremented attempt persisted, with its prior submission cleared.
+The next resume uses that attempt.
+
+A sending result includes `cross_check`, and both submission rows carry a passed
+witness. A resume that finishes without signing obtains no witness and checks
+no cap. The result has no `cross_check` field.
 
 `--size` must be in `1..=19`. The bound exists because the funder plus each
 channel must sign the sandwich envelope, and `N+1` signatures must fit the
@@ -230,7 +250,8 @@ master orphans all previously funded channels.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
-| `--size <N>` | Number of channel accounts to create (`1..=19`) | Required | none |
+| `--size <N>` | Channels to create (`1..=19`) | Fresh runs | none |
+| `--resume` | Recover the saved initialization | Recovery | `false` |
 | `--profile <NAME>` | Profile for the funder key and RPC endpoint | Optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--force` | Overwrite an existing pool master key (orphans previously funded channels) | Optional | `false` |
 | `--timeout-seconds <N>` | Deadline for the endpoint identity check and, separately, for confirming the creation transaction | Optional | `120` |

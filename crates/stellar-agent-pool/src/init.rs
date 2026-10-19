@@ -94,6 +94,37 @@ pub struct InitResult {
     pub ledger: u32,
 }
 
+/// Computes the transaction fee for 1 through [`ChannelPool::MAX_SIZE`] channels.
+/// Each channel contributes three operations.
+///
+/// # Examples
+///
+/// ```
+/// # fn main() -> Result<(), stellar_agent_pool::PoolError> {
+/// assert_eq!(stellar_agent_pool::init::total_init_fee(100, 2)?, 600);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// Returns [`PoolError::SizeOutOfRange`] for an unsupported channel count, or
+/// [`PoolError::FeeOverflow`] when the total does not fit the transaction fee field.
+pub fn total_init_fee(fee_per_op: u32, channel_count: usize) -> Result<u32, PoolError> {
+    if !(1..=ChannelPool::MAX_SIZE).contains(&channel_count) {
+        return Err(PoolError::SizeOutOfRange {
+            requested: channel_count,
+        });
+    }
+    let op_count = channel_count as u32 * 3;
+    fee_per_op
+        .checked_mul(op_count)
+        .ok_or(PoolError::FeeOverflow {
+            fee_per_op,
+            op_count,
+        })
+}
+
 /// Builds and submits the CAP-33 sponsored-reserve sandwich transaction.
 ///
 /// Creates N channel accounts on-chain with the funder as their reserve
@@ -135,16 +166,7 @@ pub async fn init_pool(
         });
     }
 
-    // Each channel contributes 3 operations. `ClassicOpBuilder::new` takes the
-    // per-operation fee and the built transaction's fee is that fee times the
-    // operation count, so the product must fit the u32 fee field.
-    let op_count = n as u32 * 3;
-    if params.fee_per_op.checked_mul(op_count).is_none() {
-        return Err(PoolError::FeeOverflow {
-            fee_per_op: params.fee_per_op,
-            op_count,
-        });
-    }
+    total_init_fee(params.fee_per_op, n)?;
 
     let mut builder = ClassicOpBuilder::new(
         params.funder_strkey,
@@ -427,4 +449,28 @@ pub fn assert_sandwich_structure(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_fee_checks_channel_range_and_overflow() {
+        assert!(matches!(total_init_fee(100, 1), Ok(300)));
+        assert!(matches!(total_init_fee(100, 19), Ok(5700)));
+        for count in [0, 20, usize::MAX] {
+            assert!(matches!(
+                total_init_fee(100, count),
+                Err(PoolError::SizeOutOfRange { .. })
+            ));
+        }
+        assert!(matches!(
+            total_init_fee(u32::MAX, 1),
+            Err(PoolError::FeeOverflow {
+                fee_per_op: u32::MAX,
+                op_count: 3
+            })
+        ));
+    }
 }

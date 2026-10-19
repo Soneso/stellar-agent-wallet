@@ -18,7 +18,9 @@ use std::{
     time::Duration,
 };
 use stellar_agent_core::audit_log::{entry::AuditEntry, reader::AuditReader};
+use stellar_agent_core::cross_check::CrossCheckValue;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
+use stellar_agent_core::error::FeeSource;
 use stellar_agent_core::error::{
     AuthError, InternalError, NetworkError, SubmissionError, WalletError,
 };
@@ -31,6 +33,10 @@ use stellar_agent_core::profile::{
     receipt::{ReceiptStatus, ReceiptStore},
 };
 use stellar_agent_network::NetworkContext;
+use stellar_agent_network::cross_check::{
+    AccountObservation, CrossCheckView, PoolInitWitnessInputs, obtain_classic_witness,
+};
+use stellar_agent_network::fees::check_classic_fee_cap;
 use stellar_agent_network::{
     SoftwareSigningKey, StellarRpcClient, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
     WalletSubmissionRecorder, fetch_account,
@@ -39,7 +45,7 @@ use stellar_agent_network::{
 use stellar_agent_pool::{
     PoolError,
     derive::{derive_channel_signer, load_pool_master_seed_from_keyring},
-    init::{InitParams, init_pool},
+    init::{InitParams, init_pool, total_init_fee},
 };
 use stellar_agent_sep5::Sep5Wallet;
 use zeroize::Zeroizing;
@@ -103,6 +109,9 @@ pub struct PoolInitResult {
     pub pool_master_keyring_service: String,
     /// Keyring account containing the pool seed.
     pub pool_master_keyring_account: String,
+    /// Witness outcome when this invocation sends the initialization transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_check: Option<CrossCheckView>,
 }
 
 fn unavailable(detail: impl Into<String>) -> WalletError {
@@ -296,7 +305,21 @@ where
             0
         }
         Err(error) => {
-            render_json(&Envelope::<()>::err(&error));
+            let resolved = resolve_profile_name(args.profile.as_deref());
+            let envelope = match load_profile_reconciled(&resolved) {
+                Ok(profile) if profile.pool_initialization.is_some() => {
+                    Envelope::<()>::err_with_details(
+                        &error,
+                        serde_json::json!({
+                            "resume_with": format!(
+                                "stellar-agent pool init --resume --profile {}", resolved.name,
+                            ),
+                        }),
+                    )
+                }
+                _ => Envelope::<()>::err(&error),
+            };
+            render_json(&envelope);
             1
         }
     }
@@ -349,6 +372,9 @@ where
         .pool_master_key_id
         .clone()
         .unwrap_or_else(|| KeyringEntryRef::default_pool_master_key(name));
+    let fee_per_op = profile
+        .classic_fee_per_op_stroops
+        .unwrap_or(stellar_agent_core::DEFAULT_CLASSIC_FEE_STROOPS);
     let (mut pending, generated) = match profile.pool_initialization.clone() {
         Some(pending) => (pending, None),
         None => {
@@ -361,13 +387,14 @@ where
                 }
                 _ => {}
             }
+            let size = args
+                .size
+                .ok_or_else(|| unavailable("pool size is required"))?;
+            precheck_init_fee(fee_per_op, size, &profile, name)?;
             let signer =
                 enrolled_keyring_signer(name, &profile, &profile.mcp_signer_default.account)
                     .await?;
             let seed = fresh_seed();
-            let size = args
-                .size
-                .ok_or_else(|| unavailable("pool size is required"))?;
             let pending = PoolInitialization {
                 id: uuid::Uuid::new_v4().to_string(),
                 network_passphrase: context.network_passphrase().to_owned(),
@@ -389,17 +416,20 @@ where
     }
     let seed = prepare_seed(name, &master, &mut pending, generated)?;
     if pending.completion_ledger.is_some() {
-        return complete(&profile, name, &master, &pending, &audit);
+        return complete(&profile, name, &master, &pending, &audit, None);
     }
     // The endpoint check precedes the channel observations and runs on the
     // client that later sends, under its own budget of `--timeout-seconds`.
     let client = context.primary_client()?;
     check_endpoint_identity(&client, &context, Duration::from_secs(args.timeout_seconds)).await?;
     let mut present = 0;
+    let mut absent_channels = Vec::new();
     for channel in &pending.channels {
         match fetch_account(&client, &channel.public_key, &[]).await {
             Ok(_) => present += 1,
-            Err(WalletError::Network(NetworkError::AccountNotFound { .. })) => {}
+            Err(WalletError::Network(NetworkError::AccountNotFound { .. })) => {
+                absent_channels.push(channel.public_key.clone());
+            }
             Err(error) => return Err(error),
         }
     }
@@ -431,7 +461,7 @@ where
         }
         pending.completion_ledger = Some(ledger);
         persist(name, &master, &pending)?;
-        return complete(&profile, name, &master, &pending, &audit);
+        return complete(&profile, name, &master, &pending, &audit, None);
     }
     if present != 0 {
         return Ok(pending_data(name, &pending));
@@ -489,6 +519,11 @@ where
                 stellar_agent_core::audit_log::PolicyDecision::Allow,
             );
         }
+    }
+    if args.resume {
+        precheck_init_fee(fee_per_op, pending.channels.len(), &profile, name)?;
+    }
+    if pending.submission.is_some() {
         pending.attempt = pending
             .attempt
             .checked_add(1)
@@ -496,6 +531,18 @@ where
         pending.submission = None;
         persist(name, &master, &pending)?;
     }
+    let funder = fetch_account(&client, &pending.funder, &[]).await?;
+    let cross_check = obtain_classic_witness(
+        &profile,
+        &context,
+        CrossCheckValue::Unvalued,
+        PoolInitWitnessInputs {
+            funder: AccountObservation::from_view(&funder)?,
+            absent_channels,
+        },
+        "pool init",
+    )
+    .await?;
     let signer =
         enrolled_keyring_signer(name, &profile, &profile.mcp_signer_default.account).await?;
     if signer.public_key().to_string().as_str() != pending.funder {
@@ -503,7 +550,6 @@ where
             "the profile signer is not the recorded pool funder",
         ));
     }
-    let funder = fetch_account(&client, &pending.funder, &[]).await?;
     let inner = build_recorder(SubmitRecord {
         policy_decision: stellar_agent_core::audit_log::PolicyDecision::Allow,
         profile: &profile,
@@ -515,7 +561,8 @@ where
         audit: Some(audit.clone()),
         now_ms: stellar_agent_core::timefmt::now_unix_ms()
             .map_err(|error| unavailable(error.to_string()))?,
-    })?;
+    })?
+    .with_witness(cross_check.witness());
     let recorder = InitRecorder {
         inner,
         name,
@@ -548,16 +595,43 @@ where
                 .map(|channel| channel.index)
                 .collect(),
             network_passphrase: context.network_passphrase(),
-            fee_per_op: profile
-                .classic_fee_per_op_stroops
-                .unwrap_or(stellar_agent_core::DEFAULT_CLASSIC_FEE_STROOPS),
+            fee_per_op,
             recorder: &recorder,
             attempt: pending.attempt,
             timeout: std::time::Duration::from_secs(args.timeout_seconds),
         },
     )
     .await
-    .map_err(|error| match error {
+    .map_err(|error| map_init_error(error, name))?;
+    pending = recorder
+        .pending
+        .into_inner()
+        .map_err(|_| unavailable("pool checkpoint mutex is poisoned"))?;
+    pending.completion_ledger = Some(result.ledger);
+    persist(name, &master, &pending)?;
+    complete(
+        &profile,
+        name,
+        &master,
+        &pending,
+        &audit,
+        Some(cross_check.view()),
+    )
+}
+
+fn precheck_init_fee(
+    per_op: u32,
+    count: usize,
+    profile: &Profile,
+    name: &str,
+) -> Result<(), WalletError> {
+    check_classic_fee_cap(per_op, FeeSource::ProfileDefault, profile)?;
+    total_init_fee(per_op, count).map_err(|error| map_init_error(error, name))?;
+    Ok(())
+}
+
+fn map_init_error(error: PoolError, name: &str) -> WalletError {
+    match error {
         // Nothing was built, signed, or sent: the operator lowers the fee.
         PoolError::FeeOverflow {
             fee_per_op,
@@ -571,14 +645,7 @@ where
         other => WalletError::Internal(InternalError::UnexpectedState {
             detail: format!("{other}; run 'stellar-agent pool init --resume --profile {name}'"),
         }),
-    })?;
-    pending = recorder
-        .pending
-        .into_inner()
-        .map_err(|_| unavailable("pool checkpoint mutex is poisoned"))?;
-    pending.completion_ledger = Some(result.ledger);
-    persist(name, &master, &pending)?;
-    complete(&profile, name, &master, &pending, &audit)
+    }
 }
 
 async fn settle_record(
@@ -620,6 +687,7 @@ fn complete(
     master: &KeyringEntryRef,
     pending: &PoolInitialization,
     audit: &stellar_agent_network::submission_record::AuditWriterHandle,
+    cross_check: Option<CrossCheckView>,
 ) -> Result<serde_json::Value, WalletError> {
     let ledger = pending
         .completion_ledger
@@ -672,6 +740,7 @@ fn complete(
         funder_redacted: redact_strkey_first5_last5(&pending.funder),
         pool_master_keyring_service: master.service.clone(),
         pool_master_keyring_account: master.account.clone(),
+        cross_check,
     })
     .map_err(|error| unavailable(error.to_string()))
 }
@@ -1142,5 +1211,481 @@ mod tests {
             "pool init must not persist via loader::save: re-saving a loaded \
              profile writes the env-merged view into the profile TOML"
         );
+    }
+    #[test]
+    fn fee_overflow_maps_to_validation() {
+        let error = map_init_error(
+            PoolError::FeeOverflow {
+                fee_per_op: u32::MAX,
+                op_count: 3,
+            },
+            "pool-fee-test",
+        );
+        assert_eq!(error.code(), "validation.fee_total_overflow");
+        assert!(error.to_string().contains("3 operations"));
+    }
+    #[test]
+    fn pool_result_omits_an_absent_witness_and_reads_legacy_json() {
+        let legacy = serde_json::json!({
+            "profile": "pool-json", "channel_count": 0, "tx_hash_redacted": null,
+            "ledger": 1001, "channels": [], "funder_redacted": "funder",
+            "pool_master_keyring_service": "pool-json", "pool_master_keyring_account": "master"
+        });
+        let result: PoolInitResult = serde_json::from_value(legacy).unwrap();
+        assert!(result.cross_check.is_none());
+        assert!(
+            serde_json::to_value(result)
+                .unwrap()
+                .get("cross_check")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pool_fee_precheck_caps_before_checking_total() {
+        let mut profile = Profile::builder_testnet("fee", "default", "nonce", "default")
+            .with_noop_engine()
+            .build();
+        profile.classic_max_fee_per_op_stroops = Some(100);
+        let error = precheck_init_fee(u32::MAX, 2, &profile, "fee").unwrap_err();
+        assert_eq!(error.code(), "fees.percentile_exceeds_cap");
+        assert!(error.to_string().contains("profile's per-operation fee"));
+        profile.classic_max_fee_per_op_stroops = None;
+        let error = precheck_init_fee(u32::MAX, 2, &profile, "fee").unwrap_err();
+        assert_eq!(error.code(), "validation.fee_total_overflow");
+    }
+
+    mod witness {
+        use super::*;
+        use crate::test_rpc::{
+            ACCOUNT_SEQUENCE, ClassicRpc, account_key, account_xdr, assert_rows_carry_witness,
+            methods, sent,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use stellar_agent_test_support::keyring_mock::{ReadHook, install_with_read_hooks};
+
+        /// Answers as `oracle` and, before each answer, records every way the
+        /// persisted state contradicts a completed seed recovery. The saved
+        /// checkpoint must mark the seed ready and the keyring must hold the
+        /// seed. No signer read may have happened yet.
+        struct RecoveredBeforeWitness {
+            oracle: ClassicRpc,
+            name: String,
+            profile_path: std::path::PathBuf,
+            master: KeyringEntryRef,
+            signer_reads: Arc<AtomicUsize>,
+            violations: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl wiremock::Respond for RecoveredBeforeWitness {
+            fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+                let saved = loader::load_from_path(&self.name, &self.profile_path, None).unwrap();
+                let mut violations = self.violations.lock().unwrap();
+                if !saved
+                    .pool_initialization
+                    .is_some_and(|pending| pending.seed_ready)
+                {
+                    violations.push("the checkpoint does not mark the seed ready".to_owned());
+                }
+                if KeyringEntry::new(&self.master.service, &self.master.account)
+                    .and_then(|entry| entry.get_password())
+                    .is_err()
+                {
+                    violations.push("the keyring holds no pool seed".to_owned());
+                }
+                if self.signer_reads.load(Ordering::SeqCst) != 0 {
+                    violations.push("the signer was read before the witness".to_owned());
+                }
+                drop(violations);
+                self.oracle.respond(request)
+            }
+        }
+
+        #[derive(Debug)]
+        enum Case {
+            Pass,
+            FreshDivergence,
+            RetryDivergence,
+            Channel,
+            Unavailable,
+            Invalid,
+            Skipped,
+            Cap,
+            Overflow,
+            RetryCap,
+            IncompleteSeed,
+            Complete,
+            Present,
+        }
+
+        async fn exercise(case: Case) {
+            let dir = tempfile::tempdir().unwrap();
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+            let _env = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+            let name = format!("pool-witness-{case:?}").to_ascii_lowercase();
+            let funder =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed([0x91; 32]);
+            let seed = Zeroizing::new([0x24; 64]);
+            let channel_records = channels(&seed, 2).unwrap();
+            let mut primary_rpc = ClassicRpc::testnet(&[&funder]);
+            if matches!(case, Case::Present) {
+                for channel in &channel_records {
+                    primary_rpc = primary_rpc.with_entry(
+                        account_key(&channel.public_key),
+                        account_xdr(&channel.public_key, 0, 0, ""),
+                    );
+                }
+            }
+            let primary = primary_rpc.serve().await;
+            let mut oracle_rpc = ClassicRpc::testnet(&[]).with_entry(
+                account_key(&funder),
+                account_xdr(
+                    &funder,
+                    if matches!(case, Case::FreshDivergence | Case::RetryDivergence) {
+                        ACCOUNT_SEQUENCE + 9
+                    } else {
+                        ACCOUNT_SEQUENCE
+                    },
+                    0,
+                    "",
+                ),
+            );
+            if matches!(case, Case::Channel) {
+                let channel = &channel_records[0].public_key;
+                oracle_rpc =
+                    oracle_rpc.with_entry(account_key(channel), account_xdr(channel, 0, 0, ""));
+            }
+            if matches!(case, Case::Unavailable) {
+                oracle_rpc.report(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE);
+            }
+            let oracle = oracle_rpc.serve().await;
+            let mut profile = Profile::builder_testnet_named(
+                &name,
+                "pool-witness-signer",
+                &funder,
+                "pool-witness-nonce",
+                &name,
+            )
+            .with_noop_engine()
+            .rpc_url(primary.uri())
+            .audit_log_path(dir.path().join("audit.jsonl"))
+            .oracle_provider_url(Some(url::Url::parse(&oracle.uri()).unwrap()))
+            .build();
+            if matches!(case, Case::Skipped) {
+                profile.oracle_provider_url = None;
+            }
+            if matches!(case, Case::Invalid) {
+                // The profile loader accepts this URL; the RPC transport
+                // refuses a URI longer than 65 534 bytes, so the oracle client
+                // cannot be built.
+                let long = format!("http://oracle.test/{}", "a".repeat(65_535));
+                profile.oracle_provider_url = Some(url::Url::parse(&long).unwrap());
+            }
+            if matches!(
+                case,
+                Case::Cap | Case::RetryCap | Case::Complete | Case::Present
+            ) {
+                profile.classic_max_fee_per_op_stroops = Some(99);
+            }
+            if matches!(case, Case::Overflow | Case::Complete | Case::Present) {
+                profile.classic_fee_per_op_stroops = Some(u32::MAX);
+            }
+            let resumed = matches!(
+                case,
+                Case::RetryDivergence
+                    | Case::RetryCap
+                    | Case::Channel
+                    | Case::IncompleteSeed
+                    | Case::Complete
+                    | Case::Present
+            );
+            let master = KeyringEntryRef::default_pool_master_key(&name);
+            if resumed {
+                profile.pool_initialization = Some(PoolInitialization {
+                    id: format!("{name}-initialization"),
+                    network_passphrase: profile.network_passphrase.clone(),
+                    funder: funder.clone(),
+                    channels: channel_records,
+                    seed_ready: !matches!(case, Case::IncompleteSeed),
+                    attempt: 0,
+                    completion_ledger: matches!(case, Case::Complete).then_some(1001),
+                    submission: matches!(case, Case::RetryDivergence | Case::RetryCap).then(|| {
+                        PoolInitSubmission {
+                            envelope_hash: "ab".repeat(32),
+                            tx_hash: "cd".repeat(32),
+                            sequence: 1,
+                            send_started: false,
+                        }
+                    }),
+                });
+                profile.pool_master_key_id = Some(master.clone());
+            }
+            loader::save_to_dir(&name, &profile, &dir.path().join("profiles")).unwrap();
+            let reads = Arc::new(AtomicUsize::new(0));
+            let count = reads.clone();
+            let profile_path = dir.path().join(format!("profiles/{name}.toml"));
+            let recovery_path = profile_path.clone();
+            let recovery_name = name.clone();
+            let incomplete = matches!(case, Case::IncompleteSeed);
+            install_with_read_hooks(vec![ReadHook::new(
+                &profile.mcp_signer_default.service,
+                &profile.mcp_signer_default.account,
+                Arc::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if incomplete {
+                        let saved =
+                            loader::load_from_path(&recovery_name, &recovery_path, None).unwrap();
+                        assert!(saved.pool_initialization.unwrap().seed_ready);
+                    }
+                }),
+            )])
+            .unwrap();
+            KeyringEntry::new(
+                &profile.audit_log_hash_chain_key_id.service,
+                &profile.audit_log_hash_chain_key_id.account,
+            )
+            .unwrap()
+            .set_password(&URL_SAFE_NO_PAD.encode([0x3a; 32]))
+            .unwrap();
+            if !matches!(
+                case,
+                Case::Cap
+                    | Case::Overflow
+                    | Case::RetryCap
+                    | Case::RetryDivergence
+                    | Case::Channel
+                    | Case::Complete
+                    | Case::Present
+            ) {
+                KeyringEntry::new(
+                    &profile.mcp_signer_default.service,
+                    &profile.mcp_signer_default.account,
+                )
+                .unwrap()
+                .set_password(
+                    stellar_strkey::ed25519::PrivateKey([0x91; 32])
+                        .as_unredacted()
+                        .to_string()
+                        .as_str(),
+                )
+                .unwrap();
+            }
+            if resumed {
+                KeyringEntry::new(&master.service, &master.account)
+                    .unwrap()
+                    .set_password(&URL_SAFE_NO_PAD.encode(seed.as_ref()))
+                    .unwrap();
+            }
+            let mut args = PoolInitArgs {
+                profile: Some(name.clone()),
+                size: if resumed { None } else { Some(2) },
+                resume: resumed,
+                force: false,
+                timeout_seconds: 5,
+                output: OutputFormat::Json,
+            };
+            let violations = Arc::new(Mutex::new(Vec::new()));
+            if incomplete {
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .respond_with(RecoveredBeforeWitness {
+                        oracle: oracle_rpc.clone(),
+                        name: name.clone(),
+                        profile_path: profile_path.clone(),
+                        master: master.clone(),
+                        signer_reads: reads.clone(),
+                        violations: violations.clone(),
+                    })
+                    .with_priority(1)
+                    .mount(&oracle)
+                    .await;
+            }
+            let rc = run_with_dependencies(&args, || Ok(())).await;
+            let value = crate::test_rpc::last_rendered();
+            if incomplete {
+                assert!(
+                    methods(&oracle)
+                        .await
+                        .contains(&"getLedgerEntries".to_owned()),
+                    "the witness read the oracle"
+                );
+                assert_eq!(*violations.lock().unwrap(), Vec::<String>::new());
+            }
+            let saved = loader::load_from_path(&name, &profile_path, None).unwrap();
+            let refusal = match case {
+                Case::FreshDivergence | Case::RetryDivergence | Case::Channel => {
+                    Some("simulation.divergence")
+                }
+                Case::Unavailable | Case::Invalid => Some("network.witness_unavailable"),
+                Case::Cap | Case::RetryCap => Some("fees.percentile_exceeds_cap"),
+                Case::Overflow => Some("validation.fee_total_overflow"),
+                _ => None,
+            };
+            if let Some(code) = refusal {
+                assert_eq!(rc, 1, "{value}");
+                assert_eq!(value["error"]["code"], code, "{value}");
+                assert!(!sent(&primary).await);
+                let message = value["error"]["message"].as_str().unwrap();
+                if matches!(case, Case::FreshDivergence | Case::RetryDivergence) {
+                    assert!(
+                        message.contains("funder account sequence (sequence delta 9)"),
+                        "{message}"
+                    );
+                }
+                if matches!(case, Case::Channel) {
+                    assert!(
+                        message.contains("pool channel account existence"),
+                        "{message}"
+                    );
+                }
+                if matches!(case, Case::Invalid) {
+                    assert!(message.contains("could not be built"), "{message}");
+                }
+                let expected_reads = usize::from(matches!(
+                    case,
+                    Case::FreshDivergence | Case::Unavailable | Case::Invalid
+                ));
+                assert_eq!(reads.load(Ordering::SeqCst), expected_reads);
+                if matches!(case, Case::Cap | Case::Overflow) {
+                    assert!(saved.pool_initialization.is_none());
+                    assert!(methods(&oracle).await.is_empty());
+                } else {
+                    let pending = saved.pool_initialization.as_ref().unwrap();
+                    assert!(
+                        value["error"]["details"]["resume_with"]
+                            .as_str()
+                            .unwrap()
+                            .contains("pool init --resume")
+                    );
+                    if matches!(case, Case::RetryDivergence) {
+                        assert_eq!(pending.attempt, 1);
+                        assert!(pending.submission.is_none());
+                    }
+                    if matches!(case, Case::RetryCap) {
+                        assert_eq!(pending.attempt, 0);
+                        assert!(pending.submission.is_some());
+                        assert!(methods(&oracle).await.is_empty());
+                    }
+                }
+                if matches!(case, Case::FreshDivergence) {
+                    let mut capped = saved.clone();
+                    capped.classic_max_fee_per_op_stroops = Some(99);
+                    loader::save_to_dir(&name, &capped, &dir.path().join("profiles")).unwrap();
+                    args.resume = true;
+                    args.size = None;
+                    reads.store(0, Ordering::SeqCst);
+                    let requests = methods(&oracle).await.len();
+                    let error = execute(&args, || Ok(())).await.unwrap_err();
+                    assert_eq!(error.code(), "fees.percentile_exceeds_cap");
+                    assert_eq!(reads.load(Ordering::SeqCst), 0);
+                    assert_eq!(methods(&oracle).await.len(), requests);
+                    loader::save_to_dir(&name, &saved, &dir.path().join("profiles")).unwrap();
+                    oracle.reset().await;
+                    wiremock::Mock::given(wiremock::matchers::method("POST"))
+                        .respond_with(ClassicRpc::testnet(&[&funder]))
+                        .mount(&oracle)
+                        .await;
+                    let result = execute(&args, || Ok(())).await.unwrap();
+                    assert_eq!(result["cross_check"]["status"], "passed");
+                    // The resume loads the signer after the witness and reads
+                    // it again to sign.
+                    assert_eq!(reads.load(Ordering::SeqCst), 2);
+                    assert_eq!(methods(&oracle).await, ["getNetwork", "getLedgerEntries"]);
+                }
+            } else {
+                assert_eq!(rc, 0, "{value}");
+                assert!(saved.pool_initialization.is_none());
+                if matches!(case, Case::Complete | Case::Present) {
+                    assert!(value["data"].get("cross_check").is_none());
+                    assert!(methods(&oracle).await.is_empty());
+                    assert_eq!(reads.load(Ordering::SeqCst), 0);
+                    assert!(!sent(&primary).await);
+                } else {
+                    assert_eq!(
+                        value["data"]["cross_check"]["status"],
+                        if matches!(case, Case::Skipped) {
+                            "skipped"
+                        } else {
+                            "passed"
+                        }
+                    );
+                    if !matches!(case, Case::Skipped) {
+                        assert_rows_carry_witness(&profile, &oracle.uri());
+                    }
+                    // A resume loads the signer after the witness and reads
+                    // it again to sign. The fresh path also loads it once
+                    // before the checkpoint as the funder identity.
+                    assert_eq!(reads.load(Ordering::SeqCst), if resumed { 2 } else { 3 });
+                }
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn pool_send_records_witness_and_rows() {
+            exercise(Case::Pass).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn fresh_divergence_is_resumable_and_rechecks_cap_and_witness() {
+            exercise(Case::FreshDivergence).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn retry_divergence_retires_attempt_without_loading_signer() {
+            exercise(Case::RetryDivergence).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn oracle_channel_presence_refuses() {
+            exercise(Case::Channel).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn unavailable_pool_oracle_precedes_send_signer() {
+            exercise(Case::Unavailable).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn invalid_pool_oracle_precedes_send_signer() {
+            exercise(Case::Invalid).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn missing_pool_oracle_reports_skipped() {
+            exercise(Case::Skipped).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn fresh_cap_refuses_before_signer_and_checkpoint() {
+            exercise(Case::Cap).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn fresh_overflow_refuses_before_signer_and_checkpoint() {
+            exercise(Case::Overflow).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn retry_cap_preserves_attempt() {
+            exercise(Case::RetryCap).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn incomplete_seed_recovers_before_witness_and_signer() {
+            exercise(Case::IncompleteSeed).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn completed_resume_has_no_cap_or_witness() {
+            exercise(Case::Complete).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn present_channels_complete_without_cap_or_witness() {
+            exercise(Case::Present).await;
+        }
     }
 }

@@ -165,30 +165,34 @@ fn value_verbs_evaluate_policy_before_the_audit_preflight() {
 
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
-    for (file, policy_calls, preflight_calls, sign_calls) in [
+    for (file, policy_calls, preflight_calls, sign_calls, witness_calls) in [
         (
             "commands/pay.rs",
             &["evaluate_pay_policy(", "evaluate_staged_pay_policy("][..],
             &["value_audit::require_value_audit_writer_for_origin("][..],
             &["sign_envelope(", "submit_envelope("][..],
+            &[][..],
         ),
         (
             "commands/claim.rs",
             &["evaluate_claim_policy(", "evaluate_staged_claim_policy("][..],
             &["value_audit::require_value_audit_writer_for_origin("][..],
             &["sign_envelope(", "submit_envelope("][..],
+            &[][..],
         ),
         (
             "commands/trustline.rs",
             &["evaluate_value_moving_policy("][..],
             &["value_audit::require_value_audit_writer("][..],
             &["enrolled_keyring_signer("][..],
+            &["obtain_classic_witness("][..],
         ),
         (
             "commands/accounts/create.rs",
             &["evaluate_create_policy("][..],
             &["value_audit::require_value_audit_writer_for_origin("][..],
             &["sponsored_create("][..],
+            &["obtain_classic_witness("][..],
         ),
     ] {
         let source = std::fs::read_to_string(src.join(file)).expect("read source");
@@ -196,6 +200,20 @@ fn value_verbs_evaluate_policy_before_the_audit_preflight() {
         let policies = call_indices(production, policy_calls);
         let preflights = call_indices(production, preflight_calls);
         let signs = call_indices(production, sign_calls);
+        if !witness_calls.is_empty() {
+            let witnesses = call_indices(production, witness_calls);
+            assert_eq!(witnesses.len(), 1, "{file}: one witness call");
+            let witness = witnesses[0];
+            assert!(
+                policies.iter().any(|&p| p < witness),
+                "{file}: policy before witness"
+            );
+            assert!(
+                signs.iter().all(|&s| witness < s),
+                "{file}: witness before signer"
+            );
+        }
+
         assert!(
             !preflights.is_empty(),
             "{file}: no audit pre-flight call found"
@@ -218,6 +236,16 @@ fn value_verbs_evaluate_policy_before_the_audit_preflight() {
             prev_preflight = preflight;
         }
     }
+    let source =
+        std::fs::read_to_string(src.join("commands/pool/init.rs")).expect("pool init source");
+    let production = production_half(&source);
+    let witness = call_indices(production, &["obtain_classic_witness("]);
+    let signers = call_indices(production, &["enrolled_keyring_signer("]);
+    assert_eq!(witness.len(), 1);
+    assert!(
+        witness[0] < *signers.last().expect("pool signer load"),
+        "pool witness precedes the send signer"
+    );
 }
 
 /// The two `tx` verbs acquire the audit writer the same way the value verbs

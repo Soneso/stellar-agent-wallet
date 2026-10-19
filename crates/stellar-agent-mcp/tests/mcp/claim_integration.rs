@@ -1770,3 +1770,305 @@ async fn claim_commit_fee_above_cap_refuses() {
             .any(|m| m == "sendTransaction")
     );
 }
+
+/// The scenario a [`witness_claim_case`] run exercises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimCase {
+    /// The oracle agrees.
+    Pass,
+    /// The oracle reports another source sequence.
+    Source,
+    /// The oracle reports another claimable-balance amount.
+    Record,
+    /// The oracle reports another network.
+    Identity,
+    /// The oracle URL cannot build a client.
+    Construction,
+    /// The profile names no oracle.
+    NoOracle,
+    /// The envelope fee exceeds the profile cap.
+    Cap,
+    /// The oracle agrees, but answers only after the nonce has expired.
+    Expiring,
+    /// The oracle disagrees first; the same nonce is committed again once it
+    /// agrees, and then replayed.
+    NonceRetry,
+}
+
+/// How long the [`ClaimCase::Expiring`] nonce stays valid after the test
+/// mints it.
+const EXPIRING_NONCE_LEAD_MS: u64 = 3_000;
+
+/// How long the [`ClaimCase::Expiring`] oracle holds each answer: the
+/// witness's identity check and its entry read together outlast the nonce.
+const EXPIRING_ORACLE_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Accepts every tool name, so the test can mint a commit nonce itself.
+struct AnyClaimTool;
+
+impl stellar_agent_nonce::ToolCatalogue for AnyClaimTool {
+    fn is_registered(&self, _: &str) -> bool {
+        true
+    }
+}
+
+async fn witness_claim_case(case: ClaimCase, expected: &str) {
+    use crate::common::{TimeoutRpc, audit_rows, received_methods, rows_of_kind};
+    let _root = crate::common::isolated_data_root();
+    let account = crate::common::own_signer_account("witness-claim");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let count = reads.clone();
+    keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+        "svc",
+        &account,
+        Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }),
+    )])
+    .unwrap();
+    install_test_nonce_key();
+    let source = gstrkey_for_seed([0x74; 32]);
+    keyring_core::Entry::new("svc", &account)
+        .unwrap()
+        .set_password(&sstrkey_for_seed([0x74; 32]))
+        .unwrap();
+    let id = test_balance_id();
+    let entries = vec![
+        (
+            account_ledger_key_xdr(&source),
+            account_entry_xdr_with_seq(&source, SOURCE_BALANCE_STROOPS, 0, SOURCE_SEQ),
+        ),
+        (
+            claim_key_xdr(&id),
+            claim_entry_xdr(
+                &id,
+                &source,
+                stellar_xdr::ClaimPredicate::Unconditional,
+                CLAIM_AMOUNT_STROOPS,
+            ),
+        ),
+    ];
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(TimeoutRpc::new(entries.clone()).confirming_in(1005))
+        .mount(&primary)
+        .await;
+    let mut oracle_entries = entries.clone();
+    if matches!(case, ClaimCase::Source | ClaimCase::NonceRetry) {
+        oracle_entries[0].1 =
+            account_entry_xdr_with_seq(&source, SOURCE_BALANCE_STROOPS, 0, SOURCE_SEQ + 1);
+    }
+    if case == ClaimCase::Record {
+        oracle_entries[1].1 = claim_entry_xdr(
+            &id,
+            &source,
+            stellar_xdr::ClaimPredicate::Unconditional,
+            CLAIM_AMOUNT_STROOPS + 1,
+        );
+    }
+    let oracle = MockServer::start().await;
+    let identity = if case == ClaimCase::Identity {
+        crate::common::EndpointNetwork::reporting("synthetic-wrong-network")
+    } else {
+        crate::common::EndpointNetwork::testnet()
+    };
+    let oracle_rpc = TimeoutRpc::new(oracle_entries).with_network(identity);
+    let oracle_rpc = if case == ClaimCase::Expiring {
+        oracle_rpc.with_delay(EXPIRING_ORACLE_DELAY)
+    } else {
+        oracle_rpc
+    };
+    Mock::given(method("POST"))
+        .respond_with(oracle_rpc)
+        .mount(&oracle)
+        .await;
+    let mut profile = crate::common::testnet_profile_for_account(&primary.uri(), &account);
+    profile.oracle_provider_url = match case {
+        ClaimCase::NoOracle => None,
+        ClaimCase::Construction => Some(url::Url::parse("ftp://oracle.test").unwrap()),
+        _ => Some(url::Url::parse(&oracle.uri()).unwrap()),
+    };
+    let server = WalletServer::new(profile.clone()).unwrap();
+    let prepared = server
+        .call_stellar_claim(StellarClaimArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            balance_id: "ab".repeat(32),
+            source_account: Some(source.clone()),
+        })
+        .await
+        .unwrap();
+    assert_ne!(
+        prepared.is_error,
+        Some(true),
+        "{}",
+        call_result_text(&prepared)
+    );
+    assert!(received_methods(&oracle).await.is_empty());
+    let (nonce, expires_at_unix_ms, envelope_xdr) = extract_commit_triple(&prepared);
+    let (nonce, expires_at_unix_ms) = if case == ClaimCase::Expiring {
+        // A nonce over the same envelope that expires shortly after the commit
+        // starts and before the delayed oracle has answered.
+        let expiry = stellar_agent_core::timefmt::now_unix_ms().unwrap() + EXPIRING_NONCE_LEAD_MS;
+        let minted = stellar_agent_nonce::NonceMint::from_profile(&profile, "witness-claim")
+            .unwrap()
+            .mint(
+                &AnyClaimTool,
+                envelope_xdr.as_bytes(),
+                expiry - stellar_agent_nonce::NonceMint::MIN_TTL_MS,
+                expiry,
+                "stellar_claim_commit",
+                "stellar:testnet",
+            )
+            .unwrap();
+        (minted.to_base64(), expiry)
+    } else {
+        (nonce, expires_at_unix_ms)
+    };
+    let commit = StellarClaimCommitArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        balance_id: "ab".repeat(32),
+        source_account: Some(source),
+        nonce,
+        expires_at_unix_ms,
+        envelope_xdr,
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    let server = if case == ClaimCase::Cap {
+        profile.classic_max_fee_per_op_stroops = Some(50);
+        WalletServer::new(profile.clone()).unwrap()
+    } else {
+        server
+    };
+    reads.store(0, Ordering::SeqCst);
+    let result = server
+        .call_stellar_claim_commit(commit.clone())
+        .await
+        .unwrap();
+    let body = call_result_json(&result);
+    if expected.contains('.') {
+        let (code, text, _) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, expected, "{body}");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert!(
+            !received_methods(&primary)
+                .await
+                .iter()
+                .any(|m| m == "sendTransaction")
+        );
+        assert!(!text.contains("synthetic-wrong-network"));
+        if case == ClaimCase::Cap {
+            assert!(received_methods(&oracle).await.is_empty());
+        }
+        if case == ClaimCase::Expiring {
+            assert!(
+                stellar_agent_core::timefmt::now_unix_ms().unwrap() > expires_at_unix_ms,
+                "the nonce expired before the commit returned"
+            );
+            assert!(
+                received_methods(&oracle)
+                    .await
+                    .iter()
+                    .any(|m| m == "getLedgerEntries"),
+                "the witness read ran before the nonce check"
+            );
+        }
+        if case == ClaimCase::NonceRetry {
+            oracle.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(TimeoutRpc::new(entries))
+                .mount(&oracle)
+                .await;
+            let retried = server
+                .call_stellar_claim_commit(commit.clone())
+                .await
+                .unwrap();
+            assert_ne!(
+                retried.is_error,
+                Some(true),
+                "{}",
+                call_result_text(&retried)
+            );
+            assert_eq!(
+                call_result_json(&retried)["data"]["cross_check"]["status"],
+                "passed"
+            );
+            // The retried commit reads the signer entry twice: once when the
+            // signer loads and once when it signs.
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
+            let replay = server.call_stellar_claim_commit(commit).await.unwrap();
+            let (code, _, _) = crate::common::assert_business_envelope(&replay);
+            assert_eq!(code, "nonce.replayed");
+            assert_eq!(reads.load(Ordering::SeqCst), 2, "a replay loads no signer");
+        }
+        return;
+    }
+    assert_ne!(result.is_error, Some(true), "{body}");
+    assert_eq!(body["data"]["cross_check"]["status"], expected);
+    let rows = audit_rows(&profile);
+    let pending = rows_of_kind(&rows, "value_action_pending");
+    let submitted = rows_of_kind(&rows, "value_action_submitted");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(submitted.len(), 1);
+    if expected == "passed" {
+        assert_eq!(pending[0]["witness"]["provider"], oracle.uri());
+        assert_eq!(pending[0]["witness"]["ledger"], 1001);
+        assert_eq!(pending[0]["witness"], submitted[0]["witness"]);
+    } else {
+        assert!(received_methods(&oracle).await.is_empty());
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn claim_witness_result_and_rows() {
+    witness_claim_case(ClaimCase::Pass, "passed").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn claim_source_divergence_precedes_signer() {
+    witness_claim_case(ClaimCase::Source, "simulation.divergence").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn claim_record_divergence_precedes_signer() {
+    witness_claim_case(ClaimCase::Record, "simulation.divergence").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn claim_oracle_identity_refuses() {
+    witness_claim_case(ClaimCase::Identity, "network.witness_unavailable").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn claim_oracle_construction_refuses() {
+    witness_claim_case(ClaimCase::Construction, "network.witness_unavailable").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn claim_no_oracle_skips() {
+    witness_claim_case(ClaimCase::NoOracle, "skipped").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn claim_cap_precedes_oracle() {
+    witness_claim_case(ClaimCase::Cap, "fees.percentile_exceeds_cap").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn claim_nonce_expiring_during_witness_refuses() {
+    witness_claim_case(ClaimCase::Expiring, "nonce.expired").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn claim_witness_refusal_keeps_nonce_usable() {
+    witness_claim_case(ClaimCase::NonceRetry, "simulation.divergence").await;
+}

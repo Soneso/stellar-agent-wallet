@@ -446,6 +446,28 @@ chain id, which must match the profile. For `stellar_sep43_get_address` and
 profile chain when omitted, but is still validated against the profile when
 supplied.
 
+The four classic MCP commits obtain a witness after their policy and fee checks
+and before the audit pre-flight, nonce consumption, and signer load.
+Results include `cross_check`; pending and submitted rows carry a passed witness.
+Trustline and claim commits are unvalued. Testnet without an oracle reports
+`skipped`; a configured but unavailable oracle refuses `network.witness_unavailable`.
+Disagreements refuse `simulation.divergence`, and credential refusals retain
+`network.rpc_credential_refused`. A witness refusal leaves the nonce usable.
+The nonce expiry is checked against the clock read after the witness, so a nonce
+that expires while the oracle answers refuses `nonce.expired`.
+
+`stellar_trustline_commit` reads the issuer again and verifies the stored
+clawback opt-in for that trustline. An absent issuer refuses `trustline.gate_refused`.
+Other issuer read errors keep their own codes and scrubbed messages.
+Clawback without a current, verified opt-in refuses
+`trustline.clawback_opt_in_required`, including when the issuer enables clawback
+after prepare. Nothing is signed and no new approval is minted.
+Re-invoke `stellar_trustline` to obtain a new opt-in request.
+A verified opt-in permits the commit to continue to its witness.
+
+`stellar_claim_commit` witnesses the source account and complete fresh
+claimable-balance record. It does not re-read the source trustline at commit.
+
 ### Payments and accounts
 
 | Tool | Purpose | Gating |
@@ -455,7 +477,7 @@ supplied.
 | `stellar_create_account` | Simulate account creation: build the CreateAccount envelope, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |
 | `stellar_create_account_commit` | Verify the nonce, re-check the envelope, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
 | `stellar_claim` | Simulate claiming a claimable balance by ID: fetch the entry, run the claimant / predicate / trustline guards, render the typed preview, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |
-| `stellar_claim_commit` | Verify the nonce, re-derive the balance ID from the envelope, re-fetch the entry and re-run the claimant and predicate guards, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
+| `stellar_claim_commit` | Recheck record, witness, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances for an account. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
 | `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it. The way out of `submission.tx_timeout`. | Reads the chain and writes the wallet's record; moves no value. Not annotated read-only. |
@@ -467,7 +489,7 @@ A v1 rule set that names tools explicitly must include `stellar_transaction_stat
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_trustline` | Simulate a trustline change: build the ChangeTrust envelope, run the issuer clawback-flag gate, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |
-| `stellar_trustline_commit` | Verify the nonce, re-derive the authoritative asset/issuer/limit from the envelope, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
+| `stellar_trustline_commit` | Recheck issuer, witness, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
 
 ### Fees
 

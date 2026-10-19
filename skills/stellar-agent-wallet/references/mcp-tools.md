@@ -68,6 +68,28 @@ submission whose outcome the wallet cannot settle on its own; `details` carries
 the full transaction hash the message redacts. No other code carries `details`.
 See "Unresolved submissions" below.
 
+The four classic MCP commits obtain a witness after their policy and fee checks
+and before the audit pre-flight, nonce consumption, and signer load.
+Results include `cross_check`; pending and submitted rows carry a passed witness.
+Trustline and claim commits are unvalued. Testnet without an oracle reports
+`skipped`; a configured but unavailable oracle refuses `network.witness_unavailable`.
+Disagreements refuse `simulation.divergence`, and credential refusals retain
+`network.rpc_credential_refused`. A witness refusal leaves the nonce usable.
+The nonce expiry is checked against the clock read after the witness, so a nonce
+that expires while the oracle answers refuses `nonce.expired`.
+
+`stellar_trustline_commit` reads the issuer again and verifies the stored
+clawback opt-in for that trustline. An absent issuer refuses `trustline.gate_refused`.
+Other issuer read errors keep their own codes and scrubbed messages.
+Clawback without a current, verified opt-in refuses
+`trustline.clawback_opt_in_required`, including when the issuer enables clawback
+after prepare. Nothing is signed and no new approval is minted.
+Re-invoke `stellar_trustline` to obtain a new opt-in request.
+A verified opt-in permits the commit to continue to its witness.
+
+`stellar_claim_commit` witnesses the source account and complete fresh
+claimable-balance record. It does not re-read the source trustline at commit.
+
 ## Gating model in brief
 
 Every call is dispatched through one gate before the tool's logic runs. The
@@ -296,7 +318,7 @@ resolved chain is used when omitted.)
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_trustline` | Build the ChangeTrust envelope, run the issuer clawback-flag gate, mint a single-use nonce. | No signing; no submission. Mints the nonce the commit step consumes. An approval block includes `profile` and `chain_id`. The pending record names the trustline holder, asset, issuer, and limit. |
-| `stellar_trustline_commit` | Verify the nonce, re-derive the authoritative asset/issuer/limit from the envelope, sign, submit. | Signs and submits. Two-phase; approval spine. |
+| `stellar_trustline_commit` | Recheck issuer, witness, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
 
 ### stellar_trustline (simulate) arguments
 
@@ -318,7 +340,7 @@ from `envelope_xdr`, not from caller-supplied args.
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_claim` | Fetch the on-chain claimable-balance entry, render a typed preview, enforce the claim guards (claimant, predicate, trustline, fee affordability), build the `ClaimClaimableBalance` envelope, mint a single-use nonce. | No signing; no submission. Mints the nonce the commit step consumes. An approval block includes `profile` and `chain_id`. |
-| `stellar_claim_commit` | Re-derive the authoritative args from the envelope, re-fetch and re-check the entry, verify the nonce, rebuild and byte-compare the envelope, sign from the keyring, submit. | Signs and submits. Two-phase; approval spine. |
+| `stellar_claim_commit` | Recheck record, witness, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
 
 ### stellar_claim (simulate) arguments
 

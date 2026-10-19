@@ -248,9 +248,10 @@ secret.
 
 CLI `pay` and `claim` check the cap in the full pipeline, `--build-only`,
 `--sign-only`, and `--submit-only`. MCP pay, create-account, trustline, and
-claim check it in both prepare and commit. No other stage checks it, including
-CLI `trustline`, sponsored `accounts create`, `pool init`, opaque staged
-envelopes, and the SEP-43 signing tools.
+claim check it in both prepare and commit. CLI sponsored `accounts create`,
+`trustline`, and every sending `pool init` path also check the cap.
+Opaque, fee-bump, and multi-operation staged envelopes and the SEP-43 signing
+tools remain outside this coverage.
 
 The cap applies to the resolved auto-selected, explicit, profile, or command
 fee, or the decoded envelope fee. A fee equal to the cap passes. A fee above
@@ -263,12 +264,19 @@ writes `10000`. The cap refuses an excessive fee; it never lowers the bid.
 
 The native threshold is `max(cross_check_threshold_stroops, 10_000_000_000)`
 stroops. The floor is 1000 XLM, so zero also means 1000 XLM.
-An MCP payment or account-creation commit at or above its threshold needs an
-oracle witness. A memo-less MCP payment needs a witness whenever an oracle is
-configured, even below threshold or without a testnet asset threshold.
-A mainnet profile without `oracle_provider_url` cannot run these required
-comparisons. Testnet continues with a warning when the oracle is absent.
+Payment and account-creation stages require a witness at or above their threshold.
+They use the source debit or starting balance. A memo-less payment requires one
+whenever an oracle is configured, including below threshold on testnet.
+Trustline changes, claims, and pool initialization are unvalued: they require a
+witness whenever an oracle is configured. Without an oracle, testnet reports
+`skipped`; the mainnet requirement rule refuses `network.witness_unavailable`.
 Mainnet writes remain structurally refused.
+
+The classic witness covers CLI `pay`, `claim`, sponsored `accounts create`,
+`trustline`, and every sending `pool init` path. It also covers MCP
+`stellar_pay_commit`, `stellar_create_account_commit`, `stellar_trustline_commit`,
+and `stellar_claim_commit`. Opaque staged envelopes and the SEP-43 signing
+tools remain uncovered.
 
 The legacy key `usd_threshold` also sets the native threshold. Setting both
 names across the file, environment, or CLI sources refuses as a duplicate field.

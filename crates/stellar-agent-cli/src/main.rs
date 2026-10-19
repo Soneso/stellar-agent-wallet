@@ -182,7 +182,7 @@ enum Commands {
     /// Enforces the full ordered trust gate before signing:
     /// operator policy evaluation, denomination resolver (USDT refusal +
     /// known-lookalike denylist + pinned-issuer-mismatch + unpinned-bare-code),
-    /// live issuer-flag fetch (fail-closed on fetch failure),
+    /// live issuer-flag fetch (an issuer read error refuses),
     /// wallet-controlled clawback opt-in check, and preview disclosure.
     Trustline(commands::trustline::TrustlineArgs),
 

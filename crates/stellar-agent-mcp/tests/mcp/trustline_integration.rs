@@ -990,3 +990,558 @@ async fn trustline_commit_fee_above_cap_refuses() {
             .any(|m| m == "sendTransaction")
     );
 }
+
+fn witness_issuer_entry(flags: u32) -> (String, String) {
+    use stellar_xdr::{LedgerEntryData, Limits, ReadXdr, WriteXdr};
+    let mut data = LedgerEntryData::from_xdr_base64(
+        account_entry_xdr_with_balance(USDC_TESTNET_ISSUER, 100_000_000_000),
+        Limits::none(),
+    )
+    .unwrap();
+    let LedgerEntryData::Account(account) = &mut data else {
+        panic!("account")
+    };
+    account.flags = flags;
+    (
+        account_ledger_key_xdr(USDC_TESTNET_ISSUER),
+        data.to_xdr_base64(Limits::none()).unwrap(),
+    )
+}
+
+/// The scenario a [`witness_trustline_case`] run exercises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustlineCase {
+    /// The oracle agrees.
+    Pass,
+    /// The oracle reports another source sequence.
+    Source,
+    /// The oracle reports other issuer flags.
+    Issuer,
+    /// The oracle reports another network.
+    Identity,
+    /// The oracle URL cannot build a client.
+    Construction,
+    /// The profile names no oracle.
+    NoOracle,
+    /// The envelope fee exceeds the profile cap.
+    Cap,
+    /// The issuer enables clawback after the prepare, with no opt-in.
+    ClawbackEnabled,
+    /// The issuer enables clawback after the prepare; a verified opt-in
+    /// covers the trustline.
+    VerifiedOptIn,
+    /// The opt-in expires between the prepare and the commit.
+    ExpiredOptIn,
+    /// The opt-in carries an attestation under another key.
+    ForgedOptIn,
+    /// The opt-in attestation binds another asset.
+    OptInForAnotherAsset,
+    /// The issuer account is absent at the commit.
+    AbsentAtCommit,
+    /// The commit's issuer read fails with server text.
+    CommitReadError,
+    /// The prepare's issuer read fails with server text.
+    PrepareReadError,
+    /// The issuer account is absent at the prepare.
+    AbsentAtPrepare,
+    /// The oracle disagrees first; the same nonce is committed again once it
+    /// agrees, and then replayed.
+    NonceRetry,
+}
+
+impl TrustlineCase {
+    /// Whether the case seeds a clawback opt-in before the prepare.
+    fn seeds_opt_in(self) -> bool {
+        matches!(
+            self,
+            Self::VerifiedOptIn
+                | Self::ExpiredOptIn
+                | Self::ForgedOptIn
+                | Self::OptInForAnotherAsset
+        )
+    }
+
+    /// Whether the case refuses before the commit reaches the oracle.
+    fn refuses_before_oracle(self) -> bool {
+        matches!(
+            self,
+            Self::Cap
+                | Self::ClawbackEnabled
+                | Self::ExpiredOptIn
+                | Self::ForgedOptIn
+                | Self::OptInForAnotherAsset
+                | Self::AbsentAtCommit
+        )
+    }
+}
+
+/// The server text an issuer read error carries: the primary endpoint's
+/// configured credential and a URL with a path.
+fn credential_echoing_server_text() -> String {
+    format!(
+        "upstream {} refused at https://rpc.test/private-route",
+        crate::common::RPC_CREDENTIAL
+    )
+}
+
+/// The part of [`crate::common::RPC_CREDENTIAL`] that names the secret.
+const RPC_CREDENTIAL_TOKEN: &str = "mcp-rpc-credential-0123456789";
+
+fn seed_witness_opt_in(profile: &Profile, dir: &std::path::Path, case: TrustlineCase) {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use stellar_agent_core::approval::{
+        AttestationBinding,
+        attestation::{compute_attestation, compute_trustline_clawback_opt_in_digest},
+        store::{PendingApproval, PendingApprovalStore},
+    };
+    let key = [0x42; 32];
+    keyring_core::Entry::new(
+        &profile.attestation_key_id.service,
+        &profile.attestation_key_id.account,
+    )
+    .unwrap()
+    .set_password(&URL_SAFE_NO_PAD.encode(key))
+    .unwrap();
+    let name = stellar_agent_core::profile::name::profile_name_for_approval(profile);
+    let mut store = PendingApprovalStore::open(dir.join(format!("{name}.toml"))).unwrap();
+    let entry = PendingApproval::new_trustline_clawback_opt_in_pending(
+        "stellar:testnet".to_owned(),
+        "USDC".to_owned(),
+        USDC_TESTNET_ISSUER.to_owned(),
+        "1000".to_owned(),
+        86_400_000,
+    )
+    .unwrap();
+    let nonce = entry.approval_nonce.clone();
+    let digest = compute_trustline_clawback_opt_in_digest(
+        "stellar:testnet",
+        if case == TrustlineCase::OptInForAnotherAsset {
+            "EURC"
+        } else {
+            "USDC"
+        },
+        USDC_TESTNET_ISSUER,
+    );
+    let blob = compute_attestation(
+        if case == TrustlineCase::ForgedOptIn {
+            &[0x99; 32]
+        } else {
+            &key
+        },
+        &AttestationBinding::new(&name, "stellar:testnet"),
+        &nonce,
+        &digest,
+        &entry.process_uid,
+    );
+    store
+        .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
+        .unwrap();
+    store
+        .record_trustline_clawback_opt_in_attestation(&nonce, blob)
+        .unwrap();
+}
+
+/// A mock answering, ahead of the server's other mocks, the
+/// `getLedgerEntries` request whose only key is `issuer_key`.
+fn issuer_read(issuer_key: &str, responder: impl Respond + 'static) -> Mock {
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "method": "getLedgerEntries", "params": {"keys": [issuer_key]}
+        })))
+        .respond_with(responder)
+        .with_priority(1)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario table drives every commit-time witness case"
+)]
+async fn witness_trustline_case(case: TrustlineCase, expected: &str) {
+    use crate::common::{RpcErrorAnswer, TimeoutRpc, audit_rows, received_methods, rows_of_kind};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use stellar_agent_core::profile::schema::ProviderRole;
+    let _root = crate::common::isolated_data_root();
+    let account = crate::common::own_signer_account("witness-trustline");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let count = reads.clone();
+    keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+        "svc",
+        &account,
+        Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }),
+    )])
+    .unwrap();
+    install_test_nonce_key(213);
+    let source = gstrkey_for_seed([0x73; 32]);
+    keyring_core::Entry::new("svc", &account)
+        .unwrap()
+        .set_password(&sstrkey_for_seed([0x73; 32]))
+        .unwrap();
+    let entries = vec![
+        (
+            account_ledger_key_xdr(&source),
+            account_entry_xdr_with_balance(&source, 100_000_000_000),
+        ),
+        witness_issuer_entry(0),
+    ];
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(TimeoutRpc::new(entries.clone()).confirming_in(1005))
+        .mount(&primary)
+        .await;
+    let mut oracle_entries = entries.clone();
+    if matches!(case, TrustlineCase::Source | TrustlineCase::NonceRetry) {
+        oracle_entries[0].1 = stellar_agent_test_support::xdr_fixtures::account_entry_xdr_with_seq(
+            &source,
+            100_000_000_000,
+            0,
+            999,
+        );
+    }
+    if case == TrustlineCase::Issuer {
+        oracle_entries[1] = witness_issuer_entry(2);
+    }
+    if case == TrustlineCase::VerifiedOptIn {
+        oracle_entries[1] = witness_issuer_entry(8);
+    }
+    let oracle = MockServer::start().await;
+    let identity = if case == TrustlineCase::Identity {
+        crate::common::EndpointNetwork::reporting("synthetic-wrong-network")
+    } else {
+        crate::common::EndpointNetwork::testnet()
+    };
+    Mock::given(method("POST"))
+        .respond_with(TimeoutRpc::new(oracle_entries).with_network(identity))
+        .mount(&oracle)
+        .await;
+    let mut profile = crate::common::testnet_profile_for_account(&primary.uri(), &account);
+    profile.oracle_provider_url = match case {
+        TrustlineCase::NoOracle => None,
+        TrustlineCase::Construction => Some(url::Url::parse("ftp://oracle.test").unwrap()),
+        _ => Some(url::Url::parse(&oracle.uri()).unwrap()),
+    };
+    let read_error = matches!(
+        case,
+        TrustlineCase::CommitReadError | TrustlineCase::PrepareReadError
+    );
+    if read_error {
+        // The primary carries a configured credential, so the server text of
+        // the read error below echoes a secret the scrub has to remove.
+        crate::common::bind_rpc_credential(&mut profile, ProviderRole::Primary, true);
+    }
+    let approval = tempfile::tempdir().unwrap();
+    if case.seeds_opt_in() {
+        seed_witness_opt_in(&profile, approval.path(), case);
+    }
+    let mut server = WalletServer::new(profile.clone()).unwrap();
+    server.set_approval_dir_for_test(approval.path().to_owned());
+    match case {
+        TrustlineCase::PrepareReadError => {
+            issuer_read(
+                &entries[1].0,
+                RpcErrorAnswer::new(credential_echoing_server_text()),
+            )
+            .mount(&primary)
+            .await;
+        }
+        TrustlineCase::AbsentAtPrepare => {
+            issuer_read(&entries[1].0, TimeoutRpc::new(vec![]))
+                .mount(&primary)
+                .await;
+        }
+        _ => {}
+    }
+    let prepared = server
+        .call_stellar_trustline(trustline_args(&source))
+        .await
+        .unwrap();
+    if matches!(
+        case,
+        TrustlineCase::PrepareReadError | TrustlineCase::AbsentAtPrepare
+    ) {
+        let (code, text, _) = crate::common::assert_business_envelope(&prepared);
+        assert_eq!(code, expected);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_scrubbed_read_error(case, &text);
+        return;
+    }
+    assert_ne!(
+        prepared.is_error,
+        Some(true),
+        "{}",
+        call_result_text(&prepared)
+    );
+    assert!(received_methods(&oracle).await.is_empty());
+    let data = call_result_json(&prepared)["data"].clone();
+    let commit = StellarTrustlineCommitArgs {
+        chain_id: "stellar:testnet".to_owned(),
+        from: source,
+        nonce: data["nonce"].as_str().unwrap().to_owned(),
+        expires_at_unix_ms: data["expires_at_unix_ms"].as_u64().unwrap(),
+        envelope_xdr: data["envelope_xdr"].as_str().unwrap().to_owned(),
+        approval_nonce: None,
+        approval_attestation: None,
+    };
+    let path = approval
+        .path()
+        .join(format!("{}.toml", server.profile_name_for_approval()));
+    if case == TrustlineCase::ExpiredOptIn {
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content
+                .lines()
+                .filter(|line| line.starts_with("expires_at_unix_ms = "))
+                .count(),
+            1
+        );
+        let expired = content
+            .lines()
+            .map(|line| {
+                if line.starts_with("expires_at_unix_ms = ") {
+                    "expires_at_unix_ms = 1"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, expired).unwrap();
+    }
+    match case {
+        TrustlineCase::ClawbackEnabled
+        | TrustlineCase::VerifiedOptIn
+        | TrustlineCase::ExpiredOptIn
+        | TrustlineCase::ForgedOptIn
+        | TrustlineCase::OptInForAnotherAsset
+        | TrustlineCase::AbsentAtCommit => {
+            let fresh = if case == TrustlineCase::AbsentAtCommit {
+                vec![]
+            } else {
+                vec![witness_issuer_entry(8)]
+            };
+            issuer_read(&entries[1].0, TimeoutRpc::new(fresh))
+                .mount(&primary)
+                .await;
+        }
+        TrustlineCase::CommitReadError => {
+            issuer_read(
+                &entries[1].0,
+                RpcErrorAnswer::new(credential_echoing_server_text()),
+            )
+            .mount(&primary)
+            .await;
+        }
+        _ => {}
+    }
+    if case == TrustlineCase::Cap {
+        profile.classic_max_fee_per_op_stroops = Some(50);
+        server = WalletServer::new(profile.clone()).unwrap();
+        server.set_approval_dir_for_test(approval.path().to_owned());
+    }
+    let before = std::fs::read(&path).ok();
+    reads.store(0, Ordering::SeqCst);
+    let result = server
+        .call_stellar_trustline_commit(commit.clone())
+        .await
+        .unwrap();
+    let body = call_result_json(&result);
+    if expected.contains('.') {
+        let (code, text, _) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, expected, "{body}");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert!(
+            !received_methods(&primary)
+                .await
+                .iter()
+                .any(|m| m == "sendTransaction")
+        );
+        assert_scrubbed_read_error(case, &text);
+        assert_eq!(
+            std::fs::read(&path).ok(),
+            before,
+            "refusal mints no approval"
+        );
+        if case.refuses_before_oracle() {
+            assert!(received_methods(&oracle).await.is_empty());
+        }
+        if case == TrustlineCase::NonceRetry {
+            oracle.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(TimeoutRpc::new(entries))
+                .mount(&oracle)
+                .await;
+            let retried = server
+                .call_stellar_trustline_commit(commit.clone())
+                .await
+                .unwrap();
+            assert_ne!(
+                retried.is_error,
+                Some(true),
+                "{}",
+                call_result_text(&retried)
+            );
+            // The retried commit reads the signer entry twice: once when the
+            // signer loads and once when it signs.
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
+            let replay = server.call_stellar_trustline_commit(commit).await.unwrap();
+            let (code, _, _) = crate::common::assert_business_envelope(&replay);
+            assert_eq!(code, "nonce.replayed");
+            assert_eq!(reads.load(Ordering::SeqCst), 2, "a replay loads no signer");
+        }
+        return;
+    }
+    assert_ne!(result.is_error, Some(true), "{body}");
+    assert_eq!(body["data"]["cross_check"]["status"], expected);
+    // The commit reads the signer entry twice: once when the signer loads and
+    // once when it signs.
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    let rows = audit_rows(&profile);
+    let pending = rows_of_kind(&rows, "value_action_pending");
+    let submitted = rows_of_kind(&rows, "value_action_submitted");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(submitted.len(), 1);
+    if expected == "passed" {
+        assert_eq!(pending[0]["witness"]["provider"], oracle.uri());
+        assert_eq!(pending[0]["witness"]["ledger"], 1001);
+        assert_eq!(pending[0]["witness"], submitted[0]["witness"]);
+    } else {
+        assert!(received_methods(&oracle).await.is_empty());
+    }
+}
+
+/// Asserts that a refusal's text holds neither the configured credential nor
+/// the path of the URL the server echoed. For a read error, the text still
+/// names the echoed host, so the server text did reach the refusal and the
+/// scrub is what removed the rest.
+fn assert_scrubbed_read_error(case: TrustlineCase, text: &str) {
+    assert!(!text.contains(RPC_CREDENTIAL_TOKEN), "{text}");
+    assert!(!text.contains("private-route"), "{text}");
+    if matches!(
+        case,
+        TrustlineCase::CommitReadError | TrustlineCase::PrepareReadError
+    ) {
+        assert!(text.contains("rpc.test"), "{text}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_witness_result_and_rows() {
+    witness_trustline_case(TrustlineCase::Pass, "passed").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_source_divergence_precedes_signer() {
+    witness_trustline_case(TrustlineCase::Source, "simulation.divergence").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_issuer_divergence_precedes_signer() {
+    witness_trustline_case(TrustlineCase::Issuer, "simulation.divergence").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_oracle_identity_refuses() {
+    witness_trustline_case(TrustlineCase::Identity, "network.witness_unavailable").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_oracle_construction_refuses() {
+    witness_trustline_case(TrustlineCase::Construction, "network.witness_unavailable").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_no_oracle_skips() {
+    witness_trustline_case(TrustlineCase::NoOracle, "skipped").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_cap_precedes_oracle() {
+    witness_trustline_case(TrustlineCase::Cap, "fees.percentile_exceeds_cap").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_clawback_enabled_after_prepare_refuses() {
+    witness_trustline_case(
+        TrustlineCase::ClawbackEnabled,
+        "trustline.clawback_opt_in_required",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_expired_opt_in_refuses() {
+    witness_trustline_case(
+        TrustlineCase::ExpiredOptIn,
+        "trustline.clawback_opt_in_required",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_forged_opt_in_refuses() {
+    witness_trustline_case(
+        TrustlineCase::ForgedOptIn,
+        "trustline.clawback_opt_in_required",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_opt_in_bound_to_another_asset_refuses() {
+    witness_trustline_case(
+        TrustlineCase::OptInForAnotherAsset,
+        "trustline.clawback_opt_in_required",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_verified_opt_in_proceeds() {
+    witness_trustline_case(TrustlineCase::VerifiedOptIn, "passed").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_absent_issuer_at_commit_refuses() {
+    witness_trustline_case(TrustlineCase::AbsentAtCommit, "trustline.gate_refused").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_commit_transport_error_is_scrubbed() {
+    witness_trustline_case(TrustlineCase::CommitReadError, "network.rpc_unreachable").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_prepare_transport_error_is_scrubbed() {
+    witness_trustline_case(TrustlineCase::PrepareReadError, "network.rpc_unreachable").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_prepare_absent_issuer_refuses() {
+    witness_trustline_case(TrustlineCase::AbsentAtPrepare, "trustline.gate_refused").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn trustline_witness_refusal_keeps_nonce_usable() {
+    witness_trustline_case(TrustlineCase::NonceRetry, "simulation.divergence").await;
+}

@@ -88,9 +88,11 @@
 //! # Endpoint identity (sponsored mode)
 //!
 //! Sponsored mode builds one client and asks the endpoint which network it
-//! serves before the sponsor read that feeds the policy gate. The reconcile,
-//! the fee and sequence reads, and the send use that same client. The submit
-//! layer checks the sending client again before the send.
+//! serves before the sponsor read. That one sponsor observation feeds the
+//! policy gate, the witness and the envelope sequence. The reconcile, the fee
+//! read and the send use the same client. The submit layer checks the sending
+//! client again before the send, and it separately reads the sponsor's signer
+//! set to verify the signature binding.
 //!
 //! # Behavior
 //!
@@ -104,10 +106,16 @@ use std::time::Duration;
 use clap::{ArgGroup, Args};
 use rand_core::OsRng;
 use stellar_agent_core::StellarAmount;
+use stellar_agent_core::asset_id::CanonicalAsset;
+use stellar_agent_core::cross_check::CrossCheckValue;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{AuthError, NetworkError, ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::NetworkContext;
+use stellar_agent_network::cross_check::{
+    AccountObservation, CreateAccountWitnessInputs, CrossCheckView, obtain_classic_witness,
+};
+use stellar_agent_network::fees::check_built_fee_cap;
 use zeroize::Zeroizing;
 
 use stellar_agent_network::builder::ClassicOpBuilder;
@@ -115,9 +123,9 @@ use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::source::signer_from_ledger;
 use stellar_agent_network::{
-    ClassicFeeSelection, StellarRpcClient, SubmissionResult, SubmissionSignerKind,
-    init_platform_keyring_store, parse_classic_fee_choice, resolve_classic_fee_selection,
-    submit_transaction_and_wait,
+    ClassicFeeChoice, ClassicFeeSelection, StellarRpcClient, SubmissionResult,
+    SubmissionSignerKind, init_platform_keyring_store, parse_classic_fee_choice,
+    resolve_classic_fee_selection, submit_transaction_and_wait,
 };
 use stellar_agent_network::{FriendbotResult, fund_with_friendbot};
 
@@ -252,18 +260,26 @@ pub struct CreateAccountResult {
     /// Fee selection source for sponsored mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_fee_percentile: Option<String>,
+
+    /// Transaction-specific cross-check outcome for sponsored creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_check: Option<CrossCheckView>,
 }
 
-#[derive(Debug, Clone)]
-struct BuiltCreateAccountEnvelope {
-    envelope_xdr: String,
-    fee_selection: ClassicFeeSelection,
+/// A failed sponsored create. `signed_xdr` is `Some` only once the envelope
+/// is signed, so the error details carry an envelope hash only then.
+struct SponsoredCreateFailure {
+    error: WalletError,
+    signed_xdr: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct SponsoredCreateResult {
-    submission: SubmissionResult,
-    fee_selection: ClassicFeeSelection,
+impl From<WalletError> for SponsoredCreateFailure {
+    fn from(error: WalletError) -> Self {
+        Self {
+            error,
+            signed_xdr: None,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -621,6 +637,7 @@ fn build_friendbot_result(new_account: &NewAccount, fb: &FriendbotResult) -> Cre
         friendbot_url_used: Some(fb.friendbot_url_used.clone()),
         selected_fee_per_op_stroops: None,
         selected_fee_percentile: None,
+        cross_check: None,
     }
 }
 
@@ -808,18 +825,8 @@ where
         }
     }
 
-    // ── Fetch sponsor account state (feeds the policy gate's account_view) ──
-    // This fetch runs BEFORE the gate, mirroring the MCP twin's
-    // fetch-then-dispatch ordering; `build_sponsored_unsigned_envelope` below
-    // re-fetches the same account for its own sequence-number read (the gate
-    // runs strictly before any build/sign/submit work in this command, so
-    // the fetched view cannot be threaded into that later call without
-    // restructuring the build pipeline — a known, accepted extra round-trip).
-    //
-    // The client is the one the reconcile, the build reads, and the send use.
-    // Its endpoint is checked first, under a fresh budget of
-    // `--timeout-seconds`, so no value the sponsor signs comes from an
-    // endpoint serving another network.
+    // One primary sponsor observation feeds policy, the witness, and the builder.
+    // The checked client also resolves the fee and submits the transaction.
     let client = match context.primary_client() {
         Ok(c) => c,
         Err(e) => {
@@ -881,6 +888,43 @@ where
         Err(code) => return code,
     };
 
+    let (fee_choice, fee_selection) = match select_create_fee(&client, args).await {
+        Ok(selection) => selection,
+        Err(error) => {
+            print_error(&Envelope::<()>::err(&error), args.output);
+            return 1;
+        }
+    };
+    if let Err(error) = check_built_fee_cap(fee_selection.per_op_stroops, fee_choice, profile) {
+        print_error(&Envelope::<()>::err(&error), args.output);
+        return 1;
+    }
+    let source = match AccountObservation::from_view(&sponsor_account_view) {
+        Ok(source) => source,
+        Err(error) => {
+            print_error(&Envelope::<()>::err(&error), args.output);
+            return 1;
+        }
+    };
+    let cross_check = match obtain_classic_witness(
+        profile,
+        context,
+        CrossCheckValue::Amount {
+            asset: &CanonicalAsset::Native,
+            base_units: i128::from(starting_balance_stroops),
+        },
+        CreateAccountWitnessInputs { source },
+        "stellar_create_account",
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            print_error(&Envelope::<()>::err(&error), args.output);
+            return 1;
+        }
+    };
+
     // ── Audit pre-flight (sponsored mode only; fail-closed for a persisted
     // profile, fail-open for the synthesized zero-config profile) ───────────
     // Friendbot mode signs nothing and is not gated — see the module doc
@@ -918,7 +962,7 @@ where
             now_ms,
         },
     ) {
-        Ok(r) => r,
+        Ok(r) => r.with_witness(cross_check.witness()),
         Err(e) => {
             print_error(
                 &crate::commands::submission_record::error_envelope(&e, "", "accounts create"),
@@ -940,14 +984,15 @@ where
             sponsor: &sponsor,
             new_account: &new_account.g_strkey,
             starting_balance,
+            sequence_number: sponsor_account_view.sequence_number,
+            fee_per_op: fee_selection.per_op_stroops,
         },
         Some(&recorder),
     )
     .await
     {
-        Ok(sponsored_result) => {
+        Ok(sub_result) => {
             let secret_key = new_account.secret.as_ref().map(|s| s.as_str().to_owned());
-            let sub_result = sponsored_result.submission;
 
             let result = CreateAccountResult {
                 account_id: new_account.g_strkey.clone(),
@@ -956,18 +1001,21 @@ where
                 tx_hash: Some(sub_result.tx_hash.clone()),
                 ledger: Some(sub_result.ledger),
                 friendbot_url_used: None,
-                selected_fee_per_op_stroops: Some(sponsored_result.fee_selection.per_op_stroops),
-                selected_fee_percentile: Some(
-                    sponsored_result.fee_selection.selected_fee_percentile,
-                ),
+                selected_fee_per_op_stroops: Some(fee_selection.per_op_stroops),
+                selected_fee_percentile: Some(fee_selection.selected_fee_percentile),
+                cross_check: Some(cross_check.view()),
             };
             let envelope = Envelope::ok(result);
             print_success(&envelope, args.output);
             0
         }
-        Err(e) => {
+        Err(failure) => {
             print_error(
-                &crate::commands::submission_record::error_envelope(&e, "", "accounts create"),
+                &crate::commands::submission_record::error_envelope(
+                    &failure.error,
+                    failure.signed_xdr.as_deref().unwrap_or_default(),
+                    "accounts create",
+                ),
                 args.output,
             );
             1
@@ -1030,12 +1078,14 @@ struct SponsoredAccount<'a> {
     sponsor: &'a str,
     new_account: &'a str,
     starting_balance: StellarAmount,
+    sequence_number: i64,
+    fee_per_op: u32,
 }
 
 /// Builds, signs, and submits the `CreateAccount` transaction.
 ///
 /// `client` is the client whose endpoint the caller checked before the
-/// sponsor read; the fee and sequence reads and the send go through it.
+/// sponsor read; the send uses that checked client.
 ///
 /// # Signing path
 ///
@@ -1056,7 +1106,7 @@ async fn sponsored_create(
     signed_by: SignedBy<'_>,
     account: SponsoredAccount<'_>,
     recorder: Option<&dyn stellar_agent_network::SubmissionRecorder>,
-) -> Result<SponsoredCreateResult, WalletError> {
+) -> Result<SubmissionResult, SponsoredCreateFailure> {
     let SignedBy {
         profile,
         profile_name,
@@ -1065,31 +1115,25 @@ async fn sponsored_create(
         sponsor,
         new_account,
         starting_balance,
+        sequence_number,
+        fee_per_op,
     } = account;
-    let built = build_sponsored_unsigned_envelope(
-        client,
+    let envelope_xdr = build_sponsored_unsigned_envelope(
         context,
-        args,
         sponsor,
+        sequence_number,
         new_account,
         starting_balance,
-    )
-    .await?;
+        fee_per_op,
+    )?;
 
-    let signed_xdr = sign_envelope(
-        context,
-        args,
-        &built.envelope_xdr,
-        sponsor,
-        profile,
-        profile_name,
-    )
-    .await?;
+    let signed_xdr =
+        sign_envelope(context, args, &envelope_xdr, sponsor, profile, profile_name).await?;
     let passphrase = context.network_passphrase();
 
     // Submit and wait for confirmation.
     let timeout = Duration::from_secs(args.timeout_seconds);
-    let submission = submit_transaction_and_wait(
+    submit_transaction_and_wait(
         client,
         &signed_xdr,
         timeout,
@@ -1097,58 +1141,71 @@ async fn sponsored_create(
         Some(SubmissionSignerKind::Software),
         recorder,
     )
-    .await?;
-
-    Ok(SponsoredCreateResult {
-        submission,
-        fee_selection: built.fee_selection,
+    .await
+    .map_err(|error| SponsoredCreateFailure {
+        error,
+        signed_xdr: Some(signed_xdr),
     })
 }
 
-/// Reads the fee and the sponsor's sequence through `client` and builds the
-/// unsigned `CreateAccount` envelope.
-async fn build_sponsored_unsigned_envelope(
+/// Resolves the command's fee choice before the cap and witness.
+async fn select_create_fee(
     client: &StellarRpcClient,
-    context: &NetworkContext,
     args: &CreateArgs,
+) -> Result<(ClassicFeeChoice, ClassicFeeSelection), WalletError> {
+    let choice = parse_classic_fee_choice(args.fee.as_deref())?;
+    let selection = resolve_classic_fee_selection(client, DEFAULT_FEE_STROOPS, choice).await?;
+    Ok((choice, selection))
+}
+
+/// Builds with the sponsor observation and fee the command checks before signing.
+///
+/// `sequence_number` is the sponsor's current sequence: the builder
+/// increments it, so passing the sequence plus one yields `TxBadSeq`.
+fn build_sponsored_unsigned_envelope(
+    context: &NetworkContext,
     sponsor: &str,
+    sequence_number: i64,
     new_account: &str,
     starting_balance: StellarAmount,
-) -> Result<BuiltCreateAccountEnvelope, WalletError> {
-    let fee_choice = parse_classic_fee_choice(args.fee.as_deref())?;
-    let fee_selection =
-        resolve_classic_fee_selection(client, DEFAULT_FEE_STROOPS, fee_choice).await?;
-
-    // Fetch sponsor account for sequence number.
-    // Pass empty slice: account creation only needs the sponsor's sequence number.
-    let sponsor_account = stellar_agent_network::fetch_account(client, sponsor, &[]).await?;
-    // Pass the current on-chain sequence directly; `stellar_baselib::TransactionBuilder::build`
-    // calls `Account::increment_sequence_number` internally. An explicit +1
-    // here would produce CURRENT+2 → TxBadSeq.
-    let sequence_number = sponsor_account.sequence_number;
-
-    let passphrase = context.network_passphrase();
-
-    // Build the unsigned CreateAccount transaction.
+    fee_per_op: u32,
+) -> Result<String, WalletError> {
     let mut builder = ClassicOpBuilder::new(
         sponsor,
         sequence_number,
-        passphrase,
-        fee_selection.per_op_stroops,
+        context.network_passphrase(),
+        fee_per_op,
     );
     builder.create_account(new_account, starting_balance)?;
-
-    let envelope_xdr = builder.build()?;
-
-    Ok(BuiltCreateAccountEnvelope {
-        envelope_xdr,
-        fee_selection,
-    })
+    builder.build()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Output helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+fn sponsored_success_lines(result: &CreateAccountResult) -> Vec<String> {
+    let hash = result
+        .tx_hash
+        .as_deref()
+        .map(stellar_agent_network::submit::redact_tx_hash)
+        .unwrap_or_default();
+    let ledger = result.ledger.unwrap_or_default();
+    let mut lines = vec![
+        format!(
+            "Account created (sponsored): {}  tx_hash {hash}  ledger {ledger}",
+            result.account_id
+        ),
+        crate::render::table::render_selected_fee_line(
+            result.selected_fee_per_op_stroops,
+            result.selected_fee_percentile.as_deref(),
+        ),
+    ];
+    if let Some(cross_check) = &result.cross_check {
+        lines.push(cross_check.text_line());
+    }
+    lines
+}
 
 fn print_success(envelope: &Envelope<CreateAccountResult>, format: OutputFormat) {
     match format {
@@ -1157,21 +1214,7 @@ fn print_success(envelope: &Envelope<CreateAccountResult>, format: OutputFormat)
             if let Some(result) = &envelope.data {
                 match &result.mode {
                     CreateMode::Sponsored => {
-                        use stellar_agent_network::submit::redact_tx_hash;
-                        let hash = result
-                            .tx_hash
-                            .as_deref()
-                            .map(redact_tx_hash)
-                            .unwrap_or_default();
-                        let ledger = result.ledger.unwrap_or_default();
-                        let selected_fee = crate::render::table::render_selected_fee_line(
-                            result.selected_fee_per_op_stroops,
-                            result.selected_fee_percentile.as_deref(),
-                        );
-                        println!(
-                            "Account created (sponsored): {}  tx_hash {}  ledger {}\n{}",
-                            result.account_id, hash, ledger, selected_fee
-                        );
+                        println!("{}", sponsored_success_lines(result).join("\n"));
                     }
                     CreateMode::Friendbot => {
                         use stellar_agent_network::submit::redact_tx_hash;
@@ -1758,19 +1801,19 @@ mod tests {
 
         let context = flag_context(&args);
         let client = StellarRpcClient::new(&context.rpc_url).expect("mock client");
+        let (_, selection) = select_create_fee(&client, &args).await.unwrap();
         let built = build_sponsored_unsigned_envelope(
-            &client,
             &context,
-            &args,
             SOURCE_G,
+            0,
             DEST_G,
             starting_balance,
+            selection.per_op_stroops,
         )
-        .await
         .expect("explicit fee create-account build succeeds");
-        assert_eq!(built.fee_selection.per_op_stroops, 250);
-        assert_eq!(built.fee_selection.selected_fee_percentile, "explicit");
-        assert_eq!(tx_fee_from_envelope_xdr(&built.envelope_xdr), 250);
+        assert_eq!(selection.per_op_stroops, 250);
+        assert_eq!(selection.selected_fee_percentile, "explicit");
+        assert_eq!(tx_fee_from_envelope_xdr(&built), 250);
 
         let result = CreateAccountResult {
             account_id: DEST_G.to_owned(),
@@ -1779,8 +1822,9 @@ mod tests {
             tx_hash: None,
             ledger: None,
             friendbot_url_used: None,
-            selected_fee_per_op_stroops: Some(built.fee_selection.per_op_stroops),
-            selected_fee_percentile: Some(built.fee_selection.selected_fee_percentile),
+            selected_fee_per_op_stroops: Some(selection.per_op_stroops),
+            selected_fee_percentile: Some(selection.selected_fee_percentile),
+            cross_check: None,
         };
         let json = serde_json::to_value(result).expect("CreateAccountResult serialises");
         assert_eq!(json["selected_fee_per_op_stroops"], "250");
@@ -1803,13 +1847,16 @@ mod tests {
             friendbot_url_used: None,
             selected_fee_per_op_stroops: None,
             selected_fee_percentile: None,
+            cross_check: None,
         };
         let json = serde_json::to_value(&result).expect("CreateAccountResult serialises");
         assert!(json.get("selected_fee_per_op_stroops").is_none());
+        assert!(json.get("cross_check").is_none());
 
         let round_tripped: CreateAccountResult = serde_json::from_value(json)
             .expect("omitted selected_fee_per_op_stroops must deserialize back to None");
         assert_eq!(round_tripped.selected_fee_per_op_stroops, None);
+        assert!(round_tripped.cross_check.is_none());
     }
 
     #[tokio::test]
@@ -1822,21 +1869,19 @@ mod tests {
 
         let context = flag_context(&args);
         let client = StellarRpcClient::new(&context.rpc_url).expect("mock client");
+        let (_, selection) = select_create_fee(&client, &args).await.unwrap();
         let built = build_sponsored_unsigned_envelope(
-            &client,
             &context,
-            &args,
             SOURCE_G,
+            0,
             DEST_G,
             starting_balance,
+            selection.per_op_stroops,
         )
-        .await
         .expect("default fee create-account build succeeds");
-        assert_eq!(built.fee_selection.per_op_stroops, DEFAULT_FEE_STROOPS);
-        assert_eq!(
-            built.fee_selection.selected_fee_percentile,
-            "profile_default"
-        );
+        assert_eq!(selection.per_op_stroops, DEFAULT_FEE_STROOPS);
+        assert_eq!(tx_fee_from_envelope_xdr(&built), DEFAULT_FEE_STROOPS);
+        assert_eq!(selection.selected_fee_percentile, "profile_default");
     }
 
     #[tokio::test]
@@ -1850,19 +1895,19 @@ mod tests {
 
         let context = flag_context(&args);
         let client = StellarRpcClient::new(&context.rpc_url).expect("mock client");
+        let (_, selection) = select_create_fee(&client, &args).await.unwrap();
         let built = build_sponsored_unsigned_envelope(
-            &client,
             &context,
-            &args,
             SOURCE_G,
+            0,
             DEST_G,
             starting_balance,
+            selection.per_op_stroops,
         )
-        .await
         .expect("auto fee create-account build succeeds");
-        assert_eq!(built.fee_selection.per_op_stroops, 333);
-        assert_eq!(built.fee_selection.selected_fee_percentile, "p95");
-        assert_eq!(tx_fee_from_envelope_xdr(&built.envelope_xdr), 333);
+        assert_eq!(selection.per_op_stroops, 333);
+        assert_eq!(selection.selected_fee_percentile, "p95");
+        assert_eq!(tx_fee_from_envelope_xdr(&built), 333);
     }
 
     // ── Network FromStr round-trips ──────────────────────────────────────────
@@ -2316,17 +2361,11 @@ mod tests {
                     .to_owned()
             })
             .collect();
-        // The endpoint check, the sponsor read that feeds the gate, then the
-        // build's sponsor read. The run passed the gate, the audit pre-flight,
-        // and the recorder. It stopped at signing for lack of a signer, before
-        // the submit layer's own endpoint check.
         assert_eq!(
-            methods,
-            ["getNetwork", "getLedgerEntries", "getLedgerEntries"],
-            "execution must reach the build reads and stop at signing, proving the \
-             synthesized profile's keyring-init failure was tolerated rather than \
-             treated as fatal"
+            crate::test_rpc::last_rendered()["error"]["code"],
+            "validation.signer_source_required",
         );
+        assert_eq!(methods, ["getNetwork", "getLedgerEntries"]);
     }
 
     #[allow(unsafe_code, reason = "serialized test seed variable")]
@@ -2353,25 +2392,17 @@ mod tests {
         args.secret_env = Some(var.into());
         args.fee = Some("100".into());
         let client = StellarRpcClient::new(&context.rpc_url).expect("mock client");
+        let (_, selection) = select_create_fee(&client, &args).await.unwrap();
         let built = build_sponsored_unsigned_envelope(
-            &client,
             &context,
-            &args,
             &g,
+            0,
             DEST_G,
             StellarAmount::parse_with_unit("1 XLM").expect("amount"),
+            selection.per_op_stroops,
         )
-        .await
         .expect("build against mock");
-        let result = sign_envelope(
-            &context,
-            &args,
-            &built.envelope_xdr,
-            &g,
-            &profile,
-            "enrolled",
-        )
-        .await;
+        let result = sign_envelope(&context, &args, &built, &g, &profile, "enrolled").await;
         unsafe {
             std::env::remove_var(var);
         }
@@ -2473,6 +2504,310 @@ mod tests {
                 ["getNetwork"],
                 "fee {fee:?}: the endpoint check precedes every read"
             );
+        }
+    }
+    #[test]
+    fn sponsored_text_includes_the_witness() {
+        let result: CreateAccountResult = serde_json::from_value(serde_json::json!({
+            "account_id": DEST_G, "mode": "sponsored",
+            "cross_check": {"status": "passed", "provider": "oracle.test", "ledger": 1001}
+        }))
+        .unwrap();
+        let view = result.cross_check.as_ref().unwrap();
+        assert!(sponsored_success_lines(&result).contains(&view.text_line()));
+        assert_eq!(
+            serde_json::to_value(&result).unwrap()["cross_check"]["status"],
+            "passed"
+        );
+    }
+
+    #[test]
+    fn unsigned_failure_has_no_envelope_hash() {
+        let failure =
+            SponsoredCreateFailure::from(WalletError::Network(NetworkError::AccountNotFound {
+                account_id: SOURCE_G.to_owned(),
+            }));
+        assert!(failure.signed_xdr.is_none());
+        let envelope = crate::commands::submission_record::error_envelope(
+            &failure.error,
+            failure.signed_xdr.as_deref().unwrap_or_default(),
+            "accounts create",
+        );
+        let value = serde_json::to_value(envelope).unwrap();
+        assert!(value["error"]["details"].get("envelope_hash").is_none());
+    }
+
+    mod witness {
+        use super::*;
+        use crate::test_rpc::{
+            ClassicRpc, EnvSigner, account_key, account_xdr, assert_rows_carry_witness,
+            last_rendered, methods, sent, signers_resolved_by, witness_profile, zero_config,
+        };
+
+        #[derive(Debug)]
+        enum Case {
+            Pass,
+            Divergent,
+            Unavailable,
+            InvalidOracle,
+            Skipped,
+            BelowFloor,
+            ExplicitCap,
+            DefaultCap,
+            Timeout,
+            Unsigned,
+        }
+
+        async fn exercise(case: Case) {
+            let _isolation = zero_config();
+            let signer = EnvSigner::new([0x71; 32], "CREATE_WITNESS_SIGNER");
+            let primary = ClassicRpc::testnet(&[])
+                .with_entry(account_key(&signer.g), account_xdr(&signer.g, 44, 0, ""))
+                .serve()
+                .await;
+            let oracle_rpc = ClassicRpc::testnet(&[]).with_entry(
+                account_key(&signer.g),
+                account_xdr(
+                    &signer.g,
+                    if matches!(case, Case::Divergent) {
+                        45
+                    } else {
+                        44
+                    },
+                    0,
+                    "",
+                ),
+            );
+            if matches!(case, Case::Unavailable) {
+                oracle_rpc.report(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE);
+            }
+            let oracle = oracle_rpc.serve().await;
+            let dir = tempfile::TempDir::new().unwrap();
+            let name = format!("create-witness-{case:?}").to_ascii_lowercase();
+            let mut profile =
+                witness_profile(&name, &primary.uri(), Some(&oracle.uri()), dir.path());
+            if matches!(case, Case::Skipped) {
+                profile.oracle_provider_url = None;
+            }
+            if matches!(case, Case::InvalidOracle) {
+                profile.oracle_provider_url = Some(url::Url::parse("ftp://oracle.test").unwrap());
+            }
+            let mut args = minimal_sponsored_args();
+            args.profile = Some(name);
+            args.sponsor = Some(signer.g.clone());
+            args.secret_env = Some(signer.var.to_owned());
+            args.starting_balance = Some(
+                if matches!(case, Case::BelowFloor) {
+                    "999 XLM"
+                } else {
+                    "1000 XLM"
+                }
+                .to_owned(),
+            );
+            args.fee = Some("250".to_owned());
+            if matches!(case, Case::ExplicitCap | Case::DefaultCap) {
+                profile.classic_max_fee_per_op_stroops = Some(99);
+            }
+            if matches!(case, Case::DefaultCap) {
+                args.fee = None;
+            }
+            if matches!(case, Case::Unsigned) {
+                args.secret_env = None;
+            }
+            if matches!(case, Case::Timeout) {
+                args.timeout_seconds = 1;
+                Mock::given(method("POST"))
+                    .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                        "method": "getTransaction"
+                    })))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "result": {
+                            "status": "NOT_FOUND", "latestLedger": 1006, "oldestLedger": 1,
+                            "latestLedgerCloseTime": "1700000005",
+                            "oldestLedgerCloseTime": "1700000000"
+                        }
+                    })))
+                    .with_priority(1)
+                    .mount(&primary)
+                    .await;
+            }
+            crate::common::render::take_rendered_for_test();
+            let context = NetworkContext::from_profile(&profile);
+            let (rc, resolutions) = signers_resolved_by(run_sponsored(
+                &context,
+                &args,
+                &resolve_profile_name(args.profile.as_deref()),
+                &profile,
+                ProfileOrigin::Persisted,
+                || Ok(()),
+            ))
+            .await;
+            let value = last_rendered();
+            let refusal = match case {
+                Case::Divergent => Some("simulation.divergence"),
+                Case::Unavailable | Case::InvalidOracle => Some("network.witness_unavailable"),
+                Case::ExplicitCap | Case::DefaultCap => Some("fees.percentile_exceeds_cap"),
+                Case::Timeout => Some("submission.tx_timeout"),
+                Case::Unsigned => Some("validation.signer_source_required"),
+                _ => None,
+            };
+            // Before signing, the primary answers the endpoint check and one
+            // sponsor read, which feeds the policy, the witness and the
+            // builder. A run that signs then reaches the submit layer, which
+            // checks the endpoint again and reads the signer set to verify the
+            // signature binding before the send.
+            let primary_methods = methods(&primary).await;
+            let signed = matches!(
+                case,
+                Case::Pass | Case::Skipped | Case::BelowFloor | Case::Timeout
+            );
+            if signed {
+                assert_eq!(
+                    primary_methods[..5],
+                    [
+                        "getNetwork",
+                        "getLedgerEntries",
+                        "getNetwork",
+                        "getLedgerEntries",
+                        "sendTransaction"
+                    ],
+                    "the sponsor is read once before signing: {primary_methods:?}"
+                );
+                assert!(
+                    primary_methods.len() > 5
+                        && primary_methods[5..].iter().all(|m| m == "getTransaction"),
+                    "{primary_methods:?}"
+                );
+            } else {
+                assert_eq!(
+                    primary_methods,
+                    ["getNetwork", "getLedgerEntries"],
+                    "the sponsor is read once and nothing is sent"
+                );
+            }
+            if let Some(code) = refusal {
+                assert_eq!(rc, 1, "{value}");
+                assert_eq!(value["error"]["code"], code, "{value}");
+                if matches!(case, Case::Divergent) {
+                    let message = value["error"]["message"].as_str().unwrap();
+                    assert!(
+                        message.contains("source account sequence (sequence delta 1)"),
+                        "{message}"
+                    );
+                }
+                if matches!(case, Case::Timeout) {
+                    let requests = primary.received_requests().await.unwrap();
+                    let body: serde_json::Value = requests
+                        .iter()
+                        .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+                        .find(|v| v["method"] == "sendTransaction")
+                        .unwrap();
+                    let signed = body["params"]["transaction"].as_str().unwrap();
+                    assert_eq!(
+                        value["error"]["details"]["envelope_hash"],
+                        stellar_agent_network::submit::envelope_hash_hex(signed)
+                    );
+                    assert!(!value.to_string().contains(signed));
+                } else {
+                    assert_eq!(resolutions, 0, "{value}");
+                    assert!(!sent(&primary).await);
+                    assert!(value["error"]["details"].get("envelope_hash").is_none());
+                }
+                if matches!(case, Case::ExplicitCap | Case::DefaultCap) {
+                    assert!(methods(&oracle).await.is_empty());
+                    let text = value["error"]["message"].as_str().unwrap();
+                    assert!(
+                        text.contains(if matches!(case, Case::DefaultCap) {
+                            "default per-operation fee"
+                        } else {
+                            "explicit per-operation fee"
+                        }),
+                        "{text}"
+                    );
+                }
+            } else {
+                assert_eq!(rc, 0, "{value}");
+                assert_eq!(resolutions, 1);
+                let status = match case {
+                    Case::Skipped => "skipped",
+                    Case::BelowFloor => "not_required",
+                    _ => "passed",
+                };
+                assert_eq!(value["data"]["cross_check"]["status"], status, "{value}");
+                if status == "passed" {
+                    assert_rows_carry_witness(&profile, &oracle.uri());
+                } else {
+                    assert!(methods(&oracle).await.is_empty());
+                }
+                let requests = primary.received_requests().await.unwrap();
+                let body: serde_json::Value = requests
+                    .iter()
+                    .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+                    .find(|v| v["method"] == "sendTransaction")
+                    .unwrap();
+                use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};
+                let envelope = TransactionEnvelope::from_xdr_base64(
+                    body["params"]["transaction"].as_str().unwrap(),
+                    Limits::none(),
+                )
+                .unwrap();
+                let TransactionEnvelope::Tx(tx) = envelope else {
+                    panic!("v1 envelope")
+                };
+                assert_eq!(tx.tx.seq_num.0, 45);
+                assert_eq!(tx.tx.fee, 250);
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn create_witness_at_floor_records_and_forwards_sequence_and_fee() {
+            exercise(Case::Pass).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn divergent_sponsor_refuses_before_signing() {
+            exercise(Case::Divergent).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn unavailable_oracle_refuses_before_signing() {
+            exercise(Case::Unavailable).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn invalid_oracle_refuses_before_signing() {
+            exercise(Case::InvalidOracle).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn missing_oracle_reports_skipped() {
+            exercise(Case::Skipped).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn below_floor_makes_no_oracle_request() {
+            exercise(Case::BelowFloor).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn explicit_fee_cap_precedes_witness() {
+            exercise(Case::ExplicitCap).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn command_default_fee_cap_precedes_witness() {
+            exercise(Case::DefaultCap).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn signed_timeout_reports_only_the_envelope_hash() {
+            exercise(Case::Timeout).await;
+        }
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn unsigned_refusal_reports_no_envelope_hash() {
+            exercise(Case::Unsigned).await;
         }
     }
 }
