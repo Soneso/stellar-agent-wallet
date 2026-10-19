@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- When the amount reaches the asset's cross-check threshold and an oracle is
+  configured, the x402 payment tools obtain the independent-RPC cross-check
+  witness before signing.
+  The oracle simulates the same unsigned transfer, and the answers are compared.
+  Their results carry `cross_check`, and the `x402_payment_authorized` row
+  carries the passed witness when the payment required one.
+  On testnet with the threshold met and no oracle, `cross_check` reports
+  `skipped`.
+- `stellar_agent_core::cross_check` gains `WitnessEntry::SorobanSimulation`
+  and nine `WitnessField` variants: `SimulationResult`, `AuthorizationCount`,
+  `Credentials`, `Address`, `Signature`, `Invocation`, `ResourceFee`,
+  `LedgerSkew`, and `Expiration`. Both enums are exhaustive, so downstream
+  exhaustive matches must add arms.
+  The witness kind serializes as `soroban_simulation`; a binary older than
+  this entry refuses an audit log that holds such a row.
+- `stellar_agent_network::cross_check` exposes `SorobanCrossCheck` and
+  `SorobanWitnessInputs`. `CrossCheckWitness` implements `PartialEq` and `Eq`.
+  `stellar_agent_x402::exact` exposes `CreatedPayment` and the `cross_check`
+  field of `AuthorizationToTransmit`; `X402Error` gains `CrossCheck`.
 - CLI sponsored `accounts create`, `trustline`, and sending `pool init` paths
   obtain a witness before signing. MCP trustline and claim commits do the same.
   Results carry `cross_check`; pending and submitted rows carry a passed witness.
@@ -94,6 +113,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `stellar_agent_x402::exact::create_payment` takes the prepared cross-check and
+  returns `CreatedPayment { payload, cross_check }`.
+- The log filter keeps the RPC client's raw request and response logging off at
+  every level; set levels apply to the wallet's own events.
 - Sponsored create, trustline, and pool init cap the selected per-operation fee
   before the witness. Pool fee overflow refuses before a fresh checkpoint or
   signer load, through the shared `stellar_agent_pool::init::total_init_fee`.

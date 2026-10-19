@@ -179,8 +179,11 @@ fresh rebuild before signing.
 The classic witness covers CLI `pay`, `claim`, sponsored `accounts create`,
 `trustline`, and every sending `pool init` path. It also covers MCP
 `stellar_pay_commit`, `stellar_create_account_commit`, `stellar_trustline_commit`,
-and `stellar_claim_commit`. Opaque staged envelopes and the SEP-43 signing
-tools remain uncovered.
+and `stellar_claim_commit`. The x402 payment tools `stellar_x402_create_payment`
+and `stellar_x402_authenticated_payment` are covered by a second simulation on
+the oracle: before the payer signs, the oracle simulates the same unsigned
+transfer, and the answers are compared. Opaque staged envelopes and the SEP-43
+signing tools remain uncovered.
 
 | Code | Meaning | Agent action |
 |---|---|---|
@@ -189,8 +192,16 @@ tools remain uncovered.
 
 For a cross-check, `simulation.divergence` means the primary and oracle disagree
 on a ledger entry the decision uses. The message names the entry and field.
+For the x402 payment tools the entry is the `soroban simulation`, and the field
+is one of `result`, `authorization count`, `credentials`, `address`, `signature`,
+`invocation`, `resource fee ceiling`, `ledger skew`, or `expiration`.
 Nothing is signed or sent. Re-simulate and retry; report persistent disagreements
 to the operator. Envelope-decode and rebuild producers of this code remain.
+
+The x402 witness runs before the health read, which keeps the deadline of
+`submit_timeout_seconds`. A witness that overruns it surfaces at the health read,
+as `x402.rpc_simulate_failed` in `stellar_x402_create_payment` and as
+`x402.payment_build_failed` in `stellar_x402_authenticated_payment`.
 
 `network.witness_unavailable` means the required oracle or asset threshold is
 missing, or the oracle cannot be constructed, identified, or read successfully.

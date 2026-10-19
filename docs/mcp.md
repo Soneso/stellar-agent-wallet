@@ -451,8 +451,9 @@ and before the audit pre-flight, nonce consumption, and signer load.
 Results include `cross_check`; pending and submitted rows carry a passed witness.
 Trustline and claim commits are unvalued. Testnet without an oracle reports
 `skipped`; a configured but unavailable oracle refuses `network.witness_unavailable`.
-Disagreements refuse `simulation.divergence`, and credential refusals retain
-`network.rpc_credential_refused`. A witness refusal leaves the nonce usable.
+Disagreements refuse `simulation.divergence`. Credential failures keep
+`network.rpc_credential_refused` or the keyring code of the oracle credential
+read (`auth.keyring_*`). A witness refusal leaves the nonce usable.
 The nonce expiry is checked against the clock read after the witness, so a nonce
 that expires while the oracle answers refuses `nonce.expired`.
 
@@ -602,9 +603,9 @@ that `stellar_sep24_interactive_url` consumes; it has no standalone tool. See
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
-| `stellar_x402_create_payment` | Construct and sign an x402 v2 Exact Stellar `PAYMENT-SIGNATURE` from a `PaymentRequirements` object; return the payment signature and its fields. The wallet does not submit. | Signs the payment authorization entry; does not submit. |
+| `stellar_x402_create_payment` | Construct and sign an x402 v2 Exact Stellar `PAYMENT-SIGNATURE` from a `PaymentRequirements` object; obtain the cross-check witness before signing; return the payment signature, its fields, and `cross_check`. The wallet does not submit. | Signs the payment authorization entry; does not submit. |
 | `stellar_x402_parse_receipt` | Decode an x402 v2 `PAYMENT-RESPONSE` into a structured settlement receipt. Text fields are escaped and cut at 200 characters. | Read-only; no keyring, no network. No `chain_id`. |
-| `stellar_x402_authenticated_payment` | Run a SEP-10 identity gate against a `home_domain` (stellar.toml, SSRF bind, ephemeral challenge/response, JWT), then construct the `PAYMENT-SIGNATURE`. Any identity failure aborts before payment. | Signs the payment authorization entry; does not submit. |
+| `stellar_x402_authenticated_payment` | Run a SEP-10 identity gate against a `home_domain` (stellar.toml, SSRF bind, ephemeral challenge/response, JWT), then construct the `PAYMENT-SIGNATURE` with the cross-check witness. Any identity failure aborts before payment. | Signs the payment authorization entry; does not submit. |
 
 The `chain_id` argument of both payment tools takes the wallet's spelling,
 `stellar:testnet` or `stellar:mainnet`. The x402 requirement `network` spells
@@ -619,8 +620,13 @@ Both payment tools run in this order:
    step consumes no spending window.
 3. The dispatch gate checks `chain_id` and the policy. A `chain_id` mismatch
    is a JSON-RPC invalid-params error, which invalid requirements never reach.
-4. The audit pre-flight runs, then the SEP-10 gate for the authenticated tool,
-   then the signer load.
+4. The audit pre-flight runs, then the SEP-10 gate for the authenticated tool.
+   The cross-check rule then decides from the transfer amount, in the asset's
+   atomic units, and the profile's thresholds and oracle whether the payment
+   needs the witness. A required witness builds the oracle client from
+   `oracle_provider_url` without a request.
+   A credential failure keeps its own code. Other client construction failures
+   refuse with `network.witness_unavailable`. The signer load follows.
 5. The tool builds one RPC client from the profile's `rpc_url`, with the
    primary credential the profile names. A URL the transport cannot parse
    refuses with `network.rpc_unreachable`; a credential the keyring cannot
@@ -628,13 +634,32 @@ Both payment tools run in this order:
 6. The payment is admitted against the spending window.
 7. The payment is built on that client. Its first request is the endpoint
    identity check, under the profile's `submit_timeout_seconds` (default 60
-   seconds); `maxTimeoutSeconds` never sets this deadline.
+   seconds); `maxTimeoutSeconds` never sets this deadline. The first
+   simulation must hold exactly one result with the payer's unsigned
+   authorization entry for the built transfer. When the witness is required,
+   the oracle then simulates the same unsigned transfer. Its answer must hold
+   the same authorization entries apart from the nonce and the expiration.
+   Its `minResourceFee` lies between 1 and 10,000,000 stroops.
+   Its ledger trails the primary's by at most two and lies before the
+   signature expiration. The health read follows under the same deadline,
+   and only then does the payer sign.
 
 An identity refusal answers `network.endpoint_network_mismatch`,
 `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`, or
-`network.mainnet_write_forbidden` through both tools. The authenticated tool answers every other build failure
+`network.mainnet_write_forbidden` through both tools. A witness refusal answers
+`simulation.divergence`, `network.witness_unavailable`,
+`network.rpc_credential_refused`, or the oracle credential read's keyring code
+(`auth.keyring_*`). Both tools refuse before the payer signs and without an
+x402 row. The authenticated tool answers every other build failure
 with `x402.payment_build_failed`. Admission comes before the identity check, so
 a refusal there, or any later failure, keeps the admitted spend.
+
+Results include `cross_check`, and the `x402_payment_authorized` row carries a
+passed witness when the payment required one. Below the asset's threshold,
+the result reports `not_required`, with or without an oracle. On testnet, a
+payment at or above the threshold without an oracle reports `skipped`.
+An asset without a threshold reports `skipped` on testnet, with or without
+an oracle.
 
 ### Machine Payments Protocol
 

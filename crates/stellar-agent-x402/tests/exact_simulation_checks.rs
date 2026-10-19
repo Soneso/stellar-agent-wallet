@@ -28,9 +28,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha256};
-use stellar_agent_core::error::WalletError;
+use stellar_agent_core::cross_check::{CrossCheckValue, WitnessEntry, WitnessField};
+use stellar_agent_core::error::{NetworkError, WalletError, WitnessUnavailableReason};
+use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_network::NetworkContext;
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::client::constructions_on_this_thread;
+use stellar_agent_network::cross_check::{CrossCheckOutcome, CrossCheckWitness, SorobanCrossCheck};
 use stellar_agent_network::signing::{Signer, SoftwareSigningKey, WebAuthnAssertion};
 use stellar_agent_test_support::rpc_request_count;
 use stellar_agent_x402::X402Error;
@@ -419,6 +423,8 @@ struct PaymentRpc {
     health: MethodAnswer,
     first: serde_json::Value,
     resimulation: Resimulation,
+    /// How long the endpoint takes to answer a simulation.
+    simulate_delay: Duration,
     /// `getNetwork` requests answered so far.
     network_requests: AtomicUsize,
     /// `getHealth` requests answered so far.
@@ -448,7 +454,7 @@ impl PaymentRpc {
             self.received_signed.lock().unwrap().push(signed.clone());
             (self.resimulation)(&signed)
         };
-        rpc_result(&body["id"], &result)
+        rpc_result(&body["id"], &result).set_delay(self.simulate_delay)
     }
 }
 
@@ -530,6 +536,14 @@ impl Signer for CountingSigner {
 
 // ── One payment ──────────────────────────────────────────────────────────────
 
+/// What the oracle answers when the payment requires the cross-check
+/// witness.
+struct OracleScenario {
+    /// The oracle's answer to the unsigned simulation.
+    simulation: serde_json::Value,
+    simulate_delay: Duration,
+}
+
 /// Everything one payment's endpoint answers and the caller passes.
 struct Scenario {
     requirements: PaymentRequirements,
@@ -538,6 +552,9 @@ struct Scenario {
     first: serde_json::Value,
     resimulation: Resimulation,
     deadline: Duration,
+    /// The oracle of a required witness; `None` passes a cross-check that is
+    /// not required.
+    oracle: Option<OracleScenario>,
 }
 
 impl Scenario {
@@ -552,7 +569,26 @@ impl Scenario {
             first: answer(&[honest_entry()]),
             resimulation: Box::new(|_| answer(&[])),
             deadline: GENEROUS_DEADLINE,
+            oracle: None,
         }
+    }
+
+    /// Requires the witness from an oracle answering the unsigned simulation
+    /// with `simulation`.
+    fn with_oracle(mut self, simulation: serde_json::Value) -> Self {
+        self.oracle = Some(OracleScenario {
+            simulation,
+            simulate_delay: Duration::ZERO,
+        });
+        self
+    }
+
+    fn with_oracle_delay(mut self, delay: Duration) -> Self {
+        self.oracle
+            .as_mut()
+            .expect("an oracle is configured")
+            .simulate_delay = delay;
+        self
     }
 
     fn with_first(mut self, first: serde_json::Value) -> Self {
@@ -592,6 +628,18 @@ impl Scenario {
 /// What one `create_payment` call returned and caused.
 struct Outcome {
     result: Result<PaymentPayload, X402Error>,
+    /// The cross-check outcome of a built payment.
+    cross_check: Option<CrossCheckOutcome>,
+    /// The JSON-RPC request bodies the primary endpoint received, in order.
+    bodies: Vec<serde_json::Value>,
+    /// The JSON-RPC request bodies the oracle received, in order.
+    oracle_bodies: Vec<serde_json::Value>,
+    /// The entries each re-simulation request to the oracle carried.
+    oracle_received_signed: Vec<Vec<SorobanAuthorizationEntry>>,
+    /// The oracle's authority, as the witness names it.
+    oracle_uri: String,
+    /// The witness the transmit gate saw, per gate call.
+    gate_witnesses: Vec<Option<CrossCheckWitness>>,
     address_auth_digests: Vec<[u8; 32]>,
     signing_calls: usize,
     gate_calls: usize,
@@ -605,6 +653,35 @@ struct Outcome {
     received_signed: Vec<Vec<SorobanAuthorizationEntry>>,
 }
 
+/// The JSON-RPC request bodies `server` received, in order.
+async fn request_bodies(server: &MockServer) -> Vec<serde_json::Value> {
+    server
+        .received_requests()
+        .await
+        .expect("request recording is enabled")
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect()
+}
+
+/// Prepares the cross-check of a profile whose oracle is `oracle`: an
+/// unvalued payment with an oracle configured requires the witness.
+fn prepared_cross_check(primary: &MockServer, oracle: &MockServer) -> SorobanCrossCheck {
+    let profile = Profile::builder_testnet("x402-signer", "payer", "x402-nonce", "nonce")
+        .rpc_url(primary.uri())
+        .oracle_provider_url(Some(oracle.uri().parse().expect("the loopback URL parses")))
+        .build();
+    let prepared = SorobanCrossCheck::prepare(
+        &profile,
+        &NetworkContext::from_profile(&profile),
+        CrossCheckValue::Unvalued,
+        "x402_test",
+    )
+    .expect("the oracle client builds");
+    assert!(matches!(prepared, SorobanCrossCheck::Required { .. }));
+    prepared
+}
+
 /// Runs `create_payment` for `scenario` on a client built before the call.
 async fn run(scenario: Scenario) -> Outcome {
     let received_signed = Arc::new(Mutex::new(Vec::new()));
@@ -615,29 +692,61 @@ async fn run(scenario: Scenario) -> Outcome {
             health: scenario.health,
             first: scenario.first,
             resimulation: scenario.resimulation,
+            simulate_delay: Duration::ZERO,
             network_requests: AtomicUsize::new(0),
             health_requests: AtomicUsize::new(0),
             received_signed: Arc::clone(&received_signed),
         })
         .mount(&server)
         .await;
+    let oracle_received_signed = Arc::new(Mutex::new(Vec::new()));
+    let oracle_server = MockServer::start().await;
+    let cross_check = match scenario.oracle {
+        Some(oracle) => {
+            Mock::given(method("POST"))
+                .respond_with(PaymentRpc {
+                    network: MethodAnswer::Result(network_result(TESTNET_PASSPHRASE)),
+                    health: MethodAnswer::Result(health_result("healthy", LATEST_LEDGER)),
+                    first: oracle.simulation,
+                    resimulation: Box::new(|_| answer(&[])),
+                    simulate_delay: oracle.simulate_delay,
+                    network_requests: AtomicUsize::new(0),
+                    health_requests: AtomicUsize::new(0),
+                    received_signed: Arc::clone(&oracle_received_signed),
+                })
+                .mount(&oracle_server)
+                .await;
+            prepared_cross_check(&server, &oracle_server)
+        }
+        None => SorobanCrossCheck::NotRequired,
+    };
     let client = StellarRpcClient::new(&server.uri()).expect("the loopback URL parses");
     let signer = CountingSigner::new();
     let gate_calls = AtomicUsize::new(0);
+    let gate_witnesses = Mutex::new(Vec::new());
     let constructions_before = constructions_on_this_thread();
     let started = tokio::time::Instant::now();
-    let result = create_payment(
+    let created = create_payment(
         &scenario.requirements,
         &signer,
         &client,
+        &cross_check,
         TESTNET_PASSPHRASE,
         started + scenario.deadline,
-        |_| {
+        |authorization| {
             gate_calls.fetch_add(1, Ordering::SeqCst);
+            gate_witnesses
+                .lock()
+                .unwrap()
+                .push(authorization.cross_check.cloned());
             Ok(())
         },
     )
     .await;
+    let (result, cross_check) = match created {
+        Ok(created) => (Ok(created.payload), Some(created.cross_check)),
+        Err(error) => (Err(error), None),
+    };
     let elapsed = started.elapsed();
     let constructions = constructions_on_this_thread() - constructions_before;
     let address_auth_digests = signer.address_auth_digests.lock().unwrap().clone();
@@ -657,8 +766,15 @@ async fn run(scenario: Scenario) -> Outcome {
         })
         .collect();
     let received_signed = received_signed.lock().unwrap().clone();
+    let oracle_received_signed = oracle_received_signed.lock().unwrap().clone();
     Outcome {
         result,
+        cross_check,
+        bodies: request_bodies(&server).await,
+        oracle_bodies: request_bodies(&oracle_server).await,
+        oracle_received_signed,
+        oracle_uri: oracle_server.uri(),
+        gate_witnesses: gate_witnesses.into_inner().unwrap(),
         address_auth_digests,
         signing_calls,
         gate_calls: gate_calls.load(Ordering::SeqCst),
@@ -1366,7 +1482,8 @@ async fn x402_identity_obeys_the_supplied_deadline() {
 }
 
 /// No production source of the crate builds an RPC client: `create_payment`
-/// sends every request through the client its caller passes.
+/// sends every request through the client its caller passes, and the
+/// witness's oracle client is the one the caller prepared.
 #[test]
 fn x402_has_no_raw_rpc_client_construction() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1389,7 +1506,14 @@ fn x402_has_no_raw_rpc_client_construction() {
     for path in files {
         let source = std::fs::read_to_string(&path).unwrap();
         let production = stellar_agent_test_support::source_order::production_half(&source);
-        for banned in ["Client::new", "StellarRpcClient::new"] {
+        for banned in [
+            "Client::new",
+            "StellarRpcClient::new",
+            "::with_credential(",
+            "profile_rpc_client(",
+            "from_profile(",
+            "::prepare(",
+        ] {
             assert!(
                 !production.contains(banned),
                 "{}: production code calls {banned}",
@@ -1901,6 +2025,7 @@ async fn a_failed_simulation_request_carries_a_phase_prefix_and_no_credentials()
                     health: MethodAnswer::Result(health_result("healthy", LATEST_LEDGER)),
                     first: answer(&[honest_entry()]),
                     resimulation: Box::new(|_| answer(&[])),
+                    simulate_delay: Duration::ZERO,
                     network_requests: AtomicUsize::new(0),
                     health_requests: AtomicUsize::new(0),
                     received_signed: Arc::new(Mutex::new(Vec::new())),
@@ -1914,6 +2039,7 @@ async fn a_failed_simulation_request_carries_a_phase_prefix_and_no_credentials()
             &requirements(),
             &signer,
             &client,
+            &SorobanCrossCheck::NotRequired,
             TESTNET_PASSPHRASE,
             tokio::time::Instant::now() + GENEROUS_DEADLINE,
             |_| Ok(()),
@@ -1986,5 +2112,445 @@ async fn a_simulation_answer_error_reaches_the_detail_scrubbed() {
         &second.result,
         "x402.rpc_simulate_failed",
         &format!("re-simulate returned error: {quoted}"),
+    );
+}
+
+// ── Cross-check witness ──────────────────────────────────────────────────────
+
+/// The methods of `bodies`, in order.
+fn methods_of(bodies: &[serde_json::Value]) -> Vec<&str> {
+    bodies
+        .iter()
+        .map(|body| body["method"].as_str().unwrap())
+        .collect()
+}
+
+/// Asserts that the witness refused before anything was signed: the primary
+/// received exactly its identity check and its simulation, and the oracle its
+/// identity check and the unsigned simulation.
+fn assert_witness_refused_before_signing(outcome: &Outcome) {
+    assert_eq!(outcome.signing_calls, 0, "nothing is signed");
+    assert_eq!(outcome.gate_calls, 0, "the transmit gate does not run");
+    assert_eq!(outcome.requests, 2, "the primary's identity and simulation");
+    assert_eq!(
+        outcome.methods,
+        ["getNetwork", "simulateTransaction"],
+        "the primary's requests"
+    );
+    assert_eq!(
+        methods_of(&outcome.oracle_bodies),
+        ["getNetwork", "simulateTransaction"],
+        "the oracle's requests"
+    );
+}
+
+/// The wallet error a witness refusal carries.
+fn witness_error(outcome: &Outcome) -> &WalletError {
+    let Err(X402Error::CrossCheck(error)) = &outcome.result else {
+        panic!("expected a cross-check refusal, got {:?}", outcome.result);
+    };
+    error
+}
+
+/// Asserts a `simulation.divergence` refusal on `field` before signing.
+fn assert_witness_divergence(outcome: &Outcome, field: WitnessField) {
+    let error = witness_error(outcome);
+    assert!(
+        matches!(
+            error,
+            WalletError::Network(NetworkError::WitnessDivergence {
+                entry: WitnessEntry::SorobanSimulation,
+                field: got,
+                sequence_delta: None,
+            }) if *got == field
+        ),
+        "expected a divergence on {field}, got {error:?}"
+    );
+    let refusal = outcome.result.as_ref().unwrap_err();
+    assert_eq!(refusal.wire_code(), "simulation.divergence");
+    assert_eq!(
+        refusal.to_string(),
+        format!(
+            "cross-check refused: the primary RPC and the oracle disagree on the soroban \
+             simulation {field}; the wallet did not sign or send. Retry the action; if the \
+             disagreement persists, investigate both endpoints"
+        )
+    );
+    assert_witness_refused_before_signing(outcome);
+}
+
+/// Runs a payment whose oracle answers the unsigned simulation with
+/// `simulation`, and asserts the divergence on `field`.
+async fn oracle_diverges(simulation: serde_json::Value, field: WitnessField) {
+    let outcome = run(Scenario::honest().with_oracle(simulation)).await;
+    assert_witness_divergence(&outcome, field);
+}
+
+/// Asserts that a payment with a required witness was built, and that the
+/// witness names the oracle and the ledger it reported.
+fn assert_paid_with_witness(outcome: &Outcome, oracle_ledger: u32) {
+    assert_paid(outcome);
+    let cross_check = outcome.cross_check.as_ref().expect("a built payment");
+    let witness = cross_check.witness().expect("the witness passed");
+    assert_eq!(witness.authority(), outcome.oracle_uri);
+    assert_eq!(witness.oracle_ledger(), oracle_ledger);
+    assert_eq!(witness.kinds(), &[WitnessEntry::SorobanSimulation]);
+    let view = cross_check.view();
+    assert_eq!(view.status, "passed");
+    assert_eq!(view.provider.as_deref(), Some(outcome.oracle_uri.as_str()));
+    assert_eq!(view.ledger, Some(oracle_ledger));
+    assert_eq!(
+        outcome.gate_witnesses,
+        vec![Some(witness.clone())],
+        "the transmit gate sees the witness"
+    );
+    assert_eq!(
+        methods_of(&outcome.oracle_bodies),
+        ["getNetwork", "simulateTransaction"],
+        "the oracle answers the identity check and the unsigned simulation"
+    );
+    assert!(
+        outcome.oracle_received_signed.is_empty(),
+        "the signed authorization never reaches the oracle"
+    );
+}
+
+/// A passing witness reports the oracle's authority and ledger, which differ
+/// from the primary's, in the outcome and to the transmit gate, and the crate
+/// builds no client of its own.
+#[tokio::test]
+async fn a_passing_witness_reports_the_oracle_and_its_ledger() {
+    let outcome = run(Scenario::honest().with_oracle(answer_at(&[honest_entry()], 1001))).await;
+    assert_paid_with_witness(&outcome, 1001);
+    assert_eq!(outcome.methods, PAYMENT_METHODS);
+    assert_eq!(
+        outcome.constructions, 0,
+        "create_payment uses the prepared oracle client and builds none"
+    );
+}
+
+/// A payment whose cross-check is not required sends nothing to an oracle and
+/// reports the outcome it was given.
+#[tokio::test]
+async fn a_witness_that_is_not_required_reports_not_required() {
+    let outcome = run(Scenario::honest()).await;
+    assert_paid(&outcome);
+    assert_eq!(
+        outcome.cross_check.as_ref().unwrap().view().status,
+        "not_required"
+    );
+    assert_eq!(outcome.gate_witnesses, vec![None]);
+    assert!(outcome.oracle_bodies.is_empty());
+}
+
+#[tokio::test]
+async fn witness_oracle_error_diverges_on_the_result() {
+    oracle_diverges(
+        answer_with(
+            &[honest_entry()],
+            "error",
+            serde_json::json!("host invocation failed"),
+        ),
+        WitnessField::SimulationResult,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn witness_oracle_restore_preamble_diverges_on_the_result() {
+    oracle_diverges(
+        answer_with(
+            &[honest_entry()],
+            "restorePreamble",
+            serde_json::json!({
+                "transactionData": transaction_data_xdr(),
+                "minResourceFee": "5000",
+            }),
+        ),
+        WitnessField::SimulationResult,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn witness_second_oracle_result_diverges_on_the_authorization_count() {
+    let auth = vec![honest_entry().to_xdr_base64(Limits::none()).unwrap()];
+    let result = serde_json::json!({ "auth": auth, "xdr": void_xdr() });
+    oracle_diverges(
+        answer_with_results(&serde_json::json!([result.clone(), result])),
+        WitnessField::AuthorizationCount,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn witness_zero_oracle_results_diverge_on_the_authorization_count() {
+    oracle_diverges(
+        answer_with_results(&serde_json::json!([])),
+        WitnessField::AuthorizationCount,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn witness_other_oracle_entry_count_diverges_on_the_authorization_count() {
+    oracle_diverges(
+        answer(&[honest_entry(), honest_entry()]),
+        WitnessField::AuthorizationCount,
+    )
+    .await;
+    oracle_diverges(answer(&[]), WitnessField::AuthorizationCount).await;
+}
+
+#[tokio::test]
+async fn witness_source_account_credentials_diverge_on_the_credentials() {
+    oracle_diverges(answer(&[source_account_entry()]), WitnessField::Credentials).await;
+}
+
+#[tokio::test]
+async fn witness_address_v2_credentials_diverge_on_the_credentials() {
+    oracle_diverges(
+        answer(&[with_credentials_arm(
+            honest_entry(),
+            SorobanCredentials::AddressV2,
+        )]),
+        WitnessField::Credentials,
+    )
+    .await;
+}
+
+/// The refusal precedes the payer's signature: the witness runs before
+/// `sign_soroban_auth_entry`.
+#[tokio::test]
+async fn witness_other_address_diverges_on_the_address() {
+    oracle_diverges(answer(&[foreign_entry()]), WitnessField::Address).await;
+}
+
+#[tokio::test]
+async fn witness_signed_oracle_entry_diverges_on_the_signature() {
+    let mut entry = honest_entry();
+    address_credentials(&mut entry).signature = ScVal::U32(1);
+    oracle_diverges(answer(&[entry]), WitnessField::Signature).await;
+}
+
+#[tokio::test]
+async fn witness_other_invocation_diverges_on_the_invocation() {
+    let entry = with_root_args(honest_entry(), |args| args[2] = amount_scval(FORGED_AMOUNT));
+    oracle_diverges(answer(&[entry]), WitnessField::Invocation).await;
+}
+
+#[tokio::test]
+async fn witness_zero_resource_fee_diverges_on_the_resource_fee() {
+    oracle_diverges(
+        answer_with(&[honest_entry()], "minResourceFee", serde_json::json!("0")),
+        WitnessField::ResourceFee,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn witness_resource_fee_above_the_ceiling_diverges_on_the_resource_fee() {
+    oracle_diverges(
+        answer_with(
+            &[honest_entry()],
+            "minResourceFee",
+            serde_json::json!((FEE_CEILING + 1).to_string()),
+        ),
+        WitnessField::ResourceFee,
+    )
+    .await;
+}
+
+/// The oracle's resource fee may be anything from one stroop to the ceiling.
+#[tokio::test]
+async fn witness_resource_fee_bounds_pass() {
+    for fee in [1, FEE_CEILING] {
+        let outcome = run(Scenario::honest().with_oracle(answer_with(
+            &[honest_entry()],
+            "minResourceFee",
+            serde_json::json!(fee.to_string()),
+        )))
+        .await;
+        assert_paid_with_witness(&outcome, LATEST_LEDGER);
+    }
+}
+
+/// An oracle three ledgers behind the primary cannot vouch for the primary's
+/// ledger.
+#[tokio::test]
+async fn witness_oracle_three_ledgers_behind_diverges_on_the_ledger_skew() {
+    oracle_diverges(
+        answer_at(&[honest_entry()], LATEST_LEDGER - 3),
+        WitnessField::LedgerSkew,
+    )
+    .await;
+}
+
+/// An oracle two ledgers behind passes, and so does one four ledgers ahead
+/// while the signature window allows it.
+#[tokio::test]
+async fn witness_oracle_ledger_within_the_bounds_passes() {
+    for ledger in [LATEST_LEDGER - 2, LATEST_LEDGER + 4] {
+        let outcome =
+            run(Scenario::honest().with_oracle(answer_at(&[honest_entry()], ledger))).await;
+        assert_paid_with_witness(&outcome, ledger);
+    }
+}
+
+/// With the primary at ledger 1000 and a one-second timeout the expiration
+/// ledger is 1001: an oracle at 1001 or 1002 refuses and one at 1000 passes.
+/// An oracle at `u32::MAX` refuses on the expiration without an overflow.
+#[tokio::test]
+async fn witness_oracle_at_or_past_the_expiration_diverges_on_the_expiration() {
+    for ledger in [LATEST_LEDGER + 1, LATEST_LEDGER + 2, u32::MAX] {
+        let outcome = run(Scenario::honest()
+            .with_max_timeout_seconds(1)
+            .with_oracle(answer_at(&[honest_entry()], ledger)))
+        .await;
+        assert_witness_divergence(&outcome, WitnessField::Expiration);
+    }
+    let outcome = run(Scenario::honest()
+        .with_max_timeout_seconds(1)
+        .with_oracle(answer_at(&[honest_entry()], LATEST_LEDGER)))
+    .await;
+    assert_paid_with_witness(&outcome, LATEST_LEDGER);
+}
+
+/// The oracle's nonce and signature expiration ledger are not compared.
+#[tokio::test]
+async fn witness_ignores_the_oracle_nonce_and_expiration() {
+    let mut entry = honest_entry();
+    let credentials = address_credentials(&mut entry);
+    credentials.nonce = NONCE + 1;
+    credentials.signature_expiration_ledger = EXPECTED_EXPIRATION;
+    let outcome = run(Scenario::honest().with_oracle(answer(&[entry]))).await;
+    assert_paid_with_witness(&outcome, LATEST_LEDGER);
+}
+
+/// An oracle answer whose authorization entry or result value does not
+/// decode is an unusable answer, refused after one attempt.
+#[tokio::test]
+async fn witness_undecodable_oracle_answer_is_witness_unavailable() {
+    let mut bad_auth = answer(&[honest_entry()]);
+    bad_auth["results"][0]["auth"][0] = serde_json::json!("AAAA");
+    let mut bad_value = answer(&[honest_entry()]);
+    bad_value["results"][0]["xdr"] = serde_json::json!("not-xdr");
+    for simulation in [bad_auth, bad_value] {
+        let outcome = run(Scenario::honest().with_oracle(simulation)).await;
+        let error = witness_error(&outcome);
+        assert!(
+            matches!(
+                error,
+                WalletError::Network(NetworkError::WitnessUnavailable {
+                    reason: WitnessUnavailableReason::InvalidAnswer { .. }
+                })
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            outcome.result.as_ref().unwrap_err().wire_code(),
+            "network.witness_unavailable"
+        );
+        assert_witness_refused_before_signing(&outcome);
+    }
+}
+
+/// The oracle receives the transaction bytes the primary simulated, with no
+/// `authMode`.
+#[tokio::test]
+async fn witness_oracle_simulates_the_primary_envelope() {
+    let outcome = run(Scenario::honest().with_oracle(answer(&[honest_entry()]))).await;
+    assert_paid_with_witness(&outcome, LATEST_LEDGER);
+    let primary = &outcome.bodies[1];
+    let oracle = &outcome.oracle_bodies[1];
+    assert_eq!(primary["method"], "simulateTransaction");
+    assert_eq!(oracle["method"], "simulateTransaction");
+    assert_eq!(
+        oracle["params"]["transaction"],
+        primary["params"]["transaction"]
+    );
+    assert!(
+        oracle["params"].get("authMode").is_none(),
+        "{}",
+        oracle["params"]
+    );
+}
+
+/// The oracle's answer is never used: the signed entry carries the primary's
+/// nonce, and the payload the primary re-simulation's resource data.
+#[tokio::test]
+async fn witness_payload_keeps_the_primary_nonce_and_resource_data() {
+    let mut entry = honest_entry();
+    address_credentials(&mut entry).nonce = NONCE + 7;
+    let mut simulation = answer(&[entry]);
+    simulation["transactionData"] = serde_json::json!(transaction_data_xdr_with_fee(999));
+    let outcome = run(Scenario::honest()
+        .with_oracle(simulation)
+        .with_resimulation(|_| {
+            let mut answer = answer(&[]);
+            answer["transactionData"] = serde_json::json!(transaction_data_xdr_with_fee(998));
+            answer
+        }))
+    .await;
+    assert_paid_with_witness(&outcome, LATEST_LEDGER);
+    let [signed] = outcome.received_signed[0].as_slice() else {
+        panic!("one signed entry");
+    };
+    let SorobanCredentials::Address(credentials) = &signed.credentials else {
+        panic!("the signed entry carries Address credentials");
+    };
+    assert_eq!(credentials.nonce, NONCE, "the primary's nonce is signed");
+    let TransactionExt::V1(data) = payment_transaction(&outcome).tx.ext else {
+        panic!("the payment carries resource data");
+    };
+    assert_eq!(
+        data,
+        transaction_data_with(SorobanTransactionDataExt::V0, 998),
+        "the payload carries the primary re-simulation's resource data"
+    );
+}
+
+/// A primary answer with a second result refuses before the witness, so the
+/// oracle receives nothing.
+#[tokio::test]
+async fn a_second_primary_result_refuses_before_the_witness() {
+    let auth = vec![honest_entry().to_xdr_base64(Limits::none()).unwrap()];
+    let result = serde_json::json!({ "auth": auth, "xdr": void_xdr() });
+    let outcome = run(Scenario::honest()
+        .with_first(answer_with_results(&serde_json::json!([
+            result.clone(),
+            result
+        ])))
+        .with_oracle(answer(&[honest_entry()])))
+    .await;
+    assert_simulate_failed(&outcome.result, "simulation returned more than one result");
+    assert_nothing_signed_after(&outcome, &["getNetwork", "simulateTransaction"]);
+    assert!(outcome.oracle_bodies.is_empty(), "no oracle request");
+}
+
+/// A witness that outlasts the caller's deadline refuses at the health read,
+/// which keeps the absolute deadline, before anything is signed.
+#[tokio::test]
+async fn a_witness_slower_than_the_deadline_refuses_at_the_health_read() {
+    let outcome = run(Scenario::honest()
+        .with_deadline(Duration::from_millis(1_000))
+        .with_oracle(answer(&[honest_entry()]))
+        .with_oracle_delay(Duration::from_millis(1_500)))
+    .await;
+    assert_simulate_failed(&outcome.result, "the endpoint's health could not be read");
+    assert_eq!(outcome.signing_calls, 0, "nothing is signed");
+    assert_eq!(outcome.gate_calls, 0, "the transmit gate does not run");
+    assert_eq!(
+        outcome
+            .methods
+            .iter()
+            .filter(|method| *method == "simulateTransaction")
+            .count(),
+        1,
+        "the signed re-simulation is never sent"
+    );
+    assert_eq!(
+        methods_of(&outcome.oracle_bodies),
+        ["getNetwork", "simulateTransaction"]
     );
 }

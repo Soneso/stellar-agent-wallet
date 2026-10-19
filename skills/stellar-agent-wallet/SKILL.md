@@ -299,7 +299,9 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
 
   `network.witness_unavailable` separately reports an unavailable required oracle
   witness for all four classic MCP commits and CLI `pay`, `claim`, sponsored
-  `accounts create`, `trustline`, and sending `pool init` paths.
+  `accounts create`, `trustline`, and sending `pool init` paths. The x402
+  payment tools are covered by a second simulation on the oracle, which
+  simulates the same unsigned transfer before the payer signs.
   Opaque staged envelopes and the SEP-43 signing tools remain uncovered.
   `fees.percentile_exceeds_cap` and
   `validation.mainnet_fee_cap_required` report the classic fee cap.

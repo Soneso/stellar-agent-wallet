@@ -1510,6 +1510,8 @@ pub struct SubscriberConfig {
     /// Explicit [`EnvFilter`] to install.  Bypasses the env-var lookup
     /// entirely.  `None` means "use the three-level fallback"
     /// ([`env_var::LOG_LEVEL`] → [`env_var::RUST_LOG_FALLBACK`] → `"info"`).
+    /// Either filter keeps the RPC client's raw request and response logging
+    /// off at every level.
     pub filter_override: Option<EnvFilter>,
 
     /// Factory producing the writer the subscriber emits to.  `None` means
@@ -1624,7 +1626,9 @@ impl std::fmt::Debug for SubscriberConfig {
 ///
 /// Builds and installs:
 /// - An [`EnvFilter`] driven by
-///   `STELLAR_AGENT_LOG` (falling back to `RUST_LOG`, then `info`).
+///   `STELLAR_AGENT_LOG` (falling back to `RUST_LOG`, then `info`). The RPC
+///   client's raw request and response logging stays off at every level, so
+///   the set levels apply to the wallet's own events.
 /// - A fmt layer (pretty or JSON per `log_format_override` / env / TTY
 ///   detection) writing to `stderr`.  Layer 2 redaction is applied in both
 ///   format paths — via `RedactingLayer<DefaultFields>` for pretty, and via
@@ -1712,34 +1716,124 @@ pub fn init_subscriber_with(config: SubscriberConfig) -> Result<(), InitError> {
         tracing_log::LogTracer::init().map_err(InitError::LogBridge)?;
     }
 
-    // 2. Build the EnvFilter: use override if provided, else three-level fallback.
-    let filter = match config.filter_override {
-        Some(f) => f,
-        None => build_env_filter()?,
-    };
-
-    // 3. Resolve format: explicit override > env/TTY auto-detect.
-    let format = match config.format_override {
-        Some(f) => f,
-        None => FormatChoice::from_env_and_tty(None),
-    };
-
-    // 4. Detect TTY + NO_COLOR for ANSI colour toggle.
+    // 2. Detect TTY + NO_COLOR for ANSI colour toggle.
     //    ANSI is enabled only when stderr is a TTY AND NO_COLOR is unset.
     use std::io::IsTerminal as _;
     let is_tty = std::io::stderr().is_terminal();
     let no_color = std::env::var_os(env_var::NO_COLOR).is_some();
     let use_ansi = resolve_ansi(is_tty, no_color);
 
-    // 5. Build a type-erased fmt layer.  Type erasure is required because the
-    //    four (format × writer) combinations have different concrete layer
-    //    types.  All four paths receive identical redaction treatment via
-    //    the [`RedactingLayer`] / [`RedactingJsonFormatter`] wrappers.
+    // 3. Compose and install.
+    let install_panic_hook_after = config.install_panic_hook;
+    build_subscriber(
+        config.filter_override,
+        config.format_override,
+        config.writer_factory,
+        use_ansi,
+    )?
+    .try_init()
+    .map_err(InitError::Init)?;
+
+    // 4. Install the panic hook, unless skipped.
+    if install_panic_hook_after {
+        install_panic_hook();
+    }
+
+    Ok(())
+}
+
+/// Builds the subscriber stack [`init_subscriber_with`] installs, without
+/// installing it and without the log bridge or the panic hook.
+///
+/// Tests run the wallet's own filter and redaction stack through it under a
+/// scoped default and a capture writer.
+///
+/// # Errors
+///
+/// [`InitError::Filter`] as [`init_subscriber_with`] returns it.
+#[cfg(feature = "test-helpers")]
+#[doc(hidden)]
+pub fn subscriber_for_tests(
+    config: SubscriberConfig,
+) -> Result<impl tracing::Subscriber + Send + Sync + 'static, InitError> {
+    build_subscriber(
+        config.filter_override,
+        config.format_override,
+        config.writer_factory,
+        false,
+    )
+}
+
+/// Target prefix of the RPC client's raw request and response logging.
+///
+/// The JSON-RPC transport under the Stellar RPC client logs every serialized
+/// request and response at TRACE on the `jsonrpsee` target before the wallet
+/// reads the answer. An endpoint's error text, or a credential an endpoint
+/// echoes, would reach the log unredacted, so the wallet keeps every target
+/// with this prefix off at every level. The wallet's own events about an
+/// endpoint, which carry its class and status but no text, stay.
+const RAW_TRANSPORT_LOG_TARGET: &str = "jsonrpsee";
+
+/// Adds the directive that disables the `jsonrpsee` target.
+///
+/// The directive follows the operator's value and overrides `jsonrpsee=trace`,
+/// shorter target directives, and a bare level.
+/// The global target filter in [`build_subscriber`] disables every target
+/// that starts with `jsonrpsee`, including those enabled by more specific
+/// target directives or span directives.
+fn raw_transport_logging_off(filter: EnvFilter) -> Result<EnvFilter, InitError> {
+    let directive = format!("{RAW_TRANSPORT_LOG_TARGET}=off")
+        .parse()
+        .map_err(|error| {
+            InitError::Filter(tracing_subscriber::filter::FromEnvError::from(error))
+        })?;
+    Ok(filter.add_directive(directive))
+}
+
+/// Whether `target` belongs to the raw transport logging.
+///
+/// The filter of [`build_subscriber`] applies it beside the `EnvFilter`: a
+/// span directive such as `[method_call]=trace` enables events inside the
+/// matching span whatever the static directives say, so the target check
+/// runs outside the operator's filter.
+fn is_raw_transport_target(target: &str) -> bool {
+    target.starts_with(RAW_TRANSPORT_LOG_TARGET)
+}
+
+/// Composes the filter, the raw transport filter, and the redacting fmt
+/// layer.
+fn build_subscriber(
+    filter_override: Option<EnvFilter>,
+    format_override: Option<FormatChoice>,
+    writer_factory: Option<BoxedMakeWriterFn>,
+    use_ansi: bool,
+) -> Result<impl tracing::Subscriber + Send + Sync + 'static, InitError> {
+    // The EnvFilter: the override if provided, else the three-level fallback.
+    // Both carry the raw transport directive.
+    let filter = match filter_override {
+        Some(f) => raw_transport_logging_off(f)?,
+        None => build_env_filter()?,
+    };
+
+    // Explicit format override > env/TTY auto-detect.
+    let format = match format_override {
+        Some(f) => f,
+        None => FormatChoice::from_env_and_tty(None),
+    };
+
+    // A type-erased fmt layer.  Type erasure is required because the four
+    // (format × writer) combinations have different concrete layer types.
+    // All four paths receive identical redaction treatment via the
+    // [`RedactingLayer`] / [`RedactingJsonFormatter`] wrappers.
     use tracing_subscriber::Registry;
+    use tracing_subscriber::filter::FilterFn;
     use tracing_subscriber::layer::Layered;
-    type S = Layered<EnvFilter, Registry>;
+    type RawTransportFilter = FilterFn<fn(&tracing::Metadata<'_>) -> bool>;
+    type S = Layered<RawTransportFilter, Layered<EnvFilter, Registry>>;
+    let raw_transport_filter: RawTransportFilter =
+        FilterFn::new(|metadata| !is_raw_transport_target(metadata.target()));
     let fmt_layer: Box<dyn tracing_subscriber::Layer<S> + Send + Sync> =
-        match (format, config.writer_factory) {
+        match (format, writer_factory) {
             (FormatChoice::Pretty, None) => Box::new(
                 fmt::layer()
                     .pretty()
@@ -1766,19 +1860,10 @@ pub fn init_subscriber_with(config: SubscriberConfig) -> Result<(), InitError> {
             ),
         };
 
-    // 6. Compose and install.
-    tracing_subscriber::registry()
+    Ok(tracing_subscriber::registry()
         .with(filter)
-        .with(fmt_layer)
-        .try_init()
-        .map_err(InitError::Init)?;
-
-    // 7. Install the panic hook, unless skipped.
-    if config.install_panic_hook {
-        install_panic_hook();
-    }
-
-    Ok(())
+        .with(raw_transport_filter)
+        .with(fmt_layer))
 }
 
 /// Build the `EnvFilter` with three-level fallback.
@@ -1809,7 +1894,20 @@ fn build_env_filter() -> Result<EnvFilter, InitError> {
 /// An unparseable `rust_log` by itself (when `stellar_agent_log` is unset)
 /// is ignored silently and the hard-coded default is used; this matches the
 /// upstream `EnvFilter::from_env` behaviour for `RUST_LOG`.
+///
+/// The resolved filter then gets the directive that keeps the RPC client's
+/// raw request and response logging off (see [`RAW_TRANSPORT_LOG_TARGET`]),
+/// so the set levels apply to the wallet's own events.
 fn resolve_env_filter_from(
+    stellar_agent_log: Option<&str>,
+    rust_log: Option<&str>,
+) -> Result<EnvFilter, InitError> {
+    raw_transport_logging_off(resolve_operator_filter(stellar_agent_log, rust_log)?)
+}
+
+/// The operator's filter value by the precedence of
+/// [`resolve_env_filter_from`], before the raw transport directive.
+fn resolve_operator_filter(
     stellar_agent_log: Option<&str>,
     rust_log: Option<&str>,
 ) -> Result<EnvFilter, InitError> {
@@ -1840,9 +1938,9 @@ fn resolve_env_filter_from(
     Ok(EnvFilter::builder().parse_lossy("info"))
 }
 
-/// Pure helper: decide whether ANSI colour codes should be emitted.
+/// Pure helper: decide whether ANSI color codes should be emitted.
 ///
-/// Matches the semantics of `init_subscriber_with` step 4 — ANSI is enabled
+/// Matches the semantics of `init_subscriber_with`: ANSI is enabled
 /// only when `is_tty` is `true` AND `no_color` is `false`.  Setting
 /// [`env_var::NO_COLOR`] to any value disables ANSI regardless of TTY state
 /// (<https://no-color.org> convention).

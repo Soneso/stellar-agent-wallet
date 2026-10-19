@@ -73,8 +73,9 @@ and before the audit pre-flight, nonce consumption, and signer load.
 Results include `cross_check`; pending and submitted rows carry a passed witness.
 Trustline and claim commits are unvalued. Testnet without an oracle reports
 `skipped`; a configured but unavailable oracle refuses `network.witness_unavailable`.
-Disagreements refuse `simulation.divergence`, and credential refusals retain
-`network.rpc_credential_refused`. A witness refusal leaves the nonce usable.
+Disagreements refuse `simulation.divergence`. Credential failures keep
+`network.rpc_credential_refused` or the keyring code of the oracle credential
+read (`auth.keyring_*`). A witness refusal leaves the nonce usable.
 The nonce expiry is checked against the clock read after the witness, so a nonce
 that expires while the oracle answers refuses `nonce.expired`.
 
@@ -648,9 +649,9 @@ Arguments:
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
-| `stellar_x402_create_payment` | Construct and sign an x402 v2 Exact Stellar `PAYMENT-SIGNATURE` from a `PaymentRequirements` object; return the payment signature and its fields. | Signs the payment authorization entry; does not submit. |
+| `stellar_x402_create_payment` | Construct and sign an x402 v2 Exact Stellar `PAYMENT-SIGNATURE` from a `PaymentRequirements` object; obtain the cross-check witness before signing; return the payment signature, its fields, and `cross_check`. | Signs the payment authorization entry; does not submit. |
 | `stellar_x402_parse_receipt` | Decode an x402 v2 `PAYMENT-RESPONSE` into a structured settlement receipt. | Read-only; no keyring, no network. No `chain_id`. |
-| `stellar_x402_authenticated_payment` | Run a SEP-10 identity gate against a `home_domain` (stellar.toml, SSRF bind, ephemeral challenge/response, JWT), then construct the `PAYMENT-SIGNATURE`. Any identity failure aborts before payment. | Signs the payment authorization entry; does not submit. |
+| `stellar_x402_authenticated_payment` | Run a SEP-10 identity gate against a `home_domain` (stellar.toml, SSRF bind, ephemeral challenge/response, JWT), then construct the `PAYMENT-SIGNATURE` with the cross-check witness. Any identity failure aborts before payment. | Signs the payment authorization entry; does not submit. |
 
 Arguments:
 
@@ -668,10 +669,16 @@ Arguments:
 Both payment tools validate the requirements in full before the dispatch gate
 and consume no spending window on a refusal. They build one RPC client from
 the profile, and its first request is the endpoint identity check under the
-profile's `submit_timeout_seconds`. An identity refusal answers its
-`network.*` code through both tools; the authenticated tool answers every other
-build failure with `x402.payment_build_failed`. A failure after admission keeps
-the admitted spend.
+profile's `submit_timeout_seconds`. When the amount reaches the asset's
+cross-check threshold and the profile names an oracle, a second client simulates
+the same unsigned transfer before the payer signs. The oracle client is prepared
+before the signer load.
+An identity refusal answers its `network.*` code through both tools.
+A witness refusal answers `simulation.divergence`, `network.witness_unavailable`,
+`network.rpc_credential_refused`, or the oracle credential read's keyring code
+(`auth.keyring_*`). The authenticated tool answers every other build failure
+with `x402.payment_build_failed`. Results carry `cross_check`. A
+failure after admission keeps the admitted spend.
 
 ## Machine Payments Protocol
 

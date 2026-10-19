@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use stellar_agent_network::StellarRpcClient;
+use stellar_agent_network::cross_check::SorobanCrossCheck;
 use stellar_agent_network::signing::SoftwareSigningKey;
 use stellar_agent_x402::X402Error;
 use stellar_agent_x402::constants::X402_STELLAR_TESTNET;
@@ -75,11 +76,13 @@ async fn pay(
         requirements,
         &dummy_signer(),
         &client,
+        &SorobanCrossCheck::NotRequired,
         profile_passphrase,
         tokio::time::Instant::now() + std::time::Duration::from_secs(60),
         gate_that_must_not_run(called),
     )
     .await
+    .map(|created| created.payload)
 }
 
 fn assert_gate_never_ran(called: &AtomicBool) {

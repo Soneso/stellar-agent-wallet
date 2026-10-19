@@ -460,7 +460,7 @@ pub struct CrossCheckRecord {
     pub ledger: u32,
     /// SHA-256 inputs digest as 64 lowercase hexadecimal characters.
     pub inputs_digest: String,
-    /// Distinct compared entry kinds, at most eight.
+    /// Distinct compared entry kinds, one entry per kind, nine kinds.
     pub kinds: Vec<crate::cross_check::WitnessEntry>,
 }
 
@@ -6011,6 +6011,23 @@ mod tests {
                 inputs_digest: "ab".repeat(32),
                 kinds: vec![crate::cross_check::WitnessEntry::SourceAccount],
             };
+            let soroban = CrossCheckRecord {
+                kinds: vec![crate::cross_check::WitnessEntry::SorobanSimulation],
+                ..witness.clone()
+            };
+            let x402 = EventKind::X402PaymentAuthorized {
+                witness: Some(soroban.clone()),
+                legs: vec![],
+                network: "stellar:testnet".into(),
+                scheme: "exact".into(),
+            };
+            let json = serde_json::to_value(&x402).unwrap();
+            assert_eq!(
+                json["witness"]["kinds"],
+                serde_json::json!(["soroban_simulation"])
+            );
+            let decoded: EventKind = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), json);
             let events = [
                 EventKind::ValueActionPending {
                     witness: Some(witness.clone()),

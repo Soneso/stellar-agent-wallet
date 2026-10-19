@@ -1698,7 +1698,8 @@ pub enum NetworkError {
         /// Safe reason, containing only validated identities or endpoint authorities.
         reason: WitnessUnavailableReason,
     },
-    /// The oracle disagrees with a ledger observation used by the action.
+    /// The oracle disagrees with a ledger observation or with the primary
+    /// simulation the action used.
     #[error(
         "cross-check refused: the primary RPC and the oracle disagree on the {entry} \
          {field}{delta}; the wallet did not sign or send. Retry the action; \
@@ -1706,7 +1707,7 @@ pub enum NetworkError {
         delta = witness_delta(*entry, *field, *sequence_delta)
     )]
     WitnessDivergence {
-        /// Kind of ledger entry that disagrees.
+        /// Kind of ledger entry or simulation that disagrees.
         entry: crate::cross_check::WitnessEntry,
         /// Field that disagrees.
         field: crate::cross_check::WitnessField,

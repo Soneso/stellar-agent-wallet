@@ -68,6 +68,7 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use serial_test::serial;
+use stellar_agent_network::cross_check::SorobanCrossCheck;
 use stellar_agent_network::signing::SoftwareSigningKey;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::{
@@ -411,12 +412,14 @@ async fn construct_sign_resimulate_happy_path() {
         &native_testnet_requirements(&recipient.address),
         &payer.signer(),
         &payment_client,
+        &SorobanCrossCheck::NotRequired,
         TESTNET_PASSPHRASE,
         tokio::time::Instant::now() + IDENTITY_TIMEOUT,
         |_| Ok(()),
     )
     .await
-    .unwrap_or_else(|e| panic!("[construct/sign FAIL] create_payment: {e}"));
+    .unwrap_or_else(|e| panic!("[construct/sign FAIL] create_payment: {e}"))
+    .payload;
 
     assert_eq!(payload.x402_version, 2, "x402Version must be 2");
     assert_eq!(payload.accepted.scheme, "exact");
@@ -477,12 +480,14 @@ async fn submit_to_testnet_reaches_ledger() {
         &native_testnet_requirements(&recipient.address),
         &payer.signer(),
         &payment_client,
+        &SorobanCrossCheck::NotRequired,
         TESTNET_PASSPHRASE,
         tokio::time::Instant::now() + IDENTITY_TIMEOUT,
         |_| Ok(()),
     )
     .await
-    .unwrap_or_else(|e| panic!("[submit/confirm FAIL] create_payment: {e}"));
+    .unwrap_or_else(|e| panic!("[submit/confirm FAIL] create_payment: {e}"))
+    .payload;
     let ledgers = capture.single();
     check_and_record("submit/confirm", &ledgers);
     let signed_entries = auth_entries(&payment_envelope(&payload));

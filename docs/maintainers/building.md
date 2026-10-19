@@ -635,7 +635,10 @@ authenticated leg also needs a live SEP-10 session with
 distinct funded accounts and fails when a prerequisite is unavailable; none
 skips. The settlement leg re-sources the payment to a third funded account,
 refreshes its resource data with a simulation, submits it, and checks that the
-payer and recipient balances move by exactly the amount. Each leg prints the
+payer and recipient balances move by exactly the amount. The witness leg
+`a6_create_payment_with_witness_passes` pays the native threshold floor with the
+acceptance endpoint as the oracle and checks the passed witness on the result
+and on the `x402_payment_authorized` row. Each leg prints the
 endpoint protocol and the ledgers `L`, `H`, and `R` the payment checked, and
 fails on a protocol outside the supported range. Acceptance evidence is a run
 in which every positive leg passed; a run with an unavailable prerequisite is

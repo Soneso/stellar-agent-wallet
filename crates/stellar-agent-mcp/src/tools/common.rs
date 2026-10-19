@@ -613,6 +613,26 @@ pub(crate) fn x402_value_leg(
     }
 }
 
+/// The canonical identity of an x402 requirement's asset, under which the
+/// cross-check rule looks up its threshold.
+///
+/// [`stellar_agent_x402::exact::validate_requirements`] holds the asset to a
+/// contract strkey, and the canonical form parses with the same strict
+/// decoder, so a validated asset converts. A failure answers as the
+/// requirement's own asset refusal.
+pub(crate) fn x402_canonical_asset(
+    requirements: &stellar_agent_x402::wire::PaymentRequirements,
+) -> Result<stellar_agent_core::asset_id::CanonicalAsset, rmcp::model::CallToolResult> {
+    stellar_agent_core::asset_id::CanonicalAsset::contract(&requirements.asset).map_err(|_| {
+        x402_error_to_tool_result(&stellar_agent_x402::X402Error::InvalidAssetAddress {
+            detail: format!(
+                "expected a canonical C-strkey (contract), got {}",
+                stellar_agent_network::quote_server_text(&requirements.asset)
+            ),
+        })
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // x402_error_to_tool_result — shared x402 error-envelope helper
 // ─────────────────────────────────────────────────────────────────────────────

@@ -450,11 +450,31 @@ impl StellarRpcClient {
         &self,
         envelope: &TransactionEnvelope,
     ) -> Result<SimulateTransactionResponse, NetworkError> {
+        self.witness_simulate(envelope)
+            .await
+            .map_err(|e| rpc_unreachable(&self.url, SIMULATE_TRANSACTION_FAILED, &e))
+    }
+
+    /// Simulates `envelope` as [`Self::simulate_transaction_envelope`] does
+    /// and keeps the raw error, so the cross-check witness classifies a
+    /// credential refusal, a transport fault, and an unusable answer before
+    /// it maps them.
+    ///
+    /// The request is the same: the envelope as given and no `authMode`
+    /// field. The answer's `error` string holds the scrubbed form of the
+    /// endpoint's text.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the witness classifies the raw transport error before mapping it"
+    )]
+    pub(crate) async fn witness_simulate(
+        &self,
+        envelope: &TransactionEnvelope,
+    ) -> Result<SimulateTransactionResponse, stellar_rpc_client::Error> {
         let mut response = self
             .inner
             .simulate_transaction_envelope(envelope, None)
-            .await
-            .map_err(|e| rpc_unreachable(&self.url, SIMULATE_TRANSACTION_FAILED, &e))?;
+            .await?;
         // The answer's `error` is the endpoint's own text. It reaches callers
         // scrubbed: no credential form, each URL as host and port, control and
         // non-ASCII characters escaped, bounded, and quoted.
