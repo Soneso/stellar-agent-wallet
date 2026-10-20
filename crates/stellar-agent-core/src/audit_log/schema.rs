@@ -483,6 +483,57 @@ pub(super) fn bound_recorded_str(s: &str) -> String {
     }
 }
 
+/// Authentication disposition of the store observed before a reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviousState {
+    /// The authenticated body matches the trusted generation.
+    Verified,
+    /// No store file exists.
+    Missing,
+    /// The file exists but its current contents cannot be authenticated.
+    Unverifiable,
+}
+
+/// Live accrual captured under the window lock before a reset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WipedAccrualRecord {
+    /// Authentication disposition of the previous file.
+    pub previous: PreviousState,
+    /// Live records across every bucket, including omitted buckets.
+    pub entry_count: usize,
+    /// Up to eight live buckets in file order.
+    pub buckets: Vec<WipedBucket>,
+    /// Whether more live buckets exist than the row carries.
+    pub truncated: bool,
+    /// Trusted generation observed before recording.
+    pub generation_before: Option<u64>,
+    /// Generation assigned to the empty replacement.
+    pub generation_after: u64,
+}
+
+/// Confirmed and pending live accrual for one window bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WipedBucket {
+    /// Policy scope component of the bucket identity.
+    pub scope_specificity: u8,
+    /// Bucket identifier, bounded by the snapshot to 64 characters and 64
+    /// serialized JSON bytes.
+    pub bucket: String,
+    /// Rolling window duration in seconds.
+    pub window_secs: u64,
+    /// Number of live confirmed records.
+    pub confirmed_count: usize,
+    /// Saturating sum of live confirmed amounts.
+    #[serde(with = "i128_decimal_str")]
+    pub confirmed_total: i128,
+    /// Number of pending records, regardless of timestamp.
+    pub pending_count: usize,
+    /// Saturating sum of pending amounts.
+    #[serde(with = "i128_decimal_str")]
+    pub pending_total: i128,
+}
+
 /// One leg of a value-moving action, in audit-wire form.
 ///
 /// Built at emission time from the SAME `ValueEffects` the policy gate sized
@@ -3022,23 +3073,17 @@ pub enum EventKind {
         public_address: Option<RedactedStrkey>,
     },
 
-    /// The persisted policy-window-state store (`per_period_cap` /
-    /// `rate_limit` / `bundle_per_period_cap` / `bundle_rate_limit`
-    /// accumulated history) was re-initialised to empty.
-    ///
-    /// Emitted by `policy reset-window-state --profile <p>`. Corrupt-file
-    /// recovery is fail-closed until reset; this row is the audit trail for
-    /// that recovery action, including the operator-supplied reason.
-    ///
-    /// # Schema additivity
-    ///
-    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    /// `profile reset-window-state` records the accrual before mutating the
+    /// store, while holding the audit writer and the window lock.
     PolicyWindowStateReset {
         /// The profile whose window-state store was reset.
         profile: String,
         /// Operator-supplied reason for the reset (bounded to
         /// [`RECORDED_STR_MAX`] characters at construction).
         reason: String,
+        /// Snapshot recorded before mutation; absent in older rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wiped: Option<WipedAccrualRecord>,
     },
 
     /// Verified MPP history was selected for generation anchoring. The row
@@ -5727,6 +5772,7 @@ mod tests {
         let ev = EventKind::PolicyWindowStateReset {
             profile: "alice".to_owned(),
             reason: "corrupt-file recovery".to_owned(),
+            wiped: None,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -6059,5 +6105,72 @@ mod tests {
                 assert_eq!(serde_json::to_value(decoded).unwrap(), json);
             }
         }
+    }
+    #[test]
+    fn reset_record_golden_carries_decimal_string_totals() {
+        let record = WipedAccrualRecord {
+            previous: PreviousState::Verified,
+            entry_count: 3,
+            buckets: vec![WipedBucket {
+                scope_specificity: 2,
+                bucket: "native".to_owned(),
+                window_secs: 86_400,
+                confirmed_count: 2,
+                confirmed_total: i128::MIN,
+                pending_count: 1,
+                pending_total: i128::MAX,
+            }],
+            truncated: false,
+            generation_before: Some(4),
+            generation_after: 5,
+        };
+        let expected = "{\"previous\":\"verified\",\"entry_count\":3,\"buckets\":[{\
+            \"scope_specificity\":2,\"bucket\":\"native\",\"window_secs\":86400,\
+            \"confirmed_count\":2,\
+            \"confirmed_total\":\"-170141183460469231731687303715884105728\",\
+            \"pending_count\":1,\
+            \"pending_total\":\"170141183460469231731687303715884105727\"}],\
+            \"truncated\":false,\"generation_before\":4,\"generation_after\":5}";
+        let json = serde_json::to_string(&record).unwrap();
+        assert_eq!(json, expected);
+        assert_eq!(
+            serde_json::from_str::<WipedAccrualRecord>(&json).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn reset_record_golden_states() {
+        for (previous, name) in [
+            (PreviousState::Verified, "verified"),
+            (PreviousState::Missing, "missing"),
+            (PreviousState::Unverifiable, "unverifiable"),
+        ] {
+            let record = WipedAccrualRecord {
+                previous,
+                entry_count: 0,
+                buckets: vec![],
+                truncated: false,
+                generation_before: None,
+                generation_after: 1,
+            };
+            let expected = format!(
+                "{{\"previous\":\"{name}\",\"entry_count\":0,\"buckets\":[],\"truncated\":false,\
+                 \"generation_before\":null,\"generation_after\":1}}"
+            );
+            let json = serde_json::to_string(&record).unwrap();
+            assert_eq!(json, expected);
+            assert_eq!(
+                serde_json::from_str::<WipedAccrualRecord>(&json).unwrap(),
+                record
+            );
+        }
+    }
+
+    #[test]
+    fn reset_row_without_wiped_keeps_golden_bytes() {
+        let golden = r#"{"kind":"policy_window_state_reset","profile":"alice","reason":"repair"}"#;
+        let row: EventKind = serde_json::from_str(golden).unwrap();
+        assert_eq!(serde_json::to_string(&row).unwrap(), golden);
     }
 }

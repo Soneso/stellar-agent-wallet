@@ -82,7 +82,14 @@ fn build_test_resolver(
         .no_deflate()
         .build()
         .expect("test client build");
-    StellarTomlResolver::with_test_base_url(profile, cache_dir, ttl, client, mock_server_uri)
+    StellarTomlResolver::with_test_base_url(
+        profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(profile),
+        cache_dir,
+        ttl,
+        client,
+        mock_server_uri,
+    )
 }
 
 async fn mount_stellar_toml_mock(mock_server: &MockServer) {
@@ -161,8 +168,10 @@ async fn read_cache_entry_expired_ttl_returns_none() {
     let service = format!("stellar-agent-counterparty-{profile}");
     let entry = keyring_core::Entry::new(&service, "default").expect("entry open");
     let raw_b64 = entry.get_password().expect("key must exist after refresh");
+    // The cache stores its key as URL-safe base64 without padding, the
+    // encoding `profile rotate-counterparty-key` writes.
     use base64::Engine as _;
-    let key_bytes = base64::engine::general_purpose::STANDARD
+    let key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&raw_b64)
         .expect("valid base64");
     let key_arr: [u8; 32] = key_bytes.try_into().expect("32-byte key");
@@ -210,8 +219,10 @@ async fn read_cache_entry_fresh_ttl_returns_some_with_correct_domain() {
     let service = format!("stellar-agent-counterparty-{profile}");
     let entry = keyring_core::Entry::new(&service, "default").expect("entry open");
     let raw_b64 = entry.get_password().expect("key must exist after refresh");
+    // The cache stores its key as URL-safe base64 without padding, the
+    // encoding `profile rotate-counterparty-key` writes.
     use base64::Engine as _;
-    let key_bytes = base64::engine::general_purpose::STANDARD
+    let key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&raw_b64)
         .expect("valid base64");
     let key_arr: [u8; 32] = key_bytes.try_into().expect("32-byte key");
@@ -300,7 +311,12 @@ async fn read_cache_entry_wrong_key_returns_hmac_mismatch() {
 #[test]
 fn stellar_toml_resolver_new_succeeds() {
     let dir = TempDir::new().expect("tmpdir");
-    let result = StellarTomlResolver::new("default", dir.path(), Duration::from_secs(3600));
+    let result = StellarTomlResolver::new(
+        "default",
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key("default"),
+        dir.path(),
+        Duration::from_secs(3600),
+    );
     assert!(
         result.is_ok(),
         "StellarTomlResolver::new must succeed with a valid cache dir: {result:?}"
@@ -532,8 +548,13 @@ fn stellar_toml_resolver_with_client_succeeds() {
     let dir = TempDir::new().expect("tmpdir");
     let client = reqwest::Client::new();
     // with_client is infallible.
-    let _resolver =
-        StellarTomlResolver::with_client("default", dir.path(), Duration::from_secs(3600), client);
+    let _resolver = StellarTomlResolver::with_client(
+        "default",
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key("default"),
+        dir.path(),
+        Duration::from_secs(3600),
+        client,
+    );
     // No assertion needed beyond "does not panic" — the Debug impl is the
     // only observable state for this path.
 }
@@ -544,9 +565,14 @@ fn stellar_toml_resolver_with_client_succeeds() {
 fn stellar_toml_resolver_with_stale_if_error_builder() {
     let dir = TempDir::new().expect("tmpdir");
     let client = reqwest::Client::new();
-    let resolver =
-        StellarTomlResolver::with_client("default", dir.path(), Duration::from_secs(3600), client)
-            .with_stale_if_error(true);
+    let resolver = StellarTomlResolver::with_client(
+        "default",
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key("default"),
+        dir.path(),
+        Duration::from_secs(3600),
+        client,
+    )
+    .with_stale_if_error(true);
     // Verify the Debug impl does not panic.
     let debug = format!("{resolver:?}");
     assert!(debug.contains("StellarTomlResolver"));

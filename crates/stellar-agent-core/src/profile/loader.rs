@@ -665,7 +665,7 @@ impl ProfileLoadError {
 /// join. Placing the guard at the join rather than at each caller is what makes
 /// the rule hold for all of them: a caller that forgets to validate still
 /// cannot reach outside the profile directory.
-fn guard_name_for_load(name: &str) -> Result<(), ProfileLoadError> {
+pub(crate) fn guard_name_for_load(name: &str) -> Result<(), ProfileLoadError> {
     validate_path_component_ascii_safe(name).map_err(|reason| ProfileLoadError::InvalidName {
         name: name.to_owned(),
         reason,

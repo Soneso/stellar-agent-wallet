@@ -449,7 +449,12 @@ fn build_counterparty_resolver(profile: &Profile) -> Arc<dyn CounterpartyResolve
     if !cache_dir.exists() {
         return Arc::new(NoopCounterpartyResolver);
     }
-    match StellarTomlResolver::new(&profile_name, cache_dir, Duration::from_secs(3600)) {
+    match StellarTomlResolver::new(
+        &profile_name,
+        profile.counterparty_cache_key_id.clone(),
+        cache_dir,
+        Duration::from_secs(3600),
+    ) {
         Ok(resolver) => Arc::new(resolver),
         Err(err) => {
             tracing::debug!(error = %err, "counterparty resolver disabled: construction failed");

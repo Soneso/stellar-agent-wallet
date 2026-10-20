@@ -51,9 +51,11 @@ pub enum CounterpartySubcommand {
     ///
     /// Reads the per-profile cache directory, verifies each entry's HMAC, and
     /// prints a JSON envelope with the list of valid cached home domains and
-    /// their expiry timestamps.  Entries whose HMAC fails validation are
-    /// silently skipped; run `stellar-agent counterparty refresh <domain>` to
-    /// re-mint them.
+    /// their expiry timestamps.  The command logs a warning for an entry whose
+    /// HMAC fails validation and skips it.
+    /// `stellar-agent counterparty refresh <domain>` rewrites the affected
+    /// entry.  `stellar-agent counterparty warm-up` refreshes only the
+    /// `HOME_DOMAIN` entries of the policy allowlist.
     List(list::ListArgs),
 
     /// Force-refresh the cached `stellar.toml` for a home domain.

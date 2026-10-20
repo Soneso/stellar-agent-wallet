@@ -51,14 +51,31 @@ refusal names both profiles and quotes the offending
 `profile show <name>` is the one command that still displays a mismatched
 profile: it is what you read to find the offending field.
 
+After name reconciliation, both binaries compare keyring entries with sibling
+profile files in the same profiles directory. Mainnet conflicts refuse with
+`profile.key_scope_conflict`; testnet conflicts warn and keep the verb's behavior.
+The check includes wallet keys, provider credentials and derived entries.
+Provider credentials may share with other provider credentials, but cannot share
+with wallet or derived entries. Two fields in one profile cannot name one entry,
+and the owner account must be `default`. Explicit wallet references must be set
+in the file; an out-of-scope overlay is a conflict.
+
+A copied profile file, including a backup in that directory, counts as a sibling.
+If this profile names a sibling's entry, give this profile its own entry.
+If the sibling claims this profile's canonical entry, correct the sibling file.
+Moving an enrolled reference orphans its stored key; enroll or rotate at the new
+entry before use. An unreadable sibling warns and is skipped on both chains.
+An unreadable selected document or profiles directory refuses on mainnet and
+warns on testnet. `profile show` still displays the document for diagnosis.
+
 The policy spend window does not travel with a copied file either. Rolling
 caps (`per_period_cap`, `rate_limit`, and their bundle forms) accumulate in a
 per-profile store keyed on the profile's `policy_window_state_key_id`. A copy
 that keeps that field shares the original's anti-rollback counter while
 pointing at a store file that does not exist, so every value-moving command
-refuses until `profile reset-window-state <name>` re-baselines it; a copy
-without the field starts a fresh, empty window and the original's spend does
-not count against it. Neither is a way to inherit or reset a spend window on
+can refuse on its generation check. Mainnet key-scope reconciliation already
+refuses the shared entry. A copy without the field starts a fresh, empty window;
+the original's spend does not count against it. Neither is a way to inherit or reset a spend window on
 purpose. Use `profile init` for a new profile and `profile reset-window-state`
 for a deliberate reset. Amount caps size outbound value, so a vault withdrawal,
 which returns underlying assets and burns the wallet's shares, reserves no
@@ -558,6 +575,13 @@ This rewrites the file in place (atomically), sets the four `*_key_id` reference
 names, and sets `[policy] engine = "noop"`. Running it again on an
 already-current profile is a no-op.
 
+The counterparty cache reads and mints its HMAC key at
+`counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.
+With an explicit reference, previously cached entries read as absent until
+a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry
+for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN`
+entries of the policy allowlist.
+
 ### Rotate each key
 
 Each command generates fresh key material from the OS CSPRNG and stores it in the
@@ -569,10 +593,10 @@ on error.
 | `stellar-agent profile enroll-owner-key` | `policy_owner_key_id` | Enrols the owner ed25519 PUBLIC key from an operator seed, stored as its G-strkey, which no 32-byte symmetric-key loader accepts. It also rewrites every other profile's older-form owner entry. Sign policy files with `profile sign-policy`; re-enrolling a different key invalidates policy files signed by the previous one. |
 | `stellar-agent profile rotate-attestation-key <name>` | `attestation_key_id` | Fresh 32-byte HMAC key. All pending approvals are invalidated. |
 | `stellar-agent profile rotate-audit-key <name>` | `audit_log_hash_chain_key_id` | Fresh 32-byte HMAC key. Rotation re-signs every existing per-file chain-root sidecar with the new key, so the whole log verifies under it; the old key stops verifying. |
-| `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. All cached `stellar.toml` entries are invalidated and re-fetched on next use. |
+| `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. Cached `stellar.toml` entries read as absent until a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. |
 | `stellar-agent profile rotate-nonce-key <name>` | `mcp_nonce_key_alias` | Fresh 32-byte HMAC key. Outstanding nonces minted with the old key are invalidated. |
 | `stellar-agent profile rotate-policy-state-key <name>` | `policy_window_state_key_id` | Fresh 32-byte HMAC key. Unlike the other rotations, the accumulated window-state store is re-signed under the new key, so `per_period_cap` / `rate_limit` history is preserved, not invalidated. |
-| `stellar-agent profile reset-window-state <name> --reason <reason>` | `policy_window_state_key_id` (mints if absent) | Re-initialises the window-state store to empty. Recovery path for an unreadable, tampered, or unparseable store. The affected criteria fail closed until reset. Discards accumulated history; the reset is audited. |
+| `stellar-agent profile reset-window-state <name> --reason <reason>` | `policy_window_state_key_id` (mints if absent) | Re-initialises the window-state store to empty. Recovery path for an unreadable, tampered, or unparseable store. The affected criteria fail closed until reset. Discards history only after its audit row is written under the audit writer and store lock. Stop the MCP server first. |
 
 ### Enroll the MCP signer
 

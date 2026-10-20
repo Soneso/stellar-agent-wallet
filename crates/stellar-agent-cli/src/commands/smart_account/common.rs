@@ -725,6 +725,7 @@ pub(crate) fn map_access_error(
 
     match err {
         ProfileAccessError::NameMismatch(_)
+        | ProfileAccessError::KeyScopeConflict(_)
         | ProfileAccessError::Load(
             ProfileLoadError::NonOverlayableField { .. }
             | ProfileLoadError::OverlayMayOnlyTighten { .. }

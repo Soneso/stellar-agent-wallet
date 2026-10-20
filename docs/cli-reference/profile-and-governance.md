@@ -316,13 +316,64 @@ Each returns the profile name and a `rotated` flag. The attestation-key and audi
 {"ok":true,"data":{"profile":"default","rotated":true,"key_kind":"hmac_32_bytes","sidecars_resigned":2},"request_id":"..."}
 ```
 
-A further rotation subcommand, `profile rotate-counterparty-key <NAME>`, rotates the `stellar.toml` cache-integrity HMAC key (`counterparty_cache_key_id`); it invalidates every cached counterparty binding, which the wallet re-fetches on the next counterparty-allowlist check. Its data object adds `"key_kind": "hmac_32_bytes"` and `"cache_invalidated": true` to the `profile` and `rotated` fields. This rotates the same keyring entry as `stellar-agent counterparty rotate-hmac-key` (see [core operations](stellar-ops.md)); the two verbs are interchangeable.
+A further rotation subcommand, `profile rotate-counterparty-key <NAME>`, rotates the `stellar.toml` cache-integrity HMAC key (`counterparty_cache_key_id`); it invalidates every cached counterparty binding. `counterparty refresh <domain>` rewrites the binding for that domain, and `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. Its data object adds `"key_kind": "hmac_32_bytes"` and `"cache_invalidated": true` to the `profile` and `rotated` fields. This rotates the same keyring entry as `stellar-agent counterparty rotate-hmac-key` (see [core operations](stellar-ops.md)); the two verbs are interchangeable.
 
 Each rotation exits `1` with `validation.profile_not_found` if the profile does not exist, or with a keyring error if the platform keyring is unavailable.
 
+The counterparty cache reads and mints its HMAC key at
+`counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.
+With an explicit reference, previously cached entries read as absent until
+a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry
+for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN`
+entries of the policy allowlist.
+
+Keyring references also pass the [profile key-scope check](../profiles.md#file-location-and-selection).
+It refuses mainnet conflicts with `profile.key_scope_conflict` and warns on testnet.
+
 ### `reset-window-state <NAME> --reason <REASON>`
 
-Not a rotation: the fail-closed recovery path for the persisted policy-window-state store. An unreadable, tampered, or unparseable store file makes the stateful criteria (`per_period_cap`, `rate_limit`, and their bundle forms) refuse every matched call until the store is re-initialised. `reset-window-state` re-initialises it to empty (minting the HMAC key if absent), discards all accumulated window history, and writes a `policy_window_state_reset` audit row recording the profile and the required `--reason`. The reset is audited BEFORE the mutation, so the audit trail records the request even if the re-initialisation fails midway. A blank or whitespace-only `--reason` exits `1` with `validation.reason_empty` before anything changes.
+`profile reset-window-state` clears persisted policy-window history after
+recovery from corruption or rollback. Stop the MCP server and repair the audit
+log first. The command requires a usable keyed audit writer on every network,
+including testnet. It acquires that writer before the window-store lock and
+writes the reset row before minting a key, advancing the generation or replacing
+the store. A reset whose row cannot be written does not happen.
+
+The `policy_window_state_reset` row carries the profile's chain, reason and
+`wiped` record. The JSON result carries the same record. A verified store reports
+live confirmed and pending counts and totals, scope specificity, bucket and
+window, plus generations before and after. Pending records count regardless of
+age. At most eight buckets appear, with bounded identifiers and a truncation flag;
+the entry count covers all live records. Missing or unverifiable stores report
+no totals. A store is unverifiable when its file fails its HMAC, does not parse,
+uses an unsupported format version, or holds an authentic older generation.
+It is also unverifiable without a usable key: an absent key, a key that is not
+valid base64, or a key that is not 32 bytes. The reset replaces such a key after
+the row. A store file that exists but cannot be read refuses before the row.
+
+A running MCP server holds the audit writer. Reset then refuses with
+`audit.chain_key_unavailable` and the message sub-code `audit.writer_locked`.
+An append failure also refuses with its audit code, leaving the window file,
+key and generation untouched. A first-use key mint is recorded through the held
+writer after the reset row, including when the later store write fails.
+
+A failure after the row but before the generation write leaves the store
+unchanged; the row's `generation_after` exceeds the keyring generation.
+After the generation write but before the file write, the generation matches
+the row while the old body remains. Its next load refuses a generation mismatch.
+Rerun reset after repairing the audit log and stopping the MCP server.
+The reset is complete when the next command that opens the window store loads
+the empty store at `generation_after`. On a V1 profile, a value-moving command
+and the MCP server's start open it. Generation equality alone does not establish
+completion.
+A blank `--reason` refuses with `validation.reason_empty` before anything changes.
+
+A reset row without `wiped` retains its serialized form and verifies unchanged.
+A row with `wiped` verifies with this release or later. An older binary drops
+that field when computing the row hash. It refuses a log once a checked root
+HMAC, successor row or tip anchor covers the new row. An uncovered tail can
+still be read by that binary with `wiped` dropped. If it then appends a row,
+this release refuses the extended log at that row.
 
 ```bash
 stellar-agent profile reset-window-state default --reason "store file corrupted after disk failure"

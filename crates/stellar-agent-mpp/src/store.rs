@@ -2506,6 +2506,14 @@ pub(crate) mod tests {
             "mpp.challenge_expired"
         );
     }
+    #[test]
+    fn generation_account_matches_the_shared_profile_derivation() {
+        let key = KeyringEntryRef::new("sample", "account");
+        assert_eq!(
+            generation_entry_ref(&key).account,
+            stellar_agent_core::profile::schema::generation_account(&key.account)
+        );
+    }
 }
 
 #[cfg(test)]

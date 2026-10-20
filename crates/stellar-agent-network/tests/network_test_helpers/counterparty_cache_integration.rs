@@ -5,13 +5,13 @@
 //! 1. **First fetch mints HMAC key + writes cache** — after the first
 //!    `refresh`, the keyring contains the `stellar-agent-counterparty-<profile>`
 //!    entry and the cache file exists.
-//! 2. **Second fetch hits cache (TTL not expired)** — `list_cached` returns the
-//!    binding without re-fetching from the network.
+//! 2. **Listing reads the cache**: after one `refresh`, `list_cached` returns
+//!    the binding and the server sees one request.
 //! 3. **Cache HMAC mismatch (corruption — flip a byte)** — `list_cached` skips
 //!    the corrupted entry (silent skip per spec) and the underlying HMAC verify
 //!    returns `HmacMismatch`.
-//! 4. **Expired cache → re-fetch** — when the TTL is set to zero, the entry is
-//!    marked expired; a subsequent `refresh` re-contacts the server.
+//! 4. **Refresh past the expiry**: with a 1-nanosecond TTL the recorded expiry
+//!    passes at once, and a second `refresh` contacts the server again.
 //! 5. **No keyring entry → empty list** — `list_cached` without a prior write
 //!    returns an empty list.
 //! 6. **Writer-locked path** — a manually held lock causes `refresh` to return
@@ -115,7 +115,14 @@ fn build_test_resolver(
         .build()
         .expect("test client build");
 
-    StellarTomlResolver::with_test_base_url(profile, cache_dir, ttl, client, mock_server_uri)
+    StellarTomlResolver::with_test_base_url(
+        profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(profile),
+        cache_dir,
+        ttl,
+        client,
+        mock_server_uri,
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -293,7 +300,7 @@ async fn first_fetch_writes_v2_cache_file_format_invariants() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// After a successful first refresh, `list_cached` must return the binding
-/// without re-contacting the server (TTL is 1 hour, far from expiry).
+/// from the cache; the listing never contacts the server.
 #[tokio::test]
 #[serial]
 async fn second_call_hits_cache_ttl_not_expired() {
@@ -403,8 +410,9 @@ async fn hmac_mismatch_on_corrupted_cache() {
 // 4. Expired cache → re-fetch
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// When TTL is effectively zero (1 nanosecond), `list_cached` skips the entry
-/// as expired.  A subsequent `refresh` re-contacts the server.
+/// With a 1-nanosecond TTL the entry's recorded expiry passes at once.
+/// `list_cached` does not filter on it, and a second `refresh` contacts the
+/// server again.
 #[tokio::test]
 #[serial]
 async fn expired_cache_entry_is_skipped_by_list_cached() {
@@ -522,8 +530,13 @@ async fn list_cached_without_keyring_entry_returns_empty() {
 
     // Deliberately DO NOT call refresh — no keyring entry is minted.
     let client = reqwest::Client::new();
-    let resolver =
-        StellarTomlResolver::with_client(&profile, dir.path(), Duration::from_secs(3600), client);
+    let resolver = StellarTomlResolver::with_client(
+        &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
+        dir.path(),
+        Duration::from_secs(3600),
+        client,
+    );
 
     let cached = resolver
         .list_cached()
@@ -570,4 +583,34 @@ async fn concurrent_refresh_second_gets_writer_locked() {
         matches!(result, Err(CounterpartyError::WriterLocked)),
         "second acquire must return WriterLocked, got: {result:?}"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_reference_refresh_mints_at_the_profile_entry() {
+    use stellar_agent_core::profile::schema::KeyringEntryRef;
+    keyring_mock::install().unwrap();
+    let dir = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_stellar_toml_mock(&server).await;
+    let name = "explicit-refresh";
+    let reference = KeyringEntryRef::new("custom-cache", "custom-account");
+    let resolver = StellarTomlResolver::with_test_base_url(
+        name,
+        reference.clone(),
+        dir.path(),
+        Duration::from_secs(3600),
+        reqwest::Client::new(),
+        server.uri(),
+    );
+    resolver.refresh(TEST_DOMAIN).await.unwrap();
+    assert!(stellar_agent_network::keyring::load_hmac_key_32(&reference).is_ok());
+    let canonical = KeyringEntryRef::default_counterparty_key(name);
+    assert!(matches!(
+        keyring_core::Entry::new(&canonical.service, &canonical.account)
+            .unwrap()
+            .get_password(),
+        Err(keyring_core::Error::NoEntry)
+    ));
+    assert_eq!(resolver.list_cached().await.unwrap().len(), 1);
 }

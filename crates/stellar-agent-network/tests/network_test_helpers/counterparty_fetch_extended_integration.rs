@@ -76,6 +76,7 @@ fn build_resolver(
 ) -> StellarTomlResolver {
     StellarTomlResolver::with_test_base_url(
         profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(profile),
         cache_dir,
         std::time::Duration::from_secs(3600),
         test_http_client(),

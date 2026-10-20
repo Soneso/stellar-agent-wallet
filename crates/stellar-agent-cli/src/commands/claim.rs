@@ -1949,9 +1949,10 @@ mod tests {
 
     /// Mainnet is rejected at the `run` boundary: the keyring initializer is
     /// never invoked and no request reaches the profile's endpoint.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn mainnet_rejected_at_run_boundary() {
+        let mut output = Vec::new();
         let guard_rpc = wiremock::MockServer::start().await;
         let counter =
             stellar_agent_test_support::ConnectionCounter::start().expect("connection counter");
@@ -1972,7 +1973,7 @@ mod tests {
                 )
             },
             || panic!("mainnet must not initialize the keyring"),
-            &mut std::io::sink(),
+            &mut output,
         )
         .await;
         assert_eq!(exit, 1, "mainnet must exit with code 1");
@@ -1988,6 +1989,8 @@ mod tests {
             0,
             "no connection may reach the persisted profile's endpoint"
         );
+        let rendered: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(rendered["error"]["code"], "network.mainnet_write_forbidden");
     }
 
     /// `--network mainnet` with no profile refuses before the keyring
@@ -2174,6 +2177,10 @@ mod tests {
         // exported value would make the name explicit and turn the synthesis
         // branch under test into a refusal. Process-global, hence `#[serial]`.
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        // The load runs the key-scope check, which lists the profiles
+        // directory; keep that read inside a temporary data root.
+        let home = tempfile::tempdir().expect("valid test fixture");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let args = minimal_args();
         let resolved = resolve_profile_name(args.profile.as_deref());
         let (_profile, origin) = load_profile_or_synthesize_testnet_with(&resolved, |name| {
@@ -2241,6 +2248,10 @@ mod tests {
     fn init_keyring_for_origin_persisted_fails_on_init_failure() {
         // Serialised with its siblings above for the same reason.
         let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        // The load runs the key-scope check, which lists the profiles
+        // directory; keep that read inside a temporary data root.
+        let home = tempfile::tempdir().expect("valid test fixture");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let args = minimal_args();
         let resolved = resolve_profile_name(args.profile.as_deref());
         let (_profile, origin) = load_profile_or_synthesize_testnet_with(&resolved, |name| {

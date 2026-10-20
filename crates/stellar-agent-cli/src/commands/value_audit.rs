@@ -20,10 +20,8 @@
 //! returned writer into [`emit_value_audit_row_with_writer`] for the post-confirm
 //! row, reusing the acquired writer.
 //!
-//! [`emit_value_audit_row`] (acquire-then-write) remains for the one
-//! legitimately non-signing caller of this module
-//! (`profile::reset_window_state`, an operator command, not a value-signing
-//! verb): its emission stays non-fatal and unchanged by this pre-flight.
+//! The reset ceremony acquires the keyed writer before locking the window
+//! store. Its recorder uses the strict append mapping through that writer.
 //!
 //! # Origin-aware pre-flight for the zero-config classic verbs
 //!
@@ -207,7 +205,9 @@ fn audit_chain_key_unavailable(profile_name: &str) -> WalletError {
     })
 }
 
-fn audit_writer_open_failed(profile_name: &str) -> WalletError {
+/// The refusal for an audit writer that cannot be opened or whose mutex is
+/// poisoned: [`ValidationError::AuditWriterOpenFailed`].
+pub(crate) fn audit_writer_open_failed(profile_name: &str) -> WalletError {
     WalletError::Validation(ValidationError::AuditWriterOpenFailed {
         profile: profile_name.to_owned(),
     })
@@ -298,36 +298,7 @@ pub(crate) fn acquire_best_effort_audit_writer(
         .map_err(|e| audit_writer_acquisition_error(profile_name, &e))
 }
 
-/// Acquires the per-profile audit writer opened under the profile's audit
-/// chain-root HMAC key.
-///
-/// Returns `None` (with a `tracing::warn!`) if the binding refuses, the key
-/// cannot be loaded, or the writer cannot be opened. A binding refusal is
-/// logged with its code and the row is skipped. `origin` selects the binding
-/// check. Private: the one caller is [`emit_value_audit_row`], the exempt,
-/// non-signing call site. Every signing verb uses
-/// [`require_value_audit_writer`] or [`require_value_audit_writer_for_origin`]
-/// instead, and both refuse a changed binding.
-fn acquire_value_audit_writer(
-    profile: &Profile,
-    profile_name: &str,
-    origin: ProfileOrigin,
-) -> Option<Arc<Mutex<AuditWriter>>> {
-    match try_keyed_value_audit_writer(profile, profile_name, origin) {
-        Ok(writer) => writer,
-        Err(e) => {
-            tracing::warn!(
-                profile = %profile_name,
-                code = %e.code(),
-                "value audit: audit binding changed; row skipped"
-            );
-            None
-        }
-    }
-}
-
-/// The keyed attempt behind [`acquire_value_audit_writer`],
-/// [`acquire_best_effort_audit_writer`], and the synthesized arm of
+/// The keyed attempt behind [`acquire_best_effort_audit_writer`], and the synthesized arm of
 /// [`require_value_audit_writer_for_origin`].
 ///
 /// `Ok(None)`, with a `tracing::warn!`, when the key cannot be loaded or the
@@ -427,24 +398,6 @@ pub(crate) fn write_row_logged(
     }
 }
 
-/// Writes a value-audit `entry` for `profile` under its audit chain-root HMAC
-/// key, acquiring the writer internally via [`acquire_value_audit_writer`].
-///
-/// Non-fatal: a failure to load the key, open the writer, take the lock, or
-/// append the row logs a `tracing::warn!` and returns without disturbing the
-/// caller. Reserved for the one non-signing caller of this module
-/// (`profile::reset_window_state`); value-moving signing verbs call
-/// [`require_value_audit_writer`] first and then
-/// [`emit_value_audit_row_with_writer`] to reuse that acquisition.
-pub(crate) fn emit_value_audit_row(profile: &Profile, profile_name: &str, entry: AuditEntry) {
-    let Some(writer_arc) =
-        acquire_value_audit_writer(profile, profile_name, ProfileOrigin::Persisted)
-    else {
-        return;
-    };
-    emit_value_audit_row_with_writer(&writer_arc, profile_name, entry);
-}
-
 /// Writes an authorization row and propagates failures while the caller can
 /// still withhold the credential.
 ///
@@ -482,11 +435,24 @@ pub(crate) fn emit_value_audit_row_strict(
         );
         audit_writer_open_failed(profile_name)
     })?;
-    guard.write_entry(entry).map_err(|e| {
+    append_value_audit_row_strict(&mut guard, profile_name, entry)
+}
+
+/// Appends through a held writer and preserves the strict audit refusal code.
+///
+/// # Errors
+///
+/// Returns the append failure mapped through the audit-writer refusal policy.
+pub(crate) fn append_value_audit_row_strict(
+    writer: &mut AuditWriter,
+    profile_name: &str,
+    entry: AuditEntry,
+) -> Result<(), WalletError> {
+    writer.write_entry(entry).map_err(|e| {
         tracing::warn!(
             profile = %profile_name,
             error = %e,
-            "value audit: authorization row NOT emitted; withholding the authorization"
+            "audit append failed; row NOT written, refusing the operation that requires it"
         );
         // The append runs its own tip-anchor check, so a log rolled back under
         // a live writer refuses here as well as at acquisition. It carries the
@@ -548,7 +514,8 @@ mod tests {
             "req-e2e-1",
             None,
         );
-        emit_value_audit_row(&profile, "e2e-emit", entry);
+        emit_value_audit_row_strict(&profile, "e2e-emit", BindingCheck::Enforce, entry)
+            .expect("strict append");
 
         let file = std::fs::File::open(&profile.audit_log_path).expect("audit.jsonl exists");
         let rows: Vec<serde_json::Value> = std::io::BufReader::new(file)
@@ -597,7 +564,7 @@ mod tests {
     /// With a real 32-byte chain-root key seeded (the post-`rotate-audit-key`
     /// state), `require_value_audit_writer` returns `Ok` with a writer that
     /// writes through to the profile's audit log — the same acquisition
-    /// [`emit_value_audit_row`] performs internally, exposed so the caller can
+    /// [`emit_value_audit_row_strict`] performs internally, exposed so the caller can
     /// reuse it for the post-confirm emission.
     #[test]
     #[serial]
@@ -1237,28 +1204,6 @@ mod tests {
             "{}",
             err.message()
         );
-    }
-
-    /// The warn-only path skips its row, logs the code, and writes nothing.
-    #[test]
-    #[serial]
-    fn the_warn_only_path_skips_its_row_and_logs_the_code() {
-        keyring_mock::install().expect("mock keyring store");
-        let dir = tempfile::tempdir().expect("tmp dir");
-        let profile = bound_then_repointed("binding-warn-only", dir.path());
-        let writer = stellar_agent_test_support::CaptureWriter::new();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            emit_value_audit_row(&profile, "binding-warn-only", sample_row());
-        });
-        let logs = String::from_utf8(writer.captured()).expect("utf8");
-        assert!(logs.contains("audit.log_binding_changed"), "{logs}");
-        assert!(!dir.path().join("repointed").exists());
     }
 
     /// A synthesized profile's warn-only pre-flight records no binding.

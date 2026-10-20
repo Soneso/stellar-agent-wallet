@@ -141,11 +141,10 @@ pub enum ProfileSubcommand {
     ///
     /// Generates 32 bytes from `OsRng` and stores them in the platform
     /// keyring entry for `counterparty_cache_key_id`.  All cached
-    /// `stellar.toml` entries are immediately invalidated; the wallet
-    /// re-fetches on the next counterparty-allowlist check.
-    ///
-    /// See `docs/runbooks/counterparty-cache-rotation.md` for operator
-    /// guidance on coordinating cache invalidation.
+    /// `stellar.toml` entries are immediately invalidated and read as absent
+    /// until a refresh rewrites them.  `counterparty refresh <domain>`
+    /// rewrites the entry for that domain.  `counterparty warm-up` refreshes
+    /// only the `HOME_DOMAIN` entries of the policy allowlist.
     RotateCounterpartyKey(rotate_counterparty_key::RotateCounterpartyKeyArgs),
     /// Rotate the persisted policy-window-state HMAC key for a profile.
     ///

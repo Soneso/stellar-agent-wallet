@@ -12,10 +12,10 @@
 //! At most one wallet process (or one task within a process) may write the
 //! cache directory at a time.  `CacheLock::acquire` fails immediately with
 //! [`CounterpartyError::WriterLocked`] if another holder owns the lock — there
-//! is no retry or spin.  The caller at `cache::StellarTomlResolver::refresh` is
-//! responsible for surfacing `WriterLocked` to the policy criterion so the
-//! criterion can fall back to the cached (possibly stale) value rather than
-//! blocking.
+//! is no retry or spin.  `cache::StellarTomlResolver::refresh` returns
+//! `WriterLocked` to its caller, the CLI `counterparty refresh` or
+//! `counterparty warm-up`.  The listing that feeds the policy criteria takes
+//! no lock, so a held lock does not block criterion evaluation.
 //!
 //! # Drop discipline
 //!

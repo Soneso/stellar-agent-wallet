@@ -22,7 +22,7 @@
 //!   encodes domain A but the caller queries domain B whose sanitised filename
 //!   collides with A, `Ok(None)` is returned.
 //! - `stale_if_error=true` returns `Ok(None)` when the stale cache's HMAC
-//!   verification fails (tampered file — the guard must not surfacea stale
+//!   verification fails (tampered file: the guard must not surface a stale
 //!   entry whose integrity is in doubt).
 //!
 //! builder.rs
@@ -484,6 +484,7 @@ async fn refresh_keyring_entry_with_invalid_base64_returns_keyring_unavailable()
 
     let resolver = StellarTomlResolver::with_test_base_url(
         &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
         tmp.path(),
         Duration::from_secs(3600),
         http_client,
@@ -656,6 +657,7 @@ async fn stale_if_error_domain_mismatch_returns_none() {
     // First: write a cache entry for domain_a using the live mock server.
     let writer = StellarTomlResolver::with_test_base_url(
         &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
         tmp.path(),
         Duration::from_secs(3600),
         http_client.clone(),
@@ -686,6 +688,7 @@ async fn stale_if_error_domain_mismatch_returns_none() {
     // must fire and return `Ok(None)`, propagating the original fetch error.
     let stale_resolver = StellarTomlResolver::with_test_base_url(
         &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
         tmp.path(),
         Duration::from_secs(3600),
         http_client,
@@ -744,6 +747,7 @@ async fn stale_if_error_hmac_mismatch_cache_returns_fetch_error() {
 
     let writer = StellarTomlResolver::with_test_base_url(
         &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
         tmp.path(),
         Duration::from_secs(3600),
         http_client.clone(),
@@ -766,6 +770,7 @@ async fn stale_if_error_hmac_mismatch_cache_returns_fetch_error() {
     // return `Ok(None)`, and the original FetchFailed error will propagate.
     let stale_resolver = StellarTomlResolver::with_test_base_url(
         &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
         tmp.path(),
         Duration::from_secs(3600),
         http_client,

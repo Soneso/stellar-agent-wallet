@@ -2574,4 +2574,83 @@ mod tests {
         ensure_platform_keyring_store().unwrap();
         assert_eq!(read_rpc_credential(&entry).unwrap().as_str(), "kept");
     }
+    #[test]
+    #[serial_test::serial]
+    fn a_rotation_is_visible_to_another_headless_store_handle() {
+        use keyring_core::api::CredentialStoreApi as _;
+        use stellar_agent_headless_keyring::{crypto::ProtectionMode, store::HeadlessStore};
+        // Restores the process-wide default store before the temp store is dropped.
+        let _restore = RestoreStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.keyring");
+        let mode = ProtectionMode::EnvKey(std::sync::Arc::new(zeroize::Zeroizing::new([7; 32])));
+        let first = std::sync::Arc::new(HeadlessStore::new(path.clone(), mode.clone()));
+        let second = HeadlessStore::new(path, mode);
+        let entry = second.build("rotation-visible", "default", None).unwrap();
+        keyring_core::set_default_store(first);
+        rotate_keyring_secret_32("rotation-visible", "default").unwrap();
+        let before = entry.get_password().unwrap();
+        rotate_keyring_secret_32("rotation-visible", "default").unwrap();
+        let after = entry.get_password().unwrap();
+        assert_ne!(after, before);
+        assert_eq!(
+            after,
+            keyring_core::Entry::new("rotation-visible", "default")
+                .unwrap()
+                .get_password()
+                .unwrap()
+        );
+    }
+
+    /// The key-scope enumeration reserves the tip-anchor coordinate the keyed
+    /// audit writer reads (`keyed_audit_access`), for a log at an explicit path.
+    #[test]
+    #[serial_test::serial]
+    fn key_scope_reserves_the_audit_writer_tip_anchor() {
+        use stellar_agent_core::profile::key_scope::{
+            Coordinate, KeyScopeKind, SharedRecovery, key_scope_findings_in_dir,
+        };
+        use stellar_agent_core::profile::loader::save_to_dir;
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let dir = home.path().join("profiles");
+        std::fs::create_dir_all(&dir).unwrap();
+        let named = |name: &str| {
+            let signer = KeyringEntryRef::default_signer(name);
+            let nonce = KeyringEntryRef::default_nonce(name);
+            Profile::builder_mainnet_named(
+                name,
+                "https://rpc.example",
+                &signer.service,
+                &signer.account,
+                &nonce.service,
+                &nonce.account,
+            )
+            .build()
+        };
+        let mut alice = named("alice");
+        alice.audit_log_path = home.path().join("explicit-audit.jsonl");
+        let anchor =
+            KeyringTipAnchorStore::new(&alice.audit_log_hash_chain_key_id, &alice.audit_log_path)
+                .anchor_entry_ref()
+                .clone();
+        let mut bob = named("bob");
+        bob.audit_log_path = home.path().join("other-audit.jsonl");
+        bob.attestation_key_id = anchor.clone();
+        save_to_dir("alice", &alice, &dir).unwrap();
+        save_to_dir("bob", &bob, &dir).unwrap();
+        let findings = key_scope_findings_in_dir(&alice, "alice", &dir);
+        assert!(
+            findings.iter().any(|finding| matches!(
+                &finding.kind,
+                KeyScopeKind::SharedWithSibling {
+                    field: "audit_log_hash_chain_key_id (tip anchor)",
+                    coordinate,
+                    recovery: SharedRecovery::CorrectTheSiblingFile,
+                    ..
+                } if *coordinate == Coordinate::from(&anchor)
+            )),
+            "{findings:?}"
+        );
+    }
 }

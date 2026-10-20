@@ -56,6 +56,7 @@
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{ValidationError, WalletError};
 use stellar_agent_core::observability::redact_path_in_message;
+use stellar_agent_core::profile::key_scope::{self, KeyScopeConflict};
 use stellar_agent_core::profile::loader as profile_loader;
 use stellar_agent_core::profile::name::{
     ProfileNameMismatch, ProfileStateLayout, ResolvedProfileName, check_mainnet_selection,
@@ -103,6 +104,9 @@ pub(crate) enum ProfileAccessError {
     /// The file loaded, but its `policy_owner_key_id.service` names a different
     /// profile than the one selected.
     NameMismatch(ProfileNameMismatch),
+    /// A mainnet profile's keyring references conflict with their host-local
+    /// scope.
+    KeyScopeConflict(KeyScopeConflict),
 }
 
 impl ProfileAccessError {
@@ -115,6 +119,7 @@ impl ProfileAccessError {
     /// raw and typed routes agree.
     /// Other load failures keep `profile.load_failed`.
     /// A name mismatch reports `profile.name_mismatch`.
+    /// A key-scope conflict reports `profile.key_scope_conflict`.
     ///
     /// [`ProfileLoadError::to_validation_error`]: profile_loader::ProfileLoadError::to_validation_error
     pub(crate) fn code(&self) -> &'static str {
@@ -137,6 +142,7 @@ impl ProfileAccessError {
             }
             Self::Load(_) => "profile.load_failed",
             Self::NameMismatch(_) => PROFILE_NAME_MISMATCH_CODE,
+            Self::KeyScopeConflict(conflict) => ValidationError::from(conflict.clone()).code(),
         }
     }
 
@@ -150,6 +156,7 @@ impl ProfileAccessError {
             Self::Load(load_err) => {
                 WalletError::Validation(load_err.to_validation_error(requested_name))
             }
+            Self::KeyScopeConflict(conflict) => WalletError::Validation(conflict.clone().into()),
             Self::NameMismatch(_) => {
                 WalletError::Validation(ValidationError::ProfileNameMismatch {
                     detail: self.message(requested_name),
@@ -174,6 +181,7 @@ impl ProfileAccessError {
         let rendered = match self {
             Self::Load(e) => format!("profile '{requested_name}' failed to load: {e}"),
             Self::NameMismatch(mismatch) => mismatch.message(CLI_STATE_LAYOUT),
+            Self::KeyScopeConflict(conflict) => return conflict.detail.clone(),
         };
         redact_path_in_message(&rendered)
     }
@@ -189,6 +197,7 @@ impl ProfileAccessError {
         matches!(
             self,
             Self::NameMismatch(_)
+                | Self::KeyScopeConflict(_)
                 | Self::Load(
                     profile_loader::ProfileLoadError::NonOverlayableField { .. }
                         | profile_loader::ProfileLoadError::OverlayMayOnlyTighten { .. }
@@ -205,6 +214,7 @@ impl std::fmt::Display for ProfileAccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Load(e) => write!(f, "{e}"),
+            Self::KeyScopeConflict(conflict) => f.write_str(&conflict.detail),
             Self::NameMismatch(mismatch) => {
                 f.write_str(&redact_path_in_message(&mismatch.message(CLI_STATE_LAYOUT)))
             }
@@ -212,17 +222,23 @@ impl std::fmt::Display for ProfileAccessError {
     }
 }
 
-/// Loads the resolved profile and refuses it when its owner-key coordinate
-/// names a different profile.
+/// Loads the resolved profile and reconciles it.
+///
+/// The owner-key coordinate must name the requested profile, and the mainnet
+/// selection rule applies. The keyring references must stay within the
+/// profile's host-local scope. A mainnet conflict refuses, and a testnet
+/// conflict warns on target `profile.key_scope`.
 ///
 /// The resolved name retains the input that selected the profile.
 ///
 /// # Errors
 ///
-/// [`ProfileAccessError::Load`] for any loader failure — including a
-/// `NotFound`, which this function never replaces with a synthesised profile —
-/// and [`ProfileAccessError::NameMismatch`] when the file names another
-/// profile.
+/// Returns [`ProfileAccessError::Load`] for any loader failure and for a
+/// refused mainnet selection. A `NotFound` stays a load error, because this
+/// function never replaces it with a synthesised profile. Returns
+/// [`ProfileAccessError::NameMismatch`] when the file names another profile,
+/// and [`ProfileAccessError::KeyScopeConflict`] when a mainnet profile names a
+/// keyring entry outside its scope (`profile.key_scope_conflict`).
 pub(crate) fn load_profile_reconciled(
     resolved: &ResolvedProfileName,
 ) -> Result<Profile, ProfileAccessError> {
@@ -261,9 +277,10 @@ pub(crate) fn injected_profile_load(
 ///
 /// # Errors
 ///
-/// [`ProfileAccessError::Load`] carries `loaded`'s error unchanged;
-/// [`ProfileAccessError::NameMismatch`] when the loaded file names another
-/// profile.
+/// [`ProfileAccessError::Load`] carries `loaded`'s error unchanged, or a
+/// refused mainnet selection; [`ProfileAccessError::NameMismatch`] when the
+/// loaded file names another profile; [`ProfileAccessError::KeyScopeConflict`]
+/// when a mainnet profile names a keyring entry outside its scope.
 pub(crate) fn reconcile_loaded_profile(
     loaded: Result<Profile, profile_loader::ProfileLoadError>,
     resolved: &ResolvedProfileName,
@@ -272,13 +289,18 @@ pub(crate) fn reconcile_loaded_profile(
 }
 
 /// Refuses `profile` when its owner-key coordinate names a profile other than
-/// `requested_name`.
+/// `resolved.name`, or when the mainnet selection rule refuses it. It also
+/// refuses when the key-scope check finds a mainnet conflict
+/// ([`ProfileAccessError::KeyScopeConflict`]). A testnet conflict is logged at
+/// `warn` on target `profile.key_scope`, and the profile loads.
 ///
 /// Every LOADED profile in this module funnels through here, so no caller can
 /// obtain a profile read from disk that has not been reconciled. The synthesis
 /// branch of [`load_profile_or_synthesize_testnet_with`] does not call it, and
 /// must not: that profile is built from the requested name by
 /// [`Profile::builder_testnet_named`] and is self-consistent by construction.
+/// That branch runs the key-scope check on its own, because sibling files can
+/// still name the synthesized profile's default entries.
 fn reconcile(
     profile: Profile,
     resolved: &ResolvedProfileName,
@@ -287,6 +309,8 @@ fn reconcile(
         return Err(ProfileAccessError::NameMismatch(mismatch));
     }
     check_mainnet_selection(&profile, resolved).map_err(ProfileAccessError::Load)?;
+    key_scope::enforce_key_scope(&profile, &resolved.name)
+        .map_err(ProfileAccessError::KeyScopeConflict)?;
     Ok(profile)
 }
 
@@ -377,7 +401,10 @@ pub(crate) use stellar_agent_core::profile::loader::ProfileOrigin;
 /// requested name exactly as [`load_profile_reconciled`] reconciles it. A
 /// [`ProfileOrigin::Synthesized`] one is not, because
 /// [`Profile::builder_testnet_named`] derives its owner coordinate from the
-/// same name it is built under and is self-consistent by construction.
+/// same name it is built under and is self-consistent by construction. It
+/// runs the key-scope check alone: a sibling file that names one of its
+/// default entries is logged at `warn` on target `profile.key_scope`, as the
+/// MCP server's synthesized fallback reports it.
 ///
 /// # Errors
 ///
@@ -386,7 +413,8 @@ pub(crate) use stellar_agent_core::profile::loader::ProfileOrigin;
 /// schema version, and a `NotFound` for a profile the operator named through
 /// `--profile` or `STELLAR_AGENT_PROFILE`. Returns
 /// [`ProfileAccessError::NameMismatch`] for a file whose owner-key coordinate
-/// names a different profile.
+/// names a different profile, and [`ProfileAccessError::KeyScopeConflict`]
+/// for a mainnet profile that names a keyring entry outside its scope.
 pub(crate) fn load_profile_or_synthesize_testnet(
     resolved: &ResolvedProfileName,
 ) -> Result<(Profile, ProfileOrigin), ProfileAccessError> {
@@ -434,6 +462,8 @@ where
                 wallet
             })
             .build();
+            key_scope::enforce_key_scope(&profile, name)
+                .map_err(ProfileAccessError::KeyScopeConflict)?;
             Ok((profile, ProfileOrigin::Synthesized))
         }
         Err(e) => Err(ProfileAccessError::Load(e)),
@@ -450,6 +480,11 @@ pub(crate) fn protected_load_errors_for_test() -> Vec<ProfileAccessError> {
     };
 
     vec![
+        ProfileAccessError::KeyScopeConflict(KeyScopeConflict {
+            profile: "mainnet".to_owned(),
+            kind: "shared_with_sibling",
+            detail: "bounded finding".to_owned(),
+        }),
         ProfileAccessError::Load(
             profile_loader::ProfileLoadError::InvalidProviderAttestation {
                 name: "mainnet".to_owned(),
@@ -505,10 +540,11 @@ mod tests {
     #[test]
     fn protected_load_codes_match_typed_and_raw_routes() {
         for error in protected_load_errors_for_test() {
-            let ProfileAccessError::Load(ref load) = error else {
-                panic!("load fixture")
-            };
-            assert_eq!(error.code(), load.to_validation_error("mainnet").code());
+            if let ProfileAccessError::Load(ref load) = error {
+                assert_eq!(error.code(), load.to_validation_error("mainnet").code());
+            } else {
+                assert_eq!(error.code(), "profile.key_scope_conflict");
+            }
             assert_eq!(error.to_wallet_error("mainnet").code(), error.code());
             let value = serde_json::to_value(profile_access_envelope(&error, "mainnet"))
                 .expect("valid test fixture");
@@ -784,7 +820,12 @@ mod tests {
     /// reports `NotFound` for an explicitly-named profile is refused even
     /// though the closure itself performs no check.
     #[test]
+    #[serial_test::serial]
     fn the_injected_loader_is_not_where_the_decision_lives() {
+        // The synthesized branch lists the profiles directory for its
+        // key-scope check; keep that read inside a temporary data root.
+        let home = tempfile::tempdir().expect("valid test fixture");
+        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let not_found = |name: &str| {
             Err(profile_loader::ProfileLoadError::NotFound {
                 name: name.to_owned(),
@@ -885,7 +926,10 @@ mod tests {
     /// The synthesized zero-config profile reconciles against the name it was
     /// synthesized for, so the fallback is never refused by its own check.
     #[test]
+    #[serial_test::serial]
     fn the_synthesized_profile_reconciles_against_its_own_name() {
+        let home = tempfile::tempdir().expect("valid test fixture");
+        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let not_found = |name: &str| {
             Err(profile_loader::ProfileLoadError::NotFound {
                 name: name.to_owned(),
@@ -903,6 +947,64 @@ mod tests {
             stellar_agent_core::profile::name::profile_name_mismatch_refusal(&profile, "default"),
             None,
             "the synthesized profile must be self-consistent by construction"
+        );
+    }
+
+    /// The synthesized profile runs the key-scope check: a sibling file that
+    /// names one of its default entries is logged at `warn` on target
+    /// `profile.key_scope`, and the testnet profile still loads.
+    #[test]
+    #[serial_test::serial]
+    fn synthesized_profile_warns_when_a_sibling_names_its_default_entry() {
+        use stellar_agent_core::profile::schema::KeyringEntryRef;
+        use stellar_agent_test_support::CaptureWriter;
+        let home = tempfile::tempdir().expect("valid test fixture");
+        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let own_entry = KeyringEntryRef::default_attestation_key("default");
+        let mut sibling = Profile::builder_testnet_named(
+            "bob",
+            "stellar-agent-signer",
+            "bob",
+            "stellar-agent-nonce",
+            "bob",
+        )
+        .build();
+        sibling.attestation_key_id = own_entry.clone();
+        profile_loader::save_to_dir("bob", &sibling, &home.path().join("profiles"))
+            .expect("valid test fixture");
+        let not_found = |name: &str| {
+            Err(profile_loader::ProfileLoadError::NotFound {
+                name: name.to_owned(),
+                path: std::path::PathBuf::from("/nonexistent"),
+            })
+        };
+
+        let capture = CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            load_profile_or_synthesize_testnet_with(
+                &resolved("default", ProfileNameSource::Default),
+                not_found,
+            )
+        });
+
+        let (profile, origin) = result.expect("a testnet finding only warns");
+        assert_eq!(origin, ProfileOrigin::Synthesized);
+        assert_eq!(profile.attestation_key_id, own_entry);
+        let output = capture.captured_str();
+        assert!(output.contains("profile.key_scope"), "{output}");
+        assert!(
+            output.contains(
+                "profile 'default': its entry 'stellar-agent-attestation-default/default' \
+                 (attestation_key_id) is also named by profile 'bob' as attestation_key_id"
+            ),
+            "{output}"
         );
     }
 
@@ -1069,8 +1171,11 @@ mod tests {
 mod synthesis_posture_tests {
     #![allow(clippy::expect_used, reason = "test fixture assertions")]
     #[test]
+    #[serial_test::serial]
     fn synthesized_profile_uses_warn_posture() {
         use super::*;
+        let home = tempfile::tempdir().expect("valid test fixture");
+        let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let resolved = ResolvedProfileName {
             name: "default".into(),
             source: stellar_agent_core::profile::ProfileNameSource::Default,

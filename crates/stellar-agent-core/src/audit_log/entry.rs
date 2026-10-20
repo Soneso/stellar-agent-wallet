@@ -2687,27 +2687,25 @@ impl AuditEntry {
         }
     }
 
-    /// Constructs a `PolicyWindowStateReset` audit entry.
+    /// Records `profile reset-window-state` before the store mutation.
     ///
-    /// Emitted by `policy reset-window-state --profile <p>` after the
-    /// persisted policy-window-state store is re-initialised to empty.
-    /// `reason` is bounded to [`crate::audit_log::schema::RECORDED_STR_MAX`]
-    /// characters via `crate::audit_log::schema::bound_recorded_str`. Not
-    /// policy-gated, so `policy_decision` is `Allow`; `chain_id` is absent —
-    /// the reset is chain-independent.
+    /// The caller holds the audit writer and window lock while capturing and
+    /// recording the accrual. The row identifies the profile's chain.
     #[must_use]
     pub fn new_policy_window_state_reset(
         tool: impl Into<String>,
         profile: impl Into<String>,
         reason: impl Into<String>,
         request_id: impl Into<String>,
+        chain_id: impl Into<String>,
+        wiped: crate::audit_log::schema::WipedAccrualRecord,
     ) -> Self {
         use crate::audit_log::schema::bound_recorded_str;
         let reason = reason.into();
         Self {
             ts: current_iso8601_utc(),
             tool: tool.into(),
-            chain_id: None,
+            chain_id: Some(chain_id.into()),
             arg_keys: vec![],
             arg_keys_truncated: None,
             truncated: false,
@@ -2719,6 +2717,7 @@ impl AuditEntry {
             event_kind: EventKind::PolicyWindowStateReset {
                 profile: profile.into(),
                 reason: bound_recorded_str(&reason),
+                wiped: Some(wiped),
             },
             previous_entry_hash: String::new(),
         }

@@ -496,7 +496,7 @@ Subcommands: `list`, `refresh`, `evict`, `warm-up`, `rotate-hmac-key`.
 
 ### `stellar-agent counterparty list [flags]`
 
-Lists the cached bindings for a profile: home domain plus fetched and expiry timestamps. Entries whose HMAC fails verification are silently skipped. Read-only (local cache read).
+Lists the cached bindings for a profile: home domain plus fetched and expiry timestamps. The command logs a warning for an entry whose HMAC fails verification and skips it. `stellar-agent counterparty refresh <domain>` rewrites the affected entry. `stellar-agent counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. Read-only (local cache read).
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
@@ -548,6 +548,13 @@ stellar-agent counterparty warm-up --profile default
 ### `stellar-agent counterparty rotate-hmac-key [flags]`
 
 Rotates the per-profile counterparty cache HMAC key. After rotation, existing cache files fail verification and must be refreshed. Rotates a keyring secret; signs no transaction. This is the same keyring entry (`counterparty_cache_key_id`) that `stellar-agent profile rotate-counterparty-key <NAME>` rotates (see [profile and governance](profile-and-governance.md)); the two verbs are interchangeable entry points to the same rotation.
+
+The counterparty cache reads and mints its HMAC key at
+`counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.
+With an explicit reference, previously cached entries read as absent until
+a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry
+for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN`
+entries of the policy allowlist.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|

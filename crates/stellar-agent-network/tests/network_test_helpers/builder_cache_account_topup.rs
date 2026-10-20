@@ -760,6 +760,7 @@ ACCOUNTS = ["GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY"]
 
     let resolver = StellarTomlResolver::with_test_base_url(
         &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
         dir.path(),
         Duration::from_secs(3600),
         client,
@@ -930,8 +931,13 @@ async fn list_cached_ignores_non_toml_cache_files() {
         .set_password(&key_b64)
         .expect("set mock key in keyring");
 
-    let resolver = StellarTomlResolver::new(&profile, dir.path(), Duration::from_secs(3600))
-        .expect("resolver construction");
+    let resolver = StellarTomlResolver::new(
+        &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
+        dir.path(),
+        Duration::from_secs(3600),
+    )
+    .expect("resolver construction");
 
     let bindings = resolver
         .list_cached()

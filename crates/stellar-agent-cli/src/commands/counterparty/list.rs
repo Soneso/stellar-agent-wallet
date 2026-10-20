@@ -148,7 +148,7 @@ pub async fn run(args: &ListArgs) -> i32 {
     // ── Step 1: load profile (fails fast on nonexistent profile).
     // Reconciled: a profile file whose owner-key coordinate names a
     // different profile is refused rather than used under this name.
-    let _profile = match load_profile_reconciled(&resolved_profile) {
+    let profile = match load_profile_reconciled(&resolved_profile) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
@@ -177,14 +177,18 @@ pub async fn run(args: &ListArgs) -> i32 {
     }
 
     // ── Step 4: construct the resolver.
-    let resolver =
-        match StellarTomlResolver::new(&profile_name, &cache_dir, Duration::from_secs(3600)) {
-            Ok(r) => r,
-            Err(e) => {
-                render::render_json(&to_counterparty_envelope(&e));
-                return 1;
-            }
-        };
+    let resolver = match StellarTomlResolver::new(
+        &profile_name,
+        profile.counterparty_cache_key_id.clone(),
+        &cache_dir,
+        Duration::from_secs(3600),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            render::render_json(&to_counterparty_envelope(&e));
+            return 1;
+        }
+    };
 
     // ── Step 5: list cached bindings.
     match resolver.list_cached().await {

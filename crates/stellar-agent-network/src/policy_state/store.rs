@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::Sha256;
+use stellar_agent_core::audit_log::schema::{PreviousState, WipedAccrualRecord, WipedBucket};
 use stellar_agent_core::policy::DenyReason;
 use stellar_agent_core::policy::v1::criteria::state_store::{
     CLOCK_SKEW_TOLERANCE_MS, PolicyStateStore, StateKey, StateStoreError, WindowEntry,
@@ -17,7 +18,7 @@ use stellar_agent_core::policy::v1::criteria::state_store::{
 use stellar_agent_core::profile::owner_key::{self, OwnerKeyContext};
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_core::profile::schema::{
-    KeyringEntryRef, Profile, default_policy_window_state_path_for,
+    KeyringEntryRef, Profile, default_policy_window_state_path_for, generation_account,
 };
 use subtle::ConstantTimeEq as _;
 
@@ -353,12 +354,39 @@ pub struct MintOutcome {
     pub newly_minted: bool,
 }
 
+/// Successful recorded reset, including the snapshot written before mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetOutcome {
+    /// Whether the reset minted a key.
+    pub mint: MintOutcome,
+    /// Accrual passed to the recorder.
+    pub accrual: WipedAccrualRecord,
+}
+
+/// Failure of the recorded reset ceremony.
+#[derive(Debug, thiserror::Error)]
+pub enum ResetError<E> {
+    /// Store failure before or after the row was recorded.
+    #[error("{error}")]
+    Store {
+        /// Underlying store failure.
+        error: WindowStoreError,
+        /// Whether this reset minted a key before failing.
+        minted: bool,
+    },
+    /// The recorder refused; durable store state is unchanged.
+    #[error("{0}")]
+    Recorder(E),
+}
+
 /// The HMAC-protected, single-writer, atomically-written per-profile policy
 /// window-state store. See the [`super`] module docs for the full design.
 #[derive(Debug, Clone)]
 pub struct PersistedWindowStore {
     path: PathBuf,
 }
+
+type ResetSnapshot = (Option<zeroize::Zeroizing<[u8; 32]>>, WipedAccrualRecord);
 
 impl PersistedWindowStore {
     /// Constructs a store handle for the OS-conventional path for
@@ -885,37 +913,131 @@ impl PersistedWindowStore {
         Ok(report)
     }
 
-    /// Re-initialises the store file to empty and bumps the generation
-    /// counter past whatever value it last held (re-baselining both), signed
-    /// under the (lazily-minted) HMAC key. Does NOT validate the pre-existing
-    /// file's HMAC or generation first — this IS the recovery path for a
-    /// tampered, deleted, or rolled-back store, so it must succeed
-    /// unconditionally rather than requiring the very state it exists to
-    /// repair.
+    /// Records the live accrual under the window lock, then replaces the store
+    /// with an authenticated empty body at the next generation.
     ///
-    /// The caller emits the `PolicyWindowStateReset` audit row — BEFORE
-    /// calling this method (see the CLI command's rustdoc for the ordering
-    /// rationale); this method performs the file + keyring generation
-    /// mutation only.
+    /// The recorder runs before minting a key or writing either durable state.
+    /// An unverifiable file carries no totals; read and keyring errors refuse.
     ///
     /// # Errors
     ///
-    /// See [`WindowStoreError`].
-    pub fn reset(&self, profile: &Profile) -> Result<MintOutcome, WindowStoreError> {
-        self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire(&self.lock_path())?;
-        let (key, mint_outcome) = self.load_or_mint_key(profile)?;
-        let gen_entry = generation_entry_ref(profile);
-        let new_generation = next_generation(&gen_entry)?;
-        let empty = WireFile {
-            version: WIRE_VERSION,
-            generation: new_generation,
-            entries: Vec::new(),
-            prepared: None,
+    /// Returns a store failure or the recorder's refusal. A store failure reports
+    /// whether this operation minted a key before it failed.
+    pub fn reset<E>(
+        &self,
+        profile: &Profile,
+        now_ms: u64,
+        record: impl FnOnce(&WipedAccrualRecord) -> Result<(), E>,
+    ) -> Result<ResetOutcome, ResetError<E>> {
+        let before_mint = |error| ResetError::Store {
+            error,
+            minted: false,
         };
-        write_generation(&gen_entry, &empty)?;
-        self.write_atomic(&key, &empty)?;
-        Ok(mint_outcome)
+        self.ensure_parent_dir().map_err(before_mint)?;
+        let _lock = WindowStoreLock::acquire(&self.lock_path()).map_err(before_mint)?;
+        let (key, accrual) = self.reset_snapshot(profile, now_ms).map_err(before_mint)?;
+        record(&accrual).map_err(ResetError::Recorder)?;
+        let mut minted = false;
+        let mutation = (|| {
+            let key = match key {
+                Some(key) => key,
+                None => {
+                    let entry = &profile.policy_window_state_key_id;
+                    crate::keyring::rotate_keyring_secret_32(&entry.service, &entry.account)
+                        .map_err(|e| WindowStoreError::Keyring {
+                            detail: e.to_string(),
+                        })?;
+                    minted = true;
+                    crate::keyring::load_hmac_key_32(entry).map_err(|e| {
+                        WindowStoreError::Keyring {
+                            detail: e.to_string(),
+                        }
+                    })?
+                }
+            };
+            let empty = WireFile {
+                version: WIRE_VERSION,
+                generation: accrual.generation_after,
+                entries: Vec::new(),
+                prepared: None,
+            };
+            write_generation(&generation_entry_ref(profile), &empty)?;
+            self.write_atomic(&key, &empty)
+        })();
+        mutation.map_err(|error| ResetError::Store { error, minted })?;
+        Ok(ResetOutcome {
+            mint: MintOutcome {
+                newly_minted: minted,
+            },
+            accrual,
+        })
+    }
+
+    fn reset_snapshot(
+        &self,
+        profile: &Profile,
+        now_ms: u64,
+    ) -> Result<ResetSnapshot, WindowStoreError> {
+        use stellar_agent_core::error::{AuthError, InternalError, WalletError};
+        refuse_owner_coordinate(profile)?;
+        let key = match crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id) {
+            Ok(key) => {
+                refuse_owner_public_key(
+                    key.as_ref(),
+                    &OwnerKeyContext::for_loaded_profile(profile),
+                )?;
+                Some(key)
+            }
+            Err(WalletError::Auth(AuthError::KeyringNotFound { .. })) => None,
+            // A stored value that is not base64 or not 32 bytes is no usable
+            // key: the file is unverifiable and the key is replaced after the row.
+            Err(WalletError::Internal(InternalError::UnexpectedState { detail }))
+                if detail.starts_with("audit.key_length_error:")
+                    || detail.starts_with("audit.key_decode_failed:") =>
+            {
+                None
+            }
+            Err(e) => {
+                return Err(WindowStoreError::Keyring {
+                    detail: e.to_string(),
+                });
+            }
+        };
+        let counter = load_counter(&generation_entry_ref(profile))?;
+        let generation_before = counter.as_ref().map(|state| state.generation);
+        let generation_after = increment_generation(generation_before.unwrap_or(0))?;
+        let mut accrual = WipedAccrualRecord {
+            previous: PreviousState::Missing,
+            entry_count: 0,
+            buckets: Vec::new(),
+            truncated: false,
+            generation_before,
+            generation_after,
+        };
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((key, accrual)),
+            Err(e) => return Err(WindowStoreError::Io { kind: e.kind() }),
+        };
+        accrual.previous = PreviousState::Unverifiable;
+        if let Some(key) = &key {
+            match self
+                .verify_with_key(key, &bytes)
+                .and_then(|wire| select_generation(wire, counter))
+            {
+                Ok(wire) => {
+                    accrual.previous = PreviousState::Verified;
+                    snapshot_accrual(&wire, now_ms, &mut accrual);
+                }
+                Err(
+                    WindowStoreError::HmacMismatch
+                    | WindowStoreError::Invalid { .. }
+                    | WindowStoreError::GenerationMismatch,
+                ) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((key, accrual))
     }
 
     /// Verifies the store file's HMAC tag under `key` WITHOUT checking the
@@ -1361,7 +1483,7 @@ impl PersistedWindowStore {
     /// Reads and fully verifies (HMAC, then anti-rollback generation) the
     /// current file, or establishes the genuine-first-run empty state.
     /// Requires an already-available `key` — used by
-    /// [`Self::record_and_persist`] / [`Self::reset`], both of which hold one
+    /// [`Self::record_and_persist`], which holds one
     /// via [`Self::load_or_mint_key`] (which mints on first use) before
     /// calling this. NOT used by [`Self::load_into`]: that method must not
     /// force a key load (and thus a `Keyring` error) for a profile that has
@@ -1499,7 +1621,7 @@ impl PersistedWindowStore {
 /// correctly-associated generation entry.
 fn generation_entry_ref(profile: &Profile) -> KeyringEntryRef {
     let base = &profile.policy_window_state_key_id;
-    KeyringEntryRef::new(base.service.clone(), format!("{}-generation", base.account))
+    KeyringEntryRef::new(base.service.clone(), generation_account(&base.account))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1593,8 +1715,11 @@ fn load_generation(entry_ref: &KeyringEntryRef) -> Result<Option<u64>, WindowSto
 }
 
 fn next_generation(entry_ref: &KeyringEntryRef) -> Result<u64, WindowStoreError> {
-    load_generation(entry_ref)?
-        .unwrap_or(0)
+    increment_generation(load_generation(entry_ref)?.unwrap_or(0))
+}
+
+fn increment_generation(generation: u64) -> Result<u64, WindowStoreError> {
+    generation
         .checked_add(1)
         .ok_or_else(|| WindowStoreError::Invalid {
             detail: "policy window-state generation counter overflow".to_owned(),
@@ -1894,8 +2019,6 @@ fn collect_pending(wire: &WireFile) -> Vec<WindowReservation> {
 /// dated by a ledger close time or by the host at authorization, count even
 /// when they are ahead of the host clock.
 fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128, u32), DenyReason> {
-    let window_ms = key.window_secs().saturating_mul(1_000);
-    let cutoff = now_ms.saturating_sub(window_ms);
     let future_limit = now_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
     let mut sum: i128 = 0;
     let mut count: u32 = 0;
@@ -1916,7 +2039,7 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
                     .to_string(),
                 });
             }
-            if record.status != RecordStatus::Pending && record.ts_ms < cutoff {
+            if !record_is_live(record, now_ms, key.window_secs()) {
                 continue;
             }
             sum = sum.saturating_add(record.amount);
@@ -1924,6 +2047,68 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
         }
     }
     Ok((sum, count))
+}
+
+/// Pending holds remain live until their outcome is settled.
+fn record_is_live(record: &WireRecord, now_ms: u64, window_secs: u64) -> bool {
+    record.status == RecordStatus::Pending
+        || record.ts_ms >= now_ms.saturating_sub(window_secs.saturating_mul(1_000))
+}
+
+// Bound serialized bytes as well as characters: JSON escapes expand control text.
+fn bounded_reset_bucket(bucket: &str) -> String {
+    bucket
+        .chars()
+        .take(64)
+        .scan(0, |bytes, ch| {
+            let encoded_len = match ch {
+                '"' | '\\' => 2,
+                ch if ch.is_control() => 6,
+                ch => ch.len_utf8(),
+            };
+            *bytes += encoded_len;
+            (*bytes <= 64).then_some(ch)
+        })
+        .collect()
+}
+
+fn snapshot_accrual(wire: &WireFile, now_ms: u64, accrual: &mut WipedAccrualRecord) {
+    for bucket in &wire.entries {
+        let mut snapshot = WipedBucket {
+            scope_specificity: bucket.scope_specificity,
+            bucket: bounded_reset_bucket(&bucket.bucket),
+            window_secs: bucket.window_secs,
+            confirmed_count: 0,
+            confirmed_total: 0,
+            pending_count: 0,
+            pending_total: 0,
+        };
+        for record in &bucket.records {
+            if !record_is_live(record, now_ms, bucket.window_secs) {
+                continue;
+            }
+            accrual.entry_count = accrual.entry_count.saturating_add(1);
+            match record.status {
+                RecordStatus::Confirmed => {
+                    snapshot.confirmed_count = snapshot.confirmed_count.saturating_add(1);
+                    snapshot.confirmed_total =
+                        snapshot.confirmed_total.saturating_add(record.amount);
+                }
+                RecordStatus::Pending => {
+                    snapshot.pending_count = snapshot.pending_count.saturating_add(1);
+                    snapshot.pending_total = snapshot.pending_total.saturating_add(record.amount);
+                }
+            }
+        }
+        if snapshot.confirmed_count == 0 && snapshot.pending_count == 0 {
+            continue;
+        }
+        if accrual.buckets.len() < 8 {
+            accrual.buckets.push(snapshot);
+        } else {
+            accrual.truncated = true;
+        }
+    }
 }
 
 /// Refuses `entries` when any of them would take its bucket past the limit it
@@ -2268,9 +2453,9 @@ mod tests {
             .record_and_persist(&profile, &[entry(k.clone(), now, 999)])
             .unwrap();
 
-        let outcome = store.reset(&profile).unwrap();
+        let outcome = store.reset(&profile, now, |_| Ok::<(), ()>(())).unwrap();
         assert!(
-            !outcome.newly_minted,
+            !outcome.mint.newly_minted,
             "the key was already minted by record_and_persist"
         );
 
@@ -2451,7 +2636,7 @@ mod tests {
         // reset re-baselines both — recovery succeeds and the store reads
         // empty (the pre-crash history is unrecoverable, by design: the
         // store cannot know whether the un-persisted write was legitimate).
-        store.reset(&profile).unwrap();
+        store.reset(&profile, now, |_| Ok::<(), ()>(())).unwrap();
         let dest2 = PolicyStateStore::new();
         store.load_into("crashgen", &profile, &dest2).unwrap();
         let (sum, count) = dest2.query_window(&k, now + 1_000).unwrap();
@@ -3326,5 +3511,585 @@ mod tests {
             "{message}"
         );
         assert!(refuse_owner_public_key(&[0x11; 32], &owner).is_ok());
+    }
+    struct ResetFixture {
+        _dir: TempDir,
+        profile: Profile,
+        store: PersistedWindowStore,
+    }
+
+    impl ResetFixture {
+        fn new() -> Self {
+            keyring_mock::install().unwrap();
+            let dir = TempDir::new().unwrap();
+            let profile = owner_profile(dir.path(), "reset-snapshot");
+            let store = PersistedWindowStore::at_path(dir.path().join("state.window"));
+            Self {
+                _dir: dir,
+                profile,
+                store,
+            }
+        }
+
+        fn seal(&self, wire: &WireFile) {
+            let (key, _) = self.store.load_or_mint_key(&self.profile).unwrap();
+            self.store.write_atomic(&key, wire).unwrap();
+            write_generation(&generation_entry_ref(&self.profile), wire).unwrap();
+        }
+
+        fn reset(&self) -> ResetOutcome {
+            self.store
+                .reset(&self.profile, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap()
+        }
+    }
+
+    fn reset_wire() -> WireFile {
+        WireFile {
+            version: WIRE_VERSION,
+            generation: 1,
+            prepared: None,
+            entries: vec![WireBucket {
+                scope_specificity: 2,
+                bucket: "native".to_owned(),
+                window_secs: 10,
+                records: vec![WireRecord {
+                    ts_ms: 90_000,
+                    amount: 7,
+                    ..WireRecord::confirmed_defaults()
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reset_snapshot_keeps_inclusive_boundary_and_pending_records() {
+        let f = ResetFixture::new();
+        let mut wire = reset_wire();
+        wire.entries[0].records.extend([
+            WireRecord {
+                ts_ms: 89_999,
+                amount: 100,
+                ..WireRecord::confirmed_defaults()
+            },
+            WireRecord {
+                ts_ms: 95_000,
+                amount: 11,
+                ..WireRecord::confirmed_defaults()
+            },
+            WireRecord {
+                ts_ms: 0,
+                amount: 13,
+                status: RecordStatus::Pending,
+                ..WireRecord::confirmed_defaults()
+            },
+            WireRecord {
+                ts_ms: u64::MAX,
+                amount: 17,
+                status: RecordStatus::Pending,
+                ..WireRecord::confirmed_defaults()
+            },
+        ]);
+        let mut other = wire.entries[0].clone();
+        other.scope_specificity = 3;
+        other.records.truncate(1);
+        wire.entries.push(other);
+        f.seal(&wire);
+        let outcome = f.reset();
+        let row = outcome.accrual;
+        assert_eq!(row.previous, PreviousState::Verified);
+        assert_eq!(row.entry_count, 5);
+        assert_eq!((row.generation_before, row.generation_after), (Some(1), 2));
+        assert_eq!(row.buckets.len(), 2);
+        assert_eq!(row.buckets[0].scope_specificity, 2);
+        assert_eq!(row.buckets[1].scope_specificity, 3);
+        assert_eq!(
+            (
+                row.buckets[0].confirmed_count,
+                row.buckets[0].confirmed_total
+            ),
+            (2, 18)
+        );
+        assert_eq!(
+            (row.buckets[0].pending_count, row.buckets[0].pending_total),
+            (2, 30)
+        );
+        assert!(!row.truncated);
+        assert_eq!(
+            load_generation(&generation_entry_ref(&f.profile)).unwrap(),
+            Some(2)
+        );
+        let empty = f.store.read_for_inspection(&f.profile).unwrap().unwrap();
+        assert_eq!(empty.generation, 2);
+        assert!(empty.entries.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn reset_totals_saturate() {
+        let f = ResetFixture::new();
+        let mut wire = reset_wire();
+        wire.entries[0].records = [RecordStatus::Confirmed, RecordStatus::Pending]
+            .into_iter()
+            .flat_map(|status| {
+                [i128::MAX, 1].map(|amount| WireRecord {
+                    ts_ms: 100_000,
+                    status,
+                    amount,
+                    ..WireRecord::confirmed_defaults()
+                })
+            })
+            .collect();
+        f.seal(&wire);
+        let row = f.reset().accrual;
+        assert_eq!(row.buckets[0].confirmed_total, i128::MAX);
+        assert_eq!(row.buckets[0].pending_total, i128::MAX);
+    }
+
+    #[test]
+    #[serial]
+    fn reset_omits_empty_buckets_and_caps_live_buckets_in_file_order() {
+        let f = ResetFixture::new();
+        let mut wire = reset_wire();
+        let live = wire.entries[0].clone();
+        wire.entries[0].records[0].ts_ms = 1;
+        for i in 0..9 {
+            let mut bucket = live.clone();
+            bucket.bucket = format!("bucket-{i}");
+            wire.entries.push(bucket);
+        }
+        f.seal(&wire);
+        let row = f.reset().accrual;
+        assert_eq!(row.entry_count, 9);
+        assert!(row.truncated);
+        assert_eq!(
+            row.buckets
+                .iter()
+                .map(|b| b.bucket.as_str())
+                .collect::<Vec<_>>(),
+            (0..8).map(|i| format!("bucket-{i}")).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn reset_largest_row_fits_without_writer_truncation() {
+        use stellar_agent_core::audit_log::AuditEntry;
+        use stellar_agent_core::audit_log::entry::MAX_ENTRY_BYTES;
+        let f = ResetFixture::new();
+        let mut wire = reset_wire();
+        wire.entries[0].bucket = "b".repeat(300);
+        wire.entries = vec![wire.entries[0].clone(); 8];
+        f.seal(&wire);
+        let mut row = f.reset().accrual;
+        for bucket in &mut row.buckets {
+            assert_eq!(bucket.bucket.chars().count(), 64);
+            bucket.confirmed_count = usize::MAX;
+            bucket.pending_count = usize::MAX;
+            bucket.confirmed_total = i128::MIN;
+            bucket.pending_total = i128::MAX;
+            bucket.window_secs = u64::MAX;
+            bucket.scope_specificity = u8::MAX;
+        }
+        row.entry_count = usize::MAX;
+        row.generation_before = Some(u64::MAX - 1);
+        row.generation_after = u64::MAX;
+        let mut entry = AuditEntry::new_policy_window_state_reset(
+            "profile_reset_window_state",
+            "p".repeat(64),
+            "r".repeat(128),
+            "00000000-0000-4000-8000-000000000000",
+            "stellar:mainnet",
+            row,
+        );
+        assert_eq!(entry.chain_id.as_deref(), Some("stellar:mainnet"));
+        // The writer runs this bound at append.
+        entry.truncate_arg_keys_if_needed().unwrap();
+        assert!(!entry.truncated);
+        let json = serde_json::to_vec(&entry).unwrap();
+        assert!(json.len() < MAX_ENTRY_BYTES, "row is {} bytes", json.len());
+    }
+
+    #[test]
+    #[serial]
+    fn reset_escaped_and_multibyte_ids_fit_without_writer_truncation() {
+        use stellar_agent_core::audit_log::AuditEntry;
+        use stellar_agent_core::audit_log::entry::MAX_ENTRY_BYTES;
+        for (id, count) in [("\0", 10), ("\u{10348}", 16)] {
+            let f = ResetFixture::new();
+            let mut wire = reset_wire();
+            wire.entries[0].bucket = id.repeat(300);
+            wire.entries = vec![wire.entries[0].clone(); 8];
+            f.seal(&wire);
+            let mut row = f.reset().accrual;
+            for bucket in &mut row.buckets {
+                assert_eq!(bucket.bucket.chars().count(), count);
+                bucket.confirmed_count = usize::MAX;
+                bucket.pending_count = usize::MAX;
+                bucket.confirmed_total = i128::MIN;
+                bucket.pending_total = i128::MAX;
+                bucket.window_secs = u64::MAX;
+                bucket.scope_specificity = u8::MAX;
+            }
+            row.entry_count = usize::MAX;
+            row.generation_before = Some(u64::MAX - 1);
+            row.generation_after = u64::MAX;
+            let mut entry = AuditEntry::new_policy_window_state_reset(
+                "profile_reset_window_state",
+                "\\".repeat(64),
+                "\0".repeat(128),
+                "00000000-0000-4000-8000-000000000000",
+                "stellar:mainnet",
+                row,
+            );
+            assert_eq!(entry.chain_id.as_deref(), Some("stellar:mainnet"));
+            entry.previous_entry_hash = format!("sha256:{}", "f".repeat(64));
+            // The writer runs this bound at append.
+            entry.truncate_arg_keys_if_needed().unwrap();
+            assert!(!entry.truncated);
+            let json = serde_json::to_vec(&entry).unwrap();
+            assert!(json.len() < MAX_ENTRY_BYTES, "row is {} bytes", json.len());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reset_snapshots_the_committed_prepared_successor() {
+        let f = ResetFixture::new();
+        let mut original = reset_wire();
+        let mut next = original.clone();
+        next.generation = 2;
+        next.entries[0].records[0].amount = 101;
+        original.prepared = Some(Box::new(next.clone()));
+        f.seal(&original);
+        write_generation(&generation_entry_ref(&f.profile), &next).unwrap();
+        let row = f.reset().accrual;
+        assert_eq!(row.previous, PreviousState::Verified);
+        assert_eq!(row.buckets[0].confirmed_total, 101);
+        assert_eq!(row.generation_before, Some(2));
+    }
+
+    #[test]
+    #[serial]
+    fn reset_tampered_file_is_unverifiable_without_totals() {
+        let f = ResetFixture::new();
+        f.seal(&reset_wire());
+        let mut bytes = fs::read(&f.store.path).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&f.store.path, bytes).unwrap();
+        let row = f.reset().accrual;
+        assert_eq!(row.previous, PreviousState::Unverifiable);
+        assert_eq!(row.entry_count, 0);
+        assert!(row.buckets.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn reset_authentic_rollback_is_unverifiable() {
+        let f = ResetFixture::new();
+        f.seal(&reset_wire());
+        put_raw(&generation_entry_ref(&f.profile), "2");
+        assert_eq!(f.reset().accrual.previous, PreviousState::Unverifiable);
+    }
+
+    #[test]
+    #[serial]
+    fn reset_malformed_and_unsupported_files_are_unverifiable() {
+        let f = ResetFixture::new();
+        f.seal(&reset_wire());
+        let key = crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
+        for body in [
+            b"invalid JSON".to_vec(),
+            serde_json::to_vec(&WireFile {
+                version: WIRE_VERSION_MAX + 1,
+                ..reset_wire()
+            })
+            .unwrap(),
+        ] {
+            f.store
+                .write_atomic_raw(&compute_tag(key.as_ref(), &body).unwrap(), &body)
+                .unwrap();
+            assert_eq!(f.reset().accrual.previous, PreviousState::Unverifiable);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reset_file_without_key_is_unverifiable_and_mints_after_recording() {
+        let f = ResetFixture::new();
+        fs::write(&f.store.path, b"unverifiable").unwrap();
+        let row = f
+            .store
+            .reset(&f.profile, 100_000, |row| {
+                assert!(get_raw(&f.profile.policy_window_state_key_id).is_none());
+                assert_eq!(row.previous, PreviousState::Unverifiable);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(row.mint.newly_minted);
+    }
+
+    #[test]
+    #[serial]
+    fn reset_short_key_is_replaced_after_the_row() {
+        let f = ResetFixture::new();
+        put_raw(&f.profile.policy_window_state_key_id, "AA");
+        fs::write(&f.store.path, b"unverifiable").unwrap();
+        let outcome = f
+            .store
+            .reset(&f.profile, 100_000, |row| {
+                assert_eq!(
+                    get_raw(&f.profile.policy_window_state_key_id).as_deref(),
+                    Some("AA")
+                );
+                assert_eq!(row.previous, PreviousState::Unverifiable);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(outcome.mint.newly_minted);
+        assert!(crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn reset_undecodable_key_is_replaced_after_the_row() {
+        let f = ResetFixture::new();
+        f.seal(&reset_wire());
+        put_raw(&f.profile.policy_window_state_key_id, "not*base64");
+        let outcome = f
+            .store
+            .reset(&f.profile, 100_000, |row| {
+                assert_eq!(
+                    get_raw(&f.profile.policy_window_state_key_id).as_deref(),
+                    Some("not*base64")
+                );
+                assert_eq!(row.previous, PreviousState::Unverifiable);
+                assert!(row.buckets.is_empty());
+                assert_eq!(row.generation_before, Some(1));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(outcome.mint.newly_minted);
+        assert!(crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn reset_key_read_error_refuses_before_recorder() {
+        let f = ResetFixture::new();
+        f.seal(&reset_wire());
+        let old = get_raw(&f.profile.policy_window_state_key_id);
+        keyring_mock::inject_error(
+            &f.profile.policy_window_state_key_id.service,
+            &f.profile.policy_window_state_key_id.account,
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))),
+        )
+        .unwrap();
+        let mut called = false;
+        let result = f.store.reset(&f.profile, 100_000, |_| {
+            called = true;
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(
+            result,
+            Err(ResetError::Store {
+                error: WindowStoreError::Keyring { .. },
+                minted: false,
+            })
+        ));
+        assert!(!called);
+        assert_eq!(get_raw(&f.profile.policy_window_state_key_id), old);
+    }
+
+    #[test]
+    #[serial]
+    fn reset_invalid_counter_refuses_before_recorder() {
+        let f = ResetFixture::new();
+        put_raw(&generation_entry_ref(&f.profile), "invalid commitment");
+        let mut called = false;
+        let result = f.store.reset(&f.profile, 100_000, |_| {
+            called = true;
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(
+            result,
+            Err(ResetError::Store {
+                error: WindowStoreError::Keyring { .. },
+                minted: false,
+            })
+        ));
+        assert!(!called);
+        assert!(get_raw(&f.profile.policy_window_state_key_id).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn reset_read_error_refuses_before_recorder() {
+        let f = ResetFixture::new();
+        fs::create_dir(&f.store.path).unwrap();
+        let mut called = false;
+        let result = f.store.reset(&f.profile, 100_000, |_| {
+            called = true;
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(
+            result,
+            Err(ResetError::Store {
+                error: WindowStoreError::Io { .. },
+                minted: false,
+            })
+        ));
+        assert!(!called);
+        assert!(get_raw(&f.profile.policy_window_state_key_id).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn reset_missing_with_counter_and_first_run_are_distinct() {
+        let f = ResetFixture::new();
+        let first = f.reset().accrual;
+        assert_eq!(first.previous, PreviousState::Missing);
+        assert_eq!(first.generation_before, None);
+        assert_eq!(first.generation_after, 1);
+        fs::remove_file(&f.store.path).unwrap();
+        let next = f.reset().accrual;
+        assert_eq!(next.previous, PreviousState::Missing);
+        assert_eq!(next.generation_before, Some(1));
+        assert_eq!(next.generation_after, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn reset_generation_overflow_refuses_before_recorder() {
+        let f = ResetFixture::new();
+        put_raw(&generation_entry_ref(&f.profile), &u64::MAX.to_string());
+        let mut called = false;
+        let result = f.store.reset(&f.profile, 100_000, |_| {
+            called = true;
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(
+            result,
+            Err(ResetError::Store {
+                error: WindowStoreError::Invalid { .. },
+                minted: false,
+            })
+        ));
+        assert!(!called);
+        assert!(get_raw(&f.profile.policy_window_state_key_id).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn reset_owner_namespace_refuses_before_recorder() {
+        let mut f = ResetFixture::new();
+        f.profile.policy_window_state_key_id = KeyringEntryRef::default_owner_key("another");
+        let mut called = false;
+        let result = f.store.reset(&f.profile, 100_000, |_| {
+            called = true;
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(
+            result,
+            Err(ResetError::Store {
+                error: WindowStoreError::KeyMatchesOwnerPublicKey,
+                minted: false,
+            })
+        ));
+        assert!(!called);
+        assert!(get_raw(&f.profile.policy_window_state_key_id).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn reset_owner_equal_key_refuses_before_recorder() {
+        use base64::Engine as _;
+        let f = ResetFixture::new();
+        let value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(OWNER_KEY);
+        put_raw(&f.profile.policy_window_state_key_id, &value);
+        put_raw(&f.profile.policy_owner_key_id, &value);
+        let mut called = false;
+        let result = f.store.reset(&f.profile, 100_000, |_| {
+            called = true;
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(
+            result,
+            Err(ResetError::Store {
+                error: WindowStoreError::KeyMatchesOwnerPublicKey,
+                minted: false,
+            })
+        ));
+        assert!(!called);
+        assert_eq!(get_raw(&f.profile.policy_window_state_key_id), Some(value));
+    }
+
+    #[test]
+    #[serial]
+    fn reset_recorder_observes_unchanged_state_and_refusal_changes_nothing() {
+        let f = ResetFixture::new();
+        for present in [false, true] {
+            if present {
+                f.seal(&reset_wire());
+            }
+            let before = fs::read(&f.store.path).ok();
+            let key = get_raw(&f.profile.policy_window_state_key_id);
+            let counter = get_raw(&generation_entry_ref(&f.profile));
+            let result = f.store.reset(&f.profile, 100_000, |row| {
+                assert_eq!(fs::read(&f.store.path).ok(), before);
+                assert_eq!(get_raw(&f.profile.policy_window_state_key_id), key);
+                assert_eq!(get_raw(&generation_entry_ref(&f.profile)), counter);
+                assert_eq!(
+                    row.generation_before,
+                    load_generation(&generation_entry_ref(&f.profile)).unwrap()
+                );
+                Err("recorder refused")
+            });
+            assert!(matches!(
+                result,
+                Err(ResetError::Recorder("recorder refused"))
+            ));
+            assert_eq!(fs::read(&f.store.path).ok(), before);
+            assert_eq!(get_raw(&f.profile.policy_window_state_key_id), key);
+            assert_eq!(get_raw(&generation_entry_ref(&f.profile)), counter);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reset_holds_window_lock_during_recorder() {
+        let f = ResetFixture::new();
+        let other = f.store.clone();
+        let mut observed = None;
+        f.store
+            .reset(&f.profile, 100_000, |_| {
+                observed = Some(other.reset(&f.profile, 100_000, |_| Ok::<_, ()>(())));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(matches!(
+            observed,
+            Some(Err(ResetError::Store {
+                error: WindowStoreError::WriterLocked,
+                minted: false,
+            }))
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn reset_write_failure_after_mint_reports_minted() {
+        let f = ResetFixture::new();
+        fs::create_dir(f.store.path.with_file_name("state.window.tmp")).unwrap();
+        let result = f.store.reset(&f.profile, 100_000, |_| Ok::<_, ()>(()));
+        assert!(matches!(
+            result,
+            Err(ResetError::Store {
+                error: WindowStoreError::Io { .. },
+                minted: true,
+            })
+        ));
+        assert!(get_raw(&f.profile.policy_window_state_key_id).is_some());
     }
 }
