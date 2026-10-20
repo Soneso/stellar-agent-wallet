@@ -12,6 +12,29 @@ This file describes the security
 model an operator should understand and the safe-operation rules an agent must
 follow. For the tool list and argument shapes see `./mcp-tools.md`.
 
+After name reconciliation, both binaries compare keyring entries with sibling
+profile files in the same profiles directory. Mainnet conflicts refuse with
+`profile.key_scope_conflict`; testnet conflicts warn and keep the verb's behavior.
+The check includes wallet keys, provider credentials and derived entries.
+Provider credentials may share with other provider credentials, but cannot share
+with wallet or derived entries. Two fields in one profile cannot name one entry,
+and the owner account must be `default`. Explicit wallet references must be set
+in the file; an out-of-scope overlay is a conflict.
+
+A copied profile file, including a backup in that directory, counts as a sibling.
+If this profile names a sibling's entry, give this profile its own entry.
+If the sibling claims this profile's canonical entry, correct the sibling file.
+Moving an enrolled reference orphans its stored key; enroll or rotate at the new
+entry before use. An unreadable sibling warns and is skipped on both chains.
+An unreadable selected document or profiles directory refuses on mainnet and
+warns on testnet. `profile show` still displays the document for diagnosis.
+
+`profile reset-window-state` writes its `policy_window_state_reset` audit row,
+with the wiped accrual, before it mints a key, advances the generation or
+replaces the store. A reset whose row cannot be written does not happen.
+The `profile` section of `./cli-reference.md` describes the row, the refusals,
+the failure windows and the recovery.
+
 ## Quick rules for an agent
 
 - Branch on the result envelope and wire codes. Never re-issue a refused commit

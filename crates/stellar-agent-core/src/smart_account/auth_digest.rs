@@ -357,6 +357,35 @@ mod tests {
         });
     }
 
+    // Tracing caches callsite interest process-wide. Each capture test runs
+    // alone so other test subscribers cannot suppress its debug event.
+    #[cfg(debug_assertions)]
+    fn run_capture_test_in_child() -> bool {
+        let thread = std::thread::current();
+        let test_name = thread.name().expect("test thread has a name");
+        const CHILD_ENV: &str = "STELLAR_AGENT_AUTH_DIGEST_CAPTURE_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(test_name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_ENV, test_name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "capture subprocess failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A test name the child does not match runs nothing and exits 0.
+        assert!(
+            stdout.contains("test result: ok. 1 passed;"),
+            "capture subprocess ran no test:\n{stdout}"
+        );
+        true
+    }
+
     // These tests exercise the `debug!` call site inside `compute_auth_digest`.
     // In release profile the `tracing/release_max_level_info` feature strips
     // `debug!` / `trace!` at compile time, so the capture below would be empty
@@ -365,6 +394,9 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn log_does_not_leak_payload_bytes() {
+        if run_capture_test_in_child() {
+            return;
+        }
         let capture = CaptureWriter::new();
         // A payload chosen to be obviously recognisable if it were to appear.
         let payload = b"recognisable_payload_bytes_do_not_leak_me";
@@ -398,6 +430,9 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn log_digest_hex_is_present_and_64_chars() {
+        if run_capture_test_in_child() {
+            return;
+        }
         let capture = CaptureWriter::new();
         with_capture(capture.clone(), || {
             let _ = compute_auth_digest(b"payload", b"rules");

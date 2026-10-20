@@ -1209,6 +1209,17 @@ pub enum ValidationError {
         detail: String,
     },
 
+    /// The profile's keyring references conflict with its host-local scope.
+    #[error("{detail}")]
+    ProfileKeyScopeConflict {
+        /// Selected profile name.
+        profile: String,
+        /// Snake-case finding kind.
+        kind: &'static str,
+        /// Bounded, path-redacted finding text.
+        detail: String,
+    },
+
     /// A verb that writes audit rows refused because the profile's audit
     /// chain-root HMAC key could not be loaded from the platform keyring.
     ///
@@ -1636,6 +1647,7 @@ impl ValidationError {
             // names the subsystem (profile.*) while the category stays
             // Validation, as `AuditLogNotFound` does for audit.*.
             Self::ProfileNameMismatch { .. } => "profile.name_mismatch",
+            Self::ProfileKeyScopeConflict { .. } => "profile.key_scope_conflict",
             Self::NetworkFlagMismatch { .. } => "profile.network_flag_mismatch",
             Self::ProfileNonOverlayableField { .. } | Self::ProfileOverlayMayOnlyTighten { .. } => {
                 "profile.non_overlayable_field"
@@ -3294,6 +3306,14 @@ mod tests {
                 "profile.name_mismatch",
             ),
             (
+                ValidationError::ProfileKeyScopeConflict {
+                    profile: "alice".to_owned(),
+                    kind: "self_collision",
+                    detail: "bounded finding".to_owned(),
+                },
+                "profile.key_scope_conflict",
+            ),
+            (
                 ValidationError::AuditChainKeyUnavailable {
                     profile: "default".to_owned(),
                 },
@@ -3531,6 +3551,15 @@ mod tests {
                         detail: detail.clone(),
                     }
                 }
+                ValidationError::ProfileKeyScopeConflict {
+                    profile,
+                    kind,
+                    detail,
+                } => ValidationError::ProfileKeyScopeConflict {
+                    profile: profile.clone(),
+                    kind,
+                    detail: detail.clone(),
+                },
                 ValidationError::AuditChainKeyUnavailable { profile } => {
                     ValidationError::AuditChainKeyUnavailable {
                         profile: profile.clone(),

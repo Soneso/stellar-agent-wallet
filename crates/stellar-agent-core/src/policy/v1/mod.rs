@@ -240,8 +240,8 @@ pub trait CounterpartyCacheView: Send + Sync {
     /// The check is based on the **key set** of the snapshot built at dispatch
     /// time from `CounterpartyResolver::list_cached()`.  A binding is
     /// considered "resolved" if it was present in the cache at snapshot
-    /// construction time, regardless of TTL; TTL expiry is the resolver's
-    /// concern, not the criterion's.
+    /// construction time.  `StellarTomlResolver::list_cached` does not filter
+    /// on a binding's recorded expiry, and neither does this check.
     ///
     /// This method is **synchronous** — criterion evaluation cannot block on
     /// async I/O.  The snapshot must be built asynchronously before entering

@@ -11,11 +11,14 @@
 //! `stellar.toml` response against post-fetch file-write tampering.
 //! **After rotation, all cached
 //! `stellar.toml` entries are immediately invalidated** because their stored
-//! HMAC tags were computed with the old key.  The wallet will re-fetch
-//! `stellar.toml` on the next counterparty-allowlist check.
+//! HMAC tags were computed with the old key.  The listing skips them, so the
+//! policy criteria that read the cache see no entry until a refresh rewrites
+//! it.  `counterparty refresh <domain>` rewrites the entry for that domain.
+//! `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the
+//! policy allowlist.
 //!
-//! See `docs/runbooks/counterparty-cache-rotation.md` for operator guidance
-//! on coordinating cache invalidation.
+//! See `docs/cli-reference/profile-and-governance.md` for the command
+//! reference.
 //!
 //! # Output (JSON envelope)
 //!

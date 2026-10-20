@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New wire code `profile.key_scope_conflict` refuses mainnet loading and warns
+  on testnet for shared wallet or derived keyring entries, self-collisions,
+  out-of-scope overlays, or an owner account other than `default`.
+  An unreadable selected profile file or profiles directory has the same policy;
+  an unreadable sibling only warns. The comparison covers one data root and OS user.
 - When the amount reaches the asset's cross-check threshold and an oracle is
   configured, the x402 payment tools obtain the independent-RPC cross-check
   witness before signing.
@@ -113,6 +118,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `profile reset-window-state` writes its audit row before wiping the store,
+  under the audit writer and store lock. The row carries live wiped accrual,
+  per-bucket totals, the generation pair and the profile's chain.
+  Bucket identifiers are bounded to 64 serialized bytes.
+  A reset whose row cannot be written does not happen on any network.
+  The command refuses while a running MCP server holds the audit writer.
+- A counterparty cache key this release mints is URL-safe base64 without
+  padding, which an older binary cannot decode. An older binary's counterparty
+  cache always uses the keyring entry `stellar-agent-counterparty-<profile>`
+  under account `default`, whatever `counterparty_cache_key_id` names. The
+  older binary reads the profile's cache as empty when that entry is absent or
+  holds a key it cannot decode. Its `counterparty refresh` and
+  `counterparty warm-up` use a key they can decode at that entry, mint one at
+  an absent entry, and refuse otherwise. With a key it can decode, the older
+  binary verifies this release's cache files unless they were signed with a
+  different key. Its listing skips such a file with a warning. Its
+  `counterparty refresh <domain>` rewrites the affected entry, and its
+  `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the
+  policy allowlist.
+- A `policy_window_state_reset` row with `wiped` verifies with this release or later.
+  An older binary refuses once a checked root HMAC, later row or tip anchor
+  covers that row. It can read an uncovered tail with `wiped` dropped;
+  a row it then appends makes this release refuse the extended log at that row.
+  Rows without `wiped` retain their serialized form.
+- `PersistedWindowStore::reset` takes the time and a recorder and returns
+  `ResetOutcome`; `ResetError` is new. `StellarTomlResolver` constructors take
+  the counterparty key reference. `AuditEntry::new_policy_window_state_reset`
+  takes the chain id and wiped record. `EventKind::PolicyWindowStateReset`
+  gains `wiped`; `WipedAccrualRecord`, `WipedBucket` and `PreviousState` are new.
+  `ValidationError` gains `ProfileKeyScopeConflict`.
+  `stellar_agent_core::profile::key_scope` and `profile::schema::generation_account`
+  are new.
 - `stellar_agent_x402::exact::create_payment` takes the prepared cross-check and
   returns `CreatedPayment { payload, cross_check }`.
 - The log filter keeps the RPC client's raw request and response logging off at
@@ -243,6 +280,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The counterparty cache reads and mints its HMAC key at the profile's
+  `counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.
+  With an explicit reference, cached entries read as absent until a refresh
+  rewrites them.
+  `counterparty refresh <domain>` rewrites the entry for that domain, and
+  `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the
+  policy allowlist.
+  The cache accepts the rotation command's URL-safe base64 encoding and the
+  standard encoding of existing cache keys.
 - Failed sponsored creation preserves signed bytes for submission error details.
   A confirmation timeout reports the envelope hash without exposing the envelope.
 

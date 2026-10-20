@@ -276,6 +276,10 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   structurally refuses every mainnet write with `network.mainnet_write_forbidden`
   regardless of engine or keys. No configuration unlocks mainnet writes in this
   alpha.
+- `profile.key_scope_conflict` refuses mainnet startup or CLI reconciliation
+  for shared or invalid key scope; testnet logs a warning. Do not retry under
+  another profile. Follow the named recovery in
+  [troubleshooting](references/troubleshooting.md).
 - The submit layer does not trust the declared network. It asks the RPC endpoint
   which network it serves and which protocol it runs, binds the submission to
   that answer, then verifies every signature on the envelope against it. The

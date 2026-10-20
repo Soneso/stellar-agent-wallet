@@ -160,7 +160,8 @@ pub mod store;
 
 pub use store::{
     MintOutcome, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
-    RECONCILE_MIN_AGE_MS, ReconcileReport, SettledSubmission, WindowReservation,
+    RECONCILE_MIN_AGE_MS, ReconcileReport, ResetError, ResetOutcome, SettledSubmission,
+    WindowReservation,
 };
 
 /// Records a confirmed call's contribution into `engine`'s window state and

@@ -32,7 +32,7 @@
 //! command reads the CURRENT store file and confirms its tag under the OLD
 //! key BEFORE that key is destroyed. A mismatch aborts the rotation entirely
 //! — the old key is never destroyed, and the command directs the operator to
-//! `policy reset-window-state` instead (a tampered file cannot be recovered
+//! `profile reset-window-state` instead (a tampered file cannot be recovered
 //! by rotation; it can only be discarded). A store file that exists but whose
 //! OLD key was never minted (no keyring entry at all) is equally refused: it
 //! cannot have been signed by any legitimate key, so there is nothing to
@@ -186,7 +186,7 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
                     error = ?e,
                     "policy-state key rotation refused: the store file did not verify under \
                      the current key; rotating would launder a tampered file — run \
-                     `policy reset-window-state` instead"
+                     `profile reset-window-state` instead"
                 );
                 let err = WalletError::Internal(
                     stellar_agent_core::error::InternalError::UnexpectedState {
@@ -207,7 +207,7 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
             // profile — it cannot have been signed legitimately.
             tracing::error!(
                 "policy-state key rotation refused: a store file exists but no key was ever \
-                 minted for this profile; run `policy reset-window-state` instead"
+                 minted for this profile; run `profile reset-window-state` instead"
             );
             let err =
                 WalletError::Internal(stellar_agent_core::error::InternalError::UnexpectedState {

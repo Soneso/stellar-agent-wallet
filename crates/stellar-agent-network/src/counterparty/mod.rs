@@ -143,8 +143,11 @@ pub enum CounterpartyError {
     },
 
     /// Cache file's HMAC does not match the recomputed value — indicates
-    /// tampering or key-rotation drift.  Treated as fail-closed (cache is
-    /// discarded; next fetch re-mints).
+    /// tampering or key-rotation drift.  Fails closed:
+    /// [`CounterpartyResolver::list_cached`] skips the file and leaves it on
+    /// disk.  `counterparty refresh <domain>` rewrites it.
+    /// `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the
+    /// policy allowlist.
     #[error("counterparty cache HMAC mismatch — possible tampering or rotation")]
     HmacMismatch,
 
@@ -178,7 +181,7 @@ pub enum CounterpartyError {
         detail: String,
     },
 
-    /// Keyring access for `stellar-agent-counterparty-<profile>` failed.
+    /// Keyring access for the profile's `counterparty_cache_key_id` entry failed.
     #[error("counterparty keyring entry unavailable: {detail}")]
     KeyringUnavailable {
         /// Operator-facing detail.
@@ -211,8 +214,8 @@ pub enum CounterpartyError {
 /// Represents the result of a successful SEP-1 fetch-and-verify cycle:
 ///
 /// 1. Wallet fetches `https://<home_domain>/.well-known/stellar.toml` over TLS.
-/// 2. Wallet HMAC-protects the canonical TOML body using the per-profile
-///    `stellar-agent-counterparty-<profile>` keyring entry.
+/// 2. Wallet HMAC-protects the canonical TOML body with the key at the
+///    keyring entry the profile's `counterparty_cache_key_id` names.
 /// 3. The HMAC is verified on every subsequent cache read.
 ///
 /// The `stellar.toml` body is retained in the cache for forensic correlation
@@ -228,16 +231,21 @@ pub struct StellarTomlBinding {
     pub home_domain: String,
 
     /// UNIX timestamp (seconds since epoch) when the binding was established
-    /// (resolver wrote the cache file).  Used by the resolver's TTL check.
+    /// (resolver wrote the cache file).  The resolver derives `expires_at` from it.
     pub fetched_at: SystemTime,
 
     /// UNIX timestamp when the binding becomes stale.  Equal to
-    /// `fetched_at + ttl`.  Resolver re-fetches on access if `now > expires_at`.
+    /// `fetched_at + ttl`.  [`StellarTomlResolver`] records it with each
+    /// binding it builds, and its `list_cached` does not filter on it, so
+    /// listing returns bindings past their expiry.  The CLI command
+    /// `counterparty refresh <domain>` rewrites that domain's entry with a
+    /// new fetch time.  `counterparty warm-up` refreshes only the
+    /// `HOME_DOMAIN` entries of the policy allowlist.
     pub expires_at: SystemTime,
 
-    /// `true` when the resolver returned an expired HMAC-verified cache entry
-    /// because an opt-in stale-if-error fallback handled a transient fetch
-    /// failure.
+    /// `true` when a refresh whose fetch failed with
+    /// [`CounterpartyError::FetchFailed`] returned the HMAC-verified cache entry
+    /// through the opt-in stale-if-error fallback, which ignores its expiry.
     pub stale: bool,
 
     /// The raw `ACCOUNTS` G-strkeys declared by `home_domain`'s `stellar.toml`,
@@ -315,16 +323,20 @@ pub trait CounterpartyResolver: Send + Sync {
     ///
     /// Reads the per-profile cache directory, validates each cache file's
     /// HMAC against the keyring entry, and returns the resolved bindings in
-    /// arbitrary order (callers sort if needed).  Bindings whose HMAC fails
-    /// validation are silently skipped (the resolver does NOT delete invalid
-    /// files; the operator must run `stellar-agent counterparty refresh
-    /// <home_domain>` to mint a fresh entry).
+    /// arbitrary order (callers sort if needed).  The listing logs an HMAC
+    /// mismatch at warn and skips the file without deleting it.
+    /// `counterparty refresh <domain>` rewrites the affected entry.
+    /// `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the
+    /// policy allowlist.
     ///
     /// # Errors
     ///
     /// Returns [`CounterpartyError::Io`] when the cache directory cannot be
-    /// enumerated.  Returns [`CounterpartyError::KeyringUnavailable`] when
-    /// the per-profile keyring entry cannot be loaded.
+    /// enumerated.  Returns [`CounterpartyError::KeyMatchesOwnerPublicKey`]
+    /// when the key reference sits in the owner key namespace or the loaded
+    /// key equals the owner public key.  A key load that fails with
+    /// [`CounterpartyError::KeyringUnavailable`] yields an empty list, for a
+    /// missing entry and a keyring backend error alike.
     async fn list_cached(&self) -> Result<Vec<StellarTomlBinding>, CounterpartyError>;
 }
 
@@ -382,7 +394,7 @@ impl CounterpartyResolver for NoopCounterpartyResolver {
 /// # Snapshot semantics
 ///
 /// The snapshot reflects cache state at construction time.  Bindings added or
-/// expired between snapshot construction and criterion evaluation are not
+/// removed between snapshot construction and criterion evaluation are not
 /// visible.  This is intentional — criterion evaluation must be deterministic
 /// within a single dispatch cycle.
 ///
@@ -409,9 +421,12 @@ impl CounterpartyCacheSnapshot {
     ///
     /// # Errors
     ///
-    /// Returns [`CounterpartyError`] when `resolver.list_cached()` fails —
-    /// typically [`CounterpartyError::Io`] (cache directory unreadable) or
-    /// [`CounterpartyError::KeyringUnavailable`] (no HMAC key).  The caller
+    /// Returns the [`CounterpartyError`] that `resolver.list_cached()` returns.
+    /// For [`StellarTomlResolver`] that is [`CounterpartyError::Io`] when the
+    /// cache directory cannot be enumerated, or
+    /// [`CounterpartyError::KeyMatchesOwnerPublicKey`] when the cache key is
+    /// refused as an owner key.  A key load that fails with
+    /// [`CounterpartyError::KeyringUnavailable`] yields an empty snapshot.  The caller
     /// should log the error and pass `None` as `counterparty_cache` to
     /// `EvalContext` when the resolver is unavailable, rather than hard-
     /// failing the dispatch.

@@ -68,6 +68,23 @@ Every value-moving signing command requires the audit key on either engine,
 refusing `audit.chain_key_unavailable` until it exists. See
 [Approvals and audit](approvals-and-audit.md#fail-closed-on-an-unminted-audit-key).
 
+After name reconciliation, both binaries compare keyring entries with sibling
+profile files in the same profiles directory. Mainnet conflicts refuse with
+`profile.key_scope_conflict`; testnet conflicts warn and keep the verb's behavior.
+The check includes wallet keys, provider credentials and derived entries.
+Provider credentials may share with other provider credentials, but cannot share
+with wallet or derived entries. Two fields in one profile cannot name one entry,
+and the owner account must be `default`. Explicit wallet references must be set
+in the file; an out-of-scope overlay is a conflict.
+
+A copied profile file, including a backup in that directory, counts as a sibling.
+If this profile names a sibling's entry, give this profile its own entry.
+If the sibling claims this profile's canonical entry, correct the sibling file.
+Moving an enrolled reference orphans its stored key; enroll or rotate at the new
+entry before use. An unreadable sibling warns and is skipped on both chains.
+An unreadable selected document or profiles directory refuses on mainnet and
+warns on testnet. `profile show` still displays the document for diagnosis.
+
 ## Loader source order
 
 A profile is assembled from three layered sources. Higher-priority sources
@@ -499,6 +516,13 @@ This rewrites the file in place (atomically), sets the four `*_key_id` reference
 names, and sets `[policy] engine = "noop"`. Running it again on an already-current
 profile is a no-op.
 
+The counterparty cache reads and mints its HMAC key at
+`counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.
+With an explicit reference, previously cached entries read as absent until
+a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry
+for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN`
+entries of the policy allowlist.
+
 ### Rotate each key
 
 Each command generates fresh key material from the OS CSPRNG and stores it in the
@@ -519,7 +543,7 @@ in the older base64 form is rewritten as its G-strkey by the next V1 verb or
 |---------|------------|-------|
 | `stellar-agent profile rotate-attestation-key <name>` | `attestation_key_id` | Fresh 32-byte HMAC key. All pending approvals are invalidated. |
 | `stellar-agent profile rotate-audit-key <name>` | `audit_log_hash_chain_key_id` | Fresh 32-byte HMAC key. Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify --profile <name>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. |
-| `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. All cached `stellar.toml` entries are invalidated and re-fetched on next use. |
+| `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. Cached `stellar.toml` entries read as absent until a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. |
 | `stellar-agent profile rotate-nonce-key <name>` | `mcp_nonce_key_alias` | Fresh 32-byte HMAC key. Outstanding nonces minted with the old key are invalidated. |
 
 ### Enroll the MCP signer

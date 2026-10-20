@@ -95,6 +95,12 @@ stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ --secret-env WALLET
 unset WALLET_SK
 ```
 
+`profile.key_scope_conflict` reports shared, self-colliding or out-of-scope
+keyring entries, a non-default owner account, or an unreadable comparison input.
+It refuses mainnet reconciliation and warns on testnet. An unreadable sibling
+only warns. See [profile key scoping](../profiles.md#file-location-and-selection)
+for the two recovery paths. `profile show` remains available for diagnosis.
+
 ## Output envelope and exit codes
 
 By default every command prints one JSON envelope on stdout. Exit code `0` means success; exit code `1` means any error. Scripts can branch on the exit code and parse the JSON for details.

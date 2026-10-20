@@ -1098,8 +1098,12 @@ mod tests {
     /// A mainnet profile is refused with exit 1 before the keyring
     /// initialiser, which panics if called, and before any request reaches
     /// the profile's endpoint.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn run_deposit_refuses_mainnet_before_keyring_and_any_request() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        crate::common::render::take_rendered_for_test();
         let rpc = wiremock::MockServer::start().await;
         let args = VaultDepositCliArgs {
             profile: Some("vault-mainnet".to_owned()),
@@ -1127,11 +1131,21 @@ mod tests {
             rpc.received_requests().await.unwrap().is_empty(),
             "a mainnet deposit must send no request"
         );
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert_eq!(
+            rendered[0]["error"]["code"],
+            "network.mainnet_write_forbidden"
+        );
     }
 
     /// The withdraw twin of the deposit refusal test.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn run_withdraw_refuses_mainnet_before_keyring_and_any_request() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        crate::common::render::take_rendered_for_test();
         let rpc = wiremock::MockServer::start().await;
         let args = VaultWithdrawCliArgs {
             profile: Some("vault-mainnet".to_owned()),
@@ -1157,6 +1171,12 @@ mod tests {
         assert!(
             rpc.received_requests().await.unwrap().is_empty(),
             "a mainnet withdrawal must send no request"
+        );
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert_eq!(
+            rendered[0]["error"]["code"],
+            "network.mainnet_write_forbidden"
         );
     }
 

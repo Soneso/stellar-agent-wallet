@@ -1668,9 +1668,9 @@ impl WalletServer {
                 return Err(ToolError::Business(business_error_result(
                     "policy.engine_required",
                     format!(
-                        "policy window-state store failed to refresh ({e}); run \
-                         `profile reset-window-state {profile_name} --reason <reason>` to \
-                         recover"
+                        "policy window-state store failed to refresh ({e}); stop the MCP server, \
+                         then run `profile reset-window-state {profile_name} --reason <reason>` \
+                         to recover; the running server holds the audit writer"
                     ),
                 )));
             }

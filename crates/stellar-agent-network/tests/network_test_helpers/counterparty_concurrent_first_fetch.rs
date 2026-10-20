@@ -83,6 +83,7 @@ fn build_resolver(
 
     StellarTomlResolver::with_test_base_url(
         profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(profile),
         cache_dir,
         Duration::from_secs(3600),
         client,
@@ -189,8 +190,10 @@ async fn two_tasks_race_first_fetch_one_wins_one_locked() {
     let entry = keyring_core::Entry::new(&service, "default").expect("entry open");
     let raw_key = entry.get_password().expect("keyring entry must exist");
 
+    // The cache stores its key as URL-safe base64 without padding, the
+    // encoding `profile rotate-counterparty-key` writes.
     use base64::Engine as _;
-    let key_bytes = base64::engine::general_purpose::STANDARD
+    let key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&raw_key)
         .expect("key must decode from base64");
 
@@ -254,8 +257,10 @@ async fn sequential_refreshes_maintain_hmac_coherence() {
     let entry = keyring_core::Entry::new(&service, "default").expect("entry open");
     let raw_key = entry.get_password().expect("keyring entry must exist");
 
+    // The cache stores its key as URL-safe base64 without padding, the
+    // encoding `profile rotate-counterparty-key` writes.
     use base64::Engine as _;
-    let key_bytes = base64::engine::general_purpose::STANDARD
+    let key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&raw_key)
         .expect("key decode");
 

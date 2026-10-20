@@ -22,18 +22,13 @@
 //!
 //! # Audit-row ordering
 //!
-//! The `PolicyWindowStateReset` audit row is emitted BEFORE the store
-//! mutation, not after. The row records the OPERATOR'S RESET REQUEST; the
-//! store file's post-mutation state is the outcome that request produced,
-//! not a precondition for recording that it was made. A crash between the
-//! row write and the file mutation leaves a request row with an unmodified
-//! store — recoverable simply by re-running the command (the row write is
-//! append-only and idempotent to repeat; the store mutation is idempotent
-//! too, since reset unconditionally re-initialises rather than requiring a
-//! specific starting state). The alternative ordering (mutate first, audit
-//! second) would leave a crash between the two with a MUTATED store and NO
-//! record of why — the reset that just discarded the operator's accumulated
-//! history would be invisible to `audit verify`.
+//! The command acquires the audit writer, then the store lock. It records the
+//! live wiped accrual before minting a key or replacing the store. A reset whose
+//! row cannot be written refuses on every chain. A running MCP server holds the
+//! audit writer, so the operator stops it before resetting.
+//!
+//! The row records intent and the generation pair. Completion requires loading
+//! the empty store at the recorded generation after the mutation.
 //!
 //! # Output (JSON envelope)
 //!
@@ -45,7 +40,11 @@
 //!   "data": {
 //!     "profile": "default",
 //!     "reset": true,
-//!     "reason": "corrupt-file recovery"
+//!     "reason": "corrupt-file recovery",
+//!     "wiped": {
+//!       "previous": "missing", "entry_count": 0, "buckets": [],
+//!       "truncated": false, "generation_before": null, "generation_after": 1
+//!     }
 //!   },
 //!   "request_id": "..."
 //! }
@@ -59,20 +58,24 @@
 use clap::{ArgGroup, Args};
 use serde::Serialize;
 use stellar_agent_core::audit_log::AuditEntry;
+use stellar_agent_core::audit_log::BindingCheck;
 use stellar_agent_core::audit_log::KeyPurpose;
+use stellar_agent_core::audit_log::schema::WipedAccrualRecord;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_network::keyring::init_platform_keyring_store;
-use stellar_agent_network::policy_state::PersistedWindowStore;
+use stellar_agent_network::policy_state::{PersistedWindowStore, ResetError};
 use uuid::Uuid;
 
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::render;
 
-use crate::commands::value_audit::emit_value_audit_row;
+use crate::commands::value_audit::{
+    acquire_keyed_audit_writer, append_value_audit_row_strict, audit_writer_open_failed,
+};
 
-use super::audit_emit::emit_keyring_key_written;
+use super::audit_emit::emit_keyring_key_written_with_writer;
 
 /// Arguments for `stellar-agent profile reset-window-state`.
 #[derive(Debug, Args)]
@@ -124,6 +127,8 @@ struct ResetWindowStateData {
     reset: bool,
     /// The operator-supplied reason, echoed back.
     reason: String,
+    /// Live accrual recorded before the mutation.
+    wiped: WipedAccrualRecord,
 }
 
 /// Runs `stellar-agent profile reset-window-state <name> --reason <reason>`.
@@ -162,39 +167,53 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
         return 1;
     }
 
-    let store = PersistedWindowStore::for_profile(args.profile_name());
-    let request_id = Uuid::new_v4().to_string();
-
-    // Audit row FIRST: records the operator's reset request, independent of
-    // whether the store mutation below succeeds. See the module docs'
-    // "Audit-row ordering" section.
-    let entry = AuditEntry::new_policy_window_state_reset(
-        "profile_reset_window_state",
-        args.profile_name(),
-        &args.reason,
-        &request_id,
-    );
-    emit_value_audit_row(&profile, args.profile_name(), entry);
-
-    let mint_outcome = match store.reset(&profile) {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("policy_window_state.reset_failed: {e}"),
-            });
-            render::render_json(&Envelope::err(&err));
+    let name = args.profile_name();
+    let writer = match acquire_keyed_audit_writer(&profile, name, BindingCheck::Enforce) {
+        Ok(writer) => writer,
+        Err(error) => {
+            render::render_json(&Envelope::err(&error.into_wallet_error(name)));
             return 1;
         }
     };
-
-    // Reset lazily mints the key on first use, exactly as a normal record
-    // would — report it the same way the rotate-* commands do. This row
-    // stays AFTER the mutation: it reports what `reset` actually did, not
-    // the operator's request.
-    if mint_outcome.newly_minted {
-        emit_keyring_key_written(
-            &profile,
-            args.profile_name(),
+    let mut writer = match writer.lock() {
+        Ok(writer) => writer,
+        Err(_) => {
+            render::render_json(&Envelope::err(&audit_writer_open_failed(name)));
+            return 1;
+        }
+    };
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(now) => now,
+        Err(error) => {
+            render::render_json(&Envelope::<()>::err_raw(
+                "wallet.clock_error",
+                error.to_string(),
+            ));
+            return 1;
+        }
+    };
+    let store = PersistedWindowStore::for_profile(name);
+    let request_id = Uuid::new_v4().to_string();
+    let result = store.reset(&profile, now_ms, |accrual| {
+        let entry = AuditEntry::new_policy_window_state_reset(
+            "profile_reset_window_state",
+            name,
+            &args.reason,
+            &request_id,
+            profile.chain_id.caip2_str(),
+            accrual.clone(),
+        );
+        append_value_audit_row_strict(&mut writer, name, entry)
+    });
+    let minted = match &result {
+        Ok(outcome) => outcome.mint.newly_minted,
+        Err(ResetError::Store { minted, .. }) => *minted,
+        Err(ResetError::Recorder(_)) => false,
+    };
+    if minted {
+        emit_keyring_key_written_with_writer(
+            &mut writer,
+            name,
             "profile_reset_window_state",
             KeyPurpose::PolicyWindowStateHmac,
             &profile.policy_window_state_key_id,
@@ -202,11 +221,27 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
             &request_id,
         );
     }
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let error = match error {
+                ResetError::Recorder(error) => error,
+                ResetError::Store { error, .. } => {
+                    WalletError::Internal(InternalError::UnexpectedState {
+                        detail: format!("policy_window_state.reset_failed: {error}"),
+                    })
+                }
+            };
+            render::render_json(&Envelope::err(&error));
+            return 1;
+        }
+    };
 
     render::render_json(&Envelope::ok(ResetWindowStateData {
         profile: args.profile_name().to_owned(),
         reset: true,
         reason: args.reason.clone(),
+        wiped: outcome.accrual,
     }));
     0
 }

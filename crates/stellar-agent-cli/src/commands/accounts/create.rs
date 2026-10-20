@@ -1578,9 +1578,10 @@ mod tests {
     /// The friendbot arm on a mainnet profile exits 1 before any request
     /// reaches the profile's endpoint. The binary tests in
     /// `tests/cli/profile_env_var_resolution.rs` pin the refusal's wire code.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn friendbot_mainnet_profile_reaches_no_endpoint() {
+        crate::common::render::take_rendered_for_test();
         let guard_rpc = wiremock::MockServer::start().await;
         let counter =
             stellar_agent_test_support::ConnectionCounter::start().expect("connection counter");
@@ -1631,6 +1632,12 @@ mod tests {
             counter.accepted().expect("connection count"),
             0,
             "no connection may reach the persisted profile's endpoint"
+        );
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert_eq!(
+            rendered[0]["error"]["code"],
+            "network.friendbot_mainnet_forbidden"
         );
     }
 
@@ -1686,9 +1693,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn sponsored_mainnet_rejected_before_rpc_call() {
+        crate::common::render::take_rendered_for_test();
         let guard_rpc = wiremock::MockServer::start().await;
         let counter =
             stellar_agent_test_support::ConnectionCounter::start().expect("connection counter");
@@ -1738,6 +1746,12 @@ mod tests {
             counter.accepted().expect("connection count"),
             0,
             "no connection may reach the persisted profile's endpoint"
+        );
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert_eq!(
+            rendered[0]["error"]["code"],
+            "network.mainnet_write_forbidden"
         );
     }
 

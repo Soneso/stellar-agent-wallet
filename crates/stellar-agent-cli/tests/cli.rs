@@ -70,3 +70,10 @@ mod tx_receipt_clear_integration;
 mod usage_error_envelope;
 #[path = "cli/v1_ceremony.rs"]
 mod v1_ceremony;
+
+#[path = "cli/profile_counterparty_key.rs"]
+mod profile_counterparty_key;
+#[path = "cli/profile_key_scope.rs"]
+mod profile_key_scope;
+#[path = "cli/profile_window_reset.rs"]
+mod profile_window_reset;

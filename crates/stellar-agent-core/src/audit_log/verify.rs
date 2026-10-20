@@ -2168,6 +2168,7 @@ mod tests {
                 reason: "recovery".to_owned(),
             },
             EventKind::PolicyWindowStateReset {
+                wiped: None,
                 profile: "default".to_owned(),
                 reason: "corrupt-file recovery".to_owned(),
             },

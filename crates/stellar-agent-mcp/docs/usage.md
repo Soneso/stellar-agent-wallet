@@ -6,6 +6,13 @@
 > schemas, send a `tools/list` request to the running server or consult the
 > live tool `instructions` returned in the `initialize` response.
 
+Startup checks the selected profile's keyring scope after reconciling its name.
+A mainnet conflict exits with `profile.key_scope_conflict` on stderr. Testnet
+logs a warning and starts. Unreadable siblings warn on both chains and are
+skipped. `profile show` displays a conflicting document for diagnosis.
+Stop the MCP server before `profile reset-window-state`: it holds the profile's
+audit writer, and the reset refuses while that writer is held.
+
 ## stellar_balances
 
 Fetches the native XLM balance and trustlines for a Stellar account.

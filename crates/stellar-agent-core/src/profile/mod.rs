@@ -48,6 +48,7 @@
 //! secret-material defence).
 
 pub mod caip2;
+pub mod key_scope;
 pub mod loader;
 pub mod migrate;
 pub mod name;

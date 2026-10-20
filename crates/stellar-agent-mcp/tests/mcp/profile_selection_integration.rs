@@ -742,3 +742,110 @@ fn provider_attestation_refusal_reports_wire_code() {
     );
     assert!(stderr.contains("providers.oracle"), "{stderr}");
 }
+
+fn key_scope_home(chain: &str, part: &str) -> ProfileHome {
+    let home = ProfileHome::new();
+    for name in ["alice", "bob"] {
+        let document = noop_profile_toml(name, chain, "https://rpc.example")
+            .replace(&format!("stellar-agent-attestation-{name}"), part);
+        home.write_profile(name, &document);
+    }
+    home
+}
+
+#[test]
+fn shared_key_entry_refuses_mainnet_startup_with_its_wire_code() {
+    let home = key_scope_home("stellar:mainnet", "shared-entry");
+    let mut command = home.command(&["--profile", "alice"]);
+    command
+        .env("STELLAR_AGENT_LOG", "info")
+        .env("HOME", "/synthetic-home");
+    let stderr = assert_refused_with(&run_with_initialize(command), 1);
+    for text in [
+        "profile.key_scope_conflict",
+        "attestation_key_id",
+        "shared-entry/default",
+        "bob",
+    ] {
+        assert!(stderr.contains(text), "{stderr}");
+    }
+}
+
+#[test]
+fn shared_key_entry_warns_and_testnet_startup_answers_initialize() {
+    let home = key_scope_home("stellar:testnet", "shared-entry");
+    let mut command = home.command(&["--profile", "alice"]);
+    command
+        .env("STELLAR_AGENT_LOG", "info")
+        .env("HOME", "/synthetic-home");
+    let output = run_with_initialize(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!output.stdout.is_empty());
+    assert!(
+        stderr.contains("WARN") && stderr.contains("profile.key_scope"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("shared-entry/default"), "{stderr}");
+}
+
+#[test]
+fn startup_diagnostics_bound_and_redact_shared_scope_and_owner_parts() {
+    let part = format!("/synthetic-home/{}HIDDEN_MARKER", "x".repeat(300));
+    for kind in ["shared", "scope", "owner"] {
+        let home = ProfileHome::new();
+        let chain = if kind == "scope" {
+            "stellar:testnet"
+        } else {
+            "stellar:mainnet"
+        };
+        let mut document = noop_profile_toml("alice", chain, "https://rpc.example");
+        match kind {
+            "shared" => {
+                document = document.replace("stellar-agent-attestation-alice", &part);
+                let sibling = noop_profile_toml("bob", chain, "https://rpc.example")
+                    .replace("stellar-agent-attestation-bob", &part);
+                home.write_profile("bob", &sibling);
+            }
+            "owner" => {
+                document = document.replace(
+                    "[policy_owner_key_id]\nservice = \"stellar-agent-owner-alice\"\n\
+                     account = \"default\"",
+                    &format!(
+                        "[policy_owner_key_id]\nservice = \"stellar-agent-owner-alice\"\n\
+                        account = \"{part}\""
+                    ),
+                );
+            }
+            "scope" => {}
+            _ => unreachable!(),
+        }
+        home.write_profile("alice", &document);
+        let mut command = home.command(&["--profile", "alice"]);
+        command
+            .env("STELLAR_AGENT_LOG", "info")
+            .env("HOME", "/synthetic-home");
+        if kind == "scope" {
+            command.env(
+                "STELLAR_AGENT_MCP_SIGNER_DEFAULT",
+                format!("{{service=\"{part}\",account=\"init\"}}"),
+            );
+        }
+        let output = run_with_initialize(command);
+        let stderr = if kind == "scope" {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        } else {
+            assert_refused_with(&output, 1)
+        };
+        assert!(stderr.contains("<HOME>"), "{kind}: {stderr}");
+        assert!(stderr.contains("..."), "{kind}: {stderr}");
+        assert!(!stderr.contains("synthetic-home"), "{kind}: {stderr}");
+        assert!(!stderr.contains("HIDDEN_MARKER"), "{kind}: {stderr}");
+        assert!(!stderr.contains(&"x".repeat(128)), "{kind}: {stderr}");
+    }
+}

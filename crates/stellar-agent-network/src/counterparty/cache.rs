@@ -7,8 +7,8 @@
 //!
 //! - **HTTPS fetch** via `fetch::fetch_stellar_toml`.
 //! - **SEP-1 parsing** via `parser::parse_minimal_sep1`.
-//! - **HMAC-SHA-256 cache integrity** using a per-profile keyring entry
-//!   (`stellar-agent-counterparty-<profile>`).
+//! - **HMAC-SHA-256 cache integrity** using the keyring entry the profile's
+//!   `counterparty_cache_key_id` names.
 //! - **Single-writer flock** via `lock::CacheLock`.
 //! - **Atomic cache writes** via `tempfile::NamedTempFile` + `persist()`
 //!   (temp-file-then-rename pattern, POSIX-atomic on the same filesystem).
@@ -41,12 +41,18 @@
 //! attack where an attacker with cache-file write access extends observed
 //! freshness by changing the file `mtime` via `touch -m`.  The `v2` label
 //! distinguishes this format from the legacy `v1` format (which lacked the
-//! `fetched_at` field); any v1 cache files fail HMAC verification cleanly and
-//! are re-fetched.
+//! `fetched_at` field). A v1 cache file fails HMAC verification cleanly, and
+//! the listing skips it. `counterparty refresh <domain>` writes a v2 entry
+//! for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN`
+//! entries of the policy allowlist.
 //!
-//! The HMAC key is the `stellar-agent-counterparty-<profile>` keyring entry
-//! (raw bytes, base64-encoded at rest), accessed under account name `"default"`
-//! to align with [`stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key`].
+//! The HMAC key (raw bytes, base64-encoded at rest) lives at the keyring entry
+//! the profile's `counterparty_cache_key_id` names. The resolver receives that
+//! reference at construction, and every key read and the lazy-mint use it.
+//! Profile creation and migration set the reference to service
+//! `stellar-agent-counterparty-<profile>` under account `default`
+//! ([`stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key`]);
+//! a profile file may name another entry.
 //!
 //! The **filename** is a sanitised form of the home domain used only for
 //! locating the file on disk.  The filename is **non-canonical**; the canonical
@@ -102,6 +108,7 @@ use std::time::{Duration, SystemTime};
 use hmac::Hmac;
 use keyring_core::Entry as KeyringEntry;
 use sha2::Sha256;
+use stellar_agent_core::profile::schema::KeyringEntryRef;
 use subtle::ConstantTimeEq as _;
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -122,17 +129,6 @@ const HMAC_TAG_LEN: usize = 32;
 
 /// Length of the generated HMAC key in bytes (256 bits).
 const HMAC_KEY_LEN: usize = 32;
-
-/// Keyring service name prefix for the per-profile counterparty cache key.
-const KEYRING_SERVICE_PREFIX: &str = "stellar-agent-counterparty-";
-
-/// Keyring account name used for the per-profile counterparty HMAC key.
-///
-/// Uses `"default"` to align with
-/// [`stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key`]
-/// and the `rotate-counterparty-key` CLI, which writes to the same
-/// `(stellar-agent-counterparty-<profile>, "default")` entry.
-const KEYRING_ACCOUNT: &str = "default";
 
 /// HMAC context label for the cache file format v2.
 ///
@@ -180,19 +176,21 @@ const CACHE_FILE_EXT: &str = ".toml.cache";
 /// [`CounterpartyError::WriterLocked`].
 ///
 pub struct StellarTomlResolver {
-    /// Profile name used to derive the keyring entry name.
+    /// Profile name used for the owner-key comparison.
     profile_name: String,
+    /// Profile reference shared with the rotation command.
+    key_ref: KeyringEntryRef,
     /// Filesystem directory where cache files are stored.
     cache_dir: PathBuf,
     /// Async HTTP client used only by the test-only base-URL fetch path; the
     /// production fetch builds its own per-request pinned client internally.
     #[cfg(any(test, feature = "test-helpers"))]
     http_client: reqwest::Client,
-    /// Cache TTL after which entries are considered stale and re-fetched.
+    /// Validity window each binding records as `expires_at = fetched_at + ttl`.
     ttl: Duration,
-    /// Return an HMAC-verified expired entry when refresh hits a transient fetch
-    /// failure. Disabled by default so callers remain fail-closed unless they
-    /// explicitly opt in.
+    /// Return the domain's HMAC-verified cache entry, whatever its expiry, when
+    /// a refresh fetch fails with `FetchFailed`. Disabled by default so callers
+    /// remain fail-closed unless they explicitly opt in.
     stale_if_error: bool,
     /// Optional base URL override for integration tests.
     ///
@@ -242,16 +240,21 @@ impl StellarTomlResolver {
     /// use std::time::Duration;
     /// use stellar_agent_network::counterparty::cache::StellarTomlResolver;
     ///
-    /// let resolver = StellarTomlResolver::new("default", "/tmp/cache", Duration::from_secs(3600))
+    /// use stellar_agent_core::profile::schema::KeyringEntryRef;
+    /// let key = KeyringEntryRef::default_counterparty_key("default");
+    /// let resolver = StellarTomlResolver::new(
+    ///     "default", key, "/tmp/cache", Duration::from_secs(3600))
     ///     .expect("resolver construction must succeed");
     /// ```
     pub fn new(
         profile_name: impl Into<String>,
+        key_ref: KeyringEntryRef,
         cache_dir: impl Into<PathBuf>,
         ttl: Duration,
     ) -> Result<Self, CounterpartyError> {
         Ok(Self {
             profile_name: profile_name.into(),
+            key_ref,
             cache_dir: cache_dir.into(),
             #[cfg(any(test, feature = "test-helpers"))]
             http_client: build_fetch_client()?,
@@ -278,18 +281,23 @@ impl StellarTomlResolver {
     /// use stellar_agent_network::counterparty::cache::StellarTomlResolver;
     ///
     /// let client = reqwest::Client::new();
-    /// let resolver = StellarTomlResolver::with_client("default", "/tmp/cache", Duration::from_secs(3600), client);
+    /// use stellar_agent_core::profile::schema::KeyringEntryRef;
+    /// let key = KeyringEntryRef::default_counterparty_key("default");
+    /// let resolver = StellarTomlResolver::with_client(
+    ///     "default", key, "/tmp/cache", Duration::from_secs(3600), client);
     /// ```
     #[cfg(any(test, feature = "test-helpers"))]
     #[must_use]
     pub fn with_client(
         profile_name: impl Into<String>,
+        key_ref: KeyringEntryRef,
         cache_dir: impl Into<PathBuf>,
         ttl: Duration,
         http_client: reqwest::Client,
     ) -> Self {
         Self {
             profile_name: profile_name.into(),
+            key_ref,
             cache_dir: cache_dir.into(),
             http_client,
             ttl,
@@ -299,12 +307,17 @@ impl StellarTomlResolver {
         }
     }
 
-    /// Configures whether refresh may return an expired HMAC-verified cache
-    /// entry after a transient fetch failure.
+    /// Configures whether refresh falls back to the cache when its fetch fails.
     ///
-    /// The default is `false` to preserve fail-closed refresh behavior. CLI or
-    /// daemon callers that prefer availability can opt in and inspect
-    /// [`StellarTomlBinding::stale`].
+    /// When enabled and the fetch fails with [`CounterpartyError::FetchFailed`],
+    /// refresh returns the domain's cache entry marked stale, whatever its
+    /// expiry. A missing cache entry, an entry that does not verify under the
+    /// cache key, and a cache key that cannot be loaded preserve the fetch
+    /// error. A read error such as [`CounterpartyError::Io`] from an unreadable
+    /// cache file, an owner-key refusal, or a verified body that fails to parse
+    /// propagates in its place. The default is `false` to preserve fail-closed
+    /// refresh behavior. CLI or daemon callers that prefer availability can opt
+    /// in and inspect [`StellarTomlBinding::stale`].
     #[must_use]
     pub fn with_stale_if_error(mut self, enabled: bool) -> Self {
         self.stale_if_error = enabled;
@@ -328,6 +341,7 @@ impl StellarTomlResolver {
     #[must_use]
     pub fn with_test_base_url(
         profile_name: impl Into<String>,
+        key_ref: KeyringEntryRef,
         cache_dir: impl Into<PathBuf>,
         ttl: Duration,
         http_client: reqwest::Client,
@@ -335,6 +349,7 @@ impl StellarTomlResolver {
     ) -> Self {
         Self {
             profile_name: profile_name.into(),
+            key_ref,
             cache_dir: cache_dir.into(),
             http_client,
             ttl,
@@ -415,7 +430,7 @@ impl CounterpartyResolver for StellarTomlResolver {
         let sep1 = parse_minimal_sep1(&body)?;
 
         // Load (or mint) the HMAC key.
-        let hmac_key = load_or_mint_hmac_key(&self.profile_name)?;
+        let hmac_key = load_or_mint_hmac_key(&self.profile_name, &self.key_ref)?;
 
         // Record fetched_at before writing — embedded in the HMAC-protected
         // header so that mtime cannot be forged.
@@ -466,15 +481,19 @@ impl CounterpartyResolver for StellarTomlResolver {
     /// Returns the list of cached bindings for this profile.
     ///
     /// Reads the cache directory, validates each file's HMAC, and returns
-    /// verified bindings.  Files whose HMAC fails validation are silently
-    /// skipped (the operator must run `stellar-agent counterparty refresh` to
-    /// re-mint them).
+    /// verified bindings.  The listing logs an HMAC mismatch at warn and skips
+    /// the file.  `counterparty refresh <domain>` rewrites the affected entry.
+    /// `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the
+    /// policy allowlist.
     ///
     /// # Errors
     ///
     /// Returns [`CounterpartyError::Io`] when the cache directory cannot be
-    /// enumerated.  Returns [`CounterpartyError::KeyringUnavailable`] when the
-    /// per-profile keyring entry cannot be loaded.
+    /// enumerated.  Returns [`CounterpartyError::KeyMatchesOwnerPublicKey`]
+    /// when the key reference sits in the owner key namespace or the loaded
+    /// key equals the owner public key.  A key load that fails with
+    /// [`CounterpartyError::KeyringUnavailable`] yields an empty list, for a
+    /// missing entry and a keyring backend error alike.
     ///
     /// # Panics
     ///
@@ -482,7 +501,7 @@ impl CounterpartyResolver for StellarTomlResolver {
     async fn list_cached(&self) -> Result<Vec<StellarTomlBinding>, CounterpartyError> {
         // Load the HMAC key — if the key is not yet minted, there are no valid
         // cache entries (lazy-mint only fires on first write).
-        let hmac_key = match load_hmac_key(&self.profile_name) {
+        let hmac_key = match load_hmac_key(&self.profile_name, &self.key_ref) {
             Ok(k) => k,
             Err(CounterpartyError::KeyringUnavailable { .. }) => return Ok(Vec::new()),
             Err(other) => return Err(other),
@@ -581,7 +600,7 @@ impl StellarTomlResolver {
         &self,
         home_domain: &str,
     ) -> Result<Option<StellarTomlBinding>, CounterpartyError> {
-        let hmac_key = match load_hmac_key(&self.profile_name) {
+        let hmac_key = match load_hmac_key(&self.profile_name, &self.key_ref) {
             Ok(key) => key,
             Err(CounterpartyError::KeyringUnavailable { .. }) => return Ok(None),
             Err(err) => return Err(err),
@@ -684,24 +703,12 @@ async fn fetch_with_base_url(
 // HMAC key management
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returns the keyring service name for a profile.
-fn keyring_service_name(profile_name: &str) -> String {
-    format!("{}{}", KEYRING_SERVICE_PREFIX, profile_name)
-}
-
-/// Loads the HMAC key for the given profile from the keyring.
+/// Loads the HMAC key at the profile's counterparty reference.
 ///
-/// Returns the key in a `zeroize::Zeroizing` wrapper so that key bytes are
-/// scrubbed from memory when the guard drops.
-///
-/// Returns [`CounterpartyError::KeyringUnavailable`] when the entry does not
-/// exist or cannot be accessed.
-///
-/// Uses `account = "default"` to align with
-/// [`stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key`]
-/// and the `rotate-counterparty-key` CLI which writes to the same account name.
+/// Keyring errors refuse, and loaded key bytes zeroize when the guard drops.
 fn load_hmac_key(
     profile_name: &str,
+    key_ref: &KeyringEntryRef,
 ) -> Result<zeroize::Zeroizing<[u8; HMAC_KEY_LEN]>, CounterpartyError> {
     // Keyring failures are carried inside the crate-local
     // `CounterpartyError::KeyringUnavailable`; `NoEntry` is distinguished and
@@ -710,9 +717,9 @@ fn load_hmac_key(
     // path is not routed through `classify_keyring_error`, so it is on the T6
     // keyring-classification allow-set; full surface-layer classification is a
     // candidate follow-up.
-    let service = keyring_service_name(profile_name);
-    refuse_owner_coordinate(&service)?;
-    let entry = KeyringEntry::new(&service, KEYRING_ACCOUNT).map_err(|e| {
+    let service = &key_ref.service;
+    refuse_owner_coordinate(key_ref)?;
+    let entry = KeyringEntry::new(service, &key_ref.account).map_err(|e| {
         CounterpartyError::KeyringUnavailable {
             detail: format!("keyring entry open failed: {e}"),
         }
@@ -744,7 +751,7 @@ fn load_hmac_key(
         }
     })?;
 
-    let key = base64_decode_key(&raw, &service)?;
+    let key = base64_decode_key(&raw, service)?;
     refuse_owner_public_key(key.as_ref(), profile_name)?;
     Ok(key)
 }
@@ -752,15 +759,10 @@ fn load_hmac_key(
 /// The label a counterparty cache key owner refusal names.
 const COUNTERPARTY_KEY_FIELD: &str = "counterparty_cache_key";
 
-/// Refuses a cache-key coordinate in the owner key namespace, before any
-/// keyring read.
-///
-/// The service derives from the profile name under
-/// `stellar-agent-counterparty-`, so no profile name reaches the owner
-/// namespace here; the check keeps one rule for every symmetric-key loader.
-fn refuse_owner_coordinate(service: &str) -> Result<(), CounterpartyError> {
+/// Refuses a profile reference in the owner namespace before any keyring read.
+fn refuse_owner_coordinate(key_ref: &KeyringEntryRef) -> Result<(), CounterpartyError> {
     stellar_agent_core::profile::owner_key::refuse_owner_key_coordinate(
-        &stellar_agent_core::profile::schema::KeyringEntryRef::new(service, KEYRING_ACCOUNT),
+        key_ref,
         COUNTERPARTY_KEY_FIELD,
     )
     .map_err(|_| CounterpartyError::KeyMatchesOwnerPublicKey)
@@ -804,19 +806,18 @@ fn refuse_owner_public_key(key: &[u8], profile_name: &str) -> Result<(), Counter
 /// This is the lazy-mint path triggered on first cache write.  After minting,
 /// the new key is stored in the keyring and returned.
 ///
-/// Uses `account = "default"` so that `rotate_counterparty_key` — which also
-/// writes `(stellar-agent-counterparty-<profile>, "default")` — invalidates
-/// the cache HMAC correctly on next read.
+/// Reads and mints at the same profile reference that key rotation writes.
 fn load_or_mint_hmac_key(
     profile_name: &str,
+    key_ref: &KeyringEntryRef,
 ) -> Result<zeroize::Zeroizing<[u8; HMAC_KEY_LEN]>, CounterpartyError> {
     // Same keyring-error discipline as `load_hmac_key` (T6 allow-set;
     // classification follow-up candidate): `NoEntry` triggers the lazy-mint,
     // every other cause is routed to debug tracing inside
     // `CounterpartyError::KeyringUnavailable`.
-    let service = keyring_service_name(profile_name);
-    refuse_owner_coordinate(&service)?;
-    let entry = KeyringEntry::new(&service, KEYRING_ACCOUNT).map_err(|e| {
+    let service = &key_ref.service;
+    refuse_owner_coordinate(key_ref)?;
+    let entry = KeyringEntry::new(service, &key_ref.account).map_err(|e| {
         CounterpartyError::KeyringUnavailable {
             detail: format!("keyring entry open failed: {e}"),
         }
@@ -825,7 +826,7 @@ fn load_or_mint_hmac_key(
     match entry.get_password() {
         // The load branch compares; a freshly minted random key is not.
         Ok(raw) => {
-            let key = base64_decode_key(&raw, &service)?;
+            let key = base64_decode_key(&raw, service)?;
             refuse_owner_public_key(key.as_ref(), profile_name)?;
             Ok(key)
         }
@@ -833,7 +834,7 @@ fn load_or_mint_hmac_key(
             // Lazy-mint: generate a fresh 256-bit random key and store it.
             tracing::info!(
                 profile = %profile_name,
-                "minting stellar-agent-counterparty-{profile_name} keyring entry"
+                "minting counterparty cache keyring entry"
             );
             let key = generate_hmac_key();
             let encoded = base64_encode_key(key.as_ref());
@@ -868,8 +869,9 @@ fn base64_decode_key(
     service: &str,
 ) -> Result<zeroize::Zeroizing<[u8; HMAC_KEY_LEN]>, CounterpartyError> {
     use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded))
         .map_err(|_| {
             // Do not embed the keyring service name (which carries the profile
             // name) in the operator-visible detail.
@@ -893,7 +895,7 @@ fn base64_decode_key(
 /// Base64-encodes an HMAC key for storage in the keyring.
 fn base64_encode_key(key: &[u8]) -> String {
     use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.encode(key)
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key)
 }
 
 /// Generates a fresh 256-bit random HMAC key using the OS CSPRNG.
@@ -1316,6 +1318,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
 
@@ -1732,8 +1735,11 @@ mod tests {
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring init");
 
         let profile_name = "sensitive-profile-244";
-        let service_name = keyring_service_name(profile_name);
-        let result = load_hmac_key(profile_name);
+        let service_name = KeyringEntryRef::default_counterparty_key(profile_name).service;
+        let result = load_hmac_key(
+            profile_name,
+            &KeyringEntryRef::default_counterparty_key(profile_name),
+        );
 
         let err = result.expect_err("missing mock keyring entry must fail");
         assert!(
@@ -1773,17 +1779,23 @@ mod tests {
     }
 
     fn set_cache_key_value(profile_name: &str, value: &str) {
-        KeyringEntry::new(&keyring_service_name(profile_name), KEYRING_ACCOUNT)
-            .unwrap()
-            .set_password(value)
-            .unwrap();
+        KeyringEntry::new(
+            &KeyringEntryRef::default_counterparty_key(profile_name).service,
+            "default",
+        )
+        .unwrap()
+        .set_password(value)
+        .unwrap();
     }
 
     fn cache_key_value(profile_name: &str) -> Option<String> {
-        KeyringEntry::new(&keyring_service_name(profile_name), KEYRING_ACCOUNT)
-            .unwrap()
-            .get_password()
-            .ok()
+        KeyringEntry::new(
+            &KeyringEntryRef::default_counterparty_key(profile_name).service,
+            "default",
+        )
+        .unwrap()
+        .get_password()
+        .ok()
     }
 
     /// A cache entry sealed under a cache key equal to the owner public key is
@@ -1807,8 +1819,15 @@ mod tests {
         .unwrap();
         let path = cache_file_path(dir.path(), home_domain);
         write_cache_atomic(dir.path(), &path, &tag, home_domain, TEST_FETCHED_AT, body).unwrap();
-        let resolver =
-            StellarTomlResolver::new(profile_name, dir.path(), Duration::from_secs(3600)).unwrap();
+        let resolver = StellarTomlResolver::new(
+            profile_name,
+            stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(
+                profile_name,
+            ),
+            dir.path(),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
 
         assert_eq!(
             resolver.list_cached().await.unwrap().len(),
@@ -1839,7 +1858,10 @@ mod tests {
         set_cache_key_value(profile_name, &stored);
         plant_older_form_owner(profile_name);
         assert!(matches!(
-            load_or_mint_hmac_key(profile_name),
+            load_or_mint_hmac_key(
+                profile_name,
+                &KeyringEntryRef::default_counterparty_key(profile_name)
+            ),
             Err(CounterpartyError::KeyMatchesOwnerPublicKey)
         ));
         assert!(
@@ -1858,8 +1880,14 @@ mod tests {
         let strkey = stellar_agent_core::profile::owner_key::encode_owner_public_key(&OWNER_KEY);
         set_cache_key_value(profile_name, &strkey);
         for result in [
-            load_hmac_key(profile_name),
-            load_or_mint_hmac_key(profile_name),
+            load_hmac_key(
+                profile_name,
+                &KeyringEntryRef::default_counterparty_key(profile_name),
+            ),
+            load_or_mint_hmac_key(
+                profile_name,
+                &KeyringEntryRef::default_counterparty_key(profile_name),
+            ),
         ] {
             let err = result.expect_err("a G-strkey is not a 32-byte key");
             assert!(err.to_string().contains("expected 32 bytes"), "{err}");
@@ -1879,7 +1907,7 @@ mod tests {
         assert!(err.to_string().contains(COUNTERPARTY_KEY_FIELD), "{err}");
         assert!(refuse_owner_public_key(&[0x11; HMAC_KEY_LEN], "owner-label").is_ok());
         assert!(matches!(
-            refuse_owner_coordinate("stellar-agent-owner-b"),
+            refuse_owner_coordinate(&KeyringEntryRef::new("stellar-agent-owner-b", "default")),
             Err(CounterpartyError::KeyMatchesOwnerPublicKey)
         ));
     }
@@ -1895,5 +1923,143 @@ mod tests {
         // Compare via boolean equality and emit a fixed message instead.
         let matches = decoded.as_ref() == key;
         assert!(matches, "base64 round-trip produced unexpected bytes");
+    }
+    #[test]
+    #[serial_test::serial]
+    fn explicit_reference_reads_the_rotated_key() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let reference = KeyringEntryRef::new("custom-counterparty", "custom-account");
+        crate::keyring::rotate_keyring_secret_32(&reference.service, &reference.account).unwrap();
+        let rotated = crate::keyring::load_hmac_key_32(&reference).unwrap();
+        let loaded = load_hmac_key("explicit-cache", &reference).unwrap();
+        assert_eq!(loaded.as_ref(), rotated.as_ref());
+        let canonical = KeyringEntryRef::default_counterparty_key("explicit-cache");
+        assert!(matches!(
+            KeyringEntry::new(&canonical.service, &canonical.account)
+                .unwrap()
+                .get_password(),
+            Err(keyring_core::Error::NoEntry)
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn explicit_reference_mints_only_at_the_selected_entry() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let reference = KeyringEntryRef::new("custom-counterparty", "custom-account");
+        let minted = load_or_mint_hmac_key("explicit-cache", &reference).unwrap();
+        let loaded = crate::keyring::load_hmac_key_32(&reference).unwrap();
+        assert_eq!(minted.as_ref(), loaded.as_ref());
+        let canonical = KeyringEntryRef::default_counterparty_key("explicit-cache");
+        assert!(matches!(
+            KeyringEntry::new(&canonical.service, &canonical.account)
+                .unwrap()
+                .get_password(),
+            Err(keyring_core::Error::NoEntry)
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn default_reference_and_owner_namespace_rules_hold() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let reference = KeyringEntryRef::default_counterparty_key("default-cache");
+        let minted = load_or_mint_hmac_key("default-cache", &reference).unwrap();
+        assert_eq!(
+            load_hmac_key("default-cache", &reference).unwrap().as_ref(),
+            minted.as_ref()
+        );
+        let owner = KeyringEntryRef::default_owner_key("default-cache");
+        assert!(matches!(
+            load_hmac_key("default-cache", &owner),
+            Err(CounterpartyError::KeyMatchesOwnerPublicKey)
+        ));
+        assert!(matches!(
+            load_or_mint_hmac_key("default-cache", &owner),
+            Err(CounterpartyError::KeyMatchesOwnerPublicKey)
+        ));
+        assert!(matches!(
+            KeyringEntry::new(&owner.service, &owner.account)
+                .unwrap()
+                .get_password(),
+            Err(keyring_core::Error::NoEntry)
+        ));
+    }
+
+    // Key bytes whose encodings carry every alphabet-specific character:
+    // `-` and `_` in the URL-safe alphabet, `+` and `/` in the standard one.
+    const ALPHABET_KEY: [u8; HMAC_KEY_LEN] = [
+        0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB,
+        0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF,
+        0xFB, 0xFF,
+    ];
+
+    fn decode_detail(encoded: &str) -> String {
+        match base64_decode_key(encoded, "svc") {
+            Err(CounterpartyError::KeyringUnavailable { detail }) => detail,
+            other => panic!(
+                "expected a keyring refusal for {encoded:?}, got {:?}",
+                other.map(|_| "a decoded key")
+            ),
+        }
+    }
+
+    #[test]
+    fn cache_key_decoder_reads_url_safe_unpadded() {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ALPHABET_KEY);
+        assert!(encoded.contains('-') && encoded.contains('_') && !encoded.ends_with('='));
+        assert_eq!(*base64_decode_key(&encoded, "svc").unwrap(), ALPHABET_KEY);
+    }
+
+    #[test]
+    fn cache_key_decoder_reads_standard_padded() {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(ALPHABET_KEY);
+        assert!(encoded.contains('+') && encoded.contains('/') && encoded.ends_with('='));
+        assert_eq!(*base64_decode_key(&encoded, "svc").unwrap(), ALPHABET_KEY);
+    }
+
+    #[test]
+    fn cache_key_decoder_refuses_mixed_alphabets() {
+        use base64::Engine as _;
+        let url_safe = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ALPHABET_KEY);
+        let standard = base64::engine::general_purpose::STANDARD.encode(ALPHABET_KEY);
+        for mixed in [
+            url_safe.replacen('-', "+", 1),
+            standard.replacen('+', "-", 1),
+        ] {
+            assert_eq!(
+                decode_detail(&mixed),
+                "keyring entry contains invalid base64"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_key_decoder_refuses_invalid_trailing_bits() {
+        // 32 bytes leave two unused bits in the last symbol; `B` sets one.
+        let unpadded = format!("{}B", "A".repeat(42));
+        let padded = format!("{}B=", "A".repeat(42));
+        for encoded in [unpadded, padded] {
+            assert_eq!(
+                decode_detail(&encoded),
+                "keyring entry contains invalid base64"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_key_decoder_refuses_31_and_33_bytes() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        for bytes in [vec![7_u8; 31], vec![7_u8; 33]] {
+            for encoded in [URL_SAFE_NO_PAD.encode(&bytes), STANDARD.encode(&bytes)] {
+                assert_eq!(
+                    decode_detail(&encoded),
+                    "keyring entry has unexpected length (expected 32 bytes)"
+                );
+            }
+        }
     }
 }

@@ -426,6 +426,11 @@ async fn main() {
     // policy, approval store, window state — belongs to a different profile.
     // Building first would report the other profile's missing owner key instead,
     // a misleading second message for a single cause.
+    //
+    // The key-scope check follows: the profile's keyring coordinates must
+    // belong to it alone on this host. A mainnet conflict refuses to start; a
+    // testnet conflict, and every finding after the refusing one, is logged at
+    // `warn` on target `profile.key_scope`.
     if let Some(mismatch) =
         transport::profile_name_mismatch_refusal(&profile, &resolved_profile.name)
     {
@@ -435,6 +440,17 @@ async fn main() {
             profile = %resolved_profile.name,
             "stellar-agent-mcp: refusing to start: {}",
             mismatch.message(transport::STARTUP_STATE_LAYOUT)
+        );
+        std::process::exit(1);
+    }
+    if let Err(conflict) =
+        stellar_agent_core::profile::key_scope::enforce_key_scope(&profile, &resolved_profile.name)
+    {
+        let error = stellar_agent_core::error::ValidationError::from(conflict);
+        tracing::error!(
+            profile = %resolved_profile.name,
+            code = error.code(),
+            "stellar-agent-mcp: refusing to start: {error}"
         );
         std::process::exit(1);
     }

@@ -2344,9 +2344,10 @@ mod tests {
 
     /// Mainnet is rejected at the `run` boundary: the keyring initializer is
     /// never invoked and no request reaches the profile's endpoint.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn mainnet_rejected_at_run_boundary() {
+        crate::common::render::take_rendered_for_test();
         let guard_rpc = wiremock::MockServer::start().await;
         let counter =
             stellar_agent_test_support::ConnectionCounter::start().expect("connection counter");
@@ -2400,6 +2401,12 @@ mod tests {
             counter.accepted().expect("connection count"),
             0,
             "no connection may reach the persisted profile's endpoint"
+        );
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert_eq!(
+            rendered[0]["error"]["code"],
+            "network.mainnet_write_forbidden"
         );
     }
 

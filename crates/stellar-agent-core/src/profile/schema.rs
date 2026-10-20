@@ -794,9 +794,11 @@ pub struct Profile {
     /// Rotating this key invalidates all cached `stellar.toml` entries —
     /// operator must re-fetch after rotation.
     ///
-    /// Lazy-mint semantics: populated at migration time with
-    /// `stellar-agent-counterparty-<profile>`; key material minted by
-    /// `rotate-counterparty-key`.
+    /// Lazy-mint semantics: `profile init` and migration populate this field
+    /// with `stellar-agent-counterparty-<profile>`.  When no key is stored at
+    /// the entry this field names, the first `counterparty refresh` or
+    /// `counterparty warm-up` mints one there.  `profile rotate-counterparty-key`
+    /// and `counterparty rotate-hmac-key` write a fresh key at the same entry.
     pub counterparty_cache_key_id: KeyringEntryRef,
 
     /// Oracle RPC endpoint for high-value native-XLM rebuilds and MCP SEP-29 reads.
@@ -2374,6 +2376,17 @@ pub(crate) fn check_rpc_credential_entry(
     }
 }
 
+/// The case-insensitive target name used by keyring stores that join both parts.
+pub(crate) fn keyring_entry_alias(entry: &KeyringEntryRef) -> String {
+    format!("{}.{}", entry.account, entry.service).to_ascii_lowercase()
+}
+
+/// Derives the generation account beside an authenticated store's HMAC entry.
+#[must_use]
+pub fn generation_account(account: &str) -> String {
+    format!("{account}-generation")
+}
+
 /// Whether a credential reference names a keyring entry another wallet key
 /// uses or that lies in a wallet key namespace.
 ///
@@ -2395,9 +2408,11 @@ pub(crate) fn rpc_credential_entry_is_reserved(
     entry: &KeyringEntryRef,
     wallet_refs: &[&KeyringEntryRef],
 ) -> bool {
-    let joined = |r: &KeyringEntryRef| format!("{}.{}", r.account, r.service).to_ascii_lowercase();
-    let candidate = joined(entry);
-    if wallet_refs.iter().any(|wallet| joined(wallet) == candidate) {
+    let candidate = keyring_entry_alias(entry);
+    if wallet_refs
+        .iter()
+        .any(|wallet| keyring_entry_alias(wallet) == candidate)
+    {
         return true;
     }
     if wallet_refs

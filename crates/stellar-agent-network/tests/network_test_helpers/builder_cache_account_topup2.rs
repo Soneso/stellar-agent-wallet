@@ -917,6 +917,7 @@ async fn stale_if_error_true_returns_stale_binding_on_fetch_failure() {
     // First write a valid cache entry (large TTL).
     let writer = StellarTomlResolver::with_test_base_url(
         &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
         dir.path(),
         Duration::from_secs(3600),
         client_builder(),
@@ -930,6 +931,7 @@ async fn stale_if_error_true_returns_stale_binding_on_fetch_failure() {
     // Now point at an unreachable server with stale_if_error = true.
     let stale_resolver = StellarTomlResolver::with_test_base_url(
         &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
         dir.path(),
         Duration::from_secs(3600),
         client_builder(),
@@ -981,6 +983,7 @@ async fn list_cached_with_valid_cache_returns_one_binding() {
 
     let resolver = StellarTomlResolver::with_test_base_url(
         &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
         dir.path(),
         Duration::from_secs(3600),
         client,
@@ -1070,8 +1073,13 @@ async fn list_cached_hmac_mismatch_file_is_silently_skipped() {
         f.write_all(&buf).expect("write cache");
     }
 
-    let resolver = StellarTomlResolver::new(&profile, dir.path(), Duration::from_secs(3600))
-        .expect("resolver construction");
+    let resolver = StellarTomlResolver::new(
+        &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
+        dir.path(),
+        Duration::from_secs(3600),
+    )
+    .expect("resolver construction");
 
     let bindings = resolver
         .list_cached()
@@ -1106,8 +1114,13 @@ async fn list_cached_too_short_cache_file_is_silently_skipped() {
     let cache_path = cache_file_path(dir.path(), "short.example");
     std::fs::write(&cache_path, [0u8; 10]).expect("write short cache file");
 
-    let resolver = StellarTomlResolver::new(&profile, dir.path(), Duration::from_secs(3600))
-        .expect("resolver construction");
+    let resolver = StellarTomlResolver::new(
+        &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
+        dir.path(),
+        Duration::from_secs(3600),
+    )
+    .expect("resolver construction");
 
     let bindings = resolver
         .list_cached()
@@ -1138,8 +1151,13 @@ async fn list_cached_no_keyring_key_returns_empty_list() {
     // Use a never-seen profile so no keyring entry exists.
     let profile = unique_profile("list-no-key");
 
-    let resolver = StellarTomlResolver::new(&profile, dir.path(), Duration::from_secs(3600))
-        .expect("resolver construction");
+    let resolver = StellarTomlResolver::new(
+        &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
+        dir.path(),
+        Duration::from_secs(3600),
+    )
+    .expect("resolver construction");
 
     let bindings = resolver
         .list_cached()

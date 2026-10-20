@@ -455,10 +455,11 @@ writer compares the profile with the record:
 
 The refusal names the profile and the remedy, never a path or coordinate. It
 covers the value-moving verbs and tools, the read-only smart-account verbs,
-`approve --id <nonce>`, `approve serve`, `audit verify --profile`, and `profile rotate-audit-key`, and
+`approve --id <nonce>`, `approve serve`, `audit verify --profile`,
+`profile rotate-audit-key`, and `profile reset-window-state`. It
 creates nothing at the path the profile names. A command whose audit row is
 best effort skips the row and continues:
-`credentials add-passkey`, `profile reset-window-state`, and the other `profile`
+`credentials add-passkey` and the other `profile`
 enroll and rotate verbs.
 Not agent-recoverable: the operator establishes
 why the profile changed, then runs `stellar-agent audit reanchor --profile
@@ -643,7 +644,7 @@ The policy-file owner key is not rotated here. It is enrolled with `profile enro
 | `profile rotate-attestation-key <NAME>` | 32-byte HMAC | All pending approvals invalidated; re-run the simulate-and-approve round trip. |
 | `profile rotate-audit-key <NAME>` | 32-byte HMAC | Re-signs every existing per-file chain-root sidecar with the new key; `audit verify --profile <p>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds the writer. |
 | `profile rotate-nonce-key <NAME>` | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
-| `profile rotate-counterparty-key <NAME>` | 32-byte HMAC | Invalidates every cached counterparty binding; the wallet re-fetches on the next counterparty-allowlist check. |
+| `profile rotate-counterparty-key <NAME>` | 32-byte HMAC | Invalidates cached bindings. `counterparty refresh <domain>` rewrites one binding, and `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. |
 
 ```bash
 stellar-agent profile rotate-attestation-key default

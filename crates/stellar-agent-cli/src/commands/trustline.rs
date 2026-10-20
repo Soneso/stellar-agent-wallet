@@ -1259,8 +1259,12 @@ mod tests {
     /// A mainnet profile is refused with exit 1 before the keyring
     /// initialiser, which panics if called, and before any request reaches
     /// the profile's endpoint.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn run_refuses_mainnet_before_keyring_and_any_request() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let mut output = Vec::new();
         let rpc = wiremock::MockServer::start().await;
         let args = TrustlineArgs {
             profile: Some("trustline-mainnet".to_owned()),
@@ -1278,7 +1282,7 @@ mod tests {
                 )
             },
             || panic!("a mainnet profile must not initialise the keyring"),
-            &mut std::io::sink(),
+            &mut output,
         )
         .await;
         assert_eq!(code, 1, "a mainnet trustline must exit with code 1");
@@ -1286,6 +1290,8 @@ mod tests {
             rpc.received_requests().await.unwrap().is_empty(),
             "a mainnet trustline must send no request"
         );
+        let rendered: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(rendered["error"]["code"], "network.mainnet_write_forbidden");
     }
 
     // ── keyring store initialisation ordering ─────────────────────────────────

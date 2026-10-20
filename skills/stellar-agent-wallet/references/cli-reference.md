@@ -551,14 +551,62 @@ The policy-file owner key is NOT rotated here — it is an ed25519 key enrolled 
 | `rotate-attestation-key` | approval-spine attestation HMAC (`attestation_key_id`) | Invalidates all pending approvals; the simulate-and-approve round trip must be re-run. `key_kind:"hmac_32_bytes"`. |
 | `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify --profile <NAME>` stays green and the old key stops verifying. Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds the writer. A changed audit binding refuses with `audit.log_binding_changed` before the writer opens. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | Invalidates outstanding nonces. Returns only `profile` + `rotated`. |
-| `rotate-counterparty-key` | `stellar.toml` cache-integrity HMAC (`counterparty_cache_key_id`) | Invalidates every cached counterparty binding (re-fetched on next check). Adds `key_kind:"hmac_32_bytes"` and `cache_invalidated:true`. |
+| `rotate-counterparty-key` | `stellar.toml` cache-integrity HMAC (`counterparty_cache_key_id`) | Invalidates cached bindings. `counterparty refresh <domain>` rewrites one binding, and `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. Adds `key_kind:"hmac_32_bytes"` and `cache_invalidated:true`. |
 | `rotate-policy-state-key` | policy-window-state HMAC (`policy_window_state_key_id`) | Re-signs the persisted window-state store under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Refused if the store does not verify under the current key (use `reset-window-state` instead). Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. |
 
 ```bash
 stellar-agent profile rotate-attestation-key default
 ```
 
-Related but not a rotation: `profile reset-window-state <NAME> --reason <REASON>` is the fail-closed recovery path for the persisted policy-window-state store. An unreadable, tampered, or unparseable store makes the stateful criteria (`per_period_cap`, `rate_limit`, and their bundle forms) refuse every matched call until the store is re-initialised; `reset-window-state` re-initialises it to empty (minting the HMAC key if absent), discards all accumulated window history, and writes a `policy_window_state_reset` audit row recording the required `--reason`.
+`profile reset-window-state` clears persisted policy-window history after
+recovery from corruption or rollback. Stop the MCP server and repair the audit
+log first. The command requires a usable keyed audit writer on every network,
+including testnet. It acquires that writer before the window-store lock and
+writes the reset row before minting a key, advancing the generation or replacing
+the store. A reset whose row cannot be written does not happen.
+
+The `policy_window_state_reset` row carries the profile's chain, reason and
+`wiped` record. The JSON result carries the same record. A verified store reports
+live confirmed and pending counts and totals, scope specificity, bucket and
+window, plus generations before and after. Pending records count regardless of
+age. At most eight buckets appear, with bounded identifiers and a truncation flag;
+the entry count covers all live records. Missing or unverifiable stores report
+no totals. A store is unverifiable when its file fails its HMAC, does not parse,
+uses an unsupported format version, or holds an authentic older generation.
+It is also unverifiable without a usable key: an absent key, a key that is not
+valid base64, or a key that is not 32 bytes. The reset replaces such a key after
+the row. A store file that exists but cannot be read refuses before the row.
+
+A running MCP server holds the audit writer. Reset then refuses with
+`audit.chain_key_unavailable` and the message sub-code `audit.writer_locked`.
+An append failure also refuses with its audit code, leaving the window file,
+key and generation untouched. A first-use key mint is recorded through the held
+writer after the reset row, including when the later store write fails.
+
+A failure after the row but before the generation write leaves the store
+unchanged; the row's `generation_after` exceeds the keyring generation.
+After the generation write but before the file write, the generation matches
+the row while the old body remains. Its next load refuses a generation mismatch.
+Rerun reset after repairing the audit log and stopping the MCP server.
+The reset is complete when the next command that opens the window store loads
+the empty store at `generation_after`. On a V1 profile, a value-moving command
+and the MCP server's start open it. Generation equality alone does not establish
+completion.
+A blank `--reason` refuses with `validation.reason_empty` before anything changes.
+
+A reset row without `wiped` retains its serialized form and verifies unchanged.
+A row with `wiped` verifies with this release or later. An older binary drops
+that field when computing the row hash. It refuses a log once a checked root
+HMAC, successor row or tip anchor covers the new row. An uncovered tail can
+still be read by that binary with `wiped` dropped. If it then appends a row,
+this release refuses the extended log at that row.
+
+The counterparty cache reads and mints its HMAC key at
+`counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.
+With an explicit reference, previously cached entries read as absent until
+a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry
+for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN`
+entries of the policy allowlist.
 
 ---
 
