@@ -331,6 +331,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - x402 `create_payment` refuses a restore preamble, and archived entries in the
   transaction data, in either simulation. The wallet has no restore path; a
   restoration made elsewhere unblocks the payment.
+- `rustls-webpki` 0.103.15 to 0.103.16, `webpki-roots` 1.0.8 to 1.0.10, and
+  `webpki-root-certs` 1.0.8 to 1.0.10, which resolve three advisories.
+  RUSTSEC-2026-0382: certificate verification can accept a path through a
+  distrusted emSign intermediate whose private key is public.
+  RUSTSEC-2026-0381 and RUSTSEC-2026-0383: the bundled root sets hold
+  `emSign ECC Root CA - G3`, which can allow such paths. The new versions drop
+  this root. `webpki-root-certs` 0.26.11 stays in the lock as a re-export of
+  1.0.10. The `reqwest` HTTPS clients verify server certificates with
+  `rustls-webpki` against the `webpki-roots` set.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 
