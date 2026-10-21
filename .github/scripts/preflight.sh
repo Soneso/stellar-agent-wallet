@@ -65,7 +65,7 @@ OFFLINE_FEATURES=test-helpers,test-hooks,test-loopback,verifier-registry
 VENDORED_CRATE=stellar-agent-smart-account
 # The workflows that check-workflow-invariants.py reads, as its docstring
 # names them.
-INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage"
+INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal"
 
 die() {
   echo "preflight: $*" >&2
@@ -243,7 +243,8 @@ PY
 }
 
 # Prints the .github/scripts/ paths that the invariants workflows and the
-# files under .github/actions/ name, one per line, sorted.
+# files under .github/actions/ name, in subdirectories too, one per line,
+# sorted.
 invariant_script_paths() {
   local name inputs=()
   for name in $INVARIANT_WORKFLOWS; do
@@ -257,7 +258,7 @@ invariant_script_paths() {
   if [ "${#inputs[@]}" -eq 0 ]; then
     return 0
   fi
-  { grep -rho '\.github/scripts/[A-Za-z0-9_.-]*' "${inputs[@]}" || true; } | sort -u
+  { grep -rhoE '\.github/scripts/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*' "${inputs[@]}" || true; } | sort -u
 }
 
 # Succeeds when path $1 is one of INVARIANT_SCRIPTS.

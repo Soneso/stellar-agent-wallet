@@ -152,11 +152,14 @@ pub enum CounterpartyError {
     HmacMismatch,
 
     /// HTTPS fetch of `stellar.toml` failed (network error, non-200 status,
-    /// body too large, redirect loop).
+    /// body too large, or refused redirect). `transient` identifies failures
+    /// eligible for the bounded stale-if-error fallback.
     #[error("counterparty stellar.toml fetch failed: {detail}")]
     FetchFailed {
         /// Operator-facing detail.
         detail: String,
+        /// Whether the failure permits the bounded stale-if-error fallback.
+        transient: bool,
     },
 
     /// `stellar.toml` parse failed — invalid TOML or missing required
@@ -234,18 +237,16 @@ pub struct StellarTomlBinding {
     /// (resolver wrote the cache file).  The resolver derives `expires_at` from it.
     pub fetched_at: SystemTime,
 
-    /// UNIX timestamp when the binding becomes stale.  Equal to
-    /// `fetched_at + ttl`.  [`StellarTomlResolver`] records it with each
-    /// binding it builds, and its `list_cached` does not filter on it, so
-    /// listing returns bindings past their expiry.  The CLI command
-    /// `counterparty refresh <domain>` rewrites that domain's entry with a
-    /// new fetch time.  `counterparty warm-up` refreshes only the
-    /// `HOME_DOMAIN` entries of the policy allowlist.
+    /// UNIX timestamp when the binding expires, equal to `fetched_at + ttl`.
+    /// Listing and policy snapshots include only bindings with a future expiry.
+    /// `counterparty refresh <domain>` rewrites that domain's entry.
+    /// `counterparty warm-up` refreshes the `HOME_DOMAIN` policy allowlist entries.
     pub expires_at: SystemTime,
 
-    /// `true` when a refresh whose fetch failed with
-    /// [`CounterpartyError::FetchFailed`] returned the HMAC-verified cache entry
-    /// through the opt-in stale-if-error fallback, which ignores its expiry.
+    /// `true` when the opt-in fallback returns HMAC-verified cached evidence
+    /// after a transient [`CounterpartyError::FetchFailed`], within one TTL past
+    /// expiry. The fallback never writes the binding back. Listing excludes
+    /// expired entries, so expired fallback evidence cannot enter policy snapshots.
     pub stale: bool,
 
     /// The raw `ACCOUNTS` G-strkeys declared by `home_domain`'s `stellar.toml`,
@@ -319,7 +320,9 @@ pub trait CounterpartyResolver: Send + Sync {
     /// See [`CounterpartyError`] for the variant table.
     async fn refresh(&self, home_domain: &str) -> Result<StellarTomlBinding, CounterpartyError>;
 
-    /// Returns the list of currently-cached bindings for this profile.
+    /// Returns the live cached bindings for this profile.
+    ///
+    /// A binding at or past its expiry is never returned.
     ///
     /// Reads the per-profile cache directory, validates each cache file's
     /// HMAC against the keyring entry, and returns the resolved bindings in
@@ -348,9 +351,8 @@ pub trait CounterpartyResolver: Send + Sync {
 ///
 /// Used as the default at process start when the operator has not yet
 /// configured a profile with a counterparty cache key.  CLI / criterion paths
-/// that consult the resolver receive empty results and degrade gracefully —
-/// the criterion's HOME_DOMAIN match falls back to the on-chain
-/// `AccountEntry.home_domain` field surfaced via `AccountReservesView`.
+/// that consult the resolver receive empty results. Criteria requiring live
+/// cached evidence fail closed.
 ///
 /// Useful in tests and as a permissions-degraded fallback.
 #[derive(Debug, Default)]
@@ -360,6 +362,7 @@ pub struct NoopCounterpartyResolver;
 impl CounterpartyResolver for NoopCounterpartyResolver {
     async fn refresh(&self, _home_domain: &str) -> Result<StellarTomlBinding, CounterpartyError> {
         Err(CounterpartyError::FetchFailed {
+            transient: false,
             detail: "NoopCounterpartyResolver does not perform fetches".to_owned(),
         })
     }
@@ -393,7 +396,7 @@ impl CounterpartyResolver for NoopCounterpartyResolver {
 ///
 /// # Snapshot semantics
 ///
-/// The snapshot reflects cache state at construction time.  Bindings added or
+/// The snapshot holds only live bindings at construction time. Bindings added or
 /// removed between snapshot construction and criterion evaluation are not
 /// visible.  This is intentional — criterion evaluation must be deterministic
 /// within a single dispatch cycle.
@@ -406,7 +409,7 @@ impl CounterpartyResolver for NoopCounterpartyResolver {
 /// impl entirely to this synchronous snapshot.
 #[derive(Debug, Clone)]
 pub struct CounterpartyCacheSnapshot {
-    /// Maps each resolved `home_domain` to the `ACCOUNTS` G-strkeys its
+    /// Maps each live resolved `home_domain` to the `ACCOUNTS` G-strkeys its
     /// `stellar.toml` declared at snapshot construction time. Key presence
     /// alone answers `has_resolved`; the value answers `is_account_listed`.
     resolved: std::collections::HashMap<String, Vec<String>>,
@@ -417,7 +420,8 @@ impl CounterpartyCacheSnapshot {
     /// [`CounterpartyResolver`].
     ///
     /// Calls `resolver.list_cached()` once and collects the `home_domain` key
-    /// and `accounts` value of every returned binding.
+    /// and `accounts` value only for bindings whose expiry is still in the future.
+    /// This also enforces expiry for third-party resolver implementations.
     ///
     /// # Errors
     ///
@@ -450,8 +454,10 @@ impl CounterpartyCacheSnapshot {
         resolver: &dyn CounterpartyResolver,
     ) -> Result<Self, CounterpartyError> {
         let bindings = resolver.list_cached().await?;
+        let now = SystemTime::now();
         let resolved = bindings
             .into_iter()
+            .filter(|b| b.expires_at > now)
             .map(|b| (b.home_domain, b.accounts))
             .collect::<std::collections::HashMap<_, _>>();
         Ok(Self { resolved })
@@ -588,6 +594,7 @@ mod tests {
                 _home_domain: &str,
             ) -> Result<StellarTomlBinding, CounterpartyError> {
                 Err(CounterpartyError::FetchFailed {
+                    transient: false,
                     detail: "stub".to_owned(),
                 })
             }
@@ -672,6 +679,7 @@ mod tests {
                 _home_domain: &str,
             ) -> Result<StellarTomlBinding, CounterpartyError> {
                 Err(CounterpartyError::FetchFailed {
+                    transient: false,
                     detail: "stub".to_owned(),
                 })
             }
@@ -713,5 +721,50 @@ mod tests {
             !snapshot.is_account_listed("unresolved.example", LISTED_G),
             "an unresolved domain must report every account as unlisted"
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_keeps_only_live_bindings() {
+        use std::time::Duration;
+
+        struct StubResolver;
+
+        #[async_trait::async_trait]
+        impl CounterpartyResolver for StubResolver {
+            async fn refresh(
+                &self,
+                home_domain: &str,
+            ) -> Result<StellarTomlBinding, CounterpartyError> {
+                NoopCounterpartyResolver.refresh(home_domain).await
+            }
+
+            async fn list_cached(&self) -> Result<Vec<StellarTomlBinding>, CounterpartyError> {
+                let now = SystemTime::now();
+                Ok(vec![
+                    StellarTomlBinding::new(
+                        "live.example".to_owned(),
+                        now,
+                        now + Duration::from_secs(3600),
+                        false,
+                        vec!["listed-account".to_owned()],
+                    ),
+                    StellarTomlBinding::new(
+                        "expired.example".to_owned(),
+                        now - Duration::from_secs(3600),
+                        now,
+                        false,
+                        vec!["listed-account".to_owned()],
+                    ),
+                ])
+            }
+        }
+
+        let snapshot = CounterpartyCacheSnapshot::from_resolver(&StubResolver)
+            .await
+            .unwrap();
+        assert!(snapshot.has_resolved("live.example"));
+        assert!(snapshot.is_account_listed("live.example", "listed-account"));
+        assert!(!snapshot.has_resolved("expired.example"));
+        assert!(!snapshot.is_account_listed("expired.example", "listed-account"));
     }
 }

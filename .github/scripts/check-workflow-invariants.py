@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Structural check of the release, publish, notarization, maintenance, and coverage workflows.
+"""Structural check of the release, publish, notarization, maintenance,
+coverage, and rehearsal workflows.
 
 Usage: ``check-workflow-invariants.py [repository-root]``
 
 Reads ``release.yml``, ``publish.yml``, ``notarize-smoke.yml``, ``labels.yml``,
 ``stale.yml``, ``triage.yml``, ``triage-review.yml``, ``triage-sweep.yml``,
-``welcome.yml``, and ``coverage.yml`` under
+``welcome.yml``, ``coverage.yml``, and ``release-rehearsal.yml`` under
 ``.github/workflows/``.
 Also reads the composite action
-``.github/actions/macos-sign-notarize/action.yml``. Needs PyYAML.
+``.github/actions/macos-sign-notarize/action.yml`` and the release build
+scripts under ``.github/scripts/release/``. Needs PyYAML.
 
 A job is credentialed when it references ``secrets.``, passes secrets to a
 reusable workflow, declares ``environment:``, or holds ``id-token: write``,
@@ -79,12 +81,33 @@ and comment lines skipped. The check fails when any of these holds:
 - ``coverage-condition``: ``coverage.yml`` has no ``coverage`` job, or that
   job's ``if`` is not a string equal to ``COVERAGE_CONDITION`` after the check
   strips the surrounding whitespace and one enclosing ``${{ }}``.
+- ``rehearsal-credentials``: ``release-rehearsal.yml`` holds a credential. A
+  job is credentialed as above. The workflow permissions, or a job's own
+  permissions or the workflow's when it sets none, are anything but exactly
+  ``contents: read``. An expression reads the ``secrets`` context, the
+  workflow token ``github.token``, or the ``github`` context other than by a
+  named property. The expressions are the ``${{ }}`` parts of every key and
+  value and the whole value of every ``if`` key, read without regard to case.
+  An unterminated expression or quoted string is refused, and so is a parsed
+  value other than a mapping, list, string, number, boolean, date or null.
+  A double quote outside a single-quoted string is refused as well, because
+  GitHub rejects one in an expression.
+- ``release-script-drift``: the scripts under ``.github/scripts/release/``
+  differ from the ``build`` job of ``release.yml``. The ``cargo build`` and
+  ``cross build`` lines of ``build.sh`` and of that job's ``run:`` blocks,
+  with ``${{ matrix.target }}`` read as ``"$TARGET"`` and whitespace
+  normalized, are not the same set, or the job has none. The body of
+  ``windows-perl.ps1`` or ``sodium.sh``, after its leading comment lines,
+  differs line for line from the ``run:`` block of the one step of that job
+  that writes ``OPENSSL_SRC_PERL`` or ``SODIUM_DIST_DIR`` to ``GITHUB_ENV``.
 """
 
 import fnmatch
+import itertools
 import pathlib
 import re
 import sys
+from datetime import date
 
 try:
     import yaml
@@ -92,7 +115,7 @@ except ImportError:
     sys.exit("check-workflow-invariants.py needs PyYAML (pip install PyYAML)")
 
 WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml", "labels.yml", "stale.yml", "triage.yml",
-             "triage-review.yml", "triage-sweep.yml", "welcome.yml", "coverage.yml")
+             "triage-review.yml", "triage-sweep.yml", "welcome.yml", "coverage.yml", "release-rehearsal.yml")
 COMPOSITE = pathlib.PurePosixPath(".github/actions/macos-sign-notarize")
 SIGNING_JOBS = {("release.yml", "sign-macos"), ("notarize-smoke.yml", "sign")}
 TOOLCHAIN_ALLOWED = {("publish.yml", "publish")}
@@ -116,6 +139,19 @@ COVERAGE_EVENTS = ("opened", "synchronize", "reopened", "labeled", "unlabeled")
 # request whose labels include `coverage`.
 COVERAGE_CONDITION = ("github.event_name != 'pull_request' || "
                       "contains(github.event.pull_request.labels.*.name, 'coverage')")
+# The release rehearsal builds the release targets of any branch on a
+# dispatch. Its token reads the repository contents and nothing else, and no
+# expression of the workflow reads a secret or the workflow token.
+REHEARSAL_WORKFLOW = "release-rehearsal.yml"
+REHEARSAL_PERMISSIONS = {"contents": "read"}
+# The rehearsal requires the build lines and the Windows setup scripts to
+# equal those of the build job in release.yml. Each setup script copies the
+# run: block of the release build step that writes its variable to GITHUB_ENV;
+# the variable finds that step.
+RELEASE_SCRIPTS = pathlib.PurePosixPath(".github/scripts/release")
+BUILD_SCRIPT = RELEASE_SCRIPTS / "build.sh"
+SETUP_SCRIPTS = (("OPENSSL_SRC_PERL", RELEASE_SCRIPTS / "windows-perl.ps1"),
+                 ("SODIUM_DIST_DIR", RELEASE_SCRIPTS / "sodium.sh"))
 # For each job: the action that receives a credential, and the text of the
 # checks that earlier steps must hold. The third entry is the text of the
 # workspace code that reads the downloaded data. A clean-checkout check must
@@ -132,7 +168,6 @@ CREDENTIAL_GUARDS = {
         "check-ref-on-main.sh", "compare-crate-sums.py", CLEAN_CHECK, "rustc -V"), "compare-crate-sums.py"),
 }
 
-EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
 RUNNER_TEMP_PATH = re.compile(r"^\$\{\{\s*runner\.temp\s*\}\}(/|$)")
 WORKFLOW_SHA_REF = re.compile(r"^\$\{\{\s*github\.workflow_sha\s*\}\}$")
 SCRIPT_REF = re.compile(r"\.github/(?:scripts|actions)/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*")
@@ -159,6 +194,15 @@ ERREXIT_OFF = re.compile(r"(?<![\w-])set\s+(?:\+\w*e|\+o\s+errexit\b)")
 # shell operator after it can chain or discard its result.
 ANCESTRY_CALL = re.compile(
     r"""^\s*["']?(?:\$\{?[A-Za-z_]\w*\}?/|[\w.-]+/)*\.github/scripts/check-ref-on-main\.sh["']?(?:\s[^;&|]*)?$""")
+# A cargo build or cross build call, with the command word as in CARGO_CALL.
+BUILD_CALL = re.compile(COMMAND_WORD.format("(?:cargo|cross)") + r"(?:\s+\+\S+)?\s+build(?![\w-])")
+MATRIX_TARGET = re.compile(r"\$\{\{\s*matrix\.target\s*\}\}")
+# A string literal of the expression syntax, whose text names no context.
+EXPRESSION_STRING = re.compile(r"'(?:[^']|'')*'")
+# A context name where a property chain starts. Expressions ignore case.
+SECRETS_CONTEXT = re.compile(r"(?<![\w.-])secrets(?![\w-])", re.IGNORECASE)
+GITHUB_CONTEXT = re.compile(r"(?<![\w.-])github(?![\w-])", re.IGNORECASE)
+NAMED_PROPERTY = re.compile(r"\s*\.\s*([A-Za-z_][\w-]*)")
 
 
 class Checker:
@@ -166,6 +210,7 @@ class Checker:
         self.root = root
         self.violations = []
         self.jobs_checked = 0
+        self.docs = {}
 
     def report(self, where, rule, message):
         self.violations.append(f"{where}: {rule}: {message}")
@@ -180,8 +225,43 @@ class Checker:
             return None
 
     @staticmethod
-    def expressions(text):
-        return [" ".join(m.split()) for m in EXPRESSION.findall(text or "")]
+    def expressions(text, require_closed=False):
+        """Returns the expressions of text.
+
+        Each ends at the first ``}}`` outside a single-quoted string.
+        GitHub rejects a double quote outside a single-quoted string. The
+        rehearsal check refuses one through require_closed, so the boundary
+        and the masking handle single-quoted strings only.
+
+        Doubled single quotes belong to their string. With require_closed,
+        a double quote outside a single-quoted string, an unfinished
+        expression, and an unfinished string each raise ValueError.
+        """
+        text = text or ""
+        expressions = []
+        position = 0
+        while (start := text.find("${{", position)) != -1:
+            position = start + 3
+            quote = None
+            while position < len(text):
+                character = text[position]
+                if quote is not None:
+                    if character == quote:
+                        quote = None
+                elif character == "'":
+                    quote = character
+                elif character == '"' and require_closed:
+                    raise ValueError("double quote outside a single-quoted string in expression")
+                elif text.startswith("}}", position):
+                    expressions.append(" ".join(text[start + 3:position].split()))
+                    position += 2
+                    break
+                position += 1
+            else:
+                if require_closed:
+                    raise ValueError("unterminated string in expression" if quote else "unterminated expression")
+                break
+        return expressions
 
     @staticmethod
     def reads(value, pattern):
@@ -261,17 +341,29 @@ class Checker:
                 self.check_referenced_files(where, content, seen)
 
     @staticmethod
-    def credentialed(job, workflow_doc):
-        if "secrets" in job or "environment" in job:
-            return True
+    def credential_reasons(job, workflow_doc):
+        """Returns why a job is credentialed, one phrase per reason,
+        or no phrase.
+        """
+        reasons = []
+        if "secrets" in job:
+            reasons.append("passes secrets")
+        if "environment" in job:
+            reasons.append("declares an environment")
         if re.search(r"\bsecrets\.", yaml.safe_dump(job)):
-            return True
+            reasons.append("references secrets.")
         permissions = job.get("permissions", workflow_doc.get("permissions"))
         if permissions == "write-all":
-            return True
+            reasons.append("holds write-all")
         if isinstance(permissions, dict):
-            return permissions.get("id-token") == "write" or permissions.get("contents") == "write"
-        return False
+            for scope in ("id-token", "contents"):
+                if permissions.get(scope) == "write":
+                    reasons.append(f"holds {scope}: write")
+        return reasons
+
+    @staticmethod
+    def credentialed(job, workflow_doc):
+        return bool(Checker.credential_reasons(job, workflow_doc))
 
     def check_credential_order(self, where, job, steps, action, checks, recheck):
         if "continue-on-error" in job:
@@ -449,10 +541,160 @@ class Checker:
         if condition != COVERAGE_CONDITION:
             self.report(workflow, "coverage-condition", "coverage job runs without the label condition")
 
+    @staticmethod
+    def describe_permissions(permissions):
+        if permissions is None:
+            return "unset"
+        if isinstance(permissions, dict):
+            return ", ".join(f"{scope}: {level}" for scope, level in
+                             sorted(permissions.items(), key=lambda item: str(item[0]))) or "{}"
+        return str(permissions)
+
+    @staticmethod
+    def expression_values(node, key=None):
+        """Yields the expressions of a parsed workflow node.
+
+        These are the ${{ }} parts of each string, and the whole value of an
+        if key, which GitHub evaluates as an expression without the braces.
+        Every key is scanned for credential expressions whether or not
+        GitHub evaluates it. An unterminated expression or quoted string is
+        refused, and so is a parsed value other than a mapping, list, string,
+        number, boolean, date or null.
+        A double quote outside a single-quoted string is refused as well,
+        because GitHub rejects one in an expression.
+        """
+        if isinstance(node, dict):
+            for child_key, child in node.items():
+                if isinstance(child_key, str):
+                    yield from Checker.expressions(child_key, require_closed=True)
+                yield from Checker.expression_values(child, child_key)
+        elif isinstance(node, list):
+            for child in node:
+                yield from Checker.expression_values(child)
+        elif isinstance(node, str):
+            if key == "if" and not node.lstrip().startswith("${{"):
+                node = "${{" + node + "}}"
+            yield from Checker.expressions(node, require_closed=True)
+        elif node is not None and not isinstance(node, (int, float, date)):
+            raise ValueError(f"unsupported workflow node type: {type(node).__name__}")
+
+    def check_rehearsal_expressions(self, where, node):
+        try:
+            expressions = list(self.expression_values(node))
+        except ValueError as err:
+            self.report(where, "rehearsal-credentials", str(err))
+            return
+        for expression in expressions:
+            text = EXPRESSION_STRING.sub("''", expression)
+            if SECRETS_CONTEXT.search(text):
+                self.report(where, "rehearsal-credentials", f"an expression reads secrets: {expression}")
+            for context in GITHUB_CONTEXT.finditer(text):
+                name = NAMED_PROPERTY.match(text, context.end())
+                if name is None:
+                    self.report(where, "rehearsal-credentials",
+                                f"an expression reads the github context other than by a named property: {expression}")
+                elif name.group(1).lower() == "token":
+                    self.report(where, "rehearsal-credentials", f"an expression reads the workflow token: {expression}")
+
+    def check_rehearsal_credentials(self, workflow, doc, jobs):
+        workflow_permissions = doc.get("permissions")
+        if workflow_permissions != REHEARSAL_PERMISSIONS:
+            self.report(workflow, "rehearsal-credentials",
+                        f"workflow permissions are {self.describe_permissions(workflow_permissions)}, "
+                        "expected exactly contents: read")
+        for key, value in doc.items():
+            if key != "jobs":
+                self.check_rehearsal_expressions(workflow, {key: value})
+        for job_id, job in jobs.items():
+            where = f"{workflow}:{job_id}"
+            if not isinstance(job, dict):
+                continue
+            for reason in self.credential_reasons(job, doc):
+                self.report(where, "rehearsal-credentials", f"the job {reason}")
+            permissions = job.get("permissions", workflow_permissions)
+            if permissions != REHEARSAL_PERMISSIONS:
+                self.report(where, "rehearsal-credentials",
+                            f"effective permissions are {self.describe_permissions(permissions)}, "
+                            "expected exactly contents: read")
+            self.check_rehearsal_expressions(where, {job_id: job})
+
+    def read_script(self, relative):
+        try:
+            return (self.root / relative).read_text(errors="replace")
+        except OSError as err:
+            self.report(str(relative), "release-script-drift", f"cannot be read: {err}")
+            return None
+
+    @staticmethod
+    def normalized(line):
+        return " ".join(line.split())
+
+    @staticmethod
+    def body_lines(text):
+        """Returns the lines of a script or run: block, without trailing
+        whitespace.
+
+        The leading comment and blank lines and the trailing blank lines are
+        left out, so a script's header and a block's final newline do not
+        count.
+        """
+        lines = [line.rstrip() for line in (text or "").split("\n")]
+        start = 0
+        while start < len(lines) and (not lines[start] or lines[start].lstrip().startswith("#")):
+            start += 1
+        end = len(lines)
+        while end > start and not lines[end - 1]:
+            end -= 1
+        return lines[start:end]
+
+    def check_release_script_drift(self):
+        release = self.docs.get("release.yml")
+        if not isinstance(release, dict):
+            return
+        job = (release.get("jobs") or {}).get("build")
+        if not isinstance(job, dict):
+            self.report("release.yml", "release-script-drift", "no build job")
+            return
+        where = "release.yml:build"
+        steps = [step for step in job.get("steps", []) or [] if isinstance(step, dict)]
+        release_lines = [self.normalized(MATRIX_TARGET.sub('"$TARGET"', line))
+                         for step in steps for line in self.logical_lines(step.get("run")) if BUILD_CALL.search(line)]
+        if not release_lines:
+            self.report(where, "release-script-drift", "runs no cargo build or cross build line")
+        script = self.read_script(BUILD_SCRIPT)
+        if script is not None:
+            script_lines = [self.normalized(line) for line in self.logical_lines(script) if BUILD_CALL.search(line)]
+            for line in release_lines:
+                if line not in script_lines:
+                    self.report(str(BUILD_SCRIPT), "release-script-drift", f"lacks the release build line: {line}")
+            for line in script_lines:
+                if line not in release_lines:
+                    self.report(str(BUILD_SCRIPT), "release-script-drift",
+                                f"build line not in the release build job: {line}")
+        for variable, relative in SETUP_SCRIPTS:
+            writers = [step for step in steps if isinstance(step.get("run"), str)
+                       and f"{variable}=" in step["run"] and "GITHUB_ENV" in step["run"]]
+            if len(writers) != 1:
+                self.report(where, "release-script-drift",
+                            f"{len(writers)} steps write {variable} to GITHUB_ENV, expected one")
+                continue
+            script = self.read_script(relative)
+            if script is None:
+                continue
+            pairs = itertools.zip_longest(self.body_lines(script), self.body_lines(writers[0]["run"]))
+            for number, (actual, expected) in enumerate(pairs, start=1):
+                if actual != expected:
+                    self.report(str(relative), "release-script-drift",
+                                f"body line {number} is {'no line' if actual is None else repr(actual)}, "
+                                f"the release step that writes {variable} has "
+                                f"{'no line' if expected is None else repr(expected)}")
+                    break
+
     def check_workflow(self, workflow):
         doc = self.load(pathlib.PurePosixPath(".github/workflows") / workflow)
         if not isinstance(doc, dict):
             return
+        self.docs[workflow] = doc
         if "permissions" not in doc:
             self.report(workflow, "workflow-permissions", "no top-level permissions")
         jobs = doc.get("jobs") or {}
@@ -462,6 +704,8 @@ class Checker:
         if workflow == COVERAGE_WORKFLOW:
             self.check_coverage_trigger(workflow, doc)
             self.check_coverage_condition(workflow, jobs)
+        if workflow == REHEARSAL_WORKFLOW:
+            self.check_rehearsal_credentials(workflow, doc, jobs)
         for job_id, job in jobs.items():
             self.check_job(workflow, doc, job_id, job)
 
@@ -480,6 +724,7 @@ class Checker:
         for workflow in WORKFLOWS:
             self.check_workflow(workflow)
         self.check_composite_expressions()
+        self.check_release_script_drift()
         return self.violations
 
 

@@ -405,11 +405,21 @@ Manages the per-profile cache of `stellar.toml` bindings backing the counterpart
 
 | Subcommand | Form | Notes |
 |---|---|---|
-| `list` | `counterparty list [--profile NAME] [--json]` | Lists cached bindings (home domain, fetched/expiry timestamps). `--json` is a no-op; JSON is the only shape. Read-only. |
+| `list` | `counterparty list [--profile NAME] [--json]` | Lists only live cached bindings (home domain, fetched/expiry timestamps). `--json` is a no-op; JSON is the only shape. Read-only. |
 | `refresh` | `counterparty refresh <HOME_DOMAIN> [--profile NAME]` | Force-fetches `https://<domain>/.well-known/stellar.toml`, HMAC-protects, writes atomically. Domain must be strict ASCII, 1–32 chars (IDN/homoglyph rejected). |
 | `evict` | `counterparty evict <HOME_DOMAIN> [--profile NAME]` | Deletes one cached binding; exits `0` even if already absent. |
-| `warm-up` | `counterparty warm-up [--profile NAME]` | Refreshes every domain in the profile's policy allowlist; exits `1` if any fails. |
+| `warm-up` | `counterparty warm-up [--profile NAME]` | Refreshes domain candidates from allowlist criteria containing `HOME_DOMAIN`. Skips strkeys and `CODE:ISSUER` values; exits `1` if any remaining candidate fails. |
 | `rotate-hmac-key` | `counterparty rotate-hmac-key [--profile NAME]` | Rotates the per-profile cache HMAC key; existing files then fail verification and need refresh. |
+
+A `HOME_DOMAIN` binding is evidence for one hour from its fetch. An entry
+whose fetch time lies more than five minutes in the future counts as expired.
+Expired entries satisfy neither the `HOME_DOMAIN` kind of
+`counterparty_allowlist` nor `home_domain_resolved`. A policy that relies on
+the `HOME_DOMAIN` kind needs `counterparty warm-up` on a schedule shorter than
+one hour. Warm-up refreshes only the domains named in `counterparty_allowlist`
+criteria that contain `HOME_DOMAIN`. A policy that uses `home_domain_resolved`
+keeps each domain it relies on live with a scheduled
+`stellar-agent counterparty refresh <domain>` per domain.
 
 `--profile` resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default` for this group.
 

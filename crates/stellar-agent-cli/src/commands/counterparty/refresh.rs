@@ -42,13 +42,12 @@
 //! Provides the CLI refresh surface for the counterparty cache, backing the
 //! counterparty allowlist policy.
 
-use std::time::Duration;
-
 use clap::Args;
 use serde::Serialize;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_network::StellarTomlResolver;
 use stellar_agent_network::counterparty::CounterpartyResolver as _;
+use stellar_agent_network::counterparty::cache::DEFAULT_TTL;
 
 use crate::commands::counterparty::envelope::to_counterparty_envelope;
 use crate::commands::counterparty::list::{counterparty_cache_dir, format_system_time};
@@ -155,7 +154,7 @@ pub async fn run(args: &RefreshArgs) -> i32 {
         &profile_name,
         profile.counterparty_cache_key_id.clone(),
         &cache_dir,
-        Duration::from_secs(3600),
+        DEFAULT_TTL,
     ) {
         Ok(r) => r,
         Err(e) => {

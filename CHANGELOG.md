@@ -115,9 +115,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MAX_SERVER_TEXT_CHARS` render server-derived text.
   `stellar_agent_x402::wire::describe_json_error` describes a JSON decode
   failure by its class and position, without its values.
+- The release rehearsal workflow `release-rehearsal.yml` builds and packs the
+  five release targets of any branch on a dispatch, without a tag or a
+  credential, and keeps the unsigned archives for 7 days. The rehearsal
+  requires the build lines and the Windows setup scripts to equal those of
+  the build job in `release.yml`.
+  `check-workflow-invariants.py` refuses an expression in any key or value
+  of the rehearsal workflow that reads a secret or the workflow token,
+  top-level keys and job IDs included. It also refuses a double quote
+  outside a single-quoted string in such an expression.
 
 ### Changed
 
+- The opt-in stale-if-error fallback returns expired entries only on transient
+  fetch failures and only within one TTL past expiry, and never an entry whose
+  fetch time lies more than five minutes in the future. It never writes them back.
+  `CounterpartyError::FetchFailed` gains `transient`; code that constructs the
+  variant or matches it without `..` must add the field.
 - `profile reset-window-state` writes its audit row before wiping the store,
   under the audit writer and store lock. The row carries live wiped accrual,
   per-bucket totals, the generation pair and the profile's chain.
@@ -280,6 +294,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `counterparty warm-up` skips Stellar strkeys and `CODE:ISSUER` values in
+  mixed-kind allowlists.
 - The counterparty cache reads and mints its HMAC key at the profile's
   `counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.
   With an explicit reference, cached entries read as absent until a refresh
@@ -330,6 +346,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- An expired binding does not satisfy the `HOME_DOMAIN` kind of a
+  `counterparty_allowlist` criterion or `home_domain_resolved`:
+  `counterparty list` and the policy snapshot skip cache entries past their TTL.
+  An entry whose fetch time lies more than five minutes in the future counts as
+  expired. A binding is evidence for one hour from its fetch. Policies that rely
+  on the `HOME_DOMAIN` kind need `counterparty warm-up` on a schedule shorter
+  than one hour, and policies that use `home_domain_resolved` need a scheduled
+  `counterparty refresh <domain>` for each domain they rely on.
 - The RPC client removes the stored credential, and the form it sends, from
   every error text it returns, before the URL scrub.
 - A credential reference that names the keyring entry of another wallet key,

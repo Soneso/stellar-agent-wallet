@@ -106,6 +106,16 @@ and SEP-10 / SEP-45 session-active checks. Criteria needing external state
 injected view at the dispatch site; when a required view is absent the criterion
 fails closed.
 
+A `HOME_DOMAIN` binding is evidence for one hour from its fetch. An entry
+whose fetch time lies more than five minutes in the future counts as expired.
+Expired entries satisfy neither the `HOME_DOMAIN` kind of
+`counterparty_allowlist` nor `home_domain_resolved`. A policy that relies on
+the `HOME_DOMAIN` kind needs `counterparty warm-up` on a schedule shorter than
+one hour. Warm-up refreshes only the domains named in `counterparty_allowlist`
+criteria that contain `HOME_DOMAIN`. A policy that uses `home_domain_resolved`
+keeps each domain it relies on live with a scheduled
+`stellar-agent counterparty refresh <domain>` per domain.
+
 At the MCP boundary, account, strkey, and contract-id fields inside a deny
 reason are redacted to first-five-last-five before crossing the wire. The tool
 registry is fail-closed at startup: a duplicate tool registration or an

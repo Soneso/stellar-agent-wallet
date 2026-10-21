@@ -346,8 +346,8 @@ gate except `shellcheck-changed`, which needs a changed shell script.
 2. `actionlint`: a workflow change.
 3. `workflow-invariants`: a change to `release.yml`, `publish.yml`,
    `notarize-smoke.yml`, `labels.yml`, `stale.yml`, `triage.yml`,
-   `triage-review.yml`, `triage-sweep.yml`, `welcome.yml`, or `coverage.yml`
-   under `.github/workflows/`, to
+   `triage-review.yml`, `triage-sweep.yml`, `welcome.yml`, `coverage.yml`, or
+   `release-rehearsal.yml` under `.github/workflows/`, to
    `.github/actions/`, or to a file under `.github/scripts/` that one of them
    names.
    `triage.yml` handles item events; `triage-review.yml` starts `triage-sweep.yml`

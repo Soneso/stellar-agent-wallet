@@ -8,7 +8,10 @@
 //! - `validate_home_domain` error message content.
 //! - `is_private_or_reserved` edge cases: broadcast, documentation, multicast,
 //!   IPv4-mapped-IPv6 public address, unspecified addresses.
-//! - `build_fetch_client` / `build_bounded_https_client` public APIs.
+//! - `build_fetch_client` / `build_bounded_https_client` public APIs, and the
+//!   production response validation through `fetch_url_with_client`: a
+//!   response slower than a short client timeout yields a transient
+//!   `FetchFailed`.
 //! - `fetch_stellar_toml` content-type edge cases: `text/plain` accepts,
 //!   `application/json` rejects, missing content-type rejects.
 //! - Body at exactly the cap boundary (MAX_BODY_BYTES accepted, MAX+1 rejected).
@@ -27,7 +30,8 @@ use stellar_agent_network::CounterpartyError;
 use stellar_agent_network::counterparty::CounterpartyResolver as _;
 use stellar_agent_network::counterparty::cache::StellarTomlResolver;
 use stellar_agent_network::counterparty::fetch::{
-    MAX_BODY_BYTES, build_bounded_https_client, build_fetch_client, validate_home_domain,
+    MAX_BODY_BYTES, build_bounded_https_client, build_fetch_client, fetch_url_with_client,
+    validate_home_domain,
 };
 use stellar_agent_test_support::keyring_mock;
 use tempfile::TempDir;
@@ -119,7 +123,12 @@ async fn fetch_500_returns_fetch_failed_with_status() {
         matches!(err, CounterpartyError::FetchFailed { .. }),
         "500 must map to FetchFailed, got: {err:?}"
     );
-    if let CounterpartyError::FetchFailed { ref detail } = err {
+    if let CounterpartyError::FetchFailed {
+        ref detail,
+        transient,
+    } = err
+    {
+        assert!(transient, "HTTP 500 must be transient");
         assert!(
             detail.contains("500"),
             "FetchFailed detail must include HTTP 500 status; got: {detail:?}"
@@ -154,7 +163,12 @@ async fn fetch_401_returns_fetch_failed() {
         matches!(err, CounterpartyError::FetchFailed { .. }),
         "401 must map to FetchFailed, got: {err:?}"
     );
-    if let CounterpartyError::FetchFailed { ref detail } = err {
+    if let CounterpartyError::FetchFailed {
+        ref detail,
+        transient,
+    } = err
+    {
+        assert!(!transient, "HTTP 401 must not be transient");
         assert!(
             detail.contains("401"),
             "FetchFailed detail must include HTTP 401 status; got: {detail:?}"
@@ -189,7 +203,12 @@ async fn fetch_403_returns_fetch_failed() {
         matches!(err, CounterpartyError::FetchFailed { .. }),
         "403 must map to FetchFailed, got: {err:?}"
     );
-    if let CounterpartyError::FetchFailed { ref detail } = err {
+    if let CounterpartyError::FetchFailed {
+        ref detail,
+        transient,
+    } = err
+    {
+        assert!(!transient, "HTTP 403 must not be transient");
         assert!(
             detail.contains("403"),
             "FetchFailed detail must include HTTP 403 status; got: {detail:?}"
@@ -284,7 +303,12 @@ async fn fetch_body_one_over_cap_is_rejected() {
         matches!(err, CounterpartyError::FetchFailed { .. }),
         "oversized body must map to FetchFailed, got: {err:?}"
     );
-    if let CounterpartyError::FetchFailed { ref detail } = err {
+    if let CounterpartyError::FetchFailed {
+        ref detail,
+        transient,
+    } = err
+    {
+        assert!(!transient, "an oversized body must not be transient");
         assert!(
             detail.contains("large") || detail.contains("bytes"),
             "FetchFailed detail must describe the size violation; got: {detail:?}"
@@ -714,6 +738,52 @@ fn build_bounded_https_client_with_zero_timeout_succeeds() {
         client.is_ok(),
         "bounded HTTPS client must build even with zero timeout; got: {client:?}"
     );
+}
+
+/// A response that arrives after the client's timeout makes the production
+/// response validation return a transient `FetchFailed`, which permits the
+/// bounded stale-cache fallback.
+#[tokio::test]
+async fn fetch_timeout_returns_transient_fetch_failed() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/stellar.toml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(VALID_TOML)
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // The bounded client settings without `https_only`, so the plain-HTTP mock
+    // server is reachable.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(200))
+        .redirect(redirect::Policy::none())
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .build()
+        .expect("short-timeout client must build");
+    let url = format!("{}{}", mock_server.uri(), "/.well-known/stellar.toml");
+    let err = fetch_url_with_client(&client, &url)
+        .await
+        .expect_err("a response slower than the timeout must fail");
+
+    match err {
+        CounterpartyError::FetchFailed {
+            transient,
+            ref detail,
+        } => {
+            assert!(transient, "a timeout must be transient");
+            assert_eq!(detail, "fetch timed out");
+        }
+        other => panic!("a timeout must map to FetchFailed; got: {other:?}"),
+    }
+
+    mock_server.verify().await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
