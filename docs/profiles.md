@@ -712,11 +712,23 @@ the chain. Review the rules before signing; an empty `criteria` list adds no
 spending cap. See [policy rules](concepts.md#the-policy-engine)
 for additional restrictions.
 
+The signature covers every key the policy schema accepts outside the
+`[signature]` table, including a rule's `reason`, `ttl_secs`, and
+`allow_opaque_signing`. Any change to a key or a value outside that table
+therefore needs a new signature. Comments, whitespace, quoting style, and number
+notation are outside the signed form; the order of keys inside a `match` table
+or a criterion is part of it.
+The loader refuses unknown keys, while `profile sign-policy` refuses them
+in the policy body and replaces the `[signature]` table whole, dropping any
+extra key in that table.
+
 Then run `stellar-agent profile sign-policy --profile default --secret-env WALLET_OWNER_SK`
 with the enrolled owner's seed in `WALLET_OWNER_SK`.
 [Pass a secret seed](getting-started.md#pass-a-secret-seed) covers setting and
-clearing that variable. The command adds the signature table; it refuses a
-missing file with `sign_policy.policy_file_unreadable`.
+clearing that variable. The command adds the signature table. It refuses a
+missing file with `sign_policy.policy_file_unreadable`, a key outside the policy
+schema with `sign_policy.canonicalization_failed`, and a body the engine would
+refuse with `sign_policy.policy_body_invalid`.
 
 ## Example profile
 

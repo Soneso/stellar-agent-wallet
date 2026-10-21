@@ -284,6 +284,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Sep10Session::parse` refuses a token longer than 8192 bytes, a token with an
   empty header or payload segment, and a token with a character outside the
   base64url alphabet, with `sep10.jwt_parse_error`.
+- `PolicyError::OwnerSignatureInvalid` gains `rules_with_signed_optional_keys`,
+  the indexes of the rules that carry a signed optional rule key. A downstream
+  pattern or constructor that names the variant's fields must add it.
+- `stellar_agent_core::policy::v1` exposes `validate_policy_keys`, which refuses
+  a key outside the policy schema, and `validate_unsigned_policy`, which applies
+  the loader's body checks to a policy that is not yet signed.
+- `profile sign-policy` refuses a policy body the V1 loader would refuse, such
+  as an out-of-range `ttl_secs` or a `scope` for another profile, with
+  `sign_policy.policy_body_invalid`. A refused file is left unchanged.
+- The MCP server's startup message for a V1 policy whose owner signature fails
+  asks to review the policy and re-sign it. A policy file that fails a body
+  check, such as an unknown key, gets no signing hint.
+- The V1 policy loader refuses a policy file without a `[signature]` table with
+  a message that names `stellar-agent profile sign-policy` with the profile.
 
 ### Removed
 
@@ -417,6 +431,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GHSA-8r9p-f939-6h3c and GHSA-q3jh-wrc6-jgq8 affect `follow-redirects`
   1.16.0. The harnesses compare the wallet's fixtures with the released
   JavaScript SDKs in CI, and no wallet crate depends on them.
+- V1 policy signatures cover `reason`, `ttl_secs`, and `allow_opaque_signing`
+  on each rule that carries them. A policy signed by an earlier release whose
+  rules carry these keys fails verification with
+  `policy.owner_signature_invalid`, and the message names those rules. Review
+  such a policy and re-sign it with `stellar-agent profile sign-policy`. A
+  policy whose rules carry none of them keeps its signature.
+- The V1 policy loader refuses a key outside the policy schema with
+  `policy.policy_file_parse_failed`, naming the key and its location, before it
+  checks the signature. Each criterion kind accepts only its own keys.
+  `profile sign-policy` refuses such a key in the policy body with
+  `sign_policy.canonicalization_failed` and replaces the `[signature]` table
+  whole, dropping any extra key in that table.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 

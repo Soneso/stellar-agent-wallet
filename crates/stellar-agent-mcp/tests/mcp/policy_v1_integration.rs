@@ -329,7 +329,10 @@ scope = "profile:default"
         .expect_err("verification with wrong key must fail");
     use stellar_agent_core::policy::PolicyError;
     assert!(
-        matches!(err, PolicyError::OwnerSignatureInvalid { ref profile } if profile == "default"),
+        matches!(
+            err,
+            PolicyError::OwnerSignatureInvalid { ref profile, .. } if profile == "default"
+        ),
         "wrong-key verification must produce OwnerSignatureInvalid; got: {err:?}"
     );
 }
@@ -359,7 +362,10 @@ decision = "allow"
         .expect_err("tampered body must fail signature verification");
     use stellar_agent_core::policy::PolicyError;
     assert!(
-        matches!(err, PolicyError::OwnerSignatureInvalid { ref profile } if profile == "default"),
+        matches!(
+            err,
+            PolicyError::OwnerSignatureInvalid { ref profile, .. } if profile == "default"
+        ),
         "tampered body must produce OwnerSignatureInvalid; got: {err:?}"
     );
 }
