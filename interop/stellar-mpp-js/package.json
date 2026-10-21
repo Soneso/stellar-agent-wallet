@@ -20,6 +20,11 @@
     "overrides": {
       "axios": "1.20.0",
       "toml": "4.3.0"
+    },
+    "peerDependencyRules": {
+      "allowedVersions": {
+        "@stellar/mpp@0.7.1>mppx": "0.8.19"
+      }
     }
   }
 }

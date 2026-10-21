@@ -14,10 +14,13 @@ Pins:
 - pnpm `10.33.0`
 
 `@stellar/mpp@0.7.1` declares the peer ranges `@stellar/stellar-sdk: ^15.1.0`
-and `mppx: ^0.6.29`. The SDK pin satisfies its range. The `mppx` pin does not,
-and pnpm reports the unmet peer when it resolves the lockfile. The `mppx` 0.6
-line carries the advisories GHSA-727h-3vm5-qwq6 and GHSA-vc9j-9wph-qghj, which
-0.8.2 fixes, and no `@stellar/mpp` release accepts a newer `mppx`.
+and `mppx: ^0.6.29`. The SDK pin satisfies its range. The `mppx` pin does not.
+The `mppx` 0.6 line carries the advisories GHSA-727h-3vm5-qwq6 and
+GHSA-vc9j-9wph-qghj, which 0.8.2 fixes, and no `@stellar/mpp` release accepts a
+newer `mppx`. The rule `"@stellar/mpp@0.7.1>mppx": "0.8.19"` under
+`pnpm.peerDependencyRules.allowedVersions` in `package.json` accepts `mppx`
+0.8.19 as the peer of `@stellar/mpp` 0.7.1 only. pnpm reports any other
+pairing as an unmet peer.
 
 With `mppx@0.8.19` the released server emits the fixture's challenge,
 credential, and receipt bytes. It answers a credential that fails its
