@@ -70,6 +70,8 @@ mod tx_receipt_clear_integration;
 mod usage_error_envelope;
 #[path = "cli/v1_ceremony.rs"]
 mod v1_ceremony;
+#[path = "cli/version_marker.rs"]
+mod version_marker;
 
 #[path = "cli/profile_counterparty_key.rs"]
 mod profile_counterparty_key;

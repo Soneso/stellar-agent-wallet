@@ -62,6 +62,9 @@ keyring-core = { workspace = true }
 stellar-agent-windows-identity = { workspace = true }
 
 [features]
+# Reports mainnet-write feature state in build information. Disabled by default.
+mainnet-write = []
+
 # Exposes policy strategies and verified audit reads to integration tests,
 # which do not receive cfg(test).
 test-helpers = ["dep:proptest", "dep:stellar-agent-test-support"]

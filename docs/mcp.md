@@ -205,6 +205,9 @@ Notes:
   `default`, pass one: `"args": ["--profile", "alice"]`, or set
   `STELLAR_AGENT_PROFILE` in the environment the client spawns the process with.
   Arguments other than `--profile`, `--help`, and `--version` are refused.
+- The second line of `--version` and `-V` output,
+  `STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on`, reports the build state of
+  the default-off `mainnet-write` Cargo feature.
 - The exact location and schema of the configuration file depend on the MCP
   client. Consult that client's documentation for where to place the stanza.
 
