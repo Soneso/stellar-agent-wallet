@@ -13,7 +13,7 @@
   "dependencies": {
     "@stellar/mpp": "0.7.1",
     "@stellar/stellar-sdk": "15.1.0",
-    "mppx": "0.6.31",
+    "mppx": "0.8.19",
     "viem": "2.57.2"
   },
   "pnpm": {
