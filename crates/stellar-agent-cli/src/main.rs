@@ -22,10 +22,23 @@ mod render;
 #[cfg(test)]
 mod test_rpc;
 
+use std::sync::LazyLock;
+
 use clap::{Parser, Subcommand};
 use stellar_agent_core::observability;
 
 use crate::common::resolve_profile_name;
+
+/// Version value clap prints after the binary name: the package version, then
+/// core's build-state marker on its own line. Built once at runtime because
+/// clap takes a `&'static str` and `concat!` accepts only literals.
+static VERSION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{}\n{}",
+        env!("CARGO_PKG_VERSION"),
+        stellar_agent_core::build_info::MAINNET_WRITE_MARKER
+    )
+});
 
 /// Stellar agent wallet command-line interface.
 ///
@@ -35,7 +48,7 @@ use crate::common::resolve_profile_name;
 #[command(
     name = "stellar-agent",
     author,
-    version,
+    version = VERSION.as_str(),
     about = "Self-custodial Stellar agent wallet CLI",
     long_about = None,
 )]

@@ -235,6 +235,7 @@ fn requested_profile_from_argv() -> Option<String> {
         Ok(Invocation::Serve { profile }) => profile,
         Ok(Invocation::Version) => {
             println!("stellar-agent-mcp {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", stellar_agent_core::build_info::MAINNET_WRITE_MARKER);
             std::process::exit(0);
         }
         Ok(Invocation::Help) => {

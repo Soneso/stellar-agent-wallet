@@ -67,5 +67,7 @@ mod toolset_sign_payment_gated_integration;
 mod toolsets_matrix_invariants;
 #[path = "mcp/trustline_integration.rs"]
 mod trustline_integration;
+#[path = "mcp/version_marker.rs"]
+mod version_marker;
 #[path = "mcp/x402_audit_gate_integration.rs"]
 mod x402_audit_gate_integration;

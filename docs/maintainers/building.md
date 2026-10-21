@@ -70,6 +70,11 @@ rustup component add llvm-tools-preview
 
 ## Building
 
+The default-off `mainnet-write` Cargo feature changes build reporting only:
+`stellar-agent` and `stellar-agent-mcp` report its state as
+`STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on` on the second line of
+`--version` and `-V` output.
+
 Build the whole workspace:
 
 ```bash

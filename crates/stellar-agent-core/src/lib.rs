@@ -66,6 +66,9 @@ pub mod audit_log;
 /// Public, non-secret constants shared by wallet crates.
 pub mod constants;
 
+/// Compile-time feature state shared by wallet binaries and libraries.
+pub mod build_info;
+
 /// Typed Stellar amount value and unit-enforcing parsers.
 ///
 /// The central type is [`amount::StellarAmount`], stored internally as `i64`

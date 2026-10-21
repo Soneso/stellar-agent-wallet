@@ -35,6 +35,12 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+#[cfg(feature = "mainnet-write")]
+const _: () = assert!(
+    stellar_agent_core::build_info::MAINNET_WRITE,
+    "the mainnet-write feature of stellar-agent-network requires stellar-agent-core/mainnet-write"
+);
+
 pub mod account;
 pub mod builder;
 pub mod client;

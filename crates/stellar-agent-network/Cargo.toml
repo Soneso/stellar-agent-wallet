@@ -14,6 +14,9 @@ categories = ["cryptography::cryptocurrencies", "api-bindings"]
 name = "stellar_agent_network"
 
 [features]
+# Forwards mainnet-write build reporting to core. Disabled by default.
+mainnet-write = ["stellar-agent-core/mainnet-write"]
+
 # Enables `validate_friendbot_url_allowing_loopback` for cross-crate integration
 # tests that need to point a wiremock server at 127.0.0.1. Never enable this
 # feature in production or release builds — the loopback escape is intentionally
