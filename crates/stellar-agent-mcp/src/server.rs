@@ -55,7 +55,7 @@
 //!   G-strkey accounts.
 //! - `mcp-resource://profiles/<name>` - non-secret profile metadata.
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use ed25519_dalek::PUBLIC_KEY_LENGTH;
 use rmcp::serde::Serialize;
@@ -84,6 +84,7 @@ use stellar_agent_core::{
     profile::schema::{KeyringEntryRef, PolicyEngineKind, Profile, default_policy_dir},
     timefmt::{Clock, default_clock},
 };
+use stellar_agent_network::counterparty::cache::DEFAULT_TTL;
 use stellar_agent_network::keyring::{KeyringOperation, map_keyring_operation_error};
 use stellar_agent_network::policy_state::PersistedWindowStore;
 use stellar_agent_network::{CounterpartyResolver, NoopCounterpartyResolver, StellarTomlResolver};
@@ -453,7 +454,7 @@ fn build_counterparty_resolver(profile: &Profile) -> Arc<dyn CounterpartyResolve
         &profile_name,
         profile.counterparty_cache_key_id.clone(),
         cache_dir,
-        Duration::from_secs(3600),
+        DEFAULT_TTL,
     ) {
         Ok(resolver) => Arc::new(resolver),
         Err(err) => {

@@ -735,8 +735,8 @@ pub enum DenyReason {
     },
 
     // ── Home-domain-resolved criterion ────────────────────────────────
-    /// The destination account's on-chain `home_domain` has not been
-    /// resolved and cached via `stellar-agent counterparty refresh`.
+    /// The destination account's on-chain `home_domain` has no live binding
+    /// in the counterparty cache. `counterparty refresh` renews the binding.
     ///
     /// Wire code: `policy.home_domain_not_resolved`.
     ///

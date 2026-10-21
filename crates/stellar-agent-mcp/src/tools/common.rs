@@ -2342,6 +2342,7 @@ mod tests {
             stellar_agent_network::CounterpartyError,
         > {
             Err(stellar_agent_network::CounterpartyError::FetchFailed {
+                transient: false,
                 detail: "not used by dispatch_gate snapshot test".to_owned(),
             })
         }

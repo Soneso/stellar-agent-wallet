@@ -47,12 +47,12 @@ pub struct CounterpartyArgs {
 #[derive(Debug, Subcommand)]
 #[non_exhaustive]
 pub enum CounterpartySubcommand {
-    /// List cached `stellar.toml` bindings for a profile.
+    /// List live cached `stellar.toml` bindings for a profile.
     ///
-    /// Reads the per-profile cache directory, verifies each entry's HMAC, and
-    /// prints a JSON envelope with the list of valid cached home domains and
-    /// their expiry timestamps.  The command logs a warning for an entry whose
-    /// HMAC fails validation and skips it.
+    /// Reads the per-profile cache directory, verifies each entry's HMAC,
+    /// skips expired entries, and prints a JSON envelope with the list of live
+    /// cached home domains and their expiry timestamps.  The command logs a
+    /// warning for an entry whose HMAC fails validation and skips it.
     /// `stellar-agent counterparty refresh <domain>` rewrites the affected
     /// entry.  `stellar-agent counterparty warm-up` refreshes only the
     /// `HOME_DOMAIN` entries of the policy allowlist.
@@ -77,7 +77,13 @@ pub enum CounterpartySubcommand {
     Evict(evict::EvictArgs),
 
     /// Refresh every HOME_DOMAIN entry currently configured in the policy
-    /// counterparty allowlist.
+    /// counterparty allowlist, skipping strkeys and CODE:ISSUER values.
+    ///
+    /// A HOME_DOMAIN binding is evidence for one hour from its fetch; schedule
+    /// warm-up more often than hourly for policies that rely on it. Warm-up
+    /// covers only `counterparty_allowlist` criteria that contain HOME_DOMAIN.
+    /// A policy that uses `home_domain_resolved` keeps each domain it relies on
+    /// live with a scheduled `stellar-agent counterparty refresh <domain>`.
     #[command(name = "warm-up")]
     WarmUp(warm_up::WarmUpArgs),
 

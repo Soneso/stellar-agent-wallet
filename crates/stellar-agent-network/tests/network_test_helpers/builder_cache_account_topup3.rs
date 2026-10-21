@@ -524,9 +524,8 @@ async fn refresh_keyring_entry_with_invalid_base64_returns_keyring_unavailable()
 /// `fetched_at_i64_to_unix_s` correctly converts the i64 wire value back
 /// to a `SystemTime` for the non-negative (normal positive clock) case.
 ///
-/// Uses a fixed timestamp of `1_800_000_000` (2027-01-15T06:13:20 UTC) which
-/// is safely representable on all platforms and is far enough in the future
-/// relative to 2026 that `now > expires_at` is false with any reasonable TTL.
+/// Uses a fixed past fetch time with a TTL of several centuries, so the entry
+/// is live and the fixture is deterministic.
 #[test]
 #[serial_test::serial]
 fn read_cache_entry_fetched_at_round_trips_exactly() {
@@ -550,48 +549,27 @@ fn read_cache_entry_fetched_at_round_trips_exactly() {
     let cache_path = cache_file_path(tmp.path(), home_domain);
 
     // The specific fetched_at we want to survive the round-trip.
-    // 1_800_000_000 = 2027-01-15T06:13:20Z — safe for all platform SystemTime.
-    let fetched_at_unix_s: i64 = 1_800_000_000;
+    // 1_700_000_000 = 2023-11-14T22:13:20Z, a fixed time in the past.
+    let fetched_at_unix_s: i64 = 1_700_000_000;
 
     // Write a valid v2 cache file with the given fetched_at.
-    {
-        use hmac::{Hmac, KeyInit as _, Mac as _};
-        use sha2::Sha256;
+    let bytes = crate::counterparty_cache_fixture::v2_cache_file_bytes(
+        &raw_key,
+        home_domain,
+        fetched_at_unix_s,
+        VALID_STELLAR_TOML.as_bytes(),
+    );
+    std::fs::write(&cache_path, bytes).expect("write cache");
 
-        type HmacSha256 = Hmac<Sha256>;
-        let body = VALID_STELLAR_TOML.as_bytes();
-        let hd_bytes = home_domain.as_bytes();
-        let context_label = b"stellar-agent-counterparty/v2/stellar-toml-body\x00";
-
-        let mut mac = HmacSha256::new_from_slice(&raw_key).expect("HMAC key");
-        mac.update(context_label);
-        mac.update(&(u16::try_from(hd_bytes.len()).unwrap()).to_be_bytes());
-        mac.update(hd_bytes);
-        mac.update(&fetched_at_unix_s.to_be_bytes());
-        mac.update(&(u32::try_from(body.len()).unwrap()).to_be_bytes());
-        mac.update(body);
-        let tag: [u8; 32] = mac.finalize().into_bytes().into();
-
-        let mut buf: Vec<u8> = Vec::new();
-        buf.extend_from_slice(&tag);
-        buf.extend_from_slice(&(u16::try_from(hd_bytes.len()).unwrap()).to_be_bytes());
-        buf.extend_from_slice(hd_bytes);
-        buf.extend_from_slice(&fetched_at_unix_s.to_be_bytes());
-        buf.extend_from_slice(&(u32::try_from(body.len()).unwrap()).to_be_bytes());
-        buf.extend_from_slice(body);
-        std::fs::write(&cache_path, &buf).expect("write cache");
-    }
-
-    // Use a generous TTL: expires_at = 1_800_000_000 + 3_600 = 1_800_003_600.
-    // SystemTime::now() in 2026 is ~1_750_000_000 — well before expires_at.
-    let ttl = Duration::from_secs(3_600);
+    // A TTL of several centuries keeps the past fetch time within its window.
+    let ttl = Duration::from_secs(10_000_000_000);
     let result =
         read_cache_entry(&cache_path, &raw_key, ttl).expect("read_cache_entry must not error");
 
     let (_parsed, binding) = result.expect("entry with future expires_at must not be expired");
 
     // The fetched_at recovered from the file must exactly match the written value.
-    let expected_unix_s: u64 = 1_800_000_000;
+    let expected_unix_s: u64 = 1_700_000_000;
     let actual_secs = binding
         .fetched_at
         .duration_since(UNIX_EPOCH)

@@ -97,6 +97,9 @@
 //! 8. `ConstantTimeEq` compare stored tag vs recomputed tag.
 //! 9. If mismatch → [`CounterpartyError::HmacMismatch`] (fail-closed).
 //! 10. `fetched_at` + TTL yields `expires_at`; `mtime` is ignored.
+//! 11. Listing skips an entry that is expired or whose fetch time lies more
+//!     than five minutes ahead of the host clock; the stale-if-error fallback
+//!     applies the same clock rule.
 //!
 //! This module is the production implementation of the counterparty resolver
 //! combining HTTPS fetch, SEP-1 parsing, HMAC-protected cache, and single-writer
@@ -188,9 +191,8 @@ pub struct StellarTomlResolver {
     http_client: reqwest::Client,
     /// Validity window each binding records as `expires_at = fetched_at + ttl`.
     ttl: Duration,
-    /// Return the domain's HMAC-verified cache entry, whatever its expiry, when
-    /// a refresh fetch fails with `FetchFailed`. Disabled by default so callers
-    /// remain fail-closed unless they explicitly opt in.
+    /// Allow HMAC-verified fallback on transient fetch failures within one TTL
+    /// past expiry. Disabled by default so callers explicitly opt in.
     stale_if_error: bool,
     /// Optional base URL override for integration tests.
     ///
@@ -309,15 +311,16 @@ impl StellarTomlResolver {
 
     /// Configures whether refresh falls back to the cache when its fetch fails.
     ///
-    /// When enabled and the fetch fails with [`CounterpartyError::FetchFailed`],
-    /// refresh returns the domain's cache entry marked stale, whatever its
-    /// expiry. A missing cache entry, an entry that does not verify under the
-    /// cache key, and a cache key that cannot be loaded preserve the fetch
-    /// error. A read error such as [`CounterpartyError::Io`] from an unreadable
-    /// cache file, an owner-key refusal, or a verified body that fails to parse
-    /// propagates in its place. The default is `false` to preserve fail-closed
-    /// refresh behavior. CLI or daemon callers that prefer availability can opt
-    /// in and inspect [`StellarTomlBinding::stale`].
+    /// A transient [`CounterpartyError::FetchFailed`] permits the domain's
+    /// HMAC-verified cache entry until one current TTL past its expiry, inclusive.
+    /// An entry whose fetch time lies more than five minutes ahead of the host
+    /// clock is not eligible. The returned binding has `stale: true` and is
+    /// never written back. Listing filters expired entries, so expired fallback
+    /// evidence cannot enter a policy snapshot.
+    /// A missing, unverifiable, too-old, or future-dated entry preserves the
+    /// fetch error, as does an unavailable cache key. Read errors, owner-key
+    /// refusals, and verified bodies that fail to parse propagate in its place.
+    /// The default is `false`; callers that opt in inspect [`StellarTomlBinding::stale`].
     #[must_use]
     pub fn with_stale_if_error(mut self, enabled: bool) -> Self {
         self.stale_if_error = enabled;
@@ -411,7 +414,11 @@ impl CounterpartyResolver for StellarTomlResolver {
 
         let body = match body_result {
             Ok(body) => body,
-            Err(err @ CounterpartyError::FetchFailed { .. }) if self.stale_if_error => {
+            Err(
+                err @ CounterpartyError::FetchFailed {
+                    transient: true, ..
+                },
+            ) if self.stale_if_error => {
                 if let Some(binding) = self.read_stale_binding(home_domain)? {
                     tracing::warn!(
                         home_domain = %home_domain,
@@ -478,11 +485,12 @@ impl CounterpartyResolver for StellarTomlResolver {
         })
     }
 
-    /// Returns the list of cached bindings for this profile.
+    /// Returns only live cached bindings for this profile.
     ///
     /// Reads the cache directory, validates each file's HMAC, and returns
-    /// verified bindings.  The listing logs an HMAC mismatch at warn and skips
-    /// the file.  `counterparty refresh <domain>` rewrites the affected entry.
+    /// verified bindings whose expiry is in the future. The listing logs
+    /// an HMAC mismatch at warn and skips the file.
+    /// `counterparty refresh <domain>` rewrites the affected entry.
     /// `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the
     /// policy allowlist.
     ///
@@ -511,6 +519,7 @@ impl CounterpartyResolver for StellarTomlResolver {
             .map_err(|e| CounterpartyError::Io { kind: e.kind() })?;
 
         let mut bindings = Vec::new();
+        let now = SystemTime::now();
 
         for entry in read_dir {
             let entry = entry.map_err(|e| CounterpartyError::Io { kind: e.kind() })?;
@@ -531,7 +540,15 @@ impl CounterpartyResolver for StellarTomlResolver {
             // (e.g. "sub-domain.com") would round-trip incorrectly if
             // recovered from the filename sanitisation.
             match read_and_verify_cache(&path, hmac_key.as_ref()) {
-                Ok((home_domain, body, file_meta)) => {
+                Ok((home_domain, body, fetched_at)) => {
+                    let expires_at = cache_expires_at(fetched_at, self.ttl);
+                    if is_expired(fetched_at, expires_at, now) {
+                        tracing::debug!(
+                            file = %file_name,
+                            "counterparty cache entry expired, skipping"
+                        );
+                        continue;
+                    }
                     // Re-parse the cached body to recover ACCOUNTS. A body
                     // that fails to parse here indicates the cache file was
                     // written by an incompatible format or corrupted in a way
@@ -549,8 +566,6 @@ impl CounterpartyResolver for StellarTomlResolver {
                             continue;
                         }
                     };
-                    let fetched_at = file_meta;
-                    let expires_at = cache_expires_at(fetched_at, self.ttl);
                     bindings.push(StellarTomlBinding {
                         home_domain,
                         fetched_at,
@@ -620,6 +635,10 @@ impl StellarTomlResolver {
         if cached_home_domain != home_domain {
             return Ok(None);
         }
+        let expires_at = cache_expires_at(fetched_at, self.ttl);
+        if !stale_fallback_permitted(fetched_at, expires_at, self.ttl, SystemTime::now()) {
+            return Ok(None);
+        }
         let body_str = String::from_utf8(body).map_err(|_| CounterpartyError::CacheInvalid {
             detail: "cache body is not valid UTF-8".to_owned(),
         })?;
@@ -627,7 +646,7 @@ impl StellarTomlResolver {
         Ok(Some(StellarTomlBinding {
             home_domain: cached_home_domain,
             fetched_at,
-            expires_at: cache_expires_at(fetched_at, self.ttl),
+            expires_at,
             stale: true,
             accounts: sep1.accounts,
         }))
@@ -657,7 +676,7 @@ async fn fetch_with_base_url(
     base_url: &str,
     http: &reqwest::Client,
 ) -> Result<String, CounterpartyError> {
-    use crate::counterparty::fetch::MAX_BODY_BYTES;
+    use crate::counterparty::fetch::{MAX_BODY_BYTES, transient_send_error, transient_status};
 
     let url = format!(
         "{}/.well-known/stellar.toml",
@@ -671,12 +690,14 @@ async fn fetch_with_base_url(
         .send()
         .await
         .map_err(|e| CounterpartyError::FetchFailed {
+            transient: transient_send_error(&e),
             detail: format!("network error: {}", e.without_url()),
         })?;
 
     let status = response.status();
     if status != reqwest::StatusCode::OK {
         return Err(CounterpartyError::FetchFailed {
+            transient: transient_status(status.as_u16()),
             detail: format!("unexpected HTTP status {}", status.as_u16()),
         });
     }
@@ -685,16 +706,19 @@ async fn fetch_with_base_url(
         .bytes()
         .await
         .map_err(|e| CounterpartyError::FetchFailed {
+            transient: true,
             detail: format!("body read error: {}", e.without_url()),
         })?;
 
     if bytes.len() > MAX_BODY_BYTES {
         return Err(CounterpartyError::FetchFailed {
+            transient: false,
             detail: format!("body too large ({} bytes)", bytes.len()),
         });
     }
 
     String::from_utf8(bytes.into()).map_err(|_| CounterpartyError::FetchFailed {
+        transient: false,
         detail: "body is not valid UTF-8".to_owned(),
     })
 }
@@ -1015,6 +1039,39 @@ fn fetched_at_i64_to_unix_s(fetched_at_unix_s: i64) -> u64 {
     u64::try_from(fetched_at_unix_s.max(0)).unwrap_or(0)
 }
 
+/// How far a recorded fetch time may lie ahead of the host clock before reads reject the entry.
+const FUTURE_FETCH_TOLERANCE: Duration = Duration::from_secs(300);
+
+/// Returns true when `fetched_at` lies more than [`FUTURE_FETCH_TOLERANCE`] after `now`.
+///
+/// The tolerance limits how far a backward clock correction can extend a cache
+/// entry's life.
+fn fetched_in_future(fetched_at: SystemTime, now: SystemTime) -> bool {
+    fetched_at > cache_expires_at(now, FUTURE_FETCH_TOLERANCE)
+}
+
+/// Returns true when the entry is expired at `now`.
+///
+/// An entry is expired when `expires_at <= now` (equality counts as expired),
+/// and when `fetched_at` lies more than [`FUTURE_FETCH_TOLERANCE`] after `now`.
+fn is_expired(fetched_at: SystemTime, expires_at: SystemTime, now: SystemTime) -> bool {
+    expires_at <= now || fetched_in_future(fetched_at, now)
+}
+
+/// Returns true when the stale-if-error fallback may return the entry at `now`.
+///
+/// The fallback is permitted while `now` lies at or before one `ttl` past
+/// `expires_at` (the deadline itself is permitted), and only when `fetched_at`
+/// lies no more than [`FUTURE_FETCH_TOLERANCE`] after `now`.
+fn stale_fallback_permitted(
+    fetched_at: SystemTime,
+    expires_at: SystemTime,
+    ttl: Duration,
+    now: SystemTime,
+) -> bool {
+    now <= cache_expires_at(expires_at, ttl) && !fetched_in_future(fetched_at, now)
+}
+
 /// Computes a cache entry's expiry instant as `fetched_at + ttl`.
 ///
 /// If the addition would overflow the representable time range (a pathologically
@@ -1286,7 +1343,7 @@ pub fn read_cache_entry(
 
     let expires_at = cache_expires_at(fetched_at, ttl);
 
-    if SystemTime::now() > expires_at {
+    if is_expired(fetched_at, expires_at, SystemTime::now()) {
         // Entry has expired; caller should re-fetch.
         return Ok(None);
     }
@@ -1810,15 +1867,19 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let home_domain = "circle.com";
         let body = b"VERSION = \"2.0.0\"\nACCOUNTS = [\"GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY\"]\n";
+        let fetched_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let tag = compute_hmac_v2(
             &OWNER_KEY,
             home_domain,
-            fetched_at_unix_s_to_i64(TEST_FETCHED_AT),
+            fetched_at_unix_s_to_i64(fetched_at),
             body,
         )
         .unwrap();
         let path = cache_file_path(dir.path(), home_domain);
-        write_cache_atomic(dir.path(), &path, &tag, home_domain, TEST_FETCHED_AT, body).unwrap();
+        write_cache_atomic(dir.path(), &path, &tag, home_domain, fetched_at, body).unwrap();
         let resolver = StellarTomlResolver::new(
             profile_name,
             stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(
@@ -2061,5 +2122,142 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Fixed instant the clock-rule unit tests evaluate at.
+    fn clock_rule_now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
+    }
+
+    #[test]
+    fn future_fetch_tolerance_is_five_minutes() {
+        assert_eq!(FUTURE_FETCH_TOLERANCE, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn is_expired_at_equality() {
+        let now = clock_rule_now();
+        assert!(is_expired(now - DEFAULT_TTL, now, now));
+    }
+
+    #[test]
+    fn is_expired_one_nanosecond_before_expiry_is_live() {
+        let now = clock_rule_now();
+        assert!(!is_expired(now, now + Duration::from_nanos(1), now));
+    }
+
+    #[test]
+    fn is_expired_future_fetch_outside_tolerance() {
+        let now = clock_rule_now();
+        let fetched_at = now + FUTURE_FETCH_TOLERANCE + Duration::from_secs(1);
+        assert!(is_expired(fetched_at, fetched_at + DEFAULT_TTL, now));
+    }
+
+    #[test]
+    fn is_expired_future_fetch_at_tolerance_is_live() {
+        let now = clock_rule_now();
+        let fetched_at = now + FUTURE_FETCH_TOLERANCE;
+        assert!(!is_expired(fetched_at, fetched_at + DEFAULT_TTL, now));
+    }
+
+    #[test]
+    fn is_expired_future_fetch_within_tolerance() {
+        let now = clock_rule_now();
+        let fetched_at = now + FUTURE_FETCH_TOLERANCE - Duration::from_secs(1);
+        assert!(!is_expired(fetched_at, fetched_at + DEFAULT_TTL, now));
+    }
+
+    #[test]
+    fn stale_fallback_permitted_at_grace_deadline() {
+        let now = clock_rule_now();
+        let expires_at = now - DEFAULT_TTL;
+        let fetched_at = expires_at - DEFAULT_TTL;
+        assert!(stale_fallback_permitted(
+            fetched_at,
+            expires_at,
+            DEFAULT_TTL,
+            now
+        ));
+    }
+
+    #[test]
+    fn stale_fallback_refused_one_nanosecond_past_grace_deadline() {
+        let now = clock_rule_now();
+        let expires_at = now - DEFAULT_TTL - Duration::from_nanos(1);
+        let fetched_at = expires_at - DEFAULT_TTL;
+        assert!(!stale_fallback_permitted(
+            fetched_at,
+            expires_at,
+            DEFAULT_TTL,
+            now
+        ));
+    }
+
+    #[test]
+    fn stale_fallback_refused_for_future_fetch_outside_tolerance() {
+        let now = clock_rule_now();
+        let fetched_at = now + FUTURE_FETCH_TOLERANCE + Duration::from_secs(1);
+        assert!(!stale_fallback_permitted(
+            fetched_at,
+            fetched_at + DEFAULT_TTL,
+            DEFAULT_TTL,
+            now
+        ));
+    }
+
+    /// The stale read refuses an entry whose fetch time lies more than the
+    /// tolerance ahead of the host clock. The control shows an entry fetched
+    /// now is returned under the same key.
+    #[test]
+    #[serial_test::serial]
+    fn stale_read_refuses_an_entry_fetched_in_the_future() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring init");
+        let profile_name = "future-fetch";
+        let key = [0x3c_u8; HMAC_KEY_LEN];
+        set_cache_key_value(profile_name, &base64_encode_key(&key));
+        let dir = TempDir::new().unwrap();
+        let body = b"VERSION = \"2.0.0\"\n";
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let entries = [
+            ("live.example", now),
+            (
+                "future.example",
+                now + FUTURE_FETCH_TOLERANCE.as_secs() + 60,
+            ),
+        ];
+        for (home_domain, fetched_at) in entries {
+            let tag = compute_hmac_v2(
+                &key,
+                home_domain,
+                fetched_at_unix_s_to_i64(fetched_at),
+                body,
+            )
+            .unwrap();
+            let path = cache_file_path(dir.path(), home_domain);
+            write_cache_atomic(dir.path(), &path, &tag, home_domain, fetched_at, body).unwrap();
+        }
+        let resolver = StellarTomlResolver::new(
+            profile_name,
+            KeyringEntryRef::default_counterparty_key(profile_name),
+            dir.path(),
+            DEFAULT_TTL,
+        )
+        .unwrap();
+
+        assert!(
+            resolver
+                .read_stale_binding("live.example")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            resolver
+                .read_stale_binding("future.example")
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -370,20 +370,25 @@ async fn stale_if_error_false_ignores_stale_cache_on_failure() {
     let dir = TempDir::new().expect("tmpdir");
     let profile = unique_profile("fail-closed-stale");
 
+    crate::counterparty_cache_fixture::plant_cache_entry(
+        &profile,
+        dir.path(),
+        TEST_DOMAIN,
+        VALID_STELLAR_TOML,
+        Duration::from_secs(5400),
+    );
     let mock_server = MockServer::start().await;
-    mount_stellar_toml_mock(&mock_server).await;
-
-    // First write a valid cache entry.
-    let tiny_ttl = Duration::from_nanos(1);
-    let writer = build_test_resolver(&profile, dir.path(), tiny_ttl, &mock_server.uri());
-    writer.refresh(TEST_DOMAIN).await.expect("initial refresh");
-    // TTL expires immediately.
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    // Now point at a failing server with stale_if_error = false (default).
-    let failing_resolver =
-        build_test_resolver(&profile, dir.path(), tiny_ttl, "http://127.0.0.1:9");
-    // stale_if_error is false by default — must NOT return the stale entry.
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    let failing_resolver = build_test_resolver(
+        &profile,
+        dir.path(),
+        Duration::from_secs(3600),
+        &mock_server.uri(),
+    );
     let result = failing_resolver.refresh(TEST_DOMAIN).await;
 
     assert!(
@@ -493,6 +498,7 @@ fn counterparty_error_cache_invalid_display_includes_detail() {
 #[test]
 fn counterparty_error_fetch_failed_display_includes_detail() {
     let err = CounterpartyError::FetchFailed {
+        transient: false,
         detail: "unexpected HTTP status 503".to_owned(),
     };
     assert!(err.to_string().contains("503"));

@@ -86,7 +86,7 @@
 //!    the same shape as every other kind's deny).
 //! 2. Strict-ASCII homoglyph defence on the resolved value (unchanged).
 //! 3. **Domain verification**: [`EvalContext::counterparty_cache`] must be
-//!    populated AND report the domain as resolved
+//!    populated AND report a live binding for the domain
 //!    ([`crate::policy::v1::CounterpartyCacheView::has_resolved`]) — proof the
 //!    wallet operator has independently fetched a real `stellar.toml` at that
 //!    domain (via `stellar-agent counterparty warm-up` or
@@ -103,23 +103,24 @@
 //!    domain still denies, distinctly from an unverified one (see the `value`
 //!    field on each deny below).
 //!
-//! # Breaking change (behavior tightening)
+//! # Cache freshness
 //!
-//! Existing `HOME_DOMAIN` rules now require `EvalContext::counterparty_cache`
-//! to carry a resolved entry that lists the counterparty account — operators
-//! MUST populate the cache (`stellar-agent counterparty warm-up` scans the
-//! configured `allowlist` entries out of the policy file and refreshes each;
-//! `stellar-agent counterparty refresh <domain>` refreshes one domain) before
-//! any `HOME_DOMAIN` rule can pass. A rule that previously passed on a
-//! self-asserted match alone will now deny until the operator populates the
-//! cache. This does NOT affect `G_ACCOUNT` / `C_ACCOUNT` / `KNOWN_ISSUER`.
+//! `HOME_DOMAIN` rules require a live entry that lists the counterparty account.
+//! A binding is evidence for one hour from its fetch. Operators run
+//! `stellar-agent counterparty warm-up` on a schedule shorter than one hour.
+//! Warm-up refreshes domain candidates from criteria containing `HOME_DOMAIN`,
+//! skipping Stellar strkeys and `CODE:ISSUER` values. The command
+//! `stellar-agent counterparty refresh <domain>` refreshes one domain.
+//! Warm-up covers only `counterparty_allowlist` criteria, so a policy that uses
+//! the `home_domain_resolved` criterion keeps each domain it relies on live
+//! with a scheduled `stellar-agent counterparty refresh <domain>`.
 //!
 //! # Deny detail
 //!
 //! All `HOME_DOMAIN` denials use [`DenyReason::CounterpartyDenied`] with
 //! `kind = "HOME_DOMAIN"`; the `value` field text distinguishes the failure
 //! mode for operator triage: no on-chain domain, non-ASCII homoglyph, cache
-//! not populated, domain not resolved in the cache, account not listed by the
+//! not populated, no live domain binding in the cache, account not listed by the
 //! domain's `stellar.toml`, or (only once verified) not on the allowlist.
 
 use stellar_strkey::{Contract, ed25519::PublicKey};
@@ -692,7 +693,7 @@ impl CounterpartyAllowlistCriterion {
         };
         if !cache.has_resolved(&resolved_lower) {
             return deny(format!(
-                "{resolved_lower}: not verified (domain not resolved in counterparty cache; \
+                "{resolved_lower}: not verified (no live entry in the counterparty cache; \
                  run `stellar-agent counterparty refresh {resolved_lower}`)"
             ));
         }
@@ -1524,6 +1525,44 @@ mod tests {
                 );
             }
             other => panic!("absent counterparty_cache must deny; got {other:?}"),
+        }
+    }
+
+    /// A populated cache with no live entry for the domain denies as
+    /// unverified, with a detail that names the missing live entry and the
+    /// refresh command for that domain.
+    #[test]
+    fn home_domain_without_live_cache_entry_denies() {
+        let tool = make_tool("stellar_pay");
+        let profile = make_profile();
+        let store = PolicyStateStore::new();
+        let identity = MockIdentityView {
+            home_domain: Some("circle.com"),
+        };
+        let cache = MockCacheView {
+            resolved: Some(("other.example", IDENTITY_ACCOUNT_ID)),
+        };
+        let criterion = CounterpartyAllowlistCriterion::new(
+            vec![CounterpartyKind::HomeDomain],
+            vec!["circle.com".to_owned()],
+        );
+        let args = json!({ "destination": G_ALLOWED });
+        let ctx =
+            make_ctx_with_identity_and_cache(&tool, &profile, &args, &store, &identity, &cache);
+        let result = criterion.evaluate(&ctx).unwrap();
+        match result {
+            Some(DenyReason::CounterpartyDenied {
+                ref kind,
+                ref value,
+            }) => {
+                assert_eq!(kind, "HOME_DOMAIN");
+                assert_eq!(
+                    value,
+                    "circle.com: not verified (no live entry in the counterparty cache; \
+                     run `stellar-agent counterparty refresh circle.com`)"
+                );
+            }
+            other => panic!("a domain without a live cache entry must deny; got {other:?}"),
         }
     }
 
