@@ -8,6 +8,8 @@ mod builder_cache_account_topup2;
 mod builder_cache_account_topup3;
 #[path = "network_test_helpers/cache_coverage.rs"]
 mod cache_coverage;
+#[path = "network_test_helpers/counterparty_cache_fixture.rs"]
+mod counterparty_cache_fixture;
 #[path = "network_test_helpers/counterparty_cache_integration.rs"]
 mod counterparty_cache_integration;
 #[path = "network_test_helpers/counterparty_concurrent_first_fetch.rs"]

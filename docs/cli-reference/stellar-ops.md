@@ -496,7 +496,7 @@ Subcommands: `list`, `refresh`, `evict`, `warm-up`, `rotate-hmac-key`.
 
 ### `stellar-agent counterparty list [flags]`
 
-Lists the cached bindings for a profile: home domain plus fetched and expiry timestamps. The command logs a warning for an entry whose HMAC fails verification and skips it. `stellar-agent counterparty refresh <domain>` rewrites the affected entry. `stellar-agent counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. Read-only (local cache read).
+Lists only live cached bindings for a profile: home domain plus fetched and expiry timestamps. The command logs a warning for an entry whose HMAC fails verification and skips it. `stellar-agent counterparty refresh <domain>` rewrites the affected entry. `stellar-agent counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. Read-only (local cache read).
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
@@ -535,7 +535,7 @@ stellar-agent counterparty evict circle.com --profile alice
 
 ### `stellar-agent counterparty warm-up [flags]`
 
-Refreshes every `HOME_DOMAIN` entry currently configured in the profile's policy counterparty allowlist and prints a per-domain summary. Exits `1` if any refresh fails. Performs network fetches and HMAC writes; signs no transaction.
+Refreshes the domain candidates from policy allowlist criteria containing `HOME_DOMAIN` and prints a per-domain summary. Stellar strkeys and values containing `:` (the `CODE:ISSUER` form) are skipped. Other malformed domain values still fail refresh. Exits `1` if any refresh fails. Performs network fetches and HMAC writes; signs no transaction.
 
 | Flag | Meaning | Required | Default |
 |---|---|---|---|
@@ -544,6 +544,16 @@ Refreshes every `HOME_DOMAIN` entry currently configured in the profile's policy
 ```bash
 stellar-agent counterparty warm-up --profile default
 ```
+
+A `HOME_DOMAIN` binding is evidence for one hour from its fetch. An entry
+whose fetch time lies more than five minutes in the future counts as expired.
+Expired entries satisfy neither the `HOME_DOMAIN` kind of
+`counterparty_allowlist` nor `home_domain_resolved`. A policy that relies on
+the `HOME_DOMAIN` kind needs `counterparty warm-up` on a schedule shorter than
+one hour. Warm-up refreshes only the domains named in `counterparty_allowlist`
+criteria that contain `HOME_DOMAIN`. A policy that uses `home_domain_resolved`
+keeps each domain it relies on live with a scheduled
+`stellar-agent counterparty refresh <domain>` per domain.
 
 ### `stellar-agent counterparty rotate-hmac-key [flags]`
 

@@ -1,9 +1,9 @@
-//! `stellar-agent counterparty list [--profile <name>]` — list cached
+//! `stellar-agent counterparty list [--profile <name>]`: list live cached
 //! `stellar.toml` bindings for the named profile.
 //!
 //! Instantiates a [`StellarTomlResolver`] for the profile's cache directory,
 //! calls `CounterpartyResolver::list_cached`, and emits a structured JSON
-//! envelope.
+//! envelope. Expired entries are skipped.
 //!
 //! # Output (JSON envelope)
 //!
@@ -35,14 +35,13 @@
 //! # Errors
 //!
 //! Returns exit code `1` when the profile cannot be loaded, the cache
-//! directory cannot be determined, the keyring is unavailable, or the cache
-//! directory cannot be enumerated.
+//! directory cannot be determined or enumerated, or the cache key is refused
+//! as an owner key. An unavailable keyring yields a successful empty list.
 //!
 //! Provides the CLI list surface for the counterparty cache, backing the
 //! counterparty allowlist policy.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use clap::Args;
 use serde::Serialize;
@@ -50,6 +49,7 @@ use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_network::StellarTomlResolver;
 use stellar_agent_network::counterparty::CounterpartyResolver as _;
+use stellar_agent_network::counterparty::cache::DEFAULT_TTL;
 
 use crate::commands::counterparty::envelope::to_counterparty_envelope;
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
@@ -181,7 +181,7 @@ pub async fn run(args: &ListArgs) -> i32 {
         &profile_name,
         profile.counterparty_cache_key_id.clone(),
         &cache_dir,
-        Duration::from_secs(3600),
+        DEFAULT_TTL,
     ) {
         Ok(r) => r,
         Err(e) => {

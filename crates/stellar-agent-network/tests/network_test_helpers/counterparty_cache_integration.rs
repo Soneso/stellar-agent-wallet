@@ -10,8 +10,8 @@
 //! 3. **Cache HMAC mismatch (corruption — flip a byte)** — `list_cached` skips
 //!    the corrupted entry (silent skip per spec) and the underlying HMAC verify
 //!    returns `HmacMismatch`.
-//! 4. **Refresh past the expiry**: with a 1-nanosecond TTL the recorded expiry
-//!    passes at once, and a second `refresh` contacts the server again.
+//! 4. **Expiry filtering**: a one-nanosecond TTL listing returns nothing;
+//!    the long-TTL control lists the same file after one fetch.
 //! 5. **No keyring entry → empty list** — `list_cached` without a prior write
 //!    returns an empty list.
 //! 6. **Writer-locked path** — a manually held lock causes `refresh` to return
@@ -53,6 +53,8 @@ use stellar_agent_test_support::keyring_mock;
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use crate::counterparty_cache_fixture::plant_cache_entry;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -407,112 +409,174 @@ async fn hmac_mismatch_on_corrupted_cache() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. Expired cache → re-fetch
+// 4. Expired cache entries
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// With a 1-nanosecond TTL the entry's recorded expiry passes at once.
-/// `list_cached` does not filter on it, and a second `refresh` contacts the
-/// server again.
+/// A one-nanosecond TTL hides the entry; the long-TTL control returns the same file.
 #[tokio::test]
 #[serial]
 async fn expired_cache_entry_is_skipped_by_list_cached() {
     keyring_mock::install().expect("mock keyring init");
     let dir = TempDir::new().expect("tmpdir");
     let profile = unique_profile("expired");
-
     let mock_server = MockServer::start().await;
-    // Two network calls expected: one for first refresh, one for re-fetch.
     Mock::given(method("GET"))
         .and(path("/.well-known/stellar.toml"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(VALID_STELLAR_TOML)
-                .insert_header("content-type", "text/toml"),
-        )
-        .expect(2)
+        .respond_with(ResponseTemplate::new(200).set_body_string(VALID_STELLAR_TOML))
+        .expect(1)
         .mount(&mock_server)
         .await;
 
-    // Use a 1-nanosecond TTL so the entry expires immediately.
-    let tiny_ttl = Duration::from_nanos(1);
-    let resolver = build_test_resolver(&profile, dir.path(), tiny_ttl, &mock_server.uri());
-
-    // First refresh.
+    let resolver = build_test_resolver(
+        &profile,
+        dir.path(),
+        Duration::from_nanos(1),
+        &mock_server.uri(),
+    );
     resolver
         .refresh(TEST_DOMAIN)
         .await
-        .expect("first refresh must succeed");
-
-    // Wait a moment to ensure the TTL has elapsed.
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    // list_cached with a 1-ns TTL should see the entry as expired → empty.
-    let cached = resolver
-        .list_cached()
-        .await
-        .expect("list_cached must succeed");
-
-    // Either empty (expired) or present but with valid shape.
-    for binding in &cached {
-        assert!(
-            !binding.home_domain.is_empty(),
-            "home_domain must not be empty"
-        );
-    }
-
-    // Second refresh — must succeed (re-fetches from network).
-    let binding2 = resolver
-        .refresh(TEST_DOMAIN)
-        .await
-        .expect("second refresh must succeed after expired cache");
-    assert_eq!(binding2.home_domain, TEST_DOMAIN);
-
+        .expect("initial refresh");
+    assert!(resolver.list_cached().await.unwrap().is_empty());
+    let control = build_test_resolver(
+        &profile,
+        dir.path(),
+        Duration::from_secs(3600),
+        &mock_server.uri(),
+    );
+    let cached = control.list_cached().await.unwrap();
+    assert_eq!(cached.len(), 1);
+    assert_eq!(cached[0].home_domain, TEST_DOMAIN);
     mock_server.verify().await;
 }
 
-/// With the opt-in stale-if-error flag enabled, a transient fetch failure can
-/// return an expired but HMAC-verified cache entry marked `stale = true`.
+/// With the opt-in stale-if-error flag enabled, a transient fetch failure
+/// returns an expired, HMAC-verified entry within one TTL past its expiry,
+/// marked `stale = true`, with the recorded timestamps and without a rewrite.
 #[tokio::test]
 #[serial]
 async fn stale_if_error_returns_expired_hmac_verified_cache_entry() {
     keyring_mock::install().expect("mock keyring init");
     let dir = TempDir::new().expect("tmpdir");
     let profile = unique_profile("stale-if-error");
-
+    let fetched_at = plant_cache_entry(
+        &profile,
+        dir.path(),
+        TEST_DOMAIN,
+        VALID_STELLAR_TOML,
+        Duration::from_secs(5400),
+    );
+    let cache_path = cache_file_path(dir.path(), TEST_DOMAIN);
+    let before = std::fs::read(&cache_path).unwrap();
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/.well-known/stellar.toml"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(VALID_STELLAR_TOML)
-                .insert_header("content-type", "text/toml"),
-        )
+        .respond_with(ResponseTemplate::new(503))
         .expect(1)
         .mount(&mock_server)
         .await;
+    let resolver = build_test_resolver(
+        &profile,
+        dir.path(),
+        Duration::from_secs(3600),
+        &mock_server.uri(),
+    )
+    .with_stale_if_error(true);
 
-    let tiny_ttl = Duration::from_nanos(1);
-    let resolver = build_test_resolver(&profile, dir.path(), tiny_ttl, &mock_server.uri());
-
-    resolver
+    let binding = resolver
         .refresh(TEST_DOMAIN)
         .await
-        .expect("first refresh must populate cache");
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let failing_resolver =
-        build_test_resolver(&profile, dir.path(), tiny_ttl, "http://127.0.0.1:9")
-            .with_stale_if_error(true);
-    let binding = failing_resolver
-        .refresh(TEST_DOMAIN)
-        .await
-        .expect("second refresh must fall back to stale cache after fetch failure");
+        .expect("bounded stale fallback");
     assert_eq!(binding.home_domain, TEST_DOMAIN);
-    assert!(binding.stale, "fallback binding must be marked stale");
-    assert!(
-        binding.expires_at < std::time::SystemTime::now(),
-        "fallback binding should preserve expired cache timestamp"
+    assert!(!binding.accounts.is_empty());
+    assert!(binding.stale);
+    assert_eq!(binding.fetched_at, fetched_at);
+    assert_eq!(binding.expires_at, fetched_at + Duration::from_secs(3600));
+    assert!(binding.expires_at < std::time::SystemTime::now());
+    assert_eq!(
+        std::fs::read(cache_path).unwrap(),
+        before,
+        "fallback must not rewrite cache"
     );
+    assert!(resolver.list_cached().await.unwrap().is_empty());
+    let snapshot =
+        stellar_agent_network::counterparty::CounterpartyCacheSnapshot::from_resolver(&resolver)
+            .await
+            .unwrap();
+    assert!(!snapshot.has_resolved(TEST_DOMAIN));
+}
+
+/// An entry older than one TTL past its expiry is refused by the stale-if-error
+/// fallback even on a transient failure; the transient fetch error propagates.
+#[tokio::test]
+#[serial]
+async fn stale_if_error_refuses_entry_past_grace_bound() {
+    keyring_mock::install().expect("mock keyring init");
+    let dir = TempDir::new().expect("tmpdir");
+    let profile = unique_profile("past-grace");
+    plant_cache_entry(
+        &profile,
+        dir.path(),
+        TEST_DOMAIN,
+        VALID_STELLAR_TOML,
+        Duration::from_secs(9000),
+    );
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    let resolver = build_test_resolver(
+        &profile,
+        dir.path(),
+        Duration::from_secs(3600),
+        &mock_server.uri(),
+    )
+    .with_stale_if_error(true);
+    assert!(matches!(
+        resolver.refresh(TEST_DOMAIN).await,
+        Err(CounterpartyError::FetchFailed {
+            transient: true,
+            ..
+        })
+    ));
+}
+
+/// A non-transient fetch failure never uses the stale-if-error fallback, even
+/// for an entry within one TTL past its expiry; the fetch error propagates.
+#[tokio::test]
+#[serial]
+async fn stale_if_error_refuses_permanent_fetch_failure() {
+    keyring_mock::install().expect("mock keyring init");
+    let dir = TempDir::new().expect("tmpdir");
+    let profile = unique_profile("permanent-failure");
+    plant_cache_entry(
+        &profile,
+        dir.path(),
+        TEST_DOMAIN,
+        VALID_STELLAR_TOML,
+        Duration::from_secs(5400),
+    );
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    let resolver = build_test_resolver(
+        &profile,
+        dir.path(),
+        Duration::from_secs(3600),
+        &mock_server.uri(),
+    )
+    .with_stale_if_error(true);
+    assert!(matches!(
+        resolver.refresh(TEST_DOMAIN).await,
+        Err(CounterpartyError::FetchFailed {
+            transient: false,
+            ..
+        })
+    ));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

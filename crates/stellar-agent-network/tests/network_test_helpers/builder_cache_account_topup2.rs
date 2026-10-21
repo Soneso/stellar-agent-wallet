@@ -887,7 +887,9 @@ fn balance_view_trustline_limit_field_accessible_and_balance_parseable() {
 /// When `stale_if_error = true` and a valid stale cache entry exists on disk,
 /// a fetch failure must return the stale binding (opt-in stale-if-error path).
 ///
-/// The returned binding must have `stale = true`.
+/// The returned binding must have `stale = true`. The connect error to the
+/// closed port is transient, which is what permits the fallback; a resolver
+/// without the opt-in reports it as `FetchFailed { transient: true, .. }`.
 #[tokio::test]
 #[serial_test::serial]
 async fn stale_if_error_true_returns_stale_binding_on_fetch_failure() {
@@ -949,6 +951,29 @@ async fn stale_if_error_true_returns_stale_binding_on_fetch_failure() {
     assert_eq!(
         binding.home_domain, "testdomain.example",
         "stale binding must carry the correct home_domain"
+    );
+
+    let fail_closed = StellarTomlResolver::with_test_base_url(
+        &profile,
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_counterparty_key(&profile),
+        dir.path(),
+        Duration::from_secs(3600),
+        client_builder(),
+        "http://127.0.0.1:9", // unreachable
+    );
+    let err = fail_closed
+        .refresh("testdomain.example")
+        .await
+        .expect_err("a refused connection must fail without the opt-in");
+    assert!(
+        matches!(
+            err,
+            stellar_agent_network::CounterpartyError::FetchFailed {
+                transient: true,
+                ..
+            }
+        ),
+        "a connect error must map to a transient FetchFailed; got: {err:?}"
     );
 }
 
@@ -1022,6 +1047,7 @@ async fn list_cached_with_valid_cache_returns_one_binding() {
 #[serial_test::serial]
 async fn list_cached_hmac_mismatch_file_is_silently_skipped() {
     use base64::Engine as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     keyring_mock::install().expect("mock keyring init");
     let dir = TempDir::new().expect("tmpdir");
@@ -1036,42 +1062,21 @@ async fn list_cached_hmac_mismatch_file_is_silently_skipped() {
     // Write a cache file whose tag was computed with a DIFFERENT key (0xCD).
     let home_domain = "mismatch.example";
     let body = VALID_STELLAR_TOML.as_bytes();
-    let fetched_at: u64 = 1_777_552_496;
+    let fetched_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let wrong_key = [0xCD_u8; 32];
 
-    // Compute HMAC with the wrong key.
-    let wrong_tag = {
-        use hmac::{KeyInit as _, Mac as _};
-        type HmacSha256 = hmac::Hmac<sha2::Sha256>;
-        let mut mac = HmacSha256::new_from_slice(&wrong_key).expect("valid key");
-        mac.update(b"stellar-agent-counterparty/v2/stellar-toml-body\x00");
-        let hd = home_domain.as_bytes();
-        mac.update(&(hd.len() as u16).to_be_bytes());
-        mac.update(hd);
-        mac.update(&(fetched_at as i64).to_be_bytes());
-        mac.update(&(body.len() as u32).to_be_bytes());
-        mac.update(body);
-        let bytes = mac.finalize().into_bytes();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        arr
-    };
-
-    // Write the file with the wrong-key tag.
+    // Write the file sealed under the wrong key.
     let cache_path = cache_file_path(dir.path(), home_domain);
-    {
-        use std::io::Write as _;
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&wrong_tag);
-        let hd = home_domain.as_bytes();
-        buf.extend_from_slice(&(hd.len() as u16).to_be_bytes());
-        buf.extend_from_slice(hd);
-        buf.extend_from_slice(&(fetched_at as i64).to_be_bytes());
-        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        buf.extend_from_slice(body);
-        let mut f = std::fs::File::create(&cache_path).expect("create cache file");
-        f.write_all(&buf).expect("write cache");
-    }
+    let bytes = crate::counterparty_cache_fixture::v2_cache_file_bytes(
+        &wrong_key,
+        home_domain,
+        fetched_at as i64,
+        body,
+    );
+    std::fs::write(&cache_path, bytes).expect("write cache");
 
     let resolver = StellarTomlResolver::new(
         &profile,
@@ -1091,6 +1096,17 @@ async fn list_cached_hmac_mismatch_file_is_silently_skipped() {
         "HMAC-mismatch file must be silently skipped; expected 0 bindings, got {}",
         bindings.len()
     );
+
+    entry
+        .set_password(&base64::engine::general_purpose::STANDARD.encode(wrong_key))
+        .unwrap();
+    let live = resolver.list_cached().await.unwrap();
+    assert_eq!(
+        live.len(),
+        1,
+        "the signing key must return this live cache file"
+    );
+    assert_eq!(live[0].home_domain, home_domain);
 }
 
 /// `list_cached` with a structurally invalid (too-short) cache file silently

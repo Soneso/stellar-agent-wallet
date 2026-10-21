@@ -54,6 +54,7 @@ mod tests {
     #[test]
     fn counterparty_fetch_failed_wire_code() {
         let err = CounterpartyError::FetchFailed {
+            transient: false,
             detail: "connection refused".to_owned(),
         };
         let env = to_counterparty_envelope(&err);

@@ -197,14 +197,17 @@ async fn resolve_and_filter_egress(
     })
     .await
     .map_err(|e| CounterpartyError::FetchFailed {
+        transient: true,
         detail: format!("DNS resolution task failed: {e}"),
     })?
     .map_err(|_| CounterpartyError::FetchFailed {
+        transient: true,
         detail: "DNS resolution failed (host not found or I/O error)".to_owned(),
     })?;
 
     if addrs.is_empty() {
         return Err(CounterpartyError::FetchFailed {
+            transient: false,
             detail: "DNS resolution returned no addresses".to_owned(),
         });
     }
@@ -212,6 +215,7 @@ async fn resolve_and_filter_egress(
     // Fail-closed: if ANY resolved address is private/reserved, reject all.
     if addrs.iter().any(|sa| is_private_or_reserved(sa.ip())) {
         return Err(CounterpartyError::FetchFailed {
+            transient: false,
             detail: "stellar.toml fetch blocked: resolved address is in a private \
                      or reserved range (SSRF egress guard)"
                 .to_owned(),
@@ -219,6 +223,21 @@ async fn resolve_and_filter_egress(
     }
 
     Ok(addrs)
+}
+
+/// Returns true for a 5xx, 408 or 429 status, which permits the bounded
+/// stale-cache fallback.
+pub(super) fn transient_status(status: u16) -> bool {
+    (500..600).contains(&status) || matches!(status, 408 | 429)
+}
+
+/// Returns true for a timeout or a connect error, which permits the bounded
+/// stale-cache fallback.
+///
+/// A TLS handshake failure reports as a connect error and counts as transient;
+/// the grace bound of one TTL past expiry limits that exposure.
+pub(super) fn transient_send_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect()
 }
 
 /// Builds a bounded HTTPS-only reqwest client with redirect following and
@@ -250,6 +269,7 @@ pub fn build_bounded_https_client(
         .no_deflate()
         .build()
         .map_err(|e| CounterpartyError::FetchFailed {
+            transient: false,
             detail: format!("failed to build bounded HTTPS client: {e}"),
         })
 }
@@ -313,10 +333,6 @@ pub fn validate_home_domain(home_domain: &str) -> Result<(), CounterpartyError> 
 ///    so the actual TCP connect uses exactly the checked set (DNS rebinding
 ///    defence).
 ///
-/// The caller-supplied `http` argument is used only as a template for its TLS
-/// and redirect settings; a new per-request client is built with the pinned
-/// addresses.
-///
 /// The body is accumulated up to [`MAX_BODY_BYTES`]; any response that would
 /// exceed that limit is rejected with [`CounterpartyError::FetchFailed`].
 ///
@@ -368,37 +384,77 @@ pub async fn fetch_stellar_toml(home_domain: &str) -> Result<String, Counterpart
         .resolve_to_addrs(home_domain, &vetted_addrs)
         .build()
         .map_err(|e| CounterpartyError::FetchFailed {
+            transient: false,
             detail: format!("failed to build pinned HTTPS client: {e}"),
         })?;
 
     let url = format!("https://{}/.well-known/stellar.toml", home_domain);
     tracing::debug!(home_domain = %home_domain, "fetching stellar.toml (egress-filtered)");
 
-    let response = pinned_http
-        .get(&url)
-        .timeout(FETCH_TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                CounterpartyError::FetchFailed {
-                    detail: "fetch timed out".to_owned(),
-                }
-            } else if e.is_redirect() {
-                CounterpartyError::FetchFailed {
-                    detail: "redirect not allowed for stellar.toml fetch".to_owned(),
-                }
-            } else {
-                CounterpartyError::FetchFailed {
-                    detail: format!("network error: {}", e.without_url()),
-                }
+    let body = fetch_validated_body(&pinned_http, &url).await?;
+
+    tracing::debug!(home_domain = %home_domain, body_len = body.len(), "stellar.toml fetched");
+    Ok(body)
+}
+
+/// Runs the response validation of [`fetch_stellar_toml`] for `url` with a
+/// caller-supplied client.
+///
+/// Available under `test` or the `test-helpers` feature only. Integration
+/// tests point it at a plain-HTTP mock server, so it skips the domain
+/// validation, the DNS egress filter, and the address pinning that
+/// [`fetch_stellar_toml`] applies before this step.
+///
+/// # Errors
+///
+/// Returns [`CounterpartyError::FetchFailed`] for every failure
+/// [`fetch_stellar_toml`] reports once its request starts.
+///
+/// # Panics
+///
+/// Never panics.
+#[cfg(any(test, feature = "test-helpers"))]
+pub async fn fetch_url_with_client(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<String, CounterpartyError> {
+    fetch_validated_body(client, url).await
+}
+
+/// Sends one GET for `url` with `client` and validates the response.
+///
+/// Refuses a redirect, a status other than 200, a content type outside
+/// `text/*`, a body over [`MAX_BODY_BYTES`], and a body that is not UTF-8.
+/// The request runs under the client's timeout. Each refusal carries the
+/// `transient` classification of the bounded stale-cache fallback.
+async fn fetch_validated_body(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<String, CounterpartyError> {
+    let response = client.get(url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            CounterpartyError::FetchFailed {
+                transient: true,
+                detail: "fetch timed out".to_owned(),
             }
-        })?;
+        } else if e.is_redirect() {
+            CounterpartyError::FetchFailed {
+                transient: false,
+                detail: "redirect not allowed for stellar.toml fetch".to_owned(),
+            }
+        } else {
+            CounterpartyError::FetchFailed {
+                transient: transient_send_error(&e),
+                detail: format!("network error: {}", e.without_url()),
+            }
+        }
+    })?;
 
     // Reject any HTTP redirect response.
     let status = response.status();
     if status.is_redirection() {
         return Err(CounterpartyError::FetchFailed {
+            transient: false,
             detail: format!(
                 "redirect ({}) not allowed for stellar.toml fetch",
                 status.as_u16()
@@ -409,6 +465,7 @@ pub async fn fetch_stellar_toml(home_domain: &str) -> Result<String, Counterpart
     // Reject non-200 status.
     if status != reqwest::StatusCode::OK {
         return Err(CounterpartyError::FetchFailed {
+            transient: transient_status(status.as_u16()),
             detail: format!("unexpected HTTP status {}", status.as_u16()),
         });
     }
@@ -423,6 +480,7 @@ pub async fn fetch_stellar_toml(home_domain: &str) -> Result<String, Counterpart
 
     if !content_type_ok {
         return Err(CounterpartyError::FetchFailed {
+            transient: false,
             detail: "response content-type is not text/*".to_owned(),
         });
     }
@@ -433,11 +491,13 @@ pub async fn fetch_stellar_toml(home_domain: &str) -> Result<String, Counterpart
         .bytes()
         .await
         .map_err(|e| CounterpartyError::FetchFailed {
+            transient: true,
             detail: format!("body read error: {}", e.without_url()),
         })?;
 
     if body_bytes.len() > MAX_BODY_BYTES {
         return Err(CounterpartyError::FetchFailed {
+            transient: false,
             detail: format!(
                 "response body too large ({} bytes, limit is {})",
                 body_bytes.len(),
@@ -446,13 +506,10 @@ pub async fn fetch_stellar_toml(home_domain: &str) -> Result<String, Counterpart
         });
     }
 
-    let body =
-        String::from_utf8(body_bytes.into()).map_err(|_| CounterpartyError::FetchFailed {
-            detail: "response body is not valid UTF-8".to_owned(),
-        })?;
-
-    tracing::debug!(home_domain = %home_domain, body_len = body.len(), "stellar.toml fetched");
-    Ok(body)
+    String::from_utf8(body_bytes.into()).map_err(|_| CounterpartyError::FetchFailed {
+        transient: false,
+        detail: "response body is not valid UTF-8".to_owned(),
+    })
 }
 
 /// Builds a `reqwest::Client` configured for `stellar.toml` fetches.
@@ -849,5 +906,25 @@ mod tests {
             !is_private_or_reserved("64:ff9b::1.1.1.1".parse().unwrap()),
             "NAT64-embedded public 1.1.1.1 must NOT be blocked"
         );
+    }
+
+    #[test]
+    fn transient_status_accepts_retryable_failures() {
+        for status in [500, 503, 408, 429] {
+            assert!(
+                transient_status(status),
+                "status {status} must be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_status_rejects_permanent_failures() {
+        for status in [404, 403, 301] {
+            assert!(
+                !transient_status(status),
+                "status {status} must not be transient"
+            );
+        }
     }
 }

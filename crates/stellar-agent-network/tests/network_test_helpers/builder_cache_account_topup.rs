@@ -964,44 +964,11 @@ fn cache_round_trip_fetched_at_zero_unix_epoch() {
     let key = [0x42_u8; 32];
     let home_domain = "epoch.example";
     let body = b"VERSION = \"2.0.0\"";
-    let _fetched_at_unix_s: u64 = 0;
 
-    // Compute the correct HMAC for timestamp 0 (i64 wire value = 0).
-    let tag = {
-        use hmac::{KeyInit, Mac};
-        type HmacSha256 = hmac::Hmac<sha2::Sha256>;
-        let context_label = b"stellar-agent-counterparty/v2/stellar-toml-body\x00";
-        let mut mac = HmacSha256::new_from_slice(&key).expect("valid key");
-        mac.update(context_label);
-        let hd = home_domain.as_bytes();
-        mac.update(&(hd.len() as u16).to_be_bytes());
-        mac.update(hd);
-        mac.update(&0_i64.to_be_bytes()); // fetched_at = 0
-        mac.update(&(body.len() as u32).to_be_bytes());
-        mac.update(body);
-        let bytes = mac.finalize().into_bytes();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        arr
-    };
-
+    // A v2 file sealed under `key` with the i64 wire value `fetched_at = 0`.
     let path = dir.path().join("epoch_example.toml.cache");
-    // Use the public write helper exercised via cache_file_path + write_cache_atomic.
-    // Since write_cache_atomic is pub(crate), we write the file manually to
-    // ensure the exact wire format is produced for `fetched_at = 0`.
-    {
-        use std::io::Write as _;
-        let mut buf: Vec<u8> = Vec::new();
-        buf.extend_from_slice(&tag);
-        let hd = home_domain.as_bytes();
-        buf.extend_from_slice(&(hd.len() as u16).to_be_bytes());
-        buf.extend_from_slice(hd);
-        buf.extend_from_slice(&0_i64.to_be_bytes()); // fetched_at = 0
-        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        buf.extend_from_slice(body);
-        let mut f = std::fs::File::create(&path).expect("create file");
-        f.write_all(&buf).expect("write");
-    }
+    let bytes = crate::counterparty_cache_fixture::v2_cache_file_bytes(&key, home_domain, 0, body);
+    std::fs::write(&path, bytes).expect("write");
 
     // A TTL of several centuries keeps the epoch-0 entry within its window, so
     // the recovered fetched_at can be checked against UNIX_EPOCH. (A short TTL

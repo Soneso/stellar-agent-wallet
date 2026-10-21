@@ -3,10 +3,16 @@
 //!
 //! The command reads the owner-signed policy TOML from the conventional policy
 //! directory and extracts `counterparty_allowlist` criteria that include
-//! `HOME_DOMAIN`. It then refreshes each listed domain and emits a JSON summary.
+//! `HOME_DOMAIN`. It skips strkeys and `CODE:ISSUER` values, refreshes the
+//! remaining domain candidates, and emits a JSON summary.
+//!
+//! A binding is evidence for one hour from its fetch, so operators schedule
+//! warm-up more often than hourly. Warm-up covers only the domains named in
+//! `counterparty_allowlist` criteria that contain `HOME_DOMAIN`. A policy that
+//! uses `home_domain_resolved` keeps each domain it relies on live with a
+//! scheduled `stellar-agent counterparty refresh <domain>`.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use clap::Args;
 use serde::Serialize;
@@ -15,6 +21,7 @@ use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_core::profile::schema::default_policy_dir;
 use stellar_agent_network::StellarTomlResolver;
 use stellar_agent_network::counterparty::CounterpartyResolver as _;
+use stellar_agent_network::counterparty::cache::DEFAULT_TTL;
 use toml_edit::{DocumentMut, Item, Value};
 
 use crate::commands::counterparty::envelope::to_counterparty_envelope;
@@ -70,10 +77,12 @@ fn warm_up_envelope(profile: &str, entries: Vec<WarmUpEntry>) -> Envelope<WarmUp
 // deserialization logic or adding an accessor that would widen the criterion's
 // public API.
 //
-// Skipping signature verification is deliberate and safe: warm-up only triggers
-// an HMAC-protected cache refresh and writes no data that influences any policy
-// decision.  The resolver validates the fetched TOML independently; the policy
-// signature is not relevant to the HTTP cache-refresh operation.
+// Warm-up obtains evidence from the domain through the resolver's fetch and
+// validation path. Authorization still uses the signed policy at evaluation,
+// so this extraction needs no separate signature verification.
+/// Extracts domain candidates from criteria containing `HOME_DOMAIN`.
+/// Stellar strkeys and values containing `:` belong to other allowlist kinds.
+/// All other values remain candidates so malformed domains fail during refresh.
 fn extract_home_domain_allowlist_from_policy_toml(body: &str) -> Result<Vec<String>, WalletError> {
     let doc: DocumentMut = body.parse().map_err(|e: toml_edit::TomlError| {
         WalletError::Internal(InternalError::UnexpectedState {
@@ -111,6 +120,12 @@ fn extract_home_domain_allowlist_from_policy_toml(body: &str) -> Result<Vec<Stri
             if let Some(allowlist) = table.get("allowlist").and_then(Value::as_array) {
                 for value in allowlist.iter() {
                     if let Some(domain) = value.as_str() {
+                        if stellar_strkey::Strkey::from_string(domain).is_ok()
+                            || domain.contains(':')
+                        {
+                            tracing::debug!("skipping non-domain counterparty allowlist value");
+                            continue;
+                        }
                         domains.insert(domain.to_owned());
                     }
                 }
@@ -192,7 +207,7 @@ pub async fn run(args: &WarmUpArgs) -> i32 {
         &profile_name,
         profile.counterparty_cache_key_id.clone(),
         &cache_dir,
-        Duration::from_secs(3600),
+        DEFAULT_TTL,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -278,5 +293,58 @@ criteria = [
         assert_eq!(data.total, 1);
         assert_eq!(data.refreshed, 1);
         assert_eq!(data.failed, 0);
+    }
+
+    #[test]
+    fn mixed_allowlist_skips_other_kinds_by_shape() {
+        let account = stellar_strkey::ed25519::PublicKey([0; 32]).to_string();
+        let muxed = stellar_strkey::ed25519::MuxedAccount {
+            ed25519: [0; 32],
+            id: 7,
+        }
+        .to_string();
+        let contract = stellar_strkey::Contract([0; 32]).to_string();
+        let body = format!(
+            r#"
+[[rules]]
+criteria = [
+  {{ kind = "counterparty_allowlist",
+     kinds = ["HOME_DOMAIN", "G_ACCOUNT", "C_ACCOUNT", "KNOWN_ISSUER"],
+     allowlist = ["anchor.example", "{account}", "{muxed}", "{contract}", "USD:{account}"] }}
+]
+"#
+        )
+        .replace("\n     ", " ");
+        let domains = extract_home_domain_allowlist_from_policy_toml(&body).unwrap();
+        assert_eq!(domains, vec!["anchor.example"]);
+    }
+
+    #[test]
+    fn allowlist_without_home_domain_yields_nothing() {
+        let body = r#"
+[[rules]]
+criteria = [
+  { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["anchor.example"] }
+]
+"#;
+        assert!(
+            extract_home_domain_allowlist_from_policy_toml(body)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_domain_remains_a_warm_up_candidate() {
+        let body = r#"
+[[rules]]
+criteria = [
+  { kind = "counterparty_allowlist", kinds = ["HOME_DOMAIN"], allowlist = ["INVALID.example"] }
+]
+"#;
+        assert_eq!(
+            extract_home_domain_allowlist_from_policy_toml(body).unwrap(),
+            vec!["INVALID.example"],
+        );
     }
 }

@@ -5,8 +5,10 @@
 //! 1. **Happy path** — wiremock returns a valid `stellar.toml` (200, text/toml).
 //! 2. **404** — resolver returns `FetchFailed` with HTTP status detail.
 //! 3. **Redirect** — wiremock returns 301; resolver returns `FetchFailed`.
-//! 4. **Oversized body** (1 MiB) — `FetchFailed` with body-too-large detail.
-//! 5. **Non-text content-type** — `FetchFailed` (content-type is not `text/*`).
+//! 4. **Oversized body** (1 MiB): the production response validation returns
+//!    a non-transient `FetchFailed` with the body-too-large detail.
+//! 5. **Non-text content-type**: the production response validation returns
+//!    a non-transient `FetchFailed` (content-type is not `text/*`).
 //! 6. **Malformed TOML** — `TomlInvalid` after a successful fetch.
 //! 7. **Missing required fields** — parser returns `Ok` with `None` fields
 //!    (SEP-1 does not mandate any field; parser is additive-optional).
@@ -36,6 +38,7 @@ use serial_test::serial;
 use stellar_agent_network::CounterpartyError;
 use stellar_agent_network::counterparty::CounterpartyResolver as _;
 use stellar_agent_network::counterparty::cache::StellarTomlResolver;
+use stellar_agent_network::counterparty::fetch::{MAX_BODY_BYTES, fetch_url_with_client};
 use stellar_agent_network::counterparty::parser::parse_minimal_sep1;
 use stellar_agent_test_support::keyring_mock;
 use tempfile::TempDir;
@@ -212,7 +215,12 @@ async fn fetch_404_returns_fetch_failed() {
         "404 must map to FetchFailed, got: {err:?}"
     );
     // Verify the detail string mentions the HTTP status.
-    if let CounterpartyError::FetchFailed { ref detail } = err {
+    if let CounterpartyError::FetchFailed {
+        ref detail,
+        transient,
+    } = err
+    {
+        assert!(!transient, "HTTP 404 must not be transient");
         assert!(
             detail.contains("404"),
             "FetchFailed detail must mention HTTP 404 status; got: {detail:?}"
@@ -252,8 +260,14 @@ async fn fetch_redirect_returns_fetch_failed() {
         .expect_err("301 redirect must produce an error");
 
     assert!(
-        matches!(err, CounterpartyError::FetchFailed { .. }),
-        "redirect must map to FetchFailed, got: {err:?}"
+        matches!(
+            err,
+            CounterpartyError::FetchFailed {
+                transient: false,
+                ..
+            }
+        ),
+        "redirect must map to a non-transient FetchFailed, got: {err:?}"
     );
 
     mock_server.verify().await;
@@ -263,7 +277,8 @@ async fn fetch_redirect_returns_fetch_failed() {
 // 4. Oversized body (>64 KiB) → FetchFailed
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A response body exceeding 64 KiB must produce `FetchFailed`.
+/// A response body exceeding 64 KiB makes the production response validation
+/// return a non-transient `FetchFailed` that names the size and the cap.
 #[tokio::test]
 async fn fetch_oversized_body_returns_fetch_failed() {
     let mock_server = MockServer::start().await;
@@ -282,36 +297,25 @@ async fn fetch_oversized_body_returns_fetch_failed() {
         .mount(&mock_server)
         .await;
 
-    let client = test_client();
     let url = format!("{}{}", mock_server.uri(), "/.well-known/stellar.toml");
+    let err = fetch_url_with_client(&test_client(), &url)
+        .await
+        .expect_err("an oversized body must be refused");
 
-    // Fetch the body and apply the 64 KiB cap check.
-    let response = client.get(&url).send().await.expect("request must succeed");
-    assert_eq!(response.status(), 200);
-    let bytes = response.bytes().await.expect("body read");
-
-    let limit = stellar_agent_network::counterparty::fetch::MAX_BODY_BYTES;
-    let err = if bytes.len() > limit {
-        Some(CounterpartyError::FetchFailed {
-            detail: format!(
-                "response body too large ({} bytes, limit is {})",
-                bytes.len(),
-                limit
-            ),
-        })
-    } else {
-        None
-    };
-
-    assert!(
-        err.is_some(),
-        "oversized body must produce FetchFailed; body was {} bytes",
-        bytes.len()
+    let expected = format!(
+        "response body too large ({} bytes, limit is {MAX_BODY_BYTES})",
+        big_body.len()
     );
-    assert!(matches!(
-        err.unwrap(),
-        CounterpartyError::FetchFailed { .. }
-    ));
+    match err {
+        CounterpartyError::FetchFailed {
+            transient,
+            ref detail,
+        } => {
+            assert!(!transient, "an oversized body must not be transient");
+            assert_eq!(*detail, expected);
+        }
+        other => panic!("an oversized body must map to FetchFailed; got: {other:?}"),
+    }
 
     mock_server.verify().await;
 }
@@ -320,8 +324,9 @@ async fn fetch_oversized_body_returns_fetch_failed() {
 // 5. Non-text content-type → FetchFailed
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A response with `content-type: application/octet-stream` must produce
-/// `FetchFailed` because only `text/*` is accepted.
+/// A response with `content-type: application/octet-stream` makes the
+/// production response validation return a non-transient `FetchFailed`,
+/// because only `text/*` is accepted.
 #[tokio::test]
 async fn fetch_non_text_content_type_returns_fetch_failed() {
     let mock_server = MockServer::start().await;
@@ -339,37 +344,21 @@ async fn fetch_non_text_content_type_returns_fetch_failed() {
         .mount(&mock_server)
         .await;
 
-    let client = test_client();
     let url = format!("{}{}", mock_server.uri(), "/.well-known/stellar.toml");
+    let err = fetch_url_with_client(&test_client(), &url)
+        .await
+        .expect_err("a non-text content type must be refused");
 
-    let response = client.get(&url).send().await.expect("request must succeed");
-    assert_eq!(response.status(), 200);
-
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-
-    // The content-type must be application/octet-stream, not text/*.
-    assert!(
-        content_type.starts_with("application/octet-stream"),
-        "mock must return application/octet-stream; got: {content_type:?}"
-    );
-
-    // A non-text/* content-type produces FetchFailed.
-    let content_type_passes = content_type.starts_with("text/");
-    assert!(
-        !content_type_passes,
-        "application/octet-stream must not pass the text/* check"
-    );
-
-    let err = CounterpartyError::FetchFailed {
-        detail: "response content-type is not text/*".to_owned(),
-    };
-    assert!(matches!(err, CounterpartyError::FetchFailed { .. }));
+    match err {
+        CounterpartyError::FetchFailed {
+            transient,
+            ref detail,
+        } => {
+            assert!(!transient, "a non-text content type must not be transient");
+            assert_eq!(detail, "response content-type is not text/*");
+        }
+        other => panic!("a non-text content type must map to FetchFailed; got: {other:?}"),
+    }
 
     mock_server.verify().await;
 }

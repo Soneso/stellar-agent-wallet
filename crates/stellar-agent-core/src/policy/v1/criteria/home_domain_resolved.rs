@@ -50,7 +50,11 @@
 //! The `CounterpartyCacheView` is keyed by `home_domain` string (not by
 //! account_id).  A `CounterpartyCacheSnapshot` is constructed at dispatch time
 //! from `CounterpartyResolver::list_cached()` so the criterion receives a
-//! point-in-time view of which domains have been resolved.
+//! point-in-time view of domains with live bindings. A binding is evidence
+//! for one hour from its fetch. `stellar-agent counterparty warm-up` refreshes
+//! only the domains named in `counterparty_allowlist` criteria that contain
+//! `HOME_DOMAIN`. A policy that uses this criterion therefore keeps each domain
+//! it relies on live with a scheduled `stellar-agent counterparty refresh <domain>`.
 
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::criteria::Criterion;
