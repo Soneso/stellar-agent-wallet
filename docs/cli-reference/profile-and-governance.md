@@ -264,7 +264,7 @@ Signs a V1 policy file so the engine accepts it. The engine loads `<state_dir>/p
 - `--profile <NAME>`: profile whose policy file is signed (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
 - `--file <PATH>` — sign a policy file at a non-default path (default `<state_dir>/policies/<profile>.toml`, the only location the engine loads).
 
-Before writing, the seed's derived public key is cross-checked against the enrolled owner key; a seed that does not match is refused (`sign_policy.owner_key_mismatch`) so a file the engine would reject is never produced. Re-signing an already-signed file replaces the `[signature]` table in place and reports `replaced: true` with the previous `owner_id`. On success the data object reports the `owner_address`, the `policy_path`, the `digest` (hex), and the `signature` (hex):
+Before writing, the seed's derived public key is cross-checked against the enrolled owner key; a seed that does not match is refused (`sign_policy.owner_key_mismatch`) so a file the engine would reject is never produced. Before signing, the command also checks the body as the engine loads it, with the `scope` compared against the profile, and refuses a body the engine would reject. A refusal leaves the file unchanged. Signing does not require a valid previous signature: re-signing a file with a stale or malformed `[signature]` table replaces that table in place, dropping any extra key in it, and reports `replaced: true` with the previous `owner_id`. On success the data object reports the `owner_address`, the `policy_path`, the `digest` (hex), and the `signature` (hex):
 
 ```json
 {"ok":true,"data":{"profile":"default","signed":true,"owner_address":"G...","policy_path":".../policies/default.toml","digest":"<hex>","signature":"<hex>","replaced":false},"request_id":"..."}
@@ -276,8 +276,20 @@ Exits `1` on refusal:
 - `sign_policy.owner_key_unavailable`: no owner key is enrolled; run `enroll-owner-key` first.
 - `sign_policy.owner_key_mismatch`: the seed does not match the enrolled owner key.
 - `sign_policy.policy_file_unreadable`: the policy file is missing.
-- `sign_policy.canonicalization_failed`: the policy file is malformed.
+- `sign_policy.canonicalization_failed`: the policy file is malformed, or its
+  body holds a key outside the V1 policy schema. The message names the key and
+  its location.
+- `sign_policy.policy_body_invalid`: the engine would refuse the policy body,
+  for example an unsupported `version`, a `scope` for another profile, an
+  unknown criterion kind or decision, or a `ttl_secs` out of range. The message
+  carries the engine's detail.
 - A keyring error: the platform keyring is unavailable.
+
+The signature covers each rule's `reason`, `ttl_secs`, and
+`allow_opaque_signing` when the rule carries them. When the signature does not
+verify over the policy and rules carry these keys, the message names those
+rules and asks you to review the policy and re-sign it with this command.
+A `sig` value that is not 64 bytes of hex is refused without rule indexes.
 
 ### Key-rotation subcommands
 

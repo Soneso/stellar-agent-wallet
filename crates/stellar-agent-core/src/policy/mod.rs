@@ -1122,10 +1122,25 @@ pub enum PolicyError {
     },
 
     /// The owner signature on the policy file is invalid.
-    #[error("owner signature invalid for profile {profile}")]
+    ///
+    /// The signature covers each rule's `reason`, `ttl_secs` and
+    /// `allow_opaque_signing` when the rule carries them. When rules carry
+    /// them, the message names those rules and asks the operator to review the
+    /// policy and re-sign it with `stellar-agent profile sign-policy`.
+    #[error(
+        "owner signature invalid for profile {profile}{}",
+        signed_optional_keys_remedy(.rules_with_signed_optional_keys)
+    )]
     OwnerSignatureInvalid {
         /// The profile name whose owner key was used for verification.
         profile: String,
+        /// Zero-based indexes, ascending, of the rules that carry `reason`,
+        /// `ttl_secs` or `allow_opaque_signing`.
+        ///
+        /// Empty when no rule carries one of them, when the `sig` value is not
+        /// 64 bytes of hex (the digest is then never checked), and when
+        /// [`crate::policy::v1::signature::verify`] is called directly.
+        rules_with_signed_optional_keys: Vec<usize>,
     },
 
     /// The keyring does not contain an owner key for the given profile.
@@ -1151,6 +1166,30 @@ pub enum PolicyError {
         /// Non-secret evaluator diagnostic.
         detail: String,
     },
+}
+
+/// Renders the remedy that [`PolicyError::OwnerSignatureInvalid`] appends
+/// when `rules` is not empty, and nothing when it is.
+///
+/// Presence of the keys does not tell a stale signature from a tampered body,
+/// so the remedy asks for review before re-signing and never names a cause.
+fn signed_optional_keys_remedy(rules: &[usize]) -> String {
+    let Some((last, rest)) = rules.split_last() else {
+        return String::new();
+    };
+    let subject = match rest {
+        [] => format!("rule {last} carries"),
+        [first] => format!("rules {first} and {last} carry"),
+        _ => {
+            let leading: Vec<String> = rest.iter().map(ToString::to_string).collect();
+            format!("rules {}, and {last} carry", leading.join(", "))
+        }
+    };
+    format!(
+        "; {subject} `reason`, `ttl_secs` or `allow_opaque_signing`, which the policy \
+         signature covers; review the policy and re-sign it with \
+         `stellar-agent profile sign-policy`"
+    )
 }
 
 impl PolicyError {
@@ -1698,6 +1737,35 @@ mod tests {
         );
     }
 
+    /// The remedy names one rule in the singular, two with "and", and three or
+    /// more as a serial list; no rules leaves the plain message.
+    #[test]
+    fn owner_signature_invalid_message_lists_the_rule_indexes() {
+        let message = |rules: Vec<usize>| {
+            PolicyError::OwnerSignatureInvalid {
+                profile: "alice".to_owned(),
+                rules_with_signed_optional_keys: rules,
+            }
+            .to_string()
+        };
+        let remedy = "`reason`, `ttl_secs` or `allow_opaque_signing`, which the policy \
+                      signature covers; review the policy and re-sign it with \
+                      `stellar-agent profile sign-policy`";
+        assert_eq!(message(vec![]), "owner signature invalid for profile alice");
+        assert_eq!(
+            message(vec![3]),
+            format!("owner signature invalid for profile alice; rule 3 carries {remedy}")
+        );
+        assert_eq!(
+            message(vec![0, 2]),
+            format!("owner signature invalid for profile alice; rules 0 and 2 carry {remedy}")
+        );
+        assert_eq!(
+            message(vec![1, 4, 7]),
+            format!("owner signature invalid for profile alice; rules 1, 4, and 7 carry {remedy}")
+        );
+    }
+
     fn representative_policy_errors(detail: &str, profile: &str) -> Vec<PolicyError> {
         // Exhaustiveness guard: forces compile-time verification that every
         // PolicyError variant is represented below. This is belt-and-braces with
@@ -1725,6 +1793,7 @@ mod tests {
             },
             PolicyError::OwnerSignatureInvalid {
                 profile: profile.to_owned(),
+                rules_with_signed_optional_keys: Vec::new(),
             },
             PolicyError::MissingOwnerKey {
                 profile: profile.to_owned(),

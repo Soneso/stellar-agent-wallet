@@ -11,6 +11,17 @@
 //! - [`crate::policy::v1::loader::load_signed_policy`] — loads a TOML policy
 //!   file from disk, verifies the owner ed25519 signature, and returns a
 //!   ready-to-use [`crate::policy::v1::loader::PolicyDocument`].
+//! - [`crate::policy::v1::loader::validate_unsigned_policy`]: applies the
+//!   same body checks to a policy that is about to be signed.
+//!
+//! ## Closed key sets
+//!
+//! A key outside the policy schema refuses the file with
+//! [`crate::policy::PolicyError::PolicyFileParseFailed`] before the signature
+//! is verified (see [`crate::policy::v1::schema::validate_policy_keys`]).
+//! Every accepted key outside the `[signature]` table is in the signed
+//! canonical form, so no key the loader reads can change without breaking the
+//! signature.
 //!
 //! ## Owner-key contract
 //!
@@ -52,10 +63,10 @@ use std::path::Path;
 use std::str::FromStr as _;
 
 use serde::{Deserialize, Serialize};
-use toml_edit::{DocumentMut, Item};
+use toml_edit::{DocumentMut, Item, TableLike, Value};
 
 use crate::counterparty::is_valid_ldh_home_domain;
-use crate::policy::v1::canonical::canonical_bytes;
+use crate::policy::v1::canonical::{OPTIONAL_RULE_KEYS, canonical_bytes};
 use crate::policy::v1::criteria::counterparty_allowlist::CounterpartyKind;
 use crate::policy::v1::criteria::per_period_cap::Window;
 use crate::policy::v1::criteria::{
@@ -64,6 +75,7 @@ use crate::policy::v1::criteria::{
     InnerInvocationCountCapCriterion, MinimumReserveCriterion, PerPeriodCapCriterion,
     PerTxCapCriterion, RateLimitCriterion, RestrictBundleToRecognisedKindsCriterion,
 };
+use crate::policy::v1::schema::{criterion_keys, validate_policy_keys};
 use crate::policy::v1::signature::{digest, verify};
 use crate::policy::{Decision, DenyReason, PolicyError};
 
@@ -396,9 +408,11 @@ impl RuleMatch {
 /// 1. Read the file at `path`.
 /// 2. Compute canonical bytes (excluding the `[signature]` table).
 /// 3. Compute a BLAKE3 digest of the canonical bytes.
-/// 4. Verify the ed25519 signature in the `[signature]` table against the
-///    digest using `owner_pubkey`.
-/// 5. Parse `version`, `scope`, and `[[rules]]` into runtime form.
+/// 4. Read `owner_id` and `sig` from the `[signature]` table.
+/// 5. Refuse any key outside the policy schema
+///    ([`crate::policy::v1::schema::validate_policy_keys`]).
+/// 6. Verify the ed25519 signature against the digest using `owner_pubkey`.
+/// 7. Parse `version`, `scope`, and `[[rules]]` into runtime form.
 ///
 /// ## Owner-key contract
 ///
@@ -419,11 +433,14 @@ impl RuleMatch {
 /// - [`PolicyError::PolicyFileLoadFailed`] — the file could not be read
 ///   (I/O error, path does not exist, permission denied).
 /// - [`PolicyError::PolicyFileParseFailed`] — the file contains invalid TOML,
-///   is missing required fields (`version`, `scope`), or the `[signature]`
-///   table is absent or malformed.
+///   is missing required fields (`version`, `scope`), the `[signature]`
+///   table is absent or malformed, or the file holds a key outside the policy
+///   schema (reported before the signature is checked).
 /// - [`PolicyError::OwnerSignatureInvalid`] — the signature in the
 ///   `[signature]` table does not verify against `owner_pubkey` and the
-///   canonical form of the document.
+///   canonical form of the document. When the digest does not verify, its
+///   `rules_with_signed_optional_keys` lists the rules that carry `reason`,
+///   `ttl_secs` or `allow_opaque_signing`.
 ///
 /// # Examples
 ///
@@ -470,18 +487,35 @@ pub fn load_signed_policy(
     let sig_item = doc
         .get("signature")
         .ok_or_else(|| PolicyError::PolicyFileParseFailed {
-            detail: "policy file missing required `[signature]` table".into(),
+            detail: format!(
+                "policy file has no `[signature]` table; sign it with \
+                 `stellar-agent profile sign-policy --profile {profile_name}`"
+            ),
         })?;
     let (owner_id, sig_hex) = extract_signature_fields(sig_item)?;
+
+    // Step 5: the loader refuses keys outside the policy schema before it
+    // decodes and verifies the signature, so an unknown key is reported by
+    // name even when the signature also fails.
+    validate_policy_keys(&doc)?;
+
+    // Step 6: verify. A failed digest verification names the rules whose
+    // signed optional keys the operator should review before re-signing.
     let sig_bytes = decode_hex_sig(&sig_hex, profile_name)?;
+    verify(&d, &sig_bytes, owner_pubkey, profile_name).map_err(|err| match err {
+        PolicyError::OwnerSignatureInvalid { profile, .. } => PolicyError::OwnerSignatureInvalid {
+            profile,
+            rules_with_signed_optional_keys: rules_with_signed_optional_keys(&doc),
+        },
+        other => other,
+    })?;
 
-    verify(&d, &sig_bytes, owner_pubkey, profile_name)?;
-
-    // Step 5: parse version, scope, rules.
-    let version = extract_version(&doc)?;
-    let scope = extract_scope(&doc)?;
-    reject_scope_profile_mismatch(&scope, profile_name)?;
-    let rules = extract_rules(&doc)?;
+    // Step 7: parse version, scope, rules.
+    let PolicyBody {
+        version,
+        scope,
+        rules,
+    } = parse_policy_body(&doc, profile_name)?;
 
     Ok(PolicyDocument {
         version,
@@ -495,8 +529,100 @@ pub fn load_signed_policy(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// validate_unsigned_policy
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Checks that [`load_signed_policy`] would accept the body of the policy
+/// document `raw` for the profile `profile_name`, given a valid owner
+/// signature.
+///
+/// Applies every check the loader applies to the body: the canonical form,
+/// the closed key sets ([`crate::policy::v1::schema::validate_policy_keys`]),
+/// `version`, `scope` against `profile_name`, and each rule with its criteria,
+/// decision, and bounds. Any `[signature]` table is ignored: it is outside the
+/// signed body, and signing replaces it whole, so a stale or malformed
+/// signature never blocks re-signing.
+///
+/// `profile_name` is the resolved profile name the loader compares the scope
+/// against. `stellar-agent profile sign-policy` calls this before it signs, so
+/// it never signs a body the loader refuses.
+///
+/// # Errors
+///
+/// Returns [`PolicyError::PolicyFileParseFailed`] with the loader's detail
+/// when the loader would refuse the body.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::policy::v1::validate_unsigned_policy;
+///
+/// let body = "version = 1\nscope = \"profile:alice\"\n\n[[rules]]\n\
+///             match = { tool = \"stellar_balances\", chain = \"*\" }\n\
+///             criteria = []\ndecision = \"allow\"\n";
+/// assert!(validate_unsigned_policy(body, "alice").is_ok());
+/// // The scope names another profile.
+/// assert!(validate_unsigned_policy(body, "bob").is_err());
+/// ```
+pub fn validate_unsigned_policy(raw: &str, profile_name: &str) -> Result<(), PolicyError> {
+    canonical_bytes(raw)?;
+    let mut doc = DocumentMut::from_str(raw).map_err(|e| PolicyError::PolicyFileParseFailed {
+        detail: e.to_string(),
+    })?;
+    doc.remove("signature");
+    validate_policy_keys(&doc)?;
+    parse_policy_body(&doc, profile_name).map(|_| ())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Internal parsing helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The parsed policy body: everything the signature covers, in runtime form.
+struct PolicyBody {
+    version: u32,
+    scope: ScopeId,
+    rules: Vec<PolicyRule>,
+}
+
+/// Parses `version`, `scope` (refusing a scope that names a profile other
+/// than `profile_name`), and the rules of `doc`.
+///
+/// The one body parser of the signed and the unsigned path, so both refuse
+/// the same bodies.
+fn parse_policy_body(doc: &DocumentMut, profile_name: &str) -> Result<PolicyBody, PolicyError> {
+    let version = extract_version(doc)?;
+    let scope = extract_scope(doc)?;
+    reject_scope_profile_mismatch(&scope, profile_name)?;
+    let rules = extract_rules(doc)?;
+    Ok(PolicyBody {
+        version,
+        scope,
+        rules,
+    })
+}
+
+/// Returns the indexes of the rules in `doc` that carry `reason`, `ttl_secs`
+/// or `allow_opaque_signing`, in either rule syntax the canonical form signs.
+fn rules_with_signed_optional_keys(doc: &DocumentMut) -> Vec<usize> {
+    let carries =
+        |rule: &dyn TableLike| OPTIONAL_RULE_KEYS.iter().any(|key| rule.contains_key(key));
+    match doc.get("rules") {
+        Some(Item::ArrayOfTables(rules)) => rules
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| carries(*rule))
+            .map(|(idx, _)| idx)
+            .collect(),
+        Some(Item::Value(Value::Array(rules))) => rules
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| rule.as_inline_table().is_some_and(|rule| carries(rule)))
+            .map(|(idx, _)| idx)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 fn reject_scope_profile_mismatch(scope: &ScopeId, profile_name: &str) -> Result<(), PolicyError> {
     let matches_profile = match scope {
@@ -548,11 +674,13 @@ fn extract_signature_fields(item: &Item) -> Result<(String, String), PolicyError
 fn decode_hex_sig(hex: &str, profile_name: &str) -> Result<[u8; 64], PolicyError> {
     let bytes = hex_to_bytes(hex).ok_or_else(|| PolicyError::OwnerSignatureInvalid {
         profile: profile_name.to_owned(),
+        rules_with_signed_optional_keys: Vec::new(),
     })?;
     bytes
         .try_into()
         .map_err(|_| PolicyError::OwnerSignatureInvalid {
             profile: profile_name.to_owned(),
+            rules_with_signed_optional_keys: Vec::new(),
         })
 }
 
@@ -836,6 +964,12 @@ fn parse_criterion(
         }
     })?;
 
+    // A kind is supported only together with its closed key set, so every
+    // parsed kind has its keys checked.
+    if criterion_keys(kind).is_none() {
+        return Err(unknown_criterion_kind(&loc, kind));
+    }
+
     match kind {
         "per_tx_cap" => {
             let asset = require_str(table, "asset", &loc)?;
@@ -1062,17 +1196,22 @@ fn parse_criterion(
         "sep45_session_active" => Ok(Box::new(
             crate::policy::v1::criteria::sep45_session_active::Sep45SessionActiveCriterion::new(),
         )),
-        other => Err(PolicyError::PolicyFileParseFailed {
-            detail: format!(
-                "{loc}: unknown criterion kind `{other}`; accepted kinds: \
-                 per_tx_cap, per_period_cap, rate_limit, counterparty_allowlist, \
-                 minimum_reserve, inner_invocation_count_cap, \
-                 bundle_aggregate_cap, restrict_bundle_to_recognised_kinds, \
-                 bundle_per_period_cap, bundle_per_tx_cap, bundle_rate_limit, \
-                 quorum_satisfied, home_domain_resolved, sep10_session_active, \
-                 sep45_session_active"
-            ),
-        }),
+        other => Err(unknown_criterion_kind(&loc, other)),
+    }
+}
+
+/// The refusal of a criterion `kind` the loader does not support, at `loc`.
+fn unknown_criterion_kind(loc: &str, kind: &str) -> PolicyError {
+    PolicyError::PolicyFileParseFailed {
+        detail: format!(
+            "{loc}: unknown criterion kind `{kind}`; accepted kinds: \
+             per_tx_cap, per_period_cap, rate_limit, counterparty_allowlist, \
+             minimum_reserve, inner_invocation_count_cap, \
+             bundle_aggregate_cap, restrict_bundle_to_recognised_kinds, \
+             bundle_per_period_cap, bundle_per_tx_cap, bundle_rate_limit, \
+             quorum_satisfied, home_domain_resolved, sep10_session_active, \
+             sep45_session_active"
+        ),
     }
 }
 
@@ -1510,7 +1649,10 @@ decision = "allow"
         // Use the wrong public key — verification must fail.
         let err = load_signed_policy(&path, "alice", &pk2).unwrap_err();
         assert!(
-            matches!(err, PolicyError::OwnerSignatureInvalid { ref profile } if profile == "alice"),
+            matches!(
+                err,
+                PolicyError::OwnerSignatureInvalid { ref profile, .. } if profile == "alice"
+            ),
             "expected OwnerSignatureInvalid, got {err:?}"
         );
     }
@@ -1524,10 +1666,10 @@ decision = "allow"
         // Policy without a [signature] table.
         let path = write_policy(&dir, "alice.toml", MINIMAL_BODY);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
-        assert!(
-            matches!(err, PolicyError::PolicyFileParseFailed { .. }),
-            "missing [signature] must produce PolicyFileParseFailed, got {err:?}"
+        assert_parse_failure(
+            load_signed_policy(&path, "alice", &pk),
+            "policy file has no `[signature]` table; sign it with \
+             `stellar-agent profile sign-policy --profile alice`",
         );
     }
 
@@ -2910,5 +3052,491 @@ decision = "deny"
             "deny decision should carry ExplicitRuleDeny, got {:?}",
             doc.rules[0].decision
         );
+    }
+
+    // ── signed optional rule keys ─────────────────────────────────────────────
+
+    /// One `require_approval` rule without optional keys.
+    const APPROVAL_BODY: &str = r#"version = 1
+scope = "profile:alice"
+
+[[rules]]
+match = { tool = "stellar_sep43_sign_transaction", chain = "*" }
+criteria = []
+decision = "require_approval"
+"#;
+
+    /// The unsigned entry point checks canonical shape and policy keys while
+    /// allowing a signature table that signing will replace.
+    #[test]
+    fn unsigned_validator_checks_the_body_and_ignores_the_previous_signature() {
+        let unknown_key = format!("foo = 1\n{APPROVAL_BODY}");
+        let err = validate_unsigned_policy(&unknown_key, "alice").unwrap_err();
+        assert!(
+            matches!(err, PolicyError::PolicyFileParseFailed { ref detail }
+                if detail.contains("`foo`")),
+            "an unknown top-level key must be named: {err:?}"
+        );
+
+        let missing_criteria = APPROVAL_BODY.replace("criteria = []\n", "");
+        let doc = DocumentMut::from_str(&missing_criteria).unwrap();
+        assert!(parse_policy_body(&doc, "alice").is_ok());
+        assert!(
+            matches!(
+                validate_unsigned_policy(&missing_criteria, "alice"),
+                Err(PolicyError::PolicyFileParseFailed { ref detail })
+                    if detail == "rule missing required `criteria` key"
+            ),
+            "a rule without criteria must fail the canonical check"
+        );
+
+        let stale_signature = format!(
+            "{APPROVAL_BODY}\n[signature]\nowner_id = \"GOLD\"\n\
+             sig = \"stale\"\nnote = \"replace this table\"\n"
+        );
+        assert!(validate_unsigned_policy(&stale_signature, "alice").is_ok());
+    }
+
+    /// One `require_approval` rule carrying all three signed optional keys.
+    const APPROVAL_BODY_WITH_OPTIONAL_KEYS: &str = r#"version = 1
+scope = "profile:alice"
+
+[[rules]]
+match = { tool = "stellar_sep43_sign_transaction", chain = "*" }
+criteria = []
+decision = "require_approval"
+reason = "bounded review"
+ttl_secs = 600
+allow_opaque_signing = true
+
+[[rules]]
+match = { tool = "*", chain = "*" }
+criteria = []
+decision = "deny"
+"#;
+
+    /// The written body with a `[signature]` over the canonical bytes of
+    /// `signed_body`, which may differ from it.
+    fn with_signature_over(
+        written_body: &str,
+        signed_body: &str,
+        sk: &ed25519_dalek::SigningKey,
+    ) -> String {
+        let signature = make_signed_toml(signed_body, sk, "GABCDE");
+        let table = &signature[signature.find("[signature]").unwrap()..];
+        format!("{written_body}\n{table}")
+    }
+
+    /// Writes `toml` and loads it for profile `alice` under `pk`.
+    fn load_alice(toml: &str, pk: &[u8; 32]) -> Result<PolicyDocument, PolicyError> {
+        let dir = TempDir::new().unwrap();
+        let path = write_policy(&dir, "alice.toml", toml);
+        load_signed_policy(&path, "alice", pk)
+    }
+
+    /// Asserts that `result` is an owner-signature failure for `alice`.
+    fn assert_owner_signature_invalid(result: Result<PolicyDocument, PolicyError>, case: &str) {
+        let err = result.expect_err(case);
+        assert!(
+            matches!(
+                err,
+                PolicyError::OwnerSignatureInvalid { ref profile, .. } if profile == "alice"
+            ),
+            "{case}: expected OwnerSignatureInvalid, got {err:?}"
+        );
+        assert_eq!(err.wire_code(), "policy.owner_signature_invalid", "{case}");
+    }
+
+    /// Adding `allow_opaque_signing`, an in-range `ttl_secs`, or a bounded
+    /// `reason` to a signed approval rule breaks the signature.
+    #[test]
+    fn adding_a_signed_optional_rule_key_after_signing_breaks_the_signature() {
+        let (sk, pk) = make_keypair();
+        let signed = make_signed_toml(APPROVAL_BODY, &sk, "GABCDE");
+        load_alice(&signed, &pk).expect("the untouched signed policy must load");
+
+        for addition in [
+            "allow_opaque_signing = true",
+            "ttl_secs = 600",
+            "ttl_secs = 86400",
+            "reason = \"bounded review\"",
+        ] {
+            let tampered = signed.replacen(
+                "decision = \"require_approval\"\n",
+                &format!("decision = \"require_approval\"\n{addition}\n"),
+                1,
+            );
+            assert_ne!(tampered, signed, "{addition}: the edit must apply");
+            assert_owner_signature_invalid(load_alice(&tampered, &pk), addition);
+        }
+    }
+
+    /// Changing or removing each signed optional rule key breaks the
+    /// signature.
+    #[test]
+    fn changing_or_removing_a_signed_optional_rule_key_breaks_the_signature() {
+        let (sk, pk) = make_keypair();
+        let signed = make_signed_toml(APPROVAL_BODY_WITH_OPTIONAL_KEYS, &sk, "GABCDE");
+        load_alice(&signed, &pk).expect("the untouched signed policy must load");
+
+        for (from, to) in [
+            (
+                "allow_opaque_signing = true\n",
+                "allow_opaque_signing = false\n",
+            ),
+            ("allow_opaque_signing = true\n", ""),
+            ("ttl_secs = 600\n", "ttl_secs = 601\n"),
+            ("ttl_secs = 600\n", ""),
+            (
+                "reason = \"bounded review\"\n",
+                "reason = \"other review\"\n",
+            ),
+            ("reason = \"bounded review\"\n", ""),
+        ] {
+            let case = format!("{from:?} -> {to:?}");
+            let tampered = signed.replacen(from, to, 1);
+            assert_ne!(tampered, signed, "{case}: the edit must apply");
+            assert_owner_signature_invalid(load_alice(&tampered, &pk), &case);
+        }
+
+        let default_ttl_body = format!("{APPROVAL_BODY}ttl_secs = 86400\n");
+        let signed = make_signed_toml(&default_ttl_body, &sk, "GABCDE");
+        load_alice(&signed, &pk).expect("the signed policy with the default TTL must load");
+        let tampered = signed.replacen("ttl_secs = 86400\n", "", 1);
+        assert_ne!(tampered, signed, "removing the default TTL must apply");
+        assert_owner_signature_invalid(load_alice(&tampered, &pk), "removing ttl_secs = 86400");
+    }
+
+    /// A policy signed over its optional rule keys loads them.
+    #[test]
+    fn a_policy_signed_with_its_optional_rule_keys_loads_them() -> Result<(), String> {
+        let (sk, pk) = make_keypair();
+        let signed = make_signed_toml(APPROVAL_BODY_WITH_OPTIONAL_KEYS, &sk, "GABCDE");
+        let doc = load_alice(&signed, &pk).map_err(|e| format!("must load: {e:?}"))?;
+
+        let rule = &doc.rules[0];
+        assert!(rule.allow_opaque_signing);
+        let Decision::RequireApproval(request) = &rule.decision else {
+            return Err(format!("expected RequireApproval, got {:?}", rule.decision));
+        };
+        assert_eq!(request.reason.as_deref(), Some("bounded review"));
+        assert_eq!(request.ttl_seconds, 600);
+        assert!(!doc.rules[1].allow_opaque_signing);
+        Ok(())
+    }
+
+    // ── unknown keys ──────────────────────────────────────────────────────────
+
+    /// Signs `body` under a fresh owner key and loads it, applying `edit` to
+    /// the signed file first.
+    fn load_signed_body_after(
+        body: &str,
+        edit: impl FnOnce(String) -> String,
+    ) -> Result<PolicyDocument, PolicyError> {
+        let (sk, pk) = make_keypair();
+        let edited = edit(make_signed_toml(body, &sk, "GABCDE"));
+        load_alice(&edited, &pk)
+    }
+
+    /// Asserts that `result` is the parse failure with exactly `detail`.
+    fn assert_parse_failure(result: Result<PolicyDocument, PolicyError>, detail: &str) {
+        let err = result.expect_err(detail);
+        assert_eq!(
+            err.wire_code(),
+            "policy.policy_file_parse_failed",
+            "{err:?}"
+        );
+        assert!(
+            matches!(
+                err,
+                PolicyError::PolicyFileParseFailed { detail: ref actual } if actual == detail
+            ),
+            "expected detail {detail:?}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_key_refuses_a_validly_signed_policy() {
+        let body = BODY_WITH_RULES.replacen(
+            "scope = \"profile:alice\"\n",
+            "scope = \"profile:alice\"\ndefault_decision = \"allow\"\n",
+            1,
+        );
+        assert_ne!(body, BODY_WITH_RULES);
+        assert_parse_failure(
+            load_signed_body_after(&body, |signed| signed),
+            "unknown key `default_decision`; the policy file accepts version, scope, rules, \
+             signature",
+        );
+    }
+
+    #[test]
+    fn unknown_signature_key_refuses_a_validly_signed_policy() {
+        assert_parse_failure(
+            load_signed_body_after(BODY_WITH_RULES, |signed| {
+                format!("{signed}algorithm = \"ed25519\"\n")
+            }),
+            "signature: unknown key `algorithm`; the signature table accepts owner_id, sig",
+        );
+    }
+
+    #[test]
+    fn unknown_rule_key_refuses_a_validly_signed_policy() {
+        let body = format!(
+            "{BODY_WITH_RULES}\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\n\
+             criteria = []\ndecision = \"require_approval\"\nttl = 600\n"
+        );
+        assert_parse_failure(
+            load_signed_body_after(&body, |signed| signed),
+            "rule[1]: unknown key `ttl`; a rule accepts match, criteria, decision, reason, \
+             ttl_secs, allow_opaque_signing",
+        );
+    }
+
+    #[test]
+    fn unknown_match_key_refuses_a_validly_signed_policy_in_both_match_syntaxes() {
+        let inline_match = BODY_WITH_RULES.replacen(
+            "chain = \"*\" }",
+            "chain = \"*\", network = \"testnet\" }",
+            1,
+        );
+        assert_ne!(inline_match, BODY_WITH_RULES);
+        let table_match = "version = 1\nscope = \"profile:alice\"\n\n[[rules]]\ncriteria = []\n\
+                           decision = \"allow\"\n\n[rules.match]\ntool = \"stellar_pay\"\n\
+                           chain = \"*\"\nnetwork = \"testnet\"\n";
+        for body in [inline_match.as_str(), table_match] {
+            assert_parse_failure(
+                load_signed_body_after(body, |signed| signed),
+                "rule[0].match: unknown key `network`; match accepts tool, chain",
+            );
+        }
+    }
+
+    /// `window` is a key of `per_period_cap` and `rate_limit`, never of
+    /// `per_tx_cap`: each kind has its own key set.
+    #[test]
+    fn key_of_another_kind_refuses_a_parameterized_criterion() {
+        let body = body_with_criterion(concat!(
+            r#"{ kind = "minimum_reserve", margin_stroops = 0 }, "#,
+            r#"{ kind = "per_tx_cap", asset = "native", max_stroops = 100, window = "1d" }"#,
+        ));
+        assert_parse_failure(
+            load_signed_body_after(&body, |signed| signed),
+            "rule[0].criteria[1]: unknown key `window`; a `per_tx_cap` criterion accepts kind, \
+             asset, max_stroops",
+        );
+    }
+
+    /// A parameterless kind accepts only `kind`; `max_calls` belongs to
+    /// `rate_limit`.
+    #[test]
+    fn key_of_another_kind_refuses_a_parameterless_criterion() {
+        let body = body_with_criterion(r#"{ kind = "quorum_satisfied", max_calls = 1 }"#);
+        assert_parse_failure(
+            load_signed_body_after(&body, |signed| signed),
+            "rule[0].criteria[0]: unknown key `max_calls`; a `quorum_satisfied` criterion \
+             accepts kind",
+        );
+    }
+
+    /// An inline `rules = [...]` array is signed, so its rule keys are checked
+    /// before the loader's refusal of the inline syntax.
+    #[test]
+    fn unknown_key_in_an_inline_rule_refuses_a_validly_signed_policy() {
+        let body = "version = 1\nscope = \"profile:alice\"\nrules = [{ match = { tool = \"*\", \
+                    chain = \"*\" }, criteria = [], decision = \"allow\", note = \"x\" }]\n";
+        assert_parse_failure(
+            load_signed_body_after(body, |signed| signed),
+            "rule[0]: unknown key `note`; a rule accepts match, criteria, decision, reason, \
+             ttl_secs, allow_opaque_signing",
+        );
+    }
+
+    /// Criterion members are signed, so a key added inside a criterion after
+    /// signing breaks the signature too. The unknown key is reported, not the
+    /// signature failure.
+    #[test]
+    fn unknown_criterion_key_added_after_signing_is_reported_before_the_signature() {
+        let body =
+            body_with_criterion(r#"{ kind = "per_tx_cap", asset = "native", max_stroops = 100 }"#);
+        assert_parse_failure(
+            load_signed_body_after(&body, |signed| {
+                let edited =
+                    signed.replacen("max_stroops = 100 }", "max_stroops = 100, foo = 1 }", 1);
+                assert_ne!(edited, signed, "the edit must apply");
+                edited
+            }),
+            "rule[0].criteria[0]: unknown key `foo`; a `per_tx_cap` criterion accepts kind, \
+             asset, max_stroops",
+        );
+    }
+
+    /// Every key of every criterion key set loads in a valid criterion, so the
+    /// closed sets refuse no key the loader parses.
+    #[test]
+    fn every_key_of_each_criterion_key_set_loads() {
+        let criteria = [
+            r#"{ kind = "per_tx_cap", asset = "native", max_stroops = 100 }"#,
+            r#"{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 100 }"#,
+            r#"{ kind = "rate_limit", window = "1h", max_calls = 5 }"#,
+            concat!(
+                r#"{ kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], "#,
+                r#"allowlist = ["GAAAA"], gate_inflows = true }"#,
+            ),
+            r#"{ kind = "minimum_reserve", margin_stroops = 0 }"#,
+            r#"{ kind = "inner_invocation_count_cap", max_count = 3 }"#,
+            r#"{ kind = "bundle_aggregate_cap", asset = "native", max_amount = "100" }"#,
+            r#"{ kind = "restrict_bundle_to_recognised_kinds", enabled = true }"#,
+            concat!(
+                r#"{ kind = "bundle_per_period_cap", asset = "native", "#,
+                r#"window = "1d", max_stroops = 100 }"#,
+            ),
+            r#"{ kind = "bundle_per_tx_cap", asset = "native", max_stroops = 100 }"#,
+            r#"{ kind = "bundle_rate_limit", window = "1h", max_calls = 5 }"#,
+            r#"{ kind = "quorum_satisfied" }"#,
+            r#"{ kind = "home_domain_resolved" }"#,
+            r#"{ kind = "sep10_session_active" }"#,
+            r#"{ kind = "sep45_session_active" }"#,
+        ];
+        assert_eq!(
+            criteria.len(),
+            crate::policy::v1::schema::CRITERION_KEY_SETS.len(),
+            "one criterion per supported kind"
+        );
+        for (criterion, (kind, keys)) in criteria
+            .iter()
+            .zip(crate::policy::v1::schema::CRITERION_KEY_SETS)
+        {
+            let inline = DocumentMut::from_str(&format!("c = {criterion}")).unwrap();
+            let table = inline["c"].as_inline_table().unwrap();
+            let present: Vec<&str> = table.iter().map(|(key, _)| key).collect();
+            assert_eq!(
+                present.as_slice(),
+                *keys,
+                "{kind}: the criterion must carry every key of its set"
+            );
+            let loaded = load_signed_body_after(&body_with_criterion(criterion), |signed| signed);
+            assert!(
+                loaded.is_ok(),
+                "{kind}: a criterion with every key must load: {:?}",
+                loaded.err()
+            );
+        }
+    }
+
+    /// Every kind with a closed key set is parsed by the loader, and the
+    /// loader refuses a kind without one, so the two lists cannot drift.
+    #[test]
+    fn every_kind_with_a_closed_key_set_is_parsed() {
+        for (kind, _) in crate::policy::v1::schema::CRITERION_KEY_SETS {
+            let doc = DocumentMut::from_str(&format!("c = {{ kind = \"{kind}\" }}")).unwrap();
+            if let Err(PolicyError::PolicyFileParseFailed { detail }) =
+                parse_criterion(&doc["c"], 0, 0)
+            {
+                assert!(
+                    !detail.contains("unknown criterion kind"),
+                    "{kind}: the loader must parse every kind with a key set, got {detail}"
+                );
+            }
+        }
+    }
+
+    // ── owner-signature remedy ────────────────────────────────────────────────
+
+    /// Four rules; rules 0 and 2 carry `key`, rules 1 and 3 carry nothing.
+    fn body_with_key_on_rules_0_and_2(key: &str) -> String {
+        format!(
+            r#"version = 1
+scope = "profile:alice"
+
+[[rules]]
+match = {{ tool = "stellar_pay", chain = "*" }}
+criteria = []
+decision = "require_approval"
+{key}
+
+[[rules]]
+match = {{ tool = "stellar_balances", chain = "*" }}
+criteria = []
+decision = "allow"
+
+[[rules]]
+match = {{ tool = "stellar_sep43_sign_transaction", chain = "*" }}
+criteria = []
+decision = "require_approval"
+{key}
+
+[[rules]]
+match = {{ tool = "*", chain = "*" }}
+criteria = []
+decision = "deny"
+"#
+        )
+    }
+
+    /// A signature over the rules without the key (the canonical bytes a
+    /// signer that leaves the key out produces) fails verification, and the
+    /// error names the rules that carry the key. Re-signing the body loads.
+    #[test]
+    fn owner_signature_failure_names_the_rules_carrying_each_signed_optional_key() {
+        for key in [
+            "reason = \"bounded review\"",
+            "ttl_secs = 600",
+            "allow_opaque_signing = true",
+        ] {
+            let (sk, pk) = make_keypair();
+            let written = body_with_key_on_rules_0_and_2(key);
+            let without_key = written.replace(&format!("{key}\n"), "");
+            assert_ne!(without_key, written, "{key}: the key must be on the rules");
+            let stale = with_signature_over(&written, &without_key, &sk);
+
+            let err = load_alice(&stale, &pk).expect_err(key);
+            assert!(
+                matches!(
+                    err,
+                    PolicyError::OwnerSignatureInvalid {
+                        ref profile,
+                        ref rules_with_signed_optional_keys,
+                    }
+                        if profile == "alice" && rules_with_signed_optional_keys == &[0, 2]
+                ),
+                "{key}: {err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "owner signature invalid for profile alice; rules 0 and 2 carry `reason`, \
+                 `ttl_secs` or `allow_opaque_signing`, which the policy signature covers; \
+                 review the policy and re-sign it with `stellar-agent profile sign-policy`",
+                "{key}"
+            );
+
+            let resigned = make_signed_toml(&written, &sk, "GABCDE");
+            let loaded = load_alice(&resigned, &pk);
+            assert!(
+                loaded.is_ok(),
+                "{key}: the re-signed policy must load: {:?}",
+                loaded.err()
+            );
+        }
+    }
+
+    /// A verification failure over rules without optional keys keeps the
+    /// plain message.
+    #[test]
+    fn owner_signature_failure_without_signed_optional_keys_keeps_the_plain_message() {
+        let (sk, _pk) = make_keypair();
+        let (_other_sk, other_pk) = make_keypair();
+        let body = body_with_key_on_rules_0_and_2("");
+        let err = load_alice(&make_signed_toml(&body, &sk, "GABCDE"), &other_pk)
+            .expect_err("a wrong owner key must fail verification");
+        assert!(
+            matches!(
+                err,
+                PolicyError::OwnerSignatureInvalid { ref rules_with_signed_optional_keys, .. }
+                    if rules_with_signed_optional_keys.is_empty()
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "owner signature invalid for profile alice");
     }
 }

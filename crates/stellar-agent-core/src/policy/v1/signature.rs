@@ -80,9 +80,10 @@ pub fn digest(canonical_bytes: &[u8]) -> [u8; 32] {
 ///
 /// On success returns `Ok(())`.  On failure returns
 /// [`PolicyError::OwnerSignatureInvalid`] with the `profile` name supplied by
-/// the caller.  The caller (typically
-/// [`crate::policy::v1::loader::load_signed_policy`]) provides `profile` so this function
-/// does not need to know the profile name itself.
+/// the caller and an empty `rules_with_signed_optional_keys`.  The caller
+/// (typically [`crate::policy::v1::loader::load_signed_policy`]) provides
+/// `profile` so this function does not need to know the profile name itself,
+/// and fills the rule indexes from the document it holds.
 ///
 /// # Errors
 ///
@@ -116,6 +117,7 @@ pub fn verify(
     let key =
         VerifyingKey::from_bytes(owner_pubkey).map_err(|_| PolicyError::OwnerSignatureInvalid {
             profile: profile.to_owned(),
+            rules_with_signed_optional_keys: Vec::new(),
         })?;
 
     let sig = Signature::from_bytes(signature);
@@ -127,6 +129,7 @@ pub fn verify(
     key.verify_strict(digest, &sig)
         .map_err(|_| PolicyError::OwnerSignatureInvalid {
             profile: profile.to_owned(),
+            rules_with_signed_optional_keys: Vec::new(),
         })
 }
 
@@ -238,7 +241,10 @@ mod tests {
 
         let err = verify(&d, &sig, &pk2, "alice").unwrap_err();
         assert!(
-            matches!(err, PolicyError::OwnerSignatureInvalid { ref profile } if profile == "alice"),
+            matches!(
+                err,
+                PolicyError::OwnerSignatureInvalid { ref profile, .. } if profile == "alice"
+            ),
             "wrong key must produce OwnerSignatureInvalid for the correct profile, got: {err:?}"
         );
     }
@@ -256,7 +262,10 @@ mod tests {
 
         let err = verify(&d, &sig, &pk, "bob").unwrap_err();
         assert!(
-            matches!(err, PolicyError::OwnerSignatureInvalid { ref profile } if profile == "bob"),
+            matches!(
+                err,
+                PolicyError::OwnerSignatureInvalid { ref profile, .. } if profile == "bob"
+            ),
             "corrupted signature must produce OwnerSignatureInvalid, got: {err:?}"
         );
     }

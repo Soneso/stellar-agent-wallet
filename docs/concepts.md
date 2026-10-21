@@ -124,6 +124,8 @@ profile with `policy.engine_required`, and on mainnet it refuses earlier with
 
 The V1 engine evaluates a signed policy document against typed Criteria. The document carries an ed25519 owner signature over its canonical form, produced with `profile sign-policy` and verified against the owner public key enrolled with `profile enroll-owner-key`; an invalid signature, or a signature from a key that was re-enrolled after signing, is rejected. The online agent holds only the owner public key. The seed stays with the operator and is supplied to `sign-policy` at sign time.
 
+The signature covers every key the loader reads except the `[signature]` table itself. These are `version`, `scope`, and each rule's `match`, `criteria`, and `decision`, plus `reason`, `ttl_secs`, and `allow_opaque_signing` when the rule carries them. Each level of the file accepts a closed set of keys, and each criterion kind has its own set. The loader refuses any other key with `policy.policy_file_parse_failed`, naming the key and its location, before it checks the signature.
+
 Evaluation is **first-match, default-deny**:
 
 1. Rules are walked in declaration order.
