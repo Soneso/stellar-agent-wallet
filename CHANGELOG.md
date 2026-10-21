@@ -386,6 +386,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this root. `webpki-root-certs` 0.26.11 stays in the lock as a re-export of
   1.0.10. The `reqwest` HTTPS clients verify server certificates with
   `rustls-webpki` against the `webpki-roots` set.
+- `mppx` 0.6.31 to 0.8.19 in the MPP interoperability harness, and
+  `follow-redirects` 1.16.0 to 1.16.1 in the `@stellar/stellar-sdk` 17
+  harness, which resolve four advisories. GHSA-727h-3vm5-qwq6 affects `mppx`
+  before 0.8.1 and GHSA-vc9j-9wph-qghj affects `mppx` before 0.8.2.
+  GHSA-8r9p-f939-6h3c and GHSA-q3jh-wrc6-jgq8 affect `follow-redirects`
+  1.16.0. The harnesses compare the wallet's fixtures with the released
+  JavaScript SDKs in CI, and no wallet crate depends on them.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 
