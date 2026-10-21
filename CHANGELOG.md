@@ -115,6 +115,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MAX_SERVER_TEXT_CHARS` render server-derived text.
   `stellar_agent_x402::wire::describe_json_error` describes a JSON decode
   failure by its class and position, without its values.
+- The release rehearsal workflow `release-rehearsal.yml` builds and packs the
+  five release targets of any branch on a dispatch, without a tag or a
+  credential, and keeps the unsigned archives for 7 days. The rehearsal
+  requires the build lines and the Windows setup scripts to equal those of
+  the build job in `release.yml`.
+  `check-workflow-invariants.py` refuses an expression in any key or value
+  of the rehearsal workflow that reads a secret or the workflow token,
+  top-level keys and job IDs included. It also refuses a double quote
+  outside a single-quoted string in such an expression.
 
 ### Changed
 
