@@ -50,13 +50,14 @@ REAL_PYTHON=$(python3 -c 'import sys; print(sys.executable)')
 FIXTURE="$TMP/fixture"
 
 CASES="docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
+release-rehearsal-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
 ci-yml-only python-check-script shell-check-script skill inbox-web one-crate two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
 wallet-manifest removed-member untracked-test-file fixture-markdown
 committed-cross-scope-rename staged-rename-record spaces-and-an-apostrophe
-full vendored contracts action-script invariants-helper duplicate-triggers changed-self-test
+full vendored contracts action-script invariants-helper release-build-scripts duplicate-triggers changed-self-test
 deleted-shell-script deleted-self-test unavailable-tool
 exit-aggregation table bad-base malformed-manifest unloadable-install-surface-check
 the-preflight-itself registry-completeness
@@ -996,6 +997,14 @@ case_release_workflow() {
   expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py
 }
 
+# The invariants check reads release-rehearsal.yml, so the change selects the
+# check and its self-test.
+case_release_rehearsal_workflow() {
+  start_case
+  edit .github/workflows/release-rehearsal.yml
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py
+}
+
 case_ci_yml_only() {
   start_case
   edit .github/workflows/ci.yml
@@ -1244,6 +1253,28 @@ case_invariants_helper() {
   edit .github/scripts/release-preflight-version-check.sh
   expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
     "shellcheck-changed=shellcheck -s bash .github/scripts/release-preflight-version-check.sh"
+}
+
+# release-rehearsal.yml names the release build scripts in a subdirectory of
+# .github/scripts/, so the computed input set of the invariants gate holds
+# them, and a change to one selects the check and its self-test.
+case_release_build_scripts() {
+  local script
+  start_case
+  # shellcheck disable=SC2016 # The inner shell expands its own argument.
+  "$REAL_BASH" -c '. "$1" && invariant_script_paths' paths "$SCRIPT_REL" >"$CASE_DIR.inputs"
+  for script in build.sh sodium.sh windows-perl.ps1; do
+    if ! grep -qxF ".github/scripts/release/$script" "$CASE_DIR.inputs"; then
+      cat "$CASE_DIR.inputs" >&2
+      fail "the invariants inputs lack .github/scripts/release/$script"
+    fi
+  done
+  edit .github/scripts/release/build.sh
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    "shellcheck-changed=shellcheck -s bash .github/scripts/release/build.sh"
+  git checkout -q -- .github/scripts/release/build.sh
+  edit .github/scripts/release/windows-perl.ps1
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py
 }
 
 case_duplicate_triggers() {

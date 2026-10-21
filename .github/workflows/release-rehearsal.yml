@@ -1,0 +1,161 @@
+name: Release rehearsal
+
+# Rehearses the build legs of release.yml on a branch, by dispatch only:
+#
+#   gh workflow run release-rehearsal.yml --ref <branch>
+#
+# Each leg builds one release target on the runner the release uses, with the
+# release's setup steps and its build command through the scripts under
+# .github/scripts/release/. The version is the stellar-agent-cli version of
+# the checkout, so the run needs no tag. Each leg packs the archive the
+# release packs, unsigned on the macOS legs, and uploads it as the artifact
+# rehearsal-<target> for 7 days. Nothing is signed, notarized, hashed,
+# attested, or published.
+#
+# The workflow holds no credential: every job's token reads the repository
+# contents and nothing else, and no job uses an environment, a secret, or the
+# workflow token. check-workflow-invariants.py enforces that, and it requires
+# the build lines and the Windows setup scripts to equal those of the build
+# job in release.yml.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The expected mainnet-write state is off.
+  EXPECTED_MAINNET_WRITE: "off"
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: x86_64-apple-darwin
+            os: macos-26
+          - target: aarch64-apple-darwin
+            os: macos-26
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      # The release build job keys its cache on the target under the default
+      # prefix. This prefix keeps the two cache families apart, so a release
+      # build never restores a cache that a rehearsal of any branch saved.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: rehearsal-
+          key: ${{ matrix.target }}
+
+      # stellar-agent-network depends on stellar-ledger, which pulls hidapi;
+      # hidapi links libudev on Linux for HID device enumeration. Only the
+      # native x86_64 build compiles directly on this runner and needs the
+      # host's libudev headers. The aarch64 leg builds inside the cross Docker
+      # image, which carries its own cross-compiled libudev.
+      - name: Install libudev (Linux hidapi)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      - name: Install cross (for aarch64-unknown-linux-gnu)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: Provide a native Perl for the vendored OpenSSL build (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: ./.github/scripts/release/windows-perl.ps1
+
+      - name: Prefetch libsodium dist (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: bash .github/scripts/release/sodium.sh
+
+      - name: Read the workspace version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(cargo metadata --format-version 1 --no-deps --locked \
+            | jq -ej '.packages[] | select(.name == "stellar-agent-cli") | .version')
+          version_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if ! [[ "$VERSION" =~ $version_re ]]; then
+            echo "workspace version '$VERSION' does not match $version_re" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Rehearsing version: $VERSION"
+
+      - name: Build binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash .github/scripts/release/build.sh "$TARGET"
+
+      # The packing script of the signing action, run on the unsigned
+      # binaries: the archive has the layout of the signed release archive.
+      - name: Pack the unsigned archive (macOS)
+        id: pack-macos
+        if: contains(matrix.target, 'apple-darwin')
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+          BINARY_DIR: ${{ github.workspace }}/target/${{ matrix.target }}/release
+        run: /bin/bash .github/actions/macos-sign-notarize/archive.sh
+
+      - name: Prepare archive
+        id: prepare
+        if: ${{ !contains(matrix.target, 'apple-darwin') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RELEASE_DIR="target/${TARGET}/release"
+          STAGING_DIR="stellar-agent-${VERSION}-${TARGET}"
+          mkdir -p "$STAGING_DIR"
+
+          cp README.md "$STAGING_DIR/"
+          cp LICENSE "$STAGING_DIR/"
+
+          if [ "$TARGET" = "x86_64-pc-windows-msvc" ]; then
+            cp "$RELEASE_DIR/stellar-agent.exe" "$STAGING_DIR/"
+            cp "$RELEASE_DIR/stellar-agent-mcp.exe" "$STAGING_DIR/"
+            ARCHIVE_NAME="${STAGING_DIR}.zip"
+            7z a -tzip "$ARCHIVE_NAME" "$STAGING_DIR" >/dev/null
+          else
+            cp "$RELEASE_DIR/stellar-agent" "$STAGING_DIR/"
+            cp "$RELEASE_DIR/stellar-agent-mcp" "$STAGING_DIR/"
+            ARCHIVE_NAME="${STAGING_DIR}.tar.xz"
+            tar --create --xz --file "$ARCHIVE_NAME" "$STAGING_DIR"
+          fi
+
+          echo "archive=$ARCHIVE_NAME" >> "$GITHUB_OUTPUT"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rehearsal-${{ matrix.target }}
+          path: ${{ steps.pack-macos.outputs.archive || steps.prepare.outputs.archive }}
+          retention-days: 7
+          if-no-files-found: error

@@ -1,1 +1,4 @@
 crates/stellar-agent-core/tests/fixtures/** -text
+# The Windows build legs run the .sh scripts here with the bash of Git for
+# Windows, which reads a carriage return as part of a command.
+.github/scripts/release/* text eol=lf

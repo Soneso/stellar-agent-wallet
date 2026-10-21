@@ -73,6 +73,7 @@ No job that holds a credential compiles code or runs dependency code.
 | `publish.yml` | `publish` | OIDC token for crates.io, in `crates-io` | no |
 | `notarize-smoke.yml` | `build` | none | yes |
 | `notarize-smoke.yml` | `sign` | Apple secrets of `release-signing` | no |
+| `release-rehearsal.yml` | `build` | none | yes |
 
 A credentialed job downloads artifacts of other jobs under the runner's temp
 directory and reads them as data. It reads outputs of other jobs only through
@@ -92,6 +93,13 @@ checkout after the download and run the ancestry, checksum, and toolchain
 checks. It must check the checkout again after the checksum comparison and
 before it mints the registry token. None of these steps may be conditional,
 turn off errexit, or chain a check with a shell operator.
+
+The same check holds every job of `release-rehearsal.yml` to a token that
+reads the repository contents and nothing else, with no environment, no
+secret, and no expression that reads the workflow token. It also requires the
+build scripts under `.github/scripts/release/` to equal the build job of
+`release.yml`: the same `cargo build` and `cross build` lines, and the Perl
+and libsodium setup steps line for line.
 
 The `sign-macos` job receives the unsigned binaries as a tar.
 `.github/scripts/validate-unsigned-archive.py` refuses the tar unless it holds
@@ -237,6 +245,28 @@ hand:
 
 10. Dispatch the same tag again. The run resumes at that crate: every crate
     already on crates.io passes when its checksum matches.
+
+## Rehearse the release build
+
+```bash
+gh workflow run release-rehearsal.yml --ref <branch>
+```
+
+The rehearsal builds the five release targets of `release.yml` from the head
+of `<branch>`, with no tag. Each target builds on the runner the release uses,
+with the release's setup steps and its build command. The version is the
+`stellar-agent-cli` version of that checkout. The run packs one archive per
+target as the release does and uploads each as the artifact
+`rehearsal-<target>`, kept for 7 days. The macOS archives are unsigned and not
+notarized, and the run hashes, attests, and publishes nothing.
+
+The workflow holds no credential: its token reads the repository contents and
+nothing else. Its build cache has a key prefix of its own, so a release build
+never restores a cache that a rehearsal saved.
+
+GitHub runs a `workflow_dispatch` workflow only once its file exists on the
+default branch. From then on, `--ref` selects any branch that holds the file,
+and the run uses that branch's workflow file and tree.
 
 ## Run the notarization smoke
 

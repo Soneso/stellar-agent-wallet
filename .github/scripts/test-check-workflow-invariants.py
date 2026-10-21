@@ -5,6 +5,7 @@ Copies the workflows, the composite action, and the scripts into a temporary
 root. Each failing case applies its edits and must make the check exit 1. For
 each rule and message fragment the case expects, in order, a line of its
 output after the previous match must name the rule and hold the fragment. The
+optional exact-count field also pins the number of reported violations. The
 unmodified copy must pass, and so must each copy that a PASSING entry edits
 into another accepted form. Each replacement must match the expected number
 of times; a case whose text drifted fails. A fixture read from the live
@@ -28,6 +29,10 @@ TRIAGE_REVIEW = ".github/workflows/triage-review.yml"
 TRIAGE_SWEEP = ".github/workflows/triage-sweep.yml"
 WELCOME = ".github/workflows/welcome.yml"
 COVERAGE = ".github/workflows/coverage.yml"
+REHEARSAL = ".github/workflows/release-rehearsal.yml"
+BUILD_SCRIPT = ".github/scripts/release/build.sh"
+PERL_SCRIPT = ".github/scripts/release/windows-perl.ps1"
+SODIUM_SCRIPT = ".github/scripts/release/sodium.sh"
 ACTION = ".github/actions/macos-sign-notarize/action.yml"
 SIGN_SCRIPT = ".github/actions/macos-sign-notarize/sign-notarize.sh"
 PUBLISH_SCRIPT = ".github/scripts/publish-crates.sh"
@@ -59,6 +64,34 @@ SIGN_MACOS_FIRST_STEP = (
 
 def before_sign_macos_tools(text):
     return (RELEASE, SIGN_MACOS_FIRST_STEP, text + SIGN_MACOS_FIRST_STEP, 1)
+
+
+REHEARSAL_TIMEOUT = "    timeout-minutes: 60\n"
+REHEARSAL_JOB_PERMISSIONS = "    permissions:\n      contents: read\n    strategy:\n"
+REHEARSAL_VERSION_ECHO = '          echo "Rehearsing version: $VERSION"\n'
+REHEARSAL_ENV = '  EXPECTED_MAINNET_WRITE: "off"\n'
+REHEARSAL_SODIUM_STEP = (
+    "      - name: Prefetch libsodium dist (Windows)\n"
+    "        if: matrix.target == 'x86_64-pc-windows-msvc'\n"
+)
+REHEARSAL_EXACT = "expected exactly contents: read"
+
+
+def in_rehearsal_version_step(line):
+    """Adds a line to the run: block of the rehearsal step that reads the
+    version.
+    """
+    return (REHEARSAL, REHEARSAL_VERSION_ECHO, REHEARSAL_VERSION_ECHO + line, 1)
+
+
+RELEASE_CARGO_BUILD = (
+    "cargo build --release --locked --target ${{ matrix.target }} --bin stellar-agent --bin stellar-agent-mcp")
+RELEASE_CROSS_BUILD = (
+    "cross build --release --locked --target ${{ matrix.target }} --bin stellar-agent --bin stellar-agent-mcp")
+SCRIPT_CARGO_BUILD = 'cargo build --release --locked --target "$TARGET" --bin stellar-agent --bin stellar-agent-mcp'
+SCRIPT_CROSS_BUILD = 'cross build --release --locked --target "$TARGET" --bin stellar-agent --bin stellar-agent-mcp'
+PERL_INSTALL = "  choco install strawberryperl --no-progress -y"
+SODIUM_CURL = "  curl --fail --silent --show-error --location --retry 5 --retry-all-errors \\"
 
 
 PUBLISH_CALL = 'cargo publish -p "$name" --locked --no-verify 2>&1 | tee "$log"'
@@ -240,18 +273,31 @@ def publish_job_only(old, new):
     return [(PUBLISH, old, HELD, 2), (PUBLISH, old, new, 1), (PUBLISH, HELD, old, 1)]
 
 
-# label, [(file, old, new, expected occurrences)]; the edited copy must pass.
+# label, [(file, old, new, expected occurrences)];
+# the edited copy must pass.
 PASSING = [
     ("coverage job condition wrapped in ${{ }} passes", [
         (COVERAGE, COVERAGE_IF_LINE, COVERAGE_IF_WRAPPED_LINE, 1)]),
     ("coverage job condition with surrounding whitespace passes", [
         (COVERAGE, COVERAGE_IF_LINE, COVERAGE_IF_SPACED_LINE, 1)]),
+    ("rehearsal job that inherits the workflow permissions passes", [
+        (REHEARSAL, REHEARSAL_JOB_PERMISSIONS, "    strategy:\n", 1)]),
+    ("rehearsal workflow env with a date and a float passes", [
+        (REHEARSAL, REHEARSAL_ENV,
+         REHEARSAL_ENV + "  RELEASE_DATE: 2026-10-21\n  RATIO: 1.5\n", 1)]),
+    ("rehearsal quoted closing braces without credentials passes", [
+        in_rehearsal_version_step("          echo \"${{ format('{0}}}', 'x') }}\"\n")]),
+    ("rehearsal quoted expression opener without credentials passes", [
+        in_rehearsal_version_step("          echo \"${{ format('}} ${{ github', 'x') }}\"\n")]),
+    ("release build line with other whitespace passes", [
+        (RELEASE, RELEASE_CARGO_BUILD,
+         "cargo  build --release --locked --target ${{matrix.target}}  --bin stellar-agent --bin stellar-agent-mcp", 1)]),
 ]
 
 # label, expected rule, a fragment that one line naming the rule must hold,
-# [(file, old, new, expected occurrences)]; each edit replaces only the first
-# occurrence. A case that expects several lines gives a tuple of rules and a
-# tuple of fragments of the same length, in output order.
+# [(file, old, new, expected occurrences)], optional exact count; each edit
+# replaces only the first occurrence. A case that expects several lines gives
+# tuples of rules and fragments of the same length, in output order.
 CASES = [
     ("labels workflow without top-level permissions", "workflow-permissions",
      'labels.yml: workflow-permissions: no top-level permissions', [
@@ -685,6 +731,157 @@ CASES = [
         (COVERAGE, "    branches: [main]\n" + COVERAGE_TYPES_LINE,
          "    branches: [main]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1),
         (COVERAGE, COVERAGE_IF_LINE, "", 1)]),
+    ("rehearsal job with id-token: write", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: the job holds id-token: write", [
+        (REHEARSAL, REHEARSAL_JOB_PERMISSIONS,
+         "    permissions:\n      contents: read\n      id-token: write\n    strategy:\n", 1)]),
+    ("rehearsal job in an environment", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: the job declares an environment", [
+        (REHEARSAL, REHEARSAL_TIMEOUT, REHEARSAL_TIMEOUT + "    environment: rehearsal\n", 1)]),
+    ("rehearsal job that inherits secrets", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: the job passes secrets", [
+        (REHEARSAL, REHEARSAL_TIMEOUT, REHEARSAL_TIMEOUT + "    secrets: inherit\n", 1)]),
+    ("rehearsal job with actions: write", "rehearsal-credentials",
+     f"release-rehearsal.yml:build: rehearsal-credentials: effective permissions are actions: write, "
+     f"contents: read, {REHEARSAL_EXACT}", [
+        (REHEARSAL, REHEARSAL_JOB_PERMISSIONS,
+         "    permissions:\n      actions: write\n      contents: read\n    strategy:\n", 1)]),
+    ("rehearsal workflow with contents: write", "rehearsal-credentials",
+     f"release-rehearsal.yml: rehearsal-credentials: workflow permissions are contents: write, {REHEARSAL_EXACT}", [
+        (REHEARSAL, "\npermissions:\n  contents: read\n\nenv:\n", "\npermissions:\n  contents: write\n\nenv:\n", 1)]),
+    ("rehearsal run line that reads a secret", ("rehearsal-credentials", "rehearsal-credentials"), (
+        "release-rehearsal.yml:build: rehearsal-credentials: the job references secrets.",
+        "release-rehearsal.yml:build: rehearsal-credentials: an expression reads secrets: secrets.RELEASE_KEY"), [
+        in_rehearsal_version_step('          echo "${{ secrets.RELEASE_KEY }}"\n')]),
+    ("rehearsal workflow env that reads a secret", "rehearsal-credentials",
+     "release-rehearsal.yml: rehearsal-credentials: an expression reads secrets: secrets.RELEASE_KEY", [
+        (REHEARSAL, REHEARSAL_ENV, REHEARSAL_ENV + "  RELEASE_KEY: ${{ secrets.RELEASE_KEY }}\n", 1)]),
+    ("rehearsal workflow env key that reads a secret", "rehearsal-credentials",
+     "release-rehearsal.yml: rehearsal-credentials: an expression reads secrets: secrets.RELEASE_KEY", [
+        (REHEARSAL, REHEARSAL_ENV, REHEARSAL_ENV + "  '${{ secrets.RELEASE_KEY }}': value\n", 1)], 1),
+    ("rehearsal step env key that reads the workflow token", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: an expression reads the workflow token: github.token", [
+        (REHEARSAL, REHEARSAL_SODIUM_STEP,
+         REHEARSAL_SODIUM_STEP + "        env:\n          '${{ github.token }}': value\n", 1)], 1),
+    ("rehearsal top-level key that reads the workflow token", "rehearsal-credentials",
+     "release-rehearsal.yml: rehearsal-credentials: an expression reads the workflow token: github.token", [
+        (REHEARSAL, "\nenv:\n", "\n'${{ github.token }}': value\n\nenv:\n", 1)], 1),
+    ("rehearsal job ID that reads the workflow token", "rehearsal-credentials",
+     "release-rehearsal.yml:${{ github.token }}: rehearsal-credentials: "
+     "an expression reads the workflow token: github.token", [
+        (REHEARSAL, "  build:\n", "  '${{ github.token }}':\n", 1)], 1),
+    ("rehearsal step env key with an unterminated expression", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: unterminated expression", [
+        (REHEARSAL, REHEARSAL_SODIUM_STEP,
+         REHEARSAL_SODIUM_STEP + '        env:\n          "${{ format(\'x\')": v\n', 1)], 1),
+    ("rehearsal step env with a set node", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: unsupported workflow node type: set", [
+        (REHEARSAL, REHEARSAL_SODIUM_STEP,
+         REHEARSAL_SODIUM_STEP + "        env: !!set\n          ? UNEXPECTED\n", 1)], 1),
+    ("rehearsal workflow env that reads a secret in another case", "rehearsal-credentials",
+     "release-rehearsal.yml: rehearsal-credentials: an expression reads secrets: Secrets.RELEASE_KEY", [
+        (REHEARSAL, REHEARSAL_ENV, REHEARSAL_ENV + "  RELEASE_KEY: ${{ Secrets.RELEASE_KEY }}\n", 1)]),
+    ("rehearsal workflow secret after quoted closing braces", "rehearsal-credentials",
+     "release-rehearsal.yml: rehearsal-credentials: an expression reads secrets: format('}}{0}', secrets.RELEASE_KEY)", [
+        (REHEARSAL, REHEARSAL_ENV,
+         REHEARSAL_ENV + "  RELEASE_KEY: ${{ format('}}{0}', secrets.RELEASE_KEY) }}\n", 1)]),
+    ("rehearsal run line that reads the workflow token", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: an expression reads the workflow token: github.token", [
+        in_rehearsal_version_step('          echo "${{ github.token }}"\n')]),
+    ("rehearsal run token after quoted closing braces", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: an expression reads the workflow token: "
+     "format('}}{0}', github.token)", [
+        in_rehearsal_version_step("          echo \"${{ format('}}{0}', github.token) }}\"\n")]),
+    ("rehearsal run token after double-quoted closing braces", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: double quote outside a single-quoted string in expression", [
+        in_rehearsal_version_step('          echo \'${{ format("}}{0}", github.token) }}\'\n')], 1),
+    ("rehearsal double-quoted apostrophes around the workflow token", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: double quote outside a single-quoted string in expression", [
+        in_rehearsal_version_step('          echo ${{ format("\'", github.token, "\'") }}\n')], 1),
+    ("rehearsal run token in a second expression", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: an expression reads the workflow token: "
+     "format('it''s }}{0}', github.token)", [
+        in_rehearsal_version_step("          echo \"${{ 'x' }} ${{ format('it''s }}{0}', github.token) }}\"\n")]),
+    ("rehearsal run with an unterminated expression", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: unterminated expression", [
+        in_rehearsal_version_step("          echo ${{ format('{0}', 'x')\n")]),
+    ("rehearsal workflow env with an unterminated string", "rehearsal-credentials",
+     "release-rehearsal.yml: rehearsal-credentials: unterminated string in expression", [
+        (REHEARSAL, REHEARSAL_ENV, REHEARSAL_ENV + "  LITERAL: ${{ 'x }}\n", 1)], 1),
+    ("rehearsal run with an unterminated double-quoted string", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: double quote outside a single-quoted string in expression", [
+        in_rehearsal_version_step('          echo ${{ "x }}\n')], 1),
+    ("rehearsal bare condition with an unterminated string", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: unterminated string in expression", [
+        (REHEARSAL, REHEARSAL_SODIUM_STEP,
+         "      - name: Prefetch libsodium dist (Windows)\n        if: github.ref == 'x\n", 1)]),
+    ("rehearsal wrapped condition with an unterminated expression", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: unterminated expression", [
+        (REHEARSAL, REHEARSAL_SODIUM_STEP,
+         "      - name: Prefetch libsodium dist (Windows)\n        if: ${{ github.ref == 'x'\n", 1)]),
+    ("rehearsal run line that reads the workflow token in another case", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: an expression reads the workflow token: GitHub.Token", [
+        in_rehearsal_version_step('          echo "${{ GitHub.Token }}"\n')]),
+    ("rehearsal step condition that reads the workflow token", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: an expression reads the workflow token: github.token != ''", [
+        (REHEARSAL, REHEARSAL_SODIUM_STEP,
+         "      - name: Prefetch libsodium dist (Windows)\n        if: github.token != ''\n", 1)]),
+    ("rehearsal run line that serializes the github context", "rehearsal-credentials",
+     "release-rehearsal.yml:build: rehearsal-credentials: an expression reads the github context other than by a "
+     "named property: toJSON(github)", [
+        in_rehearsal_version_step('          echo "${{ toJSON(github) }}"\n')]),
+    ("build script line that drifts from the release build line", ("release-script-drift", "release-script-drift"), (
+        f".github/scripts/release/build.sh: release-script-drift: lacks the release build line: {SCRIPT_CARGO_BUILD}",
+        f".github/scripts/release/build.sh: release-script-drift: build line not in the release build job: "
+        f"{SCRIPT_CARGO_BUILD} --features extra"), [
+        (BUILD_SCRIPT, SCRIPT_CARGO_BUILD, SCRIPT_CARGO_BUILD + " --features extra", 1)]),
+    ("build script with a build line the release lacks", "release-script-drift",
+     f".github/scripts/release/build.sh: release-script-drift: build line not in the release build job: "
+     f"{SCRIPT_CARGO_BUILD} --all-targets", [
+        (BUILD_SCRIPT, SCRIPT_CARGO_BUILD + "\n",
+         SCRIPT_CARGO_BUILD + "\n  " + SCRIPT_CARGO_BUILD + " --all-targets\n", 1)]),
+    ("release build line that drifts from the build script", ("release-script-drift", "release-script-drift"), (
+        f".github/scripts/release/build.sh: release-script-drift: lacks the release build line: "
+        f"{SCRIPT_CROSS_BUILD} --verbose",
+        f".github/scripts/release/build.sh: release-script-drift: build line not in the release build job: "
+        f"{SCRIPT_CROSS_BUILD}"), [
+        (RELEASE, RELEASE_CROSS_BUILD, RELEASE_CROSS_BUILD + " --verbose", 1)]),
+    ("release build job without a build line", "release-script-drift",
+     "release.yml:build: release-script-drift: runs no cargo build or cross build line", [
+        (RELEASE, RELEASE_CROSS_BUILD, RELEASE_CROSS_BUILD.replace("cross build", "cross check"), 1),
+        (RELEASE, RELEASE_CARGO_BUILD, RELEASE_CARGO_BUILD.replace("cargo build", "cargo check"), 1)]),
+    ("Perl script that drifts from the release step", "release-script-drift",
+     f".github/scripts/release/windows-perl.ps1: release-script-drift: body line 2 is "
+     f"{PERL_INSTALL.replace(' --no-progress', '')!r}, the release step that writes OPENSSL_SRC_PERL has "
+     f"{PERL_INSTALL!r}", [
+        (PERL_SCRIPT, PERL_INSTALL, PERL_INSTALL.replace(" --no-progress", ""), 1)]),
+    ("release libsodium step that drifts from the script", "release-script-drift",
+     f".github/scripts/release/sodium.sh: release-script-drift: body line 7 is {SODIUM_CURL!r}, the release step "
+     f"that writes SODIUM_DIST_DIR has {SODIUM_CURL.replace('--retry 5', '--retry 3')!r}", [
+        (RELEASE, "--retry 5 --retry-all-errors", "--retry 3 --retry-all-errors", 1)]),
+    ("libsodium script with a line the release step lacks", "release-script-drift",
+     ".github/scripts/release/sodium.sh: release-script-drift: body line 11 is 'ls \"$DIST_DIR\"', the release step "
+     "that writes SODIUM_DIST_DIR has no line", [
+        (SODIUM_SCRIPT, 'echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"\n',
+         'echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"\nls "$DIST_DIR"\n', 1)]),
+    ("release build job without the libsodium step", "release-script-drift",
+     "release.yml:build: release-script-drift: 0 steps write SODIUM_DIST_DIR to GITHUB_ENV, expected one", [
+        (RELEASE, 'echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"', 'echo "SODIUM_DIR=$DIST_DIR" >> "$GITHUB_ENV"', 1)]),
+    ("release build job with two libsodium writers", "release-script-drift",
+     "release.yml:build: release-script-drift: 2 steps write SODIUM_DIST_DIR to GITHUB_ENV, expected one", [
+        (RELEASE, '          echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"\n',
+         '          echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"\n'
+         '\n      - name: Set libsodium directory\n'
+         '        run: echo "SODIUM_DIST_DIR=$RUNNER_TEMP/sodium-dist" >> "$GITHUB_ENV"\n', 1)]),
+]
+
+
+COUNT_CASES = [
+    ("exact violation count rejects extra violations",
+     "fixture.yml: rehearsal-credentials: first\n"
+     "fixture.yml: rehearsal-credentials: second\n"
+     "2 workflow invariant violation(s)\n",
+     1, "2 violations, expected exactly 1"),
 ]
 
 
@@ -693,7 +890,7 @@ def copy_tree(destination):
 
 
 def run_check(root):
-    result = subprocess.run([sys.executable, str(SCRIPT), str(root)],
+    result = subprocess.run([sys.executable, "-B", str(SCRIPT), str(root)],
                             capture_output=True, text=True, check=False)
     return result.returncode, result.stdout + result.stderr
 
@@ -730,8 +927,47 @@ def first_unmatched(output, expected):
     return expected[position] if position < len(expected) else None
 
 
+def violation_count_problem(output, exact_count):
+    """Returns a problem when the reported violations miss an exact count."""
+    count = len(re.findall(r"^.+: [a-z][a-z-]*: ", output, re.MULTILINE))
+    if exact_count is not None and count != exact_count:
+        return f"{count} violations, expected exactly {exact_count}"
+    return None
+
+
+def case_problems(output, case):
+    """Returns problems with a CASES entry's ordered matches and exact
+    count.
+    """
+    _, rule, fragment, _, *count = case
+    problems = []
+    missing = first_unmatched(output, expectations(rule, fragment))
+    if missing is not None:
+        problems.append(f"no {missing[0]} violation with {missing[1]!r} reported in order: {output.strip()}")
+    problem = violation_count_problem(output, count[0] if count else None)
+    if problem is not None:
+        problems.append(problem)
+    return problems
+
+
 def main():
     failures = []
+    for label, output, exact_count, expected in COUNT_CASES:
+        problem = violation_count_problem(output, exact_count)
+        if problem != expected:
+            failures.append(f"{label}: {problem!r}, expected {expected!r}")
+        else:
+            print(f"ok   {label}")
+    label = "case checks enforce the CASES count field"
+    output = ("fixture.yml: rehearsal-credentials: first\n"
+              "fixture.yml: rehearsal-credentials: second\n")
+    case = (label, "rehearsal-credentials", "first", [], 1)
+    problems = case_problems(output, case)
+    expected = ["2 violations, expected exactly 1"]
+    if problems != expected:
+        failures.append(f"{label}: {problems!r}, expected {expected!r}")
+    else:
+        print(f"ok   {label}")
     with tempfile.TemporaryDirectory() as tmp:
         clean = pathlib.Path(tmp) / "clean"
         copy_tree(clean)
@@ -755,7 +991,8 @@ def main():
                 print(f"ok   {label}")
             shutil.rmtree(root)
 
-        for index, (label, rule, fragment, edits) in enumerate(CASES):
+        for index, case in enumerate(CASES):
+            label, edits = case[0], case[3]
             root = pathlib.Path(tmp) / f"case{index}"
             copy_tree(root)
             problems = apply_edits(root, edits)
@@ -764,9 +1001,7 @@ def main():
                 rc, output = run_check(root)
                 if rc != 1:
                     problems.append(f"exit {rc}, expected 1")
-                missing = first_unmatched(output, expectations(rule, fragment))
-                if missing is not None:
-                    problems.append(f"no {missing[0]} violation with {missing[1]!r} reported in order: {output.strip()}")
+                problems.extend(case_problems(output, case))
             if problems:
                 failures.append(f"{label}: {'; '.join(problems)}")
             else:
