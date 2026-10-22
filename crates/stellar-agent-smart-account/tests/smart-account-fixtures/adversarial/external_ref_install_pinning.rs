@@ -20,12 +20,12 @@
 //! Pinning writes no audit row in any case: the install writes the override
 //! rows after it confirms.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use stellar_agent_core::audit_log::{AuditReader, AuditWriter};
 use stellar_agent_core::audit_log::schema::{ContractKind, EventKind, ExecutableRefPin};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_lines;
+use stellar_agent_core::audit_log::{AuditReader, AuditWriter};
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::{AdminOrOwnerKey, SaError};
 use stellar_agent_smart_account::managers::rules::RuleContext;
