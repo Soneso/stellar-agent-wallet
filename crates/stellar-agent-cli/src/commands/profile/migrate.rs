@@ -14,7 +14,7 @@
 //!
 //! **NFS/SMB/FUSE caveat:** `rename(2)` is atomic on single-host POSIX
 //! filesystems.  Networked filesystem mounts may have weaker rename semantics.
-//! See `docs/runbooks/profile-migration.md` for operator guidance.
+//! See `docs/profiles.md#migration-and-key-rotation` for operator guidance.
 //!
 //! # Output
 //!

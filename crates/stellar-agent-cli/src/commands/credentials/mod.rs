@@ -21,7 +21,7 @@
 //! `add-passkey` warns before the first registration ceremony that the
 //! passkey will be bound to the RP-ID and is unrecoverable if the RP-ID is
 //! lost. Prompts `[y/N]` before proceeding. If the user declines, directs
-//! them to `docs/runbooks/passkey-rp-id-recovery.md`.
+//! them to `docs/remote-approval.md#making-rp_id-resolve`.
 
 pub mod add_passkey;
 pub mod delete;

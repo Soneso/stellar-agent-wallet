@@ -37,8 +37,8 @@
 //! the profile names. An absent binding is recorded. The key rotates in place
 //! at the same keyring coordinate, so the binding is otherwise unchanged.
 //!
-//! See `docs/runbooks/profile-migration.md` for operator guidance on key
-//! rotation scheduling.
+//! See `docs/cli-reference/profile-and-governance.md#key-rotation-subcommands`
+//! for the writer lock and the prerequisites of a rotation.
 //!
 //! # Output (JSON envelope)
 //!
