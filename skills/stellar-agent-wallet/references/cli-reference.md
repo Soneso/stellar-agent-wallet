@@ -575,6 +575,11 @@ including testnet. It acquires that writer before the window-store lock and
 writes the reset row before minting a key, advancing the generation or replacing
 the store. A reset whose row cannot be written does not happen.
 
+The reset requires a current tip anchor before and after its row. If repair
+fails, `audit.chain_key_unavailable` carries `audit.tip_anchor_unavailable`,
+and the window state and generation remain unchanged. A reset row can therefore
+describe an attempted reset that did not take effect.
+
 The `policy_window_state_reset` row carries the profile's chain, reason and
 `wiped` record. The JSON result carries the same record. A verified store reports
 live confirmed and pending counts and totals, scope specificity, bucket and
@@ -837,7 +842,7 @@ Asks the endpoint what became of `<HASH>` and settles the wallet's record of it.
 
 Returns `{tx_hash, chain_status, ledger, record, reservation}`, omitting absent fields. `record` is the wallet's receipt: `envelope_hash`, `status`, `failure_code`, `release_code`, `ledger`, `source_redacted`, `sequence`, `submitted` and `reservation_open`. `reservation` is a hold that remains after reconciliation, `{envelope_hash, operator_required}`; `operator_required: true` marks a reservation whose receipt is missing beyond the endpoint's retention window, which only `tx receipt clear` resolves.
 
-`SUCCESS` records the spend and writes the value-action row the submission never got to write; `FAILED` releases the reservation. `NOT_FOUND` releases it only on chain evidence that the transaction can no longer apply, confirmed by a second `NOT_FOUND`: its sequence has been consumed, or an observed ledger close time is past its time bound. The record then reads `ambiguous` with `release_code` set to `submission.sequence_consumed` or `submission.time_bound_passed`, and a `value_action_failed` row is written under that code. Otherwise the record stands. A time bound exists only on an envelope that carries one: the wallet builds classic envelopes without it. The verb is repeatable: a submission already accounted for gets no second row, and a row a release still owes is written from the receipt. It never sends.
+`SUCCESS` records the spend and writes the value-action row the submission never got to write; `FAILED` releases the reservation. `NOT_FOUND` releases it only on chain evidence that the transaction can no longer apply, confirmed by a second `NOT_FOUND`: its sequence has been consumed, or an observed ledger close time is past its time bound. The record then reads `ambiguous` with `release_code` set to `submission.sequence_consumed` or `submission.time_bound_passed`, and a `value_action_failed` row is written under that code. Otherwise the record stands. A time bound exists only on an envelope that carries one: the wallet builds classic envelopes without it. The verb is repeatable: a submission already accounted for gets no second row, and a row a release still owes is written from the receipt. When the settlement lookup cannot read the retained audit history, the verb logs the error and writes no settled row. It never sends.
 
 Writing the settled row needs the audit writer's exclusive lock, so while a `stellar-agent-mcp` server holds that writer the verb refuses with `audit.writer_locked`. Stop the server, reconcile, start it again.
 
@@ -853,6 +858,8 @@ Without `--acknowledge` nothing is reconciled or written: the exit code is 1 wit
 - `ambiguous` without evidence, `pending` with no time bound, `pending` and never sent, or a restored orphan: it releases the reservation and clears; the clear row records no evidence.
 - `pending`, sent, with an open time bound and an unconsumed sequence: refused with `submission.still_pending`, naming the time bound.
 - A ledger-time read failed for a sent, timed submission, or another reconciliation read failed: refused with `network.rpc_unreachable`.
+
+Where the profile has an audit writer, the settlement lookup of an evidence release and the check for an earlier clear row read the retained audit history. An unreadable history refuses with the verifier's code, such as `audit.chain_broken` for a broken chain, before the clear row is written, and keeps the receipt. A synthesized profile with no audit writer skips the history lookups and marks the receipt cleared without writing audit rows.
 
 `--acknowledge` states that the transaction did not move value, which the wallet cannot establish. The receipt is marked `cleared_by_operator`, not removed, and owes no settlement row. An untimed transaction cleared this way can still apply, and its spend is then not counted.
 

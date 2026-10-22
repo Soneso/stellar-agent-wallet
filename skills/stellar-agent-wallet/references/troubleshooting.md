@@ -124,7 +124,7 @@ around it. No recovery path sends a transaction again.
 | `submission.tx_timeout` | The submission ended without a confirmed outcome: the deadline passed, the endpoint reported an unexpected status, or a transport failure struck during or after the send. It may still apply; the message says to settle it by its transaction hash and not to resubmit. `details` carries `tx_hash`, `timeout_seconds`, `outcome: "unknown"`, `reconcile_with`, and `envelope_hash` where the reporting surface holds the signed bytes. | Call `stellar_transaction_status` with `details.tx_hash` (CLI: `stellar-agent tx status <HASH>`). Do not re-simulate, rebuild, or resubmit. |
 | `submission.tx_already_submitted` | A pending record already holds this transaction's source account and sequence, or the spending window already holds these signed bytes. Nothing was sent. `details.tx_hash` names the transaction to reconcile. | Reconcile `details.tx_hash` first. Once it is settled, the sequence is free and a fresh simulate-and-commit proceeds. |
 | `submission.hash_mismatch` | The endpoint reported a transaction hash that does not describe the transaction that was sent. `details` carries both hashes. | Reconcile `details.tx_hash`. Report the mismatch to the operator: the endpoint is not describing what it was handed. |
-| `submission.record_unavailable` | The wallet could not durably record the submission, so nothing was sent. The condition is local: an unwritable receipt store, an unreadable spending-window file, or an audit log that cannot be appended. | Not agent-recoverable. Report to the operator; the submission is safe to retry once it is fixed. |
+| `submission.record_unavailable` | The wallet could not durably record the submission, so nothing was sent. The condition is local: an unwritable receipt store, an unreadable spending-window file, an audit log that cannot be appended, or a pending audit row the audit log's tip anchor does not cover, whose message carries `audit.tip_anchor_unavailable`. | Not agent-recoverable. Report to the operator; the submission is safe to retry once it is fixed. |
 | `submission.tx_malformed` | The endpoint refused the transaction outright, reporting a validation error for the envelope (for example the fee was below the current floor). The wallet never sends those bytes again and releases the reservation. | A fresh simulate-and-commit is the next step; the sequence is free. |
 | `policy.approval_consumed` | The approval presented was already spent on a submission. | Check that transaction's status before asking for the action again. Do not re-present the same approval. |
 
@@ -372,6 +372,12 @@ verb whose profile cannot be resolved for its audit writer. An audit directory
 that cannot be created, or a writer lock another process holds, reports
 `audit.chain_key_unavailable` with the `audit.io_error` or `audit.writer_locked`
 detail.
+
+For `audit.tip_anchor_unavailable`, restore keyring access and retry. Keyed
+appends retry once immediately and keep an owed repair after two failures.
+The window reset and x402 gate refuse while repair fails. A submission recorded
+through the pending row reports `submission.record_unavailable` with this
+sub-code. A rotation-spanning outage can require `audit reanchor` after restart.
 
 ## Profile-selection code
 

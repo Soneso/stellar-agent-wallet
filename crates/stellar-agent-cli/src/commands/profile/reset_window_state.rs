@@ -57,10 +57,10 @@
 
 use clap::{ArgGroup, Args};
 use serde::Serialize;
-use stellar_agent_core::audit_log::AuditEntry;
 use stellar_agent_core::audit_log::BindingCheck;
 use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::audit_log::schema::WipedAccrualRecord;
+use stellar_agent_core::audit_log::{AuditEntry, AuditWriter, WriterError, audit_writer_refusal};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_core::profile::ResolvedProfileName;
@@ -195,15 +195,14 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
     let store = PersistedWindowStore::for_profile(name);
     let request_id = Uuid::new_v4().to_string();
     let result = store.reset(&profile, now_ms, |accrual| {
-        let entry = AuditEntry::new_policy_window_state_reset(
-            "profile_reset_window_state",
+        record_window_reset(
+            &mut writer,
             name,
             &args.reason,
             &request_id,
             profile.chain_id.caip2_str(),
-            accrual.clone(),
-        );
-        append_value_audit_row_strict(&mut writer, name, entry)
+            accrual,
+        )
     });
     let minted = match &result {
         Ok(outcome) => outcome.mint.newly_minted,
@@ -246,6 +245,51 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
     0
 }
 
+/// Records the attempted reset before the store or generation changes.
+///
+/// Three steps run under the held writer, and a refusal at any of them stops
+/// the reset. [`AuditWriter::require_anchor_current`] first refuses a behind
+/// tip anchor before the row is written. The reset row follows. The second
+/// [`AuditWriter::require_anchor_current`] refuses when the row's own anchor
+/// write failed, so the store is never wiped on a row the anchor does not
+/// cover. A refusal there leaves a durable row describing an attempted reset
+/// that did not take effect.
+fn record_window_reset(
+    writer: &mut AuditWriter,
+    name: &str,
+    reason: &str,
+    request_id: &str,
+    chain_id: &str,
+    accrual: &WipedAccrualRecord,
+) -> Result<(), WalletError> {
+    writer
+        .require_anchor_current()
+        .map_err(|e| anchor_refusal(name, &e))?;
+    let entry = AuditEntry::new_policy_window_state_reset(
+        "profile_reset_window_state",
+        name,
+        reason,
+        request_id,
+        chain_id,
+        accrual.clone(),
+    );
+    append_value_audit_row_strict(writer, name, entry)?;
+    writer
+        .require_anchor_current()
+        .map_err(|e| anchor_refusal(name, &e))
+}
+
+/// Maps a tip-anchor refusal to the audit refusal and logs it the way a refused
+/// strict append is logged.
+fn anchor_refusal(name: &str, e: &WriterError) -> WalletError {
+    tracing::warn!(
+        profile = %name,
+        error = %e,
+        "audit tip anchor cannot be written; refusing the reset that requires it"
+    );
+    audit_writer_refusal(name, e)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -255,6 +299,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
 
@@ -312,5 +357,91 @@ mod tests {
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn an_anchor_refusal_preserves_window_state_and_generation() {
+        use std::sync::Arc;
+        use stellar_agent_core::audit_log::KeyedAuditAccess;
+        use stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore;
+        use stellar_agent_core::policy::v1::criteria::state_store::{
+            StateKey, WindowEntry, WindowLimit,
+        };
+        use stellar_agent_core::profile::schema::{Profile, generation_account};
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let profile =
+            Profile::builder_testnet_named("reset-anchor", "signer", "account", "nonce", "account")
+                .with_noop_engine()
+                .audit_log_path(dir.path().join("audit.jsonl"))
+                .build();
+        let path = dir.path().join("window.json");
+        let store = PersistedWindowStore::at_path(path.clone());
+        store
+            .record_and_persist(
+                &profile,
+                &[WindowEntry::new(
+                    StateKey::new("reset-anchor", 3, "native", 86_400),
+                    100_000,
+                    99,
+                    WindowLimit::Amount {
+                        asset: "native".to_owned(),
+                        window: "1d".to_owned(),
+                        max_stroops: 1_000,
+                    },
+                )],
+            )
+            .unwrap();
+        let key = &profile.policy_window_state_key_id;
+        let generation =
+            keyring_core::Entry::new(&key.service, &generation_account(&key.account)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let counter = generation.get_password().unwrap();
+        let anchor = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = AuditWriter::open(
+            profile.audit_log_path.clone(),
+            Some(KeyedAuditAccess::new(
+                zeroize::Zeroizing::new([0x5a; 32]),
+                anchor.clone(),
+            )),
+        )
+        .unwrap();
+        anchor.set_failing(true);
+        let result = store.reset(&profile, 100_000, |accrual| {
+            record_window_reset(
+                &mut writer,
+                "reset-anchor",
+                "repair",
+                "reset-request",
+                "stellar:testnet",
+                accrual,
+            )
+        });
+        let Err(ResetError::Recorder(error)) = result else {
+            panic!("an unanchored reset row must refuse the wipe");
+        };
+        assert_eq!(error.code(), "audit.chain_key_unavailable");
+        assert!(error.to_string().contains("audit.tip_anchor_unavailable"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(generation.get_password().unwrap(), counter);
+        let rows = std::fs::read(&profile.audit_log_path).unwrap();
+        assert_eq!(String::from_utf8_lossy(&rows).lines().count(), 1);
+        assert!(
+            store
+                .reset(&profile, 100_000, |accrual| record_window_reset(
+                    &mut writer,
+                    "reset-anchor",
+                    "repair",
+                    "reset-request",
+                    "stellar:testnet",
+                    accrual,
+                ))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&profile.audit_log_path).unwrap(), rows);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(generation.get_password().unwrap(), counter);
     }
 }

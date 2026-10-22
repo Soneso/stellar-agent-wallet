@@ -994,7 +994,9 @@ impl AuditReader {
 /// consistency posture" section. This never masks a genuine gap: callers
 /// still see the active file missing (and, when siblings are present, still
 /// get `RotationGap`) if it never reappears within the bound.
-fn collect_files_newest_first(log_path: &Path) -> Result<Vec<PathBuf>, AuditLogIntegrityError> {
+pub(super) fn collect_files_newest_first(
+    log_path: &Path,
+) -> Result<Vec<PathBuf>, AuditLogIntegrityError> {
     let chain = scan_files_newest_first(log_path)?;
     if chain.len() > 1 && !chain[0].exists() {
         return wait_out_transient_rotation_window(
@@ -1985,6 +1987,234 @@ fn scan_file_for_timelock_operations(
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Pending value-action lookup
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What a `value_action_pending` row recorded for one submission.
+///
+/// The reconciliation surfaces settle a submission whose confirmation never
+/// arrived, and the row they write has to carry the SAME value legs the gate
+/// sized. Those legs were written once, by the pending row, so they are read
+/// back from it rather than re-derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PendingValueAction {
+    /// Witness preserved from the pending row during reconciliation.
+    pub witness: Option<super::schema::CrossCheckRecord>,
+    /// The verb that made the submission, as it appears on the outer entry.
+    pub tool: String,
+    /// CAIP-2 chain identifier from the outer entry.
+    pub chain_id: Option<String>,
+    /// The value legs the policy gate sized.
+    pub legs: Vec<ValueLegRecord>,
+    /// The commit nonce prefix the pending row carried.
+    pub nonce_id: Option<String>,
+    /// The submission gate's decision from the pending row.
+    pub policy_decision: super::PolicyDecision,
+    /// Approval nonce bound to the pending submission.
+    pub approval_nonce: Option<String>,
+}
+
+/// What a submission's value action still owes the retained audit history.
+///
+/// Reconciliation is an operator-repeatable verb. A settled row anywhere in the
+/// retained history means the submission is already accounted for, which is
+/// what keeps a second run from appending a second row for one spend.
+/// [`try_value_action_settlement`] states which files the lookup reads and the
+/// limits of that read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one owned pending row preserves the recovery API"
+)]
+pub enum ValueActionSettlement {
+    /// A retained pending row is unsettled. Its value legs are the ones the
+    /// policy gate sized.
+    Owed(PendingValueAction),
+    /// No settlement row and no pending row for the submission survives in the
+    /// retained history, so the submission is still owed a settled row and its
+    /// legs are not recoverable.
+    ///
+    /// The row is written anyway, with no legs, because the submission's
+    /// outcome belongs in the log whether or not its sizing survived. Legs from
+    /// a different submission would be worse than none.
+    OwedWithoutLegs,
+    /// A settled row already accounts for the submission.
+    Settled,
+}
+
+/// Reports what the value action for `envelope_hash` still owes the log.
+///
+/// A match is a `value_action_pending`, `value_action_submitted`, or
+/// `value_action_failed` row carrying the hash. Tool-invocation and
+/// operator-clear rows that carry it are skipped, so the walk never stops in a
+/// file that holds no settlement row. Files are visited newest first, and the
+/// walk stops at the first file holding a match, leaving older files
+/// unvisited. The last match in that file wins.
+///
+/// Each visited file's in-file chain is verified forward; in a log with no
+/// archives the first row must also chain from the zero hash. No HMAC or
+/// cross-file check runs, and the lookup acquires no writer lock.
+///
+/// Two limits follow from that read. The eleventh rotation deletes the oldest
+/// archive, so a submission whose rows only that archive held reads as
+/// [`ValueActionSettlement::OwedWithoutLegs`]. The lookup runs outside the
+/// writer guard: two reconciliations of one hash can both find
+/// [`ValueActionSettlement::Owed`], and any concurrent in-process append can
+/// rotate the log between the file listing and the scan, renaming the matched
+/// file out of the walk.
+///
+/// # Errors
+///
+/// Returns a read, parse, rotation-gap, or in-file chain integrity error.
+pub fn try_value_action_settlement(
+    log_path: &Path,
+    envelope_hash: &str,
+) -> Result<ValueActionSettlement, AuditLogIntegrityError> {
+    Ok(
+        find_latest_value_row(log_path, envelope_hash, |entry| match entry.event_kind {
+            EventKind::ValueActionSubmitted { .. } | EventKind::ValueActionFailed { .. } => {
+                Some(ValueActionSettlement::Settled)
+            }
+            EventKind::ValueActionPending {
+                witness,
+                legs,
+                approval_nonce,
+                ..
+            } => Some(ValueActionSettlement::Owed(PendingValueAction {
+                witness,
+                legs,
+                tool: entry.tool,
+                chain_id: entry.chain_id,
+                nonce_id: entry.nonce_id,
+                policy_decision: entry.policy_decision,
+                approval_nonce,
+            })),
+            _ => None,
+        })?
+        .unwrap_or(ValueActionSettlement::OwedWithoutLegs),
+    )
+}
+
+/// Reports whether the retained history carries an operator-clear row for
+/// `envelope_hash`.
+///
+/// `stellar-agent tx receipt clear` writes its row before it marks the
+/// receipt, so that a failure at the mark leaves a reservation already
+/// released rather than one stranded under a receipt no verb accepts again.
+/// The cost of that order is that a re-run after such a failure would append a
+/// second row for one clear. This lookup is what makes the re-run complete the
+/// mark instead.
+///
+/// The walk and its limits are those of [`try_value_action_settlement`], with
+/// a `submission_receipt_cleared` row as the only match.
+///
+/// # Errors
+///
+/// Returns a read, parse, rotation-gap, or in-file chain integrity error.
+pub fn try_submission_receipt_cleared_exists(
+    log_path: &Path,
+    envelope_hash: &str,
+) -> Result<bool, AuditLogIntegrityError> {
+    Ok(find_latest_value_row(log_path, envelope_hash, |entry| {
+        matches!(entry.event_kind, EventKind::SubmissionReceiptCleared { .. }).then_some(())
+    })?
+    .is_some())
+}
+
+/// Walks the retained history newest file first and returns what `select`
+/// maps from the last matching row of the first file that holds one.
+///
+/// A missing active file is an empty log only while no archive exists. With
+/// archives it is a rotation gap, so archived rows never stand in for the
+/// active file. A log with no archives is the whole chain, so its first row
+/// must name the zero hash as its predecessor.
+fn find_latest_value_row<T>(
+    log_path: &Path,
+    envelope_hash: &str,
+    select: impl Fn(AuditEntry) -> Option<T>,
+) -> Result<Option<T>, AuditLogIntegrityError> {
+    let files = collect_files_newest_first(log_path)?;
+    let expected_first_prev = (files.len() == 1).then_some(ZERO_BLOCK_HASH);
+    for path in &files {
+        if !path.exists() {
+            if path == log_path && files.len() == 1 {
+                continue;
+            }
+            return Err(AuditLogIntegrityError::RotationGap {
+                file: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            });
+        }
+        if let Some(found) =
+            scan_file_for_value_row(path, envelope_hash, &select, expected_first_prev)?
+        {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+/// Scans one file forward and returns what `select` maps from the last row
+/// carrying `envelope_hash`.
+///
+/// Every row after the first must name the hash of the row before it, and the
+/// first row must name `expected_first_prev` when the caller supplies one. The
+/// whole file is read even after a match, so a break after the match still
+/// refuses.
+fn scan_file_for_value_row<T>(
+    path: &Path,
+    envelope_hash: &str,
+    select: &impl Fn(AuditEntry) -> Option<T>,
+    expected_first_prev: Option<&str>,
+) -> Result<Option<T>, AuditLogIntegrityError> {
+    let reader = BufReader::new(open_regular_file(path)?);
+    let mut previous = expected_first_prev.map(str::to_owned);
+    let mut best = None;
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.map_err(AuditLogIntegrityError::Io)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parse_error = |error: String| AuditLogIntegrityError::ParseError {
+            line: index + 1,
+            detail: error,
+        };
+        let entry: AuditEntry =
+            serde_json::from_str(&line).map_err(|error| parse_error(error.to_string()))?;
+        if let Some(expected) = &previous
+            && entry.previous_entry_hash != *expected
+        {
+            return Err(AuditLogIntegrityError::ChainBroken {
+                line: index + 1,
+                file: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                reason: "previous_entry_hash mismatch",
+            });
+        }
+        let body = entry
+            .canonical_json_body()
+            .map_err(|error| parse_error(error.to_string()))?;
+        previous = Some(
+            compute_entry_hash(&body, &entry.previous_entry_hash)
+                .map_err(|error| parse_error(error.to_string()))?,
+        );
+        if entry.envelope_hash.as_deref() == Some(envelope_hash)
+            && let Some(found) = select(entry)
+        {
+            best = Some(found);
+        }
+    }
+    Ok(best)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2079,7 +2309,8 @@ mod tests {
             .write_entry(pending_row(SETTLE_ENVELOPE))
             .unwrap();
 
-        let ValueActionSettlement::Owed(found) = value_action_settlement(&path, SETTLE_ENVELOPE)
+        let ValueActionSettlement::Owed(found) =
+            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap()
         else {
             panic!("a pending row with no settled row is owed one");
         };
@@ -2104,7 +2335,7 @@ mod tests {
         }
 
         assert_eq!(
-            value_action_settlement(&path, SETTLE_ENVELOPE),
+            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
             ValueActionSettlement::Settled,
             "a submission already accounted for is owed no second row"
         );
@@ -2125,21 +2356,20 @@ mod tests {
 
         assert!(
             matches!(
-                value_action_settlement(&path, SETTLE_ENVELOPE),
+                try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
                 ValueActionSettlement::Owed(_)
             ),
             "the settled row names a different submission"
         );
         assert_eq!(
-            value_action_settlement(&path, OTHER_ENVELOPE),
+            try_value_action_settlement(&path, OTHER_ENVELOPE).unwrap(),
             ValueActionSettlement::Settled
         );
     }
 
-    /// A submission whose pending row is not in the active file is still owed
-    /// a settled row, written without the legs rotation took away.
+    /// A submission absent from retained history is owed a row without legs.
     #[test]
-    fn a_submission_whose_pending_row_rotated_out_is_owed_a_row_without_legs() {
+    fn an_absent_submission_is_owed_a_row_without_legs() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
@@ -2150,9 +2380,321 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            value_action_settlement(&path, SETTLE_ENVELOPE),
+            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
             ValueActionSettlement::OwedWithoutLegs
         );
+    }
+
+    fn cleared_row() -> AuditEntry {
+        AuditEntry::new_submission_receipt_cleared(
+            "tx_receipt_clear",
+            Some("stellar:testnet".to_owned()),
+            "hash...tail",
+            "pending",
+            true,
+            None,
+            Some(SETTLE_ENVELOPE.to_owned()),
+            "clear",
+        )
+    }
+
+    #[test]
+    fn a_pending_row_in_an_archive_keeps_its_legs() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut guard = writer.lock().unwrap();
+        guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+        guard.force_rotate_for_test().unwrap();
+        guard.write_entry(cleared_row()).unwrap();
+        let ValueActionSettlement::Owed(found) =
+            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap()
+        else {
+            panic!("the archived pending row is still owed with its legs");
+        };
+        assert_eq!(found.legs.len(), 1);
+        assert_eq!(found.legs[0].amount, Some(10_000_000));
+    }
+
+    #[test]
+    fn a_settled_row_in_an_archive_prevents_another_settlement() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut guard = writer.lock().unwrap();
+        guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+        guard.write_entry(submitted_row(SETTLE_ENVELOPE)).unwrap();
+        guard.force_rotate_for_test().unwrap();
+        guard.write_entry(cleared_row()).unwrap();
+        assert_eq!(
+            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            ValueActionSettlement::Settled
+        );
+    }
+
+    #[test]
+    fn a_cleared_row_is_found_in_active_and_archived_history() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut guard = writer.lock().unwrap();
+        guard.write_entry(cleared_row()).unwrap();
+        assert!(try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
+        guard.force_rotate_for_test().unwrap();
+        assert!(try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
+    }
+
+    #[test]
+    fn a_broken_visited_archive_refuses_both_lookups() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut guard = writer.lock().unwrap();
+        guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+        guard.write_entry(cleared_row()).unwrap();
+        guard.force_rotate_for_test().unwrap();
+        let archive = collect_files_newest_first(&path).unwrap().remove(1);
+        let raw = std::fs::read_to_string(&archive).unwrap();
+        let mut rows: Vec<AuditEntry> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        rows[1].tool = "changed".to_owned();
+        let changed = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap() + "\n")
+            .collect::<String>();
+        std::fs::write(&archive, changed).unwrap();
+        assert!(matches!(
+            try_value_action_settlement(&path, SETTLE_ENVELOPE),
+            Err(AuditLogIntegrityError::ChainBroken { line: 3, .. })
+        ));
+        assert!(matches!(
+            try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE),
+            Err(AuditLogIntegrityError::ChainBroken { line: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn a_missing_active_file_with_archives_refuses_both_lookups() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut guard = writer.lock().unwrap();
+        guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+        guard.force_rotate_for_test().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            try_value_action_settlement(&path, SETTLE_ENVELOPE),
+            Err(AuditLogIntegrityError::RotationGap { .. })
+        ));
+        assert!(matches!(
+            try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE),
+            Err(AuditLogIntegrityError::RotationGap { .. })
+        ));
+    }
+
+    #[test]
+    fn a_matching_file_leaves_older_corrupt_archives_unvisited() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut guard = writer.lock().unwrap();
+        guard.write_entry(pending_row(OTHER_ENVELOPE)).unwrap();
+        guard.force_rotate_for_test().unwrap();
+        guard.write_entry(submitted_row(SETTLE_ENVELOPE)).unwrap();
+        guard.write_entry(cleared_row()).unwrap();
+        let archive = collect_files_newest_first(&path).unwrap().remove(1);
+        std::fs::write(&archive, "corrupt\n").unwrap();
+        assert_eq!(
+            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            ValueActionSettlement::Settled
+        );
+        assert!(try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
+    }
+
+    /// A one-file log whose only row names `predecessor`.
+    fn one_row_log(row: AuditEntry, predecessor: &str) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        open_writer(path.clone())
+            .lock()
+            .unwrap()
+            .write_entry(row)
+            .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let mut entry: AuditEntry = serde_json::from_str(written.trim()).unwrap();
+        entry.previous_entry_hash = predecessor.to_owned();
+        std::fs::write(&path, serde_json::to_string(&entry).unwrap() + "\n").unwrap();
+        (dir, path)
+    }
+
+    /// The only row of a log with no archives is the root of the whole chain,
+    /// so a settled row that names any predecessor but the zero hash refuses.
+    #[test]
+    fn a_lone_settled_row_with_a_nonzero_predecessor_refuses_the_settlement_lookup() {
+        let (_root, rooted) = one_row_log(submitted_row(SETTLE_ENVELOPE), ZERO_BLOCK_HASH);
+        assert_eq!(
+            try_value_action_settlement(&rooted, SETTLE_ENVELOPE).unwrap(),
+            ValueActionSettlement::Settled
+        );
+        let (_dir, path) = one_row_log(submitted_row(SETTLE_ENVELOPE), &"1".repeat(64));
+        assert!(matches!(
+            try_value_action_settlement(&path, SETTLE_ENVELOPE),
+            Err(AuditLogIntegrityError::ChainBroken { line: 1, .. })
+        ));
+    }
+
+    /// The clear lookup applies the same root rule as the settlement lookup.
+    #[test]
+    fn a_lone_cleared_row_with_a_nonzero_predecessor_refuses_the_clear_lookup() {
+        let (_root, rooted) = one_row_log(cleared_row(), ZERO_BLOCK_HASH);
+        assert!(try_submission_receipt_cleared_exists(&rooted, SETTLE_ENVELOPE).unwrap());
+        let (_dir, path) = one_row_log(cleared_row(), &"1".repeat(64));
+        assert!(matches!(
+            try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE),
+            Err(AuditLogIntegrityError::ChainBroken { line: 1, .. })
+        ));
+    }
+
+    /// A walk through every retained file that finds no match answers the
+    /// not-found outcome, not an error.
+    #[test]
+    fn a_walk_through_an_archive_without_a_match_reports_not_found() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut guard = writer.lock().unwrap();
+        guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+        guard.force_rotate_for_test().unwrap();
+        guard.write_entry(submitted_row(SETTLE_ENVELOPE)).unwrap();
+        assert!(!try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
+        assert_eq!(
+            try_value_action_settlement(&path, OTHER_ENVELOPE).unwrap(),
+            ValueActionSettlement::OwedWithoutLegs
+        );
+    }
+
+    /// When two archives both hold a match, the newer archive answers and the
+    /// older one is never read.
+    #[test]
+    fn the_newest_archive_with_a_match_answers_and_older_archives_stay_unvisited() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut guard = writer.lock().unwrap();
+        guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+        guard.write_entry(cleared_row()).unwrap();
+        guard.force_rotate_for_test().unwrap();
+        guard.write_entry(submitted_row(SETTLE_ENVELOPE)).unwrap();
+        guard.write_entry(cleared_row()).unwrap();
+        guard.force_rotate_for_test().unwrap();
+        guard.write_entry(pending_row(OTHER_ENVELOPE)).unwrap();
+        assert_eq!(
+            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            ValueActionSettlement::Settled
+        );
+        let files = collect_files_newest_first(&path).unwrap();
+        assert_eq!(files.len(), 3);
+        std::fs::write(&files[2], "corrupt\n").unwrap();
+        assert_eq!(
+            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            ValueActionSettlement::Settled
+        );
+        assert!(try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
+    }
+
+    /// A tool-invocation row carrying the hash is not a settlement row, so it
+    /// neither settles the submission nor stops the walk short of the archived
+    /// pending row.
+    #[test]
+    fn a_same_hash_tool_invocation_row_does_not_stop_the_settlement_walk() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut guard = writer.lock().unwrap();
+        guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+        guard.force_rotate_for_test().unwrap();
+        let mut invocation = AuditEntry::new_tool_invocation(NewToolInvocation::new(
+            "stellar_pay",
+            "stellar:testnet",
+            vec!["destination".to_owned()],
+            PolicyDecision::Allow,
+            "req-invocation",
+        ));
+        invocation.envelope_hash = Some(SETTLE_ENVELOPE.to_owned());
+        guard.write_entry(invocation).unwrap();
+        let ValueActionSettlement::Owed(found) =
+            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap()
+        else {
+            panic!("the tool-invocation row must not settle the archived pending row");
+        };
+        assert_eq!(found.legs.len(), 1);
+    }
+
+    /// A failed row settles its submission, and the clear lookup walks past it
+    /// to the archived operator-clear row.
+    #[test]
+    fn a_failed_row_settles_and_the_clear_lookup_walks_past_it() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut guard = writer.lock().unwrap();
+        guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
+        guard.write_entry(cleared_row()).unwrap();
+        guard.force_rotate_for_test().unwrap();
+        guard
+            .write_entry(AuditEntry::new_value_action_failed(
+                "stellar_pay",
+                Some("stellar:testnet".to_owned()),
+                vec![],
+                "6ba7aaac...69060003",
+                "submission.failed",
+                PolicyDecision::Allow,
+                Some(SETTLE_ENVELOPE.to_owned()),
+                None,
+                None,
+                "req-failed",
+            ))
+            .unwrap();
+        assert_eq!(
+            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            ValueActionSettlement::Settled
+        );
+        assert!(try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
+    }
+
+    /// A failed row is not an operator clear: with no clear row anywhere in
+    /// the retained history, the clear lookup answers `false` for a
+    /// submission whose only row is a failed row.
+    #[test]
+    fn a_failed_row_alone_is_not_an_operator_clear() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let mut guard = writer.lock().unwrap();
+        guard.write_entry(pending_row(OTHER_ENVELOPE)).unwrap();
+        guard.force_rotate_for_test().unwrap();
+        guard
+            .write_entry(AuditEntry::new_value_action_failed(
+                "stellar_pay",
+                Some("stellar:testnet".to_owned()),
+                vec![],
+                "6ba7aaac...69060003",
+                "submission.record_unavailable",
+                PolicyDecision::Allow,
+                Some(SETTLE_ENVELOPE.to_owned()),
+                None,
+                None,
+                "req-failed",
+            ))
+            .unwrap();
+        assert_eq!(collect_files_newest_first(&path).unwrap().len(), 2);
+        assert_eq!(
+            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            ValueActionSettlement::Settled
+        );
+        assert!(!try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
     }
 
     // ── Helper: build a SaSignerSetBaselined EventKind ────────────────────────
@@ -4878,144 +5420,4 @@ mod tests {
         assert_eq!(payload.file(), rotated[0]);
         assert_eq!(payload.line(), 2);
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Pending value-action lookup
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// What a `value_action_pending` row recorded for one submission.
-///
-/// The reconciliation surfaces settle a submission whose confirmation never
-/// arrived, and the row they write has to carry the SAME value legs the gate
-/// sized. Those legs were written once, by the pending row, so they are read
-/// back from it rather than re-derived.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct PendingValueAction {
-    /// Witness preserved from the pending row during reconciliation.
-    pub witness: Option<super::schema::CrossCheckRecord>,
-    /// The verb that made the submission, as it appears on the outer entry.
-    pub tool: String,
-    /// CAIP-2 chain identifier from the outer entry.
-    pub chain_id: Option<String>,
-    /// The value legs the policy gate sized.
-    pub legs: Vec<ValueLegRecord>,
-    /// The commit nonce prefix the pending row carried.
-    pub nonce_id: Option<String>,
-    /// The submission gate's decision from the pending row.
-    pub policy_decision: super::PolicyDecision,
-    /// Approval nonce bound to the pending submission.
-    pub approval_nonce: Option<String>,
-}
-
-/// Whether the active log already carries an operator-clear row for
-/// `envelope_hash`.
-///
-/// `stellar-agent tx receipt clear` writes its row before it marks the
-/// receipt, so that a failure at the mark leaves a reservation already
-/// released rather than one stranded under a receipt no verb accepts again.
-/// The cost of that order is that a re-run after such a failure would append a
-/// second row for one clear. This lookup is what makes the re-run complete the
-/// mark instead.
-///
-/// Scans the active file only, backwards from the tail. Performs no chain or
-/// HMAC verification, and opens the file with no lock of its own: the caller
-/// holds the audit writer's exclusive lock by the time it calls.
-///
-/// # Panics
-///
-/// Never panics.
-#[must_use]
-pub fn submission_receipt_cleared_exists(log_path: &Path, envelope_hash: &str) -> bool {
-    let Ok(raw) = std::fs::read_to_string(log_path) else {
-        return false;
-    };
-    raw.lines().rev().any(|line| {
-        serde_json::from_str::<AuditEntry>(line).is_ok_and(|entry| {
-            entry.envelope_hash.as_deref() == Some(envelope_hash)
-                && matches!(entry.event_kind, EventKind::SubmissionReceiptCleared { .. })
-        })
-    })
-}
-
-/// What a submission's value action still owes the log.
-///
-/// The scan runs backwards from the tail and stops at the first row naming the
-/// submission, so a settled row met first means the submission is already
-/// accounted for. Reconciliation is an operator-repeatable verb, and this is
-/// what keeps a second run from appending a second row for one spend.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "one owned pending row preserves the recovery API"
-)]
-pub enum ValueActionSettlement {
-    /// A pending row is in the active file and nothing has settled it. Its
-    /// value legs are the ones the policy gate sized.
-    Owed(PendingValueAction),
-    /// Neither row is in the active file, so the submission is still owed a
-    /// settled row and its legs are not recoverable.
-    ///
-    /// The active file is what a reconciliation surface reads, and a pending
-    /// row rotates out of it after the log passes its size threshold. The row
-    /// is written anyway, with no legs, because the submission's outcome
-    /// belongs in the log whether or not its sizing survived rotation. Legs
-    /// from a different submission would be worse than none.
-    OwedWithoutLegs,
-    /// A settled row already accounts for the submission.
-    Settled,
-}
-
-/// Reports what the value action for `envelope_hash` still owes the log.
-///
-/// Scans the active file only, backwards from the tail, and stops at the first
-/// row naming the submission.
-///
-/// Performs no chain or HMAC verification: the value verbs' own pre-flight
-/// already refuses a log whose tip does not match its anchor, so a caller that
-/// reached this point has an anchored log. An unparseable line is skipped, the
-/// way a torn tail is: this lookup reports what it can read, it does not judge
-/// the log. It opens the file with no lock of its own; both callers hold the
-/// audit writer's exclusive lock by the time they call it.
-///
-/// # Panics
-///
-/// Never panics.
-#[must_use]
-pub fn value_action_settlement(log_path: &Path, envelope_hash: &str) -> ValueActionSettlement {
-    let Ok(raw) = std::fs::read_to_string(log_path) else {
-        return ValueActionSettlement::OwedWithoutLegs;
-    };
-    for line in raw.lines().rev() {
-        let Ok(entry) = serde_json::from_str::<AuditEntry>(line) else {
-            continue;
-        };
-        if entry.envelope_hash.as_deref() != Some(envelope_hash) {
-            continue;
-        }
-        match &entry.event_kind {
-            EventKind::ValueActionSubmitted { .. } | EventKind::ValueActionFailed { .. } => {
-                return ValueActionSettlement::Settled;
-            }
-            EventKind::ValueActionPending {
-                witness,
-                legs,
-                approval_nonce,
-                ..
-            } => {
-                return ValueActionSettlement::Owed(PendingValueAction {
-                    witness: witness.clone(),
-                    legs: legs.clone(),
-                    tool: entry.tool,
-                    chain_id: entry.chain_id,
-                    nonce_id: entry.nonce_id,
-                    policy_decision: entry.policy_decision,
-                    approval_nonce: approval_nonce.clone(),
-                });
-            }
-            _ => {}
-        }
-    }
-    ValueActionSettlement::OwedWithoutLegs
 }

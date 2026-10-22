@@ -19,6 +19,8 @@ mod approval_spine_integration;
 mod approve_hint_source_scan;
 #[path = "mcp/audit_binding_integration.rs"]
 mod audit_binding_integration;
+#[path = "mcp/audit_history_integration.rs"]
+mod audit_history_integration;
 #[path = "mcp/balances_integration.rs"]
 mod balances_integration;
 #[path = "mcp/claim_integration.rs"]

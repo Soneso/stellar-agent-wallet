@@ -172,9 +172,17 @@ pub(crate) fn build_recorder<'a>(
 /// and an ambiguous one whose retention window closed. A receipt an operator
 /// cleared owes no row by design.
 ///
+/// The settlement lookup reads the retained history, newest file first. A
+/// settled row found there means the submission is accounted for, so a
+/// repeated reconciliation writes nothing.
+///
 /// Non-fatal: the chain has already answered, and the settled record is the
 /// receipt and the spending window. A row that cannot be appended is logged,
-/// and the receipt keeps what a later run needs to write it.
+/// and the receipt keeps what a later run needs to write it. A settlement
+/// lookup that cannot read the retained history is logged at WARN with the
+/// profile, the envelope hash, and the error, and writes nothing: whether the
+/// row is owed is unknown, and a row written on a guess could count one spend
+/// twice.
 #[allow(
     clippy::too_many_arguments,
     reason = "settlement carries submission identity, its evidence and the reconciliation decision"
@@ -196,11 +204,23 @@ pub(crate) fn write_settled_row(
         return;
     };
 
+    let settlement = match stellar_agent_core::audit_log::reader::try_value_action_settlement(
+        &profile.audit_log_path,
+        envelope_hash,
+    ) {
+        Ok(settlement) => settlement,
+        Err(error) => {
+            tracing::warn!(
+                profile = %profile_name,
+                envelope_hash = %envelope_hash,
+                error = %error,
+                "settlement lookup could not read the audit history; settled row NOT emitted"
+            );
+            return;
+        }
+    };
     let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce, witness) =
-        match stellar_agent_core::audit_log::reader::value_action_settlement(
-            &profile.audit_log_path,
-            envelope_hash,
-        ) {
+        match settlement {
             // Already accounted for. Reconciliation is repeatable, and a second
             // row would count one spend twice.
             ValueActionSettlement::Settled => return,
@@ -213,9 +233,9 @@ pub(crate) fn write_settled_row(
                 pending.approval_nonce,
                 pending.witness,
             ),
-            // The pending row has rotated out of the active file, so its sizing is
-            // gone. The outcome still belongs in the log, under the name of the
-            // surface that settled it.
+            // No pending row survives in retained history, so its sizing is
+            // unavailable. The outcome still belongs in the log, under the name
+            // of the surface that settled it.
             ValueActionSettlement::OwedWithoutLegs => (
                 RECONCILE_TOOL.to_owned(),
                 profile.chain_id.caip2_str().to_owned().into(),

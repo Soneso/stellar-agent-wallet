@@ -1,6 +1,6 @@
 //! Verified audit-chain reads for tests.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::{AuditEntry, AuditWriter, verify_log};
@@ -53,6 +53,66 @@ pub fn verified_audit_lines(audit_writer: &Arc<Mutex<AuditWriter>>) -> Vec<Strin
 /// cannot be parsed as an [`AuditEntry`].
 pub fn verified_audit_entries_from_path(log_path: &Path) -> Vec<AuditEntry> {
     parse_rows(&verified_rows_from_path(log_path))
+}
+
+/// Returns the rotated archives of the log at `log_path`, newest first.
+///
+/// The list is the reader's own view of the rotation chain without the active
+/// file, so a test finds an archive by the rule the lookups and `audit verify`
+/// use rather than by matching file names itself.
+///
+/// # Panics
+///
+/// Panics if the audit directory cannot be listed.
+#[must_use]
+#[expect(
+    clippy::expect_used,
+    reason = "an audit directory that cannot be listed fails the calling test"
+)]
+pub fn rotated_archives_newest_first(log_path: &Path) -> Vec<PathBuf> {
+    let mut files =
+        super::reader::collect_files_newest_first(log_path).expect("audit directory must list");
+    files.remove(0);
+    files
+}
+
+/// Breaks the chain link between the first two rows of the newest archive of
+/// the log at `log_path`, and leaves every other row as it is.
+///
+/// The first archived row gets another `request_id`, so the row after it no
+/// longer names that row's hash. The active file and the archive's handoff
+/// row keep their bytes, so a writer and its tip anchor still accept the log;
+/// only a read that verifies the archive's own chain finds the break.
+///
+/// # Panics
+///
+/// Panics if the log has no archive, the newest archive holds fewer than two
+/// rows, or the archive cannot be read, parsed, or written.
+#[expect(
+    clippy::expect_used,
+    reason = "an archive that cannot be rewritten fails the calling test"
+)]
+pub fn break_newest_archive_link(log_path: &Path) {
+    let archive = rotated_archives_newest_first(log_path)
+        .into_iter()
+        .next()
+        .expect("the log must have an archive");
+    let contents = std::fs::read_to_string(&archive).expect("the archive must be readable");
+    let mut lines: Vec<String> = contents.lines().map(str::to_owned).collect();
+    let rows = lines.iter().filter(|line| !line.trim().is_empty()).count();
+    assert!(rows >= 2, "a following row must check the changed one");
+    let first = lines
+        .iter_mut()
+        .find(|line| !line.trim().is_empty())
+        .expect("the archive holds a row");
+    let mut row: serde_json::Value =
+        serde_json::from_str(first).expect("the archived row must parse");
+    let request_id = row["request_id"].as_str().unwrap_or_default().to_owned();
+    row["request_id"] = serde_json::Value::String(format!("{request_id}-changed"));
+    *first = serde_json::to_string(&row).expect("the changed row must serialize");
+    let mut rewritten = lines.join("\n");
+    rewritten.push('\n');
+    std::fs::write(&archive, rewritten).expect("the archive must be writable");
 }
 
 /// Verifies the chain at `log_path`, then reads the non-empty rows of every
@@ -288,6 +348,29 @@ mod tests {
         let contents = fs::read_to_string(&path).unwrap();
         fs::write(&path, contents.replace("original", "tampered")).unwrap();
         verified_audit_lines(&writer);
+    }
+
+    /// A broken archive link fails verification and leaves the active file
+    /// as it was.
+    #[test]
+    fn a_broken_archive_link_fails_verification_and_keeps_the_active_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let writer = rotated_writer(&path);
+        let active = fs::read(&path).unwrap();
+        break_newest_archive_link(&path);
+        assert_eq!(fs::read(&path).unwrap(), active);
+        let archive = rotated_archives_newest_first(&path).remove(0);
+        assert!(matches!(
+            verify_log(&path, None),
+            Err(crate::audit_log::verify::VerifyError::ChainBroken { .. })
+        ));
+        assert!(
+            fs::read_to_string(&archive)
+                .unwrap()
+                .contains("before-changed")
+        );
+        append(&writer, "still-appendable");
     }
 
     /// The writer lock spans verification and every file read: an append

@@ -388,7 +388,9 @@ confirmed value-moving submit (carrying the gate-sized value legs) and
 required one, before a signed x402 authorization leaves the wallet
 in the RPC re-simulation. When that payment then fails, it records
 `x402_authorization_withheld` with the same request id and a `failure_stage`
-of `resimulation`, `response_processing`, or `encoding`. MPP adds
+of `anchor_unavailable`, `resimulation`, `response_processing`, or `encoding`.
+At `anchor_unavailable`, the signed authorization stays in the wallet and the
+admitted spend remains recorded. MPP adds
 `mpp_charge_authorized`, `mpp_authorization_withheld`, `mpp_receipt_observed`,
 and `mpp_settlement_reconciled`; these carry only hashes, redacted references,
 the exact policy-sized legs, and closed status labels, never a credential,
@@ -427,11 +429,12 @@ binding is recorded again from the profile file at the next keyed use. Under
 coordinate until a V1 verb or `enroll-owner-key` rewrites it.
 
 Every value-moving verb checks the anchor before signing, on every acquisition of
-the audit writer. Five outcomes:
+the audit writer. Seven outcomes:
 
 | Log versus anchor | Result |
 |---|---|
 | The file at the log path is not the one the process already has open | Refuses `audit.tip_anchor_mismatch`; the cached writer is dropped so the next call reads the path afresh |
+| An anchor write in this process failed and its retry fails again | Refuses `audit.chain_key_unavailable` with `audit.tip_anchor_unavailable`, before the log is compared with the anchor |
 | Exactly the anchored tip | Proceeds |
 | Ahead of the anchor, anchored entry intact | Proceeds; the tail is absorbed and the anchor advances |
 | Behind the anchor, or the anchored entry is not at the anchored offset | Refuses `audit.tip_anchor_mismatch` |
@@ -487,12 +490,46 @@ A rotation leaves the anchor on the outgoing file's handoff entry until the new
 file's first append, so restoring the whole audit directory to an earlier
 snapshot is refused rather than absorbed.
 
+Keyed appends commit their in-memory state and retry the anchor once under the
+sidecar lock. Plain appends stay best-effort. A submission recorded through the
+pending row, the window-state reset, and an x402 payment require a current
+anchor before and after their pre-action row. `audit.tip_anchor_unavailable`
+refuses the send or the wipe while repair fails. A pending-row refusal before
+the row writes no receipt and no row. After the row, the recorder attempts the
+release of the reservation, a `value_action_failed` row under
+`submission.record_unavailable` that closes the pending row, and the removal of
+the receipt, each best-effort and logged. A resend that the reservation's
+duplicate check refuses after its row leaves that row open for the original
+submission's settlement. MPP's charge row keeps its existing flow. An x402
+refusal keeps the admitted spend.
+
+For `audit.tip_anchor_unavailable`, restore keyring access and retry. A live
+writer repairs the anchor value it still owes; an honest same-generation tail
+is absorbed at keyed acquisition. A mismatch requires the acknowledging repair.
+
+An outage covering both the handoff and first new-file anchor leaves the anchor
+on the pre-handoff tip. After process exit, open and verify report a mismatch
+on the honest log; investigate and use `audit reanchor` to recover.
+
+Settlement and receipt-clear lookups walk retained files newest first, and a
+match leaves older files unvisited. Each visited file's own chain is verified;
+in a log with no archives the first row must chain from the zero hash. The
+eleventh rotation deletes the oldest archive. The lookup runs outside the
+writer lock: two reconciliations of one hash can both find an owed row, and a
+concurrent append that rotates the log can move the matching file out of the
+walk. When the settlement lookup cannot read the history, `tx status` and
+`stellar_transaction_status` log the error and write no settled row. Where
+the profile has an audit writer, `tx receipt clear` refuses with the verifier's
+code, such as `audit.chain_broken` for a broken chain, and keeps the receipt.
+
 The anchor is written after the entry it covers is fsynced, so it is not
 continuous in time. Three states, differing in kind:
 
 - **Lagging**: between an entry's fsync and its anchor write, the anchor names
   the previous entry of this file. A rollback to that entry or later is
-  absorbed; anything earlier is still refused. Retried on the next append.
+  absorbed; anything earlier is still refused. The anchor retries once
+  immediately, then on the next append or keyed acquisition. After process
+  exit, rollback to the previous anchor silently loses the unanchored tail.
 - **Off, nothing anchored yet**: until the first keyed append on a log path (a
   new profile, a log written before the anchor existed). Adoption takes the file
   as it finds it. A changed `audit_log_path` is refused by the audit binding

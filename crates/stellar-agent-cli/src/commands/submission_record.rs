@@ -281,7 +281,11 @@ pub(crate) fn write_settled_row(
 ///
 /// Non-fatal: the chain has already answered, and the settled record is the
 /// receipt and the spending window. A row that cannot be appended is logged,
-/// and the receipt keeps what a later run needs to write it.
+/// and the receipt keeps what a later run needs to write it. A settlement
+/// lookup that cannot read the retained history is logged at WARN with the
+/// profile, the envelope hash, and the error, and writes nothing: whether the
+/// row is owed is unknown, and a row written on a guess could count one spend
+/// twice. A later run retries the lookup and appends any row still owed.
 #[allow(
     clippy::too_many_arguments,
     reason = "settlement carries submission identity, its evidence and the reconciliation decision"
@@ -297,7 +301,7 @@ pub(crate) fn write_settled_row_with_evidence(
     ledger: Option<u32>,
     reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
 ) {
-    if let Some(entry) = settled_row(
+    match settled_row(
         profile,
         envelope_hash,
         tx_hash,
@@ -306,23 +310,37 @@ pub(crate) fn write_settled_row_with_evidence(
         ledger,
         reconciliation_decision,
     ) {
-        crate::commands::value_audit::emit_value_audit_row_with_writer(audit, profile_name, entry);
+        Ok(Some(entry)) => crate::commands::value_audit::emit_value_audit_row_with_writer(
+            audit,
+            profile_name,
+            entry,
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            profile = %profile_name,
+            envelope_hash = %envelope_hash,
+            error = %error,
+            "settlement lookup could not read the audit history; settled row NOT emitted"
+        ),
     }
 }
 
 /// Appends the value-action row that settles a reconciled submission, and
 /// reports a failed append.
 ///
-/// `Ok` means the log carries the settled row: it was already in the active
-/// file, it was appended now, or the submission owes none. An operator verb
-/// that is about to close the submission's record calls this first, so the
-/// record is closed only once its settlement is in the log.
+/// `Ok` means the log carries the settled row: it was found in the retained
+/// history, it was appended now, or the submission owes none. An operator
+/// verb that is about to close the submission's record calls this first, so
+/// the record is closed only once its settlement is in the log. A history
+/// that cannot be read refuses, because it cannot show that the row is
+/// there.
 ///
 /// # Errors
 ///
 /// The append failure, mapped as every strict audit append maps it, to an
 /// `audit.*` code (`audit.tip_anchor_mismatch` included); a poisoned writer
-/// mutex is `audit.chain_key_unavailable`.
+/// mutex is `audit.chain_key_unavailable`. A settlement lookup that cannot
+/// read the retained history keeps the verifier's `audit.*` code and message.
 #[allow(
     clippy::too_many_arguments,
     reason = "settlement carries submission identity, its evidence and the reconciliation decision"
@@ -336,7 +354,7 @@ pub(crate) fn append_settled_row(
     status: &ReceiptStatus,
     release_code: Option<ReleaseEvidence>,
     reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
-) -> Result<(), WalletError> {
+) -> Result<(), Envelope<()>> {
     let Some(entry) = settled_row(
         profile,
         envelope_hash,
@@ -345,13 +363,18 @@ pub(crate) fn append_settled_row(
         release_code,
         None,
         reconciliation_decision,
-    ) else {
+    )
+    .map_err(|error| Envelope::err_raw(error.wire_code(), error.to_string()))?
+    else {
         return Ok(());
     };
-    let mut guard = audit
-        .lock()
-        .map_err(|_| crate::commands::value_audit::audit_writer_open_failed(profile_name))?;
+    let mut guard = audit.lock().map_err(|_| {
+        Envelope::err(&crate::commands::value_audit::audit_writer_open_failed(
+            profile_name,
+        ))
+    })?;
     crate::commands::value_audit::append_value_audit_row_strict(&mut guard, profile_name, entry)
+        .map_err(|error| Envelope::err(&error))
 }
 
 /// The value-action row a reconciled submission still owes the log, or
@@ -366,9 +389,17 @@ pub(crate) fn append_settled_row(
 /// window closed. A receipt an operator cleared owes no row by design; the
 /// `submission_receipt_cleared` row records the clear.
 ///
-/// The settlement lookup reads the active log file. A row already there
-/// means the submission is accounted for, so a repeated reconciliation
-/// writes nothing.
+/// The settlement lookup reads the retained history, newest file first. A
+/// settled row found there means the submission is accounted for, so a
+/// repeated reconciliation writes nothing. A status that owes no row returns
+/// before the lookup.
+///
+/// # Errors
+///
+/// The lookup's integrity error when a visited file cannot be read or its
+/// chain does not verify. Whether a row is owed is then unknown, which the
+/// caller handles: [`write_settled_row_with_evidence`] logs it and writes
+/// nothing, and [`append_settled_row`] refuses.
 fn settled_row(
     profile: &Profile,
     envelope_hash: &str,
@@ -377,19 +408,24 @@ fn settled_row(
     release_code: Option<ReleaseEvidence>,
     ledger: Option<u32>,
     reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
-) -> Option<stellar_agent_core::audit_log::AuditEntry> {
+) -> Result<
+    Option<stellar_agent_core::audit_log::AuditEntry>,
+    stellar_agent_core::audit_log::AuditLogIntegrityError,
+> {
     use stellar_agent_core::audit_log::{AuditEntry, reader::ValueActionSettlement};
 
-    let row = status.settled_row(release_code)?;
+    let Some(row) = status.settled_row(release_code) else {
+        return Ok(None);
+    };
 
     let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce, witness) =
-        match stellar_agent_core::audit_log::reader::value_action_settlement(
+        match stellar_agent_core::audit_log::reader::try_value_action_settlement(
             &profile.audit_log_path,
             envelope_hash,
-        ) {
+        )? {
             // Already accounted for. Reconciliation is repeatable, and a second
             // row would count one spend twice.
-            ValueActionSettlement::Settled => return None,
+            ValueActionSettlement::Settled => return Ok(None),
             ValueActionSettlement::Owed(pending) => (
                 pending.tool,
                 pending.chain_id,
@@ -399,9 +435,9 @@ fn settled_row(
                 pending.approval_nonce,
                 pending.witness,
             ),
-            // The pending row has rotated out of the active file, so its sizing is
-            // gone. The outcome still belongs in the log, under the name of the
-            // surface that settled it.
+            // No pending row survives in retained history, so its sizing is
+            // unavailable. The outcome still belongs in the log, under the name
+            // of the surface that settled it.
             ValueActionSettlement::OwedWithoutLegs => (
                 RECONCILE_VERB.to_owned(),
                 profile.chain_id.caip2_str().to_owned().into(),
@@ -415,7 +451,7 @@ fn settled_row(
     let chain_id: Option<String> = chain_id;
     let tx_redacted = stellar_agent_network::redact_tx_hash(tx_hash);
     let request_id = uuid::Uuid::new_v4().to_string();
-    Some(match row {
+    Ok(Some(match row {
         SettledRow::Submitted => AuditEntry::new_value_action_submitted(
             tool,
             chain_id,
@@ -441,7 +477,7 @@ fn settled_row(
             approval_nonce,
             &request_id,
         ),
-    })
+    }))
 }
 
 /// Renders a submit-path error, attaching the structured detail the three
@@ -1233,6 +1269,145 @@ mod tests {
                 assert!(rows.is_empty(), "{status:?}/{evidence:?}: {rows:?}");
             }
         }
+    }
+
+    /// A log at `path` whose active file holds no row for `"envelope"` and
+    /// whose archive holds that submission's pending row ahead of a broken
+    /// link, so a lookup for it reaches the break.
+    fn history_with_a_broken_archive(path: &std::path::Path) -> Arc<Mutex<AuditWriter>> {
+        use stellar_agent_core::audit_log::rotation::test_seam::set_rotation_threshold;
+        use stellar_agent_core::audit_log::test_helpers::break_newest_archive_link;
+        use stellar_agent_core::audit_log::{
+            AuditEntry, NewToolInvocation, PolicyDecision, reader::ValueActionSettlement,
+            reader::try_value_action_settlement,
+        };
+
+        let unrelated = |request_id: &str| {
+            AuditEntry::new_tool_invocation(NewToolInvocation::new(
+                "stellar_balance",
+                "stellar:testnet",
+                Vec::new(),
+                PolicyDecision::Allow,
+                request_id,
+            ))
+        };
+        let audit = Arc::new(Mutex::new(
+            AuditWriter::open(path.to_path_buf(), None).unwrap(),
+        ));
+        {
+            let mut guard = audit.lock().unwrap();
+            guard
+                .write_entry(AuditEntry::new_value_action_pending(
+                    "stellar_pay_commit",
+                    "stellar:testnet",
+                    Vec::new(),
+                    "transaction",
+                    "source",
+                    7,
+                    PolicyDecision::Allow,
+                    Some("envelope".to_owned()),
+                    None,
+                    None,
+                    "pending-request",
+                    None,
+                ))
+                .unwrap();
+            guard.write_entry(unrelated("archived")).unwrap();
+            let size = std::fs::metadata(path).unwrap().len();
+            let threshold = set_rotation_threshold(path, size);
+            guard.write_entry(unrelated("active")).unwrap();
+            drop(threshold);
+        }
+        assert!(matches!(
+            try_value_action_settlement(path, "envelope").unwrap(),
+            ValueActionSettlement::Owed(_)
+        ));
+        break_newest_archive_link(path);
+        audit
+    }
+
+    /// A settlement lookup that cannot read the retained history writes no
+    /// settled row and logs why: `tx status` settles through this helper, and
+    /// whether the row is owed is unknown.
+    #[test]
+    fn an_unreadable_history_writes_no_settled_row_and_logs_it() {
+        use stellar_agent_core::audit_log::PolicyDecision;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile =
+            Profile::builder_testnet("signer", "unreadable", "nonce", "unreadable").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let audit = history_with_a_broken_archive(&profile.audit_log_path);
+        let active = std::fs::read(&profile.audit_log_path).unwrap();
+        let logs = stellar_agent_test_support::with_captured_logs(|| {
+            write_settled_row_with_evidence(
+                &profile,
+                "unreadable",
+                &audit,
+                "envelope",
+                "transaction",
+                &ReceiptStatus::Success,
+                None,
+                Some(9),
+                PolicyDecision::Allow,
+            );
+        });
+        assert_eq!(
+            std::fs::read(&profile.audit_log_path).unwrap(),
+            active,
+            "no settled row is written"
+        );
+        let line = logs
+            .lines()
+            .find(|line| line.contains("settled row NOT emitted"));
+        assert!(
+            line.is_some_and(|line| line.contains("WARN")
+                && line.contains("unreadable")
+                && line.contains("envelope")
+                && line.contains("audit.chain_broken")),
+            "the skipped row is logged with the profile, the hash, and the error: {logs}"
+        );
+    }
+
+    /// The strict settlement refuses when the lookup cannot read the retained
+    /// history, so a clear never proceeds past a settlement it could not see.
+    #[test]
+    fn an_unreadable_history_refuses_the_strict_settlement() {
+        use stellar_agent_core::audit_log::PolicyDecision;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile =
+            Profile::builder_testnet("signer", "strict-unreadable", "nonce", "strict-unreadable")
+                .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let audit = history_with_a_broken_archive(&profile.audit_log_path);
+        let active = std::fs::read(&profile.audit_log_path).unwrap();
+        let refused = append_settled_row(
+            &profile,
+            "strict-unreadable",
+            &audit,
+            "envelope",
+            "transaction",
+            &ReceiptStatus::Ambiguous,
+            Some(ReleaseEvidence::SequenceConsumed),
+            PolicyDecision::Allow,
+        )
+        .expect_err("a history that cannot be read refuses the strict settlement");
+        let error = refused.error.as_ref().expect("error");
+        assert_eq!(error.code, "audit.chain_broken", "{refused:?}");
+        assert!(
+            error.message.contains("audit.chain_broken"),
+            "the refusal names the integrity error: {refused:?}"
+        );
+        assert!(
+            !error.message.contains("on open"),
+            "a lookup failure is not a writer-open failure: {refused:?}"
+        );
+        assert_eq!(
+            std::fs::read(&profile.audit_log_path).unwrap(),
+            active,
+            "no settled row is written"
+        );
     }
 
     #[test]

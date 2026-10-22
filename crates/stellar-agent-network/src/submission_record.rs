@@ -19,6 +19,36 @@
 //! poll timeout settle nothing: the record stands until reconciliation or an
 //! operator resolves it.
 //!
+//! # The audit tip anchor
+//!
+//! Where the wallet's recorder writes through a keyed audit writer, a
+//! submission is sent only while the audit log's tip anchor covers its pending
+//! row. The recorder checks the anchor twice. The first check runs before the
+//! receipt, the pending row, or the reservation exists, so a refusal there has
+//! nothing to undo. The second runs right after the pending row is appended,
+//! under the writer guard that appended it, so it covers the row itself and
+//! any outbox row the append drained ahead of it. A refusal at the second check
+//! comes after the pending row: the recorder attempts the release of the
+//! reservation, the `value_action_failed` row that closes the pending row, and
+//! the removal of the receipt, each best-effort and logged. Nothing is sent.
+//!
+//! A failed row settles every pending row that carries the same envelope hash.
+//! After an anchor refusal, the recorder attempts to close the row once its
+//! checks pass. With window entries, the reservation's duplicate check under
+//! the window lock must find no pending or confirmed record for the hash.
+//! Without window entries, the receipt gate must record a new receipt, so no
+//! other receipt carries the hash. A resend that the duplicate check refuses
+//! keeps its row open, and the original submission's settlement closes both.
+//! For a `record_pending` error other than the duplicate refusal, the recorder
+//! also attempts to close the row. The duplicate check may not run before that
+//! error, so ownership can remain unproven.
+//!
+//! After receipt loss, a closing row can also settle the original submission.
+//! Without current window entries, a reservation from an earlier stateful
+//! policy can remain and let reconciliation recover its identity. Without
+//! that reservation, reconciliation has no record left to settle it by.
+//! An outcome row the original process writes later wins the lookup.
+//!
 //! # Identity
 //!
 //! Two identities address a submission:
@@ -36,7 +66,7 @@
 //! computed locally from the decoded envelope before the send and is what the
 //! agent reconciles with afterwards.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use stellar_agent_core::audit_log::schema::ValueLegRecord;
 use stellar_agent_core::audit_log::writer::AuditWriter;
@@ -168,9 +198,10 @@ pub trait SubmissionRecorder: Send + Sync {
     /// # Errors
     ///
     /// Returning an error refuses the send. Implementations return one when
-    /// the record cannot be written, when a pending record already holds
-    /// this transaction's `(source, sequence)`, and when the spending window
-    /// already holds these signed bytes.
+    /// the record cannot be written or the audit log's tip anchor does not
+    /// cover it, when a pending record already holds this transaction's
+    /// `(source, sequence)`, and when the spending window already holds these
+    /// signed bytes.
     async fn pre_send(&self, intent: &SubmissionIntent) -> Result<(), WalletError>;
 
     /// Settles the record against what the network said.
@@ -350,14 +381,44 @@ impl<'a> WalletSubmissionRecorder<'a> {
         }
     }
 
-    /// Writes the pending audit row.
+    /// Refuses the submission while the audit log's tip anchor is behind and
+    /// cannot be repaired, before anything for the submission is written.
+    ///
+    /// Takes the writer guard only for the check and drops it on return. No
+    /// writer, no check: the pending row is skipped there too.
+    ///
+    /// # Errors
+    ///
+    /// The refusal [`Self::audit_refusal`] maps the writer's error to.
+    fn require_anchor_before_row(&self) -> Result<(), WalletError> {
+        let Some(writer) = self.audit.as_ref() else {
+            return Ok(());
+        };
+        lock_audit(writer)?
+            .require_anchor_current()
+            .map_err(|error| self.audit_refusal(error, BEFORE_ROW_CONTEXT))
+    }
+
+    /// Writes the pending audit row and checks that the tip anchor covers it.
     ///
     /// Fails closed where a writer exists: an unrecorded submission is one the
     /// value audit cannot account for. Where the profile has no audit log at
     /// all there is nothing to fail against, and the submission proceeds.
-    fn write_pending_row(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
+    ///
+    /// The anchor check runs under the guard that appended the row, so no
+    /// other append through this writer lands between the two. The guard is
+    /// dropped on return, before any closing row is written. A row the anchor
+    /// does not cover is durable, so it comes back as
+    /// [`AnchorAfterRow::Behind`] rather than as an error: `pre_send` closes
+    /// it only after the reservation step has decided whether this submission
+    /// owns its envelope hash.
+    ///
+    /// # Errors
+    ///
+    /// The refusal for a row that could not be appended; no row exists then.
+    fn write_pending_row(&self, intent: &SubmissionIntent) -> Result<AnchorAfterRow, WalletError> {
         let Some(writer) = self.audit.as_ref() else {
-            return Ok(());
+            return Ok(AnchorAfterRow::Current);
         };
         let entry = AuditEntry::new_value_action_pending(
             self.tool,
@@ -375,22 +436,34 @@ impl<'a> WalletSubmissionRecorder<'a> {
             &self.request_id,
             self.witness.clone(),
         );
-        let mut guard = writer.lock().map_err(|_| {
-            record_unavailable(
-                "the audit writer mutex is poisoned, so the submission cannot be recorded",
-            )
-        })?;
-        guard.write_entry(entry).map_err(|error| match error {
+        let mut guard = lock_audit(writer)?;
+        guard
+            .write_entry(entry)
+            .map_err(|error| self.audit_refusal(error, APPEND_CONTEXT))?;
+        Ok(match guard.require_anchor_current() {
+            Ok(()) => AnchorAfterRow::Current,
+            Err(error) => AnchorAfterRow::Behind(self.audit_refusal(error, AFTER_ROW_CONTEXT)),
+        })
+    }
+
+    /// Maps an audit-writer failure on the pending-row path to the refusal the
+    /// caller reports.
+    ///
+    /// A tip-anchor mismatch keeps its own code, because only `audit reanchor`
+    /// addresses it. Every other failure is `submission.record_unavailable`:
+    /// `context` names the step, and the writer error's text follows it with
+    /// its `audit.*` sub-code where it has one, `audit.tip_anchor_unavailable`
+    /// for an anchor that cannot be written.
+    fn audit_refusal(&self, error: WriterError, context: &str) -> WalletError {
+        match error {
             WriterError::TipAnchorMismatch { reason, .. } => {
                 WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
                     profile: self.profile_name.clone(),
                     reason: reason.to_owned(),
                 })
             }
-            other => record_unavailable(format!(
-                "the pending value-action row could not be appended: {other}"
-            )),
-        })
+            other => record_unavailable(format!("{context}: {other}")),
+        }
     }
 
     /// Writes a settling audit row. The transaction is already beyond recall,
@@ -516,7 +589,12 @@ pub fn repair_approval_consumption(
 #[async_trait::async_trait]
 impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
     async fn pre_send(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
-        // The replay identity first. `begin_submission` answers it and the
+        // The audit tip anchor first. A behind anchor that cannot be repaired
+        // refuses here, before the receipt, the row, or the reservation
+        // exists, so the refusal has nothing to undo.
+        self.require_anchor_before_row()?;
+
+        // Then the replay identity. `begin_submission` answers it and the
         // envelope-hash gate under one lock hold, in that order: the second
         // check writes this submission's own receipt, which carries this
         // submission's `(source, sequence)`.
@@ -577,31 +655,51 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
             }
         }
 
-        if let Err(e) = self.write_pending_row(intent) {
-            self.unwind(intent, UnwoundAfter::Receipt, e.code());
-            return Err(e);
-        }
+        let anchor = match self.write_pending_row(intent) {
+            Ok(anchor) => anchor,
+            Err(e) => {
+                self.unwind(intent, UnwoundAfter::Receipt, e.code());
+                return Err(e);
+            }
+        };
 
-        if !self.window_entries.is_empty()
-            && let Err(e) = self.window.record_pending(
+        if self.window_entries.is_empty() {
+            // The receipt gate recorded a new receipt, so no other receipt
+            // carries this hash. An older stateful policy can still have a
+            // reservation for it. Cleanup attempts to close an uncovered row here.
+            if let AnchorAfterRow::Behind(refusal) = anchor {
+                self.unwind(intent, UnwoundAfter::PendingRow, refusal.code());
+                return Err(refusal);
+            }
+        } else {
+            if let Err(e) = self.window.record_pending(
                 self.profile,
                 &self.window_entries,
                 &self.reservation(intent),
-            )
-        {
-            // A duplicate found under the lock is a resend of bytes another
-            // process reserved between the check above and this write. The
-            // pending row just written names the same envelope hash as that
-            // submission's, so the settled row its reconciliation writes
-            // closes both, so this row stays open. Every other refusal closes
-            // the row out.
-            let reached = match e {
-                WindowStoreError::DuplicateReservation => UnwoundAfter::Receipt,
-                _ => UnwoundAfter::PendingRow,
-            };
-            let refusal = reservation_refusal(e, intent);
-            self.unwind(intent, reached, refusal.code());
-            return Err(refusal);
+            ) {
+                // A duplicate found under the lock is a resend of bytes another
+                // process reserved between the check above and this write. The
+                // pending row just written names the same envelope hash as that
+                // submission's, so the settled row its reconciliation writes
+                // closes both, and this row stays open. Every other refusal
+                // attempts to close the row, even if the duplicate check did
+                // not run, whatever the anchor check found.
+                let reached = match e {
+                    WindowStoreError::DuplicateReservation => UnwoundAfter::Receipt,
+                    _ => UnwoundAfter::PendingRow,
+                };
+                let refusal = reservation_refusal(e, intent);
+                self.unwind(intent, reached, refusal.code());
+                return Err(refusal);
+            }
+            // The reservation's duplicate check under the window lock found
+            // no record carrying this hash, so the reservation and the row are
+            // this submission's, and a pending row the anchor does not cover is
+            // closed out with them.
+            if let AnchorAfterRow::Behind(refusal) = anchor {
+                self.unwind(intent, UnwoundAfter::Reservation, refusal.code());
+                return Err(refusal);
+            }
         }
 
         // Last, and immediately before the send: `submitted` is what says the
@@ -708,15 +806,43 @@ enum WindowSettlement {
     Release,
 }
 
+/// What the tip-anchor check right after the pending row found.
+#[derive(Debug)]
+enum AnchorAfterRow {
+    /// The anchor covers the pending row, or there is no audit writer.
+    Current,
+    /// The anchor does not cover the pending row. The refusal is returned
+    /// once the reservation step has decided how the row is closed.
+    Behind(WalletError),
+}
+
 /// How far `pre_send` got before it failed, which says what has to be undone.
+///
+/// A refusal at the tip-anchor check before the receipt gate, or at the
+/// receipt gate itself, has nothing of this attempt to undo and uses none of
+/// these.
+///
+/// A failed row settles every pending row that carries its envelope hash.
+/// After an anchor refusal with window entries, the recorder attempts to close
+/// the row only after `record_pending` succeeds. Without window entries, the
+/// receipt gate records a new receipt and is the only duplicate check. It does
+/// not consult a reservation from an earlier stateful policy. For a
+/// `record_pending` error other than the duplicate refusal, the recorder also
+/// attempts to close the row. That error can precede the duplicate decision,
+/// so it does not prove exclusive ownership of the hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnwoundAfter {
-    /// The receipt must be removed. On a duplicate reservation refusal the
-    /// pending row also exists and stays open for the original settlement.
+    /// The receipt must be removed. A failed pending-row append leaves no
+    /// row. On a duplicate reservation refusal the pending row exists and
+    /// stays open for the original submission's settlement.
     Receipt,
-    /// The receipt and the pending audit row exist.
+    /// The receipt and the pending audit row exist. The recorder attempts to
+    /// close the row after a nonduplicate reservation error or, without window
+    /// entries, an anchor refusal.
     PendingRow,
-    /// The receipt, the pending row and the reservation exist.
+    /// The receipt, the pending row, and the reservation exist: a pending row
+    /// the tip anchor does not cover after the reservation was admitted, or a
+    /// receipt that could not be marked submitted.
     Reservation,
 }
 
@@ -743,11 +869,16 @@ impl WalletSubmissionRecorder<'_> {
     /// as a duplicate, and a reservation left behind would count a spend that
     /// never happened against the operator's caps.
     ///
-    /// Every step is best-effort and logged. The receipt is removed last,
-    /// because it is the record the other two are keyed to. `code` is the
-    /// wire code of the refusal that stopped the submission; the row that
-    /// closes out the pending row carries it, so the audit log names a cap
-    /// refusal as the policy denial it is.
+    /// Every step is best-effort and logged: the release, the closing row,
+    /// and the receipt removal are each attempted whether or not the one
+    /// before it succeeded. The receipt is removed last, because it is the
+    /// record the other two are keyed to. `code` is the wire code of the
+    /// refusal that stopped the submission; the row that closes out the
+    /// pending row carries it, so the audit log names a cap refusal as the
+    /// policy denial it is and an uncovered row as
+    /// `submission.record_unavailable`. The closing row takes the writer guard
+    /// again, so no caller holds it here, and it is a plain append: it lands
+    /// during an anchor outage too.
     fn unwind(&self, intent: &SubmissionIntent, reached: UnwoundAfter, code: &str) {
         if reached == UnwoundAfter::Reservation {
             self.settle_window(intent, WindowSettlement::Release);
@@ -765,7 +896,8 @@ impl WalletSubmissionRecorder<'_> {
                 profile = %self.profile_name,
                 tool = %self.tool,
                 error = %e,
-                "submission record: the receipt for an unsent submission could not be removed;                  its sequence stays held until an operator clears it"
+                "submission record: the receipt for an unsent submission could not be removed; \
+                 its sequence stays held until an operator clears it"
             );
         }
     }
@@ -856,6 +988,26 @@ fn window_precheck_enabled() -> bool {
         return false;
     }
     true
+}
+
+/// The refusal context for a tip anchor that cannot be repaired before the
+/// pending row.
+const BEFORE_ROW_CONTEXT: &str = "the audit log is not ready for the pending value-action row";
+
+/// The refusal context for a pending row that could not be appended.
+const APPEND_CONTEXT: &str = "the pending value-action row could not be appended";
+
+/// The refusal context for a pending row the tip anchor does not cover.
+const AFTER_ROW_CONTEXT: &str =
+    "the pending value-action row is not covered by the audit tip anchor";
+
+/// Takes the audit writer's guard, refusing on a poisoned mutex.
+fn lock_audit(writer: &AuditWriterHandle) -> Result<MutexGuard<'_, AuditWriter>, WalletError> {
+    writer.lock().map_err(|_| {
+        record_unavailable(
+            "the audit writer mutex is poisoned, so the submission cannot be recorded",
+        )
+    })
 }
 
 fn record_unavailable(detail: impl Into<String>) -> WalletError {
@@ -954,13 +1106,19 @@ mod tests {
         }
     }
 
-    /// The in-lock duplicate refusal keeps the original settlement owed.
+    /// Runs the in-lock duplicate backstop: a first submission reserves the
+    /// bytes, its receipt is lost, and a resend of the same bytes skips the
+    /// window pre-check. `before_resend` runs between the receipt loss and
+    /// the resend. Returns the resend's refusal, after asserting what both
+    /// the plain and the anchor-outage cases leave behind: no receipt, one
+    /// reservation, two open pending rows, and the original settlement owed.
     #[cfg(all(feature = "test-helpers", feature = "test-hooks"))]
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn duplicate_backstop_keeps_the_pending_row_open() {
+    async fn assert_duplicate_backstop_keeps_the_pending_row_open(
+        access: Option<stellar_agent_core::audit_log::tip_anchor::KeyedAuditAccess>,
+        before_resend: impl FnOnce(),
+    ) -> WalletError {
         use stellar_agent_core::audit_log::reader::{
-            ValueActionSettlement, value_action_settlement,
+            ValueActionSettlement, try_value_action_settlement,
         };
         use stellar_agent_core::policy::v1::criteria::state_store::{
             StateKey, WindowEntry, WindowLimit,
@@ -971,7 +1129,7 @@ mod tests {
         let mut profile = Profile::builder_testnet("backstop", "s", "n", "a").build();
         profile.audit_log_path = dir.path().join("audit.jsonl");
         let audit = Arc::new(Mutex::new(
-            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
+            AuditWriter::open(profile.audit_log_path.clone(), access).unwrap(),
         ));
         let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
         let receipts = ReceiptStore::open_at(dir.path(), "backstop").unwrap();
@@ -1010,13 +1168,12 @@ mod tests {
         };
         recorder.pre_send(&intent).await.unwrap();
         std::fs::remove_file(receipts.file_path().unwrap()).unwrap();
+        before_resend();
         SKIP_WINDOW_PRECHECK.store(true, std::sync::atomic::Ordering::Release);
         let refused = recorder.pre_send(&intent).await;
         SKIP_WINDOW_PRECHECK.store(false, std::sync::atomic::Ordering::Release);
-        assert_eq!(
-            refused.unwrap_err().code(),
-            "submission.tx_already_submitted"
-        );
+        let refused = refused.unwrap_err();
+        assert_eq!(refused.code(), "submission.tx_already_submitted");
         assert!(receipts.get(&intent.envelope_hash).unwrap().is_none());
         assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
         drop(recorder);
@@ -1026,11 +1183,54 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows.iter().all(|row| row["kind"] == "value_action_pending"));
         assert!(matches!(
-            value_action_settlement(&profile.audit_log_path, &intent.envelope_hash),
+            try_value_action_settlement(&profile.audit_log_path, &intent.envelope_hash).unwrap(),
             ValueActionSettlement::Owed(_)
         ));
+        refused
+    }
+
+    /// The in-lock duplicate refusal keeps the original settlement owed.
+    #[cfg(all(feature = "test-helpers", feature = "test-hooks"))]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn duplicate_backstop_keeps_the_pending_row_open() {
+        assert_duplicate_backstop_keeps_the_pending_row_open(None, || {}).await;
+    }
+
+    /// A resend whose pending row the tip anchor does not cover and whose
+    /// reservation write meets the original's reservation is refused as the
+    /// duplicate it is, and its row stays open: the anchor refusal closes a
+    /// row only once the reservation step found no other record of the bytes.
+    #[cfg(all(feature = "test-helpers", feature = "test-hooks"))]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_uncovered_duplicate_keeps_the_pending_row_open() {
+        use stellar_agent_core::audit_log::tip_anchor::{
+            InMemoryTipAnchorStore, KeyedAuditAccess, TipAnchorStore,
+        };
+
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let access = KeyedAuditAccess::new(
+            zeroize::Zeroizing::new([0x5c; 32]),
+            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+        );
+        // The resend's pending-row anchor write and its immediate retry fail,
+        // and so does the retry under the guard right after the row.
+        let refused = assert_duplicate_backstop_keeps_the_pending_row_open(Some(access), || {
+            store.fail_next_writes(3);
+        })
+        .await;
+        assert!(
+            !refused.message().contains("audit.tip_anchor_unavailable"),
+            "the duplicate refusal is reported, not the anchor refusal: {refused:?}"
+        );
+        assert_eq!(
+            store.writes().len(),
+            1,
+            "only the original row was anchored"
+        );
     }
 }

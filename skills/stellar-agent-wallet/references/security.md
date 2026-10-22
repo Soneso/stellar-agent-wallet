@@ -35,6 +35,11 @@ replaces the store. A reset whose row cannot be written does not happen.
 The `profile` section of `./cli-reference.md` describes the row, the refusals,
 the failure windows and the recovery.
 
+The reset requires a current tip anchor before and after its row. If repair
+fails, `audit.chain_key_unavailable` carries `audit.tip_anchor_unavailable`,
+and the window state and generation remain unchanged. A reset row can therefore
+describe an attempted reset that did not take effect.
+
 ## Quick rules for an agent
 
 - Branch on the result envelope and wire codes. Never re-issue a refused commit
@@ -336,6 +341,11 @@ required one, before a signed x402 authorization leaves the wallet
 in the RPC re-simulation, and `x402_authorization_withheld` when that payment
 then fails. The configured RPC observes the signed x402 authorization.
 Approval and rejection rows are written before the decision takes effect.
+
+The `x402_authorization_withheld` stages are `anchor_unavailable`,
+`resimulation`, `response_processing`, and `encoding`. The transmit gate checks
+the anchor before and after its authorization row. At `anchor_unavailable`,
+the signature stays in the wallet and the previously admitted spend remains.
 
 MPP credentials follow a stricter one-shot rule. Durable state is atomically
 claimed before policy accounting or signer access; value budget is recorded

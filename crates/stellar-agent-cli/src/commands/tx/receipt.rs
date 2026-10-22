@@ -39,6 +39,9 @@
 //!   naming the receipt-store error; run `tx status` again.
 //! - **Receipt disagrees with reconciliation.** Refused with
 //!   `submission.record_unavailable`; run `tx status` again.
+//! - **Audit history lookup fails.** Refused with the verifier's code, such as
+//!   `audit.chain_broken` for a broken chain, where the profile has an audit
+//!   writer. The receipt remains clearable for a retry.
 //! - **Released on chain evidence.** The receipt carries `release_code`
 //!   (`submission.sequence_consumed` or `submission.time_bound_passed`). The
 //!   settled `value_action_failed` row is written under that code first, and
@@ -517,24 +520,28 @@ async fn run_clear(args: &ClearArgs) -> i32 {
 /// Writes the rows a clear owes and marks the receipt `cleared_by_operator`,
 /// in that order.
 ///
-/// A release on chain evidence settles the submission's value action, so its
-/// settled row goes through `audit_writer` first, and the receipt is closed
-/// only once that row is in the log: a failed append returns the audit error
-/// before the clear row and the mark, which leaves the receipt carrying its
-/// evidence and still clearable. The clear row follows, only where the log
-/// does not already carry one for this submission. It precedes the mark, so a
-/// failure at the mark leaves a reservation already released rather than one
-/// stranded under a receipt no verb accepts again; a re-run after such a
-/// failure reaches here with the rows already written and writes neither
-/// again.
+/// Where the profile has an audit writer, a release on chain evidence
+/// settles the submission's value action through `audit_writer` first.
+/// A failed append or an unreadable settlement history refuses before the
+/// clear row and the mark. The receipt keeps its evidence and stays clearable.
+/// The clear row follows only where retained history carries none for this
+/// submission. With an audit writer, an unreadable clear history also refuses
+/// before the row and the mark.
+///
+/// The clear row precedes the mark, so a failed mark leaves the reservation
+/// released and the receipt clearable. A repeated clear finds the rows already
+/// written and writes neither again.
 ///
 /// `audit_writer` is `None` only for a synthesized profile whose writer could
-/// not be acquired; nothing is recorded for it, and the receipt is marked.
+/// not be acquired; nothing is recorded for it, no history is read, and the
+/// receipt is marked.
 ///
 /// # Errors
 ///
 /// The refusal envelope: the audit error of a row that could not be written,
-/// or `submission.record_unavailable` for a receipt that could not be marked.
+/// the verifier's `audit.*` code and message for a history that could not be
+/// read, or `submission.record_unavailable` for a receipt that could not be
+/// marked.
 #[allow(
     clippy::too_many_arguments,
     reason = "the clear records the submission, its evidence and the profile's audit context"
@@ -565,28 +572,31 @@ fn record_and_mark_clear(
             &receipt.status,
             Some(evidence),
             stellar_agent_core::audit_log::PolicyDecision::Allow,
-        )
-        .map_err(|e| Envelope::<()>::err(&e))?;
+        )?;
     }
 
-    let already_recorded = stellar_agent_core::audit_log::reader::submission_receipt_cleared_exists(
-        &profile.audit_log_path,
-        &receipt.envelope_hash,
-    );
-    if !already_recorded && audit_writer.is_some() {
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let entry = AuditEntry::new_submission_receipt_cleared(
-            "tx receipt clear",
-            chain_id,
-            tx_hash_redacted.as_str(),
-            cleared_from.as_str(),
-            reservation_released,
-            evidence.map(|e| e.code().to_owned()),
-            Some(receipt.envelope_hash.clone()),
-            &request_id,
-        );
-        emit_clear_row(profile, profile_name, origin, entry)
-            .map_err(|e| Envelope::<()>::err(&e))?;
+    if audit_writer.is_some() {
+        let already_recorded =
+            stellar_agent_core::audit_log::reader::try_submission_receipt_cleared_exists(
+                &profile.audit_log_path,
+                &receipt.envelope_hash,
+            )
+            .map_err(|error| Envelope::err_raw(error.wire_code(), error.to_string()))?;
+        if !already_recorded {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let entry = AuditEntry::new_submission_receipt_cleared(
+                "tx receipt clear",
+                chain_id,
+                tx_hash_redacted.as_str(),
+                cleared_from.as_str(),
+                reservation_released,
+                evidence.map(|e| e.code().to_owned()),
+                Some(receipt.envelope_hash.clone()),
+                &request_id,
+            );
+            emit_clear_row(profile, profile_name, origin, entry)
+                .map_err(|e| Envelope::<()>::err(&e))?;
+        }
     }
 
     receipts
@@ -958,6 +968,185 @@ mod tests {
                 .expect("present")
                 .status,
             ReceiptStatus::ClearedByOperator
+        );
+    }
+
+    /// Keeps the active file valid while a lookup into its archive refuses.
+    fn break_clear_history(
+        path: &std::path::Path,
+        writer: &mut stellar_agent_core::audit_log::AuditWriter,
+    ) {
+        use stellar_agent_core::audit_log::rotation::test_seam::set_rotation_threshold;
+        use stellar_agent_core::audit_log::test_helpers::break_newest_archive_link;
+        use stellar_agent_core::audit_log::{NewToolInvocation, PolicyDecision};
+
+        let unrelated = |request_id: &str| {
+            AuditEntry::new_tool_invocation(NewToolInvocation::new(
+                "stellar_balance",
+                "stellar:testnet",
+                Vec::new(),
+                PolicyDecision::Allow,
+                request_id,
+            ))
+        };
+        for request_id in ["first", "second"] {
+            writer.write_entry(unrelated(request_id)).expect("row");
+        }
+        let size = std::fs::metadata(path).expect("log size").len();
+        let threshold = set_rotation_threshold(path, size);
+        writer.write_entry(unrelated("active")).expect("row");
+        drop(threshold);
+        break_newest_archive_link(path);
+    }
+
+    /// A clear lookup that cannot read the retained history refuses before the
+    /// clear row and the mark, and the receipt stays as it was.
+    ///
+    /// The receipt carries no release evidence, so no settled row is owed and
+    /// the strict settlement has nothing to look up. The active file holds no
+    /// clear row for the submission, so the clear lookup visits the archive,
+    /// whose interior link is broken.
+    #[test]
+    #[serial]
+    fn a_clear_lookup_that_cannot_read_the_history_refuses_and_keeps_the_receipt() {
+        use stellar_agent_core::profile::receipt::ReceiptStatus;
+
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let name = "receipt-clear-unreadable";
+        let mut profile = Profile::builder_testnet_named(name, "s", name, "n", name).build();
+        profile.audit_log_path = dir.path().join("audit").join("log.jsonl");
+        let coord = &profile.audit_log_hash_chain_key_id;
+        rotate_keyring_secret_32(&coord.service, &coord.account).expect("seed audit key");
+        let writer = crate::commands::value_audit::require_value_audit_writer(&profile, name)
+            .expect("the profile's writer");
+        break_clear_history(
+            &profile.audit_log_path,
+            &mut writer.lock().expect("writer lock"),
+        );
+        let active = std::fs::read(&profile.audit_log_path).expect("active file");
+
+        let envelope_hash = "3c".repeat(32);
+        let receipts = ReceiptStore::open_at(&dir.path().join("receipts"), name).expect("store");
+        receipts
+            .try_begin(
+                &envelope_hash,
+                &"4d".repeat(32),
+                "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+                1,
+                0,
+                100,
+            )
+            .expect("receipt");
+        receipts.mark_submitted(&envelope_hash).expect("sent");
+        let receipt = receipts
+            .get(&envelope_hash)
+            .expect("read")
+            .expect("present");
+
+        let refused = record_and_mark_clear(
+            &profile,
+            name,
+            ProfileOrigin::Persisted,
+            Some(&writer),
+            &receipts,
+            &receipt,
+            None,
+            false,
+            "stellar:testnet",
+        )
+        .expect_err("a clear lookup that cannot read the history refuses the clear");
+        let error = refused.error.as_ref().expect("error");
+        assert_eq!(error.code, "audit.chain_broken", "{}", error.message);
+        assert!(
+            error.message.contains("audit.chain_broken"),
+            "the refusal names the integrity error: {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("on open"),
+            "a lookup failure is not a writer-open failure: {}",
+            error.message
+        );
+        assert_eq!(
+            receipts
+                .get(&envelope_hash)
+                .expect("read")
+                .expect("present")
+                .status,
+            ReceiptStatus::Pending,
+            "the receipt stays as it was"
+        );
+        assert_eq!(
+            std::fs::read(&profile.audit_log_path).expect("active file"),
+            active,
+            "no clear row is written"
+        );
+    }
+
+    /// A synthesized profile without a writer clears its receipt even when
+    /// retained audit history cannot be read, since it owes no audit row.
+    #[test]
+    fn a_synthesized_clear_without_a_writer_skips_broken_history() {
+        use stellar_agent_core::audit_log::{AuditWriter, reader, verify::VerifyError};
+        use stellar_agent_core::profile::receipt::ReceiptStatus;
+
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let name = "receipt-clear-no-writer";
+        let mut profile = Profile::builder_testnet_named(name, "s", name, "n", name).build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        {
+            let mut writer =
+                AuditWriter::open(profile.audit_log_path.clone(), None).expect("fixture writer");
+            break_clear_history(&profile.audit_log_path, &mut writer);
+        }
+        let active = std::fs::read(&profile.audit_log_path).expect("active file");
+        let envelope_hash = "5e".repeat(32);
+        assert!(matches!(
+            reader::try_submission_receipt_cleared_exists(&profile.audit_log_path, &envelope_hash),
+            Err(VerifyError::ChainBroken { .. })
+        ));
+        let receipts = ReceiptStore::open_at(&dir.path().join("receipts"), name).expect("store");
+        receipts
+            .try_begin(
+                &envelope_hash,
+                &"6f".repeat(32),
+                "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+                1,
+                0,
+                100,
+            )
+            .expect("receipt");
+        receipts.mark_submitted(&envelope_hash).expect("sent");
+        let receipt = receipts
+            .get(&envelope_hash)
+            .expect("read")
+            .expect("present");
+        let cleared = record_and_mark_clear(
+            &profile,
+            name,
+            ProfileOrigin::Synthesized,
+            None,
+            &receipts,
+            &receipt,
+            None,
+            false,
+            "stellar:testnet",
+        )
+        .expect("a clear without a writer skips the broken history");
+        assert_eq!(cleared.cleared_from, "pending");
+        assert_eq!(
+            receipts
+                .get(&envelope_hash)
+                .expect("read")
+                .expect("present")
+                .status,
+            ReceiptStatus::ClearedByOperator
+        );
+        assert_eq!(
+            std::fs::read(&profile.audit_log_path).expect("active file"),
+            active,
+            "no clear row is written"
         );
     }
 
