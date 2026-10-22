@@ -89,7 +89,7 @@
 //!   the active signer set to guard against configurations where the threshold
 //!   exceeds the number of available signers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -9160,7 +9160,7 @@ impl OnChainContextRule {
 /// The `get_context_rule` entrypoint returns a `ContextRule` contracttype.
 /// In Soroban simulation, contracttype structs are returned as `ScVal::Map`
 /// with sorted keys. We decode the relevant fields: `id`, `signers`,
-/// `signer_ids`, `policies` and `policy_ids`. `ContextRule` carries no
+/// `signer_ids`, `policies`, and `policy_ids`. `ContextRule` carries no
 /// threshold: a simple-threshold policy stores it keyed by
 /// `(context_rule_id, smart_account)`, and the signer-set observation reads
 /// it there.
@@ -9187,14 +9187,18 @@ impl OnChainContextRule {
 ///
 /// # Errors
 ///
-/// Returns [`SaError::DeploymentFailed`] (phase `"simulate"`) if the `ScVal`
-/// cannot be decoded as a `ContextRule`: not a map, no `id`, a missing or
-/// non-`Vec` `signer_ids` or `signers` field, a `signer_ids` item that is not
-/// a `u32`, `signer_ids` and `signers` of different lengths, a signer that
-/// does not decode, or a malformed policy field as
-/// [`context_rule_policies`] lists. The signer fields are checked before the
-/// policy fields. The reason names the offending field or index and never
-/// renders the value.
+/// Returns [`SaError::DeploymentFailed`] (phase `"simulate"`) when the
+/// `ScVal` is not a `ContextRule`:
+///
+/// - not a map, or no `id`,
+/// - a missing or non-`Vec` `signer_ids` or `signers` field,
+/// - a `signer_ids` item that is not a `u32`,
+/// - `signer_ids` and `signers` of different lengths,
+/// - a signer that does not decode,
+/// - a malformed policy field, as [`context_rule_policies`] lists.
+///
+/// The signer fields are checked before the policy fields. The reason names
+/// the offending field or index and never renders the value.
 fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> {
     // The simulation returns a ScVal::Map for a contracttype struct.
     // We extract id, signers, signer_ids, policies, policy_ids.
@@ -9316,10 +9320,15 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
 ///
 /// # Errors
 ///
-/// Returns the refusal reason, without the caller's prefix, for a missing
-/// field, a field that is not a `Vec`, a policy that is not an `Address`, an
-/// id that is not a `u32`, a repeated policy or id, or lists of different
-/// lengths. The reason names the field, the index and the `ScVal` variant.
+/// Returns the refusal reason, without the caller's prefix, for the first of:
+///
+/// - a missing `policies` or `policy_ids` field, or one that is not a `Vec`,
+/// - a policy that is not an `Address`, or a repeated policy,
+/// - an id that is not a `u32`, or a repeated id,
+/// - lists of different lengths.
+///
+/// The reason names the field, and the index and the `ScVal` variant where
+/// they apply. It never renders a value.
 fn context_rule_policies(
     policies_val: Option<&ScVal>,
     policy_ids_val: Option<&ScVal>,
@@ -9329,7 +9338,10 @@ fn context_rule_policies(
     let policy_items = context_rule_list_items(policies_val, "policies")?;
     let id_items = context_rule_list_items(policy_ids_val, "policy_ids")?;
 
+    // The repeat checks look up a set, so the work stays near-linear in the
+    // length of a list the RPC answer chooses.
     let mut policies: Vec<ScAddress> = Vec::with_capacity(policy_items.len());
+    let mut seen_policies: BTreeSet<&ScAddress> = BTreeSet::new();
     for (i, item) in policy_items.into_iter().enumerate() {
         let ScVal::Address(address) = item else {
             return Err(format!(
@@ -9337,13 +9349,15 @@ fn context_rule_policies(
                 scval_variant_name(item)
             ));
         };
-        if policies.contains(address) {
+        if !seen_policies.insert(address) {
             return Err(format!("policies[{i}] repeats an earlier policy"));
         }
         policies.push(address.clone());
     }
 
-    let mut ids: Vec<u32> = Vec::with_capacity(id_items.len());
+    // A repeated id returns early, so past the loop `ids` holds one entry
+    // per list item.
+    let mut ids: BTreeSet<u32> = BTreeSet::new();
     for (i, item) in id_items.into_iter().enumerate() {
         let ScVal::U32(id) = item else {
             return Err(format!(
@@ -9351,10 +9365,9 @@ fn context_rule_policies(
                 scval_variant_name(item)
             ));
         };
-        if ids.contains(id) {
+        if !ids.insert(*id) {
             return Err(format!("policy_ids[{i}] repeats an earlier id"));
         }
-        ids.push(*id);
     }
 
     if ids.len() != policies.len() {
@@ -9618,11 +9631,13 @@ pub enum SignerDecodeError {
 /// # Errors
 ///
 /// Returns the [`SignerDecodeError`] variant naming the first malformed part:
-/// a value that is not a `Vec`, a `Vec` shorter or longer than its variant
-/// encodes, a tag that is not a `Symbol` or names an unknown variant, a
-/// `Delegated` address that is neither an account nor a contract, or an
-/// `External` verifier that is not a contract address or key data that is
-/// not `Bytes` or is empty.
+///
+/// - a value that is not a `Vec`,
+/// - a `Vec` shorter or longer than its variant encodes,
+/// - a tag that is not a `Symbol`, or one that names an unknown variant,
+/// - a `Delegated` address that is neither an account nor a contract,
+/// - an `External` verifier that is not a contract address,
+/// - `External` key data that is not `Bytes`, or is empty.
 pub fn decode_signer_scval_full(val: &ScVal) -> Result<DecodedOnChainSigner, SignerDecodeError> {
     let ScVal::Vec(vec) = val else {
         return Err(SignerDecodeError::NotAVec {
@@ -12301,6 +12316,7 @@ pub(crate) mod tests {
             vec![ScVal::U32(4), ScVal::U32(9)],
         ))
         .expect("aligned policy lists must decode");
+        assert_eq!(rule.id, 7);
         assert_eq!(
             rule.policies,
             vec![policy_address(0x55), policy_address(0x66)]
@@ -12521,15 +12537,11 @@ pub(crate) mod tests {
     /// with the per-index reason.
     #[test]
     fn decode_context_rule_scval_refuses_a_signer_with_surplus_items() {
-        let surplus = ScVal::Vec(Some(stellar_xdr::ScVec(
-            vec![
-                ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap()),
-                policy_item(0x44),
-                ScVal::U32(0),
-            ]
-            .try_into()
-            .unwrap(),
-        )));
+        let surplus = scval_list(vec![
+            ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap()),
+            ScVal::Address(ScAddress::Contract(ContractId(Hash([0x44; 32])))),
+            ScVal::U32(0),
+        ]);
         assert_eq!(
             refused_rule_reason(rule_with_signer_lists(vec![ScVal::U32(0)], vec![surplus])),
             "get_context_rule: signer at index 0 (id 0) is not a recognised Signer: \
