@@ -19,6 +19,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::json;
 use serial_test::serial;
+use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
+use stellar_agent_core::audit_log::tip_anchor::{
+    InMemoryTipAnchorStore, KeyedAuditAccess, TipAnchorStore,
+};
+use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox, AuditWriter, NewToolInvocation};
 use stellar_agent_core::error::{SubmissionError, WalletError};
 use stellar_agent_core::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
@@ -1102,6 +1108,10 @@ enum AuditAppendFailure {
     Io,
 }
 
+/// Drives a submission against an audit log that `failure` made unusable
+/// after the writer opened it, and checks that the tip-anchor check before
+/// the pending row refuses it: the refusal carries the code the condition
+/// names, and nothing is written, not even a receipt file.
 async fn assert_audit_append_refusal(failure: AuditAppendFailure) {
     use base64::Engine as _;
     use stellar_agent_core::audit_log::{
@@ -1134,8 +1144,13 @@ async fn assert_audit_append_refusal(failure: AuditAppendFailure) {
         )))
         .unwrap();
     let original = std::fs::read(&audit_path).unwrap();
-    match failure {
-        AuditAppendFailure::Truncated => std::fs::write(&audit_path, b"").unwrap(),
+    // Where the log now lives, and the bytes it holds, which the refusal
+    // must leave as they are.
+    let (log_now, log_bytes) = match failure {
+        AuditAppendFailure::Truncated => {
+            std::fs::write(&audit_path, b"").unwrap();
+            (audit_path.clone(), Vec::new())
+        }
         AuditAppendFailure::Rewritten => {
             let mut changed = original.clone();
             let offset = changed
@@ -1143,13 +1158,16 @@ async fn assert_audit_append_refusal(failure: AuditAppendFailure) {
                 .position(|bytes| bytes == b"audit-request")
                 .unwrap();
             changed[offset] = b'A';
-            std::fs::write(&audit_path, changed).unwrap();
+            std::fs::write(&audit_path, &changed).unwrap();
+            (audit_path.clone(), changed)
         }
         AuditAppendFailure::Io => {
-            std::fs::rename(&audit_dir, fx._dir.path().join("held-audit")).unwrap();
+            let held = fx._dir.path().join("held-audit");
+            std::fs::rename(&audit_dir, &held).unwrap();
             std::fs::write(&audit_dir, b"a file cannot be traversed as a directory").unwrap();
+            (held.join("log.jsonl"), original.clone())
         }
-    }
+    };
     let audit = Arc::new(Mutex::new(writer));
     let recorder = WalletSubmissionRecorder::new(
         &fx.profile,
@@ -1185,7 +1203,7 @@ async fn assert_audit_append_refusal(failure: AuditAppendFailure) {
         Some(&recorder),
     )
     .await
-    .expect_err("failed audit append refuses before send");
+    .expect_err("an unusable audit log refuses before the send");
     match failure {
         AuditAppendFailure::Truncated | AuditAppendFailure::Rewritten => {
             let reason = match failure {
@@ -1211,34 +1229,577 @@ async fn assert_audit_append_refusal(failure: AuditAppendFailure) {
             assert!(
                 error
                     .message()
-                    .contains("the pending value-action row could not be appended")
+                    .contains("the audit log is not ready for the pending value-action row"),
+                "{error:?}"
             );
         }
     }
-    let hash = stellar_agent_network::envelope_hash_hex(envelope.envelope_xdr());
     assert!(
-        fx.receipts.get(&hash).unwrap().is_none(),
-        "the unsent receipt is unwound"
+        !fx.receipts.file_path().unwrap().exists(),
+        "the refusal comes before the receipt gate, so no receipt file is written"
     );
+    let hash = stellar_agent_network::envelope_hash_hex(envelope.envelope_xdr());
+    assert!(fx.receipts.get(&hash).unwrap().is_none());
     assert!(!fx.reservation_is_open(&hash));
+    assert_eq!(
+        std::fs::read(&log_now).unwrap(),
+        log_bytes,
+        "no row is written"
+    );
 }
 
 #[tokio::test]
 #[serial]
-async fn audit_append_truncation_preserves_rollback_code_and_unwinds() {
+async fn a_truncated_audit_log_refuses_with_the_rollback_code_before_the_receipt() {
     assert_audit_append_refusal(AuditAppendFailure::Truncated).await;
 }
 
 #[tokio::test]
 #[serial]
-async fn audit_append_rewrite_preserves_rollback_code_and_unwinds() {
+async fn a_rewritten_audit_log_refuses_with_the_rollback_code_before_the_receipt() {
     assert_audit_append_refusal(AuditAppendFailure::Rewritten).await;
 }
 
 #[tokio::test]
 #[serial]
-async fn audit_append_io_failure_remains_record_unavailable_and_unwinds() {
+async fn an_untraversable_audit_directory_refuses_as_record_unavailable_before_the_receipt() {
     assert_audit_append_refusal(AuditAppendFailure::Io).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The audit tip anchor covers the pending row
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The refusal sentence of the tip-anchor check before the pending row.
+const BEFORE_ROW: &str = "the audit log is not ready for the pending value-action row";
+
+/// The refusal sentence of the tip-anchor check right after the pending row.
+const AFTER_ROW: &str = "the pending value-action row is not covered by the audit tip anchor";
+
+/// A keyed audit writer for `fx` whose tip anchor lives in `store`, so a test
+/// scripts which anchor writes fail.
+fn anchored_audit(
+    fx: &mut Fixture,
+    store: &Arc<InMemoryTipAnchorStore>,
+) -> Arc<Mutex<AuditWriter>> {
+    let audit_path = fx._dir.path().join("audit").join("log.jsonl");
+    fx.profile.audit_log_path = audit_path.clone();
+    let access = KeyedAuditAccess::new(
+        zeroize::Zeroizing::new([0x6a; 32]),
+        Arc::clone(store) as Arc<dyn TipAnchorStore>,
+    );
+    Arc::new(Mutex::new(
+        AuditWriter::open(audit_path, Some(access)).unwrap(),
+    ))
+}
+
+impl Fixture {
+    /// A recorder that writes through `audit` and takes no reservation, as a
+    /// policy without a stateful criterion does.
+    fn unwindowed_recorder<'a>(
+        &'a self,
+        calls: &Arc<Mutex<Vec<Call>>>,
+        audit: Arc<Mutex<AuditWriter>>,
+    ) -> RecordingRecorder<'a> {
+        RecordingRecorder {
+            inner: WalletSubmissionRecorder::new(
+                &self.profile,
+                self.profile_name.clone(),
+                "stellar_pay_commit",
+                Some("stellar:testnet".to_owned()),
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                Vec::new(),
+                Vec::new(),
+                self.receipts.clone(),
+                self.window.clone(),
+                Some(audit),
+                None,
+                "test-request",
+                now_ms(),
+            ),
+            calls: Arc::clone(calls),
+        }
+    }
+}
+
+/// An audit row that names no submission.
+fn unrelated_row(request_id: &str) -> AuditEntry {
+    AuditEntry::new_tool_invocation(NewToolInvocation::new(
+        "stellar_balance",
+        "stellar:testnet",
+        Vec::new(),
+        stellar_agent_core::audit_log::PolicyDecision::Allow,
+        request_id,
+    ))
+}
+
+/// Mounts a `sendTransaction` answer that must never be asked for.
+async fn mount_no_send(server: &MockServer, envelope: &SignedTestEnvelope) {
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(rpc_ok(
+            json!({"hash": envelope.tx_hash_hex(), "status": "PENDING"}),
+        ))
+        .expect(0)
+        .named("nothing is sent")
+        .mount(server)
+        .await;
+}
+
+/// Mounts the reads, one accepted send, and a confirmation.
+async fn mount_confirmed_send(server: &MockServer, envelope: &SignedTestEnvelope) {
+    mount_pre_send(server, envelope).await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(rpc_ok(json!({
+            "hash": envelope.tx_hash_hex(),
+            "status": "PENDING",
+            "latestLedger": 1_001,
+            "latestLedgerCloseTime": "1699999999",
+        })))
+        .expect(1)
+        .named("one send")
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getTransaction"})))
+        .respond_with(rpc_ok(json!({
+            "status": "SUCCESS",
+            "latestLedger": 1_002,
+            "ledger": 1_002,
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Submits `envelope` through `recorder` against `server`.
+async fn submit(
+    server: &MockServer,
+    envelope: &SignedTestEnvelope,
+    recorder: &RecordingRecorder<'_>,
+) -> Result<stellar_agent_network::submit::SubmissionResult, WalletError> {
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    submit_transaction_and_wait(
+        &client,
+        envelope.envelope_xdr(),
+        SUBMIT_TIMEOUT,
+        TESTNET_PASSPHRASE,
+        None,
+        Some(recorder),
+    )
+    .await
+}
+
+/// The kinds of the verified rows that name `envelope_hash`, in log order.
+fn kinds_for(audit: &Arc<Mutex<AuditWriter>>, envelope_hash: &str) -> Vec<EventKind> {
+    verified_audit_entries(audit)
+        .into_iter()
+        .filter(|entry| entry.envelope_hash.as_deref() == Some(envelope_hash))
+        .map(|entry| entry.event_kind)
+        .collect()
+}
+
+/// The failure code of a `value_action_failed` row, or `None` for any other
+/// kind.
+fn failed_code(kind: &EventKind) -> Option<&str> {
+    match kind {
+        EventKind::ValueActionFailed { code, .. } => Some(code.as_str()),
+        _ => None,
+    }
+}
+
+/// A tip anchor left behind and still unwritable refuses the submission
+/// before anything for it is written: no receipt file, no row, no
+/// reservation, and nothing sent.
+#[tokio::test]
+#[serial]
+async fn an_anchor_behind_before_the_pending_row_refuses_with_nothing_written() {
+    let mut fx = fixture("record-anchor-before");
+    let store = Arc::new(InMemoryTipAnchorStore::new());
+    let audit = anchored_audit(&mut fx, &store);
+    // An unrelated row's anchor write and its immediate retry fail, which
+    // leaves the anchor behind; the third failure is the repair the check
+    // before the pending row attempts.
+    store.fail_next_writes(3);
+    audit
+        .lock()
+        .unwrap()
+        .write_entry(unrelated_row("before-row"))
+        .unwrap();
+    let log_bytes = std::fs::read(&fx.profile.audit_log_path).unwrap();
+
+    let envelope = SignedTestEnvelope::for_source([0x63; 32]);
+    let server = MockServer::start().await;
+    mount_pre_send(&server, &envelope).await;
+    mount_no_send(&server, &envelope).await;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorder = fx.capped_recorder(&calls, Arc::clone(&audit), 500, 1_000_000);
+    let error = submit(&server, &envelope, &recorder)
+        .await
+        .expect_err("a tip anchor that cannot be repaired refuses the send");
+
+    assert_eq!(error.code(), "submission.record_unavailable", "{error:?}");
+    assert!(error.message().contains(BEFORE_ROW), "{error:?}");
+    assert!(
+        error.message().contains("audit.tip_anchor_unavailable"),
+        "the refusal names the anchor condition: {error:?}"
+    );
+    assert_eq!(calls.lock().unwrap().as_slice(), &[Call::PreSend]);
+    assert!(
+        !fx.receipts.file_path().unwrap().exists(),
+        "no receipt file is written"
+    );
+    assert_eq!(
+        std::fs::read(&fx.profile.audit_log_path).unwrap(),
+        log_bytes,
+        "no row is written"
+    );
+    assert!(
+        fx.window
+            .pending_reservations(&fx.profile)
+            .unwrap()
+            .is_empty(),
+        "no reservation is taken"
+    );
+}
+
+/// A pending row the tip anchor does not cover is closed, its reservation
+/// released, and its receipt removed, and nothing is sent.
+///
+/// The pending row's anchor write, its immediate retry, and the repair under
+/// the guard right after the row all fail. The reservation's duplicate check
+/// has passed by then, so the row and the reservation are this submission's.
+/// The closing row is a plain append: it repairs the anchor for the pending
+/// row first and then anchors itself.
+#[tokio::test]
+#[serial]
+async fn an_uncovered_pending_row_is_closed_and_its_reservation_released() {
+    let mut fx = fixture("record-anchor-after");
+    let store = Arc::new(InMemoryTipAnchorStore::new());
+    let audit = anchored_audit(&mut fx, &store);
+    let envelope = SignedTestEnvelope::for_source([0x64; 32]);
+    let server = MockServer::start().await;
+    mount_pre_send(&server, &envelope).await;
+    mount_no_send(&server, &envelope).await;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorder = fx.capped_recorder(&calls, Arc::clone(&audit), 500, 1_000_000);
+    store.fail_next_writes(3);
+    let error = submit(&server, &envelope, &recorder)
+        .await
+        .expect_err("a pending row the anchor does not cover refuses the send");
+
+    assert_eq!(error.code(), "submission.record_unavailable", "{error:?}");
+    assert!(error.message().contains(AFTER_ROW), "{error:?}");
+    assert!(
+        error.message().contains("audit.tip_anchor_unavailable"),
+        "{error:?}"
+    );
+    assert_eq!(calls.lock().unwrap().as_slice(), &[Call::PreSend]);
+    let hash = envelope_hash(&envelope);
+    assert!(
+        fx.receipts.get(&hash).unwrap().is_none(),
+        "the receipt is removed"
+    );
+    assert!(
+        fx.window
+            .pending_reservations(&fx.profile)
+            .unwrap()
+            .is_empty(),
+        "the reservation is released"
+    );
+    let kinds = kinds_for(&audit, &hash);
+    assert_eq!(kinds.len(), 2, "{kinds:?}");
+    assert!(
+        matches!(kinds[0], EventKind::ValueActionPending { .. }),
+        "{kinds:?}"
+    );
+    assert_eq!(
+        failed_code(&kinds[1]),
+        Some("submission.record_unavailable"),
+        "the closing row carries the refusal's code: {kinds:?}"
+    );
+    let anchored: Vec<u64> = store.writes().iter().map(|a| a.entry_count).collect();
+    assert_eq!(
+        anchored,
+        vec![1, 2],
+        "the closing append repairs the pending row's anchor, then anchors itself"
+    );
+}
+
+/// Without window entries a pending row the tip anchor does not cover is
+/// closed and its receipt removed.
+///
+/// The receipt gate recorded a new receipt, so no other receipt carries the
+/// hash when the row is closed.
+#[tokio::test]
+#[serial]
+async fn an_uncovered_pending_row_without_window_entries_is_closed() {
+    let mut fx = fixture("record-anchor-unwindowed");
+    let store = Arc::new(InMemoryTipAnchorStore::new());
+    let audit = anchored_audit(&mut fx, &store);
+    let envelope = SignedTestEnvelope::for_source([0x65; 32]);
+    let server = MockServer::start().await;
+    mount_pre_send(&server, &envelope).await;
+    mount_no_send(&server, &envelope).await;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorder = fx.unwindowed_recorder(&calls, Arc::clone(&audit));
+    store.fail_next_writes(3);
+    let error = submit(&server, &envelope, &recorder)
+        .await
+        .expect_err("a pending row the anchor does not cover refuses the send");
+
+    assert_eq!(error.code(), "submission.record_unavailable", "{error:?}");
+    assert!(error.message().contains(AFTER_ROW), "{error:?}");
+    assert_eq!(calls.lock().unwrap().as_slice(), &[Call::PreSend]);
+    let hash = envelope_hash(&envelope);
+    assert!(
+        fx.receipts.file_path().unwrap().exists(),
+        "the receipt gate recorded a receipt"
+    );
+    assert!(
+        fx.receipts.get(&hash).unwrap().is_none(),
+        "the receipt is removed"
+    );
+    let kinds = kinds_for(&audit, &hash);
+    assert_eq!(kinds.len(), 2, "{kinds:?}");
+    assert!(
+        matches!(kinds[0], EventKind::ValueActionPending { .. }),
+        "{kinds:?}"
+    );
+    assert_eq!(
+        failed_code(&kinds[1]),
+        Some("submission.record_unavailable"),
+        "{kinds:?}"
+    );
+}
+
+/// The repair under the guard right after the pending row lets the
+/// submission proceed when it succeeds: the row is covered, one send goes
+/// out, and no closing row is written.
+#[tokio::test]
+#[serial]
+async fn a_pending_row_covered_by_the_repair_after_it_is_sent() {
+    let mut fx = fixture("record-anchor-repaired");
+    let store = Arc::new(InMemoryTipAnchorStore::new());
+    let audit = anchored_audit(&mut fx, &store);
+    let envelope = SignedTestEnvelope::for_source([0x66; 32]);
+    let server = MockServer::start().await;
+    mount_confirmed_send(&server, &envelope).await;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorder = fx.capped_recorder(&calls, Arc::clone(&audit), 500, 1_000_000);
+    // The pending row's anchor write and its immediate retry fail; the
+    // repair right after the row succeeds.
+    store.fail_next_writes(2);
+    let result = submit(&server, &envelope, &recorder).await;
+    assert!(
+        result.is_ok(),
+        "the repaired anchor lets the send proceed: {result:?}"
+    );
+
+    let hash = envelope_hash(&envelope);
+    let kinds = kinds_for(&audit, &hash);
+    assert_eq!(kinds.len(), 2, "{kinds:?}");
+    assert!(
+        matches!(kinds[0], EventKind::ValueActionPending { .. }),
+        "{kinds:?}"
+    );
+    assert!(
+        matches!(kinds[1], EventKind::ValueActionSubmitted { .. }),
+        "no closing row precedes the outcome: {kinds:?}"
+    );
+}
+
+/// A reservation the window refuses for a reason other than a duplicate keeps
+/// its own refusal and code when the anchor check also failed, and the row is
+/// closed under that code.
+#[tokio::test]
+#[serial]
+async fn a_policy_refusal_at_the_reservation_outranks_an_uncovered_pending_row() {
+    let mut fx = fixture("record-anchor-denied");
+    let store = Arc::new(InMemoryTipAnchorStore::new());
+    let audit = anchored_audit(&mut fx, &store);
+    let envelope = SignedTestEnvelope::for_source([0x67; 32]);
+    let server = MockServer::start().await;
+    mount_pre_send(&server, &envelope).await;
+    mount_no_send(&server, &envelope).await;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    // 600 against a cap of 500: the reservation write refuses.
+    let recorder = fx.capped_recorder(&calls, Arc::clone(&audit), 600, 500);
+    store.fail_next_writes(3);
+    let error = submit(&server, &envelope, &recorder)
+        .await
+        .expect_err("the window cannot admit this submission");
+
+    assert_eq!(
+        error.code(),
+        "policy.deny.per_period_cap_exceeded",
+        "{error:?}"
+    );
+    assert_eq!(calls.lock().unwrap().as_slice(), &[Call::PreSend]);
+    let hash = envelope_hash(&envelope);
+    assert!(fx.receipts.get(&hash).unwrap().is_none());
+    assert!(
+        fx.window
+            .pending_reservations(&fx.profile)
+            .unwrap()
+            .is_empty(),
+        "the refused reservation holds nothing"
+    );
+    let kinds = kinds_for(&audit, &hash);
+    assert_eq!(kinds.len(), 2, "{kinds:?}");
+    assert_eq!(
+        failed_code(&kinds[1]),
+        Some("policy.deny.per_period_cap_exceeded"),
+        "{kinds:?}"
+    );
+}
+
+/// Submits with one consent row queued in the audit outbox and `failures`
+/// scripted anchor-write failures, and returns the result with the kinds of
+/// every verified row.
+///
+/// The pending row's append drains the queued row first. Its anchor write
+/// and retry fail twice, the pending row's own pre-append retry once, its
+/// anchor write and retry twice, and the repair right after the row once:
+/// six failures reach the refusal, and with five the repair succeeds.
+async fn submit_after_a_queued_outbox_row(
+    name: &str,
+    seed: u8,
+    failures: usize,
+) -> (
+    Result<stellar_agent_network::submit::SubmissionResult, WalletError>,
+    Vec<EventKind>,
+) {
+    let mut fx = fixture(name);
+    let store = Arc::new(InMemoryTipAnchorStore::new());
+    let audit = anchored_audit(&mut fx, &store);
+    AuditOutbox::for_log(&fx.profile.audit_log_path)
+        .append(&unrelated_row("queued-consent"))
+        .unwrap();
+    let envelope = SignedTestEnvelope::for_source([seed; 32]);
+    let server = MockServer::start().await;
+    if failures >= 6 {
+        mount_pre_send(&server, &envelope).await;
+        mount_no_send(&server, &envelope).await;
+    } else {
+        mount_confirmed_send(&server, &envelope).await;
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorder = fx.capped_recorder(&calls, Arc::clone(&audit), 500, 1_000_000);
+    store.fail_next_writes(failures);
+    let result = submit(&server, &envelope, &recorder).await;
+    let kinds = verified_audit_entries(&audit)
+        .into_iter()
+        .map(|entry| entry.event_kind)
+        .collect();
+    (result, kinds)
+}
+
+/// An outbox row the pending append drains ahead of the row is covered by the
+/// check right after the row too: six failed anchor writes refuse the send.
+#[tokio::test]
+#[serial]
+async fn a_drained_outbox_row_left_uncovered_refuses_the_send() {
+    let (result, kinds) =
+        submit_after_a_queued_outbox_row("record-anchor-drain-refused", 0x68, 6).await;
+    let error = result.expect_err("six failed anchor writes leave the rows uncovered");
+    assert_eq!(error.code(), "submission.record_unavailable", "{error:?}");
+    assert!(error.message().contains(AFTER_ROW), "{error:?}");
+    assert_eq!(kinds.len(), 3, "{kinds:?}");
+    assert!(
+        matches!(kinds[0], EventKind::ToolInvocation),
+        "the queued row lands first: {kinds:?}"
+    );
+    assert!(
+        matches!(kinds[1], EventKind::ValueActionPending { .. }),
+        "{kinds:?}"
+    );
+    assert_eq!(
+        failed_code(&kinds[2]),
+        Some("submission.record_unavailable"),
+        "{kinds:?}"
+    );
+}
+
+/// With one failure fewer the repair right after the row covers both the
+/// drained row and the pending row, and the send proceeds.
+#[tokio::test]
+#[serial]
+async fn a_drained_outbox_row_covered_by_the_repair_lets_the_send_proceed() {
+    let (result, kinds) =
+        submit_after_a_queued_outbox_row("record-anchor-drain-repaired", 0x69, 5).await;
+    assert!(result.is_ok(), "the repair covers both rows: {result:?}");
+    assert_eq!(kinds.len(), 3, "{kinds:?}");
+    assert!(
+        matches!(kinds[1], EventKind::ValueActionPending { .. }),
+        "{kinds:?}"
+    );
+    assert!(
+        matches!(kinds[2], EventKind::ValueActionSubmitted { .. }),
+        "{kinds:?}"
+    );
+}
+
+/// A pending row that cannot be appended after the tip-anchor check passed
+/// refuses the send and removes the receipt the gate recorded; no row and no
+/// reservation exist.
+///
+/// A complete outbox line that does not parse refuses the drain the append
+/// runs first, and the check before the row reads no outbox.
+#[tokio::test]
+#[serial]
+async fn a_pending_row_append_failure_after_the_anchor_check_unwinds_the_receipt() {
+    let mut fx = fixture("record-anchor-append");
+    let store = Arc::new(InMemoryTipAnchorStore::new());
+    let audit = anchored_audit(&mut fx, &store);
+    let outbox = AuditOutbox::for_log(&fx.profile.audit_log_path);
+    std::fs::write(outbox.path(), b"not an audit entry\n").unwrap();
+    let envelope = SignedTestEnvelope::for_source([0x6b; 32]);
+    let server = MockServer::start().await;
+    mount_pre_send(&server, &envelope).await;
+    mount_no_send(&server, &envelope).await;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorder = fx.capped_recorder(&calls, Arc::clone(&audit), 500, 1_000_000);
+    let error = submit(&server, &envelope, &recorder)
+        .await
+        .expect_err("a pending row that cannot be appended refuses the send");
+
+    assert_eq!(error.code(), "submission.record_unavailable", "{error:?}");
+    assert!(
+        error
+            .message()
+            .contains("the pending value-action row could not be appended"),
+        "{error:?}"
+    );
+    assert!(
+        error.message().contains("audit.outbox_unusable"),
+        "{error:?}"
+    );
+    assert_eq!(calls.lock().unwrap().as_slice(), &[Call::PreSend]);
+    let hash = envelope_hash(&envelope);
+    assert!(
+        fx.receipts.file_path().unwrap().exists(),
+        "the receipt gate recorded a receipt"
+    );
+    assert!(
+        fx.receipts.get(&hash).unwrap().is_none(),
+        "the receipt is removed"
+    );
+    assert!(
+        fx.window
+            .pending_reservations(&fx.profile)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        std::fs::read_to_string(&fx.profile.audit_log_path)
+            .unwrap_or_default()
+            .is_empty(),
+        "no row is written"
+    );
 }
 
 /// A second submission the window can no longer admit is refused at the
@@ -1254,7 +1815,9 @@ async fn audit_append_io_failure_remains_record_unavailable_and_unwinds() {
 async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
     use base64::Engine as _;
     use stellar_agent_core::audit_log::AuditWriter;
-    use stellar_agent_core::audit_log::reader::{ValueActionSettlement, value_action_settlement};
+    use stellar_agent_core::audit_log::reader::{
+        ValueActionSettlement, try_value_action_settlement,
+    };
     use stellar_agent_core::audit_log::schema::EventKind;
     use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 
@@ -1390,7 +1953,7 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
     drop(audit);
     assert!(
         matches!(
-            value_action_settlement(&audit_path, &second_hash),
+            try_value_action_settlement(&audit_path, &second_hash).unwrap(),
             ValueActionSettlement::Settled
         ),
         "the pending row the refused submission wrote is closed out"
@@ -1430,7 +1993,9 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
 async fn a_resend_after_a_lost_receipt_is_refused_before_the_send() {
     use base64::Engine as _;
     use stellar_agent_core::audit_log::AuditWriter;
-    use stellar_agent_core::audit_log::reader::{ValueActionSettlement, value_action_settlement};
+    use stellar_agent_core::audit_log::reader::{
+        ValueActionSettlement, try_value_action_settlement,
+    };
     use stellar_agent_core::audit_log::schema::EventKind;
     use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 
@@ -1543,7 +2108,7 @@ async fn a_resend_after_a_lost_receipt_is_refused_before_the_send() {
     drop(audit);
     assert!(
         matches!(
-            value_action_settlement(&audit_path, &hash),
+            try_value_action_settlement(&audit_path, &hash).unwrap(),
             ValueActionSettlement::Owed(_)
         ),
         "the original's settlement stays owed"

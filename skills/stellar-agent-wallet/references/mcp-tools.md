@@ -780,6 +780,9 @@ transaction again.
   is missing and the endpoint can no longer answer for the transaction. Only
   the operator resolves it, with `tx receipt clear`.
 
+When the settlement lookup cannot read the retained audit history, the status
+call still answers; it logs the error and writes no settled row.
+
 Every submitting tool reports these codes, `stellar_dex_trade` and the two
 vault tools included.
 
@@ -791,8 +794,10 @@ An action the policy engine sized no value for takes no reservation at all, so
 whether the submission settled.
 
 `submission.record_unavailable` is different: the wallet could not write the
-record, so nothing was sent. The condition is local and the submission is safe
-to retry once the operator has fixed it.
+record, or the audit log's tip anchor does not cover its pending row (the
+message then carries `audit.tip_anchor_unavailable`), so nothing was sent. The
+condition is local and the submission is safe to retry once the operator has
+fixed it.
 
 `policy.approval_consumed` means the approval you presented was already spent on
 a submission. Check that transaction's status before asking for the action

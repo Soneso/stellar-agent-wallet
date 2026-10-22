@@ -296,10 +296,13 @@ evidence is a consumed sequence. A presented envelope, such as one the SEP-43
 tool submits, can carry a time bound, and so can the inner transaction of a
 fee-bump.
 
-The receipt keeps its `release_code`, so a settled row that could not be
-written when the reservation was released is written by the next call. A
-receipt released without recorded evidence, for example by an older binary,
-reads as `ambiguous` with no `release_code`, and no row is written for it.
+The receipt keeps its `release_code` when the reservation is released, so
+a later call can retry any settled row still owed. A receipt released without
+recorded evidence, for example by an older binary, reads as `ambiguous` with no
+`release_code`, and no row is written for it.
+When the settlement lookup cannot read the retained audit history, the call
+still answers; it logs the error and writes no settled row. A later call
+retries the lookup and appends any row still owed.
 
 Automatic reconciliation applies the same chain and retention checks when the
 receipts file is absent. A definitive chain answer or a release on chain
@@ -315,7 +318,7 @@ A send the endpoint refused outright is settled at the send and never reaches th
 
 No recovery path sends a transaction again.
 
-`submission.record_unavailable` is different: the wallet could not write the record, so nothing was sent. The condition is local — an unwritable receipt store, an unreadable spending-window file, an audit log that cannot be appended — and the submission is safe to retry once it is fixed.
+`submission.record_unavailable` is different: the wallet could not write the record, so nothing was sent. The condition is local: an unwritable receipt store, an unreadable spending-window file, an audit log that cannot be appended, or a pending audit row the audit log's tip anchor does not cover, whose message carries `audit.tip_anchor_unavailable`. The submission is safe to retry once it is fixed.
 
 Every submitting tool reports these codes, `stellar_dex_trade`, the two vault tools and `stellar_sep43_sign_and_submit_transaction` included. The SEP-43 tool keeps its own `status: "pending"` response shape for a timeout and records the submission the same way, so `stellar_transaction_status` settles it too.
 

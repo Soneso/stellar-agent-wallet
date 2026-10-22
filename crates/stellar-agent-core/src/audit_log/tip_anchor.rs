@@ -516,6 +516,7 @@ struct InMemoryAnchorState {
     anchor: Option<TipAnchor>,
     reanchors: u64,
     fail: bool,
+    writes_to_fail: usize,
     writes: Vec<TipAnchor>,
     /// A raw value planted by a test, so the repair path can be exercised
     /// against something `load_anchor` refuses.
@@ -590,6 +591,17 @@ impl InMemoryTipAnchorStore {
         state.anchor = None;
     }
 
+    /// Fails the next `count` anchor writes while leaving reads available.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn fail_next_writes(&self, count: usize) {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.writes_to_fail = count;
+    }
+
     /// Makes every subsequent operation fail, simulating an unavailable
     /// backend.
     ///
@@ -636,6 +648,10 @@ impl TipAnchorStore for InMemoryTipAnchorStore {
         let mut state = self.state.lock().expect("in-memory anchor store mutex");
         if state.fail {
             return Err(TipAnchorStoreError::new("in-memory store set to fail"));
+        }
+        if state.writes_to_fail > 0 {
+            state.writes_to_fail -= 1;
+            return Err(TipAnchorStoreError::new("scripted anchor write failure"));
         }
         state.anchor = Some(anchor.clone());
         state.raw = None;

@@ -244,17 +244,21 @@ pub struct AuditWriter {
     /// when the file ends on an entry boundary, which it always does after a
     /// successful [`AuditWriter::write_entry`].
     end_offset: u64,
-    /// Set when a tip-anchor write failed, cleared when one succeeds.
+    /// An anchor write that failed and is still outstanding.
     ///
-    /// The append path writes the anchor best-effort, because the entry is
-    /// already durable and a keyring failure must not be reported as a failed
-    /// append. Left alone, one transient failure would leave the anchor behind
-    /// the file for every subsequent append, widening the window in which a
-    /// rollback to a state at or ahead of the stale anchor is absorbed. The next
-    /// append therefore re-writes the anchor for the writer's CURRENT state
-    /// before it appends anything, which repairs any number of missed writes in
-    /// one go.
-    anchor_behind: bool,
+    /// The value can name a durable tip (an append's new entry), a rotation's
+    /// handoff in the next file generation, or a row not yet written (the row
+    /// a refused append owed). The append path writes the anchor best-effort,
+    /// because the entry is already durable and a keyring failure must not be
+    /// reported as a failed append. A later anchor write replaces the value,
+    /// and a successful write clears it. The next append retries the value
+    /// before it appends anything, which repairs any number of missed writes
+    /// in one go, and a rotation's handoff survives the swap to an empty
+    /// active file, where the writer has no entry of its own to rebuild it
+    /// from. Value actions call [`AuditWriter::require_anchor_current`] before
+    /// and after their pre-action row, so they never proceed while an anchor
+    /// write is outstanding.
+    pending_tip_anchor: Option<TipAnchor>,
     /// Keyring-held tip anchor for the active PATH, when the opener supplied
     /// one.
     ///
@@ -714,7 +718,7 @@ impl AuditWriter {
             hmac_key,
             entry_count: scan.entry_count,
             end_offset: scan.end_offset,
-            anchor_behind: false,
+            pending_tip_anchor: None,
             log_diverged: None,
             owed_row_anchored: false,
             tip_anchor,
@@ -807,6 +811,10 @@ impl AuditWriter {
     /// - [`WriterError::Io`] on I/O failure.
     /// - [`WriterError::Serialise`] if the entry cannot be serialised.
     /// - [`WriterError::Hash`] if the hash computation fails.
+    ///
+    /// An anchor-write failure after fsync retries once and leaves the append
+    /// successful. Value actions call [`Self::require_anchor_current`] around
+    /// their pre-action row to withhold the action while repair is owed.
     pub fn write_entry(&mut self, entry: AuditEntry) -> Result<(), WriterError> {
         if self.drains {
             self.drain_outbox()?;
@@ -953,7 +961,8 @@ impl AuditWriter {
     ///
     /// [`AppendRefusal::LogMoved`] when the log at the path stopped being the
     /// log this writer holds, and [`AppendRefusal::Other`] for every other
-    /// refusal, including a failed rotation.
+    /// refusal, including a failed rotation. An anchor-write failure remains
+    /// best-effort, so post-action rows can still land.
     fn prepare_append(&mut self) -> Result<(), AppendRefusal> {
         #[cfg(test)]
         if let Some(remaining) = self.appends_before_fault.as_mut() {
@@ -990,7 +999,7 @@ impl AuditWriter {
         // append moves the tip again. The value written names the entry most
         // recently fsynced, so it is safe at any point and subsumes however many
         // writes were missed.
-        self.retry_tip_anchor_if_behind();
+        let _ = self.retry_tip_anchor_if_behind();
 
         // Rotate if needed before the row is built and written, so the
         // rotation's handoff entry is the row's predecessor.
@@ -1008,7 +1017,8 @@ impl AuditWriter {
     ///
     /// [`WriterError::Io`], [`WriterError::Serialise`], or
     /// [`WriterError::Hash`] when the row cannot be hashed, serialised, or
-    /// written.
+    /// written. Anchor writes retry once and remain best-effort after the row
+    /// is durable. Call [`Self::require_anchor_current`] to gate a value action.
     fn commit_append(&mut self, mut entry: AuditEntry) -> Result<(), WriterError> {
         // Truncate arg_keys if needed.
         entry.truncate_arg_keys_if_needed()?;
@@ -1051,24 +1061,13 @@ impl AuditWriter {
             self.is_new_file = false;
         }
 
-        // Advance the keyring-held tip anchor to the entry just fsynced, before
-        // the in-memory tip moves.  Best-effort by contract: the entry is
-        // already durable, so failing the append here would tell the caller the
-        // row was not written when it was.  A missed advance leaves the anchor
-        // behind the file, which the next reconciliation absorbs as an
-        // ahead-of-anchor file.
-        let advanced_count = self.entry_count.saturating_add(1);
-        let advanced_end = self.entry_end_offset()?;
-        self.store_tip_anchor_best_effort(&TipAnchor::new(
-            advanced_count,
-            current_hash.clone(),
-            advanced_end,
-        ));
-
-        // Advance the chain.
-        self.entry_count = advanced_count;
-        self.end_offset = advanced_end;
+        // Commit the durable chain state before either anchor-write attempt.
+        // An anchor outage must leave the next append on this row's hash.
+        self.entry_count = self.entry_count.saturating_add(1);
+        self.end_offset = self.entry_end_offset()?;
         self.last_hash = current_hash;
+        let current = TipAnchor::new(self.entry_count, self.last_hash.clone(), self.end_offset);
+        self.store_tip_anchor_best_effort(&current);
         Ok(())
     }
 
@@ -1147,6 +1146,27 @@ impl AuditWriter {
     #[must_use]
     pub fn has_tip_anchor(&self) -> bool {
         self.tip_anchor.is_some()
+    }
+
+    /// Writes the anchor value a failed write left owed, or refuses while it
+    /// cannot be written. Writes no audit row.
+    ///
+    /// A value action calls this before its pre-action row and, under the
+    /// guard that appended the row, right after it. The first call refuses a
+    /// behind anchor before the row exists. The second catches a failed anchor
+    /// write of the row itself, or of a row the outbox drain appended ahead of
+    /// it, so the action never proceeds on a row the anchor does not cover.
+    /// Plain appends do not call it: a row recording an action that already
+    /// committed must land whether or not its anchor does.
+    ///
+    /// # Errors
+    ///
+    /// [`WriterError::TipAnchorStore`] when the owed anchor cannot be written,
+    /// and the refusal an append reports when the log at the path moved or
+    /// changed under the writer.
+    pub fn require_anchor_current(&mut self) -> Result<(), WriterError> {
+        self.refuse_if_log_moved_on_append()?;
+        self.retry_tip_anchor_if_behind()
     }
 
     /// Reconciles the anchor against the active file — the check
@@ -1443,8 +1463,12 @@ impl AuditWriter {
                 active_locked_by: None,
             });
         }
-        let anchor = store.load_anchor().map_err(WriterError::TipAnchorStore)?;
+        let mut anchor = store.load_anchor().map_err(WriterError::TipAnchorStore)?;
         self.refuse_if_replaced(anchor.as_ref())?;
+        if self.anchor_behind() {
+            self.require_anchor_current()?;
+            anchor = store.load_anchor().map_err(WriterError::TipAnchorStore)?;
+        }
         let len = fs::metadata(&self.path)?.len();
 
         let Some(anchor) = anchor else {
@@ -1761,12 +1785,14 @@ impl AuditWriter {
         }
     }
 
-    /// Writes `anchor` without failing the caller.
+    /// Writes `anchor` with one immediate retry, without failing the caller.
     ///
-    /// Used on the append and rotation paths, where the log entry is already
-    /// durable and an anchor-write failure must not be reported as a failed
-    /// append. A failure latches [`AuditWriter::anchor_behind`] so the next
-    /// append retries before it appends.
+    /// Used where an anchor-write failure must not fail the caller: the append
+    /// and rotation paths, whose entry is already durable, and the owed-row
+    /// anchor of a refused append. Appends commit their chain state before this
+    /// call, so a failure leaves the next append on the row just written. Both
+    /// attempts run under the sidecar lock the writer holds. A second failure
+    /// keeps `anchor` owed in `pending_tip_anchor` for the next retry.
     fn store_tip_anchor_best_effort(&mut self, anchor: &TipAnchor) {
         #[cfg(test)]
         if self.skip_tip_anchor_write {
@@ -1775,15 +1801,17 @@ impl AuditWriter {
         let Some(store) = self.tip_anchor.clone() else {
             return;
         };
-        match store.store_anchor(anchor) {
-            Ok(()) => self.anchor_behind = false,
+        match store
+            .store_anchor(anchor)
+            .or_else(|_| store.store_anchor(anchor))
+        {
+            Ok(()) => self.pending_tip_anchor = None,
             Err(e) => {
-                self.anchor_behind = true;
+                self.pending_tip_anchor = Some(anchor.clone());
                 tracing::warn!(
                     log = %basename_lossy_path(&self.path),
                     error = %e,
-                    "audit tip anchor write failed; the next append retries it, and \
-                     the next acquisition absorbs whatever gap remains"
+                    "audit tip anchor write failed twice; repair is owed"
                 );
             }
         }
@@ -1830,7 +1858,7 @@ impl AuditWriter {
             .saturating_add(1);
         let owed = TipAnchor::new(self.entry_count.saturating_add(1), hash, owed_end);
         self.store_tip_anchor_best_effort(&owed);
-        self.owed_row_anchored = !self.anchor_behind;
+        self.owed_row_anchored = !self.anchor_behind();
     }
 
     /// Returns the byte offset just past the entry this writer has only now
@@ -1852,16 +1880,34 @@ impl AuditWriter {
         Ok(self.file.metadata()?.len())
     }
 
-    /// Re-writes the anchor for the writer's current state when an earlier
-    /// write failed.
+    /// Whether an anchor write failed and its repair is still owed.
+    fn anchor_behind(&self) -> bool {
+        self.pending_tip_anchor.is_some()
+    }
+
+    /// Writes the anchor value a failed write left owed, including a rotation
+    /// handoff's value on a file that has no entry yet.
     ///
-    /// A no-op when no write has failed, so the ordinary append pays nothing.
-    fn retry_tip_anchor_if_behind(&mut self) {
-        if !self.anchor_behind || self.entry_count == 0 {
-            return;
-        }
-        let current = TipAnchor::new(self.entry_count, self.last_hash.clone(), self.end_offset);
-        self.store_tip_anchor_best_effort(&current);
+    /// A no-op while nothing is owed. A failed retry keeps the value owed and
+    /// returns the store's error; the append path ignores it so that rows
+    /// written after an action committed still land.
+    ///
+    /// # Errors
+    ///
+    /// [`WriterError::TipAnchorStore`] when the store rejects the write.
+    fn retry_tip_anchor_if_behind(&mut self) -> Result<(), WriterError> {
+        let Some(anchor) = self.pending_tip_anchor.clone() else {
+            return Ok(());
+        };
+        let store = self
+            .tip_anchor
+            .clone()
+            .ok_or(WriterError::TipAnchorUnavailable)?;
+        store
+            .store_anchor(&anchor)
+            .map_err(WriterError::TipAnchorStore)?;
+        self.pending_tip_anchor = None;
+        Ok(())
     }
 
     /// Drains the outbox of a draining writer, then appends the adoption row
@@ -3161,7 +3207,7 @@ pub enum WriterError {
     /// The anchor lives in the keyring. An unreadable anchor cannot be
     /// distinguished from a rolled-back one, so every caller that requires the
     /// anchor treats this as fail-closed.
-    #[error("audit log tip anchor unavailable: {0}")]
+    #[error("audit.tip_anchor_unavailable: audit log tip anchor unavailable: {0}")]
     TipAnchorStore(#[from] TipAnchorStoreError),
 
     /// A tip-anchor operation was requested on a writer that has no anchor
@@ -4053,6 +4099,7 @@ mod tests {
     use super::*;
     use crate::audit_log::entry::NewToolInvocation;
     use crate::audit_log::schema::PolicyDecision;
+    use crate::audit_log::test_helpers::rotated_archives_newest_first;
     use std::{
         collections::HashSet,
         sync::{Arc, Barrier, Mutex},
@@ -6898,44 +6945,207 @@ mod tests {
         assert!(verify_log_is_clean(&path));
     }
 
+    fn keyed_anchor_writer(path: &Path, store: &Arc<InMemoryTipAnchorStore>) -> AuditWriter {
+        AuditWriter::open(
+            path.to_path_buf(),
+            Some(KeyedAuditAccess::new(
+                Zeroizing::new([0x5a; 32]),
+                Arc::clone(store) as Arc<dyn TipAnchorStore>,
+            )),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn one_failed_anchor_write_is_retried_immediately() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        store.fail_next_writes(1);
+        writer.write_entry(make_entry("")).unwrap();
+        assert!(!writer.anchor_behind());
+        assert_eq!(store.peek(), Some(tip_of(&path)));
+    }
+
+    #[test]
+    fn a_persistent_anchor_failure_keeps_the_durable_chain_state() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        store.set_failing(true);
+        writer.write_entry(make_entry("")).unwrap();
+        assert!(writer.anchor_behind());
+        let durable = tip_of(&path);
+        assert_eq!(writer.entry_count, durable.entry_count);
+        assert_eq!(writer.end_offset, durable.end_offset);
+        assert_eq!(writer.last_hash, durable.tip_hash);
+        writer.write_entry(make_entry("")).unwrap();
+        assert_eq!(tip_of(&path).entry_count, 2, "plain appends still land");
+        assert!(verify_log_is_clean(&path));
+    }
+
+    #[test]
+    fn require_anchor_current_refuses_without_writing_a_row() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        store.set_failing(true);
+        writer.write_entry(make_entry("")).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let count = writer.entry_count;
+        let error = writer.require_anchor_current().unwrap_err();
+        assert!(matches!(error, WriterError::TipAnchorStore(_)));
+        assert!(error.to_string().contains("audit.tip_anchor_unavailable"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(writer.entry_count, count);
+        store.set_failing(false);
+        writer.require_anchor_current().unwrap();
+        assert!(!writer.anchor_behind());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(store.peek(), Some(tip_of(&path)));
+    }
+
     #[test]
     fn a_failed_anchor_write_is_retried_on_the_next_append() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.jsonl");
         let store = Arc::new(InMemoryTipAnchorStore::new());
-
-        let mut writer = open_anchored(&path, &store).unwrap();
-        let writes_at_open = store.writes().len();
-
-        // The first append's anchor write fails: the entry is durable, the
-        // anchor is not moved.
+        let mut writer = keyed_anchor_writer(&path, &store);
         store.set_failing(true);
         writer.write_entry(make_entry("")).unwrap();
-        assert_eq!(
-            store.writes().len(),
-            writes_at_open,
-            "a failed write must record nothing"
-        );
-        assert!(store.peek().is_none(), "the anchor is left behind the file");
-
-        // The next append repairs it BEFORE appending, then records its own.
+        let before = fs::read(&path).unwrap();
+        assert!(writer.require_anchor_current().is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let repair = tip_of(&path);
         store.set_failing(false);
         writer.write_entry(make_entry("")).unwrap();
+        assert_eq!(store.writes(), vec![repair, tip_of(&path)]);
+        assert!(!writer.anchor_behind());
+    }
 
-        let recorded: Vec<u64> = store
-            .writes()
-            .into_iter()
-            .skip(writes_at_open)
-            .map(|a| a.entry_count)
-            .collect();
-        assert_eq!(
-            recorded,
-            vec![1, 2],
-            "the append must first re-write the anchor for the entry already on \
-             disk, then write its own; without the repair only the second \
-             would appear"
+    #[test]
+    fn an_empty_post_rotation_file_repairs_the_failed_handoff() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        writer.write_entry(make_entry("")).unwrap();
+        store.set_failing(true);
+        writer.force_rotate_for_test().unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+        assert!(writer.require_anchor_current().is_err());
+        let archive = rotated_archives_newest_first(&path).remove(0);
+        let handoff = tip_of(&archive);
+        let writes = store.writes().len();
+        store.set_failing(false);
+        writer.write_entry(make_entry("")).unwrap();
+        assert_eq!(store.writes()[writes], handoff);
+        assert_eq!(store.peek(), Some(tip_of(&path)));
+        writer.verify_tip_anchor().unwrap();
+    }
+
+    #[test]
+    fn a_cached_empty_post_rotation_file_repairs_the_handoff() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        writer.write_entry(make_entry("")).unwrap();
+        store.fail_next_writes(2);
+        writer.force_rotate_for_test().unwrap();
+        assert!(writer.anchor_behind());
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+        writer.verify_tip_anchor().unwrap();
+        assert!(!writer.anchor_behind());
+        let archive = rotated_archives_newest_first(&path).remove(0);
+        assert_eq!(store.peek(), Some(tip_of(&archive)));
+    }
+
+    #[test]
+    fn a_cached_one_entry_file_repairs_before_reconciling_the_handoff() {
+        use crate::audit_log::rotation::test_seam::set_rotation_threshold;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let profile = format!("handoff-{}", uuid::Uuid::new_v4());
+        let acquire = || {
+            AuditWriterRegistry::get_or_open_keyed(
+                &profile,
+                &path,
+                KeyedAuditAccess::new(
+                    Zeroizing::new([0x5a; 32]),
+                    Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+                ),
+            )
+        };
+        let writer = acquire().unwrap();
+        writer.lock().unwrap().write_entry(make_entry("")).unwrap();
+        let threshold = set_rotation_threshold(&path, 1);
+        store.fail_next_writes(4);
+        writer.lock().unwrap().write_entry(make_entry("")).unwrap();
+        drop(threshold);
+        assert_eq!(tip_of(&path).entry_count, 1);
+        store.fail_next_writes(1);
+        assert!(matches!(acquire(), Err(WriterError::TipAnchorStore(_))));
+        acquire().unwrap();
+        assert!(!writer.lock().unwrap().anchor_behind());
+        assert_eq!(store.peek(), Some(tip_of(&path)));
+    }
+
+    #[test]
+    fn chain_state_commits_before_the_anchor_store_is_called() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        #[derive(Debug)]
+        struct InterruptedStore {
+            inner: InMemoryTipAnchorStore,
+            armed: AtomicBool,
+        }
+        impl TipAnchorStore for InterruptedStore {
+            fn load_anchor(&self) -> Result<Option<TipAnchor>, TipAnchorStoreError> {
+                self.inner.load_anchor()
+            }
+            fn load_raw(&self) -> Result<Option<String>, TipAnchorStoreError> {
+                self.inner.load_raw()
+            }
+            fn reanchor_count(&self) -> Result<Option<u64>, TipAnchorStoreError> {
+                self.inner.reanchor_count()
+            }
+            fn store_anchor(&self, anchor: &TipAnchor) -> Result<(), TipAnchorStoreError> {
+                assert!(!self.armed.load(Ordering::SeqCst), "interrupt anchor write");
+                self.inner.store_anchor(anchor)
+            }
+            fn bump_reanchor_count(&self) -> Result<u64, TipAnchorStoreError> {
+                self.inner.bump_reanchor_count()
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InterruptedStore {
+            inner: InMemoryTipAnchorStore::new(),
+            armed: AtomicBool::new(false),
+        });
+        let mut writer = AuditWriter::open(
+            path.clone(),
+            Some(KeyedAuditAccess::new(
+                Zeroizing::new([0x5a; 32]),
+                store.clone(),
+            )),
+        )
+        .unwrap();
+        store.armed.store(true, Ordering::SeqCst);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                writer.write_entry(make_entry("")).unwrap();
+            }))
+            .is_err()
         );
-        assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
+        let durable = tip_of(&path);
+        assert_eq!(writer.entry_count, durable.entry_count);
+        assert_eq!(writer.end_offset, durable.end_offset);
+        assert_eq!(writer.last_hash, durable.tip_hash);
     }
 
     /// A log replaced by RENAME under a live keyed writer is refused, the

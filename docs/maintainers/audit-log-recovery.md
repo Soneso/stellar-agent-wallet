@@ -55,7 +55,7 @@ comparison detects divergence.
 
 The process then stops using that writer: the caller holding it is refused on its next row, and every later request is refused with the same message until nothing references it, at which point the next value verb opens whatever is now at the path and checks THAT file against the anchor.
 
-**A row refused on a replaced log leaves the anchor one entry ahead.** An append that is refused records, in the keyring, the row it was obliged to write: its count, its hash, and where it would have ended. That record is best-effort, like every other anchor write. When the keyring itself rejects it, the refusal still stands for the writer that made it and for every caller still holding that writer, but it does not survive the process. The signature described below is then absent, and the log looks like one that simply stopped. The action that row was going to prove has already committed, so the obligation outlives the process that failed to meet it. No file at the path satisfies the anchor afterward, including a byte-identical copy of the log as it stood a moment earlier. An anchor exactly one entry ahead of a log whose own chain verifies cleanly is that signature. `audit verify <log-path>` will report the chain intact while the anchored count exceeds the entry count by one. Treat it as a row that was owed and not written, establish what happened to the file, and recover with the acknowledging repair below. The `audit_tip_anchored` row it writes names the superseded anchor, which is the permanent record that a row went missing.
+**A row refused on a replaced log leaves the anchor one entry ahead.** An append that is refused records, in the keyring, the row it was obliged to write: its count, its hash, and where it would have ended. That record retries once immediately and remains best-effort. When the keyring itself rejects it, the refusal still stands for the writer that made it and for every caller still holding that writer, but it does not survive the process. The signature described below is then absent, and the log looks like one that simply stopped. The action that row was going to prove has already committed, so the obligation outlives the process that failed to meet it. No file at the path satisfies the anchor afterward, including a byte-identical copy of the log as it stood a moment earlier. An anchor exactly one entry ahead of a log whose own chain verifies cleanly is that signature. `audit verify <log-path>` will report the chain intact while the anchored count exceeds the entry count by one. Treat it as a row that was owed and not written, establish what happened to the file, and recover with the acknowledging repair below. The `audit_tip_anchored` row it writes names the superseded anchor, which is the permanent record that a row went missing.
 
 The same durability applies to a log truncated or overwritten in place inside that span: the append refuses on the file's length or on the entry at its own last append, and anchors the owed row identically. One row can still be lost, in the adjacent syscalls between an append's check and its write; the anchor then describes the displaced file, which is what turns the loss into a refusal rather than into silence.
 
@@ -113,6 +113,12 @@ An anchor naming the newest archive's handoff is recognised automatically on the
 
 There is no anchor value meaning "this file is empty". Offset 0 is a prefix of every file, so such a value would make every file read as ahead of the anchor and a restore would be absorbed rather than refused.
 
+A keyring write outage can leave the stored anchor on the pre-handoff tip when
+both the handoff and first new-file anchor fail. The live writer retains the
+repair coordinates. After process exit, open and `audit verify` report
+`audit.tip_anchor_mismatch` on this honest log. Verify the chain and investigate
+the outage, then use `audit reanchor --profile <name> --acknowledge-rollback`.
+
 ## 3. What the anchor does not protect
 
 The anchor detects rollback and truncation. It does not detect forgery.
@@ -125,7 +131,7 @@ The anchor is also not a cross-host guarantee. It is held in the local keyring a
 
 It is also not continuous in time. The anchor is written after the entry it covers is fsynced, because failing an append over a keyring error would misreport a row that was written. That leaves three states, and they differ in kind:
 
-- **Lagging.** Between an entry's fsync and its anchor write landing, the anchor names the previous entry of this file. A rollback to that entry or later is absorbed; anything earlier is still refused. A failed write is retried at the start of the next append, so a transient keyring error costs one entry; an outage widens it to the appends made during the outage.
+- **Lagging.** Between an entry's fsync and its anchor write landing, the anchor names the previous entry of this file. A rollback to that entry or later is absorbed; anything earlier is still refused. The write retries once immediately, then on the next append or keyed acquisition. After process exit, rollback to the previous anchor silently loses the unanchored tail. An outage widens the lag to the appends made during the outage.
 - **Off, no anchor yet.** Until the first keyed append on a log path, nothing is anchored: a new profile, or the first use of a log written before the anchor existed. A changed `audit_log_path` is refused by the audit binding until it is acknowledged (§4). Adoption takes the file as it finds it. A rollback performed before that first acquisition becomes the baseline, silently, because there is no earlier anchored state to compare it against.
 - **Off, freshly rotated file.** From a rotation until the first append into the new file has its anchor write land, the anchor still names the archive's handoff. Any prefix of the new file, down to empty, is accepted if it chains from that handoff. Normally one append wide; a keyring outage spanning that append holds it open.
 
@@ -248,3 +254,31 @@ Deleting a line drops a consent row whose approval may already have taken effect
 **What it means.** The outbox lock stayed held for the whole 2 s wait. Another process is appending to or draining the outbox, or a process holding it has stopped responding.
 
 **Recovery.** Retry. If it persists, find the process holding `<log>.outbox.lock` (`lsof <log>.outbox.lock` on Unix) and stop it; the lock is released when its holder exits. `approve --id` refuses with this code and persists nothing, so retrying it is safe.
+
+## 9. Tip anchor unavailable
+
+**Detail sub-code:** `audit.tip_anchor_unavailable`
+
+**What it means.** The keyring-held tip anchor could not be read or written.
+A keyed append retries its anchor once immediately. Two failed writes leave
+the row durable and the anchor behind. Plain appends continue best-effort, and
+`require_anchor_current()` repairs or refuses without writing a row.
+A submission recorded through the pending row, the window-state reset, and an
+x402 payment require repair before and after their pre-action row.
+The pending row maps the refusal to `submission.record_unavailable`; the reset
+and x402 use `audit.chain_key_unavailable`. The detail names the sub-code.
+A pending-row refusal before the row writes no receipt and no row. After the
+row, the recorder attempts the release of the reservation, a
+`value_action_failed` row under `submission.record_unavailable` that closes
+the pending row, and the removal of the receipt, each best-effort and logged.
+A resend that the reservation's duplicate check refuses after its row leaves
+that row open for the original submission's settlement. Nothing is sent.
+An x402 refusal keeps the admitted spend. A refusal after the authorized row
+also records `x402_authorization_withheld` with stage `anchor_unavailable`.
+MPP's charge row keeps its existing flow.
+
+**Recovery.** Restore keyring access and retry. A live writer retries the
+anchor value it still owes; a keyed reopen absorbs an honest tail in the same
+generation. Reopening still refuses while the keyring is unavailable. Use
+`audit reanchor` only for an established mismatch, including the rotation
+outage in section 2.5.

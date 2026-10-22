@@ -128,7 +128,7 @@ pub(crate) mod redact;
 pub mod rotation;
 pub mod schema;
 pub mod signer_set;
-#[cfg(feature = "test-helpers")]
+#[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
 pub mod tip_anchor;
 pub mod verify;
