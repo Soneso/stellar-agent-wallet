@@ -3694,7 +3694,8 @@ async fn a_submission_that_cannot_be_recorded_sends_nothing() {
 ///
 /// `confirm` makes `getTransaction` report `SUCCESS`; `advance_sequence` makes
 /// the source account report the sequence the submitted transaction needed,
-/// which is what tells a `NOT_FOUND` apart from "not indexed yet".
+/// which is what tells a `NOT_FOUND` apart from "not indexed yet". `sends`
+/// counts every `sendTransaction` the responder answers.
 #[derive(Clone)]
 struct PayReconcileRpcResponder {
     account_key_xdr: String,
@@ -3703,6 +3704,7 @@ struct PayReconcileRpcResponder {
     base_sequence: i64,
     confirm: Arc<std::sync::atomic::AtomicBool>,
     advance_sequence: Arc<std::sync::atomic::AtomicBool>,
+    sends: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PayReconcileRpcResponder {
@@ -3714,8 +3716,27 @@ impl PayReconcileRpcResponder {
             base_sequence,
             confirm: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advance_sequence: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
+}
+
+/// Mounts, ahead of every other answer, a `sendTransaction` guard that
+/// expects no call: whatever the test does after this point must not send.
+/// The guard is verified when the server is dropped.
+async fn forbid_sends_from_here(server: &MockServer) {
+    server
+        .register(
+            Mock::given(method("POST"))
+                .and(wiremock::matchers::body_partial_json(
+                    serde_json::json!({"method": "sendTransaction"}),
+                ))
+                .respond_with(ResponseTemplate::new(500))
+                .with_priority(1)
+                .expect(0)
+                .named("reconciliation never sends"),
+        )
+        .await;
 }
 
 #[async_trait]
@@ -3768,11 +3789,25 @@ impl Respond for PayReconcileRpcResponder {
                     serde_json::json!({ "entries": [], "latestLedger": 1001 })
                 }
             }
-            "sendTransaction" => serde_json::json!({
-                "hash": crate::common::submitted_tx_hash(request),
-                "status": "PENDING",
-                "latestLedger": 1001,
-                "latestLedgerCloseTime": "1234567890"
+            "sendTransaction" => {
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                serde_json::json!({
+                    "hash": crate::common::submitted_tx_hash(request),
+                    "status": "PENDING",
+                    "latestLedger": 1001,
+                    "latestLedgerCloseTime": "1234567890"
+                })
+            }
+            "getLedgers" => serde_json::json!({
+                "latestLedger": 2000,
+                "oldestLedger": 1,
+                "latestLedgerCloseTime": (stellar_agent_core::timefmt::now_unix_ms()
+                    .expect("clock")
+                    / 1_000)
+                    .to_string(),
+                "oldestLedgerCloseTime": 1,
+                "cursor": "2000",
+                "ledgers": []
             }),
             "getTransaction" => {
                 if self.confirm.load(Ordering::Acquire) {
@@ -3822,6 +3857,7 @@ async fn transaction_status_confirms_a_timed_out_submission() {
 
     let responder = PayReconcileRpcResponder::new(&source_g, 100_000_000_000_000, 41);
     let confirm = Arc::clone(&responder.confirm);
+    let sends = Arc::clone(&responder.sends);
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(responder)
@@ -3836,6 +3872,19 @@ async fn transaction_status_confirms_a_timed_out_submission() {
     let commit = simulate_then_commit(&server, &pay_args(&source_g, "600000000")).await;
     let json = call_result_json(&commit);
     assert_eq!(json["error"]["code"], "submission.tx_timeout");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.ends_with(
+            "; its outcome is unknown: settle it by its transaction hash and do not resubmit"
+        ),
+        "the agent-facing message names the recovery: {json}"
+    );
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the commit sent once"
+    );
+    forbid_sends_from_here(&mock_server).await;
     let tx_hash = json["error"]["details"]["tx_hash"]
         .as_str()
         .expect("the timeout reports its hash")
@@ -3892,6 +3941,12 @@ async fn transaction_status_confirms_a_timed_out_submission() {
         submitted[0]["envelope_hash"], envelope_hash,
         "the settled row names the same submission as the pending row: {rows:?}"
     );
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "reconciliation sent nothing after the commit's own send"
+    );
+    drop(mock_server);
 }
 
 /// Reconciling a timed-out submission the chain never took releases its hold
@@ -3912,6 +3967,7 @@ async fn transaction_status_releases_a_submission_the_chain_never_took() {
 
     let responder = PayReconcileRpcResponder::new(&source_g, 100_000_000_000_000, 41);
     let advance = Arc::clone(&responder.advance_sequence);
+    let sends = Arc::clone(&responder.sends);
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(responder)
@@ -3919,6 +3975,7 @@ async fn transaction_status_releases_a_submission_the_chain_never_took() {
         .await;
 
     let profile = timeout_profile(&mock_server.uri(), "acct-f2-release");
+    let audit_profile = profile.clone();
     let mut server = WalletServer::new(profile).expect("WalletServer::new");
     let profile_name = server.profile_name_for_approval();
     // The reconciliation tool is named in the rule as well: an operator policy
@@ -3950,6 +4007,12 @@ async fn transaction_status_releases_a_submission_the_chain_never_took() {
     // Something else consumed the sequence the submitted transaction needed,
     // so it can never apply.
     advance.store(true, std::sync::atomic::Ordering::Release);
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the commit sent once"
+    );
+    forbid_sends_from_here(&mock_server).await;
 
     let status = server
         .call_stellar_transaction_status(stellar_agent_mcp::server::StellarTransactionStatusArgs {
@@ -3974,12 +4037,36 @@ async fn transaction_status_releases_a_submission_the_chain_never_took() {
         status_json["data"]["record"]["reservation_open"], false,
         "the reservation is released: {status_json}"
     );
+    assert_eq!(
+        status_json["data"]["record"]["release_code"], "submission.sequence_consumed",
+        "the record names the evidence the reservation was released on: {status_json}"
+    );
+    assert!(
+        status_json["data"]["reservation"].is_null(),
+        "no hold remains: {status_json}"
+    );
 
     let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name)
         .expect("receipt store");
     assert_eq!(
         receipts.get(&envelope_hash).unwrap().unwrap().status,
         stellar_agent_core::profile::receipt::ReceiptStatus::Ambiguous
+    );
+    let rows = audit_rows(&audit_profile);
+    let failed: Vec<_> = rows_of_kind(&rows, "value_action_failed")
+        .into_iter()
+        .filter(|row| row["envelope_hash"] == envelope_hash.as_str())
+        .collect();
+    assert_eq!(
+        failed.len(),
+        1,
+        "the release writes its settled row: {rows:?}"
+    );
+    assert_eq!(failed[0]["code"], "submission.sequence_consumed");
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "reconciliation sent nothing after the commit's own send"
     );
 
     // With the reservation released, the cap admits the next payment again.
@@ -3993,6 +4080,128 @@ async fn transaction_status_releases_a_submission_the_chain_never_took() {
         "a released reservation stops holding the cap: {}",
         call_result_text(&sim)
     );
+}
+
+/// A resend of the same signed bytes after their receipt was lost is refused
+/// before the send, and the original's settlement stays owed, so a later
+/// `SUCCESS` writes the submitted row for it.
+///
+/// The rebuilt payment carries the same fee, sequence and operation, so its
+/// envelope hash is the original's. The receipt gate admits it because the
+/// receipt is gone; the spending window still holds the original's
+/// reservation under that hash, which is what refuses it. The cap is large
+/// enough for both payments, so the gate does not decide this.
+#[tokio::test]
+#[serial]
+async fn a_resend_after_a_lost_receipt_is_refused_and_the_original_settles_later() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().expect("mock keyring store init");
+    install_test_nonce_key(236);
+
+    let seed = [0x67_u8; 32];
+    let source_g = gstrkey_for_seed(seed);
+    keyring_core::Entry::new("svc", "acct-lost-receipt")
+        .expect("Entry::new")
+        .set_password(&sstrkey_for_seed(seed))
+        .expect("set_password");
+
+    let responder = PayReconcileRpcResponder::new(&source_g, 100_000_000_000_000, 41);
+    let confirm = Arc::clone(&responder.confirm);
+    let sends = Arc::clone(&responder.sends);
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(responder)
+        .mount(&mock_server)
+        .await;
+
+    let profile = timeout_profile(&mock_server.uri(), "acct-lost-receipt");
+    let audit_profile = profile.clone();
+    let mut server = WalletServer::new(profile).expect("WalletServer::new");
+    let profile_name = server.profile_name_for_approval();
+    server.set_policy_engine_for_test(Arc::new(per_period_cap_engine(
+        &[
+            "stellar_pay",
+            "stellar_pay_commit",
+            "stellar_transaction_status",
+        ],
+        &profile_name,
+        100_000_000_000,
+        "1d",
+    )));
+
+    let first =
+        call_result_json(&simulate_then_commit(&server, &pay_args(&source_g, "600000000")).await);
+    assert_eq!(first["error"]["code"], "submission.tx_timeout");
+    let tx_hash = first["error"]["details"]["tx_hash"]
+        .as_str()
+        .expect("the timeout reports its hash")
+        .to_owned();
+    let envelope_hash = first["error"]["details"]["envelope_hash"]
+        .as_str()
+        .expect("the timeout reports its envelope hash")
+        .to_owned();
+
+    // The receipt file is lost; the reservation stands.
+    let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name)
+        .expect("receipt store");
+    std::fs::remove_file(receipts.file_path().unwrap()).unwrap();
+    assert!(receipts.get(&envelope_hash).unwrap().is_none());
+
+    let resend =
+        call_result_json(&simulate_then_commit(&server, &pay_args(&source_g, "600000000")).await);
+    assert_eq!(
+        resend["error"]["code"], "submission.tx_already_submitted",
+        "the same bytes are refused: {resend}"
+    );
+    assert_eq!(resend["error"]["details"]["tx_hash"], tx_hash.as_str());
+    assert_eq!(
+        resend["error"]["details"]["envelope_hash"],
+        envelope_hash.as_str(),
+        "the resend carries the original's bytes: {resend}"
+    );
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the resend is refused before the send"
+    );
+    forbid_sends_from_here(&mock_server).await;
+
+    let named = |rows: &[serde_json::Value], kind: &str| {
+        rows_of_kind(rows, kind)
+            .into_iter()
+            .filter(|row| row["envelope_hash"] == envelope_hash.as_str())
+            .count()
+    };
+    let rows = audit_rows(&audit_profile);
+    assert_eq!(named(&rows, "value_action_pending"), 1, "{rows:?}");
+    assert_eq!(
+        named(&rows, "value_action_failed"),
+        0,
+        "the refused resend writes no row, so the original stays owed: {rows:?}"
+    );
+
+    // The chain had the original all along.
+    confirm.store(true, std::sync::atomic::Ordering::Release);
+    let status = call_result_json(
+        &server
+            .call_stellar_transaction_status(
+                stellar_agent_mcp::server::StellarTransactionStatusArgs {
+                    chain_id: "stellar:testnet".to_owned(),
+                    tx_hash: tx_hash.clone(),
+                },
+            )
+            .await
+            .expect("the status tool must not error"),
+    );
+    assert_eq!(status["data"]["record"]["status"], "success", "{status}");
+    let rows = audit_rows(&audit_profile);
+    assert_eq!(
+        named(&rows, "value_action_submitted"),
+        1,
+        "the original's settled row is the submitted one: {rows:?}"
+    );
+    assert_eq!(named(&rows, "value_action_failed"), 0, "{rows:?}");
+    drop(mock_server);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

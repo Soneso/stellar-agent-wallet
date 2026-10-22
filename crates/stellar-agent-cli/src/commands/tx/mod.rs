@@ -7,8 +7,7 @@
 //!
 //! - [`status`] asks the chain what became of one transaction and settles the
 //!   wallet's record of it. This is the way out of `submission.tx_timeout`.
-//! - [`receipt`] is the operator's last resort for the two states
-//!   reconciliation cannot settle.
+//! - [`receipt`]: close a submission record after reconciling it against the chain.
 
 pub mod receipt;
 pub mod status;

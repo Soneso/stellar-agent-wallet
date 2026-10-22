@@ -83,7 +83,14 @@
 //!
 //! A NOT_FOUND releases only within retention after observing a consumed
 //! sequence or a ledger close time strictly past a nonzero maxTime, followed
-//! by a fresh NOT_FOUND. A fresh SUCCESS or FAILED settles that chain outcome.
+//! by a fresh NOT_FOUND. That release records its evidence on the receipt as
+//! `release_code` and is reported as settled, so the caller writes the
+//! settled audit row under it. A fresh SUCCESS or FAILED settles that chain
+//! outcome. A release drops only the pending records of a reservation; a
+//! confirmed record under the same id keeps counting. A reservation id is
+//! the envelope hash of one signed envelope, so a second reservation for an
+//! id the file already holds is refused as
+//! [`WindowStoreError::DuplicateReservation`].
 //! The pass shares one bounded getLedgers observation; unavailable or invalid
 //! chain time closes the time arm. The host clock only controls minimum age.
 //! Receiptless holds beyond retention carry an authenticated operator marker,
@@ -160,8 +167,8 @@ pub mod store;
 
 pub use store::{
     MintOutcome, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
-    RECONCILE_MIN_AGE_MS, ReconcileReport, ResetError, ResetOutcome, SettledSubmission,
-    WindowReservation,
+    RECONCILE_MIN_AGE_MS, ReconcileFailure, ReconcileReport, ResetError, ResetOutcome,
+    SettledSubmission, WindowReservation,
 };
 
 /// Records a confirmed call's contribution into `engine`'s window state and
@@ -314,4 +321,14 @@ pub enum WindowStoreError {
         /// The typed denial, built from the refused entry's limit.
         reason: Box<stellar_agent_core::policy::DenyReason>,
     },
+
+    /// The file already holds a record under the reservation's id.
+    ///
+    /// Produced by [`PersistedWindowStore::record_pending`], under the
+    /// store's lock. The id is the envelope hash of the signed bytes, so the
+    /// window has already counted these bytes: the submission that wrote the
+    /// record settles them. The duplicate is refused before another reservation
+    /// can count that spend. Nothing is written.
+    #[error("the spending window already holds a reservation for these signed bytes")]
+    DuplicateReservation,
 }

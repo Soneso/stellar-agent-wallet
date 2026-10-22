@@ -481,7 +481,7 @@ claimable-balance record. It does not re-read the source trustline at commit.
 | `stellar_claim_commit` | Recheck record, witness, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances for an account. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
-| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it. The way out of `submission.tx_timeout`. | Reads the chain and writes the wallet's record; moves no value. Not annotated read-only. |
+| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. The way out of `submission.tx_timeout`. Reports `record.release_code` for a release on chain evidence and `reservation` for a hold that remains. | Reads the chain and writes the wallet's record; moves no value and never sends. Not annotated read-only. |
 
 A v1 rule set that names tools explicitly must include `stellar_transaction_status` to settle timed-out submissions through that server; the server logs `policy.transaction_status_unmatched` at startup when neither that tool nor `*` appears.
 
@@ -709,7 +709,9 @@ Three codes carry an additional `details` object on the error:
 `submission.tx_timeout`, `submission.tx_already_submitted` and
 `submission.hash_mismatch`. Each describes a submission whose outcome the
 wallet cannot settle on its own, and resolving it needs the full transaction
-hash, which the message redacts. `details` carries that hash, `outcome: "unknown"`,
+hash, which the message redacts. A `submission.tx_timeout` submission may
+still apply: the message says to settle it by its transaction hash and not to
+resubmit. `details` carries that hash, `outcome: "unknown"`,
 `reconcile_with: "stellar_transaction_status"`, and the envelope hash naming
 the submission record where the reporting tool holds the signed bytes.
 DeFi submission errors carry both hashes, and `stellar_transaction_status`

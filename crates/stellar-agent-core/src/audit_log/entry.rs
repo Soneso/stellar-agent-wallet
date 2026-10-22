@@ -2285,16 +2285,23 @@ impl AuditEntry {
     /// Emitted by `tx receipt clear --acknowledge`. `cleared_from` names the
     /// receipt status the clear replaced, and `reservation_released` records
     /// whether a spending-window reservation was released with it.
-    /// `transaction_hash_redacted` MUST be pre-redacted to first-8-last-8 at
-    /// the call site; `envelope_hash` carries the full envelope hash the
-    /// operator addressed.
+    /// `evidence` is the wire code of the chain evidence on which
+    /// reconciliation released the reservation, and `None` when the outcome
+    /// is unknown. `transaction_hash_redacted` MUST be pre-redacted to
+    /// first-8-last-8 at the call site; `envelope_hash` carries the full
+    /// envelope hash the operator addressed.
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the row names the clear, its evidence and the outer entry's identity"
+    )]
     pub fn new_submission_receipt_cleared(
         tool: impl Into<String>,
         chain_id: impl IntoOptionalChainId,
         transaction_hash_redacted: impl Into<String>,
         cleared_from: impl Into<String>,
         reservation_released: bool,
+        evidence: Option<String>,
         envelope_hash: Option<String>,
         request_id: impl Into<String>,
     ) -> Self {
@@ -2314,6 +2321,7 @@ impl AuditEntry {
                 transaction_hash_redacted: transaction_hash_redacted.into(),
                 cleared_from: cleared_from.into(),
                 reservation_released,
+                evidence,
             },
             previous_entry_hash: String::new(),
         }

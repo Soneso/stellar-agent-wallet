@@ -64,8 +64,8 @@ enum Commands {
     /// - `tx status <HASH>` — reconcile one submitted transaction against the
     ///   chain and settle the wallet's record of it. This is the way out of
     ///   `submission.tx_timeout`.
-    /// - `tx receipt clear <ENVELOPE_HASH> --acknowledge` — release a
-    ///   submission record reconciliation cannot settle.
+    /// - `tx receipt clear <ENVELOPE_HASH> --acknowledge`: close a submission
+    ///   record after reconciling it against the chain.
     Tx(commands::tx::TxArgs),
 
     /// Audit-log management subcommand group.

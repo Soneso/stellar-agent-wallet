@@ -43,7 +43,7 @@
 //!
 //! Therefore: `Ok(result)` → `status: "success"`;
 //! `Err(WalletError::Submission(TxTimeout))` → `status: "pending"` (the
-//! transaction may still confirm; the wallet's polling window expired).
+//! endpoint has not reported a confirmed outcome; the transaction may still apply).
 //! `RpcUnreachable` and `RpcTimeout` → explicit arms strip the URL from
 //! the Display string before surfacing `Sep43Error::RpcError` so the endpoint
 //! never bleeds to the dapp caller.  All other errors → SEP-43 code -3.
@@ -481,9 +481,9 @@ impl WalletServer {
             Err(stellar_agent_core::WalletError::Submission(
                 stellar_agent_core::error::SubmissionError::TxTimeout { ref tx_hash, .. },
             )) => {
-                // The transaction was submitted but not confirmed within the
-                // polling window. It MAY still be accepted in a future ledger,
-                // so the response is `status: "pending"` carrying the full
+                // The endpoint has not reported a confirmed outcome. The
+                // transaction may still apply, so the response is
+                // `status: "pending"` carrying the full
                 // transaction hash: the hash is computed from the envelope
                 // before the send, so it is always populated, and it is what
                 // `stellar_transaction_status` reconciles against.

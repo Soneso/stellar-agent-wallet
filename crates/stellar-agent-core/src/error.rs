@@ -2799,13 +2799,22 @@ pub enum SubmissionError {
         hash: String,
     },
 
-    /// The transaction was not included in a ledger within the allowed time.
+    /// The submission ended without a confirmed outcome.
+    ///
+    /// The submit path returns it when the confirmation deadline passes, and,
+    /// with a submission recorder present, when the endpoint reports an
+    /// unexpected transaction status, when a confirmation poll fails after the
+    /// send, and when the send itself fails without a definitive refusal. In
+    /// every case the signed bytes may have reached the network and the
+    /// transaction may still apply, so the message names the recovery: settle
+    /// the transaction by its hash, and never resubmit.
     ///
     /// `tx_hash` holds the hex-encoded transaction hash (public identifier).
     /// Display output redacts to first-8-last-8.
     /// `seconds` holds the submission timeout in seconds.
     #[error(
-        "transaction '{redacted}' was not confirmed within {seconds}s",
+        "transaction '{redacted}' was not confirmed within {seconds}s; its outcome is unknown: \
+         settle it by its transaction hash and do not resubmit",
         redacted = redact_tx_hash_display(tx_hash)
     )]
     TxTimeout {
@@ -4001,6 +4010,13 @@ mod tests {
         assert_eq!(e.code(), "submission.tx_timeout");
         // short hash (≤16 chars) is not redacted.
         assert!(e.message().contains("aabb1122ccddeeff"));
+        // The message names the recovery, so an agent reading only the text
+        // settles the hash instead of resubmitting.
+        assert_eq!(
+            e.message(),
+            "transaction 'aabb1122ccddeeff' was not confirmed within 60s; its outcome is \
+             unknown: settle it by its transaction hash and do not resubmit"
+        );
 
         // AuthError::SignerKeyMismatch
         let e = WalletError::Auth(AuthError::SignerKeyMismatch {
@@ -4216,6 +4232,12 @@ mod tests {
         assert!(msg.contains("abcdef01"), "must show first-8: {msg}");
         assert!(msg.contains("23456789"), "must show last-8: {msg}");
         assert!(!msg.contains(&full_hash), "must NOT show full hash: {msg}");
+        assert!(
+            msg.ends_with(
+                "; its outcome is unknown: settle it by its transaction hash and do not resubmit"
+            ),
+            "TxTimeout Display must name the recovery: {msg}"
+        );
 
         // TxAlreadySubmitted Display redacts to first-8-last-8.
         let already_err = WalletError::Submission(SubmissionError::TxAlreadySubmitted {

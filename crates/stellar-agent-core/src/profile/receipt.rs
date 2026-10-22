@@ -154,8 +154,9 @@ pub const RECEIPT_LOCK_BACKOFF: Duration = Duration::from_millis(20);
 /// # Variant lifecycle
 ///
 /// The submission path produces and consumes: `Pending`, `Success`, `Failed`.
-/// `Ambiguous` and `Reorged` are defined here for the full schema but are only
-/// **set** by the retention-aware polling path.
+/// Reconciliation against the chain sets `Success`, `Failed` and `Ambiguous`;
+/// the idempotent submit helper's retention-aware polling sets `Ambiguous` and
+/// `Reorged`; `tx receipt clear --acknowledge` sets `ClearedByOperator`.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
@@ -180,17 +181,23 @@ pub enum ReceiptStatus {
         code: String,
     },
 
-    /// Transaction status is unknown.
+    /// No `TransactionResult` exists for the transaction, and the wallet
+    /// records its outcome as unknown.
     ///
     /// Set by:
-    /// - The stale-Pending crash-recovery path when `getTransaction` returns
-    ///   `NOT_FOUND` after `max_time` has elapsed, or when the stored `tx_hash`
-    ///   is the all-zeros sentinel (unknown true hash — no resubmit is safe).
-    /// - The retention-aware polling path when the RPC retention window closes
-    ///   before a terminal response is received.
-    ///
-    /// The caller may safely resubmit **after** `max_time` has elapsed (the
-    /// original is then structurally too late; a replay cannot double-apply).
+    /// - Window-store reconciliation when it releases a reservation on chain
+    ///   evidence: the source account's sequence reached the transaction's,
+    ///   or an observed ledger close time passed its nonzero time bound, and
+    ///   a fresh `getTransaction` still reports `NOT_FOUND`. The receipt then
+    ///   carries the evidence in [`SubmissionReceipt::release_code`]. The
+    ///   transaction can no longer apply, which rests on the endpoint's
+    ///   answers being honest.
+    /// - Window-store reconciliation when the endpoint's retention window no
+    ///   longer covers the submission ledger, so `NOT_FOUND` proves nothing.
+    ///   No evidence is recorded and the reservation stands.
+    /// - Orphan recovery ([`ReceiptStore::recover_from_reservation`]).
+    /// - The idempotent submit helper's stale-Pending and retention-aware
+    ///   polling paths.
     Ambiguous,
 
     /// A previously-confirmed transaction was evicted by a ledger re-org.
@@ -200,19 +207,37 @@ pub enum ReceiptStatus {
     /// separately from "it was rejected".
     Reorged,
 
-    /// An operator acknowledged an unresolvable submission and released its
-    /// hold on the spending window.
+    /// An operator acknowledged a submission and released its hold on the
+    /// spending window.
     ///
-    /// Written by `tx receipt clear --acknowledge` for the two states
-    /// reconciliation cannot settle: a submitted `Pending` receipt whose
-    /// transaction `getTransaction` reports `NOT_FOUND`, and an `Ambiguous`
-    /// receipt whose window reservation is still open because the submission
-    /// ledger has fallen outside the endpoint's retention window.
+    /// Written by `tx receipt clear --acknowledge` after the command has
+    /// reconciled the submission against the chain: for an `Ambiguous`
+    /// receipt released on chain evidence (once its settled audit row is in
+    /// the log), an `Ambiguous` receipt without evidence, a `Pending` receipt
+    /// with no time bound, a `Pending` receipt that was never sent, and an
+    /// orphan recovered from its reservation. A sent `Pending` receipt whose
+    /// time bound is still open and whose sequence is unconsumed is refused.
     ///
     /// The receipt is marked, not removed, so the envelope keeps its
     /// idempotency anchor: a byte-identical resubmission still gets
     /// [`BeginOutcome::AlreadyPresent`] from [`ReceiptStore::try_begin`].
     ClearedByOperator,
+}
+
+/// The audit row owed by a settled submission.
+///
+/// Deliberately exhaustive: every caller chooses the audit row from this
+/// answer, so a new variant must make each caller fail to compile until it
+/// handles that row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettledRow<'a> {
+    /// The chain confirmed the submission.
+    Submitted,
+    /// The chain rejected the submission or evidence released its reservation.
+    Failed {
+        /// The failure or release-evidence code recorded on the row.
+        code: &'a str,
+    },
 }
 
 impl ReceiptStatus {
@@ -248,20 +273,37 @@ impl ReceiptStatus {
 
     /// Returns `true` when an operator may clear a receipt in this status.
     ///
-    /// The two states reconciliation cannot settle: a `Pending` receipt, whose
-    /// transaction the endpoint does not report, and an `Ambiguous` one, whose
-    /// submission ledger has fallen outside the endpoint's retention window. A
-    /// receipt the network answered for is refused, because it needs no
-    /// acknowledgement.
+    /// The local half of the rule: a `Pending` receipt and an `Ambiguous` one.
+    /// A receipt the network answered for (`Success`, `Failed`, `Reorged`) is
+    /// refused, because it needs no acknowledgement, and so is one already
+    /// cleared.
     ///
     /// The chain-side half of the rule is the caller's: clearing states that
     /// the transaction did not move value, and only the endpoint can
     /// contradict that. `stellar-agent tx receipt clear` evaluates this
     /// predicate first, so a clear it will refuse releases nothing and writes
-    /// no row, then asks the endpoint before it accepts.
+    /// no row, then asks the endpoint, reconciles, and refuses a sent
+    /// transaction whose time bound is still open.
     #[must_use]
     pub fn is_operator_clearable(&self) -> bool {
         matches!(self, Self::Pending | Self::Ambiguous)
+    }
+
+    /// Returns the settled audit row owed, using the receipt's `release_code`.
+    ///
+    /// `Success` owes a submitted row. `Failed` owes a failed row with its code;
+    /// `Ambiguous` with evidence owes a failed row with the evidence's code.
+    /// Other states return `None` because they owe no settled row.
+    #[must_use]
+    pub fn settled_row(&self, release_code: Option<ReleaseEvidence>) -> Option<SettledRow<'_>> {
+        match (self, release_code) {
+            (Self::Success, _) => Some(SettledRow::Submitted),
+            (Self::Failed { code }, _) => Some(SettledRow::Failed { code }),
+            (Self::Ambiguous, Some(evidence)) => Some(SettledRow::Failed {
+                code: evidence.code(),
+            }),
+            _ => None,
+        }
     }
 
     /// Returns the stable wire tag for this status.
@@ -277,6 +319,52 @@ impl ReceiptStatus {
             Self::Ambiguous => "ambiguous",
             Self::Reorged => "reorged",
             Self::ClearedByOperator => "cleared_by_operator",
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ReleaseEvidence
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wire code of [`ReleaseEvidence::SequenceConsumed`].
+pub const SEQUENCE_CONSUMED_CODE: &str = "submission.sequence_consumed";
+
+/// Wire code of [`ReleaseEvidence::TimeBoundPassed`].
+pub const TIME_BOUND_PASSED_CODE: &str = "submission.time_bound_passed";
+
+/// The chain evidence on which reconciliation released a reservation whose
+/// transaction the endpoint never reported.
+///
+/// Both kinds rest on a fresh `getTransaction` answer of `NOT_FOUND` taken
+/// after the evidence was observed, from an endpoint whose retention window
+/// covers the submission ledger. No `TransactionResult` exists for either, so
+/// the receipt stays [`ReceiptStatus::Ambiguous`] and carries the evidence in
+/// [`SubmissionReceipt::release_code`].
+///
+/// Serialized as its wire code, the same string the settled
+/// `value_action_failed` audit row carries.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReleaseEvidence {
+    /// The source account's sequence reached the one the transaction
+    /// consumes, so another transaction used it.
+    #[serde(rename = "submission.sequence_consumed")]
+    SequenceConsumed,
+    /// An observed ledger close time is strictly past the transaction's
+    /// nonzero `maxTime`, so the network can no longer apply it.
+    #[serde(rename = "submission.time_bound_passed")]
+    TimeBoundPassed,
+}
+
+impl ReleaseEvidence {
+    /// Returns the stable wire code for this evidence:
+    /// [`SEQUENCE_CONSUMED_CODE`] or [`TIME_BOUND_PASSED_CODE`].
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::SequenceConsumed => SEQUENCE_CONSUMED_CODE,
+            Self::TimeBoundPassed => TIME_BOUND_PASSED_CODE,
         }
     }
 }
@@ -466,6 +554,27 @@ pub struct SubmissionReceipt {
     /// Approval metadata is unknown when the original receipt is absent.
     #[serde(default)]
     pub recovered_from_reservation: bool,
+
+    /// The chain evidence on which reconciliation released this receipt's
+    /// reservation.
+    ///
+    /// Set once, from `None` to `Some`, and only on an
+    /// [`ReceiptStatus::Ambiguous`] receipt, by
+    /// [`ReceiptStore::finalize_released`]. It survives an operator clear, so
+    /// a cleared receipt still names why its reservation was released, and
+    /// it is dropped when a definitive network answer replaces the status.
+    /// The status surfaces read it to write the settled `value_action_failed`
+    /// row under the evidence's wire code, so a settlement row that could not
+    /// be appended when the reservation was released is written by a later
+    /// run.
+    ///
+    /// `None` on a receipt released by a binary that records no evidence and on one
+    /// whose retention window closed; such a receipt reads as `Ambiguous`
+    /// without evidence. Absent from the serialized form when `None`, so a
+    /// receipt without it keeps its bytes. A binary that predates the field
+    /// reads the receipt and drops the field when it rewrites the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_code: Option<ReleaseEvidence>,
 }
 
 /// Serde default for [`SubmissionReceipt::submitted`].
@@ -1046,6 +1155,7 @@ impl ReceiptStore {
             approval_nonce: None,
             approval_consumed: false,
             recovered_from_reservation: true,
+            release_code: None,
         };
         session
             .guard
@@ -1256,6 +1366,13 @@ impl ReceiptStore {
     /// stands; writing the status a receipt already holds is accepted and
     /// refreshes its ledger.
     ///
+    /// # Release evidence
+    ///
+    /// [`SubmissionReceipt::release_code`] stays consistent with the status:
+    /// writing `Ambiguous` keeps the evidence a receipt already carries, and
+    /// writing any other status drops it. Only
+    /// [`Self::finalize_released`] sets it.
+    ///
     /// # Errors
     ///
     /// - [`ReceiptStoreError::InvalidTransition`] if the transition is refused
@@ -1274,11 +1391,56 @@ impl ReceiptStore {
         status: ReceiptStatus,
         ledger: Option<u32>,
     ) -> Result<(), ReceiptStoreError> {
+        self.finalize_with_release(envelope_hash, status, ledger, None)
+    }
+
+    /// Records that reconciliation released the receipt's reservation on
+    /// `evidence`: the status becomes `Ambiguous` and
+    /// [`SubmissionReceipt::release_code`] carries the evidence.
+    ///
+    /// Follows the transition rule of [`Self::finalize`]: a `Pending` receipt
+    /// and an `Ambiguous` one accept it, and a settled or cleared receipt
+    /// refuses it. The evidence is written once: a receipt that already
+    /// carries evidence keeps it. An absent receipt is inserted with the
+    /// minimal identity [`Self::finalize`] inserts; a caller that holds the
+    /// submission's identity records it first.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::finalize`].
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub fn finalize_released(
+        &self,
+        envelope_hash: &str,
+        evidence: ReleaseEvidence,
+    ) -> Result<(), ReceiptStoreError> {
+        self.finalize_with_release(
+            envelope_hash,
+            ReceiptStatus::Ambiguous,
+            None,
+            Some(evidence),
+        )
+    }
+
+    /// The shared body of [`Self::finalize`] and [`Self::finalize_released`].
+    ///
+    /// `evidence` is `Some` only with `status == Ambiguous`.
+    fn finalize_with_release(
+        &self,
+        envelope_hash: &str,
+        status: ReceiptStatus,
+        ledger: Option<u32>,
+        evidence: Option<ReleaseEvidence>,
+    ) -> Result<(), ReceiptStoreError> {
         let mut session = self.write_session()?;
 
         if let Some(existing) = session.guard.map.get(envelope_hash) {
             check_transition(&existing.status, &status)?;
         }
+        let keeps_evidence = status == ReceiptStatus::Ambiguous;
 
         // Upsert: update existing entry or insert a minimal terminal receipt.
         // Inserting is safe because terminal statuses carry no sub-fields that
@@ -1293,6 +1455,11 @@ impl ReceiptStore {
             .and_modify(|r| {
                 r.status = status.clone();
                 r.ledger = ledger;
+                if !keeps_evidence {
+                    r.release_code = None;
+                } else if r.release_code.is_none() {
+                    r.release_code = evidence;
+                }
             })
             .or_insert_with(|| SubmissionReceipt {
                 envelope_hash: envelope_hash.to_owned(),
@@ -1309,6 +1476,7 @@ impl ReceiptStore {
                 approval_nonce: None,
                 approval_consumed: false,
                 recovered_from_reservation: false,
+                release_code: evidence,
             });
 
         session.guard.rebuild_indexes();
@@ -1316,8 +1484,8 @@ impl ReceiptStore {
         Ok(())
     }
 
-    /// Marks a receipt cleared by an operator and releases it from the states
-    /// reconciliation cannot settle.
+    /// Records the operator's release of a receipt the reconciliation pass
+    /// refuses or cannot finish.
     ///
     /// The accepted states are the ones [`ReceiptStatus::is_operator_clearable`]
     /// names: any `Pending` receipt, and an `Ambiguous` one. A receipt the
@@ -1737,6 +1905,7 @@ fn insert_pending(
         approval_nonce: approval_nonce.map(str::to_owned),
         approval_consumed: false,
         recovered_from_reservation: false,
+        release_code: None,
     };
 
     guard.map.insert(envelope_hash.to_owned(), receipt);
@@ -2693,6 +2862,7 @@ mod tests {
             approval_nonce: None,
             approval_consumed: false,
             recovered_from_reservation: false,
+            release_code: None,
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -2731,6 +2901,7 @@ mod tests {
             approval_nonce: None,
             approval_consumed: false,
             recovered_from_reservation: false,
+            release_code: None,
         };
 
         let json = serde_json::to_string(&r).unwrap();
@@ -3662,5 +3833,132 @@ mod tests {
                 .unwrap(),
             BeginSubmissionOutcome::Recorded
         ));
+    }
+
+    // ── Release evidence ──────────────────────────────────────────────────────
+
+    /// A receipt as a binary without the release evidence writes it reads with
+    /// no evidence, and serializes back to the same bytes.
+    #[test]
+    fn a_receipt_without_release_evidence_reads_as_none_and_keeps_its_bytes() {
+        let legacy = [
+            format!(r#"{{"envelope_hash":"{HASH_A}","tx_hash":"{TX_HASH_A}","#),
+            format!(r#""source":"{SOURCE_A}","sequence":{SEQ_A},"#),
+            r#""status":{"state":"ambiguous"},"recorded_at_ledger":1000,"max_time":0,"#.to_owned(),
+            r#""submitted":true,"approval_consumed":false,"recovered_from_reservation":false}"#
+                .to_owned(),
+        ]
+        .concat();
+        let receipt: SubmissionReceipt = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Ambiguous);
+        assert_eq!(receipt.release_code, None);
+
+        let written = serde_json::to_string(&receipt).unwrap();
+        assert!(
+            !written.contains("release_code"),
+            "an absent release code is not serialized: {written}"
+        );
+        assert_eq!(written, legacy, "the receipt keeps its serialized bytes");
+    }
+
+    /// The evidence serializes as its wire code, the string the settled audit
+    /// row carries.
+    #[test]
+    fn release_evidence_serializes_as_its_wire_code() {
+        for (evidence, code) in [
+            (
+                ReleaseEvidence::SequenceConsumed,
+                "submission.sequence_consumed",
+            ),
+            (
+                ReleaseEvidence::TimeBoundPassed,
+                "submission.time_bound_passed",
+            ),
+        ] {
+            assert_eq!(evidence.code(), code);
+            let json = serde_json::to_string(&evidence).unwrap();
+            assert_eq!(json, format!("\"{code}\""));
+            assert_eq!(
+                serde_json::from_str::<ReleaseEvidence>(&json).unwrap(),
+                evidence
+            );
+        }
+    }
+
+    /// The evidence is written once onto an ambiguous receipt, survives a
+    /// reopen and an operator clear, and is dropped by a definitive answer.
+    #[test]
+    fn release_evidence_is_set_once_and_follows_the_status() {
+        let (dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 50)
+            .unwrap();
+        store.mark_submitted(HASH_A).unwrap();
+
+        store
+            .finalize_released(HASH_A, ReleaseEvidence::SequenceConsumed)
+            .unwrap();
+        let released = store.get(HASH_A).unwrap().unwrap();
+        assert_eq!(released.status, ReceiptStatus::Ambiguous);
+        assert_eq!(
+            released.release_code,
+            Some(ReleaseEvidence::SequenceConsumed)
+        );
+        let raw = std::fs::read_to_string(store.file_path().unwrap()).unwrap();
+        assert!(
+            raw.contains(r#""release_code": "submission.sequence_consumed""#),
+            "the persisted receipt carries the wire code: {raw}"
+        );
+
+        // Once: later evidence and a plain ambiguous write keep the first.
+        store
+            .finalize_released(HASH_A, ReleaseEvidence::TimeBoundPassed)
+            .unwrap();
+        store
+            .finalize(HASH_A, ReceiptStatus::Ambiguous, None)
+            .unwrap();
+        let reopened = ReceiptStore::open_at(dir.path(), "test").unwrap();
+        assert_eq!(
+            reopened.get(HASH_A).unwrap().unwrap().release_code,
+            Some(ReleaseEvidence::SequenceConsumed)
+        );
+
+        // An operator clear keeps the reason the reservation was released.
+        let cleared = store.clear_by_operator(HASH_A).unwrap();
+        assert_eq!(cleared.status, ReceiptStatus::ClearedByOperator);
+        assert_eq!(
+            cleared.release_code,
+            Some(ReleaseEvidence::SequenceConsumed)
+        );
+
+        // A definitive answer replaces the unknown outcome and its evidence.
+        store
+            .finalize(HASH_A, ReceiptStatus::Success, Some(9))
+            .unwrap();
+        let settled = store.get(HASH_A).unwrap().unwrap();
+        assert_eq!(settled.status, ReceiptStatus::Success);
+        assert_eq!(settled.release_code, None);
+    }
+
+    /// A receipt the network answered for refuses release evidence and keeps
+    /// its status.
+    #[test]
+    fn a_settled_receipt_refuses_release_evidence() {
+        let (_dir, store) = open_temp_store();
+        store
+            .try_begin(HASH_A, TX_HASH_A, SOURCE_A, SEQ_A, 0, 50)
+            .unwrap();
+        store
+            .finalize(HASH_A, ReceiptStatus::Success, Some(9))
+            .unwrap();
+
+        let refused = store.finalize_released(HASH_A, ReleaseEvidence::TimeBoundPassed);
+        assert!(
+            matches!(refused, Err(ReceiptStoreError::InvalidTransition { .. })),
+            "{refused:?}"
+        );
+        let receipt = store.get(HASH_A).unwrap().unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Success);
+        assert_eq!(receipt.release_code, None);
     }
 }

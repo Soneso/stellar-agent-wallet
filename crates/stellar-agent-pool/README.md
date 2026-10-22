@@ -13,8 +13,10 @@ An interrupted initialization appears in `pool status`, including its transactio
 and `pool init --resume` command. Resume derives the same channel keys, completes
 configuration for accounts observed on chain, or retries a failed creation when no
 channel exists. An unknown outcome remains pending; a creation whose receipt settles
-as ambiguous is retried only after `tx receipt clear --acknowledge` records that it
-did not apply, which `pool status` names. `--force` refuses to replace a pending seed.
+as ambiguous, past the endpoint's retention window or released on chain evidence, is
+retried only after `tx receipt clear --acknowledge` records that it did not apply,
+which `pool status` names. That clear reconciles first and writes any settled row
+the release owes before it clears. `--force` refuses to replace a pending seed.
 
 Library callers supply a nonoptional `SubmissionRecorder` to `InitParams` and
 `submit_pooled`. Sponsored initialization has no transferred balance, so its

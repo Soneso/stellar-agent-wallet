@@ -2865,12 +2865,20 @@ pub enum EventKind {
         code: String,
     },
 
-    /// An operator acknowledged a submission whose outcome reconciliation
-    /// cannot settle, and released its hold on the spending window.
+    /// An operator acknowledged a submission and released its hold on the
+    /// spending window.
     ///
-    /// Written by `tx receipt clear --acknowledge`. The row names the state
+    /// Written by `tx receipt clear --acknowledge` after the command has
+    /// reconciled the submission against the chain. The row names the state
     /// the receipt was left in, so the log records what the operator
-    /// acknowledged rather than only that they acknowledged something.
+    /// acknowledged rather than only that they acknowledged something, and
+    /// it names the chain evidence when reconciliation released the
+    /// reservation on evidence. A row without `evidence` records an outcome
+    /// that is unknown.
+    ///
+    /// The row is not a settlement: a cleared receipt owes no
+    /// `value_action_*` row. When reconciliation released the reservation on
+    /// evidence, the settled `value_action_failed` row precedes this one.
     ///
     /// # Field redaction
     ///
@@ -2879,14 +2887,25 @@ pub enum EventKind {
     /// # Schema additivity
     ///
     /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    /// `evidence` is absent from a row that carries none, so such a row keeps
+    /// its serialized form.
     SubmissionReceiptCleared {
         /// Transaction hash of the cleared submission, redacted first-8-last-8.
         transaction_hash_redacted: String,
         /// The receipt status the clear replaced, as its stable wire tag
         /// (`"pending"` or `"ambiguous"`).
         cleared_from: String,
-        /// Whether a spending-window reservation was released by the clear.
+        /// True when the command finds a held reservation at its start or
+        /// after its reconciliation, and releases it through reconciliation
+        /// or the clear. False when no reservation is held while it runs.
+        /// An evidence release is recorded in `evidence`.
         reservation_released: bool,
+        /// The wire code of the chain evidence on which reconciliation
+        /// released the reservation (`"submission.sequence_consumed"` or
+        /// `"submission.time_bound_passed"`); absent when the outcome is
+        /// unknown and in older rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<String>,
     },
 
     /// An x402 payment authorization was signed and is about to leave the
@@ -6172,5 +6191,37 @@ mod tests {
         let golden = r#"{"kind":"policy_window_state_reset","profile":"alice","reason":"repair"}"#;
         let row: EventKind = serde_json::from_str(golden).unwrap();
         assert_eq!(serde_json::to_string(&row).unwrap(), golden);
+    }
+
+    /// A cleared row without evidence keeps its serialized bytes, and one with
+    /// evidence carries the wire code.
+    #[test]
+    fn cleared_row_evidence_is_additive() {
+        let golden = concat!(
+            r#"{"kind":"submission_receipt_cleared","transaction_hash_redacted":"abcd...wxyz","#,
+            r#""cleared_from":"pending","reservation_released":true}"#
+        );
+        let row: EventKind = serde_json::from_str(golden).unwrap();
+        assert!(matches!(
+            &row,
+            EventKind::SubmissionReceiptCleared { evidence: None, .. }
+        ));
+        assert_eq!(serde_json::to_string(&row).unwrap(), golden);
+
+        let with_evidence = EventKind::SubmissionReceiptCleared {
+            transaction_hash_redacted: "abcd...wxyz".to_owned(),
+            cleared_from: "ambiguous".to_owned(),
+            reservation_released: true,
+            evidence: Some("submission.time_bound_passed".to_owned()),
+        };
+        let json = serde_json::to_string(&with_evidence).unwrap();
+        assert!(
+            json.ends_with(r#""evidence":"submission.time_bound_passed"}"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<EventKind>(&json).unwrap(),
+            with_evidence
+        );
     }
 }

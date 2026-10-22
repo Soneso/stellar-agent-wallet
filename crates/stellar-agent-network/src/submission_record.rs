@@ -120,8 +120,8 @@ pub enum SubmissionOutcome {
     },
 
     /// The send step refused the bytes definitively: `sendTransaction`
-    /// answered `ERROR` with a real `TransactionResult`. Nothing was queued,
-    /// no value moved, and the refusal is not retried.
+    /// answered `ERROR` with a real `TransactionResult`; no value moved, and the
+    /// refusal is not retried.
     Rejected {
         /// Stable wire code for the refusal.
         code: String,
@@ -168,8 +168,9 @@ pub trait SubmissionRecorder: Send + Sync {
     /// # Errors
     ///
     /// Returning an error refuses the send. Implementations return one when
-    /// the record cannot be written, and when a pending record already holds
-    /// this transaction's `(source, sequence)`.
+    /// the record cannot be written, when a pending record already holds
+    /// this transaction's `(source, sequence)`, and when the spending window
+    /// already holds these signed bytes.
     async fn pre_send(&self, intent: &SubmissionIntent) -> Result<(), WalletError>;
 
     /// Settles the record against what the network said.
@@ -552,6 +553,30 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
         // From here the receipt exists and holds the pair. Every remaining
         // step is undone on failure, so a submission that never reached the
         // network leaves the sequence free for the retry the refusal invites.
+        //
+        // The window file is the other record of these exact bytes: its
+        // reservation id is the envelope hash. A receipt lost while that
+        // reservation stands lets the gate above admit a resend of the same
+        // bytes, so the window is asked before the pending row is written. A
+        // refusal here writes no row, which leaves the original submission's
+        // settlement owed until its own reconciliation writes it. The window
+        // is consulted only where this submission takes a reservation; a
+        // policy without a stateful criterion keeps no window records.
+        if !self.window_entries.is_empty() && window_precheck_enabled() {
+            let refusal = match self
+                .window
+                .holds_reservation(self.profile, &intent.envelope_hash)
+            {
+                Ok(false) => None,
+                Ok(true) => Some(already_submitted(intent)),
+                Err(e) => Some(reservation_refusal(e, intent)),
+            };
+            if let Some(refusal) = refusal {
+                self.unwind(intent, UnwoundAfter::Receipt, refusal.code());
+                return Err(refusal);
+            }
+        }
+
         if let Err(e) = self.write_pending_row(intent) {
             self.unwind(intent, UnwoundAfter::Receipt, e.code());
             return Err(e);
@@ -564,8 +589,18 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
                 &self.reservation(intent),
             )
         {
-            let refusal = reservation_refusal(e);
-            self.unwind(intent, UnwoundAfter::PendingRow, refusal.code());
+            // A duplicate found under the lock is a resend of bytes another
+            // process reserved between the check above and this write. The
+            // pending row just written names the same envelope hash as that
+            // submission's, so the settled row its reconciliation writes
+            // closes both, so this row stays open. Every other refusal closes
+            // the row out.
+            let reached = match e {
+                WindowStoreError::DuplicateReservation => UnwoundAfter::Receipt,
+                _ => UnwoundAfter::PendingRow,
+            };
+            let refusal = reservation_refusal(e, intent);
+            self.unwind(intent, reached, refusal.code());
             return Err(refusal);
         }
 
@@ -641,16 +676,27 @@ impl SubmissionRecorder for WalletSubmissionRecorder<'_> {
 ///
 /// A bucket that can no longer admit the spend is a policy denial, reported
 /// under the wire code the gate reports for the same reason and carrying the
-/// same typed reason. Every other refusal is a record the wallet could not
-/// write, which is what `submission.record_unavailable` names. Both refuse the
-/// send, and `pre_send` unwinds identically for either.
-fn reservation_refusal(error: WindowStoreError) -> WalletError {
+/// same typed reason. A window that already holds these bytes is a
+/// resubmission, reported as `submission.tx_already_submitted` with the
+/// transaction to reconcile. Every other refusal is a record the wallet could
+/// not write, which is what `submission.record_unavailable` names. All of
+/// them refuse the send.
+fn reservation_refusal(error: WindowStoreError, intent: &SubmissionIntent) -> WalletError {
     match error {
         WindowStoreError::PolicyDenied { reason } => WalletError::PolicyDenied { reason },
+        WindowStoreError::DuplicateReservation => already_submitted(intent),
         other => record_unavailable(format!(
             "the spending-window reservation could not be written: {other:?}"
         )),
     }
+}
+
+/// The refusal of a resend of bytes the wallet has already recorded: the
+/// caller reconciles the transaction it names rather than sending again.
+fn already_submitted(intent: &SubmissionIntent) -> WalletError {
+    WalletError::Submission(SubmissionError::TxAlreadySubmitted {
+        hash: intent.tx_hash.clone(),
+    })
 }
 
 /// Which way a reservation is settled.
@@ -665,7 +711,8 @@ enum WindowSettlement {
 /// How far `pre_send` got before it failed, which says what has to be undone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnwoundAfter {
-    /// The receipt exists; nothing else was written.
+    /// The receipt must be removed. On a duplicate reservation refusal the
+    /// pending row also exists and stays open for the original settlement.
     Receipt,
     /// The receipt and the pending audit row exist.
     PendingRow,
@@ -793,6 +840,24 @@ impl WalletSubmissionRecorder<'_> {
 pub static FAIL_MARK_SUBMITTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Skips the window pre-check so tests reach its in-lock duplicate backstop.
+///
+/// Only compiled when the `test-hooks` Cargo feature is enabled. Never include
+/// `test-hooks` in production or release builds.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub static SKIP_WINDOW_PRECHECK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the recorder checks for held bytes before writing its pending row.
+fn window_precheck_enabled() -> bool {
+    #[cfg(feature = "test-hooks")]
+    if SKIP_WINDOW_PRECHECK.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    true
+}
+
 fn record_unavailable(detail: impl Into<String>) -> WalletError {
     WalletError::Submission(SubmissionError::RecordUnavailable {
         detail: detail.into(),
@@ -819,13 +884,8 @@ mod tests {
         let err = record_unavailable("receipt store is not writable");
         assert_eq!(err.code(), "submission.record_unavailable");
     }
-}
 
-#[cfg(all(test, feature = "test-helpers"))]
-mod witness_tests {
-    #![allow(clippy::unwrap_used, reason = "test assertions")]
-    use super::*;
-
+    #[cfg(feature = "test-helpers")]
     #[tokio::test]
     #[serial_test::serial]
     async fn pending_and_submitted_rows_carry_the_witness() {
@@ -892,5 +952,85 @@ mod witness_tests {
                 serde_json::to_value(witness.record()).unwrap()
             );
         }
+    }
+
+    /// The in-lock duplicate refusal keeps the original settlement owed.
+    #[cfg(all(feature = "test-helpers", feature = "test-hooks"))]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn duplicate_backstop_keeps_the_pending_row_open() {
+        use stellar_agent_core::audit_log::reader::{
+            ValueActionSettlement, value_action_settlement,
+        };
+        use stellar_agent_core::policy::v1::criteria::state_store::{
+            StateKey, WindowEntry, WindowLimit,
+        };
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = Profile::builder_testnet("backstop", "s", "n", "a").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(Mutex::new(
+            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
+        ));
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        let receipts = ReceiptStore::open_at(dir.path(), "backstop").unwrap();
+        let window = PersistedWindowStore::at_path(dir.path().join("backstop.window"));
+        let recorder = WalletSubmissionRecorder::new(
+            &profile,
+            "backstop",
+            "stellar_pay_commit",
+            Some("stellar:testnet".to_owned()),
+            PolicyDecision::Allow,
+            vec![],
+            vec![WindowEntry::new(
+                StateKey::new("backstop", 1, "native", 86_400),
+                now,
+                10,
+                WindowLimit::Amount {
+                    asset: "native".to_owned(),
+                    window: "1d".to_owned(),
+                    max_stroops: 1_000,
+                },
+            )],
+            receipts.clone(),
+            window.clone(),
+            Some(audit.clone()),
+            None,
+            "request",
+            now,
+        );
+        let intent = SubmissionIntent {
+            envelope_hash: "7a".repeat(32),
+            tx_hash: "8b".repeat(32),
+            source: format!("{}", stellar_strkey::ed25519::PublicKey([7; 32])),
+            sequence: 7,
+            max_time: 0,
+            submission_ledger: 123,
+        };
+        recorder.pre_send(&intent).await.unwrap();
+        std::fs::remove_file(receipts.file_path().unwrap()).unwrap();
+        SKIP_WINDOW_PRECHECK.store(true, std::sync::atomic::Ordering::Release);
+        let refused = recorder.pre_send(&intent).await;
+        SKIP_WINDOW_PRECHECK.store(false, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            refused.unwrap_err().code(),
+            "submission.tx_already_submitted"
+        );
+        assert!(receipts.get(&intent.envelope_hash).unwrap().is_none());
+        assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
+        drop(recorder);
+        drop(audit);
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["kind"] == "value_action_pending"));
+        assert!(matches!(
+            value_action_settlement(&profile.audit_log_path, &intent.envelope_hash),
+            ValueActionSettlement::Owed(_)
+        ));
     }
 }

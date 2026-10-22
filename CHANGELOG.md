@@ -232,6 +232,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `SUCCESS` or `FAILED` status that arrives after the submission deadline is
   not accepted. The submission reports its timeout, and `tx status` settles the
   transaction hash.
+- The `submission.tx_timeout` message names the recovery: the outcome is
+  unknown, settle the transaction by its hash and do not resubmit. The
+  descriptions of `stellar_pay_commit`, `stellar_claim_commit`,
+  `stellar_trustline_commit` and `stellar_create_account_commit` say the same.
+- `tx receipt clear --acknowledge` reconciles the submission before it clears
+  it. A sent transaction that is still `pending` after that reconciliation,
+  with a time bound that has not passed on the endpoint's latest ledger and an
+  unconsumed sequence, is refused with `submission.still_pending`. A release on
+  chain evidence and a closed retention window are cleared instead. A
+  failed ledger-time read refuses sent, timed submissions with
+  `network.rpc_unreachable`. Other failed reconciliation reads also refuse.
+  Without `--acknowledge`, the refusal names the next step.
+- `stellar_transaction_status` settles a submission whose receipt is missing by
+  its reservation, as `tx status` does, and returns `reservation`
+  `{envelope_hash, operator_required}` when a hold remains. A receipt store
+  that cannot be read after reconciliation is reported as
+  `submission.record_unavailable`.
+- `stellar_transaction_status` refuses with `submission.record_unavailable`
+  when the spending-window file cannot be read.
+- Reconciliation writes the receipt before settling the window. A failed
+  receipt write leaves the reservation pending for a later pass.
+  `ReconcileReport` gains `receipt_write_failed` and `receipt_write_error`,
+  which carries the first receipt-store error for the clear refusal.
+  Struct literals must supply `ReconcileReport.endpoint_failure`,
+  `ReconcileReport.receipt_write_failed`, `ReconcileReport.receipt_write_error`,
+  and `SettledSubmission.release_code`.
+- The `record` of `tx status` and `stellar_transaction_status` carries
+  `release_code` for a reservation released on chain evidence.
+- A resubmission of signed bytes the spending window already holds is refused
+  with `submission.tx_already_submitted` before the pending audit row and the
+  send, under a policy with a stateful criterion. The original submission's
+  settlement stays owed.
+- Submission receipts gain `release_code`. A receipt without it keeps its
+  serialized form. An older binary reads a receipt that carries it and drops
+  the field when it rewrites the receipt store.
+- A `submission_receipt_cleared` row with `evidence` verifies with this release
+  or later. An older binary refuses once a checked root HMAC, later row or tip
+  anchor covers that row. It can read an uncovered tail with `evidence`
+  dropped; a row it then appends makes this release refuse the extended log at
+  that row. Rows without `evidence` retain their serialized form.
+- `stellar_agent_core::profile::receipt` gains `ReleaseEvidence`,
+  `SEQUENCE_CONSUMED_CODE`, and `TIME_BOUND_PASSED_CODE`.
+  It adds `ReceiptStore::finalize_released`, `ReceiptStatus::settled_row`, and `SettledRow`;
+  `SubmissionReceipt` gains `release_code`.
+  `AuditEntry::new_submission_receipt_cleared` takes the evidence, and
+  `EventKind::SubmissionReceiptCleared` gains `evidence`. `WindowStoreError`
+  gains `DuplicateReservation`. `PersistedWindowStore::holds_reservation` and
+  `ReconcileFailure` are new; `ReconcileReport` gains `endpoint_failure` and
+  `SettledSubmission` gains `release_code`.
 - `pay`, `claim`, sponsored `accounts create`, `trustline`, and `pool init`, and
   the MCP commit tools for pay, create-account, trustline, and claim, check the
   RPC endpoint on the client that sends. The check runs before the fee,
@@ -310,6 +359,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `counterparty warm-up` skips Stellar strkeys and `CODE:ISSUER` values in
   mixed-kind allowlists.
+- A reservation released on chain evidence writes its settled
+  `value_action_failed` row under `submission.sequence_consumed` or
+  `submission.time_bound_passed`. The receipt keeps the reason, so a later
+  `tx status` or `stellar_transaction_status` writes the row when the append
+  failed, and a missing receipt is restored with it.
+- A release drops only the pending records of a reservation, so confirmed
+  spend under the same envelope hash keeps counting.
 - The counterparty cache reads and mints its HMAC key at the profile's
   `counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.
   With an explicit reference, cached entries read as absent until a refresh

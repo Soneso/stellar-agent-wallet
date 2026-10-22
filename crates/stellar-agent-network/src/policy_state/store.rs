@@ -16,7 +16,9 @@ use stellar_agent_core::policy::v1::criteria::state_store::{
     CLOCK_SKEW_TOLERANCE_MS, PolicyStateStore, StateKey, StateStoreError, WindowEntry,
 };
 use stellar_agent_core::profile::owner_key::{self, OwnerKeyContext};
-use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
+use stellar_agent_core::profile::receipt::{
+    ReceiptStatus, ReceiptStore, ReceiptStoreError, ReleaseEvidence,
+};
 use stellar_agent_core::profile::schema::{
     KeyringEntryRef, Profile, default_policy_window_state_path_for, generation_account,
 };
@@ -52,6 +54,11 @@ struct ReconcilePass {
     observed: bool,
     oldest_ledger: Option<u32>,
     chain: Option<(u32, u64)>,
+    /// A ledger-time failure, promoted only when a sent, timed reservation needs it.
+    ledger_failure: Option<ReconcileFailure>,
+    /// The first endpoint failure the pass met. A later successful read does
+    /// not clear it.
+    failure: Option<ReconcileFailure>,
 }
 
 impl ReconcilePass {
@@ -62,6 +69,18 @@ impl ReconcilePass {
             observed: false,
             oldest_ledger: None,
             chain: None,
+            ledger_failure: None,
+            failure: None,
+        }
+    }
+
+    /// Records an endpoint failure, keeping the first one the pass met.
+    fn fail(&mut self, client: &crate::client::StellarRpcClient, reason: String) {
+        if self.failure.is_none() {
+            self.failure = Some(ReconcileFailure {
+                endpoint: client.url.authority().to_owned(),
+                reason,
+            });
         }
     }
 
@@ -86,6 +105,7 @@ impl ReconcilePass {
             Ok(health) => health,
             Err(error) => {
                 tracing::debug!(%error, "window reconcile: retention observation unavailable; reservation stands");
+                self.fail(client, network_failure_reason(error));
                 return;
             }
         };
@@ -102,19 +122,40 @@ impl ReconcilePass {
             ),
         )
         .await;
-        if let Ok(Ok(answer)) = answer
-            && answer.latest_ledger_close_time > 0
-            && answer.latest_ledger_close_time >= answer.oldest_ledger_close_time
-            && answer.latest_ledger >= health.latest_ledger
-            && answer.oldest_ledger <= answer.latest_ledger
-        {
-            self.oldest_ledger = Some(health.oldest_ledger.max(answer.oldest_ledger));
-            self.chain = Some((answer.latest_ledger, answer.latest_ledger_close_time as u64));
-            return;
-        }
+        let reason = match answer {
+            Ok(Ok(answer))
+                if answer.latest_ledger_close_time > 0
+                    && answer.latest_ledger_close_time >= answer.oldest_ledger_close_time
+                    && answer.latest_ledger >= health.latest_ledger
+                    && answer.oldest_ledger <= answer.latest_ledger =>
+            {
+                self.oldest_ledger = Some(health.oldest_ledger.max(answer.oldest_ledger));
+                self.chain = Some((answer.latest_ledger, answer.latest_ledger_close_time as u64));
+                return;
+            }
+            Ok(Ok(_)) => "getLedgers answered without a valid ledger close time".to_owned(),
+            Ok(Err(error)) => format!("getLedgers failed: {}", client.url.scrub_display(&error)),
+            Err(_) => format!(
+                "getLedgers did not answer within {}s",
+                LEDGER_OBSERVATION_TIMEOUT.as_secs()
+            ),
+        };
         tracing::debug!(
             "window reconcile: valid ledger close time unavailable; time-bound release stays closed"
         );
+        self.ledger_failure = Some(ReconcileFailure {
+            endpoint: client.url.authority().to_owned(),
+            reason,
+        });
+    }
+}
+
+/// The reason text of a failed endpoint read, without the endpoint's
+/// authority, which [`ReconcileFailure::endpoint`] carries.
+fn network_failure_reason(error: stellar_agent_core::error::NetworkError) -> String {
+    match error {
+        stellar_agent_core::error::NetworkError::RpcUnreachable { reason, .. } => reason,
+        other => other.to_string(),
     }
 }
 
@@ -263,32 +304,76 @@ pub struct ReconcileReport {
     pub rpc_calls: usize,
     /// Reservations confirmed by a `SUCCESS` answer.
     pub confirmed: usize,
-    /// Reservations released, either by a `FAILED` answer or because the
-    /// transaction can no longer apply.
+    /// Reservations released, either by a `FAILED` answer or on chain
+    /// evidence that the transaction can no longer apply.
     pub released: usize,
-    /// Reservations left standing because the answer settled nothing.
+    /// Reservations left standing because the answers settled nothing, an
+    /// endpoint failure included.
     pub kept_pending: usize,
+    /// Receipt writes that failed; their reservations remain pending for a later pass.
+    pub receipt_write_failed: usize,
+    /// The first receipt-store error that prevented an outcome from being recorded.
+    pub receipt_write_error: Option<String>,
     /// Reservations whose transaction the endpoint no longer remembers, so
-    /// `NOT_FOUND` proves nothing. Their receipts are marked ambiguous and the
-    /// reservations stand until an operator resolves them.
+    /// `NOT_FOUND` proves nothing. Their receipts are marked ambiguous without
+    /// release evidence and the reservations stand until an operator resolves
+    /// them.
     pub retention_expired: usize,
-    /// The submissions the pass settled against a definitive answer, in the
-    /// order it settled them.
+    /// The submissions the pass settled, in the order it settled them: one
+    /// per definitive answer, and one per release on chain evidence.
     ///
     /// The pass holds no audit writer of its own, so it reports what it
     /// settled and the caller writes the value-action row each one is owed.
     pub settled: Vec<SettledSubmission>,
+    /// The first unusable transaction, health or account read. An absent source
+    /// account leaves its sequence unknown without setting this field. A ledger-time
+    /// failure counts only when a sent, timed reservation needs that observation.
+    /// A later successful read in the same pass does not clear the failure.
+    ///
+    /// A reservation such a failure left standing is reported in
+    /// `kept_pending`. A caller that has to tell "the transaction can still
+    /// apply" apart from "the endpoint could not say" reads this field.
+    pub endpoint_failure: Option<ReconcileFailure>,
 }
 
-/// One submission a reconciliation pass settled against a definitive answer.
+/// An endpoint read a reconciliation pass could not complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileFailure {
+    /// The endpoint's scheme, host and port.
+    pub endpoint: String,
+    /// What failed, scrubbed of credentials and credential-bearing URLs.
+    pub reason: String,
+}
+
+impl ReconcileFailure {
+    /// The error the wallet reports for the failure,
+    /// `network.rpc_unreachable`: the code the status surfaces report when
+    /// the endpoint cannot be asked about a transaction.
+    #[must_use]
+    pub fn to_network_error(&self) -> stellar_agent_core::error::NetworkError {
+        stellar_agent_core::error::NetworkError::RpcUnreachable {
+            url: self.endpoint.clone(),
+            reason: self.reason.clone(),
+        }
+    }
+}
+
+/// One submission a reconciliation pass settled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettledSubmission {
     /// The envelope hash naming the submission record.
     pub envelope_hash: String,
     /// The transaction the chain answered for, in full.
     pub tx_hash: String,
-    /// The status the receipt now holds.
+    /// The status the receipt now holds: `Success` or `Failed` for a
+    /// definitive answer, `Ambiguous` for a release on chain evidence.
     pub status: ReceiptStatus,
+    /// The chain evidence of a release whose outcome is unknown; `None` for a
+    /// definitive answer.
+    ///
+    /// The caller writes the settled `value_action_failed` row under the
+    /// evidence's wire code.
+    pub release_code: Option<ReleaseEvidence>,
     /// The ledger the transaction confirmed in, when it did.
     pub ledger: Option<u32>,
 }
@@ -621,6 +706,16 @@ impl PersistedWindowStore {
     /// refused as [`WindowStoreError::PolicyDenied`] before anything is
     /// written. Admission is whole-batch: every entry is written, or none is.
     ///
+    /// # One reservation per envelope
+    ///
+    /// The reservation id is the envelope hash of the signed bytes. A file
+    /// that already holds a record under that id, pending or confirmed, has
+    /// already counted those bytes, so a second reservation is refused as
+    /// [`WindowStoreError::DuplicateReservation`] before admission. The
+    /// check runs under the lock; a caller asks
+    /// [`Self::holds_reservation`] first so that the refusal precedes its
+    /// own records.
+    ///
     /// # Errors
     ///
     /// See [`WindowStoreError`]. A batch a bucket can no longer admit is
@@ -639,6 +734,9 @@ impl PersistedWindowStore {
         let gen_entry = generation_entry_ref(profile);
         let mut wire = self.read_verified(&key, &gen_entry)?;
 
+        if file_holds_id(&wire, &reservation.id) {
+            return Err(WindowStoreError::DuplicateReservation);
+        }
         admit(&wire, new_entries)?;
 
         for entry in new_entries {
@@ -705,11 +803,17 @@ impl PersistedWindowStore {
         })
     }
 
-    /// Removes every record held by reservation `id`.
+    /// Removes every pending record held by reservation `id`.
     ///
     /// Called where the transaction can no longer apply: the network refused
-    /// it, it failed on-chain, or reconciliation established that it cannot
-    /// land. The reserved amount stops counting against the window.
+    /// it, it failed on-chain, reconciliation established that it cannot
+    /// land, or an operator acknowledged it. The reserved amount stops
+    /// counting against the window.
+    ///
+    /// A confirmed record carrying `id` is kept: it is spend the chain
+    /// applied, and it counts until it ages out of its window. A release for a
+    /// reservation that holds no pending record changes nothing and writes
+    /// nothing.
     ///
     /// # Errors
     ///
@@ -718,7 +822,9 @@ impl PersistedWindowStore {
         self.rewrite_records(profile, |wire| {
             let before: usize = wire.entries.iter().map(|b| b.records.len()).sum();
             for bucket in &mut wire.entries {
-                bucket.records.retain(|r| r.id != id);
+                bucket
+                    .records
+                    .retain(|r| r.id != id || r.status != RecordStatus::Pending);
             }
             wire.entries.retain(|b| !b.records.is_empty());
             let after: usize = wire.entries.iter().map(|b| b.records.len()).sum();
@@ -753,6 +859,26 @@ impl PersistedWindowStore {
         result
     }
 
+    /// Whether any record in the file, pending or confirmed, carries
+    /// reservation `id`.
+    ///
+    /// The reservation id is the envelope hash of the signed bytes, so a
+    /// `true` answer means the window has already counted those bytes. An
+    /// empty `id` matches nothing: confirmed spend recorded without a
+    /// reservation carries an empty id.
+    ///
+    /// Verifies the file's HMAC tag and generation, like every other read,
+    /// and takes no lock.
+    ///
+    /// # Errors
+    ///
+    /// See [`WindowStoreError`].
+    pub fn holds_reservation(&self, profile: &Profile, id: &str) -> Result<bool, WindowStoreError> {
+        Ok(self
+            .read_for_inspection(profile)?
+            .is_some_and(|wire| file_holds_id(&wire, id)))
+    }
+
     /// Returns every reservation the file currently holds pending, oldest
     /// first.
     ///
@@ -773,24 +899,36 @@ impl PersistedWindowStore {
     }
 
     /// Settles up to `budget` reservations that have stood at least
-    /// [`RECONCILE_MIN_AGE_MS`], oldest first, against the chain.
+    /// [`RECONCILE_MIN_AGE_MS`], oldest first, on receipt evidence or chain
+    /// answers.
     ///
-    /// Per reservation, one `getTransaction`:
+    /// Per reservation, recorded release evidence or `getTransaction` answers:
     ///
+    /// - A reservation whose receipt already records release evidence is
+    ///   released on it with no endpoint call, and the receipt is not written
+    ///   again.
     /// - `SUCCESS` confirms the reservation and finalizes the receipt.
     /// - `FAILED` releases the reservation and finalizes the receipt failed.
     /// - `NOT_FOUND` is only evidence when the endpoint would still remember
     ///   the transaction. When the reservation's submission ledger predates
     ///   the endpoint's retention floor it proves nothing, so the reservation
-    ///   stands and the receipt is marked ambiguous for an operator to
-    ///   resolve. Otherwise the reservation is released when the source
-    ///   account's sequence has reached the one the transaction needs, or an
-    ///   observed ledger close time is strictly past its nonzero time bound.
-    ///   Both arms require a fresh `NOT_FOUND`; a fresh definitive answer
-    ///   settles the spend. Missing chain time closes only the time arm.
+    ///   stands and the receipt is marked ambiguous, without release evidence,
+    ///   for an operator to resolve. Otherwise the reservation is released
+    ///   when the source account's sequence has reached the one the
+    ///   transaction needs, or an observed ledger close time is strictly past
+    ///   its nonzero time bound. Both arms require a fresh `NOT_FOUND`; a
+    ///   fresh definitive answer settles the spend. Missing chain time closes
+    ///   only the time arm.
+    /// - A release on that evidence marks the receipt ambiguous and records
+    ///   the evidence on it ([`ReleaseEvidence::SequenceConsumed`] or
+    ///   [`ReleaseEvidence::TimeBoundPassed`]). A missing receipt is restored
+    ///   from the reservation's identity first, the way a definitive answer
+    ///   restores one, and the release is reported in
+    ///   [`ReconcileReport::settled`] so the caller writes its settled row.
     ///
-    /// An endpoint that cannot answer leaves the reservation standing. Nothing
-    /// here releases a reservation on a transport error.
+    /// An endpoint that cannot answer leaves the reservation standing and is
+    /// reported in [`ReconcileReport::endpoint_failure`]. Nothing here
+    /// releases a reservation on a transport error.
     ///
     /// `now_ms` is the caller's clock, the same seam every other store
     /// operation takes it through.
@@ -811,12 +949,11 @@ impl PersistedWindowStore {
             return Ok(ReconcileReport::default());
         };
 
-        // Oldest first, but past a reservation whose receipt already records
-        // an unknown outcome. Those are the oldest records in the file and
-        // the endpoint can no longer answer for them, so leaving them in the
-        // selection would spend the whole budget on the same few every pass
-        // and no younger reservation would ever be reached. Only
-        // `tx receipt clear` settles them.
+        // Oldest first, skipping ambiguous receipts without release evidence:
+        // the budget goes only to reservations the endpoint can still answer
+        // for or a receipt can finish. An ambiguous receipt with evidence is a
+        // release whose window step did not complete; this pass finishes it.
+        // Cleared receipts also need no endpoint answer.
         // One read of the receipt file for the whole pass. The filter below
         // consults it per candidate, and re-reading it each time would cost a
         // lock acquisition and a full parse for every reservation in the file.
@@ -827,21 +964,22 @@ impl PersistedWindowStore {
         // too much settles nothing wrongly — but it is silent, so it is
         // logged: the same unreadable file is what the per-reservation read
         // below reports too.
-        let known: HashMap<String, ReceiptStatus> = match receipts.map(ReceiptStore::all) {
-            Some(Ok(all)) => all
-                .into_iter()
-                .map(|r| (r.envelope_hash, r.status))
-                .collect(),
-            Some(Err(e)) => {
-                tracing::debug!(
-                    error = %e,
-                    "window reconcile: the receipt store could not be read; the starvation \
-                     filter admits every reservation this pass"
-                );
-                HashMap::new()
-            }
-            None => HashMap::new(),
-        };
+        let known: HashMap<String, (ReceiptStatus, Option<ReleaseEvidence>)> =
+            match receipts.map(ReceiptStore::all) {
+                Some(Ok(all)) => all
+                    .into_iter()
+                    .map(|r| (r.envelope_hash, (r.status, r.release_code)))
+                    .collect(),
+                Some(Err(e)) => {
+                    tracing::debug!(
+                        error = %e,
+                        "window reconcile: the receipt store could not be read; the starvation \
+                         filter admits every reservation this pass"
+                    );
+                    HashMap::new()
+                }
+                None => HashMap::new(),
+            };
 
         let due: Vec<WindowReservation> = collect_pending(&wire)
             .into_iter()
@@ -862,16 +1000,16 @@ impl PersistedWindowStore {
         }
 
         report.rpc_calls = pass.spent;
+        report.endpoint_failure = pass.failure;
         Ok(report)
     }
 
-    /// Settles one named submission against the chain, with no budget and no
-    /// minimum age.
+    /// Settles one named submission, with no budget and no minimum age.
     ///
     /// The operator or the agent asked about this submission by name, so the
-    /// bound a background pass needs does not apply: there is exactly one
-    /// round trip's worth of work and it was requested. The release rule is
-    /// the same one [`Self::reconcile_due`] applies.
+    /// bound a background pass needs does not apply: the work covers one
+    /// requested submission. The release rule is the same one
+    /// [`Self::reconcile_due`] applies.
     ///
     /// Works whether or not the submission holds a reservation. An action the
     /// policy engine sized no value for takes none, and its receipt is still
@@ -910,6 +1048,7 @@ impl PersistedWindowStore {
             .await?;
         record_settlement(&mut report, &reservation, settlement);
         report.rpc_calls = pass.spent;
+        report.endpoint_failure = pass.failure;
         Ok(report)
     }
 
@@ -1183,8 +1322,8 @@ impl PersistedWindowStore {
         Ok(())
     }
 
-    /// Settles one reservation against the chain. See [`Self::reconcile_due`]
-    /// for the rule this implements.
+    /// Settles one reservation on receipt evidence or a chain answer. See
+    /// [`Self::reconcile_due`] for the rule this implements.
     async fn settle_reservation(
         &self,
         profile: &Profile,
@@ -1193,11 +1332,18 @@ impl PersistedWindowStore {
         reservation: &WindowReservation,
         pass: &mut ReconcilePass,
     ) -> Result<Settlement, WindowStoreError> {
-        // A missing receipt leaves the authenticated reservation as the
+        // A reservation whose receipt already records release evidence is
+        // released on it with no endpoint call, and the receipt is not written
+        // again. A missing receipt leaves the authenticated reservation as the
         // submission identity. Its chain outcome and retention boundary still
         // govern settlement. An unreadable receipt store keeps the hold.
         if let Some(store) = receipts {
             match store.get(&reservation.id) {
+                Ok(Some(receipt)) if receipt.status == ReceiptStatus::Ambiguous => {
+                    if let Some(evidence) = receipt.release_code {
+                        return self.release_on_evidence(profile, receipts, reservation, evidence);
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => {
                     tracing::debug!(
@@ -1228,6 +1374,10 @@ impl PersistedWindowStore {
                     error = %client.url.scrub_display(&e),
                     "window reconcile: getTransaction failed; reservation stands"
                 );
+                pass.fail(
+                    client,
+                    format!("getTransaction failed: {}", client.url.scrub_display(&e)),
+                );
                 return Ok(Settlement::KeptPending);
             }
         };
@@ -1254,27 +1404,35 @@ impl PersistedWindowStore {
     ) -> Result<Settlement, WindowStoreError> {
         match record.status() {
             "SUCCESS" => {
-                self.confirm(profile, &reservation.id, record.created_at())?;
-                finalize_receipt(
+                if let Err(error) = finalize_receipt(
                     receipts,
                     reservation,
                     ReceiptStatus::Success,
                     record.ledger(),
-                );
+                ) {
+                    return Ok(Settlement::ReceiptWriteFailed {
+                        error: error.to_string(),
+                    });
+                }
+                self.confirm(profile, &reservation.id, record.created_at())?;
                 Ok(Settlement::Confirmed {
                     ledger: record.ledger(),
                 })
             }
             "FAILED" => {
-                self.release(profile, &reservation.id)?;
                 let code = crate::submit::map_failed_record(record).code().to_owned();
-                finalize_receipt(
+                if let Err(error) = finalize_receipt(
                     receipts,
                     reservation,
                     ReceiptStatus::Failed { code: code.clone() },
                     None,
-                );
-                Ok(Settlement::Released { code: Some(code) })
+                ) {
+                    return Ok(Settlement::ReceiptWriteFailed {
+                        error: error.to_string(),
+                    });
+                }
+                self.release(profile, &reservation.id)?;
+                Ok(Settlement::Failed { code })
             }
             _ => Ok(Settlement::KeptPending),
         }
@@ -1306,12 +1464,18 @@ impl PersistedWindowStore {
             if let Some(receipts) = receipts {
                 match receipts.get(&reservation.id) {
                     Ok(None) => self.mark_operator_required(profile, &reservation.id)?,
-                    Ok(Some(_)) => finalize_receipt(
-                        Some(receipts),
-                        reservation,
-                        ReceiptStatus::Ambiguous,
-                        None,
-                    ),
+                    Ok(Some(_)) => {
+                        if let Err(error) = finalize_receipt(
+                            Some(receipts),
+                            reservation,
+                            ReceiptStatus::Ambiguous,
+                            None,
+                        ) {
+                            return Ok(Settlement::ReceiptWriteFailed {
+                                error: error.to_string(),
+                            });
+                        }
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "window reconcile: receipt read failed; orphan status unknown");
                         return Ok(Settlement::KeptPending);
@@ -1321,6 +1485,16 @@ impl PersistedWindowStore {
             return Ok(Settlement::RetentionExpired);
         }
 
+        // Only a timed, sent reservation needs the failed ledger observation.
+        // An unsent receipt clears without a ledger time.
+        if reservation.max_time > 0 && pass.chain.is_none() && pass.failure.is_none() {
+            let never_sent = receipts
+                .and_then(|store| store.get(&reservation.id).ok().flatten())
+                .is_some_and(|receipt| !receipt.submitted);
+            if !never_sent {
+                pass.failure = pass.ledger_failure.clone();
+            }
+        }
         let time_expired = reservation.max_time > 0
             && reservation.submission_ledger >= floor
             && reservation.submission_ledger > 0
@@ -1329,7 +1503,14 @@ impl PersistedWindowStore {
             });
         if time_expired {
             return self
-                .fresh_answer_or_release(profile, client, receipts, reservation, pass)
+                .fresh_answer_or_release(
+                    profile,
+                    client,
+                    receipts,
+                    reservation,
+                    pass,
+                    ReleaseEvidence::TimeBoundPassed,
+                )
                 .await;
         }
 
@@ -1340,24 +1521,44 @@ impl PersistedWindowStore {
         }
         let account = match crate::account::fetch_account(client, &reservation.source, &[]).await {
             Ok(a) => a,
+            Err(stellar_agent_core::error::WalletError::Network(
+                stellar_agent_core::error::NetworkError::AccountNotFound { .. },
+            )) => return Ok(Settlement::KeptPending),
             Err(e) => {
                 tracing::debug!(
                     error = %e,
                     "window reconcile: source account fetch failed; reservation stands"
+                );
+                pass.fail(
+                    client,
+                    match e {
+                        stellar_agent_core::error::WalletError::Network(error) => {
+                            network_failure_reason(error)
+                        }
+                        other => format!("the source account could not be read: {other}"),
+                    },
                 );
                 return Ok(Settlement::KeptPending);
             }
         };
         if account.sequence_number >= reservation.sequence {
             return self
-                .fresh_answer_or_release(profile, client, receipts, reservation, pass)
+                .fresh_answer_or_release(
+                    profile,
+                    client,
+                    receipts,
+                    reservation,
+                    pass,
+                    ReleaseEvidence::SequenceConsumed,
+                )
                 .await;
         }
 
         Ok(Settlement::KeptPending)
     }
 
-    /// Rechecks the transaction after observing that it cannot apply.
+    /// Rechecks the transaction after observing `evidence` that it cannot
+    /// apply.
     async fn fresh_answer_or_release(
         &self,
         profile: &Profile,
@@ -1365,6 +1566,7 @@ impl PersistedWindowStore {
         receipts: Option<&ReceiptStore>,
         reservation: &WindowReservation,
         pass: &mut ReconcilePass,
+        evidence: ReleaseEvidence,
     ) -> Result<Settlement, WindowStoreError> {
         let Ok(hash) = stellar_agent_core::hex::decode_hex32(&reservation.tx_hash) else {
             return Ok(Settlement::KeptPending);
@@ -1380,31 +1582,45 @@ impl PersistedWindowStore {
             Err(e) => {
                 tracing::debug!(error = %client.url.scrub_display(&e),
                     "window reconcile: confirmation query failed; reservation stands");
+                pass.fail(
+                    client,
+                    format!("getTransaction failed: {}", client.url.scrub_display(&e)),
+                );
                 return Ok(Settlement::KeptPending);
             }
         };
         if record.status() == "NOT_FOUND" {
-            return self.release_as_ambiguous(profile, receipts, reservation);
+            return self.release_on_evidence(profile, receipts, reservation, evidence);
         }
         self.settle_chain_answer(profile, receipts, reservation, &record)
     }
 
     /// Releases a reservation whose transaction can no longer apply, recording
-    /// the receipt as ambiguous.
+    /// the receipt as ambiguous with the evidence that released it.
     ///
     /// The outcome is ambiguous rather than failed because no
     /// `TransactionResult` exists for it: what is established is that the
     /// transaction cannot reach a ledger, which rests on the endpoint's
-    /// answers being honest.
-    fn release_as_ambiguous(
+    /// answers being honest. The evidence is what the settled audit row
+    /// names, and what lets a later status run write that row when this pass
+    /// could not.
+    fn release_on_evidence(
         &self,
         profile: &Profile,
         receipts: Option<&ReceiptStore>,
         reservation: &WindowReservation,
+        evidence: ReleaseEvidence,
     ) -> Result<Settlement, WindowStoreError> {
+        let evidence = match release_receipt(receipts, reservation, evidence) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(Settlement::ReceiptWriteFailed {
+                    error: error.to_string(),
+                });
+            }
+        };
         self.release(profile, &reservation.id)?;
-        finalize_receipt(receipts, reservation, ReceiptStatus::Ambiguous, None);
-        Ok(Settlement::Released { code: None })
+        Ok(Settlement::ReleasedOnEvidence { evidence })
     }
 
     /// Reads and fully verifies the file for inspection, taking no lock.
@@ -1809,10 +2025,13 @@ fn prune_stale(wire: &mut WireFile, now_ms: u64) {
 
 /// Whether the receipt for `envelope_hash` already records an outcome the
 /// endpoint cannot resolve.
-fn outcome_already_unknown(known: &HashMap<String, ReceiptStatus>, envelope_hash: &str) -> bool {
+fn outcome_already_unknown(
+    known: &HashMap<String, (ReceiptStatus, Option<ReleaseEvidence>)>,
+    envelope_hash: &str,
+) -> bool {
     matches!(
         known.get(envelope_hash),
-        Some(ReceiptStatus::Ambiguous | ReceiptStatus::ClearedByOperator)
+        Some((ReceiptStatus::Ambiguous, None) | (ReceiptStatus::ClearedByOperator, _))
     )
 }
 
@@ -1824,14 +2043,23 @@ enum Settlement {
         /// The ledger the endpoint reported it in.
         ledger: Option<u32>,
     },
-    /// The transaction can no longer apply; the reservation was removed.
-    ///
-    /// `code` is present only when the chain itself reported the failure. A
-    /// release the endpoint never confirmed leaves the outcome unknown, and an
-    /// unknown outcome is what the pending audit row already records.
-    Released {
-        /// The wire code of the on-chain failure, when the chain reported one.
-        code: Option<String>,
+    /// The chain reported the transaction failed; the reservation was
+    /// removed.
+    Failed {
+        /// The wire code of the on-chain failure.
+        code: String,
+    },
+    /// The transaction can no longer apply on chain evidence, and the
+    /// endpoint never reported it; the reservation was removed and the
+    /// outcome is unknown.
+    ReleasedOnEvidence {
+        /// What established that the transaction cannot apply.
+        evidence: ReleaseEvidence,
+    },
+    /// The receipt could not record the outcome; the reservation stands.
+    ReceiptWriteFailed {
+        /// The receipt-store error as displayed to the caller.
+        error: String,
     },
     /// Nothing was established; the reservation stands.
     KeptPending,
@@ -1864,22 +2092,72 @@ fn reservation_from_receipt(receipts: &ReceiptStore, id: &str) -> Option<WindowR
 
 /// Records a terminal status on the receipt a reservation belongs to.
 ///
-/// The reservation has already been settled in the window file by the time
-/// this runs, so a receipt-store failure is logged and does not undo it: the
-/// window file is the accounting record, the receipt the reconciliation
-/// handle.
+/// A missing receipt is restored from the reservation's identity only for a
+/// definitive answer; an ambiguous status without evidence is not recorded on
+/// a receipt that does not exist.
+///
+/// The receipt is the crash checkpoint and is written before the window is
+/// settled. A failed write leaves the reservation standing for the next pass.
 fn finalize_receipt(
     receipts: Option<&ReceiptStore>,
     reservation: &WindowReservation,
     status: ReceiptStatus,
     ledger: Option<u32>,
-) {
+) -> Result<(), ReceiptStoreError> {
+    let restore = status.is_definitive_outcome();
+    persist_receipt(receipts, reservation, restore, |store| {
+        store.finalize(&reservation.id, status, ledger)
+    })
+}
+
+/// Records on the receipt a reservation belongs to that the reservation was
+/// released on `evidence`.
+///
+/// A missing receipt is restored from the reservation's identity first, as
+/// for a definitive answer, so the release and its evidence stay visible to
+/// the status surfaces and the settled row stays writable after this pass.
+/// The reservation is released only after this write succeeds.
+fn release_receipt(
+    receipts: Option<&ReceiptStore>,
+    reservation: &WindowReservation,
+    evidence: ReleaseEvidence,
+) -> Result<ReleaseEvidence, ReceiptStoreError> {
+    if let Some(store) = receipts
+        && let Some(recorded) = store
+            .get(&reservation.id)?
+            .filter(|receipt| receipt.status == ReceiptStatus::Ambiguous)
+            .and_then(|receipt| receipt.release_code)
+    {
+        return Ok(recorded);
+    }
+    persist_receipt(receipts, reservation, true, |store| {
+        store.finalize_released(&reservation.id, evidence)
+    })?;
+    // A concurrent release can record its evidence first; the receipt owns the code.
+    Ok(receipts
+        .map(|store| store.get(&reservation.id))
+        .transpose()?
+        .flatten()
+        .and_then(|receipt| receipt.release_code)
+        .unwrap_or(evidence))
+}
+
+/// Applies `write` to the receipt store, restoring a missing receipt from the
+/// reservation's identity first when `restore` is set and skipping the write
+/// otherwise. A failed write leaves the reservation standing; the receipt
+/// must be durable before the window settles.
+fn persist_receipt(
+    receipts: Option<&ReceiptStore>,
+    reservation: &WindowReservation,
+    restore: bool,
+    write: impl FnOnce(&ReceiptStore) -> Result<(), ReceiptStoreError>,
+) -> Result<(), ReceiptStoreError> {
     let Some(store) = receipts else {
-        return;
+        return Ok(());
     };
     let persist = || {
         if store.get(&reservation.id)?.is_none() {
-            if !status.is_definitive_outcome() {
+            if !restore {
                 return Ok(());
             }
             store.try_begin(
@@ -1892,50 +2170,61 @@ fn finalize_receipt(
             )?;
             store.mark_submitted(&reservation.id)?;
         }
-        store.finalize(&reservation.id, status, ledger)
+        write(store)
     };
-    if let Err(e) = persist() {
+    let result = persist();
+    if let Err(error) = &result {
         tracing::warn!(
-            error = %e,
-            "window reconcile: receipt finalize failed; the window file is settled and the \
-             receipt still reports the prior status"
+            %error,
+            "window reconcile: receipt write failed; the reservation stands"
         );
     }
+    result
 }
 
-/// Collects one [`WindowReservation`] per distinct pending reservation id,
-/// oldest first by the time the reservation was taken.
 /// Counts one settlement into `report`, and records what the caller owes an
 /// audit row for.
 ///
-/// Only a definitive answer from the chain settles a submission's value
-/// action. A release the endpoint never confirmed leaves the outcome unknown,
-/// which is what the pending row already records.
+/// A definitive answer from the chain settles a submission's value action,
+/// and so does a release on chain evidence: the settled row of an evidence
+/// release is a `value_action_failed` row under the evidence's wire code.
+/// A reservation left standing owes nothing yet, and neither does one whose
+/// retention window closed: its outcome stays unknown, which is what the
+/// pending row already records.
 fn record_settlement(
     report: &mut ReconcileReport,
     reservation: &WindowReservation,
     settlement: Settlement,
 ) {
+    let settled = |status, release_code, ledger| SettledSubmission {
+        envelope_hash: reservation.id.clone(),
+        tx_hash: reservation.tx_hash.clone(),
+        status,
+        release_code,
+        ledger,
+    };
     match settlement {
         Settlement::Confirmed { ledger } => {
             report.confirmed += 1;
-            report.settled.push(SettledSubmission {
-                envelope_hash: reservation.id.clone(),
-                tx_hash: reservation.tx_hash.clone(),
-                status: ReceiptStatus::Success,
-                ledger,
-            });
+            report
+                .settled
+                .push(settled(ReceiptStatus::Success, None, ledger));
         }
-        Settlement::Released { code } => {
+        Settlement::Failed { code } => {
             report.released += 1;
-            if let Some(code) = code {
-                report.settled.push(SettledSubmission {
-                    envelope_hash: reservation.id.clone(),
-                    tx_hash: reservation.tx_hash.clone(),
-                    status: ReceiptStatus::Failed { code },
-                    ledger: None,
-                });
-            }
+            report
+                .settled
+                .push(settled(ReceiptStatus::Failed { code }, None, None));
+        }
+        Settlement::ReleasedOnEvidence { evidence } => {
+            report.released += 1;
+            report
+                .settled
+                .push(settled(ReceiptStatus::Ambiguous, Some(evidence), None));
+        }
+        Settlement::ReceiptWriteFailed { error } => {
+            report.receipt_write_failed += 1;
+            report.receipt_write_error.get_or_insert(error);
         }
         Settlement::KeptPending => report.kept_pending += 1,
         Settlement::RetentionExpired => report.retention_expired += 1,
@@ -1979,6 +2268,18 @@ fn select_generation(
     Ok(wire)
 }
 
+/// Whether any record in `wire`, pending or confirmed, carries the non-empty
+/// reservation `id`.
+fn file_holds_id(wire: &WireFile, id: &str) -> bool {
+    !id.is_empty()
+        && wire
+            .entries
+            .iter()
+            .any(|bucket| bucket.records.iter().any(|record| record.id == id))
+}
+
+/// Collects one [`WindowReservation`] per distinct pending reservation id,
+/// oldest first by the time the reservation was taken.
 fn collect_pending(wire: &WireFile) -> Vec<WindowReservation> {
     let mut seen: Vec<WindowReservation> = Vec::new();
     for bucket in &wire.entries {
@@ -2894,6 +3195,116 @@ mod tests {
             (0, 0),
             "a released reservation stops counting against the window"
         );
+    }
+
+    /// A release drops pending records only: spend the chain confirmed under
+    /// the same reservation id keeps counting, and a release that finds
+    /// nothing pending leaves the file as it stands.
+    #[test]
+    #[serial]
+    fn release_keeps_confirmed_records() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "resv-keep-confirmed");
+        let path = dir.path().join("resv-keep-confirmed.window");
+        let store = PersistedWindowStore::at_path(path.clone());
+        let k = key("resv-keep-confirmed", "native", 86_400);
+        let now = now_ms().unwrap();
+        let id = "c1".repeat(32);
+
+        store
+            .record_pending(
+                &profile,
+                &[entry(k.clone(), now, 900)],
+                &reservation(&id, "GSOURCE", 7, now),
+            )
+            .unwrap();
+        store
+            .confirm(&profile, &id, Some((now / 1_000) as i64))
+            .unwrap();
+        let confirmed_bytes = std::fs::read(&path).unwrap();
+
+        store.release(&profile, &id).unwrap();
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            confirmed_bytes,
+            "a release with nothing pending writes nothing"
+        );
+        let dest = PolicyStateStore::new();
+        store
+            .load_into("resv-keep-confirmed", &profile, &dest)
+            .unwrap();
+        assert_eq!(
+            dest.query_window(&k, now + 1_000).unwrap(),
+            (900, 1),
+            "confirmed spend keeps counting after a release of its reservation id"
+        );
+    }
+
+    /// The file refuses a second reservation for bytes it already holds,
+    /// pending or confirmed, and writes nothing.
+    #[test]
+    #[serial]
+    fn a_reservation_for_bytes_the_file_holds_is_refused() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "resv-duplicate");
+        let path = dir.path().join("resv-duplicate.window");
+        let store = PersistedWindowStore::at_path(path.clone());
+        let k = key("resv-duplicate", "native", 86_400);
+        let now = now_ms().unwrap();
+        let id = "d1".repeat(32);
+
+        assert!(!store.holds_reservation(&profile, &id).unwrap());
+        store
+            .record_pending(
+                &profile,
+                &[entry(k.clone(), now, 400)],
+                &reservation(&id, "GSOURCE", 7, now),
+            )
+            .unwrap();
+        assert!(store.holds_reservation(&profile, &id).unwrap());
+        assert!(!store.holds_reservation(&profile, &"d2".repeat(32)).unwrap());
+        assert!(
+            !store.holds_reservation(&profile, "").unwrap(),
+            "an empty id matches no record"
+        );
+
+        for settled in [false, true] {
+            if settled {
+                store
+                    .confirm(&profile, &id, Some((now / 1_000) as i64))
+                    .unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            let refused = store.record_pending(
+                &profile,
+                &[entry(k.clone(), now, 400)],
+                &reservation(&id, "GSOURCE", 7, now),
+            );
+            assert!(
+                matches!(refused, Err(WindowStoreError::DuplicateReservation)),
+                "confirmed={settled}: {refused:?}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "nothing is written");
+        }
+
+        // Spend recorded without a reservation carries an empty id and never
+        // stands in for one.
+        store
+            .record_and_persist(&profile, &[entry(k.clone(), now, 5)])
+            .unwrap();
+        store
+            .record_pending(
+                &profile,
+                &[entry(k.clone(), now, 5)],
+                &reservation(&"d3".repeat(32), "GSOURCE", 8, now),
+            )
+            .unwrap();
+        let dest = PolicyStateStore::new();
+        store.load_into("resv-duplicate", &profile, &dest).unwrap();
+        assert_eq!(dest.query_window(&k, now + 1_000).unwrap(), (410, 3));
     }
 
     /// Reservations are reported oldest first, so a bounded reconciliation
@@ -4091,5 +4502,218 @@ mod tests {
             })
         ));
         assert!(get_raw(&f.profile.policy_window_state_key_id).is_some());
+    }
+
+    /// A failed receipt checkpoint keeps the window pending until a retry succeeds.
+    fn assert_settlement_waits_for_receipt(status: Option<&str>, missing: bool) {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "checkpoint");
+        let store = PersistedWindowStore::at_path(dir.path().join("checkpoint.window"));
+        let receipts = ReceiptStore::open_at(dir.path(), "checkpoint").unwrap();
+        let now = now_ms().unwrap();
+        let res = reservation(&"7a".repeat(32), "GSOURCE", 7, now);
+        store
+            .record_pending(
+                &profile,
+                &[entry(key("checkpoint", "native", 86_400), now, 900)],
+                &res,
+            )
+            .unwrap();
+        if !missing {
+            receipts
+                .try_begin(&res.id, &res.tx_hash, &res.source, 7, 0, 100)
+                .unwrap();
+            receipts.mark_submitted(&res.id).unwrap();
+        }
+        let before = receipts.get(&res.id).unwrap();
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(receipts.lock_file_path().unwrap())
+            .unwrap();
+        held.try_lock().unwrap();
+        let settle = || {
+            if let Some(status) = status {
+                let answer = TransactionRecord::from_raw(
+                    serde_json::from_value(serde_json::json!({
+                        "status": status, "latestLedger": 200, "oldestLedger": 1,
+                        "ledger": 150, "createdAt": (now / 1_000).to_string(),
+                        "resultXdr": "AAAAAAAAAGT////wAAAAAA==",
+                    }))
+                    .unwrap(),
+                );
+                store.settle_chain_answer(&profile, Some(&receipts), &res, &answer)
+            } else {
+                store.release_on_evidence(
+                    &profile,
+                    Some(&receipts),
+                    &res,
+                    ReleaseEvidence::SequenceConsumed,
+                )
+            }
+        };
+        let failed = settle().unwrap();
+        let mut report = ReconcileReport::default();
+        record_settlement(&mut report, &res, failed);
+        assert_eq!(report.receipt_write_failed, 1);
+        assert_eq!(
+            report.receipt_write_error.as_deref(),
+            Some(ReceiptStoreError::WriterLocked.to_string().as_str())
+        );
+        assert_eq!(report.released, 0);
+        assert_eq!(report.confirmed, 0);
+        assert_eq!(
+            store.pending_reservations(&profile).unwrap(),
+            *std::slice::from_ref(&res)
+        );
+        assert_eq!(receipts.get(&res.id).unwrap(), before);
+        drop(held);
+        assert!(!matches!(
+            settle().unwrap(),
+            Settlement::ReceiptWriteFailed { .. }
+        ));
+        assert!(store.pending_reservations(&profile).unwrap().is_empty());
+        let receipt = receipts.get(&res.id).unwrap().unwrap();
+        match status {
+            Some("SUCCESS") => assert_eq!(receipt.status, ReceiptStatus::Success),
+            Some(_) => assert!(matches!(receipt.status, ReceiptStatus::Failed { .. })),
+            None => assert_eq!(
+                receipt.release_code,
+                Some(ReleaseEvidence::SequenceConsumed)
+            ),
+        }
+    }
+
+    /// An evidence release persists its receipt before releasing the reservation.
+    #[test]
+    #[serial]
+    fn evidence_waits_for_receipt_persistence() {
+        assert_settlement_waits_for_receipt(None, false);
+    }
+
+    /// Both definitive answers persist their receipts before settling the window.
+    #[test]
+    #[serial]
+    fn chain_answers_wait_for_receipt_persistence() {
+        assert_settlement_waits_for_receipt(Some("SUCCESS"), false);
+        assert_settlement_waits_for_receipt(Some("FAILED"), false);
+    }
+
+    /// A missing receipt is restored durably before its reservation is released.
+    #[test]
+    #[serial]
+    fn evidence_waits_for_a_missing_receipt_restore() {
+        assert_settlement_waits_for_receipt(None, true);
+    }
+
+    /// Clearing a receipt preserves evidence but refuses another evidence release.
+    #[test]
+    #[serial]
+    fn a_cleared_receipt_with_evidence_keeps_its_pending_reservation() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "release-cleared");
+        let store = PersistedWindowStore::at_path(dir.path().join("release.window"));
+        let receipts = ReceiptStore::open_at(dir.path(), "release-cleared").unwrap();
+        let now = now_ms().unwrap();
+        let res = reservation(&"7d".repeat(32), "GSOURCE", 7, now);
+        store
+            .record_pending(
+                &profile,
+                &[entry(key("release-cleared", "native", 86_400), now, 500)],
+                &res,
+            )
+            .unwrap();
+        receipts
+            .try_begin(&res.id, &res.tx_hash, &res.source, 7, 0, 100)
+            .unwrap();
+        receipts
+            .finalize_released(&res.id, ReleaseEvidence::TimeBoundPassed)
+            .unwrap();
+        let cleared = receipts.clear_by_operator(&res.id).unwrap();
+        assert_eq!(cleared.release_code, Some(ReleaseEvidence::TimeBoundPassed));
+        assert_eq!(
+            store
+                .release_on_evidence(
+                    &profile,
+                    Some(&receipts),
+                    &res,
+                    ReleaseEvidence::SequenceConsumed,
+                )
+                .unwrap(),
+            Settlement::ReceiptWriteFailed {
+                error: ReceiptStoreError::InvalidTransition {
+                    from: "cleared_by_operator",
+                    to: "ambiguous",
+                }
+                .to_string(),
+            }
+        );
+        assert_eq!(receipts.get(&res.id).unwrap().unwrap(), cleared);
+        assert_eq!(store.pending_reservations(&profile).unwrap(), vec![res]);
+    }
+
+    /// A durable evidence checkpoint needs no receipt write when its window retries.
+    #[test]
+    #[serial]
+    fn a_checkpointed_release_keeps_its_evidence_without_rewriting() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "release-retry");
+        let store = PersistedWindowStore::at_path(dir.path().join("release.window"));
+        let receipts = ReceiptStore::open_at(dir.path(), "release-retry").unwrap();
+        let now = now_ms().unwrap();
+        let res = reservation(&"7c".repeat(32), "GSOURCE", 7, now);
+        store
+            .record_pending(
+                &profile,
+                &[entry(key("release-retry", "native", 86_400), now, 500)],
+                &res,
+            )
+            .unwrap();
+        receipts
+            .try_begin(&res.id, &res.tx_hash, &res.source, 7, 0, 100)
+            .unwrap();
+        let held = WindowStoreLock::acquire(&store.lock_path()).unwrap();
+        assert!(matches!(
+            store.release_on_evidence(
+                &profile,
+                Some(&receipts),
+                &res,
+                ReleaseEvidence::TimeBoundPassed
+            ),
+            Err(WindowStoreError::WriterLocked)
+        ));
+        drop(held);
+        let checkpoint = receipts.get(&res.id).unwrap().unwrap();
+        let known = HashMap::from([(
+            res.id.clone(),
+            (checkpoint.status.clone(), checkpoint.release_code),
+        )]);
+        assert!(!outcome_already_unknown(&known, &res.id));
+        let held_receipt = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(receipts.lock_file_path().unwrap())
+            .unwrap();
+        held_receipt.try_lock().unwrap();
+        assert_eq!(
+            store
+                .release_on_evidence(
+                    &profile,
+                    Some(&receipts),
+                    &res,
+                    ReleaseEvidence::SequenceConsumed
+                )
+                .unwrap(),
+            Settlement::ReleasedOnEvidence {
+                evidence: ReleaseEvidence::TimeBoundPassed
+            }
+        );
+        assert_eq!(receipts.get(&res.id).unwrap().unwrap(), checkpoint);
+        assert!(store.pending_reservations(&profile).unwrap().is_empty());
     }
 }

@@ -651,6 +651,9 @@ impl WalletServer {
                        obtains the cross-check witness, verifies the nonce, signs via \
                        keyring, and submits. \
                        Returns {tx_hash, ledger, cross_check}. \
+                       On submission.tx_timeout the outcome is unknown: pass \
+                       error.details.tx_hash to stellar_transaction_status, and never \
+                       resubmit. \
                        destructive_hint=true; read_only_hint=false.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]

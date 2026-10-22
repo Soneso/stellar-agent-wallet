@@ -107,24 +107,25 @@ placement against the provider's documentation.
 ## Submission codes (unresolved outcomes)
 
 Every value-moving verb records its transaction before it is sent: a submission
-receipt, a spending-window reservation, and a `value_action_pending` audit row.
+receipt, a spending-window reservation under a policy with a stateful
+criterion, and a `value_action_pending` audit row.
 A submission whose outcome never comes back keeps that record, and the codes
 below report one. Three of them carry an `error.details` object with the full
 transaction hash the message redacts.
 
-The rule for all of them is the same: **reconcile, never rebuild.** At most one
-transaction per source account and sequence can ever apply, and the wallet
-cannot tell whether the recorded one did. A second submission at that sequence
-is refused until the first is settled, and a different fee does not get around
-it.
+The rule for all of them is the same: **reconcile, never rebuild or resubmit.**
+At most one transaction per source account and sequence can ever apply, and the
+wallet cannot tell whether the recorded one did. A second submission at that
+sequence is refused until the first is settled, and a different fee does not get
+around it. No recovery path sends a transaction again.
 
 | Code | Meaning | Agent action |
 |---|---|---|
-| `submission.tx_timeout` | The transaction was accepted for inclusion and was not confirmed within the submission timeout. It may still apply. `details` carries `tx_hash`, `timeout_seconds`, `outcome: "unknown"`, `reconcile_with`, and `envelope_hash` where the reporting surface holds the signed bytes. | Call `stellar_transaction_status` with `details.tx_hash` (CLI: `stellar-agent tx status <HASH>`). Do not re-simulate and do not rebuild. |
-| `submission.tx_already_submitted` | A pending record already holds this transaction's source account and sequence. Nothing was sent. `details.tx_hash` names the transaction to reconcile. | Reconcile `details.tx_hash` first. Once it is settled, the sequence is free and a fresh simulate-and-commit proceeds. |
+| `submission.tx_timeout` | The submission ended without a confirmed outcome: the deadline passed, the endpoint reported an unexpected status, or a transport failure struck during or after the send. It may still apply; the message says to settle it by its transaction hash and not to resubmit. `details` carries `tx_hash`, `timeout_seconds`, `outcome: "unknown"`, `reconcile_with`, and `envelope_hash` where the reporting surface holds the signed bytes. | Call `stellar_transaction_status` with `details.tx_hash` (CLI: `stellar-agent tx status <HASH>`). Do not re-simulate, rebuild, or resubmit. |
+| `submission.tx_already_submitted` | A pending record already holds this transaction's source account and sequence, or the spending window already holds these signed bytes. Nothing was sent. `details.tx_hash` names the transaction to reconcile. | Reconcile `details.tx_hash` first. Once it is settled, the sequence is free and a fresh simulate-and-commit proceeds. |
 | `submission.hash_mismatch` | The endpoint reported a transaction hash that does not describe the transaction that was sent. `details` carries both hashes. | Reconcile `details.tx_hash`. Report the mismatch to the operator: the endpoint is not describing what it was handed. |
 | `submission.record_unavailable` | The wallet could not durably record the submission, so nothing was sent. The condition is local: an unwritable receipt store, an unreadable spending-window file, or an audit log that cannot be appended. | Not agent-recoverable. Report to the operator; the submission is safe to retry once it is fixed. |
-| `submission.tx_malformed` | The network refused the transaction outright (for example the fee was below the current floor). Nothing was queued and no value moved. | A fresh simulate-and-commit is the next step; the sequence is free. |
+| `submission.tx_malformed` | The endpoint refused the transaction outright, reporting a validation error for the envelope (for example the fee was below the current floor). The wallet never sends those bytes again and releases the reservation. | A fresh simulate-and-commit is the next step; the sequence is free. |
 | `policy.approval_consumed` | The approval presented was already spent on a submission. | Check that transaction's status before asking for the action again. Do not re-present the same approval. |
 
 What `stellar_transaction_status` reports, and what it means:
@@ -133,15 +134,35 @@ What `stellar_transaction_status` reports, and what it means:
 - `chain_status: "FAILED"`: the transaction applied and failed. Nothing moved.
 - `chain_status: "NOT_FOUND"` with `record.status: "pending"`: nothing is
   settled. The transaction can still apply. Wait and call again.
-- `chain_status: "NOT_FOUND"` with `record.status: "failed"`: the transaction
-  can no longer apply. A fresh simulate-and-commit is the next step.
-- `chain_status: "NOT_FOUND"` with `record.status: "ambiguous"`: the endpoint
-  can no longer answer for it at all, and only the operator can resolve it, with
+- `chain_status: "NOT_FOUND"` with `record.status: "ambiguous"` and a
+  `record.release_code`: the transaction can no longer apply.
+  `submission.sequence_consumed` means another transaction used its sequence;
+  `submission.time_bound_passed` means its time bound passed, which needs an
+  envelope that carries one. The reservation is released and a
+  `value_action_failed` row is written under that code. A fresh
+  simulate-and-commit is the next step.
+- `chain_status: "NOT_FOUND"` with `record.status: "ambiguous"` and no
+  `release_code`: the endpoint can no longer answer for it at all, and only the
+  operator can resolve it, with
   `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`.
+- `chain_status: "NOT_FOUND"` with `record.status: "failed"`: the endpoint
+  reported a validation error for the envelope or previously reported an
+  on-chain `FAILED` that has left its retained history. The wallet never sends
+  those bytes again. A fresh simulate-and-commit is the next step.
+- No `record`, and a `reservation` with `operator_required: true`: the receipt
+  is missing and the endpoint can no longer answer for the transaction. Only
+  the operator resolves it, with `tx receipt clear`.
 
-Read `record.status`, not `record.reservation_open`. An action the policy engine
-sized no value for takes no reservation at all, so `reservation_open` is `false`
-for it from the start and says nothing about whether the submission settled.
+Read `record.status` and `record.release_code`, not `record.reservation_open`.
+An action the policy engine sized no value for takes no reservation at all, so
+`reservation_open` is `false` for it from the start and says nothing about
+whether the submission settled.
+
+`tx receipt clear --acknowledge` reconciles before it clears. It refuses with
+`submission.still_pending` while a sent transaction's time bound is open and
+its sequence unconsumed. A failed ledger-time read refuses sent, timed
+submissions with `network.rpc_unreachable`; other failed reconciliation reads
+also refuse. Both are operator conditions: wait, or ask the operator.
 
 An operator policy that lists tools explicitly must include
 `stellar_transaction_status`, or a timed-out submission cannot be resolved
