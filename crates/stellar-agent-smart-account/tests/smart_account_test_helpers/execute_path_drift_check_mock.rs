@@ -47,6 +47,7 @@ use stellar_agent_core::audit_log::signer_set::{
     BaselineReason, ObservedSignerSet, SignerEntryV2, SignerIdentityV2, SignerPubkey,
     SignerSetSnapshotV2, SignerSetView, ThresholdObservation, account_digest,
 };
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
@@ -1491,12 +1492,7 @@ impl Harness {
     }
 
     fn rows(&self) -> Vec<AuditEntry> {
-        std::fs::read_to_string(&self.log_path)
-            .unwrap()
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect()
+        verified_audit_entries(&self.audit)
     }
 
     fn pins_updated_rows(&self) -> Vec<AuditEntry> {

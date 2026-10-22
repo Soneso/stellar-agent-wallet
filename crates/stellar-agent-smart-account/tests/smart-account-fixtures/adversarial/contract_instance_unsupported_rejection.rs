@@ -20,11 +20,12 @@
 //!   refused by identification itself, before either override flag is
 //!   consulted.
 
-use std::io::{BufRead, BufReader};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::ContractKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
+use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_smart_account::error::{AdminOrOwnerKey, SaError};
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
@@ -97,14 +98,8 @@ fn ledger_entries(contract: &ScAddress, entry_xdr: &str) -> serde_json::Value {
     })
 }
 
-fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
-    let file = std::fs::File::open(log_path).expect("audit log must be readable");
-    BufReader::new(file)
-        .lines()
-        .map(|line| line.expect("audit log line must be readable"))
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<AuditEntry>(line.trim()).expect("audit row must parse"))
-        .collect()
+fn read_audit_entries(audit_writer: &Arc<Mutex<AuditWriter>>) -> Vec<AuditEntry> {
+    verified_audit_entries(audit_writer)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -210,7 +205,7 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
                 );
 
                 assert!(
-                    read_audit_entries(&audit_log_path).is_empty(),
+                    read_audit_entries(&audit_writer).is_empty(),
                     "{case}: a refused pin writes no audit row"
                 );
             }
@@ -327,7 +322,7 @@ async fn external_ref_without_live_tag_entry_rejected_before_any_override() {
             );
 
             assert!(
-                read_audit_entries(&audit_log_path).is_empty(),
+                read_audit_entries(&audit_writer).is_empty(),
                 "{case}: a refused pin writes no audit row"
             );
         }

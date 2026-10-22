@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use stellar_agent_core::audit_log::schema::ContractKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_lines;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::managers::rules::RuleContext;
@@ -187,9 +188,9 @@ async fn accept_mutable_verifier_succeeds_with_a_pending_override_and_writes_no_
     );
 
     // Pinning writes nothing; the install writes the row after it confirms.
-    let audit_log = std::fs::read_to_string(&audit_log_path).unwrap_or_default();
+    let audit_lines = verified_audit_lines(&audit_writer);
     assert!(
-        audit_log.is_empty(),
-        "pinning writes no audit row: {audit_log}"
+        audit_lines.is_empty(),
+        "pinning writes no audit row: {audit_lines:?}"
     );
 }

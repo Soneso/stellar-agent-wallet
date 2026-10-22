@@ -47,6 +47,7 @@ use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use stellar_agent_core::audit_log::writer::AuditWriter;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 use stellar_agent_core::error::{AuthError, WalletError};
 use stellar_agent_network::{Signer, SoftwareSigningKey};
 use stellar_agent_smart_account::SaError;
@@ -1654,11 +1655,9 @@ fn tmp_audit_writer() -> (AuditWriter, tempfile::TempDir) {
 }
 
 fn read_audit_entries(dir: &tempfile::TempDir) -> Vec<serde_json::Value> {
-    let path = dir.path().join("audit.jsonl");
-    let content = std::fs::read_to_string(path).expect("audit.jsonl must be readable");
-    content
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("audit line must be valid JSON"))
+    verified_audit_entries_from_path(&dir.path().join("audit.jsonl"))
+        .into_iter()
+        .map(|entry| serde_json::to_value(entry).expect("verified audit entry must serialize"))
         .collect()
 }
 

@@ -72,6 +72,7 @@ use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EventKind, PinsUpdateReason};
 use stellar_agent_core::audit_log::signer_set::{SignerEntryV2, SignerIdentityV2};
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
@@ -174,16 +175,8 @@ fn view_threshold(view: &SignerSetView) -> Option<u32> {
     }
 }
 
-fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
-    use std::io::BufRead as _;
-    let file = std::fs::File::open(log_path).expect("audit log must be readable");
-    std::io::BufReader::new(file)
-        .lines()
-        .map(|line| {
-            serde_json::from_str(&line.expect("audit line must be valid UTF-8"))
-                .expect("audit line must parse as an AuditEntry")
-        })
-        .collect()
+fn read_audit_entries(audit_writer: &Arc<Mutex<AuditWriter>>) -> Vec<AuditEntry> {
+    verified_audit_entries(audit_writer)
 }
 
 /// Generates a fresh ed25519 keypair and returns
@@ -1846,35 +1839,19 @@ async fn d3_migrate_verifier_on_chain_submit() {
 
     // Assertion 4: audit log contains exactly 1 SaVerifierMigrated row.
     //
-    // The `AuditWriter` holds the file lock for its lifetime; the manager's
-    // writer Arc is the only writer. We read the JSONL file directly (read-only
-    // access does not require the exclusive lock).
+    // The verified helper reads the chain through the manager's shared writer.
     //
     // `tmp_dir` is still alive (holds the directory); the file exists.
     {
-        use std::io::BufRead as _;
-        let file = std::fs::File::open(&audit_log_path).expect("audit.jsonl must be readable");
-        let reader = std::io::BufReader::new(file);
-        let entries: Vec<serde_json::Value> = reader
-            .lines()
-            .map(|l| {
-                let line = l.expect("audit line must be valid UTF-8");
-                serde_json::from_str(&line).expect("audit line must be valid JSON")
-            })
-            .collect();
+        let entries = verified_audit_entries(&audit_writer);
 
         // Count SaVerifierMigrated rows.
         // The install and `refresh_signer_baseline` emit SaSignerSetBaselinedV2, not
         // SaVerifierMigrated.
         // Only the submit step (one per successful signer-step pair) emits SaVerifierMigrated.
-        let migrated_rows: Vec<&serde_json::Value> = entries
+        let migrated_rows: Vec<&AuditEntry> = entries
             .iter()
-            .filter(|e| {
-                e.get("tool")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    == "sa.verifier_migrated"
-            })
+            .filter(|entry| matches!(&entry.event_kind, EventKind::SaVerifierMigrated { .. }))
             .collect();
 
         assert_eq!(
@@ -1886,11 +1863,14 @@ async fn d3_migrate_verifier_on_chain_submit() {
             entries.len()
         );
         let expected_redacted_add_hash = stellar_agent_network::redact_tx_hash(&step.add_tx_hash);
+        let EventKind::SaVerifierMigrated {
+            tx_hash_redacted, ..
+        } = &migrated_rows[0].event_kind
+        else {
+            panic!("expected SaVerifierMigrated row")
+        };
         assert_eq!(
-            migrated_rows[0]
-                .get("tx_hash_redacted")
-                .and_then(serde_json::Value::as_str),
-            Some(expected_redacted_add_hash.as_str()),
+            tx_hash_redacted, &expected_redacted_add_hash,
             "SaVerifierMigrated tx_hash_redacted must match redacted add_signer tx hash"
         );
 
@@ -1907,7 +1887,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
     // the submit's request id, with the pins row between them and the
     // migrated row last.
     {
-        let pair_rows: Vec<AuditEntry> = read_audit_entries(&audit_log_path)
+        let pair_rows: Vec<AuditEntry> = read_audit_entries(&audit_writer)
             .into_iter()
             .filter(|entry| entry.request_id == submit_request_id)
             .collect();
@@ -2257,7 +2237,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
         i64::try_from(D3_TRANSFER_STROOPS).expect("fits i64"),
         "the recipient must receive exactly the transferred amount"
     );
-    let drift_rows = read_audit_entries(&audit_log_path)
+    let drift_rows = read_audit_entries(&audit_writer)
         .into_iter()
         .filter(|entry| {
             matches!(
@@ -2272,7 +2252,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
     );
 
     // ── Pin record: the migration rewrote it to name verifier-B ──────────────
-    let pins_updated: Vec<AuditEntry> = read_audit_entries(&audit_log_path)
+    let pins_updated: Vec<AuditEntry> = read_audit_entries(&audit_writer)
         .into_iter()
         .filter(|entry| {
             matches!(

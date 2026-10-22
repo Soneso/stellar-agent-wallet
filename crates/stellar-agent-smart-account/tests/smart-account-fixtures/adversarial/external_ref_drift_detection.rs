@@ -13,11 +13,12 @@
 #![cfg(feature = "test-helpers")]
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EventKind, ExecutableRefPin};
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
+use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::signers::ObservedExecutable;
@@ -102,14 +103,8 @@ fn live_wasm(hash: [u8; 32]) -> KeyedLedgerEntriesResponder {
 
 // ── Harness ───────────────────────────────────────────────────────────────────
 
-fn read_audit_entries(log_path: &std::path::Path) -> Vec<AuditEntry> {
-    let file = std::fs::File::open(log_path).expect("audit log must be readable");
-    BufReader::new(file)
-        .lines()
-        .map(|line| line.expect("audit log line must be readable"))
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<AuditEntry>(line.trim()).expect("audit row must parse"))
-        .collect()
+fn read_audit_entries(audit_writer: &Arc<Mutex<AuditWriter>>) -> Vec<AuditEntry> {
+    verified_audit_entries(audit_writer)
 }
 
 /// Outcome of one drift check: the result, the drift rows written, and the
@@ -188,7 +183,7 @@ async fn check(
         }
     };
 
-    let drift_rows = read_audit_entries(&audit_log_path)
+    let drift_rows = read_audit_entries(&audit_writer)
         .into_iter()
         .filter(|e| e.request_id == request_id)
         .filter_map(|e| match e.event_kind {

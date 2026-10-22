@@ -60,6 +60,8 @@ use std::time::{Duration, Instant};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use stellar_agent_core::approval::RegistrationInput;
 use stellar_agent_core::approval::store::PendingApprovalStore;
+use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_smart_account::managers::credentials::{
     AddPasskeyOutcome, CredentialsError, CredentialsManager,
@@ -456,28 +458,25 @@ async fn audit_entry_emitted_on_success() {
     );
     drop(writer);
 
-    // Read the JSONL and assert on the emitted entry.
-    let content = std::fs::read_to_string(&audit_path).expect("audit file must be readable");
-    let lines: Vec<&str> = content.lines().collect();
-    assert_eq!(lines.len(), 1, "expected exactly one audit entry");
-
-    let entry: serde_json::Value =
-        serde_json::from_str(lines[0]).expect("audit entry must be valid JSON");
-    assert_eq!(
-        entry["kind"], "passkey_registered",
-        "kind must be passkey_registered"
-    );
-    assert_eq!(
-        entry["credential_name"], credential_name,
-        "credential_name must match"
-    );
-    assert_eq!(entry["rp_id"], "localhost", "rp_id must match");
-    assert_eq!(entry["status"], "registered", "status must be registered");
+    let entries = verified_audit_entries_from_path(&audit_path);
+    assert_eq!(entries.len(), 1, "expected exactly one audit entry");
+    let [entry] = entries.as_slice() else {
+        panic!("expected one verified audit entry")
+    };
+    let EventKind::PasskeyRegistered {
+        credential_name: emitted_name,
+        credential_id_redacted: redacted,
+        rp_id,
+        status,
+    } = &entry.event_kind
+    else {
+        panic!("expected PasskeyRegistered entry: {entry:?}")
+    };
+    assert_eq!(emitted_name, credential_name, "credential_name must match");
+    assert_eq!(rp_id, "localhost", "rp_id must match");
+    assert_eq!(status, "registered", "status must be registered");
 
     // credential_id_redacted must be redacted (first-5...last-5 or short passthrough).
-    let redacted = entry["credential_id_redacted"]
-        .as_str()
-        .expect("credential_id_redacted must be a string");
     assert!(
         !redacted.is_empty(),
         "credential_id_redacted must not be empty"
@@ -526,16 +525,19 @@ async fn audit_entry_emitted_on_timeout() {
     );
     drop(writer);
 
-    let content = std::fs::read_to_string(&audit_path).expect("audit file must be readable");
-    let lines: Vec<&str> = content.lines().collect();
-    assert_eq!(lines.len(), 1, "expected exactly one timeout audit entry");
-
-    let entry: serde_json::Value =
-        serde_json::from_str(lines[0]).expect("audit entry must be valid JSON");
-    assert_eq!(
-        entry["kind"], "passkey_registered",
-        "kind must be passkey_registered"
-    );
-    assert_eq!(entry["status"], "timeout", "status must be timeout");
-    assert_eq!(entry["credential_name"], credential_name);
+    let entries = verified_audit_entries_from_path(&audit_path);
+    assert_eq!(entries.len(), 1, "expected exactly one timeout audit entry");
+    let [entry] = entries.as_slice() else {
+        panic!("expected one verified timeout audit entry")
+    };
+    let EventKind::PasskeyRegistered {
+        credential_name: emitted_name,
+        status,
+        ..
+    } = &entry.event_kind
+    else {
+        panic!("expected PasskeyRegistered entry: {entry:?}")
+    };
+    assert_eq!(status, "timeout", "status must be timeout");
+    assert_eq!(emitted_name, credential_name);
 }
