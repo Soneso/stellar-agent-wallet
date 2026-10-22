@@ -15,16 +15,26 @@
 //!
 //! # What it changes
 //!
-//! - `SUCCESS` confirms the reservation, so the spend is recorded, and
-//!   finalizes the receipt.
-//! - `FAILED` releases the reservation and finalizes the receipt failed.
+//! - `SUCCESS` confirms the reservation, so the spend is recorded, finalizes
+//!   the receipt, and writes the `value_action_submitted` row.
+//! - `FAILED` releases the reservation, finalizes the receipt failed, and
+//!   writes the `value_action_failed` row under the failure code.
 //! - `NOT_FOUND` releases the reservation only when the transaction can no
 //!   longer apply: its sequence has been consumed, or an observed ledger close
 //!   time is strictly past its time bound, followed by a fresh `NOT_FOUND`.
-//!   When the submission ledger predates the endpoint's retention
-//!   floor, `NOT_FOUND` proves nothing, so the reservation stands and the
-//!   receipt is marked ambiguous for `tx receipt clear` to resolve. An absent
-//!   receipt leaves an authenticated hold marked `operator_required`.
+//!   The receipt is marked ambiguous and keeps that evidence as
+//!   `release_code` (`submission.sequence_consumed` or
+//!   `submission.time_bound_passed`), and the `value_action_failed` row is
+//!   written under it. A row that could not be written then is written by a
+//!   later run, from the receipt. An absent receipt is restored from the
+//!   reservation first.
+//! - When the submission ledger predates the endpoint's retention floor,
+//!   `NOT_FOUND` proves nothing, so the reservation stands and the receipt is
+//!   marked ambiguous, without evidence, for `tx receipt clear` to resolve.
+//!   An absent receipt leaves an authenticated hold marked
+//!   `operator_required`.
+//!
+//! No step sends the transaction again.
 //!
 //! # Concurrency
 //!
@@ -45,7 +55,9 @@ use clap::Args;
 use serde::Serialize;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::WalletError;
-use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore, SubmissionReceipt};
+use stellar_agent_core::profile::receipt::{
+    ReceiptStatus, ReceiptStore, ReleaseEvidence, SubmissionReceipt,
+};
 use stellar_agent_network::NetworkContext;
 use stellar_agent_network::policy_state::PersistedWindowStore;
 
@@ -96,6 +108,11 @@ struct RecordView {
     submitted: bool,
     /// Whether a spending-window reservation is still open for it.
     reservation_open: bool,
+    /// The chain evidence on which reconciliation released the reservation:
+    /// `submission.sequence_consumed` or `submission.time_bound_passed`.
+    /// Absent when the outcome was answered by the chain or is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_code: Option<&'static str>,
 }
 
 /// Authenticated hold identity, available even when its receipt is absent.
@@ -237,14 +254,19 @@ pub async fn run(args: &StatusArgs) -> i32 {
                 return 1;
             }
         };
-        if let Err(e) = window
+        match window
             .reconcile_one(&profile, &client, Some(&receipts), envelope_hash, now_ms)
             .await
         {
-            tracing::debug!(
+            Ok(report) if report.receipt_write_failed > 0 => tracing::warn!(
+                receipt_write_failed = report.receipt_write_failed,
+                "tx status: reconciliation could not record the receipt outcome"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::debug!(
                 error = ?e,
                 "tx status: reconciliation pass failed; the record stands"
-            );
+            ),
         }
     }
 
@@ -308,13 +330,14 @@ pub async fn run(args: &StatusArgs) -> i32 {
             // value-action row it never got to write, carrying the legs the
             // gate sized.
             if let Some(audit) = audit_writer.as_ref() {
-                crate::commands::submission_record::write_settled_row(
+                crate::commands::submission_record::write_settled_row_with_evidence(
                     &profile,
                     &resolved.name,
                     audit,
                     &settled.envelope_hash,
                     &settled.tx_hash,
                     &settled.status,
+                    settled.release_code,
                     settled.ledger.or(chain.ledger),
                     stellar_agent_core::audit_log::PolicyDecision::Allow,
                 );
@@ -355,6 +378,7 @@ fn record_view(receipt: &SubmissionReceipt, reservation_open: bool) -> RecordVie
         sequence: receipt.sequence,
         submitted: receipt.submitted,
         reservation_open,
+        release_code: receipt.release_code.map(ReleaseEvidence::code),
     }
 }
 

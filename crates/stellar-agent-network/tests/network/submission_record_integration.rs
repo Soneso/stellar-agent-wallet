@@ -480,6 +480,13 @@ async fn a_timeout_reports_the_local_hash_and_leaves_the_record_standing() {
         }
         other => panic!("expected submission.tx_timeout; got {other:?}"),
     }
+    assert!(
+        err.message().ends_with(
+            "; its outcome is unknown: settle it by its transaction hash and do not resubmit"
+        ),
+        "the deadline exit names the recovery: {}",
+        err.message()
+    );
 
     let calls = calls.lock().unwrap().clone();
     assert_eq!(calls[0], Call::PreSend);
@@ -547,6 +554,10 @@ async fn a_hash_mismatch_reports_both_hashes_and_leaves_the_record_standing() {
 /// A send that never completes leaves the outcome unknown: the record stands
 /// and the caller gets the timeout shape, which is what the recovery protocol
 /// is written against.
+///
+/// The send happens exactly once. Under the pinned RPC client an HTTP 500 on
+/// `sendTransaction` is a `TransactionSubmissionFailed` the retry classifier
+/// does not retry, so the submit path's retry loop never re-sends it.
 #[tokio::test]
 #[serial]
 async fn a_transport_failure_after_the_record_returns_the_timeout_shape() {
@@ -558,6 +569,8 @@ async fn a_transport_failure_after_the_record_returns_the_timeout_shape() {
         .and(path("/"))
         .and(body_partial_json(json!({"method": "sendTransaction"})))
         .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .named("sendTransaction is sent exactly once")
         .mount(&server)
         .await;
 
@@ -1400,6 +1413,154 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
     assert_eq!(
         closing_code, "policy.deny.per_period_cap_exceeded",
         "the closing audit row carries the refusal's own code"
+    );
+}
+
+/// A resend of bytes whose receipt was lost is refused before the send and
+/// writes no row.
+///
+/// The receipt gate admits the resend because the receipt is gone, but the
+/// window file still holds the original's reservation under the same envelope
+/// hash. The resend is refused with the transaction to reconcile, before its
+/// pending row: the original's pending row stays owed, so the settled row its
+/// own reconciliation writes is the one that closes it. The cap is far above
+/// both amounts, so admission does not decide this.
+#[tokio::test]
+#[serial]
+async fn a_resend_after_a_lost_receipt_is_refused_before_the_send() {
+    use base64::Engine as _;
+    use stellar_agent_core::audit_log::AuditWriter;
+    use stellar_agent_core::audit_log::reader::{ValueActionSettlement, value_action_settlement};
+    use stellar_agent_core::audit_log::schema::EventKind;
+    use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
+
+    let mut fx = fixture("record-resend");
+    let audit_path = fx._dir.path().join("audit").join("log.jsonl");
+    fx.profile.audit_log_path = audit_path.clone();
+    let coordinate = &fx.profile.audit_log_hash_chain_key_id;
+    keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+        .unwrap()
+        .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([8_u8; 32]))
+        .unwrap();
+    let access = stellar_agent_network::keyring::keyed_audit_access(
+        &fx.profile,
+        &fx.profile_name,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    )
+    .unwrap();
+    let audit = Arc::new(Mutex::new(
+        AuditWriter::open(audit_path.clone(), Some(access)).unwrap(),
+    ));
+
+    // The original reaches the send and is never confirmed.
+    let original = SignedTestEnvelope::for_source([0x43; 32]);
+    let server = MockServer::start().await;
+    mount_pre_send(&server, &original).await;
+    mount_send_pending(&server, original.tx_hash_hex()).await;
+    mount_get_not_found(&server).await;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorder = fx.capped_recorder(&calls, Arc::clone(&audit), 600, 1_000_000);
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let first = tokio::time::timeout(
+        TIMEOUT_OUTER_BOUND,
+        submit_transaction_and_wait(
+            &client,
+            original.envelope_xdr(),
+            TIMEOUT_DEADLINE,
+            TESTNET_PASSPHRASE,
+            None,
+            Some(&recorder),
+        ),
+    )
+    .await
+    .expect("submission must finish within the outer timeout bound");
+    assert_eq!(
+        first
+            .expect_err("the mocked endpoint never confirms")
+            .code(),
+        "submission.tx_timeout"
+    );
+    let hash = envelope_hash(&original);
+
+    // The receipt is lost; the reservation stands.
+    std::fs::remove_file(fx.receipts.file_path().unwrap()).unwrap();
+    assert!(fx.receipts.get(&hash).unwrap().is_none());
+    assert!(fx.reservation_is_open(&hash));
+
+    let resend_server = MockServer::start().await;
+    mount_pre_send(&resend_server, &original).await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "sendTransaction"})))
+        .respond_with(rpc_ok(
+            json!({"hash": original.tx_hash_hex(), "status": "PENDING"}),
+        ))
+        .expect(0)
+        .named("the resend is refused before the send")
+        .mount(&resend_server)
+        .await;
+    let resend_calls = Arc::new(Mutex::new(Vec::new()));
+    let resend_recorder = fx.capped_recorder(&resend_calls, Arc::clone(&audit), 600, 1_000_000);
+    let resend_client = StellarRpcClient::new(&resend_server.uri()).unwrap();
+    let refused = submit_transaction_and_wait(
+        &resend_client,
+        original.envelope_xdr(),
+        SUBMIT_TIMEOUT,
+        TESTNET_PASSPHRASE,
+        None,
+        Some(&resend_recorder),
+    )
+    .await
+    .expect_err("a resend of bytes the window holds must be refused");
+
+    match &refused {
+        WalletError::Submission(SubmissionError::TxAlreadySubmitted { hash: tx_hash }) => {
+            assert_eq!(
+                tx_hash,
+                original.tx_hash_hex(),
+                "the refusal names the transaction"
+            );
+        }
+        other => panic!("expected submission.tx_already_submitted; got {other:?}"),
+    }
+    assert_eq!(
+        resend_calls.lock().unwrap().as_slice(),
+        &[Call::PreSend],
+        "the refusal happens in pre_send"
+    );
+    assert!(
+        fx.receipts.get(&hash).unwrap().is_none(),
+        "the refused resend leaves no receipt of its own"
+    );
+    assert_eq!(
+        fx.window.pending_reservations(&fx.profile).unwrap().len(),
+        1,
+        "the bytes are counted once"
+    );
+
+    drop(recorder);
+    drop(resend_recorder);
+    drop(audit);
+    assert!(
+        matches!(
+            value_action_settlement(&audit_path, &hash),
+            ValueActionSettlement::Owed(_)
+        ),
+        "the original's settlement stays owed"
+    );
+    let rows: Vec<EventKind> = verified_audit_entries_from_path(&audit_path)
+        .into_iter()
+        .filter(|entry| entry.envelope_hash.as_deref() == Some(hash.as_str()))
+        .map(|entry| entry.event_kind)
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the original's pending row names the bytes: {rows:?}"
+    );
+    assert!(
+        matches!(rows[0], EventKind::ValueActionPending { .. }),
+        "{rows:?}"
     );
 }
 

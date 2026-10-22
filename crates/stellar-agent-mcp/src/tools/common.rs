@@ -1365,6 +1365,7 @@ impl WalletServer {
                 &settled.envelope_hash,
                 &settled.tx_hash,
                 &settled.status,
+                settled.release_code,
                 settled.ledger,
                 stellar_agent_core::audit_log::PolicyDecision::Allow,
             );
@@ -1923,6 +1924,7 @@ pub(crate) enum GatedApprovalKind {
 ///
 /// 1. Both `approval_nonce` and `approval_attestation` must be `Some`.
 /// 2. Attestation blob decodes to exactly 32 bytes (URL-safe base64 no-pad).
+///    A submission receipt holding the nonce reports consumption before the store opens.
 /// 3. Approval store opens at `<approvals_dir>/<profile_name>.toml`.
 /// 4. Entry exists in the store.
 /// 5. Entry is not expired.
@@ -1933,6 +1935,7 @@ pub(crate) enum GatedApprovalKind {
 /// # Errors
 ///
 /// Live rejection and consumption markers retain their terminal error codes.
+/// A durable receipt holding the nonce also reports `policy.approval_consumed`.
 /// Other failures produce [`approval_required_indistinguishable`].
 /// Internal debug tracing identifies the refusal for operator forensics.
 ///
@@ -1982,6 +1985,15 @@ pub(crate) async fn verify_attestation_gate(
             tracing::debug!(tool = tool_name, "attestation base64 decode failed");
             approval_required_indistinguishable(&profile_name)
         })?;
+
+    // A receipt that holds the nonce proves the approval was spent, also while
+    // its tombstone is owed. It is read before the mutable approval store, so a
+    // locked store or an expired entry cannot hide the spend.
+    let receipt_hold = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name)
+        .and_then(|receipts| receipts.find_by_approval_nonce(approval_nonce_str));
+    if matches!(&receipt_hold, Ok(Some(_))) {
+        return Err(approval_consumed_error());
+    }
 
     // 3. Open store and look up entry.
     //
@@ -2078,16 +2090,8 @@ pub(crate) async fn verify_attestation_gate(
         return Err(approval_consumed_error());
     }
 
-    // The submission receipt holds a spent approval while its tombstone is owed.
-    let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name)
-        .map_err(|_| approval_required_indistinguishable(&profile_name))?;
-    if receipts
-        .find_by_approval_nonce(approval_nonce_str)
-        .map_err(|_| approval_required_indistinguishable(&profile_name))?
-        .is_some()
-    {
-        return Err(approval_consumed_error());
-    }
+    // An unreadable receipt still refuses before any approval can admit a send.
+    receipt_hold.map_err(|_| approval_required_indistinguishable(&profile_name))?;
 
     // 6. The tool accepts only its own envelope approval kind.
     let stored_sha256_hex = match &entry.kind {
@@ -4152,6 +4156,108 @@ mod tests {
             )
             .await
             .is_ok()
+        );
+    }
+
+    /// A durable receipt reports consumption even while the approval store is locked.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    async fn an_owed_approval_is_consumed_before_reopening_the_approval_store() {
+        use stellar_agent_core::approval::PendingApprovalStore;
+        use stellar_agent_core::profile::receipt::ReceiptStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let server = envelope_gate_server(dir.path());
+        let entry = envelope_gate_entry(GatedApprovalKind::Payment);
+        let blob = park_gate_entry(&server, dir.path(), &entry);
+        let receipts = ReceiptStore::open(&server.profile_name_for_approval()).unwrap();
+        receipts
+            .begin_submission_with_approval(
+                "hash",
+                &"ab".repeat(32),
+                "source",
+                1,
+                0,
+                100,
+                Some(&entry.approval_nonce),
+            )
+            .unwrap();
+        receipts.mark_submitted("hash").unwrap();
+        let held = PendingApprovalStore::open(
+            dir.path()
+                .join(format!("{}.toml", server.profile_name_for_approval())),
+        )
+        .unwrap();
+        let dispatch = DispatchOutcome::RequireApproval(
+            ApprovalRequest::new(entry.approval_nonce.clone(), 120).into(),
+        );
+        let result = verify_attestation_gate(
+            &server,
+            &dispatch,
+            GatedApprovalKind::Payment,
+            "AAAA",
+            Some(&entry.approval_nonce),
+            Some(&blob),
+            "stellar_pay_commit",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            assert_business_envelope(&result).0,
+            "policy.approval_consumed"
+        );
+        for attestation in [None, Some("invalid-attestation")] {
+            let result = verify_attestation_gate(
+                &server,
+                &dispatch,
+                GatedApprovalKind::Payment,
+                "AAAA",
+                Some(&entry.approval_nonce),
+                attestation,
+                "stellar_pay_commit",
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                assert_business_envelope(&result).0,
+                "policy.approval_required"
+            );
+        }
+        assert!(!receipts.get("hash").unwrap().unwrap().approval_consumed);
+        drop(held);
+    }
+
+    /// An unreadable receipt store refuses even a valid, unspent approval.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    async fn an_unreadable_receipt_store_refuses_a_valid_attestation() {
+        use stellar_agent_core::profile::receipt::ReceiptStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let server = envelope_gate_server(dir.path());
+        let entry = envelope_gate_entry(GatedApprovalKind::Payment);
+        let blob = park_gate_entry(&server, dir.path(), &entry);
+        let receipts = ReceiptStore::open(&server.profile_name_for_approval()).unwrap();
+        std::fs::write(receipts.file_path().unwrap(), "{unparsable").unwrap();
+        let dispatch = DispatchOutcome::RequireApproval(
+            ApprovalRequest::new(entry.approval_nonce.clone(), 120).into(),
+        );
+        let result = verify_attestation_gate(
+            &server,
+            &dispatch,
+            GatedApprovalKind::Payment,
+            "AAAA",
+            Some(&entry.approval_nonce),
+            Some(&blob),
+            "stellar_pay_commit",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            assert_business_envelope(&result).0,
+            "policy.approval_required"
         );
     }
 

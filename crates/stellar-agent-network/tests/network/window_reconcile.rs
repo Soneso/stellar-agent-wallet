@@ -7,13 +7,17 @@
 //!
 //! - `SUCCESS` confirms; `FAILED` releases.
 //! - `NOT_FOUND` releases only when the transaction can no longer apply: its
-//!   sequence has been consumed, or its time bound has passed.
+//!   sequence has been consumed, or its time bound has passed. The release
+//!   records that evidence on the receipt and reports the submission as
+//!   settled, so the caller writes its settled row.
 //! - A `NOT_FOUND` from an endpoint whose retention window no longer covers the
 //!   submission proves nothing, so the reservation stands and the receipt is
 //!   marked ambiguous.
 //! - A pass is bounded: at most `RECONCILE_BUDGET` reservations, oldest first,
 //!   none younger than `RECONCILE_MIN_AGE_MS`.
-//! - Nothing releases a reservation on a transport error.
+//! - Nothing releases a reservation on a transport error, and the pass reports
+//!   the first endpoint failure it met.
+//! - Reconciliation never sends: no pass calls `sendTransaction`.
 
 #![allow(
     clippy::unwrap_used,
@@ -29,11 +33,12 @@ use serial_test::serial;
 use stellar_agent_core::policy::v1::criteria::state_store::{
     PolicyStateStore, StateKey, WindowEntry, WindowLimit,
 };
-use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
+use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore, ReleaseEvidence};
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::policy_state::{
-    PersistedWindowStore, RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS, WindowReservation,
+    PersistedWindowStore, RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS, SettledSubmission,
+    WindowReservation,
 };
 use stellar_agent_test_support::keyring_mock;
 use stellar_agent_test_support::signed_envelope::{
@@ -164,6 +169,18 @@ async fn mount(
         })
         .mount(server)
         .await;
+}
+
+/// Mounts a counted `sendTransaction` answer, so a test can assert that a
+/// reconciliation pass never sends.
+async fn mount_send_guard(server: &MockServer, counts: &MethodCounts) {
+    mount(
+        server,
+        "sendTransaction",
+        json!({"hash": "0".repeat(64), "status": "PENDING", "latestLedger": 2_000}),
+        counts,
+    )
+    .await;
 }
 
 fn health(oldest_ledger: u32) -> serde_json::Value {
@@ -556,6 +573,7 @@ async fn not_found_with_a_consumed_sequence_releases() {
         &counts,
     )
     .await;
+    mount_send_guard(&server, &counts).await;
     let client = StellarRpcClient::new(&server.uri()).unwrap();
 
     let report = fx
@@ -580,6 +598,27 @@ async fn not_found_with_a_consumed_sequence_releases() {
         receipt.status,
         ReceiptStatus::Ambiguous,
         "the release rests on the endpoint's honesty, so the outcome is recorded as unknown"
+    );
+    assert_eq!(
+        receipt.release_code,
+        Some(ReleaseEvidence::SequenceConsumed),
+        "the receipt keeps the evidence, so a later run can write the settled row"
+    );
+    assert_eq!(
+        report.settled,
+        vec![SettledSubmission {
+            envelope_hash: res.id.clone(),
+            tx_hash: res.tx_hash.clone(),
+            status: ReceiptStatus::Ambiguous,
+            release_code: Some(ReleaseEvidence::SequenceConsumed),
+            ledger: None,
+        }],
+        "the release is owed a settled row under its evidence"
+    );
+    assert_eq!(
+        counts.count("sendTransaction"),
+        0,
+        "reconciliation never sends"
     );
 }
 
@@ -613,6 +652,7 @@ async fn not_found_with_a_passed_time_bound_releases() {
     .await;
     mount(&server, "getHealth", health(1), &counts).await;
     mount(&server, "getLedgers", ledgers(now / 1_000, 1), &counts).await;
+    mount_send_guard(&server, &counts).await;
     let client = StellarRpcClient::new(&server.uri()).unwrap();
 
     let report = fx
@@ -630,6 +670,28 @@ async fn not_found_with_a_passed_time_bound_releases() {
     assert_eq!(
         report.released, 1,
         "a passed time bound releases: {report:?}"
+    );
+    let receipt = fx.receipts.get(&res.id).unwrap().unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Ambiguous);
+    assert_eq!(
+        receipt.release_code,
+        Some(ReleaseEvidence::TimeBoundPassed),
+        "the receipt keeps the evidence, so a later run can write the settled row"
+    );
+    assert_eq!(report.settled.len(), 1, "{report:?}");
+    assert_eq!(report.settled[0].status, ReceiptStatus::Ambiguous);
+    assert_eq!(
+        report.settled[0].release_code,
+        Some(ReleaseEvidence::TimeBoundPassed)
+    );
+    assert_eq!(
+        report.endpoint_failure, None,
+        "every read answered: {report:?}"
+    );
+    assert_eq!(
+        counts.count("sendTransaction"),
+        0,
+        "reconciliation never sends"
     );
     assert_eq!(
         counts.count("getLedgerEntries"),
@@ -702,6 +764,10 @@ async fn not_found_with_an_unconsumed_sequence_keeps_the_reservation() {
         report.kept_pending, 1,
         "a transaction that can still apply keeps its reservation: {report:?}"
     );
+    assert_eq!(
+        report.endpoint_failure, None,
+        "the hold stands on the endpoint's answers, not on a failure: {report:?}"
+    );
     assert_eq!(fx.window_total(now), (500, 1));
     assert_eq!(
         fx.receipts.get(&res.id).unwrap().unwrap().status,
@@ -711,7 +777,7 @@ async fn not_found_with_an_unconsumed_sequence_keeps_the_reservation() {
 
 /// A `NOT_FOUND` from an endpoint that no longer holds the submission's ledger
 /// range proves nothing, so the reservation stands and the receipt is marked
-/// ambiguous for an operator.
+/// ambiguous, without release evidence, for an operator.
 #[tokio::test]
 #[serial]
 async fn not_found_past_the_retention_floor_keeps_the_reservation() {
@@ -769,9 +835,15 @@ async fn not_found_past_the_retention_floor_keeps_the_reservation() {
         (500, 1),
         "the reservation stands until an operator resolves it"
     );
+    let receipt = fx.receipts.get(&res.id).unwrap().unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Ambiguous);
     assert_eq!(
-        fx.receipts.get(&res.id).unwrap().unwrap().status,
-        ReceiptStatus::Ambiguous
+        receipt.release_code, None,
+        "a closed retention window records no release evidence"
+    );
+    assert!(
+        report.settled.is_empty(),
+        "an unknown outcome owes no settled row: {report:?}"
     );
     assert_eq!(
         counts.count("getLedgerEntries"),
@@ -901,6 +973,14 @@ async fn a_transport_failure_settles_nothing() {
     assert_eq!(
         report.kept_pending, 1,
         "an unreachable endpoint settles nothing: {report:?}"
+    );
+    let failure = report
+        .endpoint_failure
+        .as_ref()
+        .expect("the pass reports the failure that left the reservation standing");
+    assert!(
+        failure.reason.starts_with("getTransaction failed: "),
+        "{failure:?}"
     );
     assert_eq!(fx.window_total(now), (500, 1));
     assert_eq!(
@@ -1042,6 +1122,148 @@ async fn reservations_the_endpoint_cannot_answer_for_do_not_hold_the_budget() {
     );
 }
 
+/// The automatic pass finishes a release after its receipt checkpoint, keeping
+/// the first evidence without another endpoint query.
+#[tokio::test]
+#[serial]
+async fn the_automatic_pass_finishes_a_checkpointed_evidence_release() {
+    let now = now_ms();
+    let fx = fixture("reconcile-release-checkpoint");
+    let source = account_id_for_seed([0x37; 32]);
+    let mut res = reservation(&"7c".repeat(32), &source, 1, due_since(now));
+    res.max_time = now / 1_000 - 10;
+    fx.take_reservation(now, &res, 500);
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(
+            fx._dir
+                .path()
+                .join(format!("{}.window.lock", fx.profile_name)),
+        )
+        .unwrap();
+    held.try_lock().unwrap();
+
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "getTransaction",
+        get_transaction("NOT_FOUND"),
+        &counts,
+    )
+    .await;
+    mount(&server, "getHealth", health(1), &counts).await;
+    mount(&server, "getLedgers", ledgers(now / 1_000, 1), &counts).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    assert!(matches!(
+        fx.window
+            .reconcile_one(&fx.profile, &client, Some(&fx.receipts), &res.id, now)
+            .await,
+        Err(stellar_agent_network::policy_state::WindowStoreError::WriterLocked)
+    ));
+    let checkpoint = fx.receipts.get(&res.id).unwrap().unwrap();
+    assert_eq!(
+        checkpoint.release_code,
+        Some(ReleaseEvidence::TimeBoundPassed)
+    );
+    assert_eq!(fx.window_total(now), (500, 1));
+    drop(held);
+
+    // The checkpoint finishes without asking the endpoint again.
+    counts.calls.lock().unwrap().clear();
+    server.reset().await;
+    // The durable receipt needs no second write, even while its writer is busy.
+    let held_receipt = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(fx.receipts.lock_file_path().unwrap())
+        .unwrap();
+    held_receipt.try_lock().unwrap();
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &client,
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.examined, 1);
+    assert_eq!(report.released, 1);
+    assert_eq!(report.receipt_write_failed, 0);
+    assert_eq!(report.settled.len(), 1);
+    assert_eq!(report.settled[0].release_code, checkpoint.release_code);
+    assert_eq!(fx.receipts.get(&res.id).unwrap().unwrap(), checkpoint);
+    assert!(
+        fx.window
+            .pending_reservations(&fx.profile)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fx.window_total(now), (0, 0));
+    assert_eq!(report.rpc_calls, 0);
+    assert!(counts.calls.lock().unwrap().is_empty());
+    assert_eq!(counts.count("sendTransaction"), 0);
+}
+
+/// Durable release evidence finishes the window step beyond endpoint retention.
+#[tokio::test]
+#[serial]
+async fn a_checkpointed_evidence_release_finishes_beyond_retention() {
+    let now = now_ms();
+    let fx = fixture("reconcile-release-retention");
+    let source = account_id_for_seed([0x38; 32]);
+    let res = reservation(&"7d".repeat(32), &source, 1, due_since(now));
+    fx.take_reservation(now, &res, 500);
+    fx.receipts
+        .finalize_released(&res.id, ReleaseEvidence::TimeBoundPassed)
+        .unwrap();
+    let checkpoint = fx.receipts.get(&res.id).unwrap().unwrap();
+
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "getTransaction",
+        get_transaction("NOT_FOUND"),
+        &counts,
+    )
+    .await;
+    mount(&server, "getHealth", health(SUBMISSION_LEDGER + 1), &counts).await;
+    mount(&server, "getLedgers", ledgers(now / 1_000, 1), &counts).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &client,
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.examined, 1);
+    assert_eq!(report.released, 1);
+    assert_eq!(report.rpc_calls, 0);
+    assert_eq!(report.settled.len(), 1);
+    assert_eq!(report.settled[0].release_code, checkpoint.release_code);
+    assert_eq!(fx.receipts.get(&res.id).unwrap().unwrap(), checkpoint);
+    assert!(
+        fx.window
+            .pending_reservations(&fx.profile)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fx.window_total(now), (0, 0));
+    assert!(counts.calls.lock().unwrap().is_empty());
+}
+
 /// A pending reservation older than the retention ceiling is kept.
 ///
 /// It holds the operator's cap for a submission whose outcome is still
@@ -1107,7 +1329,8 @@ async fn a_pending_reservation_is_not_pruned_by_age() {
 }
 
 /// A reservation without a receipt uses the chain's transaction answer and
-/// retention boundary when deciding whether a consumed sequence releases it.
+/// retention boundary when deciding whether a consumed sequence releases it,
+/// and a release restores the receipt with the evidence that released it.
 #[tokio::test]
 #[serial]
 async fn an_orphaned_reservation_is_released_once_its_sequence_is_consumed() {
@@ -1212,13 +1435,31 @@ async fn an_orphaned_reservation_is_released_once_its_sequence_is_consumed() {
             .is_empty(),
         "the hold is gone"
     );
-    assert!(
-        fx.receipts.get(&consumed).unwrap().is_none(),
-        "an unknown outcome does not reconstruct a missing receipt"
+    let restored = fx
+        .receipts
+        .get(&consumed)
+        .unwrap()
+        .expect("a release on evidence restores the missing receipt");
+    assert_eq!(restored.status, ReceiptStatus::Ambiguous);
+    assert_eq!(
+        restored.release_code,
+        Some(ReleaseEvidence::SequenceConsumed)
     );
+    assert_eq!(restored.tx_hash, consumed);
+    assert_eq!(restored.source, source);
+    assert_eq!(restored.sequence, 1);
     assert!(
-        report2.settled.is_empty(),
-        "a release the chain never confirmed owes no audit row: {report2:?}"
+        restored.submitted,
+        "the restored receipt records a sent transaction"
+    );
+    assert_eq!(
+        report2.settled.len(),
+        1,
+        "the release is owed a settled row under its evidence: {report2:?}"
+    );
+    assert_eq!(
+        report2.settled[0].release_code,
+        Some(ReleaseEvidence::SequenceConsumed)
     );
 }
 
@@ -1848,4 +2089,183 @@ async fn chain_observation_is_shared_and_charged_once_per_pass() {
         .unwrap();
     assert_eq!(body["params"]["startLedger"], 2000);
     assert_eq!(body["params"]["pagination"]["limit"], 1);
+}
+
+/// An endpoint failure is reported, and a later successful read in the same
+/// pass does not clear it.
+///
+/// The ledger observation fails, which closes the time arm, and the account
+/// read that follows succeeds with an unconsumed sequence. The reservation
+/// stands either way; the report says the endpoint could not answer, so a
+/// caller does not read the hold as a transaction that can still apply.
+#[tokio::test]
+#[serial]
+async fn an_endpoint_failure_survives_a_later_successful_read() {
+    let now = now_ms();
+    let fx = fixture("reconcile-failure-channel");
+    let source = account_id_for_seed([0x35; 32]);
+    let mut res = reservation(&"b5".repeat(32), &source, 9, due_since(now));
+    res.max_time = now / 1_000 - 10;
+    fx.take_reservation(now, &res, 55);
+
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "getTransaction",
+        get_transaction("NOT_FOUND"),
+        &counts,
+    )
+    .await;
+    mount(&server, "getHealth", health(1), &counts).await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({"method": "getLedgers"})))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        "getLedgerEntries",
+        ledger_entries_result_for(&[&source]),
+        &counts,
+    )
+    .await;
+    mount_send_guard(&server, &counts).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+
+    let report = fx
+        .window
+        .reconcile_one(&fx.profile, &client, Some(&fx.receipts), &res.id, now)
+        .await
+        .unwrap();
+
+    assert_eq!(report.kept_pending, 1, "{report:?}");
+    assert_eq!(
+        counts.count("getLedgerEntries"),
+        1,
+        "the account read after the failure succeeded"
+    );
+    let failure = report
+        .endpoint_failure
+        .expect("the ledger observation failure is reported after the account read");
+    assert!(
+        failure.reason.starts_with("getLedgers failed: "),
+        "{failure:?}"
+    );
+    let authority = server.uri();
+    assert_eq!(failure.endpoint, authority);
+    assert_eq!(
+        failure.to_network_error().to_string(),
+        format!(
+            "RPC endpoint '{authority}' is unreachable: {}",
+            failure.reason
+        )
+    );
+    assert_eq!(fx.window_total(now), (55, 1));
+    assert_eq!(
+        fx.receipts.get(&res.id).unwrap().unwrap().status,
+        ReceiptStatus::Pending
+    );
+    assert_eq!(
+        counts.count("sendTransaction"),
+        0,
+        "reconciliation never sends"
+    );
+}
+
+/// A receipt write is the checkpoint before a reservation can settle.
+async fn assert_receipt_checkpoint(status: &str, missing: bool) {
+    let now = now_ms();
+    let fx = fixture("reconcile-checkpoint");
+    let source = account_id_for_seed([0x36; 32]);
+    let res = reservation(&"6a".repeat(32), &source, 1, due_since(now));
+    fx.take_reservation(now, &res, 500);
+    if missing {
+        std::fs::remove_file(&fx.receipt_file).unwrap();
+    }
+    let before = fx.receipts.get(&res.id).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(fx.receipts.lock_file_path().unwrap())
+        .unwrap();
+    held.try_lock().unwrap();
+
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount(&server, "getTransaction", get_transaction(status), &counts).await;
+    mount(&server, "getHealth", health(1), &counts).await;
+    mount(&server, "getLedgers", ledgers(now / 1_000, 1), &counts).await;
+    mount(
+        &server,
+        "getLedgerEntries",
+        ledger_entries_result_for(&[&source]),
+        &counts,
+    )
+    .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+    let report = fx
+        .window
+        .reconcile_one(&fx.profile, &client, Some(&fx.receipts), &res.id, now)
+        .await
+        .unwrap();
+    assert_eq!(report.receipt_write_failed, 1, "{report:?}");
+    assert_eq!(report.released, 0);
+    assert_eq!(report.confirmed, 0);
+    assert!(report.settled.is_empty());
+    assert_eq!(
+        fx.window.pending_reservations(&fx.profile).unwrap(),
+        *std::slice::from_ref(&res)
+    );
+    assert_eq!(fx.receipts.get(&res.id).unwrap(), before);
+    drop(held);
+
+    let retried = fx
+        .window
+        .reconcile_one(&fx.profile, &client, Some(&fx.receipts), &res.id, now)
+        .await
+        .unwrap();
+    assert_eq!(retried.receipt_write_failed, 0);
+    assert!(
+        fx.window
+            .pending_reservations(&fx.profile)
+            .unwrap()
+            .is_empty()
+    );
+    let receipt = fx.receipts.get(&res.id).unwrap().unwrap();
+    if status == "SUCCESS" {
+        assert_eq!(retried.confirmed, 1);
+        assert_eq!(receipt.status, ReceiptStatus::Success);
+        assert_eq!(fx.window_total(now), (500, 1));
+    } else {
+        assert_eq!(retried.released, 1);
+        assert_eq!(receipt.status, ReceiptStatus::Ambiguous);
+        assert_eq!(
+            receipt.release_code,
+            Some(ReleaseEvidence::SequenceConsumed)
+        );
+    }
+}
+
+/// An evidence release retries its receipt checkpoint before releasing the hold.
+#[tokio::test]
+#[serial]
+async fn an_evidence_release_waits_for_its_receipt_and_retries() {
+    assert_receipt_checkpoint("NOT_FOUND", false).await;
+}
+
+/// A successful transaction retries its receipt checkpoint before confirming spend.
+#[tokio::test]
+#[serial]
+async fn a_success_waits_for_its_receipt_and_retries() {
+    assert_receipt_checkpoint("SUCCESS", false).await;
+}
+
+/// An orphan release waits for a durable reconstructed receipt.
+#[tokio::test]
+#[serial]
+async fn a_missing_receipt_must_be_restored_before_release() {
+    assert_receipt_checkpoint("NOT_FOUND", true).await;
 }

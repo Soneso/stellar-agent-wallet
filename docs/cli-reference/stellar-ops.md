@@ -175,7 +175,7 @@ Sends a payment from a source account to a destination, enforcing SEP-29 memo-re
 - **Signing.** By default the command builds, signs, and submits atomically. Three staged flags split the pipeline: `--build-only` emits the unsigned envelope XDR and exits (no signing); `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope. The stage flags are mutually exclusive. `--submit-only` requires an envelope that is already signed: handing it the unsigned XDR that `--build-only` emitted is refused with `network.envelope_unsigned` before anything is sent.
 - **Policy.** After the envelope is built and before signing (in both the full pipeline and `--build-only`), the amount/asset/destination are evaluated against `--profile`'s policy engine. This is the same evaluation the `stellar_pay` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized. So the command works without an authored profile file until an operator opts into `policy.engine = "v1"`. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`). A profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). The staged `--sign-only` and `--submit-only` flows are gated too. Each decodes the supplied envelope through the same decoder the MCP `stellar_pay_commit` path uses. It evaluates the decoded amount/asset/destination before signing (`--sign-only`) or before broadcasting (`--submit-only`). For `--submit-only`, the envelope arrives pre-signed, but broadcasting still spends funds. An envelope the decoder cannot classify into a sized shape follows the opaque-signing posture: under a matched value rule it denies `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. The staged flows match policy rules under the `stellar_pay_commit` tool name (the same name the MCP commit phase matches). A ruleset that names only `stellar_pay` default-denies them, so author rules for both names, or `tool = "*"`, for uniform behavior. Under `policy.engine = "noop"` the staged flows are ungated, matching the rest of the command. Every stage that reads from the endpoint checks its identity first, on the client that later reads and sends. An `--rpc-url` pointing at a different network than `--network` is therefore refused before the policy gate and before the audit-key pre-flight. See [Endpoint identity before the first read](index.md#endpoint-identity-before-the-first-read).
 - **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns `network.mainnet_write_forbidden` before any RPC call, with a submit-layer URL rejection as defence in depth. Beyond those two zero-RPC refusals, the submit layer asks the endpoint which network it serves and binds the submission to that answer rather than to `--network`, refusing a mainnet endpoint, a mismatch, an unestablishable endpoint identity, and any signature that was not made for the network the endpoint reported. The same answer carries the endpoint's protocol version. This release supports protocol 29. Outside it, testnet and other networks log a warning; mainnet refuses with `network.unsupported_protocol_version`, which a mainnet endpoint never reaches while mainnet writes are refused. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
-- **Submission record.** Before the transaction is sent, the command records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation, and a `value_action_pending` audit row. A submission whose confirmation does not arrive exits 1 with `submission.tx_timeout` and keeps that record. Resolve it with `stellar-agent tx status <HASH>`, never by rebuilding and re-sending: a second submission for the same source account and sequence is refused with `submission.tx_already_submitted` while the first stands. `error.details` carries the full transaction hash and the envelope hash the operator verbs take. See [`stellar-agent tx`](#stellar-agent-tx).
+- **Submission record.** Before the transaction is sent, the command records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation under a policy with a stateful criterion, and a `value_action_pending` audit row. A submission that ends without a confirmed outcome exits 1 with `submission.tx_timeout` and keeps that record: the confirmation deadline passed, the endpoint reported an unexpected status, or a transport failure struck during or after the send. The transaction may still apply, and the message says to settle it by its transaction hash and not to resubmit. Resolve it with `stellar-agent tx status <HASH>`, never by rebuilding and re-sending: a second submission for the same source account and sequence is refused with `submission.tx_already_submitted` while the first stands, and so is a resend of the same signed bytes that the spending window already holds. `error.details` carries the full transaction hash and the envelope hash the operator verbs take. See [`stellar-agent tx`](#stellar-agent-tx).
 - **Fee cap.** After the policy gate, every stage checks the per-operation fee
   against the profile's `classic_max_fee_per_op_stroops`. The full pipeline and
   `--build-only` check the fee they selected: auto-selected with `--fee
@@ -597,17 +597,46 @@ What it changes:
 
 - `SUCCESS`: the transaction reached a ledger. The reservation becomes recorded spend, the receipt becomes `success`, and the value-action row the submission never got to write is appended. Running the verb again appends no second row.
 - `FAILED`: the transaction applied and failed. The reservation is released and the receipt records the failure.
-- `NOT_FOUND`: the endpoint has no record of it. Within the retention window, an expired time bound permits release. A consumed sequence requires a second transaction lookup: `SUCCESS` records the spend, `FAILED` releases it, and a second `NOT_FOUND` permits release. Otherwise the record stands; run the verb again later.
+- `NOT_FOUND`: the endpoint has no record of it. Within the retention window, two kinds of chain evidence say the transaction can no longer apply: an observed ledger close time strictly past its time bound, or a source account sequence that has reached the transaction's. Either is followed by a second transaction lookup: `SUCCESS` records the spend, `FAILED` releases it, and a second `NOT_FOUND` releases the reservation. The receipt then becomes `ambiguous`, because no transaction result exists, and `record.release_code` names the evidence: `submission.sequence_consumed` or `submission.time_bound_passed`. A `value_action_failed` row is appended under that code. Without such evidence the record stands; run the verb again later.
+
+`submission.time_bound_passed` needs a transaction with a time bound. The
+wallet builds classic envelopes without one, so on those the evidence is a
+consumed sequence. An envelope handed to `pay --submit-only` can carry a time
+bound, and so can the inner transaction of a fee-bump.
+
+The receipt keeps its `release_code`, so a settled row that could not be
+appended when the reservation was released is appended by the next run. A
+receipt released without recorded evidence, for example by an older binary,
+reads as `ambiguous` with no `release_code`, and the verb appends no row for it.
 
 Automatic reconciliation applies the same chain and retention checks when the
-receipts file is absent. A definitive chain answer restores the receipt's
-transaction identity from its reservation.
+receipts file is absent. A definitive chain answer or a release on chain
+evidence restores the receipt's transaction identity from its reservation.
 Status also completes any approval-consumption write owed by a sent receipt.
 The receipt holds that approval against reuse until the write succeeds.
 
 A submission whose ledger has fallen outside the endpoint's retention window can
 never be settled this way. The verb reports it as `ambiguous` with
-`record.reservation_open: true`, and `tx receipt clear` is the way out.
+`record.reservation_open: true` and no `release_code`, and `tx receipt clear` is
+the way out. A reservation whose receipt is missing is reported as
+`reservation` with `operator_required: true`.
+
+A send the endpoint refused outright never reaches this verb with an open
+record. When `sendTransaction` answers `ERROR` with a transaction result, the
+endpoint has reported a validation error for the envelope: the receipt records
+the failure, the reservation is released, and the wallet never sends those
+bytes again. They did leave the wallet, though. A copy relayed elsewhere that
+later becomes valid applies without being counted against the window, and its
+receipt stays `failed`.
+
+The JSON output carries `tx_hash`, `chain_status`, `ledger`, `record` and
+`reservation`. `record` is the wallet's receipt: `envelope_hash`, `status`,
+`failure_code`, `release_code`, `ledger`, `source_redacted`, `sequence`,
+`submitted` and `reservation_open`. `reservation` names a hold that remains
+after reconciliation, `{envelope_hash, operator_required}`. Absent fields are
+omitted.
+
+No step of the verb sends the transaction again.
 
 Writing the settled row needs the audit writer's exclusive lock. The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and write settlement audit rows.
 
@@ -621,41 +650,69 @@ profile, the record, or the endpoint could not be reached.
 
 ### `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge [flags]`
 
-Releases a submission record reconciliation cannot settle. Two record states
-qualify: `pending`, whether or not the submission was sent, and `ambiguous`. A
-record the network has answered for is refused with `submission.not_clearable`,
-because it needs no acknowledgement.
+Closes a submission record after reconciling it against the chain. The verb
+decides on the chain's latest answer, not on the record as it was left.
 
-The record state is evaluated first, before anything is released and before any
-row is written, so a clear the verb refuses leaves the wallet as it found it.
-Then the verb asks the endpoint what became of the transaction. A `SUCCESS` or
-`FAILED` answer is refused with `submission.not_clearable` and the record is
-left for `tx status` to settle, and an endpoint that cannot answer is refused
-under the same code: a transaction still in flight is exactly the case an
-operator would be wrong about.
+The record state is evaluated first, before anything is reconciled, released,
+or written: a record recorded as `success`, `failed`, `reorged` or
+`cleared_by_operator` is refused with `submission.not_clearable`, so a clear
+the verb refuses leaves the wallet as it found it. Then the verb asks the
+endpoint what became of the transaction. A `SUCCESS` or `FAILED` answer is
+refused with `submission.not_clearable` and the record is left for `tx status`
+to settle, and an endpoint that cannot answer is refused under the same code:
+a transaction still in flight is exactly the case an operator would be wrong
+about. A reservation whose receipt is missing is cleared only when the
+endpoint reports `NOT_FOUND` and its submission ledger is below the endpoint's
+retention floor.
 
-The reservation is released and the audit row written before the receipt is
+Without `--acknowledge` nothing is reconciled or written, and the verb exits 1
+with `submission.acknowledgement_required`. The message names the next step,
+computed from the record: while a sent transaction's time bound is still open,
+wait for it to pass or run `tx status`; otherwise pass `--acknowledge`.
+
+With `--acknowledge` the verb takes the audit writer, restores a missing
+receipt from its reservation, reconciles the submission the way `tx status`
+does, and decides:
+
+| After reconciliation | Result |
+|---|---|
+| The reconciled outcome could not be recorded on its receipt | Refused with `submission.record_unavailable`, naming the receipt-store error. Run `stellar-agent tx status` again. |
+| The receipt disagrees with its reconciliation | Refused with `submission.record_unavailable`. Run `stellar-agent tx status` again. |
+| Released on chain evidence: the receipt carries `release_code` | The `value_action_failed` row is written under that code first; once it is in the log, the receipt is cleared and the clear row records the evidence. A settled row that cannot be written refuses with the audit error and leaves the receipt clearable. |
+| `ambiguous` without evidence (retention window closed), `pending` with no time bound, `pending` and never sent, or a restored orphan | The reservation is released and the receipt cleared. The clear row records no evidence: the outcome is unknown. |
+| `pending`, sent, with a time bound that has not passed on the endpoint's latest ledger and a sequence that is unconsumed | Refused with `submission.still_pending`, naming the time bound. Nothing changes. |
+| A ledger-time read failed for a sent, timed submission, or another reconciliation read failed, and the reservation stood | Refused with `network.rpc_unreachable`. Nothing changes. |
+
+A reconciliation that finds a `SUCCESS` or `FAILED` answer in the meantime is
+refused with `submission.not_clearable`; `tx status` writes its row.
+
+A cleared receipt owes no settlement row: the clear row records the operator's
+decision. Clearing an untimed transaction whose outcome is unknown states that
+it did not move value. If it applies later, its spend is not counted against
+the window.
+
+The reservation is released and the audit rows written before the receipt is
 marked, so a failure part-way leaves a record a re-run still accepts. That
-re-run appends no second row: the verb writes one only where the log does not
-already carry a clear row for the submission.
+re-run appends no second row: the verb writes each row only where the log does
+not already carry it for the submission.
 
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
 | `<ENVELOPE_HASH>` (positional) | Envelope hash of the submission, 64 lowercase hex characters: `tx status` reports it as `record.envelope_hash` | yes | none |
 | `--profile <NAME>` | Profile whose record and spending window are cleared | optional | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--acknowledge` | State that the transaction did not move value | yes | `false` |
+| `--acknowledge` | State that the transaction did not move value, and reconcile before clearing | yes | `false` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
-`--acknowledge` is required because releasing the reservation states that the
-transaction did not move value, and the wallet cannot establish that: it is the
-operator's judgement, made from a block explorer or a second endpoint. Without
-the flag nothing is written and the exit code is 1.
+`--acknowledge` is required because clearing a record whose outcome is unknown
+states that the transaction did not move value, and the wallet cannot
+establish that: it is the operator's judgement, made from a block explorer or a
+second endpoint.
 
 The receipt is marked `cleared_by_operator`, not removed, so the envelope keeps
 its idempotency anchor: a byte-identical resubmission of those exact bytes is
-still recognised. That costs nothing in practice, because a follow-up runs a
+still identified. That costs nothing in practice, because a follow-up runs a
 fresh simulate whose fee moves the bytes. An audit row names the state the clear
-replaced.
+replaced and any release evidence.
 
 ### After a network outage
 
@@ -672,7 +729,10 @@ Until a record is settled, the same intent at the same sequence is refused with
 `submission.tx_already_submitted`. That refusal is what stops a double payment:
 at most one transaction per source account and sequence can ever apply, and the
 wallet cannot tell whether the first one did. Rebuilding with a different fee
-does not get around it, and is not meant to.
+does not get around it, and is not meant to. Under a policy with a stateful
+criterion, a resend of the same signed bytes is refused the same way even
+when the receipt is gone, because the spending window still holds them. No
+recovery path sends a transaction again.
 
 ## Related pages
 

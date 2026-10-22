@@ -2076,6 +2076,7 @@ mod tests {
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
                 cleared_from: "ambiguous".to_owned(),
                 reservation_released: true,
+                evidence: Some("submission.sequence_consumed".to_owned()),
             },
             EventKind::X402PaymentAuthorized {
                 witness: None,
@@ -2895,6 +2896,45 @@ mod tests {
             matches!(err, VerifyError::ChainBroken { .. }),
             "expected ChainBroken, got {err:?}"
         );
+    }
+
+    #[test]
+    fn verify_tampered_release_evidence_fails() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("evidence.jsonl");
+        let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+        for evidence in [None, Some("submission.sequence_consumed".to_owned()), None] {
+            writer
+                .write_entry(AuditEntry::new_submission_receipt_cleared(
+                    "tx receipt clear",
+                    "stellar:testnet",
+                    "abcd1234...5678efgh",
+                    "ambiguous",
+                    true,
+                    evidence,
+                    None,
+                    "evidence-request",
+                ))
+                .unwrap();
+        }
+        drop(writer);
+        verify_log(&path, None).unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        let mut rows: Vec<serde_json::Value> = original
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        rows[1]["evidence"] = serde_json::json!("submission.time_bound_passed");
+        let tampered = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, tampered + "\n").unwrap();
+        assert!(matches!(
+            verify_log(&path, None),
+            Err(VerifyError::ChainBroken { .. })
+        ));
     }
 
     #[test]

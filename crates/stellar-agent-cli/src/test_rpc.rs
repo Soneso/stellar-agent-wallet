@@ -146,7 +146,7 @@ impl Respond for ClassicRpc {
                 "latestLedger": 2000,
                 "oldestLedger": 1,
                 "latestLedgerCloseTime": "1700000100",
-                "oldestLedgerCloseTime": "1",
+                "oldestLedgerCloseTime": 1,
                 "cursor": "2000",
                 "ledgers": []
             }),

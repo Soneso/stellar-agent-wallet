@@ -80,6 +80,12 @@ transaction hash that the message redacts. `details` carries that hash and the
 verb or tool that reconciles it. No other code carries `details`, and the field
 is absent from the envelope when it is not set.
 
+A `submission.tx_timeout` submission may still apply, whether the deadline
+passed or a transport failure struck during or after the send. Settle it by
+passing `details.tx_hash` to `stellar_transaction_status` (or
+`stellar-agent tx status`), and never resubmit: no recovery path sends a
+transaction again.
+
 ## Tool shapes
 
 Each tool is read-only, signs without submitting, or signs and submits; the

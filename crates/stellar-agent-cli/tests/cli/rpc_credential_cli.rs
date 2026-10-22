@@ -108,7 +108,7 @@ impl Respond for Rpc {
             }),
             "getLedgers" => json!({
                 "latestLedger": 2000, "oldestLedger": 1, "latestLedgerCloseTime": "100",
-                "oldestLedgerCloseTime": "1", "cursor": "2000", "ledgers": []
+                "oldestLedgerCloseTime": 1, "cursor": "2000", "ledgers": []
             }),
             other => panic!("unexpected RPC method {other}"),
         };
