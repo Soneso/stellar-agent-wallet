@@ -574,6 +574,8 @@ stellar-agent profile migrate my-profile
 This rewrites the file in place (atomically), sets the four `*_key_id` reference
 names, and sets `[policy] engine = "noop"`. Running it again on an
 already-current profile is a no-op.
+The atomic rewrite relies on a rename, which is atomic on single-host POSIX
+filesystems; NFS, SMB, and FUSE mounts may rename with weaker guarantees.
 
 The counterparty cache reads and mints its HMAC key at
 `counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.

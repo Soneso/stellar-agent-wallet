@@ -453,7 +453,7 @@ with `error.code` of `credentials.registration_timeout`,
 `credentials.registration_user_canceled`, or
 `credentials.registration_entry_missing` respectively. A declined
 first-registration prompt is `credentials.rp_id_binding_warning_declined`
-(the message names the recovery runbook).
+(the message points to the RP-ID guidance in `docs/remote-approval.md`).
 
 ```json
 {"ok":true,"data":{"credential_id":"AABBC...IJJKK","credential_name":"laptop-key","rp_id":"wallet.example.com","registered_at_unix_ms":0},"request_id":"..."}
