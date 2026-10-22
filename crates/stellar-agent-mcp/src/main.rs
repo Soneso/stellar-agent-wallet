@@ -17,7 +17,7 @@
 //!
 //! On Linux the process sets `PR_SET_DUMPABLE 0` and `PR_SET_NO_NEW_PRIVS 1`
 //! via raw `libc::prctl` at startup.  Details and the macOS / Windows operator
-//! discipline are documented in `docs/runbooks/mcp-process-isolation.md`.
+//! discipline are documented in `docs/mcp.md#launching-the-server`.
 //!
 //! # Transport safety
 //!
@@ -66,7 +66,7 @@ use stellar_agent_network::keyring::init_platform_keyring_store;
 /// setuid must analyse compatibility before landing.
 ///
 /// macOS / Windows: operator discipline described in
-/// `docs/runbooks/mcp-process-isolation.md`.
+/// `docs/mcp.md#launching-the-server`.
 #[cfg(target_os = "linux")]
 fn harden_process() {
     // SAFETY: prctl is a pure syscall that modifies only process-level kernel
@@ -107,7 +107,7 @@ fn harden_process() {
 #[cfg(not(target_os = "linux"))]
 fn harden_process() {
     // macOS / Windows: operator discipline documented in
-    // docs/runbooks/mcp-process-isolation.md.  Neither platform provides a
+    // docs/mcp.md#launching-the-server.  Neither platform provides a
     // direct equivalent of PR_SET_DUMPABLE; relying on the keyring backend's
     // per-app entitlement model and operator policy.
 }

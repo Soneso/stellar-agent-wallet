@@ -37,7 +37,7 @@
 //! the profile names. An absent binding is recorded. The key rotates in place
 //! at the same keyring coordinate, so the binding is otherwise unchanged.
 //!
-//! See `docs/runbooks/profile-migration.md` for operator guidance on key
+//! See `docs/profiles.md#migration-and-key-rotation` for operator guidance on key
 //! rotation scheduling.
 //!
 //! # Output (JSON envelope)
