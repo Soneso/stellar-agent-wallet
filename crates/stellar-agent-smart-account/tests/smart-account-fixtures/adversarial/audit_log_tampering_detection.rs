@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::signer_set::{BaselineReason, ObservedSignerSet, SignerPubkey};
+use stellar_agent_core::audit_log::test_helpers::verified_audit_lines;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::RedactedStrkey;
 use stellar_agent_smart_account::error::SaError;
@@ -142,10 +143,7 @@ async fn tampered_payload_returns_audit_log_integrity_error() {
     // mismatch when it recomputes `H(row1_body)` and finds it does not equal
     // `row2.previous_entry_hash`.
     {
-        let contents =
-            std::fs::read_to_string(&audit_log_path).expect("audit log JSONL must be readable");
-        // Replace only the FIRST occurrence (row 1) by splitting into lines.
-        let original_lines: Vec<&str> = contents.lines().collect();
+        let original_lines = verified_audit_lines(&audit_writer);
         assert!(
             original_lines.len() >= 2,
             "log must have at least 2 rows after witness write"

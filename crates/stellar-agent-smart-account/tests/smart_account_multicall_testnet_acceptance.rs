@@ -69,8 +69,8 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
-use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::policy::Decision;
 use stellar_agent_core::policy::v1::PolicyEngineV1;
@@ -725,16 +725,6 @@ async fn h3_bundle_aggregate_cap_deny() {
 
 // ── h5_bundle_under_a_rule_other_than_0_checks_its_signer_set ────────────────
 
-/// The rows of the audit log at `path`, in order.
-fn audit_rows(path: &std::path::Path) -> Vec<AuditEntry> {
-    std::fs::read_to_string(path)
-        .expect("the audit log reads")
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("an audit row parses"))
-        .collect()
-}
-
 /// A fresh audit writer over `audit.jsonl` in `dir`, with the log's path.
 fn audit_writer_in(dir: &std::path::Path) -> (Arc<Mutex<AuditWriter>>, std::path::PathBuf) {
     let path = dir.join("audit.jsonl");
@@ -786,7 +776,7 @@ async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
         TESTNET_RPC_URL,
         &secondary_rpc_url,
         Arc::clone(&writer),
-        log_path.clone(),
+        log_path,
         timeout,
     );
     let rule_manager = rule_manager_for_tests(
@@ -862,7 +852,7 @@ async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
         .expect("signers list reads the rule");
     assert_eq!(listed.baseline, PreviousBaseline::Matched);
     assert!(
-        !audit_rows(&log_path)
+        !verified_audit_entries(&writer)
             .iter()
             .any(|row| matches!(row.event_kind, EventKind::SaSignerSetDiverged { .. })),
         "[h5] the matched rule writes no divergence row"
@@ -914,7 +904,7 @@ async fn h5_bundle_under_a_rule_other_than_0_checks_its_signer_set() {
         }
         other => panic!("[h5] expected MulticallFailed at policy_gate; got {other:?}"),
     }
-    let rows = audit_rows(&log_path);
+    let rows = verified_audit_entries(&writer);
     assert!(
         rows.iter().any(|row| row.request_id == request_id
             && matches!(row.event_kind, EventKind::SaSignerSetDiverged { rule_id: diverged, .. } if diverged == rule_id)),

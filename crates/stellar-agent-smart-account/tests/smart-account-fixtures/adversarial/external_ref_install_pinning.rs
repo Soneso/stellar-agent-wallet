@@ -20,11 +20,12 @@
 //! Pinning writes no audit row in any case: the install writes the override
 //! rows after it confirms.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use stellar_agent_core::audit_log::AuditReader;
 use stellar_agent_core::audit_log::schema::{ContractKind, EventKind, ExecutableRefPin};
+use stellar_agent_core::audit_log::test_helpers::verified_audit_lines;
+use stellar_agent_core::audit_log::{AuditReader, AuditWriter};
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::{AdminOrOwnerKey, SaError};
 use stellar_agent_smart_account::managers::rules::RuleContext;
@@ -165,11 +166,11 @@ fn definition_for(kind: ContractKind) -> ContextRuleDefinition {
 }
 
 /// Asserts the audit log holds no row: pinning writes nothing.
-fn assert_no_audit_row(log_path: &std::path::Path, case: &str) {
-    let audit_log = std::fs::read_to_string(log_path).unwrap_or_default();
+fn assert_no_audit_row(audit_writer: &Arc<Mutex<AuditWriter>>, case: &str) {
+    let audit_lines = verified_audit_lines(audit_writer);
     assert!(
-        audit_log.is_empty(),
-        "{case}: pinning writes no audit row: {audit_log}"
+        audit_lines.is_empty(),
+        "{case}: pinning writes no audit row: {audit_lines:?}"
     );
 }
 
@@ -214,11 +215,7 @@ async fn pin_with<R: Respond + 'static>(
         .mount(&server)
         .await;
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let manager = manager_one_url(
-        &server.uri(),
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    );
+    let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
     let result = pin_referenced_contracts(
         &manager,
         smart_account_addr(),
@@ -231,7 +228,7 @@ async fn pin_with<R: Respond + 'static>(
         Uuid::new_v4().to_string(),
     )
     .await;
-    assert_no_audit_row(&audit_log_path, &format!("{kind}"));
+    assert_no_audit_row(&audit_writer, &format!("{kind}"));
     result
 }
 
@@ -310,11 +307,7 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
             .mount(&server)
             .await;
         let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-        let manager = manager_one_url(
-            &server.uri(),
-            Arc::clone(&audit_writer),
-            audit_log_path.clone(),
-        );
+        let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
         let definition = definition_for(kind);
         let request_id = Uuid::new_v4().to_string();
 
@@ -356,7 +349,7 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
             "{kind}: {:?}",
             pin_result.pending_overrides
         );
-        assert_no_audit_row(&audit_log_path, &format!("{kind}"));
+        assert_no_audit_row(&audit_writer, &format!("{kind}"));
 
         // The created row records the resolved first-8 and the pin at the
         // same position, and the reader returns them.
