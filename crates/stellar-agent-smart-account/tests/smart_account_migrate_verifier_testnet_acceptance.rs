@@ -175,10 +175,6 @@ fn view_threshold(view: &SignerSetView) -> Option<u32> {
     }
 }
 
-fn read_audit_entries(audit_writer: &Arc<Mutex<AuditWriter>>) -> Vec<AuditEntry> {
-    verified_audit_entries(audit_writer)
-}
-
 /// Generates a fresh ed25519 keypair and returns
 /// `(g_strkey, DeployerKeypair::SecretEnv { signer })`.
 ///
@@ -1600,7 +1596,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
     // its baseline there.
     let tmp_dir = tempfile::tempdir().expect("tempdir");
     let (audit_writer, audit_log_path) = audit_writer_in(&tmp_dir);
-    let manager = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path.clone());
+    let manager = fresh_signers_manager(Arc::clone(&audit_writer), audit_log_path);
     let rule_manager = fresh_rule_manager(&manager, &audit_writer);
 
     let install_out = rule_manager
@@ -1840,8 +1836,6 @@ async fn d3_migrate_verifier_on_chain_submit() {
     // Assertion 4: audit log contains exactly 1 SaVerifierMigrated row.
     //
     // The verified helper reads the chain through the manager's shared writer.
-    //
-    // `tmp_dir` is still alive (holds the directory); the file exists.
     {
         let entries = verified_audit_entries(&audit_writer);
 
@@ -1887,7 +1881,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
     // the submit's request id, with the pins row between them and the
     // migrated row last.
     {
-        let pair_rows: Vec<AuditEntry> = read_audit_entries(&audit_writer)
+        let pair_rows: Vec<AuditEntry> = verified_audit_entries(&audit_writer)
             .into_iter()
             .filter(|entry| entry.request_id == submit_request_id)
             .collect();
@@ -2237,7 +2231,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
         i64::try_from(D3_TRANSFER_STROOPS).expect("fits i64"),
         "the recipient must receive exactly the transferred amount"
     );
-    let drift_rows = read_audit_entries(&audit_writer)
+    let drift_rows = verified_audit_entries(&audit_writer)
         .into_iter()
         .filter(|entry| {
             matches!(
@@ -2252,7 +2246,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
     );
 
     // ── Pin record: the migration rewrote it to name verifier-B ──────────────
-    let pins_updated: Vec<AuditEntry> = read_audit_entries(&audit_writer)
+    let pins_updated: Vec<AuditEntry> = verified_audit_entries(&audit_writer)
         .into_iter()
         .filter(|entry| {
             matches!(

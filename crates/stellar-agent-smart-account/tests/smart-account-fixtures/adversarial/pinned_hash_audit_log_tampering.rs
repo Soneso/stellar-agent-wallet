@@ -87,7 +87,7 @@ fn pinned_hash_tampering_returns_audit_log_error_before_pin_extraction() {
         .expect("tampered log write must succeed");
     file.flush().expect("flush must succeed");
 
-    let manager = manager_one_url("http://127.0.0.1:1", audit_writer, audit_log_path.clone());
+    let manager = manager_one_url("http://127.0.0.1:1", audit_writer, audit_log_path);
     let result =
         test_helpers::read_pinned_hashes_for_rule(&manager, rule_id, ZERO_CONTRACT_REDACTED);
 

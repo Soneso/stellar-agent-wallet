@@ -459,9 +459,8 @@ async fn audit_entry_emitted_on_success() {
     drop(writer);
 
     let entries = verified_audit_entries_from_path(&audit_path);
-    assert_eq!(entries.len(), 1, "expected exactly one audit entry");
     let [entry] = entries.as_slice() else {
-        panic!("expected one verified audit entry")
+        panic!("expected exactly one audit entry: {entries:?}")
     };
     let EventKind::PasskeyRegistered {
         credential_name: emitted_name,
@@ -526,9 +525,8 @@ async fn audit_entry_emitted_on_timeout() {
     drop(writer);
 
     let entries = verified_audit_entries_from_path(&audit_path);
-    assert_eq!(entries.len(), 1, "expected exactly one timeout audit entry");
     let [entry] = entries.as_slice() else {
-        panic!("expected one verified timeout audit entry")
+        panic!("expected exactly one timeout audit entry: {entries:?}")
     };
     let EventKind::PasskeyRegistered {
         credential_name: emitted_name,

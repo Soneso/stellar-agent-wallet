@@ -120,11 +120,7 @@ async fn accept_mutable_verifier_succeeds_with_a_pending_override_and_writes_no_
         .await;
 
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let manager = manager_one_url(
-        &server.uri(),
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    );
+    let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
 
     let definition = ContextRuleDefinition::new(
         RuleContext::Default,

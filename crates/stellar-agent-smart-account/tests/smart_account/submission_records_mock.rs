@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use serial_test::serial;
 use stellar_agent_core::audit_log::AuditWriter;
-use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_lines;
 use stellar_agent_core::policy::Decision;
 use stellar_agent_core::policy::v1::PolicyEngineV1;
 use stellar_agent_core::policy::v1::criteria::bundle_per_period_cap::BundlePerPeriodCapCriterion;
@@ -393,9 +393,9 @@ impl Fixture {
     }
 
     fn rows(&self, kind: &str) -> Vec<Value> {
-        verified_audit_entries(&self.audit)
+        verified_audit_lines(&self.audit)
             .into_iter()
-            .map(|entry| serde_json::to_value(entry).unwrap())
+            .map(|line| serde_json::from_str::<Value>(&line).expect("audit row must parse"))
             .filter(|row| row["kind"] == kind)
             .collect()
     }

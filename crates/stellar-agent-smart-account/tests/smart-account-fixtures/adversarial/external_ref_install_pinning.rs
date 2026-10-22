@@ -215,11 +215,7 @@ async fn pin_with<R: Respond + 'static>(
         .mount(&server)
         .await;
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let manager = manager_one_url(
-        &server.uri(),
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    );
+    let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
     let result = pin_referenced_contracts(
         &manager,
         smart_account_addr(),
@@ -311,11 +307,7 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
             .mount(&server)
             .await;
         let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-        let manager = manager_one_url(
-            &server.uri(),
-            Arc::clone(&audit_writer),
-            audit_log_path.clone(),
-        );
+        let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
         let definition = definition_for(kind);
         let request_id = Uuid::new_v4().to_string();
 

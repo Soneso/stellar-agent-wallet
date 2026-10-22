@@ -13,12 +13,11 @@
 #![cfg(feature = "test-helpers")]
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EventKind, ExecutableRefPin};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
-use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::signers::ObservedExecutable;
@@ -103,10 +102,6 @@ fn live_wasm(hash: [u8; 32]) -> KeyedLedgerEntriesResponder {
 
 // ── Harness ───────────────────────────────────────────────────────────────────
 
-fn read_audit_entries(audit_writer: &Arc<Mutex<AuditWriter>>) -> Vec<AuditEntry> {
-    verified_audit_entries(audit_writer)
-}
-
 /// Outcome of one drift check: the result, the drift rows written, and the
 /// observation left in the per-call cache.
 struct CheckOutcome {
@@ -125,11 +120,7 @@ async fn check(
 ) -> CheckOutcome {
     let server = live.serve().await;
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let manager = manager_one_url(
-        &server.uri(),
-        Arc::clone(&audit_writer),
-        audit_log_path.clone(),
-    );
+    let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
     let request_id = Uuid::new_v4().to_string();
     let (verifier_first8, verifier_refs, policy_first8, policy_refs) = match kind {
         Kind::Verifier => (vec![pinned_first8], vec![pinned_ref], vec![], vec![]),
@@ -183,7 +174,7 @@ async fn check(
         }
     };
 
-    let drift_rows = read_audit_entries(&audit_writer)
+    let drift_rows = verified_audit_entries(&audit_writer)
         .into_iter()
         .filter(|e| e.request_id == request_id)
         .filter_map(|e| match e.event_kind {

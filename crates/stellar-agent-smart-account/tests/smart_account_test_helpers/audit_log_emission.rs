@@ -1,8 +1,8 @@
 //! Integration tests for audit-log emission from `deploy_smart_account`.
 //!
 //! Each test wires an `AuditWriter` backed by a `tempfile::NamedTempFile`, runs
-//! `deploy_smart_account` in dry-run or error mode, then reads back the JSONL
-//! output and asserts on the entry fields.
+//! `deploy_smart_account` in dry-run or error mode, then reads back the verified
+//! audit chain and asserts on the entry fields.
 //!
 //! # Coverage
 //!
@@ -113,7 +113,7 @@ fn build_failure_args() -> DeploymentArgs {
     }
 }
 
-/// Reads all JSONL lines from the temp file and parses each as `serde_json::Value`.
+/// Returns the verified audit chain under `dir` as JSON values, in chain order.
 fn read_entries(dir: &TempDir) -> Vec<serde_json::Value> {
     verified_audit_entries_from_path(&dir.path().join("audit.jsonl"))
         .into_iter()

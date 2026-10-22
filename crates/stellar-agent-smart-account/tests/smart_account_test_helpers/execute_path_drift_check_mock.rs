@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -47,7 +47,7 @@ use stellar_agent_core::audit_log::signer_set::{
     BaselineReason, ObservedSignerSet, SignerEntryV2, SignerIdentityV2, SignerPubkey,
     SignerSetSnapshotV2, SignerSetView, ThresholdObservation, account_digest,
 };
-use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
@@ -1491,8 +1491,12 @@ impl Harness {
         ));
     }
 
+    /// The rows of the verified audit chain, in chain order. Tests poison the
+    /// writer lock on purpose, so the read takes the guard out of a poisoned
+    /// lock and holds it while the chain is verified and read.
     fn rows(&self) -> Vec<AuditEntry> {
-        verified_audit_entries(&self.audit)
+        let writer = self.audit.lock().unwrap_or_else(PoisonError::into_inner);
+        verified_audit_entries_from_path(writer.path())
     }
 
     fn pins_updated_rows(&self) -> Vec<AuditEntry> {

@@ -20,12 +20,10 @@
 //!   refused by identification itself, before either override flag is
 //!   consulted.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::ContractKind;
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
-use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_smart_account::error::{AdminOrOwnerKey, SaError};
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
@@ -98,10 +96,6 @@ fn ledger_entries(contract: &ScAddress, entry_xdr: &str) -> serde_json::Value {
     })
 }
 
-fn read_audit_entries(audit_writer: &Arc<Mutex<AuditWriter>>) -> Vec<AuditEntry> {
-    verified_audit_entries(audit_writer)
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// Both instance shapes, for both contract kinds, with and without
@@ -134,11 +128,8 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
                     .await;
 
                 let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-                let manager = manager_one_url(
-                    &server.uri(),
-                    Arc::clone(&audit_writer),
-                    audit_log_path.clone(),
-                );
+                let manager =
+                    manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
 
                 let (signers, policies) = if contract_kind == ContractKind::Policy {
                     (
@@ -205,7 +196,7 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
                 );
 
                 assert!(
-                    read_audit_entries(&audit_writer).is_empty(),
+                    verified_audit_entries(&audit_writer).is_empty(),
                     "{case}: a refused pin writes no audit row"
                 );
             }
@@ -245,11 +236,7 @@ async fn external_ref_without_live_tag_entry_rejected_before_any_override() {
             let server = responder.serve().await;
 
             let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-            let manager = manager_one_url(
-                &server.uri(),
-                Arc::clone(&audit_writer),
-                audit_log_path.clone(),
-            );
+            let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
 
             let (signers, policies) = if contract_kind == ContractKind::Policy {
                 (
@@ -322,7 +309,7 @@ async fn external_ref_without_live_tag_entry_rejected_before_any_override() {
             );
 
             assert!(
-                read_audit_entries(&audit_writer).is_empty(),
+                verified_audit_entries(&audit_writer).is_empty(),
                 "{case}: a refused pin writes no audit row"
             );
         }
