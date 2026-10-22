@@ -293,6 +293,7 @@ async fn verify_pins_mixed_drift_and_unavailable_preserves_both_statuses_and_cod
                     parse_c_strkey_to_smart_account(&policy).unwrap(),
                 )]),
             ),
+            field("policy_ids", vector(vec![ScVal::U32(0)])),
             field("signer_ids", vector(vec![ScVal::U32(0)])),
             field(
                 "signers",

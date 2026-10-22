@@ -443,6 +443,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `profile sign-policy` refuses such a key in the policy body with
   `sign_policy.canonicalization_failed` and replaces the `[signature]` table
   whole, dropping any extra key in that table.
+- The context-rule reader refuses a `Delegated` signer with more than two
+  items and an `External` signer with more than three
+  (`SignerDecodeError::TooManyItems`). It requires `policies` and
+  `policy_ids` as lists of equal length, every policy an address, and every
+  id a `u32`, with no repeated policy or id. Such a rule reads as
+  `sa.deployment_failed` wherever a rule is read, and the verifier-migration
+  planner refuses it. Thanks to @ngybnc.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 

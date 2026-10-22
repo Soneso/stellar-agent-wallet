@@ -266,6 +266,9 @@ pub fn build_context_rule_scval_xdr(
         .iter()
         .map(|addr| ScVal::Address(addr.clone()))
         .collect();
+    // One policy id per policy, aligned by position, counted from 0.
+    let policy_count = u32::try_from(policies.len()).expect("policy count fits");
+    let policy_ids_scvals: Vec<ScVal> = (0..policy_count).map(ScVal::U32).collect();
 
     // Build the ScMap. Keys must be sorted lexicographically (alphabetical by name).
     // Sorted order: context_type, id, name, policies, policy_ids, signer_ids, signers, valid_until.
@@ -312,10 +315,10 @@ pub fn build_context_rule_scval_xdr(
         key: sym(b"policies"),
         val: vec_or_void(policies_scvals),
     };
-    // policy_ids: placeholder empty Vec
+    // policy_ids: Vec<u32>
     let policy_ids_entry = ScMapEntry {
         key: sym(b"policy_ids"),
-        val: vec_or_void(vec![]),
+        val: vec_or_void(policy_ids_scvals),
     };
     // signer_ids: Vec<u32>
     let signer_ids_entry = ScMapEntry {
@@ -409,6 +412,9 @@ pub fn build_context_rule_scval_xdr_with_valid_until(
         .iter()
         .map(|addr| ScVal::Address(addr.clone()))
         .collect();
+    // One policy id per policy, aligned by position, counted from 0.
+    let policy_count = u32::try_from(policies.len()).expect("policy count fits");
+    let policy_ids_scvals: Vec<ScVal> = (0..policy_count).map(ScVal::U32).collect();
 
     let sym = |s: &[u8]| {
         ScVal::Symbol(ScSymbol(
@@ -447,7 +453,7 @@ pub fn build_context_rule_scval_xdr_with_valid_until(
     };
     let policy_ids_entry = ScMapEntry {
         key: sym(b"policy_ids"),
-        val: vec_or_void(vec![]),
+        val: vec_or_void(policy_ids_scvals),
     };
     let signer_ids_entry = ScMapEntry {
         key: sym(b"signer_ids"),

@@ -276,6 +276,7 @@ fn delegated_rule() -> ScVal {
         vec![
             entry("id", ScVal::U32(RULE_ID)),
             entry("policies", vec_of(vec![])),
+            entry("policy_ids", vec_of(vec![])),
             entry("signer_ids", vec_of(vec![ScVal::U32(0)])),
             entry(
                 "signers",

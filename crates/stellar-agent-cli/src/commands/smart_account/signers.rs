@@ -3694,10 +3694,14 @@ mod tests {
         let signer_ids = (0..u32::try_from(signers.len()).unwrap())
             .map(ScVal::U32)
             .collect();
+        let policy_ids = (0..u32::try_from(policies.len()).unwrap())
+            .map(ScVal::U32)
+            .collect();
         ScVal::Map(Some(ScMap(
             vec![
                 entry("id", ScVal::U32(id)),
                 entry("policies", vec_of(policies)),
+                entry("policy_ids", vec_of(policy_ids)),
                 entry("signer_ids", vec_of(signer_ids)),
                 entry("signers", vec_of(signers)),
                 entry("valid_until", ScVal::Void),
