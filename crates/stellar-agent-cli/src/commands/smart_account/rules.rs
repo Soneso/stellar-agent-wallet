@@ -4737,27 +4737,47 @@ mod tests {
     // `AddPolicyArgsHarness` verifies the clap surface (all required flags parse
     // correctly), independently of the cap-check path.
 
-    use stellar_xdr::{ScMap as XdrScMap, ScMapEntry as XdrScMapEntry, ScVec as XdrScVec};
+    use stellar_xdr::{
+        ContractId, Hash, ScAddress, ScMap as XdrScMap, ScMapEntry as XdrScMapEntry,
+        ScSymbol as XdrScSymbol, ScVal as XdrScVal, ScVec as XdrScVec,
+    };
 
-    /// Builds a synthetic `ContextRule` `ScVal::Map` containing a `policy_ids`
-    /// field with `n` entries.
-    ///
-    /// Only the `policy_ids` key is required by `decode_policy_count_from_scval`.
-    /// The value is `ScVal::Vec(Some(ScVec([U32(0), U32(1), ...])))`.
-    ///
-    /// OZ storage layout: `ContextRuleEntry.policy_ids: Vec<u32>`.
-    fn make_rule_scval_with_policies(n: usize) -> stellar_xdr::ScVal {
-        let elems: Vec<stellar_xdr::ScVal> =
-            (0..n).map(|i| stellar_xdr::ScVal::U32(i as u32)).collect();
-        let policy_ids_vec =
-            stellar_xdr::ScVal::Vec(Some(XdrScVec(elems.try_into().expect("policy_ids VecM"))));
-        let entry = XdrScMapEntry {
-            key: stellar_xdr::ScVal::Symbol(stellar_xdr::ScSymbol(
-                "policy_ids".try_into().expect("ScSymbol"),
-            )),
-            val: policy_ids_vec,
-        };
-        stellar_xdr::ScVal::Map(Some(XdrScMap(vec![entry].try_into().expect("ScMap"))))
+    /// Builds a complete, decoder-valid ContextRule with `n` policies and no
+    /// signers for the policy cap pre-check fixtures.
+    fn make_rule_scval_with_policies(n: usize) -> XdrScVal {
+        let policy_ids: Vec<XdrScVal> = (0..n)
+            .map(|index| XdrScVal::U32(u32::try_from(index).expect("policy id")))
+            .collect();
+        let policies: Vec<XdrScVal> = (0..n)
+            .map(|index| {
+                let byte = u8::try_from(index + 1).expect("fixture policy byte");
+                XdrScVal::Address(ScAddress::Contract(ContractId(Hash([byte; 32]))))
+            })
+            .collect();
+        let empty_list =
+            || XdrScVal::Vec(Some(XdrScVec(Vec::<XdrScVal>::new().try_into().unwrap())));
+        let entries = vec![
+            ("id", XdrScVal::U32(1)),
+            ("signer_ids", empty_list()),
+            ("signers", empty_list()),
+            (
+                "policies",
+                XdrScVal::Vec(Some(XdrScVec(policies.try_into().expect("policies VecM")))),
+            ),
+            (
+                "policy_ids",
+                XdrScVal::Vec(Some(XdrScVec(
+                    policy_ids.try_into().expect("policy_ids VecM"),
+                ))),
+            ),
+        ]
+        .into_iter()
+        .map(|(key, val)| XdrScMapEntry {
+            key: XdrScVal::Symbol(XdrScSymbol::try_from(key).unwrap()),
+            val,
+        })
+        .collect::<Vec<_>>();
+        XdrScVal::Map(Some(XdrScMap(entries.try_into().expect("ScMap"))))
     }
 
     #[derive(Parser)]

@@ -9312,6 +9312,29 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
     })
 }
 
+/// Decodes a complete context rule and returns its validated signer and policy
+/// counts for callers that enforce the on-chain caps before submission.
+pub(crate) fn decode_context_rule_counts(scval: &ScVal) -> Result<(u32, u32), SaError> {
+    let rule = decode_context_rule_scval(scval.clone())?;
+    let signer_count =
+        u32::try_from(rule.signers.len()).map_err(|_| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!(
+                "get_context_rule: signers length {} overflows u32",
+                rule.signers.len()
+            ),
+        })?;
+    let policy_count =
+        u32::try_from(rule.policies.len()).map_err(|_| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!(
+                "get_context_rule: policies length {} overflows u32",
+                rule.policies.len()
+            ),
+        })?;
+    Ok((signer_count, policy_count))
+}
+
 /// Returns the policies of a `ContextRule` from its `policies` and
 /// `policy_ids` fields.
 ///
