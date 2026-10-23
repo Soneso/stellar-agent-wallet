@@ -3174,10 +3174,12 @@ mod tests {
 
     use stellar_agent_core::policy::Decision;
     use stellar_agent_core::policy::v1::PolicyEngineV1;
+    use stellar_agent_core::policy::v1::criteria::Criterion;
     use stellar_agent_core::policy::v1::criteria::minimum_reserve::MinimumReserveCriterion;
     use stellar_agent_core::policy::v1::criteria::per_tx_cap::PerTxCapCriterion;
     use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
-    use stellar_agent_core::policy::v1::{AccountReserveLookupError, AccountReservesView};
+    use stellar_agent_network::policy_view::AccountViewAdapter;
+    use stellar_agent_network::{AccountView, AssetView, BalanceView, ThresholdsView};
     use stellar_xdr::{
         AccountId, Asset, CreateAccountOp, Limits, MuxedAccount, Operation, OperationBody,
         PaymentOp, Preconditions, PublicKey as XdrPublicKey, SequenceNumber, Transaction,
@@ -3238,20 +3240,23 @@ mod tests {
         build_envelope_b64_with_fee(SOURCE_G, op, fee)
     }
 
-    #[derive(Debug)]
-    struct StagedAccountView {
-        balance: i64,
-        subentries: i64,
-    }
-
-    impl AccountReservesView for StagedAccountView {
-        fn reserves_stroops(&self, base_reserve: i64) -> i64 {
-            (2 + self.subentries).saturating_mul(base_reserve)
-        }
-
-        fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
-            Ok(self.balance)
-        }
+    fn staged_account_view(balance_stroops: i64) -> AccountView {
+        AccountView::new(
+            SOURCE_G.to_owned(),
+            100,
+            0,
+            vec![BalanceView::new(
+                AssetView::native(),
+                stellar_agent_core::stroops_to_human(balance_stroops),
+                None,
+                "0.0000000".to_owned(),
+                "0.0000000".to_owned(),
+            )],
+            ThresholdsView::new(1, 0, 0, 0),
+            vec![],
+            None,
+            None,
+        )
     }
 
     /// An envelope the pay decoder cannot classify: a `CreateAccount`
@@ -3267,16 +3272,16 @@ mod tests {
         build_envelope_b64(SOURCE_G, op)
     }
 
-    fn per_tx_cap_engine(max_stroops: i64, allow_opaque_signing: bool) -> PolicyEngineV1 {
+    fn staged_policy_engine(
+        criterion: impl Criterion + 'static,
+        allow_opaque_signing: bool,
+    ) -> PolicyEngineV1 {
         let rule = PolicyRule {
             r#match: RuleMatch {
                 tool: "stellar_pay_commit".to_owned(),
                 chain: "*".to_owned(),
             },
-            criteria: vec![Box::new(PerTxCapCriterion::new(
-                "native".to_owned(),
-                i128::from(max_stroops),
-            ))],
+            criteria: vec![Box::new(criterion)],
             decision: Decision::Allow,
             allow_opaque_signing,
         };
@@ -3299,25 +3304,6 @@ mod tests {
         .build()
     }
 
-    fn minimum_reserve_engine(margin_stroops: i64) -> PolicyEngineV1 {
-        let rule = PolicyRule {
-            r#match: RuleMatch {
-                tool: "stellar_pay_commit".to_owned(),
-                chain: "*".to_owned(),
-            },
-            criteria: vec![Box::new(MinimumReserveCriterion::new(margin_stroops))],
-            decision: Decision::Allow,
-            allow_opaque_signing: false,
-        };
-        let doc = PolicyDocument {
-            version: 1,
-            scope: ScopeId::AllProfiles,
-            rules: vec![rule],
-            signature: None,
-        };
-        PolicyEngineV1::new(doc, "alice".to_owned())
-    }
-
     fn envelope_code(
         result: &Result<Option<stellar_agent_core::policy::v1::ValueEffects>, Envelope<()>>,
     ) -> &str {
@@ -3334,7 +3320,10 @@ mod tests {
     /// A within-cap envelope under a satisfied `per_tx_cap` rule allows.
     #[test]
     fn dispatch_staged_pay_gate_within_cap_allows() {
-        let engine = per_tx_cap_engine(1_000_000_000, false); // 100 XLM cap
+        let engine = staged_policy_engine(
+            PerTxCapCriterion::new("native".to_owned(), 1_000_000_000),
+            false,
+        );
         let profile = staged_test_profile();
         let xdr = pay_envelope_b64(500_000_000); // 50 XLM
         let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
@@ -3361,7 +3350,10 @@ mod tests {
     /// at all on the `Ok` branch other than the decoded fields).
     #[test]
     fn dispatch_staged_pay_gate_over_cap_denies_with_envelope_derived_amount() {
-        let engine = per_tx_cap_engine(1_000_000_000, false); // 100 XLM cap
+        let engine = staged_policy_engine(
+            PerTxCapCriterion::new("native".to_owned(), 1_000_000_000),
+            false,
+        );
         let profile = staged_test_profile();
         let xdr = pay_envelope_b64(1_500_000_000); // 150 XLM
         let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
@@ -3384,19 +3376,15 @@ mod tests {
         );
     }
 
-    /// A decoded envelope fee is included in the minimum-reserve debit. A
-    /// caller-supplied fee is irrelevant because this path receives only the
-    /// decoder's authoritative args.
+    /// The staged gate counts the decoded envelope fee in the minimum-reserve debit.
     #[test]
     fn dispatch_staged_pay_gate_minimum_reserve_counts_envelope_fee() {
-        let engine = minimum_reserve_engine(50_000_000); // 5 XLM margin
+        let engine = staged_policy_engine(MinimumReserveCriterion::new(50_000_000), false);
         let profile = staged_test_profile();
         // Balance 106 XLM; payment 100 XLM leaves exactly the 6 XLM reserve +
         // margin threshold before the envelope fee. The nonzero fee must deny.
-        let account_view = StagedAccountView {
-            balance: 1_060_000_000,
-            subentries: 0,
-        };
+        let source_view = staged_account_view(1_060_000_000);
+        let account_view = AccountViewAdapter::new(&source_view);
         let xdr = pay_envelope_b64_with_fee(1_000_000_000, 100);
         let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
             &xdr,
@@ -3417,11 +3405,40 @@ mod tests {
         );
     }
 
+    /// The staged gate allows the minimum-reserve boundary when the envelope carries no fee.
+    #[test]
+    fn dispatch_staged_pay_gate_minimum_reserve_allows_the_boundary_without_a_fee() {
+        let engine = staged_policy_engine(MinimumReserveCriterion::new(50_000_000), false);
+        let profile = staged_test_profile();
+        let source_view = staged_account_view(1_060_000_000);
+        let account_view = AccountViewAdapter::new(&source_view);
+        let xdr = pay_envelope_b64_with_fee(1_000_000_000, 0);
+        let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            &xdr,
+            "stellar_pay_commit",
+        );
+        let result = dispatch_staged_pay_gate(
+            &engine,
+            &profile,
+            "stellar:testnet",
+            decode_result,
+            Some(&account_view),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "a staged payment without a fee must allow at the reserve boundary, got {result:?}"
+        );
+    }
+
     /// An envelope the decoder cannot classify, under a matched value rule,
     /// denies `policy.deny.unsizable_value_effect`.
     #[test]
     fn dispatch_staged_pay_gate_unclassifiable_envelope_denies_unsizable() {
-        let engine = per_tx_cap_engine(1_000_000_000, false);
+        let engine = staged_policy_engine(
+            PerTxCapCriterion::new("native".to_owned(), 1_000_000_000),
+            false,
+        );
         let profile = staged_test_profile();
         let xdr = unclassifiable_envelope_b64();
         let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
@@ -3452,7 +3469,10 @@ mod tests {
     /// `allow_opaque_signing = true`, proceeds (allows).
     #[test]
     fn dispatch_staged_pay_gate_unclassifiable_envelope_with_allow_opaque_signing_allows() {
-        let engine = per_tx_cap_engine(1_000_000_000, true);
+        let engine = staged_policy_engine(
+            PerTxCapCriterion::new("native".to_owned(), 1_000_000_000),
+            true,
+        );
         let profile = staged_test_profile();
         let xdr = unclassifiable_envelope_b64();
         let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(

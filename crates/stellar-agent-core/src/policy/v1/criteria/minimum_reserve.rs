@@ -170,12 +170,10 @@ impl Criterion for MinimumReserveCriterion {
         };
         let total_fee_stroops = extract_total_fee_stroops(ctx);
 
-        // The reserve compare and the DenyReason payload are i128 end-to-end
-        // (no clamp): `amount_stroops` may already carry an i128 token
-        // quantity, so `pre_balance`, `total_fee_stroops`, and
-        // `reserve_required_stroops` (each still `i64` at their own source —
-        // the account-view trait and the configured margin are unaffected by
-        // this widening) are promoted here rather than narrowing the debit.
+        // The reserve compare and the `DenyReason` payload are i128 end to end.
+        // `amount_stroops` may carry an i128 token quantity. The balance, the fee,
+        // and the reserve requirement are i64 at their sources and are promoted
+        // here, so the debit is never narrowed.
         let pre_balance = i128::from(pre_balance);
         let debit = amount_stroops.saturating_add(i128::from(total_fee_stroops));
         let post_balance = pre_balance.saturating_sub(debit);
@@ -267,9 +265,9 @@ fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutcome, Policy
 
 /// Extracts the decoded envelope's total transaction fee in stroops.
 ///
-/// `decode_authoritative_args` writes this internal-only value as a JSON number.
-/// Full-mode callers that have not built an envelope omit it and therefore keep
-/// the existing zero-fee behavior until fee-aware policy arguments are wired.
+/// `decode_authoritative_args` writes this value as a JSON number. Policy
+/// arguments that a caller builds itself, such as the CLI full-pipeline maps
+/// and the MCP simulate maps, carry no fee, and the fee then counts as 0.
 fn extract_total_fee_stroops(ctx: &EvalContext<'_>) -> i64 {
     ctx.args
         .get("total_fee_stroops")
@@ -540,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_total_fee_stroops_returns_decoded_envelope_value() {
+    fn extract_total_fee_stroops_reads_the_decoder_key() {
         let store = PolicyStateStore::new();
         let args = json!({
             "amount": "1 XLM",
@@ -555,18 +553,63 @@ mod tests {
     }
 
     #[test]
-    fn legacy_fee_stroops_is_not_used() {
+    fn minimum_reserve_counts_the_envelope_fee() {
+        use stellar_xdr::{
+            Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
+            SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
+            TransactionV1Envelope, Uint256, VecM, WriteXdr,
+        };
+
+        let amount = 1_000_000_000;
+        let margin = 50_000_000;
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([2; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::Payment(PaymentOp {
+                        destination: MuxedAccount::Ed25519(Uint256([4; 32])),
+                        asset: Asset::Native,
+                        amount,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+        let mut args =
+            crate::envelope_decode::decode_authoritative_args(&envelope, "stellar_pay_commit")
+                .unwrap();
         let store = PolicyStateStore::new();
-        let args = json!({
-            "amount": "1 XLM",
-            "asset": "native",
-            "fee_stroops": 12_345
-        });
+        let criterion = MinimumReserveCriterion::new(margin);
+        let view = MockAccountView {
+            balance: amount + 10_000_000 + margin,
+            subentries: 0,
+        };
         let tool = make_tool("stellar_pay_commit");
         let profile = make_profile();
-        let ctx = make_ctx(&tool, &profile, &args, &store, None);
+        let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::MinimumReserveBreached { .. })),
+            "the decoded envelope fee must push the payment below the reserve: {result:?}"
+        );
 
-        assert_eq!(extract_total_fee_stroops(&ctx), 0);
+        args.as_object_mut().unwrap().remove("total_fee_stroops");
+        let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
+        assert_eq!(
+            criterion.evaluate(&ctx).unwrap(),
+            None,
+            "a payment without the fee key must allow at the reserve boundary"
+        );
     }
 
     // ── Real production args shapes ───────────────────────────────────────────
