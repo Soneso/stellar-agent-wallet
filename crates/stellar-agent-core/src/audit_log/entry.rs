@@ -2237,10 +2237,13 @@ impl AuditEntry {
     /// Constructs a `ValueActionFailed` audit entry.
     ///
     /// Emitted where a recorded submission reached a definitive negative
-    /// answer: the send step refused the bytes, or the poll reported the
-    /// transaction applied and failed. `code` is the stable wire code of that
-    /// answer. `transaction_hash_redacted` MUST be pre-redacted to
-    /// first-8-last-8 at the call site.
+    /// answer: the send step refused the bytes, the poll reported the
+    /// transaction applied and failed, or reconciliation released its
+    /// reservation on chain evidence. It also closes the pending row of a
+    /// submission refused before the send. `code` is the stable wire code of
+    /// that answer: the refusal's code, or the evidence's code for a release.
+    /// `transaction_hash_redacted` MUST be pre-redacted to first-8-last-8 at
+    /// the call site.
     #[must_use]
     #[allow(
         clippy::too_many_arguments,

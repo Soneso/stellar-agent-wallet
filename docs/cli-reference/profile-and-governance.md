@@ -351,6 +351,11 @@ including testnet. It acquires that writer before the window-store lock and
 writes the reset row before minting a key, advancing the generation or replacing
 the store. A reset whose row cannot be written does not happen.
 
+The reset requires a current tip anchor before and after its row. If repair
+fails, `audit.chain_key_unavailable` carries `audit.tip_anchor_unavailable`,
+and the window state and generation remain unchanged. A reset row can therefore
+describe an attempted reset that did not take effect.
+
 The `policy_window_state_reset` row carries the profile's chain, reason and
 `wiped` record. The JSON result carries the same record. A verified store reports
 live confirmed and pending counts and totals, scope specificity, bucket and
@@ -453,7 +458,7 @@ with `error.code` of `credentials.registration_timeout`,
 `credentials.registration_user_canceled`, or
 `credentials.registration_entry_missing` respectively. A declined
 first-registration prompt is `credentials.rp_id_binding_warning_declined`
-(the message names the recovery runbook).
+(the message points to the RP-ID guidance in `docs/remote-approval.md`).
 
 ```json
 {"ok":true,"data":{"credential_id":"AABBC...IJJKK","credential_name":"laptop-key","rp_id":"wallet.example.com","registered_at_unix_ms":0},"request_id":"..."}

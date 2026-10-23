@@ -2794,6 +2794,12 @@ pub enum EventKind {
     /// outcome is not known, resolved by reconciling `transaction_hash_redacted`
     /// against the chain.
     ///
+    /// A pending row can also describe an attempt the recorder refused before
+    /// the send. A [`Self::ValueActionFailed`] row under the refusal's code
+    /// closes it, except for a resend refused as a duplicate of a submission
+    /// the spending window already holds: that row stays open, and the
+    /// original submission's settlement closes both.
+    ///
     /// The `legs` are the SAME descriptor the policy gate sized — the
     /// single-derivation invariant. The verb identity, chain id, policy
     /// decision, request id, and the full envelope hash ride on the OUTER
@@ -2832,14 +2838,18 @@ pub enum EventKind {
         sequence: i64,
     },
 
-    /// A value-moving transaction the network refused, or that failed
-    /// on-chain.
+    /// A recorded value-moving submission that moved no value: refused before
+    /// or at the send, or failed on-chain.
     ///
-    /// Written where a [`Self::ValueActionPending`] row's transaction reached
-    /// a definitive negative answer: the send step refused the bytes, or the
-    /// poll reported the transaction applied and failed. The value did not
-    /// move, and the spending window reservation the pending row took is
-    /// released.
+    /// Written where a [`Self::ValueActionPending`] row's submission reached
+    /// a definitive negative answer: the send step refused the bytes, the
+    /// poll reported the transaction applied and failed, or reconciliation
+    /// released the submission's reservation on chain evidence that the
+    /// transaction can no longer apply, in which case `code` names that
+    /// evidence. It also closes the pending row of a submission the recorder
+    /// refused before the send, under the refusal's code. A spending-window
+    /// reservation the submission took is released best-effort; one left
+    /// standing remains until reconciliation or an operator settles it.
     ///
     /// # Field redaction
     ///
@@ -2949,10 +2959,14 @@ pub enum EventKind {
     /// An x402 payment whose `x402_payment_authorized` row was written did not
     /// return a payment signature to the caller.
     ///
-    /// Paired with that row by the outer `request_id`. The signed authorization
-    /// reached, or may have reached, the configured RPC in the re-simulation
-    /// whatever the stage. `failure_stage` is one of a closed set:
+    /// Paired with that row by the outer `request_id`. At every stage but
+    /// `anchor_unavailable`, the signed authorization reached, or may have
+    /// reached, the configured RPC in the re-simulation. `failure_stage` is one
+    /// of a closed set:
     ///
+    /// - `anchor_unavailable`: the tip anchor could not be written after the
+    ///   authorized row, so the signed authorization never left the wallet. The
+    ///   spend admitted before the transmit gate stays admitted.
     /// - `resimulation`: the signed re-simulation request failed in transport,
     ///   or the RPC answered it with an error or with no resource data.
     /// - `response_processing`: the RPC answered, and the payload could not be

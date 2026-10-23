@@ -602,10 +602,11 @@ async fn a_confirmed_sep43_submission_writes_one_settled_row() {
         "the settled row names the submission it settles: {rows:?}"
     );
     assert_eq!(
-        stellar_agent_core::audit_log::reader::value_action_settlement(
+        stellar_agent_core::audit_log::reader::try_value_action_settlement(
             &profile.audit_log_path,
             &envelope_hash
-        ),
+        )
+        .unwrap(),
         stellar_agent_core::audit_log::reader::ValueActionSettlement::Settled,
         "the pending row is accounted for: {rows:?}"
     );

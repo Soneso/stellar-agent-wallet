@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `stellar_agent_core::audit_log::reader` exposes `try_value_action_settlement`
+  and `try_submission_receipt_cleared_exists`, which return
+  `AuditLogIntegrityError` when a visited file cannot be read or fails its
+  chain check. `AuditWriter::require_anchor_current` repairs a tip anchor left
+  behind or refuses. `InMemoryTipAnchorStore::fail_next_writes`,
+  `audit_log::test_helpers::rotated_archives_newest_first`, and
+  `audit_log::test_helpers::break_newest_archive_link` serve tests under
+  `test-helpers`.
 - New wire code `profile.key_scope_conflict` refuses mainnet loading and warns
   on testnet for shared wallet or derived keyring entries, self-collisions,
   out-of-scope overlays, or an owner account other than `default`.
@@ -132,6 +140,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetch time lies more than five minutes in the future. It never writes them back.
   `CounterpartyError::FetchFailed` gains `transient`; code that constructs the
   variant or matches it without `..` must add the field.
+- A keyed audit append retries its tip anchor once immediately. A submission
+  recorded through the pending row, the window-state reset, and an x402 payment
+  refuse to send or wipe while the anchor cannot be written
+  (`audit.tip_anchor_unavailable`). A refusal before the pending row writes
+  nothing. After the row, the recorder attempts to close it, release the
+  reservation, and remove the receipt, each best-effort and logged; a resend
+  that the reservation's duplicate check refuses leaves its row open for the
+  original submission's settlement. An x402 refusal after the authorized row
+  records the withheld stage `anchor_unavailable`, and every x402 refusal keeps
+  the admitted spend. MPP's charge row retains its existing flow.
+- `WriterError::TipAnchorStore` displays the sub-code
+  `audit.tip_anchor_unavailable` ahead of its message.
+- Settlement and receipt-clear lookups walk the archives newest first and verify
+  each visited file's chain. They stop at the first file with a matching row.
+- When the settlement lookup cannot read the retained audit history,
+  `tx status` and `stellar_transaction_status` log the error and write no
+  settled row. Where the profile has an audit writer, `tx receipt clear`
+  refuses with the verifier's code, such as `audit.chain_broken` for a broken
+  chain, and keeps the receipt.
 - `profile reset-window-state` writes its audit row before wiping the store,
   under the audit writer and store lock. The row carries live wiped accrual,
   per-bucket totals, the generation pair and the profile's chain.
@@ -352,6 +379,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `StellarRpcClient::verify_network_passphrase`, replaced by
   `StellarRpcClient::endpoint_identity`.
+- `stellar_agent_core::audit_log::reader::value_action_settlement` and
+  `stellar_agent_core::audit_log::reader::submission_receipt_cleared_exists`,
+  replaced by `try_value_action_settlement` and
+  `try_submission_receipt_cleared_exists`.
 - `ProviderAttestationRejection::PrimaryReserved`. A `[providers.primary]`
   record loads.
 
@@ -366,6 +397,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed, and a missing receipt is restored with it.
 - A release drops only the pending records of a reservation, so confirmed
   spend under the same envelope hash keeps counting.
+- A status rerun after audit rotation writes no duplicate settled row.
+  A cleared receipt is recognized after rotation.
 - The counterparty cache reads and mints its HMAC key at the profile's
   `counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.
   With an explicit reference, cached entries read as absent until a refresh

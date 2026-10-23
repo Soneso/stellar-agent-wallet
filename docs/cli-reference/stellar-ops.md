@@ -604,10 +604,13 @@ wallet builds classic envelopes without one, so on those the evidence is a
 consumed sequence. An envelope handed to `pay --submit-only` can carry a time
 bound, and so can the inner transaction of a fee-bump.
 
-The receipt keeps its `release_code`, so a settled row that could not be
-appended when the reservation was released is appended by the next run. A
-receipt released without recorded evidence, for example by an older binary,
-reads as `ambiguous` with no `release_code`, and the verb appends no row for it.
+The receipt keeps its `release_code` when the reservation is released, so
+later runs can retry any settled row still owed. A receipt released without
+recorded evidence, for example by an older binary, reads as `ambiguous` with no
+`release_code`, and the verb appends no row for it.
+When the settlement lookup cannot read the retained audit history, the verb
+logs the error and appends no settled row. A later run retries the lookup
+and appends any row still owed.
 
 Automatic reconciliation applies the same chain and retention checks when the
 receipts file is absent. A definitive chain answer or a release on chain
@@ -685,6 +688,13 @@ does, and decides:
 
 A reconciliation that finds a `SUCCESS` or `FAILED` answer in the meantime is
 refused with `submission.not_clearable`; `tx status` writes its row.
+
+Where the profile has an audit writer, the settlement lookup of an evidence
+release and the check for an earlier clear row read the retained audit history.
+A history that cannot be read refuses with the verifier's code, such as
+`audit.chain_broken` for a broken chain, before the clear row is written.
+The receipt stays as it is. A synthesized profile with no audit writer skips
+the history lookups and marks the receipt cleared without writing audit rows.
 
 A cleared receipt owes no settlement row: the clear row records the operator's
 decision. Clearing an untimed transaction whose outcome is unknown states that

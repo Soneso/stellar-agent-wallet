@@ -64,7 +64,9 @@ use rmcp::{
     schemars, serde, tool, tool_router,
 };
 use serde_json::json;
-use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision, ValueLegRecord};
+use stellar_agent_core::audit_log::{
+    AuditEntry, AuditWriter, PolicyDecision, ValueLegRecord, audit_writer_refusal,
+};
 use stellar_agent_core::cross_check::CrossCheckValue;
 use stellar_agent_core::policy::v1::ValueClass;
 use stellar_agent_mcp_macros::mcp_tool_router;
@@ -75,7 +77,9 @@ use crate::tools::common::{
     business_error_result, decode_payment_required_input, x402_canonical_asset,
     x402_error_to_tool_result, x402_value_leg,
 };
-use crate::tools::value_audit::emit_value_audit_row_strict;
+use crate::tools::value_audit::{
+    emit_anchored_value_audit_row_strict, emit_value_audit_row_strict,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument type
@@ -527,10 +531,12 @@ pub(super) enum X402Failure<'a> {
 /// when the transmit gate never returned `Ok`.
 ///
 /// Before the gate returns `Ok` the signed authorization has not left the
-/// wallet and no authorized row exists, so no withheld row is written. After
-/// it, an RPC simulate error is the re-simulation itself, every other
-/// `create_payment` error is the processing of its answer, and a failure to
-/// encode the built payload is the encoding.
+/// wallet, and no withheld row is written here: a gate that refused before its
+/// authorized row wrote no row, and one that refused after it already paired
+/// that row with an `anchor_unavailable` row. After the gate returns `Ok`, an
+/// RPC simulate error is the re-simulation itself, every other `create_payment`
+/// error is the processing of its answer, and a failure to encode the built
+/// payload is the encoding.
 pub(super) fn x402_withheld_stage(
     gate_passed: bool,
     failure: X402Failure<'_>,
@@ -550,12 +556,15 @@ pub(super) fn x402_withheld_stage(
 /// The transmit gate both x402 tools pass to `create_payment`, and what it
 /// observed.
 ///
-/// The gate writes the `x402_payment_authorized` row through the strict
-/// helper, which acquires the writer through the registry and reruns the
-/// anchor check, so the row is durable before the signed authorization is
-/// sent. A write that refuses keeps its wallet error here, and the handler
-/// answers with that error's own code. The withheld row of a later failure
-/// carries the same request id as the authorized row.
+/// The gate writes the `x402_payment_authorized` row through
+/// [`emit_anchored_value_audit_row_strict`], which acquires the writer through
+/// the registry, reruns the anchor check, and requires a current tip anchor
+/// before and after the row, so the row is durable and anchored before the
+/// signed authorization is sent. When the anchor fails after the row, the gate
+/// pairs it with an `anchor_unavailable` withheld row through the writer it
+/// still holds. A write that refuses keeps its wallet error here, and the
+/// handler answers with that error's own code. The withheld row of a later
+/// failure carries the same request id as the authorized row.
 pub(super) struct X402AuthorizationAudit<'a> {
     profile: &'a stellar_agent_core::profile::schema::Profile,
     profile_name: String,
@@ -598,8 +607,8 @@ impl<'a> X402AuthorizationAudit<'a> {
     /// # Errors
     ///
     /// [`stellar_agent_x402::X402Error::TransmitGateRefused`] when the row
-    /// cannot be written. The wallet error that refused is kept for
-    /// [`X402AuthorizationAudit::refusal_result`].
+    /// or its tip anchor cannot be written. The wallet error that refused is
+    /// kept for [`X402AuthorizationAudit::refusal_result`].
     pub(super) fn before_transmit(
         &mut self,
         authorization: &stellar_agent_x402::exact::AuthorizationToTransmit<'_>,
@@ -616,7 +625,14 @@ impl<'a> X402AuthorizationAudit<'a> {
             &self.request_id,
             authorization.cross_check.map(CrossCheckWitness::record),
         );
-        match emit_value_audit_row_strict(self.profile, &self.profile_name, self.binding, entry) {
+        let result = emit_anchored_value_audit_row_strict(
+            self.profile,
+            &self.profile_name,
+            self.binding,
+            entry,
+            |writer| self.pair_unanchored_authorization(writer),
+        );
+        match result {
             Ok(()) => {
                 self.gate_passed = true;
                 Ok(())
@@ -624,7 +640,8 @@ impl<'a> X402AuthorizationAudit<'a> {
             Err(error) => {
                 self.refusal = Some(error);
                 Err(stellar_agent_x402::X402Error::TransmitGateRefused {
-                    detail: "the x402_payment_authorized audit row was not written".to_owned(),
+                    detail: "the x402 authorization audit row or its tip anchor is unavailable"
+                        .to_owned(),
                 })
             }
         }
@@ -647,26 +664,60 @@ impl<'a> X402AuthorizationAudit<'a> {
         let Some(stage) = x402_withheld_stage(self.gate_passed, failure) else {
             return;
         };
-        let entry = AuditEntry::new_x402_authorization_withheld(
+        if let Err(error) = emit_value_audit_row_strict(
+            self.profile,
+            &self.profile_name,
+            self.binding,
+            self.withheld_row(stage),
+        ) {
+            self.log_withheld_row_not_written(stage, &error);
+        }
+    }
+
+    /// Pairs an authorized row whose tip anchor could not be written with an
+    /// `anchor_unavailable` withheld row, through the writer the gate holds.
+    ///
+    /// The gate reaches this only after the authorized row is durable, and the
+    /// signed authorization has not left the wallet. A fresh acquisition would
+    /// rerun the anchor repair and refuse while the keyring is still failing,
+    /// so the row goes through the held writer, whose append stays best-effort
+    /// for its own anchor. A row that cannot be written is logged at `error`
+    /// with its code.
+    fn pair_unanchored_authorization(&self, writer: &mut AuditWriter) {
+        let stage = "anchor_unavailable";
+        if let Err(error) = writer.write_entry(self.withheld_row(stage)) {
+            let refusal = audit_writer_refusal(&self.profile_name, &error);
+            self.log_withheld_row_not_written(stage, &refusal);
+        }
+    }
+
+    /// The `x402_authorization_withheld` row for `stage`, carrying this
+    /// payment's request id.
+    fn withheld_row(&self, stage: &str) -> AuditEntry {
+        AuditEntry::new_x402_authorization_withheld(
             self.tool,
             self.chain_id,
             self.network.as_str(),
             self.scheme.as_str(),
             stage,
             self.request_id.as_str(),
+        )
+    }
+
+    /// Logs a withheld row that could not be written, with its stage and code.
+    fn log_withheld_row_not_written(
+        &self,
+        stage: &str,
+        error: &stellar_agent_core::error::WalletError,
+    ) {
+        tracing::error!(
+            tool = self.tool,
+            event_kind = "x402_authorization_withheld",
+            failure_stage = stage,
+            code = %error.code(),
+            error = %error,
+            "x402: the withheld-authorization audit row was not written"
         );
-        if let Err(error) =
-            emit_value_audit_row_strict(self.profile, &self.profile_name, self.binding, entry)
-        {
-            tracing::error!(
-                tool = self.tool,
-                event_kind = "x402_authorization_withheld",
-                failure_stage = stage,
-                code = %error.code(),
-                error = %error,
-                "x402: the withheld-authorization audit row was not written"
-            );
-        }
     }
 }
 
