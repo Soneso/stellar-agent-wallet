@@ -878,7 +878,7 @@ Flags:
 - `--timeout-seconds <SECONDS>`: default `60`; covers the full enumeration, the baseline reads included.
 - `--output <FORMAT>`: `json` default; `table` mode is deferred (the flag is accepted but renders the JSON envelope).
 
-Each entry of `rules` carries `rule_id`, `name`, `context_type_label`, `signer_count`, `policy_count`, `valid_until` (omitted for a permanent rule) and `baseline`. `baseline` is the rule's signer-set baseline in the profile's audit log: `none` (no state row), `v1`, `v2`, `unreadable` (an audit-log integrity error for that rule) or `unknown` (the log was not read). Every signature under a rule other than `0` needs the baseline: a rule reporting `none` refuses with `sa.signer_set_missing_baseline` until one `signers list --rule-id N` records it. Rule `0` reports its own state like any rule.
+Each entry of `rules` carries `rule_id`, `name`, `context_type_label`, `signer_count`, `policy_count`, `valid_until` (omitted for a permanent rule) and `baseline`. `baseline` is the rule's signer-set baseline in the profile's audit log: `none` (no state row), `v1`, `v2`, `unreadable` (an audit-log integrity error for that rule) or `unknown` (the log was not read). Every signature under a rule other than `0` needs the baseline: a rule reporting `none` refuses with `sa.signer_set_missing_baseline` until one `signers list --rule-id N` records it. Rule `0` reports its own state like any rule. A rule the shared context-rule decoder refuses fails the listing with `sa.deployment_failed`, and the reason names the rule id.
 
 ```bash
 stellar-agent smart-account list-rules --account CABC...WXYZ

@@ -399,7 +399,7 @@ Arguments: `chain_id` only.
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
-| `stellar_rules_list` | Enumerate active context rules on a smart account: `rule_id`, `name`, `context_type_label`, `valid_until`, `signer_count`, `policy_count`, `baseline`, plus `as_of_ledger`. `baseline` is the rule's signer-set baseline in the profile's audit log (`none`, `v1`, `v2`, `unreadable`, or `unknown` when the log cannot be opened); a rule reporting `none` refuses signing until its baseline is recorded. An integrity error in the log refuses the listing with `sa.audit_log`. | Read-only. |
+| `stellar_rules_list` | Enumerate active context rules on a smart account: `rule_id`, `name`, `context_type_label`, `valid_until`, `signer_count`, `policy_count`, `baseline`, plus `as_of_ledger`. `baseline` is the rule's signer-set baseline in the profile's audit log (`none`, `v1`, `v2`, `unreadable`, or `unknown` when the log cannot be opened); a rule reporting `none` refuses signing until its baseline is recorded. An integrity error in the log refuses the listing with `sa.audit_log`. A rule the shared context-rule decoder refuses fails the listing, and so `stellar_rules_get` for every rule of the account, with `sa.deployment_failed` naming the rule id. | Read-only. |
 | `stellar_rules_get` | Read one context rule's metadata and signer-set `baseline`, its policies (`address`, `identified_kind`), and, when exactly one policy identifies as `spending-limit`, the budget snapshot. A rule holding a signer the wallet cannot decode is refused with `sa.deployment_failed`. An integrity error in the log refuses the call with `sa.audit_log`. | Read-only. |
 
 Both tools are grantable to a toolset via the `read-rules` capability token,

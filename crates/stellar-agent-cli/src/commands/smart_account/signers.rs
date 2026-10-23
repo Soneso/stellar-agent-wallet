@@ -1381,8 +1381,7 @@ async fn add_run(args: &AddArgs) -> i32 {
     {
         Ok(Some(scval)) => {
             // Decode the current signer count from the returned ContextRule ScVal.
-            // `decode_signer_count_from_scval` reads the `signer_ids` field of
-            // the OZ context-rule storage layout.
+            // The count comes from a rule the shared context-rule decoder accepts.
             match decode_signer_count_from_scval(&scval) {
                 Ok(current_signer_count) => {
                     let attempted = current_signer_count.saturating_add(1);
@@ -2651,7 +2650,9 @@ mod tests {
     use crate::commands::smart_account::common::validate_source_account;
     use clap::Parser;
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
-    use stellar_xdr::{ScMap, ScMapEntry, ScSymbol, ScVal, ScVec};
+    use stellar_xdr::{
+        AccountId, PublicKey, ScAddress, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec, Uint256,
+    };
 
     // ── Per-rule signer cap at `smart-account signers add` ──────────────────────────
     //
@@ -2663,21 +2664,48 @@ mod tests {
     // `ContextRuleCapsExceeded` error construction directly (the async `add_run`
     // path would require a live RPC or a full wiremock harness).
 
-    /// Helper: builds a minimal `ContextRule` ScVal::Map with a given number of
-    /// signer IDs in the `signer_ids` field.
-    ///
-    /// Layout per the OZ context-rule storage: the `signer_ids`
-    /// field is a `ScVal::Vec(Some(ScVec([...])))` of `ScVal::U32` values.
-    fn make_rule_scval(signer_id_count: usize) -> ScVal {
-        let signer_ids: Vec<ScVal> = (0..signer_id_count as u32).map(ScVal::U32).collect();
-        ScVal::Map(Some(ScMap(
-            vec![ScMapEntry {
-                key: ScVal::Symbol(ScSymbol("signer_ids".try_into().unwrap())),
-                val: ScVal::Vec(Some(ScVec(signer_ids.try_into().unwrap()))),
-            }]
-            .try_into()
-            .unwrap(),
-        )))
+    /// Builds a decoder-valid ContextRule with `signer_count` delegated signers
+    /// and no policies for the cap pre-check fixtures.
+    fn make_rule_scval(signer_count: usize) -> ScVal {
+        let signer_ids: Vec<ScVal> = (0..signer_count)
+            .map(|index| ScVal::U32(u32::try_from(index).unwrap()))
+            .collect();
+        let signers: Vec<ScVal> = (0..signer_count)
+            .map(|index| {
+                let byte = u8::try_from(index + 1).unwrap();
+                ScVal::Vec(Some(ScVec(
+                    vec![
+                        ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap()),
+                        ScVal::Address(ScAddress::Account(AccountId(
+                            PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32])),
+                        ))),
+                    ]
+                    .try_into()
+                    .unwrap(),
+                )))
+            })
+            .collect();
+        let empty_list = || ScVal::Vec(Some(ScVec(Vec::<ScVal>::new().try_into().unwrap())));
+        let entries = vec![
+            ("id", ScVal::U32(1)),
+            (
+                "signer_ids",
+                ScVal::Vec(Some(ScVec(signer_ids.try_into().unwrap()))),
+            ),
+            (
+                "signers",
+                ScVal::Vec(Some(ScVec(signers.try_into().unwrap()))),
+            ),
+            ("policies", empty_list()),
+            ("policy_ids", empty_list()),
+        ]
+        .into_iter()
+        .map(|(key, val)| ScMapEntry {
+            key: ScVal::Symbol(ScSymbol::try_from(key).unwrap()),
+            val,
+        })
+        .collect::<Vec<_>>();
+        ScVal::Map(Some(ScMap(entries.try_into().unwrap())))
     }
 
     /// `signer_count = 15` → cap exceeded, error returned.
