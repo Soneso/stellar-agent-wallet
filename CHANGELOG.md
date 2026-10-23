@@ -388,6 +388,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `minimum_reserve` criterion counts the transaction fee of a decoded
+  envelope in the MCP pay, create-account, trustline, and claim commits and
+  in CLI `pay --sign-only`, `pay --submit-only`, and staged `claim`.
+  A debit that leaves exactly the reserve plus `margin_stroops` refuses with
+  `policy.deny.minimum_reserve_breached` when the envelope carries a fee.
+  The CLI full pipeline and the MCP simulate steps count no fee.
+  Thanks to @huong8373tt-beep.
 - `counterparty warm-up` skips Stellar strkeys and `CODE:ISSUER` values in
   mixed-kind allowlists.
 - A reservation released on chain evidence writes its settled

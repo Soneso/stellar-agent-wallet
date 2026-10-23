@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! reserve_required = account.reserves_stroops(BASE_RESERVE_STROOPS) + margin_stroops
-//! post_balance     = pre_balance - (amount_stroops + fee_stroops)     [saturating]
+//! post_balance     = pre_balance - (amount_stroops + total_fee_stroops) [saturating]
 //!
 //! if post_balance < reserve_required → DenyReason::MinimumReserveBreached
 //! ```
@@ -168,16 +168,14 @@ impl Criterion for MinimumReserveCriterion {
             AmountOutcome::Debit(amount) => amount,
             AmountOutcome::Deny(reason) => return Ok(Some(reason)),
         };
-        let fee_stroops = extract_fee_stroops(ctx);
+        let total_fee_stroops = extract_total_fee_stroops(ctx);
 
-        // The reserve compare and the DenyReason payload are i128 end-to-end
-        // (no clamp): `amount_stroops` may already carry an i128 token
-        // quantity, so `pre_balance`, `fee_stroops`, and
-        // `reserve_required_stroops` (each still `i64` at their own source —
-        // the account-view trait and the configured margin are unaffected by
-        // this widening) are promoted here rather than narrowing the debit.
+        // The reserve compare and the `DenyReason` payload are i128 end to end.
+        // `amount_stroops` may carry an i128 token quantity. The balance, the fee,
+        // and the reserve requirement are i64 at their sources and are promoted
+        // here, so the debit is never narrowed.
         let pre_balance = i128::from(pre_balance);
-        let debit = amount_stroops.saturating_add(i128::from(fee_stroops));
+        let debit = amount_stroops.saturating_add(i128::from(total_fee_stroops));
         let post_balance = pre_balance.saturating_sub(debit);
 
         let reserve_required_stroops = i128::from(
@@ -219,8 +217,8 @@ enum AmountOutcome {
 /// Drives off the shared [`classify_value`] gate (design §7.4, native-only):
 ///
 /// - [`ValueGate::NotApplicable`] → [`AmountOutcome::Debit(0)`]: a genuinely
-///   value-less call; the reserve check still fires on the fee alone via
-///   [`extract_fee_stroops`].
+///   value-less call; the reserve check still fires on the decoded envelope fee
+///   alone via [`extract_total_fee_stroops`].
 /// - [`ValueGate::Deny`] → [`AmountOutcome::Deny`]: the call's value effect
 ///   cannot be sized (an unpopulated `MovesValue` tool, or an opaque-sign call
 ///   under a matched rule); the criterion returns this reason directly rather
@@ -265,15 +263,15 @@ fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutcome, Policy
     Ok(AmountOutcome::Debit(sum))
 }
 
-/// Extracts the transaction fee in stroops from args.
+/// Extracts the decoded envelope's total transaction fee in stroops.
 ///
-/// Falls back to 0 when the field is absent (the classic base fee is added by
-/// the transaction builder; for policy evaluation the conservative default
-/// is to ignore it when not supplied).
-fn extract_fee_stroops(ctx: &EvalContext<'_>) -> i64 {
+/// `decode_authoritative_args` writes this value as a JSON number. Policy
+/// arguments that a caller builds itself, such as the CLI full-pipeline maps
+/// and the MCP simulate maps, carry no fee, and the fee then counts as 0.
+fn extract_total_fee_stroops(ctx: &EvalContext<'_>) -> i64 {
     ctx.args
-        .get("fee_stroops")
-        .and_then(|v| v.as_i64())
+        .get("total_fee_stroops")
+        .and_then(serde_json::Value::as_i64)
         .unwrap_or(0)
 }
 
@@ -474,11 +472,12 @@ mod tests {
         };
         // Balance 12 XLM, 0 subentries.
         // Reserve: (2+0)*5_000_000 = 10_000_000 + 5_000_000 margin = 15_000_000.
-        // Sending 104_990_000 bare stroops + 10_000 fee leaves exactly 15_000_000.
+        // Sending 104_990_000 bare stroops + 10_000 decoded envelope fee leaves
+        // exactly 15_000_000.
         let args = json!({
             "amount": "104990000", // bare-stroops form intentionally exercises parser fallback.
             "asset": "native",
-            "fee_stroops": 10_000
+            "total_fee_stroops": 10_000
         });
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -511,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn fee_stroops_can_push_post_balance_below_reserve() {
+    fn total_fee_stroops_can_push_post_balance_below_reserve() {
         let store = PolicyStateStore::new();
         let criterion = MinimumReserveCriterion::new(5_000_000);
 
@@ -521,11 +520,12 @@ mod tests {
         };
         // Balance 12 XLM, 0 subentries.
         // Reserve: (2+0)*5_000_000 = 10_000_000 + 5_000_000 margin = 15_000_000.
-        // Sending 104_990_000 bare stroops + 10_001 fee leaves 14_999_999.
+        // Sending 104_990_000 bare stroops + 10_001 decoded envelope fee leaves
+        // 14_999_999.
         let args = json!({
             "amount": "104990000", // bare-stroops form intentionally exercises parser fallback.
             "asset": "native",
-            "fee_stroops": 10_001
+            "total_fee_stroops": 10_001
         });
         let tool = make_tool("stellar_pay");
         let profile = make_profile();
@@ -533,19 +533,83 @@ mod tests {
         let result = criterion.evaluate(&ctx).unwrap();
         assert!(
             matches!(result, Some(DenyReason::MinimumReserveBreached { .. })),
-            "fee_stroops must participate in the reserve debit"
+            "total_fee_stroops must participate in the reserve debit"
         );
     }
 
     #[test]
-    fn extract_fee_stroops_returns_configured_value() {
+    fn extract_total_fee_stroops_reads_the_decoder_key() {
         let store = PolicyStateStore::new();
-        let args = json!({ "amount": "1 XLM", "asset": "native", "fee_stroops": 12_345 });
-        let tool = make_tool("stellar_pay");
+        let args = json!({
+            "amount": "1 XLM",
+            "asset": "native",
+            "total_fee_stroops": 12_345
+        });
+        let tool = make_tool("stellar_pay_commit");
         let profile = make_profile();
         let ctx = make_ctx(&tool, &profile, &args, &store, None);
 
-        assert_eq!(extract_fee_stroops(&ctx), 12_345);
+        assert_eq!(extract_total_fee_stroops(&ctx), 12_345);
+    }
+
+    #[test]
+    fn minimum_reserve_counts_the_envelope_fee() {
+        use stellar_xdr::{
+            Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
+            SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
+            TransactionV1Envelope, Uint256, VecM, WriteXdr,
+        };
+
+        let amount = 1_000_000_000;
+        let margin = 50_000_000;
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([2; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::Payment(PaymentOp {
+                        destination: MuxedAccount::Ed25519(Uint256([4; 32])),
+                        asset: Asset::Native,
+                        amount,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+        let mut args =
+            crate::envelope_decode::decode_authoritative_args(&envelope, "stellar_pay_commit")
+                .unwrap();
+        let store = PolicyStateStore::new();
+        let criterion = MinimumReserveCriterion::new(margin);
+        let view = MockAccountView {
+            balance: amount + 10_000_000 + margin,
+            subentries: 0,
+        };
+        let tool = make_tool("stellar_pay_commit");
+        let profile = make_profile();
+        let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
+        let result = criterion.evaluate(&ctx).unwrap();
+        assert!(
+            matches!(result, Some(DenyReason::MinimumReserveBreached { .. })),
+            "the decoded envelope fee must push the payment below the reserve: {result:?}"
+        );
+
+        args.as_object_mut().unwrap().remove("total_fee_stroops");
+        let ctx = make_ctx(&tool, &profile, &args, &store, Some(&view));
+        assert_eq!(
+            criterion.evaluate(&ctx).unwrap(),
+            None,
+            "a payment without the fee key must allow at the reserve boundary"
+        );
     }
 
     // ── Real production args shapes ───────────────────────────────────────────
@@ -686,7 +750,7 @@ mod tests {
 
     /// A genuinely amount-less tool still gets the 0-default fail-open
     /// posture (the reserve check fires on the fee alone, via
-    /// `extract_fee_stroops`, not on a fabricated amount).
+    /// `extract_total_fee_stroops`, not on a fabricated amount).
     #[test]
     fn genuinely_amount_less_tool_still_defaults_amount_to_zero() {
         let store = PolicyStateStore::new();
