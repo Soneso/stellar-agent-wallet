@@ -31,8 +31,8 @@
 //! - OZ `packages/accounts/src/smart_account/mod.rs:558` SHA `a9c4216`:
 //!   `TooManySigners = 3010` (on-chain fallback panic if CLI check bypassed).
 //! - OZ `packages/accounts/src/smart_account/storage.rs:155-174` SHA `a9c4216`:
-//!   `ContextRule` struct + `signer_ids: Vec<u32>` field layout decoded by
-//!   `decode_signer_count_from_scval`.
+//!   `ContextRule` struct layout. `decode_signer_count_from_scval` takes the
+//!   signer count from the shared context-rule decoder.
 //!
 //! # Implements
 //!
@@ -246,8 +246,9 @@ fn release_binary() -> std::path::PathBuf {
 ///
 /// # Reference cross-check
 ///
-/// - OZ `storage.rs:155-174` SHA `a9c4216`: `ContextRule.signer_ids: Vec<u32>`
-///   is the field decoded by `decode_signer_count_from_scval`.
+/// - OZ `storage.rs:155-174` SHA `a9c4216`: `ContextRule` layout.
+///   `decode_signer_count_from_scval` takes the signer count from the shared
+///   context-rule decoder.
 /// - OZ `mod.rs:526` SHA `a9c4216`: `MAX_SIGNERS = 15`.
 /// - OZ `mod.rs:558` SHA `a9c4216`: `TooManySigners = 3010` (on-chain fallback).
 ///

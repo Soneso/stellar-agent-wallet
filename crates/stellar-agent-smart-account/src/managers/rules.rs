@@ -4735,12 +4735,9 @@ pub(crate) fn parse_context_rule_id_from_return(scval: &ScVal) -> Result<u32, Sa
 /// `ScVal::Symbol`-keyed entries sorted lexicographically by field name:
 ///
 /// - `context_type`: `ScVal::Vec([Symbol("Default")])` / `ScVal::Vec([Symbol("CallContract"), ...])`
-/// - `id`: `ScVal::U32`
+/// - `id`, `policies`, `policy_ids`, `signer_ids`, `signers`: validated by the
+///   shared context-rule decoder, which supplies the signer and policy counts
 /// - `name`: `ScVal::String`
-/// - `policies`: `ScVal::Vec(Some(ScVec([...])))` — `ScVec` len = policy count
-/// - `policy_ids`: `ScVal::Vec(Some(ScVec([...])))` — ignored here
-/// - `signer_ids`: `ScVal::Vec(Some(ScVec([...])))` — ignored here
-/// - `signers`: `ScVal::Vec(Some(ScVec([...])))` — `ScVec` len = signer count
 /// - `valid_until`: soroban `Option<u32>` uses the **standard-library `Option`**
 ///   host ABI, NOT the `#[contracttype]` enum-variant encoding. Per the
 ///   soroban-env-common `TryFromVal<E, Val> for Option<T>` conversion:
@@ -4755,18 +4752,18 @@ pub(crate) fn parse_context_rule_id_from_return(scval: &ScVal) -> Result<u32, Sa
 ///
 /// # Errors
 ///
-/// - [`SaError::DeploymentFailed`] (`phase = "simulate"`) if the
-///   ScVal shape is malformed.
+/// - [`SaError::DeploymentFailed`] (`phase = "simulate"`) when the ScVal is
+///   not a map, when the shared context-rule decoder refuses it, when `name`
+///   or `context_type` is missing or malformed, or when `valid_until` is
+///   malformed. Every reason starts with `parse ContextRule id={rule_id}: `.
 fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleSummary, SaError> {
     let parse_err = |detail: String| SaError::DeploymentFailed {
         phase: "simulate",
         redacted_reason: format!("parse ContextRule id={rule_id}: {detail}"),
     };
 
-    let (signer_count, policy_count) = decode_context_rule_counts(&scval)?;
-
     let entries = match scval {
-        ScVal::Map(Some(ScMap(ref e))) => e.clone(),
+        ScVal::Map(Some(ScMap(ref e))) => e,
         other => {
             return Err(parse_err(format!(
                 "expected ScVal::Map, got {}",
@@ -4774,6 +4771,20 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
             )));
         }
     };
+
+    // The decoder's refusal keeps its variant and phase and gains the rule id,
+    // so a listing that fails names the rule it cannot read.
+    let (signer_count, policy_count) =
+        decode_context_rule_counts(&scval).map_err(|err| match err {
+            SaError::DeploymentFailed {
+                phase,
+                redacted_reason,
+            } => SaError::DeploymentFailed {
+                phase,
+                redacted_reason: format!("parse ContextRule id={rule_id}: {redacted_reason}"),
+            },
+            other => other,
+        })?;
 
     let mut name: Option<String> = None;
     let mut context_type_label: Option<&'static str> = None;
@@ -4851,7 +4862,7 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
                     }
                 });
             }
-            // id, signer_ids, policy_ids — not needed for the summary.
+            // The shared decoder above reads id and the four list fields.
             _ => {}
         }
     }
@@ -4871,6 +4882,11 @@ fn parse_context_rule_summary(scval: ScVal, rule_id: u32) -> Result<ContextRuleS
 /// Decodes the validated signer count from an OZ `ContextRule` [`ScVal::Map`].
 ///
 /// This is the pre-simulate cap check helper used by `smart-account signers add`.
+///
+/// # Errors
+///
+/// Returns [`SaError::DeploymentFailed`] (`phase = "simulate"`) when the
+/// shared context-rule decoder refuses the map.
 pub fn decode_signer_count_from_scval(scval: &ScVal) -> Result<u32, SaError> {
     decode_context_rule_counts(scval).map(|(signer_count, _)| signer_count)
 }
@@ -4879,6 +4895,11 @@ pub fn decode_signer_count_from_scval(scval: &ScVal) -> Result<u32, SaError> {
 ///
 /// This is the pre-simulate cap check helper used by
 /// `smart-account rules add-policy`.
+///
+/// # Errors
+///
+/// Returns [`SaError::DeploymentFailed`] (`phase = "simulate"`) when the
+/// shared context-rule decoder refuses the map.
 pub fn decode_policy_count_from_scval(scval: &ScVal) -> Result<u32, SaError> {
     decode_context_rule_counts(scval).map(|(_, policy_count)| policy_count)
 }
@@ -6444,18 +6465,36 @@ mod tests {
     /// Map missing `signer_ids` key returns `DeploymentFailed`.
     #[test]
     fn decode_signer_count_missing_signer_ids_key_returns_error() {
-        let map = ScVal::Map(Some(ScMap(
-            vec![ScMapEntry {
-                key: ScVal::Symbol(stellar_xdr::ScSymbol("name".try_into().unwrap())),
-                val: ScVal::String(stellar_xdr::ScString("test-rule".try_into().unwrap())),
-            }]
-            .try_into()
-            .unwrap(),
-        )));
+        let mut map = synthetic_context_rule_scval(1, "test-rule", "Default", 2, 0, None);
+        remove_context_rule_field(&mut map, "signer_ids");
         let err = decode_signer_count_from_scval(&map).unwrap_err();
         assert!(
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "missing signer_ids key must return DeploymentFailed {{ phase: 'simulate' }}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "get_context_rule: missing 'signer_ids' field in ContextRule map"
+        );
+    }
+
+    /// The signer count refuses a `signer_ids` list shorter than `signers`.
+    #[test]
+    fn decode_signer_count_refuses_a_shorter_signer_ids_list() {
+        let mut rule = synthetic_context_rule_scval(1, "test-rule", "Default", 3, 0, None);
+        replace_context_rule_field(
+            &mut rule,
+            "signer_ids",
+            ScVal::Vec(Some(ScVec(vec![ScVal::U32(0)].try_into().unwrap()))),
+        );
+        let err = decode_signer_count_from_scval(&rule).unwrap_err();
+        assert!(
+            matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
+            "a shorter signer_ids list must be refused; got {err:?}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "get_context_rule: signer_ids has 1 entries and signers has 3"
         );
     }
 
@@ -8060,12 +8099,13 @@ mod tests {
         ScVal::Map(Some(ScMap(entries)))
     }
 
-    /// Replaces one field value in a valid synthetic ContextRule test fixture.
-    fn replace_context_rule_field(scval: &mut ScVal, field: &str, value: ScVal) {
+    /// Returns the entry of one field in a valid synthetic ContextRule test
+    /// fixture.
+    fn context_rule_entry_mut<'a>(scval: &'a mut ScVal, field: &str) -> &'a mut ScMapEntry {
         let ScVal::Map(Some(ScMap(entries))) = scval else {
             panic!("synthetic ContextRule must be an ScVal::Map");
         };
-        let entry = entries
+        entries
             .iter_mut()
             .find(|entry| {
                 matches!(
@@ -8073,25 +8113,28 @@ mod tests {
                     ScVal::Symbol(symbol) if symbol.to_utf8_string_lossy() == field
                 )
             })
-            .unwrap_or_else(|| panic!("synthetic ContextRule missing '{field}'"));
-        entry.val = value;
+            .unwrap_or_else(|| panic!("synthetic ContextRule missing '{field}'"))
+    }
+
+    /// Replaces one field value in a valid synthetic ContextRule test fixture.
+    fn replace_context_rule_field(scval: &mut ScVal, field: &str, value: ScVal) {
+        context_rule_entry_mut(scval, field).val = value;
     }
 
     /// Replaces one field key in a valid synthetic ContextRule test fixture.
     fn replace_context_rule_key(scval: &mut ScVal, field: &str, key: ScVal) {
-        let ScVal::Map(Some(ScMap(entries))) = scval else {
-            panic!("synthetic ContextRule must be an ScVal::Map");
-        };
-        let entry = entries
-            .iter_mut()
-            .find(|entry| {
-                matches!(
-                    &entry.key,
-                    ScVal::Symbol(symbol) if symbol.to_utf8_string_lossy() == field
-                )
-            })
-            .unwrap_or_else(|| panic!("synthetic ContextRule missing '{field}'"));
-        entry.key = key;
+        context_rule_entry_mut(scval, field).key = key;
+    }
+
+    /// Returns the reason of a `DeploymentFailed` refusal; any other error
+    /// fails the test.
+    fn deployment_failed_reason(err: &SaError) -> &str {
+        match err {
+            SaError::DeploymentFailed {
+                redacted_reason, ..
+            } => redacted_reason.as_str(),
+            other => panic!("expected DeploymentFailed; got {other:?}"),
+        }
     }
 
     /// Removes one field from a valid synthetic ContextRule test fixture.
@@ -8150,17 +8193,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_context_rule_summary_reports_validated_signer_and_policy_counts() {
-        let summary = parse_context_rule_summary(
-            synthetic_context_rule_scval(3, "my-rule", "Default", 2, 1, None),
-            3,
-        )
-        .expect("a complete ContextRule must decode");
-        assert_eq!(summary.signer_count, 2);
-        assert_eq!(summary.policy_count, 1);
-    }
-
+    /// The summary refuses a `signers` list shorter than `signer_ids`.
     #[test]
     fn parse_context_rule_summary_refuses_shorter_signers_than_signer_ids() {
         let mut scval = synthetic_context_rule_scval(3, "my-rule", "Default", 1, 0, None);
@@ -8176,8 +8209,13 @@ mod tests {
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "unaligned signer lists must be refused; got {err:?}"
         );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "parse ContextRule id=3: get_context_rule: signer_ids has 2 entries and signers has 1"
+        );
     }
 
+    /// The summary refuses a `policies` item that is not an `Address`.
     #[test]
     fn parse_context_rule_summary_refuses_non_address_policy() {
         let mut scval = synthetic_context_rule_scval(3, "my-rule", "Default", 0, 1, None);
@@ -8191,8 +8229,13 @@ mod tests {
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "a non-Address policy must be refused; got {err:?}"
         );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "parse ContextRule id=3: get_context_rule: policies[0] is not an Address: Void"
+        );
     }
 
+    /// The summary refuses a `policy_ids` list that repeats an id.
     #[test]
     fn parse_context_rule_summary_refuses_repeated_policy_id() {
         let mut scval = synthetic_context_rule_scval(3, "my-rule", "Default", 0, 2, None);
@@ -8207,6 +8250,10 @@ mod tests {
         assert!(
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "a repeated policy id must be refused; got {err:?}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "parse ContextRule id=3: get_context_rule: policy_ids[1] repeats an earlier id"
         );
     }
 
@@ -8261,46 +8308,27 @@ mod tests {
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "non-map ScVal must return DeploymentFailed {{ phase: 'simulate' }}; got {err:?}"
         );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "parse ContextRule id=1: expected ScVal::Map, got U32"
+        );
     }
 
     /// `parse_context_rule_summary` returns `DeploymentFailed` when the `name`
     /// field is missing.
     #[test]
     fn parse_context_rule_summary_missing_name_returns_error() {
-        // Build a ScVal::Map that contains all required fields EXCEPT "name".
-        let entries: VecM<ScMapEntry> = vec![
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("context_type").unwrap()),
-                val: ScVal::Vec(Some(ScVec(
-                    vec![ScVal::Symbol(ScSymbol::try_from("Default").unwrap())]
-                        .try_into()
-                        .unwrap(),
-                ))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("id").unwrap()),
-                val: ScVal::U32(1),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("policies").unwrap()),
-                val: ScVal::Vec(Some(ScVec(vec![].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("signers").unwrap()),
-                val: ScVal::Vec(Some(ScVec(vec![].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("valid_until").unwrap()),
-                val: ScVal::Void,
-            },
-        ]
-        .try_into()
-        .unwrap();
-        let scval = ScVal::Map(Some(ScMap(entries)));
+        // A decoder-valid rule with every field except "name".
+        let mut scval = synthetic_context_rule_scval(1, "test", "Default", 1, 1, None);
+        remove_context_rule_field(&mut scval, "name");
         let err = parse_context_rule_summary(scval, 1).unwrap_err();
         assert!(
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "missing 'name' field must return DeploymentFailed {{ phase: 'simulate' }}; got {err:?}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "parse ContextRule id=1: missing 'name' field"
         );
     }
 
@@ -8324,40 +8352,17 @@ mod tests {
     /// `context_type` field is not a `ScVal::Vec`.
     #[test]
     fn parse_context_rule_summary_non_vec_context_type_returns_error() {
-        // Build a rule ScVal with context_type = ScVal::U32 (wrong type).
-        let entries: VecM<ScMapEntry> = vec![
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("context_type").unwrap()),
-                val: ScVal::U32(99), // wrong type
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("id").unwrap()),
-                val: ScVal::U32(1),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("name").unwrap()),
-                val: ScVal::String(stellar_xdr::ScString("test".try_into().unwrap())),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("policies").unwrap()),
-                val: ScVal::Vec(Some(ScVec(vec![].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("signers").unwrap()),
-                val: ScVal::Vec(Some(ScVec(vec![].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("valid_until").unwrap()),
-                val: ScVal::Void,
-            },
-        ]
-        .try_into()
-        .unwrap();
-        let scval = ScVal::Map(Some(ScMap(entries)));
+        // A decoder-valid rule with context_type = ScVal::U32 (wrong type).
+        let mut scval = synthetic_context_rule_scval(1, "test", "Default", 1, 1, None);
+        replace_context_rule_field(&mut scval, "context_type", ScVal::U32(99));
         let err = parse_context_rule_summary(scval, 1).unwrap_err();
         assert!(
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "non-Vec context_type must return DeploymentFailed {{ phase: 'simulate' }}; got {err:?}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "parse ContextRule id=1: context_type: expected ScVal::Vec, got U32"
         );
     }
 
@@ -8409,43 +8414,17 @@ mod tests {
     /// `policies` field is not a `ScVal::Vec`.
     #[test]
     fn parse_context_rule_summary_non_vec_policies_returns_error() {
-        let entries: VecM<ScMapEntry> = vec![
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("context_type").unwrap()),
-                val: ScVal::Vec(Some(ScVec(
-                    vec![ScVal::Symbol(ScSymbol::try_from("Default").unwrap())]
-                        .try_into()
-                        .unwrap(),
-                ))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("id").unwrap()),
-                val: ScVal::U32(1),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("name").unwrap()),
-                val: ScVal::String(stellar_xdr::ScString("test".try_into().unwrap())),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("policies").unwrap()),
-                val: ScVal::U32(2), // wrong type — must be Vec
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("signers").unwrap()),
-                val: ScVal::Vec(Some(ScVec(vec![].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("valid_until").unwrap()),
-                val: ScVal::Void,
-            },
-        ]
-        .try_into()
-        .unwrap();
-        let scval = ScVal::Map(Some(ScMap(entries)));
+        // A decoder-valid rule with policies = ScVal::U32 (wrong type).
+        let mut scval = synthetic_context_rule_scval(1, "test", "Default", 1, 0, None);
+        replace_context_rule_field(&mut scval, "policies", ScVal::U32(2));
         let err = parse_context_rule_summary(scval, 1).unwrap_err();
         assert!(
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "non-Vec policies must return DeploymentFailed {{ phase: 'simulate' }}; got {err:?}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "parse ContextRule id=1: get_context_rule: policies is not a Vec: U32"
         );
     }
 
@@ -8453,43 +8432,17 @@ mod tests {
     /// `name` field is present but not `ScVal::String`.
     #[test]
     fn parse_context_rule_summary_non_string_name_returns_error() {
-        let entries: VecM<ScMapEntry> = vec![
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("context_type").unwrap()),
-                val: ScVal::Vec(Some(ScVec(
-                    vec![ScVal::Symbol(ScSymbol::try_from("Default").unwrap())]
-                        .try_into()
-                        .unwrap(),
-                ))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("id").unwrap()),
-                val: ScVal::U32(1),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("name").unwrap()),
-                val: ScVal::U32(99), // wrong type — must be String
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("policies").unwrap()),
-                val: ScVal::Vec(Some(ScVec(vec![].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("signers").unwrap()),
-                val: ScVal::Vec(Some(ScVec(vec![].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("valid_until").unwrap()),
-                val: ScVal::Void,
-            },
-        ]
-        .try_into()
-        .unwrap();
-        let scval = ScVal::Map(Some(ScMap(entries)));
+        // A decoder-valid rule with name = ScVal::U32 (wrong type).
+        let mut scval = synthetic_context_rule_scval(1, "test", "Default", 1, 1, None);
+        replace_context_rule_field(&mut scval, "name", ScVal::U32(99));
         let err = parse_context_rule_summary(scval, 1).unwrap_err();
         assert!(
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "non-String name field must return DeploymentFailed {{ phase: 'simulate' }}; got {err:?}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "parse ContextRule id=1: name field: expected ScVal::String, got U32"
         );
     }
 
@@ -8498,9 +8451,7 @@ mod tests {
     /// `decode_signer_count_from_scval` returns `DeploymentFailed` when the
     /// `signer_ids` field is present but is not `ScVal::Vec`.
     ///
-    /// The function explicitly checks for `ScVal::Vec(Some(...))` and
-    /// `ScVal::Vec(None)` at `rules.rs:3689-3700`; any other variant returns
-    /// `Err`.
+    /// The shared context-rule decoder accepts only an `ScVal::Vec` there.
     #[test]
     fn decode_signer_count_from_scval_wrong_type_returns_error() {
         let map = ScVal::Map(Some(ScMap(
@@ -8527,18 +8478,16 @@ mod tests {
     /// the policy-count path.
     #[test]
     fn decode_policy_count_from_scval_wrong_type_returns_error() {
-        let map = ScVal::Map(Some(ScMap(
-            vec![ScMapEntry {
-                key: ScVal::Symbol(stellar_xdr::ScSymbol("policy_ids".try_into().unwrap())),
-                val: ScVal::Bool(true), // wrong type — must be Vec
-            }]
-            .try_into()
-            .unwrap(),
-        )));
+        let mut map = synthetic_context_rule_scval(1, "test-rule", "Default", 0, 1, None);
+        replace_context_rule_field(&mut map, "policy_ids", ScVal::Bool(true));
         let err = decode_policy_count_from_scval(&map).unwrap_err();
         assert!(
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "policy_ids with wrong type must return DeploymentFailed {{ phase: 'simulate' }}; got {err:?}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "get_context_rule: policy_ids is not a Vec: Bool"
         );
     }
 
@@ -8807,9 +8756,9 @@ mod tests {
 
     // ── decode_policy_count_from_scval unit tests ─────────────────────────────
     //
-    // Mirror of the four `decode_signer_count_from_scval` tests above.  Reads
-    // the `policy_ids` field from a synthetic `ScVal::Map` (OZ `storage.rs:
-    // 152-174` SHA `a9c4216`).
+    // Mirror of the `decode_signer_count_from_scval` tests above. The count
+    // comes from the shared context-rule decoder, which reads the synthetic
+    // `ScVal::Map` (OZ `storage.rs:152-174` SHA `a9c4216`).
 
     /// A complete ContextRule with two aligned policies reports count=2.
     #[test]
@@ -8840,18 +8789,36 @@ mod tests {
     /// Map that contains no `policy_ids` key → `SaError::DeploymentFailed { phase: "simulate" }`.
     #[test]
     fn decode_policy_count_missing_policy_ids_key_returns_error() {
-        let map = ScVal::Map(Some(ScMap(
-            vec![ScMapEntry {
-                key: ScVal::Symbol(stellar_xdr::ScSymbol("name".try_into().unwrap())),
-                val: ScVal::String(stellar_xdr::ScString("test-rule".try_into().unwrap())),
-            }]
-            .try_into()
-            .unwrap(),
-        )));
+        let mut map = synthetic_context_rule_scval(1, "test-rule", "Default", 0, 2, None);
+        remove_context_rule_field(&mut map, "policy_ids");
         let err = decode_policy_count_from_scval(&map).unwrap_err();
         assert!(
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "missing policy_ids key must return DeploymentFailed {{ phase: 'simulate' }}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "get_context_rule: missing 'policy_ids' field in ContextRule map"
+        );
+    }
+
+    /// The policy count refuses a `policy_ids` list shorter than `policies`.
+    #[test]
+    fn decode_policy_count_refuses_a_shorter_policy_ids_list() {
+        let mut rule = synthetic_context_rule_scval(1, "test-rule", "Default", 0, 2, None);
+        replace_context_rule_field(
+            &mut rule,
+            "policy_ids",
+            ScVal::Vec(Some(ScVec(vec![ScVal::U32(0)].try_into().unwrap()))),
+        );
+        let err = decode_policy_count_from_scval(&rule).unwrap_err();
+        assert!(
+            matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
+            "a shorter policy_ids list must be refused; got {err:?}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "get_context_rule: policy_ids has 1 entries and policies has 2"
         );
     }
 
@@ -9394,38 +9361,24 @@ mod tests {
     /// `parse_context_rule_summary` returns `DeploymentFailed` when
     /// `context_type` Vec[0] is not a `ScVal::Symbol`.
     ///
-    /// Exercises lines 3559-3562: the `other =>` arm of the `elems[0]` match.
+    /// Exercises the `other =>` arm of the `elems[0]` match.
     #[test]
     fn parse_context_rule_summary_context_type_vec_first_not_symbol_returns_error() {
-        let entries: VecM<ScMapEntry> = vec![
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("context_type").unwrap()),
-                // Vec present, but first element is U32 not Symbol.
-                val: ScVal::Vec(Some(ScVec(vec![ScVal::U32(99)].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("name").unwrap()),
-                val: ScVal::String(stellar_xdr::ScString("test".try_into().unwrap())),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("policies").unwrap()),
-                val: ScVal::Vec(Some(ScVec(vec![].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("signers").unwrap()),
-                val: ScVal::Vec(Some(ScVec(vec![].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("valid_until").unwrap()),
-                val: ScVal::Void,
-            },
-        ]
-        .try_into()
-        .unwrap();
-        let err = parse_context_rule_summary(ScVal::Map(Some(ScMap(entries))), 1).unwrap_err();
+        // A decoder-valid rule whose context_type Vec holds a U32, not a Symbol.
+        let mut scval = synthetic_context_rule_scval(1, "test", "Default", 1, 1, None);
+        replace_context_rule_field(
+            &mut scval,
+            "context_type",
+            ScVal::Vec(Some(ScVec(vec![ScVal::U32(99)].try_into().unwrap()))),
+        );
+        let err = parse_context_rule_summary(scval, 1).unwrap_err();
         assert!(
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "non-Symbol context_type vec[0] must return DeploymentFailed(simulate); got {err:?}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "parse ContextRule id=1: context_type vec[0]: expected Symbol, got U32"
         );
     }
 
@@ -9446,42 +9399,26 @@ mod tests {
     /// `parse_context_rule_summary` returns `DeploymentFailed` when the
     /// `valid_until` field is present but has a malformed type (not U32 or Void).
     ///
-    /// Exercises lines 3609-3613: the `other =>` arm of the valid_until match
-    /// inside `parse_context_rule_summary`.
+    /// Exercises the `other =>` arm of the valid_until match inside
+    /// `parse_context_rule_summary`.
     #[test]
     fn parse_context_rule_summary_malformed_valid_until_returns_error() {
-        let entries: VecM<ScMapEntry> = vec![
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("context_type").unwrap()),
-                val: ScVal::Vec(Some(ScVec(
-                    vec![ScVal::Symbol(ScSymbol::try_from("Default").unwrap())]
-                        .try_into()
-                        .unwrap(),
-                ))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("name").unwrap()),
-                val: ScVal::String(stellar_xdr::ScString("test".try_into().unwrap())),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("policies").unwrap()),
-                val: ScVal::Vec(Some(ScVec(vec![].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("signers").unwrap()),
-                val: ScVal::Vec(Some(ScVec(vec![].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("valid_until").unwrap()),
-                val: ScVal::String(stellar_xdr::ScString("bad".try_into().unwrap())), // wrong type
-            },
-        ]
-        .try_into()
-        .unwrap();
-        let err = parse_context_rule_summary(ScVal::Map(Some(ScMap(entries))), 4).unwrap_err();
+        // A decoder-valid rule with valid_until = ScVal::String (wrong type).
+        let mut scval = synthetic_context_rule_scval(4, "test", "Default", 1, 1, None);
+        replace_context_rule_field(
+            &mut scval,
+            "valid_until",
+            ScVal::String(stellar_xdr::ScString("bad".try_into().unwrap())),
+        );
+        let err = parse_context_rule_summary(scval, 4).unwrap_err();
         assert!(
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "malformed valid_until in summary must return DeploymentFailed(simulate); got {err:?}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "parse ContextRule id=4: valid_until: expected ScVal::U32 (Some) or ScVal::Void \
+             (None); got String"
         );
     }
 
@@ -9510,74 +9447,38 @@ mod tests {
     /// `parse_context_rule_summary` returns `DeploymentFailed` when the
     /// `signers` field is absent.
     ///
-    /// Exercises the `ok_or_else` guard at line 3627-3629.
+    /// The shared context-rule decoder refuses the map.
     #[test]
     fn parse_context_rule_summary_missing_signers_returns_error() {
-        let entries: VecM<ScMapEntry> = vec![
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("context_type").unwrap()),
-                val: ScVal::Vec(Some(ScVec(
-                    vec![ScVal::Symbol(ScSymbol::try_from("Default").unwrap())]
-                        .try_into()
-                        .unwrap(),
-                ))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("name").unwrap()),
-                val: ScVal::String(stellar_xdr::ScString("test".try_into().unwrap())),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("policies").unwrap()),
-                val: ScVal::Vec(Some(ScVec(vec![].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("valid_until").unwrap()),
-                val: ScVal::Void,
-            },
-        ]
-        .try_into()
-        .unwrap();
-        let err = parse_context_rule_summary(ScVal::Map(Some(ScMap(entries))), 6).unwrap_err();
+        let mut scval = synthetic_context_rule_scval(6, "test", "Default", 0, 1, None);
+        remove_context_rule_field(&mut scval, "signers");
+        let err = parse_context_rule_summary(scval, 6).unwrap_err();
         assert!(
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "missing signers field must return DeploymentFailed(simulate); got {err:?}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "parse ContextRule id=6: get_context_rule: missing 'signers' field in ContextRule map"
         );
     }
 
     /// `parse_context_rule_summary` returns `DeploymentFailed` when the
     /// `policies` field is absent.
     ///
-    /// Exercises the `ok_or_else` guard at line 3630-3631.
+    /// The shared context-rule decoder refuses the map.
     #[test]
     fn parse_context_rule_summary_missing_policies_returns_error() {
-        let entries: VecM<ScMapEntry> = vec![
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("context_type").unwrap()),
-                val: ScVal::Vec(Some(ScVec(
-                    vec![ScVal::Symbol(ScSymbol::try_from("Default").unwrap())]
-                        .try_into()
-                        .unwrap(),
-                ))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("name").unwrap()),
-                val: ScVal::String(stellar_xdr::ScString("test".try_into().unwrap())),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("signers").unwrap()),
-                val: ScVal::Vec(Some(ScVec(vec![].try_into().unwrap()))),
-            },
-            ScMapEntry {
-                key: ScVal::Symbol(ScSymbol::try_from("valid_until").unwrap()),
-                val: ScVal::Void,
-            },
-        ]
-        .try_into()
-        .unwrap();
-        let err = parse_context_rule_summary(ScVal::Map(Some(ScMap(entries))), 7).unwrap_err();
+        let mut scval = synthetic_context_rule_scval(7, "test", "Default", 1, 0, None);
+        remove_context_rule_field(&mut scval, "policies");
+        let err = parse_context_rule_summary(scval, 7).unwrap_err();
         assert!(
             matches!(err, SaError::DeploymentFailed { phase, .. } if phase == "simulate"),
             "missing policies field must return DeploymentFailed(simulate); got {err:?}"
+        );
+        assert_eq!(
+            deployment_failed_reason(&err),
+            "parse ContextRule id=7: get_context_rule: missing 'policies' field in ContextRule map"
         );
     }
 

@@ -9168,22 +9168,33 @@ impl OnChainContextRule {
 /// # Complete signer set
 ///
 /// An observed signer set describes every signer the rule holds. The map
-/// must carry both `signer_ids` and `signers` as `Vec`s; the two lists are
-/// parallel, so they must have the same length, every id must be a `u32` and
-/// every signer must decode through [`decode_signer_scval_full`]. A signer the
-/// wallet cannot represent (an unknown `Signer` variant, a malformed
-/// encoding, a `Delegated` address that is neither an account nor a
-/// contract, or an `External` signer with empty key data) refuses the
-/// observation, so every read of the rule's signer set fails closed: the
-/// baseline comparison, `signers list` and `signers refresh`, the signer verbs
-/// and their post-submit reads, policy identification for threshold,
-/// spending-limit and weighted-threshold policies, the executable pin check on
-/// every rule-authorized signing verb, the passkey path and the policy
-/// classification of the MCP `stellar_rules_get` tool. Every signer of the
-/// rule can authorize its transactions, so the baseline, the threshold
-/// arithmetic and the operator's view each need all of them.
-/// Such a rule is removed with `smart-account rules delete`, authorized by a
-/// rule the wallet can read; the delete reads only its authorizing rules.
+/// must carry both `signer_ids` and `signers` as `Vec`s. The two lists are
+/// parallel, so they must have the same length, every id must be a `u32`,
+/// and every signer must decode through [`decode_signer_scval_full`].
+///
+/// A signer the wallet cannot represent refuses the observation. This
+/// includes an unknown `Signer` variant, a malformed encoding, a `Delegated`
+/// address that is neither an account nor a contract, or an `External`
+/// signer with empty key data. Every read of the rule's signer set therefore
+/// fails closed:
+///
+/// - the baseline comparison
+/// - `signers list` and `signers refresh`
+/// - the signer verbs and their post-submit reads
+/// - policy identification for threshold, spending-limit, and
+///   weighted-threshold policies
+/// - the executable pin check on every rule-authorized signing verb
+/// - the passkey path
+/// - the policy classification of the MCP `stellar_rules_get` tool
+/// - the rule listing
+/// - the cap pre-checks of `signers add` and `rules add-policy`
+///
+/// The listing and the cap pre-checks take their signer and policy counts
+/// from this decoder. Every signer of the rule can authorize its
+/// transactions, so the baseline, the threshold arithmetic, and the
+/// operator's view each need all of them. Such a rule is removed with
+/// `smart-account rules delete`, authorized by a rule the wallet can read;
+/// the delete reads only its authorizing rules.
 ///
 /// # Errors
 ///
@@ -9312,27 +9323,28 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
     })
 }
 
-/// Decodes a complete context rule and returns its validated signer and policy
-/// counts for callers that enforce the on-chain caps before submission.
+/// Returns the signer count and the policy count of a context rule the shared
+/// decoder accepts.
+///
+/// # Errors
+///
+/// Returns the [`SaError::DeploymentFailed`] (phase `"simulate"`) refusal of
+/// the shared context-rule decoder.
 pub(crate) fn decode_context_rule_counts(scval: &ScVal) -> Result<(u32, u32), SaError> {
     let rule = decode_context_rule_scval(scval.clone())?;
-    let signer_count =
-        u32::try_from(rule.signers.len()).map_err(|_| SaError::DeploymentFailed {
+    // invariant: each decoded list holds one entry per item of an `ScVec`, a
+    // `VecM` of at most `u32::MAX` items, so neither conversion fails. The
+    // shared refusal keeps the function free of a panic path.
+    let count = |field: &str, len: usize| {
+        u32::try_from(len).map_err(|_| SaError::DeploymentFailed {
             phase: "simulate",
-            redacted_reason: format!(
-                "get_context_rule: signers length {} overflows u32",
-                rule.signers.len()
-            ),
-        })?;
-    let policy_count =
-        u32::try_from(rule.policies.len()).map_err(|_| SaError::DeploymentFailed {
-            phase: "simulate",
-            redacted_reason: format!(
-                "get_context_rule: policies length {} overflows u32",
-                rule.policies.len()
-            ),
-        })?;
-    Ok((signer_count, policy_count))
+            redacted_reason: format!("get_context_rule: {field} length {len} overflows u32"),
+        })
+    };
+    Ok((
+        count("signers", rule.signers.len())?,
+        count("policies", rule.policies.len())?,
+    ))
 }
 
 /// Returns the policies of a `ContextRule` from its `policies` and

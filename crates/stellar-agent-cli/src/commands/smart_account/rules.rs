@@ -2587,8 +2587,8 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
         Err(e) => return emit_error(&e, args.output, &request_id),
     };
 
-    // Pre-simulate policy-cap check: fetch the current rule and decode
-    // `policy_ids.len()`.
+    // Pre-simulate policy-cap check: fetch the current rule and take its policy
+    // count from the shared context-rule decoder.
     // TOCTOU note: the pre-fetch + simulate-submit sequence is non-atomic. If
     // concurrent on-chain mutation lands between the `get_rule` observation and
     // the submit, the on-chain panic at discriminant 3011 (TooManyPolicies)
@@ -4731,8 +4731,7 @@ mod tests {
     // `manager.get_rule`), so we test the cap-check predicate directly on a
     // synthetic `ScVal::Map` fixture — the same approach used for the signer
     // cap.  The fixture is built by `make_rule_scval_with_policies(n)`, which
-    // constructs the minimum `ContextRule` ScVal shape needed for
-    // `decode_policy_count_from_scval` to succeed.
+    // constructs a decoder-valid `ContextRule` ScVal with `n` policies.
     //
     // `AddPolicyArgsHarness` verifies the clap surface (all required flags parse
     // correctly), independently of the cap-check path.
@@ -4742,8 +4741,8 @@ mod tests {
         ScSymbol as XdrScSymbol, ScVal as XdrScVal, ScVec as XdrScVec,
     };
 
-    /// Builds a complete, decoder-valid ContextRule with `n` policies and no
-    /// signers for the policy cap pre-check fixtures.
+    /// Builds a decoder-valid ContextRule with `n` policies and no signers for
+    /// the policy cap pre-check fixtures.
     fn make_rule_scval_with_policies(n: usize) -> XdrScVal {
         let policy_ids: Vec<XdrScVal> = (0..n)
             .map(|index| XdrScVal::U32(u32::try_from(index).expect("policy id")))

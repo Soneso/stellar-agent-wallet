@@ -1381,8 +1381,7 @@ async fn add_run(args: &AddArgs) -> i32 {
     {
         Ok(Some(scval)) => {
             // Decode the current signer count from the returned ContextRule ScVal.
-            // `decode_signer_count_from_scval` reads the `signer_ids` field of
-            // the OZ context-rule storage layout.
+            // The count comes from a rule the shared context-rule decoder accepts.
             match decode_signer_count_from_scval(&scval) {
                 Ok(current_signer_count) => {
                     let attempted = current_signer_count.saturating_add(1);
@@ -2665,8 +2664,8 @@ mod tests {
     // `ContextRuleCapsExceeded` error construction directly (the async `add_run`
     // path would require a live RPC or a full wiremock harness).
 
-    /// Builds a complete, decoder-valid ContextRule with `signer_count`
-    /// delegated signers and no policies for the cap pre-check fixtures.
+    /// Builds a decoder-valid ContextRule with `signer_count` delegated signers
+    /// and no policies for the cap pre-check fixtures.
     fn make_rule_scval(signer_count: usize) -> ScVal {
         let signer_ids: Vec<ScVal> = (0..signer_count)
             .map(|index| ScVal::U32(u32::try_from(index).unwrap()))

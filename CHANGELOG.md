@@ -539,6 +539,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id a `u32`, with no repeated policy or id. Such a rule reads as
   `sa.deployment_failed` wherever a rule is read, and the verifier-migration
   planner refuses it. Thanks to @ngybnc.
+- Context-rule listings and the signer and policy cap pre-checks take their
+  counts from the shared context-rule decoder. A rule with misaligned or
+  malformed signer or policy lists fails with `sa.deployment_failed`, and a
+  listing names the rule id. Thanks to @huong8373tt-beep.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 
