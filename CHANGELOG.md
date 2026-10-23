@@ -517,6 +517,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generation of `ctutils::Choice` and its `u128` comparisons were not
   constant-time. The wallet reaches it through `hmac` 0.13 and `sha2` 0.11,
   and through `chacha20poly1305` 0.11 in `stellar-agent-headless-keyring`.
+- `tokio` 1.52.3 to 1.54.1, which resolves RUSTSEC-2026-0386: the safe
+  `AsyncFd` constructors accepted any raw file descriptor without proof of
+  ownership. No wallet crate constructs `AsyncFd`.
 - `mppx` 0.6.31 to 0.8.19 in the MPP interoperability harness, and
   `follow-redirects` 1.16.0 to 1.16.1 in the `@stellar/stellar-sdk` 17
   harness, which resolve four advisories. GHSA-727h-3vm5-qwq6 affects `mppx`
