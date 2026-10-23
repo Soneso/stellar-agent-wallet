@@ -513,6 +513,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this root. `webpki-root-certs` 0.26.11 stays in the lock as a re-export of
   1.0.10. The `reqwest` HTTPS clients verify server certificates with
   `rustls-webpki` against the `webpki-roots` set.
+- `ctutils` 0.4.2 to 0.4.5, which resolves RUSTSEC-2026-0385: the mask
+  generation of `ctutils::Choice` and its `u128` comparisons were not
+  constant-time. The wallet reaches it through `hmac` 0.13 and `sha2` 0.11,
+  and through `chacha20poly1305` 0.11 in `stellar-agent-headless-keyring`.
 - `mppx` 0.6.31 to 0.8.19 in the MPP interoperability harness, and
   `follow-redirects` 1.16.0 to 1.16.1 in the `@stellar/stellar-sdk` 17
   harness, which resolve four advisories. GHSA-727h-3vm5-qwq6 affects `mppx`
