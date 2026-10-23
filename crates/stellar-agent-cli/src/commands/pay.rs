@@ -3174,8 +3174,10 @@ mod tests {
 
     use stellar_agent_core::policy::Decision;
     use stellar_agent_core::policy::v1::PolicyEngineV1;
+    use stellar_agent_core::policy::v1::criteria::minimum_reserve::MinimumReserveCriterion;
     use stellar_agent_core::policy::v1::criteria::per_tx_cap::PerTxCapCriterion;
     use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
+    use stellar_agent_core::policy::v1::{AccountReserveLookupError, AccountReservesView};
     use stellar_xdr::{
         AccountId, Asset, CreateAccountOp, Limits, MuxedAccount, Operation, OperationBody,
         PaymentOp, Preconditions, PublicKey as XdrPublicKey, SequenceNumber, Transaction,
@@ -3196,10 +3198,10 @@ mod tests {
         AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256(g_to_bytes(g))))
     }
 
-    fn build_envelope_b64(tx_source: &str, op: Operation) -> String {
+    fn build_envelope_b64_with_fee(tx_source: &str, op: Operation, fee: u32) -> String {
         let tx = Transaction {
             source_account: g_to_muxed(tx_source),
-            fee: 100,
+            fee,
             seq_num: SequenceNumber(101),
             cond: Preconditions::None,
             memo: stellar_xdr::Memo::None,
@@ -3214,9 +3216,17 @@ mod tests {
             .expect("XDR encoding must succeed")
     }
 
+    fn build_envelope_b64(tx_source: &str, op: Operation) -> String {
+        build_envelope_b64_with_fee(tx_source, op, 100)
+    }
+
     /// A `stellar_pay`-shaped envelope: a single native `Payment` operation
     /// for `amount_stroops` from `SOURCE_G` to `DEST_G`.
     fn pay_envelope_b64(amount_stroops: i64) -> String {
+        pay_envelope_b64_with_fee(amount_stroops, 100)
+    }
+
+    fn pay_envelope_b64_with_fee(amount_stroops: i64, fee: u32) -> String {
         let op = Operation {
             source_account: None,
             body: OperationBody::Payment(PaymentOp {
@@ -3225,7 +3235,23 @@ mod tests {
                 amount: amount_stroops,
             }),
         };
-        build_envelope_b64(SOURCE_G, op)
+        build_envelope_b64_with_fee(SOURCE_G, op, fee)
+    }
+
+    #[derive(Debug)]
+    struct StagedAccountView {
+        balance: i64,
+        subentries: i64,
+    }
+
+    impl AccountReservesView for StagedAccountView {
+        fn reserves_stroops(&self, base_reserve: i64) -> i64 {
+            (2 + self.subentries).saturating_mul(base_reserve)
+        }
+
+        fn balance_stroops(&self) -> Result<i64, AccountReserveLookupError> {
+            Ok(self.balance)
+        }
     }
 
     /// An envelope the pay decoder cannot classify: a `CreateAccount`
@@ -3271,6 +3297,25 @@ mod tests {
             "alice",
         )
         .build()
+    }
+
+    fn minimum_reserve_engine(margin_stroops: i64) -> PolicyEngineV1 {
+        let rule = PolicyRule {
+            r#match: RuleMatch {
+                tool: "stellar_pay_commit".to_owned(),
+                chain: "*".to_owned(),
+            },
+            criteria: vec![Box::new(MinimumReserveCriterion::new(margin_stroops))],
+            decision: Decision::Allow,
+            allow_opaque_signing: false,
+        };
+        let doc = PolicyDocument {
+            version: 1,
+            scope: ScopeId::AllProfiles,
+            rules: vec![rule],
+            signature: None,
+        };
+        PolicyEngineV1::new(doc, "alice".to_owned())
     }
 
     fn envelope_code(
@@ -3336,6 +3381,39 @@ mod tests {
             "policy.deny.per_tx_cap_exceeded",
             "an over-cap staged envelope must deny with the cap's wire code, sized from the \
              decoded envelope amount"
+        );
+    }
+
+    /// A decoded envelope fee is included in the minimum-reserve debit. A
+    /// caller-supplied fee is irrelevant because this path receives only the
+    /// decoder's authoritative args.
+    #[test]
+    fn dispatch_staged_pay_gate_minimum_reserve_counts_envelope_fee() {
+        let engine = minimum_reserve_engine(50_000_000); // 5 XLM margin
+        let profile = staged_test_profile();
+        // Balance 106 XLM; payment 100 XLM leaves exactly the 6 XLM reserve +
+        // margin threshold before the envelope fee. The nonzero fee must deny.
+        let account_view = StagedAccountView {
+            balance: 1_060_000_000,
+            subentries: 0,
+        };
+        let xdr = pay_envelope_b64_with_fee(1_000_000_000, 100);
+        let decode_result = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            &xdr,
+            "stellar_pay_commit",
+        );
+        let result = dispatch_staged_pay_gate(
+            &engine,
+            &profile,
+            "stellar:testnet",
+            decode_result,
+            Some(&account_view),
+            None,
+        );
+        assert_eq!(
+            envelope_code(&result),
+            "policy.deny.minimum_reserve_breached",
+            "the decoded envelope fee must push an exact-boundary payment below the reserve"
         );
     }
 

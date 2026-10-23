@@ -2323,7 +2323,11 @@ garbage = "not-a-number"
         assert_eq!(doc.rules[0].criteria[0].kind(), "minimum_reserve");
 
         let tool = test_tool("stellar_pay");
-        let args = json!({ "amount": "1 XLM", "asset": "native", "fee_stroops": 0 });
+        let args = json!({
+            "amount": "1 XLM",
+            "asset": "native",
+            "total_fee_stroops": 0
+        });
         let store = PolicyStateStore::new();
         let view = LoaderTestAccountView {
             balance: 10_000_000,
