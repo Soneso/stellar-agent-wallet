@@ -23,10 +23,6 @@ ignore = [
     "RUSTSEC-2026-0367", # zip: SUID and SGID bits preserved on extraction
     "RUSTSEC-2026-0368", # zip: symlink targets outside the extraction directory
     "RUSTSEC-2026-0369", # zip: permissions applied through extracted symlinks
-    # webpki-root-certs 0.26.11 is a re-export shim over webpki-root-certs 1.x (1.0.10 drops the emSign root).
-    # rustls-platform-verifier 0.5 pulls the shim on wasm32 targets only; jsonrpsee-http-client 0.26 requires that 0.5 line.
-    # Remove the entry once jsonrpsee-http-client moves to rustls-platform-verifier 0.6 or newer.
-    { id = "RUSTSEC-2026-0383", reason = "webpki-root-certs 0.26.11 is a shim over webpki-root-certs 1.0.10, which carries the fix; it stays until jsonrpsee-http-client moves to rustls-platform-verifier 0.6 or newer" },
 ]
 
 [licenses]
