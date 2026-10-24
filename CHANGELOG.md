@@ -542,6 +542,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GHSA-8r9p-f939-6h3c and GHSA-q3jh-wrc6-jgq8 affect `follow-redirects`
   1.16.0. The harnesses compare the wallet's fixtures with the released
   JavaScript SDKs in CI, and no wallet crate depends on them.
+- `toml` 4.3.0 to 5.0.1 in the MPP interoperability harness, which resolves
+  GHSA-4qx8-w7c3-pj3p, GHSA-9j65-hcg3-gc64, and GHSA-9qmh-m7c6-f92p.
+  The harness checks wallet fixtures against released JavaScript SDKs in CI.
+  No wallet crate uses this npm package at runtime.
+- `zod` 4.6.5 to 4.6.7 in the MPP interoperability harness, which resolves
+  GHSA-mrhx-c7xc-m3w5. Validating an oversized array, set, or map that has a
+  maximum size can exhaust memory: `zod` records an issue for every failing
+  element before it checks that maximum. `mppx` and `@stellar/mpp` in the
+  harness depend on `zod`, and no wallet crate uses this npm package at
+  runtime.
 - V1 policy signatures cover `reason`, `ttl_secs`, and `allow_opaque_signing`
   on each rule that carries them. A policy signed by an earlier release whose
   rules carry these keys fails verification with
