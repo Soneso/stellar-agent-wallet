@@ -654,7 +654,7 @@ pub(super) mod log_capture {
         future: F,
     ) -> (F::Output, String) {
         let capture = stellar_agent_test_support::CaptureWriter::new();
-        let inert = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let inert = stellar_agent_test_support::inert_dispatcher();
         let dispatch = tracing::Dispatch::new(
             tracing_subscriber::fmt()
                 .with_writer(capture.clone())
