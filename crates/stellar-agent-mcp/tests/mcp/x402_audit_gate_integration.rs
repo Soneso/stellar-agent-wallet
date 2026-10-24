@@ -2653,7 +2653,7 @@ async fn x402_oracle_texts_reach_no_tool_result_or_log() {
                 .with_writer_factory(Some(Box::new(move || Box::new(writer.clone())))),
         )
         .expect("the wallet subscriber builds");
-        let inert = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let inert = stellar_agent_test_support::inert_dispatcher();
         let dispatch = tracing::Dispatch::new(subscriber);
         tracing::callsite::rebuild_interest_cache();
         let result = call(&witness.fixture, tool).with_subscriber(dispatch).await;

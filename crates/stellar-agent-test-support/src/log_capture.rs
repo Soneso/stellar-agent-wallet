@@ -24,11 +24,41 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// Returns a dispatcher with no subscriber that keeps a log capture complete.
+///
+/// `tracing` caches each callsite's interest for the whole process. With one
+/// registered dispatcher, `tracing` computes a callsite's interest from the
+/// first thread that reaches it. A neighboring test without a subscriber can
+/// therefore cache a callsite as disabled while a capture is active on another
+/// thread. An inert dispatcher created before the capture's dispatcher and
+/// kept alive until the capture ends makes `tracing` consult every registered
+/// dispatcher, the capture's included. The rebuild through
+/// [`tracing::callsite::rebuild_interest_cache`] refreshes the callsites
+/// cached before the capture registered.
+#[must_use]
+pub fn inert_dispatcher() -> tracing::Dispatch {
+    tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+}
+
 /// A subscriber layer that records warning fields in emission order.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct WarningCapture {
     events: Arc<Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
     target_prefix: Option<&'static str>,
+    /// The inert dispatcher registered before the capture's. While the
+    /// capture lives, `tracing` computes callsite interest from every
+    /// registered dispatcher.
+    _inert: tracing::Dispatch,
+}
+
+impl Default for WarningCapture {
+    fn default() -> Self {
+        Self {
+            events: Arc::default(),
+            target_prefix: None,
+            _inert: inert_dispatcher(),
+        }
+    }
 }
 
 struct WarningFields(std::collections::BTreeMap<String, String>);
@@ -126,30 +156,31 @@ pub struct CaptureWriter {
 /// Runs `f` under a scoped fmt subscriber writing into a fresh
 /// [`CaptureWriter`] and returns everything it captured, as a string.
 ///
-/// Installs the subscriber with `tracing::subscriber::with_default` and then
-/// calls [`tracing::callsite::rebuild_interest_cache`] BEFORE running `f`.
-/// The rebuild is what makes the capture deterministic under a parallel test
-/// harness: `tracing` caches per-callsite interest globally, and a cache
-/// state computed while a different (or no) subscriber was active on another
-/// thread can transiently suppress an event that this thread's scoped
-/// subscriber would accept. `#[serial]` does not close that window — it only
-/// serializes against other `#[serial]` tests, not against the non-serial
-/// neighbors that repopulate the cache.
+/// `tracing` caches each callsite's interest for the whole process, and a
+/// test on another thread can reach a callsite first. The helper creates an
+/// [`inert_dispatcher`] before it installs the subscriber with
+/// `tracing::subscriber::with_default` and keeps it alive until `f` returns,
+/// so `tracing` computes every interest from the registered dispatchers, the
+/// capture's included. It calls [`tracing::callsite::rebuild_interest_cache`]
+/// before running `f`, which refreshes the callsites cached before the
+/// capture registered. Together they keep the capture complete under a
+/// parallel test harness.
 ///
-/// Prefer this over hand-rolling the `CaptureWriter` + `with_default` pair
-/// whenever a test asserts on captured log CONTENT; the hand-rolled form is
-/// only needed when the test must also drive the subscriber or writer
-/// directly.
+/// Prefer this over a hand-rolled `CaptureWriter` and `with_default` pair
+/// whenever a test asserts on captured log content. The hand-rolled form is
+/// for a test that must also drive the subscriber or the writer directly.
 pub fn with_captured_logs<F: FnOnce()>(f: F) -> String {
     let capture = CaptureWriter::new();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(capture.clone())
         .with_ansi(false)
         .finish();
+    let inert = inert_dispatcher();
     tracing::subscriber::with_default(subscriber, || {
         tracing::callsite::rebuild_interest_cache();
         f();
     });
+    drop(inert);
     capture.captured_str()
 }
 
@@ -292,14 +323,20 @@ impl RedactionStrictSubscriber {
     /// The subscriber is unmounted before this method returns, so callers can
     /// run the code under test inside the closure and then call
     /// [`Self::assert_clean`] knowing that no later writes can be captured.
+    /// An [`inert_dispatcher`] lives for the whole call and the interest
+    /// cache is rebuilt before `f` runs, so every event the subscriber
+    /// accepts reaches the capture.
     pub fn run<F, R>(&self, f: F) -> R
     where
         F: FnOnce() -> R,
     {
-        tracing::subscriber::with_default(self.subscriber_guard(), || {
+        let inert = inert_dispatcher();
+        let output = tracing::subscriber::with_default(self.subscriber_guard(), || {
             tracing::callsite::rebuild_interest_cache();
             f()
-        })
+        });
+        drop(inert);
+        output
     }
 
     /// Builds a `tracing` subscriber that writes every formatted event to the

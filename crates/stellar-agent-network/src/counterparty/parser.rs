@@ -999,11 +999,14 @@ FUTURE_SEP1_FIELD = "forward-compatible"
             .with_writer(writer.clone())
             .with_max_level(tracing::Level::DEBUG)
             .finish();
+        // An inert dispatcher kept alive for the capture; see `inert_dispatcher`.
+        let inert = stellar_agent_test_support::inert_dispatcher();
         let dispatch = tracing::Dispatch::new(subscriber);
         let guard = tracing::dispatcher::set_default(&dispatch);
         tracing::callsite::rebuild_interest_cache();
         let parsed = parse_minimal_sep1(&body).unwrap();
         drop(guard);
+        drop(inert);
         assert_eq!(
             parsed.federation_server.as_deref(),
             Some("https://fed.example.com/f")
