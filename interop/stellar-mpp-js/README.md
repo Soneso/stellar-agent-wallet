@@ -32,7 +32,7 @@ The committed fixture records these pins as its generation environment, and
 the check compares its whole content, provenance included.
 
 The pnpm overrides in `package.json` lift `axios` to `1.20.0` and `toml` to
-`4.3.0`, newer than the versions `@stellar/stellar-sdk@15.1.0` requires, because
+`5.0.1`, newer than the versions `@stellar/stellar-sdk@15.1.0` requires, because
 the released server's peer ranges keep the harness on SDK 15.
 
 The upstream packages are MIT or Apache-2.0 licensed as recorded in the frozen
