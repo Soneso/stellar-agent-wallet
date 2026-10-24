@@ -23,6 +23,22 @@ ignore = [
     "RUSTSEC-2026-0367", # zip: SUID and SGID bits preserved on extraction
     "RUSTSEC-2026-0368", # zip: symlink targets outside the extraction directory
     "RUSTSEC-2026-0369", # zip: permissions applied through extracted symlinks
+    # RUSTSEC-2026-0387: crypto-bigint before 0.7.6 can execute secret-dependent
+    # branches in operations intended to be constant-time. The fix is only in
+    # 0.7.6, which elliptic-curve 0.14 uses. soroban-env-host, reached through
+    # stellar-accounts and stellar-governance -> soroban-sdk, requires
+    # elliptic-curve 0.13, k256 0.13, and p256 0.13 in its newest release,
+    # 30.0.0, so crypto-bigint 0.5.5 stays in the lock. The wallet's only
+    # production use of this graph is webauthn/sig_normalize.rs in the
+    # smart-account crate: it parses an authenticator's P-256 signature and
+    # normalizes its public s value. Passkey private keys never enter the
+    # wallet, every P-256 signing call is test code, and signature verification
+    # runs through webauthn-rs-core. k256 is reached only through
+    # soroban-env-host, whose host functions the wallet never runs: production
+    # code builds no Env and simulates over RPC. Remove this entry once
+    # soroban-env-host accepts elliptic-curve 0.14 and the workspace p256 pin
+    # moves to 0.14.
+    "RUSTSEC-2026-0387", # crypto-bigint: secret-dependent branches
 ]
 
 [licenses]

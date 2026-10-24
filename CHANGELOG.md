@@ -527,6 +527,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tokio` 1.52.3 to 1.54.1, which resolves RUSTSEC-2026-0386: the safe
   `AsyncFd` constructors accepted any raw file descriptor without proof of
   ownership. No wallet crate constructs `AsyncFd`.
+- `deny.toml` accepts RUSTSEC-2026-0387 on `crypto-bigint` 0.5.5 with its
+  rationale: operations intended to be constant-time can branch on secret
+  values. The fix exists only in 0.7.6, which `elliptic-curve` 0.14 uses, and
+  `soroban-env-host` still requires `elliptic-curve` 0.13 in its newest
+  release, 30.0.0. The wallet reaches `crypto-bigint` only when it parses and
+  normalizes an authenticator's P-256 signature, which is public data; passkey
+  private keys never enter the wallet. The entry goes when `soroban-env-host`
+  accepts `elliptic-curve` 0.14 and the workspace `p256` pin moves to 0.14.
 - `mppx` 0.6.31 to 0.8.19 in the MPP interoperability harness, and
   `follow-redirects` 1.16.0 to 1.16.1 in the `@stellar/stellar-sdk` 17
   harness, which resolve four advisories. GHSA-727h-3vm5-qwq6 affects `mppx`
